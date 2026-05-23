@@ -1,4 +1,4 @@
-.PHONY: install test lint format run migrate bootstrap
+.PHONY: install test lint format run migrate bootstrap smoke
 
 install:
 	pip install -e ".[dev]"
@@ -20,3 +20,6 @@ migrate:
 
 bootstrap:
 	python scripts/bootstrap_fleet.py
+
+smoke:
+	python -m pytest tests/test_e2e_smoke.py -v -s
