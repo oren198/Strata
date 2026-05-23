@@ -1,0 +1,55 @@
+# Strata fleet example configuration
+#
+# This file demonstrates the fleet YAML format accepted by bootstrap.py.
+# Run ``make bootstrap`` (or ``python scripts/bootstrap_fleet.py --config fleet.example.yaml``)
+# to apply it to a local database.
+#
+# Vocabulary: stratum, scope, edge — see CONTEXT.md for definitions.
+#
+# Structure
+# ---------
+# strata:  Horizontal layers ordered by ``ordinal`` (0 = broadest/root).
+# scopes:  Named regions that belong to exactly one stratum.
+# edges:   Directed links between scopes.
+#            - Inter-stratum edge: from a scope to its parent in the stratum
+#              immediately above (|from.ordinal - to.ordinal| == 1).
+#            - Intra-stratum edge (peer reference): both scopes on the same
+#              stratum (|from.ordinal - to.ordinal| == 0).
+#          Edges may span at most ONE stratum layer.
+
+strata:
+  - id: L0
+    name: Executive
+    ordinal: 0
+  - id: L1
+    name: Function
+    ordinal: 1
+  - id: L2
+    name: Team
+    ordinal: 2
+
+scopes:
+  - id: g_ceo
+    name: CEO
+    stratum_id: L0
+  - id: g_eng
+    name: Engineering
+    stratum_id: L1
+  - id: g_arch
+    name: Architect
+    stratum_id: L1
+  - id: g_backend
+    name: Backend Dev
+    stratum_id: L2
+
+edges:
+  # Inter-stratum edges (child → parent, upward in the hierarchy)
+  - from: g_backend
+    to: g_eng
+  - from: g_arch
+    to: g_eng
+  - from: g_eng
+    to: g_ceo
+  # Intra-stratum peer reference (same stratum L1 — carries context only)
+  - from: g_backend
+    to: g_arch

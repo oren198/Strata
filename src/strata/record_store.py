@@ -244,21 +244,25 @@ class RecordStore:
     # Scopes
     # ------------------------------------------------------------------
 
-    def create_scope(self, *, name: str, stratum_id: str) -> Scope:
+    def create_scope(self, *, name: str, stratum_id: str, id: str | None = None) -> Scope:
         """Insert a new scope in the given stratum and return it.
 
         Args:
             name:       Human-readable label for the scope.
             stratum_id: ID of an existing stratum this scope belongs to.
+            id:         Optional explicit scope ID. When omitted, a fresh
+                        ``g_<6hex>`` ID is generated. Explicit IDs let the
+                        bootstrap config pin canonical names like ``g_arch``.
 
         Returns:
             The newly created :class:`Scope`.
 
         Raises:
             sqlite3.IntegrityError: If *stratum_id* does not reference an
-                existing stratum (FK constraint).
+                existing stratum (FK constraint), or if *id* collides with
+                an existing scope.
         """
-        scope_id = _new_scope_id()
+        scope_id = id if id is not None else _new_scope_id()
         self._conn.execute(
             "INSERT INTO scopes (id, name, stratum_id) VALUES (?, ?, ?)",
             (scope_id, name, stratum_id),

@@ -1,4 +1,4 @@
-.PHONY: install test lint format run migrate
+.PHONY: install test lint format run migrate bootstrap
 
 install:
 	pip install -e ".[dev]"
@@ -17,3 +17,6 @@ run:
 
 migrate:
 	python scripts/run_migrations.py
+
+bootstrap:
+	python scripts/bootstrap_fleet.py
