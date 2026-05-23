@@ -203,14 +203,11 @@ def apply_fleet_config(store: RecordStore, config: FleetConfig) -> BootstrapResu
                 )
             result.scopes_existing.append(scope_def.id)
         else:
-            # create_scope generates a random ID; we need to insert with the
-            # YAML-specified ID.  We use the store's connection directly,
-            # matching the store's own INSERT pattern.
-            store._conn.execute(
-                "INSERT INTO scopes (id, name, stratum_id) VALUES (?, ?, ?)",
-                (scope_def.id, scope_def.name, scope_def.stratum_id),
+            store.create_scope(
+                id=scope_def.id,
+                name=scope_def.name,
+                stratum_id=scope_def.stratum_id,
             )
-            store._conn.commit()
             result.scopes_created.append(scope_def.id)
 
     # ------------------------------------------------------------------
