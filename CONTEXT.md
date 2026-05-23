@@ -120,18 +120,34 @@ A scope summary has two sections:
 
 An agent's submission of memory to a scope's **scope-manager**. A
 contribution is never a direct write — it is a proposal the scope-manager
-judges. The scope-manager may:
+judges. The scope-manager exercises the scope's full authority and may:
 
-- **Accept as directive** — only possible if the contributor has authority
-  at the target scope (i.e. is bound there, or sits in a stratum above with
-  authority over it).
-- **Accept as context** — possible from any reachable contributor; the
-  contribution informs the scope without binding it.
-- **Decline** — the contribution does not enter the scope summary, and no
-  inheritor will see it via their perspective.
+- **Accept as directive** — the memory binds the scope and all descendants.
+- **Accept as context** — the memory informs the scope without binding it.
+- **Decline** — the memory does not enter the scope summary.
+
+A contribution carries the contributor's **proposed classification**
+(`directive` | `context`), but this is a hint, not a constraint: the
+scope-manager has the broader information (the full record, the inherited
+perspective, accumulated trust) and is free to re-classify a contribution in
+either direction — including upgrading peer-submitted context into a
+directive.
 
 Every contribution — accepted, classified, or declined — is appended to the
 scope's **record** for accountability.
+
+## Ratification
+
+The act by a scope-manager of publishing a new **directive** based on
+**context** accumulated within its scope. Ratification is how evidence
+flows upward into binding authority: contributions that a scope-manager
+accepted as context (e.g. peer-submitted observations) can, once a pattern
+or consensus warrants, be consolidated into a directive published with the
+scope's authority.
+
+Ratification is not a separate primitive — it is a directive write by the
+scope-manager, using its scope authority. The term names the *pattern* of
+context-to-directive consolidation.
 
 ## Perspective
 
