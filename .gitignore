@@ -10,3 +10,6 @@ venv/
 .env
 *.db
 *.sqlite*
+
+# Claude Code agent worktrees (created by the harness, not project state)
+.claude/worktrees/
