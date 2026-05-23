@@ -104,9 +104,48 @@ on top of* the record, not changes to it.
 ## Scope summary
 
 The curated, condensed working view of a scope, maintained by the
-**scope-manager**. Updated on each accepted write. The scope summary is what
-agents read when they inherit from this scope; the record is consulted only
-for accountability, recovery, or forensics.
+**scope-manager**. Updated on each accepted contribution. The scope summary
+is what gets composed into agents' **perspectives** when they inherit from
+this scope; the record is consulted only for accountability, recovery, or
+forensics.
+
+A scope summary has two sections:
+
+- **Directives** — listed individually, each retaining its identity so it can
+  be cited, superseded, or retired distinctly.
+- **Context** — a condensed digest of relevant non-binding knowledge from
+  this scope.
+
+## Contribution
+
+An agent's submission of memory to a scope's **scope-manager**. A
+contribution is never a direct write — it is a proposal the scope-manager
+judges. The scope-manager may:
+
+- **Accept as directive** — only possible if the contributor has authority
+  at the target scope (i.e. is bound there, or sits in a stratum above with
+  authority over it).
+- **Accept as context** — possible from any reachable contributor; the
+  contribution informs the scope without binding it.
+- **Decline** — the contribution does not enter the scope summary, and no
+  inheritor will see it via their perspective.
+
+Every contribution — accepted, classified, or declined — is appended to the
+scope's **record** for accountability.
+
+## Perspective
+
+An agent's composed view of long-term memory at read time. A perspective
+assembles:
+
+- The agent's own **scope summary**,
+- The summaries of every inter-stratum ancestor up to the root,
+- The summaries of any peer scopes referenced by scopes on that chain.
+
+Each piece in the perspective is labelled with the scope it came from —
+composition is **provenance-preserving**, not flattened. Directives compose
+with broader-stratum winning; context composes with closest-scope winning;
+context never overrides a directive.
 
 ## Directive
 
