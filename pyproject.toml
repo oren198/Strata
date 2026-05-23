@@ -39,4 +39,5 @@ target-version = "py311"
 select = ["E", "F", "I", "B", "UP", "SIM"]
 ignore = [
     "SIM108",  # ternary operator — readability preference
+    "B008",    # Depends() in function defaults is the standard FastAPI pattern
 ]

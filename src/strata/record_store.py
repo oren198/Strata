@@ -509,6 +509,30 @@ class RecordStore:
         self._conn.commit()
         return self._fetch_judgment(judgment_id)
 
+    def list_judgments(self, *, scope_id: str) -> list[Judgment]:
+        """Return all judgments for contributions belonging to *scope_id*.
+
+        Joins ``judgments`` against ``contributions`` to filter by scope.
+        Results are ordered by ``judgments.created_at`` ascending.
+
+        Args:
+            scope_id: The scope whose contribution judgments to retrieve.
+
+        Returns:
+            Ordered list of :class:`Judgment` objects.
+        """
+        rows = self._conn.execute(
+            """
+            SELECT j.id, j.contribution_id, j.decision, j.judged_by, j.notes, j.created_at
+            FROM judgments j
+            JOIN contributions c ON j.contribution_id = c.id
+            WHERE c.scope_id = ?
+            ORDER BY j.created_at ASC
+            """,
+            (scope_id,),
+        ).fetchall()
+        return [Judgment(**dict(row)) for row in rows]
+
     def _fetch_judgment(self, judgment_id: str) -> Judgment:
         row = self._conn.execute(
             """
