@@ -39,14 +39,41 @@ above both).
 
 ## Agent
 
-A **session**: a single, time-bounded execution context that reads and writes
-long-term memory in Strata. An agent is bound to exactly **one** scope at
-spawn time, for its entire lifetime — it cannot change scope. To act from a
-different scope, an agent spawns a sub-session bound to that scope.
+A `(session, skill, scope)` triple. All three are bound at spawn time and
+fixed for the agent's lifetime — the agent cannot change session, skill, or
+scope. To act differently, an agent spawns a sub-agent with the bindings it
+needs.
+
+- **Session** — execution context and short-term memory; the lifetime.
+- **Skill** — what this agent does; the specialization.
+- **Scope** — position in the strata; where authority comes from.
 
 An agent's own working state lives in its **short-term memory**; only what it
 writes to Strata persists. Agents come and go; the fleet does not track them
 individually beyond what provenance on their writes records.
+
+## Session
+
+The execution-context dimension of an **agent**: a single, time-bounded run
+with short-term memory of its own. Sessions are transient; they end and do
+not persist.
+
+## Skill
+
+The specialization dimension of an **agent**: the durable definition of *what
+this agent does*. Skills outlive sessions — the same skill is instantiated
+across many sessions over time. Examples: `scope-manager`, `code-writer`,
+`evidence-summarizer`.
+
+## Scope-manager
+
+The **agent** whose **skill** is to curate the memory of a single scope. All
+writes to a scope pass through its scope-manager, which judges every write
+(auth check, supersession, dedup, conflict detection) and updates the scope's
+**scope summary** accordingly.
+
+The scope-manager is itself a regular Strata agent — Strata uses its own
+primitives (session, skill, scope) to manage itself.
 
 ## Short-term memory
 
@@ -59,6 +86,27 @@ exist when the session ends.
 Memory written to Strata, persisting across agents. Everything Strata's
 mechanics — scope, stratum, directive/context, authority, trust, forgetting —
 operate on is long-term memory.
+
+Each scope's long-term memory has two layers:
+
+- The **record** is the append-only, immutable log of everything ever written
+  to the scope. The source of truth for accountability and forensics.
+- The **scope summary** is the curated, condensed representation of the
+  scope's *current* state, maintained by the scope-manager. This is the
+  working view — what downstream agents actually read.
+
+## Record
+
+The append-only, immutable log of every write ever accepted into a scope.
+Owned per-scope. Never edited; supersession and retirement are *bookkeeping
+on top of* the record, not changes to it.
+
+## Scope summary
+
+The curated, condensed working view of a scope, maintained by the
+**scope-manager**. Updated on each accepted write. The scope summary is what
+agents read when they inherit from this scope; the record is consulted only
+for accountability, recovery, or forensics.
 
 ## Directive
 
