@@ -149,6 +149,41 @@ Ratification is not a separate primitive — it is a directive write by the
 scope-manager, using its scope authority. The term names the *pattern* of
 context-to-directive consolidation.
 
+## Supersession
+
+The pattern by which one **directive** replaces another on the same subject.
+A new directive's contribution carries a `supersedes` reference to the
+prior item; the scope-manager publishes the new directive into the summary
+and removes the old one. The supersession event lives in the **record**; no
+tombstone remains in the summary.
+
+## Retirement
+
+The deliberate removal of a directive from a scope summary by its
+scope-manager. Retirement may be implicit (the directive was superseded by
+a new one — see **Supersession**) or explicit (the scope-manager retires it
+without a replacement). Either way, the directive ceases to appear in the
+scope summary; the retirement event lives in the **record** as audit trail;
+no tombstone is left in the summary.
+
+Retirement exists only for **directives**. Context "forgetting" requires no
+ceremony — the scope-manager simply omits stale context from the next
+summary it rewrites.
+
+## Fleet
+
+The total set of scopes and the agents that contribute to and read from
+them. The scope hierarchy (strata + edges) is the fleet's structural
+definition; agents are transient members instantiated against it.
+
+## Provenance
+
+The metadata that travels with a memory item identifying its origin — the
+contributing `(scope, skill, session, timestamp)`. Provenance is preserved
+through composition into **perspectives** so readers know where each piece
+came from; it is the basis for accountability and for aggregating **trust**
+along any of its dimensions.
+
 ## Perspective
 
 An agent's composed view of long-term memory at read time. A perspective
