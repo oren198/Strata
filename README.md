@@ -143,3 +143,43 @@ This is the deeper answer to the original goal. The fleet improves not because m
 | Forgetting | How does memory stay relevant over time? |
 
 The throughline: **a fleet should share memory so its performance compounds, and the entire difficulty — and therefore the entire design — is letting every agent contribute to that shared memory without letting any agent corrupt it.**
+
+---
+
+## Development
+
+### Prerequisites
+
+Python 3.11+. No other system dependencies for the backend.
+
+### Setup
+
+```bash
+make install    # pip install -e ".[dev]"
+```
+
+### Common tasks
+
+```bash
+make test       # run pytest
+make lint       # ruff check + ruff format --check
+make format     # ruff format (auto-fix style)
+make run        # uvicorn strata.app:app --reload --port 8000  (requires feature/app-server)
+make migrate    # apply SQLite schema migrations (requires feature/record-store)
+```
+
+### Project layout
+
+```
+src/strata/         # Python package — the backend service
+tests/              # pytest test suite
+migrations/         # SQLite schema migrations for the record store
+scripts/            # Utility scripts (run_migrations.py, etc.)
+docs/adr/           # Architecture Decision Records
+```
+
+### Vocabulary
+
+All code and comments use the canonical glossary from `CONTEXT.md`. Key terms:
+`scope`, `stratum`, `agent`, `contribution`, `scope-manager`, `directive`,
+`context`, `perspective`, `record`, `provenance`, `trust`.
