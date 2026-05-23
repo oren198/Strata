@@ -37,17 +37,59 @@ not bind the reader. To make a peer's standard binding, it must be ratified
 into a common ancestor scope (i.e. published as a directive at a stratum
 above both).
 
+## Agent
+
+A **session**: a single, time-bounded execution context that reads and writes
+long-term memory in Strata. An agent is bound to exactly **one** scope at
+spawn time, for its entire lifetime — it cannot change scope. To act from a
+different scope, an agent spawns a sub-session bound to that scope.
+
+An agent's own working state lives in its **short-term memory**; only what it
+writes to Strata persists. Agents come and go; the fleet does not track them
+individually beyond what provenance on their writes records.
+
+## Short-term memory
+
+Memory that lives only within a single agent (session), never published to
+Strata. The agent's local working state during its execution. It ceases to
+exist when the session ends.
+
+## Long-term memory
+
+Memory written to Strata, persisting across agents. Everything Strata's
+mechanics — scope, stratum, directive/context, authority, trust, forgetting —
+operate on is long-term memory.
+
 ## Directive
 
-Memory representing a **binding** decision — what the fleet (or a sub-region
-of it) has resolved to do or to treat as true. Directives propagate down
-through inter-stratum edges and bind every descendant scope. When two
-directives conflict, the one from the broader (higher) stratum wins; a
-descendant may refine within an inherited directive but may not contradict it.
+A kind of long-term memory representing a **binding** decision — what the
+fleet (or a sub-region of it) has resolved to do or to treat as true.
+Directives propagate down through inter-stratum edges and bind every
+descendant scope. When two directives conflict, the one from the broader
+(higher) stratum wins; a descendant may refine within an inherited directive
+but may not contradict it.
 
 ## Context
 
-Memory representing observation, working state, or non-binding knowledge.
-Context propagates along both inter-stratum edges (downward) and intra-stratum
-peer references (across). When two pieces of context conflict, the one from
-the scope closest to the reader wins. Context never overrides a directive.
+A kind of long-term memory representing observation, working state, or
+non-binding knowledge. Context propagates along both inter-stratum edges
+(downward) and intra-stratum peer references (across). When two pieces of
+context conflict, the one from the scope closest to the reader wins. Context
+never overrides a directive.
+
+## Authority
+
+The right to publish memory at a scope, which thereby reaches all of that
+scope's descendants. Authority is a property of the **scope** itself (its
+position in the strata), not of any individual agent. An agent bound to a
+scope exercises that scope's authority for the duration of its session;
+authority does not outlive any single agent, but the scope continues to wield
+it through whichever agents bind to it next.
+
+## Trust
+
+A property of a **memory item** that rises or falls based on outcomes from
+acting on it. Trust attaches to items, not to agents (too ephemeral) and not
+to scopes (too coarse). Trust may be aggregated across items sharing a scope
+or other provenance dimension for retrieval weighting and accountability, but
+the canonical store of trust is per-item.
