@@ -90,10 +90,23 @@ curl -s http://localhost:8000/scopes/g_arch/summary | jq
 cat ./summaries/g_arch.md
 ```
 
+### Strata Console UI
+
+After `make run`, open [http://localhost:8000/](http://localhost:8000/) in your
+browser. The root URL redirects to the Strata Console, a read-only graph and
+list view of the current fleet state.
+
+The UI polls the backend every 5 seconds; there is no WebSocket in V1. All
+memory mutations flow through `strata.contribute` — the UI has no write path
+in V1.
+
+To point the UI at a non-default backend, edit the
+`<meta name="strata-api-base" content="...">` tag in `ui/index.html`.
+
 ### Run the tests
 
 ```bash
-make test         # full suite (55 tests, scope-manager mocked)
+make test         # full suite (scope-manager mocked)
 make smoke        # end-to-end smoke (bootstrap → contribute → summary)
 make lint         # ruff check + ruff format --check
 ```
@@ -133,12 +146,22 @@ docs/
   adr/
     0001-v1-architecture.md
 src/strata/              # Python backend package
-  app.py                 # FastAPI app + endpoints
+  app.py                 # FastAPI app + endpoints (serves ui/ at /ui)
   settings.py            # pydantic-settings config
   record_store.py        # SQLite repository (append-only record + fleet config)
   summary_store.py       # Markdown on-disk scope summaries
   scope_manager.py       # LLM judgment layer (Anthropic tool use)
   bootstrap.py           # YAML fleet config loader/applier
+ui/                      # Strata Console (no build step — Babel-standalone in browser)
+  index.html             # Entry point; served at /ui/index.html
+  app.jsx                # Root app, backend polling, read-only state
+  atoms.jsx              # Shared UI atoms (Icon, Field, Toast, Modal …)
+  graph.jsx              # Force-directed scope graph
+  scope-detail.jsx       # Scope drill-in: backend summary + scope info
+  settings.jsx           # Settings screen (display prefs + fleet read-only view)
+  tweaks-panel.jsx       # Floating tweaks panel
+  store.js               # API client (fetch /scopes, /scopes/{id}/summary)
+  atlas.css              # Atlas design system tokens + component classes
 tests/                   # pytest suite
 migrations/              # SQLite schema migrations
 scripts/                 # CLI runners (run_migrations.py, bootstrap_fleet.py)
