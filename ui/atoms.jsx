@@ -2,12 +2,43 @@
 // Strata · small shared atoms. Icon, Field, Button-likes.
 // ─────────────────────────────────────────────────────────────────────
 
+const ICON_SVG_CACHE = new Map();
+
+function lucideKey(name) {
+  return name
+    .split("-")
+    .map((p) => p.charAt(0).toUpperCase() + p.slice(1))
+    .join("");
+}
+
+function getIconSvg(name, size) {
+  const cacheKey = `${name}@${size}`;
+  const cached = ICON_SVG_CACHE.get(cacheKey);
+  if (cached !== undefined) return cached;
+  const lib = window.lucide;
+  const iconNode = lib && lib.icons && lib.icons[lucideKey(name)];
+  if (!iconNode || !lib.createElement) {
+    ICON_SVG_CACHE.set(cacheKey, null);
+    return null;
+  }
+  const svg = lib.createElement(iconNode, { width: size, height: size });
+  const html = svg.outerHTML;
+  ICON_SVG_CACHE.set(cacheKey, html);
+  return html;
+}
+
 function Icon({ name, size = 16, style = {}, className = "" }) {
+  const html = getIconSvg(name, size);
+  const spanStyle = { width: size, height: size, display: "inline-flex", flexShrink: 0, ...style };
+  if (!html) {
+    return <span className={className} style={spanStyle} aria-hidden="true" />;
+  }
   return (
-    <i
-      data-lucide={name}
+    <span
       className={className}
-      style={{ width: size, height: size, display: "inline-flex", flexShrink: 0, ...style }}
+      style={spanStyle}
+      aria-hidden="true"
+      dangerouslySetInnerHTML={{ __html: html }}
     />
   );
 }
