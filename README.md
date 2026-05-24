@@ -43,41 +43,74 @@ browser-based Console, and a Claude Code MCP plugin + skills.
 
 ## Quick start
 
-### Prerequisites
+A first-time, copy-paste-able run. Five steps, ~5 minutes.
 
-- Python 3.11+
-- An Anthropic API key in `ANTHROPIC_API_KEY` (needed for live
-  scope-manager calls; the test suite mocks them)
+### 1. Prerequisites
 
-### Install
+- **Python 3.11 or newer.** Check: `python3 --version`. If your system Python is older, install 3.11+ via `pyenv`, your package manager, or [python.org](https://www.python.org/downloads/).
+- **`make`** (usually preinstalled on macOS/Linux; `xcode-select --install` on macOS if missing).
+- **An Anthropic API key.** Get one at <https://console.anthropic.com/>. It's only needed to make real scope-manager calls — the test suite mocks them, so you can run tests without it.
+
+### 2. Clone and install
 
 ```bash
-make install      # pip install -e ".[dev,cc-plugin]"
+git clone https://github.com/oren198/Strata.git
+cd Strata
+make install        # creates the package install + dev/cc-plugin extras
 ```
 
-### One command to run the system
+`make install` runs `pip install -e ".[dev,cc-plugin]"`. If you prefer an isolated virtual environment first:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
+make install
+```
+
+### 3. Set your API key
+
+Either export it in your shell:
+
+```bash
+export ANTHROPIC_API_KEY=sk-ant-...
+```
+
+…or create a `.env` file at the repo root (auto-loaded by the backend):
+
+```
+ANTHROPIC_API_KEY=sk-ant-...
+```
+
+Without a key you can still run `make test` and `make lint`, but live contributions will fail when the backend tries to call the model.
+
+### 4. Start everything with one command
 
 ```bash
 strata start
 ```
 
-That single command applies any pending SQLite migrations, auto-bootstraps
-the fleet from `fleet.yaml` (or `fleet.example.yaml` if no local
-`fleet.yaml` exists) when the DB is empty, and starts the FastAPI
-backend on port 8000. The Strata Console UI is served from the same
-process at <http://127.0.0.1:8000/>.
+This (a) applies SQLite migrations to `./strata.db`, (b) auto-bootstraps the example fleet from `fleet.example.yaml` because no `fleet.yaml` exists yet, and (c) launches the FastAPI server.
 
-### Look at memory from the terminal
+**Success looks like this:**
 
-In a separate shell (while the backend is up):
+```
+Applied 1 migration(s).
+Fleet bootstrapped from fleet.example.yaml:
+  strata: 3 created, 0 existing
+  scopes: 4 created, 0 existing
+  edges:  4 created, 0 existing
 
-```bash
-strata scopes              # list the fleet's strata, scopes, edges
-strata summary g_arch      # print a scope's curated summary (directives + context)
-strata record g_arch       # print every contribution + judgment in the scope's record
+Strata backend → http://127.0.0.1:8000
+Strata Console → http://127.0.0.1:8000/
+
+INFO:     Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)
 ```
 
-### Make a contribution by hand
+Now open <http://127.0.0.1:8000/> in your browser — you should see the Strata Console with three lanes (Executive / Function / Team) and four scope bubbles (CEO, Engineering, Architect, Backend Dev). Leave `strata start` running.
+
+### 5. Make a contribution and watch memory update
+
+In a **second terminal** (the first is busy serving):
 
 ```bash
 curl -s -X POST http://localhost:8000/contribute \
@@ -97,36 +130,70 @@ curl -s -X POST http://localhost:8000/contribute \
   }' | jq
 ```
 
-The contribution is judged by the scope-manager (an Anthropic API call)
-and, on accept, the scope summary at `summaries/g_arch.md` updates.
+Expected response (decision text may vary — the LLM judges):
+
+```json
+{
+  "contribution_id": "c_xxxxxx",
+  "judgment": {
+    "decision": "accept_as_directive",
+    "reasoning": "...",
+    "summary_updated": true
+  }
+}
+```
+
+Then inspect the result:
+
+```bash
+strata summary g_arch        # see the new directive in the curated summary
+cat summaries/g_arch.md      # same content as a markdown file
+strata record g_arch         # full contribution + judgment log
+```
+
+The UI tab will reflect the change within ~5 seconds (it polls).
+
+### Stopping
+
+`Ctrl+C` in the terminal running `strata start`. State persists across restarts in `./strata.db` and `./summaries/`.
+
+### Troubleshooting
+
+| Symptom | Fix |
+|---|---|
+| `strata: command not found` | You didn't run `make install`, or your venv isn't activated. Re-run `make install`. |
+| `Address already in use` on port 8000 | Another process owns the port. Either stop it or run `strata start --port 8001`. |
+| `strata scopes` says `Connection refused` | The backend isn't running. Start it with `strata start` in another terminal. |
+| Contribution returns 500 with `scope_manager_failure` | Your `ANTHROPIC_API_KEY` is missing or invalid. Check step 3. |
+| Want to start over with a fresh DB | `rm -f strata.db && rm -rf summaries/`, then `strata start` re-bootstraps. |
+
+---
+
+## More commands
+
+### Inspect memory from the terminal
+
+```bash
+strata scopes              # list the fleet's strata, scopes, edges
+strata summary <scope_id>  # curated summary (directives + context)
+strata record  <scope_id>  # every contribution + judgment in the scope's record
+```
 
 ### Advanced subcommands
 
-`strata` also exposes the individual steps:
-
 ```bash
-strata migrate                # apply pending SQLite migrations only
-strata bootstrap --config fleet.example.yaml   # apply a YAML fleet config only
-strata start --no-bootstrap   # skip auto-bootstrap on first run
-strata start --reload         # uvicorn auto-reload (dev mode)
+strata migrate                                  # apply pending SQLite migrations only
+strata bootstrap --config fleet.example.yaml    # apply a YAML fleet config only
+strata start --no-bootstrap                     # skip auto-bootstrap on first run
+strata start --reload                           # uvicorn auto-reload (dev mode)
+strata start --port 8001                        # serve on a different port
 ```
 
-The original `make` targets (`make migrate`, `make bootstrap`, `make run`,
-`make test`, `make lint`, `make smoke`) all still work and are useful when
-hacking on Strata itself.
+The original `make` targets (`make migrate`, `make bootstrap`, `make run`, `make test`, `make lint`, `make smoke`) still work and are useful when hacking on Strata itself.
 
 ### Strata Console UI
 
-After `make run`, open [http://localhost:8000/](http://localhost:8000/) in your
-browser. The root URL redirects to the Strata Console, a read-only graph and
-list view of the current fleet state.
-
-The UI polls the backend every 5 seconds; there is no WebSocket in V1. All
-memory mutations flow through `strata.contribute` — the UI has no write path
-in V1.
-
-To point the UI at a non-default backend, edit the
-`<meta name="strata-api-base" content="...">` tag in `ui/index.html`.
+Open <http://127.0.0.1:8000/> while the backend is running — a read-only graph and list view of the current fleet state, polling every 5 s. All memory mutations flow through `strata.contribute`; the UI has no write path in V1. To point the UI at a non-default backend, edit the `<meta name="strata-api-base" content="...">` tag in `ui/index.html`.
 
 ### Run the tests
 
