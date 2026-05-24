@@ -1,0 +1,256 @@
+/* ───────────────────────────────────────────────────────────────────────
+   HireIntel / Atlas Design System
+   Tokens for typography + color, plus semantic CSS variables.
+   Source of truth: frontend/app/globals.css in oren198/alphaSignal.
+   ─────────────────────────────────────────────────────────────────────── */
+
+@import url("https://fonts.googleapis.com/css2?family=Inter+Tight:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap");
+
+:root {
+  /* ── Atlas palette ───────────────────────────────────────────────── */
+  /* Surfaces — warm off-white, NOT pure white. Distinguishes Atlas
+     from generic shadcn/Vercel-style fintech UIs. */
+  --at-bg:           #fafaf7;   /* page background (warm off-white) */
+  --at-surface:      #ffffff;   /* card / nav / popover surface */
+  --at-highlight:    #f3efe1;   /* warm tint for chips, eyebrows, hover */
+  --at-rule:         #e7e5dd;   /* divider, card border */
+  --at-rule-soft:    #f0eee5;   /* faint divider, pill border */
+
+  /* Type colors — ink-navy, not pure black. Three weights. */
+  --at-ink:          #0e1116;   /* primary text */
+  --at-ink-soft:     #3c4250;   /* body / secondary */
+  --at-muted:        #6c7280;   /* tertiary, eyebrow, captions */
+
+  /* Brand — deep ink-navy with cool blue accent. */
+  --at-primary:      #1a2438;   /* CTAs, brand mark, active tab */
+  --at-primary-hover:#2a3550;
+  --at-brand-tint:   #1f2a44;
+  --at-accent:       #3b82f6;   /* highlighted link, "Most popular" pill */
+
+  /* Semantic — bull/bear/warn. Always paired with a tint background. */
+  --at-bull:         #0f8e5b;
+  --at-bear:         #c8362a;
+  --at-warn:         #b87514;
+
+  /* ── Spacing & radii ─────────────────────────────────────────────── */
+  --at-row-pad:      12px;
+  --at-card-pad:     18px;
+  --at-gap:          14px;     /* default grid gap between cards/sections */
+  --at-radius-sm:    6px;
+  --at-radius:       8px;      /* buttons, inputs, small cards */
+  --at-radius-md:    10px;     /* flat cards */
+  --at-radius-lg:    12px;     /* primary cards */
+  --at-radius-xl:    14px;     /* pricing / hero cards */
+
+  /* ── Shadows ─────────────────────────────────────────────────────── */
+  /* Atlas uses borders, not shadows, for elevation. The only shadow
+     allowed is a soft drop under the highlighted pricing card and the
+     mobile-menu dropdown. */
+  --at-shadow-card:  0 6px 18px rgba(0, 0, 0, 0.06);
+  --at-shadow-pop:   0 12px 32px rgba(26, 36, 56, 0.12);
+
+  /* ── Type families ───────────────────────────────────────────────── */
+  --font-display:    "Inter Tight", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-sans:       "Inter Tight", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono:       "JetBrains Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+
+  /* ── Type scale (px values; weights/leading inline below) ─────── */
+  --fs-eyebrow:      11px;
+  --fs-caption:      12px;
+  --fs-body-sm:      13px;
+  --fs-body:         14px;
+  --fs-body-lg:      15px;
+  --fs-h3:           16px;
+  --fs-num-md:       18px;
+  --fs-h2:           22px;
+  --fs-num-lg:       28px;
+  --fs-h1:           30px;
+  --fs-display:      36px;
+  --fs-num-xl:       38px;
+  --fs-hero:         52px;
+}
+
+/* ── Semantic typography classes ────────────────────────────────────── */
+
+.at-display {
+  font-family: var(--font-display);
+  letter-spacing: -0.01em;
+}
+.at-mono {
+  font-family: var(--font-mono);
+  font-feature-settings: "tnum" 1;   /* tabular numerals for tables */
+}
+
+/* Eyebrow: uppercase 11px tracked label that anchors every section. */
+.at-section-eyebrow {
+  font-family: var(--font-display);
+  font-size: var(--fs-eyebrow);
+  color: var(--at-muted);
+  font-weight: 500;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+/* Headings — display-tight tracking, sentence case. */
+.at-h1 { font-family: var(--font-display); font-size: var(--fs-h1); font-weight: 600; letter-spacing: -0.025em; margin: 0; }
+.at-h2 { font-family: var(--font-display); font-size: var(--fs-h2); font-weight: 600; letter-spacing: -0.02em;  margin: 0; }
+.at-h3 { font-family: var(--font-display); font-size: var(--fs-h3); font-weight: 600; letter-spacing: -0.01em;  margin: 0; }
+
+/* Numerals — always mono, always tight tracking. */
+.at-num-xl { font-family: var(--font-mono); font-feature-settings: "tnum" 1; font-size: var(--fs-num-xl); font-weight: 600; letter-spacing: -0.025em; }
+.at-num-lg { font-family: var(--font-mono); font-feature-settings: "tnum" 1; font-size: var(--fs-num-lg); font-weight: 600; letter-spacing: -0.02em; }
+.at-num-md { font-family: var(--font-mono); font-feature-settings: "tnum" 1; font-size: var(--fs-num-md); font-weight: 600; letter-spacing: -0.015em; }
+
+/* Body — Inter Tight, slightly negative letter-spacing inherited from <body>. */
+.at-body    { font-size: var(--fs-body);    line-height: 1.55; color: var(--at-ink-soft); }
+.at-body-sm { font-size: var(--fs-body-sm); line-height: 1.5;  color: var(--at-ink-soft); }
+.at-caption { font-size: var(--fs-caption); line-height: 1.4;  color: var(--at-muted); }
+
+/* ── Semantic states ────────────────────────────────────────────────── */
+.at-up   { color: var(--at-bull); }
+.at-down { color: var(--at-bear); }
+
+/* ── Cards ──────────────────────────────────────────────────────────── */
+.at-card      { background: var(--at-surface); border: 1px solid var(--at-rule); border-radius: var(--at-radius-lg); }
+.at-card-flat { background: var(--at-surface); border: 1px solid var(--at-rule); border-radius: var(--at-radius-md); }
+
+/* ── Pills ──────────────────────────────────────────────────────────── */
+.at-pill {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 3px 9px; border-radius: 999px;
+  font-family: var(--font-display);
+  font-size: var(--fs-eyebrow); font-weight: 500;
+  background: var(--at-highlight); color: var(--at-ink-soft);
+  border: 1px solid var(--at-rule-soft);
+  white-space: nowrap; flex-shrink: 0;
+}
+.at-pill-ok   { background: #e6f4ed; border-color: #cce5d6; color: var(--at-bull); }
+.at-pill-warn { background: #fbf3e0; border-color: #f0e2b6; color: var(--at-warn); }
+.at-pill-bear { background: #fbe8e6; border-color: #f3cec9; color: var(--at-bear); }
+
+/* ── Tabs ───────────────────────────────────────────────────────────── */
+.at-tab {
+  padding: 8px 14px; border-radius: var(--at-radius);
+  font-family: var(--font-display);
+  font-size: var(--fs-body-sm); color: var(--at-muted);
+  cursor: pointer; transition: background 120ms, color 120ms;
+  font-weight: 500; user-select: none;
+  background: transparent; border: none;
+}
+.at-tab.active                 { background: var(--at-primary); color: white; }
+.at-tab:not(.active):hover     { background: var(--at-highlight); color: var(--at-ink); }
+
+.at-tab-line {
+  padding: 10px 0; margin-right: 28px;
+  border-bottom: 2px solid transparent;
+  font-family: var(--font-display);
+  font-size: var(--fs-body); color: var(--at-muted);
+  cursor: pointer; font-weight: 500;
+  transition: color 120ms, border-color 120ms;
+  user-select: none; white-space: nowrap;
+  background: transparent;
+  border-left: none; border-right: none; border-top: none;
+}
+.at-tab-line.active                { border-bottom-color: var(--at-primary); color: var(--at-ink); }
+.at-tab-line:not(.active):hover    { color: var(--at-ink); }
+
+/* ── Tickers / inline mono / kbd ───────────────────────────────────── */
+.at-ticker-chip {
+  display: inline-block;
+  font-family: var(--font-mono);
+  font-size: var(--fs-eyebrow); font-weight: 600;
+  padding: 1px 6px; border-radius: 4px;
+  background: var(--at-highlight); color: var(--at-ink);
+}
+.at-kbd {
+  font-family: var(--font-mono);
+  font-size: 10px; padding: 1px 5px;
+  border: 1px solid var(--at-rule); border-radius: 4px;
+  color: var(--at-muted);
+}
+.at-divider { height: 1px; background: var(--at-rule); border: 0; }
+
+/* ── Links ──────────────────────────────────────────────────────────── */
+.at-link { color: var(--at-primary); text-decoration: none; font-weight: 500; cursor: pointer; }
+.at-link:hover { text-decoration: underline; }
+
+/* ── Buttons (Atlas-native, not the shadcn variant) ─────────────────── */
+.at-btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+  padding: 12px 22px; border-radius: var(--at-radius);
+  font-family: var(--font-display);
+  font-size: var(--fs-body); font-weight: 500;
+  cursor: pointer; user-select: none;
+  border: 1px solid transparent;
+  white-space: nowrap;
+  transition: background 120ms, color 120ms, border-color 120ms;
+}
+.at-btn-primary   { background: var(--at-primary); color: white; }
+.at-btn-primary:hover   { background: var(--at-primary-hover); }
+.at-btn-secondary { background: transparent; color: var(--at-ink); border-color: var(--at-rule); }
+.at-btn-secondary:hover { background: var(--at-highlight); }
+.at-btn-ghost     { background: transparent; color: var(--at-ink-soft); }
+.at-btn-ghost:hover     { color: var(--at-ink); }
+.at-btn-sm { padding: 8px 12px; font-size: var(--fs-body-sm); }
+
+/* ── Inputs ─────────────────────────────────────────────────────────── */
+.at-input {
+  width: 100%;
+  background: var(--at-surface);
+  border: 1px solid var(--at-rule);
+  border-radius: var(--at-radius);
+  padding: 12px 14px;
+  font: inherit;
+  font-family: var(--font-display);
+  font-size: var(--fs-body);
+  color: var(--at-ink);
+  outline: none;
+  transition: border-color 120ms, box-shadow 120ms;
+}
+.at-input:focus {
+  border-color: var(--at-primary);
+  box-shadow: 0 0 0 3px rgba(26, 36, 56, 0.08);
+}
+.at-input::placeholder { color: var(--at-muted); }
+
+/* ── Body defaults (apply with class="at") ─────────────────────────── */
+.at, .at * { box-sizing: border-box; }
+.at {
+  background: var(--at-bg);
+  color: var(--at-ink);
+  font-family: var(--font-display);
+  letter-spacing: -0.005em;   /* very subtle global tightening */
+}
+
+/* ── Dark mode ──────────────────────────────────────────────────────── */
+/* Atlas in dark keeps the ink palette but inverts surfaces. Primary
+   becomes the accent blue (#3b82f6) — at low-light contrast the cool
+   blue reads better than ink-navy. Source: globals.css. */
+.dark {
+  --at-bg:           #0b0e14;
+  --at-surface:      #11151c;
+  --at-highlight:    #1a1f2a;
+  --at-rule:         #1f242d;
+  --at-rule-soft:    #161a22;
+
+  --at-ink:          #f3f0e8;
+  --at-ink-soft:     #c5c8d1;
+  --at-muted:        #8b8f9a;
+
+  --at-primary:      #3b82f6;
+  --at-primary-hover:#5093f7;
+  --at-brand-tint:   #1a2438;
+
+  /* semantic colors stay roughly the same hue but lift slightly for contrast */
+  --at-bull:         #34d399;
+  --at-bear:         #f87171;
+  --at-warn:         #fbbf24;
+}
+.dark .at-pill-ok   { background: rgba(52,211,153,0.12); border-color: rgba(52,211,153,0.30); color: #6ee7b7; }
+.dark .at-pill-warn { background: rgba(251,191,36,0.12); border-color: rgba(251,191,36,0.30); color: #fde68a; }
+.dark .at-pill-bear { background: rgba(248,113,113,0.12); border-color: rgba(248,113,113,0.30); color: #fca5a5; }
+.dark .at-input:focus {
+  border-color: var(--at-primary);
+  box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.18);
+}
