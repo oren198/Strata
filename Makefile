@@ -13,7 +13,7 @@ format:
 	ruff format .
 
 run:
-	uvicorn strata.app:app --reload --port 8000
+	strata start --reload
 
 migrate:
 	python scripts/run_migrations.py
