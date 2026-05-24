@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Strata Console</title>
+
+  <!-- API base URL: override this to point at a non-default backend. -->
+  <!-- The store reads this tag; if absent it falls back to http://127.0.0.1:8000 -->
+  <meta name="strata-api-base" content="http://127.0.0.1:8000" />
+
+  <link rel="stylesheet" href="atlas.css" />
+  <style>
+    html, body { margin: 0; padding: 0; height: 100%; }
+    body {
+      background: var(--at-bg);
+      color: var(--at-ink);
+      font-family: var(--font-display);
+      letter-spacing: -0.005em;
+      -webkit-font-smoothing: antialiased;
+      transition: background 160ms, color 160ms;
+    }
+    #root { min-height: 100%; }
+    * { box-sizing: border-box; }
+
+    .at-tab { white-space: nowrap; }
+
+    @keyframes strata-toast-in {
+      from { opacity: 0; transform: translate(-50%, 10px); }
+      to   { opacity: 1; transform: translate(-50%, 0); }
+    }
+    @keyframes strata-fade-in {
+      from { opacity: 0; }
+      to   { opacity: 1; }
+    }
+    @keyframes strata-slide-in {
+      from { transform: translateX(28px); opacity: 0; }
+      to   { transform: translateX(0);    opacity: 1; }
+    }
+
+    ::-webkit-scrollbar { width: 8px; height: 8px; }
+    ::-webkit-scrollbar-thumb { background: var(--at-rule); border-radius: 4px; }
+    ::-webkit-scrollbar-thumb:hover { background: var(--at-muted); }
+  </style>
+
+  <script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
+  <script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y" crossorigin="anonymous"></script>
+  <script src="https://unpkg.com/lucide@0.469.0/dist/umd/lucide.min.js"></script>
+
+  <script src="store.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel" src="atoms.jsx"></script>
+  <script type="text/babel" src="tweaks-panel.jsx"></script>
+  <script type="text/babel" src="graph.jsx"></script>
+  <script type="text/babel" src="scope-detail.jsx"></script>
+  <script type="text/babel" src="settings.jsx"></script>
+  <script type="text/babel" src="app.jsx"></script>
+</body>
+</html>
