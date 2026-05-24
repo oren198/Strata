@@ -36,6 +36,9 @@ packages = ["src/strata"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+markers = [
+    "integration: tests that hit external services (e.g. real Anthropic API). Skipped unless STRATA_RUN_INTEGRATION=1.",
+]
 
 [tool.ruff]
 line-length = 100
