@@ -20,9 +20,9 @@ from unittest.mock import MagicMock
 
 from fastapi.testclient import TestClient
 
-from scripts.run_migrations import run_migrations
 from strata.app import create_app, get_scope_manager
 from strata.bootstrap import apply_fleet_config, load_fleet_config
+from strata.migrator import run_migrations
 from strata.record_store import RecordStore
 from strata.scope_manager import ScopeManager, ScopeManagerJudgment
 from strata.settings import Settings

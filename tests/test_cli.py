@@ -31,7 +31,7 @@ def test_version_flag(capsys: pytest.CaptureFixture[str]) -> None:
 def test_migrate_calls_runner(tmp_path, capsys: pytest.CaptureFixture[str]) -> None:
     """``strata migrate --db <path>`` calls the migrations runner."""
     db_path = str(tmp_path / "test.db")
-    with patch("scripts.run_migrations.run_migrations") as run:
+    with patch("strata.migrator.run_migrations") as run:
         run.return_value = ["0001_initial.sql"]
         rc = main(["migrate", "--db", db_path])
     assert rc == 0
