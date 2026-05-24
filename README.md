@@ -149,6 +149,82 @@ pyproject.toml           # Project metadata + deps + ruff/pytest config
 
 ---
 
+## Running Strata in Claude Code
+
+### 1. Install with the CC plugin extra
+
+```bash
+pip install -e ".[dev,cc-plugin]"
+```
+
+This adds `mcp` and `httpx` to your environment alongside the backend deps.
+
+### 2. Start the backend
+
+```bash
+make migrate && make bootstrap   # one-time fleet setup
+make run                         # uvicorn on port 8000
+```
+
+### 3. Register the MCP server in Claude Code
+
+Copy `.claude/settings.example.json` to `.claude/settings.json` (or merge the
+`mcpServers` block into your existing settings) and edit the env vars to match
+your intended role:
+
+```json
+{
+  "mcpServers": {
+    "strata": {
+      "command": "python",
+      "args": ["-m", "mcp_server.strata_mcp"],
+      "env": {
+        "STRATA_BACKEND_URL": "http://127.0.0.1:8000",
+        "STRATA_AGENT_SCOPE": "g_backend",
+        "STRATA_AGENT_SKILL": "strata-developer",
+        "STRATA_AGENT_SESSION_ID": "sess_local"
+      }
+    }
+  }
+}
+```
+
+Change `STRATA_AGENT_SCOPE` and `STRATA_AGENT_SKILL` per role:
+
+| Role | Scope | Skill |
+|---|---|---|
+| Developer | `g_backend` | `strata-developer` |
+| Architect | `g_arch` | `strata-architect` |
+| CEO | `g_ceo` | `strata-ceo` |
+
+### 4. Invoke a skill
+
+Start a CC session and run `/strata-developer`, `/strata-architect`, or
+`/strata-ceo`.  The skill prompt tells the agent to call `strata_read_perspective`
+first, then contribute observations as `context` and binding decisions as
+`directive` only when warranted.
+
+### 5. Worked example (three concurrent sessions)
+
+```bash
+# Terminal 1: backend
+make run
+
+# Terminal 2: architect session
+STRATA_AGENT_SCOPE=g_arch STRATA_AGENT_SKILL=strata-architect \
+  STRATA_AGENT_SESSION_ID=sess_arch claude
+
+# Terminal 3: developer session
+STRATA_AGENT_SCOPE=g_backend STRATA_AGENT_SKILL=strata-developer \
+  STRATA_AGENT_SESSION_ID=sess_dev claude
+```
+
+In each session invoke the matching skill.  The developer contributes
+observations; the architect reads the fleet, ratifies patterns into directives;
+all contributions land in the same SQLite record via the shared backend.
+
+---
+
 ## Git workflow
 
 - `main` — the last verified version of Strata.

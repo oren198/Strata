@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "strata": {
+      "command": "python",
+      "args": ["-m", "mcp_server.strata_mcp"],
+      "env": {
+        "STRATA_BACKEND_URL": "http://127.0.0.1:8000",
+        "STRATA_AGENT_SCOPE": "g_backend",
+        "STRATA_AGENT_SKILL": "strata-developer",
+        "STRATA_AGENT_SESSION_ID": "${SESSION_ID:-sess_local}"
+      }
+    }
+  }
+}

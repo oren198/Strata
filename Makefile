@@ -1,7 +1,7 @@
 .PHONY: install test lint format run migrate bootstrap smoke
 
 install:
-	pip install -e ".[dev]"
+	pip install -e ".[dev,cc-plugin]"
 
 test:
 	python -m pytest

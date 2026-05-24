@@ -17,6 +17,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+cc-plugin = [
+    "mcp",
+    "httpx",
+]
 dev = [
     "pytest",
     "pytest-asyncio",
