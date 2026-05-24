@@ -62,7 +62,7 @@ def _resolve_fleet_config(explicit: str | None) -> str | None:
 
 def cmd_migrate(args: argparse.Namespace) -> int:
     """Apply pending SQLite migrations to the DB."""
-    from scripts.run_migrations import run_migrations
+    from strata.migrator import run_migrations
 
     db_path = args.db or _db_path_default()
     applied = run_migrations(db_path)
@@ -109,7 +109,7 @@ def cmd_start(args: argparse.Namespace) -> int:
     The auto-bootstrap step runs only when the scopes table is empty AND a
     fleet config is discoverable. Override with ``--no-bootstrap``.
     """
-    from scripts.run_migrations import run_migrations
+    from strata.migrator import run_migrations
     from strata.record_store import RecordStore
 
     db_path = args.db or _db_path_default()

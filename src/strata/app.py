@@ -43,7 +43,7 @@ from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from scripts.run_migrations import run_migrations
+from strata.migrator import run_migrations
 from strata.record_store import (
     Contribution,
     ContributorRef,
