@@ -14,14 +14,20 @@ dependencies = [
     "pydantic",
     "pydantic-settings",
     "pyyaml",
+    "httpx",
 ]
 
+[project.scripts]
+strata = "strata.__main__:main"
+
 [project.optional-dependencies]
+cc-plugin = [
+    "mcp",
+]
 dev = [
     "pytest",
     "pytest-asyncio",
     "ruff",
-    "httpx",
 ]
 
 [tool.hatch.build.targets.wheel]

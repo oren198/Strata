@@ -1,0 +1,15 @@
+{
+  "_comment": "Strata MCP server registration for Claude Code. Customize the STRATA_AGENT_* env vars per session — they identify which scope this CC session acts as a worker for.",
+  "mcpServers": {
+    "strata": {
+      "command": "python",
+      "args": ["-m", "mcp_server.strata_mcp"],
+      "env": {
+        "STRATA_BACKEND_URL": "http://127.0.0.1:8000",
+        "STRATA_AGENT_SCOPE": "g_arch",
+        "STRATA_AGENT_SKILL": "architect",
+        "STRATA_AGENT_SESSION_ID": "sess_local"
+      }
+    }
+  }
+}

@@ -34,9 +34,10 @@ The V1 architecture decision is documented in
 
 ## Status
 
-**V1 backend is feature-complete.** Local Python service, SQLite + markdown
-storage, Anthropic-hosted scope-managers, FastAPI HTTP surface, YAML fleet
-bootstrap. CC plugin and Strata Console UI integration are next.
+**V1 backend, Strata Console UI, and Claude Code plugin all in place.**
+Local Python service with SQLite + markdown storage, Anthropic-hosted
+scope-managers, FastAPI HTTP surface, YAML fleet bootstrap, a read-only
+browser-based Console, and a Claude Code MCP plugin + skills.
 
 ---
 
@@ -45,30 +46,40 @@ bootstrap. CC plugin and Strata Console UI integration are next.
 ### Prerequisites
 
 - Python 3.11+
-- An Anthropic API key in `ANTHROPIC_API_KEY` (only needed to make real
+- An Anthropic API key in `ANTHROPIC_API_KEY` (needed for live
   scope-manager calls; the test suite mocks them)
 
 ### Install
 
 ```bash
-make install      # pip install -e ".[dev]"
+make install      # pip install -e ".[dev,cc-plugin]"
 ```
 
-### Bootstrap a fleet and run
+### One command to run the system
 
 ```bash
-make migrate                    # apply SQLite schema to ./strata.db
-make bootstrap                  # apply fleet.example.yaml — 3 strata, 4 scopes, 4 edges
-make run                        # uvicorn strata.app:app --reload --port 8000
+strata start
 ```
 
-In another shell:
+That single command applies any pending SQLite migrations, auto-bootstraps
+the fleet from `fleet.yaml` (or `fleet.example.yaml` if no local
+`fleet.yaml` exists) when the DB is empty, and starts the FastAPI
+backend on port 8000. The Strata Console UI is served from the same
+process at <http://127.0.0.1:8000/>.
+
+### Look at memory from the terminal
+
+In a separate shell (while the backend is up):
 
 ```bash
-# List the fleet
-curl -s http://localhost:8000/scopes | jq
+strata scopes              # list the fleet's strata, scopes, edges
+strata summary g_arch      # print a scope's curated summary (directives + context)
+strata record g_arch       # print every contribution + judgment in the scope's record
+```
 
-# Contribute to the architect scope
+### Make a contribution by hand
+
+```bash
 curl -s -X POST http://localhost:8000/contribute \
   -H "Content-Type: application/json" \
   -d '{
@@ -84,11 +95,25 @@ curl -s -X POST http://localhost:8000/contribute \
       "ts": "2026-05-23T20:00:00Z"
     }
   }' | jq
-
-# Read the scope summary
-curl -s http://localhost:8000/scopes/g_arch/summary | jq
-cat ./summaries/g_arch.md
 ```
+
+The contribution is judged by the scope-manager (an Anthropic API call)
+and, on accept, the scope summary at `summaries/g_arch.md` updates.
+
+### Advanced subcommands
+
+`strata` also exposes the individual steps:
+
+```bash
+strata migrate                # apply pending SQLite migrations only
+strata bootstrap --config fleet.example.yaml   # apply a YAML fleet config only
+strata start --no-bootstrap   # skip auto-bootstrap on first run
+strata start --reload         # uvicorn auto-reload (dev mode)
+```
+
+The original `make` targets (`make migrate`, `make bootstrap`, `make run`,
+`make test`, `make lint`, `make smoke`) all still work and are useful when
+hacking on Strata itself.
 
 ### Strata Console UI
 
@@ -162,6 +187,14 @@ ui/                      # Strata Console (no build step — Babel-standalone in
   tweaks-panel.jsx       # Floating tweaks panel
   store.js               # API client (fetch /scopes, /scopes/{id}/summary)
   atlas.css              # Atlas design system tokens + component classes
+mcp_server/              # Claude Code plugin — MCP server proxying to the backend
+  strata_mcp.py          # FastMCP stdio server exposing tools to CC sessions
+.claude/
+  skills/
+    strata/              # CC skill: orientation / first-time use
+    strata-worker/       # CC skill: parametric worker — reads STRATA_AGENT_SCOPE/SKILL
+    strata-inspect/      # CC skill: read-only browser
+  settings.example.json  # Example MCP-server registration block
 tests/                   # pytest suite
 migrations/              # SQLite schema migrations
 scripts/                 # CLI runners (run_migrations.py, bootstrap_fleet.py)
@@ -169,6 +202,80 @@ fleet.example.yaml       # Example fleet definition consumed by `make bootstrap`
 Makefile                 # Common tasks (install / test / lint / run / migrate / bootstrap / smoke)
 pyproject.toml           # Project metadata + deps + ruff/pytest config
 ```
+
+---
+
+## Running Strata in Claude Code
+
+### 1. Start the backend (once, in its own terminal)
+
+```bash
+strata start
+```
+
+### 2. Register the MCP server in Claude Code
+
+Copy `.claude/settings.example.json` to `.claude/settings.json` (or merge
+the `mcpServers` block into your existing settings). The env vars in
+that block identify the **scope this CC session acts at** and the
+**role identifier** for provenance — change them per session.
+
+```json
+{
+  "mcpServers": {
+    "strata": {
+      "command": "python",
+      "args": ["-m", "mcp_server.strata_mcp"],
+      "env": {
+        "STRATA_BACKEND_URL": "http://127.0.0.1:8000",
+        "STRATA_AGENT_SCOPE":       "g_arch",
+        "STRATA_AGENT_SKILL":       "architect",
+        "STRATA_AGENT_SESSION_ID":  "sess_local"
+      }
+    }
+  }
+}
+```
+
+`STRATA_AGENT_SKILL` is just a human-readable role tag (`architect`,
+`developer`, `security_reviewer`, etc.) — it shows up in provenance, but
+**the same generic CC skill (`strata-worker`) works for any role at any
+scope**. You don't need a separate Claude Code skill file per role.
+
+### 3. Invoke a skill
+
+The repo ships three CC skills under `.claude/skills/`:
+
+| Skill | What it does |
+|---|---|
+| `/strata` | First-time orientation: shows the fleet, helps you pick a role, points you to the next skill. Use once. |
+| `/strata-worker` | Binds the current CC session as a worker at `STRATA_AGENT_SCOPE`. Reads the perspective, contributes observations as `context`, contributes decisions as `directive`, cites memory back to you. **The main skill you'll use.** |
+| `/strata-inspect` | Read-only browser. Use when you want to look around without acting. |
+
+### 4. Worked example (multi-session)
+
+Three terminals, three different roles, one shared Strata:
+
+```bash
+# Terminal 1 — backend
+strata start
+
+# Terminal 2 — architect (set env vars before launching `claude`)
+STRATA_AGENT_SCOPE=g_arch     STRATA_AGENT_SKILL=architect     \
+STRATA_AGENT_SESSION_ID=sess_arch  claude
+# Then in the CC session:  /strata-worker
+
+# Terminal 3 — backend developer
+STRATA_AGENT_SCOPE=g_backend  STRATA_AGENT_SKILL=backend_dev   \
+STRATA_AGENT_SESSION_ID=sess_dev   claude
+# Then in the CC session:  /strata-worker
+```
+
+Each session contributes to the same backend. The developer captures
+implementation patterns as `context`; the architect ratifies recurring
+patterns into `directive`s that bind everyone below. Watch the state
+evolve in <http://127.0.0.1:8000/> (the Console UI) or run `strata
+summary g_arch` from a fourth terminal.
 
 ---
 
