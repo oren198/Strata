@@ -1,7 +1,7 @@
 .PHONY: install test lint format run migrate bootstrap smoke
 
 install:
-	pip install -e ".[dev]"
+	pip install -e ".[dev,cc-plugin]"
 
 test:
 	python -m pytest
@@ -13,7 +13,7 @@ format:
 	ruff format .
 
 run:
-	uvicorn strata.app:app --reload --port 8000
+	strata start --reload
 
 migrate:
 	python scripts/run_migrations.py

@@ -6,6 +6,12 @@ throughout — FastAPI mixes sync and async without issue.
 
 Endpoints
 ---------
+GET /
+    Redirect to the Strata Console UI at /ui/index.html.
+
+GET /ui/...
+    Static file server for the Strata Console UI (ui/ directory).
+
 POST /contribute
     Accept a contribution from an agent, invoke the scope-manager, persist
     the judgment, and (if accepted) update the scope summary.
@@ -25,6 +31,7 @@ Vocabulary follows CONTEXT.md verbatim.
 
 from __future__ import annotations
 
+import pathlib
 from collections.abc import AsyncGenerator, Generator
 from contextlib import asynccontextmanager
 from dataclasses import asdict
@@ -32,6 +39,8 @@ from typing import Literal
 
 import anthropic
 from fastapi import Depends, FastAPI, HTTPException
+from fastapi.responses import RedirectResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from scripts.run_migrations import run_migrations
@@ -44,6 +53,10 @@ from strata.record_store import (
 from strata.scope_manager import ScopeManager, ScopeManagerJudgment
 from strata.settings import Settings, get_settings
 from strata.summary_store import ScopeSummary, SummaryStore
+
+# Resolve the ui/ directory relative to this file so that the static mount
+# works regardless of the current working directory when the server starts.
+_UI_DIR = pathlib.Path(__file__).parent.parent.parent / "ui"
 
 # ---------------------------------------------------------------------------
 # Dependency providers
@@ -159,6 +172,23 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
 
     if settings is not None:
         application.dependency_overrides[get_settings] = lambda: settings
+
+    # -----------------------------------------------------------------------
+    # GET / — redirect to the Console UI
+    # -----------------------------------------------------------------------
+
+    @application.get("/", include_in_schema=False)
+    def root_redirect() -> RedirectResponse:
+        """Redirect the root URL to the Strata Console UI."""
+        return RedirectResponse(url="/ui/index.html", status_code=307)
+
+    # -----------------------------------------------------------------------
+    # Static file mount — Strata Console UI
+    # Served at /ui; resolved relative to the package root so that
+    # `make run` works from any working directory.
+    # -----------------------------------------------------------------------
+    if _UI_DIR.is_dir():
+        application.mount("/ui", StaticFiles(directory=str(_UI_DIR)), name="ui")
 
     # -----------------------------------------------------------------------
     # POST /contribute
