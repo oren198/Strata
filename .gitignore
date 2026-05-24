@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+dist/
+build/
+*.egg-info/
+.venv/
+venv/
+.env
+*.db
+*.sqlite*
+
+# Claude Code agent worktrees (created by the harness, not project state)
+.claude/worktrees/
