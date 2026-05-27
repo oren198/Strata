@@ -1,7 +1,9 @@
 # ADR 0003 — Frictionless CC Session Binding (`strata launch`)
 
-**Status:** Proposed
+**Status:** Proposed (depends on ADR 0002)
 **Date:** 2026-05-27
+**Related:** ADR 0002 (owns the per-scope skill declaration schema and
+the scope lifecycle)
 
 ---
 
@@ -37,20 +39,25 @@ Add a new CLI subcommand: **`strata launch [scope_id]`**.
    `/scopes` endpoint. On miss, exit non-zero with the list of valid
    scope IDs. Backend unreachable → exit non-zero with the
    start-the-backend hint; do not proceed.
-2. **Resolve skill from `fleet.yaml` declaration** (per ADR 0002, each
-   scope may declare a default skill and optionally a set of permitted
-   skills). `strata launch` honors the declaration. When ambiguous
-   (multiple permitted skills, no default), prompts interactively.
-   When no declaration exists, errors with a clear message pointing at
-   the YAML.
+2. **Resolve skill from the scope's declaration in `fleet.yaml`.** The
+   schema (`default_skill`, `permitted_skills`) and the full resolution
+   table are owned by ADR 0002 § "Per-scope skill declaration." This
+   ADR consumes the table verbatim; do not duplicate it here.
 
    **The skill is never inferred from the scope name.** Skills and
    scopes are orthogonal in CONTEXT.md — a skill is *what this agent
    does*, a scope is *where it sits*.
-3. **Auto-generate session ID** as `sess_<scope>_<skill>_<short-ts>`
-   (e.g. `sess_g_arch_code-writer_2605-1342`). This makes the record
-   self-documenting — reading provenance without joining tables still
-   tells you which session was bound where. Override via `--session`.
+3. **Auto-generate session ID** as
+   `sess_<scope>_<skill>_<YYYYMMDD-HHMMSS>` — the timestamp format is
+   pinned (compact, unambiguous, lexicographically sortable). Example:
+
+   ```
+   sess_g_arch_code-writer_20260527-134215
+   ```
+
+   This makes the record self-documenting — reading provenance without
+   joining tables still tells you which session was bound where, and
+   sessions sort chronologically by ID alone. Override via `--session`.
 4. **Set `STRATA_AGENT_*` env vars in the child environment** and
    `execvp` the `claude` binary. The CC process replaces the
    `strata launch` process so Ctrl-C, exit codes, and tty semantics are
@@ -62,6 +69,13 @@ Add a new CLI subcommand: **`strata launch [scope_id]`**.
    - Otherwise, present an interactive picker listing scopes with
      `id | stratum | name | description` columns. Bare scope-ID lists
      are not useful when scope IDs are short hashes.
+   - **Non-TTY behavior.** If `sys.stdin.isatty()` is false **and** the
+     binding cannot be resolved unambiguously from the positional
+     argument or a discovered `.strata-role` file, exit non-zero
+     immediately with the same "valid scopes are …" error as the
+     wrong-scope case. **Never block on stdin in non-interactive
+     contexts** — CI, scripted invocations, and piped callers must
+     fail fast, not hang on `input()`.
 
 ### `.strata-role` file
 

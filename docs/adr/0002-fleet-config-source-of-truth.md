@@ -2,6 +2,8 @@
 
 **Status:** Proposed
 **Date:** 2026-05-27
+**Related:** ADR 0003 (depends on this one for the per-scope skill
+declaration schema)
 
 ---
 
@@ -55,9 +57,85 @@ Specifically:
    (`*.tmp` + `os.replace`), and refreshes the in-memory mirror. An
    in-process Python lock is sufficient — FastAPI runs single-process in
    V1, so no OS-level file lock is needed.
-6. **`strata bootstrap` is removed.** Starting a new fleet means
-   authoring `fleet.yaml` directly. The repo ships starter templates
-   (`dev-team`, `support-org`, `research-group`) the user can copy.
+6. **`strata bootstrap` is repurposed, not removed.** The command name
+   stays; its docstring becomes "Validate `fleet.yaml` and prepare the
+   in-memory mirror — no DB writes." Starter templates ship in the
+   repo (`dev-team`, `support-org`, `research-group`).
+7. **`strata start` auto-seeds on first run.** If no `fleet.yaml` is
+   present in the working directory, `strata start` copies
+   `templates/dev-team.yaml` → `fleet.yaml` and prints a one-line
+   notice ("seeded fleet.yaml from the default template; edit to
+   suit"), then proceeds normally. This preserves the V1.1 zero-step
+   first-run ergonomic; the seeded file is then owned by git as the
+   ADR intends.
+
+### Scope lifecycle
+
+Each scope carries a `status` field with one of two values:
+
+| value      | semantics                                                       |
+|------------|-----------------------------------------------------------------|
+| `active`   | Default. Visible to `/scopes`; accepts new contributions; participates in perspective composition. |
+| `archived` | Invisible to `/scopes`; rejects new contributions at write time with `scope_not_active` (distinct from `scope_not_found`); remains in `fleet.yaml` so historical records resolve to a meaningful name. |
+
+The `status` field is optional; omitted means `active`. Moving
+`active` → `archived` is the controlled lifecycle event; the API
+exposes no "delete" operation. A hand-edit that physically removes a
+scope from `fleet.yaml` will leave historical records pointing
+nowhere — that consequence is on the editor.
+
+### Per-scope skill declaration (consumed by ADR 0003)
+
+Each scope may declare which skills are valid bindings for sessions
+opened against it. The fields:
+
+```yaml
+scopes:
+  - id: g_arch
+    name: Architect
+    stratum_id: L1
+    status: active                                       # optional; default active
+    default_skill: code-writer                           # optional
+    permitted_skills: [code-writer, evidence-summarizer] # optional
+```
+
+**Resolution rules** (applied by `strata launch` — see ADR 0003):
+
+| `default_skill` | `permitted_skills` | Launch behavior (TTY) | Launch behavior (non-TTY) |
+|---|---|---|---|
+| set | unset | uses `default_skill` | uses `default_skill` |
+| set | set, includes default | uses `default_skill`; `--skill X` allowed if X ∈ list | uses `default_skill` |
+| unset | set | prompts user to pick from list | error |
+| set | set, *excludes* default | **error at YAML load** (drift) | **error at YAML load** |
+| unset | unset | error: "scope X declares no skills" | error: "scope X declares no skills" |
+
+The drift case (default not in permitted list) is a hard load-time
+error so misconfigurations surface at backend start, not at session
+launch.
+
+### Validation invariants
+
+At YAML **load** time, the backend raises and refuses to start on any of:
+
+1. Duplicate stratum IDs.
+2. Duplicate scope IDs.
+3. Duplicate stratum `ordinal` values.
+4. Any scope's `stratum_id` references a stratum not in the file.
+5. Any edge's `from` or `to` references a scope not in the file.
+6. Any edge is a self-loop.
+7. Any edge violates the ±1 stratum-distance constraint (mirrors
+   V1.1's `record_store.add_edge` rule).
+8. Any scope sets `default_skill` not in its own `permitted_skills`
+   list (per the resolution-rules drift case above).
+
+At **contribute** time (additional, beyond load-time):
+
+9. The target scope exists in the current `FleetConfig`.
+10. The target scope has `status: active`. Rejection error is
+    `scope_not_active`, distinct from `scope_not_found`.
+
+These checks are SQL FK / CHECK constraints in V1.1; under V1.2 they
+become explicit application-layer validation.
 
 ### Open choices (deliberately deferred)
 
@@ -106,10 +184,12 @@ Specifically:
 ### What is given up
 
 - **FK enforcement on `contributions.scope_id` is lost.** Mitigated by
-  application-layer validation against the in-memory `FleetConfig` on
-  every contribute call. Scopes are never deleted (only marked retired
-  in the YAML), so historical contributions always have a valid scope
-  to point at.
+  the explicit validation invariants above — every contribute call
+  checks scope existence and `status: active` against the in-memory
+  `FleetConfig`. The API exposes no delete operation, so historical
+  contributions always have a valid scope to point at; physical
+  removal from `fleet.yaml` is a hand-edit consequence the operator
+  takes on.
 - **Edge walking moves from SQL JOINs to Python iteration.** Acceptable
   at our scale (dozens of scopes, single-digit stratum depth).
 - **Programmatic YAML mutations don't preserve comments** under PyYAML.
