@@ -30,6 +30,7 @@ from typing import Literal
 import anthropic
 from pydantic import BaseModel
 
+from strata.fleet_config import Scope, Stratum
 from strata.record_store import Contribution
 from strata.summary_store import Directive, ScopeSummary, _render_summary
 
@@ -160,8 +161,8 @@ def _render_recent_contributions(contributions: list[Contribution]) -> str:
 
 def _build_user_message(
     *,
-    scope: object,
-    stratum: object,
+    scope: Scope,
+    stratum: Stratum,
     current_summary: ScopeSummary | None,
     recent_contributions: list[Contribution],
     new_contribution: Contribution,
@@ -232,8 +233,8 @@ class ScopeManager:
     def judge(
         self,
         *,
-        scope: object,
-        stratum: object,
+        scope: Scope,
+        stratum: Stratum,
         current_summary: ScopeSummary | None,
         recent_contributions: list[Contribution],
         new_contribution: Contribution,

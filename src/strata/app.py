@@ -54,6 +54,7 @@ from pydantic import BaseModel
 from strata.fleet_config import FleetConfig
 from strata.migrator import run_migrations
 from strata.record_store import (
+    Contribution,
     ContributorRef,
     RecordStore,
 )
