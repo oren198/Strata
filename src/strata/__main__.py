@@ -3,10 +3,11 @@
 A small CLI that wraps the backend's common operations into a single
 runnable. Subcommands:
 
-* ``strata start``     — apply migrations, bootstrap fleet if empty,
+* ``strata start``     — apply migrations, auto-seed fleet.yaml if absent,
                         run the FastAPI app via uvicorn.
 * ``strata migrate``   — apply SQLite schema migrations.
-* ``strata bootstrap`` — apply a YAML fleet config to the DB.
+* ``strata bootstrap`` — validate fleet.yaml and prepare the in-memory
+                        FleetConfig mirror (no DB writes).
 * ``strata scopes``    — terminal-friendly listing of the fleet.
 * ``strata summary``   — print a scope's curated summary.
 * ``strata record``    — print a scope's record (contributions + judgments).
@@ -23,10 +24,15 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import sys
 from pathlib import Path
 
 from strata import __version__
+
+# Path to the bundled starter templates directory.
+_TEMPLATES_DIR = Path(__file__).parent.parent.parent / "templates"
+_DEFAULT_TEMPLATE = _TEMPLATES_DIR / "dev-team.yaml"
 
 
 def _backend_url() -> str:
@@ -76,9 +82,13 @@ def cmd_migrate(args: argparse.Namespace) -> int:
 
 
 def cmd_bootstrap(args: argparse.Namespace) -> int:
-    """Apply a YAML fleet config to the DB."""
-    from strata.bootstrap import apply_fleet_config, load_fleet_config
-    from strata.record_store import RecordStore
+    """Validate fleet.yaml and prepare the in-memory FleetConfig mirror.
+
+    No DB writes are made.  The command validates all 8 load-time invariants
+    from ADR 0002 and reports success or the first error encountered.
+    """
+    from strata.bootstrap import load_fleet_config
+    from strata.fleet_config import FleetConfigError
 
     config_path = _resolve_fleet_config(args.config)
     if config_path is None:
@@ -92,25 +102,22 @@ def cmd_bootstrap(args: argparse.Namespace) -> int:
         print(f"Fleet config not found: {config_path}", file=sys.stderr)
         return 1
 
-    db_path = args.db or _db_path_default()
-    config = load_fleet_config(config_path)
-    with RecordStore(db_path) as store:
-        result = apply_fleet_config(store, config)
-    print(f"Fleet bootstrapped from {config_path}:")
-    print(f"  strata: {len(result.strata_created)} created, {len(result.strata_existing)} existing")
-    print(f"  scopes: {len(result.scopes_created)} created, {len(result.scopes_existing)} existing")
-    print(f"  edges:  {len(result.edges_created)} created, {len(result.edges_existing)} existing")
+    try:
+        config = load_fleet_config(config_path)
+    except FleetConfigError as exc:
+        print(f"Fleet config invalid [{exc.kind}]: {exc.message}", file=sys.stderr)
+        return 1
+
+    print(f"Fleet config valid: {config_path}")
+    print(f"  strata: {len(config.strata)}")
+    print(f"  scopes: {len(config.scopes)}")
+    print(f"  edges:  {len(config.edges)}")
     return 0
 
 
 def cmd_start(args: argparse.Namespace) -> int:
-    """Apply migrations, optionally auto-bootstrap, then run uvicorn.
-
-    The auto-bootstrap step runs only when the scopes table is empty AND a
-    fleet config is discoverable. Override with ``--no-bootstrap``.
-    """
+    """Apply migrations, auto-seed fleet.yaml if absent, then run uvicorn."""
     from strata.migrator import run_migrations
-    from strata.record_store import RecordStore
 
     db_path = args.db or _db_path_default()
 
@@ -119,21 +126,11 @@ def cmd_start(args: argparse.Namespace) -> int:
     if applied:
         print(f"Applied {len(applied)} migration(s).")
 
-    # 2. Auto-bootstrap if scopes table is empty.
-    if not args.no_bootstrap:
-        with RecordStore(db_path) as store:
-            scopes_present = len(store.list_scopes()) > 0
-        if not scopes_present:
-            config_path = _resolve_fleet_config(None)
-            if config_path is not None and Path(config_path).exists():
-                rc = cmd_bootstrap(argparse.Namespace(config=config_path, db=db_path))
-                if rc != 0:
-                    return rc
-            else:
-                print(
-                    "No scopes in DB and no fleet config found — starting empty. "
-                    "Run `strata bootstrap --config <path>` later to seed.",
-                )
+    # 2. Auto-seed fleet.yaml if absent.
+    fleet_path = Path(_fleet_config_default())
+    if not fleet_path.exists() and _DEFAULT_TEMPLATE.exists():
+        shutil.copy(_DEFAULT_TEMPLATE, fleet_path)
+        print("seeded fleet.yaml from the default template; edit to suit")
 
     # 3. Serve.
     import uvicorn
@@ -152,7 +149,7 @@ def cmd_start(args: argparse.Namespace) -> int:
 
 
 def cmd_scopes(args: argparse.Namespace) -> int:
-    """List the fleet's strata, scopes, and edges (via the backend API)."""
+    """List the fleet's active scopes (via the backend API)."""
     import httpx
 
     url = f"{_backend_url()}/scopes"
@@ -266,13 +263,10 @@ def _build_parser() -> argparse.ArgumentParser:
 
     sub = parser.add_subparsers(dest="command", metavar="<command>")
 
-    p_start = sub.add_parser("start", help="Migrate, auto-bootstrap, and run the backend.")
+    p_start = sub.add_parser("start", help="Migrate, auto-seed fleet.yaml, and run the backend.")
     p_start.add_argument("--host", default="127.0.0.1")
     p_start.add_argument("--port", type=int, default=8000)
     p_start.add_argument("--reload", action="store_true", help="Enable uvicorn auto-reload.")
-    p_start.add_argument(
-        "--no-bootstrap", action="store_true", help="Skip the auto-bootstrap step."
-    )
     p_start.add_argument("--db", help=f"DB path (default: {_db_path_default()}).")
     p_start.set_defaults(func=cmd_start)
 
@@ -280,12 +274,14 @@ def _build_parser() -> argparse.ArgumentParser:
     p_migrate.add_argument("--db", help=f"DB path (default: {_db_path_default()}).")
     p_migrate.set_defaults(func=cmd_migrate)
 
-    p_bootstrap = sub.add_parser("bootstrap", help="Apply a YAML fleet config.")
+    p_bootstrap = sub.add_parser(
+        "bootstrap", help="Validate fleet.yaml (no DB writes)."
+    )
     p_bootstrap.add_argument("--config", help=f"Config path (default: {_fleet_config_default()}).")
-    p_bootstrap.add_argument("--db", help=f"DB path (default: {_db_path_default()}).")
+    p_bootstrap.add_argument("--db", help="Ignored (kept for backward compatibility).")
     p_bootstrap.set_defaults(func=cmd_bootstrap)
 
-    p_scopes = sub.add_parser("scopes", help="List the fleet's strata, scopes, and edges.")
+    p_scopes = sub.add_parser("scopes", help="List the fleet's active scopes.")
     p_scopes.set_defaults(func=cmd_scopes)
 
     p_summary = sub.add_parser("summary", help="Print a scope's curated summary.")

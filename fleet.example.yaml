@@ -1,9 +1,5 @@
 # Strata fleet example configuration
 #
-# This file demonstrates the fleet YAML format accepted by bootstrap.py.
-# Run ``make bootstrap`` (or ``python scripts/bootstrap_fleet.py --config fleet.example.yaml``)
-# to apply it to a local database.
-#
 # Vocabulary: stratum, scope, edge — see CONTEXT.md for definitions.
 #
 # Structure
@@ -16,6 +12,14 @@
 #            - Intra-stratum edge (peer reference): both scopes on the same
 #              stratum (|from.ordinal - to.ordinal| == 0).
 #          Edges may span at most ONE stratum layer.
+#
+# Scope lifecycle:
+#   status: active    (default) — accepts contributions, visible to /scopes
+#   status: archived  — rejects new contributions; kept for historical provenance
+#
+# Per-scope skill declarations (consumed by `strata launch`):
+#   default_skill: code-writer
+#   permitted_skills: [code-writer, evidence-summarizer]
 
 strata:
   - id: L0
@@ -32,15 +36,23 @@ scopes:
   - id: g_ceo
     name: CEO
     stratum_id: L0
+    status: active
   - id: g_eng
     name: Engineering
     stratum_id: L1
+    status: active
   - id: g_arch
     name: Architect
     stratum_id: L1
+    status: active
+    default_skill: code-writer
+    permitted_skills: [code-writer, evidence-summarizer]
   - id: g_backend
     name: Backend Dev
     stratum_id: L2
+    status: active
+    default_skill: code-writer
+    permitted_skills: [code-writer, evidence-summarizer]
 
 edges:
   # Inter-stratum edges (child → parent, upward in the hierarchy)

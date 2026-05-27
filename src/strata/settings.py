@@ -38,6 +38,7 @@ class Settings(BaseSettings):
 
     db_path: str = Field(default="./strata.db")
     summaries_dir: str = Field(default="./summaries")
+    fleet_yaml_path: str = Field(default="./fleet.yaml")
     manager_model: str = Field(default="claude-haiku-4-5")
     anthropic_api_key: str | None = Field(default=None)
 
