@@ -274,9 +274,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_migrate.add_argument("--db", help=f"DB path (default: {_db_path_default()}).")
     p_migrate.set_defaults(func=cmd_migrate)
 
-    p_bootstrap = sub.add_parser(
-        "bootstrap", help="Validate fleet.yaml (no DB writes)."
-    )
+    p_bootstrap = sub.add_parser("bootstrap", help="Validate fleet.yaml (no DB writes).")
     p_bootstrap.add_argument("--config", help=f"Config path (default: {_fleet_config_default()}).")
     p_bootstrap.add_argument("--db", help="Ignored (kept for backward compatibility).")
     p_bootstrap.set_defaults(func=cmd_bootstrap)

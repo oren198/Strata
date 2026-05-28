@@ -43,6 +43,7 @@ from __future__ import annotations
 import pathlib
 from collections.abc import AsyncGenerator, Generator
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from typing import Literal
 
 import anthropic
@@ -256,6 +257,15 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
             (s for s in fleet.strata if s.id == scope.stratum_id),
             None,
         )
+        if stratum is None:
+            # Invariant 4 (every scope's stratum_id resolves to a defined
+            # stratum) is enforced at load and re-checked on every mutation,
+            # so reaching here means the in-memory FleetConfig is internally
+            # inconsistent rather than the request being at fault.
+            raise HTTPException(
+                status_code=500,
+                detail={"error": "internal_inconsistency", "scope_id": body.scope_id},
+            )
 
         # Step 3: append contribution
         contributor_ref = ContributorRef(
@@ -327,16 +337,12 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
         active = fleet.active_scopes()
         # Edges involving only active scopes.
         active_ids = {s.id for s in active}
-        active_edges = [
-            e for e in fleet.edges if e.from_ in active_ids and e.to in active_ids
-        ]
+        active_edges = [e for e in fleet.edges if e.from_ in active_ids and e.to in active_ids]
 
         return {
             "strata": [s.model_dump() for s in fleet.strata],
             "scopes": [s.model_dump() for s in active],
-            "edges": [
-                {"from_scope_id": e.from_, "to_scope_id": e.to} for e in active_edges
-            ],
+            "edges": [{"from_scope_id": e.from_, "to_scope_id": e.to} for e in active_edges],
         }
 
     # -----------------------------------------------------------------------
@@ -364,13 +370,11 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
             return existing.model_dump()
 
         # Scope exists but has no summary yet — return an empty summary.
-        import datetime
-
         empty = ScopeSummary(
             scope_id=scope_id,
             directives=[],
             context="",
-            updated_at=datetime.datetime.now(tz=datetime.timezone.utc).isoformat(),
+            updated_at=datetime.now(tz=UTC).isoformat(),
         )
         return empty.model_dump()
 

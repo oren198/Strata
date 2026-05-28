@@ -23,7 +23,7 @@ from strata.record_store import RecordStore
 from strata.scope_manager import ScopeManager, ScopeManagerJudgment
 from strata.settings import Settings
 from strata.settings import get_settings as _get_settings
-from strata.summary_store import Directive, ScopeSummary, SummaryStore
+from strata.summary_store import Directive, ScopeSummary
 
 # ---------------------------------------------------------------------------
 # Helpers

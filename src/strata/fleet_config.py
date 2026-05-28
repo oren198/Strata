@@ -23,7 +23,6 @@ from typing import Annotated, Literal
 import yaml
 from pydantic import BaseModel, Field
 
-
 # ---------------------------------------------------------------------------
 # Error
 # ---------------------------------------------------------------------------
@@ -309,16 +308,12 @@ def _validate(config: FleetConfig) -> None:
         if edge.from_ not in scope_map:
             raise FleetConfigError(
                 kind="unknown_scope_ref",
-                message=(
-                    f"Edge from={edge.from_!r} references a scope not defined in fleet.yaml."
-                ),
+                message=(f"Edge from={edge.from_!r} references a scope not defined in fleet.yaml."),
             )
         if edge.to not in scope_map:
             raise FleetConfigError(
                 kind="unknown_scope_ref",
-                message=(
-                    f"Edge to={edge.to!r} references a scope not defined in fleet.yaml."
-                ),
+                message=(f"Edge to={edge.to!r} references a scope not defined in fleet.yaml."),
             )
 
     # 6. No self-loops.

@@ -19,9 +19,7 @@ from strata.migrator import run_migrations
 def _table_names(db_path: str) -> set[str]:
     conn = sqlite3.connect(db_path)
     try:
-        rows = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table'"
-        ).fetchall()
+        rows = conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
     finally:
         conn.close()
     return {r[0] for r in rows}
@@ -54,7 +52,8 @@ def test_full_chain_drops_fleet_tables_and_preserves_record(tmp_path: Path) -> N
         """INSERT INTO contributions
         (id, scope_id, content, proposed_classification, subject, supersedes,
          contributor_scope_id, contributor_skill, contributor_session_id, contributor_ts)
-        VALUES ('c_1', 'g_a', 'hello', 'context', NULL, NULL, 'g_a', 'tester', 's_1', '2026-05-27T00:00:00Z')"""
+        VALUES ('c_1', 'g_a', 'hello', 'context', NULL, NULL,
+                'g_a', 'tester', 's_1', '2026-05-27T00:00:00Z')"""
     )
     conn.execute(
         """INSERT INTO judgments
@@ -81,9 +80,7 @@ def test_full_chain_drops_fleet_tables_and_preserves_record(tmp_path: Path) -> N
     conn = sqlite3.connect(db_path)
     try:
         contribs = conn.execute("SELECT id, scope_id, content FROM contributions").fetchall()
-        judgments = conn.execute(
-            "SELECT id, contribution_id, decision FROM judgments"
-        ).fetchall()
+        judgments = conn.execute("SELECT id, contribution_id, decision FROM judgments").fetchall()
     finally:
         conn.close()
 
@@ -119,7 +116,8 @@ def test_judgment_check_constraint_survives_rebuild(tmp_path: Path, decision: st
         """INSERT INTO contributions
         (id, scope_id, content, proposed_classification, subject, supersedes,
          contributor_scope_id, contributor_skill, contributor_session_id, contributor_ts)
-        VALUES ('c_x', 'g_a', 'hi', 'context', NULL, NULL, 'g_a', 'tester', 's_1', '2026-05-27T00:00:00Z')"""
+        VALUES ('c_x', 'g_a', 'hi', 'context', NULL, NULL,
+                'g_a', 'tester', 's_1', '2026-05-27T00:00:00Z')"""
     )
     conn.execute(
         "INSERT INTO judgments (id, contribution_id, decision, judged_by) VALUES (?, ?, ?, ?)",

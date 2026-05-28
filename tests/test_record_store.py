@@ -287,10 +287,7 @@ def test_fleet_tables_absent_after_migration(tmp_path: Path) -> None:
 
     conn = sqlite3.connect(db_path)
     tables = {
-        r[0]
-        for r in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table'"
-        ).fetchall()
+        r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
     }
     conn.close()
 
