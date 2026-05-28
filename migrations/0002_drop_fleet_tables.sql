@@ -20,6 +20,14 @@
 -- migration/v1-to-v1.2 exporter).  Contributions and judgments are
 -- preserved end-to-end.
 
+-- Wrap the whole drop-and-rebuild in an explicit transaction.  The runner
+-- applies migrations via sqlite3 executescript(), which runs in autocommit
+-- and does not wrap the script in a transaction; without this BEGIN/COMMIT a
+-- crash between the DROPs and the restores would lose contributions and
+-- judgments with no rollback.  executescript honors in-script transaction
+-- control, so this makes the rebuild all-or-nothing.
+BEGIN;
+
 -- Back up judgments so we can restore after the contributions rebuild.
 CREATE TABLE judgments_backup AS SELECT * FROM judgments;
 DROP TABLE judgments;
@@ -73,4 +81,6 @@ CREATE INDEX idx_judgments_contrib ON judgments(contribution_id);
 DROP TABLE IF EXISTS edges;
 DROP TABLE IF EXISTS scopes;
 DROP TABLE IF EXISTS strata;
+
+COMMIT;
 

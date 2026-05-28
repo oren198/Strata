@@ -44,18 +44,24 @@ def _db_path_default() -> str:
 
 
 def _fleet_config_default() -> str:
-    return os.environ.get("STRATA_FLEET_CONFIG", "fleet.yaml")
+    """Resolve the canonical fleet config path through Settings.
+
+    Reads ``STRATA_FLEET_CONFIG`` (or the ``./fleet.yaml`` default) via the
+    same :class:`Settings` the backend uses, so the CLI and the running app
+    never diverge on which file is canonical (ADR 0002).
+    """
+    from strata.settings import get_settings
+
+    return get_settings().fleet_yaml_path
 
 
 def _resolve_fleet_config(explicit: str | None) -> str | None:
-    """Pick the config path: explicit arg → env var → fleet.yaml → fleet.example.yaml."""
+    """Pick the config path: explicit arg → Settings path → fleet.example.yaml."""
     if explicit:
         return explicit
-    env_path = os.environ.get("STRATA_FLEET_CONFIG")
-    if env_path:
-        return env_path
-    if Path("fleet.yaml").exists():
-        return "fleet.yaml"
+    settings_path = _fleet_config_default()
+    if Path(settings_path).exists():
+        return settings_path
     if Path("fleet.example.yaml").exists():
         return "fleet.example.yaml"
     return None

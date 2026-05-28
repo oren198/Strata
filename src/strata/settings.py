@@ -8,6 +8,10 @@ convenience, if that variable is absent the validator falls back to the bare
 ``ANTHROPIC_API_KEY`` variable (the convention used by the Anthropic SDK and
 most tooling).
 
+The fleet config path is read from ``STRATA_FLEET_CONFIG`` (an explicit
+alias, not the auto-generated ``STRATA_FLEET_YAML_PATH``) so that the CLI,
+the README, and the backend all resolve the same single canonical file.
+
 Usage::
 
     from strata.settings import get_settings
@@ -34,11 +38,18 @@ class Settings(BaseSettings):
         env_prefix="STRATA_",
         env_file=".env",
         extra="ignore",
+        # Allow fields with an explicit validation_alias (fleet_yaml_path ←
+        # STRATA_FLEET_CONFIG) to still be set by their Python name in code
+        # and tests, not only via the env alias.
+        populate_by_name=True,
     )
 
     db_path: str = Field(default="./strata.db")
     summaries_dir: str = Field(default="./summaries")
-    fleet_yaml_path: str = Field(default="./fleet.yaml")
+    fleet_yaml_path: str = Field(
+        default="./fleet.yaml",
+        validation_alias="STRATA_FLEET_CONFIG",
+    )
     manager_model: str = Field(default="claude-haiku-4-5")
     anthropic_api_key: str | None = Field(default=None)
 

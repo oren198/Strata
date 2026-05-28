@@ -64,14 +64,16 @@ scopes:
     permitted_skills: [code-writer, evidence-summarizer]
 
 edges:
-  # Inter-stratum edges (child reports to parent; directives flow downward)
-  - from: g_eng
+  # Inter-stratum edges (child → single parent; directives + context flow down).
+  # Every non-root scope has exactly one inter-stratum parent.
+  - from: g_eng       # L1 → L0
     to: g_ceo
-  - from: g_arch
-    to: g_eng
-  - from: g_backend
-    to: g_eng
+  - from: g_arch      # L1 → L0  (Engineering and Architect are peer functions)
+    to: g_ceo
+  - from: g_backend   # L2 → L1  (Architect is the Backend Dev's single parent,
+    to: g_arch        #           so Architect's directives bind Backend Dev)
 
-  # Intra-stratum peer reference (same stratum L1 — carries context only)
-  - from: g_backend
+  # Intra-stratum peer reference (same stratum L1 — carries context only,
+  # never directives). Engineering reads Architect's context for free.
+  - from: g_eng       # L1 ↔ L1
     to: g_arch

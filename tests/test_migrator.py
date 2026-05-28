@@ -55,6 +55,16 @@ def test_full_chain_drops_fleet_tables_and_preserves_record(tmp_path: Path) -> N
         VALUES ('c_1', 'g_a', 'hello', 'context', NULL, NULL,
                 'g_a', 'tester', 's_1', '2026-05-27T00:00:00Z')"""
     )
+    # A second contribution superseding the first — exercises the rebuilt
+    # contributions.supersedes self-FK during the INSERT ... SELECT under
+    # foreign_keys = ON.
+    conn.execute(
+        """INSERT INTO contributions
+        (id, scope_id, content, proposed_classification, subject, supersedes,
+         contributor_scope_id, contributor_skill, contributor_session_id, contributor_ts)
+        VALUES ('c_2', 'g_a', 'hello v2', 'directive', NULL, 'c_1',
+                'g_a', 'tester', 's_1', '2026-05-27T01:00:00Z')"""
+    )
     conn.execute(
         """INSERT INTO judgments
         (id, contribution_id, decision, judged_by, notes)
@@ -76,16 +86,27 @@ def test_full_chain_drops_fleet_tables_and_preserves_record(tmp_path: Path) -> N
     assert "contributions" in tables
     assert "judgments" in tables
 
-    # Contributions and judgments preserved end-to-end.
+    # Contributions and judgments preserved end-to-end, including the
+    # supersedes self-reference (c_2 → c_1) carried through the rebuild.
     conn = sqlite3.connect(db_path)
+    conn.execute("PRAGMA foreign_keys = ON")
     try:
-        contribs = conn.execute("SELECT id, scope_id, content FROM contributions").fetchall()
-        judgments = conn.execute("SELECT id, contribution_id, decision FROM judgments").fetchall()
+        contribs = conn.execute(
+            "SELECT id, scope_id, content, supersedes FROM contributions ORDER BY id"
+        ).fetchall()
+        judgments = conn.execute(
+            "SELECT id, contribution_id, decision FROM judgments ORDER BY id"
+        ).fetchall()
+        fk_violations = conn.execute("PRAGMA foreign_key_check").fetchall()
     finally:
         conn.close()
 
-    assert contribs == [("c_1", "g_a", "hello")]
+    assert contribs == [
+        ("c_1", "g_a", "hello", None),
+        ("c_2", "g_a", "hello v2", "c_1"),
+    ]
     assert judgments == [("j_1", "c_1", "accept_as_context")]
+    assert fk_violations == []
 
 
 def test_idempotent_reapply(tmp_path: Path) -> None:
