@@ -11,11 +11,13 @@ runnable. Subcommands:
 * ``strata scopes``    — terminal-friendly listing of the fleet.
 * ``strata summary``   — print a scope's curated summary.
 * ``strata record``    — print a scope's record (contributions + judgments).
+* ``strata launch``    — validate scope, resolve skill, and exec ``claude``
+                        with STRATA_AGENT_* env vars set (ADR 0003).
 
-The inspection commands (``scopes``, ``summary``, ``record``) talk to a
-running backend over HTTP — start the backend first with ``strata start``
-in another terminal. All other commands work directly against the DB on
-disk.
+The inspection commands (``scopes``, ``summary``, ``record``, ``launch``)
+talk to a running backend over HTTP — start the backend first with
+``strata start`` in another terminal. All other commands work directly
+against the DB on disk.
 
 Vocabulary throughout follows ``CONTEXT.md``.
 """
@@ -29,6 +31,16 @@ import sys
 from pathlib import Path
 
 from strata import __version__
+from strata.launch import (
+    SkillResolutionError,
+    StrataRoleParseError,
+    find_strata_role,
+    is_interactive,
+    make_session_id,
+    parse_strata_role,
+    prompt_scope,
+    resolve_skill,
+)
 
 # Path to the bundled starter templates directory.
 _TEMPLATES_DIR = Path(__file__).parent.parent.parent / "templates"
@@ -255,6 +267,123 @@ def cmd_record(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_launch(args: argparse.Namespace) -> int:
+    """Validate scope, resolve skill, and exec ``claude`` with STRATA_AGENT_* set.
+
+    Steps (per ADR 0003):
+    1. Fetch active scopes from GET /scopes; fail fast if backend unreachable.
+    2. Determine target scope: positional arg > .strata-role discovery > picker.
+    3. Resolve skill from scope declaration (ADR 0002 resolution table).
+    4. Build session ID (auto-generated or --session override).
+    5. execvp("claude", ...) with STRATA_AGENT_* env vars.
+    """
+    import httpx
+
+    interactive = is_interactive()
+
+    # -----------------------------------------------------------------------
+    # Step 1: Fetch active scopes from the backend.
+    # -----------------------------------------------------------------------
+    url = f"{_backend_url()}/scopes"
+    try:
+        resp = httpx.get(url, timeout=10)
+        resp.raise_for_status()
+    except httpx.HTTPError as e:
+        print(
+            f"Cannot reach backend ({e}). Start the backend with: strata start",
+            file=sys.stderr,
+        )
+        return 1
+
+    data = resp.json()
+    active_scopes: list[dict] = data.get("scopes", [])
+    valid_ids = [sc["id"] for sc in active_scopes]
+
+    # -----------------------------------------------------------------------
+    # Step 2: Determine target scope.
+    # -----------------------------------------------------------------------
+    scope_id_arg: str | None = args.scope_id  # may be None
+    skill_from_role: str | None = None
+
+    if scope_id_arg is not None:
+        # Explicit positional arg — validate it.
+        scope_data = next((sc for sc in active_scopes if sc["id"] == scope_id_arg), None)
+        if scope_data is None:
+            print(
+                f"Unknown scope {scope_id_arg!r}. Valid scope IDs: {valid_ids}",
+                file=sys.stderr,
+            )
+            return 1
+    else:
+        # Try .strata-role first.
+        role_file = find_strata_role(Path.cwd())
+        if role_file is not None:
+            try:
+                scope_id_from_role, skill_from_role = parse_strata_role(role_file)
+            except StrataRoleParseError as exc:
+                print(str(exc), file=sys.stderr)
+                return 1
+            scope_data = next((sc for sc in active_scopes if sc["id"] == scope_id_from_role), None)
+            if scope_data is None:
+                print(
+                    f"Scope {scope_id_from_role!r} (from {role_file}) is not an active scope. "
+                    f"Valid scope IDs: {valid_ids}",
+                    file=sys.stderr,
+                )
+                return 1
+        else:
+            # No positional arg, no .strata-role — need interactive picker or fail.
+            if not interactive:
+                print(
+                    f"No scope specified and no .strata-role found. Valid scope IDs: {valid_ids}",
+                    file=sys.stderr,
+                )
+                return 1
+            try:
+                scope_data = prompt_scope(active_scopes)
+            except SystemExit as exc:
+                print(str(exc), file=sys.stderr)
+                return 1
+
+    # -----------------------------------------------------------------------
+    # Step 3: Resolve skill.
+    # -----------------------------------------------------------------------
+    # --skill flag takes precedence over .strata-role skill (which in turn
+    # falls through to the resolution table).
+    requested_skill = args.skill if args.skill is not None else skill_from_role
+
+    try:
+        skill = resolve_skill(scope_data, requested_skill, interactive=interactive)
+    except SkillResolutionError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    # -----------------------------------------------------------------------
+    # Step 4: Build session ID.
+    # -----------------------------------------------------------------------
+    session_id: str = args.session if args.session else make_session_id(scope_data["id"], skill)
+
+    # -----------------------------------------------------------------------
+    # Step 5: exec claude.
+    # -----------------------------------------------------------------------
+    env = os.environ.copy()
+    env["STRATA_AGENT_SCOPE"] = scope_data["id"]
+    env["STRATA_AGENT_SKILL"] = skill
+    env["STRATA_AGENT_SESSION_ID"] = session_id
+
+    claude_bin = "claude"
+    try:
+        os.execvpe(claude_bin, [claude_bin], env)
+    except FileNotFoundError:
+        print(
+            "Cannot find 'claude' on PATH. Install Claude Code and ensure it is on your PATH.",
+            file=sys.stderr,
+        )
+        return 1
+    # execvpe does not return on success; the line below is unreachable.
+    return 0  # pragma: no cover
+
+
 # ---------------------------------------------------------------------------
 # Parser construction
 # ---------------------------------------------------------------------------
@@ -295,6 +424,25 @@ def _build_parser() -> argparse.ArgumentParser:
     p_record = sub.add_parser("record", help="Print a scope's record (contributions + judgments).")
     p_record.add_argument("scope_id")
     p_record.set_defaults(func=cmd_record)
+
+    p_launch = sub.add_parser(
+        "launch",
+        help="Resolve scope/skill binding and exec claude with STRATA_AGENT_* set (ADR 0003).",
+    )
+    p_launch.add_argument(
+        "scope_id",
+        nargs="?",
+        help="Target scope ID. Omit to use .strata-role or interactive picker.",
+    )
+    p_launch.add_argument(
+        "--skill",
+        help="Override resolved skill (must be in permitted_skills when that list is set).",
+    )
+    p_launch.add_argument(
+        "--session",
+        help="Override auto-generated session ID.",
+    )
+    p_launch.set_defaults(func=cmd_launch)
 
     return parser
 

@@ -191,6 +191,35 @@ strata start --port 8001                        # serve on a different port
 
 The original `make` targets (`make migrate`, `make bootstrap`, `make run`, `make test`, `make lint`, `make smoke`) still work and are useful when hacking on Strata itself.
 
+### `strata launch` — frictionless CC session binding (ADR 0003)
+
+`strata launch [scope_id]` validates the target scope against the live fleet,
+resolves the skill from the scope's declaration in `fleet.yaml`, generates a
+session ID, and `execvp`s `claude` with `STRATA_AGENT_SCOPE`,
+`STRATA_AGENT_SKILL`, and `STRATA_AGENT_SESSION_ID` already set. The backend
+must be running (`strata start`) before you launch.
+
+```bash
+strata launch g_arch                            # use default_skill from fleet.yaml
+strata launch g_arch --skill evidence-summarizer  # override skill
+strata launch g_arch --session my-sess          # override auto-generated session ID
+strata launch                                   # pick from interactive list, or use .strata-role
+```
+
+#### `.strata-role` — per-project default binding
+
+Place a `.strata-role` file at the root of a project repo so that
+`strata launch` (with no positional argument) binds automatically:
+
+```toml
+scope = "g_arch"
+skill = "code-writer"   # optional; resolved from fleet.yaml if omitted
+```
+
+The file is committed to git alongside the project. When you open the repo and
+run `strata launch`, Strata finds the file, validates the scope, and launches
+`claude` already bound — no manual `export` step needed.
+
 ### Strata Console UI
 
 Open <http://127.0.0.1:8000/> while the backend is running — a read-only graph and list view of the current fleet state, polling every 5 s. All memory mutations flow through `strata.contribute`; the UI has no write path in V1. To point the UI at a non-default backend, edit the `<meta name="strata-api-base" content="...">` tag in `ui/index.html`.
