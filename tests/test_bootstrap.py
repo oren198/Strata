@@ -1,46 +1,26 @@
-"""Tests for src/strata/bootstrap.py.
+"""Tests for src/strata/bootstrap.py (V1.2 behaviour).
 
-Each test uses a fresh SQLite database via pytest's ``tmp_path`` fixture.
-Migrations are applied before opening a :class:`RecordStore`, following the
-pattern established in test_record_store.py.
+Under ADR 0002, ``strata bootstrap`` validates ``fleet.yaml`` and prepares
+the in-memory :class:`FleetConfig` mirror — no DB writes.
 
-Vocabulary follows CONTEXT.md: stratum, scope, edge — never level, group,
-relation.
+Vocabulary follows CONTEXT.md: stratum, scope, edge.
 """
 
 from __future__ import annotations
 
-import sys
 import textwrap
 from pathlib import Path
 
 import pytest
 
-# Make scripts/ importable so we can call run_migrations directly.
-sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
-
-from run_migrations import run_migrations  # noqa: E402
-
-from strata.bootstrap import (  # noqa: E402
-    BootstrapResult,
-    FleetConfig,
-    apply_fleet_config,
-    load_fleet_config,
-)
-from strata.record_store import RecordStore  # noqa: E402
+from strata.bootstrap import load_fleet_config
+from strata.fleet_config import FleetConfig, FleetConfigError
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 _EXAMPLE_YAML = Path(__file__).parent.parent / "fleet.example.yaml"
-
-
-def _open_store(tmp_path: Path) -> RecordStore:
-    """Apply migrations and return an open RecordStore backed by a temp DB."""
-    db_path = str(tmp_path / "strata.db")
-    run_migrations(db_path)
-    return RecordStore(db_path)
 
 
 def _write_yaml(tmp_path: Path, content: str, name: str = "fleet.yaml") -> Path:
@@ -89,7 +69,7 @@ _MINIMAL_YAML = """
 
 
 # ---------------------------------------------------------------------------
-# Test 1 — load a valid YAML
+# Test 1 — load a valid YAML returns FleetConfig with correct counts
 # ---------------------------------------------------------------------------
 
 
@@ -110,110 +90,45 @@ def test_load_fleet_config_valid_yaml(tmp_path: Path) -> None:
     assert config.scopes[0].id == "g_ceo"
     assert config.scopes[0].stratum_id == "L0"
 
-    # Verify EdgeDef alias: ``from_`` ↔ YAML key ``from``.
     assert config.edges[0].from_ == "g_backend"
     assert config.edges[0].to == "g_eng"
 
 
 # ---------------------------------------------------------------------------
-# Test 2 — apply to a fresh DB
+# Test 2 — no DB writes happen
 # ---------------------------------------------------------------------------
 
 
-def test_apply_to_fresh_db(tmp_path: Path) -> None:
-    """Applying the config to a fresh DB creates all strata, scopes, edges."""
+def test_bootstrap_does_not_write_db(tmp_path: Path) -> None:
+    """load_fleet_config must not create or touch any DB file."""
     yaml_path = _write_yaml(tmp_path, _MINIMAL_YAML)
-    config = load_fleet_config(yaml_path)
+    load_fleet_config(yaml_path)
 
-    with _open_store(tmp_path) as store:
-        result = apply_fleet_config(store, config)
-
-    assert isinstance(result, BootstrapResult)
-    assert result.strata_created == ["L0", "L1", "L2"]
-    assert result.strata_existing == []
-    assert set(result.scopes_created) == {"g_ceo", "g_eng", "g_arch", "g_backend"}
-    assert result.scopes_existing == []
-    assert len(result.edges_created) == 4
-    assert result.edges_existing == []
+    # No SQLite DB should have appeared in tmp_path.
+    db_files = list(tmp_path.glob("*.db"))
+    assert db_files == [], f"bootstrap must not create DB files; found: {db_files}"
 
 
 # ---------------------------------------------------------------------------
-# Test 3 — idempotency (run twice)
+# Test 3 — fleet.example.yaml loads cleanly
 # ---------------------------------------------------------------------------
 
 
-def test_idempotent_second_run(tmp_path: Path) -> None:
-    """A second apply creates nothing; all items land in _existing lists."""
-    yaml_path = _write_yaml(tmp_path, _MINIMAL_YAML)
-    config = load_fleet_config(yaml_path)
-
-    with _open_store(tmp_path) as store:
-        apply_fleet_config(store, config)
-        result2 = apply_fleet_config(store, config)
-
-    assert result2.strata_created == []
-    assert set(result2.strata_existing) == {"L0", "L1", "L2"}
-    assert result2.scopes_created == []
-    assert set(result2.scopes_existing) == {"g_ceo", "g_eng", "g_arch", "g_backend"}
-    assert result2.edges_created == []
-    assert len(result2.edges_existing) == 4
+def test_example_yaml_loads(tmp_path: Path) -> None:
+    """fleet.example.yaml (repo root) loads and validates without error."""
+    assert _EXAMPLE_YAML.exists(), f"fleet.example.yaml not found at {_EXAMPLE_YAML}"
+    config = load_fleet_config(_EXAMPLE_YAML)
+    assert len(config.strata) >= 3
+    assert len(config.scopes) >= 4
 
 
 # ---------------------------------------------------------------------------
-# Test 4 — drift on stratum name
-# ---------------------------------------------------------------------------
-
-
-def test_stratum_name_drift_raises(tmp_path: Path) -> None:
-    """Pre-existing stratum with a different name raises ValueError mentioning the id."""
-    yaml_path = _write_yaml(tmp_path, _MINIMAL_YAML)
-    config = load_fleet_config(yaml_path)
-
-    with _open_store(tmp_path) as store:
-        # Insert L0 with a DIFFERENT name before applying config.
-        store._conn.execute(
-            "INSERT INTO strata (id, name, ordinal) VALUES (?, ?, ?)",
-            ("L0", "WRONG_NAME", 0),
-        )
-        store._conn.commit()
-
-        with pytest.raises(ValueError, match="L0"):
-            apply_fleet_config(store, config)
-
-
-# ---------------------------------------------------------------------------
-# Test 5 — drift on scope stratum
-# ---------------------------------------------------------------------------
-
-
-def test_scope_stratum_drift_raises(tmp_path: Path) -> None:
-    """Pre-existing scope with a different stratum_id raises ValueError mentioning the id."""
-    yaml_path = _write_yaml(tmp_path, _MINIMAL_YAML)
-    config = load_fleet_config(yaml_path)
-
-    with _open_store(tmp_path) as store:
-        # Insert the strata first (needed for FK), then g_ceo under wrong stratum.
-        store.create_stratum(name="Executive", ordinal=0)
-        store.create_stratum(name="Function", ordinal=1)
-        store.create_stratum(name="Team", ordinal=2)
-
-        store._conn.execute(
-            "INSERT INTO scopes (id, name, stratum_id) VALUES (?, ?, ?)",
-            ("g_ceo", "CEO", "L1"),  # Wrong stratum — should be L0
-        )
-        store._conn.commit()
-
-        with pytest.raises(ValueError, match="g_ceo"):
-            apply_fleet_config(store, config)
-
-
-# ---------------------------------------------------------------------------
-# Test 6 — missing stratum reference in scope
+# Test 4 — missing stratum reference raises FleetConfigError
 # ---------------------------------------------------------------------------
 
 
 def test_missing_stratum_reference_raises(tmp_path: Path) -> None:
-    """A scope that references an undefined stratum raises a clear error."""
+    """A scope that references an undefined stratum raises FleetConfigError."""
     bad_yaml = """
         strata:
           - id: L0
@@ -228,19 +143,19 @@ def test_missing_stratum_reference_raises(tmp_path: Path) -> None:
         edges: []
     """
     yaml_path = _write_yaml(tmp_path, bad_yaml)
-    config = load_fleet_config(yaml_path)
-
-    with _open_store(tmp_path) as store, pytest.raises(ValueError, match="LX"):
-        apply_fleet_config(store, config)
+    with pytest.raises(FleetConfigError) as exc_info:
+        load_fleet_config(yaml_path)
+    assert exc_info.value.kind == "unknown_stratum_ref"
+    assert "LX" in exc_info.value.message
 
 
 # ---------------------------------------------------------------------------
-# Test 7 — missing scope reference in edge
+# Test 5 — missing scope reference in edge raises FleetConfigError
 # ---------------------------------------------------------------------------
 
 
 def test_missing_scope_reference_in_edge_raises(tmp_path: Path) -> None:
-    """An edge that references an undefined scope raises a clear error."""
+    """An edge referencing an undefined scope raises FleetConfigError."""
     bad_yaml = """
         strata:
           - id: L0
@@ -257,22 +172,22 @@ def test_missing_scope_reference_in_edge_raises(tmp_path: Path) -> None:
 
         edges:
           - from: g_ceo
-            to: g_nonexistent    # not defined above
+            to: g_nonexistent
     """
     yaml_path = _write_yaml(tmp_path, bad_yaml)
-    config = load_fleet_config(yaml_path)
-
-    with _open_store(tmp_path) as store, pytest.raises(ValueError, match="g_nonexistent"):
-        apply_fleet_config(store, config)
+    with pytest.raises(FleetConfigError) as exc_info:
+        load_fleet_config(yaml_path)
+    assert exc_info.value.kind == "unknown_scope_ref"
+    assert "g_nonexistent" in exc_info.value.message
 
 
 # ---------------------------------------------------------------------------
-# Test 8 — ±1 stratum constraint propagates from record_store
+# Test 6 — ±1 stratum constraint violation raises FleetConfigError
 # ---------------------------------------------------------------------------
 
 
-def test_edge_stratum_distance_constraint_propagates(tmp_path: Path) -> None:
-    """An edge spanning more than one stratum raises (record_store enforces this)."""
+def test_edge_stratum_distance_constraint_raises(tmp_path: Path) -> None:
+    """An edge spanning more than one stratum raises FleetConfigError."""
     bad_yaml = """
         strata:
           - id: L0
@@ -295,36 +210,54 @@ def test_edge_stratum_distance_constraint_propagates(tmp_path: Path) -> None:
 
         edges:
           - from: g_backend
-            to: g_ceo    # spans 2 strata (L2 → L0), forbidden
+            to: g_ceo
     """
     yaml_path = _write_yaml(tmp_path, bad_yaml)
+    with pytest.raises(FleetConfigError) as exc_info:
+        load_fleet_config(yaml_path)
+    assert exc_info.value.kind == "stratum_distance_violation"
+
+
+# ---------------------------------------------------------------------------
+# Test 7 — FleetConfig returned with path set (mutation API ready)
+# ---------------------------------------------------------------------------
+
+
+def test_loaded_config_has_path(tmp_path: Path) -> None:
+    """The returned FleetConfig has its _path attribute set for mutations."""
+    yaml_path = _write_yaml(tmp_path, _MINIMAL_YAML)
     config = load_fleet_config(yaml_path)
-
-    with _open_store(tmp_path) as store, pytest.raises(ValueError, match="stratum"):
-        apply_fleet_config(store, config)
+    # _path is set as a private attribute
+    assert config._path == yaml_path
 
 
 # ---------------------------------------------------------------------------
-# Test 9 — fleet.example.yaml loads and applies to a fresh DB
+# Test 8 — active scopes are returned, archived are excluded
 # ---------------------------------------------------------------------------
 
 
-def test_example_yaml_loads_and_applies(tmp_path: Path) -> None:
-    """fleet.example.yaml loads cleanly and applies to a fresh DB without error."""
-    assert _EXAMPLE_YAML.exists(), f"fleet.example.yaml not found at {_EXAMPLE_YAML}"
+def test_active_scopes_excludes_archived(tmp_path: Path) -> None:
+    """active_scopes() returns only status=active scopes."""
+    yaml = """
+        strata:
+          - id: L0
+            name: Executive
+            ordinal: 0
 
-    config = load_fleet_config(_EXAMPLE_YAML)
+        scopes:
+          - id: g_active
+            name: Active
+            stratum_id: L0
+            status: active
+          - id: g_retired
+            name: Retired
+            stratum_id: L0
+            status: archived
 
-    assert len(config.strata) >= 3
-    assert len(config.scopes) >= 4
-    assert len(config.edges) >= 3
-
-    with _open_store(tmp_path) as store:
-        result = apply_fleet_config(store, config)
-
-    assert len(result.strata_created) == len(config.strata)
-    assert len(result.scopes_created) == len(config.scopes)
-    assert len(result.edges_created) == len(config.edges)
-    assert result.strata_existing == []
-    assert result.scopes_existing == []
-    assert result.edges_existing == []
+        edges: []
+    """
+    yaml_path = _write_yaml(tmp_path, yaml)
+    config = load_fleet_config(yaml_path)
+    active = config.active_scopes()
+    assert len(active) == 1
+    assert active[0].id == "g_active"

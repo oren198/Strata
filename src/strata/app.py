@@ -4,6 +4,11 @@ Wires the record store, summary store, and scope-manager together behind a
 small REST API.  All endpoints return JSON.  Sync endpoints are used
 throughout — FastAPI mixes sync and async without issue.
 
+Fleet configuration is served from the in-memory :class:`FleetConfig` mirror
+loaded at startup from ``fleet.yaml`` (ADR 0002).  The ``strata``, ``scopes``,
+and ``edges`` SQLite tables are gone; scope-existence and active-status checks
+are enforced against the in-memory mirror at contribute time.
+
 Endpoints
 ---------
 GET /
@@ -16,8 +21,12 @@ POST /contribute
     Accept a contribution from an agent, invoke the scope-manager, persist
     the judgment, and (if accepted) update the scope summary.
 
+    Contribute-time validation (ADR 0002 invariants 9 and 10):
+    - Scope not in FleetConfig → 404 ``scope_not_found``.
+    - Scope ``status == "archived"`` → 409 ``scope_not_active``.
+
 GET /scopes
-    Return the full fleet config (strata, scopes, edges) for the UI.
+    Return active scopes and strata from FleetConfig.
 
 GET /scopes/{scope_id}/summary
     Return the scope summary.  200 with an empty summary if the scope exists
@@ -34,21 +43,21 @@ from __future__ import annotations
 import pathlib
 from collections.abc import AsyncGenerator, Generator
 from contextlib import asynccontextmanager
-from dataclasses import asdict
+from datetime import UTC, datetime
 from typing import Literal
 
 import anthropic
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from strata.fleet_config import FleetConfig
 from strata.migrator import run_migrations
 from strata.record_store import (
     Contribution,
     ContributorRef,
     RecordStore,
-    Stratum,
 )
 from strata.scope_manager import ScopeManager, ScopeManagerJudgment
 from strata.settings import Settings, get_settings
@@ -94,6 +103,11 @@ def get_scope_manager(
 ) -> ScopeManager:
     """Return a :class:`ScopeManager` bound to the configured model."""
     return ScopeManager(client=client, model=settings.manager_model)
+
+
+def get_fleet_config(request: Request) -> FleetConfig:
+    """Return the in-memory :class:`FleetConfig` from app state."""
+    return request.app.state.fleet_config
 
 
 # ---------------------------------------------------------------------------
@@ -161,6 +175,14 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
         # SummaryStore.__init__ creates summaries_dir on construct; ensure it
         # exists by instantiating one here.
         SummaryStore(effective.summaries_dir)
+        # Load the FleetConfig mirror from fleet.yaml and hold it on app.state.
+        fleet_path = pathlib.Path(effective.fleet_yaml_path)
+        if fleet_path.exists():
+            app.state.fleet_config = FleetConfig.load(fleet_path)
+        else:
+            # Start with an empty config when no fleet.yaml is present (e.g.
+            # test scenarios that don't need fleet config).
+            app.state.fleet_config = FleetConfig(strata=[], scopes=[], edges=[])
         yield
 
     application = FastAPI(
@@ -197,6 +219,7 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
     @application.post("/contribute", response_model=ContributeResponse)
     def contribute(
         body: ContributeRequest,
+        request: Request,
         record_store: RecordStore = Depends(get_record_store),
         summary_store: SummaryStore = Depends(get_summary_store),
         scope_manager: ScopeManager = Depends(get_scope_manager),
@@ -204,27 +227,47 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
         """Accept a contribution and invoke the scope-manager for judgment.
 
         Flow:
-        1. Validate the target scope exists.
-        2. Append the contribution to the immutable record.
-        3. Load the current summary + recent contributions for the scope-manager.
-        4. Call the scope-manager.
-        5. Persist the judgment.
-        6. Persist the updated summary (if accepted).
+        1. Validate the target scope exists in FleetConfig (invariant 9).
+        2. Validate the target scope is active (invariant 10).
+        3. Append the contribution to the immutable record.
+        4. Load the current summary + recent contributions for the scope-manager.
+        5. Call the scope-manager.
+        6. Persist the judgment.
+        7. Persist the updated summary (if accepted).
         """
-        # Step 1: resolve scope and stratum
-        scope = record_store.get_scope(body.scope_id)
-        if scope is None:
-            raise HTTPException(status_code=404, detail=f"Scope not found: {body.scope_id!r}")
+        fleet: FleetConfig = request.app.state.fleet_config
 
-        strata = record_store.list_strata()
-        stratum: Stratum | None = next((s for s in strata if s.id == scope.stratum_id), None)
-        if stratum is None:
+        # Step 1: scope must exist in FleetConfig (invariant 9).
+        scope = fleet.get_scope(body.scope_id)
+        if scope is None:
             raise HTTPException(
-                status_code=500,
-                detail=f"Stratum {scope.stratum_id!r} for scope {body.scope_id!r} not found.",
+                status_code=404,
+                detail={"error": "scope_not_found", "scope_id": body.scope_id},
             )
 
-        # Step 2: append contribution
+        # Step 2: scope must be active (invariant 10).
+        if scope.status == "archived":
+            raise HTTPException(
+                status_code=409,
+                detail={"error": "scope_not_active", "scope_id": body.scope_id},
+            )
+
+        # Resolve stratum from FleetConfig for scope-manager context.
+        stratum = next(
+            (s for s in fleet.strata if s.id == scope.stratum_id),
+            None,
+        )
+        if stratum is None:
+            # Invariant 4 (every scope's stratum_id resolves to a defined
+            # stratum) is enforced at load and re-checked on every mutation,
+            # so reaching here means the in-memory FleetConfig is internally
+            # inconsistent rather than the request being at fault.
+            raise HTTPException(
+                status_code=500,
+                detail={"error": "internal_inconsistency", "scope_id": body.scope_id},
+            )
+
+        # Step 3: append contribution
         contributor_ref = ContributorRef(
             scope_id=body.contributor.scope_id,
             skill=body.contributor.skill,
@@ -240,11 +283,11 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
             contributor=contributor_ref,
         )
 
-        # Step 3: load summary + recent contributions
+        # Step 4: load summary + recent contributions
         current_summary = summary_store.read(body.scope_id)
         recent_contributions = record_store.list_contributions(scope_id=body.scope_id, limit=20)
 
-        # Step 4: call scope-manager
+        # Step 5: call scope-manager
         try:
             judgment: ScopeManagerJudgment = scope_manager.judge(
                 scope=scope,
@@ -259,7 +302,7 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
                 detail={"error": "scope_manager_failure", "detail": str(exc)},
             ) from exc
 
-        # Step 5: persist the judgment
+        # Step 6: persist the judgment
         record_store.record_judgment(
             contribution_id=contribution.id,
             decision=judgment.decision,
@@ -267,7 +310,7 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
             notes=judgment.reasoning,
         )
 
-        # Step 6: persist updated summary if accepted
+        # Step 7: persist updated summary if accepted
         summary_updated = False
         if judgment.decision != "decline" and judgment.new_summary is not None:
             summary_store.write(body.scope_id, judgment.new_summary)
@@ -287,18 +330,19 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
     # -----------------------------------------------------------------------
 
     @application.get("/scopes")
-    def list_scopes_endpoint(
-        record_store: RecordStore = Depends(get_record_store),
-    ) -> dict:
-        """Return the full fleet config: strata, scopes, and edges."""
-        strata = record_store.list_strata()
-        scopes = record_store.list_scopes()
-        edges = record_store.list_edges()
+    def list_scopes_endpoint(request: Request) -> dict:
+        """Return active scopes and strata from the in-memory FleetConfig."""
+        fleet: FleetConfig = request.app.state.fleet_config
+
+        active = fleet.active_scopes()
+        # Edges involving only active scopes.
+        active_ids = {s.id for s in active}
+        active_edges = [e for e in fleet.edges if e.from_ in active_ids and e.to in active_ids]
 
         return {
-            "strata": [asdict(s) for s in strata],
-            "scopes": [asdict(s) for s in scopes],
-            "edges": [asdict(e) for e in edges],
+            "strata": [s.model_dump() for s in fleet.strata],
+            "scopes": [s.model_dump() for s in active],
+            "edges": [{"from_scope_id": e.from_, "to_scope_id": e.to} for e in active_edges],
         }
 
     # -----------------------------------------------------------------------
@@ -308,15 +352,16 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
     @application.get("/scopes/{scope_id}/summary")
     def get_scope_summary(
         scope_id: str,
-        record_store: RecordStore = Depends(get_record_store),
+        request: Request,
         summary_store: SummaryStore = Depends(get_summary_store),
     ) -> dict:
         """Return the scope summary.
 
         Returns 200 with an empty summary if the scope exists but has no summary
-        yet.  Returns 404 if the scope does not exist.
+        yet.  Returns 404 if the scope is not in the FleetConfig.
         """
-        scope = record_store.get_scope(scope_id)
+        fleet: FleetConfig = request.app.state.fleet_config
+        scope = fleet.get_scope(scope_id)
         if scope is None:
             raise HTTPException(status_code=404, detail=f"Scope not found: {scope_id!r}")
 
@@ -324,12 +369,12 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
         if existing is not None:
             return existing.model_dump()
 
-        # Scope exists but has no summary yet — return an empty summary
+        # Scope exists but has no summary yet — return an empty summary.
         empty = ScopeSummary(
             scope_id=scope_id,
             directives=[],
             context="",
-            updated_at=scope.created_at,
+            updated_at=datetime.now(tz=UTC).isoformat(),
         )
         return empty.model_dump()
 
@@ -340,18 +385,22 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
     @application.get("/scopes/{scope_id}/record")
     def get_scope_record(
         scope_id: str,
+        request: Request,
         record_store: RecordStore = Depends(get_record_store),
     ) -> dict:
         """Return contributions and judgments for a scope (forensic view).
 
-        Returns 404 if the scope does not exist.
+        Returns 404 if the scope is not in the FleetConfig.
         """
-        scope = record_store.get_scope(scope_id)
+        fleet: FleetConfig = request.app.state.fleet_config
+        scope = fleet.get_scope(scope_id)
         if scope is None:
             raise HTTPException(status_code=404, detail=f"Scope not found: {scope_id!r}")
 
         contributions = record_store.list_contributions(scope_id=scope_id)
         judgments = record_store.list_judgments(scope_id=scope_id)
+
+        from dataclasses import asdict
 
         return {
             "contributions": [asdict(c) for c in contributions],

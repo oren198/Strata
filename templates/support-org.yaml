@@ -1,0 +1,43 @@
+# Strata fleet configuration — support organisation template
+#
+# A minimal two-stratum fleet for a support organisation.
+
+strata:
+  - id: L0
+    name: Support Leadership
+    ordinal: 0
+
+  - id: L1
+    name: Support Team
+    ordinal: 1
+
+scopes:
+  - id: g_head_support
+    name: Head of Support
+    stratum_id: L0
+    status: active
+    default_skill: scope-manager
+    permitted_skills: [scope-manager]
+
+  - id: g_tier1
+    name: Tier-1 Support
+    stratum_id: L1
+    status: active
+    default_skill: evidence-summarizer
+    permitted_skills: [evidence-summarizer, code-writer]
+
+  - id: g_tier2
+    name: Tier-2 Support
+    stratum_id: L1
+    status: active
+    default_skill: evidence-summarizer
+    permitted_skills: [evidence-summarizer, code-writer]
+
+edges:
+  - from: g_tier1
+    to: g_head_support
+  - from: g_tier2
+    to: g_head_support
+  # Peer reference: tier-2 reads context from tier-1
+  - from: g_tier2
+    to: g_tier1

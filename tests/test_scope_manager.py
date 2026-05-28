@@ -12,7 +12,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from strata.record_store import Contribution, ContributorRef, Scope, Stratum
+from strata.fleet_config import Scope, Stratum
+from strata.record_store import Contribution, ContributorRef
 from strata.scope_manager import ScopeManager, ScopeManagerJudgment
 from strata.summary_store import Directive, ScopeSummary
 
@@ -20,10 +21,8 @@ from strata.summary_store import Directive, ScopeSummary
 # Fixtures — shared domain objects
 # ---------------------------------------------------------------------------
 
-STRATUM = Stratum(id="L1", name="function", ordinal=1, created_at="2026-01-01T00:00:00+00:00")
-SCOPE = Scope(
-    id="g_abc123", name="architecture", stratum_id="L1", created_at="2026-01-01T00:00:00+00:00"
-)
+STRATUM = Stratum(id="L1", name="function", ordinal=1)
+SCOPE = Scope(id="g_abc123", name="architecture", stratum_id="L1")
 
 CONTRIBUTOR = ContributorRef(
     scope_id="g_def456",
