@@ -220,6 +220,27 @@ The file is committed to git alongside the project. When you open the repo and
 run `strata launch`, Strata finds the file, validates the scope, and launches
 `claude` already bound — no manual `export` step needed.
 
+### Upgrading from V1.1 to V1.2
+
+V1.2 moves fleet configuration (strata, scopes, edges) out of SQLite and into a
+file-canonical `fleet.yaml` (ADR 0002). Before upgrading, export your existing
+fleet shape so it isn't lost when migration 0002 drops the SQL fleet tables:
+
+1. **Upgrade code** — pull V1.2 (`git pull`, `make install`). The migration has not run yet.
+2. **Export your fleet** — reads the still-present V1 tables and writes `fleet.yaml`:
+   ```bash
+   strata export-fleet          # writes ./fleet.yaml from ./strata.db
+   # or specify paths explicitly:
+   strata export-fleet --db /path/to/strata.db --out /path/to/fleet.yaml
+   ```
+3. **Start V1.2** — applies migration 0002 (drops the SQL fleet tables) and loads the exported config:
+   ```bash
+   strata start
+   ```
+
+After step 3, edit `fleet.yaml` by hand to add per-scope skill declarations
+(`default_skill`, `permitted_skills`) as needed for `strata launch` (ADR 0003).
+
 ### Strata Console UI
 
 Open <http://127.0.0.1:8000/> while the backend is running — a read-only graph and list view of the current fleet state, polling every 5 s. All memory mutations flow through `strata.contribute`; the UI has no write path in V1. To point the UI at a non-default backend, edit the `<meta name="strata-api-base" content="...">` tag in `ui/index.html`.
