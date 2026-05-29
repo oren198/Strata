@@ -11,8 +11,10 @@ runnable. Subcommands:
 * ``strata scopes``    — terminal-friendly listing of the fleet.
 * ``strata summary``   — print a scope's curated summary.
 * ``strata record``    — print a scope's record (contributions + judgments).
-* ``strata launch``    — validate scope, resolve skill, and exec ``claude``
-                        with STRATA_AGENT_* env vars set (ADR 0003).
+* ``strata launch``       — validate scope, resolve skill, and exec ``claude``
+                           with STRATA_AGENT_* env vars set (ADR 0003).
+* ``strata export-fleet`` — read V1 fleet tables and write fleet.yaml for
+                           the V1 → V1.2 upgrade path.
 
 The inspection commands (``scopes``, ``summary``, ``record``, ``launch``)
 talk to a running backend over HTTP — start the backend first with
@@ -267,6 +269,51 @@ def cmd_record(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_export_fleet(args: argparse.Namespace) -> int:
+    """Read V1 fleet tables and write fleet.yaml for V1.2.
+
+    Reads ``strata``, ``scopes``, and ``edges`` from the V1 DB without running
+    migrations, converts to the V1.2 schema, and writes a ``fleet.yaml`` that
+    round-trips through :class:`FleetConfig.load`.
+    """
+    from strata.fleet_config import FleetConfigError
+    from strata.fleet_export import ExportResult, TablesAbsentError, export_fleet
+
+    db_path = args.db or _db_path_default()
+    out_path_str = args.out or _fleet_config_default()
+    out_path = Path(out_path_str)
+
+    try:
+        result: ExportResult = export_fleet(db_path, out_path, force=args.force)
+    except TablesAbsentError:
+        print(
+            f"No V1 fleet tables found in {db_path} — nothing to export "
+            "(already migrated to V1.2?)",
+            file=sys.stderr,
+        )
+        return 1
+    except FileExistsError:
+        print(
+            f"{out_path} already exists. Pass --force to overwrite, or choose a "
+            "different path with --out.",
+            file=sys.stderr,
+        )
+        return 1
+    except FleetConfigError as exc:
+        print(
+            f"Exported data failed validation [{exc.kind}]: {exc.message}",
+            file=sys.stderr,
+        )
+        return 1
+
+    print(
+        f"Exported {result.strata_count} strata, {result.scopes_count} scopes, "
+        f"{result.edges_count} edges → {result.out_path}"
+    )
+    print("Now run `strata start` to apply migration 0002 and load the exported config.")
+    return 0
+
+
 def cmd_launch(args: argparse.Namespace) -> int:
     """Validate scope, resolve skill, and exec ``claude`` with STRATA_AGENT_* set.
 
@@ -443,6 +490,22 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Override auto-generated session ID.",
     )
     p_launch.set_defaults(func=cmd_launch)
+
+    p_export = sub.add_parser(
+        "export-fleet",
+        help="Export V1 fleet tables to fleet.yaml for V1.2 upgrade.",
+    )
+    p_export.add_argument("--db", help=f"V1 DB path (default: {_db_path_default()}).")
+    p_export.add_argument(
+        "--out",
+        help=f"Output fleet.yaml path (default: {_fleet_config_default()}).",
+    )
+    p_export.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite --out if it already exists.",
+    )
+    p_export.set_defaults(func=cmd_export_fleet)
 
     return parser
 
