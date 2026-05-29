@@ -34,10 +34,16 @@ The V1 architecture decision is documented in
 
 ## Status
 
-**V1 backend, Strata Console UI, and Claude Code plugin all in place.**
-Local Python service with SQLite + markdown storage, Anthropic-hosted
-scope-managers, FastAPI HTTP surface, YAML fleet bootstrap, a read-only
+**V1.2 shipped.** Local Python service with SQLite + markdown storage,
+Anthropic-hosted scope-managers, FastAPI HTTP surface, file-canonical
+`fleet.yaml` with in-memory mirror (ADR 0002), `strata launch` for
+frictionless Claude Code session binding (ADR 0003), a read-only
 browser-based Console, and a Claude Code MCP plugin + skills.
+
+What comes next is captured in [`docs/ROADMAP.md`](docs/ROADMAP.md) — the
+enduring design principles and the sequenced direction the project is
+heading. See also the [Architecture decisions](#architecture-decisions)
+section below for the ADRs already landed.
 
 ---
 
@@ -89,16 +95,12 @@ Without a key you can still run `make test` and `make lint`, but live contributi
 strata start
 ```
 
-This (a) applies SQLite migrations to `./strata.db`, (b) auto-bootstraps the example fleet from `fleet.example.yaml` because no `fleet.yaml` exists yet, and (c) launches the FastAPI server.
+This (a) applies SQLite migrations to `./strata.db`, (b) **auto-seeds `fleet.yaml`** from the default starter template (`templates/dev-team.yaml`) because no `fleet.yaml` exists yet, and (c) launches the FastAPI server. Per ADR 0002, the backend then reads `fleet.yaml` directly into an in-memory `FleetConfig` mirror — there is no separate "bootstrap into DB" step.
 
 **Success looks like this:**
 
 ```
-Applied 1 migration(s).
-Fleet bootstrapped from fleet.example.yaml:
-  strata: 3 created, 0 existing
-  scopes: 4 created, 0 existing
-  edges:  4 created, 0 existing
+seeded fleet.yaml from the default template; edit to suit
 
 Strata backend → http://127.0.0.1:8000
 Strata Console → http://127.0.0.1:8000/
@@ -285,8 +287,11 @@ README.md                # This file
 CONTEXT.md               # Canonical glossary (23 terms — single source of vocabulary)
 docs/
   philosophy.md          # Theoretical foundations — why Strata exists
+  ROADMAP.md             # Enduring principles + sequenced direction (post-V1.2)
   adr/
     0001-v1-architecture.md
+    0002-fleet-config-source-of-truth.md
+    0003-strata-launch-cc-binding.md
 src/strata/              # Python backend package
   app.py                 # FastAPI app + endpoints (serves ui/ at /ui)
   settings.py            # pydantic-settings config
@@ -408,13 +413,20 @@ summary g_arch` from a fourth terminal.
 ## Architecture decisions
 
 ADRs live under `docs/adr/`. Each captures a hard-to-reverse decision with
-context, alternatives, and consequences.
+context, alternatives, and consequences. The future direction —
+principles plus the next horizons — is in [`docs/ROADMAP.md`](docs/ROADMAP.md).
 
 Current ADRs:
 
 - [0001 — V1 architecture](docs/adr/0001-v1-architecture.md): local Python
   backend, SQLite + markdown storage, Claude Code as the agent runtime,
   scope-manager hosted as backend-spawned Anthropic API calls.
+- [0002 — Fleet config source of truth](docs/adr/0002-fleet-config-source-of-truth.md):
+  `fleet.yaml` is canonical; SQLite holds only contributions and judgments;
+  scope lifecycle (`active`/`archived`); per-scope skill declarations.
+- [0003 — `strata launch` CC binding](docs/adr/0003-strata-launch-cc-binding.md):
+  frictionless `(scope, skill, session_id)` binding via a single CLI command
+  that validates, resolves, and `execvp`s `claude`.
 
 ---
 
