@@ -240,6 +240,8 @@ fleet shape so it isn't lost when migration 0002 drops the SQL fleet tables:
    strata start
    ```
 
+`strata start` will refuse to proceed if you forget step 2: it detects a V1 fleet config in the DB with no `fleet.yaml` and exits with an actionable error pointing you back to `strata export-fleet`.
+
 After step 3, edit `fleet.yaml` by hand to add per-scope skill declarations
 (`default_skill`, `permitted_skills`) as needed for `strata launch` (ADR 0003).
 
