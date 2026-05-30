@@ -3,6 +3,11 @@
 All unit tests use :mod:`unittest.mock` — no real Anthropic API calls are
 made.  The optional integration test (marked ``pytest.mark.integration``) is
 skipped unless ``STRATA_RUN_INTEGRATION=1`` is set in the environment.
+
+Decision 2 tests (parent summary in user message):
+- Test 11: parent summary renders under "PARENT SCOPE SUMMARY (inherited)" header.
+- Test 12: parent_summary=None (L0 root) — header is omitted entirely.
+- Test 13: parent directive text appears in user message when parent provided.
 """
 
 from __future__ import annotations
@@ -398,6 +403,106 @@ def test_tool_choice_forces_submit_judgment() -> None:
     tool_choice = call_kwargs.kwargs["tool_choice"]
 
     assert tool_choice == {"type": "tool", "name": "submit_judgment"}
+
+
+# ---------------------------------------------------------------------------
+# Decision 2 fixtures — parent scope / parent summary
+# ---------------------------------------------------------------------------
+
+PARENT_STRATUM = Stratum(id="L0", name="executive", ordinal=0)
+PARENT_SCOPE = Scope(id="g_exec", name="Executive", stratum_id="L0")
+
+PARENT_DIRECTIVE = Directive(
+    id="c_parent01",
+    content="All sub-teams must adhere to the company security policy.",
+    subject="security-policy",
+    source_scope_id=PARENT_SCOPE.id,
+    source_skill="scope-manager",
+    created_at="2026-01-01T00:00:00+00:00",
+)
+
+PARENT_SUMMARY = ScopeSummary(
+    scope_id=PARENT_SCOPE.id,
+    directives=[PARENT_DIRECTIVE],
+    context="The executive context sets overall fleet direction.",
+    updated_at="2026-01-01T00:00:00+00:00",
+)
+
+
+# ---------------------------------------------------------------------------
+# Test 11: parent summary renders under PARENT SCOPE SUMMARY (inherited) header
+# ---------------------------------------------------------------------------
+
+
+def test_parent_summary_renders_under_inherited_header() -> None:
+    """parent_summary renders into the user message with the correct section label."""
+    manager, mock_client = _make_manager(_accept_directive_input())
+
+    manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        parent_summary=PARENT_SUMMARY,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+    )
+
+    call_kwargs = mock_client.messages.create.call_args
+    messages = call_kwargs.kwargs["messages"]
+    user_message_content = messages[0]["content"]
+
+    assert "PARENT SCOPE SUMMARY (inherited)" in user_message_content
+    assert PARENT_SCOPE.id in user_message_content
+
+
+# ---------------------------------------------------------------------------
+# Test 12: parent_summary=None (L0 root) — inherited header is absent
+# ---------------------------------------------------------------------------
+
+
+def test_no_parent_summary_omits_inherited_header() -> None:
+    """When parent_summary=None (root scope), the PARENT SCOPE SUMMARY section must be absent."""
+    manager, mock_client = _make_manager(_accept_directive_input())
+
+    manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        parent_summary=None,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+    )
+
+    call_kwargs = mock_client.messages.create.call_args
+    messages = call_kwargs.kwargs["messages"]
+    user_message_content = messages[0]["content"]
+
+    assert "PARENT SCOPE SUMMARY (inherited)" not in user_message_content
+
+
+# ---------------------------------------------------------------------------
+# Test 13: parent directive text appears in user message
+# ---------------------------------------------------------------------------
+
+
+def test_parent_directive_content_in_user_message() -> None:
+    """The parent's directive content must appear in the user message for the manager."""
+    manager, mock_client = _make_manager(_accept_directive_input())
+
+    manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        parent_summary=PARENT_SUMMARY,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+    )
+
+    call_kwargs = mock_client.messages.create.call_args
+    messages = call_kwargs.kwargs["messages"]
+    user_message_content = messages[0]["content"]
+
+    assert PARENT_DIRECTIVE.content in user_message_content
 
 
 # ---------------------------------------------------------------------------

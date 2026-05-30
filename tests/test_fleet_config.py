@@ -642,3 +642,99 @@ def test_add_invalid_edge_raises_and_does_not_persist(tmp_path: Path) -> None:
     # File must be unchanged.
     reloaded = FleetConfig.load(path)
     assert len(reloaded.edges) == 0
+
+
+# ---------------------------------------------------------------------------
+# inter_stratum_parent helper
+# ---------------------------------------------------------------------------
+
+_CHAIN_YAML = """
+strata:
+  - id: L0
+    name: Executive
+    ordinal: 0
+  - id: L1
+    name: Function
+    ordinal: 1
+  - id: L2
+    name: Team
+    ordinal: 2
+
+scopes:
+  - id: g_exec
+    name: Executive
+    stratum_id: L0
+  - id: g_func
+    name: Function
+    stratum_id: L1
+  - id: g_team
+    name: Team
+    stratum_id: L2
+  - id: g_peer
+    name: Peer Function
+    stratum_id: L1
+
+edges:
+  # Inter-stratum: child → parent (from=child, to=parent)
+  - from: g_func
+    to: g_exec
+  - from: g_team
+    to: g_func
+  - from: g_peer
+    to: g_exec
+  # Intra-stratum peer reference (same L1 — must NOT be returned as parent)
+  - from: g_func
+    to: g_peer
+"""
+
+
+def test_inter_stratum_parent_returns_single_parent(tmp_path: Path) -> None:
+    """inter_stratum_parent returns the inter-stratum parent for a non-root scope."""
+    config = FleetConfig.load(_write(tmp_path, _CHAIN_YAML))
+
+    parent = config.inter_stratum_parent("g_team")
+
+    assert parent is not None
+    assert parent.id == "g_func"
+
+
+def test_inter_stratum_parent_root_scope_returns_none(tmp_path: Path) -> None:
+    """inter_stratum_parent returns None for a root (L0) scope."""
+    config = FleetConfig.load(_write(tmp_path, _CHAIN_YAML))
+
+    parent = config.inter_stratum_parent("g_exec")
+
+    assert parent is None
+
+
+def test_inter_stratum_parent_ignores_peer_edges(tmp_path: Path) -> None:
+    """inter_stratum_parent must not follow intra-stratum (peer) edges.
+
+    g_func has a peer edge to g_peer (both L1). inter_stratum_parent("g_func")
+    must return g_exec (L0), not g_peer (L1).
+    """
+    config = FleetConfig.load(_write(tmp_path, _CHAIN_YAML))
+
+    parent = config.inter_stratum_parent("g_func")
+
+    assert parent is not None
+    assert parent.id == "g_exec"
+    assert parent.id != "g_peer"
+
+
+def test_inter_stratum_ancestors_returns_root_first(tmp_path: Path) -> None:
+    """inter_stratum_ancestors returns ancestor chain ordered root-first."""
+    config = FleetConfig.load(_write(tmp_path, _CHAIN_YAML))
+
+    ancestors = config.inter_stratum_ancestors("g_team")
+
+    assert [a.id for a in ancestors] == ["g_exec", "g_func"]
+
+
+def test_inter_stratum_ancestors_root_scope_returns_empty(tmp_path: Path) -> None:
+    """inter_stratum_ancestors returns an empty list for a root (L0) scope."""
+    config = FleetConfig.load(_write(tmp_path, _CHAIN_YAML))
+
+    ancestors = config.inter_stratum_ancestors("g_exec")
+
+    assert ancestors == []

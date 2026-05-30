@@ -168,6 +168,12 @@ def strata_contribute(
     current_summary = _summary_store.read(scope_id)
     recent_contributions = _record_store.list_contributions(scope_id=scope_id, limit=20)
 
+    # Resolve the inter-stratum parent's summary for manager context (ADR 0004
+    # Decision 2). The caller (here) does the graph traversal; the manager is a
+    # pure judgment primitive that receives the resolved summary.
+    parent_scope = fleet.inter_stratum_parent(scope_id)
+    parent_summary = _summary_store.read(parent_scope.id) if parent_scope is not None else None
+
     # Import here to avoid circular imports and keep the scope-manager import
     # lazy — it pulls in anthropic which may not be configured in all envs.
     import anthropic  # noqa: PLC0415
@@ -183,6 +189,7 @@ def strata_contribute(
         judgment = manager.judge(
             scope=scope,
             stratum=stratum,
+            parent_summary=parent_summary,
             current_summary=current_summary,
             recent_contributions=recent_contributions,
             new_contribution=contribution,
@@ -261,36 +268,68 @@ def strata_read_scope_summary(scope_id: str) -> dict:
 # ---------------------------------------------------------------------------
 
 
+def _summary_for_scope(scope_id: str) -> dict:
+    """Return a scope's summary as a plain dict, using an empty summary if none exists."""
+    existing = _summary_store.read(scope_id)
+    if existing is not None:
+        return existing.model_dump()
+    empty = ScopeSummary(
+        scope_id=scope_id,
+        directives=[],
+        context="",
+        updated_at=datetime.now(tz=UTC).isoformat(),
+    )
+    return empty.model_dump()
+
+
 @mcp.tool()
 def strata_read_perspective(scope_id: str) -> dict:
     """Return this agent's perspective on the fleet's long-term memory.
 
     A perspective is a composed, provenance-preserving view of the scope's
     own summary plus all inter-stratum ancestor summaries up to the root.
-    It is the primary read interface for an agent before acting.
+    Layers are ordered root-first (L0 first, requested scope last).
 
-    V1 NOTE: True perspective composition across ancestor scopes is post-V1.
-    For now this returns the scope's own summary only, decorated with a
-    ``_v1_limitation`` note.  The tool signature and name are stable; skill
-    prompts written against this tool will not need to change when full
-    perspective composition is implemented.
+    Only inter-stratum edges are traversed — peer (intra-stratum) edges are
+    never followed.  If a scope in the ancestor chain has no summary on disk
+    yet, its layer is still included with empty directives and context so that
+    the structure is visible.
 
     Args:
         scope_id: The scope for which to build the perspective.
 
     Returns:
-        Scope summary dict plus a ``_v1_limitation`` key documenting the
-        stub behaviour.
+        ``{layers: [{scope_id, stratum_id, summary}], scope_id: <requested>,
+        _layers_count: N}`` ordered root-first.
 
     Raises:
         RuntimeError: If the scope is unknown.
     """
-    summary = strata_read_scope_summary(scope_id)
-    summary["_v1_limitation"] = (
-        "Perspective composition across ancestor scopes is post-V1. "
-        "This response contains the scope's own summary only."
-    )
-    return summary
+    fleet = _load_fleet()
+
+    scope = fleet.get_scope(scope_id)
+    if scope is None:
+        raise RuntimeError(f"Scope not found: {scope_id!r}")
+
+    # Build the ancestor chain (root-first), then append the requested scope.
+    ancestors = fleet.inter_stratum_ancestors(scope_id)
+    chain = [*ancestors, scope]
+
+    layers = []
+    for s in chain:
+        layers.append(
+            {
+                "scope_id": s.id,
+                "stratum_id": s.stratum_id,
+                "summary": _summary_for_scope(s.id),
+            }
+        )
+
+    return {
+        "scope_id": scope_id,
+        "layers": layers,
+        "_layers_count": len(layers),
+    }
 
 
 # ---------------------------------------------------------------------------
