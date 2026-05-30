@@ -338,6 +338,11 @@ layer; running `strata start` is required only to view the UI. The agent loop
 — contributions, scope-manager judgments, perspective reads — works whether
 the backend is up or down.
 
+> **Migration note for callers of the old HTTP API:** in embedded mode,
+> `strata_read_scope_record` returns an empty record (`{"contributions": [],
+> "judgments": []}`) for unknown scopes instead of the old HTTP `404`. The
+> other tools still raise on unknown scopes (matching the prior 404 behaviour).
+
 ### 1. Start the backend (optional — Console UI only)
 
 ```bash

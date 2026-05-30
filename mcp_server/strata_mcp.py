@@ -342,6 +342,11 @@ def strata_read_scope_record(scope_id: str) -> dict:
     Does not re-read fleet.yaml — record retrieval is purely from the
     SQLite record store and needs no fleet info.
 
+    Migration note: returns an empty record (``{"contributions": [],
+    "judgments": []}``) for unknown scopes, where the old HTTP
+    ``GET /scopes/{id}/record`` endpoint would have returned 404. The other
+    MCP tools still raise on unknown scopes, matching the prior behaviour.
+
     Args:
         scope_id: The scope whose record to read (e.g. ``g_backend``).
 
