@@ -57,7 +57,21 @@ access layer and nothing more.
 - **MCP server** (`mcp_server/strata_mcp.py`) — import the `strata`
   package and operate on `RecordStore`, `SummaryStore`, and
   `ScopeManager` in-process. Drop the `STRATA_BACKEND_URL` HTTP
-  dependency. Rely on SQLite WAL mode for concurrent-write safety.
+  dependency.
+- **SQLite WAL mode** for the record store provides concurrent reads
+  alongside a single active writer, plus crash recovery. Multi-writer
+  load from N CC sessions serialises on the SQLite mutex; at V1.2.1
+  contribution rates (human-shaped, low concurrency) this is
+  non-problematic. Higher-throughput domains (call centre, support)
+  will need the batched-manager work tracked separately.
+- **`FleetConfig` reads.** Each in-process consumer (MCP server, CLI)
+  re-reads `fleet.yaml` from disk on every tool call. The file is
+  small (KB range), parses fast, and re-reading sidesteps
+  inter-process staleness entirely — no mtime watcher, no IPC, no
+  event bus. The 8 load-time invariants (per ADR 0002) run on each
+  read. UI writes through the backend remain the only mutation
+  path; MCP and CLI consumers always see a fresh config because
+  they always read fresh.
 - **CLI subcommands** (`strata contribute`, `strata summary`,
   `strata launch`) — already operate directly on the stores. Verified,
   no change.
@@ -85,9 +99,23 @@ that is consistent with what is already bound from above.
   config and fetches its current summary before the LLM call.
 - L0 (root stratum) scopes have no parent; `parent_summary=None`.
   The render is omitted.
+- **Inter-stratum only.** The "parent" here is the inter-stratum
+  parent (per CONTEXT.md edge kinds: inter-stratum carries directives
+  + context; intra-stratum / peer carries context only and forms a
+  DAG). Intra-stratum peer references are not in scope for V1.2.1;
+  peer context still reaches a scope via ratification through a
+  common inter-stratum ancestor.
 
 The manager remains a single LLM call per contribution. The user
 message grows by one bounded summary's worth of tokens.
+
+**An elegant property worth naming:** the parent's summary already
+embeds the grandparent's bound directives (because the parent's
+manager last ran this same incorporation step). So recursive
+parent-aware summarisation gives the manager **transitive ancestor
+awareness for free**, without a multi-level prompt or a graph walk
+inside the manager. The depth of the chain is invisible to any
+single manager invocation.
 
 ### 3. Perspective composition fills in the stub
 
@@ -99,9 +127,10 @@ preserved per layer.
 
 - `mcp_server/strata_mcp.py:strata_read_perspective` — drop the
   `_v1_limitation` note. Walk from the requested scope up the
-  `edges` graph to the root, collecting each ancestor's
-  `ScopeSummary`. Return `{layers: [{scope_id, summary, ...}], ...}`
-  ordered root-first.
+  **inter-stratum parent chain** to the root, collecting each
+  ancestor's `ScopeSummary`. Intra-stratum peer references are not
+  traversed in V1.2.1 — same deferral as Decision 2. Return
+  `{layers: [{scope_id, summary, ...}], ...}` ordered root-first.
 - The composition is read-time and lossless. The reader sees layers
   labelled by scope; precedence (Concept 5) is presented as
   structure, not pre-resolved.
@@ -132,12 +161,32 @@ The manager's summary regeneration is triggered by `strata launch
   incorrect.
 - Each summary records the parent-summary version it was built from
   (an integer per scope), so staleness is detectable without
-  re-running the LLM.
+  re-running the LLM. **Version stamps live in the summary's YAML
+  frontmatter** (`version: 13`, `parent_version: 12`) — the same
+  artifact a human can `cat` to inspect the staleness chain.
+  Keeps state where humans can read it; no parallel SQLite
+  tracking table.
 
 Cost: one LLM call latency at session start per stale ancestor. A
 warm chain refreshes in milliseconds (no LLM call); a cold chain
 costs ~5–10s per stale scope. Acceptable as a one-time briefing per
 session.
+
+**Mitigations for cold-chain latency, deferred to future work** (named
+here so they aren't re-litigated under pressure when the cliff
+bites):
+
+- **Parallel sibling refresh.** Independent ancestor chains (e.g.
+  refreshing two scopes whose common ancestor is already warm) can
+  refresh concurrently. The recursion is only sequential *within* a
+  single chain. Future `STRATA_REFRESH_CONCURRENCY=N` flag.
+- **Pre-warm command.** `strata warm <scope>` runs the refresh
+  chain without launching `claude`. Lets ops pay the LLM cost in
+  advance, not at the user's prompt-waiting moment.
+- **Detached refresh.** First-launch could spawn the refresh
+  asynchronously and degrade gracefully (return stale perspective,
+  log "refreshing in background"). More complex; probably not
+  worth it.
 
 ### 5. Bounded summary via prompt parameter
 
@@ -155,6 +204,13 @@ trimming, no token-budget walker.
 - The implicit rule: when the manager must trim, directives never
   get cut below visibility; the context section absorbs the squeeze.
   Stated in the system prompt, not enforced post-hoc.
+- **Word-budget is approximate.** LLM length adherence is
+  best-effort; expect ±20% from the target. Why words and not
+  tokens: the model can self-monitor word count but not token count
+  (tokens require a tokenizer round-trip the manager loop doesn't
+  have). For V1.2.1 this is acceptable. If perspective composition
+  ever needs a hard ceiling, a token-based post-trim would replace
+  the prompt-level constraint.
 
 ---
 
@@ -222,6 +278,16 @@ trimming, no token-budget walker.
   Concept 2). Cross-tree knowledge flow happens via manager
   ratification through a common ancestor — no peer-visibility
   primitive.
+- **Read-side perspective bounding / relevance ranking.** ROADMAP
+  H2 names bounded working view as a coupled tenet at *two*
+  layers: within-scope (the summary, addressed by Decision 5) and
+  across-scope (the perspective). This ADR addresses only the
+  write-side. V1.2.1 returns all ancestor layers verbatim — for a
+  4-level chain with 500-word summaries that's ~2k words plus
+  directive lists, fine. The first domain that hits depth ≥ 5 or
+  wide intra-stratum reference fan-in is the forcing function for
+  the read-side work (per-layer budget, recency × importance ×
+  relevance ranking, or a token-based post-trim).
 - **Trust scores / earned-trust tracking** (philosophy Concept 6).
   Provenance is captured at contribute-time; trust weighting is a
   later layer.
