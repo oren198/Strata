@@ -34,50 +34,85 @@ The V1 architecture decision is documented in
 
 ## Status
 
-**V1 backend, Strata Console UI, and Claude Code plugin all in place.**
-Local Python service with SQLite + markdown storage, Anthropic-hosted
-scope-managers, FastAPI HTTP surface, YAML fleet bootstrap, a read-only
+**V1.2 shipped.** Local Python service with SQLite + markdown storage,
+Anthropic-hosted scope-managers, FastAPI HTTP surface, file-canonical
+`fleet.yaml` with in-memory mirror (ADR 0002), `strata launch` for
+frictionless Claude Code session binding (ADR 0003), a read-only
 browser-based Console, and a Claude Code MCP plugin + skills.
+
+What comes next is captured in [`docs/ROADMAP.md`](docs/ROADMAP.md) — the
+enduring design principles and the sequenced direction the project is
+heading. See also the [Architecture decisions](#architecture-decisions)
+section below for the ADRs already landed.
 
 ---
 
 ## Quick start
 
-### Prerequisites
+A first-time, copy-paste-able run. Five steps, ~5 minutes.
 
-- Python 3.11+
-- An Anthropic API key in `ANTHROPIC_API_KEY` (needed for live
-  scope-manager calls; the test suite mocks them)
+### 1. Prerequisites
 
-### Install
+- **Python 3.11 or newer.** Check: `python3 --version`. If your system Python is older, install 3.11+ via `pyenv`, your package manager, or [python.org](https://www.python.org/downloads/).
+- **`make`** (usually preinstalled on macOS/Linux; `xcode-select --install` on macOS if missing).
+- **An Anthropic API key.** Get one at <https://console.anthropic.com/>. It's only needed to make real scope-manager calls — the test suite mocks them, so you can run tests without it.
+
+### 2. Clone and install
 
 ```bash
-make install      # pip install -e ".[dev,cc-plugin]"
+git clone https://github.com/oren198/Strata.git
+cd Strata
+make install        # creates the package install + dev/cc-plugin extras
 ```
 
-### One command to run the system
+`make install` runs `pip install -e ".[dev,cc-plugin]"`. If you prefer an isolated virtual environment first:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
+make install
+```
+
+### 3. Set your API key
+
+Either export it in your shell:
+
+```bash
+export ANTHROPIC_API_KEY=sk-ant-...
+```
+
+…or create a `.env` file at the repo root (auto-loaded by the backend):
+
+```
+ANTHROPIC_API_KEY=sk-ant-...
+```
+
+Without a key you can still run `make test` and `make lint`, but live contributions will fail when the backend tries to call the model.
+
+### 4. Start everything with one command
 
 ```bash
 strata start
 ```
 
-That single command applies any pending SQLite migrations, auto-bootstraps
-the fleet from `fleet.yaml` (or `fleet.example.yaml` if no local
-`fleet.yaml` exists) when the DB is empty, and starts the FastAPI
-backend on port 8000. The Strata Console UI is served from the same
-process at <http://127.0.0.1:8000/>.
+This (a) applies SQLite migrations to `./strata.db`, (b) **auto-seeds `fleet.yaml`** from the default starter template (`templates/dev-team.yaml`) because no `fleet.yaml` exists yet, and (c) launches the FastAPI server. Per ADR 0002, the backend then reads `fleet.yaml` directly into an in-memory `FleetConfig` mirror — there is no separate "bootstrap into DB" step.
 
-### Look at memory from the terminal
+**Success looks like this:**
 
-In a separate shell (while the backend is up):
+```
+seeded fleet.yaml from the default template; edit to suit
 
-```bash
-strata scopes              # list the fleet's strata, scopes, edges
-strata summary g_arch      # print a scope's curated summary (directives + context)
-strata record g_arch       # print every contribution + judgment in the scope's record
+Strata backend → http://127.0.0.1:8000
+Strata Console → http://127.0.0.1:8000/
+
+INFO:     Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)
 ```
 
-### Make a contribution by hand
+Now open <http://127.0.0.1:8000/> in your browser — you should see the Strata Console with three lanes (Executive / Function / Team) and four scope bubbles (CEO, Engineering, Architect, Backend Dev). Leave `strata start` running.
+
+### 5. Make a contribution and watch memory update
+
+In a **second terminal** (the first is busy serving):
 
 ```bash
 curl -s -X POST http://localhost:8000/contribute \
@@ -97,36 +132,122 @@ curl -s -X POST http://localhost:8000/contribute \
   }' | jq
 ```
 
-The contribution is judged by the scope-manager (an Anthropic API call)
-and, on accept, the scope summary at `summaries/g_arch.md` updates.
+Expected response (decision text may vary — the LLM judges):
+
+```json
+{
+  "contribution_id": "c_xxxxxx",
+  "judgment": {
+    "decision": "accept_as_directive",
+    "reasoning": "...",
+    "summary_updated": true
+  }
+}
+```
+
+Then inspect the result:
+
+```bash
+strata summary g_arch        # see the new directive in the curated summary
+cat summaries/g_arch.md      # same content as a markdown file
+strata record g_arch         # full contribution + judgment log
+```
+
+The UI tab will reflect the change within ~5 seconds (it polls).
+
+### Stopping
+
+`Ctrl+C` in the terminal running `strata start`. State persists across restarts in `./strata.db` and `./summaries/`.
+
+### Troubleshooting
+
+| Symptom | Fix |
+|---|---|
+| `strata: command not found` | You didn't run `make install`, or your venv isn't activated. Re-run `make install`. |
+| `Address already in use` on port 8000 | Another process owns the port. Either stop it or run `strata start --port 8001`. |
+| `strata scopes` says `Connection refused` | The backend isn't running. Start it with `strata start` in another terminal. |
+| Contribution returns 500 with `scope_manager_failure` | Your `ANTHROPIC_API_KEY` is missing or invalid. Check step 3. |
+| Want to start over with a fresh DB | `rm -f strata.db && rm -rf summaries/`, then `strata start` re-bootstraps. |
+
+---
+
+## More commands
+
+### Inspect memory from the terminal
+
+```bash
+strata scopes              # list the fleet's strata, scopes, edges
+strata summary <scope_id>  # curated summary (directives + context)
+strata record  <scope_id>  # every contribution + judgment in the scope's record
+```
 
 ### Advanced subcommands
 
-`strata` also exposes the individual steps:
-
 ```bash
-strata migrate                # apply pending SQLite migrations only
-strata bootstrap --config fleet.example.yaml   # apply a YAML fleet config only
-strata start --no-bootstrap   # skip auto-bootstrap on first run
-strata start --reload         # uvicorn auto-reload (dev mode)
+strata migrate                                  # apply pending SQLite migrations only
+strata bootstrap --config fleet.example.yaml    # apply a YAML fleet config only
+strata start --no-bootstrap                     # skip auto-bootstrap on first run
+strata start --reload                           # uvicorn auto-reload (dev mode)
+strata start --port 8001                        # serve on a different port
 ```
 
-The original `make` targets (`make migrate`, `make bootstrap`, `make run`,
-`make test`, `make lint`, `make smoke`) all still work and are useful when
-hacking on Strata itself.
+The original `make` targets (`make migrate`, `make bootstrap`, `make run`, `make test`, `make lint`, `make smoke`) still work and are useful when hacking on Strata itself.
+
+### `strata launch` — frictionless CC session binding (ADR 0003)
+
+`strata launch [scope_id]` validates the target scope against the live fleet,
+resolves the skill from the scope's declaration in `fleet.yaml`, generates a
+session ID, and `execvp`s `claude` with `STRATA_AGENT_SCOPE`,
+`STRATA_AGENT_SKILL`, and `STRATA_AGENT_SESSION_ID` already set. The backend
+must be running (`strata start`) before you launch.
+
+```bash
+strata launch g_arch                            # use default_skill from fleet.yaml
+strata launch g_arch --skill evidence-summarizer  # override skill
+strata launch g_arch --session my-sess          # override auto-generated session ID
+strata launch                                   # pick from interactive list, or use .strata-role
+```
+
+#### `.strata-role` — per-project default binding
+
+Place a `.strata-role` file at the root of a project repo so that
+`strata launch` (with no positional argument) binds automatically:
+
+```toml
+scope = "g_arch"
+skill = "code-writer"   # optional; resolved from fleet.yaml if omitted
+```
+
+The file is committed to git alongside the project. When you open the repo and
+run `strata launch`, Strata finds the file, validates the scope, and launches
+`claude` already bound — no manual `export` step needed.
+
+### Upgrading from V1.1 to V1.2
+
+V1.2 moves fleet configuration (strata, scopes, edges) out of SQLite and into a
+file-canonical `fleet.yaml` (ADR 0002). Before upgrading, export your existing
+fleet shape so it isn't lost when migration 0002 drops the SQL fleet tables:
+
+1. **Upgrade code** — pull V1.2 (`git pull`, `make install`). The migration has not run yet.
+2. **Export your fleet** — reads the still-present V1 tables and writes `fleet.yaml`:
+   ```bash
+   strata export-fleet          # writes ./fleet.yaml from ./strata.db
+   # or specify paths explicitly:
+   strata export-fleet --db /path/to/strata.db --out /path/to/fleet.yaml
+   ```
+3. **Start V1.2** — applies migration 0002 (drops the SQL fleet tables) and loads the exported config:
+   ```bash
+   strata start
+   ```
+
+`strata start` will refuse to proceed if you forget step 2: it detects a V1 fleet config in the DB with no `fleet.yaml` and exits with an actionable error pointing you back to `strata export-fleet`.
+
+After step 3, edit `fleet.yaml` by hand to add per-scope skill declarations
+(`default_skill`, `permitted_skills`) as needed for `strata launch` (ADR 0003).
 
 ### Strata Console UI
 
-After `make run`, open [http://localhost:8000/](http://localhost:8000/) in your
-browser. The root URL redirects to the Strata Console, a read-only graph and
-list view of the current fleet state.
-
-The UI polls the backend every 5 seconds; there is no WebSocket in V1. All
-memory mutations flow through `strata.contribute` — the UI has no write path
-in V1.
-
-To point the UI at a non-default backend, edit the
-`<meta name="strata-api-base" content="...">` tag in `ui/index.html`.
+Open <http://127.0.0.1:8000/> while the backend is running — a read-only graph and list view of the current fleet state, polling every 5 s. All memory mutations flow through `strata.contribute`; the UI has no write path in V1. To point the UI at a non-default backend, edit the `<meta name="strata-api-base" content="...">` tag in `ui/index.html`.
 
 ### Run the tests
 
@@ -168,8 +289,11 @@ README.md                # This file
 CONTEXT.md               # Canonical glossary (23 terms — single source of vocabulary)
 docs/
   philosophy.md          # Theoretical foundations — why Strata exists
+  ROADMAP.md             # Enduring principles + sequenced direction (post-V1.2)
   adr/
     0001-v1-architecture.md
+    0002-fleet-config-source-of-truth.md
+    0003-strata-launch-cc-binding.md
 src/strata/              # Python backend package
   app.py                 # FastAPI app + endpoints (serves ui/ at /ui)
   settings.py            # pydantic-settings config
@@ -291,13 +415,20 @@ summary g_arch` from a fourth terminal.
 ## Architecture decisions
 
 ADRs live under `docs/adr/`. Each captures a hard-to-reverse decision with
-context, alternatives, and consequences.
+context, alternatives, and consequences. The future direction —
+principles plus the next horizons — is in [`docs/ROADMAP.md`](docs/ROADMAP.md).
 
 Current ADRs:
 
 - [0001 — V1 architecture](docs/adr/0001-v1-architecture.md): local Python
   backend, SQLite + markdown storage, Claude Code as the agent runtime,
   scope-manager hosted as backend-spawned Anthropic API calls.
+- [0002 — Fleet config source of truth](docs/adr/0002-fleet-config-source-of-truth.md):
+  `fleet.yaml` is canonical; SQLite holds only contributions and judgments;
+  scope lifecycle (`active`/`archived`); per-scope skill declarations.
+- [0003 — `strata launch` CC binding](docs/adr/0003-strata-launch-cc-binding.md):
+  frictionless `(scope, skill, session_id)` binding via a single CLI command
+  that validates, resolves, and `execvp`s `claude`.
 
 ---
 

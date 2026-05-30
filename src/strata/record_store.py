@@ -1,12 +1,16 @@
-"""Strata record store — the persistence layer for the append-only contribution log
-and fleet configuration (scopes, strata, edges).
+"""Strata record store — the persistence layer for the append-only contribution log.
 
 This module owns all SQLite access.  It is the authoritative source of truth for:
   - The **record**: the append-only, immutable log of every contribution ever
     accepted into a scope (see CONTEXT.md § Record).
-  - Fleet configuration: strata, scopes, and the inter/intra-stratum edges
-    between them.
   - Judgments: the scope-manager's verdict on each contribution.
+
+Fleet configuration (strata, scopes, edges) is no longer stored here.  Under
+ADR 0002 it lives in ``fleet.yaml`` and is held in memory by
+:class:`~strata.fleet_config.FleetConfig`.  The ``scope_id`` column in
+``contributions`` is an unvalidated string; scope-existence and active-status
+checks are enforced at the application layer via the in-memory
+:class:`~strata.fleet_config.FleetConfig`.
 
 Design decisions
 ----------------
@@ -16,9 +20,6 @@ Design decisions
 - ``RecordStore`` is a context-manager-friendly class: open on construct,
   close via ``.close()`` or ``__exit__``.
 - IDs are short, prefixed, human-readable in logs:
-    ``L<n>``      strata      (e.g. "L1")
-    ``g_<6hex>``  scopes      (groups in UI vocabulary)
-    ``e_<6hex>``  edges
     ``c_<6hex>``  contributions
     ``j_<6hex>``  judgments
 
@@ -38,14 +39,6 @@ from typing import Literal
 # ---------------------------------------------------------------------------
 
 
-def _new_scope_id() -> str:
-    return f"g_{secrets.token_hex(3)}"
-
-
-def _new_edge_id() -> str:
-    return f"e_{secrets.token_hex(3)}"
-
-
 def _new_contribution_id() -> str:
     return f"c_{secrets.token_hex(3)}"
 
@@ -57,49 +50,6 @@ def _new_judgment_id() -> str:
 # ---------------------------------------------------------------------------
 # Domain models
 # ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class Stratum:
-    """A horizontal layer of scopes.
-
-    ``ordinal`` establishes the broadcast order of directives: 0 is the
-    broadest stratum (directives from here bind everyone), higher ordinals are
-    progressively narrower.
-    """
-
-    id: str
-    name: str
-    ordinal: int
-    created_at: str
-
-
-@dataclass(frozen=True)
-class Scope:
-    """A bounded region of the fleet for which memory is relevant and authoritative.
-
-    Every scope belongs to exactly one stratum.
-    """
-
-    id: str
-    name: str
-    stratum_id: str
-    created_at: str
-
-
-@dataclass(frozen=True)
-class Edge:
-    """A directed link between two scopes.
-
-    Edges may span at most one stratum (``abs(from.ordinal - to.ordinal) <= 1``).
-    Self-loops are forbidden.  Intra-stratum edges are peer references; inter-
-    stratum edges connect a scope to its parent or child stratum.
-    """
-
-    id: str
-    from_scope_id: str
-    to_scope_id: str
-    created_at: str
 
 
 @dataclass(frozen=True)
@@ -169,7 +119,7 @@ class RecordStore:
     Example::
 
         with RecordStore("./strata.db") as rs:
-            layer = rs.create_stratum(name="executive", ordinal=0)
+            c = rs.append_contribution(scope_id="g_arch", ...)
     """
 
     def __init__(self, db_path: str) -> None:
@@ -194,171 +144,6 @@ class RecordStore:
         self._conn.close()
 
     # ------------------------------------------------------------------
-    # Strata
-    # ------------------------------------------------------------------
-
-    def create_stratum(self, *, name: str, ordinal: int) -> Stratum:
-        """Insert a new stratum and return it.
-
-        A stratum's ``ordinal`` must be unique; SQLite will raise an
-        ``IntegrityError`` on collision (UNIQUE constraint on ``ordinal``).
-
-        The ID is derived from the ordinal as ``L<ordinal>`` so that log
-        entries are self-explanatory (e.g. ``L0`` for the broadest stratum).
-
-        Args:
-            name:    Human-readable label for this stratum layer.
-            ordinal: Position in the broadcast order (0 = broadest).
-
-        Returns:
-            The newly created :class:`Stratum`.
-
-        Raises:
-            sqlite3.IntegrityError: If *ordinal* is already in use.
-        """
-        stratum_id = f"L{ordinal}"
-        self._conn.execute(
-            "INSERT INTO strata (id, name, ordinal) VALUES (?, ?, ?)",
-            (stratum_id, name, ordinal),
-        )
-        self._conn.commit()
-        return self._fetch_stratum(stratum_id)
-
-    def list_strata(self) -> list[Stratum]:
-        """Return all strata ordered by ``ordinal`` ascending (0 = broadest first)."""
-        rows = self._conn.execute(
-            "SELECT id, name, ordinal, created_at FROM strata ORDER BY ordinal"
-        ).fetchall()
-        return [Stratum(**dict(row)) for row in rows]
-
-    def _fetch_stratum(self, stratum_id: str) -> Stratum:
-        row = self._conn.execute(
-            "SELECT id, name, ordinal, created_at FROM strata WHERE id = ?",
-            (stratum_id,),
-        ).fetchone()
-        if row is None:
-            raise KeyError(f"Stratum not found: {stratum_id!r}")
-        return Stratum(**dict(row))
-
-    # ------------------------------------------------------------------
-    # Scopes
-    # ------------------------------------------------------------------
-
-    def create_scope(self, *, name: str, stratum_id: str, id: str | None = None) -> Scope:
-        """Insert a new scope in the given stratum and return it.
-
-        Args:
-            name:       Human-readable label for the scope.
-            stratum_id: ID of an existing stratum this scope belongs to.
-            id:         Optional explicit scope ID. When omitted, a fresh
-                        ``g_<6hex>`` ID is generated. Explicit IDs let the
-                        bootstrap config pin canonical names like ``g_arch``.
-
-        Returns:
-            The newly created :class:`Scope`.
-
-        Raises:
-            sqlite3.IntegrityError: If *stratum_id* does not reference an
-                existing stratum (FK constraint), or if *id* collides with
-                an existing scope.
-        """
-        scope_id = id if id is not None else _new_scope_id()
-        self._conn.execute(
-            "INSERT INTO scopes (id, name, stratum_id) VALUES (?, ?, ?)",
-            (scope_id, name, stratum_id),
-        )
-        self._conn.commit()
-        return self._fetch_scope(scope_id)
-
-    def get_scope(self, scope_id: str) -> Scope | None:
-        """Return the scope with *scope_id*, or ``None`` if it does not exist."""
-        row = self._conn.execute(
-            "SELECT id, name, stratum_id, created_at FROM scopes WHERE id = ?",
-            (scope_id,),
-        ).fetchone()
-        if row is None:
-            return None
-        return Scope(**dict(row))
-
-    def list_scopes(self) -> list[Scope]:
-        """Return all scopes (unordered)."""
-        rows = self._conn.execute("SELECT id, name, stratum_id, created_at FROM scopes").fetchall()
-        return [Scope(**dict(row)) for row in rows]
-
-    def _fetch_scope(self, scope_id: str) -> Scope:
-        scope = self.get_scope(scope_id)
-        if scope is None:
-            raise KeyError(f"Scope not found: {scope_id!r}")
-        return scope
-
-    # ------------------------------------------------------------------
-    # Edges
-    # ------------------------------------------------------------------
-
-    def add_edge(self, *, from_scope_id: str, to_scope_id: str) -> Edge:
-        """Add a directed edge between two scopes and return it.
-
-        Enforces two structural rules from ADR 0001:
-          1. **No self-loops** — ``from_scope_id != to_scope_id``.
-          2. **±1 stratum constraint** — the two scopes must be on the same
-             stratum or adjacent strata (``|from.ordinal - to.ordinal| <= 1``).
-
-        Args:
-            from_scope_id: Source scope.
-            to_scope_id:   Target scope.
-
-        Returns:
-            The newly created :class:`Edge`.
-
-        Raises:
-            ValueError:            On self-loop or stratum distance > 1.
-            KeyError:              If either scope does not exist.
-            sqlite3.IntegrityError: On duplicate edge (UNIQUE constraint).
-        """
-        if from_scope_id == to_scope_id:
-            raise ValueError(
-                f"Self-loop forbidden: scope {from_scope_id!r} cannot reference itself."
-            )
-        from_scope = self._fetch_scope(from_scope_id)
-        to_scope = self._fetch_scope(to_scope_id)
-
-        from_stratum = self._fetch_stratum(from_scope.stratum_id)
-        to_stratum = self._fetch_stratum(to_scope.stratum_id)
-
-        if abs(from_stratum.ordinal - to_stratum.ordinal) > 1:
-            raise ValueError(
-                f"Edge from {from_scope_id!r} (stratum ordinal {from_stratum.ordinal}) "
-                f"to {to_scope_id!r} (stratum ordinal {to_stratum.ordinal}) spans more "
-                f"than one stratum layer (distance="
-                f"{abs(from_stratum.ordinal - to_stratum.ordinal)}).  "
-                "Edges must stay within ±1 stratum."
-            )
-
-        edge_id = _new_edge_id()
-        self._conn.execute(
-            "INSERT INTO edges (id, from_scope_id, to_scope_id) VALUES (?, ?, ?)",
-            (edge_id, from_scope_id, to_scope_id),
-        )
-        self._conn.commit()
-        return self._fetch_edge(edge_id)
-
-    def list_edges(self) -> list[Edge]:
-        """Return all edges (unordered)."""
-        rows = self._conn.execute(
-            "SELECT id, from_scope_id, to_scope_id, created_at FROM edges"
-        ).fetchall()
-        return [Edge(**dict(row)) for row in rows]
-
-    def _fetch_edge(self, edge_id: str) -> Edge:
-        row = self._conn.execute(
-            "SELECT id, from_scope_id, to_scope_id, created_at FROM edges WHERE id = ?",
-            (edge_id,),
-        ).fetchone()
-        if row is None:
-            raise KeyError(f"Edge not found: {edge_id!r}")
-        return Edge(**dict(row))
-
-    # ------------------------------------------------------------------
     # Contributions (the record)
     # ------------------------------------------------------------------
 
@@ -378,8 +163,12 @@ class RecordStore:
         *proposed* one; the scope-manager's final verdict is recorded
         separately via :meth:`record_judgment`.
 
+        The caller is responsible for validating that *scope_id* exists and
+        is active (via the in-memory :class:`~strata.fleet_config.FleetConfig`)
+        before calling this method.
+
         Args:
-            scope_id:                The target scope.
+            scope_id:                The target scope (unvalidated string; no FK).
             content:                 The full text of the contribution.
             proposed_classification: Contributor's hint: ``'directive'`` or
                                      ``'context'``.
@@ -393,8 +182,8 @@ class RecordStore:
             The newly appended :class:`Contribution`.
 
         Raises:
-            sqlite3.IntegrityError: If *scope_id* does not exist, or if
-                *supersedes* references a non-existent contribution.
+            sqlite3.IntegrityError: If *supersedes* references a non-existent
+                contribution.
         """
         contribution_id = _new_contribution_id()
         self._conn.execute(

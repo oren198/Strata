@@ -30,7 +30,8 @@ from typing import Literal
 import anthropic
 from pydantic import BaseModel
 
-from strata.record_store import Contribution, Scope, Stratum
+from strata.fleet_config import Scope, Stratum
+from strata.record_store import Contribution
 from strata.summary_store import Directive, ScopeSummary, _render_summary
 
 # ---------------------------------------------------------------------------

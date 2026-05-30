@@ -1,9 +1,5 @@
 # Strata fleet example configuration
 #
-# This file demonstrates the fleet YAML format accepted by bootstrap.py.
-# Run ``make bootstrap`` (or ``python scripts/bootstrap_fleet.py --config fleet.example.yaml``)
-# to apply it to a local database.
-#
 # Vocabulary: stratum, scope, edge — see CONTEXT.md for definitions.
 #
 # Structure
@@ -16,6 +12,14 @@
 #            - Intra-stratum edge (peer reference): both scopes on the same
 #              stratum (|from.ordinal - to.ordinal| == 0).
 #          Edges may span at most ONE stratum layer.
+#
+# Scope lifecycle:
+#   status: active    (default) — accepts contributions, visible to /scopes
+#   status: archived  — rejects new contributions; kept for historical provenance
+#
+# Per-scope skill declarations (consumed by `strata launch`):
+#   default_skill: code-writer
+#   permitted_skills: [code-writer, evidence-summarizer]
 
 strata:
   - id: L0
@@ -32,24 +36,33 @@ scopes:
   - id: g_ceo
     name: CEO
     stratum_id: L0
+    status: active
   - id: g_eng
     name: Engineering
     stratum_id: L1
+    status: active
   - id: g_arch
     name: Architect
     stratum_id: L1
+    status: active
+    default_skill: code-writer
+    permitted_skills: [code-writer, evidence-summarizer]
   - id: g_backend
     name: Backend Dev
     stratum_id: L2
+    status: active
+    default_skill: code-writer
+    permitted_skills: [code-writer, evidence-summarizer]
 
 edges:
-  # Inter-stratum edges (child → parent, upward in the hierarchy)
-  - from: g_backend
-    to: g_eng
-  - from: g_arch
-    to: g_eng
-  - from: g_eng
+  # Inter-stratum edges (child → single parent, upward in the hierarchy).
+  # Every non-root scope has exactly one inter-stratum parent.
+  - from: g_eng       # L1 → L0
     to: g_ceo
+  - from: g_arch      # L1 → L0  (Engineering and Architect are peer functions)
+    to: g_ceo
+  - from: g_backend   # L2 → L1  (Architect is the Backend Dev's single parent)
+    to: g_arch
   # Intra-stratum peer reference (same stratum L1 — carries context only)
-  - from: g_backend
+  - from: g_eng       # L1 ↔ L1
     to: g_arch

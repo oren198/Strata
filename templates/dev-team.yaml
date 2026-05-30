@@ -1,0 +1,79 @@
+# Strata fleet configuration — development team template
+#
+# This file is the source of truth for fleet shape: strata, scopes, and edges.
+# Edit it to match your organisation, then run `strata bootstrap` to validate.
+#
+# Vocabulary (from CONTEXT.md):
+#   stratum  — a horizontal layer of scopes (ordinal 0 = broadest)
+#   scope    — a bounded region of the fleet; memory attaches here
+#   edge     — a directed link between two scopes
+#              inter-stratum: connects a scope to its parent (|ordinal diff| == 1)
+#              intra-stratum: peer reference on the same stratum (ordinal diff == 0)
+#
+# Scope lifecycle:
+#   status: active    (default) — accepts contributions, visible to /scopes
+#   status: archived  — rejects new contributions; kept for historical provenance
+#
+# Per-scope skill declarations (consumed by `strata launch`):
+#   default_skill: code-writer           # optional — used when launching without --skill
+#   permitted_skills: [code-writer, ...]  # optional — restricts valid skill bindings
+
+strata:
+  - id: L0
+    name: Executive
+    ordinal: 0      # broadest stratum; directives here bind the whole fleet
+
+  - id: L1
+    name: Function
+    ordinal: 1      # functional leads (engineering, product, etc.)
+
+  - id: L2
+    name: Team
+    ordinal: 2      # individual teams and contributors
+
+scopes:
+  # ---- Executive ----
+  - id: g_ceo
+    name: CEO
+    stratum_id: L0
+    status: active
+    default_skill: scope-manager
+    permitted_skills: [scope-manager]
+
+  # ---- Function ----
+  - id: g_eng
+    name: Engineering
+    stratum_id: L1
+    status: active
+    default_skill: scope-manager
+    permitted_skills: [scope-manager, evidence-summarizer]
+
+  - id: g_arch
+    name: Architect
+    stratum_id: L1
+    status: active
+    default_skill: code-writer
+    permitted_skills: [code-writer, evidence-summarizer]
+
+  # ---- Team ----
+  - id: g_backend
+    name: Backend Dev
+    stratum_id: L2
+    status: active
+    default_skill: code-writer
+    permitted_skills: [code-writer, evidence-summarizer]
+
+edges:
+  # Inter-stratum edges (child → single parent; directives + context flow down).
+  # Every non-root scope has exactly one inter-stratum parent.
+  - from: g_eng       # L1 → L0
+    to: g_ceo
+  - from: g_arch      # L1 → L0  (Engineering and Architect are peer functions)
+    to: g_ceo
+  - from: g_backend   # L2 → L1  (Architect is the Backend Dev's single parent,
+    to: g_arch        #           so Architect's directives bind Backend Dev)
+
+  # Intra-stratum peer reference (same stratum L1 — carries context only,
+  # never directives). Engineering reads Architect's context for free.
+  - from: g_eng       # L1 ↔ L1
+    to: g_arch

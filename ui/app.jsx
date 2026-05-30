@@ -83,14 +83,6 @@ function App() {
     document.documentElement.classList.toggle("dark", !!state.options.dark_mode);
   }, [state.options.dark_mode]);
 
-  // Lucide rebind.
-  React.useEffect(() => {
-    if (window.lucide?.createIcons) {
-      const id = requestAnimationFrame(() => window.lucide.createIcons());
-      return () => cancelAnimationFrame(id);
-    }
-  });
-
   // Backend polling: hydrate on mount and every REFRESH_INTERVAL_MS.
   React.useEffect(() => {
     let cancelled = false;
@@ -361,4 +353,43 @@ function ViewToggle({ view, onChange }) {
 }
 window.ViewToggle = ViewToggle;
 
-ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+class ErrorBoundary extends React.Component {
+  constructor(props) {
+    super(props);
+    this.state = { error: null };
+  }
+  static getDerivedStateFromError(error) {
+    return { error };
+  }
+  componentDidCatch(error, info) {
+    console.error("Strata UI crashed:", error, info);
+  }
+  render() {
+    if (!this.state.error) return this.props.children;
+    return (
+      <div className="at" style={{
+        minHeight: "100vh",
+        display: "flex", alignItems: "center", justifyContent: "center",
+        flexDirection: "column", gap: 14, padding: 24,
+        color: "var(--at-muted)", textAlign: "center",
+      }}>
+        <div style={{ fontSize: 15, fontWeight: 600, color: "var(--at-bear)" }}>
+          The Strata Console hit an unexpected error.
+        </div>
+        <div style={{ fontSize: 12, fontFamily: "var(--font-mono)", color: "var(--at-muted)", maxWidth: 560, wordBreak: "break-word" }}>
+          {String(this.state.error && (this.state.error.message || this.state.error))}
+        </div>
+        <button
+          className="at-btn at-btn-secondary at-btn-sm"
+          onClick={() => window.location.reload()}
+        >
+          Reload
+        </button>
+      </div>
+    );
+  }
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(
+  <ErrorBoundary><App /></ErrorBoundary>
+);

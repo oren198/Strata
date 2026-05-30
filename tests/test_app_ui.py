@@ -22,9 +22,12 @@ from strata.settings import Settings
 @pytest.fixture()
 def client(tmp_path: pathlib.Path) -> TestClient:
     """Return a TestClient wired to a temp-isolated Strata app."""
+    fleet_yaml = tmp_path / "fleet.yaml"
+    fleet_yaml.write_text("strata: []\nscopes: []\nedges: []\n", encoding="utf-8")
     settings = Settings(
         db_path=str(tmp_path / "test.db"),
         summaries_dir=str(tmp_path / "summaries"),
+        fleet_yaml_path=str(fleet_yaml),
         anthropic_api_key="test-key",
     )
     app = create_app(settings=settings)
@@ -70,9 +73,12 @@ def test_static_files_resolve_from_changed_cwd(
     The app resolves ui/ relative to the package file (__file__), not the cwd,
     so a mid-test cwd change must not break static serving.
     """
+    fleet_yaml = tmp_path / "fleet.yaml"
+    fleet_yaml.write_text("strata: []\nscopes: []\nedges: []\n", encoding="utf-8")
     settings = Settings(
         db_path=str(tmp_path / "test.db"),
         summaries_dir=str(tmp_path / "summaries"),
+        fleet_yaml_path=str(fleet_yaml),
         anthropic_api_key="test-key",
     )
     app = create_app(settings=settings)

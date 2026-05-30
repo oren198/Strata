@@ -1,0 +1,43 @@
+# Strata fleet configuration — research group template
+#
+# A minimal fleet for a research group with principal and researchers.
+
+strata:
+  - id: L0
+    name: Principal
+    ordinal: 0
+
+  - id: L1
+    name: Researcher
+    ordinal: 1
+
+scopes:
+  - id: g_pi
+    name: Principal Investigator
+    stratum_id: L0
+    status: active
+    default_skill: scope-manager
+    permitted_skills: [scope-manager, evidence-summarizer]
+
+  - id: g_researcher_a
+    name: Researcher A
+    stratum_id: L1
+    status: active
+    default_skill: evidence-summarizer
+    permitted_skills: [evidence-summarizer, code-writer]
+
+  - id: g_researcher_b
+    name: Researcher B
+    stratum_id: L1
+    status: active
+    default_skill: evidence-summarizer
+    permitted_skills: [evidence-summarizer, code-writer]
+
+edges:
+  - from: g_researcher_a
+    to: g_pi
+  - from: g_researcher_b
+    to: g_pi
+  # Peer reference: researchers share context
+  - from: g_researcher_a
+    to: g_researcher_b
