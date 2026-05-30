@@ -274,9 +274,10 @@ All settings are env-var driven, prefixed `STRATA_`:
 |---|---|---|
 | `STRATA_DB_PATH` | `./strata.db` | SQLite path for the record store |
 | `STRATA_SUMMARIES_DIR` | `./summaries` | Directory for per-scope markdown summary files |
+| `STRATA_FLEET_CONFIG` | `./fleet.yaml` | Fleet YAML — re-read on every MCP tool call that needs fleet info |
 | `STRATA_MANAGER_MODEL` | `claude-haiku-4-5` | Model used by scope-managers |
 | `STRATA_ANTHROPIC_API_KEY` | (unset) | Optional; falls back to `ANTHROPIC_API_KEY` |
-| `STRATA_FLEET_CONFIG` | `./fleet.yaml` | YAML config consumed by `make bootstrap` |
+| `STRATA_BACKEND_URL` | `http://127.0.0.1:8000` | UI client only — the MCP server no longer reads this (ADR 0004 Decision 1) |
 
 A local `.env` file is loaded automatically.
 
@@ -311,8 +312,8 @@ ui/                      # Strata Console (no build step — Babel-standalone in
   tweaks-panel.jsx       # Floating tweaks panel
   store.js               # API client (fetch /scopes, /scopes/{id}/summary)
   atlas.css              # Atlas design system tokens + component classes
-mcp_server/              # Claude Code plugin — MCP server proxying to the backend
-  strata_mcp.py          # FastMCP stdio server exposing tools to CC sessions
+mcp_server/              # Claude Code plugin — MCP server (embedded mode, no HTTP proxy)
+  strata_mcp.py          # FastMCP stdio server; operates directly on RecordStore + SummaryStore
 .claude/
   skills/
     strata/              # CC skill: orientation / first-time use
@@ -331,18 +332,35 @@ pyproject.toml           # Project metadata + deps + ruff/pytest config
 
 ## Running Strata in Claude Code
 
-### 1. Start the backend (once, in its own terminal)
+The MCP server operates directly on the SQLite record store and summary files
+(ADR 0004 Decision 1, "embedded mode"). The FastAPI backend is the Console UI
+layer; running `strata start` is required only to view the UI. The agent loop
+— contributions, scope-manager judgments, perspective reads — works whether
+the backend is up or down.
+
+> **Migration note for callers of the old HTTP API:** in embedded mode,
+> `strata_read_scope_record` returns an empty record (`{"contributions": [],
+> "judgments": []}`) for unknown scopes instead of the old HTTP `404`. The
+> other tools still raise on unknown scopes (matching the prior 404 behaviour).
+
+### 1. Start the backend (optional — Console UI only)
 
 ```bash
 strata start
 ```
+
+The backend is only required if you want the browser Console UI at
+<http://127.0.0.1:8000/>. MCP tool calls work with or without it.
 
 ### 2. Register the MCP server in Claude Code
 
 Copy `.claude/settings.example.json` to `.claude/settings.json` (or merge
 the `mcpServers` block into your existing settings). The env vars in
 that block identify the **scope this CC session acts at** and the
-**role identifier** for provenance — change them per session.
+**role identifier** for provenance — change them per session. Store path
+vars (`STRATA_DB_PATH`, `STRATA_FLEET_CONFIG`, `STRATA_SUMMARIES_DIR`) come
+from your shell env or `.env` — the MCP server reads them at startup via
+`get_settings()`.
 
 ```json
 {
@@ -351,7 +369,6 @@ that block identify the **scope this CC session acts at** and the
       "command": "python",
       "args": ["-m", "mcp_server.strata_mcp"],
       "env": {
-        "STRATA_BACKEND_URL": "http://127.0.0.1:8000",
         "STRATA_AGENT_SCOPE":       "g_arch",
         "STRATA_AGENT_SKILL":       "architect",
         "STRATA_AGENT_SESSION_ID":  "sess_local"
@@ -429,6 +446,9 @@ Current ADRs:
 - [0003 — `strata launch` CC binding](docs/adr/0003-strata-launch-cc-binding.md):
   frictionless `(scope, skill, session_id)` binding via a single CLI command
   that validates, resolves, and `execvp`s `claude`.
+- [0004 — H2 foundations](docs/adr/0004-h2-foundations.md): embedded mode
+  (MCP server direct-store access), manager composition, lazy refresh, bounded
+  summaries.
 
 ---
 
