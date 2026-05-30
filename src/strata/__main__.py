@@ -24,11 +24,36 @@ against the DB on disk.
 Vocabulary throughout follows ``CONTEXT.md``.
 """
 
+# ---------------------------------------------------------------------------
+# V1 → V1.2 upgrade guard
+# ---------------------------------------------------------------------------
+#
+# ``strata start`` auto-applies migration 0002_drop_fleet_tables.sql, which
+# drops the V1 fleet tables (strata, scopes, edges) that were the V1
+# operational source of truth.  A V1 operator who runs ``strata start``
+# before exporting their fleet config will silently lose it.
+#
+# ``_v1_upgrade_guard_should_refuse`` detects this situation by issuing
+# read-only SELECTs against the source DB (same discipline as fleet_export.py)
+# and returns True only when all four conditions hold:
+#
+#   1. The DB file exists.
+#   2. Migration 0002_drop_fleet_tables.sql is pending (not in _migrations, or
+#      the _migrations table itself doesn't exist yet).
+#   3. The three V1 fleet tables (strata, scopes, edges) are present in
+#      sqlite_master.
+#   4. No fleet.yaml exists at the resolved path.
+#
+# ``cmd_start`` calls this before ``run_migrations``.  If it returns True,
+# start exits non-zero with an actionable error message.  Pass
+# ``--skip-upgrade-check`` to bypass.
+
 from __future__ import annotations
 
 import argparse
 import os
 import shutil
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -79,6 +104,76 @@ def _resolve_fleet_config(explicit: str | None) -> str | None:
     if Path("fleet.example.yaml").exists():
         return "fleet.example.yaml"
     return None
+
+
+_GUARD_MIGRATION = "0002_drop_fleet_tables.sql"
+_V1_FLEET_TABLES = frozenset({"strata", "scopes", "edges"})
+
+
+def _v1_upgrade_guard_should_refuse(
+    db_path: str,
+    fleet_yaml_path: str,
+    *,
+    skip: bool,
+) -> bool:
+    """Return True when ``strata start`` should refuse due to a risky V1→V1.2 upgrade.
+
+    All DB access is read-only (SELECT only). The connection is opened, checked,
+    and closed before any other action, following the same discipline as
+    ``src/strata/fleet_export.py``.
+
+    Refuse when all four conditions hold:
+    1. The DB file exists (not a fresh install).
+    2. Migration ``0002_drop_fleet_tables.sql`` is pending (absent from
+       ``_migrations``, or the ``_migrations`` table doesn't exist yet).
+    3. The three V1 fleet tables (``strata``, ``scopes``, ``edges``) are
+       present in ``sqlite_master``.
+    4. No ``fleet.yaml`` exists at the resolved path.
+
+    Args:
+        db_path:        Resolved path to the SQLite DB.
+        fleet_yaml_path: Resolved path to fleet.yaml (from ``_fleet_config_default()``).
+        skip:           When True, bypass the check and return False unconditionally.
+    """
+    if skip:
+        return False
+
+    # Condition 1: DB file must exist.
+    if not Path(db_path).exists():
+        return False
+
+    # Condition 4: fleet.yaml must be absent.
+    if Path(fleet_yaml_path).exists():
+        return False
+
+    # Open a read-only connection for conditions 2 and 3.
+    conn = sqlite3.connect(db_path)
+    try:
+        # Condition 2: 0002_drop_fleet_tables.sql pending.
+        try:
+            applied = {row[0] for row in conn.execute("SELECT name FROM _migrations").fetchall()}
+            migration_pending = _GUARD_MIGRATION not in applied
+        except sqlite3.OperationalError:
+            # _migrations table doesn't exist → migration definitely pending.
+            migration_pending = True
+
+        if not migration_pending:
+            return False
+
+        # Condition 3: All three V1 fleet tables present in sqlite_master.
+        present = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master"
+                " WHERE type='table' AND name IN ('strata','scopes','edges')"
+            ).fetchall()
+        }
+        if present != _V1_FLEET_TABLES:
+            return False
+    finally:
+        conn.close()
+
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -140,6 +235,23 @@ def cmd_start(args: argparse.Namespace) -> int:
     from strata.migrator import run_migrations
 
     db_path = args.db or _db_path_default()
+    fleet_yaml_path = _fleet_config_default()
+
+    # 0. V1 → V1.2 upgrade guard: refuse if migration 0002 is pending but
+    #    the V1 fleet tables are still present and no fleet.yaml exists.
+    #    Must run before run_migrations so we catch the footgun before it fires.
+    if _v1_upgrade_guard_should_refuse(
+        db_path,
+        fleet_yaml_path,
+        skip=args.skip_upgrade_check,
+    ):
+        print(
+            f"Detected a V1 fleet config in {db_path} and no fleet.yaml at {fleet_yaml_path}.\n"
+            "Run `strata export-fleet` first to preserve it, then re-run `strata start`.\n"
+            "(Pass --skip-upgrade-check to bypass this check.)",
+            file=sys.stderr,
+        )
+        return 1
 
     # 1. Migrate.
     applied = run_migrations(db_path)
@@ -450,6 +562,14 @@ def _build_parser() -> argparse.ArgumentParser:
     p_start.add_argument("--port", type=int, default=8000)
     p_start.add_argument("--reload", action="store_true", help="Enable uvicorn auto-reload.")
     p_start.add_argument("--db", help=f"DB path (default: {_db_path_default()}).")
+    p_start.add_argument(
+        "--skip-upgrade-check",
+        action="store_true",
+        help=(
+            "Bypass the V1→V1.2 upgrade guard. Use only after you have already "
+            "run `strata export-fleet`, or on a fresh install."
+        ),
+    )
     p_start.set_defaults(func=cmd_start)
 
     p_migrate = sub.add_parser("migrate", help="Apply pending SQLite migrations.")
