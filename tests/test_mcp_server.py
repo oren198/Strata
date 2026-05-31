@@ -161,13 +161,23 @@ def _load_mcp_module(db_path: str, summaries_dir: str, fleet_yaml_path: str):
         anthropic_api_key=None,
     )
 
-    with patch("strata.settings.get_settings", return_value=fake_settings):
+    # Patch both get_settings and load_project_config so module-level singletons
+    # use our tmp-path instances and don't accidentally discover a real project config
+    # on the filesystem.
+    with (
+        patch("strata.settings.get_settings", return_value=fake_settings),
+        patch("strata.project_config.load_project_config", return_value=None),
+    ):
         import strata.mcp.server as mod
 
         importlib.reload(mod)
 
     # Patch module-level singletons to use our tmp-path instances.
     mod._settings = fake_settings
+    mod._project_config = None
+    mod._db_path = db_path
+    mod._summaries_dir = summaries_dir
+    mod._fleet_yaml_path = fleet_yaml_path
     mod._record_store = RecordStore(db_path)
     mod._summary_store = SummaryStore(summaries_dir)
 

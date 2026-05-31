@@ -42,21 +42,37 @@ from mcp.server.fastmcp import FastMCP
 
 from strata.fleet_config import FleetConfig
 from strata.migrator import run_migrations
+from strata.project_config import load_project_config
 from strata.record_store import ContributorRef, RecordStore
 from strata.settings import get_settings
 from strata.summary_store import ScopeSummary, SummaryStore
 
 # ---------------------------------------------------------------------------
-# Module-level singletons — instantiated once at import via get_settings()
+# Module-level singletons — instantiated once at import.
+#
+# Storage paths prefer .strata/config.toml (per-project config, ADR 0005
+# Decision 2) when discoverable via the walk-up loader.  Fall back to
+# get_settings() (env-var behaviour) when no project config is found —
+# this keeps the development-against-the-Strata-repo workflow unchanged.
 # ---------------------------------------------------------------------------
 
 _settings = get_settings()
+_project_config = load_project_config()
+
+# Resolve effective paths: project config wins when present.
+_db_path: str = str(_project_config.db) if _project_config else _settings.db_path
+_summaries_dir: str = (
+    str(_project_config.summaries_dir) if _project_config else _settings.summaries_dir
+)
+_fleet_yaml_path: str = (
+    str(_project_config.fleet_yaml) if _project_config else _settings.fleet_yaml_path
+)
 
 # Apply any pending migrations so the DB is ready before first tool call.
-run_migrations(_settings.db_path)
+run_migrations(_db_path)
 
-_record_store = RecordStore(_settings.db_path)
-_summary_store = SummaryStore(_settings.summaries_dir)
+_record_store = RecordStore(_db_path)
+_summary_store = SummaryStore(_summaries_dir)
 
 # Agent provenance — recorded on every contribution.
 # STRATA_AGENT_SCOPE and STRATA_AGENT_SKILL have no defaults;
@@ -80,8 +96,11 @@ def _load_fleet() -> FleetConfig:
 
     Re-reads fleet.yaml on every call so the MCP server always sees the
     current config without IPC or a file-watcher.
+
+    Uses the effective fleet YAML path resolved at startup: project config
+    takes precedence over env-var settings (ADR 0005 Decision 2).
     """
-    fleet_path = Path(_settings.fleet_yaml_path)
+    fleet_path = Path(_fleet_yaml_path)
     if not fleet_path.exists():
         return FleetConfig(strata=[], scopes=[], edges=[])
     return FleetConfig.load(fleet_path)
@@ -92,26 +111,57 @@ def _load_fleet() -> FleetConfig:
 # ---------------------------------------------------------------------------
 
 
-def _validate_binding(fleet: FleetConfig, scope: str, skill: str) -> None:
+def _validate_binding(
+    fleet: FleetConfig,
+    scope: str,
+    skill: str,
+    *,
+    project_config_found: bool = False,
+    searched_paths: list[str] | None = None,
+) -> None:
     """Validate agent binding before starting the MCP server.
 
-    Checks (in order):
-    1. STRATA_AGENT_SCOPE env var is set.
-    2. The scope exists in the fleet config.
-    3. STRATA_AGENT_SKILL is set.
-    4. STRATA_AGENT_SKILL is in the scope's permitted_skills (if that list
-       is non-empty; an empty list means any skill is permitted).
+    Checks (in order, per ADR 0005 Decision 5):
+    1. ``.strata/config.toml`` resolvable via walk-up — else exit(1) with
+       the paths that were searched.
+    2. ``STRATA_AGENT_SCOPE`` env var set — else exit(1) with binding
+       instructions.
+    3. Scope exists in fleet config — else exit(1) listing available scopes.
+    4. ``STRATA_AGENT_SKILL`` is in the scope's ``permitted_skills`` (when
+       that list is non-empty) — else exit(1) listing permitted skills.
 
     Any failure calls sys.exit(1) with an actionable message.
 
     Args:
-        fleet:  The loaded FleetConfig (or empty FleetConfig if no file).
-        scope:  Value of STRATA_AGENT_SCOPE (may be empty string).
-        skill:  Value of STRATA_AGENT_SKILL (may be empty string).
+        fleet:                 The loaded FleetConfig.
+        scope:                 Value of ``STRATA_AGENT_SCOPE`` (may be empty).
+        skill:                 Value of ``STRATA_AGENT_SKILL`` (may be empty).
+        project_config_found:  True when ``.strata/config.toml`` was located.
+        searched_paths:        Paths that were searched (for the error message
+                               when config not found).
     """
     import sys
 
-    # 1. STRATA_AGENT_SCOPE must be set.
+    # 1. .strata/config.toml must be resolvable.
+    if not project_config_found:
+        paths_str = (
+            "\n  ".join(searched_paths)
+            if searched_paths
+            else "(no paths — walk-up search from CWD found nothing)"
+        )
+        print(
+            "Strata MCP server refuses to start: .strata/config.toml not found.\n"
+            "\n"
+            "Strata looked for .strata/config.toml walking up from the current directory:\n"
+            f"  {paths_str}\n"
+            "\n"
+            "Run `strata register` from your project root to create it, then open Claude Code\n"
+            "from within the project directory.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    # 2. STRATA_AGENT_SCOPE must be set.
     if not scope:
         print(
             "Strata MCP server refuses to start: STRATA_AGENT_SCOPE is not set.\n"
@@ -502,11 +552,17 @@ def strata_read_scope_record(scope_id: str) -> dict:
 def main() -> None:
     """Start the Strata MCP server.
 
-    Validates the agent binding (scope, skill) before starting.  Any
-    validation failure calls sys.exit(1) with an actionable message.
+    Validates that ``.strata/config.toml`` is present and the agent binding
+    (scope, skill) is correct before starting.  Any validation failure calls
+    sys.exit(1) with an actionable message.
     """
     fleet = _load_fleet()
-    _validate_binding(fleet, _AGENT_SCOPE, _AGENT_SKILL)
+    _validate_binding(
+        fleet,
+        _AGENT_SCOPE,
+        _AGENT_SKILL,
+        project_config_found=_project_config is not None,
+    )
     mcp.run(transport="stdio")
 
 
