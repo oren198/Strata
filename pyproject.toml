@@ -19,6 +19,7 @@ dependencies = [
 
 [project.scripts]
 strata = "strata.__main__:main"
+strata-mcp = "strata.mcp.server:main"
 
 [project.optional-dependencies]
 cc-plugin = [

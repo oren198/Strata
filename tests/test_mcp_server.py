@@ -141,12 +141,12 @@ def _make_contributor() -> ContributorRef:
 
 
 def _load_mcp_module(db_path: str, summaries_dir: str, fleet_yaml_path: str):
-    """Import (or reload) strata_mcp with settings wired to *tmp_path*."""
+    """Import (or reload) strata.mcp.server with settings wired to *tmp_path*."""
     import importlib
 
     # Remove any prior import so the module-level singletons re-initialise.
     for key in list(sys.modules.keys()):
-        if "strata_mcp" in key:
+        if "strata.mcp" in key or "strata_mcp" in key:
             del sys.modules[key]
 
     from strata.settings import Settings, get_settings
@@ -162,7 +162,7 @@ def _load_mcp_module(db_path: str, summaries_dir: str, fleet_yaml_path: str):
     )
 
     with patch("strata.settings.get_settings", return_value=fake_settings):
-        import mcp_server.strata_mcp as mod
+        import strata.mcp.server as mod
 
         importlib.reload(mod)
 

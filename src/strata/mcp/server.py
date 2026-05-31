@@ -17,18 +17,22 @@ STRATA_FLEET_CONFIG
     Path to the fleet YAML file.  Default: ``./fleet.yaml``
 STRATA_AGENT_SCOPE
     The scope this agent is bound to (e.g. ``g_backend``).
-    Recorded in contribution provenance.  Default: ``unknown``
+    Recorded in contribution provenance.  Required — server refuses to start
+    if unset (ADR 0005 Decision 5).
 STRATA_AGENT_SKILL
     The skill this agent is running (e.g. ``strata-developer``).
-    Recorded in contribution provenance.  Default: ``unknown``
+    Recorded in contribution provenance.  Required — server refuses to start
+    if unset (ADR 0005 Decision 5).
 STRATA_AGENT_SESSION_ID
     Unique identifier for this session.
-    Recorded in contribution provenance.  Default: ``sess_local``
+    Recorded in contribution provenance.  Optional — defaults to a generated
+    value when absent.
 """
 
 from __future__ import annotations
 
 import os
+import uuid
 from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
@@ -54,10 +58,15 @@ run_migrations(_settings.db_path)
 _record_store = RecordStore(_settings.db_path)
 _summary_store = SummaryStore(_settings.summaries_dir)
 
-# Agent provenance — recorded on every contribution
-_AGENT_SCOPE: str = os.environ.get("STRATA_AGENT_SCOPE", "unknown")
-_AGENT_SKILL: str = os.environ.get("STRATA_AGENT_SKILL", "unknown")
-_AGENT_SESSION_ID: str = os.environ.get("STRATA_AGENT_SESSION_ID", "sess_local")
+# Agent provenance — recorded on every contribution.
+# STRATA_AGENT_SCOPE and STRATA_AGENT_SKILL have no defaults;
+# _validate_binding() enforces they are set before mcp.run().
+# STRATA_AGENT_SESSION_ID is optional; generate one when absent.
+_AGENT_SCOPE: str = os.environ.get("STRATA_AGENT_SCOPE", "")
+_AGENT_SKILL: str = os.environ.get("STRATA_AGENT_SKILL", "")
+_AGENT_SESSION_ID: str = os.environ.get(
+    "STRATA_AGENT_SESSION_ID", f"sess_{uuid.uuid4().hex[:8]}"
+)
 
 # ---------------------------------------------------------------------------
 # Fleet config helper — re-read on every call that needs fleet info (ADR 0004
@@ -76,6 +85,90 @@ def _load_fleet() -> FleetConfig:
     if not fleet_path.exists():
         return FleetConfig(strata=[], scopes=[], edges=[])
     return FleetConfig.load(fleet_path)
+
+
+# ---------------------------------------------------------------------------
+# Refuse-to-start validation (ADR 0005 Decision 5)
+# ---------------------------------------------------------------------------
+
+
+def _validate_binding(fleet: FleetConfig, scope: str, skill: str) -> None:
+    """Validate agent binding before starting the MCP server.
+
+    Checks (in order):
+    1. STRATA_AGENT_SCOPE env var is set.
+    2. The scope exists in the fleet config.
+    3. STRATA_AGENT_SKILL is set.
+    4. STRATA_AGENT_SKILL is in the scope's permitted_skills (if that list
+       is non-empty; an empty list means any skill is permitted).
+
+    Any failure calls sys.exit(1) with an actionable message.
+
+    Args:
+        fleet:  The loaded FleetConfig (or empty FleetConfig if no file).
+        scope:  Value of STRATA_AGENT_SCOPE (may be empty string).
+        skill:  Value of STRATA_AGENT_SKILL (may be empty string).
+    """
+    import sys
+
+    # 1. STRATA_AGENT_SCOPE must be set.
+    if not scope:
+        print(
+            "Strata MCP server refuses to start: STRATA_AGENT_SCOPE is not set.\n"
+            "\n"
+            "Set it before launching Claude Code:\n"
+            "  export STRATA_AGENT_SCOPE=<scope_id>\n"
+            "  export STRATA_AGENT_SKILL=<skill_name>\n"
+            "\n"
+            "See README.md § 'Quick Start for an existing project' for the full setup.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    # 2. Scope must exist in fleet config.
+    scope_obj = fleet.get_scope(scope)
+    if scope_obj is None:
+        available = [s.id for s in fleet.active_scopes()]
+        available_str = ", ".join(available) if available else "(none — fleet.yaml may be empty)"
+        print(
+            f"Strata MCP server refuses to start: scope {scope!r} not found in fleet config.\n"
+            f"\n"
+            f"Available scope IDs: {available_str}\n"
+            f"\n"
+            f"Update STRATA_AGENT_SCOPE to one of the above, or add scope {scope!r} to your "
+            f"fleet.yaml.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    # 3. STRATA_AGENT_SKILL must be set.
+    if not skill:
+        print(
+            "Strata MCP server refuses to start: STRATA_AGENT_SKILL is not set.\n"
+            "\n"
+            "Set it before launching Claude Code:\n"
+            "  export STRATA_AGENT_SCOPE=<scope_id>\n"
+            "  export STRATA_AGENT_SKILL=<skill_name>\n"
+            "\n"
+            "See README.md § 'Quick Start for an existing project' for the full setup.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    # 4. STRATA_AGENT_SKILL must be in permitted_skills (when list is non-empty).
+    permitted = scope_obj.permitted_skills or []
+    if permitted and skill not in permitted:
+        print(
+            f"Strata MCP server refuses to start: skill {skill!r} is not in the permitted "
+            f"skills for scope {scope!r}.\n"
+            f"\n"
+            f"Permitted skills for {scope!r}: {', '.join(permitted)}\n"
+            f"\n"
+            f"Update STRATA_AGENT_SKILL to one of the above, or update permitted_skills in "
+            f"fleet.yaml.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
 
 # ---------------------------------------------------------------------------
@@ -405,5 +498,17 @@ def strata_read_scope_record(scope_id: str) -> dict:
 # Entry point
 # ---------------------------------------------------------------------------
 
-if __name__ == "__main__":
+
+def main() -> None:
+    """Start the Strata MCP server.
+
+    Validates the agent binding (scope, skill) before starting.  Any
+    validation failure calls sys.exit(1) with an actionable message.
+    """
+    fleet = _load_fleet()
+    _validate_binding(fleet, _AGENT_SCOPE, _AGENT_SKILL)
     mcp.run(transport="stdio")
+
+
+if __name__ == "__main__":
+    main()
