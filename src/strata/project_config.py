@@ -29,7 +29,6 @@ from typing import Any
 
 from pydantic import BaseModel, field_validator
 
-
 # ---------------------------------------------------------------------------
 # Error type (mirrors FleetConfigError pattern)
 # ---------------------------------------------------------------------------
@@ -163,7 +162,8 @@ def _parse_config(config_path: Path, project_root: Path) -> ProjectConfig:
         if not isinstance(raw_value, str):
             raise ProjectConfigError(
                 "invalid_path",
-                f"Field {field!r} in {config_path} must be a string, got {type(raw_value).__name__}",
+                f"Field {field!r} in {config_path} must be a string, "
+                f"got {type(raw_value).__name__}",
             )
         p = Path(raw_value)
         if not p.is_absolute():

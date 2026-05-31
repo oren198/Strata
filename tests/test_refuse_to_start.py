@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from unittest.mock import MagicMock, patch
 
 import pytest
 import yaml
@@ -28,13 +27,14 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 from strata.fleet_config import FleetConfig
 from strata.mcp.server import _validate_binding
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 
-def _make_fleet_with_skills(tmp_path: Path, permitted_skills: list[str] | None = None) -> FleetConfig:
+def _make_fleet_with_skills(
+    tmp_path: Path, permitted_skills: list[str] | None = None
+) -> FleetConfig:
     """Build a minimal FleetConfig with one scope optionally having permitted_skills."""
     scope_def: dict = {"id": "g_root", "name": "Root", "stratum_id": "L0"}
     if permitted_skills is not None:

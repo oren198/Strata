@@ -22,7 +22,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from strata.project_config import ProjectConfig, ProjectConfigError, load_project_config
 
-
 # ---------------------------------------------------------------------------
 # Helper
 # ---------------------------------------------------------------------------
@@ -36,6 +35,13 @@ def _write_config(strata_dir: Path, content: str) -> Path:
     return config
 
 
+_MINIMAL_TOML = (
+    'db = ".strata/strata.db"\n'
+    'fleet_yaml = ".strata/fleet.yaml"\n'
+    'summaries_dir = ".strata/summaries"\n'
+)
+
+
 # ---------------------------------------------------------------------------
 # Test 1: walk-up discovery from a deep subdir
 # ---------------------------------------------------------------------------
@@ -45,7 +51,7 @@ def test_walk_up_discovers_config_from_deep_subdir(tmp_path: Path) -> None:
     """Walk-up from a deep subdir must find .strata/config.toml at the project root."""
     _write_config(
         tmp_path / ".strata",
-        'db = ".strata/strata.db"\nfleet_yaml = ".strata/fleet.yaml"\nsummaries_dir = ".strata/summaries"\n',
+        _MINIMAL_TOML,
     )
 
     # Start from a deep subdir.
@@ -119,7 +125,7 @@ def test_non_string_path_field_raises_project_config_error(tmp_path: Path) -> No
     """A non-string value for a path field raises ProjectConfigError(kind='invalid_path')."""
     _write_config(
         tmp_path / ".strata",
-        "db = 42\nfleet_yaml = \".strata/fleet.yaml\"\nsummaries_dir = \".strata/summaries\"\n",
+        'db = 42\nfleet_yaml = ".strata/fleet.yaml"\nsummaries_dir = ".strata/summaries"\n',
     )
 
     with pytest.raises(ProjectConfigError) as exc_info:
@@ -178,7 +184,7 @@ def test_project_root_set_on_returned_config(tmp_path: Path) -> None:
     """project_root on the returned ProjectConfig must equal the directory containing .strata/."""
     _write_config(
         tmp_path / ".strata",
-        'db = ".strata/strata.db"\nfleet_yaml = ".strata/fleet.yaml"\nsummaries_dir = ".strata/summaries"\n',
+        _MINIMAL_TOML,
     )
 
     result = load_project_config(start=tmp_path)
@@ -196,7 +202,7 @@ def test_config_found_at_start_directory(tmp_path: Path) -> None:
     """load_project_config finds .strata/config.toml in the start directory itself."""
     _write_config(
         tmp_path / ".strata",
-        'db = ".strata/strata.db"\nfleet_yaml = ".strata/fleet.yaml"\nsummaries_dir = ".strata/summaries"\n',
+        _MINIMAL_TOML,
     )
 
     result = load_project_config(start=tmp_path)
@@ -213,7 +219,7 @@ def test_minimal_valid_config_parses_ok(tmp_path: Path) -> None:
     """A minimal valid config with all three fields parses without error."""
     _write_config(
         tmp_path / ".strata",
-        'db = ".strata/strata.db"\nfleet_yaml = ".strata/fleet.yaml"\nsummaries_dir = ".strata/summaries"\n',
+        _MINIMAL_TOML,
     )
 
     result = load_project_config(start=tmp_path)

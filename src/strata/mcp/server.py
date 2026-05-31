@@ -80,9 +80,7 @@ _summary_store = SummaryStore(_summaries_dir)
 # STRATA_AGENT_SESSION_ID is optional; generate one when absent.
 _AGENT_SCOPE: str = os.environ.get("STRATA_AGENT_SCOPE", "")
 _AGENT_SKILL: str = os.environ.get("STRATA_AGENT_SKILL", "")
-_AGENT_SESSION_ID: str = os.environ.get(
-    "STRATA_AGENT_SESSION_ID", f"sess_{uuid.uuid4().hex[:8]}"
-)
+_AGENT_SESSION_ID: str = os.environ.get("STRATA_AGENT_SESSION_ID", f"sess_{uuid.uuid4().hex[:8]}")
 
 # ---------------------------------------------------------------------------
 # Fleet config helper — re-read on every call that needs fleet info (ADR 0004

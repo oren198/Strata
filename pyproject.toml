@@ -42,6 +42,7 @@ testpaths = ["tests"]
 asyncio_mode = "auto"
 markers = [
     "integration: tests that hit external services (e.g. real Anthropic API). Skipped unless STRATA_RUN_INTEGRATION=1.",
+    "slow: slow tests (e.g. --bootstrap-venv requires network). Skipped unless STRATA_RUN_BOOTSTRAP_VENV=1.",
 ]
 
 [tool.ruff]

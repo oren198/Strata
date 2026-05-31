@@ -845,6 +845,264 @@ def cmd_launch(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# strata register — brownfield install helper (ADR 0005 Decision 4)
+# ---------------------------------------------------------------------------
+
+#: Project root marker files — at least one must be present.
+_PROJECT_MARKERS = (".git", "pyproject.toml", "package.json", "Cargo.toml", "go.mod")
+
+#: Gitignore block appended by strata register (idempotent — detected by header).
+_GITIGNORE_MARKER = "# Strata"
+_GITIGNORE_BLOCK = """\
+# Strata — managed by `strata register` — do not remove this line
+.strata/.venv/
+.strata/strata.db*
+.strata/summaries/
+# fleet.yaml is intentionally NOT listed above — commit it (it is your team's org chart).
+"""
+
+#: Minimal settings.json merge entry.
+_MCP_ENTRY: dict = {"command": "strata-mcp", "env": {}}
+
+#: Default .strata/config.toml content.
+_CONFIG_TOML = """\
+# Strata per-project configuration — managed by `strata register`.
+# Paths are relative to this project's root.
+db = ".strata/strata.db"
+fleet_yaml = ".strata/fleet.yaml"
+summaries_dir = ".strata/summaries"
+"""
+
+
+def cmd_register(args: argparse.Namespace) -> int:
+    """Idempotent brownfield installer — per ADR 0005 Decision 4.
+
+    Walks the registration steps in order:
+    1. Detect project root (require a project marker).
+    2. Create .strata/ directory.
+    3. Write .strata/config.toml (skip if exists).
+    4. Update .gitignore (idempotent block with # Strata marker).
+    5. Seed .strata/fleet.yaml from templates/minimal.yaml (skip if exists).
+    6. Copy strata skills to .claude/skills/ (skip each if exists).
+    7. Merge strata into .claude/settings.json mcpServers (skip if exists).
+    8. Print next-steps or diff report.
+
+    All writes are strictly additive (never overwrite existing user state).
+    With --diff: read-only mode, prints what would differ.
+    With --bootstrap-venv: creates .strata/.venv/ with strata installed.
+    """
+    import importlib.resources
+    import json
+    import subprocess
+    import venv
+
+    path_arg: str | None = getattr(args, "path", None)
+    project_root = Path(path_arg).resolve() if path_arg else Path.cwd().resolve()
+    diff_mode: bool = getattr(args, "diff", False)
+    bootstrap_venv: bool = getattr(args, "bootstrap_venv", False)
+
+    # -----------------------------------------------------------------------
+    # Step 1: Require a project marker.
+    # -----------------------------------------------------------------------
+    if not any((project_root / m).exists() for m in _PROJECT_MARKERS):
+        markers_str = ", ".join(_PROJECT_MARKERS)
+        print(
+            f"Not a project root — register from a directory containing one of: {markers_str}\n"
+            f"(checked: {project_root})",
+            file=sys.stderr,
+        )
+        return 1
+
+    # -----------------------------------------------------------------------
+    # Helper: print action or diff line.
+    # -----------------------------------------------------------------------
+    def _act(action: str, path: str | Path, *, skipped: bool = False) -> None:
+        rel = Path(path).relative_to(project_root) if Path(path).is_absolute() else Path(path)
+        if diff_mode:
+            if skipped:
+                print(f"  [unchanged]  {rel}")
+            else:
+                print(f"  [would create/update]  {rel}")
+        else:
+            if skipped:
+                print(f"  kept user's {rel}")
+            else:
+                print(f"  {action}: {rel}")
+
+    if diff_mode:
+        print(f"strata register --diff  (dry-run, no writes)\nProject root: {project_root}")
+    else:
+        print(f"strata register\nProject root: {project_root}")
+
+    # -----------------------------------------------------------------------
+    # Step 2: Create .strata/ directory.
+    # -----------------------------------------------------------------------
+    strata_dir = project_root / ".strata"
+    if not strata_dir.exists():
+        if not diff_mode:
+            strata_dir.mkdir(parents=True)
+        _act("created", strata_dir)
+
+    # -----------------------------------------------------------------------
+    # Step 3: Write .strata/config.toml.
+    # -----------------------------------------------------------------------
+    config_toml = strata_dir / "config.toml"
+    if config_toml.exists():
+        _act("skip", config_toml, skipped=True)
+    else:
+        if not diff_mode:
+            config_toml.write_text(_CONFIG_TOML, encoding="utf-8")
+        _act("wrote", config_toml)
+
+    # -----------------------------------------------------------------------
+    # Step 4: Update .gitignore.
+    # -----------------------------------------------------------------------
+    gitignore = project_root / ".gitignore"
+    existing_gitignore = gitignore.read_text(encoding="utf-8") if gitignore.exists() else ""
+    if _GITIGNORE_MARKER in existing_gitignore:
+        _act("skip", gitignore, skipped=True)
+    else:
+        if not diff_mode:
+            with gitignore.open("a", encoding="utf-8") as f:
+                if existing_gitignore and not existing_gitignore.endswith("\n"):
+                    f.write("\n")
+                f.write("\n")
+                f.write(_GITIGNORE_BLOCK)
+        _act("appended Strata block to", gitignore)
+
+    # -----------------------------------------------------------------------
+    # Step 5: Seed .strata/fleet.yaml from templates/minimal.yaml.
+    # -----------------------------------------------------------------------
+    fleet_yaml = strata_dir / "fleet.yaml"
+    minimal_template = Path(__file__).parent.parent.parent / "templates" / "minimal.yaml"
+    if fleet_yaml.exists():
+        _act("skip", fleet_yaml, skipped=True)
+    else:
+        if not diff_mode:
+            if minimal_template.exists():
+                shutil.copy(minimal_template, fleet_yaml)
+            else:
+                # Fallback: write a minimal inline template.
+                fleet_yaml.write_text(
+                    "# TODO: replace with your team's structure\n"
+                    "strata:\n  - id: L0\n    name: root\n    ordinal: 0\n"
+                    "scopes:\n  - id: g_root\n    name: Root\n    stratum_id: L0\n"
+                    "edges: []\n",
+                    encoding="utf-8",
+                )
+        _act("seeded", fleet_yaml)
+
+    # -----------------------------------------------------------------------
+    # Step 6: Copy canonical skills to .claude/skills/ (skip each if exists).
+    # -----------------------------------------------------------------------
+    claude_skills_dir = project_root / ".claude" / "skills"
+    skills_root = importlib.resources.files("strata") / "_skills"
+    for skill_name in ["strata", "strata-worker", "strata-inspect"]:
+        dest_skill_dir = claude_skills_dir / skill_name
+        if dest_skill_dir.exists():
+            _act("skip", dest_skill_dir, skipped=True)
+        else:
+            skill_src = skills_root / skill_name / "Skill.md"
+            if not diff_mode:
+                dest_skill_dir.mkdir(parents=True, exist_ok=True)
+                dest_skill_md = dest_skill_dir / "Skill.md"
+                dest_skill_md.write_text(skill_src.read_text(encoding="utf-8"), encoding="utf-8")
+            _act("copied", dest_skill_dir)
+
+    # -----------------------------------------------------------------------
+    # Step 7: Merge strata into .claude/settings.json mcpServers block.
+    # -----------------------------------------------------------------------
+    settings_json = project_root / ".claude" / "settings.json"
+    if settings_json.exists():
+        try:
+            settings_data: dict = json.loads(settings_json.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            print(
+                f"Warning: .claude/settings.json is not valid JSON ({exc}). Skipping MCP merge.",
+                file=sys.stderr,
+            )
+            settings_data = {}
+    else:
+        settings_data = {}
+
+    mcp_servers: dict = settings_data.get("mcpServers", {})
+    if "strata" in mcp_servers:
+        _act("skip", settings_json, skipped=True)
+    else:
+        mcp_servers["strata"] = _MCP_ENTRY
+        settings_data["mcpServers"] = mcp_servers
+        if not diff_mode:
+            (project_root / ".claude").mkdir(parents=True, exist_ok=True)
+            settings_json.write_text(json.dumps(settings_data, indent=2) + "\n", encoding="utf-8")
+        _act("merged strata into", settings_json)
+
+    # -----------------------------------------------------------------------
+    # Step 8: bootstrap-venv (if requested).
+    # -----------------------------------------------------------------------
+    if bootstrap_venv:
+        venv_dir = strata_dir / ".venv"
+        venv_strata_mcp = venv_dir / "bin" / "strata-mcp"
+        if venv_dir.exists():
+            print("  .strata/.venv/ already exists — skipping venv creation")
+        else:
+            if not diff_mode:
+                print("  creating .strata/.venv/ ...")
+                venv.create(str(venv_dir), with_pip=True, clear=False)
+                pip = venv_dir / "bin" / "pip"
+                subprocess.check_call(
+                    [str(pip), "install", "--quiet", "strata[cc-plugin]"],
+                )
+                print("  installed strata into .strata/.venv/")
+
+                # Update settings.json to use absolute path.
+                if not diff_mode:
+                    settings_data_venv: dict
+                    if settings_json.exists():
+                        settings_data_venv = json.loads(settings_json.read_text(encoding="utf-8"))
+                    else:
+                        settings_data_venv = {}
+                    mcp_venv = settings_data_venv.get("mcpServers", {})
+                    mcp_venv["strata"] = {
+                        "command": str(venv_strata_mcp),
+                        "env": {},
+                    }
+                    settings_data_venv["mcpServers"] = mcp_venv
+                    (project_root / ".claude").mkdir(parents=True, exist_ok=True)
+                    settings_json.write_text(
+                        json.dumps(settings_data_venv, indent=2) + "\n", encoding="utf-8"
+                    )
+                    print(f"  updated .claude/settings.json to use {venv_strata_mcp}")
+            else:
+                print("  [would create] .strata/.venv/ and pip install strata")
+
+    # -----------------------------------------------------------------------
+    # Print next steps.
+    # -----------------------------------------------------------------------
+    if not diff_mode:
+        # Determine the first scope ID from the seeded fleet.yaml.
+        first_scope = "g_root"
+        if fleet_yaml.exists():
+            try:
+                import yaml  # noqa: PLC0415
+
+                fleet_data = yaml.safe_load(fleet_yaml.read_text(encoding="utf-8"))
+                scopes = fleet_data.get("scopes", [])
+                if scopes:
+                    first_scope = scopes[0].get("id", "g_root")
+            except Exception:  # noqa: BLE001
+                pass
+
+        print()
+        print("Done. Next steps:")
+        print(f"  1. Edit {fleet_yaml.relative_to(project_root)} for your team's structure")
+        print(f"  2. export STRATA_AGENT_SCOPE={first_scope}")
+        print("     export STRATA_AGENT_SKILL=<your-skill>")
+        print("  3. Open Claude Code in this directory: claude")
+
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Parser construction
 # ---------------------------------------------------------------------------
 
@@ -948,6 +1206,39 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Overwrite --out if it already exists.",
     )
     p_export.set_defaults(func=cmd_export_fleet)
+
+    p_register = sub.add_parser(
+        "register",
+        help=(
+            "Idempotent brownfield installer — create .strata/config.toml, "
+            "seed fleet.yaml, copy skills, merge MCP entry (ADR 0005)."
+        ),
+    )
+    p_register.add_argument(
+        "path",
+        nargs="?",
+        default=None,
+        help="Project root directory (default: current working directory).",
+    )
+    p_register.add_argument(
+        "--diff",
+        action="store_true",
+        help=(
+            "Read-only mode: show what would differ between current state and canonical "
+            "without writing anything. Useful after `pipx upgrade strata`."
+        ),
+    )
+    p_register.add_argument(
+        "--bootstrap-venv",
+        action="store_true",
+        dest="bootstrap_venv",
+        help=(
+            "Create .strata/.venv/ with strata installed and update "
+            ".claude/settings.json to use the absolute venv path. "
+            "Use when pipx is not available or strata-mcp is not on PATH."
+        ),
+    )
+    p_register.set_defaults(func=cmd_register)
 
     return parser
 
