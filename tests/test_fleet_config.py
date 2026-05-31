@@ -738,3 +738,58 @@ def test_inter_stratum_ancestors_root_scope_returns_empty(tmp_path: Path) -> Non
     ancestors = config.inter_stratum_ancestors("g_exec")
 
     assert ancestors == []
+
+
+_DOWNWARD_EDGE_YAML = """
+strata:
+  - id: L0
+    name: Executive
+    ordinal: 0
+  - id: L1
+    name: Function
+    ordinal: 1
+  - id: L2
+    name: Team
+    ordinal: 2
+
+scopes:
+  - id: g_root
+    name: Root
+    stratum_id: L0
+  - id: g_mid
+    name: Mid
+    stratum_id: L1
+  - id: g_leaf
+    name: Leaf
+    stratum_id: L2
+
+edges:
+  # Inverted downward edge listed FIRST so a buggy `!= ordinal` resolver
+  # would return g_leaf (the descendant) before reaching the upward edge.
+  # g_leaf is NOT g_mid's parent; only a strict `< ordinal` resolver skips it.
+  # The ±1 stratum invariant (#7) is direction-agnostic so this passes load.
+  - from: g_mid
+    to: g_leaf
+  # Proper upward edge: g_mid (L1) → g_root (L0). g_root is g_mid's true parent.
+  - from: g_mid
+    to: g_root
+"""
+
+
+def test_inter_stratum_parent_ignores_downward_edges(tmp_path: Path) -> None:
+    """inter_stratum_parent must not follow edges to *higher*-ordinal scopes.
+
+    Per ADR 0002, parents have lower stratum ordinals than children
+    (ordinal 0 is the broadest). An edge from a scope to a higher-ordinal
+    scope is a descendant reference and must be ignored when resolving
+    the parent. Regression test for the bug where `!= current_ordinal`
+    would silently return the descendant.
+    """
+    config = FleetConfig.load(_write(tmp_path, _DOWNWARD_EDGE_YAML))
+
+    parent = config.inter_stratum_parent("g_mid")
+
+    assert parent is not None, "g_mid has a valid upward edge to g_root"
+    assert parent.id == "g_root", (
+        f"expected g_mid's parent to be g_root (lower ordinal), got {parent.id!r}"
+    )

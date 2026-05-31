@@ -136,9 +136,10 @@ class FleetConfig(BaseModel):
         """Return the single inter-stratum parent of *scope_id*, or ``None`` for root scopes.
 
         Edges are written child→parent (from=child, to=parent) in fleet.yaml.
-        An inter-stratum edge connects scopes with *different* stratum ordinals;
-        a peer (intra-stratum) edge connects scopes on the *same* ordinal and
-        is never traversed here.
+        A parent has a *lower* stratum ordinal than its child (per ADR 0002,
+        ordinal 0 is the broadest stratum). An edge to a scope with a *higher*
+        ordinal is a descendant reference, not a parent reference, and is
+        never followed here. Peer (same-ordinal) edges are likewise ignored.
         """
         stratum_map = {s.id: s for s in self.strata}
         scope_map = {s.id: s for s in self.scopes}
@@ -156,7 +157,7 @@ class FleetConfig(BaseModel):
             if target is None:
                 continue
             target_ordinal = stratum_map[target.stratum_id].ordinal
-            if target_ordinal != current_ordinal:
+            if target_ordinal < current_ordinal:
                 return target
 
         return None
