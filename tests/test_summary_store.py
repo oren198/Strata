@@ -162,7 +162,10 @@ def test_tmp_files_ignored_by_list(tmp_path: Path) -> None:
 
 
 def test_overwrite_returns_latest(tmp_path: Path) -> None:
-    """Writing a second summary for the same scope replaces the first."""
+    """Writing a second summary for the same scope replaces the first.
+
+    Version is bumped on each write, so the second write produces version=2.
+    """
     store = SummaryStore(str(tmp_path))
 
     first = ScopeSummary(
@@ -183,9 +186,11 @@ def test_overwrite_returns_latest(tmp_path: Path) -> None:
 
     result = store.read("g_arch")
     assert result is not None
-    assert result == second
+    # Version is bumped on each write: first write → 1, second write → 2
+    assert result.version == 2
     assert result.directives[0].content == "second version"
     assert result.context == "updated context"
+    assert result.updated_at == second.updated_at
 
 
 # ---------------------------------------------------------------------------
