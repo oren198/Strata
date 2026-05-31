@@ -40,12 +40,20 @@ Anthropic-hosted scope-managers, FastAPI HTTP surface, file-canonical
 frictionless Claude Code session binding (ADR 0003), a read-only
 browser-based Console, and a Claude Code MCP plugin + skills.
 
-**V1.2.1 in progress on `dev`** — H2 foundations per
+**V1.2.1 shipped** — H2 foundations per
 [ADR 0004](docs/adr/0004-h2-foundations.md): embedded mode (the MCP
 server operates directly on the record store; the FastAPI backend is the
 UI layer only), real perspective composition (the agent's read walks
 the inter-stratum ancestor chain), parent-aware scope-managers, and
 lazy refresh + bounded summaries via a pre-session hook.
+
+**V1.3 in progress** — brownfield install per
+[ADR 0005](docs/adr/0005-brownfield-install.md): `strata register` for
+two-command onboarding of any foreign project, per-project
+`.strata/config.toml` discovery, `strata-mcp` console script (no more
+Python-path gymnastics), skills vendored as package data, and honest
+provenance — the MCP server refuses to start without a valid scope
+binding.
 
 What comes next is captured in [`docs/ROADMAP.md`](docs/ROADMAP.md) — the
 enduring design principles and the sequenced direction the project is
@@ -178,6 +186,74 @@ The UI tab will reflect the change within ~5 seconds (it polls).
 
 ---
 
+## Quick Start for an existing project
+
+This section is for users who have **an existing project** and want to add Strata as its memory layer — without cloning this repo or touching their project's Python runtime.
+
+Two universal commands, then you're ready:
+
+```bash
+pipx install strata          # install strata in an isolated env; puts strata-mcp on PATH
+cd /path/to/your/project
+strata register              # idempotent: creates .strata/, seeds fleet.yaml, wires Claude Code
+```
+
+### What `strata register` does
+
+`strata register` is strictly additive — it never overwrites files you've already edited:
+
+1. Creates `.strata/` directory and `config.toml` (relative paths, portable workspace).
+2. Appends a `# Strata` block to `.gitignore` (ignores the DB and venv, never `fleet.yaml`).
+3. Seeds `.strata/fleet.yaml` from a minimal template (1 scope, ready to edit).
+4. Copies the `strata`, `strata-worker`, and `strata-inspect` skills to `.claude/skills/`.
+5. Merges a `strata` entry into `.claude/settings.json`'s `mcpServers` block.
+
+Run it again at any time — it skips everything that already exists and reports what it kept.
+
+### After registration
+
+```bash
+# Edit your fleet to match your team
+$EDITOR .strata/fleet.yaml
+
+# Set your scope binding in the shell that opens Claude Code
+export STRATA_AGENT_SCOPE=g_root       # scope ID from your fleet.yaml
+export STRATA_AGENT_SKILL=strata-worker  # your role name
+
+# Open Claude Code — the MCP server validates the binding at startup
+claude
+```
+
+The MCP server starts with `strata-mcp` (on your PATH from pipx). It reads
+`.strata/config.toml` automatically — no `STRATA_DB_PATH` or `STRATA_FLEET_CONFIG`
+env vars needed. If binding is wrong (scope unknown, skill not permitted), the
+server exits immediately with an actionable message.
+
+### Checking for skill updates
+
+After `pipx upgrade strata`, run:
+
+```bash
+strata register --diff       # shows what would change if you re-ran register
+```
+
+Review the diff and copy the pieces you want manually. Strata never silently
+overwrites skills or settings you've already customised.
+
+### No Python 3.11+ globally? Use `--bootstrap-venv`
+
+If `pipx` can't find Python 3.11+ (locked-down corporate environment), use:
+
+```bash
+strata register --bootstrap-venv
+```
+
+This creates `.strata/.venv/` with strata installed, and updates `.claude/settings.json`
+to point at the absolute venv path. The `.strata/.venv/` directory is gitignored
+automatically. Note: this downloads ~100MB of Python deps.
+
+---
+
 ## More commands
 
 ### Inspect memory from the terminal
@@ -275,13 +351,34 @@ STRATA_RUN_INTEGRATION=1 ANTHROPIC_API_KEY=... pytest tests/test_scope_manager.p
 
 ## Configuration
 
-All settings are env-var driven, prefixed `STRATA_`:
+### Per-project: `.strata/config.toml`
+
+When `strata register` has been run, the project root contains
+`.strata/config.toml` with relative storage paths:
+
+```toml
+db = ".strata/strata.db"
+fleet_yaml = ".strata/fleet.yaml"
+summaries_dir = ".strata/summaries"
+```
+
+The MCP server walks up from its current directory to find this file. When
+present, it takes precedence over the env vars below — no shell exports needed
+for storage paths.
+
+### Environment variables
+
+All settings are env-var driven, prefixed `STRATA_`. When `.strata/config.toml`
+is present, the first three are ignored for the MCP server (project config wins):
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `STRATA_DB_PATH` | `./strata.db` | SQLite path for the record store |
-| `STRATA_SUMMARIES_DIR` | `./summaries` | Directory for per-scope markdown summary files |
-| `STRATA_FLEET_CONFIG` | `./fleet.yaml` | Fleet YAML — re-read on every MCP tool call that needs fleet info |
+| `STRATA_DB_PATH` | `./strata.db` | SQLite path for the record store (overridden by `config.toml`) |
+| `STRATA_SUMMARIES_DIR` | `./summaries` | Directory for per-scope summary files (overridden by `config.toml`) |
+| `STRATA_FLEET_CONFIG` | `./fleet.yaml` | Fleet YAML (overridden by `config.toml`) |
+| `STRATA_AGENT_SCOPE` | (required) | The scope this session acts at — MCP server refuses to start if unset |
+| `STRATA_AGENT_SKILL` | (required) | The skill identifier for provenance — MCP server refuses to start if unset |
+| `STRATA_AGENT_SESSION_ID` | (auto) | Session identifier — auto-generated when absent |
 | `STRATA_MANAGER_MODEL` | `claude-haiku-4-5` | Model used by scope-managers |
 | `STRATA_ANTHROPIC_API_KEY` | (unset) | Optional; falls back to `ANTHROPIC_API_KEY` |
 | `STRATA_BACKEND_URL` | `http://127.0.0.1:8000` | UI client only — the MCP server no longer reads this (ADR 0004 Decision 1) |
@@ -319,14 +416,20 @@ ui/                      # Strata Console (no build step — Babel-standalone in
   tweaks-panel.jsx       # Floating tweaks panel
   store.js               # API client (fetch /scopes, /scopes/{id}/summary)
   atlas.css              # Atlas design system tokens + component classes
-mcp_server/              # Claude Code plugin — MCP server (embedded mode, no HTTP proxy)
-  strata_mcp.py          # FastMCP stdio server; operates directly on RecordStore + SummaryStore
+src/strata/
+  mcp/
+    server.py            # FastMCP stdio server; operates directly on RecordStore + SummaryStore
+  _skills/               # Canonical skill files vendored as package data
+    strata/Skill.md      # CC skill: orientation / first-time use
+    strata-worker/Skill.md  # CC skill: parametric worker — reads STRATA_AGENT_SCOPE/SKILL
+    strata-inspect/Skill.md # CC skill: read-only browser
+  project_config.py      # .strata/config.toml walk-up loader (ADR 0005 Decision 2)
 .claude/
   skills/
-    strata/              # CC skill: orientation / first-time use
-    strata-worker/       # CC skill: parametric worker — reads STRATA_AGENT_SCOPE/SKILL
-    strata-inspect/      # CC skill: read-only browser
-  settings.example.json  # Example MCP-server registration block
+    strata/              # CC skill (copy used in Strata-repo sessions)
+    strata-worker/       # CC skill (copy used in Strata-repo sessions)
+    strata-inspect/      # CC skill (copy used in Strata-repo sessions)
+  settings.example.json  # Example MCP-server registration block (command: strata-mcp)
 tests/                   # pytest suite
 migrations/              # SQLite schema migrations
 scripts/                 # CLI runners (run_migrations.py, bootstrap_fleet.py)
@@ -350,6 +453,10 @@ the backend is up or down.
 > "judgments": []}`) for unknown scopes instead of the old HTTP `404`. The
 > other tools still raise on unknown scopes (matching the prior 404 behaviour).
 
+**For a foreign project**: use `strata register` (see
+[Quick Start for an existing project](#quick-start-for-an-existing-project)
+above). The steps below are for developing on Strata itself.
+
 ### 1. Start the backend (optional — Console UI only)
 
 ```bash
@@ -361,29 +468,24 @@ The backend is only required if you want the browser Console UI at
 
 ### 2. Register the MCP server in Claude Code
 
-Copy `.claude/settings.example.json` to `.claude/settings.json` (or merge
-the `mcpServers` block into your existing settings). The env vars in
-that block identify the **scope this CC session acts at** and the
-**role identifier** for provenance — change them per session. Store path
-vars (`STRATA_DB_PATH`, `STRATA_FLEET_CONFIG`, `STRATA_SUMMARIES_DIR`) come
-from your shell env or `.env` — the MCP server reads them at startup via
-`get_settings()`.
+After running `strata register`, `.claude/settings.json` already contains the
+correct `mcpServers.strata` entry. If you're setting this up manually (e.g. for
+developing on Strata itself), the entry is:
 
 ```json
 {
   "mcpServers": {
     "strata": {
-      "command": "python",
-      "args": ["-m", "mcp_server.strata_mcp"],
-      "env": {
-        "STRATA_AGENT_SCOPE":       "g_arch",
-        "STRATA_AGENT_SKILL":       "architect",
-        "STRATA_AGENT_SESSION_ID":  "sess_local"
-      }
+      "command": "strata-mcp",
+      "env": {}
     }
   }
 }
 ```
+
+Set `STRATA_AGENT_SCOPE` and `STRATA_AGENT_SKILL` in the shell before launching
+`claude`. Storage paths are read from `.strata/config.toml` automatically when
+that file is present.
 
 `STRATA_AGENT_SKILL` is just a human-readable role tag (`architect`,
 `developer`, `security_reviewer`, etc.) — it shows up in provenance, but
@@ -456,6 +558,9 @@ Current ADRs:
 - [0004 — H2 foundations](docs/adr/0004-h2-foundations.md): embedded mode
   (MCP server direct-store access), manager composition, lazy refresh, bounded
   summaries.
+- [0005 — Brownfield install](docs/adr/0005-brownfield-install.md): `strata register`
+  two-command onboarding, per-project `.strata/config.toml` discovery, `strata-mcp`
+  console script, skills as package data, honest provenance enforcement.
 
 ---
 
