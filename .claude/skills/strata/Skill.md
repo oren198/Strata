@@ -40,7 +40,7 @@ lives in `docs/philosophy.md`; the canonical vocabulary (23 terms) lives in
 |---|---|
 | `strata_list_scopes()` | Show the fleet |
 | `strata_read_scope_summary(scope_id)` | Peek at a scope's current state |
-| `strata_read_perspective(scope_id)` | Same as summary in V1 |
+| `strata_read_perspective(scope_id)` | Composed view: this scope's summary + every inter-stratum ancestor's summary, ordered root-first |
 | `strata_read_scope_record(scope_id)` | Forensic — every contribution + judgment |
 
 ## What you do NOT do here

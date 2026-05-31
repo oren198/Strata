@@ -37,7 +37,7 @@ user matches what they'll see in the data (`directive`, `context`,
 |---|---|
 | `strata_list_scopes()` | Fleet overview |
 | `strata_read_scope_summary(scope_id)` | A scope's curated current state |
-| `strata_read_perspective(scope_id)` | Same as summary in V1 |
+| `strata_read_perspective(scope_id)` | Composed view: this scope's summary + every inter-stratum ancestor's summary, ordered root-first |
 | `strata_read_scope_record(scope_id)` | Full append-only contribution + judgment log |
 
 ## What you do NOT do

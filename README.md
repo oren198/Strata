@@ -40,6 +40,13 @@ Anthropic-hosted scope-managers, FastAPI HTTP surface, file-canonical
 frictionless Claude Code session binding (ADR 0003), a read-only
 browser-based Console, and a Claude Code MCP plugin + skills.
 
+**V1.2.1 in progress on `dev`** — H2 foundations per
+[ADR 0004](docs/adr/0004-h2-foundations.md): embedded mode (the MCP
+server operates directly on the record store; the FastAPI backend is the
+UI layer only), real perspective composition (the agent's read walks
+the inter-stratum ancestor chain), parent-aware scope-managers, and
+lazy refresh + bounded summaries via a pre-session hook.
+
 What comes next is captured in [`docs/ROADMAP.md`](docs/ROADMAP.md) — the
 enduring design principles and the sequenced direction the project is
 heading. See also the [Architecture decisions](#architecture-decisions)

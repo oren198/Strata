@@ -6,13 +6,20 @@ The MCP server now operates directly on RecordStore and SummaryStore in-process
 Tests:
 1. strata_contribute writes a row to RecordStore without any HTTP server.
 2. strata_read_scope_summary reads from SummaryStore (file on disk) directly.
-3. strata_read_perspective returns the scope summary + _v1_limitation note.
+3. strata_read_perspective returns layers in root-first order (Decision 3).
 4. strata_list_scopes reads fleet.yaml fresh on each call; second call reflects
    a change made between the two calls.
 5. strata_read_scope_record reads contributions and judgments from RecordStore
    directly (no fleet info needed, no HTTP).
 6. strata_contribute raises RuntimeError when scope is not in fleet config.
 7. WAL mode: after RecordStore init, PRAGMA journal_mode returns 'wal'.
+
+Decision 3 (perspective composition) tests:
+8.  strata_read_perspective on a root scope returns exactly one layer.
+9.  strata_read_perspective on a deep scope returns N+1 layers, root-first.
+10. Peer (intra-stratum) edges are NOT traversed — peer scope absent from layers.
+11. Missing ancestor summary → layer still present with empty content.
+12. _v1_limitation key is absent (regression guard).
 
 The MCP protocol layer (FastMCP, stdio transport) is not tested here — that is
 the SDK's responsibility.  Only the tool wrappers are exercised.
@@ -51,7 +58,12 @@ def _make_db(tmp_path: Path) -> str:
 
 
 def _make_fleet_yaml(tmp_path: Path) -> Path:
-    """Write a minimal fleet.yaml and return its path."""
+    """Write a minimal fleet.yaml and return its path.
+
+    Edge convention: child→parent (from=child, to=parent), matching the
+    dev-team.yaml and research-group.yaml templates.  g_backend (L1) is a
+    child of g_arch (L0).
+    """
     fleet = {
         "strata": [
             {"id": "L0", "name": "executive", "ordinal": 0},
@@ -62,7 +74,41 @@ def _make_fleet_yaml(tmp_path: Path) -> Path:
             {"id": "g_backend", "name": "Backend Dev", "stratum_id": "L1"},
         ],
         "edges": [
-            {"from": "g_arch", "to": "g_backend"},
+            # Inter-stratum: child (L1) → parent (L0)
+            {"from": "g_backend", "to": "g_arch"},
+        ],
+    }
+    fleet_path = tmp_path / "fleet.yaml"
+    fleet_path.write_text(yaml.dump(fleet, default_flow_style=False), encoding="utf-8")
+    return fleet_path
+
+
+def _make_deep_fleet_yaml(tmp_path: Path) -> Path:
+    """Write a three-level fleet.yaml for ancestor-walk tests.
+
+    Topology: g_exec (L0) ← g_func (L1) ← g_team (L2)
+    g_peer is an intra-stratum peer of g_func (L1) — must not appear in
+    the g_team perspective.
+    """
+    fleet = {
+        "strata": [
+            {"id": "L0", "name": "executive", "ordinal": 0},
+            {"id": "L1", "name": "function", "ordinal": 1},
+            {"id": "L2", "name": "team", "ordinal": 2},
+        ],
+        "scopes": [
+            {"id": "g_exec", "name": "Executive", "stratum_id": "L0"},
+            {"id": "g_func", "name": "Function", "stratum_id": "L1"},
+            {"id": "g_team", "name": "Team", "stratum_id": "L2"},
+            {"id": "g_peer", "name": "Peer Function", "stratum_id": "L1"},
+        ],
+        "edges": [
+            # Inter-stratum: child → parent
+            {"from": "g_func", "to": "g_exec"},
+            {"from": "g_team", "to": "g_func"},
+            {"from": "g_peer", "to": "g_exec"},
+            # Intra-stratum peer reference (same L1 — must NOT be traversed)
+            {"from": "g_func", "to": "g_peer"},
         ],
     }
     fleet_path = tmp_path / "fleet.yaml"
@@ -210,32 +256,42 @@ def test_read_scope_summary_reads_from_summary_store(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Test 3: strata_read_perspective returns summary + _v1_limitation
+# Test 3: strata_read_perspective returns layers in root-first order
 # ---------------------------------------------------------------------------
 
 
-def test_read_perspective_returns_summary_plus_limitation_note(tmp_path: Path) -> None:
-    """strata_read_perspective must return the scope summary with a _v1_limitation key."""
+def test_read_perspective_returns_layers_root_first(tmp_path: Path) -> None:
+    """strata_read_perspective returns a layered perspective (Decision 3).
+
+    For g_backend (L1, child of g_arch L0) the perspective must have two
+    layers: g_arch first (root), then g_backend (requested scope).
+    """
     db_path = _make_db(tmp_path)
     summaries_dir = str(tmp_path / "summaries")
     fleet_path = _make_fleet_yaml(tmp_path)
 
     mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
 
-    summary = _make_summary("g_arch", "arch context")
     ss = SummaryStore(summaries_dir)
-    ss.write("g_arch", summary)
+    ss.write("g_arch", _make_summary("g_arch", "arch context"))
+    ss.write("g_backend", _make_summary("g_backend", "backend context"))
 
     fleet = FleetConfig.load(fleet_path)
 
     with patch.object(mod, "_load_fleet", return_value=fleet):
         mod._summary_store = ss
-        result = mod.strata_read_perspective("g_arch")
+        result = mod.strata_read_perspective("g_backend")
 
-    assert result["scope_id"] == "g_arch"
-    assert result["context"] == "arch context"
-    assert "_v1_limitation" in result
-    assert "post-V1" in result["_v1_limitation"]
+    assert result["scope_id"] == "g_backend"
+    assert result["_layers_count"] == 2
+    layers = result["layers"]
+    assert len(layers) == 2
+    # Root-first ordering
+    assert layers[0]["scope_id"] == "g_arch"
+    assert layers[1]["scope_id"] == "g_backend"
+    # Summary content is preserved per layer
+    assert layers[0]["summary"]["context"] == "arch context"
+    assert layers[1]["summary"]["context"] == "backend context"
 
 
 # ---------------------------------------------------------------------------
@@ -352,4 +408,158 @@ def test_wal_mode_enabled_after_record_store_init(tmp_path: Path) -> None:
     assert journal_mode == "wal", (
         f"Expected journal_mode='wal', got {journal_mode!r}. "
         "Check that RecordStore.__init__ issues PRAGMA journal_mode=WAL."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 8: L0 root scope returns exactly one layer (itself)
+# ---------------------------------------------------------------------------
+
+
+def test_perspective_root_scope_returns_one_layer(tmp_path: Path) -> None:
+    """strata_read_perspective on a root (L0) scope returns a single layer."""
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fleet_yaml(tmp_path)
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+
+    ss = SummaryStore(summaries_dir)
+    ss.write("g_arch", _make_summary("g_arch", "root context"))
+
+    fleet = FleetConfig.load(fleet_path)
+
+    with patch.object(mod, "_load_fleet", return_value=fleet):
+        mod._summary_store = ss
+        result = mod.strata_read_perspective("g_arch")
+
+    assert result["scope_id"] == "g_arch"
+    assert result["_layers_count"] == 1
+    assert len(result["layers"]) == 1
+    assert result["layers"][0]["scope_id"] == "g_arch"
+    assert result["layers"][0]["summary"]["context"] == "root context"
+
+
+# ---------------------------------------------------------------------------
+# Test 9: Deep scope returns N+1 layers (root-first), correct order
+# ---------------------------------------------------------------------------
+
+
+def test_perspective_deep_scope_returns_layers_root_first(tmp_path: Path) -> None:
+    """strata_read_perspective on a 3-level chain returns 3 layers in root-first order."""
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_deep_fleet_yaml(tmp_path)
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+
+    ss = SummaryStore(summaries_dir)
+    ss.write("g_exec", _make_summary("g_exec", "executive context"))
+    ss.write("g_func", _make_summary("g_func", "function context"))
+    ss.write("g_team", _make_summary("g_team", "team context"))
+
+    fleet = FleetConfig.load(fleet_path)
+
+    with patch.object(mod, "_load_fleet", return_value=fleet):
+        mod._summary_store = ss
+        result = mod.strata_read_perspective("g_team")
+
+    assert result["scope_id"] == "g_team"
+    assert result["_layers_count"] == 3
+    layers = result["layers"]
+    assert [layer["scope_id"] for layer in layers] == ["g_exec", "g_func", "g_team"]
+    assert layers[0]["summary"]["context"] == "executive context"
+    assert layers[1]["summary"]["context"] == "function context"
+    assert layers[2]["summary"]["context"] == "team context"
+
+
+# ---------------------------------------------------------------------------
+# Test 10: Peer (intra-stratum) edges are NOT traversed
+# ---------------------------------------------------------------------------
+
+
+def test_perspective_peer_edges_not_traversed(tmp_path: Path) -> None:
+    """Inter-stratum-only invariant: peer (intra-stratum) scope must not appear in layers.
+
+    The deep fleet has g_func (L1) with a peer edge to g_peer (L1).
+    When reading g_team's perspective, g_peer must not appear in any layer.
+    """
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_deep_fleet_yaml(tmp_path)
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+
+    ss = SummaryStore(summaries_dir)
+    ss.write("g_exec", _make_summary("g_exec", "executive context"))
+    ss.write("g_func", _make_summary("g_func", "function context"))
+    ss.write("g_team", _make_summary("g_team", "team context"))
+    ss.write("g_peer", _make_summary("g_peer", "peer context — must not appear"))
+
+    fleet = FleetConfig.load(fleet_path)
+
+    with patch.object(mod, "_load_fleet", return_value=fleet):
+        mod._summary_store = ss
+        result = mod.strata_read_perspective("g_team")
+
+    layer_scope_ids = {layer["scope_id"] for layer in result["layers"]}
+    assert "g_peer" not in layer_scope_ids, (
+        "Peer (intra-stratum) scope g_peer must not appear in the perspective layers"
+    )
+    # Exactly the inter-stratum chain: exec, func, team
+    assert layer_scope_ids == {"g_exec", "g_func", "g_team"}
+
+
+# ---------------------------------------------------------------------------
+# Test 11: Missing ancestor summary → layer still present with empty content
+# ---------------------------------------------------------------------------
+
+
+def test_perspective_missing_ancestor_summary_produces_empty_layer(tmp_path: Path) -> None:
+    """A scope with no on-disk summary still appears as a layer with empty content."""
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fleet_yaml(tmp_path)
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+
+    # Write only the child summary; leave g_arch (the ancestor) with no file.
+    ss = SummaryStore(summaries_dir)
+    ss.write("g_backend", _make_summary("g_backend", "backend context"))
+
+    fleet = FleetConfig.load(fleet_path)
+
+    with patch.object(mod, "_load_fleet", return_value=fleet):
+        mod._summary_store = ss
+        result = mod.strata_read_perspective("g_backend")
+
+    assert result["_layers_count"] == 2
+    layers = result["layers"]
+    # Root layer (g_arch) must be present even though no summary file exists
+    root_layer = next(layer for layer in layers if layer["scope_id"] == "g_arch")
+    assert root_layer["summary"]["directives"] == []
+    assert root_layer["summary"]["context"] == ""
+
+
+# ---------------------------------------------------------------------------
+# Test 12: _v1_limitation key is absent (regression guard)
+# ---------------------------------------------------------------------------
+
+
+def test_perspective_no_v1_limitation_key(tmp_path: Path) -> None:
+    """strata_read_perspective must NOT include the _v1_limitation key."""
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fleet_yaml(tmp_path)
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+
+    fleet = FleetConfig.load(fleet_path)
+
+    with patch.object(mod, "_load_fleet", return_value=fleet):
+        mod._summary_store = SummaryStore(summaries_dir)
+        result = mod.strata_read_perspective("g_arch")
+
+    assert "_v1_limitation" not in result, (
+        "_v1_limitation must be removed now that real perspective composition is implemented"
     )
