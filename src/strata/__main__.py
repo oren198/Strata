@@ -75,6 +75,7 @@ from strata.launch import (
     prompt_scope,
     resolve_skill,
 )
+from strata.preflight import Check, run_launch_preflight, run_start_preflight
 
 # Path to the bundled starter templates directory.
 _TEMPLATES_DIR = Path(__file__).parent.parent.parent / "templates"
@@ -184,6 +185,34 @@ def _v1_upgrade_guard_should_refuse(
 
 
 # ---------------------------------------------------------------------------
+# Preflight runner
+# ---------------------------------------------------------------------------
+
+
+def _run_preflight(checks: list[Check]) -> int:
+    """Print structured preflight output and return non-zero on any hard failure.
+
+    Output symbols:
+      ✓  — check passed (hard or soft)
+      ⚠  — soft check failed (warning; continues)
+      ✗  — hard check failed (fatal; will exit 1)
+
+    Returns 0 when all hard checks pass (soft failures are printed but
+    do not affect the exit code).  Returns 1 when any hard check fails.
+    """
+    has_hard_failure = False
+    for check in checks:
+        if check.passed:
+            print(f"  ✓ {check.name}: {check.message}")
+        elif check.kind == "soft":
+            print(f"  ⚠ {check.name}: {check.message}", file=sys.stderr)
+        else:
+            print(f"  ✗ {check.name}: {check.message}", file=sys.stderr)
+            has_hard_failure = True
+    return 1 if has_hard_failure else 0
+
+
+# ---------------------------------------------------------------------------
 # Subcommand implementations
 # ---------------------------------------------------------------------------
 
@@ -244,7 +273,13 @@ def cmd_start(args: argparse.Namespace) -> int:
     db_path = args.db or _db_path_default()
     fleet_yaml_path = _fleet_config_default()
 
-    # 0. V1 → V1.2 upgrade guard: refuse if migration 0002 is pending but
+    # 0. Preflight — prerequisite hygiene checks before any DB or server work.
+    if not args.skip_preflight:
+        rc = _run_preflight(run_start_preflight(port=args.port, db_path=db_path))
+        if rc != 0:
+            return rc
+
+    # 2. V1 → V1.2 upgrade guard: refuse if migration 0002 is pending but
     #    the V1 fleet tables are still present and no fleet.yaml exists.
     #    Must run before run_migrations so we catch the footgun before it fires.
     if _v1_upgrade_guard_should_refuse(
@@ -260,18 +295,18 @@ def cmd_start(args: argparse.Namespace) -> int:
         )
         return 1
 
-    # 1. Migrate.
+    # 3. Migrate.
     applied = run_migrations(db_path)
     if applied:
         print(f"Applied {len(applied)} migration(s).")
 
-    # 2. Auto-seed fleet.yaml if absent.
+    # 4. Auto-seed fleet.yaml if absent.
     fleet_path = Path(_fleet_config_default())
     if not fleet_path.exists() and _DEFAULT_TEMPLATE.exists():
         shutil.copy(_DEFAULT_TEMPLATE, fleet_path)
         print("seeded fleet.yaml from the default template; edit to suit")
 
-    # 3. Serve.
+    # 5. Serve.
     import uvicorn
 
     print()
@@ -677,6 +712,7 @@ def cmd_launch(args: argparse.Namespace) -> int:
     """Validate scope, resolve skill, and exec ``claude`` with STRATA_AGENT_* set.
 
     Steps (per ADR 0003 + ADR 0004 D4):
+    0. Preflight — prerequisite hygiene checks.
     1. Fetch active scopes from GET /scopes; fail fast if backend unreachable.
     2. Determine target scope: positional arg > .strata-role discovery > picker.
     3. Resolve skill from scope declaration (ADR 0002 resolution table).
@@ -686,6 +722,14 @@ def cmd_launch(args: argparse.Namespace) -> int:
     5. execvp("claude", ...) with STRATA_AGENT_* env vars.
     """
     import httpx
+
+    # -----------------------------------------------------------------------
+    # Step 0: Preflight.
+    # -----------------------------------------------------------------------
+    if not args.skip_preflight:
+        rc = _run_preflight(run_launch_preflight())
+        if rc != 0:
+            return rc
 
     interactive = is_interactive()
 
@@ -827,6 +871,12 @@ def _build_parser() -> argparse.ArgumentParser:
             "run `strata export-fleet`, or on a fresh install."
         ),
     )
+    p_start.add_argument(
+        "--skip-preflight",
+        action="store_true",
+        dest="skip_preflight",
+        help="Bypass all preflight prerequisite checks.",
+    )
     p_start.set_defaults(func=cmd_start)
 
     p_migrate = sub.add_parser("migrate", help="Apply pending SQLite migrations.")
@@ -874,6 +924,12 @@ def _build_parser() -> argparse.ArgumentParser:
             "Skip the pre-session manager-refresh step (ADR 0004 D4). "
             "Use when the API key is unavailable or for debugging."
         ),
+    )
+    p_launch.add_argument(
+        "--skip-preflight",
+        action="store_true",
+        dest="skip_preflight",
+        help="Bypass all preflight prerequisite checks.",
     )
     p_launch.set_defaults(func=cmd_launch)
 
