@@ -33,6 +33,9 @@ dev = [
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/strata"]
+include = [
+    "src/strata/_skills/**/*",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
