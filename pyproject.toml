@@ -19,6 +19,7 @@ dependencies = [
 
 [project.scripts]
 strata = "strata.__main__:main"
+strata-mcp = "strata.mcp.server:main"
 
 [project.optional-dependencies]
 cc-plugin = [
@@ -32,12 +33,16 @@ dev = [
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/strata"]
+include = [
+    "src/strata/_skills/**/*",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
 markers = [
     "integration: tests that hit external services (e.g. real Anthropic API). Skipped unless STRATA_RUN_INTEGRATION=1.",
+    "slow: slow tests (e.g. --bootstrap-venv requires network). Skipped unless STRATA_RUN_BOOTSTRAP_VENV=1.",
 ]
 
 [tool.ruff]

@@ -1,0 +1,24 @@
+# Strata fleet configuration — minimal starter
+# TODO: replace with your team's structure
+#
+# This file was seeded by `strata register`. It defines:
+#   - strata: horizontal layers (L0 = root/executive, higher ordinal = more specific)
+#   - scopes: bounded regions for memory (one per team/role/service)
+#   - edges:  parent-child relationships between scopes across strata
+#
+# Keep this file in version control — it is your team's org chart for Strata.
+# See docs/adr/0002-fleet-config-source-of-truth.md for the full schema.
+
+strata:
+  - id: L0
+    name: root
+    ordinal: 0
+
+scopes:
+  - id: g_root
+    name: Root
+    stratum_id: L0
+    default_skill: strata-worker
+    permitted_skills: []
+
+edges: []
