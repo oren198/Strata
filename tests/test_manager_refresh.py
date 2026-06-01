@@ -590,3 +590,110 @@ def test_cmd_launch_stale_chain_triggers_refresh(
     # judge should have been called for g_child (stale) — g_root has no parent
     # so it won't be stale, but g_child should be refreshed
     assert "g_child" in judge_calls, f"Expected g_child in judge calls: {judge_calls}"
+
+
+# ---------------------------------------------------------------------------
+# Test 7 — Regression: deleted parent summary must not crash refresh
+# ---------------------------------------------------------------------------
+
+
+def test_refresh_does_not_crash_when_parent_summary_deleted(
+    tmp_path: Path,
+) -> None:
+    """Regression for the latent AttributeError at __main__.py:498 (PR #31 review).
+
+    Reachable path: child has a summary on disk with parent_version stamped
+    (non-None), but the parent's summary file has been deleted (manual cleanup,
+    storage reset, etc.).  When ``_refresh_scope`` is called for the child
+    directly (e.g. via the cascade inside another refresh), the previous code
+    would call ``_is_stale(my_summary, parent_summary=None)`` and dereference
+    ``parent_summary.version`` — crashing with AttributeError before the
+    recovery path could even fire. The fix is the ``parent_summary is not
+    None`` short-circuit in the ``already_fresh`` expression.
+    """
+    from strata.__main__ import _refresh_scope
+    from strata.fleet_config import FleetConfig
+    from strata.migrator import run_migrations
+    from strata.record_store import RecordStore
+    from strata.scope_manager import ScopeManagerJudgment
+    from strata.summary_store import ScopeSummary, SummaryStore
+
+    fleet_yaml = tmp_path / "fleet.yaml"
+    fleet_yaml.write_text(
+        textwrap.dedent("""
+            strata:
+              - id: L0
+                name: Root
+                ordinal: 0
+              - id: L1
+                name: Child
+                ordinal: 1
+            scopes:
+              - id: g_root
+                name: Root Scope
+                stratum_id: L0
+              - id: g_child
+                name: Child Scope
+                stratum_id: L1
+            edges:
+              - from: g_child
+                to: g_root
+        """),
+        encoding="utf-8",
+    )
+
+    db_path = str(tmp_path / "test.db")
+    summaries_dir_path = tmp_path / "summaries"
+    run_migrations(db_path)
+
+    ss = SummaryStore(str(summaries_dir_path))
+
+    # Write g_child with a non-None parent_version stamp.  g_root has NO
+    # summary on disk (simulates manual deletion / fresh-storage state) —
+    # this is the precise input shape that crashes the buggy code.
+    child_summary = ScopeSummary(
+        scope_id="g_child",
+        directives=[],
+        context="Child context.",
+        updated_at="2026-05-31T10:00:00Z",
+        version=1,
+        parent_version=2,
+    )
+    ss.write("g_child", child_summary)
+
+    fleet_config = FleetConfig.load(fleet_yaml)
+
+    def fake_judge(**kwargs: Any) -> ScopeManagerJudgment:
+        scope_id = kwargs["scope"].id
+        return ScopeManagerJudgment(
+            decision="accept_as_context",
+            reasoning="Test refresh.",
+            new_summary=ScopeSummary(
+                scope_id=scope_id,
+                directives=[],
+                context=f"Refreshed context for {scope_id}.",
+                updated_at="2026-05-31T12:00:00Z",
+            ),
+        )
+
+    mock_manager = MagicMock()
+    mock_manager.judge.side_effect = fake_judge
+
+    with RecordStore(db_path) as record_store:
+        # Must not raise AttributeError (regression). On the buggy code,
+        # `_is_stale(child_summary, parent_summary=None)` crashed before the
+        # recovery path could fire.
+        _refresh_scope(
+            "g_child",
+            fleet_config=fleet_config,
+            record_store=record_store,
+            summary_store=ss,
+            manager=mock_manager,
+            summary_max_words=500,
+        )
+
+    # The recovery path should have refreshed the parent first, then the child.
+    judge_scopes = [call.kwargs["scope"].id for call in mock_manager.judge.call_args_list]
+    assert "g_child" in judge_scopes, (
+        f"Expected g_child refresh after the deleted-parent-summary recovery: {judge_scopes}"
+    )

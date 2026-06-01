@@ -495,9 +495,18 @@ def _refresh_scope(
         parent_summary = summary_store.read(parent_scope.id)
         my_summary = summary_store.read(scope_id)
 
-        already_fresh = my_summary is not None and not _is_stale(my_summary, parent_summary)
+        # `parent_summary is not None` MUST come first — `_is_stale`'s signature
+        # requires a non-None parent_summary. Without the short-circuit, a child
+        # whose parent_version stamp is non-None but whose parent summary has
+        # been deleted from disk would crash with AttributeError.
+        already_fresh = (
+            parent_summary is not None
+            and my_summary is not None
+            and not _is_stale(my_summary, parent_summary)
+        )
         if parent_summary is None or already_fresh:
-            # Parent exists and my summary is up-to-date → no need to recurse further
+            # Either parent has no on-disk summary yet, or my summary is already
+            # fresh against the parent's current version → no need to recurse.
             pass
         else:
             # Parent is missing or my summary is stale → refresh parent first
