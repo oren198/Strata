@@ -64,13 +64,19 @@ def test_strata_mcp_server_module_importable() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_strata_mcp_console_script_on_path() -> None:
-    """``strata-mcp`` must be resolvable via shutil.which after pip install -e."""
-    import shutil
+def test_strata_mcp_console_script_alongside_python() -> None:
+    """``strata-mcp`` must install into the same bin dir as the running Python.
 
-    path = shutil.which("strata-mcp")
-    assert path is not None, (
-        "strata-mcp not found on PATH. "
+    We test the entry point via the *installing Python's* bin dir rather than
+    the ambient ``PATH``. ``shutil.which`` searches ``PATH`` and returns ``None``
+    in a fresh venv that hasn't been activated (e.g. CI invoking
+    ``/path/to/venv/bin/pytest`` directly without sourcing ``activate``), even
+    though the console script is correctly installed. We want to verify the
+    pyproject ``[project.scripts]`` wiring, not coincidental PATH state.
+    """
+    script = Path(sys.executable).parent / "strata-mcp"
+    assert script.is_file(), (
+        f"strata-mcp not installed alongside {sys.executable}. "
         "Run `pip install -e '.[dev,cc-plugin]'` to install the console script."
     )
 

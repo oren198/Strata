@@ -864,6 +864,31 @@ _GITIGNORE_BLOCK = """\
 #: Minimal settings.json merge entry.
 _MCP_ENTRY: dict = {"command": "strata-mcp", "env": {}}
 
+
+def _is_v1_2_shape_mcp_entry(entry: dict) -> bool:
+    """Return True if *entry* matches a known-stale V1.2 mcpServer shape.
+
+    V1.2 settings shipped:
+      command: python
+      args: ["-m", "mcp_server.strata_mcp"]
+      env: { "STRATA_BACKEND_URL": "...", ... }
+
+    All three of those break on V1.3:
+    - mcp_server is no longer a top-level module (folded into strata.mcp).
+    - STRATA_BACKEND_URL is no longer consumed (embedded mode, ADR 0004 D1).
+
+    We only need to recognise *any* of these signals to warn.
+    """
+    if entry.get("command") == "python":
+        args = entry.get("args") or []
+        if isinstance(args, list) and "-m" in args:
+            tail = args[args.index("-m") + 1 :]
+            if tail and "mcp_server" in tail[0]:
+                return True
+    env = entry.get("env") or {}
+    return isinstance(env, dict) and "STRATA_BACKEND_URL" in env
+
+
 #: Default .strata/config.toml content.
 _CONFIG_TOML = """\
 # Strata per-project configuration — managed by `strata register`.
@@ -909,6 +934,24 @@ def cmd_register(args: argparse.Namespace) -> int:
         print(
             f"Not a project root — register from a directory containing one of: {markers_str}\n"
             f"(checked: {project_root})",
+            file=sys.stderr,
+        )
+        return 1
+
+    # -----------------------------------------------------------------------
+    # Step 1b: .strata/ sanity check (ADR 0005 Decision 4).
+    #
+    # Before any action, if .strata/ exists but lacks config.toml, refuse to
+    # proceed.  Prevents silently writing into a foreign tool's directory and
+    # prevents register from running against a half-initialised state from
+    # an interrupted prior register.
+    # -----------------------------------------------------------------------
+    candidate_strata = project_root / ".strata"
+    if candidate_strata.exists() and not (candidate_strata / "config.toml").exists():
+        print(
+            f"Existing .strata/ directory at {candidate_strata} does not look like a Strata "
+            f"workspace (no config.toml).\n"
+            f"Please remove or rename it before running `strata register`.",
             file=sys.stderr,
         )
         return 1
@@ -1028,6 +1071,34 @@ def cmd_register(args: argparse.Namespace) -> int:
     mcp_servers: dict = settings_data.get("mcpServers", {})
     if "strata" in mcp_servers:
         _act("skip", settings_json, skipped=True)
+        # Stale-shape detection (ADR 0005 Decision 6): warn if the existing
+        # strata mcpServer entry is V1.2-shape (broken on V1.3). Keeps the
+        # strict-additive contract — we never overwrite — but surfaces the
+        # upgrade-path issue at register time, when the user is in fix-mind.
+        existing = mcp_servers["strata"]
+        if isinstance(existing, dict) and _is_v1_2_shape_mcp_entry(existing):
+            print(
+                "  ⚠ WARNING: your existing strata mcpServer entry is V1.2-shape and will silently",
+                file=sys.stderr,
+            )
+            print(
+                "    fail on V1.3 (the `mcp_server` Python module no longer exists; "
+                "`STRATA_BACKEND_URL` is unused).",
+                file=sys.stderr,
+            )
+            print(
+                f"    The canonical V1.3 entry is: {json.dumps(_MCP_ENTRY)}",
+                file=sys.stderr,
+            )
+            print(
+                "    Strata never overwrites your settings — run `strata register --diff` to "
+                "see the canonical,",
+                file=sys.stderr,
+            )
+            print(
+                "    then update .claude/settings.json by hand.",
+                file=sys.stderr,
+            )
     else:
         mcp_servers["strata"] = _MCP_ENTRY
         settings_data["mcpServers"] = mcp_servers
@@ -1045,9 +1116,26 @@ def cmd_register(args: argparse.Namespace) -> int:
         if venv_dir.exists():
             print("  .strata/.venv/ already exists — skipping venv creation")
         else:
+            # Python discovery (ADR 0005 Decision 7).
+            #
+            # `python -m venv` itself requires a Python ≥ 3.11 interpreter.
+            # Strata's own runtime is already ≥ 3.11 (per pyproject.toml's
+            # requires-python), so sys.executable is the right default.
+            # --python is the escape hatch for the rare case where the user
+            # wants to seed the venv with a different interpreter than the
+            # one running register.
+            python_arg: str | None = getattr(args, "python", None)
+            venv_python = python_arg if python_arg else sys.executable
+
             if not diff_mode:
-                print("  creating .strata/.venv/ ...")
-                venv.create(str(venv_dir), with_pip=True, clear=False)
+                print(f"  creating .strata/.venv/ using {venv_python} ...")
+                # Use the chosen Python to drive `venv` if it isn't us.
+                if venv_python == sys.executable:
+                    venv.create(str(venv_dir), with_pip=True, clear=False)
+                else:
+                    subprocess.check_call(
+                        [venv_python, "-m", "venv", str(venv_dir)],
+                    )
                 pip = venv_dir / "bin" / "pip"
                 subprocess.check_call(
                     [str(pip), "install", "--quiet", "strata[cc-plugin]"],
@@ -1055,23 +1143,24 @@ def cmd_register(args: argparse.Namespace) -> int:
                 print("  installed strata into .strata/.venv/")
 
                 # Update settings.json to use absolute path.
-                if not diff_mode:
-                    settings_data_venv: dict
-                    if settings_json.exists():
-                        settings_data_venv = json.loads(settings_json.read_text(encoding="utf-8"))
-                    else:
-                        settings_data_venv = {}
-                    mcp_venv = settings_data_venv.get("mcpServers", {})
-                    mcp_venv["strata"] = {
-                        "command": str(venv_strata_mcp),
-                        "env": {},
-                    }
-                    settings_data_venv["mcpServers"] = mcp_venv
-                    (project_root / ".claude").mkdir(parents=True, exist_ok=True)
-                    settings_json.write_text(
-                        json.dumps(settings_data_venv, indent=2) + "\n", encoding="utf-8"
-                    )
-                    print(f"  updated .claude/settings.json to use {venv_strata_mcp}")
+                # (Outer `if not diff_mode:` at L1048 guarantees we're in
+                # write-mode here — no inner check needed.)
+                settings_data_venv: dict
+                if settings_json.exists():
+                    settings_data_venv = json.loads(settings_json.read_text(encoding="utf-8"))
+                else:
+                    settings_data_venv = {}
+                mcp_venv = settings_data_venv.get("mcpServers", {})
+                mcp_venv["strata"] = {
+                    "command": str(venv_strata_mcp),
+                    "env": {},
+                }
+                settings_data_venv["mcpServers"] = mcp_venv
+                (project_root / ".claude").mkdir(parents=True, exist_ok=True)
+                settings_json.write_text(
+                    json.dumps(settings_data_venv, indent=2) + "\n", encoding="utf-8"
+                )
+                print(f"  updated .claude/settings.json to use {venv_strata_mcp}")
             else:
                 print("  [would create] .strata/.venv/ and pip install strata")
 
@@ -1236,6 +1325,18 @@ def _build_parser() -> argparse.ArgumentParser:
             "Create .strata/.venv/ with strata installed and update "
             ".claude/settings.json to use the absolute venv path. "
             "Use when pipx is not available or strata-mcp is not on PATH."
+        ),
+    )
+    p_register.add_argument(
+        "--python",
+        dest="python",
+        default=None,
+        help=(
+            "Path to a Python ≥ 3.11 interpreter used to seed the bootstrap venv. "
+            "Only relevant with --bootstrap-venv. Defaults to the running "
+            "interpreter when it is itself ≥ 3.11; otherwise the user must "
+            "supply this flag explicitly. Strata cannot create a 3.11 venv from a "
+            "3.10 interpreter."
         ),
     )
     p_register.set_defaults(func=cmd_register)

@@ -17,6 +17,7 @@ Vocabulary: scope, fleet, skill, scope-manager.
 
 from __future__ import annotations
 
+import argparse
 import json
 import sys
 from pathlib import Path
@@ -425,3 +426,136 @@ def test_register_in_parser() -> None:
     with pytest.raises(SystemExit) as exc_info:
         parser.parse_args(["register", "--help"])
     assert exc_info.value.code == 0
+
+
+# ---------------------------------------------------------------------------
+# Test 12: .strata/ collision check (ADR 0005 Decision 4 / PR #30 review)
+# ---------------------------------------------------------------------------
+
+
+def test_existing_strata_dir_without_config_toml_rejected(tmp_path: Path, capsys) -> None:
+    """If .strata/ exists but lacks config.toml, register refuses (not a Strata workspace).
+
+    Prevents silently writing into a foreign tool's directory and prevents
+    register from running against a half-initialised state from an interrupted
+    prior register.
+    """
+    (tmp_path / "pyproject.toml").write_text("[project]\nname = 'x'\n", encoding="utf-8")
+    # Create .strata/ with content that does NOT look like a Strata workspace.
+    strata_dir = tmp_path / ".strata"
+    strata_dir.mkdir()
+    (strata_dir / "some-other-tool.txt").write_text("not strata", encoding="utf-8")
+
+    args = argparse.Namespace(path=str(tmp_path), diff=False, bootstrap_venv=False, python=None)
+    rc = cmd_register(args)
+
+    assert rc == 1
+    captured = capsys.readouterr()
+    assert "does not look like a Strata workspace" in captured.err
+    # Nothing else should have been written.
+    assert not (strata_dir / "config.toml").exists()
+    assert not (tmp_path / ".claude").exists()
+
+
+def test_existing_strata_dir_with_config_toml_proceeds(tmp_path: Path) -> None:
+    """If .strata/ already has config.toml, register proceeds (idempotent re-run)."""
+    (tmp_path / "pyproject.toml").write_text("[project]\nname = 'x'\n", encoding="utf-8")
+    strata_dir = tmp_path / ".strata"
+    strata_dir.mkdir()
+    (strata_dir / "config.toml").write_text(
+        'db = ".strata/strata.db"\nfleet_yaml = ".strata/fleet.yaml"\n'
+        'summaries_dir = ".strata/summaries"\n',
+        encoding="utf-8",
+    )
+
+    args = argparse.Namespace(path=str(tmp_path), diff=False, bootstrap_venv=False, python=None)
+    rc = cmd_register(args)
+
+    assert rc == 0
+
+
+# ---------------------------------------------------------------------------
+# Test 13: V1.2-shape mcpServers entry detection (ADR 0005 Decision 6)
+# ---------------------------------------------------------------------------
+
+
+def test_v1_2_shape_mcp_entry_warns(tmp_path: Path, capsys) -> None:
+    """Existing V1.2-shape mcpServers.strata entry → register warns about staleness.
+
+    The strict-additive contract holds: register does not overwrite. But it
+    surfaces the upgrade-path issue (V1.2 `python -m mcp_server.strata_mcp` +
+    `STRATA_BACKEND_URL` env block is broken on V1.3) at register time, when
+    the user is in fix-mind.
+    """
+    (tmp_path / "pyproject.toml").write_text("[project]\nname = 'x'\n", encoding="utf-8")
+    settings_dir = tmp_path / ".claude"
+    settings_dir.mkdir()
+    settings_json = settings_dir / "settings.json"
+    # Stale V1.2-shape entry.
+    settings_json.write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "strata": {
+                        "command": "python",
+                        "args": ["-m", "mcp_server.strata_mcp"],
+                        "env": {"STRATA_BACKEND_URL": "http://127.0.0.1:8000"},
+                    }
+                }
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    args = argparse.Namespace(path=str(tmp_path), diff=False, bootstrap_venv=False, python=None)
+    rc = cmd_register(args)
+
+    assert rc == 0
+    captured = capsys.readouterr()
+    err = captured.err
+    assert "V1.2-shape" in err, "expected stale-shape warning"
+    assert "strata register --diff" in err, "expected --diff hint"
+    # Strict-additive: the user's V1.2-shape entry is NOT overwritten.
+    on_disk = json.loads(settings_json.read_text(encoding="utf-8"))
+    assert on_disk["mcpServers"]["strata"]["command"] == "python", (
+        "register must not overwrite user's stale mcpServer entry"
+    )
+
+
+def test_v3_shape_mcp_entry_no_warning(tmp_path: Path, capsys) -> None:
+    """Canonical V1.3-shape mcpServers.strata entry → no V1.2 stale warning."""
+    (tmp_path / "pyproject.toml").write_text("[project]\nname = 'x'\n", encoding="utf-8")
+    settings_dir = tmp_path / ".claude"
+    settings_dir.mkdir()
+    settings_json = settings_dir / "settings.json"
+    settings_json.write_text(
+        json.dumps({"mcpServers": {"strata": {"command": "strata-mcp", "env": {}}}}, indent=2),
+        encoding="utf-8",
+    )
+
+    args = argparse.Namespace(path=str(tmp_path), diff=False, bootstrap_venv=False, python=None)
+    rc = cmd_register(args)
+
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert "V1.2-shape" not in captured.err
+
+
+# ---------------------------------------------------------------------------
+# Test 14: --python flag for --bootstrap-venv (ADR 0005 Decision 7)
+# ---------------------------------------------------------------------------
+
+
+def test_python_flag_in_parser() -> None:
+    """'strata register --python /path' is accepted by the parser."""
+    parser = _build_parser()
+    args = parser.parse_args(["register", "--python", "/usr/bin/python3.11"])
+    assert args.python == "/usr/bin/python3.11"
+
+
+def test_python_flag_default_is_none() -> None:
+    """When --python is not passed, args.python defaults to None (use sys.executable)."""
+    parser = _build_parser()
+    args = parser.parse_args(["register"])
+    assert args.python is None

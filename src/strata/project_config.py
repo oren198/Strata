@@ -88,7 +88,11 @@ class ProjectConfig(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-def load_project_config(start: Path | None = None) -> ProjectConfig | None:
+def load_project_config(
+    start: Path | None = None,
+    *,
+    searched_paths_out: list[Path] | None = None,
+) -> ProjectConfig | None:
     """Walk up from *start* (default: cwd) looking for ``.strata/config.toml``.
 
     Returns :data:`None` if no config is found anywhere up to the filesystem
@@ -100,8 +104,12 @@ def load_project_config(start: Path | None = None) -> ProjectConfig | None:
             TOML or is missing required fields.
 
     Args:
-        start: Directory from which to begin the walk.  Defaults to the
-               current working directory.
+        start:              Directory from which to begin the walk.  Defaults
+                            to the current working directory.
+        searched_paths_out: When provided, populated with every
+                            ``.strata/config.toml`` path the loader examined
+                            during the walk.  Useful for error messages that
+                            need to show the user where the loader looked.
     """
     if start is None:
         start = Path.cwd()
@@ -110,6 +118,8 @@ def load_project_config(start: Path | None = None) -> ProjectConfig | None:
 
     while True:
         candidate = current / ".strata" / "config.toml"
+        if searched_paths_out is not None:
+            searched_paths_out.append(candidate)
         if candidate.exists():
             return _parse_config(candidate, project_root=current)
 

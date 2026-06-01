@@ -285,20 +285,26 @@ def test_happy_path_with_empty_permitted_skills_no_exit(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_condition_1_checked_before_condition_2(tmp_path: Path, capsys) -> None:
-    """Config-not-found (condition 1) error fires even when scope is also empty."""
-    fleet = _make_fleet_with_skills(tmp_path)
+def test_all_failures_reported_in_single_error(tmp_path: Path, capsys) -> None:
+    """Per ADR 0005 Decision 5: all validation failures are reported in a
+    single error message before exit, not first-failure-wins.
 
+    A user with three missing pieces (no config, no scope env, no skill env)
+    sees the complete remediation list in one pass.
+    """
     with pytest.raises(SystemExit) as exc_info:
         _validate_binding(
-            fleet,
-            scope="",  # also missing
+            None,  # No fleet because no config (mirrors main() behaviour)
+            scope="",
             skill="",
-            project_config_found=False,  # this should fire first
+            project_config_found=False,
         )
 
     assert exc_info.value.code == 1
     captured = capsys.readouterr()
-    # The message should be about config not found, not about scope not set
-    assert "strata register" in captured.err
-    assert "export STRATA_AGENT_SCOPE" not in captured.err
+    # All three remediations appear in the same message.
+    assert "strata register" in captured.err, "missing config remediation"
+    assert "export STRATA_AGENT_SCOPE" in captured.err, "missing scope remediation"
+    assert "export STRATA_AGENT_SKILL" in captured.err, "missing skill remediation"
+    # The header announces the failure count.
+    assert "3 validation failures" in captured.err
