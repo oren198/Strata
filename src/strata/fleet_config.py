@@ -302,7 +302,7 @@ class FleetConfig(BaseModel):
 
 
 def _validate(config: FleetConfig) -> None:
-    """Validate all 8 load-time invariants from ADR 0002.
+    """Validate all load-time invariants from ADR 0002 (8 original) and ADR 0004 (1 new).
 
     Raises :class:`FleetConfigError` on the first failure.
     """
@@ -402,6 +402,30 @@ def _validate(config: FleetConfig) -> None:
                 message=(
                     f"Scope {scope.id!r}: default_skill {scope.default_skill!r} "
                     f"is not in permitted_skills {scope.permitted_skills!r}."
+                ),
+            )
+
+    # 9. Each scope may have at most one inter-stratum-parent edge (i.e. at
+    #    most one outgoing edge whose target has a strictly lower stratum
+    #    ordinal).  Multiple such edges would create ambiguity about which
+    #    scope carries the authoritative parent perspective (ADR 0004 D4).
+    inter_stratum_parent_count: dict[str, int] = {}
+    for edge in config.edges:
+        from_scope = scope_map[edge.from_]
+        to_scope = scope_map[edge.to]
+        from_ordinal = stratum_map[from_scope.stratum_id].ordinal
+        to_ordinal = stratum_map[to_scope.stratum_id].ordinal
+        if to_ordinal < from_ordinal:
+            inter_stratum_parent_count[edge.from_] = (
+                inter_stratum_parent_count.get(edge.from_, 0) + 1
+            )
+    for scope_id, count in inter_stratum_parent_count.items():
+        if count > 1:
+            raise FleetConfigError(
+                kind="multiple_inter_stratum_parents",
+                message=(
+                    f"Scope {scope_id!r} has {count} inter-stratum-parent edges; "
+                    "each scope may have at most one."
                 ),
             )
 

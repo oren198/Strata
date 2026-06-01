@@ -124,6 +124,12 @@ When a PARENT SCOPE SUMMARY is provided in the user message:
 - Do not copy directives from the parent that are already listed in the
   current summary — preserve them as-is.
 
+When a BUDGET is given in the user message:
+- Directives are never trimmed below visibility — each directive must
+  remain complete and individually identifiable in the rewritten summary.
+- The context section absorbs the squeeze: condense or abbreviate context
+  prose to stay within the budget while keeping all directives intact.
+
 You must call the `submit_judgment` tool exactly once and provide a
 one-or-two-sentence reasoning. When declining, set `new_summary` to null.\
 """
@@ -177,6 +183,7 @@ def _build_user_message(
     current_summary: ScopeSummary | None,
     recent_contributions: list[Contribution],
     new_contribution: Contribution,
+    summary_max_words: int = 500,
 ) -> str:
     """Compose the (non-cached) per-call user message."""
     if current_summary is not None:
@@ -192,10 +199,13 @@ def _build_user_message(
         rendered_parent = _render_summary(parent_summary)
         parent_block = f"PARENT SCOPE SUMMARY (inherited)\n---\n{rendered_parent}\n---\n\n"
 
+    budget_line = f"BUDGET: your rewritten summary must be at most {summary_max_words} words.\n\n"
+
     return (
         f"SCOPE: {scope.name} (id={scope.id})\n"
         f"STRATUM: {stratum.name} (ordinal={stratum.ordinal})\n"
         "\n"
+        f"{budget_line}"
         f"{parent_block}"
         "CURRENT SUMMARY\n"
         "---\n"
@@ -256,6 +266,7 @@ class ScopeManager:
         current_summary: ScopeSummary | None,
         recent_contributions: list[Contribution],
         new_contribution: Contribution,
+        summary_max_words: int = 500,
     ) -> ScopeManagerJudgment:
         """Judge a new contribution against the scope's current state.
 
@@ -277,6 +288,10 @@ class ScopeManager:
                                   (oldest-first) providing trend/context to
                                   the model.
             new_contribution:     The contribution to be judged.
+            summary_max_words:    Maximum word count for the rewritten summary
+                                  (ADR 0004 D5).  Rendered as a BUDGET line in
+                                  the user message; the LLM enforces the limit.
+                                  Defaults to 500.
 
         Returns:
             A :class:`ScopeManagerJudgment` with the verdict, reasoning, and
@@ -295,6 +310,7 @@ class ScopeManager:
             current_summary=current_summary,
             recent_contributions=recent_contributions,
             new_contribution=new_contribution,
+            summary_max_words=summary_max_words,
         )
 
         # Build the system prompt with cache_control on the last text block

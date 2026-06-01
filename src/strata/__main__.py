@@ -56,6 +56,13 @@ import shutil
 import sqlite3
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from strata.fleet_config import FleetConfig
+    from strata.record_store import RecordStore
+    from strata.scope_manager import ScopeManager
+    from strata.summary_store import ScopeSummary, SummaryStore
 
 from strata import __version__
 from strata.launch import (
@@ -426,14 +433,265 @@ def cmd_export_fleet(args: argparse.Namespace) -> int:
     return 0
 
 
+def _is_stale(summary: ScopeSummary, parent_summary: ScopeSummary) -> bool:
+    """Return True when *summary* was built from an older parent version.
+
+    A summary is stale when its ``parent_version`` stamp is less than the
+    parent scope's current ``version`` stamp.  A missing ``parent_version``
+    (``None``) is treated as stale so that legacy summaries without stamps
+    get refreshed on the next launch.
+    """
+    if summary.parent_version is None:
+        return True
+    return summary.parent_version < parent_summary.version
+
+
+def _refresh_scope(
+    scope_id: str,
+    *,
+    fleet_config: FleetConfig,
+    record_store: RecordStore,
+    summary_store: SummaryStore,
+    manager: ScopeManager,
+    summary_max_words: int,
+    _visited: set[str] | None = None,
+) -> None:
+    """Refresh the summary for *scope_id* via one scope-manager LLM call.
+
+    Recursively refreshes stale ancestors first (root-first order).  Uses a
+    ``_visited`` set to guard against cycles (which validation prevents, but
+    this is defensive).
+
+    ADR 0004 Decision 4 — last-write-wins; no lock.
+    """
+    from datetime import UTC, datetime
+
+    from strata.record_store import Contribution, ContributorRef
+
+    if _visited is None:
+        _visited = set()
+    if scope_id in _visited:
+        return
+    _visited.add(scope_id)
+
+    scope = fleet_config.get_scope(scope_id)
+    if scope is None:
+        print(
+            f"  [refresh] scope {scope_id!r} not found in fleet config — skipping",
+            file=sys.stderr,
+        )
+        return
+
+    stratum_map = {s.id: s for s in fleet_config.strata}
+    stratum = stratum_map.get(scope.stratum_id)
+    if stratum is None:
+        return
+
+    # Resolve inter-stratum parent
+    parent_scope = fleet_config.inter_stratum_parent(scope_id)
+
+    # If there is a parent, ensure it is fresh first (recursive bottom-out at L0)
+    if parent_scope is not None:
+        parent_summary = summary_store.read(parent_scope.id)
+        my_summary = summary_store.read(scope_id)
+
+        # `parent_summary is not None` MUST come first — `_is_stale`'s signature
+        # requires a non-None parent_summary. Without the short-circuit, a child
+        # whose parent_version stamp is non-None but whose parent summary has
+        # been deleted from disk would crash with AttributeError.
+        already_fresh = (
+            parent_summary is not None
+            and my_summary is not None
+            and not _is_stale(my_summary, parent_summary)
+        )
+        if parent_summary is None or already_fresh:
+            # Either parent has no on-disk summary yet, or my summary is already
+            # fresh against the parent's current version → no need to recurse.
+            pass
+        else:
+            # Parent is missing or my summary is stale → refresh parent first
+            _refresh_scope(
+                parent_scope.id,
+                fleet_config=fleet_config,
+                record_store=record_store,
+                summary_store=summary_store,
+                manager=manager,
+                summary_max_words=summary_max_words,
+                _visited=_visited,
+            )
+
+        # Re-read parent summary after potential refresh
+        parent_summary = summary_store.read(parent_scope.id)
+    else:
+        parent_summary = None
+
+    # Now refresh this scope
+    current_summary = summary_store.read(scope_id)
+    recent_contributions = record_store.list_contributions(scope_id=scope_id, limit=20)
+
+    # Build a synthetic "refresh" contribution that requests a summary rewrite.
+    # We use a ContributorRef representing the manager itself.
+    ts = datetime.now(tz=UTC).isoformat()
+    refresh_contribution = Contribution(
+        id=f"refresh_{scope_id}_{ts}",
+        scope_id=scope_id,
+        content=(
+            "[Manager refresh triggered by strata launch"
+            " — rewrite summary incorporating current state.]"
+        ),
+        proposed_classification="context",
+        subject="manager-refresh",
+        supersedes=None,
+        contributor=ContributorRef(
+            scope_id=scope_id,
+            skill="scope-manager",
+            session_id="refresh",
+            ts=ts,
+        ),
+        created_at=ts,
+    )
+
+    print(f"  [refresh] refreshing scope {scope_id!r}...", file=sys.stderr)
+    judgment = manager.judge(
+        scope=scope,
+        stratum=stratum,
+        parent_summary=parent_summary,
+        current_summary=current_summary,
+        recent_contributions=recent_contributions,
+        new_contribution=refresh_contribution,
+        summary_max_words=summary_max_words,
+    )
+
+    if judgment.new_summary is not None:
+        # Stamp the parent_version before writing
+        parent_ver = parent_summary.version if parent_summary is not None else None
+        to_write = judgment.new_summary.model_copy(update={"parent_version": parent_ver})
+        summary_store.write(scope_id, to_write)
+        print(f"  [refresh] scope {scope_id!r} summary updated", file=sys.stderr)
+
+
+def _run_manager_refresh(scope_id: str, *, skip: bool = False) -> None:
+    """Run the pre-session manager-refresh step for *scope_id*.
+
+    Walks the inter-stratum ancestor chain (root-first), refreshes any stale
+    ancestors, then refreshes *scope_id* itself.  Skipped when:
+
+    - ``skip`` is True (``--skip-refresh`` flag).
+    - No ``ANTHROPIC_API_KEY`` is available (soft — prints a warning).
+    - Any ancestor/scope is missing from the fleet config (non-fatal warning).
+
+    ADR 0004 Decision 4 — last-write-wins, no lock.
+    """
+    import anthropic
+
+    from strata.fleet_config import FleetConfig
+    from strata.record_store import RecordStore
+    from strata.scope_manager import ScopeManager
+    from strata.settings import get_settings
+    from strata.summary_store import SummaryStore
+
+    if skip:
+        return
+
+    settings = get_settings()
+
+    if not settings.anthropic_api_key:
+        print(
+            "  [refresh] ANTHROPIC_API_KEY not set — skipping manager refresh",
+            file=sys.stderr,
+        )
+        return
+
+    fleet_yaml = _fleet_config_default()
+    if not Path(fleet_yaml).exists():
+        print(
+            f"  [refresh] fleet config not found at {fleet_yaml!r} — skipping manager refresh",
+            file=sys.stderr,
+        )
+        return
+
+    try:
+        fleet_config = FleetConfig.load(Path(fleet_yaml))
+    except Exception as exc:
+        print(
+            f"  [refresh] cannot load fleet config: {exc} — skipping manager refresh",
+            file=sys.stderr,
+        )
+        return
+
+    db_path = settings.db_path
+    summaries_dir = settings.summaries_dir
+
+    client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
+    manager = ScopeManager(client=client, model=settings.manager_model)
+
+    with RecordStore(db_path) as record_store:
+        summary_store = SummaryStore(summaries_dir)
+
+        # Walk ancestors root-first; refresh stale ones first, then the target scope.
+        ancestors = fleet_config.inter_stratum_ancestors(scope_id)
+
+        visited: set[str] = set()
+        # Refresh stale ancestors (root-first)
+        for ancestor in ancestors:
+            ancestor_summary = summary_store.read(ancestor.id)
+            if ancestor_summary is None:
+                # No existing summary — refresh it
+                _refresh_scope(
+                    ancestor.id,
+                    fleet_config=fleet_config,
+                    record_store=record_store,
+                    summary_store=summary_store,
+                    manager=manager,
+                    summary_max_words=settings.summary_max_words,
+                    _visited=visited,
+                )
+            else:
+                # Check if this ancestor is stale relative to its own parent
+                ancestor_parent = fleet_config.inter_stratum_parent(ancestor.id)
+                if ancestor_parent is not None:
+                    ap_summary = summary_store.read(ancestor_parent.id)
+                    if ap_summary is not None and _is_stale(ancestor_summary, ap_summary):
+                        _refresh_scope(
+                            ancestor.id,
+                            fleet_config=fleet_config,
+                            record_store=record_store,
+                            summary_store=summary_store,
+                            manager=manager,
+                            summary_max_words=settings.summary_max_words,
+                            _visited=visited,
+                        )
+
+        # Refresh the target scope itself
+        my_summary = summary_store.read(scope_id)
+        parent_scope = fleet_config.inter_stratum_parent(scope_id)
+        parent_summary = summary_store.read(parent_scope.id) if parent_scope is not None else None
+
+        needs_refresh = my_summary is None or (
+            parent_summary is not None and _is_stale(my_summary, parent_summary)
+        )
+        if needs_refresh:
+            _refresh_scope(
+                scope_id,
+                fleet_config=fleet_config,
+                record_store=record_store,
+                summary_store=summary_store,
+                manager=manager,
+                summary_max_words=settings.summary_max_words,
+                _visited=visited,
+            )
+
+
 def cmd_launch(args: argparse.Namespace) -> int:
     """Validate scope, resolve skill, and exec ``claude`` with STRATA_AGENT_* set.
 
-    Steps (per ADR 0003):
+    Steps (per ADR 0003 + ADR 0004 D4):
     1. Fetch active scopes from GET /scopes; fail fast if backend unreachable.
     2. Determine target scope: positional arg > .strata-role discovery > picker.
     3. Resolve skill from scope declaration (ADR 0002 resolution table).
     4. Build session ID (auto-generated or --session override).
+    4a. Manager-refresh step (ADR 0004 D4): refresh stale ancestor summaries,
+        then refresh the scope itself.  Skipped with --skip-refresh.
     5. execvp("claude", ...) with STRATA_AGENT_* env vars.
     """
     import httpx
@@ -523,6 +781,14 @@ def cmd_launch(args: argparse.Namespace) -> int:
     session_id: str = args.session if args.session else make_session_id(scope_data["id"], skill)
 
     # -----------------------------------------------------------------------
+    # Step 4a: Manager-refresh (ADR 0004 D4) — before execvp.
+    # -----------------------------------------------------------------------
+    _run_manager_refresh(
+        scope_data["id"],
+        skip=getattr(args, "skip_refresh", False),
+    )
+
+    # -----------------------------------------------------------------------
     # Step 5: exec claude.
     # -----------------------------------------------------------------------
     env = os.environ.copy()
@@ -608,6 +874,15 @@ def _build_parser() -> argparse.ArgumentParser:
     p_launch.add_argument(
         "--session",
         help="Override auto-generated session ID.",
+    )
+    p_launch.add_argument(
+        "--skip-refresh",
+        action="store_true",
+        dest="skip_refresh",
+        help=(
+            "Skip the pre-session manager-refresh step (ADR 0004 D4). "
+            "Use when the API key is unavailable or for debugging."
+        ),
     )
     p_launch.set_defaults(func=cmd_launch)
 
