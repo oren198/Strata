@@ -63,8 +63,6 @@ _MINIMAL_YAML = """
         to: g_eng
       - from: g_eng
         to: g_ceo
-      - from: g_backend
-        to: g_arch
 """
 
 
@@ -81,7 +79,7 @@ def test_load_fleet_config_valid_yaml(tmp_path: Path) -> None:
     assert isinstance(config, FleetConfig)
     assert len(config.strata) == 3
     assert len(config.scopes) == 4
-    assert len(config.edges) == 4
+    assert len(config.edges) == 3
 
     assert config.strata[0].id == "L0"
     assert config.strata[0].name == "Executive"

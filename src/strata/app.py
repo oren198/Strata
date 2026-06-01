@@ -287,11 +287,18 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
         current_summary = summary_store.read(body.scope_id)
         recent_contributions = record_store.list_contributions(scope_id=body.scope_id, limit=20)
 
+        # Resolve the inter-stratum parent's summary for manager context (ADR 0004
+        # Decision 2). The caller (here) does the graph traversal; the manager is a
+        # pure judgment primitive that receives the resolved summary.
+        parent_scope = fleet.inter_stratum_parent(body.scope_id)
+        parent_summary = summary_store.read(parent_scope.id) if parent_scope is not None else None
+
         # Step 5: call scope-manager
         try:
             judgment: ScopeManagerJudgment = scope_manager.judge(
                 scope=scope,
                 stratum=stratum,
+                parent_summary=parent_summary,
                 current_summary=current_summary,
                 recent_contributions=recent_contributions,
                 new_contribution=contribution,

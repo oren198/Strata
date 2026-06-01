@@ -114,6 +114,22 @@ Concepts you must know (from CONTEXT.md):
   Update the context digest to incorporate the new contribution's
   observations (and to retire stale ones).
 
+When a PARENT SCOPE SUMMARY is provided in the user message:
+- Your directives section must quote any parent directives VERBATIM (no
+  paraphrase) so that inherited binding decisions are preserved exactly.
+  Locally-added directives (originating at this scope) are your own to
+  word as you see fit.
+- Context from the parent may be paraphrased or summarised into this
+  scope's context digest, but must not contradict or override it.
+- Do not copy directives from the parent that are already listed in the
+  current summary — preserve them as-is.
+
+When a BUDGET is given in the user message:
+- Directives are never trimmed below visibility — each directive must
+  remain complete and individually identifiable in the rewritten summary.
+- The context section absorbs the squeeze: condense or abbreviate context
+  prose to stay within the budget while keeping all directives intact.
+
 You must call the `submit_judgment` tool exactly once and provide a
 one-or-two-sentence reasoning. When declining, set `new_summary` to null.\
 """
@@ -163,9 +179,11 @@ def _build_user_message(
     *,
     scope: Scope,
     stratum: Stratum,
+    parent_summary: ScopeSummary | None,
     current_summary: ScopeSummary | None,
     recent_contributions: list[Contribution],
     new_contribution: Contribution,
+    summary_max_words: int = 500,
 ) -> str:
     """Compose the (non-cached) per-call user message."""
     if current_summary is not None:
@@ -176,10 +194,19 @@ def _build_user_message(
     recent_block = _render_recent_contributions(recent_contributions)
     contributor = new_contribution.contributor
 
+    parent_block = ""
+    if parent_summary is not None:
+        rendered_parent = _render_summary(parent_summary)
+        parent_block = f"PARENT SCOPE SUMMARY (inherited)\n---\n{rendered_parent}\n---\n\n"
+
+    budget_line = f"BUDGET: your rewritten summary must be at most {summary_max_words} words.\n\n"
+
     return (
         f"SCOPE: {scope.name} (id={scope.id})\n"
         f"STRATUM: {stratum.name} (ordinal={stratum.ordinal})\n"
         "\n"
+        f"{budget_line}"
+        f"{parent_block}"
         "CURRENT SUMMARY\n"
         "---\n"
         f"{rendered_summary}\n"
@@ -235,9 +262,11 @@ class ScopeManager:
         *,
         scope: Scope,
         stratum: Stratum,
+        parent_summary: ScopeSummary | None = None,
         current_summary: ScopeSummary | None,
         recent_contributions: list[Contribution],
         new_contribution: Contribution,
+        summary_max_words: int = 500,
     ) -> ScopeManagerJudgment:
         """Judge a new contribution against the scope's current state.
 
@@ -249,12 +278,20 @@ class ScopeManager:
         Args:
             scope:                The scope receiving the contribution.
             stratum:              The stratum *scope* belongs to.
+            parent_summary:       The inter-stratum parent scope's current
+                                  summary, or ``None`` for L0 root scopes
+                                  (no parent exists).  Resolved by the caller
+                                  — the manager does not traverse the graph.
             current_summary:      The scope's current summary, or ``None``
                                   for a fresh scope with no prior summary.
             recent_contributions: Ordered slice of recent contributions
                                   (oldest-first) providing trend/context to
                                   the model.
             new_contribution:     The contribution to be judged.
+            summary_max_words:    Maximum word count for the rewritten summary
+                                  (ADR 0004 D5).  Rendered as a BUDGET line in
+                                  the user message; the LLM enforces the limit.
+                                  Defaults to 500.
 
         Returns:
             A :class:`ScopeManagerJudgment` with the verdict, reasoning, and
@@ -269,9 +306,11 @@ class ScopeManager:
         user_message = _build_user_message(
             scope=scope,
             stratum=stratum,
+            parent_summary=parent_summary,
             current_summary=current_summary,
             recent_contributions=recent_contributions,
             new_contribution=new_contribution,
+            summary_max_words=summary_max_words,
         )
 
         # Build the system prompt with cache_control on the last text block

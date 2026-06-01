@@ -1,15 +1,9 @@
 {
-  "_comment": "Strata MCP server registration for Claude Code. Customize the STRATA_AGENT_* env vars per session — they identify which scope this CC session acts as a worker for.",
+  "_comment": "Strata MCP server registration for Claude Code. The MCP server operates in embedded mode (ADR 0004 Decision 1) — no backend URL needed. Set STRATA_AGENT_SCOPE and STRATA_AGENT_SKILL via your shell env before launching. Store path vars (STRATA_DB_PATH, STRATA_FLEET_CONFIG, STRATA_SUMMARIES_DIR) are read from .strata/config.toml when present, or from your shell env / .env file. See README.md § 'Quick Start for an existing project'.",
   "mcpServers": {
     "strata": {
-      "command": "python",
-      "args": ["-m", "mcp_server.strata_mcp"],
-      "env": {
-        "STRATA_BACKEND_URL": "http://127.0.0.1:8000",
-        "STRATA_AGENT_SCOPE": "g_arch",
-        "STRATA_AGENT_SKILL": "architect",
-        "STRATA_AGENT_SESSION_ID": "sess_local"
-      }
+      "command": "strata-mcp",
+      "env": {}
     }
   }
 }

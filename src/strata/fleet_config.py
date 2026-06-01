@@ -132,6 +132,55 @@ class FleetConfig(BaseModel):
         """Return only scopes with ``status == 'active'``."""
         return [s for s in self.scopes if s.status == "active"]
 
+    def inter_stratum_parent(self, scope_id: str) -> Scope | None:
+        """Return the single inter-stratum parent of *scope_id*, or ``None`` for root scopes.
+
+        Edges are written child→parent (from=child, to=parent) in fleet.yaml.
+        A parent has a *lower* stratum ordinal than its child (per ADR 0002,
+        ordinal 0 is the broadest stratum). An edge to a scope with a *higher*
+        ordinal is a descendant reference, not a parent reference, and is
+        never followed here. Peer (same-ordinal) edges are likewise ignored.
+        """
+        stratum_map = {s.id: s for s in self.strata}
+        scope_map = {s.id: s for s in self.scopes}
+
+        current = scope_map.get(scope_id)
+        if current is None:
+            return None
+
+        current_ordinal = stratum_map[current.stratum_id].ordinal
+
+        for edge in self.edges:
+            if edge.from_ != scope_id:
+                continue
+            target = scope_map.get(edge.to)
+            if target is None:
+                continue
+            target_ordinal = stratum_map[target.stratum_id].ordinal
+            if target_ordinal < current_ordinal:
+                return target
+
+        return None
+
+    def inter_stratum_ancestors(self, scope_id: str) -> list[Scope]:
+        """Return the ancestor chain from root (L0) down to *scope_id*'s parent.
+
+        Follows inter-stratum-only edges (child→parent convention in fleet.yaml).
+        Returns an empty list when *scope_id* is a root scope (no inter-stratum
+        parent).  The requested scope itself is NOT included — callers append it.
+        """
+        ancestors: list[Scope] = []
+        current_id = scope_id
+        while True:
+            parent = self.inter_stratum_parent(current_id)
+            if parent is None:
+                break
+            ancestors.append(parent)
+            current_id = parent.id
+        # Chain is built deepest-first; reverse to get root-first order.
+        ancestors.reverse()
+        return ancestors
+
     # ------------------------------------------------------------------
     # Mutation API
     # ------------------------------------------------------------------
@@ -253,7 +302,7 @@ class FleetConfig(BaseModel):
 
 
 def _validate(config: FleetConfig) -> None:
-    """Validate all 8 load-time invariants from ADR 0002.
+    """Validate all load-time invariants from ADR 0002 (8 original) and ADR 0004 (1 new).
 
     Raises :class:`FleetConfigError` on the first failure.
     """
@@ -353,6 +402,30 @@ def _validate(config: FleetConfig) -> None:
                 message=(
                     f"Scope {scope.id!r}: default_skill {scope.default_skill!r} "
                     f"is not in permitted_skills {scope.permitted_skills!r}."
+                ),
+            )
+
+    # 9. Each scope may have at most one inter-stratum-parent edge (i.e. at
+    #    most one outgoing edge whose target has a strictly lower stratum
+    #    ordinal).  Multiple such edges would create ambiguity about which
+    #    scope carries the authoritative parent perspective (ADR 0004 D4).
+    inter_stratum_parent_count: dict[str, int] = {}
+    for edge in config.edges:
+        from_scope = scope_map[edge.from_]
+        to_scope = scope_map[edge.to]
+        from_ordinal = stratum_map[from_scope.stratum_id].ordinal
+        to_ordinal = stratum_map[to_scope.stratum_id].ordinal
+        if to_ordinal < from_ordinal:
+            inter_stratum_parent_count[edge.from_] = (
+                inter_stratum_parent_count.get(edge.from_, 0) + 1
+            )
+    for scope_id, count in inter_stratum_parent_count.items():
+        if count > 1:
+            raise FleetConfigError(
+                kind="multiple_inter_stratum_parents",
+                message=(
+                    f"Scope {scope_id!r} has {count} inter-stratum-parent edges; "
+                    "each scope may have at most one."
                 ),
             )
 

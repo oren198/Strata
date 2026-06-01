@@ -65,6 +65,14 @@ class ScopeSummary(BaseModel):
     This is what gets composed into agents' *perspectives* when they inherit
     from this scope.  The raw record is consulted only for accountability,
     recovery, or forensics.
+
+    Version stamps (ADR 0004 Decision 4):
+
+    * ``version`` — incremented on each write; used by descendant scopes to
+      detect staleness.
+    * ``parent_version`` — the parent scope's ``version`` at the time this
+      summary was built.  ``None`` for L0 (root) scopes which have no
+      inter-stratum parent.
     """
 
     scope_id: str
@@ -74,6 +82,13 @@ class ScopeSummary(BaseModel):
 
     updated_at: str
     """ISO 8601 timestamp of the last summary rewrite."""
+
+    version: int = 1
+    """Monotonically increasing write counter.  Bumped on every :meth:`SummaryStore.write`."""
+
+    parent_version: int | None = None
+    """The parent scope's ``version`` when this summary was last refreshed.
+    ``None`` for root scopes (no inter-stratum parent)."""
 
 
 # ---------------------------------------------------------------------------
@@ -97,7 +112,13 @@ def _render_summary(summary: ScopeSummary) -> str:
     lines: list[str] = []
 
     # --- YAML frontmatter ---
-    frontmatter = {"scope_id": summary.scope_id, "updated_at": summary.updated_at}
+    frontmatter: dict = {
+        "scope_id": summary.scope_id,
+        "version": summary.version,
+        "updated_at": summary.updated_at,
+    }
+    if summary.parent_version is not None:
+        frontmatter["parent_version"] = summary.parent_version
     lines.append("---")
     lines.append(yaml.dump(frontmatter, default_flow_style=False).rstrip())
     lines.append("---")
@@ -155,6 +176,8 @@ def _parse_summary(text: str) -> ScopeSummary:
     fm = yaml.safe_load(fm_text)
     scope_id: str = fm["scope_id"]
     updated_at: str = fm["updated_at"]
+    version: int = int(fm.get("version", 1))
+    parent_version: int | None = fm.get("parent_version")
 
     # Parse body line by line using a simple state machine.
     # States: OUTSIDE, IN_DIRECTIVES, IN_DIRECTIVE_BLOCK, IN_CONTEXT
@@ -262,6 +285,8 @@ def _parse_summary(text: str) -> ScopeSummary:
         directives=directives,
         context=context,
         updated_at=updated_at,
+        version=version,
+        parent_version=parent_version,
     )
 
 
@@ -311,8 +336,12 @@ class SummaryStore:
             return None
         return _parse_summary(path.read_text(encoding="utf-8"))
 
-    def write(self, scope_id: str, summary: ScopeSummary) -> None:
+    def write(self, scope_id: str, summary: ScopeSummary) -> ScopeSummary:
         """Persist *summary* to disk, overwriting any existing file.
+
+        Bumps ``summary.version`` by reading the current on-disk version first
+        (or defaulting to 0 if no file exists) and writing ``current + 1``.
+        Returns the summary as actually written (with the bumped version).
 
         Writes atomically: the new content lands in a ``.tmp`` sibling first,
         then :func:`os.replace` renames it to the final path so readers never
@@ -320,9 +349,18 @@ class SummaryStore:
         """
         final = self.path_for(scope_id)
         final.parent.mkdir(parents=True, exist_ok=True)
+
+        # Determine the next version.
+        existing = self.read(scope_id)
+        next_version = (existing.version if existing is not None else 0) + 1
+
+        # Build the summary that will actually be written.
+        to_write = summary.model_copy(update={"version": next_version})
+
         tmp = final.with_suffix(".md.tmp")
-        tmp.write_text(_render_summary(summary), encoding="utf-8")
+        tmp.write_text(_render_summary(to_write), encoding="utf-8")
         os.replace(tmp, final)
+        return to_write
 
     def delete(self, scope_id: str) -> bool:
         """Remove the summary file for *scope_id*.

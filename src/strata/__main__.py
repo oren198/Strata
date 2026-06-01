@@ -56,6 +56,13 @@ import shutil
 import sqlite3
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from strata.fleet_config import FleetConfig
+    from strata.record_store import RecordStore
+    from strata.scope_manager import ScopeManager
+    from strata.summary_store import ScopeSummary, SummaryStore
 
 from strata import __version__
 from strata.launch import (
@@ -68,6 +75,7 @@ from strata.launch import (
     prompt_scope,
     resolve_skill,
 )
+from strata.preflight import Check, run_launch_preflight, run_start_preflight
 
 # Path to the bundled starter templates directory.
 _TEMPLATES_DIR = Path(__file__).parent.parent.parent / "templates"
@@ -177,6 +185,34 @@ def _v1_upgrade_guard_should_refuse(
 
 
 # ---------------------------------------------------------------------------
+# Preflight runner
+# ---------------------------------------------------------------------------
+
+
+def _run_preflight(checks: list[Check]) -> int:
+    """Print structured preflight output and return non-zero on any hard failure.
+
+    Output symbols:
+      ✓  — check passed (hard or soft)
+      ⚠  — soft check failed (warning; continues)
+      ✗  — hard check failed (fatal; will exit 1)
+
+    Returns 0 when all hard checks pass (soft failures are printed but
+    do not affect the exit code).  Returns 1 when any hard check fails.
+    """
+    has_hard_failure = False
+    for check in checks:
+        if check.passed:
+            print(f"  ✓ {check.name}: {check.message}")
+        elif check.kind == "soft":
+            print(f"  ⚠ {check.name}: {check.message}", file=sys.stderr)
+        else:
+            print(f"  ✗ {check.name}: {check.message}", file=sys.stderr)
+            has_hard_failure = True
+    return 1 if has_hard_failure else 0
+
+
+# ---------------------------------------------------------------------------
 # Subcommand implementations
 # ---------------------------------------------------------------------------
 
@@ -237,7 +273,13 @@ def cmd_start(args: argparse.Namespace) -> int:
     db_path = args.db or _db_path_default()
     fleet_yaml_path = _fleet_config_default()
 
-    # 0. V1 → V1.2 upgrade guard: refuse if migration 0002 is pending but
+    # 0. Preflight — prerequisite hygiene checks before any DB or server work.
+    if not args.skip_preflight:
+        rc = _run_preflight(run_start_preflight(port=args.port, db_path=db_path))
+        if rc != 0:
+            return rc
+
+    # 2. V1 → V1.2 upgrade guard: refuse if migration 0002 is pending but
     #    the V1 fleet tables are still present and no fleet.yaml exists.
     #    Must run before run_migrations so we catch the footgun before it fires.
     if _v1_upgrade_guard_should_refuse(
@@ -253,18 +295,18 @@ def cmd_start(args: argparse.Namespace) -> int:
         )
         return 1
 
-    # 1. Migrate.
+    # 3. Migrate.
     applied = run_migrations(db_path)
     if applied:
         print(f"Applied {len(applied)} migration(s).")
 
-    # 2. Auto-seed fleet.yaml if absent.
+    # 4. Auto-seed fleet.yaml if absent.
     fleet_path = Path(_fleet_config_default())
     if not fleet_path.exists() and _DEFAULT_TEMPLATE.exists():
         shutil.copy(_DEFAULT_TEMPLATE, fleet_path)
         print("seeded fleet.yaml from the default template; edit to suit")
 
-    # 3. Serve.
+    # 5. Serve.
     import uvicorn
 
     print()
@@ -426,17 +468,277 @@ def cmd_export_fleet(args: argparse.Namespace) -> int:
     return 0
 
 
+def _is_stale(summary: ScopeSummary, parent_summary: ScopeSummary) -> bool:
+    """Return True when *summary* was built from an older parent version.
+
+    A summary is stale when its ``parent_version`` stamp is less than the
+    parent scope's current ``version`` stamp.  A missing ``parent_version``
+    (``None``) is treated as stale so that legacy summaries without stamps
+    get refreshed on the next launch.
+    """
+    if summary.parent_version is None:
+        return True
+    return summary.parent_version < parent_summary.version
+
+
+def _refresh_scope(
+    scope_id: str,
+    *,
+    fleet_config: FleetConfig,
+    record_store: RecordStore,
+    summary_store: SummaryStore,
+    manager: ScopeManager,
+    summary_max_words: int,
+    _visited: set[str] | None = None,
+) -> None:
+    """Refresh the summary for *scope_id* via one scope-manager LLM call.
+
+    Recursively refreshes stale ancestors first (root-first order).  Uses a
+    ``_visited`` set to guard against cycles (which validation prevents, but
+    this is defensive).
+
+    ADR 0004 Decision 4 — last-write-wins; no lock.
+    """
+    from datetime import UTC, datetime
+
+    from strata.record_store import Contribution, ContributorRef
+
+    if _visited is None:
+        _visited = set()
+    if scope_id in _visited:
+        return
+    _visited.add(scope_id)
+
+    scope = fleet_config.get_scope(scope_id)
+    if scope is None:
+        print(
+            f"  [refresh] scope {scope_id!r} not found in fleet config — skipping",
+            file=sys.stderr,
+        )
+        return
+
+    stratum_map = {s.id: s for s in fleet_config.strata}
+    stratum = stratum_map.get(scope.stratum_id)
+    if stratum is None:
+        return
+
+    # Resolve inter-stratum parent
+    parent_scope = fleet_config.inter_stratum_parent(scope_id)
+
+    # If there is a parent, ensure it is fresh first (recursive bottom-out at L0)
+    if parent_scope is not None:
+        parent_summary = summary_store.read(parent_scope.id)
+        my_summary = summary_store.read(scope_id)
+
+        # `parent_summary is not None` MUST come first — `_is_stale`'s signature
+        # requires a non-None parent_summary. Without the short-circuit, a child
+        # whose parent_version stamp is non-None but whose parent summary has
+        # been deleted from disk would crash with AttributeError.
+        already_fresh = (
+            parent_summary is not None
+            and my_summary is not None
+            and not _is_stale(my_summary, parent_summary)
+        )
+        if parent_summary is None or already_fresh:
+            # Either parent has no on-disk summary yet, or my summary is already
+            # fresh against the parent's current version → no need to recurse.
+            pass
+        else:
+            # Parent is missing or my summary is stale → refresh parent first
+            _refresh_scope(
+                parent_scope.id,
+                fleet_config=fleet_config,
+                record_store=record_store,
+                summary_store=summary_store,
+                manager=manager,
+                summary_max_words=summary_max_words,
+                _visited=_visited,
+            )
+
+        # Re-read parent summary after potential refresh
+        parent_summary = summary_store.read(parent_scope.id)
+    else:
+        parent_summary = None
+
+    # Now refresh this scope
+    current_summary = summary_store.read(scope_id)
+    recent_contributions = record_store.list_contributions(scope_id=scope_id, limit=20)
+
+    # Build a synthetic "refresh" contribution that requests a summary rewrite.
+    # We use a ContributorRef representing the manager itself.
+    ts = datetime.now(tz=UTC).isoformat()
+    refresh_contribution = Contribution(
+        id=f"refresh_{scope_id}_{ts}",
+        scope_id=scope_id,
+        content=(
+            "[Manager refresh triggered by strata launch"
+            " — rewrite summary incorporating current state.]"
+        ),
+        proposed_classification="context",
+        subject="manager-refresh",
+        supersedes=None,
+        contributor=ContributorRef(
+            scope_id=scope_id,
+            skill="scope-manager",
+            session_id="refresh",
+            ts=ts,
+        ),
+        created_at=ts,
+    )
+
+    print(f"  [refresh] refreshing scope {scope_id!r}...", file=sys.stderr)
+    judgment = manager.judge(
+        scope=scope,
+        stratum=stratum,
+        parent_summary=parent_summary,
+        current_summary=current_summary,
+        recent_contributions=recent_contributions,
+        new_contribution=refresh_contribution,
+        summary_max_words=summary_max_words,
+    )
+
+    if judgment.new_summary is not None:
+        # Stamp the parent_version before writing
+        parent_ver = parent_summary.version if parent_summary is not None else None
+        to_write = judgment.new_summary.model_copy(update={"parent_version": parent_ver})
+        summary_store.write(scope_id, to_write)
+        print(f"  [refresh] scope {scope_id!r} summary updated", file=sys.stderr)
+
+
+def _run_manager_refresh(scope_id: str, *, skip: bool = False) -> None:
+    """Run the pre-session manager-refresh step for *scope_id*.
+
+    Walks the inter-stratum ancestor chain (root-first), refreshes any stale
+    ancestors, then refreshes *scope_id* itself.  Skipped when:
+
+    - ``skip`` is True (``--skip-refresh`` flag).
+    - No ``ANTHROPIC_API_KEY`` is available (soft — prints a warning).
+    - Any ancestor/scope is missing from the fleet config (non-fatal warning).
+
+    ADR 0004 Decision 4 — last-write-wins, no lock.
+    """
+    import anthropic
+
+    from strata.fleet_config import FleetConfig
+    from strata.record_store import RecordStore
+    from strata.scope_manager import ScopeManager
+    from strata.settings import get_settings
+    from strata.summary_store import SummaryStore
+
+    if skip:
+        return
+
+    settings = get_settings()
+
+    if not settings.anthropic_api_key:
+        print(
+            "  [refresh] ANTHROPIC_API_KEY not set — skipping manager refresh",
+            file=sys.stderr,
+        )
+        return
+
+    fleet_yaml = _fleet_config_default()
+    if not Path(fleet_yaml).exists():
+        print(
+            f"  [refresh] fleet config not found at {fleet_yaml!r} — skipping manager refresh",
+            file=sys.stderr,
+        )
+        return
+
+    try:
+        fleet_config = FleetConfig.load(Path(fleet_yaml))
+    except Exception as exc:
+        print(
+            f"  [refresh] cannot load fleet config: {exc} — skipping manager refresh",
+            file=sys.stderr,
+        )
+        return
+
+    db_path = settings.db_path
+    summaries_dir = settings.summaries_dir
+
+    client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
+    manager = ScopeManager(client=client, model=settings.manager_model)
+
+    with RecordStore(db_path) as record_store:
+        summary_store = SummaryStore(summaries_dir)
+
+        # Walk ancestors root-first; refresh stale ones first, then the target scope.
+        ancestors = fleet_config.inter_stratum_ancestors(scope_id)
+
+        visited: set[str] = set()
+        # Refresh stale ancestors (root-first)
+        for ancestor in ancestors:
+            ancestor_summary = summary_store.read(ancestor.id)
+            if ancestor_summary is None:
+                # No existing summary — refresh it
+                _refresh_scope(
+                    ancestor.id,
+                    fleet_config=fleet_config,
+                    record_store=record_store,
+                    summary_store=summary_store,
+                    manager=manager,
+                    summary_max_words=settings.summary_max_words,
+                    _visited=visited,
+                )
+            else:
+                # Check if this ancestor is stale relative to its own parent
+                ancestor_parent = fleet_config.inter_stratum_parent(ancestor.id)
+                if ancestor_parent is not None:
+                    ap_summary = summary_store.read(ancestor_parent.id)
+                    if ap_summary is not None and _is_stale(ancestor_summary, ap_summary):
+                        _refresh_scope(
+                            ancestor.id,
+                            fleet_config=fleet_config,
+                            record_store=record_store,
+                            summary_store=summary_store,
+                            manager=manager,
+                            summary_max_words=settings.summary_max_words,
+                            _visited=visited,
+                        )
+
+        # Refresh the target scope itself
+        my_summary = summary_store.read(scope_id)
+        parent_scope = fleet_config.inter_stratum_parent(scope_id)
+        parent_summary = summary_store.read(parent_scope.id) if parent_scope is not None else None
+
+        needs_refresh = my_summary is None or (
+            parent_summary is not None and _is_stale(my_summary, parent_summary)
+        )
+        if needs_refresh:
+            _refresh_scope(
+                scope_id,
+                fleet_config=fleet_config,
+                record_store=record_store,
+                summary_store=summary_store,
+                manager=manager,
+                summary_max_words=settings.summary_max_words,
+                _visited=visited,
+            )
+
+
 def cmd_launch(args: argparse.Namespace) -> int:
     """Validate scope, resolve skill, and exec ``claude`` with STRATA_AGENT_* set.
 
-    Steps (per ADR 0003):
+    Steps (per ADR 0003 + ADR 0004 D4):
+    0. Preflight — prerequisite hygiene checks.
     1. Fetch active scopes from GET /scopes; fail fast if backend unreachable.
     2. Determine target scope: positional arg > .strata-role discovery > picker.
     3. Resolve skill from scope declaration (ADR 0002 resolution table).
     4. Build session ID (auto-generated or --session override).
+    4a. Manager-refresh step (ADR 0004 D4): refresh stale ancestor summaries,
+        then refresh the scope itself.  Skipped with --skip-refresh.
     5. execvp("claude", ...) with STRATA_AGENT_* env vars.
     """
     import httpx
+
+    # -----------------------------------------------------------------------
+    # Step 0: Preflight.
+    # -----------------------------------------------------------------------
+    if not args.skip_preflight:
+        rc = _run_preflight(run_launch_preflight())
+        if rc != 0:
+            return rc
 
     interactive = is_interactive()
 
@@ -523,6 +825,14 @@ def cmd_launch(args: argparse.Namespace) -> int:
     session_id: str = args.session if args.session else make_session_id(scope_data["id"], skill)
 
     # -----------------------------------------------------------------------
+    # Step 4a: Manager-refresh (ADR 0004 D4) — before execvp.
+    # -----------------------------------------------------------------------
+    _run_manager_refresh(
+        scope_data["id"],
+        skip=getattr(args, "skip_refresh", False),
+    )
+
+    # -----------------------------------------------------------------------
     # Step 5: exec claude.
     # -----------------------------------------------------------------------
     env = os.environ.copy()
@@ -541,6 +851,353 @@ def cmd_launch(args: argparse.Namespace) -> int:
         return 1
     # execvpe does not return on success; the line below is unreachable.
     return 0  # pragma: no cover
+
+
+# ---------------------------------------------------------------------------
+# strata register — brownfield install helper (ADR 0005 Decision 4)
+# ---------------------------------------------------------------------------
+
+#: Project root marker files — at least one must be present.
+_PROJECT_MARKERS = (".git", "pyproject.toml", "package.json", "Cargo.toml", "go.mod")
+
+#: Gitignore block appended by strata register (idempotent — detected by header).
+_GITIGNORE_MARKER = "# Strata"
+_GITIGNORE_BLOCK = """\
+# Strata — managed by `strata register` — do not remove this line
+.strata/.venv/
+.strata/strata.db*
+.strata/summaries/
+# fleet.yaml is intentionally NOT listed above — commit it (it is your team's org chart).
+"""
+
+#: Minimal settings.json merge entry.
+_MCP_ENTRY: dict = {"command": "strata-mcp", "env": {}}
+
+
+def _is_v1_2_shape_mcp_entry(entry: dict) -> bool:
+    """Return True if *entry* matches a known-stale V1.2 mcpServer shape.
+
+    V1.2 settings shipped:
+      command: python
+      args: ["-m", "mcp_server.strata_mcp"]
+      env: { "STRATA_BACKEND_URL": "...", ... }
+
+    All three of those break on V1.3:
+    - mcp_server is no longer a top-level module (folded into strata.mcp).
+    - STRATA_BACKEND_URL is no longer consumed (embedded mode, ADR 0004 D1).
+
+    We only need to recognise *any* of these signals to warn.
+    """
+    if entry.get("command") == "python":
+        args = entry.get("args") or []
+        if isinstance(args, list) and "-m" in args:
+            tail = args[args.index("-m") + 1 :]
+            if tail and "mcp_server" in tail[0]:
+                return True
+    env = entry.get("env") or {}
+    return isinstance(env, dict) and "STRATA_BACKEND_URL" in env
+
+
+#: Default .strata/config.toml content.
+_CONFIG_TOML = """\
+# Strata per-project configuration — managed by `strata register`.
+# Paths are relative to this project's root.
+db = ".strata/strata.db"
+fleet_yaml = ".strata/fleet.yaml"
+summaries_dir = ".strata/summaries"
+"""
+
+
+def cmd_register(args: argparse.Namespace) -> int:
+    """Idempotent brownfield installer — per ADR 0005 Decision 4.
+
+    Walks the registration steps in order:
+    1. Detect project root (require a project marker).
+    2. Create .strata/ directory.
+    3. Write .strata/config.toml (skip if exists).
+    4. Update .gitignore (idempotent block with # Strata marker).
+    5. Seed .strata/fleet.yaml from templates/minimal.yaml (skip if exists).
+    6. Copy strata skills to .claude/skills/ (skip each if exists).
+    7. Merge strata into .claude/settings.json mcpServers (skip if exists).
+    8. Print next-steps or diff report.
+
+    All writes are strictly additive (never overwrite existing user state).
+    With --diff: read-only mode, prints what would differ.
+    With --bootstrap-venv: creates .strata/.venv/ with strata installed.
+    """
+    import importlib.resources
+    import json
+    import subprocess
+    import venv
+
+    path_arg: str | None = getattr(args, "path", None)
+    project_root = Path(path_arg).resolve() if path_arg else Path.cwd().resolve()
+    diff_mode: bool = getattr(args, "diff", False)
+    bootstrap_venv: bool = getattr(args, "bootstrap_venv", False)
+
+    # -----------------------------------------------------------------------
+    # Step 1: Require a project marker.
+    # -----------------------------------------------------------------------
+    if not any((project_root / m).exists() for m in _PROJECT_MARKERS):
+        markers_str = ", ".join(_PROJECT_MARKERS)
+        print(
+            f"Not a project root — register from a directory containing one of: {markers_str}\n"
+            f"(checked: {project_root})",
+            file=sys.stderr,
+        )
+        return 1
+
+    # -----------------------------------------------------------------------
+    # Step 1b: .strata/ sanity check (ADR 0005 Decision 4).
+    #
+    # Before any action, if .strata/ exists but lacks config.toml, refuse to
+    # proceed.  Prevents silently writing into a foreign tool's directory and
+    # prevents register from running against a half-initialised state from
+    # an interrupted prior register.
+    # -----------------------------------------------------------------------
+    candidate_strata = project_root / ".strata"
+    if candidate_strata.exists() and not (candidate_strata / "config.toml").exists():
+        print(
+            f"Existing .strata/ directory at {candidate_strata} does not look like a Strata "
+            f"workspace (no config.toml).\n"
+            f"Please remove or rename it before running `strata register`.",
+            file=sys.stderr,
+        )
+        return 1
+
+    # -----------------------------------------------------------------------
+    # Helper: print action or diff line.
+    # -----------------------------------------------------------------------
+    def _act(action: str, path: str | Path, *, skipped: bool = False) -> None:
+        rel = Path(path).relative_to(project_root) if Path(path).is_absolute() else Path(path)
+        if diff_mode:
+            if skipped:
+                print(f"  [unchanged]  {rel}")
+            else:
+                print(f"  [would create/update]  {rel}")
+        else:
+            if skipped:
+                print(f"  kept user's {rel}")
+            else:
+                print(f"  {action}: {rel}")
+
+    if diff_mode:
+        print(f"strata register --diff  (dry-run, no writes)\nProject root: {project_root}")
+    else:
+        print(f"strata register\nProject root: {project_root}")
+
+    # -----------------------------------------------------------------------
+    # Step 2: Create .strata/ directory.
+    # -----------------------------------------------------------------------
+    strata_dir = project_root / ".strata"
+    if not strata_dir.exists():
+        if not diff_mode:
+            strata_dir.mkdir(parents=True)
+        _act("created", strata_dir)
+
+    # -----------------------------------------------------------------------
+    # Step 3: Write .strata/config.toml.
+    # -----------------------------------------------------------------------
+    config_toml = strata_dir / "config.toml"
+    if config_toml.exists():
+        _act("skip", config_toml, skipped=True)
+    else:
+        if not diff_mode:
+            config_toml.write_text(_CONFIG_TOML, encoding="utf-8")
+        _act("wrote", config_toml)
+
+    # -----------------------------------------------------------------------
+    # Step 4: Update .gitignore.
+    # -----------------------------------------------------------------------
+    gitignore = project_root / ".gitignore"
+    existing_gitignore = gitignore.read_text(encoding="utf-8") if gitignore.exists() else ""
+    if _GITIGNORE_MARKER in existing_gitignore:
+        _act("skip", gitignore, skipped=True)
+    else:
+        if not diff_mode:
+            with gitignore.open("a", encoding="utf-8") as f:
+                if existing_gitignore and not existing_gitignore.endswith("\n"):
+                    f.write("\n")
+                f.write("\n")
+                f.write(_GITIGNORE_BLOCK)
+        _act("appended Strata block to", gitignore)
+
+    # -----------------------------------------------------------------------
+    # Step 5: Seed .strata/fleet.yaml from templates/minimal.yaml.
+    # -----------------------------------------------------------------------
+    fleet_yaml = strata_dir / "fleet.yaml"
+    minimal_template = Path(__file__).parent.parent.parent / "templates" / "minimal.yaml"
+    if fleet_yaml.exists():
+        _act("skip", fleet_yaml, skipped=True)
+    else:
+        if not diff_mode:
+            if minimal_template.exists():
+                shutil.copy(minimal_template, fleet_yaml)
+            else:
+                # Fallback: write a minimal inline template.
+                fleet_yaml.write_text(
+                    "# TODO: replace with your team's structure\n"
+                    "strata:\n  - id: L0\n    name: root\n    ordinal: 0\n"
+                    "scopes:\n  - id: g_root\n    name: Root\n    stratum_id: L0\n"
+                    "edges: []\n",
+                    encoding="utf-8",
+                )
+        _act("seeded", fleet_yaml)
+
+    # -----------------------------------------------------------------------
+    # Step 6: Copy canonical skills to .claude/skills/ (skip each if exists).
+    # -----------------------------------------------------------------------
+    claude_skills_dir = project_root / ".claude" / "skills"
+    skills_root = importlib.resources.files("strata") / "_skills"
+    for skill_name in ["strata", "strata-worker", "strata-inspect"]:
+        dest_skill_dir = claude_skills_dir / skill_name
+        if dest_skill_dir.exists():
+            _act("skip", dest_skill_dir, skipped=True)
+        else:
+            skill_src = skills_root / skill_name / "Skill.md"
+            if not diff_mode:
+                dest_skill_dir.mkdir(parents=True, exist_ok=True)
+                dest_skill_md = dest_skill_dir / "Skill.md"
+                dest_skill_md.write_text(skill_src.read_text(encoding="utf-8"), encoding="utf-8")
+            _act("copied", dest_skill_dir)
+
+    # -----------------------------------------------------------------------
+    # Step 7: Merge strata into .claude/settings.json mcpServers block.
+    # -----------------------------------------------------------------------
+    settings_json = project_root / ".claude" / "settings.json"
+    if settings_json.exists():
+        try:
+            settings_data: dict = json.loads(settings_json.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            print(
+                f"Warning: .claude/settings.json is not valid JSON ({exc}). Skipping MCP merge.",
+                file=sys.stderr,
+            )
+            settings_data = {}
+    else:
+        settings_data = {}
+
+    mcp_servers: dict = settings_data.get("mcpServers", {})
+    if "strata" in mcp_servers:
+        _act("skip", settings_json, skipped=True)
+        # Stale-shape detection (ADR 0005 Decision 6): warn if the existing
+        # strata mcpServer entry is V1.2-shape (broken on V1.3). Keeps the
+        # strict-additive contract — we never overwrite — but surfaces the
+        # upgrade-path issue at register time, when the user is in fix-mind.
+        existing = mcp_servers["strata"]
+        if isinstance(existing, dict) and _is_v1_2_shape_mcp_entry(existing):
+            print(
+                "  ⚠ WARNING: your existing strata mcpServer entry is V1.2-shape and will silently",
+                file=sys.stderr,
+            )
+            print(
+                "    fail on V1.3 (the `mcp_server` Python module no longer exists; "
+                "`STRATA_BACKEND_URL` is unused).",
+                file=sys.stderr,
+            )
+            print(
+                f"    The canonical V1.3 entry is: {json.dumps(_MCP_ENTRY)}",
+                file=sys.stderr,
+            )
+            print(
+                "    Strata never overwrites your settings — run `strata register --diff` to "
+                "see the canonical,",
+                file=sys.stderr,
+            )
+            print(
+                "    then update .claude/settings.json by hand.",
+                file=sys.stderr,
+            )
+    else:
+        mcp_servers["strata"] = _MCP_ENTRY
+        settings_data["mcpServers"] = mcp_servers
+        if not diff_mode:
+            (project_root / ".claude").mkdir(parents=True, exist_ok=True)
+            settings_json.write_text(json.dumps(settings_data, indent=2) + "\n", encoding="utf-8")
+        _act("merged strata into", settings_json)
+
+    # -----------------------------------------------------------------------
+    # Step 8: bootstrap-venv (if requested).
+    # -----------------------------------------------------------------------
+    if bootstrap_venv:
+        venv_dir = strata_dir / ".venv"
+        venv_strata_mcp = venv_dir / "bin" / "strata-mcp"
+        if venv_dir.exists():
+            print("  .strata/.venv/ already exists — skipping venv creation")
+        else:
+            # Python discovery (ADR 0005 Decision 7).
+            #
+            # `python -m venv` itself requires a Python ≥ 3.11 interpreter.
+            # Strata's own runtime is already ≥ 3.11 (per pyproject.toml's
+            # requires-python), so sys.executable is the right default.
+            # --python is the escape hatch for the rare case where the user
+            # wants to seed the venv with a different interpreter than the
+            # one running register.
+            python_arg: str | None = getattr(args, "python", None)
+            venv_python = python_arg if python_arg else sys.executable
+
+            if not diff_mode:
+                print(f"  creating .strata/.venv/ using {venv_python} ...")
+                # Use the chosen Python to drive `venv` if it isn't us.
+                if venv_python == sys.executable:
+                    venv.create(str(venv_dir), with_pip=True, clear=False)
+                else:
+                    subprocess.check_call(
+                        [venv_python, "-m", "venv", str(venv_dir)],
+                    )
+                pip = venv_dir / "bin" / "pip"
+                subprocess.check_call(
+                    [str(pip), "install", "--quiet", "strata[cc-plugin]"],
+                )
+                print("  installed strata into .strata/.venv/")
+
+                # Update settings.json to use absolute path.
+                # (Outer `if not diff_mode:` at L1048 guarantees we're in
+                # write-mode here — no inner check needed.)
+                settings_data_venv: dict
+                if settings_json.exists():
+                    settings_data_venv = json.loads(settings_json.read_text(encoding="utf-8"))
+                else:
+                    settings_data_venv = {}
+                mcp_venv = settings_data_venv.get("mcpServers", {})
+                mcp_venv["strata"] = {
+                    "command": str(venv_strata_mcp),
+                    "env": {},
+                }
+                settings_data_venv["mcpServers"] = mcp_venv
+                (project_root / ".claude").mkdir(parents=True, exist_ok=True)
+                settings_json.write_text(
+                    json.dumps(settings_data_venv, indent=2) + "\n", encoding="utf-8"
+                )
+                print(f"  updated .claude/settings.json to use {venv_strata_mcp}")
+            else:
+                print("  [would create] .strata/.venv/ and pip install strata")
+
+    # -----------------------------------------------------------------------
+    # Print next steps.
+    # -----------------------------------------------------------------------
+    if not diff_mode:
+        # Determine the first scope ID from the seeded fleet.yaml.
+        first_scope = "g_root"
+        if fleet_yaml.exists():
+            try:
+                import yaml  # noqa: PLC0415
+
+                fleet_data = yaml.safe_load(fleet_yaml.read_text(encoding="utf-8"))
+                scopes = fleet_data.get("scopes", [])
+                if scopes:
+                    first_scope = scopes[0].get("id", "g_root")
+            except Exception:  # noqa: BLE001
+                pass
+
+        print()
+        print("Done. Next steps:")
+        print(f"  1. Edit {fleet_yaml.relative_to(project_root)} for your team's structure")
+        print(f"  2. export STRATA_AGENT_SCOPE={first_scope}")
+        print("     export STRATA_AGENT_SKILL=<your-skill>")
+        print("  3. Open Claude Code in this directory: claude")
+
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -569,6 +1226,12 @@ def _build_parser() -> argparse.ArgumentParser:
             "Bypass the V1→V1.2 upgrade guard. Use only after you have already "
             "run `strata export-fleet`, or on a fresh install."
         ),
+    )
+    p_start.add_argument(
+        "--skip-preflight",
+        action="store_true",
+        dest="skip_preflight",
+        help="Bypass all preflight prerequisite checks.",
     )
     p_start.set_defaults(func=cmd_start)
 
@@ -609,6 +1272,21 @@ def _build_parser() -> argparse.ArgumentParser:
         "--session",
         help="Override auto-generated session ID.",
     )
+    p_launch.add_argument(
+        "--skip-refresh",
+        action="store_true",
+        dest="skip_refresh",
+        help=(
+            "Skip the pre-session manager-refresh step (ADR 0004 D4). "
+            "Use when the API key is unavailable or for debugging."
+        ),
+    )
+    p_launch.add_argument(
+        "--skip-preflight",
+        action="store_true",
+        dest="skip_preflight",
+        help="Bypass all preflight prerequisite checks.",
+    )
     p_launch.set_defaults(func=cmd_launch)
 
     p_export = sub.add_parser(
@@ -626,6 +1304,51 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Overwrite --out if it already exists.",
     )
     p_export.set_defaults(func=cmd_export_fleet)
+
+    p_register = sub.add_parser(
+        "register",
+        help=(
+            "Idempotent brownfield installer — create .strata/config.toml, "
+            "seed fleet.yaml, copy skills, merge MCP entry (ADR 0005)."
+        ),
+    )
+    p_register.add_argument(
+        "path",
+        nargs="?",
+        default=None,
+        help="Project root directory (default: current working directory).",
+    )
+    p_register.add_argument(
+        "--diff",
+        action="store_true",
+        help=(
+            "Read-only mode: show what would differ between current state and canonical "
+            "without writing anything. Useful after `pipx upgrade strata`."
+        ),
+    )
+    p_register.add_argument(
+        "--bootstrap-venv",
+        action="store_true",
+        dest="bootstrap_venv",
+        help=(
+            "Create .strata/.venv/ with strata installed and update "
+            ".claude/settings.json to use the absolute venv path. "
+            "Use when pipx is not available or strata-mcp is not on PATH."
+        ),
+    )
+    p_register.add_argument(
+        "--python",
+        dest="python",
+        default=None,
+        help=(
+            "Path to a Python ≥ 3.11 interpreter used to seed the bootstrap venv. "
+            "Only relevant with --bootstrap-venv. Defaults to the running "
+            "interpreter when it is itself ≥ 3.11; otherwise the user must "
+            "supply this flag explicitly. Strata cannot create a 3.11 venv from a "
+            "3.10 interpreter."
+        ),
+    )
+    p_register.set_defaults(func=cmd_register)
 
     return parser
 
