@@ -19,6 +19,8 @@ jobs:
   test:
     name: test & lint (py${{ matrix.python-version }})
     runs-on: ubuntu-latest
+    # NOTE: the branch ruleset requires a status check named "CI". That is the
+    # `ci` gate job below, not this matrix job. Keep the names in sync.
     strategy:
       fail-fast: false
       matrix:
@@ -40,3 +42,19 @@ jobs:
 
       - name: Test
         run: python -m pytest
+
+  # Single, stable status-check context required by the branch ruleset.
+  # Succeeds only if every matrix leg of `test` succeeded.
+  ci:
+    name: CI
+    needs: test
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify matrix result
+        run: |
+          if [ "${{ needs.test.result }}" != "success" ]; then
+            echo "One or more test/lint jobs failed: ${{ needs.test.result }}"
+            exit 1
+          fi
+          echo "All test/lint jobs passed."
