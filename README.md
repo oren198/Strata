@@ -15,7 +15,7 @@ layer between them that lets a fleet's performance compound.
 
 ---
 
-## How Strata works (one paragraph)
+## How Strata works
 
 Memory is organised into **scopes** arranged into ordered **strata**.
 Agents are sessions running a **skill**, bound to one scope. Every write is
