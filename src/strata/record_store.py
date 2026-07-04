@@ -127,7 +127,13 @@ class RecordStore:
 
     def __init__(self, db_path: str) -> None:
         self._db_path = str(Path(db_path).expanduser())
-        self._conn = sqlite3.connect(self._db_path)
+        # check_same_thread=False: FastAPI runs a sync generator dependency
+        # and the endpoint body in separate threadpool threads, so the
+        # connection created in get_record_store may legally be used from a
+        # different thread within the same request. Each RecordStore is
+        # request-scoped and never used from two threads at once, which is
+        # the condition that makes this safe (SQLite serialized mode).
+        self._conn = sqlite3.connect(self._db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         # journal_mode=WAL is NOT set here: it is persistent in the database
         # file and is applied once by run_migrations (issue #39 — re-issuing
