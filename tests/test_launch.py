@@ -1,19 +1,20 @@
 """Tests for ``strata launch`` — skill resolution, .strata-role discovery,
 session-ID generation, and CLI integration.
 
-All tests that touch the CLI use the ``main()`` entry point with mocked
-``httpx`` and ``os.execvpe`` so no real process is spawned and no real backend
-is needed.
+All tests that touch the CLI use the ``main()`` entry point with a real
+fleet.yaml on disk (launch reads the fleet directly — embedded mode, issue
+#45; no backend and no HTTP involved) and mocked ``os.execvpe`` so no real
+process is spawned.
 """
 
 from __future__ import annotations
 
 from datetime import UTC, datetime
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
-import httpx
 import pytest
+import yaml
 
 from strata.__main__ import main
 from strata.launch import (
@@ -66,16 +67,38 @@ _SCOPE_NO_SKILLS: dict = {
 }
 
 
-def _fake_scopes_response(scopes: list[dict]) -> MagicMock:
-    """Build a mock httpx response for GET /scopes."""
-    resp = MagicMock()
-    resp.status_code = 200
-    resp.json.return_value = {
+def _write_fleet(tmp_path: Path, scopes: list[dict]) -> Path:
+    """Write a valid fleet.yaml containing *scopes* and return its path."""
+    fleet = {
         "strata": [{"id": "L1", "name": "Function", "ordinal": 1}],
-        "scopes": scopes,
+        "scopes": [
+            {k: v for k, v in sc.items() if v is not None and k != "status"} for sc in scopes
+        ],
         "edges": [],
     }
-    return resp
+    path = tmp_path / "fleet.yaml"
+    path.write_text(yaml.dump(fleet), encoding="utf-8")
+    return path
+
+
+@pytest.fixture
+def fleet_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Point STRATA_FLEET_CONFIG at a tmp fleet.yaml written per test.
+
+    Yields a function ``set_scopes(scopes) -> Path``. Clears the Settings
+    cache on setup and teardown so the env var takes effect and never leaks.
+    """
+    from strata.settings import get_settings
+
+    def set_scopes(scopes: list[dict]) -> Path:
+        path = _write_fleet(tmp_path, scopes)
+        monkeypatch.setenv("STRATA_FLEET_CONFIG", str(path))
+        get_settings.cache_clear()
+        return path
+
+    get_settings.cache_clear()
+    yield set_scopes
+    get_settings.cache_clear()
 
 
 # ---------------------------------------------------------------------------
@@ -267,18 +290,55 @@ class TestMakeSessionId:
 
 
 # ---------------------------------------------------------------------------
-# CLI integration — backend unreachable
+# CLI integration — no fleet config (launch reads fleet.yaml directly; #45)
 # ---------------------------------------------------------------------------
 
 
-class TestLaunchBackendUnreachable:
-    def test_backend_unreachable_exits_nonzero(self, capsys: pytest.CaptureFixture[str]) -> None:
-        """Backend unreachable → exit 1 with hint to run strata start."""
-        with patch("httpx.get", side_effect=httpx.ConnectError("refused")):
+class TestLaunchNoFleet:
+    def test_missing_fleet_exits_nonzero_with_actionable_message(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """No fleet.yaml anywhere → exit 1 pointing at register / start."""
+        from strata.settings import get_settings
+
+        monkeypatch.setenv("STRATA_FLEET_CONFIG", str(tmp_path / "absent.yaml"))
+        get_settings.cache_clear()
+        try:
             rc = main(["launch", "g_arch"])
+        finally:
+            get_settings.cache_clear()
         assert rc == 1
         err = capsys.readouterr().err
-        assert "strata start" in err
+        assert "strata register" in err
+
+    def test_invalid_fleet_exits_nonzero(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Invalid fleet.yaml → exit 1 with the FleetConfig error, no traceback."""
+        from strata.settings import get_settings
+
+        bad = tmp_path / "fleet.yaml"
+        bad.write_text(
+            "strata:\n  - id: L1\n    name: F\n    ordinal: 1\n"
+            "scopes:\n  - id: g_a\n    name: A\n    stratum_id: NOPE\n"
+            "edges: []\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("STRATA_FLEET_CONFIG", str(bad))
+        get_settings.cache_clear()
+        try:
+            rc = main(["launch", "g_a"])
+        finally:
+            get_settings.cache_clear()
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "Fleet config invalid" in err
 
 
 # ---------------------------------------------------------------------------
@@ -288,12 +348,11 @@ class TestLaunchBackendUnreachable:
 
 class TestLaunchUnknownScope:
     def test_unknown_scope_exits_nonzero_lists_valid(
-        self, capsys: pytest.CaptureFixture[str]
+        self, fleet_env, capsys: pytest.CaptureFixture[str]
     ) -> None:
         """Unknown scope → exit 1, error message lists valid scope IDs."""
-        resp = _fake_scopes_response([_SCOPE_DEFAULT_ONLY])
-        with patch("httpx.get", return_value=resp):
-            rc = main(["launch", "g_nope"])
+        fleet_env([_SCOPE_DEFAULT_ONLY])
+        rc = main(["launch", "g_nope"])
         assert rc == 1
         err = capsys.readouterr().err
         assert "g_arch" in err
@@ -307,10 +366,10 @@ class TestLaunchUnknownScope:
 
 class TestLaunchNonTTY:
     def test_no_arg_no_role_non_tty_exits_nonzero(
-        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+        self, fleet_env, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
         """Non-TTY + no positional arg + no .strata-role → exit 1, no input() call."""
-        resp = _fake_scopes_response([_SCOPE_DEFAULT_ONLY])
+        fleet_env([_SCOPE_DEFAULT_ONLY])
         called_input = []
 
         def fake_input(prompt: str = "") -> str:
@@ -318,7 +377,6 @@ class TestLaunchNonTTY:
             return "1"
 
         with (
-            patch("httpx.get", return_value=resp),
             patch("strata.__main__.is_interactive", return_value=False),
             patch("builtins.input", side_effect=fake_input),
             # Run from tmp_path which has no .strata-role and no .git nearby.
@@ -341,12 +399,11 @@ class TestLaunchNonTTY:
 
 class TestLaunchPicker:
     def test_picker_resolves_scope_and_skill(
-        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+        self, fleet_env, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
         """Interactive picker: user picks scope '1', skill resolved from default."""
-        resp = _fake_scopes_response([_SCOPE_DEFAULT_ONLY])
+        fleet_env([_SCOPE_DEFAULT_ONLY])
         with (
-            patch("httpx.get", return_value=resp),
             patch("strata.__main__.is_interactive", return_value=True),
             patch("builtins.input", return_value="1"),
             patch("pathlib.Path.cwd", return_value=tmp_path),
@@ -367,13 +424,12 @@ class TestLaunchPicker:
 
 
 class TestLaunchExecvpe:
-    def test_execvpe_called_with_correct_env(self, capsys: pytest.CaptureFixture[str]) -> None:
+    def test_execvpe_called_with_correct_env(
+        self, fleet_env, capsys: pytest.CaptureFixture[str]
+    ) -> None:
         """Happy path: execvpe invoked with STRATA_AGENT_* env vars."""
-        resp = _fake_scopes_response([_SCOPE_DEFAULT_ONLY])
-        with (
-            patch("httpx.get", return_value=resp),
-            patch("os.execvpe") as mock_exec,
-        ):
+        fleet_env([_SCOPE_DEFAULT_ONLY])
+        with patch("os.execvpe") as mock_exec:
             rc = main(["launch", "g_arch"])
         assert rc == 0
         mock_exec.assert_called_once()
@@ -384,52 +440,44 @@ class TestLaunchExecvpe:
         assert env["STRATA_AGENT_SKILL"] == "code-writer"
         assert env["STRATA_AGENT_SESSION_ID"].startswith("sess_g_arch_code-writer_")
 
-    def test_session_override_propagated(self, capsys: pytest.CaptureFixture[str]) -> None:
+    def test_session_override_propagated(
+        self, fleet_env, capsys: pytest.CaptureFixture[str]
+    ) -> None:
         """--session flag overrides auto-generated session ID."""
-        resp = _fake_scopes_response([_SCOPE_DEFAULT_ONLY])
-        with (
-            patch("httpx.get", return_value=resp),
-            patch("os.execvpe") as mock_exec,
-        ):
+        fleet_env([_SCOPE_DEFAULT_ONLY])
+        with patch("os.execvpe") as mock_exec:
             rc = main(["launch", "g_arch", "--session", "my-sess"])
         assert rc == 0
         _cmd, _argv, env = mock_exec.call_args[0]
         assert env["STRATA_AGENT_SESSION_ID"] == "my-sess"
 
-    def test_skill_override_propagated(self, capsys: pytest.CaptureFixture[str]) -> None:
+    def test_skill_override_propagated(self, fleet_env, capsys: pytest.CaptureFixture[str]) -> None:
         """--skill flag overrides resolved skill (must be in permitted list)."""
-        resp = _fake_scopes_response([_SCOPE_DEFAULT_AND_PERMITTED])
-        with (
-            patch("httpx.get", return_value=resp),
-            patch("os.execvpe") as mock_exec,
-        ):
+        fleet_env([_SCOPE_DEFAULT_AND_PERMITTED])
+        with patch("os.execvpe") as mock_exec:
             rc = main(["launch", "g_arch", "--skill", "evidence-summarizer"])
         assert rc == 0
         _cmd, _argv, env = mock_exec.call_args[0]
         assert env["STRATA_AGENT_SKILL"] == "evidence-summarizer"
 
     def test_skill_override_not_permitted_exits_nonzero(
-        self, capsys: pytest.CaptureFixture[str]
+        self, fleet_env, capsys: pytest.CaptureFixture[str]
     ) -> None:
         """--skill not in permitted_skills → exit 1, no exec."""
-        resp = _fake_scopes_response([_SCOPE_DEFAULT_AND_PERMITTED])
-        with (
-            patch("httpx.get", return_value=resp),
-            patch("os.execvpe") as mock_exec,
-        ):
+        fleet_env([_SCOPE_DEFAULT_AND_PERMITTED])
+        with patch("os.execvpe") as mock_exec:
             rc = main(["launch", "g_arch", "--skill", "scope-manager"])
         assert rc == 1
         mock_exec.assert_not_called()
         err = capsys.readouterr().err
         assert "not permitted" in err
 
-    def test_claude_not_on_path_exits_nonzero(self, capsys: pytest.CaptureFixture[str]) -> None:
+    def test_claude_not_on_path_exits_nonzero(
+        self, fleet_env, capsys: pytest.CaptureFixture[str]
+    ) -> None:
         """FileNotFoundError from execvpe → exit 1 with clear message."""
-        resp = _fake_scopes_response([_SCOPE_DEFAULT_ONLY])
-        with (
-            patch("httpx.get", return_value=resp),
-            patch("os.execvpe", side_effect=FileNotFoundError),
-        ):
+        fleet_env([_SCOPE_DEFAULT_ONLY])
+        with patch("os.execvpe", side_effect=FileNotFoundError):
             rc = main(["launch", "g_arch"])
         assert rc == 1
         err = capsys.readouterr().err
@@ -443,14 +491,13 @@ class TestLaunchExecvpe:
 
 class TestLaunchStrataRole:
     def test_strata_role_scope_only(
-        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+        self, fleet_env, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
         """.strata-role with scope only → skill resolved from fleet declaration."""
         role = tmp_path / ".strata-role"
         role.write_text('scope = "g_arch"\n', encoding="utf-8")
-        resp = _fake_scopes_response([_SCOPE_DEFAULT_ONLY])
+        fleet_env([_SCOPE_DEFAULT_ONLY])
         with (
-            patch("httpx.get", return_value=resp),
             patch("pathlib.Path.cwd", return_value=tmp_path),
             patch("os.execvpe") as mock_exec,
         ):
@@ -461,15 +508,14 @@ class TestLaunchStrataRole:
         assert env["STRATA_AGENT_SKILL"] == "code-writer"
 
     def test_strata_role_scope_and_skill(
-        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+        self, fleet_env, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
         """.strata-role with scope+skill overrides resolution table."""
         role = tmp_path / ".strata-role"
         role.write_text('scope = "g_arch"\nskill = "evidence-summarizer"\n', encoding="utf-8")
         # Use a scope that would normally resolve code-writer.
-        resp = _fake_scopes_response([_SCOPE_DEFAULT_ONLY])
+        fleet_env([_SCOPE_DEFAULT_ONLY])
         with (
-            patch("httpx.get", return_value=resp),
             patch("pathlib.Path.cwd", return_value=tmp_path),
             patch("os.execvpe") as mock_exec,
         ):
@@ -479,16 +525,15 @@ class TestLaunchStrataRole:
         assert env["STRATA_AGENT_SKILL"] == "evidence-summarizer"
 
     def test_strata_role_in_parent_dir(
-        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+        self, fleet_env, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
         """.strata-role in a parent directory is discovered from a nested cwd."""
         role = tmp_path / ".strata-role"
         role.write_text('scope = "g_arch"\n', encoding="utf-8")
         nested = tmp_path / "proj" / "src"
         nested.mkdir(parents=True)
-        resp = _fake_scopes_response([_SCOPE_DEFAULT_ONLY])
+        fleet_env([_SCOPE_DEFAULT_ONLY])
         with (
-            patch("httpx.get", return_value=resp),
             patch("pathlib.Path.cwd", return_value=nested),
             patch("os.execvpe") as mock_exec,
         ):
@@ -498,16 +543,13 @@ class TestLaunchStrataRole:
         assert env["STRATA_AGENT_SCOPE"] == "g_arch"
 
     def test_strata_role_inactive_scope_exits_nonzero(
-        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+        self, fleet_env, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
         """.strata-role referencing a non-active scope ID exits nonzero."""
         role = tmp_path / ".strata-role"
         role.write_text('scope = "g_old"\n', encoding="utf-8")
-        resp = _fake_scopes_response([_SCOPE_DEFAULT_ONLY])  # only g_arch is active
-        with (
-            patch("httpx.get", return_value=resp),
-            patch("pathlib.Path.cwd", return_value=tmp_path),
-        ):
+        fleet_env([_SCOPE_DEFAULT_ONLY])  # only g_arch is active
+        with patch("pathlib.Path.cwd", return_value=tmp_path):
             rc = main(["launch"])
         assert rc == 1
         err = capsys.readouterr().err
@@ -521,14 +563,11 @@ class TestLaunchStrataRole:
 
 class TestLaunchNoSkills:
     def test_scope_declares_no_skills_exits_nonzero(
-        self, capsys: pytest.CaptureFixture[str]
+        self, fleet_env, capsys: pytest.CaptureFixture[str]
     ) -> None:
         """Scope with no default_skill and no permitted_skills → exit 1."""
-        resp = _fake_scopes_response([_SCOPE_NO_SKILLS])
-        with (
-            patch("httpx.get", return_value=resp),
-            patch("os.execvpe") as mock_exec,
-        ):
+        fleet_env([_SCOPE_NO_SKILLS])
+        with patch("os.execvpe") as mock_exec:
             rc = main(["launch", "g_arch"])
         assert rc == 1
         mock_exec.assert_not_called()
@@ -542,13 +581,10 @@ class TestLaunchNoSkills:
 
 
 class TestSessionIdViaCLI:
-    def test_session_id_format_in_env(self, capsys: pytest.CaptureFixture[str]) -> None:
+    def test_session_id_format_in_env(self, fleet_env, capsys: pytest.CaptureFixture[str]) -> None:
         """Auto-generated session ID matches pinned format."""
-        resp = _fake_scopes_response([_SCOPE_DEFAULT_ONLY])
-        with (
-            patch("httpx.get", return_value=resp),
-            patch("os.execvpe") as mock_exec,
-        ):
+        fleet_env([_SCOPE_DEFAULT_ONLY])
+        with patch("os.execvpe") as mock_exec:
             rc = main(["launch", "g_arch"])
         assert rc == 0
         _cmd, _argv, env = mock_exec.call_args[0]

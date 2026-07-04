@@ -75,6 +75,10 @@ def run_migrations(db_path: str, *, migrations_dir: Path | None = None) -> list[
 
     conn = sqlite3.connect(db_path)
     try:
+        # WAL is set once here rather than per connection: journal_mode is
+        # persistent in the database file, and re-issuing it on live
+        # connections can require exclusive access (issue #39).
+        conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA foreign_keys = ON")
         _ensure_migrations_table(conn)
         already_applied = _applied_migration_names(conn)

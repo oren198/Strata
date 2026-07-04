@@ -32,47 +32,68 @@ STRATA_AGENT_SESSION_ID
 from __future__ import annotations
 
 import os
+import sqlite3
+import sys
 import uuid
 from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
 
+import yaml
 from mcp.server.fastmcp import FastMCP
 
-from strata.fleet_config import FleetConfig
+from strata.fleet_config import FleetConfig, FleetConfigError
 from strata.migrator import run_migrations
-from strata.project_config import load_project_config
+from strata.project_config import (
+    ProjectConfigError,
+    StoragePaths,
+    load_project_config,
+    resolve_storage_paths,
+)
 from strata.record_store import ContributorRef, RecordStore
 from strata.settings import get_settings
 from strata.summary_store import ScopeSummary, SummaryStore
 
 # ---------------------------------------------------------------------------
-# Module-level singletons — instantiated once at import.
+# Module-level runtime state — populated by _init_runtime() from main(),
+# AFTER binding validation (issue #46). Nothing at import time touches the
+# filesystem, so any storage failure surfaces inside the refuse-to-start
+# report instead of as a raw traceback. Tests populate these globals
+# directly after importing the module.
 #
 # Storage paths prefer .strata/config.toml (per-project config, ADR 0005
-# Decision 2) when discoverable via the walk-up loader.  Fall back to
-# get_settings() (env-var behaviour) when no project config is found —
-# this keeps the development-against-the-Strata-repo workflow unchanged.
+# Decision 2) via resolve_storage_paths() — the same single source of truth
+# used by the CLI and the FastAPI backend (issue #44).
 # ---------------------------------------------------------------------------
 
 _settings = get_settings()
-_project_config = load_project_config()
 
-# Resolve effective paths: project config wins when present.
-_db_path: str = str(_project_config.db) if _project_config else _settings.db_path
-_summaries_dir: str = (
-    str(_project_config.summaries_dir) if _project_config else _settings.summaries_dir
-)
-_fleet_yaml_path: str = (
-    str(_project_config.fleet_yaml) if _project_config else _settings.fleet_yaml_path
-)
+_db_path: str = ""
+_summaries_dir: str = ""
+_fleet_yaml_path: str = ""
+_record_store: RecordStore | None = None
+_summary_store: SummaryStore | None = None
 
-# Apply any pending migrations so the DB is ready before first tool call.
-run_migrations(_db_path)
 
-_record_store = RecordStore(_db_path)
-_summary_store = SummaryStore(_summaries_dir)
+def _set_paths(paths: StoragePaths) -> None:
+    """Publish resolved storage paths to the module globals (no I/O)."""
+    global _db_path, _summaries_dir, _fleet_yaml_path
+    _db_path = paths.db_path
+    _summaries_dir = paths.summaries_dir
+    _fleet_yaml_path = paths.fleet_yaml_path
+
+
+def _init_stores() -> None:
+    """Initialise storage-backed singletons — called AFTER binding validation.
+
+    Applies pending migrations so the DB is ready before the first tool call.
+    """
+    global _record_store, _summary_store
+    run_migrations(_db_path)
+    _record_store = RecordStore(_db_path)
+    _summary_store = SummaryStore(_summaries_dir)
+
 
 # Agent provenance — recorded on every contribution.
 # STRATA_AGENT_SCOPE and STRATA_AGENT_SKILL have no defaults;
@@ -116,6 +137,7 @@ def _validate_binding(
     *,
     project_config_found: bool = False,
     searched_paths: list[str] | None = None,
+    extra_errors: list[str] | None = None,
 ) -> None:
     """Validate agent binding before starting the MCP server.
 
@@ -144,10 +166,11 @@ def _validate_binding(
         project_config_found:  True when ``.strata/config.toml`` was located.
         searched_paths:        Paths that were searched (for the error
                                message when config not found).
+        extra_errors:          Startup failures collected before binding
+                               validation (malformed config/fleet files, issue
+                               #46) — reported in the same aggregated message.
     """
-    import sys
-
-    errors: list[str] = []
+    errors: list[str] = list(extra_errors) if extra_errors else []
 
     # 1. .strata/config.toml must be resolvable.
     if not project_config_found:
@@ -338,6 +361,7 @@ def strata_contribute(
             current_summary=current_summary,
             recent_contributions=recent_contributions,
             new_contribution=contribution,
+            summary_max_words=_settings.summary_max_words,
         )
     except Exception as exc:
         raise RuntimeError(f"Scope-manager judgment failed: {exc}") from exc
@@ -351,7 +375,12 @@ def strata_contribute(
 
     summary_updated = False
     if judgment.decision != "decline" and judgment.new_summary is not None:
-        _summary_store.write(scope_id, judgment.new_summary)
+        # Stamp the parent-summary version the judgment was built from, so
+        # staleness stays detectable without re-running the LLM (ADR 0004 D4).
+        to_write = judgment.new_summary.model_copy(
+            update={"parent_version": parent_summary.version if parent_summary else None}
+        )
+        _summary_store.write(scope_id, to_write)
         summary_updated = True
 
     return {
@@ -554,18 +583,52 @@ def strata_read_scope_record(scope_id: str) -> dict:
 def main() -> None:
     """Start the Strata MCP server.
 
-    Validates that ``.strata/config.toml`` is present and the agent binding
-    (scope, skill) is correct before starting.  Any validation failure calls
-    sys.exit(1) with an actionable message.
+    Startup order (issue #46 — nothing touches storage before validation):
+
+    1. Resolve paths (project config walk-up; env fallback).
+    2. Load the fleet config — parse/invariant failures become refuse-to-start
+       entries, not tracebacks.
+    3. Validate the agent binding (scope, skill) — all failures aggregated.
+    4. Initialise storage (migrations, stores) — failures also render as a
+       refuse-to-start message.
+    5. Serve.
+
+    Any failure exits 1 with a single actionable message (ADR 0005 D5).
     """
     # Walk for the project config once at startup so we can show the user
     # exactly which paths we examined when validation fails.
+    startup_errors: list[str] = []
     searched_paths_out: list[Path] = []
-    project_config = load_project_config(searched_paths_out=searched_paths_out)
+    project_config = None
+    try:
+        project_config = load_project_config(searched_paths_out=searched_paths_out)
+    except ProjectConfigError as exc:
+        startup_errors.append(
+            f".strata/config.toml is invalid: {exc}\n"
+            "  Fix the file (or delete it and re-run `strata register`)."
+        )
+
+    paths = resolve_storage_paths(_settings)
+    _set_paths(paths)
 
     # Load fleet only when we have a config; without one there's nothing to
     # validate against, and the loader would just hit env-var fallbacks.
-    fleet = _load_fleet() if project_config is not None else None
+    # Parse errors and invariant violations become refuse-to-start entries.
+    fleet = None
+    if project_config is not None:
+        try:
+            fleet = _load_fleet()
+        except FleetConfigError as exc:
+            startup_errors.append(
+                f"fleet config at {paths.fleet_yaml_path} is invalid "
+                f"[{exc.kind}]: {exc.message}\n"
+                "  Fix fleet.yaml, then relaunch."
+            )
+        except yaml.YAMLError as exc:
+            startup_errors.append(
+                f"fleet config at {paths.fleet_yaml_path} is not valid YAML: {exc}\n"
+                "  Fix fleet.yaml, then relaunch."
+            )
 
     _validate_binding(
         fleet,
@@ -573,7 +636,24 @@ def main() -> None:
         _AGENT_SKILL,
         project_config_found=project_config is not None,
         searched_paths=[str(p) for p in searched_paths_out],
+        extra_errors=startup_errors,
     )
+
+    # Storage init after validation — failures here (unwritable directory,
+    # corrupt DB) also render as a refuse-to-start message, not a traceback.
+    try:
+        _init_stores()
+    except (OSError, sqlite3.Error) as exc:
+        print(
+            "Strata MCP server refuses to start — storage initialisation failed:\n\n"
+            f"[1] cannot initialise storage at db={paths.db_path!r}, "
+            f"summaries={paths.summaries_dir!r}:\n"
+            f"  {exc}\n"
+            "  Check that the paths in .strata/config.toml exist and are writable.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     mcp.run(transport="stdio")
 
 

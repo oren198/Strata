@@ -75,6 +75,12 @@ access layer and nothing more.
 - **CLI subcommands** (`strata contribute`, `strata summary`,
   `strata launch`) — already operate directly on the stores. Verified,
   no change.
+  > **Erratum (2026-07-04):** this bullet was inaccurate as written.
+  > `strata contribute` does not exist; `strata summary` / `strata record`
+  > / `strata scopes` are HTTP clients of the Console backend; and
+  > `strata launch` validated against the backend until issue #45 moved it
+  > to reading `fleet.yaml` directly. The decision itself (embedded MCP
+  > server, backend = UI only) stands.
 - **`strata start`** — keeps starting the FastAPI server. Running it
   gives you the Console UI; not running it does not interrupt the
   agent loop. Documented as optional.

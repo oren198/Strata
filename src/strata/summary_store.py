@@ -137,7 +137,11 @@ def _render_summary(summary: ScopeSummary) -> str:
         lines.append("")
     else:
         for directive in summary.directives:
-            lines.append(f"### [{directive.id}] {directive.content}")
+            # Heading shows the first line only (headings cannot span lines);
+            # the blockquote below carries the full content and is what the
+            # parser treats as canonical.
+            heading_content = directive.content.splitlines()[0] if directive.content else ""
+            lines.append(f"### [{directive.id}] {heading_content}")
             subject_value = directive.subject if directive.subject is not None else ""
             lines.append(f"- subject: {subject_value}")
             lines.append(
@@ -146,7 +150,10 @@ def _render_summary(summary: ScopeSummary) -> str:
                 f" · at={directive.created_at}"
             )
             lines.append("")
-            lines.append(f"> {directive.content}")
+            # Blockquote every line so multi-line directives round-trip
+            # instead of being truncated to their first line.
+            for content_line in directive.content.splitlines() or [""]:
+                lines.append(f"> {content_line}")
             lines.append("")
 
     # --- Context section ---
@@ -194,16 +201,20 @@ def _parse_summary(text: str) -> ScopeSummary:
     cur_source_scope: str | None = None
     cur_source_skill: str | None = None
     cur_created_at: str | None = None
-    cur_blockquote: str | None = None
+    cur_blockquote_lines: list[str] = []
 
     def _flush_directive() -> None:
         """Save the current in-progress directive to the list."""
         nonlocal cur_id, cur_content_from_heading, cur_subject
-        nonlocal cur_source_scope, cur_source_skill, cur_created_at, cur_blockquote
+        nonlocal cur_source_scope, cur_source_skill, cur_created_at, cur_blockquote_lines
         if cur_id is None:
             return
-        # Use blockquote as canonical content (as spec requires)
-        content = cur_blockquote if cur_blockquote is not None else (cur_content_from_heading or "")
+        # Use blockquote as canonical content (as spec requires); the heading
+        # carries only the first line for display.
+        if cur_blockquote_lines:
+            content = "\n".join(cur_blockquote_lines)
+        else:
+            content = cur_content_from_heading or ""
         directives.append(
             Directive(
                 id=cur_id,
@@ -220,17 +231,20 @@ def _parse_summary(text: str) -> ScopeSummary:
         cur_source_scope = None
         cur_source_skill = None
         cur_created_at = None
-        cur_blockquote = None
+        cur_blockquote_lines = []
 
     for raw_line in body.splitlines():
         line = raw_line.rstrip()
 
-        # Detect section headers first
-        if line == "## Directives":
+        # Detect section headers — but only from states where a header is
+        # structurally expected. Once IN_CONTEXT, header-lookalike lines are
+        # content: context text quoting "## Directives" must not flip the
+        # state machine back and silently drop the rest of the section.
+        if line == "## Directives" and state == "OUTSIDE":
             state = "IN_DIRECTIVES"
             continue
 
-        if line == "## Context":
+        if line == "## Context" and state in ("OUTSIDE", "IN_DIRECTIVES", "IN_DIRECTIVE_BLOCK"):
             _flush_directive()
             state = "IN_CONTEXT"
             continue
@@ -267,7 +281,7 @@ def _parse_summary(text: str) -> ScopeSummary:
 
             m_bq = _BLOCKQUOTE_RE.match(line)
             if m_bq:
-                cur_blockquote = m_bq.group(1)
+                cur_blockquote_lines.append(m_bq.group(1))
                 continue
 
         if state == "IN_CONTEXT":

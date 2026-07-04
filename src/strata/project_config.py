@@ -24,10 +24,14 @@ scope-manager.
 from __future__ import annotations
 
 import tomllib
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import BaseModel, field_validator
+
+if TYPE_CHECKING:
+    from strata.settings import Settings
 
 # ---------------------------------------------------------------------------
 # Error type (mirrors FleetConfigError pattern)
@@ -185,4 +189,75 @@ def _parse_config(config_path: Path, project_root: Path) -> ProjectConfig:
         fleet_yaml=resolved["fleet_yaml"],
         summaries_dir=resolved["summaries_dir"],
         project_root=project_root,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Storage-path resolution — the single source of truth (issue #44)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class StoragePaths:
+    """The one resolved answer to "where does Strata state live?".
+
+    Every entry point (CLI, FastAPI backend, MCP server) must obtain its
+    storage paths through :func:`resolve_storage_paths` so they can never
+    diverge (ROADMAP enduring principle: single source of truth).
+
+    Attributes:
+        db_path:         SQLite record-store path.
+        summaries_dir:   Per-scope summary directory.
+        fleet_yaml_path: Fleet YAML path.
+        source:          ``"project"`` when ``.strata/config.toml`` won,
+                         ``"env"`` when env-var settings were used.
+        project_root:    The registered project root when ``source ==
+                         "project"``; ``None`` otherwise.
+    """
+
+    db_path: str
+    summaries_dir: str
+    fleet_yaml_path: str
+    source: Literal["project", "env"]
+    project_root: Path | None
+
+
+def resolve_storage_paths(
+    settings: Settings | None = None,
+    *,
+    start: Path | None = None,
+) -> StoragePaths:
+    """Resolve storage paths: project config wins, env settings are the fallback.
+
+    Precedence (ADR 0005 Decision 2, extended to all entry points by #44):
+
+    1. ``.strata/config.toml`` discovered by walking up from *start* (cwd).
+    2. Env-var-driven :class:`~strata.settings.Settings` defaults.
+
+    Args:
+        settings: Optional pre-built settings (tests / ``create_app``).
+                  When None, the cached :func:`~strata.settings.get_settings`
+                  singleton is used for the fallback values.
+        start:    Directory to begin the config walk-up from (default: cwd).
+    """
+    project = load_project_config(start)
+    if project is not None:
+        return StoragePaths(
+            db_path=str(project.db),
+            summaries_dir=str(project.summaries_dir),
+            fleet_yaml_path=str(project.fleet_yaml),
+            source="project",
+            project_root=project.project_root,
+        )
+
+    if settings is None:
+        from strata.settings import get_settings  # local import — avoid cycle
+
+        settings = get_settings()
+    return StoragePaths(
+        db_path=settings.db_path,
+        summaries_dir=settings.summaries_dir,
+        fleet_yaml_path=settings.fleet_yaml_path,
+        source="env",
+        project_root=None,
     )

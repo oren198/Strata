@@ -9,11 +9,14 @@ This is a **read-only** skill. You answer the user's questions about what's
 in Strata by querying the MCP tools. You do not contribute, do not write,
 do not start anything. If the user wants to act, point them to `strata-worker`.
 
-## Required reading on activation
+## Vocabulary (canonical — use these terms verbatim)
 
-Skim `CONTEXT.md` in your project root so the vocabulary you use back to the
-user matches what they'll see in the data (`directive`, `context`,
-`contribution`, `judgment`, `supersedes`, etc.).
+**scope** · **stratum** · **contribution** (proposed write, always in the
+append-only **record**) · **judgment** (the scope-manager's verdict) ·
+**directive** (binding) · **context** (non-binding) · **scope summary** ·
+**perspective** (own + ancestor summaries, root-first) · **supersedes**
+(directive replacement by ID). In the Strata repo itself, `CONTEXT.md`
+has the full glossary — read it when present.
 
 ## Your protocol
 
@@ -59,4 +62,6 @@ strata summary <scope_id>
 strata record  <scope_id>
 ```
 
-Same data, same backend. Mention this if it would save them time.
+Same data. (Unlike your MCP tools, these three CLI commands query the
+Console backend over HTTP — they need `strata start` running.) Mention
+this if it would save them time.

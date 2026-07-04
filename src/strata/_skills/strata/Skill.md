@@ -5,33 +5,50 @@ description: Onboarding entry skill for Strata — the shared-memory layer for a
 
 # Strata — first time?
 
-Strata is a **shared memory system for fleets of agents**. The full theory
-lives in `docs/philosophy.md`; the canonical vocabulary (23 terms) lives in
-`CONTEXT.md`. Both are short and worth one read.
+Strata is a **shared memory system for fleets of agents**.
+
+## Vocabulary (canonical — use these terms verbatim)
+
+- **scope** — a bounded region of the fleet where memory attaches.
+- **stratum** — a horizontal layer of scopes; lower ordinal = broader.
+- **contribution** — any proposed write to a scope's memory; always
+  appended to the scope's **record** (append-only, never edited).
+- **scope-manager** — the agent that judges every contribution for its scope.
+- **directive** — binding memory; flows down to descendant scopes.
+- **context** — non-binding memory; informs but never binds.
+- **scope summary** — the curated working view of one scope.
+- **perspective** — composed view: own summary + inter-stratum ancestors',
+  ordered root-first.
+- **supersession** — a new directive replacing an old one by ID.
+
+(In the Strata repo itself, `CONTEXT.md` has the full 23-term glossary and
+`docs/philosophy.md` the theory — read them when present.)
 
 ## What you do in this skill
 
-1. **Read `CONTEXT.md`** if you haven't yet — the rest of Strata only makes
-   sense in that vocabulary.
-2. **Verify the backend is running**: call `strata_list_scopes`. If it
-   errors with a connection refused, the user needs to start the backend
-   (`strata start` in another terminal). Don't try to start it yourself.
-3. **Show the user the fleet**: report the strata, scopes, and edges from
+1. **Check the MCP tools work**: call `strata_list_scopes`. The tools are
+   embedded — no backend process is involved. If the tool is unavailable,
+   the Strata MCP server refused to start (its startup message names the
+   fix — usually `STRATA_AGENT_SCOPE`/`STRATA_AGENT_SKILL` or a missing
+   `.strata/config.toml`); relay that to the user.
+2. **Show the user the fleet**: report the strata, scopes, and edges from
    `strata_list_scopes`. Explain which scopes the user can act *as*.
-4. **Help the user pick a role**:
+3. **Help the user pick a role**:
    - If they want to *act as an agent* and contribute memory at a specific
      scope, point them to the `strata-worker` skill. They start a new CC
      session with these env vars set, then invoke `/strata-worker`:
      ```
      STRATA_AGENT_SCOPE=<scope_id>
-     STRATA_AGENT_SKILL=<a human-readable skill name, e.g. "architect">
+     STRATA_AGENT_SKILL=<a skill name permitted for that scope in fleet.yaml>
      STRATA_AGENT_SESSION_ID=<any unique-per-session string>
      ```
    - If they want to *browse memory* without contributing, point them to
-     `strata-inspect`. No env vars required.
+     `strata-inspect` (same env vars — the MCP server validates the binding
+     for every session, read-only or not).
    - If they want a visual view, the Strata Console is at
-     `http://localhost:8000/` once the backend is running.
-5. **Stop here.** This skill is the airport map, not the destination. Do
+     `http://localhost:8000/` — the one thing that DOES need the backend
+     (`strata start`).
+4. **Stop here.** This skill is the airport map, not the destination. Do
    not call `strata_contribute` from this skill — that's the worker's job.
 
 ## Available tools (read-only from this skill)
@@ -46,6 +63,7 @@ lives in `docs/philosophy.md`; the canonical vocabulary (23 terms) lives in
 ## What you do NOT do here
 
 - Do not contribute. Use `strata-worker` for that.
-- Do not modify config. Bootstrap happens via `strata bootstrap` on the CLI.
+- Do not modify config. `fleet.yaml` is the source of truth; the user edits
+  it and can validate with `strata bootstrap`.
 - Do not assume which scope the user belongs at — ask, or list and let them
   pick.
