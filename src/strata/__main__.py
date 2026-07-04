@@ -16,10 +16,11 @@ runnable. Subcommands:
 * ``strata export-fleet`` — read V1 fleet tables and write fleet.yaml for
                            the V1 → V1.2 upgrade path.
 
-The inspection commands (``scopes``, ``summary``, ``record``, ``launch``)
-talk to a running backend over HTTP — start the backend first with
-``strata start`` in another terminal. All other commands work directly
-against the DB on disk.
+The inspection commands (``scopes``, ``summary``, ``record``) talk to a
+running backend over HTTP — start the backend first with ``strata start``
+in another terminal. All other commands (including ``launch``, which reads
+fleet.yaml directly — embedded mode, ADR 0004 D1) work directly against
+the files on disk.
 
 Vocabulary throughout follows ``CONTEXT.md``.
 """
@@ -51,6 +52,7 @@ Vocabulary throughout follows ``CONTEXT.md``.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shutil
 import sqlite3
@@ -77,8 +79,8 @@ from strata.launch import (
 )
 from strata.preflight import Check, run_launch_preflight, run_start_preflight
 
-# Path to the bundled starter templates directory.
-_TEMPLATES_DIR = Path(__file__).parent.parent.parent / "templates"
+# Path to the bundled starter templates directory (package data, like _skills).
+_TEMPLATES_DIR = Path(__file__).parent / "_templates"
 _DEFAULT_TEMPLATE = _TEMPLATES_DIR / "dev-team.yaml"
 
 
@@ -86,20 +88,31 @@ def _backend_url() -> str:
     return os.environ.get("STRATA_BACKEND_URL", "http://127.0.0.1:8000").rstrip("/")
 
 
+def _storage_paths():
+    """Resolve storage paths through the single source of truth (issue #44).
+
+    ``.strata/config.toml`` (walk-up discovery) wins over env-var settings,
+    exactly as the MCP server and the backend resolve them, so no two entry
+    points can ever operate on different state.
+    """
+    from strata.project_config import resolve_storage_paths
+
+    return resolve_storage_paths()
+
+
 def _db_path_default() -> str:
-    return os.environ.get("STRATA_DB_PATH", "./strata.db")
+    return _storage_paths().db_path
 
 
 def _fleet_config_default() -> str:
-    """Resolve the canonical fleet config path through Settings.
+    """Resolve the canonical fleet config path (ADR 0002 + ADR 0005 D2).
 
-    Reads ``STRATA_FLEET_CONFIG`` (or the ``./fleet.yaml`` default) via the
-    same :class:`Settings` the backend uses, so the CLI and the running app
-    never diverge on which file is canonical (ADR 0002).
+    Project config (``.strata/config.toml``) wins when present; otherwise
+    ``STRATA_FLEET_CONFIG`` / the ``./fleet.yaml`` default via the same
+    :class:`Settings` the backend uses, so the CLI and the running app never
+    diverge on which file is canonical.
     """
-    from strata.settings import get_settings
-
-    return get_settings().fleet_yaml_path
+    return _storage_paths().fleet_yaml_path
 
 
 def _resolve_fleet_config(explicit: str | None) -> str | None:
@@ -270,10 +283,29 @@ def cmd_start(args: argparse.Namespace) -> int:
     """Apply migrations, auto-seed fleet.yaml if absent, then run uvicorn."""
     from strata.migrator import run_migrations
 
-    db_path = args.db or _db_path_default()
-    fleet_yaml_path = _fleet_config_default()
+    paths = _storage_paths()
+    db_path = args.db or paths.db_path
+    fleet_yaml_path = paths.fleet_yaml_path
+    if paths.source == "project":
+        print(f"using project config: {paths.project_root}/.strata/config.toml")
+        if args.db and args.db != paths.db_path:
+            print(
+                f"--db {args.db} conflicts with .strata/config.toml (db = {paths.db_path}).\n"
+                "The project config is the single source of truth for a registered "
+                "project — edit .strata/config.toml instead of passing --db.",
+                file=sys.stderr,
+            )
+            return 1
+    elif args.db:
+        # The served app resolves its own paths via Settings; export the
+        # override so migrations, the upgrade guard, and the app all use the
+        # SAME database (previously --db was migrated but ./strata.db served).
+        os.environ["STRATA_DB_PATH"] = args.db
+        from strata.settings import get_settings
 
-    # 0. Preflight — prerequisite hygiene checks before any DB or server work.
+        get_settings.cache_clear()
+
+    # 1. Preflight — prerequisite hygiene checks before any DB or server work.
     if not args.skip_preflight:
         rc = _run_preflight(run_start_preflight(port=args.port, db_path=db_path))
         if rc != 0:
@@ -300,11 +332,22 @@ def cmd_start(args: argparse.Namespace) -> int:
     if applied:
         print(f"Applied {len(applied)} migration(s).")
 
-    # 4. Auto-seed fleet.yaml if absent.
-    fleet_path = Path(_fleet_config_default())
-    if not fleet_path.exists() and _DEFAULT_TEMPLATE.exists():
-        shutil.copy(_DEFAULT_TEMPLATE, fleet_path)
-        print("seeded fleet.yaml from the default template; edit to suit")
+    # 4. Auto-seed fleet.yaml if absent. Only for the env-driven dev flow —
+    #    in a registered project (source == "project") the fleet was seeded
+    #    by `strata register`; a missing file there is a broken state the
+    #    user should repair, not silently paper over with the dev template.
+    fleet_path = Path(fleet_yaml_path)
+    if not fleet_path.exists():
+        if paths.source == "project":
+            print(
+                f"fleet.yaml missing at {fleet_path} (listed in .strata/config.toml).\n"
+                "Re-run `strata register` from the project root to re-seed it.",
+                file=sys.stderr,
+            )
+            return 1
+        if _DEFAULT_TEMPLATE.exists():
+            shutil.copy(_DEFAULT_TEMPLATE, fleet_path)
+            print("seeded fleet.yaml from the default template; edit to suit")
 
     # 5. Serve.
     import uvicorn
@@ -356,13 +399,13 @@ def cmd_summary(args: argparse.Namespace) -> int:
     url = f"{_backend_url()}/scopes/{args.scope_id}/summary"
     try:
         resp = httpx.get(url, timeout=10)
+        if resp.status_code == 404:
+            print(f"Scope not found: {args.scope_id}", file=sys.stderr)
+            return 1
+        resp.raise_for_status()
     except httpx.HTTPError as e:
         print(f"Backend error: {e}", file=sys.stderr)
         return 2
-    if resp.status_code == 404:
-        print(f"Scope not found: {args.scope_id}", file=sys.stderr)
-        return 1
-    resp.raise_for_status()
     summary = resp.json()
 
     print(f"# Scope: {summary['scope_id']}")
@@ -393,13 +436,13 @@ def cmd_record(args: argparse.Namespace) -> int:
     url = f"{_backend_url()}/scopes/{args.scope_id}/record"
     try:
         resp = httpx.get(url, timeout=10)
+        if resp.status_code == 404:
+            print(f"Scope not found: {args.scope_id}", file=sys.stderr)
+            return 1
+        resp.raise_for_status()
     except httpx.HTTPError as e:
         print(f"Backend error: {e}", file=sys.stderr)
         return 2
-    if resp.status_code == 404:
-        print(f"Scope not found: {args.scope_id}", file=sys.stderr)
-        return 1
-    resp.raise_for_status()
     data = resp.json()
 
     print(f"Scope: {args.scope_id}")
@@ -439,6 +482,9 @@ def cmd_export_fleet(args: argparse.Namespace) -> int:
 
     try:
         result: ExportResult = export_fleet(db_path, out_path, force=args.force)
+    except FileNotFoundError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
     except TablesAbsentError:
         print(
             f"No V1 fleet tables found in {db_path} — nothing to export "
@@ -501,7 +547,7 @@ def _refresh_scope(
     """
     from datetime import UTC, datetime
 
-    from strata.record_store import Contribution, ContributorRef
+    from strata.record_store import ContributorRef
 
     if _visited is None:
         _visited = set()
@@ -564,11 +610,12 @@ def _refresh_scope(
     current_summary = summary_store.read(scope_id)
     recent_contributions = record_store.list_contributions(scope_id=scope_id, limit=20)
 
-    # Build a synthetic "refresh" contribution that requests a summary rewrite.
-    # We use a ContributorRef representing the manager itself.
+    # The refresh request is itself a contribution: it is appended to the
+    # record BEFORE judgment and its judgment is recorded after, so the
+    # summary never changes without a record trail ("the record is sacred" —
+    # ROADMAP principle 4; CONTEXT.md § Contribution).
     ts = datetime.now(tz=UTC).isoformat()
-    refresh_contribution = Contribution(
-        id=f"refresh_{scope_id}_{ts}",
+    refresh_contribution = record_store.append_contribution(
         scope_id=scope_id,
         content=(
             "[Manager refresh triggered by strata launch"
@@ -583,7 +630,6 @@ def _refresh_scope(
             session_id="refresh",
             ts=ts,
         ),
-        created_at=ts,
     )
 
     print(f"  [refresh] refreshing scope {scope_id!r}...", file=sys.stderr)
@@ -595,6 +641,13 @@ def _refresh_scope(
         recent_contributions=recent_contributions,
         new_contribution=refresh_contribution,
         summary_max_words=summary_max_words,
+    )
+
+    record_store.record_judgment(
+        contribution_id=refresh_contribution.id,
+        decision=judgment.decision,
+        judged_by="scope-manager",
+        notes=judgment.reasoning,
     )
 
     if judgment.new_summary is not None:
@@ -637,7 +690,8 @@ def _run_manager_refresh(scope_id: str, *, skip: bool = False) -> None:
         )
         return
 
-    fleet_yaml = _fleet_config_default()
+    paths = _storage_paths()
+    fleet_yaml = paths.fleet_yaml_path
     if not Path(fleet_yaml).exists():
         print(
             f"  [refresh] fleet config not found at {fleet_yaml!r} — skipping manager refresh",
@@ -654,8 +708,8 @@ def _run_manager_refresh(scope_id: str, *, skip: bool = False) -> None:
         )
         return
 
-    db_path = settings.db_path
-    summaries_dir = settings.summaries_dir
+    db_path = paths.db_path
+    summaries_dir = paths.summaries_dir
 
     client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
     manager = ScopeManager(client=client, model=settings.manager_model)
@@ -720,48 +774,59 @@ def _run_manager_refresh(scope_id: str, *, skip: bool = False) -> None:
 def cmd_launch(args: argparse.Namespace) -> int:
     """Validate scope, resolve skill, and exec ``claude`` with STRATA_AGENT_* set.
 
-    Steps (per ADR 0003 + ADR 0004 D4):
-    0. Preflight — prerequisite hygiene checks.
-    1. Fetch active scopes from GET /scopes; fail fast if backend unreachable.
-    2. Determine target scope: positional arg > .strata-role discovery > picker.
-    3. Resolve skill from scope declaration (ADR 0002 resolution table).
-    4. Build session ID (auto-generated or --session override).
-    4a. Manager-refresh step (ADR 0004 D4): refresh stale ancestor summaries,
+    Steps (per ADR 0003 + ADR 0004 D1/D4 + issue #45):
+    1. Preflight — prerequisite hygiene checks, reported in the same pass as
+       fleet-resolution failures (all problems in one run, matching the MCP
+       server's refuse-to-start style).
+    2. Load active scopes from fleet.yaml directly (embedded mode — the
+       backend is the Console UI only and is NOT required to launch).
+    3. Determine target scope: positional arg > .strata-role discovery > picker.
+    4. Resolve skill from scope declaration (ADR 0002 resolution table).
+    5. Build session ID (auto-generated or --session override).
+    5a. Manager-refresh step (ADR 0004 D4): refresh stale ancestor summaries,
         then refresh the scope itself.  Skipped with --skip-refresh.
-    5. execvp("claude", ...) with STRATA_AGENT_* env vars.
+    6. execvp("claude", ...) with STRATA_AGENT_* env vars.
     """
-    import httpx
+    from strata.fleet_config import FleetConfig, FleetConfigError
 
     # -----------------------------------------------------------------------
-    # Step 0: Preflight.
+    # Step 1: Preflight + fleet resolution — one pass, all failures reported.
     # -----------------------------------------------------------------------
+    preflight_rc = 0
     if not args.skip_preflight:
-        rc = _run_preflight(run_launch_preflight())
-        if rc != 0:
-            return rc
-
-    interactive = is_interactive()
+        preflight_rc = _run_preflight(run_launch_preflight())
 
     # -----------------------------------------------------------------------
-    # Step 1: Fetch active scopes from the backend.
+    # Step 2: Load active scopes from fleet.yaml (no backend required).
     # -----------------------------------------------------------------------
-    url = f"{_backend_url()}/scopes"
-    try:
-        resp = httpx.get(url, timeout=10)
-        resp.raise_for_status()
-    except httpx.HTTPError as e:
-        print(
-            f"Cannot reach backend ({e}). Start the backend with: strata start",
-            file=sys.stderr,
+    paths = _storage_paths()
+    fleet_path = Path(paths.fleet_yaml_path)
+    fleet_error: str | None = None
+    active_scopes: list[dict] = []
+    if not fleet_path.exists():
+        fleet_error = (
+            f"No fleet config found at {fleet_path}.\n"
+            "  In a registered project: run `strata register` from the project root.\n"
+            "  In the Strata repo: run `strata start` once to seed fleet.yaml, "
+            "or set STRATA_FLEET_CONFIG."
         )
+    else:
+        try:
+            fleet = FleetConfig.load(fleet_path)
+            active_scopes = [sc.model_dump() for sc in fleet.active_scopes()]
+        except FleetConfigError as exc:
+            fleet_error = f"Fleet config invalid [{exc.kind}]: {exc.message}"
+
+    if fleet_error is not None:
+        print(fleet_error, file=sys.stderr)
+    if preflight_rc != 0 or fleet_error is not None:
         return 1
 
-    data = resp.json()
-    active_scopes: list[dict] = data.get("scopes", [])
+    interactive = is_interactive()
     valid_ids = [sc["id"] for sc in active_scopes]
 
     # -----------------------------------------------------------------------
-    # Step 2: Determine target scope.
+    # Step 3: Determine target scope.
     # -----------------------------------------------------------------------
     scope_id_arg: str | None = args.scope_id  # may be None
     skill_from_role: str | None = None
@@ -807,7 +872,7 @@ def cmd_launch(args: argparse.Namespace) -> int:
                 return 1
 
     # -----------------------------------------------------------------------
-    # Step 3: Resolve skill.
+    # Step 4: Resolve skill.
     # -----------------------------------------------------------------------
     # --skill flag takes precedence over .strata-role skill (which in turn
     # falls through to the resolution table).
@@ -820,20 +885,29 @@ def cmd_launch(args: argparse.Namespace) -> int:
         return 1
 
     # -----------------------------------------------------------------------
-    # Step 4: Build session ID.
+    # Step 5: Build session ID.
     # -----------------------------------------------------------------------
     session_id: str = args.session if args.session else make_session_id(scope_data["id"], skill)
 
     # -----------------------------------------------------------------------
-    # Step 4a: Manager-refresh (ADR 0004 D4) — before execvp.
+    # Step 5a: Manager-refresh (ADR 0004 D4) — before execvp. A refresh
+    # failure (API outage, bad key, malformed model output) must not abort
+    # the launch: the session can still run on the existing summaries.
     # -----------------------------------------------------------------------
-    _run_manager_refresh(
-        scope_data["id"],
-        skip=getattr(args, "skip_refresh", False),
-    )
+    try:
+        _run_manager_refresh(
+            scope_data["id"],
+            skip=getattr(args, "skip_refresh", False),
+        )
+    except Exception as exc:  # noqa: BLE001 — deliberate: refresh is best-effort
+        print(
+            f"  [refresh] failed: {exc} — continuing with existing summaries "
+            "(use --skip-refresh to skip this step entirely)",
+            file=sys.stderr,
+        )
 
     # -----------------------------------------------------------------------
-    # Step 5: exec claude.
+    # Step 6: exec claude.
     # -----------------------------------------------------------------------
     env = os.environ.copy()
     env["STRATA_AGENT_SCOPE"] = scope_data["id"]
@@ -861,7 +935,9 @@ def cmd_launch(args: argparse.Namespace) -> int:
 _PROJECT_MARKERS = (".git", "pyproject.toml", "package.json", "Cargo.toml", "go.mod")
 
 #: Gitignore block appended by strata register (idempotent — detected by header).
-_GITIGNORE_MARKER = "# Strata"
+# Exact managed line, not a loose "# Strata" substring — a user comment like
+# "# Strata console output" must not suppress the ignore block.
+_GITIGNORE_MARKER = "# Strata — managed by `strata register`"
 _GITIGNORE_BLOCK = """\
 # Strata — managed by `strata register` — do not remove this line
 .strata/.venv/
@@ -872,6 +948,42 @@ _GITIGNORE_BLOCK = """\
 
 #: Minimal settings.json merge entry.
 _MCP_ENTRY: dict = {"command": "strata-mcp", "env": {}}
+
+
+def _self_install_spec() -> str | None:
+    """Return a pip-installable spec for the *currently running* strata.
+
+    Uses the PEP 610 ``direct_url.json`` metadata pip records for installs
+    from a path or VCS URL. Returns None when no safe source can be
+    determined (e.g. a hypothetical index install) — the caller must fail
+    actionably rather than ``pip install strata``, which today resolves to an
+    unrelated PyPI package (issue #49).
+    """
+    import importlib.metadata  # noqa: PLC0415
+
+    try:
+        dist = importlib.metadata.distribution("strata")
+    except importlib.metadata.PackageNotFoundError:
+        return None
+    try:
+        raw = dist.read_text("direct_url.json")
+    except OSError:
+        raw = None
+    if not raw:
+        return None
+    try:
+        info = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    url = info.get("url", "")
+    vcs_info = info.get("vcs_info")
+    if vcs_info and url:
+        vcs = vcs_info.get("vcs", "git")
+        commit = vcs_info.get("commit_id", "")
+        return f"{vcs}+{url}@{commit}" if commit else f"{vcs}+{url}"
+    if url.startswith("file://"):
+        return url.removeprefix("file://")
+    return None
 
 
 def _is_v1_2_shape_mcp_entry(entry: dict) -> bool:
@@ -1026,7 +1138,7 @@ def cmd_register(args: argparse.Namespace) -> int:
     # Step 5: Seed .strata/fleet.yaml from templates/minimal.yaml.
     # -----------------------------------------------------------------------
     fleet_yaml = strata_dir / "fleet.yaml"
-    minimal_template = Path(__file__).parent.parent.parent / "templates" / "minimal.yaml"
+    minimal_template = _TEMPLATES_DIR / "minimal.yaml"
     if fleet_yaml.exists():
         _act("skip", fleet_yaml, skipped=True)
     else:
@@ -1065,20 +1177,30 @@ def cmd_register(args: argparse.Namespace) -> int:
     # Step 7: Merge strata into .claude/settings.json mcpServers block.
     # -----------------------------------------------------------------------
     settings_json = project_root / ".claude" / "settings.json"
+    settings_unreadable = False
     if settings_json.exists():
         try:
             settings_data: dict = json.loads(settings_json.read_text(encoding="utf-8"))
         except json.JSONDecodeError as exc:
+            # NEVER fall through to a write here: writing with an empty dict
+            # would replace the user's entire settings file with just the
+            # strata entry. Skip the merge outright and fail the run so the
+            # user notices ("never overwrite user state" — ADR 0005 D6).
             print(
-                f"Warning: .claude/settings.json is not valid JSON ({exc}). Skipping MCP merge.",
+                f"  ✗ .claude/settings.json exists but is not valid JSON ({exc}).\n"
+                "    Fix the file, then re-run `strata register` to add the strata "
+                "mcpServers entry.",
                 file=sys.stderr,
             )
+            settings_unreadable = True
             settings_data = {}
     else:
         settings_data = {}
 
     mcp_servers: dict = settings_data.get("mcpServers", {})
-    if "strata" in mcp_servers:
+    if settings_unreadable:
+        pass  # merge skipped — reported above; register exits non-zero below
+    elif "strata" in mcp_servers:
         _act("skip", settings_json, skipped=True)
         # Stale-shape detection (ADR 0005 Decision 6): warn if the existing
         # strata mcpServer entry is V1.2-shape (broken on V1.3). Keeps the
@@ -1122,21 +1244,37 @@ def cmd_register(args: argparse.Namespace) -> int:
     if bootstrap_venv:
         venv_dir = strata_dir / ".venv"
         venv_strata_mcp = venv_dir / "bin" / "strata-mcp"
-        if venv_dir.exists():
-            print("  .strata/.venv/ already exists — skipping venv creation")
+        if diff_mode:
+            print("  [would create] .strata/.venv/ and pip install strata into it")
         else:
-            # Python discovery (ADR 0005 Decision 7).
-            #
-            # `python -m venv` itself requires a Python ≥ 3.11 interpreter.
-            # Strata's own runtime is already ≥ 3.11 (per pyproject.toml's
-            # requires-python), so sys.executable is the right default.
-            # --python is the escape hatch for the rare case where the user
-            # wants to seed the venv with a different interpreter than the
-            # one running register.
-            python_arg: str | None = getattr(args, "python", None)
-            venv_python = python_arg if python_arg else sys.executable
+            if venv_dir.exists():
+                print("  .strata/.venv/ already exists — skipping venv creation")
+            else:
+                # Python discovery (ADR 0005 Decision 7).
+                #
+                # `python -m venv` itself requires a Python ≥ 3.11 interpreter.
+                # Strata's own runtime is already ≥ 3.11 (per pyproject.toml's
+                # requires-python), so sys.executable is the right default.
+                # --python is the escape hatch for the rare case where the user
+                # wants to seed the venv with a different interpreter than the
+                # one running register.
+                python_arg: str | None = getattr(args, "python", None)
+                venv_python = python_arg if python_arg else sys.executable
 
-            if not diff_mode:
+                install_spec = _self_install_spec()
+                if install_spec is None:
+                    print(
+                        "  ✗ cannot determine a safe install source for strata: this "
+                        "process was not\n"
+                        "    installed from a local path or VCS URL, and strata is not "
+                        "yet published to PyPI\n"
+                        "    (the name currently belongs to an unrelated package). "
+                        "Install strata into\n"
+                        "    .strata/.venv/ manually, or re-run once Strata is on PyPI.",
+                        file=sys.stderr,
+                    )
+                    return 1
+
                 print(f"  creating .strata/.venv/ using {venv_python} ...")
                 # Use the chosen Python to drive `venv` if it isn't us.
                 if venv_python == sys.executable:
@@ -1147,22 +1285,52 @@ def cmd_register(args: argparse.Namespace) -> int:
                     )
                 pip = venv_dir / "bin" / "pip"
                 subprocess.check_call(
-                    [str(pip), "install", "--quiet", "strata[cc-plugin]"],
+                    [str(pip), "install", "--quiet", install_spec],
                 )
                 print("  installed strata into .strata/.venv/")
 
-                # Update settings.json to use absolute path.
-                # (Outer `if not diff_mode:` at L1048 guarantees we're in
-                # write-mode here — no inner check needed.)
+            if not venv_strata_mcp.exists():
+                print(
+                    "  ✗ .strata/.venv/ exists but bin/strata-mcp is missing — the venv "
+                    "looks half-built\n"
+                    "    (interrupted install?). Remove .strata/.venv/ and re-run "
+                    "`strata register --bootstrap-venv`.",
+                    file=sys.stderr,
+                )
+                return 1
+
+            # Update settings.json to point at the venv binary. Runs on every
+            # bootstrap-venv invocation (not only when the venv was just
+            # created) so an earlier interrupted run can be repaired by
+            # re-running. Merge, never replace: a user-customised env block
+            # on the strata entry is preserved.
+            if settings_unreadable:
+                print(
+                    "  ✗ skipping settings.json venv update — fix the JSON first (see above).",
+                    file=sys.stderr,
+                )
+            else:
                 settings_data_venv: dict
                 if settings_json.exists():
-                    settings_data_venv = json.loads(settings_json.read_text(encoding="utf-8"))
+                    try:
+                        settings_data_venv = json.loads(settings_json.read_text(encoding="utf-8"))
+                    except json.JSONDecodeError as exc:
+                        print(
+                            f"  ✗ .claude/settings.json is not valid JSON ({exc}) — "
+                            "fix it, then re-run.",
+                            file=sys.stderr,
+                        )
+                        return 1
                 else:
                     settings_data_venv = {}
                 mcp_venv = settings_data_venv.get("mcpServers", {})
+                existing_entry = mcp_venv.get("strata")
+                preserved_env = (
+                    existing_entry.get("env", {}) if isinstance(existing_entry, dict) else {}
+                )
                 mcp_venv["strata"] = {
                     "command": str(venv_strata_mcp),
-                    "env": {},
+                    "env": preserved_env,
                 }
                 settings_data_venv["mcpServers"] = mcp_venv
                 (project_root / ".claude").mkdir(parents=True, exist_ok=True)
@@ -1170,8 +1338,6 @@ def cmd_register(args: argparse.Namespace) -> int:
                     json.dumps(settings_data_venv, indent=2) + "\n", encoding="utf-8"
                 )
                 print(f"  updated .claude/settings.json to use {venv_strata_mcp}")
-            else:
-                print("  [would create] .strata/.venv/ and pip install strata")
 
     # -----------------------------------------------------------------------
     # Print next steps.
@@ -1197,6 +1363,13 @@ def cmd_register(args: argparse.Namespace) -> int:
         print("     export STRATA_AGENT_SKILL=<your-skill>")
         print("  3. Open Claude Code in this directory: claude")
 
+    if settings_unreadable:
+        print(
+            "\nCompleted with 1 problem: .claude/settings.json could not be merged "
+            "(invalid JSON — see above).",
+            file=sys.stderr,
+        )
+        return 1
     return 0
 
 

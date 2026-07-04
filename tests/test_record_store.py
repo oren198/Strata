@@ -94,7 +94,7 @@ def test_migration_runner_applies_only_new(tmp_path: Path) -> None:
     assert "0001_initial.sql" in applied_after_first
 
     # Write a temporary migration to the real migrations folder, run, then remove.
-    migrations_dir = Path(__file__).parent.parent / "migrations"
+    migrations_dir = Path(__file__).parent.parent / "src" / "strata" / "_migrations"
     temp_migration = migrations_dir / "0099_temp_test.sql"
     try:
         temp_migration.write_text("-- temporary test migration\n", encoding="utf-8")

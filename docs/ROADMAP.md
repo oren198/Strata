@@ -38,6 +38,13 @@ These govern every future decision. They are the answer when an ADR is silent.
 7. **LLM-native, no spaghetti, no premature abstraction.** Reject on
    conceptual-model grounds (cite `CONTEXT.md` / `philosophy.md`), not just
    blast radius.
+8. **Single source of truth.** Every piece of state has exactly one
+   canonical owner and one resolution path: fleet shape → `fleet.yaml`
+   (ADR 0002); storage paths → `resolve_storage_paths` (project config
+   over env, ADR 0005 D2 + issue #44); summaries → `SummaryStore`; the
+   record → `RecordStore`. Any second copy must be a derived, disposable
+   cache — two entry points resolving the same state differently is a bug
+   by definition.
 
 ---
 
@@ -54,20 +61,25 @@ Nothing else here. Look forward.
 
 ## Horizon 2 — Realize the core: perspective composition + bounded working view
 
-The single most important unrealized concept. Today `read_perspective` is a
-stub that returns the agent's own-scope summary. Until perspectives genuinely
-compose across the strata, the system isn't yet Strata.
+**Write side delivered** in V1.2.1/V1.3 (ADR 0004, ADR 0005):
 
-This horizon is one principle (#5 above) at two layers; the architect decides
-whether it's a single ADR or a sibling pair:
+- **Perspective composition (shipped)** — `read_perspective` walks the
+  inter-stratum ancestor chain root-first and returns provenance-labelled
+  layers (`{scope_id, stratum_id, summary}`). The V1 own-scope stub is gone.
+- **Bounded summary at write time (shipped)** — per-scope word budget
+  (`STRATA_SUMMARY_MAX_WORDS`) enforced by the scope-manager on every
+  judgment; lazy ancestor refresh keeps stale summaries from compounding.
+- Delivered alongside: embedded mode (MCP server operates on the stores
+  in-process; the backend is Console-UI-only), and brownfield install
+  (`strata register`, `.strata/config.toml`, refuse-to-start binding
+  validation).
 
-- **Perspective composition** — walk the inter-stratum ancestor chain plus
-  any peer references; assemble a **provenance-preserving** view (each item
-  labelled with origin scope); directives broadest-first, never dropped;
-  context **relevance-ranked**, not concatenated wholesale.
-- **Bounded working view** — per-scope summary size budget; the
-  scope-manager condenses / supersedes / retires on overflow. Forgetting
-  gets a concrete trigger instead of a vague "the manager curates."
+**Read side remaining** — the perspective itself is still concatenation,
+not selection: every ancestor layer arrives whole, and context is not
+**relevance-ranked**. Principle #5's across-scopes half. Deferred in
+ADR 0005 with a forcing function: revisit when a real fleet at depth ≥ 5
+makes composed perspectives too large. Dogfooding shallow real fleets
+first will sharpen this more than speculation.
 
 *Research anchors (inspiration, not mandate):* Generative Agents'
 recency × importance × relevance for context selection; MemGPT-style paging

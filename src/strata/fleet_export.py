@@ -100,9 +100,13 @@ def export_fleet(
     """
     from strata.fleet_config import FleetConfig, _validate
 
-    conn = sqlite3.connect(db_path)
+    if not Path(db_path).exists():
+        # sqlite3.connect would silently create an empty DB file at the typo'd
+        # path — a side effect this read-only exporter must never have.
+        raise FileNotFoundError(f"No SQLite database at {db_path}")
+
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     try:
-        conn.execute("PRAGMA foreign_keys = ON")
         if not _v1_tables_present(conn):
             raise TablesAbsentError(db_path)
         raw = _read_v1(conn)

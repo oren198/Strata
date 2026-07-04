@@ -19,6 +19,7 @@ scopes:
     name: Root
     stratum_id: L0
     default_skill: strata-worker
-    permitted_skills: []
+    # No permitted_skills restriction — any skill may bind while you are
+    # getting started. Tighten this once your fleet takes shape.
 
 edges: []

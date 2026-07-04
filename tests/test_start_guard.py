@@ -27,12 +27,13 @@ import pytest
 
 from strata.__main__ import _v1_upgrade_guard_should_refuse, main
 from strata.migrator import run_migrations
+from strata.project_config import StoragePaths
 
 # ---------------------------------------------------------------------------
 # Shared test fixtures and helpers
 # ---------------------------------------------------------------------------
 
-_MIGRATIONS_DIR = Path(__file__).resolve().parent.parent / "migrations"
+_MIGRATIONS_DIR = Path(__file__).resolve().parent.parent / "src" / "strata" / "_migrations"
 
 
 def _build_v1_db(db_path: str, tmp_path: Path) -> None:
@@ -112,8 +113,16 @@ def test_guard_refuses_when_v1_db_and_no_fleet_yaml(
     with (
         patch("strata.migrator.run_migrations", return_value=[]) as mock_migrate,
         patch("uvicorn.run"),
-        patch("strata.__main__._fleet_config_default", return_value=fleet_yaml_path),
-        patch("strata.__main__._db_path_default", return_value=db_path),
+        patch(
+            "strata.__main__._storage_paths",
+            return_value=StoragePaths(
+                db_path=db_path,
+                summaries_dir=str(Path(db_path).parent / "summaries"),
+                fleet_yaml_path=fleet_yaml_path,
+                source="env",
+                project_root=None,
+            ),
+        ),
     ):
         rc = main(["start"])
 
@@ -147,8 +156,16 @@ def test_guard_bypassed_by_skip_flag(
     with (
         patch("strata.migrator.run_migrations", return_value=[]) as mock_migrate,
         patch("uvicorn.run"),
-        patch("strata.__main__._fleet_config_default", return_value=fleet_yaml_path),
-        patch("strata.__main__._db_path_default", return_value=db_path),
+        patch(
+            "strata.__main__._storage_paths",
+            return_value=StoragePaths(
+                db_path=db_path,
+                summaries_dir=str(Path(db_path).parent / "summaries"),
+                fleet_yaml_path=fleet_yaml_path,
+                source="env",
+                project_root=None,
+            ),
+        ),
     ):
         rc = main(["start", "--skip-upgrade-check"])
 
@@ -175,8 +192,16 @@ def test_guard_passes_when_fleet_yaml_exists(
     with (
         patch("strata.migrator.run_migrations", return_value=[]) as mock_migrate,
         patch("uvicorn.run"),
-        patch("strata.__main__._fleet_config_default", return_value=fleet_yaml_path),
-        patch("strata.__main__._db_path_default", return_value=db_path),
+        patch(
+            "strata.__main__._storage_paths",
+            return_value=StoragePaths(
+                db_path=db_path,
+                summaries_dir=str(Path(db_path).parent / "summaries"),
+                fleet_yaml_path=fleet_yaml_path,
+                source="env",
+                project_root=None,
+            ),
+        ),
     ):
         rc = main(["start"])
 
@@ -200,8 +225,16 @@ def test_guard_passes_on_fresh_install(
     with (
         patch("strata.migrator.run_migrations", return_value=[]) as mock_migrate,
         patch("uvicorn.run"),
-        patch("strata.__main__._fleet_config_default", return_value=fleet_yaml_path),
-        patch("strata.__main__._db_path_default", return_value=db_path),
+        patch(
+            "strata.__main__._storage_paths",
+            return_value=StoragePaths(
+                db_path=db_path,
+                summaries_dir=str(Path(db_path).parent / "summaries"),
+                fleet_yaml_path=fleet_yaml_path,
+                source="env",
+                project_root=None,
+            ),
+        ),
     ):
         rc = main(["start"])
 
@@ -227,8 +260,16 @@ def test_guard_passes_when_0002_already_applied(
     with (
         patch("strata.migrator.run_migrations", return_value=[]) as mock_migrate,
         patch("uvicorn.run"),
-        patch("strata.__main__._fleet_config_default", return_value=fleet_yaml_path),
-        patch("strata.__main__._db_path_default", return_value=db_path),
+        patch(
+            "strata.__main__._storage_paths",
+            return_value=StoragePaths(
+                db_path=db_path,
+                summaries_dir=str(Path(db_path).parent / "summaries"),
+                fleet_yaml_path=fleet_yaml_path,
+                source="env",
+                project_root=None,
+            ),
+        ),
     ):
         rc = main(["start"])
 
@@ -270,8 +311,16 @@ def test_guard_passes_when_v1_tables_absent(
     with (
         patch("strata.migrator.run_migrations", return_value=[]) as mock_migrate,
         patch("uvicorn.run"),
-        patch("strata.__main__._fleet_config_default", return_value=fleet_yaml_path),
-        patch("strata.__main__._db_path_default", return_value=db_path),
+        patch(
+            "strata.__main__._storage_paths",
+            return_value=StoragePaths(
+                db_path=db_path,
+                summaries_dir=str(Path(db_path).parent / "summaries"),
+                fleet_yaml_path=fleet_yaml_path,
+                source="env",
+                project_root=None,
+            ),
+        ),
     ):
         rc = main(["start"])
 
@@ -296,8 +345,16 @@ def test_guard_does_not_mutate_source_db(tmp_path: Path) -> None:
     with (
         patch("strata.migrator.run_migrations", return_value=[]),
         patch("uvicorn.run"),
-        patch("strata.__main__._fleet_config_default", return_value=fleet_yaml_path),
-        patch("strata.__main__._db_path_default", return_value=db_path),
+        patch(
+            "strata.__main__._storage_paths",
+            return_value=StoragePaths(
+                db_path=db_path,
+                summaries_dir=str(Path(db_path).parent / "summaries"),
+                fleet_yaml_path=fleet_yaml_path,
+                source="env",
+                project_root=None,
+            ),
+        ),
     ):
         rc = main(["start"])
 

@@ -35,7 +35,7 @@ jobs:
           cache: pip
 
       - name: Install
-        run: pip install -e ".[dev,cc-plugin]"
+        run: pip install -e ".[dev]"
 
       - name: Lint
         run: ruff check . && ruff format --check .
@@ -43,18 +43,60 @@ jobs:
       - name: Test
         run: python -m pytest
 
+  # Non-editable install smoke: build the wheel, install it into a clean
+  # venv, and walk the brownfield flow. Editable installs mask packaging
+  # bugs (missing package data, deps hidden in extras) — this leg is the
+  # only place they can surface before a user does (issues #40/#43 dogfood).
+  wheel-smoke:
+    name: wheel install smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Build wheel
+        run: pipx run build --wheel
+
+      - name: Install wheel into a clean venv
+        run: |
+          python -m venv /tmp/wheelenv
+          /tmp/wheelenv/bin/pip install --quiet dist/*.whl
+
+      - name: strata register + refuse-to-start smoke (foreign project)
+        run: |
+          set -eu
+          mkdir /tmp/foreign && cd /tmp/foreign && git init -q
+          /tmp/wheelenv/bin/strata register
+          test -f .strata/config.toml
+          test -f .strata/fleet.yaml
+          # No binding → must exit 1 with the aggregated refuse-to-start
+          # message, NOT a traceback.
+          set +e
+          out=$(/tmp/wheelenv/bin/strata-mcp </dev/null 2>&1)
+          rc=$?
+          set -e
+          [ "$rc" -eq 1 ]
+          echo "$out" | grep -q "refuses to start"
+          if echo "$out" | grep -q "Traceback"; then
+            echo "strata-mcp crashed with a traceback:"; echo "$out"; exit 1
+          fi
+
   # Single, stable status-check context required by the branch ruleset.
   # Succeeds only if every matrix leg of `test` succeeded.
   ci:
     name: CI
-    needs: test
+    needs: [test, wheel-smoke]
     if: always()
     runs-on: ubuntu-latest
     steps:
       - name: Verify matrix result
         run: |
-          if [ "${{ needs.test.result }}" != "success" ]; then
-            echo "One or more test/lint jobs failed: ${{ needs.test.result }}"
+          if [ "${{ needs.test.result }}" != "success" ] || [ "${{ needs.wheel-smoke.result }}" != "success" ]; then
+            echo "test: ${{ needs.test.result }}, wheel-smoke: ${{ needs.wheel-smoke.result }}"
             exit 1
           fi
-          echo "All test/lint jobs passed."
+          echo "All jobs passed."

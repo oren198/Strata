@@ -13,3 +13,8 @@ venv/
 
 # Claude Code agent worktrees (created by the harness, not project state)
 .claude/worktrees/
+
+# Local Strata workspace for developing-on-Strata sessions (`strata register`
+# run in this repo) — per-machine state, never committed.
+.strata/
+summaries/

@@ -34,7 +34,7 @@ def test_full_chain_drops_fleet_tables_and_preserves_record(tmp_path: Path) -> N
     db_path = str(tmp_path / "migrate.db")
 
     # Apply 0001 first (alone), then seed sample data.
-    migrations_dir = Path(__file__).resolve().parent.parent / "migrations"
+    migrations_dir = Path(__file__).resolve().parent.parent / "src" / "strata" / "_migrations"
     only_0001_dir = tmp_path / "migrations_step1"
     only_0001_dir.mkdir()
     (only_0001_dir / "0001_initial.sql").write_text(
@@ -112,7 +112,7 @@ def test_full_chain_drops_fleet_tables_and_preserves_record(tmp_path: Path) -> N
 def test_idempotent_reapply(tmp_path: Path) -> None:
     """Re-running migrations after a full apply is a no-op."""
     db_path = str(tmp_path / "idempotent.db")
-    migrations_dir = Path(__file__).resolve().parent.parent / "migrations"
+    migrations_dir = Path(__file__).resolve().parent.parent / "src" / "strata" / "_migrations"
 
     first = run_migrations(db_path, migrations_dir=migrations_dir)
     assert first == ["0001_initial.sql", "0002_drop_fleet_tables.sql"]
@@ -128,7 +128,7 @@ def test_judgment_check_constraint_survives_rebuild(tmp_path: Path, decision: st
     Guards against the rebuild silently widening the schema.
     """
     db_path = str(tmp_path / f"check_{decision}.db")
-    migrations_dir = Path(__file__).resolve().parent.parent / "migrations"
+    migrations_dir = Path(__file__).resolve().parent.parent / "src" / "strata" / "_migrations"
     run_migrations(db_path, migrations_dir=migrations_dir)
 
     conn = sqlite3.connect(db_path)

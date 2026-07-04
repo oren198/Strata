@@ -135,7 +135,6 @@ def _check_port_available(port: int) -> Check:
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
     try:
         sock.bind(("127.0.0.1", port))
-        sock.close()
         return Check(
             name=f"port {port} available",
             kind="hard",
