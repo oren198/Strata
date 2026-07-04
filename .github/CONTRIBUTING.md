@@ -22,7 +22,7 @@ Requires **Python 3.11+**.
 git clone https://github.com/oren198/strata.git
 cd strata
 python3 -m venv .venv && source .venv/bin/activate   # recommended
-make install          # pip install -e ".[dev,cc-plugin]"
+make install          # pip install -e ".[dev]"
 ```
 
 No Anthropic API key is needed for development — the test suite mocks all

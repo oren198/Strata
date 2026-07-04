@@ -77,8 +77,8 @@ from strata.launch import (
 )
 from strata.preflight import Check, run_launch_preflight, run_start_preflight
 
-# Path to the bundled starter templates directory.
-_TEMPLATES_DIR = Path(__file__).parent.parent.parent / "templates"
+# Path to the bundled starter templates directory (package data, like _skills).
+_TEMPLATES_DIR = Path(__file__).parent / "_templates"
 _DEFAULT_TEMPLATE = _TEMPLATES_DIR / "dev-team.yaml"
 
 
@@ -1026,7 +1026,7 @@ def cmd_register(args: argparse.Namespace) -> int:
     # Step 5: Seed .strata/fleet.yaml from templates/minimal.yaml.
     # -----------------------------------------------------------------------
     fleet_yaml = strata_dir / "fleet.yaml"
-    minimal_template = Path(__file__).parent.parent.parent / "templates" / "minimal.yaml"
+    minimal_template = _TEMPLATES_DIR / "minimal.yaml"
     if fleet_yaml.exists():
         _act("skip", fleet_yaml, skipped=True)
     else:

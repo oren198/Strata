@@ -32,7 +32,7 @@ from strata.migrator import run_migrations
 # Shared test fixtures and helpers
 # ---------------------------------------------------------------------------
 
-_MIGRATIONS_DIR = Path(__file__).resolve().parent.parent / "migrations"
+_MIGRATIONS_DIR = Path(__file__).resolve().parent.parent / "src" / "strata" / "_migrations"
 
 
 def _build_v1_db(db_path: str, tmp_path: Path) -> None:

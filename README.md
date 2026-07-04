@@ -77,10 +77,10 @@ A first-time, copy-paste-able run. Five steps, ~5 minutes.
 ```bash
 git clone https://github.com/oren198/Strata.git
 cd Strata
-make install        # creates the package install + dev/cc-plugin extras
+make install        # editable install + dev extras
 ```
 
-`make install` runs `pip install -e ".[dev,cc-plugin]"`. If you prefer an isolated virtual environment first:
+`make install` runs `pip install -e ".[dev]"`. If you prefer an isolated virtual environment first:
 
 ```bash
 python3 -m venv .venv

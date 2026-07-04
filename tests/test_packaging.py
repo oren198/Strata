@@ -77,7 +77,7 @@ def test_strata_mcp_console_script_alongside_python() -> None:
     script = Path(sys.executable).parent / "strata-mcp"
     assert script.is_file(), (
         f"strata-mcp not installed alongside {sys.executable}. "
-        "Run `pip install -e '.[dev,cc-plugin]'` to install the console script."
+        "Run `pip install -e '.[dev]'` to install the console script."
     )
 
 
@@ -102,3 +102,65 @@ def test_old_mcp_server_module_gone() -> None:
     """The old ``mcp_server.strata_mcp`` module must no longer exist."""
     with pytest.raises(ModuleNotFoundError):
         importlib.import_module("mcp_server.strata_mcp")
+
+
+# ---------------------------------------------------------------------------
+# Tests: wheel completeness — data dirs bundled, mcp a core dependency.
+#
+# V1.3 dogfooding found `pipx install strata` produced a broken install:
+# migrations/ and templates/ lived at the repo root (absent from the wheel)
+# and the `mcp` SDK sat in an optional extra while `strata-mcp` is an
+# unconditional console script. These are the tripwires.
+# ---------------------------------------------------------------------------
+
+
+def test_migrations_bundled_as_package_data() -> None:
+    """``strata/_migrations`` must ship inside the package with the SQL files."""
+    from importlib.resources import files
+
+    mig_dir = files("strata") / "_migrations"
+    names = [entry.name for entry in mig_dir.iterdir()]
+    assert "0001_initial.sql" in names
+    assert "0002_drop_fleet_tables.sql" in names
+
+
+def test_templates_bundled_as_package_data() -> None:
+    """``strata/_templates`` must ship inside the package with the starter fleets."""
+    from importlib.resources import files
+
+    tpl_dir = files("strata") / "_templates"
+    names = {entry.name for entry in tpl_dir.iterdir()}
+    assert {"minimal.yaml", "dev-team.yaml"} <= names, (
+        f"starter templates missing from package data: {names}"
+    )
+
+
+def test_bundled_templates_are_valid_fleet_configs() -> None:
+    """Every starter template must pass FleetConfig validation.
+
+    Dogfooding found ``minimal.yaml`` shipped with ``default_skill`` outside
+    an empty ``permitted_skills`` — an invalid fleet that made ``strata-mcp``
+    crash on first start in a freshly registered project.
+    """
+    from strata.fleet_config import FleetConfig
+
+    tpl_dir = Path(__file__).parent.parent / "src" / "strata" / "_templates"
+    templates = sorted(tpl_dir.glob("*.yaml"))
+    assert templates, f"no starter templates found in {tpl_dir}"
+    for template in templates:
+        FleetConfig.load(template)  # raises FleetConfigError if invalid
+
+
+def test_mcp_is_a_core_dependency() -> None:
+    """``mcp`` must be in [project] dependencies, not an optional extra.
+
+    ``strata-mcp`` is an unconditional console script; if its imports live
+    behind an extra, a plain ``pipx install strata`` ships a broken binary.
+    """
+    import tomllib
+
+    pyproject = Path(__file__).parent.parent / "pyproject.toml"
+    with pyproject.open("rb") as fh:
+        meta = tomllib.load(fh)
+    core_deps = [dep.split("[")[0].split(" ")[0] for dep in meta["project"]["dependencies"]]
+    assert "mcp" in core_deps, "the mcp SDK must be a core dependency (strata-mcp imports it)"
