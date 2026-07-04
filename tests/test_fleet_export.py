@@ -25,7 +25,7 @@ from strata.migrator import run_migrations
 
 def _build_v1_db(db_path: str, tmp_path: Path) -> None:
     """Apply only 0001_initial.sql to *db_path*, leaving 0002 unapplied."""
-    migrations_dir = Path(__file__).resolve().parent.parent / "migrations"
+    migrations_dir = Path(__file__).resolve().parent.parent / "src" / "strata" / "_migrations"
     only_0001 = tmp_path / "migrations_0001_only"
     only_0001.mkdir()
     (only_0001 / "0001_initial.sql").write_text(
@@ -244,7 +244,7 @@ def test_export_absent_tables_no_file_written(tmp_path: Path) -> None:
 def test_export_post_migration_db_raises_tables_absent_error(tmp_path: Path) -> None:
     """A DB that has already had 0002 applied raises TablesAbsentError."""
     db_path = str(tmp_path / "migrated.db")
-    migrations_dir = Path(__file__).resolve().parent.parent / "migrations"
+    migrations_dir = Path(__file__).resolve().parent.parent / "src" / "strata" / "_migrations"
     # Apply both migrations.
     run_migrations(db_path, migrations_dir=migrations_dir)
 

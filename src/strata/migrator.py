@@ -1,9 +1,9 @@
 """Migration runner for the Strata record store.
 
-Discovers SQL migration files in ``migrations/`` at the project root, in
-lexicographic order; tracks which ones have been applied in a
-``_migrations`` table; applies pending migrations one transaction per file.
-Idempotent — re-running applies nothing new.
+Discovers SQL migration files in ``strata/_migrations/`` (bundled package
+data, like ``_skills``), in lexicographic order; tracks which ones have been
+applied in a ``_migrations`` table; applies pending migrations one
+transaction per file. Idempotent — re-running applies nothing new.
 
 Lives inside the ``strata`` package (rather than ``scripts/``) so that the
 ``strata`` console script and the FastAPI app's lifespan can import it
@@ -19,16 +19,12 @@ from pathlib import Path
 
 
 def _default_migrations_dir() -> Path:
-    """Resolve the project's migrations/ directory.
+    """Resolve the bundled ``strata/_migrations/`` directory.
 
-    Walks up from this file's location: ``src/strata/migrator.py`` →
-    ``src/strata/`` → ``src/`` → project root → ``migrations``.
-
-    Only correct for editable installs (``pip install -e .``). When Strata
-    is eventually shipped as a wheel, migrations should be bundled into the
-    package via ``importlib.resources`` and this function replaced.
+    Migrations ship as package data next to this file, so the same path
+    works for editable installs and wheel installs (pip/pipx).
     """
-    return Path(__file__).resolve().parent.parent.parent / "migrations"
+    return Path(__file__).resolve().parent / "_migrations"
 
 
 def _ensure_migrations_table(conn: sqlite3.Connection) -> None:

@@ -47,13 +47,13 @@ UI layer only), real perspective composition (the agent's read walks
 the inter-stratum ancestor chain), parent-aware scope-managers, and
 lazy refresh + bounded summaries via a pre-session hook.
 
-**V1.3 in progress** — brownfield install per
+**V1.3 shipped** — brownfield install per
 [ADR 0005](docs/adr/0005-brownfield-install.md): `strata register` for
 two-command onboarding of any foreign project, per-project
 `.strata/config.toml` discovery, `strata-mcp` console script (no more
-Python-path gymnastics), skills vendored as package data, and honest
-provenance — the MCP server refuses to start without a valid scope
-binding.
+Python-path gymnastics), skills vendored as package data, preflight
+checks on `strata start` / `strata launch`, and honest provenance — the
+MCP server refuses to start without a valid scope binding.
 
 What comes next is captured in [`docs/ROADMAP.md`](docs/ROADMAP.md) — the
 enduring design principles and the sequenced direction the project is
@@ -77,10 +77,10 @@ A first-time, copy-paste-able run. Five steps, ~5 minutes.
 ```bash
 git clone https://github.com/oren198/Strata.git
 cd Strata
-make install        # creates the package install + dev/cc-plugin extras
+make install        # editable install + dev extras
 ```
 
-`make install` runs `pip install -e ".[dev,cc-plugin]"`. If you prefer an isolated virtual environment first:
+`make install` runs `pip install -e ".[dev]"`. If you prefer an isolated virtual environment first:
 
 ```bash
 python3 -m venv .venv
@@ -110,7 +110,7 @@ Without a key you can still run `make test` and `make lint`, but live contributi
 strata start
 ```
 
-This (a) applies SQLite migrations to `./strata.db`, (b) **auto-seeds `fleet.yaml`** from the default starter template (`templates/dev-team.yaml`) because no `fleet.yaml` exists yet, and (c) launches the FastAPI server. Per ADR 0002, the backend then reads `fleet.yaml` directly into an in-memory `FleetConfig` mirror — there is no separate "bootstrap into DB" step.
+This (a) applies SQLite migrations to `./strata.db`, (b) **auto-seeds `fleet.yaml`** from the bundled dev-team starter template because no `fleet.yaml` exists yet, and (c) launches the FastAPI server. Per ADR 0002, the backend then reads `fleet.yaml` directly into an in-memory `FleetConfig` mirror — there is no separate "bootstrap into DB" step.
 
 **Success looks like this:**
 
@@ -197,6 +197,11 @@ pipx install strata          # install strata in an isolated env; puts strata-mc
 cd /path/to/your/project
 strata register              # idempotent: creates .strata/, seeds fleet.yaml, wires Claude Code
 ```
+
+> **Until Strata is published on PyPI**, install from the repo instead:
+> `pipx install git+https://github.com/oren198/Strata.git` (or
+> `pipx install /path/to/Strata` from a local clone). Everything below is
+> identical either way.
 
 ### What `strata register` does
 
@@ -423,6 +428,8 @@ src/strata/
     strata/Skill.md      # CC skill: orientation / first-time use
     strata-worker/Skill.md  # CC skill: parametric worker — reads STRATA_AGENT_SCOPE/SKILL
     strata-inspect/Skill.md # CC skill: read-only browser
+  _migrations/           # SQLite schema migrations (package data)
+  _templates/            # Starter fleet.yaml templates (package data)
   project_config.py      # .strata/config.toml walk-up loader (ADR 0005 Decision 2)
 .claude/
   skills/
@@ -431,7 +438,6 @@ src/strata/
     strata-inspect/      # CC skill (copy used in Strata-repo sessions)
   settings.example.json  # Example MCP-server registration block (command: strata-mcp)
 tests/                   # pytest suite
-migrations/              # SQLite schema migrations
 scripts/                 # CLI runners (run_migrations.py, bootstrap_fleet.py)
 fleet.example.yaml       # Example fleet definition consumed by `make bootstrap`
 Makefile                 # Common tasks (install / test / lint / run / migrate / bootstrap / smoke)
