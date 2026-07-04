@@ -255,7 +255,10 @@ def test_read_scope_summary_reads_from_summary_store(tmp_path: Path) -> None:
 
     fleet = FleetConfig.load(fleet_path)
 
-    with patch.object(mod, "_load_fleet", return_value=fleet):
+    with (
+        patch.object(mod, "_load_fleet", return_value=fleet),
+        patch.object(mod, "_AGENT_SCOPE", "g_arch"),
+    ):
         mod._summary_store = ss
         result = mod.strata_read_scope_summary("g_arch")
 
@@ -288,7 +291,10 @@ def test_read_perspective_returns_layers_root_first(tmp_path: Path) -> None:
 
     fleet = FleetConfig.load(fleet_path)
 
-    with patch.object(mod, "_load_fleet", return_value=fleet):
+    with (
+        patch.object(mod, "_load_fleet", return_value=fleet),
+        patch.object(mod, "_AGENT_SCOPE", "g_backend"),
+    ):
         mod._summary_store = ss
         result = mod.strata_read_perspective("g_backend")
 
@@ -368,7 +374,16 @@ def test_read_scope_record_reads_from_record_store(tmp_path: Path) -> None:
         )
 
     mod._record_store = RecordStore(db_path)
-    result = mod.strata_read_scope_record("g_arch")
+
+    # Reading the record requires the fleet for the entitlement check
+    # (issue #48) — patch _AGENT_SCOPE to the scope under test, which is now
+    # the entitled bound scope.
+    fleet = FleetConfig.load(fleet_path)
+    with (
+        patch.object(mod, "_AGENT_SCOPE", "g_arch"),
+        patch.object(mod, "_load_fleet", return_value=fleet),
+    ):
+        result = mod.strata_read_scope_record("g_arch")
 
     assert len(result["contributions"]) == 1
     assert result["contributions"][0]["content"] == "Use WAL mode for SQLite."
@@ -439,7 +454,10 @@ def test_perspective_root_scope_returns_one_layer(tmp_path: Path) -> None:
 
     fleet = FleetConfig.load(fleet_path)
 
-    with patch.object(mod, "_load_fleet", return_value=fleet):
+    with (
+        patch.object(mod, "_load_fleet", return_value=fleet),
+        patch.object(mod, "_AGENT_SCOPE", "g_arch"),
+    ):
         mod._summary_store = ss
         result = mod.strata_read_perspective("g_arch")
 
@@ -470,7 +488,10 @@ def test_perspective_deep_scope_returns_layers_root_first(tmp_path: Path) -> Non
 
     fleet = FleetConfig.load(fleet_path)
 
-    with patch.object(mod, "_load_fleet", return_value=fleet):
+    with (
+        patch.object(mod, "_load_fleet", return_value=fleet),
+        patch.object(mod, "_AGENT_SCOPE", "g_team"),
+    ):
         mod._summary_store = ss
         result = mod.strata_read_perspective("g_team")
 
@@ -508,7 +529,10 @@ def test_perspective_peer_edges_not_traversed(tmp_path: Path) -> None:
 
     fleet = FleetConfig.load(fleet_path)
 
-    with patch.object(mod, "_load_fleet", return_value=fleet):
+    with (
+        patch.object(mod, "_load_fleet", return_value=fleet),
+        patch.object(mod, "_AGENT_SCOPE", "g_team"),
+    ):
         mod._summary_store = ss
         result = mod.strata_read_perspective("g_team")
 
@@ -539,7 +563,10 @@ def test_perspective_missing_ancestor_summary_produces_empty_layer(tmp_path: Pat
 
     fleet = FleetConfig.load(fleet_path)
 
-    with patch.object(mod, "_load_fleet", return_value=fleet):
+    with (
+        patch.object(mod, "_load_fleet", return_value=fleet),
+        patch.object(mod, "_AGENT_SCOPE", "g_backend"),
+    ):
         mod._summary_store = ss
         result = mod.strata_read_perspective("g_backend")
 
@@ -566,10 +593,137 @@ def test_perspective_no_v1_limitation_key(tmp_path: Path) -> None:
 
     fleet = FleetConfig.load(fleet_path)
 
-    with patch.object(mod, "_load_fleet", return_value=fleet):
+    with (
+        patch.object(mod, "_load_fleet", return_value=fleet),
+        patch.object(mod, "_AGENT_SCOPE", "g_arch"),
+    ):
         mod._summary_store = SummaryStore(summaries_dir)
         result = mod.strata_read_perspective("g_arch")
 
     assert "_v1_limitation" not in result, (
         "_v1_limitation must be removed now that real perspective composition is implemented"
     )
+
+
+# ---------------------------------------------------------------------------
+# Issue #48 — entitlement-scoped reads
+#
+# Entitled read surface = bound scope (_AGENT_SCOPE) + its inter-stratum
+# ancestors. Peer scopes are excluded — they reach an agent only through
+# ratified content composed into its perspective (issue #41), never a direct
+# read. Uses the deep fleet: g_exec (L0) <- g_func (L1) <- g_team (L2), with
+# g_peer as an L1 peer of g_func (NOT an ancestor of g_team).
+# ---------------------------------------------------------------------------
+
+
+def test_entitled_no_argument_returns_bound_scope_data(tmp_path: Path) -> None:
+    """Calling read tools with no scope_id defaults to the agent's bound scope."""
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_deep_fleet_yaml(tmp_path)
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+
+    ss = SummaryStore(summaries_dir)
+    ss.write("g_team", _make_summary("g_team", "team context"))
+    ss.write("g_func", _make_summary("g_func", "function context"))
+    ss.write("g_exec", _make_summary("g_exec", "executive context"))
+
+    fleet = FleetConfig.load(fleet_path)
+
+    with (
+        patch.object(mod, "_load_fleet", return_value=fleet),
+        patch.object(mod, "_AGENT_SCOPE", "g_team"),
+    ):
+        mod._summary_store = ss
+        summary_result = mod.strata_read_scope_summary()
+        perspective_result = mod.strata_read_perspective()
+        record_result = mod.strata_read_scope_record()
+
+    assert summary_result["scope_id"] == "g_team"
+    assert summary_result["context"] == "team context"
+
+    assert perspective_result["scope_id"] == "g_team"
+    assert perspective_result["layers"][-1]["scope_id"] == "g_team"
+
+    assert record_result == {"contributions": [], "judgments": []}
+
+
+def test_entitled_ancestor_read_allowed(tmp_path: Path) -> None:
+    """Reading an inter-stratum ancestor of the bound scope is allowed."""
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_deep_fleet_yaml(tmp_path)
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+
+    ss = SummaryStore(summaries_dir)
+    ss.write("g_exec", _make_summary("g_exec", "executive context"))
+
+    fleet = FleetConfig.load(fleet_path)
+
+    with (
+        patch.object(mod, "_load_fleet", return_value=fleet),
+        patch.object(mod, "_AGENT_SCOPE", "g_team"),
+    ):
+        mod._summary_store = ss
+        result = mod.strata_read_scope_summary("g_exec")
+
+    assert result["scope_id"] == "g_exec"
+    assert result["context"] == "executive context"
+
+
+def test_entitled_peer_read_raises_with_entitlement_message(tmp_path: Path) -> None:
+    """Reading a peer (intra-stratum, non-ancestor) scope raises RuntimeError."""
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_deep_fleet_yaml(tmp_path)
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+
+    ss = SummaryStore(summaries_dir)
+    ss.write("g_peer", _make_summary("g_peer", "peer context"))
+
+    fleet = FleetConfig.load(fleet_path)
+
+    with (
+        patch.object(mod, "_load_fleet", return_value=fleet),
+        patch.object(mod, "_AGENT_SCOPE", "g_team"),
+    ):
+        mod._summary_store = ss
+        with pytest.raises(RuntimeError, match="entitled read surface") as exc_info:
+            mod.strata_read_scope_summary("g_peer")
+
+    message = str(exc_info.value)
+    assert "g_peer" in message
+    assert "g_team" in message
+    assert "issue #41" in message
+
+    # Same entitlement gate applies to perspective and record reads.
+    with (
+        patch.object(mod, "_load_fleet", return_value=fleet),
+        patch.object(mod, "_AGENT_SCOPE", "g_team"),
+    ):
+        with pytest.raises(RuntimeError, match="entitled read surface"):
+            mod.strata_read_perspective("g_peer")
+        with pytest.raises(RuntimeError, match="entitled read surface"):
+            mod.strata_read_scope_record("g_peer")
+
+
+def test_entitled_own_empty_record_returns_empty_shape(tmp_path: Path) -> None:
+    """Reading the bound scope's own record with no rows yet returns the empty shape."""
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_deep_fleet_yaml(tmp_path)
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+
+    fleet = FleetConfig.load(fleet_path)
+
+    with (
+        patch.object(mod, "_load_fleet", return_value=fleet),
+        patch.object(mod, "_AGENT_SCOPE", "g_team"),
+    ):
+        result = mod.strata_read_scope_record("g_team")
+
+    assert result == {"contributions": [], "judgments": []}

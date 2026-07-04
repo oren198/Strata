@@ -453,10 +453,17 @@ layer; running `strata start` is required only to view the UI. The agent loop
 — contributions, scope-manager judgments, perspective reads — works whether
 the backend is up or down.
 
-> **Migration note for callers of the old HTTP API:** in embedded mode,
-> `strata_read_scope_record` returns an empty record (`{"contributions": [],
-> "judgments": []}`) for unknown scopes instead of the old HTTP `404`. The
-> other tools still raise on unknown scopes (matching the prior 404 behaviour).
+> **Entitlement-scoped reads (issue #48):** `strata_read_perspective`,
+> `strata_read_scope_summary`, and `strata_read_scope_record` default to your
+> bound scope (`STRATA_AGENT_SCOPE`) when called with no `scope_id`. An
+> explicit `scope_id` is limited to your bound scope plus its inter-stratum
+> ancestors — peer scopes are not directly readable; they reach you only
+> through ratified content composed into your perspective (see issue #41).
+> This supersedes the old HTTP-parity note for `strata_read_scope_record`:
+> it now loads the fleet on every call to run this check, so reading your
+> own scope's record while it has no rows still returns the empty record
+> shape (`{"contributions": [], "judgments": []}`), but a scope outside your
+> entitled surface raises instead of silently returning an empty record.
 
 **For a foreign project**: use `strata register` (see
 [Quick Start for an existing project](#quick-start-for-an-existing-project)
