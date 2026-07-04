@@ -55,6 +55,11 @@ strata register              # from the project root, idempotent
 
 ### 1. Packaging: fold `mcp_server/` into `src/strata/`
 
+> **Supersedes ADR 0004 D1's path** of `mcp_server/strata_mcp.py`.
+> The module moves to `src/strata/mcp/server.py` so it ships as proper
+> package data; the embedded-mode contract (no HTTP, in-process stores)
+> is unchanged.
+
 Move `mcp_server/strata_mcp.py` to `src/strata/mcp/server.py`. Update
 `pyproject.toml` to include the `strata.mcp` sub-package. Add a
 console-script entry:
@@ -106,14 +111,25 @@ Concrete actions, in order:
 
 - Detect the project root (`path` or cwd; fail if no clear marker
   like `.git/` or `pyproject.toml`).
+- **`.strata/` directory sanity check.** Before any action, check
+  `.strata/`: if the directory exists but lacks a `config.toml`,
+  fail with `"existing .strata/ directory at <path> does not look
+  like a Strata workspace (no config.toml). Please remove or rename
+  it before running strata register."` This prevents silently
+  writing into a foreign tool's directory and prevents `register`
+  from running against a half-initialised state from an interrupted
+  prior register.
 - Create `.strata/` if absent. Create `.strata/config.toml` with
   default relative paths (Decision 2).
 - Update `.gitignore` (append, with a `# Strata` marker block,
   idempotent): ignore `.strata/.venv/`, `.strata/strata.db*`,
   `.strata/summaries/`. Never `.strata/fleet.yaml` — that file is the
   org chart, must be committed.
-- Seed `.strata/fleet.yaml` from a minimal template if absent. Skip
-  if present.
+- Seed `.strata/fleet.yaml` from a **minimum-viable single-scope
+  template** if absent (one stratum `L0`, one scope `g_root`, no
+  edges; user edits in whatever they actually need). Brownfield
+  projects don't want the dev-team example fleet — they need
+  something neutral that fits their context. Skip if present.
 - Copy canonical skills to `.claude/skills/strata*` **only if absent**
   (Decision 6).
 - Merge the `strata` entry into `.claude/settings.json`'s `mcpServers`
@@ -144,7 +160,14 @@ new bridge validates at startup:
 4. `STRATA_AGENT_SKILL` is in the scope's `permitted_skills` — else
    fail listing permitted skills.
 
-Any failure → `sys.exit(1)` with an actionable message → CC surfaces
+**All four checks run independently; all failures are reported in a
+single error message before exit.** A user with multiple missing
+pieces sees the complete remediation list in one pass rather than
+fix-one-rerun-fix-next. Checks are ordered 1 → 4 so the message
+flows from "outermost setup gap" (no project config) to "innermost
+binding mismatch" (skill not permitted).
+
+Any failure → `sys.exit(1)` with the actionable message → CC surfaces
 the unusable MCP server → user fixes config. The `"unknown"` defaults
 are dropped entirely.
 
@@ -158,6 +181,16 @@ or settings.**
   `"kept user's strata-worker"`.
 - Settings entries are merged. If `mcpServers.strata` already exists,
   register skips it and reports `"kept user's strata mcpServer entry"`.
+- **Stale-shape detection (V1.2 → V1.3 upgrade path).** If the
+  existing `mcpServers.strata` entry matches a known-stale V1.2
+  shape (`command: python` + `args: ["-m", "mcp_server.strata_mcp"]`
+  or any `env.STRATA_BACKEND_URL`), register emits a clear warning:
+  `"WARNING: your existing strata mcpServer entry is V1.2-shape and
+  will silently fail on V1.3 (no mcp_server module; no
+  STRATA_BACKEND_URL). The canonical V1.3 entry is: <one-liner>.
+  Strata never overwrites your settings — run `strata register
+  --diff` to see the canonical, then update by hand."` The
+  strict-additive rule still holds: register does not overwrite.
 - `.strata/fleet.yaml` is seeded once; if it exists, register leaves
   it alone.
 - `.gitignore` block is added once, marked with `# Strata` for
@@ -185,11 +218,23 @@ PATH). The **foreign project's Python version is irrelevant** —
 strata runs in its own pipx-managed environment.
 
 For users with no global Python ≥ 3.11 available (locked-down
-corporate systems, etc.), `strata register --bootstrap-venv`:
+corporate systems, etc.), `strata register --bootstrap-venv
+[--python PATH]`:
 
 - Creates `.strata/.venv/` with strata installed inside.
 - Writes `.claude/settings.json` to point at the absolute path
   `<project>/.strata/.venv/bin/strata-mcp`.
+
+**Python discovery.** If Strata itself was installed against a
+Python ≥ 3.11, `--bootstrap-venv` uses `sys.executable` to seed the
+new venv. Otherwise the user must pass `--python /path/to/python3.11+`
+explicitly. Strata cannot create a 3.11 venv from a 3.10 interpreter,
+so this requirement is surfaced before invoking `venv` with a clear
+remediation message rather than failing inside the venv stdlib. The
+typical user invoking `--bootstrap-venv` already has Strata installed
+somehow, and that install used a Python ≥ 3.11, so `sys.executable`
+is the right default; `--python` is the escape hatch for the
+edge case.
 
 Less universal but works where pipx can't reach.
 
