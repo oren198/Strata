@@ -104,6 +104,45 @@ def test_list_contributions_limit_returns_newest_window(tmp_path: Path) -> None:
     )
 
 
+def test_record_store_usable_across_threads(tmp_path: Path) -> None:
+    """A RecordStore created in one thread must work from another.
+
+    FastAPI runs a sync generator dependency and the endpoint body in
+    separate threadpool threads, so within one request the connection made
+    in get_record_store is legally used from a different thread. With the
+    default check_same_thread=True this raised sqlite3.ProgrammingError —
+    surfaced by the strata-evals G2 concurrency probe once the WAL-pragma
+    crash (#39) stopped masking it.
+    """
+    import threading
+
+    db_path = str(tmp_path / "s.db")
+    run_migrations(db_path)
+    store = RecordStore(db_path)  # created in the main thread
+    result: dict = {}
+
+    def use_from_other_thread() -> None:
+        try:
+            c = store.append_contribution(
+                scope_id="g_child",
+                content="cross-thread write",
+                proposed_classification="context",
+                subject=None,
+                supersedes=None,
+                contributor=_contributor(),
+            )
+            result["id"] = c.id
+        except Exception as exc:  # pragma: no cover - failure path
+            result["error"] = repr(exc)
+
+    t = threading.Thread(target=use_from_other_thread)
+    t.start()
+    t.join()
+    store.close()
+    assert "error" not in result, result.get("error")
+    assert result["id"].startswith("c_")
+
+
 def test_contribution_ids_are_collision_resistant(tmp_path: Path) -> None:
     """IDs use 8 random bytes (16 hex chars) — token_hex(3) collided by ~5k rows."""
     db_path = str(tmp_path / "s.db")
