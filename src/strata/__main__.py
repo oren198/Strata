@@ -85,6 +85,11 @@ _DEFAULT_TEMPLATE = _TEMPLATES_DIR / "dev-team.yaml"
 
 
 def _backend_url() -> str:
+    # STRATA_BACKEND_URL is deprecated pending a design session (owner
+    # decision on issue #52: "leave it as deprecated... we don't want dead
+    # code" — no removal until that session happens). Read only by the CLI
+    # inspection commands (scopes/summary/record) below; do not add new
+    # consumers.
     return os.environ.get("STRATA_BACKEND_URL", "http://127.0.0.1:8000").rstrip("/")
 
 

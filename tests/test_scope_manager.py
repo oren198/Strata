@@ -19,7 +19,7 @@ import pytest
 
 from strata.fleet_config import Scope, Stratum
 from strata.record_store import Contribution, ContributorRef
-from strata.scope_manager import ScopeManager, ScopeManagerJudgment
+from strata.scope_manager import ScopeManager, ScopeManagerJudgment, _summary_word_count
 from strata.summary_store import Directive, ScopeSummary
 
 # ---------------------------------------------------------------------------
@@ -503,6 +503,147 @@ def test_parent_directive_content_in_user_message() -> None:
     user_message_content = messages[0]["content"]
 
     assert PARENT_DIRECTIVE.content in user_message_content
+
+
+# ---------------------------------------------------------------------------
+# Issue #63 fixtures — overflow re-ask
+# ---------------------------------------------------------------------------
+
+
+def _summary_input_with_context(context: str) -> dict:
+    """An accept_as_directive payload whose summary context is *context*."""
+    return {
+        "decision": "accept_as_directive",
+        "reasoning": "The contribution establishes a clear, enforceable coding standard.",
+        "new_summary": {
+            "directives": [
+                {
+                    "id": EXISTING_DIRECTIVE.id,
+                    "content": EXISTING_DIRECTIVE.content,
+                    "subject": EXISTING_DIRECTIVE.subject,
+                    "source_scope_id": EXISTING_DIRECTIVE.source_scope_id,
+                    "source_skill": EXISTING_DIRECTIVE.source_skill,
+                    "created_at": EXISTING_DIRECTIVE.created_at,
+                },
+            ],
+            "context": context,
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
+# Test 14: within-budget first response — exactly one API call
+# ---------------------------------------------------------------------------
+
+
+def test_within_budget_makes_exactly_one_call() -> None:
+    manager, mock_client = _make_manager(_summary_input_with_context("Short context."))
+
+    judgment = manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+        summary_max_words=500,
+    )
+
+    assert mock_client.messages.create.call_count == 1
+    assert judgment.decision == "accept_as_directive"
+
+
+# ---------------------------------------------------------------------------
+# Test 15: over-budget first response — exactly two calls, overflow re-ask,
+# and the returned judgment is the second response's.
+# ---------------------------------------------------------------------------
+
+
+def test_over_budget_triggers_one_corrective_retry() -> None:
+    over_budget_context = " ".join(f"word{i}" for i in range(20))
+    first_input = _summary_input_with_context(over_budget_context)
+
+    second_context = "Condensed context."
+    second_input = _summary_input_with_context(second_context)
+
+    first_response = _fake_response(first_input)
+    second_response = _fake_response(second_input)
+    first_tool_use_id = first_response.content[0].id
+
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [first_response, second_response]
+    manager = ScopeManager(client=mock_client)
+
+    small_budget = 5  # first response's ~20-word context blows this budget
+
+    judgment = manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+        summary_max_words=small_budget,
+    )
+
+    assert mock_client.messages.create.call_count == 2
+
+    first_call_kwargs = mock_client.messages.create.call_args_list[0].kwargs
+    second_call_kwargs = mock_client.messages.create.call_args_list[1].kwargs
+    second_messages = second_call_kwargs["messages"]
+
+    # Original user turn preserved verbatim.
+    assert second_messages[0] == first_call_kwargs["messages"][0]
+
+    # Assistant turn containing the first response's content blocks.
+    assert second_messages[1] == {"role": "assistant", "content": first_response.content}
+
+    # User turn with a tool_result for the first tool_use id + overflow text.
+    followup_user_turn = second_messages[2]
+    assert followup_user_turn["role"] == "user"
+    tool_result_blocks = [b for b in followup_user_turn["content"] if b["type"] == "tool_result"]
+    assert len(tool_result_blocks) == 1
+    assert tool_result_blocks[0]["tool_use_id"] == first_tool_use_id
+
+    text_blocks = [b for b in followup_user_turn["content"] if b["type"] == "text"]
+    assert len(text_blocks) == 1
+    assert "BUDGET" in text_blocks[0]["text"]
+    assert "VERBATIM" in text_blocks[0]["text"]
+    assert str(small_budget) in text_blocks[0]["text"]
+
+    # The returned judgment reflects the SECOND response, not the first.
+    assert judgment.new_summary is not None
+    assert judgment.new_summary.context == second_context
+
+
+# ---------------------------------------------------------------------------
+# Test 16: _summary_word_count counts context + directive content
+# ---------------------------------------------------------------------------
+
+
+def test_summary_word_count_counts_context_and_directives() -> None:
+    summary = ScopeSummary(
+        scope_id=SCOPE.id,
+        directives=[
+            Directive(
+                id="d1",
+                content="one two three",
+                source_scope_id=SCOPE.id,
+                source_skill="architect",
+                created_at="2026-01-01T00:00:00+00:00",
+            ),
+            Directive(
+                id="d2",
+                content="four five",
+                source_scope_id=SCOPE.id,
+                source_skill="architect",
+                created_at="2026-01-01T00:00:00+00:00",
+            ),
+        ],
+        context="six seven eight nine",
+        updated_at="2026-01-01T00:00:00+00:00",
+    )
+
+    # 3 (d1) + 2 (d2) + 4 (context) = 9
+    assert _summary_word_count(summary) == 9
 
 
 # ---------------------------------------------------------------------------

@@ -234,6 +234,20 @@ The MCP server starts with `strata-mcp` (on your PATH from pipx). It reads
 env vars needed. If binding is wrong (scope unknown, skill not permitted), the
 server exits immediately with an actionable message.
 
+### `.strata/config.toml` vs `.strata-role`
+
+Two per-project files, two independent jobs:
+
+- **`.strata/config.toml`** — storage paths (DB, fleet YAML, summaries dir).
+  Created by `strata register`. Machine-oriented; says **where memory lives**.
+- **`.strata-role`** — an optional default `(scope, skill)` binding for
+  `strata launch` (see below). Created by hand, committed to git; says
+  **who you are by default**.
+
+Neither implies the other: you can have storage configured with no default
+role (`strata launch` prompts interactively), or a role file pointing at a
+scope that resolves storage from `config.toml` as usual.
+
 ### Checking for skill updates
 
 After `pipx upgrade strata`, run:
@@ -385,7 +399,7 @@ is present, the first three are ignored for the MCP server (project config wins)
 | `STRATA_AGENT_SESSION_ID` | (auto) | Session identifier — auto-generated when absent |
 | `STRATA_MANAGER_MODEL` | `claude-haiku-4-5` | Model used by scope-managers |
 | `STRATA_ANTHROPIC_API_KEY` | (unset) | Optional; falls back to `ANTHROPIC_API_KEY` |
-| `STRATA_BACKEND_URL` | `http://127.0.0.1:8000` | Read only by the CLI inspection commands (`scopes`/`summary`/`record`), which query the Console backend — the MCP server and `strata launch` never read it (ADR 0004 Decision 1; deprecation tracked in #52) |
+| `STRATA_BACKEND_URL` | `http://127.0.0.1:8000` | **Deprecated** — read only by the CLI inspection commands (`scopes`/`summary`/`record`), which query the Console backend — the MCP server and `strata launch` never read it (ADR 0004 Decision 1). Kept until a design session revisits it (#52); no removal planned yet. |
 
 A local `.env` file is loaded automatically.
 
@@ -453,10 +467,17 @@ layer; running `strata start` is required only to view the UI. The agent loop
 — contributions, scope-manager judgments, perspective reads — works whether
 the backend is up or down.
 
-> **Migration note for callers of the old HTTP API:** in embedded mode,
-> `strata_read_scope_record` returns an empty record (`{"contributions": [],
-> "judgments": []}`) for unknown scopes instead of the old HTTP `404`. The
-> other tools still raise on unknown scopes (matching the prior 404 behaviour).
+> **Entitlement-scoped reads (issue #48):** `strata_read_perspective`,
+> `strata_read_scope_summary`, and `strata_read_scope_record` default to your
+> bound scope (`STRATA_AGENT_SCOPE`) when called with no `scope_id`. An
+> explicit `scope_id` is limited to your bound scope plus its inter-stratum
+> ancestors — peer scopes are not directly readable; they reach you only
+> through ratified content composed into your perspective (see issue #41).
+> This supersedes the old HTTP-parity note for `strata_read_scope_record`:
+> it now loads the fleet on every call to run this check, so reading your
+> own scope's record while it has no rows still returns the empty record
+> shape (`{"contributions": [], "judgments": []}`), but a scope outside your
+> entitled surface raises instead of silently returning an empty record.
 
 **For a foreign project**: use `strata register` (see
 [Quick Start for an existing project](#quick-start-for-an-existing-project)

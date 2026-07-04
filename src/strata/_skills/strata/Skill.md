@@ -53,12 +53,18 @@ Strata is a **shared memory system for fleets of agents**.
 
 ## Available tools (read-only from this skill)
 
+Read tools default to your bound scope when called with no argument. An
+explicit `scope_id` is limited to your bound scope plus its inter-stratum
+ancestors (issue #48) — peer scopes are not directly readable; they reach
+you only through ratified content composed into your perspective (see
+issue #41).
+
 | Tool | Use |
 |---|---|
 | `strata_list_scopes()` | Show the fleet |
-| `strata_read_scope_summary(scope_id)` | Peek at a scope's current state |
-| `strata_read_perspective(scope_id)` | Composed view: this scope's summary + every inter-stratum ancestor's summary, ordered root-first |
-| `strata_read_scope_record(scope_id)` | Forensic — every contribution + judgment |
+| `strata_read_scope_summary(scope_id=None)` | Peek at a scope's current state |
+| `strata_read_perspective(scope_id=None)` | Composed view: this scope's summary + every inter-stratum ancestor's summary, ordered root-first |
+| `strata_read_scope_record(scope_id=None)` | Forensic — every contribution + judgment |
 
 ## What you do NOT do here
 

@@ -139,6 +139,21 @@ one-or-two-sentence reasoning. When declining, set `new_summary` to null.\
 # ---------------------------------------------------------------------------
 
 
+def _summary_word_count(summary: ScopeSummary) -> int:
+    """Return the budget-accounting word count for a scope summary.
+
+    This is the canonical definition of "words" against ``summary_max_words``:
+    a whitespace split of ``summary.context`` plus the sum of whitespace-split
+    word counts of every directive's ``content``.  Directive metadata (id,
+    subject, provenance) is not counted — only the prose that consumes the
+    reader's attention.
+    """
+    count = len(summary.context.split())
+    for directive in summary.directives:
+        count += len(directive.content.split())
+    return count
+
+
 class ScopeManagerJudgment(BaseModel):
     """The scope-manager's structured verdict on a contribution.
 
@@ -297,6 +312,14 @@ class ScopeManager:
             A :class:`ScopeManagerJudgment` with the verdict, reasoning, and
             (when accepting) the rewritten :class:`ScopeSummary`.
 
+        Overflow handling (issue #63): if the first response's rewritten
+        summary exceeds ``summary_max_words`` (per
+        :func:`_summary_word_count`), the manager makes exactly ONE
+        corrective follow-up call asking the model to rewrite the summary to
+        fit the budget while preserving every directive verbatim.  The
+        second response is used regardless of whether it now fits — there is
+        only ever one retry, never a loop.
+
         Raises:
             ValueError: If the model response is missing the ``tool_use``
                 block, or if the verdict is internally inconsistent (e.g.
@@ -338,34 +361,80 @@ class ScopeManager:
             }
         ]
 
-        try:
-            response = self._client.messages.create(
-                model=self._model,
-                max_tokens=4096,
-                system=system,
-                tools=tools,
-                tool_choice={"type": "tool", "name": "submit_judgment"},
-                messages=[{"role": "user", "content": user_message}],
-            )
-        except anthropic.AuthenticationError as exc:
-            raise RuntimeError(
-                "Anthropic rejected the API key — check ANTHROPIC_API_KEY "
-                "(or STRATA_ANTHROPIC_API_KEY)."
-            ) from exc
+        def _call(messages: list[dict]):
+            try:
+                return self._client.messages.create(
+                    model=self._model,
+                    max_tokens=4096,
+                    system=system,
+                    tools=tools,
+                    tool_choice={"type": "tool", "name": "submit_judgment"},
+                    messages=messages,
+                )
+            except anthropic.AuthenticationError as exc:
+                raise RuntimeError(
+                    "Anthropic rejected the API key — check ANTHROPIC_API_KEY "
+                    "(or STRATA_ANTHROPIC_API_KEY)."
+                ) from exc
 
-        # Extract the tool_use block
-        tool_use_block = None
+        first_messages = [{"role": "user", "content": user_message}]
+        response = _call(first_messages)
+        tool_use_block = self._extract_tool_use_block(response)
+        judgment = self._parse_judgment(scope=scope, tool_use_block=tool_use_block)
+
+        # Overflow re-ask (issue #63): the LLM was told the BUDGET but nothing
+        # enforced it.  Give it exactly one corrective follow-up call if the
+        # rewritten summary is over budget — never more than one retry.
+        if judgment.new_summary is not None:
+            word_count = _summary_word_count(judgment.new_summary)
+            if word_count > summary_max_words:
+                overflow_text = (
+                    f"Your rewritten summary is {word_count} words — over the "
+                    f"BUDGET of {summary_max_words} words. Call submit_judgment "
+                    "again with the ENTIRE summary rewritten to fit within "
+                    f"{summary_max_words} words: condense and merge context, "
+                    "retire stale or low-value items, but preserve every "
+                    "directive VERBATIM — directives must never be dropped or "
+                    "reworded."
+                )
+                second_messages = [
+                    *first_messages,
+                    {"role": "assistant", "content": response.content},
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": tool_use_block.id,
+                                "content": "Received.",
+                            },
+                            {
+                                "type": "text",
+                                "text": overflow_text,
+                            },
+                        ],
+                    },
+                ]
+                second_response = _call(second_messages)
+                second_tool_use_block = self._extract_tool_use_block(second_response)
+                judgment = self._parse_judgment(scope=scope, tool_use_block=second_tool_use_block)
+
+        return judgment
+
+    @staticmethod
+    def _extract_tool_use_block(response):
+        """Return the response's ``tool_use`` content block, or raise."""
         for block in response.content:
             if block.type == "tool_use":
-                tool_use_block = block
-                break
+                return block
+        raise ValueError(
+            "Scope-manager response contained no tool_use block; "
+            "expected exactly one `submit_judgment` call."
+        )
 
-        if tool_use_block is None:
-            raise ValueError(
-                "Scope-manager response contained no tool_use block; "
-                "expected exactly one `submit_judgment` call."
-            )
-
+    @staticmethod
+    def _parse_judgment(*, scope: Scope, tool_use_block) -> ScopeManagerJudgment:
+        """Validate a ``submit_judgment`` tool-call payload into a judgment."""
         raw: dict = tool_use_block.input
         decision: str = raw["decision"]
         reasoning: str = raw["reasoning"]
