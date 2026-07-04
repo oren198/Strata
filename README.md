@@ -399,7 +399,7 @@ is present, the first three are ignored for the MCP server (project config wins)
 | `STRATA_AGENT_SESSION_ID` | (auto) | Session identifier — auto-generated when absent |
 | `STRATA_MANAGER_MODEL` | `claude-haiku-4-5` | Model used by scope-managers |
 | `STRATA_ANTHROPIC_API_KEY` | (unset) | Optional; falls back to `ANTHROPIC_API_KEY` |
-| `STRATA_BACKEND_URL` | `http://127.0.0.1:8000` | Read only by the CLI inspection commands (`scopes`/`summary`/`record`), which query the Console backend — the MCP server and `strata launch` never read it (ADR 0004 Decision 1; deprecation tracked in #52) |
+| `STRATA_BACKEND_URL` | `http://127.0.0.1:8000` | **Deprecated** — read only by the CLI inspection commands (`scopes`/`summary`/`record`), which query the Console backend — the MCP server and `strata launch` never read it (ADR 0004 Decision 1). Kept until a design session revisits it (#52); no removal planned yet. |
 
 A local `.env` file is loaded automatically.
 
