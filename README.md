@@ -234,6 +234,20 @@ The MCP server starts with `strata-mcp` (on your PATH from pipx). It reads
 env vars needed. If binding is wrong (scope unknown, skill not permitted), the
 server exits immediately with an actionable message.
 
+### `.strata/config.toml` vs `.strata-role`
+
+Two per-project files, two independent jobs:
+
+- **`.strata/config.toml`** — storage paths (DB, fleet YAML, summaries dir).
+  Created by `strata register`. Machine-oriented; says **where memory lives**.
+- **`.strata-role`** — an optional default `(scope, skill)` binding for
+  `strata launch` (see below). Created by hand, committed to git; says
+  **who you are by default**.
+
+Neither implies the other: you can have storage configured with no default
+role (`strata launch` prompts interactively), or a role file pointing at a
+scope that resolves storage from `config.toml` as usual.
+
 ### Checking for skill updates
 
 After `pipx upgrade strata`, run:
