@@ -208,6 +208,30 @@ class TestCheckPortAvailable:
         assert not check.passed
         assert str(held_port) in check.message
 
+    def test_lsof_positive_branch_names_process(self) -> None:
+        """_lsof_port_info returns ' (held by <name> PID <pid>)' when lsof finds one."""
+        from strata.preflight import _lsof_port_info
+
+        lsof_result = MagicMock(stdout="12345\n")
+        ps_result = MagicMock(stdout="uvicorn\n")
+        with (
+            patch("strata.preflight.shutil.which", return_value="/usr/bin/lsof"),
+            patch("subprocess.run", side_effect=[lsof_result, ps_result]),
+        ):
+            info = _lsof_port_info(8000)
+        assert info == " (held by uvicorn PID 12345)"
+
+    def test_lsof_positive_branch_empty_output(self) -> None:
+        """lsof present but no listener → empty string, no crash."""
+        from strata.preflight import _lsof_port_info
+
+        with (
+            patch("strata.preflight.shutil.which", return_value="/usr/bin/lsof"),
+            patch("subprocess.run", return_value=MagicMock(stdout="")),
+        ):
+            info = _lsof_port_info(8000)
+        assert info == ""
+
 
 # ---------------------------------------------------------------------------
 # Individual check: ANTHROPIC_API_KEY
@@ -502,43 +526,70 @@ _SCOPE_DEFAULT_ONLY: dict = {
 }
 
 
-def _fake_scopes_response(scopes: list[dict]) -> MagicMock:
-    resp = MagicMock()
-    resp.status_code = 200
-    resp.json.return_value = {
-        "strata": [{"id": "L1", "name": "Function", "ordinal": 1}],
-        "scopes": scopes,
-        "edges": [],
-    }
-    return resp
+def _write_launch_fleet(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Write a one-scope fleet.yaml and point STRATA_FLEET_CONFIG at it."""
+    from strata.settings import get_settings
+
+    fleet = tmp_path / "fleet.yaml"
+    fleet.write_text(
+        "strata:\n  - id: L1\n    name: Function\n    ordinal: 1\n"
+        "scopes:\n  - id: g_arch\n    name: Architect\n    stratum_id: L1\n"
+        "    default_skill: code-writer\n"
+        "edges: []\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("STRATA_FLEET_CONFIG", str(fleet))
+    get_settings.cache_clear()
+
+
+@pytest.fixture
+def _settings_cache_guard():
+    """Clear the Settings cache before and after (env-var isolation)."""
+    from strata.settings import get_settings
+
+    get_settings.cache_clear()
+    yield
+    get_settings.cache_clear()
 
 
 class TestCmdLaunchPreflight:
-    def test_failing_preflight_returns_1_before_scope_fetch(
+    def test_failing_preflight_and_missing_fleet_report_in_one_pass(
         self,
+        tmp_path,
+        monkeypatch: pytest.MonkeyPatch,
+        _settings_cache_guard,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
-        """Hard launch preflight failure → returns 1; backend is not contacted."""
+        """Hard preflight failure + missing fleet → BOTH reported in one run (#45)."""
+        from strata.settings import get_settings
+
         hard_fail = Check("Python ≥ 3.11", "hard", False, "Python 3.10 too old.")
+        monkeypatch.setenv("STRATA_FLEET_CONFIG", str(tmp_path / "absent.yaml"))
+        get_settings.cache_clear()
 
         with (
             patch("strata.__main__.run_launch_preflight", return_value=[hard_fail]),
-            patch("httpx.get") as mock_get,
+            patch("os.execvpe") as mock_exec,
         ):
             rc = main(["launch", "g_arch"])
 
         assert rc == 1
-        mock_get.assert_not_called()
+        mock_exec.assert_not_called()
+        err = capsys.readouterr().err
+        assert "Python 3.10 too old." in err
+        assert "No fleet config found" in err  # reported in the SAME run
 
     def test_skip_preflight_bypasses_checks(
         self,
+        tmp_path,
+        monkeypatch: pytest.MonkeyPatch,
+        _settings_cache_guard,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
         """--skip-preflight bypasses preflight entirely for launch."""
-        resp = _fake_scopes_response([_SCOPE_DEFAULT_ONLY])
+        _write_launch_fleet(tmp_path, monkeypatch)
         with (
             patch("strata.__main__.run_launch_preflight") as mock_preflight,
-            patch("httpx.get", return_value=resp),
             patch("os.execvpe"),
             patch("strata.__main__._run_manager_refresh"),
         ):
@@ -547,24 +598,26 @@ class TestCmdLaunchPreflight:
         assert rc == 0
         mock_preflight.assert_not_called()
 
-    def test_passing_preflight_proceeds_to_scope_fetch(
+    def test_passing_preflight_proceeds_to_exec(
         self,
+        tmp_path,
+        monkeypatch: pytest.MonkeyPatch,
+        _settings_cache_guard,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
-        """All-passing launch preflight → backend is contacted normally."""
+        """All-passing launch preflight → fleet loaded from disk, claude exec'd."""
         good_checks = [
             Check("Python ≥ 3.11", "hard", True, "Python 3.11.5"),
             Check("git on PATH", "soft", True, "git found"),
             Check("claude CLI on PATH", "soft", True, "claude found"),
         ]
-        resp = _fake_scopes_response([_SCOPE_DEFAULT_ONLY])
+        _write_launch_fleet(tmp_path, monkeypatch)
         with (
             patch("strata.__main__.run_launch_preflight", return_value=good_checks),
-            patch("httpx.get", return_value=resp) as mock_get,
-            patch("os.execvpe"),
+            patch("os.execvpe") as mock_exec,
             patch("strata.__main__._run_manager_refresh"),
         ):
             rc = main(["launch", "g_arch"])
 
         assert rc == 0
-        mock_get.assert_called_once()
+        mock_exec.assert_called_once()

@@ -40,11 +40,14 @@ from typing import Literal
 
 
 def _new_contribution_id() -> str:
-    return f"c_{secrets.token_hex(3)}"
+    # 8 bytes (16 hex chars): token_hex(3) had ~50% collision odds by ~5k
+    # rows (birthday bound on 16.7M values), and a collision is an
+    # IntegrityError → failed contribute.
+    return f"c_{secrets.token_hex(8)}"
 
 
 def _new_judgment_id() -> str:
-    return f"j_{secrets.token_hex(3)}"
+    return f"j_{secrets.token_hex(8)}"
 
 
 # ---------------------------------------------------------------------------
@@ -126,7 +129,12 @@ class RecordStore:
         self._db_path = str(Path(db_path).expanduser())
         self._conn = sqlite3.connect(self._db_path)
         self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA journal_mode=WAL;")
+        # journal_mode=WAL is NOT set here: it is persistent in the database
+        # file and is applied once by run_migrations (issue #39 — re-issuing
+        # it per connection needs exclusive access and raised "database is
+        # locked" under concurrent requests). busy_timeout makes residual
+        # write contention wait instead of failing immediately.
+        self._conn.execute("PRAGMA busy_timeout = 5000")
         self._conn.execute("PRAGMA foreign_keys = ON")
         self._conn.commit()
 
@@ -223,11 +231,13 @@ class RecordStore:
         Args:
             scope_id: Filter to this scope's record.
             limit:    Maximum number of rows to return (``None`` = all).
+                      When set, the *newest* ``limit`` rows are returned —
+                      a recency window — still ordered oldest-first.
 
         Returns:
-            Ordered list of :class:`Contribution` objects.
+            Ordered (oldest-first) list of :class:`Contribution` objects.
         """
-        sql = """
+        base = """
             SELECT id, scope_id, content, proposed_classification,
                    subject, supersedes,
                    contributor_scope_id, contributor_skill,
@@ -235,13 +245,20 @@ class RecordStore:
                    created_at
             FROM contributions
             WHERE scope_id = ?
-            ORDER BY created_at ASC
         """
         params: list[object] = [scope_id]
         if limit is not None:
-            sql += " LIMIT ?"
+            # The *newest* N rows (a "recent contributions" window for the
+            # scope-manager), still presented oldest-first. ORDER ASC + LIMIT
+            # would return the oldest N — the manager would judge against a
+            # permanently stale window. rowid breaks same-second ties.
+            sql = base + " ORDER BY created_at DESC, rowid DESC LIMIT ?"
             params.append(limit)
-        rows = self._conn.execute(sql, params).fetchall()
+            rows = self._conn.execute(sql, params).fetchall()
+            rows = list(reversed(rows))
+        else:
+            sql = base + " ORDER BY created_at ASC, rowid ASC"
+            rows = self._conn.execute(sql, params).fetchall()
         return [_contribution_from_row(row) for row in rows]
 
     def _fetch_contribution(self, contribution_id: str) -> Contribution:

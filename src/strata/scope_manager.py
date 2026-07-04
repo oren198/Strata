@@ -303,6 +303,14 @@ class ScopeManager:
                 ``decline`` with a non-null ``new_summary``, or an accept
                 with ``new_summary=None``).
         """
+        # Fail with an actionable message when no API key is available — the
+        # SDK's own error never names the env var the user needs (issue #47).
+        if getattr(self._client, "api_key", None) is None:
+            raise RuntimeError(
+                "ANTHROPIC_API_KEY is not set — export it or add it to .env. "
+                "The scope-manager cannot judge contributions without it."
+            )
+
         user_message = _build_user_message(
             scope=scope,
             stratum=stratum,
@@ -330,14 +338,20 @@ class ScopeManager:
             }
         ]
 
-        response = self._client.messages.create(
-            model=self._model,
-            max_tokens=4096,
-            system=system,
-            tools=tools,
-            tool_choice={"type": "tool", "name": "submit_judgment"},
-            messages=[{"role": "user", "content": user_message}],
-        )
+        try:
+            response = self._client.messages.create(
+                model=self._model,
+                max_tokens=4096,
+                system=system,
+                tools=tools,
+                tool_choice={"type": "tool", "name": "submit_judgment"},
+                messages=[{"role": "user", "content": user_message}],
+            )
+        except anthropic.AuthenticationError as exc:
+            raise RuntimeError(
+                "Anthropic rejected the API key — check ANTHROPIC_API_KEY "
+                "(or STRATA_ANTHROPIC_API_KEY)."
+            ) from exc
 
         # Extract the tool_use block
         tool_use_block = None

@@ -41,6 +41,7 @@ Vocabulary follows CONTEXT.md verbatim.
 from __future__ import annotations
 
 import pathlib
+import sqlite3
 from collections.abc import AsyncGenerator, Generator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
@@ -54,6 +55,7 @@ from pydantic import BaseModel
 
 from strata.fleet_config import FleetConfig
 from strata.migrator import run_migrations
+from strata.project_config import StoragePaths, resolve_storage_paths
 from strata.record_store import (
     Contribution,
     ContributorRef,
@@ -72,11 +74,23 @@ _UI_DIR = pathlib.Path(__file__).parent.parent.parent / "ui"
 # ---------------------------------------------------------------------------
 
 
-def get_record_store(
+def get_storage_paths(
     settings: Settings = Depends(get_settings),
+) -> StoragePaths:
+    """Resolve storage paths — the single source of truth (issue #44).
+
+    ``.strata/config.toml`` (when discoverable) wins over env-var settings,
+    exactly as the MCP server resolves them, so the Console backend and the
+    agents can never operate on different state.
+    """
+    return resolve_storage_paths(settings)
+
+
+def get_record_store(
+    paths: StoragePaths = Depends(get_storage_paths),
 ) -> Generator[RecordStore, None, None]:
     """Yield a fresh :class:`RecordStore` per request, closing it afterwards."""
-    store = RecordStore(settings.db_path)
+    store = RecordStore(paths.db_path)
     try:
         yield store
     finally:
@@ -84,10 +98,10 @@ def get_record_store(
 
 
 def get_summary_store(
-    settings: Settings = Depends(get_settings),
+    paths: StoragePaths = Depends(get_storage_paths),
 ) -> SummaryStore:
     """Return a :class:`SummaryStore` for the configured summaries directory."""
-    return SummaryStore(settings.summaries_dir)
+    return SummaryStore(paths.summaries_dir)
 
 
 def get_anthropic_client(
@@ -171,12 +185,13 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         effective = resolved_settings if resolved_settings is not None else get_settings()
-        run_migrations(effective.db_path)
+        paths = resolve_storage_paths(effective)
+        run_migrations(paths.db_path)
         # SummaryStore.__init__ creates summaries_dir on construct; ensure it
         # exists by instantiating one here.
-        SummaryStore(effective.summaries_dir)
+        SummaryStore(paths.summaries_dir)
         # Load the FleetConfig mirror from fleet.yaml and hold it on app.state.
-        fleet_path = pathlib.Path(effective.fleet_yaml_path)
+        fleet_path = pathlib.Path(paths.fleet_yaml_path)
         if fleet_path.exists():
             app.state.fleet_config = FleetConfig.load(fleet_path)
         else:
@@ -223,6 +238,7 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
         record_store: RecordStore = Depends(get_record_store),
         summary_store: SummaryStore = Depends(get_summary_store),
         scope_manager: ScopeManager = Depends(get_scope_manager),
+        request_settings: Settings = Depends(get_settings),
     ) -> ContributeResponse:
         """Accept a contribution and invoke the scope-manager for judgment.
 
@@ -274,14 +290,22 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
             session_id=body.contributor.session_id,
             ts=body.contributor.ts,
         )
-        contribution: Contribution = record_store.append_contribution(
-            scope_id=body.scope_id,
-            content=body.content,
-            proposed_classification=body.proposed_classification,
-            subject=body.subject,
-            supersedes=body.supersedes,
-            contributor=contributor_ref,
-        )
+        try:
+            contribution: Contribution = record_store.append_contribution(
+                scope_id=body.scope_id,
+                content=body.content,
+                proposed_classification=body.proposed_classification,
+                subject=body.subject,
+                supersedes=body.supersedes,
+                contributor=contributor_ref,
+            )
+        except sqlite3.IntegrityError as exc:
+            # The only FK on contributions is supersedes → contributions(id):
+            # a bad supersedes reference is client input error, not a 500.
+            raise HTTPException(
+                status_code=422,
+                detail={"error": "supersedes_not_found", "supersedes": body.supersedes},
+            ) from exc
 
         # Step 4: load summary + recent contributions
         current_summary = summary_store.read(body.scope_id)
@@ -302,6 +326,7 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
                 current_summary=current_summary,
                 recent_contributions=recent_contributions,
                 new_contribution=contribution,
+                summary_max_words=request_settings.summary_max_words,
             )
         except Exception as exc:
             raise HTTPException(
@@ -320,7 +345,12 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
         # Step 7: persist updated summary if accepted
         summary_updated = False
         if judgment.decision != "decline" and judgment.new_summary is not None:
-            summary_store.write(body.scope_id, judgment.new_summary)
+            # Stamp the parent-summary version the judgment was built from, so
+            # staleness stays detectable without re-running the LLM (ADR 0004 D4).
+            to_write = judgment.new_summary.model_copy(
+                update={"parent_version": parent_summary.version if parent_summary else None}
+            )
+            summary_store.write(body.scope_id, to_write)
             summary_updated = True
 
         return ContributeResponse(
