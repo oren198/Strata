@@ -273,8 +273,7 @@ strata record  <scope_id>  # every contribution + judgment in the scope's record
 
 ```bash
 strata migrate                                  # apply pending SQLite migrations only
-strata bootstrap --config fleet.example.yaml    # apply a YAML fleet config only
-strata start --no-bootstrap                     # skip auto-bootstrap on first run
+strata bootstrap --config fleet.example.yaml    # validate a fleet YAML (no DB writes)
 strata start --reload                           # uvicorn auto-reload (dev mode)
 strata start --port 8001                        # serve on a different port
 ```
@@ -283,11 +282,11 @@ The original `make` targets (`make migrate`, `make bootstrap`, `make run`, `make
 
 ### `strata launch` — frictionless CC session binding (ADR 0003)
 
-`strata launch [scope_id]` validates the target scope against the live fleet,
-resolves the skill from the scope's declaration in `fleet.yaml`, generates a
-session ID, and `execvp`s `claude` with `STRATA_AGENT_SCOPE`,
-`STRATA_AGENT_SKILL`, and `STRATA_AGENT_SESSION_ID` already set. The backend
-must be running (`strata start`) before you launch.
+`strata launch [scope_id]` validates the target scope against `fleet.yaml`
+directly (embedded mode — no backend required), resolves the skill from the
+scope's declaration, generates a session ID, and `execvp`s `claude` with
+`STRATA_AGENT_SCOPE`, `STRATA_AGENT_SKILL`, and `STRATA_AGENT_SESSION_ID`
+already set. Run `strata start` only if you also want the Console UI.
 
 ```bash
 strata launch g_arch                            # use default_skill from fleet.yaml
@@ -386,7 +385,7 @@ is present, the first three are ignored for the MCP server (project config wins)
 | `STRATA_AGENT_SESSION_ID` | (auto) | Session identifier — auto-generated when absent |
 | `STRATA_MANAGER_MODEL` | `claude-haiku-4-5` | Model used by scope-managers |
 | `STRATA_ANTHROPIC_API_KEY` | (unset) | Optional; falls back to `ANTHROPIC_API_KEY` |
-| `STRATA_BACKEND_URL` | `http://127.0.0.1:8000` | UI client only — the MCP server no longer reads this (ADR 0004 Decision 1) |
+| `STRATA_BACKEND_URL` | `http://127.0.0.1:8000` | Read only by the CLI inspection commands (`scopes`/`summary`/`record`), which query the Console backend — the MCP server and `strata launch` never read it (ADR 0004 Decision 1; deprecation tracked in #52) |
 
 A local `.env` file is loaded automatically.
 
@@ -475,8 +474,11 @@ The backend is only required if you want the browser Console UI at
 ### 2. Register the MCP server in Claude Code
 
 After running `strata register`, `.claude/settings.json` already contains the
-correct `mcpServers.strata` entry. If you're setting this up manually (e.g. for
-developing on Strata itself), the entry is:
+correct `mcpServers.strata` entry. **This applies to the Strata repo itself
+too**: the MCP server refuses to start without a discoverable
+`.strata/config.toml` (ADR 0005 D5), so for developing on Strata run
+`strata register` once from the repo root — it is strictly additive, and the
+created `.strata/` workspace is gitignored. The settings entry it merges is:
 
 ```json
 {
@@ -490,13 +492,13 @@ developing on Strata itself), the entry is:
 ```
 
 Set `STRATA_AGENT_SCOPE` and `STRATA_AGENT_SKILL` in the shell before launching
-`claude`. Storage paths are read from `.strata/config.toml` automatically when
-that file is present.
+`claude`. Storage paths are read from `.strata/config.toml`.
 
-`STRATA_AGENT_SKILL` is just a human-readable role tag (`architect`,
-`developer`, `security_reviewer`, etc.) — it shows up in provenance, but
-**the same generic CC skill (`strata-worker`) works for any role at any
-scope**. You don't need a separate Claude Code skill file per role.
+`STRATA_AGENT_SKILL` is a skill identifier recorded in provenance and
+**validated against the scope's `permitted_skills`** in `fleet.yaml` (when
+that list is set, the MCP server refuses to start on a mismatch). It does
+not select a Claude Code skill file — **the same generic CC skill
+(`strata-worker`) works for any role at any scope**.
 
 ### 3. Invoke a skill
 
@@ -516,13 +518,14 @@ Three terminals, three different roles, one shared Strata:
 # Terminal 1 — backend
 strata start
 
-# Terminal 2 — architect (set env vars before launching `claude`)
-STRATA_AGENT_SCOPE=g_arch     STRATA_AGENT_SKILL=architect     \
+# Terminal 2 — architect (skills must be permitted for the scope in fleet.yaml;
+# the dev-team template permits code-writer + evidence-summarizer here)
+STRATA_AGENT_SCOPE=g_arch     STRATA_AGENT_SKILL=code-writer   \
 STRATA_AGENT_SESSION_ID=sess_arch  claude
 # Then in the CC session:  /strata-worker
 
 # Terminal 3 — backend developer
-STRATA_AGENT_SCOPE=g_backend  STRATA_AGENT_SKILL=backend_dev   \
+STRATA_AGENT_SCOPE=g_backend  STRATA_AGENT_SKILL=code-writer   \
 STRATA_AGENT_SESSION_ID=sess_dev   claude
 # Then in the CC session:  /strata-worker
 ```

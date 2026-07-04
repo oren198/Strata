@@ -20,11 +20,16 @@ The Strata MCP server validates these at startup. If they aren't set correctly,
 the server will have already exited with an actionable error before your session
 begins.
 
-## Required reading on activation
+## Vocabulary (canonical — use these terms verbatim)
 
-Read `CONTEXT.md` in your project root once. The vocabulary (scope, stratum,
-contribution, directive, context, scope-manager, perspective, supersession)
-is precise — match it.
+**scope** (bounded memory region) · **stratum** (layer; lower ordinal =
+broader) · **contribution** (proposed write; always appended to the
+append-only **record**) · **scope-manager** (judges every contribution) ·
+**directive** (binding, flows down) · **context** (non-binding) ·
+**scope summary** (curated working view) · **perspective** (own summary +
+inter-stratum ancestors', root-first) · **supersession** (new directive
+replaces an old one by ID). In the Strata repo itself, `CONTEXT.md` has
+the full glossary — read it when present.
 
 ## Your protocol (in this order)
 
@@ -77,7 +82,7 @@ auditable and helps the user trust (or correct) the memory.
 
 | Tool | When to call |
 |---|---|
-| `strata_read_perspective(scope_id)` | Once at session start; again if your scope changes mid-session (rare). |
+| `strata_read_perspective(scope_id)` | Once at session start; again after a long gap to pick up refreshed ancestor summaries. (Your scope binding is fixed for the session's lifetime.) |
 | `strata_read_scope_summary(scope_id)` | To consult a peer or ancestor scope explicitly. |
 | `strata_contribute(scope_id, content, proposed_classification, subject, supersedes)` | Per triggers above — **frequently**. |
 | `strata_list_scopes()` | When you need to understand fleet structure. |
@@ -86,7 +91,9 @@ auditable and helps the user trust (or correct) the memory.
 ## What you do NOT do
 
 - Don't run `strata` CLI commands yourself; those are the user's tools.
-- Don't try to start the backend; if it's down, tell the user.
+- Don't reach for the backend — your tools are embedded and work without
+  it. If a tool fails, relay the error; the MCP server's startup message
+  is the diagnosis.
 - Don't speculate about which scope to use — use `STRATA_AGENT_SCOPE`. If
   you genuinely need to contribute to a different scope, ask the user
   first.

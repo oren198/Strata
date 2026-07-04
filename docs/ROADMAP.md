@@ -38,6 +38,13 @@ These govern every future decision. They are the answer when an ADR is silent.
 7. **LLM-native, no spaghetti, no premature abstraction.** Reject on
    conceptual-model grounds (cite `CONTEXT.md` / `philosophy.md`), not just
    blast radius.
+8. **Single source of truth.** Every piece of state has exactly one
+   canonical owner and one resolution path: fleet shape → `fleet.yaml`
+   (ADR 0002); storage paths → `resolve_storage_paths` (project config
+   over env, ADR 0005 D2 + issue #44); summaries → `SummaryStore`; the
+   record → `RecordStore`. Any second copy must be a derived, disposable
+   cache — two entry points resolving the same state differently is a bug
+   by definition.
 
 ---
 

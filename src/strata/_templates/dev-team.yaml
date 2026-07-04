@@ -33,20 +33,22 @@ strata:
 
 scopes:
   # ---- Executive ----
+  # Note: `scope-manager` is a reserved identity (the LLM curator of each
+  # scope's memory, per CONTEXT.md) — never use it as a worker skill.
   - id: g_ceo
     name: CEO
     stratum_id: L0
     status: active
-    default_skill: scope-manager
-    permitted_skills: [scope-manager]
+    default_skill: ceo
+    permitted_skills: [ceo]
 
   # ---- Function ----
   - id: g_eng
     name: Engineering
     stratum_id: L1
     status: active
-    default_skill: scope-manager
-    permitted_skills: [scope-manager, evidence-summarizer]
+    default_skill: eng-lead
+    permitted_skills: [eng-lead, evidence-summarizer]
 
   - id: g_arch
     name: Architect
