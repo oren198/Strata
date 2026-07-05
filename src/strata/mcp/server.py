@@ -509,6 +509,7 @@ def strata_contribute(
             recent_contributions=recent_contributions,
             new_contribution=contribution,
             summary_max_words=_settings.summary_max_words,
+            entitlement=fleet.entitlement_view(scope_id),
         )
     except Exception as exc:
         raise RuntimeError(f"Scope-manager judgment failed: {exc}") from exc

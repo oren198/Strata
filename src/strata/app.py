@@ -331,6 +331,7 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
                 recent_contributions=recent_contributions,
                 new_contribution=contribution,
                 summary_max_words=request_settings.summary_max_words,
+                entitlement=fleet.entitlement_view(body.scope_id),
             )
         except Exception as exc:
             raise HTTPException(
