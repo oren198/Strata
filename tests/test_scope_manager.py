@@ -402,7 +402,9 @@ def test_tool_choice_forces_submit_judgment() -> None:
     call_kwargs = mock_client.messages.create.call_args
     tool_choice = call_kwargs.kwargs["tool_choice"]
 
-    assert tool_choice == {"type": "tool", "name": "submit_judgment"}
+    assert tool_choice["type"] == "tool"
+    assert tool_choice["name"] == "submit_judgment"
+    assert tool_choice["disable_parallel_tool_use"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -689,3 +691,109 @@ def test_integration_real_api() -> None:
         assert isinstance(judgment.new_summary.context, str)
     else:
         assert judgment.new_summary is None
+
+
+# ---------------------------------------------------------------------------
+# Retry robustness (release-review findings): the FIRST judgment is
+# authoritative — the corrective call may only replace its summary.
+# ---------------------------------------------------------------------------
+
+
+def test_retry_decline_keeps_first_judgment() -> None:
+    """A formatting re-ask must never flip an accept into a decline."""
+    over_budget_context = " ".join(f"word{i}" for i in range(20))
+    first_input = _summary_input_with_context(over_budget_context)
+    decline_input = {"decision": "decline", "reasoning": "changed my mind", "new_summary": None}
+
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [
+        _fake_response(first_input),
+        _fake_response(decline_input),
+    ]
+    manager = ScopeManager(client=mock_client)
+
+    judgment = manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+        summary_max_words=5,
+    )
+
+    assert mock_client.messages.create.call_count == 2
+    assert judgment.decision != "decline", (
+        "the retry's verdict reversal must be discarded — first judgment is authoritative"
+    )
+    assert judgment.new_summary is not None
+    assert over_budget_context in judgment.new_summary.context
+
+
+def test_retry_parse_failure_keeps_first_judgment() -> None:
+    """A malformed second response must not destroy the valid first judgment."""
+    over_budget_context = " ".join(f"word{i}" for i in range(20))
+    first_input = _summary_input_with_context(over_budget_context)
+
+    broken_response = MagicMock()
+    broken_response.content = []  # no tool_use block at all (e.g. truncation)
+
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [
+        _fake_response(first_input),
+        broken_response,
+    ]
+    manager = ScopeManager(client=mock_client)
+
+    judgment = manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+        summary_max_words=5,
+    )
+
+    assert mock_client.messages.create.call_count == 2
+    assert judgment.new_summary is not None, (
+        "parse failure on the retry must fall back to the first judgment"
+    )
+    assert over_budget_context in judgment.new_summary.context
+
+
+def test_retry_api_error_keeps_first_judgment() -> None:
+    """A transient API failure on the retry falls back to the first judgment."""
+    over_budget_context = " ".join(f"word{i}" for i in range(20))
+    first_input = _summary_input_with_context(over_budget_context)
+
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [
+        _fake_response(first_input),
+        RuntimeError("api unavailable"),
+    ]
+    manager = ScopeManager(client=mock_client)
+
+    judgment = manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+        summary_max_words=5,
+    )
+
+    assert judgment.new_summary is not None
+    assert over_budget_context in judgment.new_summary.context
+
+
+def test_tool_choice_disables_parallel_tool_use() -> None:
+    """Both calls must pin exactly one tool_use block per response."""
+    manager, mock_client = _make_manager(_summary_input_with_context("Short."))
+    manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+    )
+    tool_choice = mock_client.messages.create.call_args.kwargs["tool_choice"]
+    assert tool_choice.get("disable_parallel_tool_use") is True

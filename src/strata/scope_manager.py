@@ -368,7 +368,15 @@ class ScopeManager:
                     max_tokens=4096,
                     system=system,
                     tools=tools,
-                    tool_choice={"type": "tool", "name": "submit_judgment"},
+                    tool_choice={
+                        "type": "tool",
+                        "name": "submit_judgment",
+                        # Exactly one tool_use block per response: the retry
+                        # turn echoes response.content with a single
+                        # tool_result, which the API rejects if the model
+                        # emitted parallel tool_use blocks.
+                        "disable_parallel_tool_use": True,
+                    },
                     messages=messages,
                 )
             except anthropic.AuthenticationError as exc:
@@ -391,11 +399,12 @@ class ScopeManager:
                 overflow_text = (
                     f"Your rewritten summary is {word_count} words — over the "
                     f"BUDGET of {summary_max_words} words. Call submit_judgment "
-                    "again with the ENTIRE summary rewritten to fit within "
-                    f"{summary_max_words} words: condense and merge context, "
-                    "retire stale or low-value items, but preserve every "
-                    "directive VERBATIM — directives must never be dropped or "
-                    "reworded."
+                    "again with the SAME decision and the ENTIRE summary "
+                    f"rewritten to fit within {summary_max_words} words: "
+                    "condense and merge context, retire stale or low-value "
+                    "items, but preserve every directive VERBATIM — directives "
+                    "must never be dropped or reworded. Do not change your "
+                    "verdict — this is a formatting correction only."
                 )
                 second_messages = [
                     *first_messages,
@@ -415,9 +424,22 @@ class ScopeManager:
                         ],
                     },
                 ]
-                second_response = _call(second_messages)
-                second_tool_use_block = self._extract_tool_use_block(second_response)
-                judgment = self._parse_judgment(scope=scope, tool_use_block=second_tool_use_block)
+                # The corrective call is best-effort: the FIRST judgment is
+                # authoritative and only its summary may be replaced. If the
+                # retry fails to parse (truncation, missing tool_use, API
+                # error) or comes back without a summary (verdict reversal —
+                # a formatting re-ask must never flip accept into decline),
+                # keep the first, over-budget judgment: an over-budget
+                # summary is strictly better than a destroyed or reversed
+                # judgment, and the record must always get a judgment row.
+                try:
+                    second_response = _call(second_messages)
+                    second_block = self._extract_tool_use_block(second_response)
+                    second_judgment = self._parse_judgment(scope=scope, tool_use_block=second_block)
+                except Exception:  # noqa: BLE001 — deliberate: retry is best-effort
+                    second_judgment = None
+                if second_judgment is not None and second_judgment.new_summary is not None:
+                    judgment = second_judgment
 
         return judgment
 

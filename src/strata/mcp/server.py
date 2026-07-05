@@ -149,6 +149,16 @@ def _entitled_scope_ids(fleet: FleetConfig) -> set[str]:
 
 def _check_entitled(fleet: FleetConfig, scope_id: str) -> None:
     """Raise RuntimeError if *scope_id* is outside the entitled read surface."""
+    if fleet.get_scope(_AGENT_SCOPE) is None:
+        # Binding was valid at startup but the bound scope has since vanished
+        # from fleet.yaml (rename/removal). Without this check the entitled
+        # surface silently collapses and every read gets a misleading
+        # peer-entitlement error.
+        raise RuntimeError(
+            f"your bound scope {_AGENT_SCOPE!r} no longer exists in the fleet "
+            "config — fleet.yaml changed since this session started. Restore "
+            "the scope in fleet.yaml or relaunch with a valid binding."
+        )
     if scope_id not in _entitled_scope_ids(fleet):
         raise RuntimeError(
             f"scope {scope_id!r} is outside your entitled read surface "

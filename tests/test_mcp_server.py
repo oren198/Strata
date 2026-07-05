@@ -727,3 +727,40 @@ def test_entitled_own_empty_record_returns_empty_shape(tmp_path: Path) -> None:
         result = mod.strata_read_scope_record("g_team")
 
     assert result == {"contributions": [], "judgments": []}
+
+
+# ---------------------------------------------------------------------------
+# Entitlement edge cases (release-review findings)
+# ---------------------------------------------------------------------------
+
+
+def test_descendant_read_is_denied(tmp_path: Path) -> None:
+    """The entitled surface is self + ANCESTORS — descendants are not readable."""
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fleet_yaml(tmp_path)
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+    fleet = FleetConfig.load(fleet_path)
+
+    with (
+        patch.object(mod, "_AGENT_SCOPE", "g_arch"),  # the L0 parent
+        patch.object(mod, "_load_fleet", return_value=fleet),
+        pytest.raises(RuntimeError, match="entitled read surface"),
+    ):
+        mod.strata_read_scope_summary("g_backend")  # its L1 child
+
+
+def test_stale_bound_scope_gets_distinct_error(tmp_path: Path) -> None:
+    """Bound scope removed from fleet.yaml mid-session → rebind error, not a peer error."""
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fleet_yaml(tmp_path)
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+    fleet = FleetConfig.load(fleet_path)
+
+    with (
+        patch.object(mod, "_AGENT_SCOPE", "g_removed"),  # not in the fleet
+        patch.object(mod, "_load_fleet", return_value=fleet),
+        pytest.raises(RuntimeError, match="no longer exists in the fleet"),
+    ):
+        mod.strata_read_perspective()
