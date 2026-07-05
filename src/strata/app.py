@@ -15,7 +15,7 @@ GET /
     Redirect to the Strata Console UI at /ui/index.html.
 
 GET /ui/...
-    Static file server for the Strata Console UI (ui/ directory).
+    Static file server for the Strata Console UI (strata/_ui/ package data).
 
 POST /contribute
     Accept a contribution from an agent, invoke the scope-manager, persist
@@ -40,6 +40,7 @@ Vocabulary follows CONTEXT.md verbatim.
 
 from __future__ import annotations
 
+import importlib.resources
 import pathlib
 import sqlite3
 from collections.abc import AsyncGenerator, Generator
@@ -65,9 +66,10 @@ from strata.scope_manager import ScopeManager, ScopeManagerJudgment
 from strata.settings import Settings, get_settings
 from strata.summary_store import ScopeSummary, SummaryStore
 
-# Resolve the ui/ directory relative to this file so that the static mount
-# works regardless of the current working directory when the server starts.
-_UI_DIR = pathlib.Path(__file__).parent.parent.parent / "ui"
+# Console UI static files bundled as package data (same vendoring pattern as
+# _skills/ / _migrations/ / _templates/), so the static mount works regardless
+# of cwd and in wheel installs (pipx, ADR 0005 / issue #65).
+_UI_DIR = pathlib.Path(str(importlib.resources.files("strata"))) / "_ui"
 
 # ---------------------------------------------------------------------------
 # Dependency providers

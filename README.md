@@ -348,7 +348,7 @@ After step 3, edit `fleet.yaml` by hand to add per-scope skill declarations
 
 ### Strata Console UI
 
-Open <http://127.0.0.1:8000/> while the backend is running — a read-only graph and list view of the current fleet state, polling every 5 s. All memory mutations flow through `strata.contribute`; the UI has no write path in V1. To point the UI at a non-default backend, edit the `<meta name="strata-api-base" content="...">` tag in `ui/index.html`.
+Open <http://127.0.0.1:8000/> while the backend is running — a read-only graph and list view of the current fleet state, polling every 5 s. All memory mutations flow through `strata.contribute`; the UI has no write path in V1. To point the UI at a non-default backend, edit the `<meta name="strata-api-base" content="...">` tag in `src/strata/_ui/index.html`.
 
 ### Run the tests
 
@@ -418,23 +418,12 @@ docs/
     0002-fleet-config-source-of-truth.md
     0003-strata-launch-cc-binding.md
 src/strata/              # Python backend package
-  app.py                 # FastAPI app + endpoints (serves ui/ at /ui)
+  app.py                 # FastAPI app + endpoints (serves _ui/ at /ui)
   settings.py            # pydantic-settings config
   record_store.py        # SQLite repository (append-only record + fleet config)
   summary_store.py       # Markdown on-disk scope summaries
   scope_manager.py       # LLM judgment layer (Anthropic tool use)
   bootstrap.py           # YAML fleet config loader/applier
-ui/                      # Strata Console (no build step — Babel-standalone in browser)
-  index.html             # Entry point; served at /ui/index.html
-  app.jsx                # Root app, backend polling, read-only state
-  atoms.jsx              # Shared UI atoms (Icon, Field, Toast, Modal …)
-  graph.jsx              # Force-directed scope graph
-  scope-detail.jsx       # Scope drill-in: backend summary + scope info
-  settings.jsx           # Settings screen (display prefs + fleet read-only view)
-  tweaks-panel.jsx       # Floating tweaks panel
-  store.js               # API client (fetch /scopes, /scopes/{id}/summary)
-  atlas.css              # Atlas design system tokens + component classes
-src/strata/
   mcp/
     server.py            # FastMCP stdio server; operates directly on RecordStore + SummaryStore
   _skills/               # Canonical skill files vendored as package data
@@ -443,6 +432,16 @@ src/strata/
     strata-inspect/Skill.md # CC skill: read-only browser
   _migrations/           # SQLite schema migrations (package data)
   _templates/            # Starter fleet.yaml templates (package data)
+  _ui/                   # Strata Console (package data; no build step — Babel-standalone)
+    index.html           # Entry point; served at /ui/index.html
+    app.jsx              # Root app, backend polling, read-only state
+    atoms.jsx            # Shared UI atoms (Icon, Field, Toast, Modal …)
+    graph.jsx            # Force-directed scope graph
+    scope-detail.jsx     # Scope drill-in: backend summary + scope info
+    settings.jsx         # Settings screen (display prefs + fleet read-only view)
+    tweaks-panel.jsx     # Floating tweaks panel
+    store.js             # API client (fetch /scopes, /scopes/{id}/summary)
+    atlas.css            # Atlas design system tokens + component classes
   project_config.py      # .strata/config.toml walk-up loader (ADR 0005 Decision 2)
 .claude/
   skills/
