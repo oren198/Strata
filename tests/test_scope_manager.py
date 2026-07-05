@@ -17,9 +17,14 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from strata.fleet_config import Scope, Stratum
+from strata.fleet_config import EntitlementView, Scope, Stratum
 from strata.record_store import Contribution, ContributorRef
-from strata.scope_manager import ScopeManager, ScopeManagerJudgment, _summary_word_count
+from strata.scope_manager import (
+    _SYSTEM_PROMPT,
+    ScopeManager,
+    ScopeManagerJudgment,
+    _summary_word_count,
+)
 from strata.summary_store import Directive, ScopeSummary
 
 # ---------------------------------------------------------------------------
@@ -797,3 +802,113 @@ def test_tool_choice_disables_parallel_tool_use() -> None:
     )
     tool_choice = mock_client.messages.create.call_args.kwargs["tool_choice"]
     assert tool_choice.get("disable_parallel_tool_use") is True
+
+
+# ---------------------------------------------------------------------------
+# ADR 0006 D2 — entitlement signal + admission rule
+# ---------------------------------------------------------------------------
+
+PEER_SCOPE = Scope(id="g_peer1", name="Peer One", stratum_id="L1")
+OTHER_SCOPE = Scope(id="g_other1", name="Other One", stratum_id="L1")
+
+ENTITLEMENT_VIEW = EntitlementView(
+    chain=[SCOPE],
+    referenced_peers=[PEER_SCOPE],
+    others=[OTHER_SCOPE],
+)
+
+
+def test_entitlement_block_present_with_correct_groups() -> None:
+    """The ENTITLEMENT block lists chain/peer/other scopes under the right headers."""
+    manager, mock_client = _make_manager(_accept_directive_input())
+
+    manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+        entitlement=ENTITLEMENT_VIEW,
+    )
+
+    call_kwargs = mock_client.messages.create.call_args
+    content = call_kwargs.kwargs["messages"][0]["content"]
+
+    assert "ENTITLEMENT (relative to this scope)" in content
+
+    chain_header_idx = content.index("entitled — directives and context")
+    chain_names_idx = content.index(f"{SCOPE.id} ({SCOPE.name})")
+    peer_header_idx = content.index("entitled for CONTEXT only")
+    peer_names_idx = content.index(f"{PEER_SCOPE.id} ({PEER_SCOPE.name})")
+    other_header_idx = content.index("NOT entitled")
+    other_names_idx = content.index(f"{OTHER_SCOPE.id} ({OTHER_SCOPE.name})")
+
+    assert (
+        chain_header_idx
+        < chain_names_idx
+        < peer_header_idx
+        < peer_names_idx
+        < other_header_idx
+        < other_names_idx
+    )
+
+
+def test_entitlement_omitted_when_none() -> None:
+    """entitlement=None (the default) omits the ENTITLEMENT section entirely."""
+    manager, mock_client = _make_manager(_accept_directive_input())
+
+    manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+    )
+
+    call_kwargs = mock_client.messages.create.call_args
+    content = call_kwargs.kwargs["messages"][0]["content"]
+
+    assert "ENTITLEMENT" not in content
+
+
+def test_entitlement_empty_groups_render_none_sentinel() -> None:
+    """An empty entitlement group (e.g. no referenced peers) renders '(none)'."""
+    manager, mock_client = _make_manager(_accept_directive_input())
+    empty_view = EntitlementView(chain=[SCOPE], referenced_peers=[], others=[])
+
+    manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+        entitlement=empty_view,
+    )
+
+    call_kwargs = mock_client.messages.create.call_args
+    content = call_kwargs.kwargs["messages"][0]["content"]
+
+    assert "(none)" in content
+
+
+def test_system_prompt_admission_step_precedes_classification_guidance() -> None:
+    """STEP 1 — ADMISSION CHECK is an explicit first step, before classification."""
+    assert "STEP 1" in _SYSTEM_PROMPT
+    assert "ADMISSION CHECK" in _SYSTEM_PROMPT
+    assert "DECLINED" in _SYSTEM_PROMPT
+
+    admission_idx = _SYSTEM_PROMPT.index("ADMISSION CHECK")
+    classification_idx = _SYSTEM_PROMPT.index("Concepts you must know")
+
+    assert admission_idx < classification_idx, (
+        "the admission check must precede classification guidance in the system prompt"
+    )
+
+
+def test_system_prompt_admission_step_is_generic() -> None:
+    """The static system prompt must never name a concrete fleet/team/scope."""
+    # No sample scope id (e.g. this suite's own SCOPE.id) should ever leak
+    # into the cached, static system prompt — only the per-call user message
+    # may carry real fleet names (grill decision, ADR 0006 D2).
+    assert SCOPE.id not in _SYSTEM_PROMPT
+    assert PEER_SCOPE.id not in _SYSTEM_PROMPT

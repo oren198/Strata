@@ -31,6 +31,7 @@ STRATA_AGENT_SESSION_ID
 
 from __future__ import annotations
 
+import logging
 import os
 import sqlite3
 import sys
@@ -68,6 +69,13 @@ from strata.summary_store import ScopeSummary, SummaryStore
 # ---------------------------------------------------------------------------
 
 _settings = get_settings()
+
+# Module-level logger. This is an MCP stdio server — stdout is the JSON-RPC
+# channel, so nothing may ever be print()'d there. Python's logging module
+# defaults to stderr when no handler is configured, which is exactly what we
+# want; we deliberately do not call logging.basicConfig() or attach a stdout
+# handler here.
+_logger = logging.getLogger("strata.mcp")
 
 _db_path: str = ""
 _summaries_dir: str = ""
@@ -126,29 +134,66 @@ def _load_fleet() -> FleetConfig:
 
 
 # ---------------------------------------------------------------------------
-# Entitled read surface (issue #48 — agent-facing reads are scope-entitled,
-# not fleet-wide). Decision, recorded on the issue: "Why do we need cross
-# scope reads? Isn't it breaking the Strata philosophy?" — it was. Reads are
-# limited to the bound scope plus its inter-stratum ancestor chain; peer
-# scopes reach an agent only through ratified content composed into its
-# perspective (see issue #41), never through a direct read.
+# Entitlement surfaces (ADR 0006 — one model, shared computation, distinct
+# capacities). The write surface (ADR 0006 D1, below) is derived from the
+# ancestor-chain computation alone and never grows. The read side now splits
+# in two (ADR 0006 D3/D4, shipped): a chain-only surface for records and
+# perspective targets, and a wider context surface — chain plus
+# chain-referenced peer scopes (one hop, via intra-stratum edges) — for scope
+# summary reads and perspective peer layers. Sideways knowledge flow still
+# never extends to writes: it stays gated behind ratification or a
+# context-only reference edge, never a direct write.
 # ---------------------------------------------------------------------------
 
 
-def _entitled_scope_ids(fleet: FleetConfig) -> set[str]:
-    """Return the scope ids this agent is entitled to read directly.
+def _binding_surface_scope_ids(fleet: FleetConfig) -> set[str]:
+    """Return this agent's bound scope plus its inter-stratum ancestor chain.
 
-    The entitled surface is this agent's bound scope (``_AGENT_SCOPE``) plus
-    its inter-stratum ancestor chain. Intra-stratum peers are deliberately
-    excluded — a peer's memory reaches this agent only if a common ancestor's
-    scope-manager ratifies it into a directive.
+    This is the shared computation behind the chain-only entitlement surfaces
+    (_entitled_scope_ids for records/perspective targets,
+    _entitled_write_scope_ids for writes). Intra-stratum peers are never
+    included here — a peer's memory binds this agent only if a common
+    ancestor's scope-manager ratifies it into a directive. (Chain-referenced
+    peers still reach this agent through the wider *context* surface — see
+    _context_surface_scope_ids — but never through this binding surface.)
     """
     ancestors = fleet.inter_stratum_ancestors(_AGENT_SCOPE)
     return {_AGENT_SCOPE, *(s.id for s in ancestors)}
 
 
+# ---------------------------------------------------------------------------
+# Entitled chain-only surface (issue #48 — agent-facing reads are scope-
+# entitled, not fleet-wide). Decision, recorded on the issue: "Why do we need
+# cross scope reads? Isn't it breaking the Strata philosophy?" — it was.
+# This surface — the bound scope plus its inter-stratum ancestor chain — now
+# gates strata_read_scope_record and the strata_read_perspective *target*
+# (ADR 0006 D4): records audit the authority that binds you, and you compose
+# perspectives for your own chain, not a peer's. Scope summary reads use the
+# wider context surface instead (_check_entitled_context, below).
+# ---------------------------------------------------------------------------
+
+
+def _entitled_scope_ids(fleet: FleetConfig) -> set[str]:
+    """Return the scope ids entitled for records and perspective targets.
+
+    The chain-only surface is this agent's bound scope (``_AGENT_SCOPE``)
+    plus its inter-stratum ancestor chain. Intra-stratum peers are
+    deliberately excluded here even when chain-referenced — a peer's record
+    is its own, and a peer is never a valid perspective target (ADR 0006
+    D4). Chain-referenced peers are readable via the wider context surface
+    (_check_entitled_context) and appear as non-binding layers inside a
+    perspective, never as the perspective's own target or record.
+    """
+    return _binding_surface_scope_ids(fleet)
+
+
 def _check_entitled(fleet: FleetConfig, scope_id: str) -> None:
-    """Raise RuntimeError if *scope_id* is outside the entitled read surface."""
+    """Raise RuntimeError if *scope_id* is outside the chain-only entitled surface.
+
+    Used by strata_read_scope_record and the strata_read_perspective target
+    (ADR 0006 D4) — both stay chain-only even after D3's context surface
+    widened scope summary reads.
+    """
     if fleet.get_scope(_AGENT_SCOPE) is None:
         # Binding was valid at startup but the bound scope has since vanished
         # from fleet.yaml (rename/removal). Without this check the entitled
@@ -161,10 +206,116 @@ def _check_entitled(fleet: FleetConfig, scope_id: str) -> None:
         )
     if scope_id not in _entitled_scope_ids(fleet):
         raise RuntimeError(
-            f"scope {scope_id!r} is outside your entitled read surface "
+            f"scope {scope_id!r} is outside your entitled surface "
             f"(your scope {_AGENT_SCOPE!r} plus its inter-stratum ancestors). "
-            "Peer scopes reach you only through ratified content in your "
-            "perspective (see issue #41)."
+            "Records and perspective targets stay chain-only: a record "
+            "audits the authority that binds you, and a perspective is "
+            "composed for your own chain, not a peer's. A scope reachable "
+            "only through a peer reference informs you via "
+            "strata_read_scope_summary and as a non-binding peer_reference "
+            "layer inside your own perspective (ADR 0006 D3/D4) — never as "
+            "its own record or perspective target."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Entitled context surface (ADR 0006 D3/D4 — scope summary reads widen beyond
+# the chain-only surface). A chain-referenced peer's summary is composed into
+# this agent's perspective anyway (as a non-binding peer_reference layer), so
+# refusing the direct summary read is empty ceremony — reuses
+# FleetConfig.entitlement_view rather than re-deriving peer logic.
+# ---------------------------------------------------------------------------
+
+
+def _context_surface_scope_ids(fleet: FleetConfig) -> set[str]:
+    """Return the scope ids entitled for scope summary reads.
+
+    The context surface is this agent's chain-only surface plus every peer
+    scope referenced (one hop, via an intra-stratum edge) by a scope on that
+    chain — computed via ``fleet.entitlement_view(_AGENT_SCOPE)`` so peer
+    logic lives in exactly one place.
+    """
+    view = fleet.entitlement_view(_AGENT_SCOPE)
+    return {s.id for s in view.chain} | {s.id for s in view.referenced_peers}
+
+
+def _check_entitled_context(fleet: FleetConfig, scope_id: str) -> None:
+    """Raise RuntimeError if *scope_id* is outside the entitled context surface."""
+    if fleet.get_scope(_AGENT_SCOPE) is None:
+        # Same stale-binding hazard as the chain-only check.
+        raise RuntimeError(
+            f"your bound scope {_AGENT_SCOPE!r} no longer exists in the fleet "
+            "config — fleet.yaml changed since this session started. Restore "
+            "the scope in fleet.yaml or relaunch with a valid binding."
+        )
+    if scope_id not in _context_surface_scope_ids(fleet):
+        raise RuntimeError(
+            f"scope {scope_id!r} is outside your entitled context surface "
+            f"(your scope {_AGENT_SCOPE!r}, its inter-stratum ancestors, and "
+            "any peer scope referenced by a scope on that chain via an "
+            "intra-stratum edge). Unreferenced peer scopes and descendants "
+            "are not directly readable — legitimizing a knowledge flow "
+            "between scopes is a reviewed reference edge in fleet.yaml, not "
+            "a workaround here."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Entitled write surface (ADR 0006 Decision D1 — agent-facing contributions
+# are target-entitled, mirroring the #48 read surface). `strata_contribute`
+# refuses any target outside the bound scope plus its inter-stratum
+# ancestors: contributing to your own scope or proposing upward to an
+# ancestor is the mechanism of legitimate upward influence (evidence +
+# ratification); a direct write into a peer or descendant scope is refused
+# structurally, before any judging or recording happens. Unlike the read
+# surface, this surface is never extended by reference edges (ADR 0006 D3/
+# D4) — sideways flow always requires ratification through a shared
+# ancestor. A refusal here is an error, not a scope-manager decline: no
+# record row is appended, and the refusal is logged for auditing (grill
+# decision, ADR 0006 D1).
+# ---------------------------------------------------------------------------
+
+
+def _entitled_write_scope_ids(fleet: FleetConfig) -> set[str]:
+    """Return the scope ids this agent is entitled to contribute to directly.
+
+    The entitled write surface is this agent's bound scope (``_AGENT_SCOPE``)
+    plus its inter-stratum ancestor chain — identical in shape to the read
+    surface today, computed via the same shared helper, but named separately
+    because the two are expected to diverge (ADR 0006 D1/D3/D4).
+    """
+    return _binding_surface_scope_ids(fleet)
+
+
+def _check_entitled_write(fleet: FleetConfig, scope_id: str) -> None:
+    """Raise RuntimeError if *scope_id* is outside the entitled write surface."""
+    if fleet.get_scope(_AGENT_SCOPE) is None:
+        # Same stale-binding hazard as the read surface: without this check,
+        # a bound scope removed from fleet.yaml mid-session would silently
+        # collapse the write surface and every write would get a misleading
+        # entitlement error instead of a rebind error.
+        raise RuntimeError(
+            f"your bound scope {_AGENT_SCOPE!r} no longer exists in the fleet "
+            "config — fleet.yaml changed since this session started. Restore "
+            "the scope in fleet.yaml or relaunch with a valid binding."
+        )
+    if scope_id not in _entitled_write_scope_ids(fleet):
+        _logger.warning(
+            "contribution refused: contributor scope=%r skill=%r session=%r "
+            "target scope=%r is outside the entitled write surface",
+            _AGENT_SCOPE,
+            _AGENT_SKILL,
+            _AGENT_SESSION_ID,
+            scope_id,
+        )
+        raise RuntimeError(
+            f"scope {scope_id!r} is outside your entitled write surface "
+            f"(your scope {_AGENT_SCOPE!r} plus its inter-stratum ancestors). "
+            "Contribute to your own scope, or propose upward to an ancestor "
+            "scope — that is how memory legitimately moves toward broader "
+            "authority. Sideways flow to a peer scope happens only through "
+            "ratification into a shared ancestor scope, or a context-only "
+            "reference edge — never a direct write."
         )
 
 
@@ -328,8 +479,18 @@ def strata_contribute(
     populated automatically from the agent's environment variables:
     STRATA_AGENT_SCOPE, STRATA_AGENT_SKILL, STRATA_AGENT_SESSION_ID.
 
+    Write surface: ``scope_id`` must be this agent's bound scope
+    (``STRATA_AGENT_SCOPE``) or one of its inter-stratum ancestors — the same
+    surface shape as the entitled read surface (issue #48). Contribute to
+    your own scope, or propose upward to an ancestor scope; that is the
+    mechanism of legitimate upward influence. A peer or descendant scope is
+    refused before any judging or recording happens — sideways flow reaches
+    other scopes only via ratification through a shared ancestor, or a
+    context-only reference edge, never a direct write.
+
     Args:
-        scope_id: Target scope to contribute to (e.g. ``g_arch``).
+        scope_id: Target scope to contribute to (e.g. ``g_arch``). Must be
+            the bound scope or one of its inter-stratum ancestors.
         content: The memory content being proposed.
         proposed_classification: Hint to the scope-manager — ``directive``
             for a binding decision, ``context`` for an observation or
@@ -343,7 +504,8 @@ def strata_contribute(
         ``contribution_id`` and ``judgment`` (decision, reasoning, summary_updated).
 
     Raises:
-        RuntimeError: If the scope is not found or is archived.
+        RuntimeError: If the scope is not found, is archived, or is outside
+            this agent's entitled write surface.
     """
     fleet = _load_fleet()
 
@@ -352,6 +514,7 @@ def strata_contribute(
         raise RuntimeError(f"Scope not found: {scope_id!r}")
     if scope.status == "archived":
         raise RuntimeError(f"Scope is archived and not accepting contributions: {scope_id!r}")
+    _check_entitled_write(fleet, scope_id)
 
     stratum = next((s for s in fleet.strata if s.id == scope.stratum_id), None)
     if stratum is None:
@@ -405,6 +568,7 @@ def strata_contribute(
             recent_contributions=recent_contributions,
             new_contribution=contribution,
             summary_max_words=_settings.summary_max_words,
+            entitlement=fleet.entitlement_view(scope_id),
         )
     except Exception as exc:
         raise RuntimeError(f"Scope-manager judgment failed: {exc}") from exc
@@ -452,23 +616,29 @@ def strata_read_scope_summary(scope_id: str | None = None) -> dict:
 
     Args:
         scope_id: The scope whose summary to read (e.g. ``g_arch``). Defaults
-            to this agent's bound scope. An explicit scope_id must be the
-            bound scope or one of its inter-stratum ancestors (issue #48) —
-            peer scopes are not directly readable.
+            to this agent's bound scope. An explicit scope_id must be within
+            this agent's entitled *context* surface (ADR 0006 D3/D4): the
+            bound scope, one of its inter-stratum ancestors, or a peer scope
+            referenced by a scope on that chain via an intra-stratum edge.
+            Unreferenced peers and descendants are not directly readable.
 
     Returns:
         Parsed scope summary: ``scope_id``, ``directives``, ``context``,
-        ``updated_at``.
+        ``updated_at``, ``version``, ``exists``. If the scope has no summary
+        on disk yet, a synthesized empty summary is returned with
+        ``version=0`` and ``exists=False`` — distinguishable from a real
+        first write (``version=1``, ``exists=True``); see
+        :class:`strata.summary_store.ScopeSummary` (issue #59).
 
     Raises:
         RuntimeError: If the scope does not exist, or if scope_id is outside
-            this agent's entitled read surface.
+            this agent's entitled context surface.
     """
     fleet = _load_fleet()
 
     if scope_id is None:
         scope_id = _AGENT_SCOPE
-    _check_entitled(fleet, scope_id)
+    _check_entitled_context(fleet, scope_id)
 
     scope = fleet.get_scope(scope_id)
     if scope is None:
@@ -478,12 +648,16 @@ def strata_read_scope_summary(scope_id: str | None = None) -> dict:
     if existing is not None:
         return existing.model_dump()
 
-    # Scope exists but has no summary yet — return an empty summary.
+    # Scope exists but has no summary yet — return a synthesized empty
+    # summary. version=0 + exists=False mark it as synthesized so it's never
+    # mistaken for a real first write (version=1, exists=True).
     empty = ScopeSummary(
         scope_id=scope_id,
         directives=[],
         context="",
         updated_at=datetime.now(tz=UTC).isoformat(),
+        version=0,
+        exists=False,
     )
     return empty.model_dump()
 
@@ -494,7 +668,12 @@ def strata_read_scope_summary(scope_id: str | None = None) -> dict:
 
 
 def _summary_for_scope(scope_id: str) -> dict:
-    """Return a scope's summary as a plain dict, using an empty summary if none exists."""
+    """Return a scope's summary as a plain dict, using a synthesized empty summary if none exists.
+
+    The synthesized summary reports ``version=0``/``exists=False`` so it is
+    never mistaken for a real first write (``version=1``, ``exists=True``) —
+    see :class:`strata.summary_store.ScopeSummary` (issue #59).
+    """
     existing = _summary_store.read(scope_id)
     if existing is not None:
         return existing.model_dump()
@@ -503,6 +682,8 @@ def _summary_for_scope(scope_id: str) -> dict:
         directives=[],
         context="",
         updated_at=datetime.now(tz=UTC).isoformat(),
+        version=0,
+        exists=False,
     )
     return empty.model_dump()
 
@@ -511,28 +692,45 @@ def _summary_for_scope(scope_id: str) -> dict:
 def strata_read_perspective(scope_id: str | None = None) -> dict:
     """Return this agent's perspective on the fleet's long-term memory.
 
-    A perspective is a composed, provenance-preserving view of the scope's
-    own summary plus all inter-stratum ancestor summaries up to the root.
-    Layers are ordered root-first (L0 first, requested scope last).
+    A perspective is a composed, provenance-preserving view of: the scope's
+    own summary, all inter-stratum ancestor summaries up to the root, and —
+    ADR 0006 D3 — the summaries of any peer scopes referenced (one hop, via
+    an intra-stratum edge) by a scope on that chain. Layers are ordered
+    root-first: ancestors first, then the requested scope's own layer, then
+    referenced-peer layers (sorted by scope id for deterministic ordering).
 
-    Only inter-stratum edges are traversed — peer (intra-stratum) edges are
-    never followed.  If a scope in the ancestor chain has no summary on disk
-    yet, its layer is still included with empty directives and context so that
-    the structure is visible.
+    Every layer carries ``relation`` (``"self"``, ``"ancestor"``, or
+    ``"peer_reference"``) and ``binding`` (``True`` for self/ancestor layers,
+    ``False`` for peer layers). Peer layers are **context only** — nothing in
+    them binds the reader: a peer's directives remain directives in their
+    home scope, but to this reader they are context (CONTEXT.md §
+    Intra-stratum edge). Each peer layer carries that peer's full summary,
+    clearly labelled by its own scope id — composition is provenance-
+    preserving, not lossy; a peer's content is never stripped down before
+    being composed in. Peer-of-peer references are not traversed: only edges
+    whose source scope is itself on the chain count (one hop, per
+    ``FleetConfig.entitlement_view``).
+
+    If a chain or peer scope has no summary on disk yet, its layer is still
+    included with empty directives and context so that the structure is
+    visible; that layer's summary honestly reports ``version=0``/
+    ``exists=False`` rather than looking like a real first write (issue #59).
 
     Args:
         scope_id: The scope for which to build the perspective. Defaults to
             this agent's bound scope. An explicit scope_id must be the bound
-            scope or one of its inter-stratum ancestors (issue #48) — peer
-            scopes are not directly readable.
+            scope or one of its inter-stratum ancestors (issue #48) — this is
+            the perspective *target*, which stays chain-only (ADR 0006 D4):
+            you compose a perspective for your own chain, not for a peer's.
 
     Returns:
-        ``{layers: [{scope_id, stratum_id, summary}], scope_id: <requested>,
-        _layers_count: N}`` ordered root-first.
+        ``{layers: [{scope_id, stratum_id, summary, relation, binding}],
+        scope_id: <requested>, _layers_count: N}`` ordered root-first, then
+        self, then sorted peer layers.
 
     Raises:
         RuntimeError: If the scope is unknown, or if scope_id is outside this
-            agent's entitled read surface.
+            agent's entitled (chain-only) surface.
     """
     fleet = _load_fleet()
 
@@ -555,6 +753,23 @@ def strata_read_perspective(scope_id: str | None = None) -> dict:
                 "scope_id": s.id,
                 "stratum_id": s.stratum_id,
                 "summary": _summary_for_scope(s.id),
+                "relation": "self" if s.id == scope_id else "ancestor",
+                "binding": True,
+            }
+        )
+
+    # ADR 0006 D3: append one layer per peer referenced (one hop) by any
+    # scope on the chain. Reuses FleetConfig.entitlement_view rather than
+    # re-deriving peer logic — sorted by scope id for deterministic order.
+    view = fleet.entitlement_view(scope_id)
+    for s in sorted(view.referenced_peers, key=lambda peer: peer.id):
+        layers.append(
+            {
+                "scope_id": s.id,
+                "stratum_id": s.stratum_id,
+                "summary": _summary_for_scope(s.id),
+                "relation": "peer_reference",
+                "binding": False,
             }
         )
 
@@ -620,18 +835,26 @@ def strata_read_scope_record(scope_id: str | None = None) -> dict:
     returns the empty record shape; a scope_id outside the entitled surface
     raises instead of silently returning an empty record.
 
+    Stays chain-only even after ADR 0006 D3 widened scope summary reads to
+    chain-referenced peers (D4): the record audits the authority that binds
+    you, and a peer scope — however freely its summary composes into your
+    perspective as context — only ever informs you, never binds you. Its own
+    record is its own accountability surface, not yours.
+
     Args:
         scope_id: The scope whose record to read (e.g. ``g_backend``).
             Defaults to this agent's bound scope. An explicit scope_id must
             be the bound scope or one of its inter-stratum ancestors
-            (issue #48) — peer scopes are not directly readable.
+            (issue #48) — a peer scope is not readable here even when it is
+            referenced by your chain and its summary is otherwise readable
+            (ADR 0006 D4).
 
     Returns:
         ``contributions`` (list) and ``judgments`` (list).
 
     Raises:
-        RuntimeError: If scope_id is outside this agent's entitled read
-            surface.
+        RuntimeError: If scope_id is outside this agent's entitled
+            (chain-only) surface.
     """
     fleet = _load_fleet()
 

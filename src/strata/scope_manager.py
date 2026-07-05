@@ -30,7 +30,7 @@ from typing import Literal
 import anthropic
 from pydantic import BaseModel
 
-from strata.fleet_config import Scope, Stratum
+from strata.fleet_config import EntitlementView, Scope, Stratum
 from strata.record_store import Contribution
 from strata.summary_store import Directive, ScopeSummary, _render_summary
 
@@ -97,7 +97,21 @@ _SYSTEM_PROMPT = """\
 You are the scope-manager for a Strata fleet — a shared memory system for
 agent fleets. Your job is to judge a single new contribution to one scope.
 
-Concepts you must know (from CONTEXT.md):
+STEP 1 — ADMISSION CHECK (do this before classifying): When an ENTITLEMENT
+section is present in the user message, check where the contribution's
+material substantively originates. Material whose substantive origin is a
+scope listed as NOT entitled — another scope's internal notes, findings, or
+working material, however helpful or well-intentioned — must be DECLINED,
+even when correctly classified and even when the contributor legitimately
+belongs to this scope. The contributor's good standing does not entitle the
+material. Distinguish substance from mention: naming another scope, or
+citing a directive already ratified into a shared ancestor, is not
+cross-boundary material. Material from scopes entitled for CONTEXT only may
+be accepted as context, never as a directive. Material from outside the
+fleet (user reports, public documents, vendor advisories) is not covered by
+this rule.
+
+STEP 2 — CLASSIFICATION. Concepts you must know (from CONTEXT.md):
 - A scope is a bounded region of the fleet.
 - A scope's summary has two sections: directives (binding decisions, listed
   individually) and context (a condensed prose digest of non-binding
@@ -190,6 +204,32 @@ def _render_recent_contributions(contributions: list[Contribution]) -> str:
     return "\n".join(lines)
 
 
+def _render_entitlement_group(scopes: list[Scope]) -> str:
+    """Render one entitlement group as a comma-separated ``id (name)`` list."""
+    if not scopes:
+        return "(none)"
+    return ", ".join(f"{s.id} ({s.name})" for s in scopes)
+
+
+def _render_entitlement(entitlement: EntitlementView) -> str:
+    """Render the ENTITLEMENT block for the user message (ADR 0006 D2).
+
+    Names only, grouped by relationship to the judged scope. All names come
+    from ``fleet.yaml`` at call time — nothing fleet- or team-specific is
+    ever baked into prompt text (grill decision, ADR 0006 D2).
+    """
+    return (
+        "ENTITLEMENT (relative to this scope)\n"
+        "- This scope and its ancestors (entitled — directives and context):\n"
+        f"    {_render_entitlement_group(entitlement.chain)}\n"
+        "- Peer scopes referenced by this chain (entitled for CONTEXT only):\n"
+        f"    {_render_entitlement_group(entitlement.referenced_peers)}\n"
+        "- All other scopes in this fleet (NOT entitled — material "
+        "substantively originating from these must not enter this scope):\n"
+        f"    {_render_entitlement_group(entitlement.others)}\n"
+    )
+
+
 def _build_user_message(
     *,
     scope: Scope,
@@ -199,6 +239,7 @@ def _build_user_message(
     recent_contributions: list[Contribution],
     new_contribution: Contribution,
     summary_max_words: int = 500,
+    entitlement: EntitlementView | None = None,
 ) -> str:
     """Compose the (non-cached) per-call user message."""
     if current_summary is not None:
@@ -214,6 +255,10 @@ def _build_user_message(
         rendered_parent = _render_summary(parent_summary)
         parent_block = f"PARENT SCOPE SUMMARY (inherited)\n---\n{rendered_parent}\n---\n\n"
 
+    entitlement_block = ""
+    if entitlement is not None:
+        entitlement_block = f"{_render_entitlement(entitlement)}\n"
+
     budget_line = f"BUDGET: your rewritten summary must be at most {summary_max_words} words.\n\n"
 
     return (
@@ -222,6 +267,7 @@ def _build_user_message(
         "\n"
         f"{budget_line}"
         f"{parent_block}"
+        f"{entitlement_block}"
         "CURRENT SUMMARY\n"
         "---\n"
         f"{rendered_summary}\n"
@@ -282,6 +328,7 @@ class ScopeManager:
         recent_contributions: list[Contribution],
         new_contribution: Contribution,
         summary_max_words: int = 500,
+        entitlement: EntitlementView | None = None,
     ) -> ScopeManagerJudgment:
         """Judge a new contribution against the scope's current state.
 
@@ -307,6 +354,13 @@ class ScopeManager:
                                   (ADR 0004 D5).  Rendered as a BUDGET line in
                                   the user message; the LLM enforces the limit.
                                   Defaults to 500.
+            entitlement:          The judged scope's entitlement surface
+                                  (ADR 0006 D2), from
+                                  :meth:`~strata.fleet_config.FleetConfig.entitlement_view`.
+                                  Rendered as an ENTITLEMENT block in the user
+                                  message so the judge can apply the admission
+                                  check. ``None`` omits the block entirely
+                                  (backward compatible call shape).
 
         Returns:
             A :class:`ScopeManagerJudgment` with the verdict, reasoning, and
@@ -342,6 +396,7 @@ class ScopeManager:
             recent_contributions=recent_contributions,
             new_contribution=new_contribution,
             summary_max_words=summary_max_words,
+            entitlement=entitlement,
         )
 
         # Build the system prompt with cache_control on the last text block
