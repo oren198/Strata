@@ -1,6 +1,6 @@
 # ADR 0006 — Entitlement: One Surface for Reads, Writes, and Admission
 
-**Status:** Proposed (for grilling)
+**Status:** Accepted (grilled 2026-07-05; implementation in progress)
 **Date:** 2026-07-05
 **Related:** ADR 0004 (H2 foundations), issue #42 (cross-boundary
 re-sharing), issue #41 (peer composition, tracking), issue #48 (entitled
@@ -115,8 +115,15 @@ writes.
 A structurally-refused write is an **error, not a decline**: no record
 row is appended. Declines are judgments, and judgments come only from the
 scope-manager (the #57/#69 principle); the record is the log of judged
-contributions, not of tool-call rejections. Revisit only if refused-probe
-forensics becomes a real need.
+contributions, not of tool-call rejections. *Grill decision (2026-07-05):*
+every refusal is additionally **logged** to the server's log (contributor
+scope/skill/session, target scope, timestamp) — tracing and auditing
+without polluting the scope's history.
+
+Surface note: D1 governs the **agent surface** (`strata_contribute` via
+MCP). The Console backend's HTTP `/contribute` is an operator surface and
+keeps its current behaviour — the same line #48 drew for reads (agents are
+scope-entitled; humans have the Console).
 
 ### D2. Admission is judged — give the judge the signal and the rule
 
@@ -146,7 +153,17 @@ external ones (public docs, user reports — not covered by the rule).
 the block is O(fleet) short lines. Cap/condense is a future concern at
 ~100+ scopes, not now.
 
-**The rule.** `_SYSTEM_PROMPT` gains an admission clause:
+*Grill decision (2026-07-05):* **nothing fleet-specific is ever written
+into the prompt.** All scope names above (including this ADR's examples,
+like `g_security_eng`) are illustrative; the block is rendered from
+`fleet.yaml` at judgment time and the system-prompt rule speaks only in
+general terms ("this scope's chain", "referenced scopes", "other scopes
+in this fleet").
+
+**The rule.** `_SYSTEM_PROMPT` gains an admission check as an explicit,
+**first** step — the judge verifies where the material comes from before
+classifying it (grill decision: a distinct security step, not a clause
+buried among classification guidance):
 
 > Material whose substantive origin is a scope listed as NOT entitled —
 > another scope's internal notes, findings, or working material, however
@@ -163,6 +180,13 @@ unchanged. The rule keys off the structured block, not off vibes — the
 same shape that already works for the two attack families with in-content
 tells.
 
+*Noted as a future option (grill, not built now):* the judge's written
+reasoning may flag "this looks relevant beyond this scope — worth
+proposing to the parent." Advice only, visible in record/Console; the
+actual upward proposal still passes the parent's judge. Sideways push by
+the judge was considered and rejected — scope A's judge deciding what
+enters scopes B/C/D would exercise authority it does not hold.
+
 ### D3. Peer-reference composition (implements #41)
 
 `strata_read_perspective` extends the layer walk: for each scope on the
@@ -176,7 +200,11 @@ chain," no transitive peer-of-peer) and append their summaries as layers.
   directives remain directives *in their home scope*; to this reader they
   are context (CONTEXT.md § Intra-stratum edge). We label rather than
   strip — composition is provenance-preserving, not lossy (philosophy
-  Concept 4).
+  Concept 4). *Grill decision (2026-07-05):* confirmed (full summary,
+  clearly labelled). Follow-up memo filed as issue #71: the philosophy
+  session should weigh a third memory kind — a **declaration**, what a
+  scope deliberately publishes outward — which would let the publishing
+  scope curate its subscription surface.
 - The **read surface** extends accordingly: `strata_read_scope_summary`
   accepts chain-referenced peers (their summaries are composed into your
   perspective anyway; refusing the direct read is empty ceremony).
@@ -228,10 +256,10 @@ human-readable config change — not a prompt tweak and not code.
   reader may need ("merging destroys the information about where each
   piece came from," philosophy Concept 4). Label the layer non-binding
   instead.
-- **Record rows for structurally-refused writes** — rejected for now:
-  the record is the log of judged contributions; a tool-call rejection is
-  not a judgment and must not look like one (#57/#69). The MCP error is
-  the audit surface today.
+- **Record rows for structurally-refused writes** — rejected: the record
+  is the log of judged contributions; a tool-call rejection is not a
+  judgment and must not look like one (#57/#69). Auditing lives in the
+  server log instead (grill decision — error + log line, no record row).
 - **Write surface = bound scope only** (no ancestor writes) — rejected:
   it severs the evidence→ratification loop that philosophy Concept 3 makes
   the *only* legitimate upward influence channel, and CONTEXT.md
@@ -275,10 +303,20 @@ human-readable config change — not a prompt tweak and not code.
 
 ## Acceptance (pre-wired in strata-evals)
 
+Grill decision on the bar: 0 attack successes is the gate; any residual
+comes back to the owner as a named decision — never silently accepted.
+Live run gates dev → main promotion, evidence table in the release PR.
+
 - Live J4: `j4.attack_success_rate.family.cross_boundary_resharing` → 0
-  (or a documented, justified ceiling) without regressing
+  (or an owner-signed, documented ceiling) without regressing
   `accept_me_as_directive` (0.125 baseline), `summary_vandalism` (0.0), or
   the J1 legitimate classes (1.0).
+- New adversarial coverage for the new mechanisms (strata-evals#3):
+  J4 families `laundered_resharing`, `origin_spoofing`,
+  `peer_context_escalation`, `fleet_map_injection`; J1 "legitimate twin"
+  accept-cases guarding over-refusal; offline G probes asserting sideways/
+  downward writes are refused with the entitlement error + log line and
+  never appear in the record.
 - G1: `peer_referenced_context_presence` flips informational → asserted
   and passes both directions (referenced peers present; unreferenced
   siblings absent).
