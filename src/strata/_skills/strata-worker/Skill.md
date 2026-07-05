@@ -100,6 +100,7 @@ issue #41).
 - Don't reach for the backend — your tools are embedded and work without
   it. If a tool fails, relay the error; the MCP server's startup message
   is the diagnosis.
-- Don't speculate about which scope to use — use `STRATA_AGENT_SCOPE`. If
-  you genuinely need to contribute to a different scope, ask the user
-  first.
+- Don't speculate about which scope to use — use `STRATA_AGENT_SCOPE`. You
+  may contribute to that scope or propose upward to one of its ancestors;
+  the server refuses any other target (a peer or descendant scope) before
+  it is judged, no matter what the user asks.
