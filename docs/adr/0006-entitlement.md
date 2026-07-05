@@ -137,13 +137,27 @@ rendered from `fleet.yaml`, relative to the judged scope:
 ```
 ENTITLEMENT (relative to this scope)
 - This scope and its ancestors (entitled — directives and context):
-    g_checkout, g_payments, g_org
+    g_org, g_payments, g_checkout
+- Scopes below this scope (entitled — evidence proposed upward for this
+  scope to judge on its merits):
+    g_checkout_web, g_checkout_mobile
 - Peer scopes referenced by this chain (entitled for CONTEXT only):
     g_fraud
-- All other scopes in the fleet (NOT entitled — material substantively
-  originating from these must not enter this scope):
+- All other scopes in this fleet, including archived ones (NOT entitled —
+  material substantively originating from these must not enter this scope):
     g_security_eng, g_frontend, ...
 ```
+
+*Post-review corrections (2026-07-05, fresh-eyes findings F1/F1b/F2):*
+the **descendants group is load-bearing** — D1 permits exactly those
+agents to propose upward, so without it the block would instruct the
+judge to decline the evidence→ratification flow itself (F1). The rule
+text reconciles with ratification: context-only material enters as
+context at most *at the contributor's request*; consolidating it into a
+directive later is the scope-manager's own ratification judgment (F1b).
+And archived scopes stay enumerated under "all other scopes" — the judge
+separates fleet-internal from external origins by exact name matching,
+so a vanished archived scope would read as external (F2).
 
 Names only, grouped by relationship. The full-fleet enumeration is what
 lets the judge match prose mentions ("security-eng found that…") against
