@@ -908,15 +908,53 @@ def test_entitlement_view_peer_of_peer_lands_in_others(tmp_path: Path) -> None:
     assert any(s.id == "g_funcC" for s in view.others)
 
 
-def test_entitlement_view_excludes_archived_scopes(tmp_path: Path) -> None:
-    """Archived scopes never appear, whether referenced or not."""
+def test_entitlement_view_archived_scopes_land_in_others(tmp_path: Path) -> None:
+    """Archived scopes are enumerated in 'others', never as entitled groups.
+
+    They must not vanish from the view entirely: the judge distinguishes
+    fleet-internal origins from external material by exact name matching,
+    and an archived origin scope that disappeared from the enumeration
+    would read as external and slip past the admission rule (fresh-eyes
+    review finding F2).
+    """
     config = FleetConfig.load(_write(tmp_path, _ENTITLEMENT_YAML))
 
     view = config.entitlement_view("g_teamX")
-    all_ids = {s.id for s in (*view.chain, *view.referenced_peers, *view.others)}
+    entitled_ids = {s.id for s in (*view.chain, *view.descendants, *view.referenced_peers)}
+    other_ids = {s.id for s in view.others}
 
-    assert "g_funcD" not in all_ids, "referenced-but-archived scope must be excluded"
-    assert "g_funcE" not in all_ids, "unreferenced archived scope must be excluded"
+    assert "g_funcD" not in entitled_ids, "archived scope must not be an entitled peer"
+    assert "g_funcD" in other_ids, "referenced-but-archived scope must still be enumerated"
+    assert "g_funcE" in other_ids, "unreferenced archived scope must still be enumerated"
+
+
+def test_entitlement_view_descendants_are_entitled_not_others(tmp_path: Path) -> None:
+    """A scope's descendants land in 'descendants', never in 'others'.
+
+    This is the F1 regression pin: ADR 0006 D1 permits descendant-bound
+    agents to propose upward, so the judge must see descendants as entitled
+    evidence sources — a descendant listed as NOT entitled would instruct
+    the judge to decline the legitimate upward-evidence flow.
+    """
+    config = FleetConfig.load(_write(tmp_path, _ENTITLEMENT_YAML))
+
+    view = config.entitlement_view("g_funcA")
+
+    descendant_ids = {s.id for s in view.descendants}
+    other_ids = {s.id for s in view.others}
+    assert descendant_ids == {"g_teamX", "g_teamSibling"}
+    assert not descendant_ids & other_ids
+
+
+def test_entitlement_view_descendants_any_depth_and_leaf_empty(tmp_path: Path) -> None:
+    """Descendants include grandchildren (any depth); a leaf scope has none."""
+    config = FleetConfig.load(_write(tmp_path, _ENTITLEMENT_YAML))
+
+    exec_view = config.entitlement_view("g_exec")
+    assert {s.id for s in exec_view.descendants} == {"g_funcA", "g_teamX", "g_teamSibling"}
+
+    leaf_view = config.entitlement_view("g_teamX")
+    assert leaf_view.descendants == []
 
 
 def test_entitlement_view_root_scope_works(tmp_path: Path) -> None:
@@ -928,4 +966,4 @@ def test_entitlement_view_root_scope_works(tmp_path: Path) -> None:
     assert [s.id for s in view.chain] == ["g_exec"]
     assert view.referenced_peers == []
     other_ids = {s.id for s in view.others}
-    assert other_ids == {"g_funcA", "g_funcB", "g_funcC", "g_teamX", "g_teamSibling"}
+    assert other_ids == {"g_funcB", "g_funcC", "g_funcD", "g_funcE"}
