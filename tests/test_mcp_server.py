@@ -21,6 +21,19 @@ Decision 3 (perspective composition) tests:
 11. Missing ancestor summary → layer still present with empty content.
 12. _v1_limitation key is absent (regression guard).
 
+ADR 0006 Decision D1 (entitled write-target surface) tests:
+13. strata_contribute to own scope, parent, and root/grandparent all succeed.
+14. strata_contribute to a sibling (peer) scope is refused with the write
+    entitlement error.
+15. strata_contribute to a descendant scope is refused with the write
+    entitlement error.
+16. A refused write leaves no row in the record store (no contribution, no
+    judgment).
+17. A refused write emits a WARNING log line naming the contributor scope,
+    skill, session id, and the refused target scope.
+18. Unknown-scope and archived-scope errors are unchanged, and are still
+    reported before the entitlement check runs.
+
 The MCP protocol layer (FastMCP, stdio transport) is not tested here — that is
 the SDK's responsibility.  Only the tool wrappers are exercised.
 
@@ -30,6 +43,7 @@ contribution, scope summary, perspective, record, provenance.
 
 from __future__ import annotations
 
+import logging
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -109,6 +123,44 @@ def _make_deep_fleet_yaml(tmp_path: Path) -> Path:
             {"from": "g_peer", "to": "g_exec"},
             # Intra-stratum peer reference (same L1 — must NOT be traversed)
             {"from": "g_func", "to": "g_peer"},
+        ],
+    }
+    fleet_path = tmp_path / "fleet.yaml"
+    fleet_path.write_text(yaml.dump(fleet, default_flow_style=False), encoding="utf-8")
+    return fleet_path
+
+
+def _make_write_surface_fleet_yaml(tmp_path: Path) -> Path:
+    """Write a fleet.yaml for ADR 0006 D1 (entitled write-target surface) tests.
+
+    Topology: g_exec (L0) <- g_func (L1) <- g_team (L2), with g_team2 as a
+    sibling of g_team (also L2, child of g_func, no reference edge between
+    them) and g_archived an archived L2 scope (also a child of g_func).
+    """
+    fleet = {
+        "strata": [
+            {"id": "L0", "name": "executive", "ordinal": 0},
+            {"id": "L1", "name": "function", "ordinal": 1},
+            {"id": "L2", "name": "team", "ordinal": 2},
+        ],
+        "scopes": [
+            {"id": "g_exec", "name": "Executive", "stratum_id": "L0"},
+            {"id": "g_func", "name": "Function", "stratum_id": "L1"},
+            {"id": "g_team", "name": "Team", "stratum_id": "L2"},
+            {"id": "g_team2", "name": "Team Two", "stratum_id": "L2"},
+            {
+                "id": "g_archived",
+                "name": "Archived Team",
+                "stratum_id": "L2",
+                "status": "archived",
+            },
+        ],
+        "edges": [
+            # Inter-stratum: child → parent
+            {"from": "g_func", "to": "g_exec"},
+            {"from": "g_team", "to": "g_func"},
+            {"from": "g_team2", "to": "g_func"},
+            {"from": "g_archived", "to": "g_func"},
         ],
     }
     fleet_path = tmp_path / "fleet.yaml"
@@ -829,3 +881,266 @@ def test_stale_bound_scope_gets_distinct_error(tmp_path: Path) -> None:
         pytest.raises(RuntimeError, match="no longer exists in the fleet"),
     ):
         mod.strata_read_perspective()
+
+
+# ---------------------------------------------------------------------------
+# ADR 0006 Decision D1 — entitled write-target surface
+#
+# strata_contribute must refuse any target scope outside the bound scope
+# (_AGENT_SCOPE) plus its inter-stratum ancestors — the same surface shape as
+# the #48 read surface, but a separate named concept (_check_entitled_write)
+# with its own error message. Uses the write-surface fleet: g_exec (L0) <-
+# g_func (L1) <- g_team (L2), with g_team2 a sibling of g_team and g_archived
+# an archived sibling.
+# ---------------------------------------------------------------------------
+
+
+def _patch_agent_binding(
+    mod, *, scope: str, skill: str = "strata-developer", session_id: str = "sess_test"
+):
+    """Return the three patch context managers used to bind an agent identity in tests."""
+    return (
+        patch.object(mod, "_AGENT_SCOPE", scope),
+        patch.object(mod, "_AGENT_SKILL", skill),
+        patch.object(mod, "_AGENT_SESSION_ID", session_id),
+    )
+
+
+@pytest.mark.parametrize(
+    "target_scope_id",
+    ["g_team", "g_func", "g_exec"],
+    ids=["own-scope", "parent", "root-grandparent"],
+)
+def test_contribute_within_write_surface_allowed(tmp_path: Path, target_scope_id: str) -> None:
+    """Own scope, parent, and root/grandparent are all within the write surface."""
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_write_surface_fleet_yaml(tmp_path)
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+    fleet = FleetConfig.load(fleet_path)
+
+    fake_judgment = MagicMock()
+    fake_judgment.decision = "accept_as_context"
+    fake_judgment.reasoning = "Valid observation."
+    fake_judgment.new_summary = _make_summary(target_scope_id, "updated context")
+
+    scope_p, skill_p, session_p = _patch_agent_binding(mod, scope="g_team")
+    with (
+        scope_p,
+        skill_p,
+        session_p,
+        patch.object(mod, "_load_fleet", return_value=fleet),
+        patch("strata.scope_manager.ScopeManager.judge", return_value=fake_judgment),
+        patch("anthropic.Anthropic", return_value=MagicMock()),
+    ):
+        result = mod.strata_contribute(
+            scope_id=target_scope_id,
+            content="within the write surface",
+            proposed_classification="context",
+        )
+
+    assert result["judgment"]["decision"] == "accept_as_context"
+    with RecordStore(db_path) as rs:
+        contributions = rs.list_contributions(scope_id=target_scope_id)
+    assert len(contributions) == 1
+    assert contributions[0].content == "within the write surface"
+
+
+def test_contribute_to_sibling_refused(tmp_path: Path) -> None:
+    """A direct write into a peer (sibling) scope is refused (ADR 0006 D1).
+
+    Sideways knowledge flow has exactly two sanctioned routes: ratification
+    into a common ancestor, or a context-only reference edge — never a
+    direct write.
+    """
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_write_surface_fleet_yaml(tmp_path)
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+    fleet = FleetConfig.load(fleet_path)
+
+    scope_p, skill_p, session_p = _patch_agent_binding(mod, scope="g_team")
+    with (
+        scope_p,
+        skill_p,
+        session_p,
+        patch.object(mod, "_load_fleet", return_value=fleet),
+        pytest.raises(RuntimeError, match="entitled write surface") as exc_info,
+    ):
+        mod.strata_contribute(
+            scope_id="g_team2",
+            content="sideways contribution",
+            proposed_classification="context",
+        )
+
+    message = str(exc_info.value)
+    assert "g_team2" in message
+    assert "g_team" in message
+
+
+def test_contribute_to_descendant_refused(tmp_path: Path) -> None:
+    """A direct write into a descendant scope is refused (ADR 0006 D1).
+
+    Authority already flows down structurally: publish at your own scope and
+    it binds every descendant. A direct write into a child scope bypasses
+    that scope's own judgment loop.
+    """
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_write_surface_fleet_yaml(tmp_path)
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+    fleet = FleetConfig.load(fleet_path)
+
+    scope_p, skill_p, session_p = _patch_agent_binding(mod, scope="g_func")
+    with (
+        scope_p,
+        skill_p,
+        session_p,
+        patch.object(mod, "_load_fleet", return_value=fleet),
+        pytest.raises(RuntimeError, match="entitled write surface") as exc_info,
+    ):
+        mod.strata_contribute(
+            scope_id="g_team",
+            content="downward contribution",
+            proposed_classification="context",
+        )
+
+    message = str(exc_info.value)
+    assert "g_team" in message
+    assert "g_func" in message
+
+
+def test_refused_write_leaves_no_record_row(tmp_path: Path) -> None:
+    """A structurally-refused write must not append a contribution or judgment row.
+
+    ADR 0006 D1: a structural refusal is an error, not a scope-manager
+    decline — the record is the log of judged contributions, not of
+    tool-call rejections.
+    """
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_write_surface_fleet_yaml(tmp_path)
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+    fleet = FleetConfig.load(fleet_path)
+
+    with RecordStore(db_path) as rs:
+        assert rs.list_contributions(scope_id="g_team2") == []
+        assert rs.list_judgments(scope_id="g_team2") == []
+
+    scope_p, skill_p, session_p = _patch_agent_binding(mod, scope="g_team")
+    with (
+        scope_p,
+        skill_p,
+        session_p,
+        patch.object(mod, "_load_fleet", return_value=fleet),
+        pytest.raises(RuntimeError, match="entitled write surface"),
+    ):
+        mod.strata_contribute(
+            scope_id="g_team2",
+            content="sideways contribution",
+            proposed_classification="context",
+        )
+
+    with RecordStore(db_path) as rs:
+        assert rs.list_contributions(scope_id="g_team2") == []
+        assert rs.list_judgments(scope_id="g_team2") == []
+
+
+def test_refused_write_emits_warning_log(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """A refused write emits one WARNING log line naming contributor and target.
+
+    Grill decision (ADR 0006 D1): every refusal is logged (contributor
+    scope/skill/session, target scope) for tracing and auditing without
+    polluting the scope's record.
+    """
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_write_surface_fleet_yaml(tmp_path)
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+    fleet = FleetConfig.load(fleet_path)
+
+    scope_p, skill_p, session_p = _patch_agent_binding(
+        mod, scope="g_team", skill="strata-developer", session_id="sess_test"
+    )
+    with (
+        scope_p,
+        skill_p,
+        session_p,
+        patch.object(mod, "_load_fleet", return_value=fleet),
+        caplog.at_level(logging.WARNING, logger="strata.mcp"),
+        pytest.raises(RuntimeError, match="entitled write surface"),
+    ):
+        mod.strata_contribute(
+            scope_id="g_team2",
+            content="sideways contribution",
+            proposed_classification="context",
+        )
+
+    warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warning_records) == 1
+    message = warning_records[0].getMessage()
+    assert "g_team" in message
+    assert "strata-developer" in message
+    assert "sess_test" in message
+    assert "g_team2" in message
+
+
+def test_contribute_raises_for_unknown_scope_before_entitlement_check(tmp_path: Path) -> None:
+    """Scope-not-found errors are unchanged and reported before the entitlement check runs."""
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_write_surface_fleet_yaml(tmp_path)
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+    fleet = FleetConfig.load(fleet_path)
+
+    scope_p, skill_p, session_p = _patch_agent_binding(mod, scope="g_team")
+    with (
+        scope_p,
+        skill_p,
+        session_p,
+        patch.object(mod, "_load_fleet", return_value=fleet),
+        pytest.raises(RuntimeError, match="Scope not found"),
+    ):
+        mod.strata_contribute(
+            scope_id="g_nonexistent",
+            content="This should fail.",
+            proposed_classification="context",
+        )
+
+
+def test_contribute_raises_for_archived_scope_before_entitlement_check(tmp_path: Path) -> None:
+    """Archived-scope errors are unchanged and reported before the entitlement check runs.
+
+    g_archived is a sibling of g_team (not in g_team's write surface), so this
+    also pins that the archived check fires first — fleet topology is not
+    secret (strata_list_scopes is open), so existence checks may stay first.
+    """
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_write_surface_fleet_yaml(tmp_path)
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+    fleet = FleetConfig.load(fleet_path)
+
+    scope_p, skill_p, session_p = _patch_agent_binding(mod, scope="g_team")
+    with (
+        scope_p,
+        skill_p,
+        session_p,
+        patch.object(mod, "_load_fleet", return_value=fleet),
+        pytest.raises(RuntimeError, match="archived") as exc_info,
+    ):
+        mod.strata_contribute(
+            scope_id="g_archived",
+            content="This should fail.",
+            proposed_classification="context",
+        )
+
+    # Must be the archived-scope error, not the write-entitlement error.
+    assert "entitled write surface" not in str(exc_info.value)

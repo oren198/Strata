@@ -31,6 +31,7 @@ STRATA_AGENT_SESSION_ID
 
 from __future__ import annotations
 
+import logging
 import os
 import sqlite3
 import sys
@@ -68,6 +69,13 @@ from strata.summary_store import ScopeSummary, SummaryStore
 # ---------------------------------------------------------------------------
 
 _settings = get_settings()
+
+# Module-level logger. This is an MCP stdio server — stdout is the JSON-RPC
+# channel, so nothing may ever be print()'d there. Python's logging module
+# defaults to stderr when no handler is configured, which is exactly what we
+# want; we deliberately do not call logging.basicConfig() or attach a stdout
+# handler here.
+_logger = logging.getLogger("strata.mcp")
 
 _db_path: str = ""
 _summaries_dir: str = ""
@@ -126,6 +134,32 @@ def _load_fleet() -> FleetConfig:
 
 
 # ---------------------------------------------------------------------------
+# Entitlement surfaces (ADR 0006 — one model, shared computation, distinct
+# capacities). Both the read surface (issue #48, shipped) and the write
+# surface (ADR 0006 D1, below) are derived from the same ancestor-chain
+# computation and happen to be equal sets today. They are kept as separate
+# named concepts, not one shared check, because they are expected to
+# diverge: the read surface is slated to grow to include chain-referenced
+# peer scopes (ADR 0006 D3/D4), while the write surface never does — sideways
+# knowledge flow stays gated behind ratification or a context-only reference
+# edge, never a direct write.
+# ---------------------------------------------------------------------------
+
+
+def _binding_surface_scope_ids(fleet: FleetConfig) -> set[str]:
+    """Return this agent's bound scope plus its inter-stratum ancestor chain.
+
+    This is the shared computation behind both entitlement surfaces
+    (_entitled_scope_ids for reads, _entitled_write_scope_ids for writes).
+    Intra-stratum peers are never included here — a peer's memory reaches
+    this agent only if a common ancestor's scope-manager ratifies it into a
+    directive (or, for reads once ADR 0006 D3 lands, via a reference edge).
+    """
+    ancestors = fleet.inter_stratum_ancestors(_AGENT_SCOPE)
+    return {_AGENT_SCOPE, *(s.id for s in ancestors)}
+
+
+# ---------------------------------------------------------------------------
 # Entitled read surface (issue #48 — agent-facing reads are scope-entitled,
 # not fleet-wide). Decision, recorded on the issue: "Why do we need cross
 # scope reads? Isn't it breaking the Strata philosophy?" — it was. Reads are
@@ -143,8 +177,7 @@ def _entitled_scope_ids(fleet: FleetConfig) -> set[str]:
     excluded — a peer's memory reaches this agent only if a common ancestor's
     scope-manager ratifies it into a directive.
     """
-    ancestors = fleet.inter_stratum_ancestors(_AGENT_SCOPE)
-    return {_AGENT_SCOPE, *(s.id for s in ancestors)}
+    return _binding_surface_scope_ids(fleet)
 
 
 def _check_entitled(fleet: FleetConfig, scope_id: str) -> None:
@@ -165,6 +198,65 @@ def _check_entitled(fleet: FleetConfig, scope_id: str) -> None:
             f"(your scope {_AGENT_SCOPE!r} plus its inter-stratum ancestors). "
             "Peer scopes reach you only through ratified content in your "
             "perspective (see issue #41)."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Entitled write surface (ADR 0006 Decision D1 — agent-facing contributions
+# are target-entitled, mirroring the #48 read surface). `strata_contribute`
+# refuses any target outside the bound scope plus its inter-stratum
+# ancestors: contributing to your own scope or proposing upward to an
+# ancestor is the mechanism of legitimate upward influence (evidence +
+# ratification); a direct write into a peer or descendant scope is refused
+# structurally, before any judging or recording happens. Unlike the read
+# surface, this surface is never extended by reference edges (ADR 0006 D3/
+# D4) — sideways flow always requires ratification through a shared
+# ancestor. A refusal here is an error, not a scope-manager decline: no
+# record row is appended, and the refusal is logged for auditing (grill
+# decision, ADR 0006 D1).
+# ---------------------------------------------------------------------------
+
+
+def _entitled_write_scope_ids(fleet: FleetConfig) -> set[str]:
+    """Return the scope ids this agent is entitled to contribute to directly.
+
+    The entitled write surface is this agent's bound scope (``_AGENT_SCOPE``)
+    plus its inter-stratum ancestor chain — identical in shape to the read
+    surface today, computed via the same shared helper, but named separately
+    because the two are expected to diverge (ADR 0006 D1/D3/D4).
+    """
+    return _binding_surface_scope_ids(fleet)
+
+
+def _check_entitled_write(fleet: FleetConfig, scope_id: str) -> None:
+    """Raise RuntimeError if *scope_id* is outside the entitled write surface."""
+    if fleet.get_scope(_AGENT_SCOPE) is None:
+        # Same stale-binding hazard as the read surface: without this check,
+        # a bound scope removed from fleet.yaml mid-session would silently
+        # collapse the write surface and every write would get a misleading
+        # entitlement error instead of a rebind error.
+        raise RuntimeError(
+            f"your bound scope {_AGENT_SCOPE!r} no longer exists in the fleet "
+            "config — fleet.yaml changed since this session started. Restore "
+            "the scope in fleet.yaml or relaunch with a valid binding."
+        )
+    if scope_id not in _entitled_write_scope_ids(fleet):
+        _logger.warning(
+            "contribution refused: contributor scope=%r skill=%r session=%r "
+            "target scope=%r is outside the entitled write surface",
+            _AGENT_SCOPE,
+            _AGENT_SKILL,
+            _AGENT_SESSION_ID,
+            scope_id,
+        )
+        raise RuntimeError(
+            f"scope {scope_id!r} is outside your entitled write surface "
+            f"(your scope {_AGENT_SCOPE!r} plus its inter-stratum ancestors). "
+            "Contribute to your own scope, or propose upward to an ancestor "
+            "scope — that is how memory legitimately moves toward broader "
+            "authority. Sideways flow to a peer scope happens only through "
+            "ratification into a shared ancestor scope, or a context-only "
+            "reference edge — never a direct write."
         )
 
 
@@ -328,8 +420,18 @@ def strata_contribute(
     populated automatically from the agent's environment variables:
     STRATA_AGENT_SCOPE, STRATA_AGENT_SKILL, STRATA_AGENT_SESSION_ID.
 
+    Write surface: ``scope_id`` must be this agent's bound scope
+    (``STRATA_AGENT_SCOPE``) or one of its inter-stratum ancestors — the same
+    surface shape as the entitled read surface (issue #48). Contribute to
+    your own scope, or propose upward to an ancestor scope; that is the
+    mechanism of legitimate upward influence. A peer or descendant scope is
+    refused before any judging or recording happens — sideways flow reaches
+    other scopes only via ratification through a shared ancestor, or a
+    context-only reference edge, never a direct write.
+
     Args:
-        scope_id: Target scope to contribute to (e.g. ``g_arch``).
+        scope_id: Target scope to contribute to (e.g. ``g_arch``). Must be
+            the bound scope or one of its inter-stratum ancestors.
         content: The memory content being proposed.
         proposed_classification: Hint to the scope-manager — ``directive``
             for a binding decision, ``context`` for an observation or
@@ -343,7 +445,8 @@ def strata_contribute(
         ``contribution_id`` and ``judgment`` (decision, reasoning, summary_updated).
 
     Raises:
-        RuntimeError: If the scope is not found or is archived.
+        RuntimeError: If the scope is not found, is archived, or is outside
+            this agent's entitled write surface.
     """
     fleet = _load_fleet()
 
@@ -352,6 +455,7 @@ def strata_contribute(
         raise RuntimeError(f"Scope not found: {scope_id!r}")
     if scope.status == "archived":
         raise RuntimeError(f"Scope is archived and not accepting contributions: {scope_id!r}")
+    _check_entitled_write(fleet, scope_id)
 
     stratum = next((s for s in fleet.strata if s.id == scope.stratum_id), None)
     if stratum is None:
