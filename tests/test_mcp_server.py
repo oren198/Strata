@@ -1144,3 +1144,52 @@ def test_contribute_raises_for_archived_scope_before_entitlement_check(tmp_path:
 
     # Must be the archived-scope error, not the write-entitlement error.
     assert "entitled write surface" not in str(exc_info.value)
+
+
+# ---------------------------------------------------------------------------
+# ADR 0006 Decision D2 — the judge gets an entitlement signal
+# ---------------------------------------------------------------------------
+
+
+def test_contribute_passes_entitlement_view_to_judge(tmp_path: Path) -> None:
+    """strata_contribute must compute and pass a non-None entitlement view to judge."""
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fleet_yaml(tmp_path)
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+    fleet = FleetConfig.load(fleet_path)
+
+    fake_judgment = MagicMock()
+    fake_judgment.decision = "accept_as_context"
+    fake_judgment.reasoning = "Valid observation."
+    fake_judgment.new_summary = _make_summary("g_arch", "updated context")
+
+    judge_spy = MagicMock(return_value=fake_judgment)
+
+    with (
+        patch.object(mod, "_AGENT_SCOPE", "g_backend"),
+        patch.object(mod, "_AGENT_SKILL", "strata-developer"),
+        patch.object(mod, "_AGENT_SESSION_ID", "sess_test"),
+        patch.object(mod, "_load_fleet", return_value=fleet),
+        patch("strata.scope_manager.ScopeManager.judge", judge_spy),
+        patch("anthropic.Anthropic", return_value=MagicMock()),
+    ):
+        mod.strata_contribute(
+            scope_id="g_arch",
+            content="All services should use structured logging.",
+            proposed_classification="context",
+            subject="logging-standard",
+            supersedes=None,
+        )
+
+    assert judge_spy.call_count == 1
+    passed_entitlement = judge_spy.call_args.kwargs["entitlement"]
+    expected_entitlement = fleet.entitlement_view("g_arch")
+
+    assert passed_entitlement is not None
+    assert {s.id for s in passed_entitlement.chain} == {s.id for s in expected_entitlement.chain}
+    assert {s.id for s in passed_entitlement.referenced_peers} == {
+        s.id for s in expected_entitlement.referenced_peers
+    }
+    assert {s.id for s in passed_entitlement.others} == {s.id for s in expected_entitlement.others}
