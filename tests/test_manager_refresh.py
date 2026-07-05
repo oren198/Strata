@@ -193,6 +193,24 @@ def test_stale_when_parent_version_none(tmp_path: Path) -> None:
     assert _is_stale(my_summary, parent_summary) is True
 
 
+def test_stale_across_parents_first_write(tmp_path: Path) -> None:
+    """version=0 (issue #59's synthesized-summary sentinel) is always older
+    than a parent's real first write (version=1).
+
+    A child stamped with parent_version=0 — because it was built while the
+    parent had no on-disk summary yet, i.e. against the synthesized
+    ``ScopeSummary(version=0, exists=False)`` — must be detected as stale
+    the moment the parent's real first write lands, without any special
+    casing: 0 < 1 falls straight out of ``parent_version < version``.
+    """
+    from strata.__main__ import _is_stale
+
+    my_summary = _make_summary(parent_version=0)
+    parent_summary = _make_summary(version=1)
+
+    assert _is_stale(my_summary, parent_summary) is True
+
+
 # ---------------------------------------------------------------------------
 # Test 3 — Budget rendering in user message
 # ---------------------------------------------------------------------------

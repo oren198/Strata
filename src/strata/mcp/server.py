@@ -458,7 +458,11 @@ def strata_read_scope_summary(scope_id: str | None = None) -> dict:
 
     Returns:
         Parsed scope summary: ``scope_id``, ``directives``, ``context``,
-        ``updated_at``.
+        ``updated_at``, ``version``, ``exists``. If the scope has no summary
+        on disk yet, a synthesized empty summary is returned with
+        ``version=0`` and ``exists=False`` — distinguishable from a real
+        first write (``version=1``, ``exists=True``); see
+        :class:`strata.summary_store.ScopeSummary` (issue #59).
 
     Raises:
         RuntimeError: If the scope does not exist, or if scope_id is outside
@@ -478,12 +482,16 @@ def strata_read_scope_summary(scope_id: str | None = None) -> dict:
     if existing is not None:
         return existing.model_dump()
 
-    # Scope exists but has no summary yet — return an empty summary.
+    # Scope exists but has no summary yet — return a synthesized empty
+    # summary. version=0 + exists=False mark it as synthesized so it's never
+    # mistaken for a real first write (version=1, exists=True).
     empty = ScopeSummary(
         scope_id=scope_id,
         directives=[],
         context="",
         updated_at=datetime.now(tz=UTC).isoformat(),
+        version=0,
+        exists=False,
     )
     return empty.model_dump()
 
@@ -494,7 +502,12 @@ def strata_read_scope_summary(scope_id: str | None = None) -> dict:
 
 
 def _summary_for_scope(scope_id: str) -> dict:
-    """Return a scope's summary as a plain dict, using an empty summary if none exists."""
+    """Return a scope's summary as a plain dict, using a synthesized empty summary if none exists.
+
+    The synthesized summary reports ``version=0``/``exists=False`` so it is
+    never mistaken for a real first write (``version=1``, ``exists=True``) —
+    see :class:`strata.summary_store.ScopeSummary` (issue #59).
+    """
     existing = _summary_store.read(scope_id)
     if existing is not None:
         return existing.model_dump()
@@ -503,6 +516,8 @@ def _summary_for_scope(scope_id: str) -> dict:
         directives=[],
         context="",
         updated_at=datetime.now(tz=UTC).isoformat(),
+        version=0,
+        exists=False,
     )
     return empty.model_dump()
 
@@ -518,7 +533,9 @@ def strata_read_perspective(scope_id: str | None = None) -> dict:
     Only inter-stratum edges are traversed — peer (intra-stratum) edges are
     never followed.  If a scope in the ancestor chain has no summary on disk
     yet, its layer is still included with empty directives and context so that
-    the structure is visible.
+    the structure is visible; that layer's summary honestly reports
+    ``version=0``/``exists=False`` rather than looking like a real first
+    write (issue #59).
 
     Args:
         scope_id: The scope for which to build the perspective. Defaults to
