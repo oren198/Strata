@@ -466,12 +466,20 @@ layer; running `strata start` is required only to view the UI. The agent loop
 — contributions, scope-manager judgments, perspective reads — works whether
 the backend is up or down.
 
-> **Entitlement-scoped reads (issue #48):** `strata_read_perspective`,
-> `strata_read_scope_summary`, and `strata_read_scope_record` default to your
-> bound scope (`STRATA_AGENT_SCOPE`) when called with no `scope_id`. An
-> explicit `scope_id` is limited to your bound scope plus its inter-stratum
-> ancestors — peer scopes are not directly readable; they reach you only
-> through ratified content composed into your perspective (see issue #41).
+> **Entitlement-scoped reads (issue #48; ADR 0006 D3/D4):**
+> `strata_read_perspective`, `strata_read_scope_summary`, and
+> `strata_read_scope_record` default to your bound scope
+> (`STRATA_AGENT_SCOPE`) when called with no `scope_id`. An explicit
+> `scope_id` for `strata_read_scope_summary` reaches your bound scope, its
+> inter-stratum ancestors, and any peer scope referenced by a scope on that
+> chain via an intra-stratum edge (context surface); `strata_read_scope_record`
+> and `strata_read_perspective`'s target stay chain-only — records audit the
+> authority that binds you, and a perspective composes your own chain, not a
+> peer's. `strata_read_perspective` itself composes those same
+> chain-referenced peers in as labelled, non-binding `peer_reference` layers
+> (`binding: false`) alongside the chain's `self`/`ancestor` layers
+> (`binding: true`) — a peer's directives inform the reader but never bind
+> them. Unreferenced peers and descendants stay refused everywhere.
 > This supersedes the old HTTP-parity note for `strata_read_scope_record`:
 > it now loads the fleet on every call to run this check, so reading your
 > own scope's record while it has no rows still returns the empty record

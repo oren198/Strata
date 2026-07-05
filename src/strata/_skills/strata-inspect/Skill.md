@@ -36,11 +36,12 @@ has the full glossary — read it when present.
    paraphrase directive content unless the user asks for a summary.
 
 Read tools default to your bound scope when called with no argument. An
-explicit `scope_id` (`X` above) is limited to your bound scope plus its
-inter-stratum ancestors (issue #48) — peer scopes are not directly readable;
-they reach you only through ratified content composed into your perspective
-(see issue #41). If the user asks about a peer scope, say so rather than
-guessing at its content.
+explicit `scope_id` (`X` above) for `strata_read_scope_summary` reaches your
+bound scope, its inter-stratum ancestors, and any peer scope referenced by a
+scope on that chain (context only); `strata_read_scope_record` and
+`strata_read_perspective`'s target stay chain-only (issue #48; ADR 0006
+D3/D4). If the user asks about an unreferenced peer scope, say so rather
+than guessing at its content.
 
 ## Available tools
 

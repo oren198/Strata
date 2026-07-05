@@ -54,10 +54,10 @@ Strata is a **shared memory system for fleets of agents**.
 ## Available tools (read-only from this skill)
 
 Read tools default to your bound scope when called with no argument. An
-explicit `scope_id` is limited to your bound scope plus its inter-stratum
-ancestors (issue #48) — peer scopes are not directly readable; they reach
-you only through ratified content composed into your perspective (see
-issue #41).
+explicit `scope_id` for `strata_read_scope_summary` reaches your bound scope,
+its inter-stratum ancestors, and any peer scope referenced by a scope on that
+chain (context only); `strata_read_scope_record` and `strata_read_perspective`'s
+target stay chain-only (issue #48; ADR 0006 D3/D4).
 
 | Tool | Use |
 |---|---|
