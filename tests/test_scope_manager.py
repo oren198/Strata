@@ -19,7 +19,7 @@ import pytest
 
 from strata.fleet_config import Scope, Stratum
 from strata.record_store import Contribution, ContributorRef
-from strata.scope_manager import ScopeManager, ScopeManagerJudgment
+from strata.scope_manager import ScopeManager, ScopeManagerJudgment, _summary_word_count
 from strata.summary_store import Directive, ScopeSummary
 
 # ---------------------------------------------------------------------------
@@ -402,7 +402,9 @@ def test_tool_choice_forces_submit_judgment() -> None:
     call_kwargs = mock_client.messages.create.call_args
     tool_choice = call_kwargs.kwargs["tool_choice"]
 
-    assert tool_choice == {"type": "tool", "name": "submit_judgment"}
+    assert tool_choice["type"] == "tool"
+    assert tool_choice["name"] == "submit_judgment"
+    assert tool_choice["disable_parallel_tool_use"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -506,6 +508,147 @@ def test_parent_directive_content_in_user_message() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Issue #63 fixtures — overflow re-ask
+# ---------------------------------------------------------------------------
+
+
+def _summary_input_with_context(context: str) -> dict:
+    """An accept_as_directive payload whose summary context is *context*."""
+    return {
+        "decision": "accept_as_directive",
+        "reasoning": "The contribution establishes a clear, enforceable coding standard.",
+        "new_summary": {
+            "directives": [
+                {
+                    "id": EXISTING_DIRECTIVE.id,
+                    "content": EXISTING_DIRECTIVE.content,
+                    "subject": EXISTING_DIRECTIVE.subject,
+                    "source_scope_id": EXISTING_DIRECTIVE.source_scope_id,
+                    "source_skill": EXISTING_DIRECTIVE.source_skill,
+                    "created_at": EXISTING_DIRECTIVE.created_at,
+                },
+            ],
+            "context": context,
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
+# Test 14: within-budget first response — exactly one API call
+# ---------------------------------------------------------------------------
+
+
+def test_within_budget_makes_exactly_one_call() -> None:
+    manager, mock_client = _make_manager(_summary_input_with_context("Short context."))
+
+    judgment = manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+        summary_max_words=500,
+    )
+
+    assert mock_client.messages.create.call_count == 1
+    assert judgment.decision == "accept_as_directive"
+
+
+# ---------------------------------------------------------------------------
+# Test 15: over-budget first response — exactly two calls, overflow re-ask,
+# and the returned judgment is the second response's.
+# ---------------------------------------------------------------------------
+
+
+def test_over_budget_triggers_one_corrective_retry() -> None:
+    over_budget_context = " ".join(f"word{i}" for i in range(20))
+    first_input = _summary_input_with_context(over_budget_context)
+
+    second_context = "Condensed context."
+    second_input = _summary_input_with_context(second_context)
+
+    first_response = _fake_response(first_input)
+    second_response = _fake_response(second_input)
+    first_tool_use_id = first_response.content[0].id
+
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [first_response, second_response]
+    manager = ScopeManager(client=mock_client)
+
+    small_budget = 5  # first response's ~20-word context blows this budget
+
+    judgment = manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+        summary_max_words=small_budget,
+    )
+
+    assert mock_client.messages.create.call_count == 2
+
+    first_call_kwargs = mock_client.messages.create.call_args_list[0].kwargs
+    second_call_kwargs = mock_client.messages.create.call_args_list[1].kwargs
+    second_messages = second_call_kwargs["messages"]
+
+    # Original user turn preserved verbatim.
+    assert second_messages[0] == first_call_kwargs["messages"][0]
+
+    # Assistant turn containing the first response's content blocks.
+    assert second_messages[1] == {"role": "assistant", "content": first_response.content}
+
+    # User turn with a tool_result for the first tool_use id + overflow text.
+    followup_user_turn = second_messages[2]
+    assert followup_user_turn["role"] == "user"
+    tool_result_blocks = [b for b in followup_user_turn["content"] if b["type"] == "tool_result"]
+    assert len(tool_result_blocks) == 1
+    assert tool_result_blocks[0]["tool_use_id"] == first_tool_use_id
+
+    text_blocks = [b for b in followup_user_turn["content"] if b["type"] == "text"]
+    assert len(text_blocks) == 1
+    assert "BUDGET" in text_blocks[0]["text"]
+    assert "VERBATIM" in text_blocks[0]["text"]
+    assert str(small_budget) in text_blocks[0]["text"]
+
+    # The returned judgment reflects the SECOND response, not the first.
+    assert judgment.new_summary is not None
+    assert judgment.new_summary.context == second_context
+
+
+# ---------------------------------------------------------------------------
+# Test 16: _summary_word_count counts context + directive content
+# ---------------------------------------------------------------------------
+
+
+def test_summary_word_count_counts_context_and_directives() -> None:
+    summary = ScopeSummary(
+        scope_id=SCOPE.id,
+        directives=[
+            Directive(
+                id="d1",
+                content="one two three",
+                source_scope_id=SCOPE.id,
+                source_skill="architect",
+                created_at="2026-01-01T00:00:00+00:00",
+            ),
+            Directive(
+                id="d2",
+                content="four five",
+                source_scope_id=SCOPE.id,
+                source_skill="architect",
+                created_at="2026-01-01T00:00:00+00:00",
+            ),
+        ],
+        context="six seven eight nine",
+        updated_at="2026-01-01T00:00:00+00:00",
+    )
+
+    # 3 (d1) + 2 (d2) + 4 (context) = 9
+    assert _summary_word_count(summary) == 9
+
+
+# ---------------------------------------------------------------------------
 # Integration test (optional — requires STRATA_RUN_INTEGRATION=1)
 # ---------------------------------------------------------------------------
 
@@ -548,3 +691,109 @@ def test_integration_real_api() -> None:
         assert isinstance(judgment.new_summary.context, str)
     else:
         assert judgment.new_summary is None
+
+
+# ---------------------------------------------------------------------------
+# Retry robustness (release-review findings): the FIRST judgment is
+# authoritative — the corrective call may only replace its summary.
+# ---------------------------------------------------------------------------
+
+
+def test_retry_decline_keeps_first_judgment() -> None:
+    """A formatting re-ask must never flip an accept into a decline."""
+    over_budget_context = " ".join(f"word{i}" for i in range(20))
+    first_input = _summary_input_with_context(over_budget_context)
+    decline_input = {"decision": "decline", "reasoning": "changed my mind", "new_summary": None}
+
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [
+        _fake_response(first_input),
+        _fake_response(decline_input),
+    ]
+    manager = ScopeManager(client=mock_client)
+
+    judgment = manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+        summary_max_words=5,
+    )
+
+    assert mock_client.messages.create.call_count == 2
+    assert judgment.decision != "decline", (
+        "the retry's verdict reversal must be discarded — first judgment is authoritative"
+    )
+    assert judgment.new_summary is not None
+    assert over_budget_context in judgment.new_summary.context
+
+
+def test_retry_parse_failure_keeps_first_judgment() -> None:
+    """A malformed second response must not destroy the valid first judgment."""
+    over_budget_context = " ".join(f"word{i}" for i in range(20))
+    first_input = _summary_input_with_context(over_budget_context)
+
+    broken_response = MagicMock()
+    broken_response.content = []  # no tool_use block at all (e.g. truncation)
+
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [
+        _fake_response(first_input),
+        broken_response,
+    ]
+    manager = ScopeManager(client=mock_client)
+
+    judgment = manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+        summary_max_words=5,
+    )
+
+    assert mock_client.messages.create.call_count == 2
+    assert judgment.new_summary is not None, (
+        "parse failure on the retry must fall back to the first judgment"
+    )
+    assert over_budget_context in judgment.new_summary.context
+
+
+def test_retry_api_error_keeps_first_judgment() -> None:
+    """A transient API failure on the retry falls back to the first judgment."""
+    over_budget_context = " ".join(f"word{i}" for i in range(20))
+    first_input = _summary_input_with_context(over_budget_context)
+
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [
+        _fake_response(first_input),
+        RuntimeError("api unavailable"),
+    ]
+    manager = ScopeManager(client=mock_client)
+
+    judgment = manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+        summary_max_words=5,
+    )
+
+    assert judgment.new_summary is not None
+    assert over_budget_context in judgment.new_summary.context
+
+
+def test_tool_choice_disables_parallel_tool_use() -> None:
+    """Both calls must pin exactly one tool_use block per response."""
+    manager, mock_client = _make_manager(_summary_input_with_context("Short."))
+    manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+    )
+    tool_choice = mock_client.messages.create.call_args.kwargs["tool_choice"]
+    assert tool_choice.get("disable_parallel_tool_use") is True

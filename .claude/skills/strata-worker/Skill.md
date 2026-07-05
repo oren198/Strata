@@ -35,7 +35,7 @@ the full glossary — read it when present.
 
 ### 1. Orient — every session, before doing anything
 
-Call `strata_read_perspective(scope_id=<your scope>)`. Internalise the
+Call `strata_read_perspective()` (defaults to your bound scope). Internalise the
 directives (binding rules you must follow) and the context (non-binding
 background you should know). Cite directives explicitly when the user's
 request touches one.
@@ -80,13 +80,19 @@ auditable and helps the user trust (or correct) the memory.
 
 ## Available tools
 
+Read tools default to your bound scope when called with no argument. An
+explicit `scope_id` is limited to your bound scope plus its inter-stratum
+ancestors (issue #48) — peer scopes are not directly readable; they reach
+you only through ratified content composed into your perspective (see
+issue #41).
+
 | Tool | When to call |
 |---|---|
-| `strata_read_perspective(scope_id)` | Once at session start; again after a long gap to pick up refreshed ancestor summaries. (Your scope binding is fixed for the session's lifetime.) |
-| `strata_read_scope_summary(scope_id)` | To consult a peer or ancestor scope explicitly. |
+| `strata_read_perspective(scope_id=None)` | Once at session start; again after a long gap to pick up refreshed ancestor summaries. (Your scope binding is fixed for the session's lifetime.) |
+| `strata_read_scope_summary(scope_id=None)` | To consult an ancestor scope explicitly. |
 | `strata_contribute(scope_id, content, proposed_classification, subject, supersedes)` | Per triggers above — **frequently**. |
 | `strata_list_scopes()` | When you need to understand fleet structure. |
-| `strata_read_scope_record(scope_id)` | Forensic — full contribution + judgment log. Rare. |
+| `strata_read_scope_record(scope_id=None)` | Forensic — full contribution + judgment log. Rare. |
 
 ## What you do NOT do
 

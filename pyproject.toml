@@ -35,6 +35,7 @@ include = [
     "src/strata/_skills/**/*",
     "src/strata/_migrations/**/*",
     "src/strata/_templates/**/*",
+    "src/strata/_ui/**/*",
 ]
 
 [tool.pytest.ini_options]

@@ -126,6 +126,49 @@ def _load_fleet() -> FleetConfig:
 
 
 # ---------------------------------------------------------------------------
+# Entitled read surface (issue #48 — agent-facing reads are scope-entitled,
+# not fleet-wide). Decision, recorded on the issue: "Why do we need cross
+# scope reads? Isn't it breaking the Strata philosophy?" — it was. Reads are
+# limited to the bound scope plus its inter-stratum ancestor chain; peer
+# scopes reach an agent only through ratified content composed into its
+# perspective (see issue #41), never through a direct read.
+# ---------------------------------------------------------------------------
+
+
+def _entitled_scope_ids(fleet: FleetConfig) -> set[str]:
+    """Return the scope ids this agent is entitled to read directly.
+
+    The entitled surface is this agent's bound scope (``_AGENT_SCOPE``) plus
+    its inter-stratum ancestor chain. Intra-stratum peers are deliberately
+    excluded — a peer's memory reaches this agent only if a common ancestor's
+    scope-manager ratifies it into a directive.
+    """
+    ancestors = fleet.inter_stratum_ancestors(_AGENT_SCOPE)
+    return {_AGENT_SCOPE, *(s.id for s in ancestors)}
+
+
+def _check_entitled(fleet: FleetConfig, scope_id: str) -> None:
+    """Raise RuntimeError if *scope_id* is outside the entitled read surface."""
+    if fleet.get_scope(_AGENT_SCOPE) is None:
+        # Binding was valid at startup but the bound scope has since vanished
+        # from fleet.yaml (rename/removal). Without this check the entitled
+        # surface silently collapses and every read gets a misleading
+        # peer-entitlement error.
+        raise RuntimeError(
+            f"your bound scope {_AGENT_SCOPE!r} no longer exists in the fleet "
+            "config — fleet.yaml changed since this session started. Restore "
+            "the scope in fleet.yaml or relaunch with a valid binding."
+        )
+    if scope_id not in _entitled_scope_ids(fleet):
+        raise RuntimeError(
+            f"scope {scope_id!r} is outside your entitled read surface "
+            f"(your scope {_AGENT_SCOPE!r} plus its inter-stratum ancestors). "
+            "Peer scopes reach you only through ratified content in your "
+            "perspective (see issue #41)."
+        )
+
+
+# ---------------------------------------------------------------------------
 # Refuse-to-start validation (ADR 0005 Decision 5)
 # ---------------------------------------------------------------------------
 
@@ -399,7 +442,7 @@ def strata_contribute(
 
 
 @mcp.tool()
-def strata_read_scope_summary(scope_id: str) -> dict:
+def strata_read_scope_summary(scope_id: str | None = None) -> dict:
     """Return the scope summary for the given scope.
 
     The scope summary is the curated, condensed working view of a scope,
@@ -408,16 +451,24 @@ def strata_read_scope_summary(scope_id: str) -> dict:
     observations and knowledge).
 
     Args:
-        scope_id: The scope whose summary to read (e.g. ``g_arch``).
+        scope_id: The scope whose summary to read (e.g. ``g_arch``). Defaults
+            to this agent's bound scope. An explicit scope_id must be the
+            bound scope or one of its inter-stratum ancestors (issue #48) —
+            peer scopes are not directly readable.
 
     Returns:
         Parsed scope summary: ``scope_id``, ``directives``, ``context``,
         ``updated_at``.
 
     Raises:
-        RuntimeError: If the scope does not exist.
+        RuntimeError: If the scope does not exist, or if scope_id is outside
+            this agent's entitled read surface.
     """
     fleet = _load_fleet()
+
+    if scope_id is None:
+        scope_id = _AGENT_SCOPE
+    _check_entitled(fleet, scope_id)
 
     scope = fleet.get_scope(scope_id)
     if scope is None:
@@ -457,7 +508,7 @@ def _summary_for_scope(scope_id: str) -> dict:
 
 
 @mcp.tool()
-def strata_read_perspective(scope_id: str) -> dict:
+def strata_read_perspective(scope_id: str | None = None) -> dict:
     """Return this agent's perspective on the fleet's long-term memory.
 
     A perspective is a composed, provenance-preserving view of the scope's
@@ -470,16 +521,24 @@ def strata_read_perspective(scope_id: str) -> dict:
     the structure is visible.
 
     Args:
-        scope_id: The scope for which to build the perspective.
+        scope_id: The scope for which to build the perspective. Defaults to
+            this agent's bound scope. An explicit scope_id must be the bound
+            scope or one of its inter-stratum ancestors (issue #48) — peer
+            scopes are not directly readable.
 
     Returns:
         ``{layers: [{scope_id, stratum_id, summary}], scope_id: <requested>,
         _layers_count: N}`` ordered root-first.
 
     Raises:
-        RuntimeError: If the scope is unknown.
+        RuntimeError: If the scope is unknown, or if scope_id is outside this
+            agent's entitled read surface.
     """
     fleet = _load_fleet()
+
+    if scope_id is None:
+        scope_id = _AGENT_SCOPE
+    _check_entitled(fleet, scope_id)
 
     scope = fleet.get_scope(scope_id)
     if scope is None:
@@ -544,7 +603,7 @@ def strata_list_scopes() -> dict:
 
 
 @mcp.tool()
-def strata_read_scope_record(scope_id: str) -> dict:
+def strata_read_scope_record(scope_id: str | None = None) -> dict:
     """Return the immutable contribution record for a scope (forensic view).
 
     The record is the append-only log of every write ever accepted into the
@@ -552,20 +611,34 @@ def strata_read_scope_record(scope_id: str) -> dict:
     this for debugging, accountability investigation, or understanding the
     history behind the current scope summary.
 
-    Does not re-read fleet.yaml — record retrieval is purely from the
-    SQLite record store and needs no fleet info.
-
-    Migration note: returns an empty record (``{"contributions": [],
-    "judgments": []}``) for unknown scopes, where the old HTTP
-    ``GET /scopes/{id}/record`` endpoint would have returned 404. The other
-    MCP tools still raise on unknown scopes, matching the prior behaviour.
+    Migration note (issue #48 supersedes the earlier HTTP-parity note): this
+    tool used to skip fleet loading entirely and return an empty record for
+    any unknown scope, mirroring the old HTTP ``GET /scopes/{id}/record``
+    contract. Entitlement now takes precedence over that parity concern — the
+    fleet is loaded on every call so the entitled-surface check can run.
+    Reading the bound scope's own record while it has no rows yet still
+    returns the empty record shape; a scope_id outside the entitled surface
+    raises instead of silently returning an empty record.
 
     Args:
         scope_id: The scope whose record to read (e.g. ``g_backend``).
+            Defaults to this agent's bound scope. An explicit scope_id must
+            be the bound scope or one of its inter-stratum ancestors
+            (issue #48) — peer scopes are not directly readable.
 
     Returns:
         ``contributions`` (list) and ``judgments`` (list).
+
+    Raises:
+        RuntimeError: If scope_id is outside this agent's entitled read
+            surface.
     """
+    fleet = _load_fleet()
+
+    if scope_id is None:
+        scope_id = _AGENT_SCOPE
+    _check_entitled(fleet, scope_id)
+
     contributions = _record_store.list_contributions(scope_id=scope_id)
     judgments = _record_store.list_judgments(scope_id=scope_id)
 

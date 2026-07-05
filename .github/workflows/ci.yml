@@ -85,6 +85,21 @@ jobs:
             echo "strata-mcp crashed with a traceback:"; echo "$out"; exit 1
           fi
 
+      # The Console must serve from the wheel install (issue #65) — a
+      # repo-root ui/ path resolves to nothing in site-packages, and the
+      # static mount silently serves 404s.
+      - name: Console UI serves from the wheel
+        run: |
+          set -eu
+          mkdir /tmp/uismoke && cd /tmp/uismoke
+          /tmp/wheelenv/bin/strata start --port 8971 > server.log 2>&1 &
+          SERVER_PID=$!
+          trap 'kill $SERVER_PID 2>/dev/null || true' EXIT
+          curl --retry 20 --retry-connrefused --retry-delay 1 -fsS \
+            http://127.0.0.1:8971/ui/index.html | grep -q "Strata Console"
+          curl -fsS -o /dev/null http://127.0.0.1:8971/ui/atlas.css
+          curl -fsS -o /dev/null http://127.0.0.1:8971/scopes
+
   # Single, stable status-check context required by the branch ruleset.
   # Succeeds only if every matrix leg of `test` succeeded.
   ci:
