@@ -1,6 +1,6 @@
 # ADR 0002 — Fleet Config Source of Truth
 
-**Status:** Proposed
+**Status:** Accepted (implemented)
 **Date:** 2026-05-27
 **Related:** ADR 0003 (depends on this one for the per-scope skill
 declaration schema)

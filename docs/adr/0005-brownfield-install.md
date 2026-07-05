@@ -1,6 +1,6 @@
 # ADR 0005 — Brownfield Install: Strata as a Foreign Project's Memory Layer
 
-**Status:** Proposed
+**Status:** Accepted (implemented)
 **Date:** 2026-05-31
 **Related:** ADR 0001 (V1 architecture), ADR 0002 (fleet config source of
 truth), ADR 0003 (`strata launch`), ADR 0004 (H2 foundations: embedded

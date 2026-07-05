@@ -268,6 +268,61 @@ def test_read_scope_summary_reads_from_summary_store(tmp_path: Path) -> None:
     assert "updated_at" in result
 
 
+def test_read_scope_summary_no_summary_yet_reports_version_zero_and_not_exists(
+    tmp_path: Path,
+) -> None:
+    """Issue #59: a scope with no on-disk summary gets a synthesized empty
+    summary that is honest about being synthesized — version=0, exists=False
+    — rather than looking identical to a real first write (version=1,
+    exists=True).
+    """
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fleet_yaml(tmp_path)
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+    fleet = FleetConfig.load(fleet_path)
+
+    with (
+        patch.object(mod, "_load_fleet", return_value=fleet),
+        patch.object(mod, "_AGENT_SCOPE", "g_arch"),
+    ):
+        mod._summary_store = SummaryStore(summaries_dir)
+        result = mod.strata_read_scope_summary("g_arch")
+
+    assert result["version"] == 0
+    assert result["exists"] is False
+
+
+def test_read_scope_summary_after_first_write_reports_version_one_and_exists(
+    tmp_path: Path,
+) -> None:
+    """Issue #59: once a scope has a real first write, strata_read_scope_summary
+    reports version=1, exists=True — distinguishable from the version=0,
+    exists=False it would have reported a moment earlier.
+    """
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fleet_yaml(tmp_path)
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+
+    ss = SummaryStore(summaries_dir)
+    ss.write("g_arch", _make_summary("g_arch", "arch context"))
+
+    fleet = FleetConfig.load(fleet_path)
+
+    with (
+        patch.object(mod, "_load_fleet", return_value=fleet),
+        patch.object(mod, "_AGENT_SCOPE", "g_arch"),
+    ):
+        mod._summary_store = ss
+        result = mod.strata_read_scope_summary("g_arch")
+
+    assert result["version"] == 1
+    assert result["exists"] is True
+
+
 # ---------------------------------------------------------------------------
 # Test 3: strata_read_perspective returns layers in root-first order
 # ---------------------------------------------------------------------------
@@ -576,6 +631,16 @@ def test_perspective_missing_ancestor_summary_produces_empty_layer(tmp_path: Pat
     root_layer = next(layer for layer in layers if layer["scope_id"] == "g_arch")
     assert root_layer["summary"]["directives"] == []
     assert root_layer["summary"]["context"] == ""
+    # Issue #59: the synthesized layer is honest about being synthesized —
+    # version=0/exists=False — not a look-alike for a real first write.
+    assert root_layer["summary"]["version"] == 0
+    assert root_layer["summary"]["exists"] is False
+
+    # The child layer (g_backend) has a real on-disk summary, so it reports
+    # a real first write: version=1, exists=True.
+    child_layer = next(layer for layer in layers if layer["scope_id"] == "g_backend")
+    assert child_layer["summary"]["version"] == 1
+    assert child_layer["summary"]["exists"] is True
 
 
 # ---------------------------------------------------------------------------

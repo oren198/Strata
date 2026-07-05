@@ -223,6 +223,16 @@ class TestScopeSummary:
         assert data["directives"] == []
         assert data["context"] == ""
 
+    def test_scope_with_no_summary_reports_version_zero_and_not_exists(self, client):
+        """Issue #59: a synthesized empty summary must not look like a real
+        first write — it reports version=0 and exists=False.
+        """
+        resp = client.get("/scopes/g_active/summary")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["version"] == 0
+        assert data["exists"] is False
+
     def test_summary_after_accept_returns_content(self, client):
         resp = client.post(
             "/contribute",
@@ -244,6 +254,30 @@ class TestScopeSummary:
         directives = data["directives"]
         assert len(directives) == 1
         assert directives[0]["content"] == "use gRPC, not REST"
+
+    def test_summary_after_first_accept_reports_version_one_and_exists(self, client):
+        """Issue #59: a real first write reports version=1, exists=True —
+        distinct from the version=0/exists=False synthesized placeholder a
+        scope with no summary yet would have returned a moment earlier.
+        """
+        resp = client.post(
+            "/contribute",
+            json={
+                "scope_id": "g_active",
+                "content": "use gRPC, not REST",
+                "proposed_classification": "directive",
+                "subject": "rpc-protocol",
+                "supersedes": None,
+                "contributor": _CONTRIBUTOR_BODY,
+            },
+        )
+        assert resp.status_code == 200
+
+        resp = client.get("/scopes/g_active/summary")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["version"] == 1
+        assert data["exists"] is True
 
 
 class TestContribute:

@@ -29,8 +29,10 @@ GET /scopes
     Return active scopes and strata from FleetConfig.
 
 GET /scopes/{scope_id}/summary
-    Return the scope summary.  200 with an empty summary if the scope exists
-    but has no summary yet; 404 if the scope is unknown.
+    Return the scope summary.  200 with a synthesized empty summary
+    (``version=0``, ``exists=False``) if the scope exists but has no summary
+    yet, distinguishable from a real first write (``version=1``,
+    ``exists=True``); 404 if the scope is unknown.
 
 GET /scopes/{scope_id}/record
     Return the contribution record + judgments for a scope (forensic view).
@@ -408,12 +410,17 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
         if existing is not None:
             return existing.model_dump()
 
-        # Scope exists but has no summary yet — return an empty summary.
+        # Scope exists but has no summary yet — return a synthesized empty
+        # summary. version=0 + exists=False mark it as synthesized so it's
+        # never mistaken for a real first write (version=1, exists=True) —
+        # see ScopeSummary's docstring (issue #59).
         empty = ScopeSummary(
             scope_id=scope_id,
             directives=[],
             context="",
             updated_at=datetime.now(tz=UTC).isoformat(),
+            version=0,
+            exists=False,
         )
         return empty.model_dump()
 
