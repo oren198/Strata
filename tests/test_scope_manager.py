@@ -810,9 +810,11 @@ def test_tool_choice_disables_parallel_tool_use() -> None:
 
 PEER_SCOPE = Scope(id="g_peer1", name="Peer One", stratum_id="L1")
 OTHER_SCOPE = Scope(id="g_other1", name="Other One", stratum_id="L1")
+DESCENDANT_SCOPE = Scope(id="g_below1", name="Below One", stratum_id="L2")
 
 ENTITLEMENT_VIEW = EntitlementView(
     chain=[SCOPE],
+    descendants=[DESCENDANT_SCOPE],
     referenced_peers=[PEER_SCOPE],
     others=[OTHER_SCOPE],
 )
@@ -838,6 +840,8 @@ def test_entitlement_block_present_with_correct_groups() -> None:
 
     chain_header_idx = content.index("entitled — directives and context")
     chain_names_idx = content.index(f"{SCOPE.id} ({SCOPE.name})")
+    descendants_header_idx = content.index("evidence proposed upward")
+    descendants_names_idx = content.index(f"{DESCENDANT_SCOPE.id} ({DESCENDANT_SCOPE.name})")
     peer_header_idx = content.index("entitled for CONTEXT only")
     peer_names_idx = content.index(f"{PEER_SCOPE.id} ({PEER_SCOPE.name})")
     other_header_idx = content.index("NOT entitled")
@@ -846,6 +850,8 @@ def test_entitlement_block_present_with_correct_groups() -> None:
     assert (
         chain_header_idx
         < chain_names_idx
+        < descendants_header_idx
+        < descendants_names_idx
         < peer_header_idx
         < peer_names_idx
         < other_header_idx
@@ -874,7 +880,7 @@ def test_entitlement_omitted_when_none() -> None:
 def test_entitlement_empty_groups_render_none_sentinel() -> None:
     """An empty entitlement group (e.g. no referenced peers) renders '(none)'."""
     manager, mock_client = _make_manager(_accept_directive_input())
-    empty_view = EntitlementView(chain=[SCOPE], referenced_peers=[], others=[])
+    empty_view = EntitlementView(chain=[SCOPE], descendants=[], referenced_peers=[], others=[])
 
     manager.judge(
         scope=SCOPE,
