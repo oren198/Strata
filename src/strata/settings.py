@@ -51,7 +51,7 @@ class Settings(BaseSettings):
         validation_alias="STRATA_FLEET_CONFIG",
     )
     manager_model: str = Field(default="claude-haiku-4-5")
-    summary_max_words: int = Field(default=500)
+    summary_max_words: int = Field(default=500, ge=1)
     anthropic_api_key: str | None = Field(default=None)
 
     @model_validator(mode="after")
