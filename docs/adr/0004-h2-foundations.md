@@ -1,6 +1,6 @@
 # ADR 0004 — H2 Foundations: Embedded Mode, Manager Composition, Lazy Refresh
 
-**Status:** Proposed
+**Status:** Accepted (implemented)
 **Date:** 2026-05-30
 **Related:** ADR 0001 (V1 architecture), ADR 0002 (fleet config source of
 truth), ADR 0003 (`strata launch` as the binding point)

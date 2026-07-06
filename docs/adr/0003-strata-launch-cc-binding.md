@@ -1,6 +1,6 @@
 # ADR 0003 — Frictionless CC Session Binding (`strata launch`)
 
-**Status:** Proposed (depends on ADR 0002)
+**Status:** Accepted (implemented)
 **Date:** 2026-05-27
 **Related:** ADR 0002 (owns the per-scope skill declaration schema and
 the scope lifecycle)

@@ -646,6 +646,7 @@ def _refresh_scope(
         recent_contributions=recent_contributions,
         new_contribution=refresh_contribution,
         summary_max_words=summary_max_words,
+        entitlement=fleet_config.entitlement_view(scope_id),
     )
 
     record_store.record_judgment(

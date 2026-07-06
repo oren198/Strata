@@ -274,3 +274,86 @@ def test_directive_id_preserved_on_round_trip(tmp_path: Path) -> None:
     assert result is not None
     assert len(result.directives) == 1
     assert result.directives[0].id == "c_abc123"
+
+
+# ---------------------------------------------------------------------------
+# Test 11 — version=0 / exists=False sentinel for synthesized summaries
+# (issue #59): a synthesized empty summary must be distinguishable from a
+# real first write.
+# ---------------------------------------------------------------------------
+
+
+def test_synthesized_summary_defaults_are_a_real_write() -> None:
+    """Constructing a ScopeSummary with no version/exists override defaults
+    to version=1, exists=True — i.e. callers that synthesize a placeholder
+    for "no summary yet" must pass version=0, exists=False explicitly;
+    the model's own defaults describe a real write, not a placeholder.
+    """
+    summary = ScopeSummary(
+        scope_id="g_new",
+        directives=[],
+        context="",
+        updated_at="2026-05-23T12:00:00Z",
+    )
+    assert summary.version == 1
+    assert summary.exists is True
+
+
+def test_synthesized_empty_summary_reads_as_version_zero_not_exists() -> None:
+    """A synthesized placeholder (as API/MCP callers build for a scope with
+    no on-disk summary) explicitly reports version=0, exists=False.
+    """
+    empty = ScopeSummary(
+        scope_id="g_new",
+        directives=[],
+        context="",
+        updated_at="2026-05-23T12:00:00Z",
+        version=0,
+        exists=False,
+    )
+    assert empty.version == 0
+    assert empty.exists is False
+
+
+def test_first_real_write_is_version_one_and_exists(tmp_path: Path) -> None:
+    """A scope's first real write reports version=1, exists=True — distinct
+    from the version=0/exists=False synthesized placeholder for "no summary
+    yet" (issue #59), even though nothing was on disk beforehand either.
+    """
+    store = SummaryStore(str(tmp_path))
+    written = store.write("g_new", _make_summary(scope_id="g_new"))
+
+    assert written.version == 1
+    assert written.exists is True
+
+    result = store.read("g_new")
+    assert result is not None
+    assert result.version == 1
+    assert result.exists is True
+
+
+def test_write_forces_exists_true_even_if_caller_passed_false(tmp_path: Path) -> None:
+    """write() always persists a real write as exists=True.
+
+    Defensive: even if a caller mistakenly hands write() a summary built
+    with exists=False (the synthesized-placeholder marker), the fact that
+    it is being written for real must win — a summary on disk is by
+    definition not a synthesized placeholder.
+    """
+    store = SummaryStore(str(tmp_path))
+    mislabeled = ScopeSummary(
+        scope_id="g_new",
+        directives=[],
+        context="",
+        updated_at="2026-05-23T12:00:00Z",
+        version=0,
+        exists=False,
+    )
+    written = store.write("g_new", mislabeled)
+
+    assert written.version == 1
+    assert written.exists is True
+
+    result = store.read("g_new")
+    assert result is not None
+    assert result.exists is True

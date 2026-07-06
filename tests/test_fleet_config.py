@@ -791,3 +791,179 @@ def test_inter_stratum_parent_ignores_downward_edges(tmp_path: Path) -> None:
     assert parent.id == "g_root", (
         f"expected g_mid's parent to be g_root (lower ordinal), got {parent.id!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# entitlement_view (ADR 0006 D2)
+# ---------------------------------------------------------------------------
+
+_ENTITLEMENT_YAML = """
+strata:
+  - id: L0
+    name: Executive
+    ordinal: 0
+  - id: L1
+    name: Function
+    ordinal: 1
+  - id: L2
+    name: Team
+    ordinal: 2
+
+scopes:
+  - id: g_exec
+    name: Executive
+    stratum_id: L0
+  - id: g_funcA
+    name: Function A
+    stratum_id: L1
+  - id: g_funcB
+    name: Function B
+    stratum_id: L1
+  - id: g_funcC
+    name: Function C
+    stratum_id: L1
+  - id: g_funcD
+    name: Function D
+    stratum_id: L1
+    status: archived
+  - id: g_funcE
+    name: Function E
+    stratum_id: L1
+    status: archived
+  - id: g_teamX
+    name: Team X
+    stratum_id: L2
+  - id: g_teamSibling
+    name: Team Sibling
+    stratum_id: L2
+
+edges:
+  # Inter-stratum: child -> parent.
+  - from: g_funcA
+    to: g_exec
+  - from: g_teamX
+    to: g_funcA
+  - from: g_teamSibling
+    to: g_funcA
+  # Intra-stratum: g_funcA references g_funcB (one hop -> referenced peer).
+  - from: g_funcA
+    to: g_funcB
+  # Intra-stratum: g_funcA references archived g_funcD -> must be excluded.
+  - from: g_funcA
+    to: g_funcD
+  # Intra-stratum: g_funcB references g_funcC -> peer-of-peer, must NOT
+  # appear as a referenced peer of g_teamX (only chain-sourced edges count).
+  - from: g_funcB
+    to: g_funcC
+"""
+
+
+def test_entitlement_view_chain_is_ancestors_plus_self(tmp_path: Path) -> None:
+    """chain is the ancestor chain (root-first) with the scope itself last."""
+    config = FleetConfig.load(_write(tmp_path, _ENTITLEMENT_YAML))
+
+    view = config.entitlement_view("g_teamX")
+
+    assert [s.id for s in view.chain] == ["g_exec", "g_funcA", "g_teamX"]
+
+
+def test_entitlement_view_referenced_peer_one_hop_only(tmp_path: Path) -> None:
+    """A peer referenced by a chain scope appears; a peer-of-peer does not."""
+    config = FleetConfig.load(_write(tmp_path, _ENTITLEMENT_YAML))
+
+    view = config.entitlement_view("g_teamX")
+    peer_ids = {s.id for s in view.referenced_peers}
+
+    assert "g_funcB" in peer_ids
+    assert "g_funcC" not in peer_ids, "peer-of-peer must not be a referenced peer"
+
+
+def test_entitlement_view_peer_referenced_by_ancestor_appears(tmp_path: Path) -> None:
+    """A peer referenced by an ANCESTOR (not the judged scope itself) still appears."""
+    config = FleetConfig.load(_write(tmp_path, _ENTITLEMENT_YAML))
+
+    view = config.entitlement_view("g_teamX")
+
+    # g_funcA (an ancestor of g_teamX) references g_funcB, not g_teamX itself.
+    assert any(s.id == "g_funcB" for s in view.referenced_peers)
+
+
+def test_entitlement_view_unreferenced_sibling_lands_in_others(tmp_path: Path) -> None:
+    """A sibling scope with no reference edge lands in 'others'."""
+    config = FleetConfig.load(_write(tmp_path, _ENTITLEMENT_YAML))
+
+    view = config.entitlement_view("g_teamX")
+
+    assert any(s.id == "g_teamSibling" for s in view.others)
+    assert not any(s.id == "g_teamSibling" for s in view.chain)
+    assert not any(s.id == "g_teamSibling" for s in view.referenced_peers)
+
+
+def test_entitlement_view_peer_of_peer_lands_in_others(tmp_path: Path) -> None:
+    """The excluded peer-of-peer (g_funcC) still shows up somewhere — in 'others'."""
+    config = FleetConfig.load(_write(tmp_path, _ENTITLEMENT_YAML))
+
+    view = config.entitlement_view("g_teamX")
+
+    assert any(s.id == "g_funcC" for s in view.others)
+
+
+def test_entitlement_view_archived_scopes_land_in_others(tmp_path: Path) -> None:
+    """Archived scopes are enumerated in 'others', never as entitled groups.
+
+    They must not vanish from the view entirely: the judge distinguishes
+    fleet-internal origins from external material by exact name matching,
+    and an archived origin scope that disappeared from the enumeration
+    would read as external and slip past the admission rule (fresh-eyes
+    review finding F2).
+    """
+    config = FleetConfig.load(_write(tmp_path, _ENTITLEMENT_YAML))
+
+    view = config.entitlement_view("g_teamX")
+    entitled_ids = {s.id for s in (*view.chain, *view.descendants, *view.referenced_peers)}
+    other_ids = {s.id for s in view.others}
+
+    assert "g_funcD" not in entitled_ids, "archived scope must not be an entitled peer"
+    assert "g_funcD" in other_ids, "referenced-but-archived scope must still be enumerated"
+    assert "g_funcE" in other_ids, "unreferenced archived scope must still be enumerated"
+
+
+def test_entitlement_view_descendants_are_entitled_not_others(tmp_path: Path) -> None:
+    """A scope's descendants land in 'descendants', never in 'others'.
+
+    This is the F1 regression pin: ADR 0006 D1 permits descendant-bound
+    agents to propose upward, so the judge must see descendants as entitled
+    evidence sources — a descendant listed as NOT entitled would instruct
+    the judge to decline the legitimate upward-evidence flow.
+    """
+    config = FleetConfig.load(_write(tmp_path, _ENTITLEMENT_YAML))
+
+    view = config.entitlement_view("g_funcA")
+
+    descendant_ids = {s.id for s in view.descendants}
+    other_ids = {s.id for s in view.others}
+    assert descendant_ids == {"g_teamX", "g_teamSibling"}
+    assert not descendant_ids & other_ids
+
+
+def test_entitlement_view_descendants_any_depth_and_leaf_empty(tmp_path: Path) -> None:
+    """Descendants include grandchildren (any depth); a leaf scope has none."""
+    config = FleetConfig.load(_write(tmp_path, _ENTITLEMENT_YAML))
+
+    exec_view = config.entitlement_view("g_exec")
+    assert {s.id for s in exec_view.descendants} == {"g_funcA", "g_teamX", "g_teamSibling"}
+
+    leaf_view = config.entitlement_view("g_teamX")
+    assert leaf_view.descendants == []
+
+
+def test_entitlement_view_root_scope_works(tmp_path: Path) -> None:
+    """A root (L0) scope with no ancestors still produces a valid view."""
+    config = FleetConfig.load(_write(tmp_path, _ENTITLEMENT_YAML))
+
+    view = config.entitlement_view("g_exec")
+
+    assert [s.id for s in view.chain] == ["g_exec"]
+    assert view.referenced_peers == []
+    other_ids = {s.id for s in view.others}
+    assert other_ids == {"g_funcB", "g_funcC", "g_funcD", "g_funcE"}

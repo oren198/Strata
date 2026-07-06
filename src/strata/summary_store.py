@@ -69,10 +69,23 @@ class ScopeSummary(BaseModel):
     Version stamps (ADR 0004 Decision 4):
 
     * ``version`` — incremented on each write; used by descendant scopes to
-      detect staleness.
+      detect staleness. ``0`` is reserved as the sentinel for a *synthesized*
+      summary that has never actually been written to disk (see ``exists``)
+      — real writes start at ``1`` and increase monotonically from there, so
+      any real write is always newer than the "no summary yet" sentinel and
+      ``parent_version < version`` staleness detection holds even across a
+      parent's first write.
     * ``parent_version`` — the parent scope's ``version`` at the time this
       summary was built.  ``None`` for L0 (root) scopes which have no
       inter-stratum parent.
+
+    Issue #59: callers that read a scope with no on-disk summary yet (e.g.
+    ``GET /scopes/{id}/summary``, ``strata_read_scope_summary``) synthesize
+    an empty :class:`ScopeSummary` for display. Without ``exists``, that
+    synthesized summary is indistinguishable from a genuine first write —
+    both would otherwise report ``version=1``. Synthesized summaries must
+    set ``version=0, exists=False`` explicitly; :meth:`SummaryStore.write`
+    always produces ``version >= 1, exists=True``.
     """
 
     scope_id: str
@@ -84,11 +97,23 @@ class ScopeSummary(BaseModel):
     """ISO 8601 timestamp of the last summary rewrite."""
 
     version: int = 1
-    """Monotonically increasing write counter.  Bumped on every :meth:`SummaryStore.write`."""
+    """Monotonically increasing write counter.  Bumped on every :meth:`SummaryStore.write`.
+
+    ``0`` is the sentinel for a synthesized (never-written) summary — see
+    ``exists`` and the class docstring."""
 
     parent_version: int | None = None
     """The parent scope's ``version`` when this summary was last refreshed.
     ``None`` for root scopes (no inter-stratum parent)."""
+
+    exists: bool = True
+    """Whether this summary corresponds to a real on-disk write.
+
+    ``False`` marks a summary synthesized on the fly for a scope with no
+    summary file yet (paired with ``version=0``) — this lets API and MCP
+    consumers distinguish "no summary yet" from a genuine first write
+    (``version=1``, ``exists=True``), which otherwise look identical.
+    :meth:`SummaryStore.write` always forces this to ``True``."""
 
 
 # ---------------------------------------------------------------------------
@@ -354,8 +379,12 @@ class SummaryStore:
         """Persist *summary* to disk, overwriting any existing file.
 
         Bumps ``summary.version`` by reading the current on-disk version first
-        (or defaulting to 0 if no file exists) and writing ``current + 1``.
-        Returns the summary as actually written (with the bumped version).
+        (or defaulting to 0 if no file exists) and writing ``current + 1`` —
+        so the first real write is always ``version=1``, never the ``0``
+        sentinel reserved for synthesized (never-written) summaries (issue
+        #59). Also forces ``exists=True``, since a real write is by
+        definition not a synthesized placeholder. Returns the summary as
+        actually written (with the bumped version).
 
         Writes atomically: the new content lands in a ``.tmp`` sibling first,
         then :func:`os.replace` renames it to the final path so readers never
@@ -369,7 +398,7 @@ class SummaryStore:
         next_version = (existing.version if existing is not None else 0) + 1
 
         # Build the summary that will actually be written.
-        to_write = summary.model_copy(update={"version": next_version})
+        to_write = summary.model_copy(update={"version": next_version, "exists": True})
 
         tmp = final.with_suffix(".md.tmp")
         tmp.write_text(_render_summary(to_write), encoding="utf-8")

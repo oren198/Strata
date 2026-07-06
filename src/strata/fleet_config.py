@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import os
 import threading
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Literal
 
@@ -75,6 +76,48 @@ class Edge(BaseModel):
     to: str
 
     model_config = {"populate_by_name": True}
+
+
+@dataclass(frozen=True)
+class EntitlementView:
+    """A scope's entitlement surface, derived from ``fleet.yaml`` (ADR 0006 D2).
+
+    Groups every scope in the fleet relative to one judged scope:
+
+    - ``chain`` — the scope itself plus its inter-stratum ancestors (root
+      first, scope last). Entitled for both directives and context — this is
+      the binding surface.
+    - ``descendants`` — every active scope below the judged scope (its
+      authority region), any depth. Entitled: evidence proposed upward from
+      below is the normal, legitimate inflow the scope-manager exists to
+      judge — the evidence→ratification channel (philosophy Concept 3), and
+      ADR 0006 D1 permits exactly these agents to write here. Without this
+      group the rendered ENTITLEMENT block would instruct the judge to
+      decline the very flow D1 legitimizes.
+    - ``referenced_peers`` — active scopes referenced one hop away via an
+      intra-stratum edge from any scope on ``chain`` (edges where the
+      target's stratum ordinal equals the source's). Entitled for context
+      only, never a directive at the contributor's request (CONTEXT.md
+      § Intra-stratum edge). No transitive peer-of-peer traversal — only
+      edges whose source is itself on ``chain`` count.
+    - ``others`` — every remaining scope in the fleet, **including archived
+      scopes** (archived chain members excepted — the chain is structural).
+      The judge distinguishes fleet-internal origins from external material
+      by exact name matching against this enumeration; an archived scope
+      that vanished from the list would read as external and slip past the
+      admission rule. Not entitled: material substantively originating from
+      these scopes must not enter the judged scope.
+
+    This is the single source of truth for entitlement grouping (ROADMAP
+    principle 8): :mod:`strata.scope_manager` renders it into the judge's
+    user message, and ADR 0006 D3's peer-reference composition reuses the
+    same grouping.
+    """
+
+    chain: list[Scope]
+    descendants: list[Scope]
+    referenced_peers: list[Scope]
+    others: list[Scope]
 
 
 class FleetConfig(BaseModel):
@@ -180,6 +223,76 @@ class FleetConfig(BaseModel):
         # Chain is built deepest-first; reverse to get root-first order.
         ancestors.reverse()
         return ancestors
+
+    def entitlement_view(self, scope_id: str) -> EntitlementView:
+        """Compute *scope_id*'s entitlement surface (ADR 0006 D2).
+
+        Args:
+            scope_id: The scope the view is relative to (the scope about to
+                be judged).
+
+        Returns:
+            An :class:`EntitlementView` grouping the fleet's scopes into
+            ``chain`` (this scope + inter-stratum ancestors), ``descendants``
+            (active scopes below this scope — entitled upward-evidence
+            sources), ``referenced_peers`` (one hop via intra-stratum edges
+            from any chain scope), and ``others`` (everything else,
+            archived scopes included).
+        """
+        stratum_map = {s.id: s for s in self.strata}
+        scope_map = {s.id: s for s in self.scopes}
+
+        scope = scope_map.get(scope_id)
+        ancestors = self.inter_stratum_ancestors(scope_id)
+        chain = [*ancestors, *([scope] if scope is not None else [])]
+        chain_ids = {s.id for s in chain}
+
+        # Descendants: every active scope whose own ancestor chain passes
+        # through the judged scope (any depth). These are the agents ADR 0006
+        # D1 permits to propose upward into this scope, so the judge must see
+        # them as entitled evidence sources, never as foreign material.
+        descendant_ids: set[str] = set()
+        descendants: list[Scope] = []
+        for candidate in self.scopes:
+            if candidate.id in chain_ids or candidate.status != "active":
+                continue
+            if any(a.id == scope_id for a in self.inter_stratum_ancestors(candidate.id)):
+                descendant_ids.add(candidate.id)
+                descendants.append(candidate)
+
+        referenced_peer_ids: list[str] = []
+        seen: set[str] = set()
+        for edge in self.edges:
+            if edge.from_ not in chain_ids or edge.to in chain_ids or edge.to in seen:
+                continue
+            from_scope = scope_map.get(edge.from_)
+            target_scope = scope_map.get(edge.to)
+            if from_scope is None or target_scope is None or target_scope.status != "active":
+                continue
+            from_ordinal = stratum_map[from_scope.stratum_id].ordinal
+            target_ordinal = stratum_map[target_scope.stratum_id].ordinal
+            if target_ordinal != from_ordinal:
+                continue
+            seen.add(edge.to)
+            referenced_peer_ids.append(edge.to)
+
+        referenced_peers = [scope_map[sid] for sid in referenced_peer_ids]
+
+        # Everything else — including archived scopes, so every fleet name
+        # the judge might meet in prose appears in exactly one group and an
+        # archived origin cannot masquerade as external material.
+        others = [
+            s
+            for s in self.scopes
+            if s.id not in chain_ids and s.id not in seen and s.id not in descendant_ids
+        ]
+
+        return EntitlementView(
+            chain=chain,
+            descendants=descendants,
+            referenced_peers=referenced_peers,
+            others=others,
+        )
 
     # ------------------------------------------------------------------
     # Mutation API
