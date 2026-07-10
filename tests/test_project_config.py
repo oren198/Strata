@@ -162,11 +162,17 @@ def test_relative_paths_resolved_against_project_root(tmp_path: Path) -> None:
 def test_absolute_paths_kept_absolute(tmp_path: Path) -> None:
     """Absolute paths in config.toml are used as-is (not prepended with project_root)."""
     abs_db = (tmp_path / "shared" / "strata.db").resolve()
+    abs_fleet = (tmp_path / "fleet.yaml").resolve()
+    abs_summaries = (tmp_path / "summaries").resolve()
+    # Use POSIX-style separators in the TOML: a raw Windows path like
+    # ``C:\Users\...`` embeds backslash escapes that are invalid in a TOML
+    # basic string. Forward slashes are valid TOML and still resolve to the
+    # same absolute Path on Windows.
     _write_config(
         tmp_path / ".strata",
-        f'db = "{abs_db}"\n'
-        f'fleet_yaml = "{tmp_path / "fleet.yaml"}"\n'
-        f'summaries_dir = "{tmp_path / "summaries"}"\n',
+        f'db = "{abs_db.as_posix()}"\n'
+        f'fleet_yaml = "{abs_fleet.as_posix()}"\n'
+        f'summaries_dir = "{abs_summaries.as_posix()}"\n',
     )
 
     result = load_project_config(start=tmp_path)
