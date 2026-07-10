@@ -77,6 +77,20 @@ This does not silence the worker — it changes *how* its influence travels. An 
 
 The result is the resolution of the central tension. Every agent can influence shared memory — that is the whole point of the system — but the breadth of influence is governed by authority, so no single agent can corrupt what the fleet collectively holds to be true.
 
+### Where authority grounds: the operator
+
+One question remains: what gives the *broadest* scope its authority? Nothing inside the fleet can — every scope's authority is derived from the level above it. The chain grounds outside the system, in the **operator**: the human who defined the fleet in the first place. The operator is best understood as an implicit stratum above the broadest scope — not a special mechanism, but the top of the same structure. Like any stratum, the operator's layer carries both **directives** (binding) and **context** (informative), and the ordinary precedence rule is all that is needed: a fleet-wide native directive cannot contradict an operator directive for the same reason a team directive cannot contradict a fleet-wide one — nothing outranks the source of its own authority.
+
+Three things distinguish the operator layer, and all three follow from its position rather than from special rules:
+
+- **It is not judged.** Judgment is how *delegated* authority is exercised; the operator's authority is not delegated. Its acts are still recorded — accountability applies to everyone.
+- **It is never rewritten.** Operator memory composes verbatim as its own labelled layer. A paraphrased ruling would make the human's authority probabilistic. It is, however, **judge-aware**: scope-managers see the operator memory that binds their scope when judging, and decline contributions that contradict it.
+- **It is exempt from earned trust.** Outcomes cannot quietly erode a human ruling. Instead, outcomes that contradict operator memory are surfaced back to the operator, who can revise. The system may never outvote the operator — but it must be able to tell the operator it is wrong.
+
+The operator also **reads everything** — every scope's working memory and record. Agents see only what reaches them; the operator sees the whole store, because verification and fast steering are the operator's job, and because the operator answers for the fleet as a whole. For the same reason, the operator may **correct any scope's memory directly** — superseding or retiring what is wrong — with every correction recorded under operator provenance. Scope-managers exercise their scope's authority as the operator's standing delegates; the operator may always exercise it in person.
+
+The bound: operator memory is constitutional, not operational. It should be small, rare, and mostly stable. An operator who steers the fleet day-to-day through the operator layer has replaced the self-correcting system this design exists to build; the health of a fleet can be read partly in how little constitutional memory it needs.
+
 ---
 
 ## Core concept 4: Composition over merging

@@ -20,7 +20,8 @@ A horizontal layer of scopes. Strata define the structure along which
 scope to its descendants), never upward and never sideways.
 
 The set of strata is defined by the fleet (e.g. `executive` → `function` →
-`team` → `individual`); strata are named layers, not depths.
+`team` → `individual`); strata are named layers, not depths. Above the
+broadest stratum sits the implicit **operator** stratum (see Operator).
 
 ## Inter-stratum edge
 
@@ -77,7 +78,30 @@ writes to a scope pass through its scope-manager, which judges every write
 **scope summary** accordingly.
 
 The scope-manager is itself a regular Strata agent — Strata uses its own
-primitives (session, skill, scope) to manage itself.
+primitives (session, skill, scope) to manage itself. It exercises the
+scope's authority as the **operator**'s standing delegate; the operator may
+also exercise any scope's authority directly (see Operator).
+
+## Operator
+
+The human authority that defines the fleet — its strata, scopes, and edges —
+and from which all scope authority is delegated. The operator occupies the
+implicit stratum above the broadest scope: operator **directives** bind
+every scope below their attachment point by ordinary broader-stratum
+precedence, and operator **context** informs without binding, like any
+stratum's.
+
+Operator memory is stored in Strata with external provenance, appended to a
+record like all memory, and composed into perspectives verbatim as its own
+labelled layer — never rewritten by any scope-manager. It is **judge-aware**:
+scope-managers see the operator memory binding their scope when judging, and
+decline contributions that contradict it. It is exempt from outcome-based
+**trust** weighting; outcomes that contradict it are surfaced to the
+operator instead.
+
+The operator reads the entire store — every scope summary and record — for
+verification and steering, and may directly correct any scope's memory
+(supersede, retire), each correction recorded under operator provenance.
 
 ## Short-term memory
 
@@ -249,7 +273,8 @@ scope's descendants. Authority is a property of the **scope** itself (its
 position in the strata), not of any individual agent. An agent bound to a
 scope exercises that scope's authority for the duration of its session;
 authority does not outlive any single agent, but the scope continues to wield
-it through whichever agents bind to it next.
+it through whichever agents bind to it next. All scope authority is
+delegated from the **operator**, in whom the chain grounds.
 
 ## Trust
 
