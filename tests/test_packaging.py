@@ -73,10 +73,16 @@ def test_strata_mcp_console_script_alongside_python() -> None:
     ``/path/to/venv/bin/pytest`` directly without sourcing ``activate``), even
     though the console script is correctly installed. We want to verify the
     pyproject ``[project.scripts]`` wiring, not coincidental PATH state.
+
+    On Windows the console script is an executable launcher named
+    ``strata-mcp.exe``, so we accept either the bare POSIX name or the ``.exe``
+    form rather than hard-coding one platform.
     """
-    script = Path(sys.executable).parent / "strata-mcp"
-    assert script.is_file(), (
-        f"strata-mcp not installed alongside {sys.executable}. "
+    bin_dir = Path(sys.executable).parent
+    candidates = [bin_dir / "strata-mcp", bin_dir / "strata-mcp.exe"]
+    assert any(script.is_file() for script in candidates), (
+        f"strata-mcp not installed alongside {sys.executable} "
+        f"(looked for {[c.name for c in candidates]}). "
         "Run `pip install -e '.[dev]'` to install the console script."
     )
 

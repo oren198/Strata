@@ -203,6 +203,43 @@ def _v1_upgrade_guard_should_refuse(
 
 
 # ---------------------------------------------------------------------------
+# Console glyphs — ASCII-safe on non-UTF8 terminals (issue #66)
+# ---------------------------------------------------------------------------
+#
+# Status output uses Unicode markers (✓ ⚠ ✗). A non-UTF8 console — e.g. a
+# Windows code page such as cp1255 — cannot encode them and raises
+# UnicodeEncodeError mid-print. ``_glyph`` returns the Unicode marker when the
+# console can encode it and an ASCII token otherwise, so output degrades
+# gracefully instead of crashing.
+
+_GLYPHS: dict[str, tuple[str, str]] = {
+    "pass": ("✓", "OK"),
+    "warn": ("⚠", "!"),
+    "fail": ("✗", "x"),
+}
+
+
+def _glyph(status: str) -> str:
+    """Return a status marker safe for the current console encoding.
+
+    Maps a semantic *status* (``"pass"`` / ``"warn"`` / ``"fail"``) to its
+    Unicode glyph, falling back to an ASCII token when either stdout or stderr
+    cannot encode it — e.g. a cp1255 Windows console (issue #66), which would
+    otherwise raise UnicodeEncodeError mid-print.
+    """
+    unicode_glyph, ascii_fallback = _GLYPHS[status]
+    for stream in (sys.stdout, sys.stderr):
+        encoding = getattr(stream, "encoding", None)
+        if not encoding:
+            continue
+        try:
+            unicode_glyph.encode(encoding)
+        except (UnicodeError, LookupError):
+            return ascii_fallback
+    return unicode_glyph
+
+
+# ---------------------------------------------------------------------------
 # Preflight runner
 # ---------------------------------------------------------------------------
 
@@ -221,11 +258,11 @@ def _run_preflight(checks: list[Check]) -> int:
     has_hard_failure = False
     for check in checks:
         if check.passed:
-            print(f"  ✓ {check.name}: {check.message}")
+            print(f"  {_glyph('pass')} {check.name}: {check.message}")
         elif check.kind == "soft":
-            print(f"  ⚠ {check.name}: {check.message}", file=sys.stderr)
+            print(f"  {_glyph('warn')} {check.name}: {check.message}", file=sys.stderr)
         else:
-            print(f"  ✗ {check.name}: {check.message}", file=sys.stderr)
+            print(f"  {_glyph('fail')} {check.name}: {check.message}", file=sys.stderr)
             has_hard_failure = True
     return 1 if has_hard_failure else 0
 
@@ -1193,7 +1230,7 @@ def cmd_register(args: argparse.Namespace) -> int:
             # strata entry. Skip the merge outright and fail the run so the
             # user notices ("never overwrite user state" — ADR 0005 D6).
             print(
-                f"  ✗ .claude/settings.json exists but is not valid JSON ({exc}).\n"
+                f"  {_glyph('fail')} .claude/settings.json exists but is not valid JSON ({exc}).\n"
                 "    Fix the file, then re-run `strata register` to add the strata "
                 "mcpServers entry.",
                 file=sys.stderr,
@@ -1215,7 +1252,8 @@ def cmd_register(args: argparse.Namespace) -> int:
         existing = mcp_servers["strata"]
         if isinstance(existing, dict) and _is_v1_2_shape_mcp_entry(existing):
             print(
-                "  ⚠ WARNING: your existing strata mcpServer entry is V1.2-shape and will silently",
+                f"  {_glyph('warn')} WARNING: your existing strata mcpServer entry is "
+                "V1.2-shape and will silently",
                 file=sys.stderr,
             )
             print(
@@ -1270,8 +1308,8 @@ def cmd_register(args: argparse.Namespace) -> int:
                 install_spec = _self_install_spec()
                 if install_spec is None:
                     print(
-                        "  ✗ cannot determine a safe install source for strata: this "
-                        "process was not\n"
+                        f"  {_glyph('fail')} cannot determine a safe install source for "
+                        "strata: this process was not\n"
                         "    installed from a local path or VCS URL, and strata is not "
                         "yet published to PyPI\n"
                         "    (the name currently belongs to an unrelated package). "
@@ -1297,8 +1335,8 @@ def cmd_register(args: argparse.Namespace) -> int:
 
             if not venv_strata_mcp.exists():
                 print(
-                    "  ✗ .strata/.venv/ exists but bin/strata-mcp is missing — the venv "
-                    "looks half-built\n"
+                    f"  {_glyph('fail')} .strata/.venv/ exists but bin/strata-mcp is missing "
+                    "— the venv looks half-built\n"
                     "    (interrupted install?). Remove .strata/.venv/ and re-run "
                     "`strata register --bootstrap-venv`.",
                     file=sys.stderr,
@@ -1312,7 +1350,8 @@ def cmd_register(args: argparse.Namespace) -> int:
             # on the strata entry is preserved.
             if settings_unreadable:
                 print(
-                    "  ✗ skipping settings.json venv update — fix the JSON first (see above).",
+                    f"  {_glyph('fail')} skipping settings.json venv update — fix the JSON "
+                    "first (see above).",
                     file=sys.stderr,
                 )
             else:
@@ -1322,8 +1361,8 @@ def cmd_register(args: argparse.Namespace) -> int:
                         settings_data_venv = json.loads(settings_json.read_text(encoding="utf-8"))
                     except json.JSONDecodeError as exc:
                         print(
-                            f"  ✗ .claude/settings.json is not valid JSON ({exc}) — "
-                            "fix it, then re-run.",
+                            f"  {_glyph('fail')} .claude/settings.json is not valid JSON "
+                            f"({exc}) — fix it, then re-run.",
                             file=sys.stderr,
                         )
                         return 1
