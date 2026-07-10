@@ -83,9 +83,14 @@ function App() {
     document.documentElement.classList.toggle("dark", !!state.options.dark_mode);
   }, [state.options.dark_mode]);
 
-  // Backend polling: hydrate on mount and every REFRESH_INTERVAL_MS.
+  // Backend polling: hydrate on mount, then one refresh every
+  // REFRESH_INTERVAL_MS. Self-scheduling (setTimeout after each fetch settles)
+  // rather than setInterval, so there is exactly one poll in flight at a time:
+  // a slow /scopes can never stack a second overlapping request behind the
+  // first the way a fixed-cadence interval would (#65).
   React.useEffect(() => {
     let cancelled = false;
+    let timer = null;
 
     async function refresh() {
       try {
@@ -93,14 +98,15 @@ function App() {
         if (!cancelled) dispatch({ type: "hydrate", data });
       } catch (err) {
         if (!cancelled) dispatch({ type: "set_error", message: err.message });
+      } finally {
+        if (!cancelled) timer = setTimeout(refresh, STRATA_STORE.REFRESH_INTERVAL_MS);
       }
     }
 
-    refresh(); // immediate first load
-    const interval = setInterval(refresh, STRATA_STORE.REFRESH_INTERVAL_MS);
+    refresh(); // immediate first load, then it re-schedules itself
     return () => {
       cancelled = true;
-      clearInterval(interval);
+      if (timer) clearTimeout(timer);
     };
   }, []);
 

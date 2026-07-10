@@ -11,15 +11,19 @@
 //   edges   — between scopes. {from, to}.
 //
 // API base URL is read from <meta name="strata-api-base" content="..."> in
-// index.html (defaults to http://127.0.0.1:8000 if the tag is absent).
+// index.html. When the tag is absent or its content is empty it defaults to
+// window.location.origin — the host and port the Console was served from — so
+// `strata start --port 8123` yields a Console that reaches its own backend.
 // ─────────────────────────────────────────────────────────────────────
 
 (function () {
-  // Resolve the API base URL from a <meta> tag, falling back to localhost.
+  // Resolve the API base URL from a <meta> tag, falling back to the origin the
+  // Console is served from. The meta override only matters when the UI is
+  // hosted separately from the API.
   function getApiBase() {
     const meta = document.querySelector('meta[name="strata-api-base"]');
     const content = meta && meta.getAttribute("content");
-    return (content && content.trim()) || "http://127.0.0.1:8000";
+    return (content && content.trim()) || window.location.origin;
   }
 
   // How often to refresh state from the backend (milliseconds).
@@ -79,7 +83,14 @@
         color: s.color || pickColor(i),
       })),
       memories: [], // V1: memory items are not stored in UI state; summaries are fetched per-scope.
-      edges: data.edges || [],
+      // Backend edges are {from_scope_id, to_scope_id}; the rest of the UI
+      // (graph links, scope-detail relations) reads {from, to}. Normalise here
+      // so there is a single edge-field contract inside the app — otherwise the
+      // lookups silently miss and drill-in shows "No relations" (#65).
+      edges: (data.edges || []).map((e) => ({
+        from: e.from_scope_id,
+        to: e.to_scope_id,
+      })),
     };
   }
 

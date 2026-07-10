@@ -66,8 +66,18 @@ function MemoryGraph({ state, tweaks, onOpenScope, onExpandSummary }) {
   }
 
   // ─── Force sim ─────────────────────────────────────────────────
+  // Cooldown model (d3-force style). `alpha` is the simulation temperature:
+  // it starts at 1 on every kick and decays a little each frame. All forces
+  // are scaled by alpha, so as the layout cools the forces fade out and the
+  // velocity damping drives every node to rest. Below ALPHA_MIN the loop goes
+  // idle and nodes stop moving — which is what lets a double-click actually
+  // land (#65: nodes used to drift forever because the collision pass kept
+  // injecting motion the old fixed tick-budget never let decay). A drag or a
+  // structural change reheats alpha to 1 so interaction still animates.
+  const ALPHA_DECAY = 0.94; // per-frame cooldown → ~65 frames (~1s) to settle
+  const ALPHA_MIN = 0.02; // below this the layout is considered settled
   const nodesRef = React.useRef(new Map());
-  const ticksRef = React.useRef(0);
+  const alphaRef = React.useRef(1);
   const settledRef = React.useRef(false);
   const [, setTick] = React.useState(0);
   const draggingRef = React.useRef(null);
@@ -88,8 +98,8 @@ function MemoryGraph({ state, tweaks, onOpenScope, onExpandSummary }) {
     }, 180);
   }
 
-  function kickSim(n = 100) {
-    ticksRef.current = Math.max(ticksRef.current, n);
+  function kickSim() {
+    alphaRef.current = 1;
     settledRef.current = false;
   }
 
@@ -132,13 +142,18 @@ function MemoryGraph({ state, tweaks, onOpenScope, onExpandSummary }) {
     const innerRight = size.w - padX;
 
     function step() {
-      if (ticksRef.current <= 0 && !draggingRef.current) {
+      if (alphaRef.current < ALPHA_MIN && !draggingRef.current) {
         raf = requestAnimationFrame(step);
         return;
       }
 
       const list = Array.from(nodesRef.current.values());
       if (list.length === 0) { raf = requestAnimationFrame(step); return; }
+
+      // Temperature for this frame: forces are scaled by it so motion fades as
+      // the layout cools. While a node is held, keep the sim fully warm so its
+      // neighbours keep reacting to the drag.
+      const alpha = draggingRef.current ? 1 : alphaRef.current;
 
       for (const n of list) { n.fx = 0; n.fy = 0; }
 
@@ -184,8 +199,8 @@ function MemoryGraph({ state, tweaks, onOpenScope, onExpandSummary }) {
       let maxV = 0;
       for (const n of list) {
         if (n.pinned) { n.vx = 0; n.vy = 0; continue; }
-        n.vx = (n.vx + n.fx) * damping;
-        n.vy = (n.vy + n.fy) * damping;
+        n.vx = (n.vx + n.fx * alpha) * damping;
+        n.vy = (n.vy + n.fy * alpha) * damping;
         if (Math.abs(n.vx) < 0.04) n.vx = 0;
         if (Math.abs(n.vy) < 0.04) n.vy = 0;
         const sp = Math.sqrt(n.vx * n.vx + n.vy * n.vy);
@@ -201,9 +216,12 @@ function MemoryGraph({ state, tweaks, onOpenScope, onExpandSummary }) {
         if (sp > maxV) maxV = sp;
       }
 
-      ticksRef.current -= 1;
-      if (maxV < 0.08) {
-        ticksRef.current = 0;
+      // Cool the simulation. Once it is cold (or already essentially still),
+      // stop cleanly: zero the velocities so nodes settle exactly in place.
+      // Dragging keeps it warm — don't decay while a node is held.
+      if (!draggingRef.current) alphaRef.current *= ALPHA_DECAY;
+      if (maxV < 0.08 || alphaRef.current < ALPHA_MIN) {
+        alphaRef.current = 0;
         settledRef.current = true;
         for (const n of list) { n.vx = 0; n.vy = 0; }
       }
