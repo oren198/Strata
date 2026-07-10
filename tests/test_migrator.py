@@ -73,9 +73,10 @@ def test_full_chain_drops_fleet_tables_and_preserves_record(tmp_path: Path) -> N
     conn.commit()
     conn.close()
 
-    # Now apply 0002 from the real migrations directory (it's pending).
+    # Now apply the remaining real migrations (0002 rebuild + 0003), both
+    # pending after the 0001-only seed above.
     applied = run_migrations(db_path, migrations_dir=migrations_dir)
-    assert applied == ["0002_drop_fleet_tables.sql"]
+    assert applied == ["0002_drop_fleet_tables.sql", "0003_judgment_attempts.sql"]
 
     # Fleet tables gone.
     tables = _table_names(db_path)
@@ -115,7 +116,11 @@ def test_idempotent_reapply(tmp_path: Path) -> None:
     migrations_dir = Path(__file__).resolve().parent.parent / "src" / "strata" / "_migrations"
 
     first = run_migrations(db_path, migrations_dir=migrations_dir)
-    assert first == ["0001_initial.sql", "0002_drop_fleet_tables.sql"]
+    assert first == [
+        "0001_initial.sql",
+        "0002_drop_fleet_tables.sql",
+        "0003_judgment_attempts.sql",
+    ]
 
     second = run_migrations(db_path, migrations_dir=migrations_dir)
     assert second == []
@@ -310,4 +315,8 @@ def test_crash_at_tracking_insert_rolls_back_script_too(
     # A plain re-run (no monkeypatch) converges cleanly with no manual
     # intervention.
     applied = run_migrations(db_path, migrations_dir=migrations_dir)
-    assert applied == ["0001_initial.sql", "0002_drop_fleet_tables.sql"]
+    assert applied == [
+        "0001_initial.sql",
+        "0002_drop_fleet_tables.sql",
+        "0003_judgment_attempts.sql",
+    ]

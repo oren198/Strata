@@ -1118,7 +1118,7 @@ def test_entitled_no_argument_returns_bound_scope_data(tmp_path: Path) -> None:
     assert perspective_result["scope_id"] == "g_team"
     assert perspective_result["layers"][-1]["scope_id"] == "g_team"
 
-    assert record_result == {"contributions": [], "judgments": []}
+    assert record_result == {"contributions": [], "judgments": [], "judgment_attempts": []}
 
 
 def test_entitled_ancestor_read_allowed(tmp_path: Path) -> None:
@@ -1204,7 +1204,7 @@ def test_entitled_own_empty_record_returns_empty_shape(tmp_path: Path) -> None:
     ):
         result = mod.strata_read_scope_record("g_team")
 
-    assert result == {"contributions": [], "judgments": []}
+    assert result == {"contributions": [], "judgments": [], "judgment_attempts": []}
 
 
 # ---------------------------------------------------------------------------
@@ -1559,3 +1559,158 @@ def test_contribute_passes_entitlement_view_to_judge(tmp_path: Path) -> None:
         s.id for s in expected_entitlement.referenced_peers
     }
     assert {s.id for s in passed_entitlement.others} == {s.id for s in expected_entitlement.others}
+
+
+# ---------------------------------------------------------------------------
+# Issue #57 — judge-failure recovery through the MCP surface
+#
+# strata_contribute on a judge() failure records a judgment-attempt-failed
+# event (never a verdict), leaves no judgment, and raises an error carrying the
+# contribution id and naming strata_rejudge as the retry path. strata_rejudge
+# then recovers the pending contribution idempotently.
+# ---------------------------------------------------------------------------
+
+
+def test_contribute_judge_failure_records_attempt_and_points_to_rejudge(tmp_path: Path) -> None:
+    """A scope-manager failure records the contribution + an attempt event, no
+    judgment, and the raised error carries the contribution id + strata_rejudge.
+    """
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fleet_yaml(tmp_path)
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+    fleet = FleetConfig.load(fleet_path)
+
+    with (
+        patch.object(mod, "_AGENT_SCOPE", "g_backend"),
+        patch.object(mod, "_AGENT_SKILL", "strata-developer"),
+        patch.object(mod, "_AGENT_SESSION_ID", "sess_test"),
+        patch.object(mod, "_load_fleet", return_value=fleet),
+        patch("strata.scope_manager.ScopeManager.judge", side_effect=ValueError("LLM down")),
+        patch("anthropic.Anthropic", return_value=MagicMock()),
+        pytest.raises(RuntimeError) as exc_info,
+    ):
+        mod.strata_contribute(
+            scope_id="g_backend",
+            content="contribution before the crash",
+            proposed_classification="context",
+        )
+
+    message = str(exc_info.value)
+    assert "strata_rejudge" in message
+    assert "ValueError" in message
+
+    with RecordStore(db_path) as rs:
+        contributions = rs.list_contributions(scope_id="g_backend")
+        judgments = rs.list_judgments(scope_id="g_backend")
+        attempts = rs.list_judgment_attempts(scope_id="g_backend")
+
+    assert len(contributions) == 1
+    # The error names the contribution id so a retry can route to re-judge.
+    assert contributions[0].id in message
+    assert judgments == []
+    assert len(attempts) == 1
+    assert attempts[0].error_class == "ValueError"
+    assert attempts[0].contribution_id == contributions[0].id
+    # The pending contribution reached no reader: no summary was written.
+    assert SummaryStore(summaries_dir).read("g_backend") is None
+
+
+def test_strata_rejudge_recovers_pending_then_idempotent(tmp_path: Path) -> None:
+    """strata_rejudge judges a pending contribution against the current summary
+    and appends exactly one judgment; a second call is a no-op (idempotent).
+    """
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fleet_yaml(tmp_path)
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+    fleet = FleetConfig.load(fleet_path)
+
+    scope_p, skill_p, session_p = _patch_agent_binding(mod, scope="g_backend")
+
+    # 1. A judge() failure leaves a pending contribution.
+    with (
+        scope_p,
+        skill_p,
+        session_p,
+        patch.object(mod, "_load_fleet", return_value=fleet),
+        patch("strata.scope_manager.ScopeManager.judge", side_effect=ValueError("outage")),
+        patch("anthropic.Anthropic", return_value=MagicMock()),
+        pytest.raises(RuntimeError),
+    ):
+        mod.strata_contribute(
+            scope_id="g_backend",
+            content="recover me",
+            proposed_classification="context",
+        )
+
+    with RecordStore(db_path) as rs:
+        contribution_id = rs.list_contributions(scope_id="g_backend")[0].id
+        assert rs.list_judgments(scope_id="g_backend") == []
+
+    # 2. First re-judge: the scope-manager is back — it judges and updates state.
+    good_judgment = MagicMock()
+    good_judgment.decision = "accept_as_context"
+    good_judgment.reasoning = "recovered"
+    good_judgment.new_summary = _make_summary("g_backend", "recovered context")
+
+    scope_p2, skill_p2, session_p2 = _patch_agent_binding(mod, scope="g_backend")
+    with (
+        scope_p2,
+        skill_p2,
+        session_p2,
+        patch.object(mod, "_load_fleet", return_value=fleet),
+        patch("strata.scope_manager.ScopeManager.judge", return_value=good_judgment),
+        patch("anthropic.Anthropic", return_value=MagicMock()),
+    ):
+        result = mod.strata_rejudge(contribution_id)
+
+    assert result["contribution_id"] == contribution_id
+    assert result["judgment"]["decision"] == "accept_as_context"
+    assert result["judgment"]["summary_updated"] is True
+    with RecordStore(db_path) as rs:
+        assert len(rs.list_judgments(scope_id="g_backend")) == 1
+
+    # 3. Second re-judge: a verdict exists → no-op. The scope-manager must NOT
+    # be invoked (a raising judge proves the short-circuit) and no second
+    # judgment is written.
+    scope_p3, skill_p3, session_p3 = _patch_agent_binding(mod, scope="g_backend")
+    with (
+        scope_p3,
+        skill_p3,
+        session_p3,
+        patch.object(mod, "_load_fleet", return_value=fleet),
+        patch(
+            "strata.scope_manager.ScopeManager.judge",
+            side_effect=AssertionError("re-judge must not judge when a verdict exists"),
+        ),
+        patch("anthropic.Anthropic", return_value=MagicMock()),
+    ):
+        result2 = mod.strata_rejudge(contribution_id)
+
+    assert result2["judgment"]["decision"] == "accept_as_context"
+    assert result2["judgment"]["summary_updated"] is False
+    with RecordStore(db_path) as rs:
+        assert len(rs.list_judgments(scope_id="g_backend")) == 1
+
+
+def test_strata_rejudge_unknown_contribution_raises(tmp_path: Path) -> None:
+    """strata_rejudge on an unknown contribution id raises RuntimeError."""
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fleet_yaml(tmp_path)
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+    fleet = FleetConfig.load(fleet_path)
+
+    scope_p, skill_p, session_p = _patch_agent_binding(mod, scope="g_backend")
+    with (
+        scope_p,
+        skill_p,
+        session_p,
+        patch.object(mod, "_load_fleet", return_value=fleet),
+        pytest.raises(RuntimeError, match="Contribution not found"),
+    ):
+        mod.strata_rejudge("c_does_not_exist")

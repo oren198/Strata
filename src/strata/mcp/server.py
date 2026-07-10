@@ -103,6 +103,23 @@ def _init_stores() -> None:
     _summary_store = SummaryStore(_summaries_dir)
 
 
+def _build_scope_manager():
+    """Construct a :class:`ScopeManager` bound to the configured model.
+
+    Imports anthropic + the scope-manager lazily (they pull in the Anthropic
+    SDK, which may not be configured in every env) and are only needed when a
+    contribution or re-judge actually invokes the judge.
+    """
+    import anthropic  # noqa: PLC0415
+
+    from strata.scope_manager import ScopeManager  # noqa: PLC0415
+
+    return ScopeManager(
+        client=anthropic.Anthropic(api_key=_settings.anthropic_api_key),
+        model=_settings.manager_model,
+    )
+
+
 # Agent provenance — recorded on every contribution.
 # STRATA_AGENT_SCOPE and STRATA_AGENT_SKILL have no defaults;
 # _validate_binding() enforces they are set before mcp.run().
@@ -530,72 +547,130 @@ def strata_contribute(
         ts=ts,
     )
 
-    contribution = _record_store.append_contribution(
-        scope_id=scope_id,
-        content=content,
-        proposed_classification=proposed_classification,
-        subject=subject,
-        supersedes=supersedes,
-        contributor=contributor,
-    )
+    # The record-append -> read-summary -> judge -> record-judgment ->
+    # summary-write sequence runs through the shared choke point in strata.app
+    # under the per-scope serialization lock (issue #38), so two concurrent
+    # contributions to the same scope can never leave the summary
+    # unexplainable by the record. Imported lazily (like the scope-manager) to
+    # keep the import path light until a contribution actually happens.
+    from strata.app import JudgeUnavailable, run_contribution  # noqa: PLC0415
 
-    current_summary = _summary_store.read(scope_id)
-    recent_contributions = _record_store.list_contributions(scope_id=scope_id, limit=20)
-
-    # Resolve the inter-stratum parent's summary for manager context (ADR 0004
-    # Decision 2). The caller (here) does the graph traversal; the manager is a
-    # pure judgment primitive that receives the resolved summary.
-    parent_scope = fleet.inter_stratum_parent(scope_id)
-    parent_summary = _summary_store.read(parent_scope.id) if parent_scope is not None else None
-
-    # Import here to avoid circular imports and keep the scope-manager import
-    # lazy — it pulls in anthropic which may not be configured in all envs.
-    import anthropic  # noqa: PLC0415
-
-    from strata.scope_manager import ScopeManager  # noqa: PLC0415
-
-    manager = ScopeManager(
-        client=anthropic.Anthropic(api_key=_settings.anthropic_api_key),
-        model=_settings.manager_model,
-    )
+    manager = _build_scope_manager()
 
     try:
-        judgment = manager.judge(
+        outcome = run_contribution(
             scope=scope,
             stratum=stratum,
-            parent_summary=parent_summary,
-            current_summary=current_summary,
-            recent_contributions=recent_contributions,
-            new_contribution=contribution,
+            content=content,
+            proposed_classification=proposed_classification,
+            subject=subject,
+            supersedes=supersedes,
+            contributor=contributor,
+            fleet=fleet,
+            record_store=_record_store,
+            summary_store=_summary_store,
+            scope_manager=manager,
             summary_max_words=_settings.summary_max_words,
-            entitlement=fleet.entitlement_view(scope_id),
         )
-    except Exception as exc:
-        raise RuntimeError(f"Scope-manager judgment failed: {exc}") from exc
-
-    _record_store.record_judgment(
-        contribution_id=contribution.id,
-        decision=judgment.decision,
-        judged_by="scope-manager",
-        notes=judgment.reasoning,
-    )
-
-    summary_updated = False
-    if judgment.decision != "decline" and judgment.new_summary is not None:
-        # Stamp the parent-summary version the judgment was built from, so
-        # staleness stays detectable without re-running the LLM (ADR 0004 D4).
-        to_write = judgment.new_summary.model_copy(
-            update={"parent_version": parent_summary.version if parent_summary else None}
-        )
-        _summary_store.write(scope_id, to_write)
-        summary_updated = True
+    except JudgeUnavailable as exc:
+        # The contribution and a judgment-attempt-failed event are already in
+        # the record (issue #57); a verdict is never fabricated. Surface the
+        # contribution id and route the retry to strata_rejudge — calling
+        # strata_contribute again would duplicate the contribution.
+        raise RuntimeError(
+            f"Scope-manager judgment failed ({exc.error_class}): {exc}. "
+            f"The contribution is recorded as {exc.contribution_id} with a "
+            "judgment-attempt-failed event but has no verdict yet. Retry with "
+            f"strata_rejudge(contribution_id={exc.contribution_id!r}) — do NOT "
+            "call strata_contribute again, which would duplicate it."
+        ) from exc
 
     return {
-        "contribution_id": contribution.id,
+        "contribution_id": outcome.contribution_id,
         "judgment": {
-            "decision": judgment.decision,
-            "reasoning": judgment.reasoning,
-            "summary_updated": summary_updated,
+            "decision": outcome.decision,
+            "reasoning": outcome.reasoning,
+            "summary_updated": outcome.summary_updated,
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
+# Tool: strata_rejudge
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def strata_rejudge(contribution_id: str) -> dict:
+    """Re-judge a contribution whose scope-manager judgment previously failed.
+
+    Idempotent (issue #57): if the contribution already has a verdict, this is
+    a no-op that returns that verdict unchanged. Otherwise it re-reads the
+    scope's CURRENT summary, invokes the scope-manager, records the judgment,
+    and updates the summary — all under the scope's serialization lock, so a
+    re-judge never races a concurrent contribution.
+
+    Use this to recover a contribution left pending by a judge() failure (API
+    outage, malformed model output): the failing strata_contribute response
+    carries the contribution id and names this tool as the retry path. Calling
+    strata_contribute again instead would duplicate the contribution. A verdict
+    is an exercise of scope authority — re-judge invokes the scope-manager, it
+    never fabricates one, and a failed attempt is recorded as an event, never a
+    verdict.
+
+    Write surface: re-judging exercises the scope's authority just as
+    contributing does, so it is gated by the same entitled write surface
+    (ADR 0006 D1) — the contribution's scope must be your bound scope or one of
+    its inter-stratum ancestors.
+
+    Args:
+        contribution_id: The id returned by the failed strata_contribute call.
+
+    Returns:
+        ``contribution_id`` and ``judgment`` (decision, reasoning,
+        summary_updated). ``summary_updated`` is False for the idempotent
+        no-op (a verdict already existed).
+
+    Raises:
+        RuntimeError: If the contribution is unknown, its scope is outside this
+            agent's entitled write surface, or the scope-manager fails again
+            (the contribution stays pending; a fresh judgment-attempt-failed
+            event is recorded and you may re-judge again later).
+    """
+    fleet = _load_fleet()
+
+    contribution = _record_store.get_contribution(contribution_id)
+    if contribution is None:
+        raise RuntimeError(f"Contribution not found: {contribution_id!r}")
+    _check_entitled_write(fleet, contribution.scope_id)
+
+    from strata.app import JudgeUnavailable, rejudge_contribution  # noqa: PLC0415
+
+    manager = _build_scope_manager()
+
+    try:
+        outcome = rejudge_contribution(
+            contribution_id,
+            fleet=fleet,
+            record_store=_record_store,
+            summary_store=_summary_store,
+            scope_manager=manager,
+            summary_max_words=_settings.summary_max_words,
+        )
+    except JudgeUnavailable as exc:
+        raise RuntimeError(
+            f"Scope-manager judgment failed again ({exc.error_class}): {exc}. "
+            f"Contribution {exc.contribution_id} stays pending with a fresh "
+            "judgment-attempt-failed event; call strata_rejudge again once the "
+            "scope-manager is available."
+        ) from exc
+
+    return {
+        "contribution_id": outcome.contribution_id,
+        "judgment": {
+            "decision": outcome.decision,
+            "reasoning": outcome.reasoning,
+            "summary_updated": outcome.summary_updated,
         },
     }
 
@@ -864,10 +939,14 @@ def strata_read_scope_record(scope_id: str | None = None) -> dict:
 
     contributions = _record_store.list_contributions(scope_id=scope_id)
     judgments = _record_store.list_judgments(scope_id=scope_id)
+    judgment_attempts = _record_store.list_judgment_attempts(scope_id=scope_id)
 
     return {
         "contributions": [asdict(c) for c in contributions],
         "judgments": [asdict(j) for j in judgments],
+        # Failed-judgment events (issue #57): a contribution with attempts but
+        # no judgment is pending, distinguishable in the forensic view.
+        "judgment_attempts": [asdict(a) for a in judgment_attempts],
     }
 
 

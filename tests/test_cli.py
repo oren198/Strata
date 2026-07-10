@@ -123,3 +123,68 @@ def test_bootstrap_no_config_found(
         rc = main(["bootstrap"])
     assert rc == 1
     assert "No fleet config found" in err_buf.getvalue()
+
+
+def test_record_marks_pending_with_failed_attempt_count(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A pending contribution with judgment-attempt-failed events renders as
+    "(pending — N failed attempts)"; one with none stays a bare "(pending)"
+    and a judged one shows its verdict (issue #57)."""
+    fake_resp = MagicMock()
+    fake_resp.status_code = 200
+    fake_resp.json.return_value = {
+        "contributions": [
+            {
+                "id": "c_failed",
+                "content": "judge kept crashing",
+                "proposed_classification": "directive",
+                "subject": None,
+                "supersedes": None,
+                "contributor": {
+                    "scope_id": "g_arch",
+                    "skill": "architect",
+                    "session_id": "s",
+                    "ts": "t",
+                },
+            },
+            {
+                "id": "c_neverjudged",
+                "content": "not judged yet",
+                "proposed_classification": "context",
+                "subject": None,
+                "supersedes": None,
+                "contributor": {
+                    "scope_id": "g_arch",
+                    "skill": "architect",
+                    "session_id": "s",
+                    "ts": "t",
+                },
+            },
+            {
+                "id": "c_ok",
+                "content": "accepted",
+                "proposed_classification": "directive",
+                "subject": None,
+                "supersedes": None,
+                "contributor": {
+                    "scope_id": "g_arch",
+                    "skill": "architect",
+                    "session_id": "s",
+                    "ts": "t",
+                },
+            },
+        ],
+        "judgments": [{"contribution_id": "c_ok", "decision": "accept_as_directive"}],
+        "judgment_attempts": [
+            {"contribution_id": "c_failed", "error_class": "ValueError", "message": "boom"},
+            {"contribution_id": "c_failed", "error_class": "TimeoutError", "message": "slow"},
+        ],
+    }
+    with patch("httpx.get", return_value=fake_resp):
+        rc = main(["record", "g_arch"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "(pending — 2 failed attempts)" in out
+    assert "(pending)" in out  # c_neverjudged has no attempts
+    assert "accept_as_directive" in out  # c_ok is judged
