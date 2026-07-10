@@ -33,16 +33,20 @@ Carries both directives and context downward.
 A reference from one scope to another scope on the **same** stratum. A scope
 may have any number of peer references; together they form a DAG within the
 stratum. Carries **context only** — directives published in a peer scope do
-not bind the reader. To make a peer's standard binding, it must be ratified
-into a common ancestor scope (i.e. published as a directive at a stratum
-above both).
+not bind the reader. What a peer reference delivers is the referenced
+scope's **publication** — its curated outward face — never its full internal
+summary. To make a peer's standard binding, it must be ratified into a
+common ancestor scope (i.e. published as a directive at a stratum above
+both).
 
 ## Agent
 
 A `(session, skill, scope)` triple. All three are bound at spawn time and
 fixed for the agent's lifetime — the agent cannot change session, skill, or
 scope. To act differently, an agent spawns a sub-agent with the bindings it
-needs.
+needs. A sub-agent's scope binding is bounded by its spawner's: the same
+scope or a descendant of it. Reach can only narrow through delegation, never
+widen.
 
 - **Session** — execution context and short-term memory; the lifetime.
 - **Skill** — what this agent does; the specialization.
@@ -149,6 +153,29 @@ Ratification is not a separate primitive — it is a directive write by the
 scope-manager, using its scope authority. The term names the *pattern* of
 context-to-directive consolidation.
 
+## Publication
+
+The act by a scope of exporting a curated subset of its memory for scopes
+that do not contain it — the sideways channel, counterpart to
+**ratification** (which widens *binding* reach upward, where publication
+widens *read* reach sideways, conveying no authority). Publishing is a
+judged act by the publishing scope's authority, distinct from internal
+acceptance: being in the scope's memory does not make an item published.
+
+Properties of published memory:
+
+- **Non-binding** to every reader; the only path to binding beyond a scope's
+  subtree remains ratification.
+- **Published within believed** — a scope publishes from its own memory
+  only; when the source memory is superseded or retired, the publication
+  follows.
+- **Attributed** — publication-derived memory stays attributed to its source
+  scope ("according to X") through composition and through condensation
+  (summary rewrites) alike, and outcome-based **trust** feedback on it flows
+  back to the source memory.
+- **Never self-corroborating** — a publication does not count as independent
+  corroboration for ratifying its own source.
+
 ## Supersession
 
 The pattern by which one **directive** replaces another on the same subject.
@@ -191,7 +218,7 @@ assembles:
 
 - The agent's own **scope summary**,
 - The summaries of every inter-stratum ancestor up to the root,
-- The summaries of any peer scopes referenced by scopes on that chain.
+- The **publications** of any peer scopes referenced by scopes on that chain.
 
 Each piece in the perspective is labelled with the scope it came from —
 composition is **provenance-preserving**, not flattened. Directives compose
