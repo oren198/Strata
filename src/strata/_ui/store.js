@@ -83,7 +83,14 @@
         color: s.color || pickColor(i),
       })),
       memories: [], // V1: memory items are not stored in UI state; summaries are fetched per-scope.
-      edges: data.edges || [],
+      // Backend edges are {from_scope_id, to_scope_id}; the rest of the UI
+      // (graph links, scope-detail relations) reads {from, to}. Normalise here
+      // so there is a single edge-field contract inside the app — otherwise the
+      // lookups silently miss and drill-in shows "No relations" (#65).
+      edges: (data.edges || []).map((e) => ({
+        from: e.from_scope_id,
+        to: e.to_scope_id,
+      })),
     };
   }
 
