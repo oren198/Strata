@@ -61,6 +61,8 @@ An agent does not see the whole store. It sees memory from its own scope and fro
 
 This is the mechanism of shared *reading*. A fleet-wide decision is visible to every agent because every agent sits within the broadest scope. A team-specific fact is visible only within that team. Visibility falls directly out of the scope hierarchy: an agent sees what reaches it.
 
+Visibility is structural, and it stays structural. When a scope needs readers — or reading — beyond what its position provides, the answer is never to grant reach ad hoc: it is to add structure the whole fleet can see in its definition (an explicit reference, a published face). **Reach is never granted; structure is added.** The same rule governs delegation: an agent may spawn sub-agents bound only to its own scope or a narrower one — reach can only shrink through delegation, never widen.
+
 Crucially, visibility is about *content and reach*, not about identity. An agent does not address another agent and ask for its memory. It draws on whatever memory reaches its position, and the original author is incidental to that — relevant for trust and accountability, but not for discovery. This decoupling is what lets agents come and go without the rest of the fleet having to know about them.
 
 ---
@@ -74,6 +76,20 @@ Authority is tied to position in the scope hierarchy, not granted ad hoc. An age
 This does not silence the worker — it changes *how* its influence travels. An agent without authority over a scope influences that scope **indirectly**: by producing evidence. Repeated, corroborated contributions accumulate weight, and an agent that does hold authority can ratify them into broader reach. Influence flows upward through evidence and ratification, never through unilateral assertion.
 
 The result is the resolution of the central tension. Every agent can influence shared memory — that is the whole point of the system — but the breadth of influence is governed by authority, so no single agent can corrupt what the fleet collectively holds to be true.
+
+### Where authority grounds: the operator
+
+One question remains: what gives the *broadest* scope its authority? Nothing inside the fleet can — every scope's authority is derived from the level above it. The chain grounds outside the system, in the **operator**: the human who defined the fleet in the first place. The operator is best understood as an implicit stratum above the broadest scope — not a special mechanism, but the top of the same structure. Like any stratum, the operator's layer carries both **directives** (binding) and **context** (informative), and the ordinary precedence rule is all that is needed: a fleet-wide native directive cannot contradict an operator directive for the same reason a team directive cannot contradict a fleet-wide one — nothing outranks the source of its own authority.
+
+Three things distinguish the operator layer, and all three follow from its position rather than from special rules:
+
+- **It is not judged.** Judgment is how *delegated* authority is exercised; the operator's authority is not delegated. Its acts are still recorded — accountability applies to everyone.
+- **It is never rewritten.** Operator memory composes verbatim as its own labelled layer. A paraphrased ruling would make the human's authority probabilistic. It is, however, **judge-aware**: scope-managers see the operator memory that binds their scope when judging, and decline contributions that contradict it.
+- **It is exempt from earned trust.** Outcomes cannot quietly erode a human ruling. Instead, outcomes that contradict operator memory are surfaced back to the operator, who can revise. The system may never outvote the operator — but it must be able to tell the operator it is wrong.
+
+The operator also **reads everything** — every scope's working memory and record. Agents see only what reaches them; the operator sees the whole store, because verification and fast steering are the operator's job, and because the operator answers for the fleet as a whole. For the same reason, the operator may **correct any scope's memory directly** — superseding or retiring what is wrong — with every correction recorded under operator provenance. Scope-managers exercise their scope's authority as the operator's standing delegates; the operator may always exercise it in person.
+
+The bound: operator memory is constitutional, not operational. It should be small, rare, and mostly stable. An operator who steers the fleet day-to-day through the operator layer has replaced the self-correcting system this design exists to build; the health of a fleet can be read partly in how little constitutional memory it needs.
 
 ---
 
@@ -120,11 +136,36 @@ A useful principle is to separate the **record** from the **working memory**: th
 
 ---
 
+## Core concept 8: Publication — how memory crosses sideways
+
+The concepts so far give memory two sanctioned directions of travel. Directives cross *downward*: an authority publishes, descendants are bound. Evidence crosses *upward*: contributions are judged, and what proves out is ratified into broader reach. But fleets also need memory to travel *sideways* — between scopes where neither contains the other. One team needs another's interfaces, conventions, findings, status: knowledge that is wider than its home scope but narrower than the common ancestor, and informative rather than binding.
+
+Neither existing direction serves this. Sharing a scope's entire working face is naive sharing wearing labels: internal memory is written for internal readers — half-formed hypotheses, dead ends, low-trust observations — and exporting it wholesale is exactly the contamination and relevance collapse this design exists to prevent. Ratifying into a common ancestor forces every sideways share to escalate into a claim it doesn't mean: binding force, and relevance to everyone under the ancestor.
+
+The resolution is a third channel, **publication**: a scope exports a curated subset of its knowledge for outside readers, through a deliberate act of judgment by its own authority. Publication is the sideways twin of ratification — ratification widens *binding* reach upward through judgment; publication widens *read* reach sideways through judgment, adding no authority. Together the three channels close a single principle:
+
+**Memory never crosses a scope boundary raw. It crosses downward through directives, upward through ratification, and sideways through publication — each a judged act by the responsible authority.**
+
+Being judged into a scope's memory and being judged fit for outsiders are different judgments, because the audience differs: "true and useful for us" is not "ready for others to act on."
+
+Publication carries obligations that follow from the concepts before it:
+
+- **Non-binding, always.** A publication informs; it never binds a reader. The only path to binding beyond a scope's subtree remains ratification.
+- **Published within believed.** A scope publishes from its own memory only; it cannot publish what it does not hold. When the source memory is superseded or retired, its publication follows.
+- **Trust flows home.** Outcomes from readers acting on a publication feed back to the source memory — otherwise self-correction (Concept 6) is severed at exactly the boundary where errors travel farthest.
+- **Attribution survives condensation.** Memory that entered a scope from another's publication stays attributed to its source — "according to X" — not only when views are composed (Concept 4) but through every rewrite of the reader's own memory. Provenance that dissolves in summarization is provenance lost.
+- **No echo.** A publication never counts as corroboration for its own source. Wherever ratification weighs corroboration, corroboration must be provenance-independent — or one scope's hypothesis, republished by another, returns dressed as consensus.
+- **Forgetting, with extra force.** A stale publication contaminates other teams, not just its own. Withdrawal must be possible and must actually stop readers from acting on it.
+
+Publication is demand-driven, not a duty. A scope nobody needs to read from is not failing by staying quiet; the system's job is to make publish-and-subscribe wiring legible enough that unmet demand is visible when it exists.
+
+---
+
 ## The system as a living equilibrium
 
 Putting the concepts together, shared fleet memory is not a static store that fills up. It is a **moving equilibrium.**
 
-Knowledge flows **upward**: an observation made in a narrow scope, once corroborated and ratified, consolidates into broader reach — narrow becomes wide, transient becomes durable. Knowledge fades **downward and out**: stale or distrusted memory is superseded, decays, or is retired. At any moment, what an agent reads is the current balance of these flows, scoped to its position and resolved by precedence.
+Knowledge flows **upward**: an observation made in a narrow scope, once corroborated and ratified, consolidates into broader reach — narrow becomes wide, transient becomes durable. Knowledge flows **sideways**: published by one scope, read by others — curated, attributed, never binding. Knowledge fades **downward and out**: stale or distrusted memory is superseded, decays, or is retired. At any moment, what an agent reads is the current balance of these flows, scoped to its position and resolved by precedence.
 
 This is the deeper answer to the original goal. The fleet improves not because memory accumulates, but because useful contributions propagate to where they are relevant, gain trust as they prove out, and displace what they supersede — all while authority and scope keep any single contribution from corrupting the whole. Shared memory, contributed safely, is what lets a fleet's performance compound.
 
@@ -141,5 +182,6 @@ This is the deeper answer to the original goal. The fleet improves not because m
 | Precedence (directives vs. context) | When sources conflict, which wins? |
 | Provenance and earned trust | How reliable is a piece of memory, and who is accountable? |
 | Forgetting | How does memory stay relevant over time? |
+| Publication | How does memory travel sideways, without authority? |
 
 The throughline: **a fleet should share memory so its performance compounds, and the entire difficulty — and therefore the entire design — is letting every agent contribute to that shared memory without letting any agent corrupt it.**
