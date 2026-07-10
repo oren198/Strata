@@ -11,15 +11,19 @@
 //   edges   — between scopes. {from, to}.
 //
 // API base URL is read from <meta name="strata-api-base" content="..."> in
-// index.html (defaults to http://127.0.0.1:8000 if the tag is absent).
+// index.html. When the tag is absent or its content is empty it defaults to
+// window.location.origin — the host and port the Console was served from — so
+// `strata start --port 8123` yields a Console that reaches its own backend.
 // ─────────────────────────────────────────────────────────────────────
 
 (function () {
-  // Resolve the API base URL from a <meta> tag, falling back to localhost.
+  // Resolve the API base URL from a <meta> tag, falling back to the origin the
+  // Console is served from. The meta override only matters when the UI is
+  // hosted separately from the API.
   function getApiBase() {
     const meta = document.querySelector('meta[name="strata-api-base"]');
     const content = meta && meta.getAttribute("content");
-    return (content && content.trim()) || "http://127.0.0.1:8000";
+    return (content && content.trim()) || window.location.origin;
   }
 
   // How often to refresh state from the backend (milliseconds).

@@ -5,9 +5,11 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Strata Console</title>
 
-  <!-- API base URL: override this to point at a non-default backend. -->
-  <!-- The store reads this tag; if absent it falls back to http://127.0.0.1:8000 -->
-  <meta name="strata-api-base" content="http://127.0.0.1:8000" />
+  <!-- API base URL override. Leave content empty to talk to the origin the
+       Console is served from (window.location.origin) — correct when the API
+       serves this UI, on whatever host/port `strata start` was given. Only set
+       an absolute URL here when the Console is hosted separately from the API. -->
+  <meta name="strata-api-base" content="" />
 
   <link rel="stylesheet" href="atlas.css" />
   <style>
