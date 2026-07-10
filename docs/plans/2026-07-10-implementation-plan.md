@@ -275,6 +275,26 @@ feature lands with its eval family in the same release; ADRs before code
 for both mechanisms; all Strata features work fully locally before any
 strata-web exposure.
 
+## Issue index (every package has a tracker)
+
+| Package | Issue(s) |
+|---|---|
+| S0.1 coherence + judge-failure recovery | Strata#38, Strata#57 · gate: strata-evals#7 |
+| S0.2 judge admission (origin_spoofing) | Strata#79 |
+| S0.3 Record tab crash | strata-web#31 |
+| S0.4 PyPI `mem-strata` | Strata#49 |
+| S0.5 housekeeping | Strata#64, #52, #53, #76, #65, #66 |
+| E0.1 threshold noise margins | strata-evals#1 |
+| S1.1 ADR 0007 publication mechanism | Strata#89 |
+| S1.2 ADR 0008 operator mechanism | Strata#80 |
+| S2.1/S2.2 library primitives + operator | Strata#83, Strata#91 · gate: strata-evals#6 (O-family) |
+| S2.3 publication channel | Strata#90 · gate: strata-evals#5 (P-family; Strata#86 closed into it) |
+| S2.4 admission integration | Strata#79 (operator/publication variants) |
+| W3.1 adopt compose_perspective | strata-web#40 |
+| W3.2 operator Console (+ pending queue) | strata-web#16 |
+| W3.3 publication surfaces | strata-web#41 |
+| W3.4 dormant trackers | strata-web#20, #21, #18, #15, #12 |
+
 ## Suggested immediate next steps (this week)
 
 1. **S0.1** (Strata #38/#57) — start now; top priority by owner ruling.
