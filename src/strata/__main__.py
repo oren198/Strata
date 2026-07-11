@@ -70,6 +70,7 @@ from strata import __version__
 from strata.launch import (
     SkillResolutionError,
     StrataRoleParseError,
+    exec_claude,
     find_strata_role,
     is_interactive,
     make_session_id,
@@ -950,24 +951,25 @@ def cmd_launch(args: argparse.Namespace) -> int:
         )
 
     # -----------------------------------------------------------------------
-    # Step 6: exec claude.
+    # Step 6: hand off to claude with STRATA_AGENT_* set.
+    #
+    # POSIX replaces this process image (execvpe); Windows spawns a
+    # console-sharing child and propagates its exit code. Both raise
+    # FileNotFoundError when claude is not on PATH — one message either way.
     # -----------------------------------------------------------------------
     env = os.environ.copy()
     env["STRATA_AGENT_SCOPE"] = scope_data["id"]
     env["STRATA_AGENT_SKILL"] = skill
     env["STRATA_AGENT_SESSION_ID"] = session_id
 
-    claude_bin = "claude"
     try:
-        os.execvpe(claude_bin, [claude_bin], env)
+        return exec_claude(env)
     except FileNotFoundError:
         print(
             "Cannot find 'claude' on PATH. Install Claude Code and ensure it is on your PATH.",
             file=sys.stderr,
         )
         return 1
-    # execvpe does not return on success; the line below is unreachable.
-    return 0  # pragma: no cover
 
 
 # ---------------------------------------------------------------------------

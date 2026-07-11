@@ -3,15 +3,20 @@ session-ID generation, and CLI integration.
 
 All tests that touch the CLI use the ``main()`` entry point with a real
 fleet.yaml on disk (launch reads the fleet directly — embedded mode, issue
-#45; no backend and no HTTP involved) and mocked ``os.execvpe`` so no real
-process is spawned.
+#45; no backend and no HTTP involved) and a mocked ``exec_claude`` seam so no
+real process is spawned. The platform-specific handoff inside ``exec_claude``
+(POSIX ``execvpe`` vs. the Windows spawn — issue #20) is covered separately by
+``TestExecClaudePosix`` / ``TestExecClaudeWindowsBranch`` /
+``TestExecClaudeWindowsIntegration``.
 """
 
 from __future__ import annotations
 
+import os
+import signal
 from datetime import UTC, datetime
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 import yaml
@@ -20,6 +25,8 @@ from strata.__main__ import main
 from strata.launch import (
     SkillResolutionError,
     StrataRoleParseError,
+    _windows_claude_argv,
+    exec_claude,
     find_strata_role,
     make_session_id,
     parse_strata_role,
@@ -407,57 +414,71 @@ class TestLaunchPicker:
             patch("strata.__main__.is_interactive", return_value=True),
             patch("builtins.input", return_value="1"),
             patch("pathlib.Path.cwd", return_value=tmp_path),
-            patch("os.execvpe") as mock_exec,
+            patch("strata.__main__.exec_claude", return_value=0) as mock_exec,
         ):
             rc = main(["launch"])
         assert rc == 0
         mock_exec.assert_called_once()
-        _cmd, _argv, env = mock_exec.call_args[0]
+        (env,) = mock_exec.call_args[0]
         assert env["STRATA_AGENT_SCOPE"] == "g_arch"
         assert env["STRATA_AGENT_SKILL"] == "code-writer"
         assert "STRATA_AGENT_SESSION_ID" in env
 
 
 # ---------------------------------------------------------------------------
-# CLI integration — execvp with correct args + env vars
+# CLI integration — handoff receives the correct env (platform-independent)
 # ---------------------------------------------------------------------------
 
 
-class TestLaunchExecvpe:
-    def test_execvpe_called_with_correct_env(
+class TestLaunchHandoff:
+    """cmd_launch builds STRATA_AGENT_* and hands it to exec_claude.
+
+    The exec_claude seam is patched, so these assert the launcher's binding job
+    on any platform. The OS handoff mechanism itself is covered per-platform by
+    TestExecClaude.
+    """
+
+    def test_handoff_called_with_correct_env(
         self, fleet_env, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        """Happy path: execvpe invoked with STRATA_AGENT_* env vars."""
+        """Happy path: exec_claude invoked with STRATA_AGENT_* env vars."""
         fleet_env([_SCOPE_DEFAULT_ONLY])
-        with patch("os.execvpe") as mock_exec:
+        with patch("strata.__main__.exec_claude", return_value=0) as mock_exec:
             rc = main(["launch", "g_arch"])
         assert rc == 0
         mock_exec.assert_called_once()
-        cmd, argv, env = mock_exec.call_args[0]
-        assert cmd == "claude"
-        assert argv == ["claude"]
+        (env,) = mock_exec.call_args[0]
         assert env["STRATA_AGENT_SCOPE"] == "g_arch"
         assert env["STRATA_AGENT_SKILL"] == "code-writer"
         assert env["STRATA_AGENT_SESSION_ID"].startswith("sess_g_arch_code-writer_")
+
+    def test_child_exit_code_propagates(
+        self, fleet_env, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """cmd_launch returns exec_claude's value verbatim (Windows exit code)."""
+        fleet_env([_SCOPE_DEFAULT_ONLY])
+        with patch("strata.__main__.exec_claude", return_value=42):
+            rc = main(["launch", "g_arch"])
+        assert rc == 42
 
     def test_session_override_propagated(
         self, fleet_env, capsys: pytest.CaptureFixture[str]
     ) -> None:
         """--session flag overrides auto-generated session ID."""
         fleet_env([_SCOPE_DEFAULT_ONLY])
-        with patch("os.execvpe") as mock_exec:
+        with patch("strata.__main__.exec_claude", return_value=0) as mock_exec:
             rc = main(["launch", "g_arch", "--session", "my-sess"])
         assert rc == 0
-        _cmd, _argv, env = mock_exec.call_args[0]
+        (env,) = mock_exec.call_args[0]
         assert env["STRATA_AGENT_SESSION_ID"] == "my-sess"
 
     def test_skill_override_propagated(self, fleet_env, capsys: pytest.CaptureFixture[str]) -> None:
         """--skill flag overrides resolved skill (must be in permitted list)."""
         fleet_env([_SCOPE_DEFAULT_AND_PERMITTED])
-        with patch("os.execvpe") as mock_exec:
+        with patch("strata.__main__.exec_claude", return_value=0) as mock_exec:
             rc = main(["launch", "g_arch", "--skill", "evidence-summarizer"])
         assert rc == 0
-        _cmd, _argv, env = mock_exec.call_args[0]
+        (env,) = mock_exec.call_args[0]
         assert env["STRATA_AGENT_SKILL"] == "evidence-summarizer"
 
     def test_skill_override_not_permitted_exits_nonzero(
@@ -465,7 +486,7 @@ class TestLaunchExecvpe:
     ) -> None:
         """--skill not in permitted_skills → exit 1, no exec."""
         fleet_env([_SCOPE_DEFAULT_AND_PERMITTED])
-        with patch("os.execvpe") as mock_exec:
+        with patch("strata.__main__.exec_claude", return_value=0) as mock_exec:
             rc = main(["launch", "g_arch", "--skill", "scope-manager"])
         assert rc == 1
         mock_exec.assert_not_called()
@@ -475,9 +496,13 @@ class TestLaunchExecvpe:
     def test_claude_not_on_path_exits_nonzero(
         self, fleet_env, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        """FileNotFoundError from execvpe → exit 1 with clear message."""
+        """FileNotFoundError from exec_claude → exit 1 with clear message.
+
+        Parity: raised by execvpe on POSIX and by shutil.which on Windows;
+        cmd_launch reports one message either way.
+        """
         fleet_env([_SCOPE_DEFAULT_ONLY])
-        with patch("os.execvpe", side_effect=FileNotFoundError):
+        with patch("strata.__main__.exec_claude", side_effect=FileNotFoundError):
             rc = main(["launch", "g_arch"])
         assert rc == 1
         err = capsys.readouterr().err
@@ -499,11 +524,11 @@ class TestLaunchStrataRole:
         fleet_env([_SCOPE_DEFAULT_ONLY])
         with (
             patch("pathlib.Path.cwd", return_value=tmp_path),
-            patch("os.execvpe") as mock_exec,
+            patch("strata.__main__.exec_claude", return_value=0) as mock_exec,
         ):
             rc = main(["launch"])
         assert rc == 0
-        _cmd, _argv, env = mock_exec.call_args[0]
+        (env,) = mock_exec.call_args[0]
         assert env["STRATA_AGENT_SCOPE"] == "g_arch"
         assert env["STRATA_AGENT_SKILL"] == "code-writer"
 
@@ -517,11 +542,11 @@ class TestLaunchStrataRole:
         fleet_env([_SCOPE_DEFAULT_ONLY])
         with (
             patch("pathlib.Path.cwd", return_value=tmp_path),
-            patch("os.execvpe") as mock_exec,
+            patch("strata.__main__.exec_claude", return_value=0) as mock_exec,
         ):
             rc = main(["launch"])
         assert rc == 0
-        _cmd, _argv, env = mock_exec.call_args[0]
+        (env,) = mock_exec.call_args[0]
         assert env["STRATA_AGENT_SKILL"] == "evidence-summarizer"
 
     def test_strata_role_in_parent_dir(
@@ -535,11 +560,11 @@ class TestLaunchStrataRole:
         fleet_env([_SCOPE_DEFAULT_ONLY])
         with (
             patch("pathlib.Path.cwd", return_value=nested),
-            patch("os.execvpe") as mock_exec,
+            patch("strata.__main__.exec_claude", return_value=0) as mock_exec,
         ):
             rc = main(["launch"])
         assert rc == 0
-        _cmd, _argv, env = mock_exec.call_args[0]
+        (env,) = mock_exec.call_args[0]
         assert env["STRATA_AGENT_SCOPE"] == "g_arch"
 
     def test_strata_role_inactive_scope_exits_nonzero(
@@ -567,7 +592,7 @@ class TestLaunchNoSkills:
     ) -> None:
         """Scope with no default_skill and no permitted_skills → exit 1."""
         fleet_env([_SCOPE_NO_SKILLS])
-        with patch("os.execvpe") as mock_exec:
+        with patch("strata.__main__.exec_claude", return_value=0) as mock_exec:
             rc = main(["launch", "g_arch"])
         assert rc == 1
         mock_exec.assert_not_called()
@@ -584,10 +609,10 @@ class TestSessionIdViaCLI:
     def test_session_id_format_in_env(self, fleet_env, capsys: pytest.CaptureFixture[str]) -> None:
         """Auto-generated session ID matches pinned format."""
         fleet_env([_SCOPE_DEFAULT_ONLY])
-        with patch("os.execvpe") as mock_exec:
+        with patch("strata.__main__.exec_claude", return_value=0) as mock_exec:
             rc = main(["launch", "g_arch"])
         assert rc == 0
-        _cmd, _argv, env = mock_exec.call_args[0]
+        (env,) = mock_exec.call_args[0]
         sid = env["STRATA_AGENT_SESSION_ID"]
         # Format: sess_<scope>_<skill>_<YYYYMMDD-HHMMSS>
         assert sid.startswith("sess_g_arch_code-writer_")
@@ -595,3 +620,240 @@ class TestSessionIdViaCLI:
         ts_part = sid.split("_")[-1]
         assert len(ts_part) == 15  # YYYYMMDD-HHMMSS
         assert ts_part[8] == "-"
+
+
+# ---------------------------------------------------------------------------
+# exec_claude — the platform-specific handoff (issue #20)
+# ---------------------------------------------------------------------------
+
+
+class TestWindowsClaudeArgv:
+    """_windows_claude_argv routing — pure, runs on every platform."""
+
+    def test_exe_spawned_directly(self) -> None:
+        assert _windows_claude_argv(r"C:\tools\claude.exe") == [r"C:\tools\claude.exe"]
+
+    def test_cmd_shim_routed_through_comspec(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("COMSPEC", r"C:\Windows\System32\cmd.exe")
+        assert _windows_claude_argv(r"C:\npm\claude.cmd") == [
+            r"C:\Windows\System32\cmd.exe",
+            "/c",
+            r"C:\npm\claude.cmd",
+        ]
+
+    def test_bat_shim_routed_through_comspec(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("COMSPEC", "cmd.exe")
+        assert _windows_claude_argv(r"C:\x\claude.bat") == ["cmd.exe", "/c", r"C:\x\claude.bat"]
+
+    def test_extension_match_is_case_insensitive(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("COMSPEC", "cmd.exe")
+        assert _windows_claude_argv(r"C:\x\CLAUDE.CMD")[:2] == ["cmd.exe", "/c"]
+        assert _windows_claude_argv(r"C:\x\CLAUDE.EXE") == [r"C:\x\CLAUDE.EXE"]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX exec path (execvpe)")
+class TestExecClaudePosix:
+    """POSIX keeps true process replacement via os.execvpe."""
+
+    def test_execvpe_called_with_claude_and_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """exec_claude replaces the image with claude, argv=['claude'], env passed."""
+        execvpe = MagicMock()
+        monkeypatch.setattr("strata.launch.os.execvpe", execvpe)
+        env = {"STRATA_AGENT_SCOPE": "g_arch"}
+        exec_claude(env)
+        execvpe.assert_called_once_with("claude", ["claude"], env)
+
+    def test_execvpe_filenotfound_propagates(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A missing claude surfaces as FileNotFoundError for the caller."""
+        monkeypatch.setattr("strata.launch.os.execvpe", MagicMock(side_effect=FileNotFoundError))
+        with pytest.raises(FileNotFoundError):
+            exec_claude({"STRATA_AGENT_SCOPE": "g_arch"})
+
+
+class TestExecClaudeWindowsBranch:
+    """Windows spawn-and-wait logic, forced on any host by pinning os.name.
+
+    shutil.which / subprocess.Popen / signal.signal are mocked, so no process
+    is spawned — this exercises resolution, SIGINT handling, and exit-code
+    propagation deterministically on Linux CI as well as on Windows.
+    """
+
+    @pytest.fixture
+    def force_windows(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("strata.launch.os.name", "nt")
+
+    def test_resolves_exe_spawns_and_propagates_exit_code(
+        self, force_windows, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        child = MagicMock()
+        child.wait.return_value = 3
+        popen = MagicMock(return_value=child)
+        sig = MagicMock(return_value="prev-handler")
+        which = MagicMock(return_value=r"C:\t\claude.exe")
+        monkeypatch.setattr("strata.launch.shutil.which", which)
+        monkeypatch.setattr("strata.launch.subprocess.Popen", popen)
+        monkeypatch.setattr("strata.launch.signal.signal", sig)
+
+        env = {"STRATA_AGENT_SCOPE": "g_arch"}
+        rc = exec_claude(env)
+
+        assert rc == 3
+        popen.assert_called_once_with([r"C:\t\claude.exe"], env=env)
+        child.wait.assert_called_once()
+
+    def test_ignores_sigint_during_wait_then_restores(
+        self, force_windows, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        child = MagicMock()
+        child.wait.return_value = 0
+        sig = MagicMock(return_value="prev-handler")
+        which = MagicMock(return_value=r"C:\t\claude.exe")
+        monkeypatch.setattr("strata.launch.shutil.which", which)
+        monkeypatch.setattr("strata.launch.subprocess.Popen", MagicMock(return_value=child))
+        monkeypatch.setattr("strata.launch.signal.signal", sig)
+
+        exec_claude({"X": "1"})
+
+        # First: ignore SIGINT so the child owns the interrupt. Last: restore.
+        assert sig.call_args_list[0].args == (signal.SIGINT, signal.SIG_IGN)
+        assert sig.call_args_list[-1].args == (signal.SIGINT, "prev-handler")
+
+    def test_missing_claude_raises_filenotfound(
+        self, force_windows, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr("strata.launch.shutil.which", MagicMock(return_value=None))
+        with pytest.raises(FileNotFoundError):
+            exec_claude({"STRATA_AGENT_SCOPE": "g_arch"})
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows spawn path (real child)")
+class TestExecClaudeWindowsIntegration:
+    """End-to-end on Windows: a real fake claude spawned by exec_claude."""
+
+    def test_spawns_child_binds_env_and_propagates_exit_code(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The child sees STRATA_AGENT_* and its exit code becomes exec_claude's."""
+        marker = tmp_path / "child_env.txt"
+        fake = tmp_path / "claude.cmd"
+        fake.write_text(
+            "@echo off\r\n"
+            f'>"{marker}" echo %STRATA_AGENT_SCOPE%\r\n'
+            f'>>"{marker}" echo %STRATA_AGENT_SKILL%\r\n'
+            f'>>"{marker}" echo %STRATA_AGENT_SESSION_ID%\r\n'
+            "exit /b 7\r\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("PATH", str(tmp_path) + os.pathsep + os.environ.get("PATH", ""))
+
+        env = os.environ.copy()
+        env["STRATA_AGENT_SCOPE"] = "g_arch"
+        env["STRATA_AGENT_SKILL"] = "code-writer"
+        env["STRATA_AGENT_SESSION_ID"] = "sess_probe"
+
+        rc = exec_claude(env)
+
+        assert rc == 7  # exit /b 7 propagated through cmd.exe /c and Popen.wait()
+        lines = marker.read_text(encoding="utf-8").split()
+        assert lines == ["g_arch", "code-writer", "sess_probe"]
+
+
+# ---------------------------------------------------------------------------
+# Live console Ctrl-C on Windows (opt-in — needs a real console)
+# ---------------------------------------------------------------------------
+
+# Body of a fake 'claude', executed by claude.exe (a python copy) via stdin.
+# Re-enables Ctrl-C (the launcher's new process group starts with it disabled),
+# then exits with sentinel 42 on SIGINT. Paths arrive via env (no __file__ for
+# a stdin script).
+_CTRLC_CHILD = """\
+import ctypes, os, signal, sys, time
+def _w(p, t):
+    with open(p, "w", encoding="utf-8") as f:
+        f.write(t)
+_w(os.environ["CHILD_STARTED_PATH"], "started")
+ctypes.windll.kernel32.SetConsoleCtrlHandler(None, False)
+def _h(signum, frame):
+    _w(os.environ["CHILD_MARKER_PATH"], "CHILD_GOT_SIGINT")
+    sys.exit(42)
+signal.signal(signal.SIGINT, _h)
+_w(os.environ["CHILD_READY_PATH"], "ready")
+time.sleep(30)
+_w(os.environ["CHILD_MARKER_PATH"], "TIMEOUT")
+sys.exit(99)
+"""
+
+# The launcher under test, run in its own process group so the driver can send
+# CTRL_C_EVENT at it without hitting pytest. Its stdin is the child body.
+_CTRLC_HARNESS = (
+    "import os, sys;"
+    "from strata.launch import exec_claude;"
+    "e = os.environ.copy();"
+    "e['STRATA_AGENT_SCOPE'] = 'g_arch';"
+    "e['STRATA_AGENT_SKILL'] = 'code-writer';"
+    "e['STRATA_AGENT_SESSION_ID'] = 'sess_ctrlc';"
+    "sys.exit(exec_claude(e))"
+)
+
+
+@pytest.mark.ctrlc
+@pytest.mark.skipif(os.name != "nt", reason="Windows console Ctrl-C path")
+def test_ctrlc_launcher_survives_child_handles_and_exit_code_propagates(
+    tmp_path: Path,
+) -> None:
+    """Live Ctrl-C: launcher ignores SIGINT and survives, child handles it, and
+    the child's exit code propagates.
+
+    Opt-in (needs a real console): set STRATA_RUN_CTRLC=1. Delivers a real
+    CTRL_C_EVENT to the launcher's process group and asserts exec_claude
+    returned the child's sentinel exit code (42).
+    """
+    if os.environ.get("STRATA_RUN_CTRLC") != "1":
+        pytest.skip("Set STRATA_RUN_CTRLC=1 to run the live Ctrl-C test.")
+
+    import ctypes
+    import shutil
+    import subprocess
+    import sys
+    import time
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    # A real .exe fake claude (a python copy): exec_claude spawns it directly —
+    # no cmd.exe layer — and it runs the child body from its inherited stdin.
+    shutil.copy(sys.executable, bin_dir / "claude.exe")
+
+    child_py = tmp_path / "child.py"
+    child_py.write_text(_CTRLC_CHILD, encoding="utf-8")
+    ready = tmp_path / "ready.txt"
+    marker = tmp_path / "marker.txt"
+
+    env = os.environ.copy()
+    env["PATH"] = str(bin_dir) + os.pathsep + env["PATH"]
+    env["CHILD_STARTED_PATH"] = str(tmp_path / "started.txt")
+    env["CHILD_READY_PATH"] = str(ready)
+    env["CHILD_MARKER_PATH"] = str(marker)
+
+    create_new_process_group = 0x00000200
+    ctrl_c_event = 0
+
+    with open(child_py, "rb") as child_stdin:
+        proc = subprocess.Popen(
+            [sys.executable, "-c", _CTRLC_HARNESS],
+            stdin=child_stdin,
+            env=env,
+            creationflags=create_new_process_group,
+        )
+        deadline = time.time() + 15
+        while time.time() < deadline and not ready.exists():
+            time.sleep(0.05)
+        assert ready.exists(), "fake claude child never signaled readiness"
+        time.sleep(0.5)  # let the child enter its wait before the interrupt
+
+        sent = ctypes.windll.kernel32.GenerateConsoleCtrlEvent(ctrl_c_event, proc.pid)
+        assert sent, "GenerateConsoleCtrlEvent failed"
+
+        rc = proc.wait(timeout=15)
+
+    assert marker.read_text(encoding="utf-8") == "CHILD_GOT_SIGINT"  # child handled it
+    assert rc == 42  # launcher survived the Ctrl-C and propagated the child's exit code
