@@ -13,7 +13,13 @@ from pathlib import Path
 
 import pytest
 
-from strata.migrator import run_migrations
+from strata.migrator import (
+    _is_transaction_control,
+    _leading_token,
+    _split_statements,
+    _statements_for_migration,
+    run_migrations,
+)
 
 
 def _table_names(db_path: str) -> set[str]:
@@ -73,9 +79,10 @@ def test_full_chain_drops_fleet_tables_and_preserves_record(tmp_path: Path) -> N
     conn.commit()
     conn.close()
 
-    # Now apply 0002 from the real migrations directory (it's pending).
+    # Now apply the remaining real migrations (0002 rebuild + 0003), both
+    # pending after the 0001-only seed above.
     applied = run_migrations(db_path, migrations_dir=migrations_dir)
-    assert applied == ["0002_drop_fleet_tables.sql"]
+    assert applied == ["0002_drop_fleet_tables.sql", "0003_judgment_attempts.sql"]
 
     # Fleet tables gone.
     tables = _table_names(db_path)
@@ -115,7 +122,11 @@ def test_idempotent_reapply(tmp_path: Path) -> None:
     migrations_dir = Path(__file__).resolve().parent.parent / "src" / "strata" / "_migrations"
 
     first = run_migrations(db_path, migrations_dir=migrations_dir)
-    assert first == ["0001_initial.sql", "0002_drop_fleet_tables.sql"]
+    assert first == [
+        "0001_initial.sql",
+        "0002_drop_fleet_tables.sql",
+        "0003_judgment_attempts.sql",
+    ]
 
     second = run_migrations(db_path, migrations_dir=migrations_dir)
     assert second == []
@@ -310,4 +321,162 @@ def test_crash_at_tracking_insert_rolls_back_script_too(
     # A plain re-run (no monkeypatch) converges cleanly with no manual
     # intervention.
     applied = run_migrations(db_path, migrations_dir=migrations_dir)
-    assert applied == ["0001_initial.sql", "0002_drop_fleet_tables.sql"]
+    assert applied == [
+        "0001_initial.sql",
+        "0002_drop_fleet_tables.sql",
+        "0003_judgment_attempts.sql",
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Statement-splitting / transaction-control classification tests (issue #76).
+#
+# Two latent defects, neither reachable from the shipped migration files:
+#   1. The old line-based splitter accumulated whole lines, so a one-line
+#      multi-statement input never split within the line.
+#   2. The old comment-stripping regexes in _is_transaction_control did not
+#      respect string literals, so a literal containing "--" or "BEGIN"
+#      could cause a false classification.
+# ---------------------------------------------------------------------------
+
+
+def test_two_statements_on_one_line_both_apply(tmp_path: Path) -> None:
+    """A single line carrying two statements is split and both execute.
+
+    Before the character-level rewrite, ``_split_statements`` accumulated
+    whole lines, so this one-liner came back as a single string and
+    ``conn.execute`` raised "You can only execute one statement at a time."
+    """
+    db_path = str(tmp_path / "oneline.db")
+    migrations_dir = tmp_path / "migrations_oneline"
+    migrations_dir.mkdir()
+    (migrations_dir / "0001_two_on_one_line.sql").write_text(
+        "CREATE TABLE a (x TEXT); CREATE TABLE b (y TEXT);\n"
+    )
+
+    applied = run_migrations(db_path, migrations_dir=migrations_dir)
+    assert applied == ["0001_two_on_one_line.sql"]
+
+    tables = _table_names(db_path)
+    assert "a" in tables
+    assert "b" in tables
+
+
+def test_string_literal_with_double_dash_and_begin_is_executed(tmp_path: Path) -> None:
+    """A literal containing '--' or 'BEGIN' is executed, not dropped or misclassified.
+
+    Guards against the old regex-based comment stripping in
+    ``_is_transaction_control``, which didn't respect string literals and
+    could misclassify a statement whose literal payload merely contains
+    ``--`` or ``BEGIN`` as transaction control.
+    """
+    db_path = str(tmp_path / "literal.db")
+    migrations_dir = tmp_path / "migrations_literal"
+    migrations_dir.mkdir()
+    (migrations_dir / "0001_literal.sql").write_text(
+        "CREATE TABLE notes (id TEXT PRIMARY KEY, body TEXT);\n"
+        "INSERT INTO notes (id, body) VALUES "
+        "('n1', 'contains -- not a comment and BEGIN not a keyword');\n"
+    )
+
+    applied = run_migrations(db_path, migrations_dir=migrations_dir)
+    assert applied == ["0001_literal.sql"]
+
+    conn = sqlite3.connect(db_path)
+    try:
+        rows = conn.execute("SELECT id, body FROM notes").fetchall()
+    finally:
+        conn.close()
+    assert rows == [("n1", "contains -- not a comment and BEGIN not a keyword")]
+
+
+def test_is_transaction_control_ignores_string_literal_content() -> None:
+    """Direct unit check: a literal's ``BEGIN``/``--`` never leaks into classification."""
+    statement = "SELECT 'BEGIN this is not a real BEGIN, and -- not a comment either';"
+    assert not _is_transaction_control(statement)
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "CREATE TABLE beginnings (id TEXT);",
+        "INSERT INTO t (x) VALUES (1);",
+        "SELECT 1;",
+        "-- leading comment\nCREATE TABLE t (id TEXT);",
+        "/* block comment */ DROP TABLE t;",
+        "BEGINNING_OF_SOMETHING (id TEXT);",  # first token merely starts with BEGIN
+        "ENDPOINT (id TEXT);",  # first token merely starts with END
+    ],
+)
+def test_statement_with_non_control_first_token_is_never_transaction_control(
+    statement: str,
+) -> None:
+    """A statement whose first token isn't BEGIN/COMMIT/END can never be tx control."""
+    assert not _is_transaction_control(statement)
+
+
+@pytest.mark.parametrize("keyword", ["BEGIN", "COMMIT", "END", "begin", "Commit", "end"])
+def test_statement_with_control_first_token_is_always_transaction_control(keyword: str) -> None:
+    """Every case variant of the three control keywords is classified as tx control,
+    including when a comment is glued in front of it (see 0002's file-level comment
+    block preceding its ``BEGIN;``)."""
+    assert _is_transaction_control(f"{keyword};")
+    assert _is_transaction_control(f"{keyword} TRANSACTION;")
+    assert _is_transaction_control(f"  -- leading comment\n{keyword};")
+    assert _is_transaction_control(f"/* block */ {keyword};")
+
+
+def test_statements_for_migration_strips_transaction_control_from_0002() -> None:
+    """No BEGIN/COMMIT statement from 0002's own file-level wrapper reaches the runner."""
+    migrations_dir = Path(__file__).resolve().parent.parent / "src" / "strata" / "_migrations"
+    sql = (migrations_dir / "0002_drop_fleet_tables.sql").read_text(encoding="utf-8")
+    statements = _statements_for_migration(sql)
+    assert statements  # sanity: the file has real DDL/DML left after stripping
+    assert not any(_is_transaction_control(s) for s in statements)
+    firsts = {_leading_token(s).upper() for s in statements}
+    assert "BEGIN" not in firsts
+    assert "COMMIT" not in firsts
+
+
+def _old_split_statements(sql: str) -> list[str]:
+    """Reimplementation of the pre-issue-#76 line-based splitter.
+
+    ``_split_statements`` used to accumulate whole *lines* (rather than
+    characters) before checking :func:`sqlite3.complete_statement`. Kept
+    here only to pin the new character-level splitter's output against the
+    old one for every shipped migration file below — none of them has more
+    than one statement per line, so the two splitters must agree exactly.
+    """
+    statements: list[str] = []
+    buffer = ""
+    for line in sql.splitlines(keepends=True):
+        buffer += line
+        if sqlite3.complete_statement(buffer):
+            statement = buffer.strip()
+            if statement:
+                statements.append(statement)
+            buffer = ""
+    trailing = buffer.strip()
+    if trailing:
+        statements.append(trailing)
+    return statements
+
+
+def _shipped_migration_files() -> list[Path]:
+    migrations_dir = Path(__file__).resolve().parent.parent / "src" / "strata" / "_migrations"
+    return sorted(migrations_dir.glob("*.sql"))
+
+
+@pytest.mark.parametrize("migration_file", _shipped_migration_files(), ids=lambda p: p.name)
+def test_split_statements_matches_pre_76_line_based_splitter_for_shipped_migrations(
+    migration_file: Path,
+) -> None:
+    """Regression pin: the char-level splitter agrees with the old line-based one.
+
+    Every shipped migration file is one-statement-per-line, so re-splitting
+    with the new character-driven ``_split_statements`` must reproduce
+    exactly the statement list the old line-based splitter produced —
+    confirming issue #76's fix is behavior-preserving for real migrations.
+    """
+    sql = migration_file.read_text(encoding="utf-8")
+    assert _split_statements(sql) == _old_split_statements(sql)

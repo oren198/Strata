@@ -492,8 +492,22 @@ def cmd_record(args: argparse.Namespace) -> int:
     print(f"Judgments:     {len(data['judgments'])}")
     print()
     judgments_by_contrib = {j["contribution_id"]: j for j in data["judgments"]}
+    # Count failed-judgment events per contribution (issue #57) so a pending
+    # contribution that hit a judge() failure reads as "(pending — N failed
+    # attempts)" rather than a bare "(pending)" — a verdict is never
+    # fabricated, so the forensic view distinguishes "never judged" from
+    # "judgment attempted and failed".
+    attempts_by_contrib: dict[str, int] = {}
+    for a in data.get("judgment_attempts", []):
+        cid = a["contribution_id"]
+        attempts_by_contrib[cid] = attempts_by_contrib.get(cid, 0) + 1
     for c in data["contributions"]:
-        verdict = judgments_by_contrib.get(c["id"], {}).get("decision", "(pending)")
+        judgment = judgments_by_contrib.get(c["id"])
+        if judgment is not None:
+            verdict = judgment["decision"]
+        else:
+            n = attempts_by_contrib.get(c["id"], 0)
+            verdict = f"(pending — {n} failed attempt{'s' if n != 1 else ''})" if n else "(pending)"
         print(f"  · {c['id']}  [{c['proposed_classification']:9s} → {verdict}]")
         contributor = c["contributor"]
         print(f"      by {contributor['skill']}@{contributor['scope_id']} at {contributor['ts']}")

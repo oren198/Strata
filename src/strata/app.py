@@ -45,8 +45,10 @@ from __future__ import annotations
 import importlib.resources
 import pathlib
 import sqlite3
+import threading
 from collections.abc import AsyncGenerator, Generator
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Literal
 
@@ -56,7 +58,7 @@ from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from strata.fleet_config import FleetConfig
+from strata.fleet_config import FleetConfig, Scope, Stratum
 from strata.migrator import run_migrations
 from strata.project_config import StoragePaths, resolve_storage_paths
 from strata.record_store import (
@@ -166,6 +168,264 @@ class ContributeResponse(BaseModel):
 
     contribution_id: str
     judgment: JudgmentResult
+
+
+# ---------------------------------------------------------------------------
+# Contribute choke point (issues #38, #57)
+#
+# The single place where the read-summary -> judge -> record-judgment ->
+# summary-write sequence for a scope runs. Both agent (MCP ``strata_contribute``
+# / ``strata_rejudge``) and operator (HTTP ``POST /contribute``) surfaces route
+# through ``run_contribution`` / ``rejudge_contribution`` so the serialization
+# invariant lives in exactly one place.
+# ---------------------------------------------------------------------------
+
+# Per-scope lock registry: scope_id -> Lock, guarded by one registry lock.
+# Module-level so every code path in the process shares it.
+_scope_locks: dict[str, threading.Lock] = {}
+_scope_locks_guard = threading.Lock()
+
+
+def _scope_lock(scope_id: str) -> threading.Lock:
+    """Return the process-wide lock serialising the contribute path for *scope_id*.
+
+    Single-process scope only (issue #38). The lock serialises the
+    read-summary -> judge -> record-judgment -> summary-write sequence within
+    one process — threaded FastAPI endpoints and threadpool-dispatched MCP
+    tools both run the sync path in worker threads — so the summary can never
+    reflect a judgment the record does not, nor silently drop a judgment the
+    record kept: the summary is always explainable by the record. Cross-process
+    serialisation (N separate CC sessions, each its own MCP server) is issue
+    #19 and out of scope; those still serialise the record itself on the
+    SQLite writer mutex.
+    """
+    with _scope_locks_guard:
+        lock = _scope_locks.get(scope_id)
+        if lock is None:
+            lock = threading.Lock()
+            _scope_locks[scope_id] = lock
+        return lock
+
+
+@dataclass
+class ContributionOutcome:
+    """The result of running (or re-judging) a contribution through the choke point."""
+
+    contribution_id: str
+    decision: Literal["accept_as_directive", "accept_as_context", "decline"]
+    reasoning: str
+    summary_updated: bool
+
+
+class JudgeUnavailable(Exception):
+    """Raised when the scope-manager's ``judge()`` fails during a contribution.
+
+    The contribution is already in the record (issue #57 — the record never
+    lies) and a judgment-attempt-failed *event* has been recorded against it,
+    but no judgment exists: a verdict is an exercise of scope authority and no
+    component outside the authority chain may forge one. Carries
+    ``contribution_id`` so the caller routes a retry to re-judge
+    (``strata_rejudge`` / :func:`rejudge_contribution`) instead of appending a
+    duplicate contribution.
+    """
+
+    def __init__(self, contribution_id: str, error_class: str, message: str) -> None:
+        self.contribution_id = contribution_id
+        self.error_class = error_class
+        super().__init__(message)
+
+
+def _judge_and_record(
+    *,
+    contribution: Contribution,
+    scope: Scope,
+    stratum: Stratum,
+    fleet: FleetConfig,
+    record_store: RecordStore,
+    summary_store: SummaryStore,
+    scope_manager: ScopeManager,
+    summary_max_words: int,
+) -> ContributionOutcome:
+    """Judge *contribution* against the scope's current state and persist the result.
+
+    The caller MUST hold ``_scope_lock(scope.id)`` — this reads the current
+    summary, judges, records the judgment, and writes the summary as one
+    serialized unit. On judge failure it records a judgment-attempt-failed
+    event and raises :class:`JudgeUnavailable`; no judgment row is written.
+    """
+    current_summary = summary_store.read(scope.id)
+    recent_contributions = record_store.list_contributions(scope_id=scope.id, limit=20)
+
+    # Resolve the inter-stratum parent's summary for manager context (ADR 0004
+    # Decision 2). The caller does the graph traversal; the manager is a pure
+    # judgment primitive that receives the resolved summary.
+    parent_scope = fleet.inter_stratum_parent(scope.id)
+    parent_summary = summary_store.read(parent_scope.id) if parent_scope is not None else None
+
+    try:
+        judgment: ScopeManagerJudgment = scope_manager.judge(
+            scope=scope,
+            stratum=stratum,
+            parent_summary=parent_summary,
+            current_summary=current_summary,
+            recent_contributions=recent_contributions,
+            new_contribution=contribution,
+            summary_max_words=summary_max_words,
+            entitlement=fleet.entitlement_view(scope.id),
+        )
+    except Exception as exc:
+        # Record the failure as an event against the contribution — never as a
+        # fabricated verdict (issue #57) — then surface it with the
+        # contribution id so a retry routes to re-judge, not a duplicate.
+        record_store.record_judgment_attempt(
+            contribution_id=contribution.id,
+            error_class=type(exc).__name__,
+            message=str(exc),
+        )
+        raise JudgeUnavailable(contribution.id, type(exc).__name__, str(exc)) from exc
+
+    record_store.record_judgment(
+        contribution_id=contribution.id,
+        decision=judgment.decision,
+        judged_by="scope-manager",
+        notes=judgment.reasoning,
+    )
+
+    summary_updated = False
+    if judgment.decision != "decline" and judgment.new_summary is not None:
+        # Stamp the parent-summary version the judgment was built from, so
+        # staleness stays detectable without re-running the LLM (ADR 0004 D4).
+        to_write = judgment.new_summary.model_copy(
+            update={"parent_version": parent_summary.version if parent_summary else None}
+        )
+        summary_store.write(scope.id, to_write)
+        summary_updated = True
+
+    return ContributionOutcome(
+        contribution_id=contribution.id,
+        decision=judgment.decision,
+        reasoning=judgment.reasoning,
+        summary_updated=summary_updated,
+    )
+
+
+def run_contribution(
+    *,
+    scope: Scope,
+    stratum: Stratum,
+    content: str,
+    proposed_classification: Literal["directive", "context"],
+    subject: str | None,
+    supersedes: str | None,
+    contributor: ContributorRef,
+    fleet: FleetConfig,
+    record_store: RecordStore,
+    summary_store: SummaryStore,
+    scope_manager: ScopeManager,
+    summary_max_words: int,
+) -> ContributionOutcome:
+    """Append a contribution and judge it under the scope's serialization lock.
+
+    Fixes issue #38: the whole record-append -> read-summary -> judge ->
+    record-judgment -> summary-write sequence runs under ``_scope_lock``, so two
+    concurrent contributions to the same scope are judged and written one after
+    the other. Each accepted judgment's content reaches the summary; the record
+    carries both. The append runs inside the lock too, so the manager always
+    judges against a summary consistent with every already-recorded judgment.
+
+    Callers validate the scope (exists / active / entitled) before calling.
+
+    Raises:
+        JudgeUnavailable: the scope-manager's judge() call failed. The
+            contribution and a judgment-attempt-failed event are already in the
+            record; retry via :func:`rejudge_contribution`, never a fresh
+            contribute (which would duplicate the contribution).
+        sqlite3.IntegrityError: *supersedes* references a missing contribution
+            (a client-input error the caller maps to its surface's error shape).
+    """
+    with _scope_lock(scope.id):
+        contribution = record_store.append_contribution(
+            scope_id=scope.id,
+            content=content,
+            proposed_classification=proposed_classification,
+            subject=subject,
+            supersedes=supersedes,
+            contributor=contributor,
+        )
+        return _judge_and_record(
+            contribution=contribution,
+            scope=scope,
+            stratum=stratum,
+            fleet=fleet,
+            record_store=record_store,
+            summary_store=summary_store,
+            scope_manager=scope_manager,
+            summary_max_words=summary_max_words,
+        )
+
+
+def rejudge_contribution(
+    contribution_id: str,
+    *,
+    fleet: FleetConfig,
+    record_store: RecordStore,
+    summary_store: SummaryStore,
+    scope_manager: ScopeManager,
+    summary_max_words: int,
+) -> ContributionOutcome:
+    """Idempotently (re-)judge a contribution that has no verdict yet (issue #57).
+
+    No-op returning the existing judgment if one exists. Otherwise re-reads the
+    *current* summary, judges, records the judgment, and updates the summary —
+    all under the same per-scope lock as :func:`run_contribution`, so a re-judge
+    never races a concurrent contribution or another re-judge (issue #38). A
+    verdict is an exercise of scope authority: re-judge invokes the
+    scope-manager, it never fabricates one.
+
+    Raises:
+        KeyError: *contribution_id* is not in the record.
+        RuntimeError: the contribution's scope or stratum no longer resolves in
+            the fleet config.
+        JudgeUnavailable: the scope-manager's judge() call failed again. A fresh
+            judgment-attempt-failed event is recorded; the contribution stays
+            pending and can be re-judged again later.
+    """
+    contribution = record_store.get_contribution(contribution_id)
+    if contribution is None:
+        raise KeyError(f"Contribution not found: {contribution_id!r}")
+
+    scope = fleet.get_scope(contribution.scope_id)
+    if scope is None:
+        raise RuntimeError(
+            f"Scope {contribution.scope_id!r} for contribution {contribution_id!r} "
+            "no longer exists in the fleet config."
+        )
+    stratum = next((s for s in fleet.strata if s.id == scope.stratum_id), None)
+    if stratum is None:
+        raise RuntimeError(
+            f"Stratum {scope.stratum_id!r} for scope {scope.id!r} not found in fleet config."
+        )
+
+    with _scope_lock(scope.id):
+        existing = record_store.get_judgment(contribution_id)
+        if existing is not None:
+            # Idempotent: a verdict already exists — return it, touch nothing.
+            return ContributionOutcome(
+                contribution_id=contribution_id,
+                decision=existing.decision,
+                reasoning=existing.notes or "",
+                summary_updated=False,
+            )
+        return _judge_and_record(
+            contribution=contribution,
+            scope=scope,
+            stratum=stratum,
+            fleet=fleet,
+            record_store=record_store,
+            summary_store=summary_store,
+            scope_manager=scope_manager,
+            summary_max_words=summary_max_words,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -287,7 +547,10 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
                 detail={"error": "internal_inconsistency", "scope_id": body.scope_id},
             )
 
-        # Step 3: append contribution
+        # Steps 3–7 run through the shared contribute choke point under the
+        # per-scope serialization lock (issue #38), so a concurrent operator
+        # write to the same scope cannot leave the summary unexplainable by the
+        # record.
         contributor_ref = ContributorRef(
             scope_id=body.contributor.scope_id,
             skill=body.contributor.skill,
@@ -295,13 +558,19 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
             ts=body.contributor.ts,
         )
         try:
-            contribution: Contribution = record_store.append_contribution(
-                scope_id=body.scope_id,
+            outcome = run_contribution(
+                scope=scope,
+                stratum=stratum,
                 content=body.content,
                 proposed_classification=body.proposed_classification,
                 subject=body.subject,
                 supersedes=body.supersedes,
                 contributor=contributor_ref,
+                fleet=fleet,
+                record_store=record_store,
+                summary_store=summary_store,
+                scope_manager=scope_manager,
+                summary_max_words=request_settings.summary_max_words,
             )
         except sqlite3.IntegrityError as exc:
             # The only FK on contributions is supersedes → contributions(id):
@@ -310,60 +579,27 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
                 status_code=422,
                 detail={"error": "supersedes_not_found", "supersedes": body.supersedes},
             ) from exc
-
-        # Step 4: load summary + recent contributions
-        current_summary = summary_store.read(body.scope_id)
-        recent_contributions = record_store.list_contributions(scope_id=body.scope_id, limit=20)
-
-        # Resolve the inter-stratum parent's summary for manager context (ADR 0004
-        # Decision 2). The caller (here) does the graph traversal; the manager is a
-        # pure judgment primitive that receives the resolved summary.
-        parent_scope = fleet.inter_stratum_parent(body.scope_id)
-        parent_summary = summary_store.read(parent_scope.id) if parent_scope is not None else None
-
-        # Step 5: call scope-manager
-        try:
-            judgment: ScopeManagerJudgment = scope_manager.judge(
-                scope=scope,
-                stratum=stratum,
-                parent_summary=parent_summary,
-                current_summary=current_summary,
-                recent_contributions=recent_contributions,
-                new_contribution=contribution,
-                summary_max_words=request_settings.summary_max_words,
-                entitlement=fleet.entitlement_view(body.scope_id),
-            )
-        except Exception as exc:
+        except JudgeUnavailable as exc:
+            # The contribution and a judgment-attempt-failed event are already
+            # in the record (issue #57); carry the contribution id so a retry
+            # routes to re-judge (strata_rejudge) instead of duplicating it.
             raise HTTPException(
                 status_code=500,
-                detail={"error": "scope_manager_failure", "detail": str(exc)},
+                detail={
+                    "error": "scope_manager_failure",
+                    "detail": str(exc),
+                    "error_class": exc.error_class,
+                    "contribution_id": exc.contribution_id,
+                    "retry": "strata_rejudge",
+                },
             ) from exc
 
-        # Step 6: persist the judgment
-        record_store.record_judgment(
-            contribution_id=contribution.id,
-            decision=judgment.decision,
-            judged_by="scope-manager",
-            notes=judgment.reasoning,
-        )
-
-        # Step 7: persist updated summary if accepted
-        summary_updated = False
-        if judgment.decision != "decline" and judgment.new_summary is not None:
-            # Stamp the parent-summary version the judgment was built from, so
-            # staleness stays detectable without re-running the LLM (ADR 0004 D4).
-            to_write = judgment.new_summary.model_copy(
-                update={"parent_version": parent_summary.version if parent_summary else None}
-            )
-            summary_store.write(body.scope_id, to_write)
-            summary_updated = True
-
         return ContributeResponse(
-            contribution_id=contribution.id,
+            contribution_id=outcome.contribution_id,
             judgment=JudgmentResult(
-                decision=judgment.decision,
-                reasoning=judgment.reasoning,
-                summary_updated=summary_updated,
+                decision=outcome.decision,
+                reasoning=outcome.reasoning,
+                summary_updated=outcome.summary_updated,
             ),
         )
 
@@ -446,12 +682,16 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
 
         contributions = record_store.list_contributions(scope_id=scope_id)
         judgments = record_store.list_judgments(scope_id=scope_id)
+        judgment_attempts = record_store.list_judgment_attempts(scope_id=scope_id)
 
         from dataclasses import asdict
 
         return {
             "contributions": [asdict(c) for c in contributions],
             "judgments": [asdict(j) for j in judgments],
+            # Failed-judgment events (issue #57): let the forensic view mark a
+            # pending contribution as "(pending — N failed attempts)".
+            "judgment_attempts": [asdict(a) for a in judgment_attempts],
         }
 
     return application
