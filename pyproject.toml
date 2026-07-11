@@ -44,6 +44,7 @@ asyncio_mode = "auto"
 markers = [
     "integration: tests that hit external services (e.g. real Anthropic API). Skipped unless STRATA_RUN_INTEGRATION=1.",
     "slow: slow tests (e.g. --bootstrap-venv requires network). Skipped unless STRATA_RUN_BOOTSTRAP_VENV=1.",
+    "ctrlc: Windows live Ctrl-C launch test (needs a real console). Skipped unless STRATA_RUN_CTRLC=1.",
 ]
 
 [tool.ruff]

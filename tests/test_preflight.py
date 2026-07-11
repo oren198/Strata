@@ -569,7 +569,7 @@ class TestCmdLaunchPreflight:
 
         with (
             patch("strata.__main__.run_launch_preflight", return_value=[hard_fail]),
-            patch("os.execvpe") as mock_exec,
+            patch("strata.__main__.exec_claude") as mock_exec,
         ):
             rc = main(["launch", "g_arch"])
 
@@ -590,7 +590,7 @@ class TestCmdLaunchPreflight:
         _write_launch_fleet(tmp_path, monkeypatch)
         with (
             patch("strata.__main__.run_launch_preflight") as mock_preflight,
-            patch("os.execvpe"),
+            patch("strata.__main__.exec_claude", return_value=0),
             patch("strata.__main__._run_manager_refresh"),
         ):
             rc = main(["launch", "g_arch", "--skip-preflight"])
@@ -614,7 +614,7 @@ class TestCmdLaunchPreflight:
         _write_launch_fleet(tmp_path, monkeypatch)
         with (
             patch("strata.__main__.run_launch_preflight", return_value=good_checks),
-            patch("os.execvpe") as mock_exec,
+            patch("strata.__main__.exec_claude", return_value=0) as mock_exec,
             patch("strata.__main__._run_manager_refresh"),
         ):
             rc = main(["launch", "g_arch"])

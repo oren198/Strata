@@ -8,6 +8,10 @@ Vocabulary follows CONTEXT.md verbatim: scope, skill, session, stratum, fleet.
 
 from __future__ import annotations
 
+import os
+import shutil
+import signal
+import subprocess
 import sys
 import tomllib
 from datetime import UTC, datetime
@@ -232,3 +236,76 @@ def prompt_scope(scopes: list[ScopeData]) -> ScopeData:
 def is_interactive() -> bool:
     """Return True when stdin is a TTY."""
     return sys.stdin.isatty()
+
+
+# ---------------------------------------------------------------------------
+# Handoff to claude (platform-specific)
+# ---------------------------------------------------------------------------
+
+
+def exec_claude(env: dict[str, str]) -> int:
+    """Hand the console off to the ``claude`` binary with *env* applied.
+
+    POSIX replaces this process image via :func:`os.execvpe` — a true handoff,
+    so Ctrl-C, the exit code, and tty semantics belong to Claude Code directly.
+    It never returns on success; a missing binary raises ``FileNotFoundError``
+    for the caller to translate.
+
+    Windows has no real ``exec``: there :func:`os.execvpe` spawns a *new*
+    process and the parent exits immediately, which loses the child's exit code
+    and orphans it against the console. So on Windows we spawn ``claude`` as a
+    console-sharing child, ignore SIGINT in the launcher while it runs (the
+    console delivers Ctrl-C to *both* processes; the child owns the interrupt,
+    the launcher must survive to reap it), and return the child's exit code.
+
+    Args:
+        env: The full child environment (already carries STRATA_AGENT_*).
+
+    Returns:
+        The child's exit code on Windows. On POSIX it does not return on
+        success — the process image is replaced.
+
+    Raises:
+        FileNotFoundError: When ``claude`` cannot be found on PATH. Raised on
+            both paths for parity — POSIX from ``execvpe``, Windows from
+            ``shutil.which`` — so the caller reports one message.
+    """
+    claude_bin = "claude"
+
+    if os.name != "nt":
+        # POSIX: true process replacement. execvpe resolves claude on PATH and
+        # raises FileNotFoundError when it is absent.
+        os.execvpe(claude_bin, [claude_bin], env)
+        return 0  # pragma: no cover — execvpe never returns on success.
+
+    # Windows: resolve via PATHEXT (claude may be claude.exe or a .cmd shim);
+    # a bare Popen(["claude"]) would miss that resolution.
+    resolved = shutil.which(claude_bin)
+    if resolved is None:
+        raise FileNotFoundError(claude_bin)
+    argv = _windows_claude_argv(resolved)
+
+    # The child shares this console, so a Ctrl-C reaches BOTH processes. Ignore
+    # SIGINT in the launcher for the child's lifetime so the child handles the
+    # interrupt and the launcher survives to reap it and report its real exit
+    # code; restore the handler afterward.
+    previous_handler = signal.signal(signal.SIGINT, signal.SIG_IGN)
+    try:
+        child = subprocess.Popen(argv, env=env)
+        return child.wait()
+    finally:
+        signal.signal(signal.SIGINT, previous_handler)
+
+
+def _windows_claude_argv(resolved: str) -> list[str]:
+    """Build the spawn argv for a resolved Windows ``claude`` launcher.
+
+    ``shutil.which`` may return a ``.cmd``/``.bat`` shim (the npm-installed
+    form). ``CreateProcess`` — and therefore ``subprocess.Popen`` with a list —
+    cannot execute a batch file directly (WinError 193), so route those through
+    ``cmd.exe /c``. A real ``.exe`` is spawned directly.
+    """
+    if os.path.splitext(resolved)[1].lower() in (".cmd", ".bat"):
+        comspec = os.environ.get("COMSPEC", "cmd.exe")
+        return [comspec, "/c", resolved]
+    return [resolved]
