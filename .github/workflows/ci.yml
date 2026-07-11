@@ -100,18 +100,60 @@ jobs:
           curl -fsS -o /dev/null http://127.0.0.1:8971/ui/atlas.css
           curl -fsS -o /dev/null http://127.0.0.1:8971/scopes
 
+  # Windows is the real target for `strata launch` (issue #20): POSIX uses
+  # execvp, Windows spawns a console-sharing child and propagates its exit
+  # code. A dedicated lane keeps this from regressing without ballooning the
+  # cross-platform matrix. Focused on the launch surface, not the full suite.
+  windows-launch:
+    name: windows launch (py3.12)
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install
+        run: pip install -e ".[dev]"
+
+      - name: strata launch --help
+        run: python -m strata launch --help
+
+      - name: Launch handoff — fake claude (exits 0), env bound to the child
+        run: |
+          set -eu
+          mkdir -p fakebin
+          # Fake claude: echo the bound env, then exit 0. printf keeps this off
+          # heredoc indentation; %% escapes to a literal % for the batch vars.
+          printf '@echo off\r\necho FAKE scope=%%STRATA_AGENT_SCOPE%% skill=%%STRATA_AGENT_SKILL%%\r\nexit /b 0\r\n' > fakebin/claude.cmd
+          printf 'strata:\n  - id: L1\n    name: Function\n    ordinal: 1\nscopes:\n  - id: g_arch\n    name: Architect\n    stratum_id: L1\n    default_skill: code-writer\nedges: []\n' > fleet.yaml
+          export PATH="$PWD/fakebin:$PATH"
+          export STRATA_FLEET_CONFIG="$PWD/fleet.yaml"
+          out=$(python -m strata launch g_arch --skip-preflight --skip-refresh)
+          echo "$out"
+          echo "$out" | grep -q "scope=g_arch skill=code-writer"
+
+      - name: Launch test suite (Windows spawn path + real fake-claude child)
+        run: python -m pytest tests/test_launch.py -q
+
   # Single, stable status-check context required by the branch ruleset.
   # Succeeds only if every matrix leg of `test` succeeded.
   ci:
     name: CI
-    needs: [test, wheel-smoke]
+    needs: [test, wheel-smoke, windows-launch]
     if: always()
     runs-on: ubuntu-latest
     steps:
       - name: Verify matrix result
         run: |
-          if [ "${{ needs.test.result }}" != "success" ] || [ "${{ needs.wheel-smoke.result }}" != "success" ]; then
-            echo "test: ${{ needs.test.result }}, wheel-smoke: ${{ needs.wheel-smoke.result }}"
+          if [ "${{ needs.test.result }}" != "success" ] || [ "${{ needs.wheel-smoke.result }}" != "success" ] || [ "${{ needs.windows-launch.result }}" != "success" ]; then
+            echo "test: ${{ needs.test.result }}, wheel-smoke: ${{ needs.wheel-smoke.result }}, windows-launch: ${{ needs.windows-launch.result }}"
             exit 1
           fi
           echo "All jobs passed."
