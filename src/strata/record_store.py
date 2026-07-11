@@ -50,6 +50,10 @@ def _new_judgment_id() -> str:
     return f"j_{secrets.token_hex(8)}"
 
 
+def _new_judgment_attempt_id() -> str:
+    return f"ja_{secrets.token_hex(8)}"
+
+
 # ---------------------------------------------------------------------------
 # Domain models
 # ---------------------------------------------------------------------------
@@ -104,6 +108,25 @@ class Judgment:
     judged_by: str
     notes: str | None
     created_at: str
+
+
+@dataclass(frozen=True)
+class JudgmentAttempt:
+    """A record of the scope-manager's judgment *failing* on a contribution.
+
+    An event, never a verdict (issue #57): a verdict is an exercise of scope
+    authority and only the scope-manager (or operator) may write one, so a
+    ``judge()`` failure — API outage, malformed model output — is recorded
+    here rather than fabricated as a ``decline``.  Append-only: a contribution
+    may accumulate several attempts and still, later, gain exactly one
+    judgment once a re-judge succeeds.
+    """
+
+    id: str
+    contribution_id: str
+    error_class: str
+    message: str | None
+    attempted_at: str
 
 
 # ---------------------------------------------------------------------------
@@ -267,6 +290,19 @@ class RecordStore:
             rows = self._conn.execute(sql, params).fetchall()
         return [_contribution_from_row(row) for row in rows]
 
+    def get_contribution(self, contribution_id: str) -> Contribution | None:
+        """Return the contribution with *contribution_id*, or ``None`` if absent.
+
+        Unlike :meth:`_fetch_contribution` (which raises on a missing id
+        because it only ever looks up an id it just inserted), this is the
+        public lookup used by re-judge (issue #57), where a client-supplied id
+        may legitimately not exist and a clean ``None`` beats a ``KeyError``.
+        """
+        try:
+            return self._fetch_contribution(contribution_id)
+        except KeyError:
+            return None
+
     def _fetch_contribution(self, contribution_id: str) -> Contribution:
         row = self._conn.execute(
             """
@@ -350,6 +386,24 @@ class RecordStore:
         ).fetchall()
         return [Judgment(**dict(row)) for row in rows]
 
+    def get_judgment(self, contribution_id: str) -> Judgment | None:
+        """Return the judgment for *contribution_id*, or ``None`` if unjudged.
+
+        There is at most one judgment per contribution (UNIQUE constraint), so
+        this is the idempotency check re-judge keys off (issue #57): a
+        contribution that already carries a verdict is never re-judged.
+        """
+        row = self._conn.execute(
+            """
+            SELECT id, contribution_id, decision, judged_by, notes, created_at
+            FROM judgments WHERE contribution_id = ?
+            """,
+            (contribution_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return Judgment(**dict(row))
+
     def _fetch_judgment(self, judgment_id: str) -> Judgment:
         row = self._conn.execute(
             """
@@ -361,6 +415,73 @@ class RecordStore:
         if row is None:
             raise KeyError(f"Judgment not found: {judgment_id!r}")
         return Judgment(**dict(row))
+
+    # ------------------------------------------------------------------
+    # Judgment attempts (failed-judgment events — issue #57)
+    # ------------------------------------------------------------------
+
+    def record_judgment_attempt(
+        self,
+        *,
+        contribution_id: str,
+        error_class: str,
+        message: str | None = None,
+    ) -> JudgmentAttempt:
+        """Record a failed scope-manager judgment as an event on the contribution.
+
+        This is an event, never a verdict (issue #57): the ``judgment_attempts``
+        table has no decision column, so a failure can never be mistaken for a
+        ``decline``.  Append-only — a contribution may accumulate several
+        attempts across re-judge retries.
+
+        Args:
+            contribution_id: The contribution whose judgment failed.
+            error_class:     The failing exception's class name (e.g.
+                             ``'AuthenticationError'``, ``'ValueError'``).
+            message:         Optional free-text detail (the exception message).
+
+        Returns:
+            The newly recorded :class:`JudgmentAttempt`.
+
+        Raises:
+            sqlite3.IntegrityError: If *contribution_id* does not exist (FK).
+        """
+        attempt_id = _new_judgment_attempt_id()
+        self._conn.execute(
+            """
+            INSERT INTO judgment_attempts (id, contribution_id, error_class, message)
+            VALUES (?, ?, ?, ?)
+            """,
+            (attempt_id, contribution_id, error_class, message),
+        )
+        self._conn.commit()
+        row = self._conn.execute(
+            """
+            SELECT id, contribution_id, error_class, message, attempted_at
+            FROM judgment_attempts WHERE id = ?
+            """,
+            (attempt_id,),
+        ).fetchone()
+        return JudgmentAttempt(**dict(row))
+
+    def list_judgment_attempts(self, *, scope_id: str) -> list[JudgmentAttempt]:
+        """Return all judgment-attempt events for contributions in *scope_id*.
+
+        Joins ``judgment_attempts`` against ``contributions`` to filter by
+        scope, ordered by ``attempted_at`` ascending — the forensic view of
+        which contributions failed judgment and how many times (issue #57).
+        """
+        rows = self._conn.execute(
+            """
+            SELECT a.id, a.contribution_id, a.error_class, a.message, a.attempted_at
+            FROM judgment_attempts a
+            JOIN contributions c ON a.contribution_id = c.id
+            WHERE c.scope_id = ?
+            ORDER BY a.attempted_at ASC
+            """,
+            (scope_id,),
+        ).fetchall()
+        return [JudgmentAttempt(**dict(row)) for row in rows]
 
 
 # ---------------------------------------------------------------------------

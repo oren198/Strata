@@ -27,7 +27,6 @@ Vocabulary follows CONTEXT.md.
 
 from __future__ import annotations
 
-import re
 import sqlite3
 from pathlib import Path
 
@@ -60,43 +59,23 @@ def _applied_migration_names(conn: sqlite3.Connection) -> set[str]:
     return {row[0] for row in rows}
 
 
-# Transaction-control statements a migration file might carry on its own
-# (e.g. 0002 wraps its drop-and-rebuild in BEGIN…COMMIT). The runner now
-# supplies the single real transaction for the whole file, so these are
-# stripped rather than executed — nesting them would either error
-# ("cannot start a transaction within a transaction") or, worse, prematurely
-# commit the runner's own transaction.
-_TRANSACTION_CONTROL_STATEMENTS = {
-    "BEGIN",
-    "BEGIN DEFERRED",
-    "BEGIN DEFERRED TRANSACTION",
-    "BEGIN IMMEDIATE",
-    "BEGIN IMMEDIATE TRANSACTION",
-    "BEGIN EXCLUSIVE",
-    "BEGIN EXCLUSIVE TRANSACTION",
-    "BEGIN TRANSACTION",
-    "COMMIT",
-    "COMMIT TRANSACTION",
-    "END",
-    "END TRANSACTION",
-}
-
-
 def _split_statements(sql: str) -> list[str]:
     """Split *sql* into individual statements, in file order.
 
     Migration files are plain DDL/DML, but statements can still legitimately
     contain semicolons inside string literals or comments (e.g. a default
-    value or a descriptive comment). Naively splitting on ``;`` would cut
-    those in half, so instead we accumulate lines and use
-    :func:`sqlite3.complete_statement` — the same technique the ``sqlite3``
-    CLI uses — to find real statement boundaries.
+    value or a descriptive comment), and more than one statement can share a
+    single line. Naively splitting on ``;`` would cut string literals in
+    half and miss same-line statement boundaries, so instead we accumulate
+    characters and use :func:`sqlite3.complete_statement` — the same
+    technique the ``sqlite3`` CLI uses — to find real statement boundaries
+    wherever they fall, including mid-line.
     """
     statements: list[str] = []
     buffer = ""
-    for line in sql.splitlines(keepends=True):
-        buffer += line
-        if sqlite3.complete_statement(buffer):
+    for char in sql:
+        buffer += char
+        if char == ";" and sqlite3.complete_statement(buffer):
             statement = buffer.strip()
             if statement:
                 statements.append(statement)
@@ -110,33 +89,64 @@ def _split_statements(sql: str) -> list[str]:
     return statements
 
 
-_LINE_COMMENT_RE = re.compile(r"--[^\n]*")
-_BLOCK_COMMENT_RE = re.compile(r"/\*.*?\*/", re.DOTALL)
+# Every transaction-control form SQLite accepts (BEGIN, BEGIN DEFERRED,
+# BEGIN IMMEDIATE TRANSACTION, COMMIT, COMMIT TRANSACTION, END, END
+# TRANSACTION, ...) starts with one of these three keywords, and no
+# legitimate migration DDL/DML statement does — so classification is by
+# first token rather than a whitelist of exact forms.
+_TRANSACTION_CONTROL_FIRST_TOKENS = {"BEGIN", "COMMIT", "END"}
+
+
+def _leading_token(statement: str) -> str:
+    """Return *statement*'s first SQL token, skipping leading whitespace/comments.
+
+    Scans forward character by character instead of using a regex, so it
+    never has to reason about string literals: it stops at the first
+    non-whitespace, non-comment character, which for any legitimate SQL
+    statement is the start of the real token — always before any string
+    literal the statement might contain later on. This is what makes it
+    safe against a literal containing ``--`` or ``BEGIN``: that text is
+    never inspected because scanning stops at the token before reaching it.
+    """
+    i, n = 0, len(statement)
+    while i < n:
+        if statement[i].isspace():
+            i += 1
+        elif statement[i : i + 2] == "--":
+            newline = statement.find("\n", i)
+            i = n if newline == -1 else newline + 1
+        elif statement[i : i + 2] == "/*":
+            close = statement.find("*/", i + 2)
+            i = n if close == -1 else close + 2
+        else:
+            break
+    j = i
+    while j < n and (statement[j].isalnum() or statement[j] == "_"):
+        j += 1
+    return statement[i:j]
 
 
 def _is_transaction_control(statement: str) -> bool:
-    """Return True if *statement* is a bare ``BEGIN``/``COMMIT``/``END``.
+    """Return True if *statement*'s first token is ``BEGIN``, ``COMMIT``, or ``END``.
 
     A statement returned by :func:`_split_statements` may have leading
     comments glued to it (e.g. 0002's file-level comment block ends right
     before its ``BEGIN;``, so ``sqlite3.complete_statement`` treats them as
-    one statement). Comments are stripped before comparing so a
-    comment-prefixed ``BEGIN``/``COMMIT`` is still recognised and dropped —
-    otherwise it would slip through as literal SQL and collide with the
-    transaction ``run_migrations`` itself opens.
+    one statement) — :func:`_leading_token` skips those safely before the
+    comparison, so a comment-prefixed ``BEGIN``/``COMMIT`` is still
+    recognised and dropped. Otherwise it would slip through as literal SQL
+    and collide with the transaction ``run_migrations`` itself opens.
     """
-    without_comments = _BLOCK_COMMENT_RE.sub("", statement)
-    without_comments = _LINE_COMMENT_RE.sub("", without_comments)
-    normalized = without_comments.strip().rstrip(";").strip().upper()
-    return normalized in _TRANSACTION_CONTROL_STATEMENTS
+    return _leading_token(statement).upper() in _TRANSACTION_CONTROL_FIRST_TOKENS
 
 
 def _statements_for_migration(sql: str) -> list[str]:
     """Return the statements to execute for a migration file's SQL.
 
-    Strips any ``BEGIN``/``COMMIT`` the file carries on its own — see
-    ``_TRANSACTION_CONTROL_STATEMENTS`` — since ``run_migrations`` now wraps
-    the whole file (script + tracking row) in one explicit transaction.
+    Strips any ``BEGIN``/``COMMIT``/``END`` the file carries on its own —
+    see ``_TRANSACTION_CONTROL_FIRST_TOKENS`` — since ``run_migrations`` now
+    wraps the whole file (script + tracking row) in one explicit
+    transaction.
     """
     statements = _split_statements(sql)
     return [s for s in statements if not _is_transaction_control(s)]
