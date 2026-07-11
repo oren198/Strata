@@ -3,8 +3,8 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "strata"
-version = "0.0.1"
+name = "mem-strata"
+version = "1.5.0"
 description = "Shared memory for agent fleets."
 requires-python = ">=3.11"
 dependencies = [

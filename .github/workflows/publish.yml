@@ -1,0 +1,75 @@
+# Publish to PyPI via trusted publishing (OIDC — no API token stored in
+# GitHub secrets). Runs on a published GitHub release.
+#
+# ---------------------------------------------------------------------------
+# ONE-TIME MANUAL STEP (owner does this once on pypi.org before the first
+# release runs this workflow):
+#
+#   On https://pypi.org, register a trusted publisher for a project named
+#   `mem-strata` pointing at:
+#     - Owner/repo:        oren198/Strata
+#     - Workflow filename: publish.yml
+#     - Environment name:  pypi
+#
+#   (If the `mem-strata` project doesn't exist on PyPI yet, PyPI supports
+#   "pending publisher" registration ahead of the first publish — same
+#   settings, done from https://pypi.org/manage/account/publishing/.)
+#
+# No PyPI API token is needed or should be added to repo/environment
+# secrets — trusted publishing exchanges a short-lived OIDC token for a
+# scoped upload token per run.
+# ---------------------------------------------------------------------------
+
+name: Publish to PyPI
+
+on:
+  release:
+    types: [published]
+
+# Read-only by default; id-token:write is what trusted publishing needs to
+# mint the OIDC token exchanged for a PyPI upload token.
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build distributions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install build
+        run: pip install build
+
+      - name: Build sdist and wheel
+        run: python -m build
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    name: publish to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/mem-strata/
+    permissions:
+      id-token: write
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1

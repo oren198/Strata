@@ -66,7 +66,7 @@ if TYPE_CHECKING:
     from strata.scope_manager import ScopeManager
     from strata.summary_store import ScopeSummary, SummaryStore
 
-from strata import __version__
+from strata import DISTRIBUTION_NAME, __version__
 from strata.launch import (
     SkillResolutionError,
     StrataRoleParseError,
@@ -1015,13 +1015,14 @@ def _self_install_spec() -> str | None:
     Uses the PEP 610 ``direct_url.json`` metadata pip records for installs
     from a path or VCS URL. Returns None when no safe source can be
     determined (e.g. a hypothetical index install) — the caller must fail
-    actionably rather than ``pip install strata``, which today resolves to an
-    unrelated PyPI package (issue #49).
+    actionably rather than ``pip install strata``, which resolves to an
+    unrelated PyPI package; this project publishes as ``mem-strata``
+    (issue #49).
     """
     import importlib.metadata  # noqa: PLC0415
 
     try:
-        dist = importlib.metadata.distribution("strata")
+        dist = importlib.metadata.distribution(DISTRIBUTION_NAME)
     except importlib.metadata.PackageNotFoundError:
         return None
     try:
@@ -1325,12 +1326,13 @@ def cmd_register(args: argparse.Namespace) -> int:
                 if install_spec is None:
                     print(
                         f"  {_glyph('fail')} cannot determine a safe install source for "
-                        "strata: this process was not\n"
-                        "    installed from a local path or VCS URL, and strata is not "
-                        "yet published to PyPI\n"
-                        "    (the name currently belongs to an unrelated package). "
-                        "Install strata into\n"
-                        "    .strata/.venv/ manually, or re-run once Strata is on PyPI.",
+                        f"strata: this process was not\n"
+                        "    installed from a local path or VCS URL (PEP 610 direct_url.json "
+                        "not found for the\n"
+                        f"    `{DISTRIBUTION_NAME}` distribution). Install strata into\n"
+                        f"    .strata/.venv/ manually (e.g. `pip install {DISTRIBUTION_NAME}`), "
+                        "or re-run --bootstrap-venv\n"
+                        "    from a path or VCS install (editable install, git clone, etc).",
                         file=sys.stderr,
                     )
                     return 1

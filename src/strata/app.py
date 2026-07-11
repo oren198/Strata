@@ -58,6 +58,7 @@ from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from strata import __version__
 from strata.fleet_config import FleetConfig, Scope, Stratum
 from strata.migrator import run_migrations
 from strata.project_config import StoragePaths, resolve_storage_paths
@@ -467,7 +468,7 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
     application = FastAPI(
         title="Strata",
         description="Shared memory for agent fleets.",
-        version="0.0.1",
+        version=__version__,
         lifespan=lifespan,
     )
 
