@@ -298,9 +298,10 @@ The original `make` targets (`make migrate`, `make bootstrap`, `make run`, `make
 
 `strata launch [scope_id]` validates the target scope against `fleet.yaml`
 directly (embedded mode — no backend required), resolves the skill from the
-scope's declaration, generates a session ID, and `execvp`s `claude` with
-`STRATA_AGENT_SCOPE`, `STRATA_AGENT_SKILL`, and `STRATA_AGENT_SESSION_ID`
-already set. Run `strata start` only if you also want the Console UI.
+scope's declaration, generates a session ID, and hands the session off to
+`claude` with `STRATA_AGENT_SCOPE`, `STRATA_AGENT_SKILL`, and
+`STRATA_AGENT_SESSION_ID` already set. Run `strata start` only if you also want
+the Console UI.
 
 ```bash
 strata launch g_arch                            # use default_skill from fleet.yaml
@@ -322,6 +323,15 @@ skill = "code-writer"   # optional; resolved from fleet.yaml if omitted
 The file is committed to git alongside the project. When you open the repo and
 run `strata launch`, Strata finds the file, validates the scope, and launches
 `claude` already bound — no manual `export` step needed.
+
+#### Platform notes
+
+`strata launch` works on POSIX and Windows. On POSIX it `execvp`s `claude`, so
+the launcher process is replaced outright. Windows has no real `exec`, so the
+launcher resolves `claude` on `PATH` (including `.cmd`/`.exe` shims), spawns it
+as a child sharing the console, and forwards its exit code. Ctrl-C reaches the
+`claude` session in both cases, and the child's exit code becomes the exit code
+of `strata launch`.
 
 ### Upgrading from V1.1 to V1.2
 
