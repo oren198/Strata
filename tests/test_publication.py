@@ -526,6 +526,7 @@ def test_mechanical_propagation_withdraws_directive_only_anchored_item(
         "g_team",
         {"c_dir1"},
         "c_trigger1",
+        surviving_directive_ids=set(),
         record_store=record_store,
         summaries_dir=summaries_dir,
     )
@@ -560,6 +561,7 @@ def test_mechanical_propagation_spares_item_with_surviving_subject_anchor(
         "g_team",
         {"c_dir1"},
         "c_trigger1",
+        surviving_directive_ids=set(),
         record_store=record_store,
         summaries_dir=summaries_dir,
     )
@@ -586,6 +588,7 @@ def test_mechanical_propagation_spares_item_anchored_to_a_different_surviving_di
         "g_team",
         {"c_dir1"},  # c_dir2 survives
         "c_trigger1",
+        surviving_directive_ids={"c_dir2"},
         record_store=record_store,
         summaries_dir=summaries_dir,
     )
@@ -594,12 +597,58 @@ def test_mechanical_propagation_spares_item_anchored_to_a_different_surviving_di
     assert read_publication("g_team", summaries_dir=summaries_dir) == [item]
 
 
+def test_mechanical_propagation_fires_when_the_last_anchor_vanishes_in_a_later_event(
+    record_store, summaries_dir
+) -> None:
+    # Review fix (PR #97): anchor vanishing is a property of the summary's
+    # CURRENT state, not of one removal batch. A two-anchor item loses
+    # c_dir1 in one event (it survives — c_dir2 still stands), then loses
+    # c_dir2 in a LATER event: that second event removes only c_dir2, but
+    # the item's anchors have now ALL vanished and it must be withdrawn.
+    item = PublishedItem(
+        id="pub_x4",
+        kind="directive",
+        content="Two-anchor item, anchors vanish across separate events.",
+        subject=None,
+        anchors=["directive:c_dir1", "directive:c_dir2"],
+        published_at="2026-07-12T00:00:00+00:00",
+    )
+    _write_publication("g_team", [item], summaries_dir=summaries_dir)
+
+    first = propagate_directive_removals(
+        "g_team",
+        {"c_dir1"},
+        "c_trigger1",
+        surviving_directive_ids={"c_dir2"},
+        record_store=record_store,
+        summaries_dir=summaries_dir,
+    )
+    assert first == []
+
+    second = propagate_directive_removals(
+        "g_team",
+        {"c_dir2"},
+        "c_trigger2",
+        surviving_directive_ids=set(),
+        record_store=record_store,
+        summaries_dir=summaries_dir,
+    )
+
+    assert [i.id for i in second] == [item.id]
+    assert read_publication("g_team", summaries_dir=summaries_dir) == []
+    withdraw_act = next(
+        a for a in record_store.list_publication_acts(scope_id="g_team") if a.act == "withdraw"
+    )
+    assert withdraw_act.trigger == "c_trigger2"
+
+
 def test_mechanical_propagation_noop_for_empty_publication(record_store, summaries_dir) -> None:
     assert (
         propagate_directive_removals(
             "g_never_published",
             {"c_dir1"},
             "c_trigger1",
+            surviving_directive_ids=set(),
             record_store=record_store,
             summaries_dir=summaries_dir,
         )

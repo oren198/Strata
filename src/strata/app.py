@@ -341,6 +341,7 @@ def _judge_and_record(
                 scope.id,
                 removed_directive_ids,
                 contribution.id,
+                surviving_directive_ids=new_directive_ids,
                 record_store=record_store,
                 summaries_dir=str(summary_store.summaries_dir),
             )

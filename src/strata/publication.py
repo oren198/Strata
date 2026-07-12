@@ -666,22 +666,34 @@ def propagate_directive_removals(
     removed_directive_ids: Collection[str],
     trigger_id: str,
     *,
+    surviving_directive_ids: Collection[str],
     record_store: RecordStore,
     summaries_dir: str,
 ) -> list[PublishedItem]:
-    """Mechanically withdraw published items whose anchors are now ALL removed directives.
+    """Mechanically withdraw published items none of whose anchors still stand.
 
     ADR 0007 D3's mechanical path: no LLM in the loop. An item survives if
-    ANY of its anchors still stands — including any ``subject:`` anchor, and
-    including any ``directive:`` anchor NOT in *removed_directive_ids*. Only
-    an item every one of whose anchors is a ``directive:`` anchor now in
-    *removed_directive_ids* is withdrawn.
+    ANY of its anchors still stands — any ``subject:`` anchor, or any
+    ``directive:`` anchor whose id is in *surviving_directive_ids* (the
+    directive ids present in the scope's summary AFTER this event's write).
+    Only a directive-only-anchored item with no surviving anchor is
+    withdrawn.
+
+    Vanishing is checked against the summary's CURRENT state, not against
+    *removed_directive_ids* alone: a multi-anchored item loses its anchors
+    across SEPARATE supersession/retirement events, and the ADR's rule —
+    "withdraws any published item whose anchors all vanished" — must fire on
+    the event that removes the LAST one, regardless of when the others went.
+    *removed_directive_ids* is the change that triggered this call; it
+    gates the fast path and is what makes the withdrawal attributable to
+    *trigger_id*.
 
     The caller MUST already hold ``strata.locks.scope_lock(scope_id)`` — this
     is called from the three choke points that remove a directive from a
     scope's summary (:func:`strata.app._judge_and_record`,
     :func:`strata.operator.operator_supersede`,
-    :func:`strata.operator.operator_retire`), all already inside that lock.
+    :func:`strata.operator.operator_retire`), all already inside that lock,
+    after the new summary is written.
 
     Each withdrawal appends a ``withdraw`` act with ``trigger=trigger_id``
     and NO judgment row (a mechanical consequence of an already-judged
@@ -694,6 +706,9 @@ def propagate_directive_removals(
             summary (superseded or retired).
         trigger_id: The record id of the triggering event (a contribution id
             or an operator retirement id) — carried on each withdraw act.
+        surviving_directive_ids: Directive ids present in the scope's summary
+            after this event's write — the set anchor survival is checked
+            against.
 
     Returns:
         The published items that were withdrawn (empty if none qualified).
@@ -705,13 +720,13 @@ def propagate_directive_removals(
     if not current_publication:
         return []
 
-    removed = set(removed_directive_ids)
+    surviving = set(surviving_directive_ids)
     to_withdraw: list[PublishedItem] = []
     for item in current_publication:
         if not _is_directive_only_anchor_set(item.anchors):
             continue
         directive_ids = {_anchor_directive_id(a) for a in item.anchors}
-        if directive_ids <= removed:
+        if not (directive_ids & surviving):
             to_withdraw.append(item)
 
     if not to_withdraw:

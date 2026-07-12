@@ -660,6 +660,7 @@ def operator_supersede(
             scope_id,
             {directive_id},
             contribution.id,
+            surviving_directive_ids={d.id for d in new_directives},
             record_store=record_store,
             summaries_dir=str(summary_store.summaries_dir),
         )
@@ -729,6 +730,7 @@ def operator_retire(
             scope_id,
             {directive_id},
             retirement.id,
+            surviving_directive_ids={d.id for d in new_directives},
             record_store=record_store,
             summaries_dir=str(summary_store.summaries_dir),
         )
