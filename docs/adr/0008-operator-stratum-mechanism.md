@@ -1,6 +1,6 @@
 # ADR 0008 — Operator Stratum Mechanism: Storage, Verbatim Layer, Judge-Aware Rendering, Corrections
 
-**Status:** Proposed (architect grill 2026-07-12; owner ratification pending)
+**Status:** Accepted (architect grill 2026-07-12; owner-ratified 2026-07-12)
 **Date:** 2026-07-12
 **Related:** issue #80 (adoption decision + owner rulings — closes when this
 ADR lands), #91 (implementation), #83 (library primitives this lands inside;

@@ -1,6 +1,6 @@
 # ADR 0007 — Publication Mechanism: The Publication as a Judged Outward Artifact
 
-**Status:** Proposed (architect grill 2026-07-12; owner ratification pending).
+**Status:** Accepted (architect grill 2026-07-12; owner-ratified 2026-07-12).
 Amends ADR 0006 D3 — see § Decision D4 and the erratum note in ADR 0006.
 **Date:** 2026-07-12
 **Related:** ADR 0006 (entitlement; D3 amended here), ADR 0004 (read-time
