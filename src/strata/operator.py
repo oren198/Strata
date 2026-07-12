@@ -30,6 +30,15 @@ Same human, two capacities, two records — operator-stratum acts never enter
 a scope's record, and scope corrections never enter the operator's own
 record (ADR 0008 D1/D4).
 
+An in-person correction (capacity 2) that removes a directive from a scope's
+summary is also one of the three ADR 0007 D3 mechanical-propagation choke
+points: :func:`operator_supersede` and :func:`operator_retire` call
+:func:`strata.publication.propagate_directive_removals` after their splice,
+under the same lock, so a published item anchored only to the
+superseded/retired directive is withdrawn from that scope's publication with
+no LLM in the loop — exactly as it would be for an ordinary contribution
+judgment's rewrite (:func:`strata.app._judge_and_record`).
+
 This module also provides :func:`operator_memory_binding` (what operator
 memory binds a scope, for judge-aware rendering — ADR 0008 D3) and
 :func:`operator_health` (the constitutional-not-operational size/churn
@@ -53,6 +62,7 @@ import yaml
 
 from strata.fleet_config import FleetConfig
 from strata.locks import scope_lock
+from strata.publication import propagate_directive_removals
 from strata.record_store import ContributorRef, OperatorAct, RecordStore, Retirement
 from strata.summary_store import Directive, SummaryStore
 
@@ -642,6 +652,17 @@ def operator_supersede(
             update={"directives": new_directives, "updated_at": ts}
         )
         summary_store.write(scope_id, to_write)
+
+        # ADR 0007 D3 mechanical propagation: the superseded directive's id
+        # just vanished from the summary — withdraw any published item
+        # anchored only to it. No LLM in the loop.
+        propagate_directive_removals(
+            scope_id,
+            {directive_id},
+            contribution.id,
+            record_store=record_store,
+            summaries_dir=str(summary_store.summaries_dir),
+        )
         return new_directive
 
 
@@ -701,4 +722,14 @@ def operator_retire(
             update={"directives": new_directives, "updated_at": retirement.created_at}
         )
         summary_store.write(scope_id, to_write)
+
+        # ADR 0007 D3 mechanical propagation: same as operator_supersede's —
+        # withdraw any published item anchored only to the retired directive.
+        propagate_directive_removals(
+            scope_id,
+            {directive_id},
+            retirement.id,
+            record_store=record_store,
+            summaries_dir=str(summary_store.summaries_dir),
+        )
         return retirement
