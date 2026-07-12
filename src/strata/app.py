@@ -63,6 +63,11 @@ from strata.locks import scope_lock as _scope_lock
 from strata.migrator import run_migrations
 from strata.operator import operator_memory_binding
 from strata.project_config import StoragePaths, resolve_storage_paths
+from strata.publication import (
+    apply_judged_withdrawals,
+    propagate_directive_removals,
+    read_publication,
+)
 from strata.record_store import (
     Contribution,
     ContributorRef,
@@ -252,6 +257,17 @@ def _judge_and_record(
         scope.id, fleet=fleet, summaries_dir=summary_store.summaries_dir
     )
 
+    # ADR 0007 D3/D5: this scope's own current publication, and the
+    # publications of every peer scope referenced by this scope's chain —
+    # the rendered evidence the judge's withdraw_published verdict and the
+    # #79 admission rule's "peer X published this" check are checked against.
+    entitlement = fleet.entitlement_view(scope.id)
+    current_publication = read_publication(scope.id, summaries_dir=str(summary_store.summaries_dir))
+    peer_publications = [
+        (peer.id, read_publication(peer.id, summaries_dir=str(summary_store.summaries_dir)))
+        for peer in sorted(entitlement.referenced_peers, key=lambda s: s.id)
+    ]
+
     try:
         judgment: ScopeManagerJudgment = scope_manager.judge(
             scope=scope,
@@ -261,8 +277,10 @@ def _judge_and_record(
             recent_contributions=recent_contributions,
             new_contribution=contribution,
             summary_max_words=summary_max_words,
-            entitlement=fleet.entitlement_view(scope.id),
+            entitlement=entitlement,
             operator_memory=operator_memory,
+            current_publication=current_publication,
+            peer_publications=peer_publications,
         )
     except Exception as exc:
         # Record the failure as an event against the contribution — never as a
@@ -291,6 +309,42 @@ def _judge_and_record(
         )
         summary_store.write(scope.id, to_write)
         summary_updated = True
+
+        # ADR 0007 D3 — staleness propagation, two paths, both under the
+        # lock this function's caller already holds:
+        #
+        # 1. Judged propagation (D3/D5): the judge itself named published
+        #    items whose belief this rewrite drops or contradicts. Each
+        #    withdrawal carries the SAME judged_by/reasoning as this
+        #    contribution's own judgment — it was judged, just as part of
+        #    this call rather than a fresh one.
+        if judgment.withdraw_published:
+            apply_judged_withdrawals(
+                scope.id,
+                judgment.withdraw_published,
+                judged_by="scope-manager",
+                reasoning=judgment.reasoning,
+                record_store=record_store,
+                summaries_dir=str(summary_store.summaries_dir),
+            )
+
+        # 2. Mechanical propagation (D3): diff surviving directive ids —
+        #    any published item anchored ONLY to directives that just
+        #    vanished from the summary is withdrawn, no LLM in the loop.
+        previous_directive_ids = (
+            {d.id for d in current_summary.directives} if current_summary is not None else set()
+        )
+        new_directive_ids = {d.id for d in judgment.new_summary.directives}
+        removed_directive_ids = previous_directive_ids - new_directive_ids
+        if removed_directive_ids:
+            propagate_directive_removals(
+                scope.id,
+                removed_directive_ids,
+                contribution.id,
+                surviving_directive_ids=new_directive_ids,
+                record_store=record_store,
+                summaries_dir=str(summary_store.summaries_dir),
+            )
 
     return ContributionOutcome(
         contribution_id=contribution.id,

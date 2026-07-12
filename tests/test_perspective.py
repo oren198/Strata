@@ -35,6 +35,7 @@ from strata.fleet_config import FleetConfig
 from strata.migrator import run_migrations
 from strata.operator import OperatorItem
 from strata.perspective import compose_perspective
+from strata.publication import PublishedItem
 from strata.record_store import RecordStore
 from strata.summary_store import ScopeSummary, SummaryStore
 
@@ -183,6 +184,15 @@ def test_golden_equivalence_mcp_tool_matches_compose_perspective(tmp_path: Path)
     store = _seed_summaries(summaries_dir)
     fleet = FleetConfig.load(fleet_path)
 
+    # ADR 0007 D4: the MCP tool ALWAYS wires a publication_reader, so the
+    # direct library call must pass an equivalent one (reading the same
+    # on-disk publication artifacts) for the two paths to stay comparable —
+    # peer layers now carry a "publication" payload, not a "summary" one.
+    from strata.publication import read_publication
+
+    def _publication_reader(scope_id: str) -> list:
+        return read_publication(scope_id, summaries_dir=summaries_dir)
+
     # g_peer_b has no summary file, so each compose_perspective call
     # synthesizes an empty one stamped with the current time (issue #59).
     # Freeze it so the two independent calls below (direct + via the MCP
@@ -193,7 +203,9 @@ def test_golden_equivalence_mcp_tool_matches_compose_perspective(tmp_path: Path)
     # Direct library call.
     with patch("strata.perspective.datetime") as mock_dt:
         mock_dt.now.return_value = fixed_now
-        direct_result = compose_perspective("g_team", fleet=fleet, summary_store=store)
+        direct_result = compose_perspective(
+            "g_team", fleet=fleet, summary_store=store, publication_reader=_publication_reader
+        )
 
     # Through the MCP tool (entitlement checks + delegation).
     mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
@@ -231,17 +243,16 @@ def test_golden_equivalence_mcp_tool_matches_compose_perspective(tmp_path: Path)
     assert "g_note_a" not in layer_scope_ids
     assert "g_note_b" not in layer_scope_ids
 
-    # Spot-check summary content on a couple of layers.
+    # Spot-check layer payloads. Self/ancestor layers still carry a full
+    # "summary"; peer layers carry "publication" instead (ADR 0007 D4) — none
+    # of the seeded peer scopes have published anything, so each gets the
+    # honestly empty face rather than its (seeded but irrelevant) summary.
     layers_by_id = {layer["scope_id"]: layer for layer in direct_result["layers"]}
     assert layers_by_id["g_team"]["summary"]["context"] == "team context"
-    assert layers_by_id["g_peer_a"]["summary"]["context"] == "peer a context"
-
-    # g_peer_b has no summary file on disk — synthesized empty summary.
-    peer_b_summary = layers_by_id["g_peer_b"]["summary"]
-    assert peer_b_summary["directives"] == []
-    assert peer_b_summary["context"] == ""
-    assert peer_b_summary["version"] == 0
-    assert peer_b_summary["exists"] is False
+    assert "summary" not in layers_by_id["g_peer_a"]
+    assert layers_by_id["g_peer_a"]["publication"] == {"items": []}
+    assert layers_by_id["g_peer_b"]["publication"] == {"items": []}
+    assert layers_by_id["g_exec_peer"]["publication"] == {"items": []}
 
 
 # ---------------------------------------------------------------------------
@@ -374,6 +385,15 @@ def _make_operator_reader(memory: dict[str, list[OperatorItem]]):
 
     def _reader(scope_id: str) -> list[OperatorItem]:
         return memory.get(scope_id, [])
+
+    return _reader
+
+
+def _make_publication_reader(publications: dict[str, list[PublishedItem]]):
+    """Build a publication_reader callable from a plain {scope_id: [items]} dict."""
+
+    def _reader(scope_id: str) -> list[PublishedItem]:
+        return publications.get(scope_id, [])
 
     return _reader
 
@@ -562,3 +582,90 @@ def test_operator_reader_none_default_changes_nothing(tmp_path: Path) -> None:
     assert default_result == explicit_none_result
     assert default_result["_layers_count"] == 6
     assert all(layer["relation"] != "operator" for layer in default_result["layers"])
+
+
+# ---------------------------------------------------------------------------
+# ADR 0007 D4 — publication_reader: peer layers carry publications, not
+# internal summaries. extra_context_scopes layers are unaffected.
+# ---------------------------------------------------------------------------
+
+
+def test_publication_reader_peer_layers_carry_publication_payload(tmp_path: Path) -> None:
+    """With publication_reader given, peer layers carry items and no "summary" key."""
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fixture_fleet_yaml(tmp_path)
+    store = _seed_summaries(summaries_dir)
+    fleet = FleetConfig.load(fleet_path)
+
+    item = PublishedItem(
+        id="pub_a1",
+        kind="context",
+        content="Peer A's outward face.",
+        subject="status",
+        anchors=["subject:status"],
+        published_at="2026-07-12T00:00:00+00:00",
+    )
+    reader = _make_publication_reader({"g_peer_a": [item]})
+
+    result = compose_perspective(
+        "g_team", fleet=fleet, summary_store=store, publication_reader=reader
+    )
+
+    peer_a_layer = next(layer for layer in result["layers"] if layer["scope_id"] == "g_peer_a")
+    assert peer_a_layer["relation"] == "peer_reference"
+    assert peer_a_layer["binding"] is False
+    assert "summary" not in peer_a_layer
+    assert peer_a_layer["publication"] == {
+        "items": [
+            {
+                "id": "pub_a1",
+                "kind": "context",
+                "content": "Peer A's outward face.",
+                "subject": "status",
+                "anchors": ["subject:status"],
+                "published_at": "2026-07-12T00:00:00+00:00",
+            }
+        ]
+    }
+
+    # A peer with no published items gets the honestly empty face — the
+    # layer is still present, just with zero items.
+    peer_b_layer = next(layer for layer in result["layers"] if layer["scope_id"] == "g_peer_b")
+    assert peer_b_layer["publication"] == {"items": []}
+
+
+def test_publication_reader_none_default_composes_full_peer_summaries(tmp_path: Path) -> None:
+    """The legacy call shape (publication_reader=None) is unchanged — peers carry summaries."""
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fixture_fleet_yaml(tmp_path)
+    store = _seed_summaries(summaries_dir)
+    fleet = FleetConfig.load(fleet_path)
+
+    result = compose_perspective("g_team", fleet=fleet, summary_store=store)
+
+    peer_a_layer = next(layer for layer in result["layers"] if layer["scope_id"] == "g_peer_a")
+    assert "publication" not in peer_a_layer
+    assert peer_a_layer["summary"]["context"] == "peer a context"
+
+
+def test_publication_reader_does_not_affect_extra_context_scopes(tmp_path: Path) -> None:
+    """extra_context_scopes layers always carry a full summary, regardless of publication_reader."""
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fixture_fleet_yaml(tmp_path)
+    store = _seed_summaries(summaries_dir)
+    fleet = FleetConfig.load(fleet_path)
+
+    reader = _make_publication_reader({})  # never returns anything — proves it's never consulted
+
+    result = compose_perspective(
+        "g_team",
+        fleet=fleet,
+        summary_store=store,
+        extra_context_scopes=["g_note_a"],
+        publication_reader=reader,
+    )
+
+    extra_layer = next(layer for layer in result["layers"] if layer["scope_id"] == "g_note_a")
+    assert extra_layer["relation"] == "extra_context"
+    assert "publication" not in extra_layer
+    assert "summary" in extra_layer

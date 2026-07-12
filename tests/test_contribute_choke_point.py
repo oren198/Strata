@@ -43,6 +43,7 @@ from strata.app import (  # noqa: E402
 )
 from strata.fleet_config import FleetConfig  # noqa: E402
 from strata.migrator import run_migrations  # noqa: E402
+from strata.publication import read_publication  # noqa: E402
 from strata.record_store import ContributorRef, RecordStore  # noqa: E402
 from strata.scope_manager import ScopeManagerJudgment  # noqa: E402
 from strata.summary_store import Directive, ScopeSummary, SummaryStore  # noqa: E402
@@ -99,6 +100,8 @@ class _AccumulatingManager:
         summary_max_words,
         entitlement,
         operator_memory=None,
+        current_publication=None,
+        peer_publications=None,
     ):  # noqa: ANN001, ANN201, E501
         existing = list(current_summary.directives) if current_summary is not None else []
         time.sleep(self.delay)
@@ -402,6 +405,8 @@ class _CapturingManager:
         summary_max_words,
         entitlement,
         operator_memory=None,
+        current_publication=None,
+        peer_publications=None,
     ):  # noqa: ANN001, ANN201, E501
         self.received_operator_memory = operator_memory
         return ScopeManagerJudgment(
@@ -504,3 +509,247 @@ def test_rejudge_contribution_passes_operator_memory_binding_to_judge(tmp_path: 
     assert manager.received_operator_memory is not None
     items = manager.received_operator_memory[0][1]
     assert items[0].content == "Operator directive for rejudge."
+
+
+# ---------------------------------------------------------------------------
+# ADR 0007 D3 — staleness propagation wired into the choke point.
+# ---------------------------------------------------------------------------
+
+
+def _seed_publish_act(
+    record_store: RecordStore, summaries_dir, scope_id: str, *, kind: str, content: str, anchors
+):
+    """Append a real publish act + accept judgment, and write the matching artifact."""
+    from strata.publication import PublishedItem, _write_publication
+
+    act = record_store.append_publication_act(
+        scope_id=scope_id,
+        act="publish",
+        kind=kind,
+        content=content,
+        subject=None,
+        anchors=anchors,
+        withdraws=None,
+        trigger=None,
+        proposer=_contributor(),
+    )
+    record_store.record_publication_judgment(
+        act_id=act.id, decision="accept", judged_by="scope-manager", reasoning="seeded"
+    )
+    item = PublishedItem(
+        id=act.id,
+        kind=kind,
+        content=content,
+        subject=None,
+        anchors=anchors,
+        published_at=act.created_at,
+    )
+    existing = read_publication(scope_id, summaries_dir=str(summaries_dir))
+    _write_publication(scope_id, [*existing, item], summaries_dir=str(summaries_dir))
+    return item
+
+
+class _DirectiveDroppingManager:
+    """A scope-manager fake whose rewrite drops the existing directive (mechanical propagation)."""
+
+    def judge(self, *, scope, new_contribution, **_kwargs):  # noqa: ANN001, ANN201
+        summary = ScopeSummary(
+            scope_id=scope.id,
+            directives=[],  # the existing directive is gone
+            context="rewritten, directive dropped",
+            updated_at="2026-07-12T00:00:00+00:00",
+        )
+        return ScopeManagerJudgment(
+            decision="accept_as_context",
+            reasoning="rewrite drops the directive",
+            new_summary=summary,
+        )
+
+
+def test_mechanical_propagation_withdraws_item_on_accepted_rewrite(tmp_path: Path) -> None:
+    """An accepted rewrite drops a directive; a published item anchored only to it is withdrawn."""
+    db_path, fleet, summary_store = _setup(tmp_path)
+    scope = fleet.get_scope("g_root")
+    stratum = fleet.strata[0]
+
+    summary_store.write(
+        "g_root",
+        ScopeSummary(
+            scope_id="g_root",
+            directives=[
+                Directive(
+                    id="c_existing1",
+                    content="Existing directive.",
+                    subject=None,
+                    source_scope_id="g_root",
+                    source_skill="strata-developer",
+                    created_at="2026-07-10T00:00:00+00:00",
+                )
+            ],
+            context="",
+            updated_at="2026-07-10T00:00:00+00:00",
+        ),
+    )
+
+    with RecordStore(db_path) as rs:
+        item = _seed_publish_act(
+            rs,
+            summary_store.summaries_dir,
+            "g_root",
+            kind="directive",
+            content="Published version of the directive.",
+            anchors=["directive:c_existing1"],
+        )
+
+        outcome = run_contribution(
+            scope=scope,
+            stratum=stratum,
+            content="new observation",
+            proposed_classification="context",
+            subject=None,
+            supersedes=None,
+            contributor=_contributor(),
+            fleet=fleet,
+            record_store=rs,
+            summary_store=summary_store,
+            scope_manager=_DirectiveDroppingManager(),
+            summary_max_words=500,
+        )
+
+        remaining = read_publication("g_root", summaries_dir=str(summary_store.summaries_dir))
+        assert remaining == []
+
+        acts = rs.list_publication_acts(scope_id="g_root")
+        withdraw_act = next(a for a in acts if a.act == "withdraw")
+        assert withdraw_act.withdraws == item.id
+        assert withdraw_act.trigger == outcome.contribution_id
+        # Mechanical propagation: no judgment row for the withdrawal.
+        assert rs.get_publication_judgment(withdraw_act.id) is None
+
+
+class _WithdrawPublishedManager:
+    """A scope-manager fake whose judgment names a published item for judged withdrawal."""
+
+    def __init__(self, item_id: str) -> None:
+        self._item_id = item_id
+
+    def judge(self, *, scope, new_contribution, **_kwargs):  # noqa: ANN001, ANN201
+        summary = ScopeSummary(
+            scope_id=scope.id,
+            directives=[],
+            context="rewritten, belief changed",
+            updated_at="2026-07-12T00:00:00+00:00",
+        )
+        return ScopeManagerJudgment(
+            decision="accept_as_context",
+            reasoning="belief changed, withdraw the stale export",
+            new_summary=summary,
+            withdraw_published=[self._item_id],
+        )
+
+
+def test_judged_propagation_withdraws_item_named_by_judgment(tmp_path: Path) -> None:
+    """withdraw_published on an accepted judgment withdraws that item WITH a judgment row."""
+    db_path, fleet, summary_store = _setup(tmp_path)
+    scope = fleet.get_scope("g_root")
+    stratum = fleet.strata[0]
+
+    with RecordStore(db_path) as rs:
+        item = _seed_publish_act(
+            rs,
+            summary_store.summaries_dir,
+            "g_root",
+            kind="context",
+            content="Stale belief.",
+            anchors=["subject:status"],
+        )
+
+        run_contribution(
+            scope=scope,
+            stratum=stratum,
+            content="new observation contradicting the stale belief",
+            proposed_classification="context",
+            subject=None,
+            supersedes=None,
+            contributor=_contributor(),
+            fleet=fleet,
+            record_store=rs,
+            summary_store=summary_store,
+            scope_manager=_WithdrawPublishedManager(item.id),
+            summary_max_words=500,
+        )
+
+        remaining = read_publication("g_root", summaries_dir=str(summary_store.summaries_dir))
+        assert remaining == []
+
+        acts = rs.list_publication_acts(scope_id="g_root")
+        withdraw_act = next(a for a in acts if a.act == "withdraw")
+        assert withdraw_act.withdraws == item.id
+        assert withdraw_act.trigger is None
+
+        judgment = rs.get_publication_judgment(withdraw_act.id)
+        assert judgment is not None
+        assert judgment.decision == "accept"
+        assert judgment.judged_by == "scope-manager"
+        assert judgment.reasoning == "belief changed, withdraw the stale export"
+
+
+class _PublicationCapturingManager:
+    """A scope-manager fake that records the current_publication/peer_publications it was given."""
+
+    def __init__(self) -> None:
+        self.received_current_publication = "UNSET"
+        self.received_peer_publications = "UNSET"
+
+    def judge(self, *, scope, current_publication=None, peer_publications=None, **_kwargs):  # noqa: ANN001, ANN201
+        self.received_current_publication = current_publication
+        self.received_peer_publications = peer_publications
+        return ScopeManagerJudgment(
+            decision="accept_as_context",
+            reasoning="captured",
+            new_summary=ScopeSummary(
+                scope_id=scope.id,
+                directives=[],
+                context="captured",
+                updated_at="2026-07-12T00:00:00+00:00",
+            ),
+        )
+
+
+def test_run_contribution_passes_current_publication_to_judge(tmp_path: Path) -> None:
+    """run_contribution reads this scope's own publication and passes it to judge()."""
+    db_path, fleet, summary_store = _setup(tmp_path)
+    scope = fleet.get_scope("g_root")
+    stratum = fleet.strata[0]
+
+    with RecordStore(db_path) as rs:
+        item = _seed_publish_act(
+            rs,
+            summary_store.summaries_dir,
+            "g_root",
+            kind="context",
+            content="Currently published.",
+            anchors=["subject:x"],
+        )
+
+        manager = _PublicationCapturingManager()
+        run_contribution(
+            scope=scope,
+            stratum=stratum,
+            content="observation",
+            proposed_classification="context",
+            subject=None,
+            supersedes=None,
+            contributor=_contributor(),
+            fleet=fleet,
+            record_store=rs,
+            summary_store=summary_store,
+            scope_manager=manager,
+            summary_max_words=500,
+        )
+
+    assert manager.received_current_publication is not None
+    assert manager.received_current_publication != "UNSET"
+    assert [i.id for i in manager.received_current_publication] == [item.id]
+    # No referenced peers in this single-scope fleet — an empty list, not None.
+    assert manager.received_peer_publications == []

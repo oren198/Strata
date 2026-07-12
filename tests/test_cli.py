@@ -491,3 +491,160 @@ def test_operator_retire_op_prefixed_item(
     assert rc == 0
     out = capsys.readouterr().out
     assert "Retired operator item" in out
+
+
+# ---------------------------------------------------------------------------
+# strata publication — ADR 0007's local entry surface
+# ---------------------------------------------------------------------------
+
+
+def test_publication_root_prints_help(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``strata publication`` with no subcommand prints the group's help, exit 0."""
+    _seed_fleet(tmp_path, monkeypatch)
+    rc = main(["publication"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "show" in out
+    assert "bootstrap" in out
+
+
+def test_publication_show_no_scope_no_publications_yet(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _seed_fleet(tmp_path, monkeypatch)
+    rc = main(["publication", "show"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "No scope has published anything yet." in out
+
+
+def test_publication_show_unknown_scope_returns_1(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _seed_fleet(tmp_path, monkeypatch)
+    rc = main(["publication", "show", "g_nonexistent"])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "Scope not found" in err
+
+
+def test_publication_show_scope_with_no_publication_yet(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _seed_fleet(tmp_path, monkeypatch)
+    rc = main(["publication", "show", "g_ceo"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "published nothing yet" in out
+
+
+def test_publication_show_prints_artifact_verbatim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``strata publication show <scope>`` prints the artifact's raw text, byte-for-byte."""
+    _seed_fleet(tmp_path, monkeypatch)
+
+    from strata.publication import PublishedItem, _render_publication, _write_publication
+    from strata.settings import get_settings
+
+    summaries_dir = get_settings().summaries_dir
+    item = PublishedItem(
+        id="pub_abc123",
+        kind="directive",
+        content="Use protobuf for all RPC.",
+        subject="rpc-protocol",
+        anchors=["directive:c_x1"],
+        published_at="2026-07-12T00:00:00+00:00",
+    )
+    _write_publication("g_ceo", [item], summaries_dir=summaries_dir)
+
+    rc = main(["publication", "show", "g_ceo"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert out == _render_publication("g_ceo", [item])
+
+    # Without a scope_id: every scope that publishes, each under its own header.
+    rc = main(["publication", "show"])
+    assert rc == 0
+    out_all = capsys.readouterr().out
+    assert "=== g_ceo ===" in out_all
+    assert "Use protobuf for all RPC." in out_all
+
+
+def test_publication_bootstrap_accept_prints_items(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``strata publication bootstrap`` runs bootstrap_publication and prints the outcome."""
+    _seed_fleet(tmp_path, monkeypatch)
+
+    from strata.scope_manager import BootstrapJudgment, BootstrapPublishedItemInput
+
+    fake_judgment = BootstrapJudgment(
+        decision="accept",
+        reasoning="One directive is fit for export.",
+        items=[
+            BootstrapPublishedItemInput(
+                content="Use protobuf for all RPC.",
+                kind="directive",
+                subject="rpc",
+                anchors=["subject:rpc"],
+            )
+        ],
+    )
+
+    with (
+        patch(
+            "strata.scope_manager.ScopeManager.judge_bootstrap_publication",
+            return_value=fake_judgment,
+        ),
+        patch("anthropic.Anthropic"),
+    ):
+        rc = main(["publication", "bootstrap", "g_ceo"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "Bootstrapped 1 published item(s)" in out
+    assert "g_ceo" in out
+
+    from strata.publication import read_publication
+    from strata.settings import get_settings
+
+    items = read_publication("g_ceo", summaries_dir=get_settings().summaries_dir)
+    assert len(items) == 1
+    assert items[0].content == "Use protobuf for all RPC."
+
+
+def test_publication_bootstrap_decline_prints_reasoning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _seed_fleet(tmp_path, monkeypatch)
+
+    from strata.scope_manager import BootstrapJudgment
+
+    fake_judgment = BootstrapJudgment(
+        decision="decline", reasoning="Nothing fit to publish yet.", items=[]
+    )
+
+    with (
+        patch(
+            "strata.scope_manager.ScopeManager.judge_bootstrap_publication",
+            return_value=fake_judgment,
+        ),
+        patch("anthropic.Anthropic"),
+    ):
+        rc = main(["publication", "bootstrap", "g_ceo"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "declined" in out
+    assert "Nothing fit to publish yet." in out
+
+
+def test_publication_bootstrap_unknown_scope_returns_1(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _seed_fleet(tmp_path, monkeypatch)
+    rc = main(["publication", "bootstrap", "g_nonexistent"])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "Scope not found" in err

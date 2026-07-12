@@ -492,6 +492,65 @@ def test_operator_supersede_splices_summary_old_out_new_in(
     assert spliced.source_skill == "operator"
 
 
+def test_operator_supersede_propagates_directive_removal_to_publication(
+    fleet, record_store, summary_store
+) -> None:
+    """ADR 0007 D3: superseding mechanically withdraws a directive-only-anchored published item."""
+    from strata.publication import PublishedItem, _write_publication, read_publication
+
+    directive_id = _seed_directive(
+        record_store, summary_store, scope_id="g_team", content="Original text."
+    )
+    act = record_store.append_publication_act(
+        scope_id="g_team",
+        act="publish",
+        kind="directive",
+        content="Published copy of the original text.",
+        subject=None,
+        anchors=[f"directive:{directive_id}"],
+        withdraws=None,
+        trigger=None,
+        proposer=ContributorRef(
+            scope_id="g_team", skill="strata-developer", session_id="s1", ts="2026-07-01T00:00:00Z"
+        ),
+    )
+    record_store.record_publication_judgment(
+        act_id=act.id, decision="accept", judged_by="scope-manager", reasoning="seeded"
+    )
+    _write_publication(
+        "g_team",
+        [
+            PublishedItem(
+                id=act.id,
+                kind="directive",
+                content="Published copy of the original text.",
+                subject=None,
+                anchors=[f"directive:{directive_id}"],
+                published_at=act.created_at,
+            )
+        ],
+        summaries_dir=str(summary_store.summaries_dir),
+    )
+
+    new_directive = operator_supersede(
+        "g_team",
+        directive_id,
+        "Corrected text.",
+        fleet=fleet,
+        record_store=record_store,
+        summary_store=summary_store,
+    )
+
+    remaining = read_publication("g_team", summaries_dir=str(summary_store.summaries_dir))
+    assert remaining == []
+
+    acts = record_store.list_publication_acts(scope_id="g_team")
+    withdraw_act = next(a for a in acts if a.act == "withdraw")
+    assert withdraw_act.withdraws == act.id
+    assert withdraw_act.trigger == new_directive.id
+    assert record_store.get_publication_judgment(withdraw_act.id) is None
+
+
 def test_operator_supersede_unknown_directive_raises_keyerror(
     fleet, record_store, summary_store
 ) -> None:
@@ -560,6 +619,88 @@ def test_operator_retire_filters_directive_from_summary(fleet, record_store, sum
     summary = summary_store.read("g_team")
     assert directive_id not in [d.id for d in summary.directives]
     assert summary.directives == []
+
+
+def test_operator_retire_propagates_directive_removal_to_publication(
+    fleet, record_store, summary_store
+) -> None:
+    """ADR 0007 D3: retiring mechanically withdraws a directive-only-anchored published item.
+
+    A published item carrying an ADDITIONAL surviving subject anchor is
+    spared — only a fully directive-anchored item is withdrawn.
+    """
+    from strata.publication import PublishedItem, _write_publication, read_publication
+
+    directive_id = _seed_directive(
+        record_store, summary_store, scope_id="g_team", content="To be retired."
+    )
+    proposer = ContributorRef(
+        scope_id="g_team", skill="strata-developer", session_id="s1", ts="2026-07-01T00:00:00Z"
+    )
+
+    withdrawn_act = record_store.append_publication_act(
+        scope_id="g_team",
+        act="publish",
+        kind="directive",
+        content="Directive-only anchored — must be withdrawn.",
+        subject=None,
+        anchors=[f"directive:{directive_id}"],
+        withdraws=None,
+        trigger=None,
+        proposer=proposer,
+    )
+    record_store.record_publication_judgment(
+        act_id=withdrawn_act.id, decision="accept", judged_by="scope-manager", reasoning="seeded"
+    )
+    surviving_act = record_store.append_publication_act(
+        scope_id="g_team",
+        act="publish",
+        kind="directive",
+        content="Also anchored to a subject — must survive.",
+        subject="policy",
+        anchors=[f"directive:{directive_id}", "subject:policy"],
+        withdraws=None,
+        trigger=None,
+        proposer=proposer,
+    )
+    record_store.record_publication_judgment(
+        act_id=surviving_act.id, decision="accept", judged_by="scope-manager", reasoning="seeded"
+    )
+    _write_publication(
+        "g_team",
+        [
+            PublishedItem(
+                id=withdrawn_act.id,
+                kind="directive",
+                content="Directive-only anchored — must be withdrawn.",
+                subject=None,
+                anchors=[f"directive:{directive_id}"],
+                published_at=withdrawn_act.created_at,
+            ),
+            PublishedItem(
+                id=surviving_act.id,
+                kind="directive",
+                content="Also anchored to a subject — must survive.",
+                subject="policy",
+                anchors=[f"directive:{directive_id}", "subject:policy"],
+                published_at=surviving_act.created_at,
+            ),
+        ],
+        summaries_dir=str(summary_store.summaries_dir),
+    )
+
+    retirement = operator_retire(
+        "g_team", directive_id, fleet=fleet, record_store=record_store, summary_store=summary_store
+    )
+
+    remaining = read_publication("g_team", summaries_dir=str(summary_store.summaries_dir))
+    assert [i.id for i in remaining] == [surviving_act.id]
+
+    acts = record_store.list_publication_acts(scope_id="g_team")
+    withdraw_act = next(a for a in acts if a.act == "withdraw")
+    assert withdraw_act.withdraws == withdrawn_act.id
+    assert withdraw_act.trigger == retirement.id
+    assert record_store.get_publication_judgment(withdraw_act.id) is None
 
 
 def test_operator_retire_unknown_directive_raises_keyerror(
