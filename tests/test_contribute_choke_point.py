@@ -98,6 +98,7 @@ class _AccumulatingManager:
         new_contribution,
         summary_max_words,
         entitlement,
+        operator_memory=None,
     ):  # noqa: ANN001, ANN201, E501
         existing = list(current_summary.directives) if current_summary is not None else []
         time.sleep(self.delay)
@@ -376,3 +377,130 @@ def test_pending_contribution_never_enters_summary_or_perspective(tmp_path: Path
     contents = [d.content for d in final.directives]
     assert "ACCEPTED material" in contents
     assert all("PENDING" not in c for c in contents)
+
+
+# ---------------------------------------------------------------------------
+# ADR 0008 D3 — run_contribution wires operator_memory_binding into judge()
+# ---------------------------------------------------------------------------
+
+
+class _CapturingManager:
+    """A scope-manager fake that records the kwargs it was judged with."""
+
+    def __init__(self) -> None:
+        self.received_operator_memory = "UNSET"
+
+    def judge(
+        self,
+        *,
+        scope,
+        stratum,
+        parent_summary,
+        current_summary,
+        recent_contributions,
+        new_contribution,
+        summary_max_words,
+        entitlement,
+        operator_memory=None,
+    ):  # noqa: ANN001, ANN201, E501
+        self.received_operator_memory = operator_memory
+        return ScopeManagerJudgment(
+            decision="accept_as_context",
+            reasoning="captured",
+            new_summary=ScopeSummary(
+                scope_id=scope.id,
+                directives=[],
+                context="captured",
+                updated_at="2026-07-12T00:00:00+00:00",
+            ),
+        )
+
+
+def test_run_contribution_passes_operator_memory_binding_to_judge(tmp_path: Path) -> None:
+    """run_contribution fetches operator_memory_binding(scope.id, ...) and passes it to judge()."""
+    from strata.operator import operator_publish
+
+    db_path, fleet, summary_store = _setup(tmp_path)
+    scope = fleet.get_scope("g_root")
+    stratum = fleet.strata[0]
+
+    with RecordStore(db_path) as rs:
+        operator_publish(
+            "g_root",
+            "Operator-mandated directive.",
+            "directive",
+            record_store=rs,
+            summaries_dir=summary_store.summaries_dir,
+        )
+
+    manager = _CapturingManager()
+    with RecordStore(db_path) as rs:
+        run_contribution(
+            scope=scope,
+            stratum=stratum,
+            content="some material",
+            proposed_classification="context",
+            subject=None,
+            supersedes=None,
+            contributor=_contributor(),
+            fleet=fleet,
+            record_store=rs,
+            summary_store=summary_store,
+            scope_manager=manager,
+            summary_max_words=500,
+        )
+
+    assert manager.received_operator_memory != "UNSET"
+    assert manager.received_operator_memory is not None
+    assert [scope_id for scope_id, _ in manager.received_operator_memory] == ["g_root"]
+    items = manager.received_operator_memory[0][1]
+    assert items[0].content == "Operator-mandated directive."
+
+
+def test_rejudge_contribution_passes_operator_memory_binding_to_judge(tmp_path: Path) -> None:
+    """rejudge_contribution also fetches operator_memory_binding and passes it through."""
+    from strata.operator import operator_publish
+
+    db_path, fleet, summary_store = _setup(tmp_path)
+    scope = fleet.get_scope("g_root")
+    stratum = fleet.strata[0]
+
+    with pytest.raises(JudgeUnavailable), RecordStore(db_path) as rs:
+        run_contribution(
+            scope=scope,
+            stratum=stratum,
+            content="PENDING material",
+            proposed_classification="directive",
+            subject=None,
+            supersedes=None,
+            contributor=_contributor(),
+            fleet=fleet,
+            record_store=rs,
+            summary_store=summary_store,
+            scope_manager=_FailingManager(ValueError("down")),
+            summary_max_words=500,
+        )
+    with RecordStore(db_path) as rs:
+        pending = rs.list_contributions(scope_id="g_root")[0]
+        operator_publish(
+            "g_root",
+            "Operator directive for rejudge.",
+            "directive",
+            record_store=rs,
+            summaries_dir=summary_store.summaries_dir,
+        )
+
+    manager = _CapturingManager()
+    with RecordStore(db_path) as rs:
+        rejudge_contribution(
+            pending.id,
+            fleet=fleet,
+            record_store=rs,
+            summary_store=summary_store,
+            scope_manager=manager,
+            summary_max_words=500,
+        )
+
+    assert manager.received_operator_memory is not None
+    items = manager.received_operator_memory[0][1]
+    assert items[0].content == "Operator directive for rejudge."

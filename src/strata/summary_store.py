@@ -354,6 +354,16 @@ class SummaryStore:
     # Path helpers
     # ------------------------------------------------------------------
 
+    @property
+    def summaries_dir(self) -> Path:
+        """Root directory holding the per-scope summary files.
+
+        Exposed so co-located sibling stores (e.g. the ADR 0008 operator
+        working layer, one directory level below this one) can resolve their
+        own paths without duplicating storage-path resolution.
+        """
+        return self._dir
+
     def path_for(self, scope_id: str) -> Path:
         """Return the deterministic path for *scope_id*'s summary file.
 

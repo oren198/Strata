@@ -31,6 +31,7 @@ import anthropic
 from pydantic import BaseModel
 
 from strata.fleet_config import EntitlementView, Scope, Stratum
+from strata.operator import OperatorItem
 from strata.record_store import Contribution
 from strata.summary_store import Directive, ScopeSummary, _render_summary
 
@@ -141,6 +142,25 @@ STEP 2 — CLASSIFICATION. Concepts you must know (from CONTEXT.md):
   Update the context digest to incorporate the new contribution's
   observations (and to retire stale ones).
 
+When an OPERATOR MEMORY section is present in the user message (ADR 0008 D3):
+this is verbatim operator memory binding this scope — attached here or at
+any inter-stratum ancestor. The operator occupies the implicit stratum above
+every fleet stratum (CONTEXT.md § Operator), so its directives bind by the
+same broader-stratum precedence as any ancestor's. A contribution that
+CONTRADICTS an operator directive listed there must be DECLINED, citing that
+operator directive's id in your reasoning. Refinement WITHIN an inherited
+operator directive remains legitimate, exactly as with any inherited
+directive — narrowing detail is not contradiction, but reversing or
+countermanding what the operator directive establishes is. When you
+incorporate operator-consistent material into the rewritten summary — an
+echo of an operator directive's substance, whether in a locally-worded
+directive or in the context digest — the summary text must carry the
+attribution "per operator directive <id>" (substituting the real id) so the
+echo stays visible and never masquerades as native scope memory. The
+authoritative operator layer composes into every perspective verbatim
+regardless of what any summary says; attribution is what keeps an echo
+detectable, not what makes it authoritative.
+
 When a PARENT SCOPE SUMMARY is provided in the user message:
 - Your directives section must quote any parent directives VERBATIM (no
   paraphrase) so that inherited binding decisions are preserved exactly.
@@ -247,6 +267,31 @@ def _render_entitlement(entitlement: EntitlementView) -> str:
     )
 
 
+def _render_operator_memory(
+    operator_memory: list[tuple[str, list[OperatorItem]]] | None,
+) -> str:
+    """Render the OPERATOR MEMORY block for the user message (ADR 0008 D3).
+
+    *operator_memory* is the ``(attachment_scope_id, items)`` pairs from
+    :func:`strata.operator.operator_memory_binding`, root-first. Items render
+    verbatim — this block is read-only input, never a summary the
+    scope-manager may paraphrase. Returns ``""`` (block omitted entirely) when *operator_memory*
+    is ``None`` or empty, so a call site that never wires operator memory in
+    changes nothing about the rendered message.
+    """
+    if not operator_memory:
+        return ""
+    lines = ["OPERATOR MEMORY (binding this scope — verbatim, from the operator stratum)"]
+    for attachment_scope_id, items in operator_memory:
+        for item in items:
+            subject_part = f" subject={item.subject}" if item.subject else ""
+            lines.append(
+                f"[{item.id}] ({item.kind}, attached at {attachment_scope_id}){subject_part} "
+                f"{item.content}"
+            )
+    return "\n".join(lines) + "\n\n"
+
+
 def _build_user_message(
     *,
     scope: Scope,
@@ -257,6 +302,7 @@ def _build_user_message(
     new_contribution: Contribution,
     summary_max_words: int = 500,
     entitlement: EntitlementView | None = None,
+    operator_memory: list[tuple[str, list[OperatorItem]]] | None = None,
 ) -> str:
     """Compose the (non-cached) per-call user message."""
     if current_summary is not None:
@@ -266,6 +312,8 @@ def _build_user_message(
 
     recent_block = _render_recent_contributions(recent_contributions)
     contributor = new_contribution.contributor
+
+    operator_block = _render_operator_memory(operator_memory)
 
     parent_block = ""
     if parent_summary is not None:
@@ -283,6 +331,7 @@ def _build_user_message(
         f"STRATUM: {stratum.name} (ordinal={stratum.ordinal})\n"
         "\n"
         f"{budget_line}"
+        f"{operator_block}"
         f"{parent_block}"
         f"{entitlement_block}"
         "CURRENT SUMMARY\n"
@@ -346,6 +395,7 @@ class ScopeManager:
         new_contribution: Contribution,
         summary_max_words: int = 500,
         entitlement: EntitlementView | None = None,
+        operator_memory: list[tuple[str, list[OperatorItem]]] | None = None,
     ) -> ScopeManagerJudgment:
         """Judge a new contribution against the scope's current state.
 
@@ -378,6 +428,15 @@ class ScopeManager:
                                   message so the judge can apply the admission
                                   check. ``None`` omits the block entirely
                                   (backward compatible call shape).
+            operator_memory:      The operator memory binding *scope*
+                                  (ADR 0008 D3), from
+                                  :func:`strata.operator.operator_memory_binding`
+                                  — ``(attachment_scope_id, items)`` pairs,
+                                  root-first. Rendered verbatim as an
+                                  OPERATOR MEMORY block ahead of the parent
+                                  summary. ``None`` (or empty) omits the
+                                  block entirely (backward compatible call
+                                  shape).
 
         Returns:
             A :class:`ScopeManagerJudgment` with the verdict, reasoning, and
@@ -414,6 +473,7 @@ class ScopeManager:
             new_contribution=new_contribution,
             summary_max_words=summary_max_words,
             entitlement=entitlement,
+            operator_memory=operator_memory,
         )
 
         # Build the system prompt with cache_control on the last text block

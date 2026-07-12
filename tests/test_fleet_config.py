@@ -967,3 +967,50 @@ def test_entitlement_view_root_scope_works(tmp_path: Path) -> None:
     assert view.referenced_peers == []
     other_ids = {s.id for s in view.others}
     assert other_ids == {"g_funcB", "g_funcC", "g_funcD", "g_funcE"}
+
+
+# ---------------------------------------------------------------------------
+# ADR 0008 — reserved "operator" stratum label
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("stratum_id", ["operator", "Operator", "OPERATOR", "OpErAtOr"])
+def test_reserved_operator_stratum_id_rejected_case_insensitive(
+    tmp_path: Path, stratum_id: str
+) -> None:
+    """A fleet stratum may not claim the reserved 'operator' label, in any case."""
+    bad = f"""
+        strata:
+          - id: {stratum_id}
+            name: Bad Stratum
+            ordinal: 0
+        scopes: []
+        edges: []
+    """
+    with pytest.raises(FleetConfigError) as exc_info:
+        FleetConfig.load(_write(tmp_path, bad))
+    assert exc_info.value.kind == "reserved_stratum_id"
+    assert stratum_id in exc_info.value.message
+
+
+def test_non_reserved_stratum_ids_accepted(tmp_path: Path) -> None:
+    """A stratum named anything other than 'operator' loads fine."""
+    FleetConfig.load(_write(tmp_path, _VALID_YAML))
+
+
+def test_reserved_stratum_check_runs_before_duplicate_check(tmp_path: Path) -> None:
+    """The reserved-label check is first — it fires even alongside other violations."""
+    bad = """
+        strata:
+          - id: operator
+            name: First
+            ordinal: 0
+          - id: operator
+            name: Second
+            ordinal: 0
+        scopes: []
+        edges: []
+    """
+    with pytest.raises(FleetConfigError) as exc_info:
+        FleetConfig.load(_write(tmp_path, bad))
+    assert exc_info.value.kind == "reserved_stratum_id"

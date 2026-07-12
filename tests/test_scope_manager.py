@@ -18,6 +18,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from strata.fleet_config import EntitlementView, Scope, Stratum
+from strata.operator import OperatorItem
 from strata.record_store import Contribution, ContributorRef
 from strata.scope_manager import (
     _SYSTEM_PROMPT,
@@ -940,6 +941,120 @@ def test_system_prompt_verifies_authority_claims_against_rendered_summaries() ->
     assert "verified against the summaries rendered" in _SYSTEM_PROMPT
     # ...with the unconfirmed-claim disposition spelled out.
     assert "UNESTABLISHED" in _SYSTEM_PROMPT
+
+
+# ---------------------------------------------------------------------------
+# ADR 0008 D3 — judge-aware rendering: OPERATOR MEMORY block + system prompt
+# ---------------------------------------------------------------------------
+
+OPERATOR_DIRECTIVE = OperatorItem(
+    id="op_tls123",
+    kind="directive",
+    content="All services must use TLS 1.3 or later.",
+    subject="tls",
+    created_at="2026-01-01T00:00:00+00:00",
+)
+OPERATOR_CONTEXT = OperatorItem(
+    id="op_ctx456",
+    kind="context",
+    content="Quarterly security review is due in Q3.",
+    subject=None,
+    created_at="2026-01-02T00:00:00+00:00",
+)
+
+
+def test_operator_memory_block_present_with_verbatim_items() -> None:
+    """The OPERATOR MEMORY block lists items verbatim, tagged with kind and attachment scope."""
+    manager, mock_client = _make_manager(_accept_directive_input())
+
+    manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+        operator_memory=[("g_exec", [OPERATOR_DIRECTIVE, OPERATOR_CONTEXT])],
+    )
+
+    call_kwargs = mock_client.messages.create.call_args
+    content = call_kwargs.kwargs["messages"][0]["content"]
+
+    assert "OPERATOR MEMORY (binding this scope" in content
+    assert OPERATOR_DIRECTIVE.id in content
+    assert OPERATOR_DIRECTIVE.content in content
+    assert "attached at g_exec" in content
+    assert OPERATOR_CONTEXT.id in content
+    assert OPERATOR_CONTEXT.content in content
+
+
+def test_operator_memory_block_omitted_when_none_or_empty() -> None:
+    """operator_memory=None (default) and operator_memory=[] both omit the block."""
+    manager, mock_client = _make_manager(_accept_directive_input())
+
+    manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+    )
+    content_none = mock_client.messages.create.call_args.kwargs["messages"][0]["content"]
+    assert "OPERATOR MEMORY" not in content_none
+
+    manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+        operator_memory=[],
+    )
+    content_empty = mock_client.messages.create.call_args.kwargs["messages"][0]["content"]
+    assert "OPERATOR MEMORY" not in content_empty
+
+
+def test_operator_memory_block_precedes_parent_summary_block() -> None:
+    """OPERATOR MEMORY renders before PARENT SCOPE SUMMARY, per ADR 0008 D3."""
+    manager, mock_client = _make_manager(_accept_directive_input())
+
+    manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        parent_summary=PARENT_SUMMARY,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+        operator_memory=[("g_exec", [OPERATOR_DIRECTIVE])],
+    )
+    content = mock_client.messages.create.call_args.kwargs["messages"][0]["content"]
+    operator_idx = content.index("OPERATOR MEMORY")
+    parent_idx = content.index("PARENT SCOPE SUMMARY (inherited)")
+    assert operator_idx < parent_idx
+
+
+def test_system_prompt_declines_contradiction_citing_operator_directive() -> None:
+    """The system prompt instructs declining contradictions and citing the directive id."""
+    flat = " ".join(_SYSTEM_PROMPT.split())
+    assert "OPERATOR MEMORY" in flat
+    assert "CONTRADICTS" in flat
+    assert "DECLINED" in flat
+    assert "citing that operator directive's id" in flat
+    # Refinement within an inherited operator directive stays legitimate.
+    assert "Refinement WITHIN an inherited" in flat
+
+
+def test_system_prompt_requires_per_operator_directive_attribution() -> None:
+    """Echoing operator-consistent material must be attributed in the summary."""
+    flat = " ".join(_SYSTEM_PROMPT.split())
+    assert "per operator directive <id>" in flat
+    assert "never masquerades as native scope memory" in flat
+
+
+def test_system_prompt_operator_memory_precedes_parent_summary_guidance() -> None:
+    """The OPERATOR MEMORY rule appears before the PARENT SCOPE SUMMARY rule."""
+    operator_idx = _SYSTEM_PROMPT.index("When an OPERATOR MEMORY section is present")
+    parent_idx = _SYSTEM_PROMPT.index("When a PARENT SCOPE SUMMARY is provided")
+    assert operator_idx < parent_idx
 
 
 def test_system_prompt_authority_rule_is_generic_over_layers() -> None:

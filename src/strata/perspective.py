@@ -14,27 +14,87 @@ and D4 (reconciliation with the #48 read surface): layers compose root-first
 chain-referenced peers (one hop via intra-stratum edges, sorted by scope id
 for deterministic order).
 
-This branch (S2.1) is a byte-identical extraction plus one additive,
+This branch (S2.1) was a byte-identical extraction plus one additive,
 library-only parameter (``extra_context_scopes``) — nothing about layer
-payloads, ordering, or labelling changes. Two follow-up mechanisms are
-explicitly scoped to land INSIDE this primitive, not here:
+payloads, ordering, or labelling changed. ADR 0007 (publication mechanism —
+peer-reference layers carrying the referenced scope's *publication* instead
+of its full internal summary) remains a follow-up, scoped to land inside
+this primitive.
 
-- ADR 0007 (publication mechanism) — peer-reference layers will carry the
-  referenced scope's *publication* instead of its full internal summary.
-- ADR 0008 (operator stratum mechanism) — an operator layer will be inserted
-  immediately above each chain scope that has attached operator memory.
+ADR 0008 (operator stratum mechanism, #91) lands here: ``compose_perspective``
+gains an optional ``operator_reader`` — a callable, not a store object, so
+this module stays free of SQLite/record-store machinery. For each chain
+scope (ancestors + self) that has attached operator memory, an operator
+layer is inserted IMMEDIATELY ABOVE that scope's own layer — verbatim,
+never part of any scope's summary, so no scope-manager rewrite can ever
+touch it (ADR 0008 D2). Peer and extra-context layers never get an operator
+layer: operator memory binds a *chain*, and a peer's chain is not this
+reader's to compose.
 
 Vocabulary follows CONTEXT.md verbatim: scope, stratum, perspective, scope
-summary, directive, context, intra-stratum edge (peer reference).
+summary, directive, context, intra-stratum edge (peer reference), operator.
 """
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
+from typing import Protocol
 
 from strata.fleet_config import FleetConfig
 from strata.summary_store import ScopeSummary, SummaryStore
+
+
+class _OperatorItemLike(Protocol):
+    """Structural shape ``compose_perspective`` needs from an operator item.
+
+    A lightweight protocol rather than importing :class:`strata.operator.OperatorItem`
+    directly — this module composes perspectives from a reader callable, not
+    from ``strata.operator`` or any record-store machinery (ADR 0008 D2).
+    """
+
+    id: str
+    kind: str
+    content: str
+    subject: str | None
+    created_at: str
+
+
+#: Reads the current operator memory attached at one scope. Returns an empty
+#: sequence for a scope with no operator memory. See
+#: :func:`strata.operator.read_operator_layer` for the canonical implementation
+#: — callers typically pass ``functools.partial(read_operator_layer, summaries_dir=...)``.
+OperatorReader = Callable[[str], Sequence[_OperatorItemLike]]
+
+
+def _operator_layer(attachment_scope_id: str, items: Sequence[_OperatorItemLike]) -> dict:
+    """Build the operator layer dict for *attachment_scope_id* (ADR 0008 D2).
+
+    Verbatim: item dicts carry exactly ``id``, ``content``, ``subject``,
+    ``created_at`` — no rewriting, no summarisation. Directives and context
+    are split into separate lists so the shape mirrors a scope summary's own
+    two sections without reusing the ``summary`` key (an operator layer is
+    never a scope summary — ADR 0008 D2's "not part of any scope's summary").
+    """
+
+    def _item_dict(item: _OperatorItemLike) -> dict:
+        return {
+            "id": item.id,
+            "content": item.content,
+            "subject": item.subject,
+            "created_at": item.created_at,
+        }
+
+    return {
+        "scope_id": attachment_scope_id,
+        "stratum_id": "operator",
+        "relation": "operator",
+        "binding": True,
+        "operator_memory": {
+            "directives": [_item_dict(i) for i in items if i.kind == "directive"],
+            "context": [_item_dict(i) for i in items if i.kind == "context"],
+        },
+    }
 
 
 def summary_for_scope(scope_id: str, *, summary_store: SummaryStore) -> dict:
@@ -64,6 +124,7 @@ def compose_perspective(
     fleet: FleetConfig,
     summary_store: SummaryStore,
     extra_context_scopes: Sequence[str] = (),
+    operator_reader: OperatorReader | None = None,
 ) -> dict:
     """Compose *scope_id*'s perspective: its own summary, ancestor chain, and referenced peers.
 
@@ -104,11 +165,22 @@ def compose_perspective(
             for consumers that need to compose in scopes beyond the chain
             and its referenced peers; the MCP server does not use it — every
             entry must exist in *fleet* or the whole call raises.
+        operator_reader: ADR 0008 D2. When given, called once per chain scope
+            (ancestors + self) with that scope's id; for each chain scope
+            that has operator memory (a non-empty return), an operator layer
+            — ``{scope_id, stratum_id: "operator", relation: "operator",
+            binding: True, operator_memory: {directives, context}}`` with
+            VERBATIM item dicts — is inserted immediately above that chain
+            scope's own layer. Peer and extra-context layers never get an
+            operator layer. ``None`` (the default) composes zero operator
+            layers — existing callers see no behaviour change.
 
     Returns:
         ``{scope_id: <requested>, layers: [{scope_id, stratum_id, summary,
         relation, binding}], _layers_count: N}`` ordered root-first, then
         self, then sorted peer layers, then sorted extra-context layers.
+        When *operator_reader* is given, an operator layer (see above)
+        precedes each chain layer that has operator memory.
 
     Raises:
         ValueError: If *scope_id*, or any entry of *extra_context_scopes*, is
@@ -131,6 +203,13 @@ def compose_perspective(
 
     layers = []
     for s in chain:
+        if operator_reader is not None:
+            operator_items = operator_reader(s.id)
+            if operator_items:
+                # ADR 0008 D2: the operator layer sits immediately above its
+                # attachment scope's own layer — inserted here, before the
+                # chain scope's layer itself is appended below.
+                layers.append(_operator_layer(s.id, operator_items))
         layers.append(
             {
                 "scope_id": s.id,

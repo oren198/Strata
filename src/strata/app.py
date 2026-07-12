@@ -45,7 +45,6 @@ from __future__ import annotations
 import importlib.resources
 import pathlib
 import sqlite3
-import threading
 from collections.abc import AsyncGenerator, Generator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -60,7 +59,9 @@ from pydantic import BaseModel
 
 from strata import __version__
 from strata.fleet_config import FleetConfig, Scope, Stratum
+from strata.locks import scope_lock as _scope_lock
 from strata.migrator import run_migrations
+from strata.operator import operator_memory_binding
 from strata.project_config import StoragePaths, resolve_storage_paths
 from strata.record_store import (
     Contribution,
@@ -181,31 +182,12 @@ class ContributeResponse(BaseModel):
 # invariant lives in exactly one place.
 # ---------------------------------------------------------------------------
 
-# Per-scope lock registry: scope_id -> Lock, guarded by one registry lock.
-# Module-level so every code path in the process shares it.
-_scope_locks: dict[str, threading.Lock] = {}
-_scope_locks_guard = threading.Lock()
-
-
-def _scope_lock(scope_id: str) -> threading.Lock:
-    """Return the process-wide lock serialising the contribute path for *scope_id*.
-
-    Single-process scope only (issue #38). The lock serialises the
-    read-summary -> judge -> record-judgment -> summary-write sequence within
-    one process — threaded FastAPI endpoints and threadpool-dispatched MCP
-    tools both run the sync path in worker threads — so the summary can never
-    reflect a judgment the record does not, nor silently drop a judgment the
-    record kept: the summary is always explainable by the record. Cross-process
-    serialisation (N separate CC sessions, each its own MCP server) is issue
-    #19 and out of scope; those still serialise the record itself on the
-    SQLite writer mutex.
-    """
-    with _scope_locks_guard:
-        lock = _scope_locks.get(scope_id)
-        if lock is None:
-            lock = threading.Lock()
-            _scope_locks[scope_id] = lock
-        return lock
+# The per-scope lock registry lives in strata.locks (extracted for ADR 0008 —
+# strata.operator's correction primitives (operator_supersede/operator_retire)
+# must serialize under this SAME lock, and importing strata.app from
+# strata.operator would cycle back here, since this module also needs
+# strata.operator.operator_memory_binding for judge inputs). `_scope_lock` is
+# imported at module top under this name so every call site below is unchanged.
 
 
 @dataclass
@@ -263,6 +245,13 @@ def _judge_and_record(
     parent_scope = fleet.inter_stratum_parent(scope.id)
     parent_summary = summary_store.read(parent_scope.id) if parent_scope is not None else None
 
+    # Judge-aware rendering (ADR 0008 D3): the operator memory binding this
+    # scope (attached here or at any inter-stratum ancestor) is rendered to
+    # the scope-manager as a binding input, alongside the parent summary.
+    operator_memory = operator_memory_binding(
+        scope.id, fleet=fleet, summaries_dir=summary_store.summaries_dir
+    )
+
     try:
         judgment: ScopeManagerJudgment = scope_manager.judge(
             scope=scope,
@@ -273,6 +262,7 @@ def _judge_and_record(
             new_contribution=contribution,
             summary_max_words=summary_max_words,
             entitlement=fleet.entitlement_view(scope.id),
+            operator_memory=operator_memory,
         )
     except Exception as exc:
         # Record the failure as an event against the contribution — never as a

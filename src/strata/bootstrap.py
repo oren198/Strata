@@ -34,7 +34,9 @@ def load_fleet_config(yaml_path: str | Path) -> FleetConfig:
 
     Raises:
         FileNotFoundError:    If *yaml_path* does not exist.
-        FleetConfigError:     On any of the 8 load-time invariant violations
-                              (see ADR 0002 § "Validation invariants").
+        FleetConfigError:     On any load-time invariant violation — the
+                              original 8 (see ADR 0002 § "Validation
+                              invariants") plus ADR 0004's and ADR 0008's
+                              reserved ``"operator"`` stratum label.
     """
     return FleetConfig.load(Path(yaml_path))

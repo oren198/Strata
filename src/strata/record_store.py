@@ -4,6 +4,12 @@ This module owns all SQLite access.  It is the authoritative source of truth for
   - The **record**: the append-only, immutable log of every contribution ever
     accepted into a scope (see CONTEXT.md § Record).
   - Judgments: the scope-manager's verdict on each contribution.
+  - The operator's own record (``operator_acts``) and retirement events
+    (``retirements``) — ADR 0008. Two separate tables because the operator
+    acts in two capacities: writing the operator stratum itself (not judged,
+    never enters a scope's record) versus correcting a scope's native memory
+    in person (a judgment, lives in that scope's own record). See
+    :mod:`strata.operator` for the primitives built on top of these tables.
 
 Fleet configuration (strata, scopes, edges) is no longer stored here.  Under
 ADR 0002 it lives in ``fleet.yaml`` and is held in memory by
@@ -20,8 +26,10 @@ Design decisions
 - ``RecordStore`` is a context-manager-friendly class: open on construct,
   close via ``.close()`` or ``__exit__``.
 - IDs are short, prefixed, human-readable in logs:
-    ``c_<6hex>``  contributions
-    ``j_<6hex>``  judgments
+    ``c_<6hex>``   contributions
+    ``j_<6hex>``   judgments
+    ``op_<6hex>``  operator acts (ADR 0008)
+    ``ret_<6hex>`` retirement events (ADR 0008)
 
 Vocabulary throughout follows CONTEXT.md verbatim.
 """
@@ -52,6 +60,18 @@ def _new_judgment_id() -> str:
 
 def _new_judgment_attempt_id() -> str:
     return f"ja_{secrets.token_hex(8)}"
+
+
+def _new_operator_act_id() -> str:
+    # ADR 0008 D1: operator-stratum act ids are prefixed op_ so they are
+    # never mistaken for a contribution id (c_) when they appear as a
+    # `supersedes`/`retires` reference — operator-stratum acts never enter a
+    # scope's record and vice versa (two capacities, two records).
+    return f"op_{secrets.token_hex(8)}"
+
+
+def _new_retirement_id() -> str:
+    return f"ret_{secrets.token_hex(8)}"
 
 
 # ---------------------------------------------------------------------------
@@ -127,6 +147,50 @@ class JudgmentAttempt:
     error_class: str
     message: str | None
     attempted_at: str
+
+
+@dataclass(frozen=True)
+class OperatorAct:
+    """One act on the operator stratum itself (ADR 0008 D1).
+
+    The operator's OWN record: publishing, superseding, or retiring a piece
+    of operator memory attached above ``target_scope_id``. Not judged — the
+    operator's stratum authority is not delegated, so there is no judgment
+    row here, only the act. ``kind``/``content`` are ``None`` only for
+    ``act == "retire"`` (retiring removes an item; no new memory enters).
+    ``supersedes``/``retires`` reference a prior :class:`OperatorAct` id
+    (``op_``-prefixed) — never a contribution id: operator-stratum acts
+    never enter a scope's record (ADR 0008 D4).
+    """
+
+    id: str
+    act: Literal["publish", "supersede", "retire"]
+    target_scope_id: str
+    kind: Literal["directive", "context"] | None
+    content: str | None
+    subject: str | None
+    supersedes: str | None
+    retires: str | None
+    created_at: str
+
+
+@dataclass(frozen=True)
+class Retirement:
+    """A retirement event in a *scope's own* record (ADR 0008 D4 / CONTEXT.md § Retirement).
+
+    Recorded when the operator retires a native directive inside a scope's
+    summary WITHOUT a replacement — no new memory enters, so no contribution
+    row is fabricated. ``retired_by`` carries operator provenance
+    (``"operator"``); the shape is reusable by a future scope-manager
+    explicit-retire.
+    """
+
+    id: str
+    scope_id: str
+    directive_id: str
+    retired_by: str
+    reason: str | None
+    created_at: str
 
 
 # ---------------------------------------------------------------------------
@@ -482,6 +546,180 @@ class RecordStore:
             (scope_id,),
         ).fetchall()
         return [JudgmentAttempt(**dict(row)) for row in rows]
+
+    # ------------------------------------------------------------------
+    # Operator acts (the operator's own record — ADR 0008 D1)
+    # ------------------------------------------------------------------
+
+    def append_operator_act(
+        self,
+        *,
+        act: Literal["publish", "supersede", "retire"],
+        target_scope_id: str,
+        kind: Literal["directive", "context"] | None,
+        content: str | None,
+        subject: str | None = None,
+        supersedes: str | None = None,
+        retires: str | None = None,
+    ) -> OperatorAct:
+        """Append one operator-stratum act to the operator's own record.
+
+        This is the append-only log of everything the operator does ON the
+        operator stratum (ADR 0008 D1) — never judged, never mixed into any
+        scope's own record. ``kind``/``content`` must both be ``None`` for
+        ``act == "retire"`` (no new memory enters on a retire) and both
+        non-``None`` otherwise.
+
+        Args:
+            act:             ``'publish'``, ``'supersede'``, or ``'retire'``.
+            target_scope_id: The attachment scope — the operator layer's
+                             reach point, per ADR 0008 D2.
+            kind:            ``'directive'`` or ``'context'``; ``None`` only
+                             for ``act == 'retire'``.
+            content:         Verbatim operator memory text; ``None`` only for
+                             ``act == 'retire'``.
+            subject:         Optional short subject line.
+            supersedes:      For ``act == 'supersede'``: the ``op_`` id of the
+                             operator item being replaced.
+            retires:         For ``act == 'retire'``: the ``op_`` id of the
+                             operator item being removed.
+
+        Returns:
+            The newly appended :class:`OperatorAct`.
+
+        Raises:
+            sqlite3.IntegrityError: If *supersedes* or *retires* references a
+                non-existent operator act.
+        """
+        act_id = _new_operator_act_id()
+        self._conn.execute(
+            """
+            INSERT INTO operator_acts (
+                id, act, target_scope_id, kind, content, subject, supersedes, retires
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (act_id, act, target_scope_id, kind, content, subject, supersedes, retires),
+        )
+        self._conn.commit()
+        return self._fetch_operator_act(act_id)
+
+    def list_operator_acts(self, *, target_scope_id: str | None = None) -> list[OperatorAct]:
+        """Return operator acts ordered by ``created_at`` ascending.
+
+        Args:
+            target_scope_id: When given, filter to acts attached at this
+                scope only. ``None`` returns the operator's entire record
+                (ADR 0008 D5 — the operator reads everything).
+        """
+        if target_scope_id is not None:
+            rows = self._conn.execute(
+                """
+                SELECT id, act, target_scope_id, kind, content, subject,
+                       supersedes, retires, created_at
+                FROM operator_acts
+                WHERE target_scope_id = ?
+                ORDER BY created_at ASC, rowid ASC
+                """,
+                (target_scope_id,),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                """
+                SELECT id, act, target_scope_id, kind, content, subject,
+                       supersedes, retires, created_at
+                FROM operator_acts
+                ORDER BY created_at ASC, rowid ASC
+                """
+            ).fetchall()
+        return [OperatorAct(**dict(row)) for row in rows]
+
+    def _fetch_operator_act(self, act_id: str) -> OperatorAct:
+        row = self._conn.execute(
+            """
+            SELECT id, act, target_scope_id, kind, content, subject,
+                   supersedes, retires, created_at
+            FROM operator_acts WHERE id = ?
+            """,
+            (act_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"Operator act not found: {act_id!r}")
+        return OperatorAct(**dict(row))
+
+    # ------------------------------------------------------------------
+    # Retirements (retirement events in a SCOPE's own record — ADR 0008 D4)
+    # ------------------------------------------------------------------
+
+    def append_retirement(
+        self,
+        *,
+        scope_id: str,
+        directive_id: str,
+        retired_by: str,
+        reason: str | None = None,
+    ) -> Retirement:
+        """Append a retirement event to *scope_id*'s own record.
+
+        Used when a directive is removed from a scope summary WITHOUT a
+        replacement (no new memory enters) — no contribution row is
+        fabricated (CONTEXT.md § Retirement; ADR 0008 D4).
+
+        Args:
+            scope_id:     The scope whose summary the directive is retired
+                          from.
+            directive_id: The contribution id of the directive being retired.
+            retired_by:   Provenance of the retiring authority (``"operator"``
+                          for an ADR 0008 correction).
+            reason:       Optional free-text rationale.
+
+        Returns:
+            The newly appended :class:`Retirement`.
+        """
+        retirement_id = _new_retirement_id()
+        self._conn.execute(
+            """
+            INSERT INTO retirements (id, scope_id, directive_id, retired_by, reason)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (retirement_id, scope_id, directive_id, retired_by, reason),
+        )
+        self._conn.commit()
+        row = self._conn.execute(
+            """
+            SELECT id, scope_id, directive_id, retired_by, reason, created_at
+            FROM retirements WHERE id = ?
+            """,
+            (retirement_id,),
+        ).fetchone()
+        return Retirement(**dict(row))
+
+    def list_retirements(self, *, scope_id: str | None = None) -> list[Retirement]:
+        """Return retirement events ordered by ``created_at`` ascending.
+
+        Args:
+            scope_id: When given, filter to retirements from this scope's
+                record only. ``None`` returns every retirement event
+                (ADR 0008 D5 — the operator reads everything).
+        """
+        if scope_id is not None:
+            rows = self._conn.execute(
+                """
+                SELECT id, scope_id, directive_id, retired_by, reason, created_at
+                FROM retirements
+                WHERE scope_id = ?
+                ORDER BY created_at ASC, rowid ASC
+                """,
+                (scope_id,),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                """
+                SELECT id, scope_id, directive_id, retired_by, reason, created_at
+                FROM retirements
+                ORDER BY created_at ASC, rowid ASC
+                """
+            ).fetchall()
+        return [Retirement(**dict(row)) for row in rows]
 
 
 # ---------------------------------------------------------------------------
