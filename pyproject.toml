@@ -14,7 +14,6 @@ dependencies = [
     "pydantic",
     "pydantic-settings",
     "pyyaml",
-    "httpx",
     "mcp",
 ]
 
@@ -27,6 +26,11 @@ dev = [
     "pytest",
     "pytest-asyncio",
     "ruff",
+    # httpx: no longer a runtime dependency (issue #64 — the CLI inspection
+    # commands were ported to embedded store reads, dropping the last src/
+    # consumer). Kept for tests only: FastAPI's starlette.testclient.TestClient
+    # requires it importable.
+    "httpx",
 ]
 
 [tool.hatch.build.targets.wheel]

@@ -16,10 +16,10 @@ run:
 	strata start --reload
 
 migrate:
-	python scripts/run_migrations.py
+	python -m strata migrate
 
 bootstrap:
-	python scripts/bootstrap_fleet.py
+	python -m strata bootstrap
 
 smoke:
 	python -m pytest tests/test_e2e_smoke.py -v -s

@@ -16,11 +16,10 @@ runnable. Subcommands:
 * ``strata export-fleet`` — read V1 fleet tables and write fleet.yaml for
                            the V1 → V1.2 upgrade path.
 
-The inspection commands (``scopes``, ``summary``, ``record``) talk to a
-running backend over HTTP — start the backend first with ``strata start``
-in another terminal. All other commands (including ``launch``, which reads
-fleet.yaml directly — embedded mode, ADR 0004 D1) work directly against
-the files on disk.
+All commands — including the inspection commands (``scopes``, ``summary``,
+``record``) and ``launch`` — read ``fleet.yaml`` and the record/summary
+stores directly (embedded mode, ADR 0004 D1). No backend needs to be
+running; ``strata start`` is required only for the Console UI.
 
 Vocabulary throughout follows ``CONTEXT.md``.
 """
@@ -85,15 +84,6 @@ _TEMPLATES_DIR = Path(__file__).parent / "_templates"
 _DEFAULT_TEMPLATE = _TEMPLATES_DIR / "dev-team.yaml"
 
 
-def _backend_url() -> str:
-    # STRATA_BACKEND_URL is deprecated pending a design session (owner
-    # decision on issue #52: "leave it as deprecated... we don't want dead
-    # code" — no removal until that session happens). Read only by the CLI
-    # inspection commands (scopes/summary/record) below; do not add new
-    # consumers.
-    return os.environ.get("STRATA_BACKEND_URL", "http://127.0.0.1:8000").rstrip("/")
-
-
 def _storage_paths():
     """Resolve storage paths through the single source of truth (issue #44).
 
@@ -122,14 +112,19 @@ def _fleet_config_default() -> str:
 
 
 def _resolve_fleet_config(explicit: str | None) -> str | None:
-    """Pick the config path: explicit arg → Settings path → fleet.example.yaml."""
+    """Pick the config path: explicit arg → Settings path.
+
+    Returns ``None`` when neither resolves to an existing file — the caller
+    reports "no fleet config found" rather than trying to load a path that
+    doesn't exist. (There used to be a further fallback to a root-level
+    ``fleet.example.yaml``; it was removed — ``src/strata/_templates/`` is
+    the single starter-fleet source, issue #64.)
+    """
     if explicit:
         return explicit
     settings_path = _fleet_config_default()
     if Path(settings_path).exists():
         return settings_path
-    if Path("fleet.example.yaml").exists():
-        return "fleet.example.yaml"
     return None
 
 
@@ -409,117 +404,142 @@ def cmd_start(args: argparse.Namespace) -> int:
 
 
 def cmd_scopes(args: argparse.Namespace) -> int:
-    """List the fleet's active scopes (via the backend API)."""
-    import httpx
+    """List the fleet's active scopes (embedded read — fleet.yaml, ADR 0004 D1)."""
+    from strata.stores import EmbeddedStoreError, open_embedded_stores
 
-    url = f"{_backend_url()}/scopes"
     try:
-        resp = httpx.get(url, timeout=10)
-        resp.raise_for_status()
-    except httpx.HTTPError as e:
-        print(f"Backend error: {e}", file=sys.stderr)
-        return 2
-    data = resp.json()
+        stores = open_embedded_stores()
+    except EmbeddedStoreError as exc:
+        print(exc.message, file=sys.stderr)
+        return 1
 
-    print(f"Strata ({len(data['strata'])}):")
-    for s in data["strata"]:
-        print(f"  [{s['ordinal']}] {s['id']:6s}  {s['name']}")
-    print()
-    print(f"Scopes ({len(data['scopes'])}):")
-    for sc in data["scopes"]:
-        print(f"  {sc['id']:12s}  stratum={sc['stratum_id']:4s}  {sc['name']}")
-    print()
-    print(f"Edges ({len(data['edges'])}):")
-    for e in data["edges"]:
-        print(f"  {e['from_scope_id']:12s} → {e['to_scope_id']}")
+    with stores:
+        fleet = stores.fleet_config
+        active = fleet.active_scopes()
+        active_ids = {s.id for s in active}
+        active_edges = [e for e in fleet.edges if e.from_ in active_ids and e.to in active_ids]
+
+        print(f"Strata ({len(fleet.strata)}):")
+        for s in fleet.strata:
+            print(f"  [{s.ordinal}] {s.id:6s}  {s.name}")
+        print()
+        print(f"Scopes ({len(active)}):")
+        for sc in active:
+            print(f"  {sc.id:12s}  stratum={sc.stratum_id:4s}  {sc.name}")
+        print()
+        print(f"Edges ({len(active_edges)}):")
+        for e in active_edges:
+            print(f"  {e.from_:12s} → {e.to}")
     return 0
 
 
 def cmd_summary(args: argparse.Namespace) -> int:
-    """Print a scope's curated summary as markdown."""
-    import httpx
+    """Print a scope's curated summary as markdown (embedded read, ADR 0004 D1)."""
+    from datetime import UTC, datetime
 
-    url = f"{_backend_url()}/scopes/{args.scope_id}/summary"
+    from strata.stores import EmbeddedStoreError, open_embedded_stores
+    from strata.summary_store import ScopeSummary
+
     try:
-        resp = httpx.get(url, timeout=10)
-        if resp.status_code == 404:
+        stores = open_embedded_stores()
+    except EmbeddedStoreError as exc:
+        print(exc.message, file=sys.stderr)
+        return 1
+
+    with stores:
+        scope = stores.fleet_config.get_scope(args.scope_id)
+        if scope is None:
             print(f"Scope not found: {args.scope_id}", file=sys.stderr)
             return 1
-        resp.raise_for_status()
-    except httpx.HTTPError as e:
-        print(f"Backend error: {e}", file=sys.stderr)
-        return 2
-    summary = resp.json()
 
-    print(f"# Scope: {summary['scope_id']}")
-    print(f"_updated_at: {summary['updated_at']}_")
-    print()
-    print("## Directives")
-    if not summary["directives"]:
-        print("_(none yet)_")
-    for d in summary["directives"]:
+        summary = stores.summary_store.read(args.scope_id)
+        if summary is None:
+            # Scope exists but has no summary yet — synthesize an empty one,
+            # matching GET /scopes/{id}/summary (issue #59: version=0,
+            # exists=False marks it as never actually written).
+            summary = ScopeSummary(
+                scope_id=args.scope_id,
+                directives=[],
+                context="",
+                updated_at=datetime.now(tz=UTC).isoformat(),
+                version=0,
+                exists=False,
+            )
+
+        print(f"# Scope: {summary.scope_id}")
+        print(f"_updated_at: {summary.updated_at}_")
         print()
-        print(f"### [{d['id']}] {d['content']}")
-        if d.get("subject"):
-            print(f"- subject: {d['subject']}")
-        print(
-            f"- source: scope={d['source_scope_id']} · "
-            f"skill={d['source_skill']} · at={d['created_at']}"
-        )
-    print()
-    print("## Context")
-    print(summary["context"] or "_(none yet)_")
+        print("## Directives")
+        if not summary.directives:
+            print("_(none yet)_")
+        for d in summary.directives:
+            print()
+            print(f"### [{d.id}] {d.content}")
+            if d.subject:
+                print(f"- subject: {d.subject}")
+            print(
+                f"- source: scope={d.source_scope_id} · skill={d.source_skill} · at={d.created_at}"
+            )
+        print()
+        print("## Context")
+        print(summary.context or "_(none yet)_")
     return 0
 
 
 def cmd_record(args: argparse.Namespace) -> int:
-    """Print a scope's record (all contributions + their judgments)."""
-    import httpx
+    """Print a scope's record (all contributions + their judgments) — embedded read."""
+    from strata.stores import EmbeddedStoreError, open_embedded_stores
 
-    url = f"{_backend_url()}/scopes/{args.scope_id}/record"
     try:
-        resp = httpx.get(url, timeout=10)
-        if resp.status_code == 404:
+        stores = open_embedded_stores()
+    except EmbeddedStoreError as exc:
+        print(exc.message, file=sys.stderr)
+        return 1
+
+    with stores:
+        scope = stores.fleet_config.get_scope(args.scope_id)
+        if scope is None:
             print(f"Scope not found: {args.scope_id}", file=sys.stderr)
             return 1
-        resp.raise_for_status()
-    except httpx.HTTPError as e:
-        print(f"Backend error: {e}", file=sys.stderr)
-        return 2
-    data = resp.json()
 
-    print(f"Scope: {args.scope_id}")
-    print(f"Contributions: {len(data['contributions'])}")
-    print(f"Judgments:     {len(data['judgments'])}")
-    print()
-    judgments_by_contrib = {j["contribution_id"]: j for j in data["judgments"]}
-    # Count failed-judgment events per contribution (issue #57) so a pending
-    # contribution that hit a judge() failure reads as "(pending — N failed
-    # attempts)" rather than a bare "(pending)" — a verdict is never
-    # fabricated, so the forensic view distinguishes "never judged" from
-    # "judgment attempted and failed".
-    attempts_by_contrib: dict[str, int] = {}
-    for a in data.get("judgment_attempts", []):
-        cid = a["contribution_id"]
-        attempts_by_contrib[cid] = attempts_by_contrib.get(cid, 0) + 1
-    for c in data["contributions"]:
-        judgment = judgments_by_contrib.get(c["id"])
-        if judgment is not None:
-            verdict = judgment["decision"]
-        else:
-            n = attempts_by_contrib.get(c["id"], 0)
-            verdict = f"(pending — {n} failed attempt{'s' if n != 1 else ''})" if n else "(pending)"
-        print(f"  · {c['id']}  [{c['proposed_classification']:9s} → {verdict}]")
-        contributor = c["contributor"]
-        print(f"      by {contributor['skill']}@{contributor['scope_id']} at {contributor['ts']}")
-        if c.get("subject"):
-            print(f"      subject: {c['subject']}")
-        if c.get("supersedes"):
-            print(f"      supersedes: {c['supersedes']}")
-        # Indent multi-line content.
-        for line in c["content"].splitlines():
-            print(f"      | {line}")
+        contributions = stores.record_store.list_contributions(scope_id=args.scope_id)
+        judgments = stores.record_store.list_judgments(scope_id=args.scope_id)
+        judgment_attempts = stores.record_store.list_judgment_attempts(scope_id=args.scope_id)
+
+        print(f"Scope: {args.scope_id}")
+        print(f"Contributions: {len(contributions)}")
+        print(f"Judgments:     {len(judgments)}")
         print()
+        judgments_by_contrib = {j.contribution_id: j for j in judgments}
+        # Count failed-judgment events per contribution (issue #57) so a pending
+        # contribution that hit a judge() failure reads as "(pending — N failed
+        # attempts)" rather than a bare "(pending)" — a verdict is never
+        # fabricated, so the forensic view distinguishes "never judged" from
+        # "judgment attempted and failed".
+        attempts_by_contrib: dict[str, int] = {}
+        for a in judgment_attempts:
+            cid = a.contribution_id
+            attempts_by_contrib[cid] = attempts_by_contrib.get(cid, 0) + 1
+        for c in contributions:
+            judgment = judgments_by_contrib.get(c.id)
+            if judgment is not None:
+                verdict = judgment.decision
+            else:
+                n = attempts_by_contrib.get(c.id, 0)
+                verdict = (
+                    f"(pending — {n} failed attempt{'s' if n != 1 else ''})" if n else "(pending)"
+                )
+            print(f"  · {c.id}  [{c.proposed_classification:9s} → {verdict}]")
+            contributor = c.contributor
+            print(f"      by {contributor.skill}@{contributor.scope_id} at {contributor.ts}")
+            if c.subject:
+                print(f"      subject: {c.subject}")
+            if c.supersedes:
+                print(f"      supersedes: {c.supersedes}")
+            # Indent multi-line content.
+            for line in c.content.splitlines():
+                print(f"      | {line}")
+            print()
     return 0
 
 

@@ -55,6 +55,11 @@ Python-path gymnastics), skills vendored as package data, preflight
 checks on `strata start` / `strata launch`, and honest provenance — the
 MCP server refuses to start without a valid scope binding.
 
+**V1.5 shipped** — embedded-mode cleanup (issues #64, #52): the CLI
+inspection commands (`scopes` / `summary` / `record`) now read the record
+and summary stores directly instead of proxying through the Console
+backend, and the now-dead `STRATA_BACKEND_URL` was removed.
+
 What comes next is captured in [`docs/ROADMAP.md`](docs/ROADMAP.md) — the
 enduring design principles and the sequenced direction the project is
 heading. See also the [Architecture decisions](#architecture-decisions)
@@ -322,7 +327,7 @@ strata record  <scope_id>  # every contribution + judgment in the scope's record
 
 ```bash
 strata migrate                                  # apply pending SQLite migrations only
-strata bootstrap --config fleet.example.yaml    # validate a fleet YAML (no DB writes)
+strata bootstrap --config path/to/fleet.yaml    # validate a fleet YAML (no DB writes)
 strata start --reload                           # uvicorn auto-reload (dev mode)
 strata start --port 8001                        # serve on a different port
 ```
@@ -444,9 +449,13 @@ is present, the first three are ignored for the MCP server (project config wins)
 | `STRATA_AGENT_SESSION_ID` | (auto) | Session identifier — auto-generated when absent |
 | `STRATA_MANAGER_MODEL` | `claude-haiku-4-5` | Model used by scope-managers |
 | `STRATA_ANTHROPIC_API_KEY` | (unset) | Optional; falls back to `ANTHROPIC_API_KEY` |
-| `STRATA_BACKEND_URL` | `http://127.0.0.1:8000` | **Deprecated** — read only by the CLI inspection commands (`scopes`/`summary`/`record`), which query the Console backend — the MCP server and `strata launch` never read it (ADR 0004 Decision 1). Kept until a design session revisits it (#52); no removal planned yet. |
 
 A local `.env` file is loaded automatically.
+
+> `STRATA_BACKEND_URL` was **removed in 1.5.0** (issue #52). The CLI
+> inspection commands (`scopes` / `summary` / `record`) now read the record
+> and summary stores directly, like every other embedded-mode consumer
+> (ADR 0004 Decision 1) — no backend needs to be running.
 
 ---
 
@@ -495,8 +504,8 @@ src/strata/              # Python backend package
     strata-inspect/      # CC skill (copy used in Strata-repo sessions)
   settings.example.json  # Example MCP-server registration block (command: strata-mcp)
 tests/                   # pytest suite
-scripts/                 # CLI runners (run_migrations.py, bootstrap_fleet.py)
-fleet.example.yaml       # Example fleet definition consumed by `make bootstrap`
+src/strata/_templates/   # Bundled starter fleets (dev-team.yaml is the default seed;
+                          #   minimal.yaml/research-group.yaml/support-org.yaml also ship)
 Makefile                 # Common tasks (install / test / lint / run / migrate / bootstrap / smoke)
 pyproject.toml           # Project metadata + deps + ruff/pytest config
 ```

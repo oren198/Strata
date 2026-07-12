@@ -29,10 +29,12 @@ from strata.settings import Settings
 from strata.summary_store import Directive, ScopeSummary, SummaryStore
 
 # ---------------------------------------------------------------------------
-# Fleet config (uses the example in the repo root, updated for V1.2 schema)
+# Fleet config (uses the bundled dev-team.yaml starter template — the single
+# starter-fleet source, issue #64; the root-level fleet.example.yaml that
+# used to duplicate it was removed)
 # ---------------------------------------------------------------------------
 
-_FLEET_YAML = Path(__file__).parent.parent / "fleet.example.yaml"
+_FLEET_YAML = Path(__file__).parent.parent / "src" / "strata" / "_templates" / "dev-team.yaml"
 
 # ---------------------------------------------------------------------------
 # Contributor stub
@@ -298,12 +300,12 @@ def test_e2e_full_loop(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Companion test: FleetConfig loads cleanly from fleet.example.yaml
+# Companion test: FleetConfig loads cleanly from the bundled dev-team.yaml
 # ---------------------------------------------------------------------------
 
 
 def test_e2e_fleet_config_loads(tmp_path):
-    """fleet.example.yaml must load and validate without error via FleetConfig."""
+    """dev-team.yaml (bundled starter template) loads and validates via FleetConfig."""
     config = FleetConfig.load(_FLEET_YAML)
     assert len(config.strata) >= 3
     assert len(config.scopes) >= 4

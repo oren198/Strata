@@ -142,6 +142,14 @@ jobs:
       - name: Launch test suite (Windows spawn path + real fake-claude child)
         run: python -m pytest tests/test_launch.py -q
 
+      # Issue #66's three Windows-portability fixes (PR #84): strata-mcp.exe
+      # console-script entry point, TOML path escaping for absolute Windows
+      # paths (test_project_config.py), and packaging (test_packaging.py).
+      # Runs on this real Windows runner so a regression in any of the three
+      # is caught here, not just on Linux.
+      - name: Windows portability suite (issue #66 / PR #84)
+        run: python -m pytest tests/test_packaging.py tests/test_project_config.py -q
+
   # Single, stable status-check context required by the branch ruleset.
   # Succeeds only if every matrix leg of `test` succeeded.
   ci:
