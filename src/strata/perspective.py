@@ -16,10 +16,22 @@ for deterministic order).
 
 This branch (S2.1) was a byte-identical extraction plus one additive,
 library-only parameter (``extra_context_scopes``) — nothing about layer
-payloads, ordering, or labelling changed. ADR 0007 (publication mechanism —
-peer-reference layers carrying the referenced scope's *publication* instead
-of its full internal summary) remains a follow-up, scoped to land inside
-this primitive.
+payloads, ordering, or labelling changed.
+
+ADR 0007 (publication mechanism, issue #90) now lands here — the D4
+amendment to ADR 0006 D3: ``compose_perspective`` gains an optional
+``publication_reader``. When given, every ``peer_reference`` layer carries
+that peer's CURRENT PUBLICATION — its curated, judged outward face — instead
+of its full internal summary: a ``"publication": {"items": [...]}`` payload
+replaces the ``"summary"`` key entirely (never both). ``publication_reader``
+is a lightweight callable, not a store object, mirroring
+``operator_reader``'s shape — this module stays free of SQLite/markdown-store
+machinery. ``extra_context_scopes`` layers are deliberately UNAFFECTED: they
+remain full summaries regardless of ``publication_reader``, because that
+parameter is a distinct, operator-sanctioned hosting surface (issue #83), not
+a peer reference — ADR 0007 D4 retired whole-face reads specifically for the
+peer-reference channel CONTEXT.md § Intra-stratum edge describes, not for
+every context-only layer this primitive can compose.
 
 ADR 0008 (operator stratum mechanism, #91) lands here: ``compose_perspective``
 gains an optional ``operator_reader`` — a callable, not a store object, so
@@ -65,6 +77,42 @@ class _OperatorItemLike(Protocol):
 #: :func:`strata.operator.read_operator_layer` for the canonical implementation
 #: — callers typically pass ``functools.partial(read_operator_layer, summaries_dir=...)``.
 OperatorReader = Callable[[str], Sequence[_OperatorItemLike]]
+
+
+class _PublishedItemLike(Protocol):
+    """Structural shape ``compose_perspective`` needs from a published item.
+
+    A lightweight protocol rather than importing
+    :class:`strata.publication.PublishedItem` directly — same rationale as
+    ``_OperatorItemLike`` above.
+    """
+
+    id: str
+    kind: str
+    content: str
+    subject: str | None
+    anchors: list[str]
+    published_at: str
+
+
+#: Reads the current published items for one scope (ADR 0007 D1/D4). Returns
+#: an empty sequence for a scope that has published nothing yet — the
+#: honestly empty face. See :func:`strata.publication.read_publication` for
+#: the canonical implementation — callers typically pass
+#: ``functools.partial(read_publication, summaries_dir=...)``.
+PublicationReader = Callable[[str], Sequence[_PublishedItemLike]]
+
+
+def _publication_item_dict(item: _PublishedItemLike) -> dict:
+    """Verbatim item dict for a peer_reference layer's publication payload."""
+    return {
+        "id": item.id,
+        "kind": item.kind,
+        "content": item.content,
+        "subject": item.subject,
+        "anchors": list(item.anchors),
+        "published_at": item.published_at,
+    }
 
 
 def _operator_layer(attachment_scope_id: str, items: Sequence[_OperatorItemLike]) -> dict:
@@ -125,28 +173,42 @@ def compose_perspective(
     summary_store: SummaryStore,
     extra_context_scopes: Sequence[str] = (),
     operator_reader: OperatorReader | None = None,
+    publication_reader: PublicationReader | None = None,
 ) -> dict:
     """Compose *scope_id*'s perspective: its own summary, ancestor chain, and referenced peers.
 
     A perspective assembles (CONTEXT.md § Perspective): the scope's own
     summary, the summaries of every inter-stratum ancestor up to the root,
-    and — ADR 0006 D3 — the summaries of any peer scopes referenced (one
-    hop, via an intra-stratum edge) by a scope on that chain. Layers are
-    ordered root-first: ancestors first, then the requested scope's own
-    layer, then referenced-peer layers (sorted by scope id for deterministic
-    ordering).
+    and — ADR 0006 D3, delivering the referenced scope's **publication** per
+    the ADR 0007 D4 amendment — the outward face of any peer scopes
+    referenced (one hop, via an intra-stratum edge) by a scope on that
+    chain. Layers are ordered root-first: ancestors first, then the
+    requested scope's own layer, then referenced-peer layers (sorted by
+    scope id for deterministic ordering).
 
     Every layer carries ``relation`` (``"self"``, ``"ancestor"``, or
     ``"peer_reference"``) and ``binding`` (``True`` for self/ancestor layers,
     ``False`` for peer layers). Peer layers are **context only** — nothing in
-    them binds the reader: a peer's directives remain directives in their
-    home scope, but to this reader they are context (CONTEXT.md §
-    Intra-stratum edge). Each peer layer carries that peer's full summary,
-    clearly labelled by its own scope id — composition is provenance-
-    preserving, not lossy; a peer's content is never stripped down before
-    being composed in. Peer-of-peer references are not traversed: only edges
-    whose source scope is itself on the chain count (one hop, per
+    them binds the reader. Peer-of-peer references are not traversed: only
+    edges whose source scope is itself on the chain count (one hop, per
     ``FleetConfig.entitlement_view``).
+
+    Peer layer payload (ADR 0007 D4 — the ADR 0006 D3 amendment):
+
+    - When *publication_reader* is given, each peer layer carries
+      ``"publication": {"items": [<item dicts: id, kind, content, subject,
+      anchors, published_at>]}`` — that peer's CURRENT published items,
+      verbatim, and NO ``"summary"`` key. A peer that has published nothing
+      gets ``{"items": []}`` — the honestly empty face stays visible
+      (composition is provenance-preserving even when empty: "you reference
+      this scope; it publishes nothing" is itself information). Never the
+      peer's internal summary — publishing is a judged act distinct from
+      internal acceptance (ADR 0007 D2), and composing raw internal memory
+      into a reader who never judged it for export is exactly what ADR 0007
+      retires.
+    - When *publication_reader* is ``None`` (the legacy call shape), peer
+      layers carry the peer's full ``"summary"`` exactly as before — no
+      behaviour change for callers that have not adopted publication yet.
 
     If a chain or peer scope has no summary on disk yet, its layer is still
     included with empty directives and context so that the structure is
@@ -174,13 +236,26 @@ def compose_perspective(
             scope's own layer. Peer and extra-context layers never get an
             operator layer. ``None`` (the default) composes zero operator
             layers — existing callers see no behaviour change.
+        publication_reader: ADR 0007 D4. When given, called once per
+            referenced-peer scope with that scope's id; each peer layer's
+            payload becomes ``{"publication": {"items": [...]}}`` (see
+            above) instead of ``{"summary": {...}}``. Does NOT affect
+            ``extra_context_scopes`` layers, which always carry a full
+            summary regardless — that parameter is a distinct,
+            operator-sanctioned hosting surface (issue #83), not the peer-
+            reference channel ADR 0007 D4 retired whole-face reads for.
+            ``None`` (the default) composes peer layers exactly as before —
+            existing callers see no behaviour change.
 
     Returns:
-        ``{scope_id: <requested>, layers: [{scope_id, stratum_id, summary,
-        relation, binding}], _layers_count: N}`` ordered root-first, then
-        self, then sorted peer layers, then sorted extra-context layers.
-        When *operator_reader* is given, an operator layer (see above)
-        precedes each chain layer that has operator memory.
+        ``{scope_id: <requested>, layers: [{scope_id, stratum_id, relation,
+        binding, summary | publication}], _layers_count: N}`` ordered
+        root-first, then self, then sorted peer layers, then sorted
+        extra-context layers. Self/ancestor/extra-context layers always
+        carry ``"summary"``; peer layers carry ``"summary"`` when
+        *publication_reader* is ``None`` and ``"publication"`` otherwise
+        (never both). When *operator_reader* is given, an operator layer
+        (see above) precedes each chain layer that has operator memory.
 
     Raises:
         ValueError: If *scope_id*, or any entry of *extra_context_scopes*, is
@@ -225,15 +300,22 @@ def compose_perspective(
     # re-deriving peer logic — sorted by scope id for deterministic order.
     view = fleet.entitlement_view(scope_id)
     for s in sorted(view.referenced_peers, key=lambda peer: peer.id):
-        layers.append(
-            {
-                "scope_id": s.id,
-                "stratum_id": s.stratum_id,
-                "summary": summary_for_scope(s.id, summary_store=summary_store),
-                "relation": "peer_reference",
-                "binding": False,
-            }
-        )
+        peer_layer: dict = {
+            "scope_id": s.id,
+            "stratum_id": s.stratum_id,
+            "relation": "peer_reference",
+            "binding": False,
+        }
+        if publication_reader is not None:
+            # ADR 0007 D4: the referenced scope's PUBLICATION, never its
+            # internal summary. No "summary" key at all in this shape.
+            items = publication_reader(s.id)
+            peer_layer["publication"] = {"items": [_publication_item_dict(i) for i in items]}
+        else:
+            # Legacy call shape — unchanged behaviour for callers that have
+            # not adopted publication_reader yet.
+            peer_layer["summary"] = summary_for_scope(s.id, summary_store=summary_store)
+        layers.append(peer_layer)
 
     # Issue #83 addition: library-only extra context scopes, appended last,
     # sorted by scope id. Never used by the MCP server (which only ever
