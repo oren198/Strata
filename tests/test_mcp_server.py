@@ -482,6 +482,59 @@ def test_read_perspective_returns_layers_root_first(tmp_path: Path) -> None:
     assert layers[1]["summary"]["context"] == "backend context"
 
 
+def test_read_perspective_includes_operator_layers_for_bound_chain(tmp_path: Path) -> None:
+    """ADR 0008 D2: strata_read_perspective composes operator layers for the agent's chain.
+
+    Agents are never the operator (ADR 0008 D1 — no agent-facing operator MCP
+    surface), but they DO read operator memory through the perspective they
+    already read, so a judge-consistent view reaches them.
+    """
+    from strata.operator import operator_publish
+
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fleet_yaml(tmp_path)
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+
+    ss = SummaryStore(summaries_dir)
+    ss.write("g_arch", _make_summary("g_arch", "arch context"))
+    ss.write("g_backend", _make_summary("g_backend", "backend context"))
+
+    rs = RecordStore(db_path)
+    operator_publish(
+        "g_arch",
+        "All services must use TLS 1.3.",
+        "directive",
+        "tls",
+        record_store=rs,
+        summaries_dir=summaries_dir,
+    )
+    rs.close()
+
+    fleet = FleetConfig.load(fleet_path)
+
+    with (
+        patch.object(mod, "_load_fleet", return_value=fleet),
+        patch.object(mod, "_AGENT_SCOPE", "g_backend"),
+    ):
+        mod._summary_store = ss
+        result = mod.strata_read_perspective("g_backend")
+
+    layers = result["layers"]
+    # Operator layer for g_arch immediately precedes g_arch's own layer;
+    # g_backend has no operator memory, so it gets no operator layer.
+    assert [layer["relation"] for layer in layers] == ["operator", "ancestor", "self"]
+    operator_layer = layers[0]
+    assert operator_layer["scope_id"] == "g_arch"
+    assert operator_layer["stratum_id"] == "operator"
+    assert operator_layer["binding"] is True
+    assert operator_layer["operator_memory"]["directives"][0]["content"] == (
+        "All services must use TLS 1.3."
+    )
+    assert operator_layer["operator_memory"]["context"] == []
+
+
 # ---------------------------------------------------------------------------
 # Test 4: strata_list_scopes re-reads fleet.yaml on each call
 # ---------------------------------------------------------------------------

@@ -5,7 +5,12 @@ No HTTP proxy — the FastAPI backend is the Console UI layer only.
 (ADR 0004 Decision 1 — embedded mode.)
 
 Vocabulary follows CONTEXT.md verbatim: scope, stratum, directive, context,
-contribution, scope summary, perspective, record, provenance.
+contribution, scope summary, perspective, record, provenance, operator.
+
+No agent-facing operator surface exists here (ADR 0008 D1 — agents are never
+the operator); ``strata_read_perspective`` composes operator layers into an
+agent's own perspective like any other layer (ADR 0008 D2), and that is the
+only place operator memory reaches an agent through this server.
 
 Environment variables
 ---------------------
@@ -46,6 +51,7 @@ from mcp.server.fastmcp import FastMCP
 
 from strata.fleet_config import FleetConfig, FleetConfigError
 from strata.migrator import run_migrations
+from strata.operator import read_operator_layer
 from strata.perspective import compose_perspective
 from strata.project_config import (
     ProjectConfigError,
@@ -802,7 +808,21 @@ def strata_read_perspective(scope_id: str | None = None) -> dict:
     # primitive (issue #83A) — not here. This tool's job is entitlement plus
     # the scope-not-found error above; scope existence is already confirmed,
     # so compose_perspective's own ValueError never triggers.
-    return compose_perspective(scope_id, fleet=fleet, summary_store=_summary_store)
+    #
+    # operator_reader (ADR 0008 D2): agents read operator layers through this
+    # tool like any other layer — no separate operator-facing MCP surface
+    # exists (agents are never the operator, ADR 0008 D1) — so the perspective
+    # they compose is judge-consistent with what bound their scope at write
+    # time.
+    def _operator_reader(attachment_scope_id: str) -> list:
+        return read_operator_layer(attachment_scope_id, summaries_dir=_summaries_dir)
+
+    return compose_perspective(
+        scope_id,
+        fleet=fleet,
+        summary_store=_summary_store,
+        operator_reader=_operator_reader,
+    )
 
 
 # ---------------------------------------------------------------------------
