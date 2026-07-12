@@ -18,9 +18,18 @@ from unittest.mock import MagicMock
 import pytest
 
 from strata.fleet_config import EntitlementView, Scope, Stratum
+from strata.operator import OperatorItem
+from strata.publication import PublishedItem
 from strata.record_store import Contribution, ContributorRef
 from strata.scope_manager import (
+    _BOOTSTRAP_SYSTEM_PROMPT,
+    _PUBLICATION_SYSTEM_PROMPT,
     _SYSTEM_PROMPT,
+    BOOTSTRAP_JUDGE_TOOL,
+    JUDGE_TOOL,
+    PUBLICATION_JUDGE_TOOL,
+    BootstrapJudgment,
+    PublicationJudgment,
     ScopeManager,
     ScopeManagerJudgment,
     _summary_word_count,
@@ -942,6 +951,120 @@ def test_system_prompt_verifies_authority_claims_against_rendered_summaries() ->
     assert "UNESTABLISHED" in _SYSTEM_PROMPT
 
 
+# ---------------------------------------------------------------------------
+# ADR 0008 D3 — judge-aware rendering: OPERATOR MEMORY block + system prompt
+# ---------------------------------------------------------------------------
+
+OPERATOR_DIRECTIVE = OperatorItem(
+    id="op_tls123",
+    kind="directive",
+    content="All services must use TLS 1.3 or later.",
+    subject="tls",
+    created_at="2026-01-01T00:00:00+00:00",
+)
+OPERATOR_CONTEXT = OperatorItem(
+    id="op_ctx456",
+    kind="context",
+    content="Quarterly security review is due in Q3.",
+    subject=None,
+    created_at="2026-01-02T00:00:00+00:00",
+)
+
+
+def test_operator_memory_block_present_with_verbatim_items() -> None:
+    """The OPERATOR MEMORY block lists items verbatim, tagged with kind and attachment scope."""
+    manager, mock_client = _make_manager(_accept_directive_input())
+
+    manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+        operator_memory=[("g_exec", [OPERATOR_DIRECTIVE, OPERATOR_CONTEXT])],
+    )
+
+    call_kwargs = mock_client.messages.create.call_args
+    content = call_kwargs.kwargs["messages"][0]["content"]
+
+    assert "OPERATOR MEMORY (binding this scope" in content
+    assert OPERATOR_DIRECTIVE.id in content
+    assert OPERATOR_DIRECTIVE.content in content
+    assert "attached at g_exec" in content
+    assert OPERATOR_CONTEXT.id in content
+    assert OPERATOR_CONTEXT.content in content
+
+
+def test_operator_memory_block_omitted_when_none_or_empty() -> None:
+    """operator_memory=None (default) and operator_memory=[] both omit the block."""
+    manager, mock_client = _make_manager(_accept_directive_input())
+
+    manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+    )
+    content_none = mock_client.messages.create.call_args.kwargs["messages"][0]["content"]
+    assert "OPERATOR MEMORY" not in content_none
+
+    manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+        operator_memory=[],
+    )
+    content_empty = mock_client.messages.create.call_args.kwargs["messages"][0]["content"]
+    assert "OPERATOR MEMORY" not in content_empty
+
+
+def test_operator_memory_block_precedes_parent_summary_block() -> None:
+    """OPERATOR MEMORY renders before PARENT SCOPE SUMMARY, per ADR 0008 D3."""
+    manager, mock_client = _make_manager(_accept_directive_input())
+
+    manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        parent_summary=PARENT_SUMMARY,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+        operator_memory=[("g_exec", [OPERATOR_DIRECTIVE])],
+    )
+    content = mock_client.messages.create.call_args.kwargs["messages"][0]["content"]
+    operator_idx = content.index("OPERATOR MEMORY")
+    parent_idx = content.index("PARENT SCOPE SUMMARY (inherited)")
+    assert operator_idx < parent_idx
+
+
+def test_system_prompt_declines_contradiction_citing_operator_directive() -> None:
+    """The system prompt instructs declining contradictions and citing the directive id."""
+    flat = " ".join(_SYSTEM_PROMPT.split())
+    assert "OPERATOR MEMORY" in flat
+    assert "CONTRADICTS" in flat
+    assert "DECLINED" in flat
+    assert "citing that operator directive's id" in flat
+    # Refinement within an inherited operator directive stays legitimate.
+    assert "Refinement WITHIN an inherited" in flat
+
+
+def test_system_prompt_requires_per_operator_directive_attribution() -> None:
+    """Echoing operator-consistent material must be attributed in the summary."""
+    flat = " ".join(_SYSTEM_PROMPT.split())
+    assert "per operator directive <id>" in flat
+    assert "never masquerades as native scope memory" in flat
+
+
+def test_system_prompt_operator_memory_precedes_parent_summary_guidance() -> None:
+    """The OPERATOR MEMORY rule appears before the PARENT SCOPE SUMMARY rule."""
+    operator_idx = _SYSTEM_PROMPT.index("When an OPERATOR MEMORY section is present")
+    parent_idx = _SYSTEM_PROMPT.index("When a PARENT SCOPE SUMMARY is provided")
+    assert operator_idx < parent_idx
+
+
 def test_system_prompt_authority_rule_is_generic_over_layers() -> None:
     """The rule must be phrased over rendered layers, not a single hard-coded one.
 
@@ -955,3 +1078,391 @@ def test_system_prompt_authority_rule_is_generic_over_layers() -> None:
     # Generic phrasing, not scoped to the parent summary alone (whitespace-
     # insensitive so line-wrapping the prompt does not break the pin).
     assert "summaries rendered in this message" in " ".join(_SYSTEM_PROMPT.split())
+
+
+# ---------------------------------------------------------------------------
+# ADR 0007 — publication mechanism (issue #90)
+#
+# D3/D5 additions to the CONTRIBUTION judge (_build_user_message, JUDGE_TOOL,
+# _SYSTEM_PROMPT), plus the two new judgment surfaces: judge_publication
+# (D2) and judge_bootstrap_publication (D4).
+# ---------------------------------------------------------------------------
+
+_PUBLISHED_ITEM = PublishedItem(
+    id="pub_abc123",
+    kind="directive",
+    content="Use protobuf for all RPC.",
+    subject="rpc-protocol",
+    anchors=["directive:c_old001"],
+    published_at="2026-06-01T00:00:00+00:00",
+)
+
+
+def test_withdraw_published_field_defaults_to_empty_list() -> None:
+    """ScopeManagerJudgment.withdraw_published defaults to [] when the tool omits it."""
+    manager, _ = _make_manager(_accept_context_input())
+
+    judgment = manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+    )
+
+    assert judgment.withdraw_published == []
+
+
+def test_withdraw_published_field_parsed_from_tool_response() -> None:
+    """A non-empty withdraw_published list in the tool response is parsed through."""
+    raw = _accept_context_input()
+    raw["withdraw_published"] = ["pub_abc123", "pub_def456"]
+    manager, _ = _make_manager(raw)
+
+    judgment = manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+    )
+
+    assert judgment.withdraw_published == ["pub_abc123", "pub_def456"]
+
+
+def test_withdraw_published_null_parses_as_empty_list() -> None:
+    raw = _accept_context_input()
+    raw["withdraw_published"] = None
+    manager, _ = _make_manager(raw)
+
+    judgment = manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+    )
+
+    assert judgment.withdraw_published == []
+
+
+def test_judge_tool_schema_carries_withdraw_published_not_required() -> None:
+    """withdraw_published is in the schema but NOT in the required list (may be omitted)."""
+    props = JUDGE_TOOL["input_schema"]["properties"]
+    assert "withdraw_published" in props
+    assert props["withdraw_published"]["type"] == ["array", "null"]
+    assert "withdraw_published" not in JUDGE_TOOL["input_schema"]["required"]
+
+
+def test_current_publication_block_rendered_when_provided() -> None:
+    """THIS SCOPE'S PUBLICATION renders when current_publication is given (even if empty)."""
+    manager, mock_client = _make_manager(_accept_context_input())
+
+    manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+        current_publication=[_PUBLISHED_ITEM],
+    )
+
+    content = mock_client.messages.create.call_args.kwargs["messages"][0]["content"]
+    assert "THIS SCOPE'S PUBLICATION" in content
+    assert "pub_abc123" in content
+    assert "Use protobuf for all RPC." in content
+    assert "directive:c_old001" in content
+
+
+def test_current_publication_block_omitted_when_none() -> None:
+    """current_publication=None (the default) omits the block entirely — no behaviour change."""
+    manager, mock_client = _make_manager(_accept_context_input())
+
+    manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+    )
+
+    content = mock_client.messages.create.call_args.kwargs["messages"][0]["content"]
+    assert "THIS SCOPE'S PUBLICATION" not in content
+
+
+def test_current_publication_block_shows_none_yet_when_empty_list() -> None:
+    """An explicit empty current_publication still renders the header — the honest empty face."""
+    manager, mock_client = _make_manager(_accept_context_input())
+
+    manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+        current_publication=[],
+    )
+
+    content = mock_client.messages.create.call_args.kwargs["messages"][0]["content"]
+    assert "THIS SCOPE'S PUBLICATION" in content
+    assert "(none yet)" in content
+
+
+def test_peer_publications_block_rendered_when_provided() -> None:
+    """REFERENCED PEER PUBLICATIONS renders when peer_publications is given, labelled by origin."""
+    manager, mock_client = _make_manager(_accept_context_input())
+
+    manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+        peer_publications=[("g_peer_a", [_PUBLISHED_ITEM])],
+    )
+
+    content = mock_client.messages.create.call_args.kwargs["messages"][0]["content"]
+    assert "REFERENCED PEER PUBLICATIONS" in content
+    assert "g_peer_a" in content
+    assert "pub_abc123" in content
+
+
+def test_peer_publications_block_omitted_when_none_or_empty() -> None:
+    manager, mock_client = _make_manager(_accept_context_input())
+
+    manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+        peer_publications=[],
+    )
+
+    content = mock_client.messages.create.call_args.kwargs["messages"][0]["content"]
+    assert "REFERENCED PEER PUBLICATIONS" not in content
+
+
+def test_system_prompt_states_attribution_through_condensation() -> None:
+    flat = " ".join(_SYSTEM_PROMPT.split())
+    assert "according to" in flat
+    assert "attribution through condensation" in flat.lower() or "every SUBSEQUENT rewrite" in flat
+
+
+def test_system_prompt_states_no_echo_rule() -> None:
+    flat = " ".join(_SYSTEM_PROMPT.split())
+    assert "never corroborates its own source" in flat
+
+
+def test_system_prompt_names_withdraw_published_trigger() -> None:
+    flat = " ".join(_SYSTEM_PROMPT.split())
+    assert "withdraw_published" in flat
+    assert "drops or contradicts the belief" in flat.lower() or "drops OR CONTRADICTS" in flat
+
+
+# ---------------------------------------------------------------------------
+# judge_publication (ADR 0007 D2)
+# ---------------------------------------------------------------------------
+
+
+def _make_publication_manager(
+    decision: str, reasoning: str = "reasoning"
+) -> tuple[ScopeManager, MagicMock]:
+    block = MagicMock()
+    block.type = "tool_use"
+    block.input = {"decision": decision, "reasoning": reasoning}
+    response = MagicMock()
+    response.content = [block]
+
+    mock_client = MagicMock()
+    mock_client.messages.create.return_value = response
+    manager = ScopeManager(client=mock_client)
+    return manager, mock_client
+
+
+def test_judge_publication_publish_accept_parses_correctly() -> None:
+    manager, mock_client = _make_publication_manager("accept", "Fits published <= believed.")
+
+    judgment = manager.judge_publication(
+        scope=SCOPE,
+        act_kind="publish",
+        content="Use protobuf for all RPC.",
+        kind="directive",
+        subject="rpc-protocol",
+        anchors=["directive:c_old001"],
+        current_summary=CURRENT_SUMMARY,
+        current_publication=[],
+    )
+
+    assert isinstance(judgment, PublicationJudgment)
+    assert judgment.decision == "accept"
+    assert judgment.reasoning == "Fits published <= believed."
+
+    call_kwargs = mock_client.messages.create.call_args.kwargs
+    assert call_kwargs["tool_choice"]["name"] == "submit_publication_judgment"
+    assert call_kwargs["system"][0]["text"] == _PUBLICATION_SYSTEM_PROMPT
+    assert call_kwargs["tools"][0]["name"] == PUBLICATION_JUDGE_TOOL["name"]
+    message = call_kwargs["messages"][0]["content"]
+    assert "PROPOSED ACT: publish" in message
+    assert "Use protobuf for all RPC." in message
+
+
+def test_judge_publication_publish_decline_parses_correctly() -> None:
+    manager, _ = _make_publication_manager("decline", "Reads as internal scratch.")
+
+    judgment = manager.judge_publication(
+        scope=SCOPE,
+        act_kind="publish",
+        content="half-formed idea",
+        kind="context",
+        subject=None,
+        anchors=["subject:notes"],
+        current_summary=CURRENT_SUMMARY,
+        current_publication=[],
+    )
+
+    assert judgment.decision == "decline"
+
+
+def test_judge_publication_publish_missing_fields_raises() -> None:
+    manager, _ = _make_publication_manager("accept")
+    with pytest.raises(ValueError, match="content, kind"):
+        manager.judge_publication(
+            scope=SCOPE,
+            act_kind="publish",
+            current_summary=CURRENT_SUMMARY,
+            current_publication=[],
+        )
+
+
+def test_judge_publication_withdraw_renders_item_and_parses_correctly() -> None:
+    manager, mock_client = _make_publication_manager("accept", "Fine to withdraw.")
+
+    judgment = manager.judge_publication(
+        scope=SCOPE,
+        act_kind="withdraw",
+        withdraw_item=_PUBLISHED_ITEM,
+        current_summary=CURRENT_SUMMARY,
+        current_publication=[_PUBLISHED_ITEM],
+    )
+
+    assert judgment.decision == "accept"
+    message = mock_client.messages.create.call_args.kwargs["messages"][0]["content"]
+    assert "PROPOSED ACT: withdraw" in message
+    assert "pub_abc123" in message
+
+
+def test_judge_publication_withdraw_missing_item_raises() -> None:
+    manager, _ = _make_publication_manager("accept")
+    with pytest.raises(ValueError, match="withdraw_item"):
+        manager.judge_publication(
+            scope=SCOPE,
+            act_kind="withdraw",
+            current_summary=CURRENT_SUMMARY,
+            current_publication=[],
+        )
+
+
+def test_judge_publication_missing_api_key_raises_runtimeerror() -> None:
+    mock_client = MagicMock()
+    mock_client.api_key = None
+    manager = ScopeManager(client=mock_client)
+    with pytest.raises(RuntimeError, match="ANTHROPIC_API_KEY"):
+        manager.judge_publication(
+            scope=SCOPE,
+            act_kind="publish",
+            content="x",
+            kind="context",
+            subject=None,
+            anchors=["subject:x"],
+            current_summary=CURRENT_SUMMARY,
+            current_publication=[],
+        )
+
+
+def test_publication_system_prompt_states_distinct_judgment() -> None:
+    flat = " ".join(_PUBLICATION_SYSTEM_PROMPT.split())
+    assert "true and useful for us" in flat
+    assert "ready for others to act on" in flat
+
+
+def test_publication_system_prompt_states_published_within_believed() -> None:
+    flat = " ".join(_PUBLICATION_SYSTEM_PROMPT.split())
+    assert "PUBLISHED MUST STAY WITHIN BELIEVED" in flat
+    assert "not round up" in flat or "round up" in flat
+
+
+def test_publication_system_prompt_states_audience_fitness() -> None:
+    flat = " ".join(_PUBLICATION_SYSTEM_PROMPT.split())
+    assert "internal scratch" in flat
+    assert "dead end" in flat
+
+
+# ---------------------------------------------------------------------------
+# judge_bootstrap_publication (ADR 0007 D4)
+# ---------------------------------------------------------------------------
+
+
+def _make_bootstrap_manager(decision: str, items: list[dict] | None, reasoning: str = "reasoning"):
+    block = MagicMock()
+    block.type = "tool_use"
+    block.input = {"decision": decision, "reasoning": reasoning, "items": items}
+    response = MagicMock()
+    response.content = [block]
+
+    mock_client = MagicMock()
+    mock_client.messages.create.return_value = response
+    manager = ScopeManager(client=mock_client)
+    return manager, mock_client
+
+
+def test_judge_bootstrap_publication_accept_parses_items() -> None:
+    manager, mock_client = _make_bootstrap_manager(
+        "accept",
+        [
+            {
+                "content": "Use protobuf for all RPC.",
+                "kind": "directive",
+                "subject": "rpc",
+                "anchors": ["c_old001"],
+            }
+        ],
+        "One item is fit for export.",
+    )
+
+    judgment = manager.judge_bootstrap_publication(scope=SCOPE, current_summary=CURRENT_SUMMARY)
+
+    assert isinstance(judgment, BootstrapJudgment)
+    assert judgment.decision == "accept"
+    assert len(judgment.items) == 1
+    assert judgment.items[0].content == "Use protobuf for all RPC."
+    assert judgment.items[0].anchors == ["c_old001"]
+
+    call_kwargs = mock_client.messages.create.call_args.kwargs
+    assert call_kwargs["tool_choice"]["name"] == "submit_bootstrap_publication"
+    assert call_kwargs["system"][0]["text"] == _BOOTSTRAP_SYSTEM_PROMPT
+    assert call_kwargs["tools"][0]["name"] == BOOTSTRAP_JUDGE_TOOL["name"]
+
+
+def test_judge_bootstrap_publication_decline_parses_empty_items() -> None:
+    manager, _ = _make_bootstrap_manager("decline", None, "Nothing fit yet.")
+
+    judgment = manager.judge_bootstrap_publication(scope=SCOPE, current_summary=CURRENT_SUMMARY)
+
+    assert judgment.decision == "decline"
+    assert judgment.items == []
+
+
+def test_judge_bootstrap_publication_no_summary_uses_sentinel() -> None:
+    manager, mock_client = _make_bootstrap_manager("decline", None)
+
+    manager.judge_bootstrap_publication(scope=SCOPE, current_summary=None)
+
+    message = mock_client.messages.create.call_args.kwargs["messages"][0]["content"]
+    assert "this scope has no summary yet" in message
+
+
+def test_bootstrap_system_prompt_states_conservative_default() -> None:
+    flat = " ".join(_BOOTSTRAP_SYSTEM_PROMPT.split())
+    assert "conservative" in flat.lower()
+    assert "initial" in flat.lower() or "INITIAL" in flat

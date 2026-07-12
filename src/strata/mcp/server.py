@@ -5,7 +5,12 @@ No HTTP proxy — the FastAPI backend is the Console UI layer only.
 (ADR 0004 Decision 1 — embedded mode.)
 
 Vocabulary follows CONTEXT.md verbatim: scope, stratum, directive, context,
-contribution, scope summary, perspective, record, provenance.
+contribution, scope summary, perspective, record, provenance, operator.
+
+No agent-facing operator surface exists here (ADR 0008 D1 — agents are never
+the operator); ``strata_read_perspective`` composes operator layers into an
+agent's own perspective like any other layer (ADR 0008 D2), and that is the
+only place operator memory reaches an agent through this server.
 
 Environment variables
 ---------------------
@@ -46,12 +51,15 @@ from mcp.server.fastmcp import FastMCP
 
 from strata.fleet_config import FleetConfig, FleetConfigError
 from strata.migrator import run_migrations
+from strata.operator import read_operator_layer
+from strata.perspective import compose_perspective
 from strata.project_config import (
     ProjectConfigError,
     StoragePaths,
     load_project_config,
     resolve_storage_paths,
 )
+from strata.publication import PublishedItem, propose_publish, propose_withdraw, read_publication
 from strata.record_store import ContributorRef, RecordStore
 from strata.settings import get_settings
 from strata.summary_store import ScopeSummary, SummaryStore
@@ -148,6 +156,18 @@ def _load_fleet() -> FleetConfig:
     if not fleet_path.exists():
         return FleetConfig(strata=[], scopes=[], edges=[])
     return FleetConfig.load(fleet_path)
+
+
+def _publication_item_dict(item: PublishedItem) -> dict:
+    """Verbatim item dict for a published item, as returned across MCP tool surfaces."""
+    return {
+        "id": item.id,
+        "kind": item.kind,
+        "content": item.content,
+        "subject": item.subject,
+        "anchors": list(item.anchors),
+        "published_at": item.published_at,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -676,34 +696,221 @@ def strata_rejudge(contribution_id: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Tool: strata_publish
+#
+# ADR 0007 D2 — publishing is a judged act, distinct from internal
+# acceptance. NO scope_id parameter: own-scope-only publishing is
+# STRUCTURAL, not a check that could fail — there is no publishing upward or
+# sideways (that is what ratification and the entitled write surface are
+# for), so the tool simply never accepts a target other than the bound
+# scope.
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def strata_publish(
+    content: str,
+    kind: Literal["directive", "context"],
+    anchors: list[str],
+    subject: str | None = None,
+) -> dict:
+    """Propose publishing content from this agent's bound scope's own memory.
+
+    A publish call is a PROPOSAL, not a direct write — it mirrors
+    ``strata_contribute``'s shape: the scope-manager judges it, distinctly
+    from ordinary contribution judging, because "true and useful for us" is
+    not "ready for others to act on" (CONTEXT.md § Publication; ADR 0007
+    D2). The judge enforces **published ⊆ believed**: content absent from or
+    contradicted by this scope's current summary is declined, including a
+    plausible-sounding extension of what the summary actually says — do not
+    round up.
+
+    There is no publishing upward or sideways. This tool always acts on your
+    bound scope (``STRATA_AGENT_SCOPE``) — publishing *for* another scope
+    would exercise authority you do not hold; upward influence remains
+    contribution + ratification, unaffected by this channel.
+
+    Every publish call must carry at least one ANCHOR: either the id of a
+    directive currently in this scope's summary, or a free-form subject
+    string. Anchors are validated STRUCTURALLY, before judging — zero
+    anchors, or an anchor explicitly tagged ``directive:<id>`` naming an id
+    not currently in this scope's summary, is refused outright (an error,
+    not a scope-manager decline; nothing is recorded).
+
+    Args:
+        content: The outward wording, published verbatim if accepted — never
+            rewritten by the scope-manager (ADR 0007 D1).
+        kind: ``'directive'`` or ``'context'`` as this content stands in your
+            OWN scope's memory. Purely informative to readers — every
+            published item is non-binding to them regardless (ADR 0007 D1).
+        anchors: At least one anchor — a directive id from this scope's
+            current summary, or a subject string.
+        subject: Optional short label.
+
+    Returns:
+        ``act_id`` and ``judgment`` (``decision``: ``"accept"``/``"decline"``,
+        ``reasoning``, ``artifact_updated``).
+
+    Raises:
+        RuntimeError: The bound scope is unknown, or the anchors fail
+            structural validation.
+    """
+    fleet = _load_fleet()
+
+    scope = fleet.get_scope(_AGENT_SCOPE)
+    if scope is None:
+        raise RuntimeError(f"Your bound scope {_AGENT_SCOPE!r} was not found in the fleet config.")
+
+    ts = datetime.now(UTC).isoformat()
+    proposer = ContributorRef(
+        scope_id=_AGENT_SCOPE,
+        skill=_AGENT_SKILL,
+        session_id=_AGENT_SESSION_ID,
+        ts=ts,
+    )
+
+    manager = _build_scope_manager()
+
+    try:
+        outcome = propose_publish(
+            _AGENT_SCOPE,
+            content,
+            kind,
+            subject,
+            anchors,
+            proposer,
+            fleet=fleet,
+            record_store=_record_store,
+            summary_store=_summary_store,
+            scope_manager=manager,
+        )
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from exc
+
+    return {
+        "act_id": outcome.act_id,
+        "judgment": {
+            "decision": outcome.decision,
+            "reasoning": outcome.reasoning,
+            "artifact_updated": outcome.artifact_updated,
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
+# Tool: strata_withdraw
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def strata_withdraw(item_id: str) -> dict:
+    """Propose withdrawing a published item from this agent's bound scope's publication.
+
+    Same proposal-not-write shape as ``strata_publish`` — the scope-manager
+    judges the withdrawal (ADR 0007 D2). Withdrawal is effective immediately
+    for readers once accepted: composition is read-time (ADR 0004), so a
+    withdrawn item is gone from every subsequent reader's perspective, with
+    no cache to invalidate.
+
+    This tool always acts on your bound scope's own publication — there is
+    no withdrawing from another scope's outward face.
+
+    Args:
+        item_id: The ``pub_``-prefixed id of the published item to withdraw
+            (from this scope's current publication).
+
+    Returns:
+        ``act_id`` and ``judgment`` (``decision``: ``"accept"``/``"decline"``,
+        ``reasoning``, ``artifact_updated``).
+
+    Raises:
+        RuntimeError: The bound scope is unknown, or *item_id* is not in this
+            scope's current publication.
+    """
+    fleet = _load_fleet()
+
+    scope = fleet.get_scope(_AGENT_SCOPE)
+    if scope is None:
+        raise RuntimeError(f"Your bound scope {_AGENT_SCOPE!r} was not found in the fleet config.")
+
+    ts = datetime.now(UTC).isoformat()
+    proposer = ContributorRef(
+        scope_id=_AGENT_SCOPE,
+        skill=_AGENT_SKILL,
+        session_id=_AGENT_SESSION_ID,
+        ts=ts,
+    )
+
+    manager = _build_scope_manager()
+
+    try:
+        outcome = propose_withdraw(
+            _AGENT_SCOPE,
+            item_id,
+            proposer,
+            fleet=fleet,
+            record_store=_record_store,
+            summary_store=_summary_store,
+            scope_manager=manager,
+        )
+    except (ValueError, KeyError) as exc:
+        raise RuntimeError(str(exc)) from exc
+
+    return {
+        "act_id": outcome.act_id,
+        "judgment": {
+            "decision": outcome.decision,
+            "reasoning": outcome.reasoning,
+            "artifact_updated": outcome.artifact_updated,
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
 # Tool: strata_read_scope_summary
 # ---------------------------------------------------------------------------
 
 
 @mcp.tool()
 def strata_read_scope_summary(scope_id: str | None = None) -> dict:
-    """Return the scope summary for the given scope.
+    """Return the scope summary for the given scope — or a peer's publication.
 
-    The scope summary is the curated, condensed working view of a scope,
-    maintained by its scope-manager.  It has two sections: directives (binding
-    decisions that propagate to all descendant scopes) and context (non-binding
+    For your own bound scope or an inter-stratum ancestor, this returns the
+    scope summary: the curated, condensed working view of a scope, maintained
+    by its scope-manager, with two sections — directives (binding decisions
+    that propagate to all descendant scopes) and context (non-binding
     observations and knowledge).
 
+    For a chain-referenced PEER scope (ADR 0007 D4: the ADR 0006 D3
+    amendment), this returns that peer's **publication** instead — its
+    curated, judged outward face — never its internal summary. The entitled
+    content for a peer was always "its outward face" (CONTEXT.md §
+    Intra-stratum edge: "what a peer reference delivers is the referenced
+    scope's publication — never its full internal summary"); the face just
+    became a real, judged artifact rather than the whole internal summary.
+
     Args:
-        scope_id: The scope whose summary to read (e.g. ``g_arch``). Defaults
-            to this agent's bound scope. An explicit scope_id must be within
-            this agent's entitled *context* surface (ADR 0006 D3/D4): the
-            bound scope, one of its inter-stratum ancestors, or a peer scope
-            referenced by a scope on that chain via an intra-stratum edge.
-            Unreferenced peers and descendants are not directly readable.
+        scope_id: The scope whose summary (or publication) to read (e.g.
+            ``g_arch``). Defaults to this agent's bound scope. An explicit
+            scope_id must be within this agent's entitled *context* surface
+            (ADR 0006 D3/D4): the bound scope, one of its inter-stratum
+            ancestors, or a peer scope referenced by a scope on that chain
+            via an intra-stratum edge. Unreferenced peers and descendants are
+            not directly readable.
 
     Returns:
-        Parsed scope summary: ``scope_id``, ``directives``, ``context``,
-        ``updated_at``, ``version``, ``exists``. If the scope has no summary
-        on disk yet, a synthesized empty summary is returned with
-        ``version=0`` and ``exists=False`` — distinguishable from a real
-        first write (``version=1``, ``exists=True``); see
+        For own scope / ancestor: parsed scope summary — ``scope_id``,
+        ``directives``, ``context``, ``updated_at``, ``version``, ``exists``.
+        If the scope has no summary on disk yet, a synthesized empty summary
+        is returned with ``version=0`` and ``exists=False`` — distinguishable
+        from a real first write (``version=1``, ``exists=True``); see
         :class:`strata.summary_store.ScopeSummary` (issue #59).
+
+        For a chain-referenced peer: ``{"scope_id": ..., "relation":
+        "peer_reference", "publication": {"items": [<item dicts: id, kind,
+        content, subject, anchors, published_at>]}}``. A peer that has
+        published nothing returns ``{"items": []}`` — the honestly empty
+        face.
 
     Raises:
         RuntimeError: If the scope does not exist, or if scope_id is outside
@@ -718,6 +925,17 @@ def strata_read_scope_summary(scope_id: str | None = None) -> dict:
     scope = fleet.get_scope(scope_id)
     if scope is None:
         raise RuntimeError(f"Scope not found: {scope_id!r}")
+
+    # ADR 0007 D4: a chain-referenced peer (not the bound scope, not an
+    # ancestor) is entitled for its OUTWARD FACE, never its internal summary.
+    chain_ids = {s.id for s in fleet.entitlement_view(_AGENT_SCOPE).chain}
+    if scope_id not in chain_ids:
+        items = read_publication(scope_id, summaries_dir=_summaries_dir)
+        return {
+            "scope_id": scope_id,
+            "relation": "peer_reference",
+            "publication": {"items": [_publication_item_dict(i) for i in items]},
+        }
 
     existing = _summary_store.read(scope_id)
     if existing is not None:
@@ -742,54 +960,34 @@ def strata_read_scope_summary(scope_id: str | None = None) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def _summary_for_scope(scope_id: str) -> dict:
-    """Return a scope's summary as a plain dict, using a synthesized empty summary if none exists.
-
-    The synthesized summary reports ``version=0``/``exists=False`` so it is
-    never mistaken for a real first write (``version=1``, ``exists=True``) —
-    see :class:`strata.summary_store.ScopeSummary` (issue #59).
-    """
-    existing = _summary_store.read(scope_id)
-    if existing is not None:
-        return existing.model_dump()
-    empty = ScopeSummary(
-        scope_id=scope_id,
-        directives=[],
-        context="",
-        updated_at=datetime.now(tz=UTC).isoformat(),
-        version=0,
-        exists=False,
-    )
-    return empty.model_dump()
-
-
 @mcp.tool()
 def strata_read_perspective(scope_id: str | None = None) -> dict:
     """Return this agent's perspective on the fleet's long-term memory.
 
     A perspective is a composed, provenance-preserving view of: the scope's
     own summary, all inter-stratum ancestor summaries up to the root, and —
-    ADR 0006 D3 — the summaries of any peer scopes referenced (one hop, via
-    an intra-stratum edge) by a scope on that chain. Layers are ordered
-    root-first: ancestors first, then the requested scope's own layer, then
-    referenced-peer layers (sorted by scope id for deterministic ordering).
+    ADR 0006 D3, delivering the referenced scope's **publication** per the
+    ADR 0007 D4 amendment — the outward face of any peer scopes referenced
+    (one hop, via an intra-stratum edge) by a scope on that chain. Layers are
+    ordered root-first: ancestors first, then the requested scope's own
+    layer, then referenced-peer layers (sorted by scope id for deterministic
+    ordering).
 
     Every layer carries ``relation`` (``"self"``, ``"ancestor"``, or
     ``"peer_reference"``) and ``binding`` (``True`` for self/ancestor layers,
     ``False`` for peer layers). Peer layers are **context only** — nothing in
-    them binds the reader: a peer's directives remain directives in their
-    home scope, but to this reader they are context (CONTEXT.md §
-    Intra-stratum edge). Each peer layer carries that peer's full summary,
-    clearly labelled by its own scope id — composition is provenance-
-    preserving, not lossy; a peer's content is never stripped down before
-    being composed in. Peer-of-peer references are not traversed: only edges
-    whose source scope is itself on the chain count (one hop, per
+    them binds the reader. Self/ancestor layers carry that scope's full
+    ``summary``; peer layers carry that peer's CURRENT ``publication``
+    (``{"items": [...]}``, verbatim, never that peer's internal summary — a
+    peer that has published nothing gets an empty ``items`` list, the
+    honestly empty face). Peer-of-peer references are not traversed: only
+    edges whose source scope is itself on the chain count (one hop, per
     ``FleetConfig.entitlement_view``).
 
-    If a chain or peer scope has no summary on disk yet, its layer is still
-    included with empty directives and context so that the structure is
-    visible; that layer's summary honestly reports ``version=0``/
-    ``exists=False`` rather than looking like a real first write (issue #59).
+    If a chain scope has no summary on disk yet, its layer is still included
+    with empty directives and context so that the structure is visible; that
+    layer's summary honestly reports ``version=0``/``exists=False`` rather
+    than looking like a real first write (issue #59).
 
     Args:
         scope_id: The scope for which to build the perspective. Defaults to
@@ -799,9 +997,9 @@ def strata_read_perspective(scope_id: str | None = None) -> dict:
             you compose a perspective for your own chain, not for a peer's.
 
     Returns:
-        ``{layers: [{scope_id, stratum_id, summary, relation, binding}],
-        scope_id: <requested>, _layers_count: N}`` ordered root-first, then
-        self, then sorted peer layers.
+        ``{layers: [{scope_id, stratum_id, relation, binding, summary |
+        publication}], scope_id: <requested>, _layers_count: N}`` ordered
+        root-first, then self, then sorted peer layers.
 
     Raises:
         RuntimeError: If the scope is unknown, or if scope_id is outside this
@@ -817,42 +1015,33 @@ def strata_read_perspective(scope_id: str | None = None) -> dict:
     if scope is None:
         raise RuntimeError(f"Scope not found: {scope_id!r}")
 
-    # Build the ancestor chain (root-first), then append the requested scope.
-    ancestors = fleet.inter_stratum_ancestors(scope_id)
-    chain = [*ancestors, scope]
+    # Composition (ordering, relation labelling, the synthesized-empty-
+    # summary fallback) lives in strata.perspective — the importable library
+    # primitive (issue #83A) — not here. This tool's job is entitlement plus
+    # the scope-not-found error above; scope existence is already confirmed,
+    # so compose_perspective's own ValueError never triggers.
+    #
+    # operator_reader (ADR 0008 D2): agents read operator layers through this
+    # tool like any other layer — no separate operator-facing MCP surface
+    # exists (agents are never the operator, ADR 0008 D1) — so the perspective
+    # they compose is judge-consistent with what bound their scope at write
+    # time.
+    def _operator_reader(attachment_scope_id: str) -> list:
+        return read_operator_layer(attachment_scope_id, summaries_dir=_summaries_dir)
 
-    layers = []
-    for s in chain:
-        layers.append(
-            {
-                "scope_id": s.id,
-                "stratum_id": s.stratum_id,
-                "summary": _summary_for_scope(s.id),
-                "relation": "self" if s.id == scope_id else "ancestor",
-                "binding": True,
-            }
-        )
+    # publication_reader (ADR 0007 D4): this server ALWAYS wires it in — the
+    # release that ships D4 also retires whole-face peer reads; there is no
+    # legacy-shape agent surface left to preserve here.
+    def _publication_reader(peer_scope_id: str) -> list:
+        return read_publication(peer_scope_id, summaries_dir=_summaries_dir)
 
-    # ADR 0006 D3: append one layer per peer referenced (one hop) by any
-    # scope on the chain. Reuses FleetConfig.entitlement_view rather than
-    # re-deriving peer logic — sorted by scope id for deterministic order.
-    view = fleet.entitlement_view(scope_id)
-    for s in sorted(view.referenced_peers, key=lambda peer: peer.id):
-        layers.append(
-            {
-                "scope_id": s.id,
-                "stratum_id": s.stratum_id,
-                "summary": _summary_for_scope(s.id),
-                "relation": "peer_reference",
-                "binding": False,
-            }
-        )
-
-    return {
-        "scope_id": scope_id,
-        "layers": layers,
-        "_layers_count": len(layers),
-    }
+    return compose_perspective(
+        scope_id,
+        fleet=fleet,
+        summary_store=_summary_store,
+        operator_reader=_operator_reader,
+        publication_reader=_publication_reader,
+    )
 
 
 # ---------------------------------------------------------------------------

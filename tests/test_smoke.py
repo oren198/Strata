@@ -4,4 +4,4 @@
 def test_module_imports():
     import strata
 
-    assert strata.__version__ == "1.5.0"
+    assert strata.__version__ == "1.6.0"

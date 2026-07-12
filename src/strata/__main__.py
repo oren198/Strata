@@ -286,8 +286,9 @@ def cmd_migrate(args: argparse.Namespace) -> int:
 def cmd_bootstrap(args: argparse.Namespace) -> int:
     """Validate fleet.yaml and prepare the in-memory FleetConfig mirror.
 
-    No DB writes are made.  The command validates all 8 load-time invariants
-    from ADR 0002 and reports success or the first error encountered.
+    No DB writes are made.  The command validates all load-time invariants
+    (the original 8 from ADR 0002, plus ADR 0004's and ADR 0008's) and
+    reports success or the first error encountered.
     """
     from strata.bootstrap import load_fleet_config
     from strata.fleet_config import FleetConfigError
@@ -543,6 +544,368 @@ def cmd_record(args: argparse.Namespace) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# strata operator — the operator stratum's vanilla-Strata entry surface
+# (ADR 0008 D1: "Strata must work fully locally"). Embedded reads/writes,
+# same discipline as scopes/summary/record above.
+# ---------------------------------------------------------------------------
+
+# Set by _build_parser() so `strata operator` with no subcommand can print
+# its own help (mirrors main()'s bare-`strata` behaviour, one level down).
+_operator_parser: argparse.ArgumentParser | None = None
+
+
+def cmd_operator_root(args: argparse.Namespace) -> int:
+    """``strata operator`` with no subcommand — print the group's help."""
+    if _operator_parser is not None:
+        _operator_parser.print_help()
+    return 0
+
+
+def cmd_operator_publish(args: argparse.Namespace) -> int:
+    """``strata operator publish`` — publish a new operator memory item (ADR 0008 D1)."""
+    from strata.operator import operator_publish
+    from strata.stores import EmbeddedStoreError, open_embedded_stores
+
+    try:
+        stores = open_embedded_stores()
+    except EmbeddedStoreError as exc:
+        print(exc.message, file=sys.stderr)
+        return 1
+
+    with stores:
+        scope = stores.fleet_config.get_scope(args.scope_id)
+        if scope is None:
+            print(f"Scope not found: {args.scope_id}", file=sys.stderr)
+            return 1
+
+        item = operator_publish(
+            args.scope_id,
+            args.content,
+            args.kind,
+            args.subject,
+            record_store=stores.record_store,
+            summaries_dir=stores.summary_store.summaries_dir,
+        )
+        print(f"Published operator {item.kind} [{item.id}] attached at {args.scope_id!r}.")
+    return 0
+
+
+def cmd_operator_supersede(args: argparse.Namespace) -> int:
+    """``strata operator supersede`` — routes by id prefix (ADR 0008 D1 vs. D4).
+
+    ``op_`` ids supersede an operator-stratum item (capacity 1, not judged).
+    ``c_`` ids correct a scope's own native directive in person (capacity 2,
+    a judgment made by the operator).
+    """
+    from strata.operator import operator_supersede, operator_supersede_item
+    from strata.stores import EmbeddedStoreError, open_embedded_stores
+
+    try:
+        stores = open_embedded_stores()
+    except EmbeddedStoreError as exc:
+        print(exc.message, file=sys.stderr)
+        return 1
+
+    with stores:
+        scope = stores.fleet_config.get_scope(args.scope_id)
+        if scope is None:
+            print(f"Scope not found: {args.scope_id}", file=sys.stderr)
+            return 1
+
+        item_id: str = args.id
+        if item_id.startswith("op_"):
+            try:
+                item = operator_supersede_item(
+                    args.scope_id,
+                    item_id,
+                    args.content,
+                    args.subject,
+                    record_store=stores.record_store,
+                    summaries_dir=stores.summary_store.summaries_dir,
+                )
+            except KeyError as exc:
+                print(str(exc), file=sys.stderr)
+                return 1
+            print(
+                f"Superseded operator item {item_id} -> [{item.id}] attached at {args.scope_id!r}."
+            )
+        elif item_id.startswith("c_"):
+            try:
+                new_directive = operator_supersede(
+                    args.scope_id,
+                    item_id,
+                    args.content,
+                    args.subject,
+                    fleet=stores.fleet_config,
+                    record_store=stores.record_store,
+                    summary_store=stores.summary_store,
+                )
+            except (ValueError, KeyError) as exc:
+                print(str(exc), file=sys.stderr)
+                return 1
+            print(
+                f"Superseded directive {item_id} -> [{new_directive.id}] "
+                f"in scope {args.scope_id!r} (operator correction)."
+            )
+        else:
+            print(
+                f"Unrecognized id {item_id!r} — expected an 'op_' operator item id "
+                "(operator stratum) or a 'c_' directive id (scope correction).",
+                file=sys.stderr,
+            )
+            return 1
+    return 0
+
+
+def cmd_operator_retire(args: argparse.Namespace) -> int:
+    """``strata operator retire`` — routes by id prefix (ADR 0008 D1 vs. D4).
+
+    ``op_`` ids retire an operator-stratum item (capacity 1, not judged).
+    ``c_`` ids retire a scope's own native directive in person without
+    replacement (capacity 2 — appends a ``retirements`` event, never a
+    fabricated contribution).
+    """
+    from strata.operator import operator_retire, operator_retire_item
+    from strata.stores import EmbeddedStoreError, open_embedded_stores
+
+    try:
+        stores = open_embedded_stores()
+    except EmbeddedStoreError as exc:
+        print(exc.message, file=sys.stderr)
+        return 1
+
+    with stores:
+        scope = stores.fleet_config.get_scope(args.scope_id)
+        if scope is None:
+            print(f"Scope not found: {args.scope_id}", file=sys.stderr)
+            return 1
+
+        item_id: str = args.id
+        if item_id.startswith("op_"):
+            try:
+                act = operator_retire_item(
+                    args.scope_id,
+                    item_id,
+                    record_store=stores.record_store,
+                    summaries_dir=stores.summary_store.summaries_dir,
+                )
+            except KeyError as exc:
+                print(str(exc), file=sys.stderr)
+                return 1
+            print(f"Retired operator item {item_id} (act {act.id}) attached at {args.scope_id!r}.")
+        elif item_id.startswith("c_"):
+            try:
+                retirement = operator_retire(
+                    args.scope_id,
+                    item_id,
+                    args.reason,
+                    fleet=stores.fleet_config,
+                    record_store=stores.record_store,
+                    summary_store=stores.summary_store,
+                )
+            except (ValueError, KeyError) as exc:
+                print(str(exc), file=sys.stderr)
+                return 1
+            print(
+                f"Retired directive {item_id} from scope {args.scope_id!r} "
+                f"(retirement {retirement.id}, operator correction)."
+            )
+        else:
+            print(
+                f"Unrecognized id {item_id!r} — expected an 'op_' operator item id "
+                "(operator stratum) or a 'c_' directive id (scope correction).",
+                file=sys.stderr,
+            )
+            return 1
+    return 0
+
+
+def cmd_operator_show(args: argparse.Namespace) -> int:
+    """``strata operator show`` — print operator layer(s) verbatim + the health signal.
+
+    Without ``scope_id``: every attachment scope's operator memory plus
+    fleet-wide totals. With ``scope_id``: that scope's operator layer plus
+    its own item/word counts (ADR 0008 D6 — constitutional, not operational).
+    """
+    from strata.operator import operator_health, read_operator_layer
+    from strata.stores import EmbeddedStoreError, open_embedded_stores
+
+    try:
+        stores = open_embedded_stores()
+    except EmbeddedStoreError as exc:
+        print(exc.message, file=sys.stderr)
+        return 1
+
+    with stores:
+        summaries_dir = stores.summary_store.summaries_dir
+        health = operator_health(record_store=stores.record_store, summaries_dir=summaries_dir)
+
+        if args.scope_id:
+            scope = stores.fleet_config.get_scope(args.scope_id)
+            if scope is None:
+                print(f"Scope not found: {args.scope_id}", file=sys.stderr)
+                return 1
+
+            items = read_operator_layer(args.scope_id, summaries_dir=summaries_dir)
+            print(f"Operator memory attached at {args.scope_id!r} ({len(items)} item(s)):")
+            if not items:
+                print("  _(none yet)_")
+            for item in items:
+                subject_part = f" — {item.subject}" if item.subject else ""
+                print(f"  [{item.id}] {item.kind}{subject_part}  (at {item.created_at})")
+                for line in item.content.splitlines():
+                    print(f"      | {line}")
+            print()
+            scope_health = health["per_scope"].get(args.scope_id, {"items": 0, "words": 0})
+            print(f"Health: {scope_health['items']} item(s), {scope_health['words']} word(s).")
+        else:
+            print(
+                f"Operator memory — {health['total_items']} item(s), "
+                f"{health['total_words']} word(s) across "
+                f"{len(health['per_scope'])} attachment scope(s):"
+            )
+            if not health["per_scope"]:
+                print("  _(none yet)_")
+            for scope_id, counts in sorted(health["per_scope"].items()):
+                print(f"  {scope_id}: {counts['items']} item(s), {counts['words']} word(s)")
+
+        print()
+        print(
+            f"Operator acts: {health['total_acts']} total, "
+            f"{health['acts_last_N_days']} in the last {health['churn_window_days']} days."
+        )
+        print(
+            "Doctrine (ADR 0008 D6): operator memory is constitutional, not operational — "
+            "small, rare, and mostly stable."
+        )
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# strata publication — ADR 0007's local entry surface: show a scope's (or
+# every scope's) publication artifact verbatim, or bootstrap a scope's
+# initial publication (ADR 0007 D4). Embedded reads/writes, same discipline
+# as the operator group above.
+# ---------------------------------------------------------------------------
+
+# Set by _build_parser() so `strata publication` with no subcommand can print
+# its own help (mirrors the operator group's pattern).
+_publication_parser: argparse.ArgumentParser | None = None
+
+
+def cmd_publication_root(args: argparse.Namespace) -> int:
+    """``strata publication`` with no subcommand — print the group's help."""
+    if _publication_parser is not None:
+        _publication_parser.print_help()
+    return 0
+
+
+def cmd_publication_show(args: argparse.Namespace) -> int:
+    """``strata publication show [scope_id]`` — print publication artifact(s) verbatim.
+
+    Without ``scope_id``: every scope that has published anything. With
+    ``scope_id``: that scope's artifact (or a "published nothing yet"
+    message when it has no publication file).
+    """
+    from strata.publication import list_scopes_with_publications, read_publication_text
+    from strata.stores import EmbeddedStoreError, open_embedded_stores
+
+    try:
+        stores = open_embedded_stores()
+    except EmbeddedStoreError as exc:
+        print(exc.message, file=sys.stderr)
+        return 1
+
+    with stores:
+        summaries_dir = str(stores.summary_store.summaries_dir)
+
+        if args.scope_id:
+            scope = stores.fleet_config.get_scope(args.scope_id)
+            if scope is None:
+                print(f"Scope not found: {args.scope_id}", file=sys.stderr)
+                return 1
+            text = read_publication_text(args.scope_id, summaries_dir=summaries_dir)
+            if text is None:
+                print(f"Scope {args.scope_id!r} has published nothing yet.")
+            else:
+                print(text, end="" if text.endswith("\n") else "\n")
+            return 0
+
+        scope_ids = list_scopes_with_publications(summaries_dir)
+        if not scope_ids:
+            print("No scope has published anything yet.")
+            return 0
+        for sid in scope_ids:
+            text = read_publication_text(sid, summaries_dir=summaries_dir) or ""
+            print(f"=== {sid} ===")
+            print(text, end="" if text.endswith("\n") else "\n")
+            print()
+    return 0
+
+
+def cmd_publication_bootstrap(args: argparse.Namespace) -> int:
+    """``strata publication bootstrap <scope_id>`` — bootstrap an initial publication (ADR 0007 D4).
+
+    A one-shot, operator-initiated migration step: the scope-manager
+    proposes an initial publication distilled from the scope's CURRENT
+    summary, judged through the normal publication path. Requires
+    ``ANTHROPIC_API_KEY`` (or ``STRATA_ANTHROPIC_API_KEY``) — this is an LLM
+    judgment, not a mechanical copy.
+    """
+    import anthropic
+
+    from strata.publication import bootstrap_publication
+    from strata.scope_manager import ScopeManager
+    from strata.settings import get_settings
+    from strata.stores import EmbeddedStoreError, open_embedded_stores
+
+    try:
+        stores = open_embedded_stores()
+    except EmbeddedStoreError as exc:
+        print(exc.message, file=sys.stderr)
+        return 1
+
+    with stores:
+        scope = stores.fleet_config.get_scope(args.scope_id)
+        if scope is None:
+            print(f"Scope not found: {args.scope_id}", file=sys.stderr)
+            return 1
+
+        settings = get_settings()
+        manager = ScopeManager(
+            client=anthropic.Anthropic(api_key=settings.anthropic_api_key),
+            model=settings.manager_model,
+        )
+
+        try:
+            outcome = bootstrap_publication(
+                args.scope_id,
+                fleet=stores.fleet_config,
+                record_store=stores.record_store,
+                summary_store=stores.summary_store,
+                scope_manager=manager,
+            )
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+
+        if outcome.decision == "decline" or not outcome.items:
+            print(
+                f"Scope-manager declined to bootstrap a publication for {args.scope_id!r}: "
+                f"{outcome.reasoning}"
+            )
+            return 0
+
+        print(
+            f"Bootstrapped {len(outcome.items)} published item(s) for {args.scope_id!r}: "
+            f"{outcome.reasoning}"
+        )
+        for item in outcome.items:
+            print(f"  [{item.id}] {item.kind} anchors={item.anchors}")
+    return 0
+
+
 def cmd_export_fleet(args: argparse.Namespace) -> int:
     """Read V1 fleet tables and write fleet.yaml for V1.2.
 
@@ -709,6 +1072,8 @@ def _refresh_scope(
         ),
     )
 
+    from strata.operator import operator_memory_binding
+
     print(f"  [refresh] refreshing scope {scope_id!r}...", file=sys.stderr)
     judgment = manager.judge(
         scope=scope,
@@ -719,6 +1084,9 @@ def _refresh_scope(
         new_contribution=refresh_contribution,
         summary_max_words=summary_max_words,
         entitlement=fleet_config.entitlement_view(scope_id),
+        operator_memory=operator_memory_binding(
+            scope_id, fleet=fleet_config, summaries_dir=summary_store.summaries_dir
+        ),
     )
 
     record_store.record_judgment(
@@ -1787,6 +2155,109 @@ def _build_parser() -> argparse.ArgumentParser:
     p_record = sub.add_parser("record", help="Print a scope's record (contributions + judgments).")
     p_record.add_argument("scope_id")
     p_record.set_defaults(func=cmd_record)
+
+    # -------------------------------------------------------------------
+    # strata operator — ADR 0008 D1's local entry surface: publish/supersede/
+    # retire operator memory, or (via a 'c_' id) correct a scope's native
+    # memory in person.
+    # -------------------------------------------------------------------
+    global _operator_parser
+    p_operator = sub.add_parser(
+        "operator",
+        help=(
+            "Operator stratum: publish/supersede/retire operator memory, or "
+            "correct a scope's native memory in person (ADR 0008)."
+        ),
+    )
+    _operator_parser = p_operator
+    p_operator.set_defaults(func=cmd_operator_root)
+    operator_sub = p_operator.add_subparsers(dest="operator_command", metavar="<operator-command>")
+
+    p_op_publish = operator_sub.add_parser(
+        "publish", help="Publish a new operator memory item attached at a scope."
+    )
+    p_op_publish.add_argument("scope_id")
+    p_op_publish.add_argument(
+        "--kind", choices=["directive", "context"], required=True, help="Operator memory kind."
+    )
+    p_op_publish.add_argument("--content", required=True, help="Verbatim operator memory text.")
+    p_op_publish.add_argument("--subject", default=None, help="Optional short subject line.")
+    p_op_publish.set_defaults(func=cmd_operator_publish)
+
+    p_op_supersede = operator_sub.add_parser(
+        "supersede",
+        help=(
+            "Supersede an operator item ('op_' id) or a scope's native "
+            "directive ('c_' id) in person."
+        ),
+    )
+    p_op_supersede.add_argument("scope_id")
+    p_op_supersede.add_argument(
+        "id", help="An 'op_...' operator item id or a 'c_...' directive id."
+    )
+    p_op_supersede.add_argument("--content", required=True, help="Verbatim replacement content.")
+    p_op_supersede.add_argument("--subject", default=None, help="Optional short subject line.")
+    p_op_supersede.set_defaults(func=cmd_operator_supersede)
+
+    p_op_retire = operator_sub.add_parser(
+        "retire",
+        help=(
+            "Retire an operator item ('op_' id) or a scope's native directive "
+            "('c_' id) in person, without replacement."
+        ),
+    )
+    p_op_retire.add_argument("scope_id")
+    p_op_retire.add_argument("id", help="An 'op_...' operator item id or a 'c_...' directive id.")
+    p_op_retire.add_argument("--reason", default=None, help="Optional free-text rationale.")
+    p_op_retire.set_defaults(func=cmd_operator_retire)
+
+    p_op_show = operator_sub.add_parser(
+        "show", help="Print operator memory verbatim, plus the health signal (ADR 0008 D6)."
+    )
+    p_op_show.add_argument(
+        "scope_id",
+        nargs="?",
+        default=None,
+        help="Attachment scope to show. Omit to show every attachment scope + totals.",
+    )
+    p_op_show.set_defaults(func=cmd_operator_show)
+
+    # -------------------------------------------------------------------
+    # strata publication — ADR 0007's local entry surface: show a scope's
+    # (or every scope's) publication artifact verbatim, or bootstrap a
+    # scope's initial publication (ADR 0007 D4).
+    # -------------------------------------------------------------------
+    global _publication_parser
+    p_publication = sub.add_parser(
+        "publication",
+        help=(
+            "Show a scope's publication artifact, or bootstrap its initial publication (ADR 0007)."
+        ),
+    )
+    _publication_parser = p_publication
+    p_publication.set_defaults(func=cmd_publication_root)
+    publication_sub = p_publication.add_subparsers(
+        dest="publication_command", metavar="<publication-command>"
+    )
+
+    p_pub_show = publication_sub.add_parser(
+        "show",
+        help="Print a scope's publication artifact verbatim (or every scope that publishes).",
+    )
+    p_pub_show.add_argument(
+        "scope_id",
+        nargs="?",
+        default=None,
+        help="Scope whose publication to show. Omit to show every scope that publishes.",
+    )
+    p_pub_show.set_defaults(func=cmd_publication_show)
+
+    p_pub_bootstrap = publication_sub.add_parser(
+        "bootstrap",
+        help="Bootstrap a scope's initial publication from its current summary (ADR 0007 D4).",
+    )
+    p_pub_bootstrap.add_argument("scope_id")
+    p_pub_bootstrap.set_defaults(func=cmd_publication_bootstrap)
 
     p_launch = sub.add_parser(
         "launch",
