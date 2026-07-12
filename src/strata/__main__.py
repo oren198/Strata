@@ -782,6 +782,130 @@ def cmd_operator_show(args: argparse.Namespace) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# strata publication — ADR 0007's local entry surface: show a scope's (or
+# every scope's) publication artifact verbatim, or bootstrap a scope's
+# initial publication (ADR 0007 D4). Embedded reads/writes, same discipline
+# as the operator group above.
+# ---------------------------------------------------------------------------
+
+# Set by _build_parser() so `strata publication` with no subcommand can print
+# its own help (mirrors the operator group's pattern).
+_publication_parser: argparse.ArgumentParser | None = None
+
+
+def cmd_publication_root(args: argparse.Namespace) -> int:
+    """``strata publication`` with no subcommand — print the group's help."""
+    if _publication_parser is not None:
+        _publication_parser.print_help()
+    return 0
+
+
+def cmd_publication_show(args: argparse.Namespace) -> int:
+    """``strata publication show [scope_id]`` — print publication artifact(s) verbatim.
+
+    Without ``scope_id``: every scope that has published anything. With
+    ``scope_id``: that scope's artifact (or a "published nothing yet"
+    message when it has no publication file).
+    """
+    from strata.publication import list_scopes_with_publications, read_publication_text
+    from strata.stores import EmbeddedStoreError, open_embedded_stores
+
+    try:
+        stores = open_embedded_stores()
+    except EmbeddedStoreError as exc:
+        print(exc.message, file=sys.stderr)
+        return 1
+
+    with stores:
+        summaries_dir = str(stores.summary_store.summaries_dir)
+
+        if args.scope_id:
+            scope = stores.fleet_config.get_scope(args.scope_id)
+            if scope is None:
+                print(f"Scope not found: {args.scope_id}", file=sys.stderr)
+                return 1
+            text = read_publication_text(args.scope_id, summaries_dir=summaries_dir)
+            if text is None:
+                print(f"Scope {args.scope_id!r} has published nothing yet.")
+            else:
+                print(text, end="" if text.endswith("\n") else "\n")
+            return 0
+
+        scope_ids = list_scopes_with_publications(summaries_dir)
+        if not scope_ids:
+            print("No scope has published anything yet.")
+            return 0
+        for sid in scope_ids:
+            text = read_publication_text(sid, summaries_dir=summaries_dir) or ""
+            print(f"=== {sid} ===")
+            print(text, end="" if text.endswith("\n") else "\n")
+            print()
+    return 0
+
+
+def cmd_publication_bootstrap(args: argparse.Namespace) -> int:
+    """``strata publication bootstrap <scope_id>`` — bootstrap an initial publication (ADR 0007 D4).
+
+    A one-shot, operator-initiated migration step: the scope-manager
+    proposes an initial publication distilled from the scope's CURRENT
+    summary, judged through the normal publication path. Requires
+    ``ANTHROPIC_API_KEY`` (or ``STRATA_ANTHROPIC_API_KEY``) — this is an LLM
+    judgment, not a mechanical copy.
+    """
+    import anthropic
+
+    from strata.publication import bootstrap_publication
+    from strata.scope_manager import ScopeManager
+    from strata.settings import get_settings
+    from strata.stores import EmbeddedStoreError, open_embedded_stores
+
+    try:
+        stores = open_embedded_stores()
+    except EmbeddedStoreError as exc:
+        print(exc.message, file=sys.stderr)
+        return 1
+
+    with stores:
+        scope = stores.fleet_config.get_scope(args.scope_id)
+        if scope is None:
+            print(f"Scope not found: {args.scope_id}", file=sys.stderr)
+            return 1
+
+        settings = get_settings()
+        manager = ScopeManager(
+            client=anthropic.Anthropic(api_key=settings.anthropic_api_key),
+            model=settings.manager_model,
+        )
+
+        try:
+            outcome = bootstrap_publication(
+                args.scope_id,
+                fleet=stores.fleet_config,
+                record_store=stores.record_store,
+                summary_store=stores.summary_store,
+                scope_manager=manager,
+            )
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+
+        if outcome.decision == "decline" or not outcome.items:
+            print(
+                f"Scope-manager declined to bootstrap a publication for {args.scope_id!r}: "
+                f"{outcome.reasoning}"
+            )
+            return 0
+
+        print(
+            f"Bootstrapped {len(outcome.items)} published item(s) for {args.scope_id!r}: "
+            f"{outcome.reasoning}"
+        )
+        for item in outcome.items:
+            print(f"  [{item.id}] {item.kind} anchors={item.anchors}")
+    return 0
+
+
 def cmd_export_fleet(args: argparse.Namespace) -> int:
     """Read V1 fleet tables and write fleet.yaml for V1.2.
 
@@ -2097,6 +2221,43 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Attachment scope to show. Omit to show every attachment scope + totals.",
     )
     p_op_show.set_defaults(func=cmd_operator_show)
+
+    # -------------------------------------------------------------------
+    # strata publication — ADR 0007's local entry surface: show a scope's
+    # (or every scope's) publication artifact verbatim, or bootstrap a
+    # scope's initial publication (ADR 0007 D4).
+    # -------------------------------------------------------------------
+    global _publication_parser
+    p_publication = sub.add_parser(
+        "publication",
+        help=(
+            "Show a scope's publication artifact, or bootstrap its initial publication (ADR 0007)."
+        ),
+    )
+    _publication_parser = p_publication
+    p_publication.set_defaults(func=cmd_publication_root)
+    publication_sub = p_publication.add_subparsers(
+        dest="publication_command", metavar="<publication-command>"
+    )
+
+    p_pub_show = publication_sub.add_parser(
+        "show",
+        help="Print a scope's publication artifact verbatim (or every scope that publishes).",
+    )
+    p_pub_show.add_argument(
+        "scope_id",
+        nargs="?",
+        default=None,
+        help="Scope whose publication to show. Omit to show every scope that publishes.",
+    )
+    p_pub_show.set_defaults(func=cmd_publication_show)
+
+    p_pub_bootstrap = publication_sub.add_parser(
+        "bootstrap",
+        help="Bootstrap a scope's initial publication from its current summary (ADR 0007 D4).",
+    )
+    p_pub_bootstrap.add_argument("scope_id")
+    p_pub_bootstrap.set_defaults(func=cmd_publication_bootstrap)
 
     p_launch = sub.add_parser(
         "launch",
