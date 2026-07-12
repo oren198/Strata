@@ -274,6 +274,38 @@ This creates `.strata/.venv/` with strata installed, and updates `.claude/settin
 to point at the absolute venv path. The `.strata/.venv/` directory is gitignored
 automatically. Note: this downloads ~100MB of Python deps.
 
+### Undoing it: `strata unregister`
+
+`strata unregister` reverses register's wiring. Like register, it is strictly
+conservative — it removes each artifact **only when it still matches what
+register wrote**, and reports (leaving in place) anything you have since
+edited:
+
+```bash
+strata unregister               # remove the wiring; keep your .strata/ memory
+strata unregister --dry-run     # preview every action, write nothing
+strata unregister --purge-data  # also delete .strata/ (fleet.yaml, DB, summaries)
+```
+
+What it does, step by step:
+
+1. Removes the managed `# Strata` block from `.gitignore`, leaving every other
+   line byte-for-byte unchanged. An edited block is reported and left.
+2. Removes the `mcpServers.strata` entry from `.claude/settings.json`,
+   preserving all your other keys. If you customised the entry, it is left in
+   place and reported.
+3. Removes each of the `strata`, `strata-worker`, and `strata-inspect` skills
+   **only if byte-identical to the shipped version**. A modified or
+   older-version skill is left alone and reported.
+4. Leaves your `.strata/` workspace untouched — that is memory, not wiring.
+   Pass `--purge-data` to remove it too (`--dry-run --purge-data` previews the
+   purge without deleting).
+
+**Exit code:** `0` on success, including when there is nothing to do (running
+it on an unregistered project is a safe no-op). It exits `1` when something you
+asked to remove was left in place because it had been edited — so scripts can
+detect the partial case.
+
 ---
 
 ## More commands

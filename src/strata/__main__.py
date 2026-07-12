@@ -1437,6 +1437,283 @@ def cmd_register(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# strata unregister — reverse the brownfield wiring (issue #53)
+# ---------------------------------------------------------------------------
+#
+# Undoes exactly what `strata register` wired, honouring ADR 0005 Decision 6
+# ("never delete or override user state") in reverse: every artifact is
+# removed ONLY when it still byte-matches what register would have written.
+# Anything the user has since edited is reported and left in place, and the
+# run exits 1 so scripts can detect the partial case.
+#
+#   1. `.gitignore` managed block  — removed verbatim, other lines byte-stable.
+#   2. `mcpServers.strata` entry    — removed only if identical to _MCP_ENTRY.
+#   3. the three vendored skills     — removed only if byte-identical to the
+#                                     currently-shipped src/strata/_skills copy.
+#   4. `.strata/` data               — memory, not wiring: left alone unless
+#                                     --purge-data is passed.
+#
+# --dry-run prints every action with the same _glyph format and touches
+# nothing.  Running against an already-clean project reports "nothing to do"
+# per item and exits 0 (idempotent).
+
+
+def _remove_gitignore_block(text: str) -> tuple[str, str]:
+    """Remove register's managed `.gitignore` block from *text*.
+
+    Returns ``(new_text, status)`` where *status* is one of:
+
+    - ``"removed"``  — the verbatim managed block was found and stripped,
+      along with the single blank-line separator register prepends, so the
+      surrounding lines stay byte-identical.
+    - ``"edited"``   — the managed marker line is present but the block no
+      longer matches verbatim (the user edited inside it); *text* is returned
+      unchanged so nothing user-authored is destroyed.
+    - ``"absent"``   — no managed marker at all; nothing to do.
+    """
+    if _GITIGNORE_BLOCK in text:
+        # Register appends "\n" + _GITIGNORE_BLOCK (a blank-line separator
+        # before the block). Strip that separator too so a `.gitignore` that
+        # ended in a newline before register round-trips byte-for-byte.
+        sep_block = "\n" + _GITIGNORE_BLOCK
+        if sep_block in text:
+            return text.replace(sep_block, "", 1), "removed"
+        return text.replace(_GITIGNORE_BLOCK, "", 1), "removed"
+    if _GITIGNORE_MARKER in text:
+        return text, "edited"
+    return text, "absent"
+
+
+def _skill_matches_shipped(installed_md: Path, skill_name: str) -> bool | None:
+    """Return whether an installed skill's ``Skill.md`` matches the shipped copy.
+
+    - ``True``  — the installed ``Skill.md`` is byte-identical to the version
+      shipped in the running distribution (``src/strata/_skills/<name>``);
+      safe to delete.
+    - ``False`` — it differs (user-edited, or an older Strata version); leave
+      it and report.
+    - ``None``  — the shipped reference could not be read, so we cannot prove a
+      match; treat conservatively as "leave it".
+    """
+    import importlib.resources  # noqa: PLC0415
+
+    try:
+        shipped = importlib.resources.files("strata") / "_skills" / skill_name / "Skill.md"
+        shipped_text = shipped.read_text(encoding="utf-8")
+    except (OSError, ModuleNotFoundError):
+        return None
+    try:
+        installed_text = installed_md.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    return installed_text == shipped_text
+
+
+def cmd_unregister(args: argparse.Namespace) -> int:
+    """Reverse `strata register`'s wiring — issue #53.
+
+    Removes each artifact register wired ONLY when it still byte-matches what
+    register would have written; user-edited artifacts are reported and left
+    in place (ADR 0005 Decision 6, applied in reverse). Steps:
+
+    1. `.gitignore` managed block   (removed verbatim, other lines untouched).
+    2. `mcpServers.strata` entry     (removed only if == the canonical entry).
+    3. the three vendored skills      (removed only if byte-identical to shipped).
+    4. `.strata/` data                (left alone unless --purge-data).
+
+    --dry-run prints every action and touches nothing. Idempotent: an
+    already-clean project reports "nothing to do" per item and exits 0.
+
+    Exit code: 0 on success (including nothing-to-do); 1 when something the
+    user asked to remove was left in place because it had been edited, so
+    scripts can detect the partial case.
+    """
+    import json  # noqa: PLC0415
+
+    path_arg: str | None = getattr(args, "path", None)
+    project_root = Path(path_arg).resolve() if path_arg else Path.cwd().resolve()
+    dry_run: bool = getattr(args, "dry_run", False)
+    purge_data: bool = getattr(args, "purge_data", False)
+
+    # Tracks whether any artifact the user asked to remove was left in place
+    # (edited/modified) — drives the exit-1 partial-completion signal.
+    left_in_place = False
+
+    def _ok(message: str) -> None:
+        print(f"  {_glyph('pass')} {message}")
+
+    def _left(message: str) -> None:
+        nonlocal left_in_place
+        left_in_place = True
+        print(f"  {_glyph('warn')} {message}", file=sys.stderr)
+
+    def _would(present: str, past: str) -> str:
+        return f"would {present}" if dry_run else past
+
+    header = "strata unregister --dry-run  (no writes)" if dry_run else "strata unregister"
+    print(f"{header}\nProject root: {project_root}")
+    print()
+
+    # -----------------------------------------------------------------------
+    # Step 1: `.gitignore` managed block.
+    # -----------------------------------------------------------------------
+    gitignore = project_root / ".gitignore"
+    if not gitignore.exists():
+        _ok(".gitignore: nothing to do (no .gitignore)")
+    else:
+        original = gitignore.read_text(encoding="utf-8")
+        new_text, status = _remove_gitignore_block(original)
+        if status == "removed":
+            if new_text.strip() == "":
+                # The file is now empty. Register creates `.gitignore` when it
+                # is absent, but that origin is not detectable from content
+                # alone, so we leave the (now-empty) file rather than risk
+                # deleting a file the user created. (design item 1)
+                if not dry_run:
+                    gitignore.write_text(new_text, encoding="utf-8")
+                _ok(
+                    f".gitignore: {_would('remove', 'removed')} managed Strata block "
+                    "(file now empty — left in place; register's authorship is not detectable)"
+                )
+            else:
+                if not dry_run:
+                    gitignore.write_text(new_text, encoding="utf-8")
+                _ok(f".gitignore: {_would('remove', 'removed')} managed Strata block")
+        elif status == "edited":
+            _left(
+                ".gitignore: managed Strata block was edited — left in place "
+                "(remove it by hand if you meant to)"
+            )
+        else:  # absent
+            _ok(".gitignore: nothing to do (no managed Strata block)")
+
+    # -----------------------------------------------------------------------
+    # Step 2: `mcpServers.strata` settings entry.
+    # -----------------------------------------------------------------------
+    settings_json = project_root / ".claude" / "settings.json"
+    if not settings_json.exists():
+        _ok(".claude/settings.json: nothing to do (no settings.json)")
+    else:
+        try:
+            settings_data: dict = json.loads(settings_json.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            _left(
+                f".claude/settings.json: not valid JSON ({exc}) — left untouched "
+                "(fix it, then re-run)"
+            )
+            settings_data = None  # type: ignore[assignment]
+
+        if settings_data is not None:
+            mcp_servers = settings_data.get("mcpServers")
+            entry = mcp_servers.get("strata") if isinstance(mcp_servers, dict) else None
+            if entry is None:
+                _ok(".claude/settings.json: nothing to do (no mcpServers.strata entry)")
+            elif entry == _MCP_ENTRY:
+                # Byte-stable rewrite: match register's writer exactly
+                # (json.dumps(indent=2) + trailing newline).
+                del mcp_servers["strata"]
+                # Register creates the mcpServers block when absent; if strata
+                # was its only key, drop the now-empty block so a project that
+                # had no mcpServers before register round-trips byte-for-byte.
+                if not mcp_servers:
+                    del settings_data["mcpServers"]
+                if not dry_run:
+                    settings_json.write_text(
+                        json.dumps(settings_data, indent=2) + "\n", encoding="utf-8"
+                    )
+                verb = _would("remove", "removed")
+                if not settings_data:
+                    # The file is now an empty object. Register creates
+                    # settings.json when absent, but that origin is not
+                    # detectable from content, so we leave the empty file
+                    # rather than risk deleting one the user created —
+                    # mirroring the empty-.gitignore treatment. (design item 2)
+                    _ok(
+                        f".claude/settings.json: {verb} mcpServers.strata entry "
+                        "(file now empty — left in place; register's authorship is not detectable)"
+                    )
+                else:
+                    _ok(f".claude/settings.json: {verb} mcpServers.strata entry")
+            else:
+                _left(
+                    ".claude/settings.json: mcpServers.strata entry was edited "
+                    "(differs from the canonical entry) — left in place"
+                )
+
+    # -----------------------------------------------------------------------
+    # Step 3: the three vendored skills.
+    # -----------------------------------------------------------------------
+    claude_skills_dir = project_root / ".claude" / "skills"
+    for skill_name in ["strata", "strata-worker", "strata-inspect"]:
+        skill_dir = claude_skills_dir / skill_name
+        skill_md = skill_dir / "Skill.md"
+        if not skill_dir.exists():
+            _ok(f"skill {skill_name}: nothing to do (not installed)")
+            continue
+        match = _skill_matches_shipped(skill_md, skill_name) if skill_md.exists() else False
+        if match is True:
+            if not dry_run:
+                skill_md.unlink()
+                # Remove the skill directory only if register's Skill.md was
+                # its sole content; never delete other files the user added.
+                _rmdir_if_empty(skill_dir)
+            _ok(f"skill {skill_name}: {_would('remove', 'removed')} (matched shipped version)")
+        elif match is None:
+            _left(
+                f"skill {skill_name}: could not read the shipped reference to compare "
+                "— left in place"
+            )
+        else:  # False — differs
+            _left(
+                f"skill {skill_name}: modified or from an older Strata version "
+                "(differs from shipped) — left in place"
+            )
+
+    # Tidy up register-created empty parent dirs so a clean unregister restores
+    # the tree exactly. Only ever removes directories that are already empty.
+    if not dry_run:
+        _rmdir_if_empty(claude_skills_dir)
+        _rmdir_if_empty(project_root / ".claude")
+
+    # -----------------------------------------------------------------------
+    # Step 4: `.strata/` data — memory, not wiring.
+    # -----------------------------------------------------------------------
+    strata_dir = project_root / ".strata"
+    if not strata_dir.exists():
+        _ok(".strata/: nothing to do (no workspace)")
+    elif purge_data:
+        if not dry_run:
+            shutil.rmtree(strata_dir)
+        verb = _would("purge", "purged")
+        _ok(f".strata/: {verb} project memory (config, fleet.yaml, DB, summaries)")
+    else:
+        _ok(
+            ".strata/: left in place — memory, not wiring "
+            "(config, fleet.yaml, DB, summaries; pass --purge-data to remove)"
+        )
+
+    print()
+    if left_in_place:
+        print(
+            "Completed with items left in place (edited artifacts were not removed — see above). "
+            "Exit code 1.",
+            file=sys.stderr,
+        )
+        return 1
+    print("Done." if not dry_run else "Dry run complete — nothing was changed.")
+    return 0
+
+
+def _rmdir_if_empty(directory: Path) -> None:
+    """Remove *directory* only when it exists and is empty. Never touches files."""
+    try:
+        if directory.is_dir() and not any(directory.iterdir()):
+            directory.rmdir()
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------------------
 # Parser construction
 # ---------------------------------------------------------------------------
 
@@ -1585,6 +1862,50 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_register.set_defaults(func=cmd_register)
+
+    p_unregister = sub.add_parser(
+        "unregister",
+        help=(
+            "Reverse `strata register` — remove the .gitignore block, the "
+            "mcpServers.strata entry, and the vendored skills (only when "
+            "unmodified). Leaves .strata/ data unless --purge-data (issue #53)."
+        ),
+        description=(
+            "Reverse the wiring `strata register` added, honouring the "
+            "strict-additive contract in reverse: each artifact is removed only "
+            "when it still byte-matches what register wrote. Artifacts you have "
+            "since edited (the .gitignore block, the mcpServers.strata entry, a "
+            "vendored skill) are reported and left in place. Your project's "
+            "memory under .strata/ (fleet.yaml, DB, summaries, config.toml) is "
+            "left untouched unless you pass --purge-data. "
+            "Exit code: 0 on success including nothing-to-do; 1 when something "
+            "you asked to remove was left in place because it had been edited, "
+            "so scripts can detect the partial case."
+        ),
+    )
+    p_unregister.add_argument(
+        "path",
+        nargs="?",
+        default=None,
+        help="Project root directory (default: current working directory).",
+    )
+    p_unregister.add_argument(
+        "--dry-run",
+        action="store_true",
+        dest="dry_run",
+        help="Show every action in the same format without writing anything.",
+    )
+    p_unregister.add_argument(
+        "--purge-data",
+        action="store_true",
+        dest="purge_data",
+        help=(
+            "Also delete the .strata/ workspace (fleet.yaml, DB, summaries, "
+            "config.toml). Off by default — that data is memory, not wiring. "
+            "Combine with --dry-run to preview what would be purged."
+        ),
+    )
+    p_unregister.set_defaults(func=cmd_unregister)
 
     return parser
 
