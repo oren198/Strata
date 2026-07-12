@@ -186,6 +186,10 @@ widens *read* reach sideways, conveying no authority). Publishing is a
 judged act by the publishing scope's authority, distinct from internal
 acceptance: being in the scope's memory does not make an item published.
 
+Publishing and **withdrawal** (removing an item from the publication) are
+both judged acts by the publishing scope's authority, each appended to the
+scope's **record**.
+
 Properties of published memory:
 
 - **Non-binding** to every reader; the only path to binding beyond a scope's
