@@ -605,15 +605,13 @@ def test_mechanical_propagation_fires_when_the_last_anchor_vanishes_in_a_later_e
     # c_dir1 in one event (it survives — c_dir2 still stands), then loses
     # c_dir2 in a LATER event: that second event removes only c_dir2, but
     # the item's anchors have now ALL vanished and it must be withdrawn.
-    item = PublishedItem(
-        id="pub_x4",
-        kind="directive",
+    item = _seed_published_item(
+        record_store,
+        summaries_dir,
+        "g_team",
         content="Two-anchor item, anchors vanish across separate events.",
-        subject=None,
         anchors=["directive:c_dir1", "directive:c_dir2"],
-        published_at="2026-07-12T00:00:00+00:00",
     )
-    _write_publication("g_team", [item], summaries_dir=summaries_dir)
 
     first = propagate_directive_removals(
         "g_team",
