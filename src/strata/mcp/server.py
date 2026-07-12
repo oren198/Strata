@@ -46,6 +46,7 @@ from mcp.server.fastmcp import FastMCP
 
 from strata.fleet_config import FleetConfig, FleetConfigError
 from strata.migrator import run_migrations
+from strata.perspective import compose_perspective
 from strata.project_config import (
     ProjectConfigError,
     StoragePaths,
@@ -742,27 +743,6 @@ def strata_read_scope_summary(scope_id: str | None = None) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def _summary_for_scope(scope_id: str) -> dict:
-    """Return a scope's summary as a plain dict, using a synthesized empty summary if none exists.
-
-    The synthesized summary reports ``version=0``/``exists=False`` so it is
-    never mistaken for a real first write (``version=1``, ``exists=True``) —
-    see :class:`strata.summary_store.ScopeSummary` (issue #59).
-    """
-    existing = _summary_store.read(scope_id)
-    if existing is not None:
-        return existing.model_dump()
-    empty = ScopeSummary(
-        scope_id=scope_id,
-        directives=[],
-        context="",
-        updated_at=datetime.now(tz=UTC).isoformat(),
-        version=0,
-        exists=False,
-    )
-    return empty.model_dump()
-
-
 @mcp.tool()
 def strata_read_perspective(scope_id: str | None = None) -> dict:
     """Return this agent's perspective on the fleet's long-term memory.
@@ -817,42 +797,12 @@ def strata_read_perspective(scope_id: str | None = None) -> dict:
     if scope is None:
         raise RuntimeError(f"Scope not found: {scope_id!r}")
 
-    # Build the ancestor chain (root-first), then append the requested scope.
-    ancestors = fleet.inter_stratum_ancestors(scope_id)
-    chain = [*ancestors, scope]
-
-    layers = []
-    for s in chain:
-        layers.append(
-            {
-                "scope_id": s.id,
-                "stratum_id": s.stratum_id,
-                "summary": _summary_for_scope(s.id),
-                "relation": "self" if s.id == scope_id else "ancestor",
-                "binding": True,
-            }
-        )
-
-    # ADR 0006 D3: append one layer per peer referenced (one hop) by any
-    # scope on the chain. Reuses FleetConfig.entitlement_view rather than
-    # re-deriving peer logic — sorted by scope id for deterministic order.
-    view = fleet.entitlement_view(scope_id)
-    for s in sorted(view.referenced_peers, key=lambda peer: peer.id):
-        layers.append(
-            {
-                "scope_id": s.id,
-                "stratum_id": s.stratum_id,
-                "summary": _summary_for_scope(s.id),
-                "relation": "peer_reference",
-                "binding": False,
-            }
-        )
-
-    return {
-        "scope_id": scope_id,
-        "layers": layers,
-        "_layers_count": len(layers),
-    }
+    # Composition (ordering, relation labelling, the synthesized-empty-
+    # summary fallback) lives in strata.perspective — the importable library
+    # primitive (issue #83A) — not here. This tool's job is entitlement plus
+    # the scope-not-found error above; scope existence is already confirmed,
+    # so compose_perspective's own ValueError never triggers.
+    return compose_perspective(scope_id, fleet=fleet, summary_store=_summary_store)
 
 
 # ---------------------------------------------------------------------------
