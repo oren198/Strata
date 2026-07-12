@@ -10,6 +10,11 @@ This module owns all SQLite access.  It is the authoritative source of truth for
     never enters a scope's record) versus correcting a scope's native memory
     in person (a judgment, lives in that scope's own record). See
     :mod:`strata.operator` for the primitives built on top of these tables.
+  - The publication channel's own record (``publication_acts`` +
+    ``publication_judgments``) — ADR 0007. Every publish/withdraw act on a
+    scope's curated outward face, distinct from its contribution record; see
+    :mod:`strata.publication` for the primitives built on top of these
+    tables.
 
 Fleet configuration (strata, scopes, edges) is no longer stored here.  Under
 ADR 0002 it lives in ``fleet.yaml`` and is held in memory by
@@ -30,12 +35,16 @@ Design decisions
     ``j_<6hex>``   judgments
     ``op_<6hex>``  operator acts (ADR 0008)
     ``ret_<6hex>`` retirement events (ADR 0008)
+    ``pub_<6hex>`` publication acts (ADR 0007) — a publish act's id doubles
+                   as its published item's id
+    ``pubj_<6hex>`` publication judgments (ADR 0007)
 
 Vocabulary throughout follows CONTEXT.md verbatim.
 """
 
 from __future__ import annotations
 
+import json
 import secrets
 import sqlite3
 from dataclasses import dataclass
@@ -72,6 +81,16 @@ def _new_operator_act_id() -> str:
 
 def _new_retirement_id() -> str:
     return f"ret_{secrets.token_hex(8)}"
+
+
+def _new_publication_act_id() -> str:
+    # ADR 0007 D1/D2: publication acts are prefixed pub_ — this id doubles as
+    # a published item's own id once accepted (see strata.publication).
+    return f"pub_{secrets.token_hex(8)}"
+
+
+def _new_publication_judgment_id() -> str:
+    return f"pubj_{secrets.token_hex(8)}"
 
 
 # ---------------------------------------------------------------------------
@@ -190,6 +209,54 @@ class Retirement:
     directive_id: str
     retired_by: str
     reason: str | None
+    created_at: str
+
+
+@dataclass(frozen=True)
+class PublicationAct:
+    """One act on a scope's publication — its curated outward face (ADR 0007 D1/D2).
+
+    Mirrors :class:`Contribution` but acts on the OUTWARD face, never the
+    internal summary. ``act == "publish"`` introduces a new published item
+    (``kind``/``content``/``subject``/``anchors`` all populated, ``withdraws``
+    ``None``); ``act == "withdraw"`` removes one (those four fields ``None``,
+    ``withdraws`` naming the publish act's id being removed). ``anchors`` is
+    the list of anchor strings (``directive:<id>`` or ``subject:<text>``,
+    ADR 0007 D1) — ``None`` for withdraw. ``trigger`` is ``None`` for an
+    agent-proposed or operator-in-person act; for a MECHANICALLY propagated
+    withdrawal (ADR 0007 D3) it carries the record id of the internal change
+    that caused it (a contribution id or an operator retirement id).
+    ``proposer`` mirrors :class:`ContributorRef` — this act's provenance.
+    """
+
+    id: str
+    scope_id: str
+    act: Literal["publish", "withdraw"]
+    kind: Literal["directive", "context"] | None
+    content: str | None
+    subject: str | None
+    anchors: list[str] | None
+    withdraws: str | None
+    trigger: str | None
+    proposer: ContributorRef
+    created_at: str
+
+
+@dataclass(frozen=True)
+class PublicationJudgment:
+    """The scope-manager's verdict on a publish/withdraw act (ADR 0007 D2).
+
+    Exactly one judgment per JUDGED act; a second attempt raises an
+    ``IntegrityError`` (UNIQUE constraint on ``act_id``). Mechanical
+    propagation withdrawals (:func:`~strata.publication.propagate_directive_removals`)
+    get no row here — see the migration's header comment.
+    """
+
+    id: str
+    act_id: str
+    decision: Literal["accept", "decline"]
+    judged_by: str
+    reasoning: str | None
     created_at: str
 
 
@@ -721,6 +788,197 @@ class RecordStore:
             ).fetchall()
         return [Retirement(**dict(row)) for row in rows]
 
+    # ------------------------------------------------------------------
+    # Publication acts + judgments (ADR 0007 D1/D2) — the publication
+    # channel's own record, distinct from a scope's contribution record.
+    # ------------------------------------------------------------------
+
+    def append_publication_act(
+        self,
+        *,
+        scope_id: str,
+        act: Literal["publish", "withdraw"],
+        kind: Literal["directive", "context"] | None,
+        content: str | None,
+        subject: str | None,
+        anchors: list[str] | None,
+        withdraws: str | None,
+        trigger: str | None,
+        proposer: ContributorRef,
+    ) -> PublicationAct:
+        """Append a publish or withdraw act to *scope_id*'s publication record.
+
+        This is the raw record append — the caller judges (or, for
+        mechanical propagation, mechanically decides) separately and records
+        the verdict via :meth:`record_publication_judgment` (agent-proposed
+        and judged-propagation acts only; mechanical propagation appends no
+        judgment row — see the migration's header comment).
+
+        Args:
+            scope_id:  The publishing scope.
+            act:       ``'publish'`` or ``'withdraw'``.
+            kind:      ``'directive'`` or ``'context'``; ``None`` for withdraw.
+            content:   Verbatim outward wording; ``None`` for withdraw.
+            subject:   Optional short label; ``None`` for withdraw.
+            anchors:   The anchor strings supporting this item (ADR 0007 D1);
+                       ``None`` for withdraw. Stored as a JSON array.
+            withdraws: For ``act == 'withdraw'``: the ``pub_`` id of the
+                       published item being removed. ``None`` for publish.
+            trigger:   For a mechanically propagated withdrawal (ADR 0007
+                       D3): the record id of the triggering internal change.
+                       ``None`` otherwise.
+            proposer:  Provenance — mirrors :class:`ContributorRef`.
+
+        Returns:
+            The newly appended :class:`PublicationAct`.
+
+        Raises:
+            sqlite3.IntegrityError: If *withdraws* references a non-existent
+                publication act.
+        """
+        act_id = _new_publication_act_id()
+        anchors_json = json.dumps(anchors) if anchors is not None else None
+        self._conn.execute(
+            """
+            INSERT INTO publication_acts (
+                id, scope_id, act, kind, content, subject, anchors, withdraws, "trigger",
+                proposer_scope_id, proposer_skill, proposer_session_id, proposer_ts
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                act_id,
+                scope_id,
+                act,
+                kind,
+                content,
+                subject,
+                anchors_json,
+                withdraws,
+                trigger,
+                proposer.scope_id,
+                proposer.skill,
+                proposer.session_id,
+                proposer.ts,
+            ),
+        )
+        self._conn.commit()
+        return self._fetch_publication_act(act_id)
+
+    def list_publication_acts(self, *, scope_id: str) -> list[PublicationAct]:
+        """Return publication acts for *scope_id* ordered by ``created_at`` ascending."""
+        rows = self._conn.execute(
+            """
+            SELECT id, scope_id, act, kind, content, subject, anchors, withdraws,
+                   "trigger", proposer_scope_id, proposer_skill, proposer_session_id,
+                   proposer_ts, created_at
+            FROM publication_acts
+            WHERE scope_id = ?
+            ORDER BY created_at ASC, rowid ASC
+            """,
+            (scope_id,),
+        ).fetchall()
+        return [_publication_act_from_row(row) for row in rows]
+
+    def get_publication_act(self, act_id: str) -> PublicationAct | None:
+        """Return the publication act with *act_id*, or ``None`` if absent."""
+        try:
+            return self._fetch_publication_act(act_id)
+        except KeyError:
+            return None
+
+    def _fetch_publication_act(self, act_id: str) -> PublicationAct:
+        row = self._conn.execute(
+            """
+            SELECT id, scope_id, act, kind, content, subject, anchors, withdraws,
+                   "trigger", proposer_scope_id, proposer_skill, proposer_session_id,
+                   proposer_ts, created_at
+            FROM publication_acts WHERE id = ?
+            """,
+            (act_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"Publication act not found: {act_id!r}")
+        return _publication_act_from_row(row)
+
+    def record_publication_judgment(
+        self,
+        *,
+        act_id: str,
+        decision: Literal["accept", "decline"],
+        judged_by: str,
+        reasoning: str | None = None,
+    ) -> PublicationJudgment:
+        """Record the scope-manager's verdict on a publish/withdraw act.
+
+        Only one judgment is allowed per act; a second call raises an
+        ``IntegrityError`` (UNIQUE constraint on ``act_id``). Never called
+        for a mechanically propagated withdrawal (ADR 0007 D3) — that act
+        carries a ``trigger`` instead and gets no judgment row.
+
+        Args:
+            act_id:    The publication act being judged.
+            decision:  ``'accept'`` or ``'decline'``.
+            judged_by: Identifier of the judging authority (``"scope-manager"``
+                       for the normal judged path).
+            reasoning: Optional free-text rationale.
+
+        Returns:
+            The newly recorded :class:`PublicationJudgment`.
+
+        Raises:
+            sqlite3.IntegrityError: If *act_id* does not exist (FK) or
+                already has a judgment (UNIQUE).
+        """
+        judgment_id = _new_publication_judgment_id()
+        self._conn.execute(
+            """
+            INSERT INTO publication_judgments (id, act_id, decision, judged_by, reasoning)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (judgment_id, act_id, decision, judged_by, reasoning),
+        )
+        self._conn.commit()
+        return self._fetch_publication_judgment(judgment_id)
+
+    def get_publication_judgment(self, act_id: str) -> PublicationJudgment | None:
+        """Return the judgment for *act_id*, or ``None`` if unjudged (or mechanical)."""
+        row = self._conn.execute(
+            """
+            SELECT id, act_id, decision, judged_by, reasoning, created_at
+            FROM publication_judgments WHERE act_id = ?
+            """,
+            (act_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return PublicationJudgment(**dict(row))
+
+    def list_publication_judgments(self, *, scope_id: str) -> list[PublicationJudgment]:
+        """Return all publication judgments for acts belonging to *scope_id*."""
+        rows = self._conn.execute(
+            """
+            SELECT j.id, j.act_id, j.decision, j.judged_by, j.reasoning, j.created_at
+            FROM publication_judgments j
+            JOIN publication_acts a ON j.act_id = a.id
+            WHERE a.scope_id = ?
+            ORDER BY j.created_at ASC
+            """,
+            (scope_id,),
+        ).fetchall()
+        return [PublicationJudgment(**dict(row)) for row in rows]
+
+    def _fetch_publication_judgment(self, judgment_id: str) -> PublicationJudgment:
+        row = self._conn.execute(
+            """
+            SELECT id, act_id, decision, judged_by, reasoning, created_at
+            FROM publication_judgments WHERE id = ?
+            """,
+            (judgment_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"Publication judgment not found: {judgment_id!r}")
+        return PublicationJudgment(**dict(row))
+
 
 # ---------------------------------------------------------------------------
 # Row → model helpers
@@ -737,3 +995,18 @@ def _contribution_from_row(row: sqlite3.Row) -> Contribution:
         ts=d.pop("contributor_ts"),
     )
     return Contribution(**d, contributor=contributor)
+
+
+def _publication_act_from_row(row: sqlite3.Row) -> PublicationAct:
+    """Map a ``sqlite3.Row`` from the publication_acts table to a :class:`PublicationAct`."""
+    d = dict(row)
+    proposer = ContributorRef(
+        scope_id=d.pop("proposer_scope_id"),
+        skill=d.pop("proposer_skill"),
+        session_id=d.pop("proposer_session_id"),
+        ts=d.pop("proposer_ts"),
+    )
+    anchors_json = d.pop("anchors")
+    anchors = json.loads(anchors_json) if anchors_json is not None else None
+    trigger = d.pop("trigger")
+    return PublicationAct(**d, anchors=anchors, trigger=trigger, proposer=proposer)
