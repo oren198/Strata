@@ -889,7 +889,12 @@ def test_perspective_self_and_ancestor_layers_are_binding(tmp_path: Path) -> Non
 
 
 def test_perspective_referenced_peer_appears_as_context_layer(tmp_path: Path) -> None:
-    """A peer referenced by a chain scope appears with relation="peer_reference", binding=False."""
+    """A peer referenced by a chain scope appears with relation="peer_reference", binding=False.
+
+    ADR 0007 D4: the peer layer carries that peer's PUBLICATION, not its
+    internal summary — writing only a summary (no publication artifact)
+    leaves the layer with an honestly empty ``publication.items`` list.
+    """
     db_path = _make_db(tmp_path)
     summaries_dir = str(tmp_path / "summaries")
     fleet_path = _make_peer_composition_fleet_yaml(tmp_path)
@@ -910,8 +915,60 @@ def test_perspective_referenced_peer_appears_as_context_layer(tmp_path: Path) ->
     peer_layer = next(layer for layer in result["layers"] if layer["scope_id"] == "g_peer_a")
     assert peer_layer["relation"] == "peer_reference"
     assert peer_layer["binding"] is False
-    # Full summary, clearly labelled — never stripped down.
-    assert peer_layer["summary"]["context"] == "peer a context"
+    # Never the peer's internal summary — no "summary" key at all.
+    assert "summary" not in peer_layer
+    assert peer_layer["publication"] == {"items": []}
+
+
+def test_perspective_referenced_peer_publication_composed_verbatim(tmp_path: Path) -> None:
+    """A peer's PUBLISHED items compose into the peer layer, verbatim and labelled."""
+    from strata.publication import PublishedItem, _write_publication
+
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_peer_composition_fleet_yaml(tmp_path)
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+    ss = SummaryStore(summaries_dir)
+    ss.write("g_peer_a", _make_summary("g_peer_a", "peer a internal context — must NOT appear"))
+    _write_publication(
+        "g_peer_a",
+        [
+            PublishedItem(
+                id="pub_a1",
+                kind="context",
+                content="Peer A's outward status update.",
+                subject="status",
+                anchors=["subject:status"],
+                published_at="2026-07-12T00:00:00+00:00",
+            )
+        ],
+        summaries_dir=summaries_dir,
+    )
+
+    fleet = FleetConfig.load(fleet_path)
+
+    with (
+        patch.object(mod, "_load_fleet", return_value=fleet),
+        patch.object(mod, "_AGENT_SCOPE", "g_team"),
+    ):
+        mod._summary_store = ss
+        result = mod.strata_read_perspective("g_team")
+
+    peer_layer = next(layer for layer in result["layers"] if layer["scope_id"] == "g_peer_a")
+    assert peer_layer["publication"]["items"] == [
+        {
+            "id": "pub_a1",
+            "kind": "context",
+            "content": "Peer A's outward status update.",
+            "subject": "status",
+            "anchors": ["subject:status"],
+            "published_at": "2026-07-12T00:00:00+00:00",
+        }
+    ]
+    # The internal summary's content never leaks into the composed layer.
+    rendered = str(result)
+    assert "must NOT appear" not in rendered
 
 
 def test_perspective_ancestor_referenced_peer_appears(tmp_path: Path) -> None:
@@ -982,8 +1039,8 @@ def test_perspective_unreferenced_sibling_absent_alongside_referenced_peers(
     assert "g_sibling" not in layer_scope_ids
 
 
-def test_perspective_peer_without_summary_reports_version_zero(tmp_path: Path) -> None:
-    """A referenced peer with no on-disk summary gets the synthesized empty-summary treatment."""
+def test_perspective_peer_without_publication_reports_honestly_empty_face(tmp_path: Path) -> None:
+    """A referenced peer with nothing published gets an honestly empty face (ADR 0007 D4)."""
     db_path = _make_db(tmp_path)
     summaries_dir = str(tmp_path / "summaries")
     fleet_path = _make_peer_composition_fleet_yaml(tmp_path)
@@ -999,8 +1056,8 @@ def test_perspective_peer_without_summary_reports_version_zero(tmp_path: Path) -
         result = mod.strata_read_perspective("g_team")
 
     peer_layer = next(layer for layer in result["layers"] if layer["scope_id"] == "g_peer_a")
-    assert peer_layer["summary"]["version"] == 0
-    assert peer_layer["summary"]["exists"] is False
+    assert "summary" not in peer_layer
+    assert peer_layer["publication"] == {"items": []}
 
 
 def test_perspective_peer_layers_sorted_by_scope_id(tmp_path: Path) -> None:
@@ -1045,7 +1102,12 @@ def test_perspective_peer_layers_sorted_by_scope_id(tmp_path: Path) -> None:
 
 
 def test_summary_read_of_referenced_peer_succeeds(tmp_path: Path) -> None:
-    """strata_read_scope_summary succeeds for a peer referenced by the caller's chain."""
+    """strata_read_scope_summary succeeds for a peer referenced by the caller's chain.
+
+    ADR 0007 D4: the entitled content for a peer is its PUBLICATION, not its
+    internal summary — writing only a summary produces an honestly empty
+    face, not the summary's content.
+    """
     db_path = _make_db(tmp_path)
     summaries_dir = str(tmp_path / "summaries")
     fleet_path = _make_peer_composition_fleet_yaml(tmp_path)
@@ -1064,7 +1126,50 @@ def test_summary_read_of_referenced_peer_succeeds(tmp_path: Path) -> None:
         result = mod.strata_read_scope_summary("g_peer_a")
 
     assert result["scope_id"] == "g_peer_a"
-    assert result["context"] == "peer a context"
+    assert result["relation"] == "peer_reference"
+    assert result["publication"] == {"items": []}
+    assert "context" not in result
+
+
+def test_summary_read_of_referenced_peer_returns_its_publication(tmp_path: Path) -> None:
+    """strata_read_scope_summary on a referenced peer returns its PUBLISHED items, verbatim."""
+    from strata.publication import PublishedItem, _write_publication
+
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_peer_composition_fleet_yaml(tmp_path)
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+    _write_publication(
+        "g_peer_a",
+        [
+            PublishedItem(
+                id="pub_a1",
+                kind="directive",
+                content="Peer A's published directive (non-binding to us).",
+                subject=None,
+                anchors=["directive:c_x1"],
+                published_at="2026-07-12T00:00:00+00:00",
+            )
+        ],
+        summaries_dir=summaries_dir,
+    )
+
+    fleet = FleetConfig.load(fleet_path)
+
+    with (
+        patch.object(mod, "_load_fleet", return_value=fleet),
+        patch.object(mod, "_AGENT_SCOPE", "g_team"),
+    ):
+        mod._summary_store = SummaryStore(summaries_dir)
+        result = mod.strata_read_scope_summary("g_peer_a")
+
+    assert result["scope_id"] == "g_peer_a"
+    assert result["relation"] == "peer_reference"
+    assert result["publication"]["items"][0]["id"] == "pub_a1"
+    assert result["publication"]["items"][0]["content"] == (
+        "Peer A's published directive (non-binding to us)."
+    )
 
 
 def test_summary_read_of_unreferenced_sibling_still_refused(tmp_path: Path) -> None:
@@ -1767,3 +1872,214 @@ def test_strata_rejudge_unknown_contribution_raises(tmp_path: Path) -> None:
         pytest.raises(RuntimeError, match="Contribution not found"),
     ):
         mod.strata_rejudge("c_does_not_exist")
+
+
+# ---------------------------------------------------------------------------
+# ADR 0007 D2 — Tools: strata_publish / strata_withdraw
+#
+# Own-scope-only publishing is structural: neither tool takes a scope_id
+# parameter — they always act on STRATA_AGENT_SCOPE.
+# ---------------------------------------------------------------------------
+
+
+def _seed_summary_with_directive(ss: SummaryStore, scope_id: str, directive_id: str) -> None:
+    from strata.summary_store import Directive
+
+    ss.write(
+        scope_id,
+        ScopeSummary(
+            scope_id=scope_id,
+            directives=[
+                Directive(
+                    id=directive_id,
+                    content="Use protobuf for all RPC.",
+                    subject="rpc",
+                    source_scope_id=scope_id,
+                    source_skill="strata-developer",
+                    created_at="2026-07-12T00:00:00+00:00",
+                )
+            ],
+            context="",
+            updated_at="2026-07-12T00:00:00+00:00",
+        ),
+    )
+
+
+def test_strata_publish_acts_on_bound_scope_with_own_provenance(tmp_path: Path) -> None:
+    """strata_publish always targets STRATA_AGENT_SCOPE and stamps the agent's own provenance."""
+    from strata.scope_manager import PublicationJudgment
+
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fleet_yaml(tmp_path)
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+    fleet = FleetConfig.load(fleet_path)
+
+    ss = SummaryStore(summaries_dir)
+    _seed_summary_with_directive(ss, "g_backend", "c_dir1")
+
+    fake_judgment = PublicationJudgment(decision="accept", reasoning="Fit for export.")
+
+    scope_p, skill_p, session_p = _patch_agent_binding(
+        mod, scope="g_backend", skill="strata-developer", session_id="sess_pub"
+    )
+    with (
+        scope_p,
+        skill_p,
+        session_p,
+        patch.object(mod, "_load_fleet", return_value=fleet),
+        patch("strata.scope_manager.ScopeManager.judge_publication", return_value=fake_judgment),
+        patch("anthropic.Anthropic", return_value=MagicMock()),
+    ):
+        mod._summary_store = ss
+        result = mod.strata_publish(
+            content="Use protobuf for all RPC.",
+            kind="directive",
+            anchors=["c_dir1"],
+            subject="rpc-protocol",
+        )
+
+    assert result["judgment"]["decision"] == "accept"
+    assert result["judgment"]["artifact_updated"] is True
+
+    with RecordStore(db_path) as rs:
+        acts = rs.list_publication_acts(scope_id="g_backend")
+        assert len(acts) == 1
+        act = acts[0]
+        assert act.proposer.scope_id == "g_backend"
+        assert act.proposer.skill == "strata-developer"
+        assert act.proposer.session_id == "sess_pub"
+
+    from strata.publication import read_publication
+
+    items = read_publication("g_backend", summaries_dir=summaries_dir)
+    assert len(items) == 1
+    assert items[0].content == "Use protobuf for all RPC."
+
+
+def test_strata_publish_no_scope_id_parameter_exists() -> None:
+    """strata_publish's signature has no scope_id — own-scope-only publishing is structural."""
+    import inspect
+
+    import strata.mcp.server as mod
+
+    params = inspect.signature(mod.strata_publish).parameters
+    assert "scope_id" not in params
+
+
+def test_strata_publish_zero_anchors_raises_runtimeerror(tmp_path: Path) -> None:
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fleet_yaml(tmp_path)
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+    fleet = FleetConfig.load(fleet_path)
+
+    ss = SummaryStore(summaries_dir)
+    _seed_summary_with_directive(ss, "g_backend", "c_dir1")
+
+    scope_p, skill_p, session_p = _patch_agent_binding(mod, scope="g_backend")
+    with (
+        scope_p,
+        skill_p,
+        session_p,
+        patch.object(mod, "_load_fleet", return_value=fleet),
+        pytest.raises(RuntimeError, match="at least one anchor"),
+    ):
+        mod._summary_store = ss
+        mod.strata_publish(content="x", kind="context", anchors=[])
+
+    with RecordStore(db_path) as rs:
+        assert rs.list_publication_acts(scope_id="g_backend") == []
+
+
+def test_strata_withdraw_acts_on_bound_scope_with_own_provenance(tmp_path: Path) -> None:
+    """strata_withdraw always targets STRATA_AGENT_SCOPE's own publication."""
+    from strata.publication import PublishedItem, _write_publication, read_publication
+    from strata.scope_manager import PublicationJudgment
+
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fleet_yaml(tmp_path)
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+    fleet = FleetConfig.load(fleet_path)
+
+    with RecordStore(db_path) as rs:
+        act = rs.append_publication_act(
+            scope_id="g_backend",
+            act="publish",
+            kind="context",
+            content="Stale status.",
+            subject=None,
+            anchors=["subject:status"],
+            withdraws=None,
+            trigger=None,
+            proposer=ContributorRef(
+                scope_id="g_backend", skill="strata-developer", session_id="s1", ts="t"
+            ),
+        )
+        rs.record_publication_judgment(
+            act_id=act.id, decision="accept", judged_by="scope-manager", reasoning="seeded"
+        )
+    _write_publication(
+        "g_backend",
+        [
+            PublishedItem(
+                id=act.id,
+                kind="context",
+                content="Stale status.",
+                subject=None,
+                anchors=["subject:status"],
+                published_at=act.created_at,
+            )
+        ],
+        summaries_dir=summaries_dir,
+    )
+
+    fake_judgment = PublicationJudgment(decision="accept", reasoning="No longer accurate.")
+
+    scope_p, skill_p, session_p = _patch_agent_binding(
+        mod, scope="g_backend", skill="strata-developer", session_id="sess_wd"
+    )
+    with (
+        scope_p,
+        skill_p,
+        session_p,
+        patch.object(mod, "_load_fleet", return_value=fleet),
+        patch("strata.scope_manager.ScopeManager.judge_publication", return_value=fake_judgment),
+        patch("anthropic.Anthropic", return_value=MagicMock()),
+    ):
+        mod._summary_store = SummaryStore(summaries_dir)
+        result = mod.strata_withdraw(act.id)
+
+    assert result["judgment"]["decision"] == "accept"
+    assert result["judgment"]["artifact_updated"] is True
+    assert read_publication("g_backend", summaries_dir=summaries_dir) == []
+
+    with RecordStore(db_path) as rs:
+        acts = rs.list_publication_acts(scope_id="g_backend")
+        withdraw_act = next(a for a in acts if a.act == "withdraw")
+        assert withdraw_act.proposer.scope_id == "g_backend"
+        assert withdraw_act.proposer.session_id == "sess_wd"
+
+
+def test_strata_withdraw_unknown_item_raises_runtimeerror(tmp_path: Path) -> None:
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fleet_yaml(tmp_path)
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+    fleet = FleetConfig.load(fleet_path)
+
+    scope_p, skill_p, session_p = _patch_agent_binding(mod, scope="g_backend")
+    with (
+        scope_p,
+        skill_p,
+        session_p,
+        patch.object(mod, "_load_fleet", return_value=fleet),
+        pytest.raises(RuntimeError, match="not found"),
+    ):
+        mod._summary_store = SummaryStore(summaries_dir)
+        mod.strata_withdraw("pub_does_not_exist")
