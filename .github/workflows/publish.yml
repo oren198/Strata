@@ -23,7 +23,9 @@
 name: Publish to PyPI
 
 on:
+  workflow_dispatch:  
   release:
+  
     types: [published]
 
 # Read-only by default; id-token:write is what trusted publishing needs to
