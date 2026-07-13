@@ -16,11 +16,10 @@ runnable. Subcommands:
 * ``strata export-fleet`` — read V1 fleet tables and write fleet.yaml for
                            the V1 → V1.2 upgrade path.
 
-The inspection commands (``scopes``, ``summary``, ``record``) talk to a
-running backend over HTTP — start the backend first with ``strata start``
-in another terminal. All other commands (including ``launch``, which reads
-fleet.yaml directly — embedded mode, ADR 0004 D1) work directly against
-the files on disk.
+All commands — including the inspection commands (``scopes``, ``summary``,
+``record``) and ``launch`` — read ``fleet.yaml`` and the record/summary
+stores directly (embedded mode, ADR 0004 D1). No backend needs to be
+running; ``strata start`` is required only for the Console UI.
 
 Vocabulary throughout follows ``CONTEXT.md``.
 """
@@ -66,10 +65,11 @@ if TYPE_CHECKING:
     from strata.scope_manager import ScopeManager
     from strata.summary_store import ScopeSummary, SummaryStore
 
-from strata import __version__
+from strata import DISTRIBUTION_NAME, __version__
 from strata.launch import (
     SkillResolutionError,
     StrataRoleParseError,
+    exec_claude,
     find_strata_role,
     is_interactive,
     make_session_id,
@@ -82,15 +82,6 @@ from strata.preflight import Check, run_launch_preflight, run_start_preflight
 # Path to the bundled starter templates directory (package data, like _skills).
 _TEMPLATES_DIR = Path(__file__).parent / "_templates"
 _DEFAULT_TEMPLATE = _TEMPLATES_DIR / "dev-team.yaml"
-
-
-def _backend_url() -> str:
-    # STRATA_BACKEND_URL is deprecated pending a design session (owner
-    # decision on issue #52: "leave it as deprecated... we don't want dead
-    # code" — no removal until that session happens). Read only by the CLI
-    # inspection commands (scopes/summary/record) below; do not add new
-    # consumers.
-    return os.environ.get("STRATA_BACKEND_URL", "http://127.0.0.1:8000").rstrip("/")
 
 
 def _storage_paths():
@@ -121,14 +112,19 @@ def _fleet_config_default() -> str:
 
 
 def _resolve_fleet_config(explicit: str | None) -> str | None:
-    """Pick the config path: explicit arg → Settings path → fleet.example.yaml."""
+    """Pick the config path: explicit arg → Settings path.
+
+    Returns ``None`` when neither resolves to an existing file — the caller
+    reports "no fleet config found" rather than trying to load a path that
+    doesn't exist. (There used to be a further fallback to a root-level
+    ``fleet.example.yaml``; it was removed — ``src/strata/_templates/`` is
+    the single starter-fleet source, issue #64.)
+    """
     if explicit:
         return explicit
     settings_path = _fleet_config_default()
     if Path(settings_path).exists():
         return settings_path
-    if Path("fleet.example.yaml").exists():
-        return "fleet.example.yaml"
     return None
 
 
@@ -290,8 +286,9 @@ def cmd_migrate(args: argparse.Namespace) -> int:
 def cmd_bootstrap(args: argparse.Namespace) -> int:
     """Validate fleet.yaml and prepare the in-memory FleetConfig mirror.
 
-    No DB writes are made.  The command validates all 8 load-time invariants
-    from ADR 0002 and reports success or the first error encountered.
+    No DB writes are made.  The command validates all load-time invariants
+    (the original 8 from ADR 0002, plus ADR 0004's and ADR 0008's) and
+    reports success or the first error encountered.
     """
     from strata.bootstrap import load_fleet_config
     from strata.fleet_config import FleetConfigError
@@ -408,117 +405,504 @@ def cmd_start(args: argparse.Namespace) -> int:
 
 
 def cmd_scopes(args: argparse.Namespace) -> int:
-    """List the fleet's active scopes (via the backend API)."""
-    import httpx
+    """List the fleet's active scopes (embedded read — fleet.yaml, ADR 0004 D1)."""
+    from strata.stores import EmbeddedStoreError, open_embedded_stores
 
-    url = f"{_backend_url()}/scopes"
     try:
-        resp = httpx.get(url, timeout=10)
-        resp.raise_for_status()
-    except httpx.HTTPError as e:
-        print(f"Backend error: {e}", file=sys.stderr)
-        return 2
-    data = resp.json()
+        stores = open_embedded_stores()
+    except EmbeddedStoreError as exc:
+        print(exc.message, file=sys.stderr)
+        return 1
 
-    print(f"Strata ({len(data['strata'])}):")
-    for s in data["strata"]:
-        print(f"  [{s['ordinal']}] {s['id']:6s}  {s['name']}")
-    print()
-    print(f"Scopes ({len(data['scopes'])}):")
-    for sc in data["scopes"]:
-        print(f"  {sc['id']:12s}  stratum={sc['stratum_id']:4s}  {sc['name']}")
-    print()
-    print(f"Edges ({len(data['edges'])}):")
-    for e in data["edges"]:
-        print(f"  {e['from_scope_id']:12s} → {e['to_scope_id']}")
+    with stores:
+        fleet = stores.fleet_config
+        active = fleet.active_scopes()
+        active_ids = {s.id for s in active}
+        active_edges = [e for e in fleet.edges if e.from_ in active_ids and e.to in active_ids]
+
+        print(f"Strata ({len(fleet.strata)}):")
+        for s in fleet.strata:
+            print(f"  [{s.ordinal}] {s.id:6s}  {s.name}")
+        print()
+        print(f"Scopes ({len(active)}):")
+        for sc in active:
+            print(f"  {sc.id:12s}  stratum={sc.stratum_id:4s}  {sc.name}")
+        print()
+        print(f"Edges ({len(active_edges)}):")
+        for e in active_edges:
+            print(f"  {e.from_:12s} → {e.to}")
     return 0
 
 
 def cmd_summary(args: argparse.Namespace) -> int:
-    """Print a scope's curated summary as markdown."""
-    import httpx
+    """Print a scope's curated summary as markdown (embedded read, ADR 0004 D1)."""
+    from datetime import UTC, datetime
 
-    url = f"{_backend_url()}/scopes/{args.scope_id}/summary"
+    from strata.stores import EmbeddedStoreError, open_embedded_stores
+    from strata.summary_store import ScopeSummary
+
     try:
-        resp = httpx.get(url, timeout=10)
-        if resp.status_code == 404:
+        stores = open_embedded_stores()
+    except EmbeddedStoreError as exc:
+        print(exc.message, file=sys.stderr)
+        return 1
+
+    with stores:
+        scope = stores.fleet_config.get_scope(args.scope_id)
+        if scope is None:
             print(f"Scope not found: {args.scope_id}", file=sys.stderr)
             return 1
-        resp.raise_for_status()
-    except httpx.HTTPError as e:
-        print(f"Backend error: {e}", file=sys.stderr)
-        return 2
-    summary = resp.json()
 
-    print(f"# Scope: {summary['scope_id']}")
-    print(f"_updated_at: {summary['updated_at']}_")
-    print()
-    print("## Directives")
-    if not summary["directives"]:
-        print("_(none yet)_")
-    for d in summary["directives"]:
+        summary = stores.summary_store.read(args.scope_id)
+        if summary is None:
+            # Scope exists but has no summary yet — synthesize an empty one,
+            # matching GET /scopes/{id}/summary (issue #59: version=0,
+            # exists=False marks it as never actually written).
+            summary = ScopeSummary(
+                scope_id=args.scope_id,
+                directives=[],
+                context="",
+                updated_at=datetime.now(tz=UTC).isoformat(),
+                version=0,
+                exists=False,
+            )
+
+        print(f"# Scope: {summary.scope_id}")
+        print(f"_updated_at: {summary.updated_at}_")
         print()
-        print(f"### [{d['id']}] {d['content']}")
-        if d.get("subject"):
-            print(f"- subject: {d['subject']}")
-        print(
-            f"- source: scope={d['source_scope_id']} · "
-            f"skill={d['source_skill']} · at={d['created_at']}"
-        )
-    print()
-    print("## Context")
-    print(summary["context"] or "_(none yet)_")
+        print("## Directives")
+        if not summary.directives:
+            print("_(none yet)_")
+        for d in summary.directives:
+            print()
+            print(f"### [{d.id}] {d.content}")
+            if d.subject:
+                print(f"- subject: {d.subject}")
+            print(
+                f"- source: scope={d.source_scope_id} · skill={d.source_skill} · at={d.created_at}"
+            )
+        print()
+        print("## Context")
+        print(summary.context or "_(none yet)_")
     return 0
 
 
 def cmd_record(args: argparse.Namespace) -> int:
-    """Print a scope's record (all contributions + their judgments)."""
-    import httpx
+    """Print a scope's record (all contributions + their judgments) — embedded read."""
+    from strata.stores import EmbeddedStoreError, open_embedded_stores
 
-    url = f"{_backend_url()}/scopes/{args.scope_id}/record"
     try:
-        resp = httpx.get(url, timeout=10)
-        if resp.status_code == 404:
+        stores = open_embedded_stores()
+    except EmbeddedStoreError as exc:
+        print(exc.message, file=sys.stderr)
+        return 1
+
+    with stores:
+        scope = stores.fleet_config.get_scope(args.scope_id)
+        if scope is None:
             print(f"Scope not found: {args.scope_id}", file=sys.stderr)
             return 1
-        resp.raise_for_status()
-    except httpx.HTTPError as e:
-        print(f"Backend error: {e}", file=sys.stderr)
-        return 2
-    data = resp.json()
 
-    print(f"Scope: {args.scope_id}")
-    print(f"Contributions: {len(data['contributions'])}")
-    print(f"Judgments:     {len(data['judgments'])}")
-    print()
-    judgments_by_contrib = {j["contribution_id"]: j for j in data["judgments"]}
-    # Count failed-judgment events per contribution (issue #57) so a pending
-    # contribution that hit a judge() failure reads as "(pending — N failed
-    # attempts)" rather than a bare "(pending)" — a verdict is never
-    # fabricated, so the forensic view distinguishes "never judged" from
-    # "judgment attempted and failed".
-    attempts_by_contrib: dict[str, int] = {}
-    for a in data.get("judgment_attempts", []):
-        cid = a["contribution_id"]
-        attempts_by_contrib[cid] = attempts_by_contrib.get(cid, 0) + 1
-    for c in data["contributions"]:
-        judgment = judgments_by_contrib.get(c["id"])
-        if judgment is not None:
-            verdict = judgment["decision"]
-        else:
-            n = attempts_by_contrib.get(c["id"], 0)
-            verdict = f"(pending — {n} failed attempt{'s' if n != 1 else ''})" if n else "(pending)"
-        print(f"  · {c['id']}  [{c['proposed_classification']:9s} → {verdict}]")
-        contributor = c["contributor"]
-        print(f"      by {contributor['skill']}@{contributor['scope_id']} at {contributor['ts']}")
-        if c.get("subject"):
-            print(f"      subject: {c['subject']}")
-        if c.get("supersedes"):
-            print(f"      supersedes: {c['supersedes']}")
-        # Indent multi-line content.
-        for line in c["content"].splitlines():
-            print(f"      | {line}")
+        contributions = stores.record_store.list_contributions(scope_id=args.scope_id)
+        judgments = stores.record_store.list_judgments(scope_id=args.scope_id)
+        judgment_attempts = stores.record_store.list_judgment_attempts(scope_id=args.scope_id)
+
+        print(f"Scope: {args.scope_id}")
+        print(f"Contributions: {len(contributions)}")
+        print(f"Judgments:     {len(judgments)}")
         print()
+        judgments_by_contrib = {j.contribution_id: j for j in judgments}
+        # Count failed-judgment events per contribution (issue #57) so a pending
+        # contribution that hit a judge() failure reads as "(pending — N failed
+        # attempts)" rather than a bare "(pending)" — a verdict is never
+        # fabricated, so the forensic view distinguishes "never judged" from
+        # "judgment attempted and failed".
+        attempts_by_contrib: dict[str, int] = {}
+        for a in judgment_attempts:
+            cid = a.contribution_id
+            attempts_by_contrib[cid] = attempts_by_contrib.get(cid, 0) + 1
+        for c in contributions:
+            judgment = judgments_by_contrib.get(c.id)
+            if judgment is not None:
+                verdict = judgment.decision
+            else:
+                n = attempts_by_contrib.get(c.id, 0)
+                verdict = (
+                    f"(pending — {n} failed attempt{'s' if n != 1 else ''})" if n else "(pending)"
+                )
+            print(f"  · {c.id}  [{c.proposed_classification:9s} → {verdict}]")
+            contributor = c.contributor
+            print(f"      by {contributor.skill}@{contributor.scope_id} at {contributor.ts}")
+            if c.subject:
+                print(f"      subject: {c.subject}")
+            if c.supersedes:
+                print(f"      supersedes: {c.supersedes}")
+            # Indent multi-line content.
+            for line in c.content.splitlines():
+                print(f"      | {line}")
+            print()
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# strata operator — the operator stratum's vanilla-Strata entry surface
+# (ADR 0008 D1: "Strata must work fully locally"). Embedded reads/writes,
+# same discipline as scopes/summary/record above.
+# ---------------------------------------------------------------------------
+
+# Set by _build_parser() so `strata operator` with no subcommand can print
+# its own help (mirrors main()'s bare-`strata` behaviour, one level down).
+_operator_parser: argparse.ArgumentParser | None = None
+
+
+def cmd_operator_root(args: argparse.Namespace) -> int:
+    """``strata operator`` with no subcommand — print the group's help."""
+    if _operator_parser is not None:
+        _operator_parser.print_help()
+    return 0
+
+
+def cmd_operator_publish(args: argparse.Namespace) -> int:
+    """``strata operator publish`` — publish a new operator memory item (ADR 0008 D1)."""
+    from strata.operator import operator_publish
+    from strata.stores import EmbeddedStoreError, open_embedded_stores
+
+    try:
+        stores = open_embedded_stores()
+    except EmbeddedStoreError as exc:
+        print(exc.message, file=sys.stderr)
+        return 1
+
+    with stores:
+        scope = stores.fleet_config.get_scope(args.scope_id)
+        if scope is None:
+            print(f"Scope not found: {args.scope_id}", file=sys.stderr)
+            return 1
+
+        item = operator_publish(
+            args.scope_id,
+            args.content,
+            args.kind,
+            args.subject,
+            record_store=stores.record_store,
+            summaries_dir=stores.summary_store.summaries_dir,
+        )
+        print(f"Published operator {item.kind} [{item.id}] attached at {args.scope_id!r}.")
+    return 0
+
+
+def cmd_operator_supersede(args: argparse.Namespace) -> int:
+    """``strata operator supersede`` — routes by id prefix (ADR 0008 D1 vs. D4).
+
+    ``op_`` ids supersede an operator-stratum item (capacity 1, not judged).
+    ``c_`` ids correct a scope's own native directive in person (capacity 2,
+    a judgment made by the operator).
+    """
+    from strata.operator import operator_supersede, operator_supersede_item
+    from strata.stores import EmbeddedStoreError, open_embedded_stores
+
+    try:
+        stores = open_embedded_stores()
+    except EmbeddedStoreError as exc:
+        print(exc.message, file=sys.stderr)
+        return 1
+
+    with stores:
+        scope = stores.fleet_config.get_scope(args.scope_id)
+        if scope is None:
+            print(f"Scope not found: {args.scope_id}", file=sys.stderr)
+            return 1
+
+        item_id: str = args.id
+        if item_id.startswith("op_"):
+            try:
+                item = operator_supersede_item(
+                    args.scope_id,
+                    item_id,
+                    args.content,
+                    args.subject,
+                    record_store=stores.record_store,
+                    summaries_dir=stores.summary_store.summaries_dir,
+                )
+            except KeyError as exc:
+                print(str(exc), file=sys.stderr)
+                return 1
+            print(
+                f"Superseded operator item {item_id} -> [{item.id}] attached at {args.scope_id!r}."
+            )
+        elif item_id.startswith("c_"):
+            try:
+                new_directive = operator_supersede(
+                    args.scope_id,
+                    item_id,
+                    args.content,
+                    args.subject,
+                    fleet=stores.fleet_config,
+                    record_store=stores.record_store,
+                    summary_store=stores.summary_store,
+                )
+            except (ValueError, KeyError) as exc:
+                print(str(exc), file=sys.stderr)
+                return 1
+            print(
+                f"Superseded directive {item_id} -> [{new_directive.id}] "
+                f"in scope {args.scope_id!r} (operator correction)."
+            )
+        else:
+            print(
+                f"Unrecognized id {item_id!r} — expected an 'op_' operator item id "
+                "(operator stratum) or a 'c_' directive id (scope correction).",
+                file=sys.stderr,
+            )
+            return 1
+    return 0
+
+
+def cmd_operator_retire(args: argparse.Namespace) -> int:
+    """``strata operator retire`` — routes by id prefix (ADR 0008 D1 vs. D4).
+
+    ``op_`` ids retire an operator-stratum item (capacity 1, not judged).
+    ``c_`` ids retire a scope's own native directive in person without
+    replacement (capacity 2 — appends a ``retirements`` event, never a
+    fabricated contribution).
+    """
+    from strata.operator import operator_retire, operator_retire_item
+    from strata.stores import EmbeddedStoreError, open_embedded_stores
+
+    try:
+        stores = open_embedded_stores()
+    except EmbeddedStoreError as exc:
+        print(exc.message, file=sys.stderr)
+        return 1
+
+    with stores:
+        scope = stores.fleet_config.get_scope(args.scope_id)
+        if scope is None:
+            print(f"Scope not found: {args.scope_id}", file=sys.stderr)
+            return 1
+
+        item_id: str = args.id
+        if item_id.startswith("op_"):
+            try:
+                act = operator_retire_item(
+                    args.scope_id,
+                    item_id,
+                    record_store=stores.record_store,
+                    summaries_dir=stores.summary_store.summaries_dir,
+                )
+            except KeyError as exc:
+                print(str(exc), file=sys.stderr)
+                return 1
+            print(f"Retired operator item {item_id} (act {act.id}) attached at {args.scope_id!r}.")
+        elif item_id.startswith("c_"):
+            try:
+                retirement = operator_retire(
+                    args.scope_id,
+                    item_id,
+                    args.reason,
+                    fleet=stores.fleet_config,
+                    record_store=stores.record_store,
+                    summary_store=stores.summary_store,
+                )
+            except (ValueError, KeyError) as exc:
+                print(str(exc), file=sys.stderr)
+                return 1
+            print(
+                f"Retired directive {item_id} from scope {args.scope_id!r} "
+                f"(retirement {retirement.id}, operator correction)."
+            )
+        else:
+            print(
+                f"Unrecognized id {item_id!r} — expected an 'op_' operator item id "
+                "(operator stratum) or a 'c_' directive id (scope correction).",
+                file=sys.stderr,
+            )
+            return 1
+    return 0
+
+
+def cmd_operator_show(args: argparse.Namespace) -> int:
+    """``strata operator show`` — print operator layer(s) verbatim + the health signal.
+
+    Without ``scope_id``: every attachment scope's operator memory plus
+    fleet-wide totals. With ``scope_id``: that scope's operator layer plus
+    its own item/word counts (ADR 0008 D6 — constitutional, not operational).
+    """
+    from strata.operator import operator_health, read_operator_layer
+    from strata.stores import EmbeddedStoreError, open_embedded_stores
+
+    try:
+        stores = open_embedded_stores()
+    except EmbeddedStoreError as exc:
+        print(exc.message, file=sys.stderr)
+        return 1
+
+    with stores:
+        summaries_dir = stores.summary_store.summaries_dir
+        health = operator_health(record_store=stores.record_store, summaries_dir=summaries_dir)
+
+        if args.scope_id:
+            scope = stores.fleet_config.get_scope(args.scope_id)
+            if scope is None:
+                print(f"Scope not found: {args.scope_id}", file=sys.stderr)
+                return 1
+
+            items = read_operator_layer(args.scope_id, summaries_dir=summaries_dir)
+            print(f"Operator memory attached at {args.scope_id!r} ({len(items)} item(s)):")
+            if not items:
+                print("  _(none yet)_")
+            for item in items:
+                subject_part = f" — {item.subject}" if item.subject else ""
+                print(f"  [{item.id}] {item.kind}{subject_part}  (at {item.created_at})")
+                for line in item.content.splitlines():
+                    print(f"      | {line}")
+            print()
+            scope_health = health["per_scope"].get(args.scope_id, {"items": 0, "words": 0})
+            print(f"Health: {scope_health['items']} item(s), {scope_health['words']} word(s).")
+        else:
+            print(
+                f"Operator memory — {health['total_items']} item(s), "
+                f"{health['total_words']} word(s) across "
+                f"{len(health['per_scope'])} attachment scope(s):"
+            )
+            if not health["per_scope"]:
+                print("  _(none yet)_")
+            for scope_id, counts in sorted(health["per_scope"].items()):
+                print(f"  {scope_id}: {counts['items']} item(s), {counts['words']} word(s)")
+
+        print()
+        print(
+            f"Operator acts: {health['total_acts']} total, "
+            f"{health['acts_last_N_days']} in the last {health['churn_window_days']} days."
+        )
+        print(
+            "Doctrine (ADR 0008 D6): operator memory is constitutional, not operational — "
+            "small, rare, and mostly stable."
+        )
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# strata publication — ADR 0007's local entry surface: show a scope's (or
+# every scope's) publication artifact verbatim, or bootstrap a scope's
+# initial publication (ADR 0007 D4). Embedded reads/writes, same discipline
+# as the operator group above.
+# ---------------------------------------------------------------------------
+
+# Set by _build_parser() so `strata publication` with no subcommand can print
+# its own help (mirrors the operator group's pattern).
+_publication_parser: argparse.ArgumentParser | None = None
+
+
+def cmd_publication_root(args: argparse.Namespace) -> int:
+    """``strata publication`` with no subcommand — print the group's help."""
+    if _publication_parser is not None:
+        _publication_parser.print_help()
+    return 0
+
+
+def cmd_publication_show(args: argparse.Namespace) -> int:
+    """``strata publication show [scope_id]`` — print publication artifact(s) verbatim.
+
+    Without ``scope_id``: every scope that has published anything. With
+    ``scope_id``: that scope's artifact (or a "published nothing yet"
+    message when it has no publication file).
+    """
+    from strata.publication import list_scopes_with_publications, read_publication_text
+    from strata.stores import EmbeddedStoreError, open_embedded_stores
+
+    try:
+        stores = open_embedded_stores()
+    except EmbeddedStoreError as exc:
+        print(exc.message, file=sys.stderr)
+        return 1
+
+    with stores:
+        summaries_dir = str(stores.summary_store.summaries_dir)
+
+        if args.scope_id:
+            scope = stores.fleet_config.get_scope(args.scope_id)
+            if scope is None:
+                print(f"Scope not found: {args.scope_id}", file=sys.stderr)
+                return 1
+            text = read_publication_text(args.scope_id, summaries_dir=summaries_dir)
+            if text is None:
+                print(f"Scope {args.scope_id!r} has published nothing yet.")
+            else:
+                print(text, end="" if text.endswith("\n") else "\n")
+            return 0
+
+        scope_ids = list_scopes_with_publications(summaries_dir)
+        if not scope_ids:
+            print("No scope has published anything yet.")
+            return 0
+        for sid in scope_ids:
+            text = read_publication_text(sid, summaries_dir=summaries_dir) or ""
+            print(f"=== {sid} ===")
+            print(text, end="" if text.endswith("\n") else "\n")
+            print()
+    return 0
+
+
+def cmd_publication_bootstrap(args: argparse.Namespace) -> int:
+    """``strata publication bootstrap <scope_id>`` — bootstrap an initial publication (ADR 0007 D4).
+
+    A one-shot, operator-initiated migration step: the scope-manager
+    proposes an initial publication distilled from the scope's CURRENT
+    summary, judged through the normal publication path. Requires
+    ``ANTHROPIC_API_KEY`` (or ``STRATA_ANTHROPIC_API_KEY``) — this is an LLM
+    judgment, not a mechanical copy.
+    """
+    import anthropic
+
+    from strata.publication import bootstrap_publication
+    from strata.scope_manager import ScopeManager
+    from strata.settings import get_settings
+    from strata.stores import EmbeddedStoreError, open_embedded_stores
+
+    try:
+        stores = open_embedded_stores()
+    except EmbeddedStoreError as exc:
+        print(exc.message, file=sys.stderr)
+        return 1
+
+    with stores:
+        scope = stores.fleet_config.get_scope(args.scope_id)
+        if scope is None:
+            print(f"Scope not found: {args.scope_id}", file=sys.stderr)
+            return 1
+
+        settings = get_settings()
+        manager = ScopeManager(
+            client=anthropic.Anthropic(api_key=settings.anthropic_api_key),
+            model=settings.manager_model,
+        )
+
+        try:
+            outcome = bootstrap_publication(
+                args.scope_id,
+                fleet=stores.fleet_config,
+                record_store=stores.record_store,
+                summary_store=stores.summary_store,
+                scope_manager=manager,
+            )
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+
+        if outcome.decision == "decline" or not outcome.items:
+            print(
+                f"Scope-manager declined to bootstrap a publication for {args.scope_id!r}: "
+                f"{outcome.reasoning}"
+            )
+            return 0
+
+        print(
+            f"Bootstrapped {len(outcome.items)} published item(s) for {args.scope_id!r}: "
+            f"{outcome.reasoning}"
+        )
+        for item in outcome.items:
+            print(f"  [{item.id}] {item.kind} anchors={item.anchors}")
     return 0
 
 
@@ -688,6 +1072,8 @@ def _refresh_scope(
         ),
     )
 
+    from strata.operator import operator_memory_binding
+
     print(f"  [refresh] refreshing scope {scope_id!r}...", file=sys.stderr)
     judgment = manager.judge(
         scope=scope,
@@ -698,6 +1084,9 @@ def _refresh_scope(
         new_contribution=refresh_contribution,
         summary_max_words=summary_max_words,
         entitlement=fleet_config.entitlement_view(scope_id),
+        operator_memory=operator_memory_binding(
+            scope_id, fleet=fleet_config, summaries_dir=summary_store.summaries_dir
+        ),
     )
 
     record_store.record_judgment(
@@ -964,24 +1353,25 @@ def cmd_launch(args: argparse.Namespace) -> int:
         )
 
     # -----------------------------------------------------------------------
-    # Step 6: exec claude.
+    # Step 6: hand off to claude with STRATA_AGENT_* set.
+    #
+    # POSIX replaces this process image (execvpe); Windows spawns a
+    # console-sharing child and propagates its exit code. Both raise
+    # FileNotFoundError when claude is not on PATH — one message either way.
     # -----------------------------------------------------------------------
     env = os.environ.copy()
     env["STRATA_AGENT_SCOPE"] = scope_data["id"]
     env["STRATA_AGENT_SKILL"] = skill
     env["STRATA_AGENT_SESSION_ID"] = session_id
 
-    claude_bin = "claude"
     try:
-        os.execvpe(claude_bin, [claude_bin], env)
+        return exec_claude(env)
     except FileNotFoundError:
         print(
             "Cannot find 'claude' on PATH. Install Claude Code and ensure it is on your PATH.",
             file=sys.stderr,
         )
         return 1
-    # execvpe does not return on success; the line below is unreachable.
-    return 0  # pragma: no cover
 
 
 # ---------------------------------------------------------------------------
@@ -1013,13 +1403,14 @@ def _self_install_spec() -> str | None:
     Uses the PEP 610 ``direct_url.json`` metadata pip records for installs
     from a path or VCS URL. Returns None when no safe source can be
     determined (e.g. a hypothetical index install) — the caller must fail
-    actionably rather than ``pip install strata``, which today resolves to an
-    unrelated PyPI package (issue #49).
+    actionably rather than ``pip install strata``, which resolves to an
+    unrelated PyPI package; this project publishes as ``memfleet``
+    (issue #49).
     """
     import importlib.metadata  # noqa: PLC0415
 
     try:
-        dist = importlib.metadata.distribution("strata")
+        dist = importlib.metadata.distribution(DISTRIBUTION_NAME)
     except importlib.metadata.PackageNotFoundError:
         return None
     try:
@@ -1323,12 +1714,13 @@ def cmd_register(args: argparse.Namespace) -> int:
                 if install_spec is None:
                     print(
                         f"  {_glyph('fail')} cannot determine a safe install source for "
-                        "strata: this process was not\n"
-                        "    installed from a local path or VCS URL, and strata is not "
-                        "yet published to PyPI\n"
-                        "    (the name currently belongs to an unrelated package). "
-                        "Install strata into\n"
-                        "    .strata/.venv/ manually, or re-run once Strata is on PyPI.",
+                        f"strata: this process was not\n"
+                        "    installed from a local path or VCS URL (PEP 610 direct_url.json "
+                        "not found for the\n"
+                        f"    `{DISTRIBUTION_NAME}` distribution). Install strata into\n"
+                        f"    .strata/.venv/ manually (e.g. `pip install {DISTRIBUTION_NAME}`), "
+                        "or re-run --bootstrap-venv\n"
+                        "    from a path or VCS install (editable install, git clone, etc).",
                         file=sys.stderr,
                     )
                     return 1
@@ -1433,6 +1825,283 @@ def cmd_register(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# strata unregister — reverse the brownfield wiring (issue #53)
+# ---------------------------------------------------------------------------
+#
+# Undoes exactly what `strata register` wired, honouring ADR 0005 Decision 6
+# ("never delete or override user state") in reverse: every artifact is
+# removed ONLY when it still byte-matches what register would have written.
+# Anything the user has since edited is reported and left in place, and the
+# run exits 1 so scripts can detect the partial case.
+#
+#   1. `.gitignore` managed block  — removed verbatim, other lines byte-stable.
+#   2. `mcpServers.strata` entry    — removed only if identical to _MCP_ENTRY.
+#   3. the three vendored skills     — removed only if byte-identical to the
+#                                     currently-shipped src/strata/_skills copy.
+#   4. `.strata/` data               — memory, not wiring: left alone unless
+#                                     --purge-data is passed.
+#
+# --dry-run prints every action with the same _glyph format and touches
+# nothing.  Running against an already-clean project reports "nothing to do"
+# per item and exits 0 (idempotent).
+
+
+def _remove_gitignore_block(text: str) -> tuple[str, str]:
+    """Remove register's managed `.gitignore` block from *text*.
+
+    Returns ``(new_text, status)`` where *status* is one of:
+
+    - ``"removed"``  — the verbatim managed block was found and stripped,
+      along with the single blank-line separator register prepends, so the
+      surrounding lines stay byte-identical.
+    - ``"edited"``   — the managed marker line is present but the block no
+      longer matches verbatim (the user edited inside it); *text* is returned
+      unchanged so nothing user-authored is destroyed.
+    - ``"absent"``   — no managed marker at all; nothing to do.
+    """
+    if _GITIGNORE_BLOCK in text:
+        # Register appends "\n" + _GITIGNORE_BLOCK (a blank-line separator
+        # before the block). Strip that separator too so a `.gitignore` that
+        # ended in a newline before register round-trips byte-for-byte.
+        sep_block = "\n" + _GITIGNORE_BLOCK
+        if sep_block in text:
+            return text.replace(sep_block, "", 1), "removed"
+        return text.replace(_GITIGNORE_BLOCK, "", 1), "removed"
+    if _GITIGNORE_MARKER in text:
+        return text, "edited"
+    return text, "absent"
+
+
+def _skill_matches_shipped(installed_md: Path, skill_name: str) -> bool | None:
+    """Return whether an installed skill's ``Skill.md`` matches the shipped copy.
+
+    - ``True``  — the installed ``Skill.md`` is byte-identical to the version
+      shipped in the running distribution (``src/strata/_skills/<name>``);
+      safe to delete.
+    - ``False`` — it differs (user-edited, or an older Strata version); leave
+      it and report.
+    - ``None``  — the shipped reference could not be read, so we cannot prove a
+      match; treat conservatively as "leave it".
+    """
+    import importlib.resources  # noqa: PLC0415
+
+    try:
+        shipped = importlib.resources.files("strata") / "_skills" / skill_name / "Skill.md"
+        shipped_text = shipped.read_text(encoding="utf-8")
+    except (OSError, ModuleNotFoundError):
+        return None
+    try:
+        installed_text = installed_md.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    return installed_text == shipped_text
+
+
+def cmd_unregister(args: argparse.Namespace) -> int:
+    """Reverse `strata register`'s wiring — issue #53.
+
+    Removes each artifact register wired ONLY when it still byte-matches what
+    register would have written; user-edited artifacts are reported and left
+    in place (ADR 0005 Decision 6, applied in reverse). Steps:
+
+    1. `.gitignore` managed block   (removed verbatim, other lines untouched).
+    2. `mcpServers.strata` entry     (removed only if == the canonical entry).
+    3. the three vendored skills      (removed only if byte-identical to shipped).
+    4. `.strata/` data                (left alone unless --purge-data).
+
+    --dry-run prints every action and touches nothing. Idempotent: an
+    already-clean project reports "nothing to do" per item and exits 0.
+
+    Exit code: 0 on success (including nothing-to-do); 1 when something the
+    user asked to remove was left in place because it had been edited, so
+    scripts can detect the partial case.
+    """
+    import json  # noqa: PLC0415
+
+    path_arg: str | None = getattr(args, "path", None)
+    project_root = Path(path_arg).resolve() if path_arg else Path.cwd().resolve()
+    dry_run: bool = getattr(args, "dry_run", False)
+    purge_data: bool = getattr(args, "purge_data", False)
+
+    # Tracks whether any artifact the user asked to remove was left in place
+    # (edited/modified) — drives the exit-1 partial-completion signal.
+    left_in_place = False
+
+    def _ok(message: str) -> None:
+        print(f"  {_glyph('pass')} {message}")
+
+    def _left(message: str) -> None:
+        nonlocal left_in_place
+        left_in_place = True
+        print(f"  {_glyph('warn')} {message}", file=sys.stderr)
+
+    def _would(present: str, past: str) -> str:
+        return f"would {present}" if dry_run else past
+
+    header = "strata unregister --dry-run  (no writes)" if dry_run else "strata unregister"
+    print(f"{header}\nProject root: {project_root}")
+    print()
+
+    # -----------------------------------------------------------------------
+    # Step 1: `.gitignore` managed block.
+    # -----------------------------------------------------------------------
+    gitignore = project_root / ".gitignore"
+    if not gitignore.exists():
+        _ok(".gitignore: nothing to do (no .gitignore)")
+    else:
+        original = gitignore.read_text(encoding="utf-8")
+        new_text, status = _remove_gitignore_block(original)
+        if status == "removed":
+            if new_text.strip() == "":
+                # The file is now empty. Register creates `.gitignore` when it
+                # is absent, but that origin is not detectable from content
+                # alone, so we leave the (now-empty) file rather than risk
+                # deleting a file the user created. (design item 1)
+                if not dry_run:
+                    gitignore.write_text(new_text, encoding="utf-8")
+                _ok(
+                    f".gitignore: {_would('remove', 'removed')} managed Strata block "
+                    "(file now empty — left in place; register's authorship is not detectable)"
+                )
+            else:
+                if not dry_run:
+                    gitignore.write_text(new_text, encoding="utf-8")
+                _ok(f".gitignore: {_would('remove', 'removed')} managed Strata block")
+        elif status == "edited":
+            _left(
+                ".gitignore: managed Strata block was edited — left in place "
+                "(remove it by hand if you meant to)"
+            )
+        else:  # absent
+            _ok(".gitignore: nothing to do (no managed Strata block)")
+
+    # -----------------------------------------------------------------------
+    # Step 2: `mcpServers.strata` settings entry.
+    # -----------------------------------------------------------------------
+    settings_json = project_root / ".claude" / "settings.json"
+    if not settings_json.exists():
+        _ok(".claude/settings.json: nothing to do (no settings.json)")
+    else:
+        try:
+            settings_data: dict = json.loads(settings_json.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            _left(
+                f".claude/settings.json: not valid JSON ({exc}) — left untouched "
+                "(fix it, then re-run)"
+            )
+            settings_data = None  # type: ignore[assignment]
+
+        if settings_data is not None:
+            mcp_servers = settings_data.get("mcpServers")
+            entry = mcp_servers.get("strata") if isinstance(mcp_servers, dict) else None
+            if entry is None:
+                _ok(".claude/settings.json: nothing to do (no mcpServers.strata entry)")
+            elif entry == _MCP_ENTRY:
+                # Byte-stable rewrite: match register's writer exactly
+                # (json.dumps(indent=2) + trailing newline).
+                del mcp_servers["strata"]
+                # Register creates the mcpServers block when absent; if strata
+                # was its only key, drop the now-empty block so a project that
+                # had no mcpServers before register round-trips byte-for-byte.
+                if not mcp_servers:
+                    del settings_data["mcpServers"]
+                if not dry_run:
+                    settings_json.write_text(
+                        json.dumps(settings_data, indent=2) + "\n", encoding="utf-8"
+                    )
+                verb = _would("remove", "removed")
+                if not settings_data:
+                    # The file is now an empty object. Register creates
+                    # settings.json when absent, but that origin is not
+                    # detectable from content, so we leave the empty file
+                    # rather than risk deleting one the user created —
+                    # mirroring the empty-.gitignore treatment. (design item 2)
+                    _ok(
+                        f".claude/settings.json: {verb} mcpServers.strata entry "
+                        "(file now empty — left in place; register's authorship is not detectable)"
+                    )
+                else:
+                    _ok(f".claude/settings.json: {verb} mcpServers.strata entry")
+            else:
+                _left(
+                    ".claude/settings.json: mcpServers.strata entry was edited "
+                    "(differs from the canonical entry) — left in place"
+                )
+
+    # -----------------------------------------------------------------------
+    # Step 3: the three vendored skills.
+    # -----------------------------------------------------------------------
+    claude_skills_dir = project_root / ".claude" / "skills"
+    for skill_name in ["strata", "strata-worker", "strata-inspect"]:
+        skill_dir = claude_skills_dir / skill_name
+        skill_md = skill_dir / "Skill.md"
+        if not skill_dir.exists():
+            _ok(f"skill {skill_name}: nothing to do (not installed)")
+            continue
+        match = _skill_matches_shipped(skill_md, skill_name) if skill_md.exists() else False
+        if match is True:
+            if not dry_run:
+                skill_md.unlink()
+                # Remove the skill directory only if register's Skill.md was
+                # its sole content; never delete other files the user added.
+                _rmdir_if_empty(skill_dir)
+            _ok(f"skill {skill_name}: {_would('remove', 'removed')} (matched shipped version)")
+        elif match is None:
+            _left(
+                f"skill {skill_name}: could not read the shipped reference to compare "
+                "— left in place"
+            )
+        else:  # False — differs
+            _left(
+                f"skill {skill_name}: modified or from an older Strata version "
+                "(differs from shipped) — left in place"
+            )
+
+    # Tidy up register-created empty parent dirs so a clean unregister restores
+    # the tree exactly. Only ever removes directories that are already empty.
+    if not dry_run:
+        _rmdir_if_empty(claude_skills_dir)
+        _rmdir_if_empty(project_root / ".claude")
+
+    # -----------------------------------------------------------------------
+    # Step 4: `.strata/` data — memory, not wiring.
+    # -----------------------------------------------------------------------
+    strata_dir = project_root / ".strata"
+    if not strata_dir.exists():
+        _ok(".strata/: nothing to do (no workspace)")
+    elif purge_data:
+        if not dry_run:
+            shutil.rmtree(strata_dir)
+        verb = _would("purge", "purged")
+        _ok(f".strata/: {verb} project memory (config, fleet.yaml, DB, summaries)")
+    else:
+        _ok(
+            ".strata/: left in place — memory, not wiring "
+            "(config, fleet.yaml, DB, summaries; pass --purge-data to remove)"
+        )
+
+    print()
+    if left_in_place:
+        print(
+            "Completed with items left in place (edited artifacts were not removed — see above). "
+            "Exit code 1.",
+            file=sys.stderr,
+        )
+        return 1
+    print("Done." if not dry_run else "Dry run complete — nothing was changed.")
+    return 0
+
+
+def _rmdir_if_empty(directory: Path) -> None:
+    """Remove *directory* only when it exists and is empty. Never touches files."""
+    try:
+        if directory.is_dir() and not any(directory.iterdir()):
+            directory.rmdir()
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------------------
 # Parser construction
 # ---------------------------------------------------------------------------
 
@@ -1486,6 +2155,109 @@ def _build_parser() -> argparse.ArgumentParser:
     p_record = sub.add_parser("record", help="Print a scope's record (contributions + judgments).")
     p_record.add_argument("scope_id")
     p_record.set_defaults(func=cmd_record)
+
+    # -------------------------------------------------------------------
+    # strata operator — ADR 0008 D1's local entry surface: publish/supersede/
+    # retire operator memory, or (via a 'c_' id) correct a scope's native
+    # memory in person.
+    # -------------------------------------------------------------------
+    global _operator_parser
+    p_operator = sub.add_parser(
+        "operator",
+        help=(
+            "Operator stratum: publish/supersede/retire operator memory, or "
+            "correct a scope's native memory in person (ADR 0008)."
+        ),
+    )
+    _operator_parser = p_operator
+    p_operator.set_defaults(func=cmd_operator_root)
+    operator_sub = p_operator.add_subparsers(dest="operator_command", metavar="<operator-command>")
+
+    p_op_publish = operator_sub.add_parser(
+        "publish", help="Publish a new operator memory item attached at a scope."
+    )
+    p_op_publish.add_argument("scope_id")
+    p_op_publish.add_argument(
+        "--kind", choices=["directive", "context"], required=True, help="Operator memory kind."
+    )
+    p_op_publish.add_argument("--content", required=True, help="Verbatim operator memory text.")
+    p_op_publish.add_argument("--subject", default=None, help="Optional short subject line.")
+    p_op_publish.set_defaults(func=cmd_operator_publish)
+
+    p_op_supersede = operator_sub.add_parser(
+        "supersede",
+        help=(
+            "Supersede an operator item ('op_' id) or a scope's native "
+            "directive ('c_' id) in person."
+        ),
+    )
+    p_op_supersede.add_argument("scope_id")
+    p_op_supersede.add_argument(
+        "id", help="An 'op_...' operator item id or a 'c_...' directive id."
+    )
+    p_op_supersede.add_argument("--content", required=True, help="Verbatim replacement content.")
+    p_op_supersede.add_argument("--subject", default=None, help="Optional short subject line.")
+    p_op_supersede.set_defaults(func=cmd_operator_supersede)
+
+    p_op_retire = operator_sub.add_parser(
+        "retire",
+        help=(
+            "Retire an operator item ('op_' id) or a scope's native directive "
+            "('c_' id) in person, without replacement."
+        ),
+    )
+    p_op_retire.add_argument("scope_id")
+    p_op_retire.add_argument("id", help="An 'op_...' operator item id or a 'c_...' directive id.")
+    p_op_retire.add_argument("--reason", default=None, help="Optional free-text rationale.")
+    p_op_retire.set_defaults(func=cmd_operator_retire)
+
+    p_op_show = operator_sub.add_parser(
+        "show", help="Print operator memory verbatim, plus the health signal (ADR 0008 D6)."
+    )
+    p_op_show.add_argument(
+        "scope_id",
+        nargs="?",
+        default=None,
+        help="Attachment scope to show. Omit to show every attachment scope + totals.",
+    )
+    p_op_show.set_defaults(func=cmd_operator_show)
+
+    # -------------------------------------------------------------------
+    # strata publication — ADR 0007's local entry surface: show a scope's
+    # (or every scope's) publication artifact verbatim, or bootstrap a
+    # scope's initial publication (ADR 0007 D4).
+    # -------------------------------------------------------------------
+    global _publication_parser
+    p_publication = sub.add_parser(
+        "publication",
+        help=(
+            "Show a scope's publication artifact, or bootstrap its initial publication (ADR 0007)."
+        ),
+    )
+    _publication_parser = p_publication
+    p_publication.set_defaults(func=cmd_publication_root)
+    publication_sub = p_publication.add_subparsers(
+        dest="publication_command", metavar="<publication-command>"
+    )
+
+    p_pub_show = publication_sub.add_parser(
+        "show",
+        help="Print a scope's publication artifact verbatim (or every scope that publishes).",
+    )
+    p_pub_show.add_argument(
+        "scope_id",
+        nargs="?",
+        default=None,
+        help="Scope whose publication to show. Omit to show every scope that publishes.",
+    )
+    p_pub_show.set_defaults(func=cmd_publication_show)
+
+    p_pub_bootstrap = publication_sub.add_parser(
+        "bootstrap",
+        help="Bootstrap a scope's initial publication from its current summary (ADR 0007 D4).",
+    )
+    p_pub_bootstrap.add_argument("scope_id")
+    p_pub_bootstrap.set_defaults(func=cmd_publication_bootstrap)
 
     p_launch = sub.add_parser(
         "launch",
@@ -1581,6 +2353,50 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_register.set_defaults(func=cmd_register)
+
+    p_unregister = sub.add_parser(
+        "unregister",
+        help=(
+            "Reverse `strata register` — remove the .gitignore block, the "
+            "mcpServers.strata entry, and the vendored skills (only when "
+            "unmodified). Leaves .strata/ data unless --purge-data (issue #53)."
+        ),
+        description=(
+            "Reverse the wiring `strata register` added, honouring the "
+            "strict-additive contract in reverse: each artifact is removed only "
+            "when it still byte-matches what register wrote. Artifacts you have "
+            "since edited (the .gitignore block, the mcpServers.strata entry, a "
+            "vendored skill) are reported and left in place. Your project's "
+            "memory under .strata/ (fleet.yaml, DB, summaries, config.toml) is "
+            "left untouched unless you pass --purge-data. "
+            "Exit code: 0 on success including nothing-to-do; 1 when something "
+            "you asked to remove was left in place because it had been edited, "
+            "so scripts can detect the partial case."
+        ),
+    )
+    p_unregister.add_argument(
+        "path",
+        nargs="?",
+        default=None,
+        help="Project root directory (default: current working directory).",
+    )
+    p_unregister.add_argument(
+        "--dry-run",
+        action="store_true",
+        dest="dry_run",
+        help="Show every action in the same format without writing anything.",
+    )
+    p_unregister.add_argument(
+        "--purge-data",
+        action="store_true",
+        dest="purge_data",
+        help=(
+            "Also delete the .strata/ workspace (fleet.yaml, DB, summaries, "
+            "config.toml). Off by default — that data is memory, not wiring. "
+            "Combine with --dry-run to preview what would be purged."
+        ),
+    )
+    p_unregister.set_defaults(func=cmd_unregister)
 
     return parser
 

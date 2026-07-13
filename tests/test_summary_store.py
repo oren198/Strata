@@ -232,6 +232,27 @@ def test_list_scopes_ignores_non_md_files(tmp_path: Path) -> None:
     assert sorted(scopes) == ["scope_a", "scope_b"]
 
 
+def test_list_scopes_ignores_publication_artifacts(tmp_path: Path) -> None:
+    """A scope's ``<id>.pub.md`` publication artifact is never listed as a scope summary.
+
+    ADR 0007 D1: the publication artifact is a sibling file in the same
+    summaries directory, not a scope summary — list_scopes_with_summaries
+    must exclude it even though it ends in ``.md``.
+    """
+    store = SummaryStore(str(tmp_path))
+    store.write("scope_a", _make_summary(scope_id="scope_a"))
+
+    # A publication artifact for a scope that has NO summary of its own —
+    # proves this isn't merely "scope_a's .pub.md is masked by scope_a.md".
+    (tmp_path / "scope_only_publishes.pub.md").write_text("pub", encoding="utf-8")
+    (tmp_path / "scope_a.pub.md").write_text("pub", encoding="utf-8")
+
+    scopes = store.list_scopes_with_summaries()
+    assert sorted(scopes) == ["scope_a"]
+    assert "scope_only_publishes" not in scopes
+    assert "scope_only_publishes.pub" not in scopes
+
+
 # ---------------------------------------------------------------------------
 # Test 9 — markdown output contains the expected section headings
 # ---------------------------------------------------------------------------

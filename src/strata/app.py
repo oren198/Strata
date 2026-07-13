@@ -45,7 +45,6 @@ from __future__ import annotations
 import importlib.resources
 import pathlib
 import sqlite3
-import threading
 from collections.abc import AsyncGenerator, Generator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -58,9 +57,17 @@ from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from strata import __version__
 from strata.fleet_config import FleetConfig, Scope, Stratum
+from strata.locks import scope_lock as _scope_lock
 from strata.migrator import run_migrations
+from strata.operator import operator_memory_binding
 from strata.project_config import StoragePaths, resolve_storage_paths
+from strata.publication import (
+    apply_judged_withdrawals,
+    propagate_directive_removals,
+    read_publication,
+)
 from strata.record_store import (
     Contribution,
     ContributorRef,
@@ -180,31 +187,12 @@ class ContributeResponse(BaseModel):
 # invariant lives in exactly one place.
 # ---------------------------------------------------------------------------
 
-# Per-scope lock registry: scope_id -> Lock, guarded by one registry lock.
-# Module-level so every code path in the process shares it.
-_scope_locks: dict[str, threading.Lock] = {}
-_scope_locks_guard = threading.Lock()
-
-
-def _scope_lock(scope_id: str) -> threading.Lock:
-    """Return the process-wide lock serialising the contribute path for *scope_id*.
-
-    Single-process scope only (issue #38). The lock serialises the
-    read-summary -> judge -> record-judgment -> summary-write sequence within
-    one process — threaded FastAPI endpoints and threadpool-dispatched MCP
-    tools both run the sync path in worker threads — so the summary can never
-    reflect a judgment the record does not, nor silently drop a judgment the
-    record kept: the summary is always explainable by the record. Cross-process
-    serialisation (N separate CC sessions, each its own MCP server) is issue
-    #19 and out of scope; those still serialise the record itself on the
-    SQLite writer mutex.
-    """
-    with _scope_locks_guard:
-        lock = _scope_locks.get(scope_id)
-        if lock is None:
-            lock = threading.Lock()
-            _scope_locks[scope_id] = lock
-        return lock
+# The per-scope lock registry lives in strata.locks (extracted for ADR 0008 —
+# strata.operator's correction primitives (operator_supersede/operator_retire)
+# must serialize under this SAME lock, and importing strata.app from
+# strata.operator would cycle back here, since this module also needs
+# strata.operator.operator_memory_binding for judge inputs). `_scope_lock` is
+# imported at module top under this name so every call site below is unchanged.
 
 
 @dataclass
@@ -262,6 +250,24 @@ def _judge_and_record(
     parent_scope = fleet.inter_stratum_parent(scope.id)
     parent_summary = summary_store.read(parent_scope.id) if parent_scope is not None else None
 
+    # Judge-aware rendering (ADR 0008 D3): the operator memory binding this
+    # scope (attached here or at any inter-stratum ancestor) is rendered to
+    # the scope-manager as a binding input, alongside the parent summary.
+    operator_memory = operator_memory_binding(
+        scope.id, fleet=fleet, summaries_dir=summary_store.summaries_dir
+    )
+
+    # ADR 0007 D3/D5: this scope's own current publication, and the
+    # publications of every peer scope referenced by this scope's chain —
+    # the rendered evidence the judge's withdraw_published verdict and the
+    # #79 admission rule's "peer X published this" check are checked against.
+    entitlement = fleet.entitlement_view(scope.id)
+    current_publication = read_publication(scope.id, summaries_dir=str(summary_store.summaries_dir))
+    peer_publications = [
+        (peer.id, read_publication(peer.id, summaries_dir=str(summary_store.summaries_dir)))
+        for peer in sorted(entitlement.referenced_peers, key=lambda s: s.id)
+    ]
+
     try:
         judgment: ScopeManagerJudgment = scope_manager.judge(
             scope=scope,
@@ -271,7 +277,10 @@ def _judge_and_record(
             recent_contributions=recent_contributions,
             new_contribution=contribution,
             summary_max_words=summary_max_words,
-            entitlement=fleet.entitlement_view(scope.id),
+            entitlement=entitlement,
+            operator_memory=operator_memory,
+            current_publication=current_publication,
+            peer_publications=peer_publications,
         )
     except Exception as exc:
         # Record the failure as an event against the contribution — never as a
@@ -300,6 +309,42 @@ def _judge_and_record(
         )
         summary_store.write(scope.id, to_write)
         summary_updated = True
+
+        # ADR 0007 D3 — staleness propagation, two paths, both under the
+        # lock this function's caller already holds:
+        #
+        # 1. Judged propagation (D3/D5): the judge itself named published
+        #    items whose belief this rewrite drops or contradicts. Each
+        #    withdrawal carries the SAME judged_by/reasoning as this
+        #    contribution's own judgment — it was judged, just as part of
+        #    this call rather than a fresh one.
+        if judgment.withdraw_published:
+            apply_judged_withdrawals(
+                scope.id,
+                judgment.withdraw_published,
+                judged_by="scope-manager",
+                reasoning=judgment.reasoning,
+                record_store=record_store,
+                summaries_dir=str(summary_store.summaries_dir),
+            )
+
+        # 2. Mechanical propagation (D3): diff surviving directive ids —
+        #    any published item anchored ONLY to directives that just
+        #    vanished from the summary is withdrawn, no LLM in the loop.
+        previous_directive_ids = (
+            {d.id for d in current_summary.directives} if current_summary is not None else set()
+        )
+        new_directive_ids = {d.id for d in judgment.new_summary.directives}
+        removed_directive_ids = previous_directive_ids - new_directive_ids
+        if removed_directive_ids:
+            propagate_directive_removals(
+                scope.id,
+                removed_directive_ids,
+                contribution.id,
+                surviving_directive_ids=new_directive_ids,
+                record_store=record_store,
+                summaries_dir=str(summary_store.summaries_dir),
+            )
 
     return ContributionOutcome(
         contribution_id=contribution.id,
@@ -467,7 +512,7 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
     application = FastAPI(
         title="Strata",
         description="Shared memory for agent fleets.",
-        version="0.0.1",
+        version=__version__,
         lifespan=lifespan,
     )
 

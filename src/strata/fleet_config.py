@@ -124,8 +124,10 @@ class FleetConfig(BaseModel):
     """The complete fleet definition loaded from a YAML file.
 
     Instantiate via :meth:`FleetConfig.load` — the classmethod validates all
-    8 load-time invariants from ADR 0002.  Direct construction skips
-    validation; prefer ``load`` in production code.
+    load-time invariants: the original 8 from ADR 0002, ADR 0004's
+    at-most-one-inter-stratum-parent invariant, and ADR 0008's reserved
+    ``"operator"`` stratum label.  Direct construction skips validation;
+    prefer ``load`` in production code.
     """
 
     strata: list[Stratum]
@@ -142,7 +144,7 @@ class FleetConfig(BaseModel):
 
     @classmethod
     def load(cls, path: Path) -> FleetConfig:
-        """Parse *path*, validate all 8 load-time invariants, and return a
+        """Parse *path*, validate all load-time invariants, and return a
         :class:`FleetConfig`.
 
         Args:
@@ -415,10 +417,31 @@ class FleetConfig(BaseModel):
 
 
 def _validate(config: FleetConfig) -> None:
-    """Validate all load-time invariants from ADR 0002 (8 original) and ADR 0004 (1 new).
+    """Validate all load-time invariants from ADR 0002 (8 original), ADR 0004 (1 new),
+    and ADR 0008 (1 new — reserved stratum label).
 
     Raises :class:`FleetConfigError` on the first failure.
     """
+    # 0. Reserved stratum label (ADR 0008 D2/Consequences): "operator" (any
+    # case) is the implicit stratum's reserved label in layer provenance —
+    # fleet.yaml never declares it, and a fleet stratum may not claim it. The
+    # operator is not a region of the fleet (ADR 0008 "Alternatives
+    # Considered" — a real fleet.yaml stratum/scope for the operator was
+    # rejected), so a stratum claiming this id would collide with the
+    # operator layer's own ``stratum_id: "operator"`` in composed
+    # perspectives.
+    for stratum in config.strata:
+        if stratum.id.lower() == "operator":
+            raise FleetConfigError(
+                kind="reserved_stratum_id",
+                message=(
+                    f"Stratum {stratum.id!r} claims the reserved 'operator' label "
+                    "(case-insensitive) — reserved for the implicit operator stratum "
+                    "in composed perspectives (ADR 0008 D2/Consequences). Choose a "
+                    "different stratum id."
+                ),
+            )
+
     # 1. Duplicate stratum IDs.
     stratum_ids: list[str] = [s.id for s in config.strata]
     seen: set[str] = set()

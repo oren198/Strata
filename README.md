@@ -55,6 +55,11 @@ Python-path gymnastics), skills vendored as package data, preflight
 checks on `strata start` / `strata launch`, and honest provenance — the
 MCP server refuses to start without a valid scope binding.
 
+**V1.5 shipped** — embedded-mode cleanup (issues #64, #52): the CLI
+inspection commands (`scopes` / `summary` / `record`) now read the record
+and summary stores directly instead of proxying through the Console
+backend, and the now-dead `STRATA_BACKEND_URL` was removed.
+
 What comes next is captured in [`docs/ROADMAP.md`](docs/ROADMAP.md) — the
 enduring design principles and the sequenced direction the project is
 heading. See also the [Architecture decisions](#architecture-decisions)
@@ -193,15 +198,19 @@ This section is for users who have **an existing project** and want to add Strat
 Two universal commands, then you're ready:
 
 ```bash
-pipx install strata          # install strata in an isolated env; puts strata-mcp on PATH
+pipx install memfleet      # install strata in an isolated env; puts strata + strata-mcp on PATH
 cd /path/to/your/project
 strata register              # idempotent: creates .strata/, seeds fleet.yaml, wires Claude Code
 ```
 
-> **Until Strata is published on PyPI**, install from the repo instead:
-> `pipx install git+https://github.com/oren198/Strata.git` (or
-> `pipx install /path/to/Strata` from a local clone). Everything below is
-> identical either way.
+> **PyPI distribution name vs. import/CLI names.** Strata is published to
+> PyPI as **`memfleet`**, matching the hosted platform at memfleet.com
+> (the name `strata` was already taken by an
+> unrelated, dormant package — see
+> [issue #49](https://github.com/oren198/Strata/issues/49)). Everything you
+> actually type stays `strata`: `import strata` in Python, and the
+> `strata` / `strata-mcp` console scripts on your PATH. Only the
+> `pipx install` / `pip install` argument differs.
 
 ### What `strata register` does
 
@@ -250,7 +259,7 @@ scope that resolves storage from `config.toml` as usual.
 
 ### Checking for skill updates
 
-After `pipx upgrade strata`, run:
+After `pipx upgrade memfleet`, run:
 
 ```bash
 strata register --diff       # shows what would change if you re-ran register
@@ -271,6 +280,38 @@ This creates `.strata/.venv/` with strata installed, and updates `.claude/settin
 to point at the absolute venv path. The `.strata/.venv/` directory is gitignored
 automatically. Note: this downloads ~100MB of Python deps.
 
+### Undoing it: `strata unregister`
+
+`strata unregister` reverses register's wiring. Like register, it is strictly
+conservative — it removes each artifact **only when it still matches what
+register wrote**, and reports (leaving in place) anything you have since
+edited:
+
+```bash
+strata unregister               # remove the wiring; keep your .strata/ memory
+strata unregister --dry-run     # preview every action, write nothing
+strata unregister --purge-data  # also delete .strata/ (fleet.yaml, DB, summaries)
+```
+
+What it does, step by step:
+
+1. Removes the managed `# Strata` block from `.gitignore`, leaving every other
+   line byte-for-byte unchanged. An edited block is reported and left.
+2. Removes the `mcpServers.strata` entry from `.claude/settings.json`,
+   preserving all your other keys. If you customised the entry, it is left in
+   place and reported.
+3. Removes each of the `strata`, `strata-worker`, and `strata-inspect` skills
+   **only if byte-identical to the shipped version**. A modified or
+   older-version skill is left alone and reported.
+4. Leaves your `.strata/` workspace untouched — that is memory, not wiring.
+   Pass `--purge-data` to remove it too (`--dry-run --purge-data` previews the
+   purge without deleting).
+
+**Exit code:** `0` on success, including when there is nothing to do (running
+it on an unregistered project is a safe no-op). It exits `1` when something you
+asked to remove was left in place because it had been edited — so scripts can
+detect the partial case.
+
 ---
 
 ## More commands
@@ -287,7 +328,7 @@ strata record  <scope_id>  # every contribution + judgment in the scope's record
 
 ```bash
 strata migrate                                  # apply pending SQLite migrations only
-strata bootstrap --config fleet.example.yaml    # validate a fleet YAML (no DB writes)
+strata bootstrap --config path/to/fleet.yaml    # validate a fleet YAML (no DB writes)
 strata start --reload                           # uvicorn auto-reload (dev mode)
 strata start --port 8001                        # serve on a different port
 ```
@@ -298,9 +339,10 @@ The original `make` targets (`make migrate`, `make bootstrap`, `make run`, `make
 
 `strata launch [scope_id]` validates the target scope against `fleet.yaml`
 directly (embedded mode — no backend required), resolves the skill from the
-scope's declaration, generates a session ID, and `execvp`s `claude` with
-`STRATA_AGENT_SCOPE`, `STRATA_AGENT_SKILL`, and `STRATA_AGENT_SESSION_ID`
-already set. Run `strata start` only if you also want the Console UI.
+scope's declaration, generates a session ID, and hands the session off to
+`claude` with `STRATA_AGENT_SCOPE`, `STRATA_AGENT_SKILL`, and
+`STRATA_AGENT_SESSION_ID` already set. Run `strata start` only if you also want
+the Console UI.
 
 ```bash
 strata launch g_arch                            # use default_skill from fleet.yaml
@@ -322,6 +364,15 @@ skill = "code-writer"   # optional; resolved from fleet.yaml if omitted
 The file is committed to git alongside the project. When you open the repo and
 run `strata launch`, Strata finds the file, validates the scope, and launches
 `claude` already bound — no manual `export` step needed.
+
+#### Platform notes
+
+`strata launch` works on POSIX and Windows. On POSIX it `execvp`s `claude`, so
+the launcher process is replaced outright. Windows has no real `exec`, so the
+launcher resolves `claude` on `PATH` (including `.cmd`/`.exe` shims), spawns it
+as a child sharing the console, and forwards its exit code. Ctrl-C reaches the
+`claude` session in both cases, and the child's exit code becomes the exit code
+of `strata launch`.
 
 ### Upgrading from V1.1 to V1.2
 
@@ -399,9 +450,13 @@ is present, the first three are ignored for the MCP server (project config wins)
 | `STRATA_AGENT_SESSION_ID` | (auto) | Session identifier — auto-generated when absent |
 | `STRATA_MANAGER_MODEL` | `claude-haiku-4-5` | Model used by scope-managers |
 | `STRATA_ANTHROPIC_API_KEY` | (unset) | Optional; falls back to `ANTHROPIC_API_KEY` |
-| `STRATA_BACKEND_URL` | `http://127.0.0.1:8000` | **Deprecated** — read only by the CLI inspection commands (`scopes`/`summary`/`record`), which query the Console backend — the MCP server and `strata launch` never read it (ADR 0004 Decision 1). Kept until a design session revisits it (#52); no removal planned yet. |
 
 A local `.env` file is loaded automatically.
+
+> `STRATA_BACKEND_URL` was **removed in 1.5.0** (issue #52). The CLI
+> inspection commands (`scopes` / `summary` / `record`) now read the record
+> and summary stores directly, like every other embedded-mode consumer
+> (ADR 0004 Decision 1) — no backend needs to be running.
 
 ---
 
@@ -450,8 +505,8 @@ src/strata/              # Python backend package
     strata-inspect/      # CC skill (copy used in Strata-repo sessions)
   settings.example.json  # Example MCP-server registration block (command: strata-mcp)
 tests/                   # pytest suite
-scripts/                 # CLI runners (run_migrations.py, bootstrap_fleet.py)
-fleet.example.yaml       # Example fleet definition consumed by `make bootstrap`
+src/strata/_templates/   # Bundled starter fleets (dev-team.yaml is the default seed;
+                          #   minimal.yaml/research-group.yaml/support-org.yaml also ship)
 Makefile                 # Common tasks (install / test / lint / run / migrate / bootstrap / smoke)
 pyproject.toml           # Project metadata + deps + ruff/pytest config
 ```

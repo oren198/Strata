@@ -1,6 +1,9 @@
 # ADR 0006 — Entitlement: One Surface for Reads, Writes, and Admission
 
-**Status:** Accepted (grilled 2026-07-05; implementation in progress)
+**Status:** Accepted (grilled 2026-07-05; implementation in progress).
+**D3 amended by ADR 0007 (2026-07-12):** peer-reference layers deliver the
+referenced scope's *publication*, never its full internal summary — see the
+erratum note in D3.
 **Date:** 2026-07-05
 **Related:** ADR 0004 (H2 foundations), issue #42 (cross-boundary
 re-sharing), issue #41 (peer composition, tracking), issue #48 (entitled
@@ -202,6 +205,19 @@ the judge was considered and rejected — scope A's judge deciding what
 enters scopes B/C/D would exercise authority it does not hold.
 
 ### D3. Peer-reference composition (implements #41)
+
+> **Erratum / amendment (2026-07-12, ADR 0007):** the whole-face peer read
+> this decision composes — the referenced peer's **full internal summary**
+> as a labelled non-binding layer — was identified by the 2026-07-10
+> philosophy session (#71, philosophy.md Concept 8) as the one channel that
+> violates the boundary-crossing principle: judged for internal acceptance,
+> never judged for export. ADR 0007 **retires** it: peer-reference layers
+> (and peer scope-summary reads) deliver the referenced scope's
+> *publication* — its curated, judged outward face — never its full internal
+> summary. The structural mechanics below (one hop, chain-referenced,
+> labelled, `binding: false`, records stay chain-only) all stand; only the
+> layer's payload changes. The follow-up memo filed as #71 is resolved:
+> publication is that "declaration" idea, adopted as a channel, not a kind.
 
 `strata_read_perspective` extends the layer walk: for each scope on the
 reader's chain (self + ancestors), collect the scopes it references via

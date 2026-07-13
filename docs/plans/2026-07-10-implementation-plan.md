@@ -100,14 +100,16 @@ the CI integration drive to click into a scope's Record tab so the class
 stays caught. **DoD:** Record tab renders against the real backend; drive
 covers it; mock matches the backend shape.
 
-### S0.4 — Publish to PyPI as `mem-strata`
+### S0.4 — Publish to PyPI as `memfleet`
 **Repo:** Strata · **Issue:** #49 · Owner comment: use `mem-strata`, keep the
-version format. Distribution name `mem-strata`, import name `strata`
+version format — later renamed `memfleet` (PyPI rejected `mem-strata` as
+too similar to the existing `memstrata`; `memfleet` matches the product
+domain). Distribution name `memfleet`, import name `strata`
 unchanged; `pyproject.toml` version to semver matching release naming
 (V1.4 → `1.4.x`), bumped at dev→main promotion; trusted-publisher GitHub
 Action on main releases. README two-command bar updated; interim git-URL
 note removed. Also unblocks the strata-evals dogfood friction list.
-**DoD:** `pipx install mem-strata` on a clean machine yields working
+**DoD:** `pipx install memfleet` on a clean machine yields working
 `strata` + `strata-mcp` at the release version.
 
 ### S0.5 — Housekeeping bundle (small, independent)
@@ -282,7 +284,7 @@ strata-web exposure.
 | S0.1 coherence + judge-failure recovery | Strata#38, Strata#57 · gate: strata-evals#7 |
 | S0.2 judge admission (origin_spoofing) | Strata#79 |
 | S0.3 Record tab crash | strata-web#31 |
-| S0.4 PyPI `mem-strata` | Strata#49 |
+| S0.4 PyPI `memfleet` | Strata#49 |
 | S0.5 housekeeping | Strata#64, #52, #53, #76, #65, #66 |
 | E0.1 threshold noise margins | strata-evals#1 |
 | S1.1 ADR 0007 publication mechanism | Strata#89 |
@@ -301,4 +303,4 @@ strata-web exposure.
 2. **E0.1** (evals#1 re-baseline) — one session; unblocks trustworthy gates.
 3. **S1.1 + S1.2 grilling sessions** — schedule; docs only, parallel-safe.
 4. **S0.3** (strata-web #31) — small fix + drive extension; ship in days.
-5. **S0.4** (`mem-strata` on PyPI) — small; big dogfood payoff.
+5. **S0.4** (`memfleet` on PyPI) — small; big dogfood payoff.

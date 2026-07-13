@@ -14,20 +14,12 @@ Vocabulary follows CONTEXT.md: scope, stratum, contribution, record, etc.
 from __future__ import annotations
 
 import sqlite3
-import sys
 from pathlib import Path
 
 import pytest
 
-# Make scripts/ importable without installing it as a package.
-sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
-
-from run_migrations import run_migrations  # noqa: E402
-
-from strata.record_store import (  # noqa: E402
-    ContributorRef,
-    RecordStore,
-)
+from strata.migrator import run_migrations
+from strata.record_store import ContributorRef, RecordStore
 
 # ---------------------------------------------------------------------------
 # Shared helpers

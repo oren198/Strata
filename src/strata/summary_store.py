@@ -354,6 +354,16 @@ class SummaryStore:
     # Path helpers
     # ------------------------------------------------------------------
 
+    @property
+    def summaries_dir(self) -> Path:
+        """Root directory holding the per-scope summary files.
+
+        Exposed so co-located sibling stores (e.g. the ADR 0008 operator
+        working layer, one directory level below this one) can resolve their
+        own paths without duplicating storage-path resolution.
+        """
+        return self._dir
+
     def path_for(self, scope_id: str) -> Path:
         """Return the deterministic path for *scope_id*'s summary file.
 
@@ -429,12 +439,18 @@ class SummaryStore:
 
         * Hidden files (names starting with ``.``).
         * Temporary files (names ending with ``.tmp``).
+        * Publication artifacts (names ending with ``.pub.md`` — ADR 0007
+          D1's ``<scope_id>.pub.md`` sibling files live in this same
+          directory but are a scope's OUTWARD face, never its summary; see
+          :mod:`strata.publication`).
         * Anything not matching the ``<scope_id>.md`` pattern.
         """
         ids: list[str] = []
         for entry in self._dir.iterdir():
             name = entry.name
             if name.startswith("."):
+                continue
+            if name.endswith(".pub.md"):
                 continue
             if not name.endswith(".md"):
                 continue

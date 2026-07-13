@@ -3,8 +3,8 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "strata"
-version = "0.0.1"
+name = "memfleet"
+version = "1.6.0"
 description = "Shared memory for agent fleets."
 requires-python = ">=3.11"
 dependencies = [
@@ -14,7 +14,6 @@ dependencies = [
     "pydantic",
     "pydantic-settings",
     "pyyaml",
-    "httpx",
     "mcp",
 ]
 
@@ -27,6 +26,11 @@ dev = [
     "pytest",
     "pytest-asyncio",
     "ruff",
+    # httpx: no longer a runtime dependency (issue #64 — the CLI inspection
+    # commands were ported to embedded store reads, dropping the last src/
+    # consumer). Kept for tests only: FastAPI's starlette.testclient.TestClient
+    # requires it importable.
+    "httpx",
 ]
 
 [tool.hatch.build.targets.wheel]
@@ -44,6 +48,7 @@ asyncio_mode = "auto"
 markers = [
     "integration: tests that hit external services (e.g. real Anthropic API). Skipped unless STRATA_RUN_INTEGRATION=1.",
     "slow: slow tests (e.g. --bootstrap-venv requires network). Skipped unless STRATA_RUN_BOOTSTRAP_VENV=1.",
+    "ctrlc: Windows live Ctrl-C launch test (needs a real console). Skipped unless STRATA_RUN_CTRLC=1.",
 ]
 
 [tool.ruff]

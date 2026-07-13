@@ -20,7 +20,7 @@ from strata.fleet_config import FleetConfig, FleetConfigError
 # Helpers
 # ---------------------------------------------------------------------------
 
-_EXAMPLE_YAML = Path(__file__).parent.parent / "fleet.example.yaml"
+_EXAMPLE_YAML = Path(__file__).parent.parent / "src" / "strata" / "_templates" / "dev-team.yaml"
 
 
 def _write_yaml(tmp_path: Path, content: str, name: str = "fleet.yaml") -> Path:
@@ -108,13 +108,17 @@ def test_bootstrap_does_not_write_db(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Test 3 — fleet.example.yaml loads cleanly
+# Test 3 — the bundled dev-team.yaml starter template loads cleanly
 # ---------------------------------------------------------------------------
 
 
 def test_example_yaml_loads(tmp_path: Path) -> None:
-    """fleet.example.yaml (repo root) loads and validates without error."""
-    assert _EXAMPLE_YAML.exists(), f"fleet.example.yaml not found at {_EXAMPLE_YAML}"
+    """src/strata/_templates/dev-team.yaml loads and validates without error.
+
+    This is the single starter-fleet source (issue #64) — the root-level
+    ``fleet.example.yaml`` that used to duplicate it was removed.
+    """
+    assert _EXAMPLE_YAML.exists(), f"dev-team.yaml template not found at {_EXAMPLE_YAML}"
     config = load_fleet_config(_EXAMPLE_YAML)
     assert len(config.strata) >= 3
     assert len(config.scopes) >= 4
