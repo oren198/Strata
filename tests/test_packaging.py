@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import importlib
 import sys
+import sysconfig
 from pathlib import Path
 
 import pytest
@@ -65,24 +66,32 @@ def test_strata_mcp_server_module_importable() -> None:
 
 
 def test_strata_mcp_console_script_alongside_python() -> None:
-    """``strata-mcp`` must install into the same bin dir as the running Python.
+    """``strata-mcp`` must install into the running Python's scripts directory.
 
-    We test the entry point via the *installing Python's* bin dir rather than
-    the ambient ``PATH``. ``shutil.which`` searches ``PATH`` and returns ``None``
-    in a fresh venv that hasn't been activated (e.g. CI invoking
+    We test the entry point via the *installing Python's* scripts dir rather
+    than the ambient ``PATH``. ``shutil.which`` searches ``PATH`` and returns
+    ``None`` in a fresh venv that hasn't been activated (e.g. CI invoking
     ``/path/to/venv/bin/pytest`` directly without sourcing ``activate``), even
     though the console script is correctly installed. We want to verify the
     pyproject ``[project.scripts]`` wiring, not coincidental PATH state.
 
-    On Windows the console script is an executable launcher named
-    ``strata-mcp.exe``, so we accept either the bare POSIX name or the ``.exe``
-    form rather than hard-coding one platform.
+    Where the scripts dir IS depends on the layout: in any venv (POSIX ``bin``
+    or Windows ``Scripts``) it is ``sys.executable``'s own directory, but a
+    non-venv Windows Python (e.g. the GitHub Actions hosted toolcache) keeps
+    ``python.exe`` at the install root while pip writes console scripts into
+    ``Scripts\\`` below it. ``sysconfig.get_path("scripts")`` is the
+    interpreter's own answer, so probe it first and keep the executable's
+    directory as a fallback. On Windows the console script is an executable
+    launcher named ``strata-mcp.exe``, so both name forms are accepted rather
+    than hard-coding one platform.
     """
-    bin_dir = Path(sys.executable).parent
-    candidates = [bin_dir / "strata-mcp", bin_dir / "strata-mcp.exe"]
+    script_dirs = {Path(sysconfig.get_path("scripts")), Path(sys.executable).parent}
+    candidates = [
+        directory / name for directory in script_dirs for name in ("strata-mcp", "strata-mcp.exe")
+    ]
     assert any(script.is_file() for script in candidates), (
-        f"strata-mcp not installed alongside {sys.executable} "
-        f"(looked for {[c.name for c in candidates]}). "
+        f"strata-mcp not installed for {sys.executable} "
+        f"(looked in {sorted(str(d) for d in script_dirs)}). "
         "Run `pip install -e '.[dev]'` to install the console script."
     )
 
