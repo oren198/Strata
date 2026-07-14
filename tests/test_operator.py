@@ -15,6 +15,7 @@ scope summary, record, contribution, retirement, supersession.
 
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -619,6 +620,22 @@ def test_operator_retire_filters_directive_from_summary(fleet, record_store, sum
     summary = summary_store.read("g_team")
     assert directive_id not in [d.id for d in summary.directives]
     assert summary.directives == []
+
+
+def test_operator_retire_stamps_summary_updated_at_iso8601(
+    fleet, record_store, summary_store
+) -> None:
+    """Issue #106 item 1: the summary's updated_at is ISO-8601 UTC, not the
+    retirements row's SQLite datetime('now') format."""
+    directive_id = _seed_directive(
+        record_store, summary_store, scope_id="g_team", content="To be retired."
+    )
+    operator_retire(
+        "g_team", directive_id, fleet=fleet, record_store=record_store, summary_store=summary_store
+    )
+    summary = summary_store.read("g_team")
+    parsed = datetime.fromisoformat(summary.updated_at)
+    assert parsed.tzinfo is not None
 
 
 def test_operator_retire_propagates_directive_removal_to_publication(
