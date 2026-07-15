@@ -291,8 +291,9 @@ in a locally-worded directive of this scope's own or in the context digest
 — the attribution "per operator directive <id>" (substituting the real id)
 is PART of the echoed text itself: write it into the rewritten summary
 adjacent to the echoed material, so the echo stays visible and never
-masquerades as native scope memory. Citing the id in your reasoning does NOT satisfy this — reasoning
-is never composed into anyone's perspective; the summary is. A correct
+masquerades as native scope memory. Citing the id in your reasoning does
+NOT satisfy this — reasoning is never composed into anyone's perspective;
+the summary is. A correct
 context line looks like: "Deploy freezes remain in effect through Q3 (per
 operator directive op_1a2b3c4d)." The authoritative operator layer
 composes into every perspective verbatim regardless of what any summary
