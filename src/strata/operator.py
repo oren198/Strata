@@ -718,9 +718,13 @@ def operator_retire(
             reason=reason,
         )
 
+        # The retirements row keeps its SQLite datetime('now') stamp; the
+        # summary's updated_at is ISO-8601 UTC like every other summary write
+        # (matching operator_supersede above), not the record row's format.
+        ts = datetime.now(tz=UTC).isoformat()
         new_directives = [d for d in current_summary.directives if d.id != directive_id]
         to_write = current_summary.model_copy(
-            update={"directives": new_directives, "updated_at": retirement.created_at}
+            update={"directives": new_directives, "updated_at": ts}
         )
         summary_store.write(scope_id, to_write)
 
