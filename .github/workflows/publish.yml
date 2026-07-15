@@ -25,6 +25,7 @@ name: Publish to PyPI
 on:
   release:
     types: [published]
+  workflow_dispatch:
 
 # Read-only by default; id-token:write is what trusted publishing needs to
 # mint the OIDC token exchanged for a PyPI upload token.
