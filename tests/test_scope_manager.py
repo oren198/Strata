@@ -12,6 +12,7 @@ Decision 2 tests (parent summary in user message):
 
 from __future__ import annotations
 
+import json
 import os
 from unittest.mock import MagicMock
 
@@ -220,6 +221,68 @@ def test_accept_as_context_parses_correctly() -> None:
     assert judgment.new_summary is not None
     assert judgment.new_summary.scope_id == SCOPE.id
     assert judgment.new_summary.context == "Updated context with new observations."
+
+
+def test_accept_with_json_string_summary_parses_correctly() -> None:
+    tool_input = _accept_context_input()
+    tool_input["new_summary"] = json.dumps(tool_input["new_summary"])
+    manager, _ = _make_manager(tool_input)
+
+    judgment = manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+    )
+
+    assert judgment.new_summary is not None
+    assert judgment.new_summary.context == "Updated context with new observations."
+
+
+def test_accept_with_unparseable_string_summary_raises_value_error() -> None:
+    tool_input = _accept_context_input()
+    tool_input["new_summary"] = "not json"
+    manager, mock_client = _make_manager(tool_input)
+
+    with pytest.raises(ValueError, match="new_summary as an unparseable string"):
+        manager.judge(
+            scope=SCOPE,
+            stratum=STRATUM,
+            current_summary=CURRENT_SUMMARY,
+            recent_contributions=[],
+            new_contribution=NEW_CONTRIBUTION,
+        )
+
+    assert mock_client.messages.create.call_count == 2
+
+
+def test_invalid_first_summary_gets_one_corrective_retry() -> None:
+    first_input = _accept_context_input()
+    first_input["new_summary"] = "not json"
+    second_input = _accept_context_input()
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [
+        _fake_response(first_input),
+        _fake_response(second_input),
+    ]
+    manager = ScopeManager(client=mock_client)
+
+    judgment = manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+    )
+
+    assert mock_client.messages.create.call_count == 2
+    assert judgment.new_summary is not None
+    assert judgment.new_summary.context == "Updated context with new observations."
+    retry_messages = mock_client.messages.create.call_args_list[1].kwargs["messages"]
+    retry_text = retry_messages[-1]["content"][1]["text"]
+    assert "new_summary as an unparseable string" in retry_text
+    assert "structured object" in retry_text
 
 
 # ---------------------------------------------------------------------------

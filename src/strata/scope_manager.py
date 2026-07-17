@@ -43,6 +43,7 @@ Vocabulary follows ``CONTEXT.md`` verbatim:
 
 from __future__ import annotations
 
+import json
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Literal, Protocol
@@ -912,7 +913,32 @@ class ScopeManager:
         first_messages = [{"role": "user", "content": user_message}]
         response = _call(first_messages)
         tool_use_block = self._extract_tool_use_block(response)
-        judgment = self._parse_judgment(scope=scope, tool_use_block=tool_use_block)
+        try:
+            judgment = self._parse_judgment(scope=scope, tool_use_block=tool_use_block)
+        except ValueError as exc:
+            correction_text = (
+                f"Your submit_judgment payload was invalid: {exc} "
+                "Call submit_judgment again with new_summary as the structured object "
+                "defined by the tool schema."
+            )
+            retry_messages = [
+                *first_messages,
+                {"role": "assistant", "content": response.content},
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": tool_use_block.id,
+                            "content": "Invalid payload.",
+                        },
+                        {"type": "text", "text": correction_text},
+                    ],
+                },
+            ]
+            response = _call(retry_messages)
+            tool_use_block = self._extract_tool_use_block(response)
+            judgment = self._parse_judgment(scope=scope, tool_use_block=tool_use_block)
 
         # Overflow re-ask (issue #63): the LLM was told the BUDGET but nothing
         # enforced it.  Give it exactly one corrective follow-up call if the
@@ -1011,6 +1037,16 @@ class ScopeManager:
                 f"Scope-manager returned decision={decision!r} but new_summary is null. "
                 f"An accepted contribution must include a rewritten summary."
             )
+
+        if isinstance(raw_summary, str):
+            try:
+                raw_summary = json.loads(raw_summary)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    "Scope-manager returned new_summary as an unparseable string."
+                ) from exc
+        if not isinstance(raw_summary, dict):
+            raise ValueError("Scope-manager returned new_summary in an invalid format.")
 
         # Build Directive objects from the LLM-provided data
         directives: list[Directive] = []
