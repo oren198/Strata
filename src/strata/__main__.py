@@ -66,6 +66,36 @@ if TYPE_CHECKING:
     from strata.summary_store import ScopeSummary, SummaryStore
 
 from strata import DISTRIBUTION_NAME, __version__
+from strata.install import (
+    CONFIG_TOML as _CONFIG_TOML,
+)
+from strata.install import (
+    GITIGNORE_BLOCK as _GITIGNORE_BLOCK,
+)
+from strata.install import (
+    GITIGNORE_MARKER as _GITIGNORE_MARKER,
+)
+from strata.install import (
+    MCP_ENTRY as _MCP_ENTRY,
+)
+from strata.install import (
+    SKILL_NAMES,
+    copy_skill,
+    merge_mcp_server,
+    render_action_line,
+)
+from strata.install import (
+    is_v1_2_shape_mcp_entry as _is_v1_2_shape_mcp_entry,
+)
+from strata.install import (
+    mcp_server_present as _mcp_server_present,
+)
+from strata.install import (
+    remove_gitignore_block as _remove_gitignore_block,
+)
+from strata.install import (
+    skill_matches_shipped as _skill_matches_shipped,
+)
 from strata.launch import (
     SkillResolutionError,
     StrataRoleParseError,
@@ -1381,20 +1411,11 @@ def cmd_launch(args: argparse.Namespace) -> int:
 #: Project root marker files — at least one must be present.
 _PROJECT_MARKERS = (".git", "pyproject.toml", "package.json", "Cargo.toml", "go.mod")
 
-#: Gitignore block appended by strata register (idempotent — detected by header).
-# Exact managed line, not a loose "# Strata" substring — a user comment like
-# "# Strata console output" must not suppress the ignore block.
-_GITIGNORE_MARKER = "# Strata — managed by `strata register`"
-_GITIGNORE_BLOCK = """\
-# Strata — managed by `strata register` — do not remove this line
-.strata/.venv/
-.strata/strata.db*
-.strata/summaries/
-# fleet.yaml is intentionally NOT listed above — commit it (it is your team's org chart).
-"""
-
-#: Minimal settings.json merge entry.
-_MCP_ENTRY: dict = {"command": "strata-mcp", "env": {}}
+# The additive-merge constants and machinery (_MCP_ENTRY, _GITIGNORE_MARKER,
+# _GITIGNORE_BLOCK, _CONFIG_TOML, the settings merge, skill copy, and --diff
+# rendering) live in strata.install — the documented import surface the
+# memfleet cloud client reuses (ADR 0009 D3). Imported at the top of this
+# module; strata register below is built on them so the rules exist once.
 
 
 def _self_install_spec() -> str | None:
@@ -1404,8 +1425,8 @@ def _self_install_spec() -> str | None:
     from a path or VCS URL. Returns None when no safe source can be
     determined (e.g. a hypothetical index install) — the caller must fail
     actionably rather than ``pip install strata``, which resolves to an
-    unrelated PyPI package; this project publishes as ``memfleet``
-    (issue #49).
+    unrelated PyPI package; this project publishes as ``mem-strata``
+    (ADR 0009 D1; issue #49).
     """
     import importlib.metadata  # noqa: PLC0415
 
@@ -1432,40 +1453,6 @@ def _self_install_spec() -> str | None:
     if url.startswith("file://"):
         return url.removeprefix("file://")
     return None
-
-
-def _is_v1_2_shape_mcp_entry(entry: dict) -> bool:
-    """Return True if *entry* matches a known-stale V1.2 mcpServer shape.
-
-    V1.2 settings shipped:
-      command: python
-      args: ["-m", "mcp_server.strata_mcp"]
-      env: { "STRATA_BACKEND_URL": "...", ... }
-
-    All three of those break on V1.3:
-    - mcp_server is no longer a top-level module (folded into strata.mcp).
-    - STRATA_BACKEND_URL is no longer consumed (embedded mode, ADR 0004 D1).
-
-    We only need to recognise *any* of these signals to warn.
-    """
-    if entry.get("command") == "python":
-        args = entry.get("args") or []
-        if isinstance(args, list) and "-m" in args:
-            tail = args[args.index("-m") + 1 :]
-            if tail and "mcp_server" in tail[0]:
-                return True
-    env = entry.get("env") or {}
-    return isinstance(env, dict) and "STRATA_BACKEND_URL" in env
-
-
-#: Default .strata/config.toml content.
-_CONFIG_TOML = """\
-# Strata per-project configuration — managed by `strata register`.
-# Paths are relative to this project's root.
-db = ".strata/strata.db"
-fleet_yaml = ".strata/fleet.yaml"
-summaries_dir = ".strata/summaries"
-"""
 
 
 def cmd_register(args: argparse.Namespace) -> int:
@@ -1530,16 +1517,7 @@ def cmd_register(args: argparse.Namespace) -> int:
     # -----------------------------------------------------------------------
     def _act(action: str, path: str | Path, *, skipped: bool = False) -> None:
         rel = Path(path).relative_to(project_root) if Path(path).is_absolute() else Path(path)
-        if diff_mode:
-            if skipped:
-                print(f"  [unchanged]  {rel}")
-            else:
-                print(f"  [would create/update]  {rel}")
-        else:
-            if skipped:
-                print(f"  kept user's {rel}")
-            else:
-                print(f"  {action}: {rel}")
+        print(render_action_line(action, rel, diff_mode=diff_mode, skipped=skipped))
 
     if diff_mode:
         print(f"strata register --diff  (dry-run, no writes)\nProject root: {project_root}")
@@ -1609,17 +1587,10 @@ def cmd_register(args: argparse.Namespace) -> int:
     # -----------------------------------------------------------------------
     claude_skills_dir = project_root / ".claude" / "skills"
     skills_root = importlib.resources.files("strata") / "_skills"
-    for skill_name in ["strata", "strata-worker", "strata-inspect"]:
+    for skill_name in SKILL_NAMES:
         dest_skill_dir = claude_skills_dir / skill_name
-        if dest_skill_dir.exists():
-            _act("skip", dest_skill_dir, skipped=True)
-        else:
-            skill_src = skills_root / skill_name / "Skill.md"
-            if not diff_mode:
-                dest_skill_dir.mkdir(parents=True, exist_ok=True)
-                dest_skill_md = dest_skill_dir / "Skill.md"
-                dest_skill_md.write_text(skill_src.read_text(encoding="utf-8"), encoding="utf-8")
-            _act("copied", dest_skill_dir)
+        copied = copy_skill(skills_root, skill_name, claude_skills_dir, dry_run=diff_mode)
+        _act("copied" if copied else "skip", dest_skill_dir, skipped=not copied)
 
     # -----------------------------------------------------------------------
     # Step 7: Merge strata into .claude/settings.json mcpServers block.
@@ -1648,7 +1619,7 @@ def cmd_register(args: argparse.Namespace) -> int:
     mcp_servers: dict = settings_data.get("mcpServers", {})
     if settings_unreadable:
         pass  # merge skipped — reported above; register exits non-zero below
-    elif "strata" in mcp_servers:
+    elif _mcp_server_present(settings_data):
         _act("skip", settings_json, skipped=True)
         # Stale-shape detection (ADR 0005 Decision 6): warn if the existing
         # strata mcpServer entry is V1.2-shape (broken on V1.3). Keeps the
@@ -1680,8 +1651,7 @@ def cmd_register(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
     else:
-        mcp_servers["strata"] = _MCP_ENTRY
-        settings_data["mcpServers"] = mcp_servers
+        merge_mcp_server(settings_data)
         if not diff_mode:
             (project_root / ".claude").mkdir(parents=True, exist_ok=True)
             settings_json.write_text(json.dumps(settings_data, indent=2) + "\n", encoding="utf-8")
@@ -1844,57 +1814,6 @@ def cmd_register(args: argparse.Namespace) -> int:
 # --dry-run prints every action with the same _glyph format and touches
 # nothing.  Running against an already-clean project reports "nothing to do"
 # per item and exits 0 (idempotent).
-
-
-def _remove_gitignore_block(text: str) -> tuple[str, str]:
-    """Remove register's managed `.gitignore` block from *text*.
-
-    Returns ``(new_text, status)`` where *status* is one of:
-
-    - ``"removed"``  — the verbatim managed block was found and stripped,
-      along with the single blank-line separator register prepends, so the
-      surrounding lines stay byte-identical.
-    - ``"edited"``   — the managed marker line is present but the block no
-      longer matches verbatim (the user edited inside it); *text* is returned
-      unchanged so nothing user-authored is destroyed.
-    - ``"absent"``   — no managed marker at all; nothing to do.
-    """
-    if _GITIGNORE_BLOCK in text:
-        # Register appends "\n" + _GITIGNORE_BLOCK (a blank-line separator
-        # before the block). Strip that separator too so a `.gitignore` that
-        # ended in a newline before register round-trips byte-for-byte.
-        sep_block = "\n" + _GITIGNORE_BLOCK
-        if sep_block in text:
-            return text.replace(sep_block, "", 1), "removed"
-        return text.replace(_GITIGNORE_BLOCK, "", 1), "removed"
-    if _GITIGNORE_MARKER in text:
-        return text, "edited"
-    return text, "absent"
-
-
-def _skill_matches_shipped(installed_md: Path, skill_name: str) -> bool | None:
-    """Return whether an installed skill's ``Skill.md`` matches the shipped copy.
-
-    - ``True``  — the installed ``Skill.md`` is byte-identical to the version
-      shipped in the running distribution (``src/strata/_skills/<name>``);
-      safe to delete.
-    - ``False`` — it differs (user-edited, or an older Strata version); leave
-      it and report.
-    - ``None``  — the shipped reference could not be read, so we cannot prove a
-      match; treat conservatively as "leave it".
-    """
-    import importlib.resources  # noqa: PLC0415
-
-    try:
-        shipped = importlib.resources.files("strata") / "_skills" / skill_name / "Skill.md"
-        shipped_text = shipped.read_text(encoding="utf-8")
-    except (OSError, ModuleNotFoundError):
-        return None
-    try:
-        installed_text = installed_md.read_text(encoding="utf-8")
-    except OSError:
-        return None
-    return installed_text == shipped_text
 
 
 def cmd_unregister(args: argparse.Namespace) -> int:

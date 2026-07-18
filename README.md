@@ -198,19 +198,21 @@ This section is for users who have **an existing project** and want to add Strat
 Two universal commands, then you're ready:
 
 ```bash
-pipx install memfleet      # install strata in an isolated env; puts strata + strata-mcp on PATH
+pipx install mem-strata    # install strata in an isolated env; puts strata + strata-mcp on PATH
 cd /path/to/your/project
 strata register              # idempotent: creates .strata/, seeds fleet.yaml, wires Claude Code
 ```
 
-> **PyPI distribution name vs. import/CLI names.** Strata is published to
-> PyPI as **`memfleet`**, matching the hosted platform at memfleet.com
-> (the name `strata` was already taken by an
-> unrelated, dormant package — see
-> [issue #49](https://github.com/oren198/Strata/issues/49)). Everything you
+> **PyPI distribution name vs. import/CLI names.** The Strata engine is
+> published to PyPI as **`mem-strata`** (the name `strata` was already taken
+> by an unrelated, dormant package — see
+> [issue #49](https://github.com/oren198/Strata/issues/49); the engine/cloud
+> packaging split is
+> [ADR 0009](docs/adr/0009-packaging-engine-client-split.md)). Everything you
 > actually type stays `strata`: `import strata` in Python, and the
 > `strata` / `strata-mcp` console scripts on your PATH. Only the
-> `pipx install` / `pip install` argument differs.
+> `pipx install` / `pip install` argument differs. The `memfleet` distribution
+> name belongs to the separate cloud client (memfleet.com), not the engine.
 
 ### What `strata register` does
 
@@ -259,7 +261,7 @@ scope that resolves storage from `config.toml` as usual.
 
 ### Checking for skill updates
 
-After `pipx upgrade memfleet`, run:
+After `pipx upgrade mem-strata`, run:
 
 ```bash
 strata register --diff       # shows what would change if you re-ran register
