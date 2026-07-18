@@ -39,6 +39,7 @@ include = [
     "src/strata/_skills/**/*",
     "src/strata/_migrations/**/*",
     "src/strata/_templates/**/*",
+    "src/strata/_hooks/**/*",
     "src/strata/_ui/**/*",
 ]
 

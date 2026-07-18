@@ -76,13 +76,21 @@ from strata.install import (
     GITIGNORE_MARKER as _GITIGNORE_MARKER,
 )
 from strata.install import (
+    HOOK_SCRIPT_NAME as _HOOK_SCRIPT_NAME,
+)
+from strata.install import (
     MCP_ENTRY as _MCP_ENTRY,
 )
 from strata.install import (
     SKILL_NAMES,
+    copy_hook,
     copy_skill,
     merge_mcp_server,
+    merge_stop_hook,
     render_action_line,
+)
+from strata.install import (
+    hook_matches_shipped as _hook_matches_shipped,
 )
 from strata.install import (
     is_v1_2_shape_mcp_entry as _is_v1_2_shape_mcp_entry,
@@ -94,7 +102,13 @@ from strata.install import (
     remove_gitignore_block as _remove_gitignore_block,
 )
 from strata.install import (
+    remove_stop_hook as _remove_stop_hook,
+)
+from strata.install import (
     skill_matches_shipped as _skill_matches_shipped,
+)
+from strata.install import (
+    stop_hook_present as _stop_hook_present,
 )
 from strata.launch import (
     SkillResolutionError,
@@ -1645,7 +1659,18 @@ def cmd_register(args: argparse.Namespace) -> int:
         _act("copied" if copied else "skip", dest_skill_dir, skipped=not copied)
 
     # -----------------------------------------------------------------------
-    # Step 7: Merge strata into .claude/settings.json mcpServers block.
+    # Step 6b: Copy the freshness Stop-hook script to .claude/hooks/ (issue #112).
+    # Additive like the skills — an existing script is kept.
+    # -----------------------------------------------------------------------
+    claude_hooks_dir = project_root / ".claude" / "hooks"
+    hooks_root = importlib.resources.files("strata") / "_hooks"
+    dest_hook = claude_hooks_dir / _HOOK_SCRIPT_NAME
+    hook_copied = copy_hook(hooks_root, claude_hooks_dir, dry_run=diff_mode)
+    _act("copied" if hook_copied else "skip", dest_hook, skipped=not hook_copied)
+
+    # -----------------------------------------------------------------------
+    # Step 7: Merge strata into .claude/settings.json — the mcpServers block and
+    # the freshness hooks.Stop entry (issue #112), both strictly additive.
     # -----------------------------------------------------------------------
     settings_json = project_root / ".claude" / "settings.json"
     settings_unreadable = False
@@ -1668,6 +1693,7 @@ def cmd_register(args: argparse.Namespace) -> int:
     else:
         settings_data = {}
 
+    settings_changed = False
     mcp_servers: dict = settings_data.get("mcpServers", {})
     if settings_unreadable:
         pass  # merge skipped — reported above; register exits non-zero below
@@ -1704,10 +1730,26 @@ def cmd_register(args: argparse.Namespace) -> int:
             )
     else:
         merge_mcp_server(settings_data)
-        if not diff_mode:
-            (project_root / ".claude").mkdir(parents=True, exist_ok=True)
-            settings_json.write_text(json.dumps(settings_data, indent=2) + "\n", encoding="utf-8")
+        settings_changed = True
         _act("merged strata into", settings_json)
+
+    # Step 7b: additively merge the freshness hooks.Stop entry (issue #112).
+    # A user's own Stop hooks — and every other settings key — are preserved;
+    # the Strata group is appended only when absent.
+    if not settings_unreadable:
+        if _stop_hook_present(settings_data):
+            _act("skip Stop hook in", settings_json, skipped=True)
+        else:
+            merge_stop_hook(settings_data)
+            settings_changed = True
+            _act("merged Stop hook into", settings_json)
+
+    # One write for both additive merges — so an existing mcpServers entry that
+    # was skipped still gets the new Stop hook, and bootstrap-venv (step 8) reads
+    # the up-to-date file back.
+    if settings_changed and not diff_mode:
+        (project_root / ".claude").mkdir(parents=True, exist_ok=True)
+        settings_json.write_text(json.dumps(settings_data, indent=2) + "\n", encoding="utf-8")
 
     # -----------------------------------------------------------------------
     # Step 8: bootstrap-venv (if requested).
@@ -1947,7 +1989,9 @@ def cmd_unregister(args: argparse.Namespace) -> int:
             _ok(".gitignore: nothing to do (no managed Strata block)")
 
     # -----------------------------------------------------------------------
-    # Step 2: `mcpServers.strata` settings entry.
+    # Step 2: `.claude/settings.json` — the `mcpServers.strata` entry and the
+    # freshness `hooks.Stop` entry (issue #112). Both removed only when they
+    # still byte-match what register wrote; one write persists both removals.
     # -----------------------------------------------------------------------
     settings_json = project_root / ".claude" / "settings.json"
     if not settings_json.exists():
@@ -1963,40 +2007,55 @@ def cmd_unregister(args: argparse.Namespace) -> int:
             settings_data = None  # type: ignore[assignment]
 
         if settings_data is not None:
+            settings_changed = False
+
+            # mcpServers.strata entry.
             mcp_servers = settings_data.get("mcpServers")
             entry = mcp_servers.get("strata") if isinstance(mcp_servers, dict) else None
             if entry is None:
                 _ok(".claude/settings.json: nothing to do (no mcpServers.strata entry)")
             elif entry == _MCP_ENTRY:
-                # Byte-stable rewrite: match register's writer exactly
-                # (json.dumps(indent=2) + trailing newline).
                 del mcp_servers["strata"]
                 # Register creates the mcpServers block when absent; if strata
                 # was its only key, drop the now-empty block so a project that
                 # had no mcpServers before register round-trips byte-for-byte.
                 if not mcp_servers:
                     del settings_data["mcpServers"]
-                if not dry_run:
-                    settings_json.write_text(
-                        json.dumps(settings_data, indent=2) + "\n", encoding="utf-8"
-                    )
-                verb = _would("remove", "removed")
-                if not settings_data:
-                    # The file is now an empty object. Register creates
-                    # settings.json when absent, but that origin is not
-                    # detectable from content, so we leave the empty file
-                    # rather than risk deleting one the user created —
-                    # mirroring the empty-.gitignore treatment. (design item 2)
-                    _ok(
-                        f".claude/settings.json: {verb} mcpServers.strata entry "
-                        "(file now empty — left in place; register's authorship is not detectable)"
-                    )
-                else:
-                    _ok(f".claude/settings.json: {verb} mcpServers.strata entry")
+                settings_changed = True
+                _ok(f".claude/settings.json: {_would('remove', 'removed')} mcpServers.strata entry")
             else:
                 _left(
                     ".claude/settings.json: mcpServers.strata entry was edited "
                     "(differs from the canonical entry) — left in place"
+                )
+
+            # Freshness hooks.Stop entry (issue #112) — same byte-identity rule;
+            # remove_stop_hook drops emptied Stop/hooks containers so a project
+            # with no hooks before register round-trips byte-for-byte.
+            hook_status = _remove_stop_hook(settings_data)
+            if hook_status == "removed":
+                settings_changed = True
+                _ok(f".claude/settings.json: {_would('remove', 'removed')} freshness Stop hook")
+            elif hook_status == "edited":
+                _left(
+                    ".claude/settings.json: freshness Stop hook was edited "
+                    "(differs from the canonical entry) — left in place"
+                )
+            else:  # absent
+                _ok(".claude/settings.json: nothing to do (no freshness Stop hook)")
+
+            if settings_changed and not dry_run:
+                settings_json.write_text(
+                    json.dumps(settings_data, indent=2) + "\n", encoding="utf-8"
+                )
+            if settings_changed and not settings_data:
+                # The file is now an empty object. Register creates settings.json
+                # when absent, but that origin is not detectable from content, so
+                # the empty file is left rather than risk deleting one the user
+                # created — mirroring the empty-.gitignore treatment.
+                _ok(
+                    ".claude/settings.json: now an empty object — left in place "
+                    "(register's authorship is not detectable)"
                 )
 
     # -----------------------------------------------------------------------
@@ -2028,10 +2087,37 @@ def cmd_unregister(args: argparse.Namespace) -> int:
                 "(differs from shipped) — left in place"
             )
 
+    # -----------------------------------------------------------------------
+    # Step 3b: the vendored freshness Stop-hook script (issue #112).
+    # -----------------------------------------------------------------------
+    claude_hooks_dir = project_root / ".claude" / "hooks"
+    hook_script = claude_hooks_dir / _HOOK_SCRIPT_NAME
+    if not hook_script.exists():
+        _ok(f"hook {_HOOK_SCRIPT_NAME}: nothing to do (not installed)")
+    else:
+        hook_match = _hook_matches_shipped(hook_script)
+        if hook_match is True:
+            if not dry_run:
+                hook_script.unlink()
+            _ok(
+                f"hook {_HOOK_SCRIPT_NAME}: {_would('remove', 'removed')} (matched shipped version)"
+            )
+        elif hook_match is None:
+            _left(
+                f"hook {_HOOK_SCRIPT_NAME}: could not read the shipped reference to compare "
+                "— left in place"
+            )
+        else:  # False — differs
+            _left(
+                f"hook {_HOOK_SCRIPT_NAME}: modified or from an older Strata version "
+                "(differs from shipped) — left in place"
+            )
+
     # Tidy up register-created empty parent dirs so a clean unregister restores
     # the tree exactly. Only ever removes directories that are already empty.
     if not dry_run:
         _rmdir_if_empty(claude_skills_dir)
+        _rmdir_if_empty(claude_hooks_dir)
         _rmdir_if_empty(project_root / ".claude")
 
     # -----------------------------------------------------------------------
@@ -2070,6 +2156,44 @@ def _rmdir_if_empty(directory: Path) -> None:
             directory.rmdir()
     except OSError:
         pass
+
+
+# ---------------------------------------------------------------------------
+# strata freshness-hook / freshness-evaluator — the turn-boundary contribution
+# Stop-hook and its detached background evaluator (issue #112, WP3). Hidden
+# subcommands: they are the engine the installed `.claude/hooks/strata-stop-hook`
+# wrapper and its spawned child invoke, not commands a user runs by hand.
+# ---------------------------------------------------------------------------
+
+
+def cmd_freshness_hook(args: argparse.Namespace) -> int:
+    """Run the Stop hook from Claude Code's stdin payload (issue #112).
+
+    Reads the hook JSON on stdin, consults the session's #110 asymmetry
+    counters, and either spawns a detached background evaluator (default) or
+    emits the strict-mode block JSON on stdout. Always exits 0 — a broken hook
+    must never break the user's session — so the return code is fixed at 0 and
+    any strict-mode decision rides on stdout.
+    """
+    from strata.freshness import run_stop_hook  # noqa: PLC0415
+
+    stdin_text = sys.stdin.read() if not sys.stdin.isatty() else ""
+    run_stop_hook(stdin_text, out=sys.stdout)
+    return 0
+
+
+def cmd_freshness_evaluator(args: argparse.Namespace) -> int:
+    """Run the detached background evaluator for one stale session (issue #112).
+
+    Reads the session transcript tail, drafts a possible contribution via the
+    evaluator model, and either submits it through the judged contribute path or
+    records a mechanical decline — resetting the session's asymmetry counters
+    either way. Spawned detached by the Stop hook; always exits 0.
+    """
+    from strata.freshness import run_evaluator  # noqa: PLC0415
+
+    run_evaluator(session_id=args.session_id, transcript_path=args.transcript_path)
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -2381,6 +2505,21 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_unregister.set_defaults(func=cmd_unregister)
+
+    # -------------------------------------------------------------------
+    # Hidden engine subcommands for the freshness Stop-hook (issue #112).
+    # help=SUPPRESS: invoked by the installed hook wrapper and its spawned
+    # evaluator, not by users. Kept on the `strata` CLI so PATH resolution
+    # matches the installed engine (`strata-mcp`) and there is one shipped
+    # implementation for every installer to point at.
+    # -------------------------------------------------------------------
+    p_fresh_hook = sub.add_parser("freshness-hook", help=argparse.SUPPRESS)
+    p_fresh_hook.set_defaults(func=cmd_freshness_hook)
+
+    p_fresh_eval = sub.add_parser("freshness-evaluator", help=argparse.SUPPRESS)
+    p_fresh_eval.add_argument("--session-id", dest="session_id", required=True)
+    p_fresh_eval.add_argument("--transcript-path", dest="transcript_path", required=True)
+    p_fresh_eval.set_defaults(func=cmd_freshness_evaluator)
 
     return parser
 

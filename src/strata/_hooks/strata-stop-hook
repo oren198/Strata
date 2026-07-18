@@ -1,0 +1,14 @@
+#!/bin/sh
+# Strata contribution Stop-hook — managed by `strata register` (issue #112).
+#
+# A Claude Code `Stop` hook. At each turn end it reads the session's
+# read/contribute asymmetry counters (#110 state file) and, when the gate opens,
+# either spawns a detached background evaluator (default mode) or blocks the stop
+# once with the contribute-or-decline instruction (STRATA_FRESHNESS_STRICT=1).
+# It degrades silently — no `.strata` project, no session state, no API key, or
+# any error all exit 0 doing nothing. A broken hook must never break the session.
+#
+# This wrapper `exec`s the installed engine so PATH resolution matches
+# `strata-mcp`; the JSON payload on stdin flows through unchanged. All logic
+# lives in `strata freshness-hook` so the engine ships exactly one implementation.
+exec strata freshness-hook
