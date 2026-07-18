@@ -219,6 +219,44 @@ def test_record_renders_contributions_and_judgments(
     assert "use gRPC" in out
 
 
+def test_status_renders_per_scope_staleness_metric(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``strata status`` renders the per-scope memory-freshness metric (issue #110)."""
+    _seed_fleet(tmp_path, monkeypatch)
+
+    # A session read g_ceo's perspective — recorded in the runtime sessions dir
+    # (sibling of the summaries dir the embedded stores resolve to).
+    from strata.session_state import SessionStateStore, sessions_dir_for
+
+    summaries_dir = tmp_path / "summaries"
+    store = SessionStateStore(sessions_dir_for(str(summaries_dir)))
+    store.record_read("sess_a", "g_ceo")
+    store.record_read("sess_b", "g_ceo")
+
+    rc = main(["status"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "Memory freshness" in out
+    assert "g_ceo" in out
+    # g_ceo has no accepted contribution yet, so both sessions' reads count.
+    ceo_line = next(line for line in out.splitlines() if line.strip().startswith("g_ceo"))
+    assert "2" in ceo_line
+    # g_arch was read by nobody → 0.
+    arch_line = next(line for line in out.splitlines() if line.strip().startswith("g_arch"))
+    assert "0" in arch_line
+
+
+def test_status_custom_window_flag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``strata status --window-days`` is reflected in the header."""
+    _seed_fleet(tmp_path, monkeypatch)
+    rc = main(["status", "--window-days", "7"])
+    assert rc == 0
+    assert "7-day window" in capsys.readouterr().out
+
+
 def test_bootstrap_no_config_found(
     monkeypatch: pytest.MonkeyPatch, tmp_path, capsys: pytest.CaptureFixture[str]
 ) -> None:

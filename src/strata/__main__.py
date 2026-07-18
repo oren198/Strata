@@ -574,6 +574,58 @@ def cmd_record(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_status(args: argparse.Namespace) -> int:
+    """Show the per-scope memory-freshness (staleness) metric — embedded read.
+
+    Mechanical (issue #110): for each active scope, "N sessions read this scope's
+    perspective since its last accepted contribution", over a recency window. A
+    high count is the drift signal — memory being consumed but not updated. The
+    metric never triggers or gates judgment; it only measures.
+    """
+    from strata.session_state import (
+        DEFAULT_STALENESS_WINDOW_DAYS,
+        SessionStateStore,
+        compute_fleet_staleness,
+        sessions_dir_for,
+    )
+    from strata.stores import EmbeddedStoreError, open_embedded_stores
+
+    window_days = getattr(args, "window_days", None) or DEFAULT_STALENESS_WINDOW_DAYS
+
+    try:
+        stores = open_embedded_stores()
+    except EmbeddedStoreError as exc:
+        print(exc.message, file=sys.stderr)
+        return 1
+
+    with stores:
+        summaries_dir = str(stores.summary_store.summaries_dir)
+        session_store = SessionStateStore(sessions_dir_for(summaries_dir))
+        active = stores.fleet_config.active_scopes()
+        metrics = compute_fleet_staleness(
+            [s.id for s in active],
+            record_store=stores.record_store,
+            session_store=session_store,
+            window_days=window_days,
+        )
+
+        print(
+            f"Memory freshness — staleness over a {window_days}-day window "
+            f"({len(active)} scope(s)):"
+        )
+        print()
+        if not active:
+            print("  _(no active scopes)_")
+            return 0
+        # Column width tracks the longest scope id so the metric column lines up.
+        id_width = max((len(m.scope_id) for m in metrics), default=6)
+        print(f"  {'scope':{id_width}}  reads-since-contrib  last accepted contribution")
+        for m in metrics:
+            last = m.last_accepted_contribution_at or "(none)"
+            print(f"  {m.scope_id:{id_width}}  {m.reads_since_last_contribution:<19}  {last}")
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # strata operator — the operator stratum's vanilla-Strata entry surface
 # (ADR 0008 D1: "Strata must work fully locally"). Embedded reads/writes,
@@ -2074,6 +2126,19 @@ def _build_parser() -> argparse.ArgumentParser:
     p_record = sub.add_parser("record", help="Print a scope's record (contributions + judgments).")
     p_record.add_argument("scope_id")
     p_record.set_defaults(func=cmd_record)
+
+    p_status = sub.add_parser(
+        "status",
+        help="Show per-scope memory-freshness (read-vs-contribute staleness, issue #110).",
+    )
+    p_status.add_argument(
+        "--window-days",
+        type=int,
+        default=None,
+        dest="window_days",
+        help="Recency window in days for the staleness metric (default: 30).",
+    )
+    p_status.set_defaults(func=cmd_status)
 
     # -------------------------------------------------------------------
     # strata operator — ADR 0008 D1's local entry surface: publish/supersede/

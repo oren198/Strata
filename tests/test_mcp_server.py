@@ -298,6 +298,15 @@ def _load_mcp_module(db_path: str, summaries_dir: str, fleet_yaml_path: str):
     mod._record_store = RecordStore(db_path)
     mod._summary_store = SummaryStore(summaries_dir)
 
+    # Session-state substrate (issue #110): reads/contributions are recorded into
+    # a per-session JSON file beside the summaries dir. Wire it the way
+    # _set_paths/_init_stores would in production so the read/contribute tools
+    # can update it.
+    from strata.session_state import SessionStateStore, sessions_dir_for
+
+    mod._sessions_dir = str(sessions_dir_for(summaries_dir))
+    mod._session_store = SessionStateStore(mod._sessions_dir)
+
     return mod
 
 
@@ -2083,3 +2092,151 @@ def test_strata_withdraw_unknown_item_raises_runtimeerror(tmp_path: Path) -> Non
     ):
         mod._summary_store = SummaryStore(summaries_dir)
         mod.strata_withdraw("pub_does_not_exist")
+
+
+# ---------------------------------------------------------------------------
+# Issue #110: per-session asymmetry counters + read receipts (mechanical)
+# ---------------------------------------------------------------------------
+
+
+def test_read_scope_summary_increments_session_reads(tmp_path: Path) -> None:
+    """A summary read increments the session's reads counter and per-scope receipt."""
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fleet_yaml(tmp_path)
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+    SummaryStore(summaries_dir).write("g_arch", _make_summary("g_arch", "ctx"))
+    fleet = FleetConfig.load(fleet_path)
+
+    scope_p, skill_p, session_p = _patch_agent_binding(mod, scope="g_backend", session_id="sess_r")
+    with scope_p, skill_p, session_p, patch.object(mod, "_load_fleet", return_value=fleet):
+        mod.strata_read_scope_summary("g_arch")
+        mod.strata_read_scope_summary("g_arch")
+
+    # The state file exists, is readable, and records both reads of g_arch.
+    state = mod._session_store.read("sess_r")
+    assert state is not None
+    assert state.reads == 2
+    assert state.contributions == 0
+    assert state.declines == 0
+    assert state.reads_by_scope["g_arch"].count == 2
+    assert state.reads_by_scope["g_arch"].last_read_at != ""
+
+
+def test_read_perspective_records_read_for_target_scope(tmp_path: Path) -> None:
+    """A perspective read is attributed to its target scope only, not its ancestors."""
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fleet_yaml(tmp_path)
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+    fleet = FleetConfig.load(fleet_path)
+
+    scope_p, skill_p, session_p = _patch_agent_binding(mod, scope="g_backend", session_id="sess_p")
+    with scope_p, skill_p, session_p, patch.object(mod, "_load_fleet", return_value=fleet):
+        mod.strata_read_perspective("g_backend")
+
+    state = mod._session_store.read("sess_p")
+    assert state is not None
+    assert state.reads == 1
+    # g_backend is the target; g_arch (its ancestor layer) is NOT attributed a read.
+    assert set(state.reads_by_scope) == {"g_backend"}
+
+
+def test_session_stats_tool_returns_counters(tmp_path: Path) -> None:
+    """strata_session_stats returns the live counters; zeroed before any activity."""
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fleet_yaml(tmp_path)
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+    SummaryStore(summaries_dir).write("g_arch", _make_summary("g_arch", "ctx"))
+    fleet = FleetConfig.load(fleet_path)
+
+    scope_p, skill_p, session_p = _patch_agent_binding(mod, scope="g_backend", session_id="sess_s")
+    with scope_p, skill_p, session_p, patch.object(mod, "_load_fleet", return_value=fleet):
+        # Before any read, the self-query returns zeroed counters (never errors).
+        empty = mod.strata_session_stats()
+        assert empty["reads"] == 0
+        assert empty["session_id"] == "sess_s"
+
+        mod.strata_read_scope_summary("g_arch")
+        stats = mod.strata_session_stats()
+
+    assert stats["reads"] == 1
+    assert stats["contributions"] == 0
+    assert stats["reads_by_scope"]["g_arch"]["count"] == 1
+
+
+def test_accepted_contribution_increments_session_counter(tmp_path: Path) -> None:
+    """An accepted contribution bumps the session's contributions counter (release valve)."""
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fleet_yaml(tmp_path)
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+    fleet = FleetConfig.load(fleet_path)
+
+    fake_judgment = MagicMock()
+    fake_judgment.decision = "accept_as_context"
+    fake_judgment.reasoning = "ok"
+    fake_judgment.new_summary = _make_summary("g_arch", "updated")
+
+    scope_p, skill_p, session_p = _patch_agent_binding(mod, scope="g_backend", session_id="sess_c")
+    with (
+        scope_p,
+        skill_p,
+        session_p,
+        patch.object(mod, "_load_fleet", return_value=fleet),
+        patch("strata.scope_manager.ScopeManager.judge", return_value=fake_judgment),
+        patch("anthropic.Anthropic", return_value=MagicMock()),
+    ):
+        mod.strata_contribute(
+            scope_id="g_arch",
+            content="Use structured logging.",
+            proposed_classification="context",
+            subject=None,
+            supersedes=None,
+        )
+
+    state = mod._session_store.read("sess_c")
+    assert state is not None
+    assert state.contributions == 1
+
+
+def test_declined_contribution_does_not_increment_counter(tmp_path: Path) -> None:
+    """A scope-manager decline is not an accepted contribution — no counter bump."""
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fleet_yaml(tmp_path)
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+    fleet = FleetConfig.load(fleet_path)
+
+    fake_judgment = MagicMock()
+    fake_judgment.decision = "decline"
+    fake_judgment.reasoning = "not memory-worthy"
+    fake_judgment.new_summary = None
+
+    scope_p, skill_p, session_p = _patch_agent_binding(mod, scope="g_backend", session_id="sess_d")
+    with (
+        scope_p,
+        skill_p,
+        session_p,
+        patch.object(mod, "_load_fleet", return_value=fleet),
+        patch("strata.scope_manager.ScopeManager.judge", return_value=fake_judgment),
+        patch("anthropic.Anthropic", return_value=MagicMock()),
+    ):
+        mod.strata_contribute(
+            scope_id="g_arch",
+            content="trivia",
+            proposed_classification="context",
+            subject=None,
+            supersedes=None,
+        )
+
+    # A decline creates no session file (no counters ever incremented) — or, if
+    # one exists, contributions is still 0. Either way contributions must be 0.
+    state = mod._session_store.read("sess_d")
+    assert state is None or state.contributions == 0
