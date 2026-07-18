@@ -89,3 +89,16 @@ locally there are only named agent profiles; the binding lives server-side.
   releases; the 2.0 README note is the permanent explanation.
 - strata-web's engine pin is a git SHA and is unaffected.
 - Docs sweep in both repos (#116, strata-web#53).
+
+---
+
+## Amendment 2026-07-18 — engine distribution name is `strata-mem`, not `mem-strata`
+
+PyPI rejected the `mem-strata` trusted-publisher registration with "this
+project name is too similar to an existing project" — the existing project
+being the `memstrata` squat (already recorded in the 2026-07-10 plan);
+PyPI's similarity check treats the hyphen-only difference as confusable.
+Owner picked **`strata-mem`** (verified absent on PyPI 2026-07-18) as the
+replacement. Everything else in this ADR stands: import package `strata`,
+`strata` CLI, `memfleet` as the cloud client, D2/D3 unchanged. Every
+occurrence of `mem-strata` above reads as `strata-mem`.

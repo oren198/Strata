@@ -1477,7 +1477,7 @@ def _self_install_spec() -> str | None:
     from a path or VCS URL. Returns None when no safe source can be
     determined (e.g. a hypothetical index install) — the caller must fail
     actionably rather than ``pip install strata``, which resolves to an
-    unrelated PyPI package; this project publishes as ``mem-strata``
+    unrelated PyPI package; this project publishes as ``strata-mem``
     (ADR 0009 D1; issue #49).
     """
     import importlib.metadata  # noqa: PLC0415
