@@ -43,6 +43,7 @@ Vocabulary follows ``CONTEXT.md`` verbatim:
 
 from __future__ import annotations
 
+import json
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Literal, Protocol
@@ -462,6 +463,26 @@ def _summary_word_count(summary: ScopeSummary) -> int:
     return count
 
 
+def _coerce_json_object(value: str, error_message: str) -> dict:
+    """Parse a JSON-encoded object out of a stringified tool-call field.
+
+    Issue #113: the judge model occasionally returns a structured field of its
+    ``submit_judgment`` payload as a JSON-encoded string instead of the nested
+    object the tool schema defines. Decode it back to a ``dict`` so the parse
+    path can walk it. A string that does not decode to a JSON object raises
+    ``ValueError(error_message)`` — the clear-error style ``_parse_judgment``
+    uses everywhere — rather than letting an ``AttributeError`` escape from a
+    later ``.get()`` call.
+    """
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise ValueError(error_message) from exc
+    if not isinstance(parsed, dict):
+        raise ValueError(error_message)
+    return parsed
+
+
 class ScopeManagerJudgment(BaseModel):
     """The scope-manager's structured verdict on a contribution.
 
@@ -840,6 +861,13 @@ class ScopeManager:
         second response is used regardless of whether it now fits — there is
         only ever one retry, never a loop.
 
+        Parse re-ask (issue #113): if the first response's ``submit_judgment``
+        payload fails to parse (e.g. the model returned ``new_summary`` as a
+        JSON-encoded string rather than the structured object), the manager
+        makes exactly ONE corrective follow-up call echoing the parse error
+        and parses the second response.  A second parse failure propagates —
+        there is only ever one retry, never a loop.
+
         Raises:
             ValueError: If the model response is missing the ``tool_use``
                 block, or if the verdict is internally inconsistent (e.g.
@@ -912,7 +940,49 @@ class ScopeManager:
         first_messages = [{"role": "user", "content": user_message}]
         response = _call(first_messages)
         tool_use_block = self._extract_tool_use_block(response)
-        judgment = self._parse_judgment(scope=scope, tool_use_block=tool_use_block)
+        try:
+            judgment = self._parse_judgment(scope=scope, tool_use_block=tool_use_block)
+        except ValueError as parse_error:
+            # Parse re-ask (issue #113): the first payload did not parse —
+            # most often because the model returned new_summary (or a
+            # directive) as a JSON-encoded string rather than the structured
+            # object the tool schema defines. Give it exactly one corrective
+            # follow-up echoing the error, then parse the second payload —
+            # the same one-retry discipline as the overflow re-ask (#63)
+            # below. A second parse failure is NOT caught here: it propagates
+            # as the ValueError, so there is never more than one retry.
+            corrective_text = (
+                f"Your submit_judgment call could not be parsed: {parse_error} "
+                "Call submit_judgment again with the SAME verdict, returning "
+                "new_summary as the structured object the tool schema defines "
+                "— a JSON object with 'directives' and 'context' fields, not a "
+                "string, and each directive itself an object, not a string."
+            )
+            retry_messages = [
+                *first_messages,
+                {"role": "assistant", "content": response.content},
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": tool_use_block.id,
+                            "content": "Received.",
+                        },
+                        {
+                            "type": "text",
+                            "text": corrective_text,
+                        },
+                    ],
+                },
+            ]
+            response = _call(retry_messages)
+            tool_use_block = self._extract_tool_use_block(response)
+            judgment = self._parse_judgment(scope=scope, tool_use_block=tool_use_block)
+            # Chain the overflow re-ask below onto the corrective turn: its
+            # budget follow-up must build on the retry's conversation, not
+            # the discarded first turn.
+            first_messages = retry_messages
 
         # Overflow re-ask (issue #63): the LLM was told the BUDGET but nothing
         # enforced it.  Give it exactly one corrective follow-up call if the
@@ -985,6 +1055,18 @@ class ScopeManager:
         decision: str = raw["decision"]
         reasoning: str = raw["reasoning"]
         raw_summary = raw.get("new_summary")
+        # Issue #113: the judge model sometimes returns new_summary as a
+        # JSON-encoded *string* rather than the nested object the tool schema
+        # defines — a tool-call failure mode whose likelihood grows with
+        # payload size. Coerce it back before the object is walked, so a
+        # stringified payload parses instead of exploding with AttributeError
+        # on .get(). An unparseable string raises the clear ValueError below
+        # (which the first-parse re-ask in judge() then corrects).
+        if isinstance(raw_summary, str):
+            raw_summary = _coerce_json_object(
+                raw_summary,
+                "submit_judgment returned new_summary as an unparseable string.",
+            )
         # ADR 0007 D3/D5: published item ids this rewrite invalidates. Parsed
         # regardless of decision (though only meaningful on accept, since a
         # decline changes nothing) — always a list, never None, so callers
@@ -1015,6 +1097,14 @@ class ScopeManager:
         # Build Directive objects from the LLM-provided data
         directives: list[Directive] = []
         for d in raw_summary.get("directives", []):
+            # Issue #113: a directive entry may itself arrive as a
+            # JSON-encoded string when the model stringifies part of the
+            # payload. Coerce per-entry the same way as new_summary.
+            if isinstance(d, str):
+                d = _coerce_json_object(
+                    d,
+                    "submit_judgment returned a directive entry as an unparseable string.",
+                )
             directives.append(
                 Directive(
                     id=d["id"],

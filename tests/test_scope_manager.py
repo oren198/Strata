@@ -12,6 +12,7 @@ Decision 2 tests (parent summary in user message):
 
 from __future__ import annotations
 
+import json
 import os
 from unittest.mock import MagicMock
 
@@ -811,6 +812,222 @@ def test_tool_choice_disables_parallel_tool_use() -> None:
     )
     tool_choice = mock_client.messages.create.call_args.kwargs["tool_choice"]
     assert tool_choice.get("disable_parallel_tool_use") is True
+
+
+# ---------------------------------------------------------------------------
+# Issue #113 — new_summary returned as a JSON-encoded string
+# ---------------------------------------------------------------------------
+
+
+def _tool_use_block(tool_input: dict) -> MagicMock:
+    """A bare tool_use block for driving _parse_judgment directly."""
+    return _fake_response(tool_input).content[0]
+
+
+def test_stringified_new_summary_is_coerced() -> None:
+    """A new_summary arriving as a JSON string is decoded, not crashed on.
+
+    Test (a): the model stringified the whole new_summary object. The parse
+    coerces it back and succeeds on the first call — no re-ask needed.
+    """
+    valid = _accept_directive_input()
+    stringified_input = {
+        **valid,
+        "new_summary": json.dumps(valid["new_summary"]),
+    }
+    manager, mock_client = _make_manager(stringified_input)
+
+    judgment = manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[RECENT_CONTRIBUTION],
+        new_contribution=NEW_CONTRIBUTION,
+    )
+
+    assert mock_client.messages.create.call_count == 1
+    assert judgment.decision == "accept_as_directive"
+    assert judgment.new_summary is not None
+    assert len(judgment.new_summary.directives) == 2
+    assert NEW_CONTRIBUTION.id in [d.id for d in judgment.new_summary.directives]
+
+
+def test_stringified_directive_entry_is_coerced() -> None:
+    """A single directive entry arriving as a JSON string is decoded."""
+    valid = _accept_directive_input()
+    directives = valid["new_summary"]["directives"]
+    # Stringify only the first directive entry, leave the second as an object.
+    directives[0] = json.dumps(directives[0])
+    block = _tool_use_block(valid)
+
+    judgment = ScopeManager._parse_judgment(scope=SCOPE, tool_use_block=block)
+
+    assert judgment.new_summary is not None
+    assert len(judgment.new_summary.directives) == 2
+
+
+def test_garbage_string_new_summary_raises_clean_valueerror() -> None:
+    """Test (b): an unparseable new_summary string is a clean ValueError.
+
+    The pre-fix bug was an ``AttributeError: 'str' object has no attribute
+    'get'`` escaping from the parse path. The coercion must convert that into
+    the specific, actionable ValueError instead.
+    """
+    bad_input = {
+        "decision": "accept_as_directive",
+        "reasoning": "The contribution is a clear standard.",
+        "new_summary": "I could not fit the summary into JSON, sorry.",
+    }
+    block = _tool_use_block(bad_input)
+
+    with pytest.raises(ValueError, match="new_summary as an unparseable string"):
+        ScopeManager._parse_judgment(scope=SCOPE, tool_use_block=block)
+
+
+def test_garbage_string_new_summary_not_attributeerror() -> None:
+    """The failure mode is a ValueError, never the original AttributeError."""
+    bad_input = {
+        "decision": "accept_as_directive",
+        "reasoning": "The contribution is a clear standard.",
+        "new_summary": "not json",
+    }
+    block = _tool_use_block(bad_input)
+
+    try:
+        ScopeManager._parse_judgment(scope=SCOPE, tool_use_block=block)
+    except ValueError:
+        pass
+    except AttributeError as exc:  # pragma: no cover - regression guard
+        pytest.fail(f"parse leaked AttributeError instead of ValueError: {exc}")
+    else:  # pragma: no cover - must raise
+        pytest.fail("expected a ValueError for a garbage new_summary string")
+
+
+def test_first_parse_failure_triggers_one_corrective_reask() -> None:
+    """Test (c): a stringified first payload triggers exactly one re-ask.
+
+    First response returns new_summary as a garbage string (unparseable);
+    the manager sends one corrective follow-up echoing the error, and the
+    second (well-formed) response parses successfully. Exactly two API calls.
+    """
+    garbage_input = {
+        "decision": "accept_as_directive",
+        "reasoning": "The contribution is a clear standard.",
+        "new_summary": "oops, this should have been an object",
+    }
+    good_input = _accept_directive_input()
+
+    first_response = _fake_response(garbage_input)
+    second_response = _fake_response(good_input)
+    first_tool_use_id = first_response.content[0].id
+
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [first_response, second_response]
+    manager = ScopeManager(client=mock_client)
+
+    judgment = manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+    )
+
+    assert mock_client.messages.create.call_count == 2
+
+    # The corrective turn echoes the first response and a tool_result for its
+    # tool_use id, plus a text block naming the parse failure.
+    second_messages = mock_client.messages.create.call_args_list[1].kwargs["messages"]
+    assert second_messages[0] == mock_client.messages.create.call_args_list[0].kwargs["messages"][0]
+    assert second_messages[1] == {"role": "assistant", "content": first_response.content}
+    followup = second_messages[2]
+    assert followup["role"] == "user"
+    tool_results = [b for b in followup["content"] if b["type"] == "tool_result"]
+    assert len(tool_results) == 1
+    assert tool_results[0]["tool_use_id"] == first_tool_use_id
+    text_blocks = [b for b in followup["content"] if b["type"] == "text"]
+    assert len(text_blocks) == 1
+    assert "could not be parsed" in text_blocks[0]["text"]
+
+    # The second, well-formed response is the one that parsed.
+    assert judgment.decision == "accept_as_directive"
+    assert judgment.new_summary is not None
+    assert len(judgment.new_summary.directives) == 2
+
+
+def test_second_parse_failure_does_not_loop() -> None:
+    """Test (c): a second parse failure propagates — never more than one retry."""
+    garbage_input = {
+        "decision": "accept_as_directive",
+        "reasoning": "The contribution is a clear standard.",
+        "new_summary": "still not an object",
+    }
+
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [
+        _fake_response(garbage_input),
+        _fake_response(garbage_input),
+    ]
+    manager = ScopeManager(client=mock_client)
+
+    with pytest.raises(ValueError, match="new_summary as an unparseable string"):
+        manager.judge(
+            scope=SCOPE,
+            stratum=STRATUM,
+            current_summary=CURRENT_SUMMARY,
+            recent_contributions=[],
+            new_contribution=NEW_CONTRIBUTION,
+        )
+
+    # Exactly one retry: two calls total, no third attempt.
+    assert mock_client.messages.create.call_count == 2
+
+
+def test_parse_reask_then_overflow_reask_chain() -> None:
+    """A parse re-ask and the overflow re-ask are independent single retries.
+
+    First response is an unparseable new_summary string (parse re-ask); the
+    corrective response parses but is over budget (overflow re-ask); the third
+    response fits. The overflow follow-up must build on the corrective turn,
+    not the discarded first turn — three calls, final judgment is the third.
+    """
+    garbage_input = {
+        "decision": "accept_as_directive",
+        "reasoning": "The contribution is a clear standard.",
+        "new_summary": "not an object",
+    }
+    over_budget_input = _summary_input_with_context(" ".join(f"word{i}" for i in range(20)))
+    fitting_input = _summary_input_with_context("Condensed.")
+
+    first_response = _fake_response(garbage_input)
+    retry_response = _fake_response(over_budget_input)
+    third_response = _fake_response(fitting_input)
+    retry_tool_use_id = retry_response.content[0].id
+
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [first_response, retry_response, third_response]
+    manager = ScopeManager(client=mock_client)
+
+    judgment = manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+        summary_max_words=5,
+    )
+
+    assert mock_client.messages.create.call_count == 3
+
+    # The overflow follow-up (third call) chains onto the corrective turn: its
+    # tool_result references the RETRY response's tool_use id, not the first.
+    third_messages = mock_client.messages.create.call_args_list[2].kwargs["messages"]
+    assert third_messages[-2] == {"role": "assistant", "content": retry_response.content}
+    tool_results = [b for b in third_messages[-1]["content"] if b["type"] == "tool_result"]
+    assert tool_results[0]["tool_use_id"] == retry_tool_use_id
+
+    assert judgment.new_summary is not None
+    assert judgment.new_summary.context == "Condensed."
 
 
 # ---------------------------------------------------------------------------

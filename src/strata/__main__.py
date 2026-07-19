@@ -66,6 +66,50 @@ if TYPE_CHECKING:
     from strata.summary_store import ScopeSummary, SummaryStore
 
 from strata import DISTRIBUTION_NAME, __version__
+from strata.install import (
+    CONFIG_TOML as _CONFIG_TOML,
+)
+from strata.install import (
+    GITIGNORE_BLOCK as _GITIGNORE_BLOCK,
+)
+from strata.install import (
+    GITIGNORE_MARKER as _GITIGNORE_MARKER,
+)
+from strata.install import (
+    HOOK_SCRIPT_NAME as _HOOK_SCRIPT_NAME,
+)
+from strata.install import (
+    MCP_ENTRY as _MCP_ENTRY,
+)
+from strata.install import (
+    SKILL_NAMES,
+    copy_hook,
+    copy_skill,
+    merge_mcp_server,
+    merge_stop_hook,
+    render_action_line,
+)
+from strata.install import (
+    hook_matches_shipped as _hook_matches_shipped,
+)
+from strata.install import (
+    is_v1_2_shape_mcp_entry as _is_v1_2_shape_mcp_entry,
+)
+from strata.install import (
+    mcp_server_present as _mcp_server_present,
+)
+from strata.install import (
+    remove_gitignore_block as _remove_gitignore_block,
+)
+from strata.install import (
+    remove_stop_hook as _remove_stop_hook,
+)
+from strata.install import (
+    skill_matches_shipped as _skill_matches_shipped,
+)
+from strata.install import (
+    stop_hook_present as _stop_hook_present,
+)
 from strata.launch import (
     SkillResolutionError,
     StrataRoleParseError,
@@ -541,6 +585,58 @@ def cmd_record(args: argparse.Namespace) -> int:
             for line in c.content.splitlines():
                 print(f"      | {line}")
             print()
+    return 0
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    """Show the per-scope memory-freshness (staleness) metric — embedded read.
+
+    Mechanical (issue #110): for each active scope, "N sessions read this scope's
+    perspective since its last accepted contribution", over a recency window. A
+    high count is the drift signal — memory being consumed but not updated. The
+    metric never triggers or gates judgment; it only measures.
+    """
+    from strata.session_state import (
+        DEFAULT_STALENESS_WINDOW_DAYS,
+        SessionStateStore,
+        compute_fleet_staleness,
+        sessions_dir_for,
+    )
+    from strata.stores import EmbeddedStoreError, open_embedded_stores
+
+    window_days = getattr(args, "window_days", None) or DEFAULT_STALENESS_WINDOW_DAYS
+
+    try:
+        stores = open_embedded_stores()
+    except EmbeddedStoreError as exc:
+        print(exc.message, file=sys.stderr)
+        return 1
+
+    with stores:
+        summaries_dir = str(stores.summary_store.summaries_dir)
+        session_store = SessionStateStore(sessions_dir_for(summaries_dir))
+        active = stores.fleet_config.active_scopes()
+        metrics = compute_fleet_staleness(
+            [s.id for s in active],
+            record_store=stores.record_store,
+            session_store=session_store,
+            window_days=window_days,
+        )
+
+        print(
+            f"Memory freshness — staleness over a {window_days}-day window "
+            f"({len(active)} scope(s)):"
+        )
+        print()
+        if not active:
+            print("  _(no active scopes)_")
+            return 0
+        # Column width tracks the longest scope id so the metric column lines up.
+        id_width = max((len(m.scope_id) for m in metrics), default=6)
+        print(f"  {'scope':{id_width}}  reads-since-contrib  last accepted contribution")
+        for m in metrics:
+            last = m.last_accepted_contribution_at or "(none)"
+            print(f"  {m.scope_id:{id_width}}  {m.reads_since_last_contribution:<19}  {last}")
     return 0
 
 
@@ -1381,20 +1477,11 @@ def cmd_launch(args: argparse.Namespace) -> int:
 #: Project root marker files — at least one must be present.
 _PROJECT_MARKERS = (".git", "pyproject.toml", "package.json", "Cargo.toml", "go.mod")
 
-#: Gitignore block appended by strata register (idempotent — detected by header).
-# Exact managed line, not a loose "# Strata" substring — a user comment like
-# "# Strata console output" must not suppress the ignore block.
-_GITIGNORE_MARKER = "# Strata — managed by `strata register`"
-_GITIGNORE_BLOCK = """\
-# Strata — managed by `strata register` — do not remove this line
-.strata/.venv/
-.strata/strata.db*
-.strata/summaries/
-# fleet.yaml is intentionally NOT listed above — commit it (it is your team's org chart).
-"""
-
-#: Minimal settings.json merge entry.
-_MCP_ENTRY: dict = {"command": "strata-mcp", "env": {}}
+# The additive-merge constants and machinery (_MCP_ENTRY, _GITIGNORE_MARKER,
+# _GITIGNORE_BLOCK, _CONFIG_TOML, the settings merge, skill copy, and --diff
+# rendering) live in strata.install — the documented import surface the
+# memfleet cloud client reuses (ADR 0009 D3). Imported at the top of this
+# module; strata register below is built on them so the rules exist once.
 
 
 def _self_install_spec() -> str | None:
@@ -1404,8 +1491,8 @@ def _self_install_spec() -> str | None:
     from a path or VCS URL. Returns None when no safe source can be
     determined (e.g. a hypothetical index install) — the caller must fail
     actionably rather than ``pip install strata``, which resolves to an
-    unrelated PyPI package; this project publishes as ``memfleet``
-    (issue #49).
+    unrelated PyPI package; this project publishes as ``strata-mem``
+    (ADR 0009 D1; issue #49).
     """
     import importlib.metadata  # noqa: PLC0415
 
@@ -1432,40 +1519,6 @@ def _self_install_spec() -> str | None:
     if url.startswith("file://"):
         return url.removeprefix("file://")
     return None
-
-
-def _is_v1_2_shape_mcp_entry(entry: dict) -> bool:
-    """Return True if *entry* matches a known-stale V1.2 mcpServer shape.
-
-    V1.2 settings shipped:
-      command: python
-      args: ["-m", "mcp_server.strata_mcp"]
-      env: { "STRATA_BACKEND_URL": "...", ... }
-
-    All three of those break on V1.3:
-    - mcp_server is no longer a top-level module (folded into strata.mcp).
-    - STRATA_BACKEND_URL is no longer consumed (embedded mode, ADR 0004 D1).
-
-    We only need to recognise *any* of these signals to warn.
-    """
-    if entry.get("command") == "python":
-        args = entry.get("args") or []
-        if isinstance(args, list) and "-m" in args:
-            tail = args[args.index("-m") + 1 :]
-            if tail and "mcp_server" in tail[0]:
-                return True
-    env = entry.get("env") or {}
-    return isinstance(env, dict) and "STRATA_BACKEND_URL" in env
-
-
-#: Default .strata/config.toml content.
-_CONFIG_TOML = """\
-# Strata per-project configuration — managed by `strata register`.
-# Paths are relative to this project's root.
-db = ".strata/strata.db"
-fleet_yaml = ".strata/fleet.yaml"
-summaries_dir = ".strata/summaries"
-"""
 
 
 def cmd_register(args: argparse.Namespace) -> int:
@@ -1530,16 +1583,7 @@ def cmd_register(args: argparse.Namespace) -> int:
     # -----------------------------------------------------------------------
     def _act(action: str, path: str | Path, *, skipped: bool = False) -> None:
         rel = Path(path).relative_to(project_root) if Path(path).is_absolute() else Path(path)
-        if diff_mode:
-            if skipped:
-                print(f"  [unchanged]  {rel}")
-            else:
-                print(f"  [would create/update]  {rel}")
-        else:
-            if skipped:
-                print(f"  kept user's {rel}")
-            else:
-                print(f"  {action}: {rel}")
+        print(render_action_line(action, rel, diff_mode=diff_mode, skipped=skipped))
 
     if diff_mode:
         print(f"strata register --diff  (dry-run, no writes)\nProject root: {project_root}")
@@ -1609,20 +1653,24 @@ def cmd_register(args: argparse.Namespace) -> int:
     # -----------------------------------------------------------------------
     claude_skills_dir = project_root / ".claude" / "skills"
     skills_root = importlib.resources.files("strata") / "_skills"
-    for skill_name in ["strata", "strata-worker", "strata-inspect"]:
+    for skill_name in SKILL_NAMES:
         dest_skill_dir = claude_skills_dir / skill_name
-        if dest_skill_dir.exists():
-            _act("skip", dest_skill_dir, skipped=True)
-        else:
-            skill_src = skills_root / skill_name / "Skill.md"
-            if not diff_mode:
-                dest_skill_dir.mkdir(parents=True, exist_ok=True)
-                dest_skill_md = dest_skill_dir / "Skill.md"
-                dest_skill_md.write_text(skill_src.read_text(encoding="utf-8"), encoding="utf-8")
-            _act("copied", dest_skill_dir)
+        copied = copy_skill(skills_root, skill_name, claude_skills_dir, dry_run=diff_mode)
+        _act("copied" if copied else "skip", dest_skill_dir, skipped=not copied)
 
     # -----------------------------------------------------------------------
-    # Step 7: Merge strata into .claude/settings.json mcpServers block.
+    # Step 6b: Copy the freshness Stop-hook script to .claude/hooks/ (issue #112).
+    # Additive like the skills — an existing script is kept.
+    # -----------------------------------------------------------------------
+    claude_hooks_dir = project_root / ".claude" / "hooks"
+    hooks_root = importlib.resources.files("strata") / "_hooks"
+    dest_hook = claude_hooks_dir / _HOOK_SCRIPT_NAME
+    hook_copied = copy_hook(hooks_root, claude_hooks_dir, dry_run=diff_mode)
+    _act("copied" if hook_copied else "skip", dest_hook, skipped=not hook_copied)
+
+    # -----------------------------------------------------------------------
+    # Step 7: Merge strata into .claude/settings.json — the mcpServers block and
+    # the freshness hooks.Stop entry (issue #112), both strictly additive.
     # -----------------------------------------------------------------------
     settings_json = project_root / ".claude" / "settings.json"
     settings_unreadable = False
@@ -1645,10 +1693,11 @@ def cmd_register(args: argparse.Namespace) -> int:
     else:
         settings_data = {}
 
+    settings_changed = False
     mcp_servers: dict = settings_data.get("mcpServers", {})
     if settings_unreadable:
         pass  # merge skipped — reported above; register exits non-zero below
-    elif "strata" in mcp_servers:
+    elif _mcp_server_present(settings_data):
         _act("skip", settings_json, skipped=True)
         # Stale-shape detection (ADR 0005 Decision 6): warn if the existing
         # strata mcpServer entry is V1.2-shape (broken on V1.3). Keeps the
@@ -1680,12 +1729,27 @@ def cmd_register(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
     else:
-        mcp_servers["strata"] = _MCP_ENTRY
-        settings_data["mcpServers"] = mcp_servers
-        if not diff_mode:
-            (project_root / ".claude").mkdir(parents=True, exist_ok=True)
-            settings_json.write_text(json.dumps(settings_data, indent=2) + "\n", encoding="utf-8")
+        merge_mcp_server(settings_data)
+        settings_changed = True
         _act("merged strata into", settings_json)
+
+    # Step 7b: additively merge the freshness hooks.Stop entry (issue #112).
+    # A user's own Stop hooks — and every other settings key — are preserved;
+    # the Strata group is appended only when absent.
+    if not settings_unreadable:
+        if _stop_hook_present(settings_data):
+            _act("skip Stop hook in", settings_json, skipped=True)
+        else:
+            merge_stop_hook(settings_data)
+            settings_changed = True
+            _act("merged Stop hook into", settings_json)
+
+    # One write for both additive merges — so an existing mcpServers entry that
+    # was skipped still gets the new Stop hook, and bootstrap-venv (step 8) reads
+    # the up-to-date file back.
+    if settings_changed and not diff_mode:
+        (project_root / ".claude").mkdir(parents=True, exist_ok=True)
+        settings_json.write_text(json.dumps(settings_data, indent=2) + "\n", encoding="utf-8")
 
     # -----------------------------------------------------------------------
     # Step 8: bootstrap-venv (if requested).
@@ -1846,57 +1910,6 @@ def cmd_register(args: argparse.Namespace) -> int:
 # per item and exits 0 (idempotent).
 
 
-def _remove_gitignore_block(text: str) -> tuple[str, str]:
-    """Remove register's managed `.gitignore` block from *text*.
-
-    Returns ``(new_text, status)`` where *status* is one of:
-
-    - ``"removed"``  — the verbatim managed block was found and stripped,
-      along with the single blank-line separator register prepends, so the
-      surrounding lines stay byte-identical.
-    - ``"edited"``   — the managed marker line is present but the block no
-      longer matches verbatim (the user edited inside it); *text* is returned
-      unchanged so nothing user-authored is destroyed.
-    - ``"absent"``   — no managed marker at all; nothing to do.
-    """
-    if _GITIGNORE_BLOCK in text:
-        # Register appends "\n" + _GITIGNORE_BLOCK (a blank-line separator
-        # before the block). Strip that separator too so a `.gitignore` that
-        # ended in a newline before register round-trips byte-for-byte.
-        sep_block = "\n" + _GITIGNORE_BLOCK
-        if sep_block in text:
-            return text.replace(sep_block, "", 1), "removed"
-        return text.replace(_GITIGNORE_BLOCK, "", 1), "removed"
-    if _GITIGNORE_MARKER in text:
-        return text, "edited"
-    return text, "absent"
-
-
-def _skill_matches_shipped(installed_md: Path, skill_name: str) -> bool | None:
-    """Return whether an installed skill's ``Skill.md`` matches the shipped copy.
-
-    - ``True``  — the installed ``Skill.md`` is byte-identical to the version
-      shipped in the running distribution (``src/strata/_skills/<name>``);
-      safe to delete.
-    - ``False`` — it differs (user-edited, or an older Strata version); leave
-      it and report.
-    - ``None``  — the shipped reference could not be read, so we cannot prove a
-      match; treat conservatively as "leave it".
-    """
-    import importlib.resources  # noqa: PLC0415
-
-    try:
-        shipped = importlib.resources.files("strata") / "_skills" / skill_name / "Skill.md"
-        shipped_text = shipped.read_text(encoding="utf-8")
-    except (OSError, ModuleNotFoundError):
-        return None
-    try:
-        installed_text = installed_md.read_text(encoding="utf-8")
-    except OSError:
-        return None
-    return installed_text == shipped_text
-
-
 def cmd_unregister(args: argparse.Namespace) -> int:
     """Reverse `strata register`'s wiring — issue #53.
 
@@ -1976,7 +1989,9 @@ def cmd_unregister(args: argparse.Namespace) -> int:
             _ok(".gitignore: nothing to do (no managed Strata block)")
 
     # -----------------------------------------------------------------------
-    # Step 2: `mcpServers.strata` settings entry.
+    # Step 2: `.claude/settings.json` — the `mcpServers.strata` entry and the
+    # freshness `hooks.Stop` entry (issue #112). Both removed only when they
+    # still byte-match what register wrote; one write persists both removals.
     # -----------------------------------------------------------------------
     settings_json = project_root / ".claude" / "settings.json"
     if not settings_json.exists():
@@ -1992,40 +2007,55 @@ def cmd_unregister(args: argparse.Namespace) -> int:
             settings_data = None  # type: ignore[assignment]
 
         if settings_data is not None:
+            settings_changed = False
+
+            # mcpServers.strata entry.
             mcp_servers = settings_data.get("mcpServers")
             entry = mcp_servers.get("strata") if isinstance(mcp_servers, dict) else None
             if entry is None:
                 _ok(".claude/settings.json: nothing to do (no mcpServers.strata entry)")
             elif entry == _MCP_ENTRY:
-                # Byte-stable rewrite: match register's writer exactly
-                # (json.dumps(indent=2) + trailing newline).
                 del mcp_servers["strata"]
                 # Register creates the mcpServers block when absent; if strata
                 # was its only key, drop the now-empty block so a project that
                 # had no mcpServers before register round-trips byte-for-byte.
                 if not mcp_servers:
                     del settings_data["mcpServers"]
-                if not dry_run:
-                    settings_json.write_text(
-                        json.dumps(settings_data, indent=2) + "\n", encoding="utf-8"
-                    )
-                verb = _would("remove", "removed")
-                if not settings_data:
-                    # The file is now an empty object. Register creates
-                    # settings.json when absent, but that origin is not
-                    # detectable from content, so we leave the empty file
-                    # rather than risk deleting one the user created —
-                    # mirroring the empty-.gitignore treatment. (design item 2)
-                    _ok(
-                        f".claude/settings.json: {verb} mcpServers.strata entry "
-                        "(file now empty — left in place; register's authorship is not detectable)"
-                    )
-                else:
-                    _ok(f".claude/settings.json: {verb} mcpServers.strata entry")
+                settings_changed = True
+                _ok(f".claude/settings.json: {_would('remove', 'removed')} mcpServers.strata entry")
             else:
                 _left(
                     ".claude/settings.json: mcpServers.strata entry was edited "
                     "(differs from the canonical entry) — left in place"
+                )
+
+            # Freshness hooks.Stop entry (issue #112) — same byte-identity rule;
+            # remove_stop_hook drops emptied Stop/hooks containers so a project
+            # with no hooks before register round-trips byte-for-byte.
+            hook_status = _remove_stop_hook(settings_data)
+            if hook_status == "removed":
+                settings_changed = True
+                _ok(f".claude/settings.json: {_would('remove', 'removed')} freshness Stop hook")
+            elif hook_status == "edited":
+                _left(
+                    ".claude/settings.json: freshness Stop hook was edited "
+                    "(differs from the canonical entry) — left in place"
+                )
+            else:  # absent
+                _ok(".claude/settings.json: nothing to do (no freshness Stop hook)")
+
+            if settings_changed and not dry_run:
+                settings_json.write_text(
+                    json.dumps(settings_data, indent=2) + "\n", encoding="utf-8"
+                )
+            if settings_changed and not settings_data:
+                # The file is now an empty object. Register creates settings.json
+                # when absent, but that origin is not detectable from content, so
+                # the empty file is left rather than risk deleting one the user
+                # created — mirroring the empty-.gitignore treatment.
+                _ok(
+                    ".claude/settings.json: now an empty object — left in place "
+                    "(register's authorship is not detectable)"
                 )
 
     # -----------------------------------------------------------------------
@@ -2057,10 +2087,37 @@ def cmd_unregister(args: argparse.Namespace) -> int:
                 "(differs from shipped) — left in place"
             )
 
+    # -----------------------------------------------------------------------
+    # Step 3b: the vendored freshness Stop-hook script (issue #112).
+    # -----------------------------------------------------------------------
+    claude_hooks_dir = project_root / ".claude" / "hooks"
+    hook_script = claude_hooks_dir / _HOOK_SCRIPT_NAME
+    if not hook_script.exists():
+        _ok(f"hook {_HOOK_SCRIPT_NAME}: nothing to do (not installed)")
+    else:
+        hook_match = _hook_matches_shipped(hook_script)
+        if hook_match is True:
+            if not dry_run:
+                hook_script.unlink()
+            _ok(
+                f"hook {_HOOK_SCRIPT_NAME}: {_would('remove', 'removed')} (matched shipped version)"
+            )
+        elif hook_match is None:
+            _left(
+                f"hook {_HOOK_SCRIPT_NAME}: could not read the shipped reference to compare "
+                "— left in place"
+            )
+        else:  # False — differs
+            _left(
+                f"hook {_HOOK_SCRIPT_NAME}: modified or from an older Strata version "
+                "(differs from shipped) — left in place"
+            )
+
     # Tidy up register-created empty parent dirs so a clean unregister restores
     # the tree exactly. Only ever removes directories that are already empty.
     if not dry_run:
         _rmdir_if_empty(claude_skills_dir)
+        _rmdir_if_empty(claude_hooks_dir)
         _rmdir_if_empty(project_root / ".claude")
 
     # -----------------------------------------------------------------------
@@ -2099,6 +2156,44 @@ def _rmdir_if_empty(directory: Path) -> None:
             directory.rmdir()
     except OSError:
         pass
+
+
+# ---------------------------------------------------------------------------
+# strata freshness-hook / freshness-evaluator — the turn-boundary contribution
+# Stop-hook and its detached background evaluator (issue #112, WP3). Hidden
+# subcommands: they are the engine the installed `.claude/hooks/strata-stop-hook`
+# wrapper and its spawned child invoke, not commands a user runs by hand.
+# ---------------------------------------------------------------------------
+
+
+def cmd_freshness_hook(args: argparse.Namespace) -> int:
+    """Run the Stop hook from Claude Code's stdin payload (issue #112).
+
+    Reads the hook JSON on stdin, consults the session's #110 asymmetry
+    counters, and either spawns a detached background evaluator (default) or
+    emits the strict-mode block JSON on stdout. Always exits 0 — a broken hook
+    must never break the user's session — so the return code is fixed at 0 and
+    any strict-mode decision rides on stdout.
+    """
+    from strata.freshness import run_stop_hook  # noqa: PLC0415
+
+    stdin_text = sys.stdin.read() if not sys.stdin.isatty() else ""
+    run_stop_hook(stdin_text, out=sys.stdout)
+    return 0
+
+
+def cmd_freshness_evaluator(args: argparse.Namespace) -> int:
+    """Run the detached background evaluator for one stale session (issue #112).
+
+    Reads the session transcript tail, drafts a possible contribution via the
+    evaluator model, and either submits it through the judged contribute path or
+    records a mechanical decline — resetting the session's asymmetry counters
+    either way. Spawned detached by the Stop hook; always exits 0.
+    """
+    from strata.freshness import run_evaluator  # noqa: PLC0415
+
+    run_evaluator(session_id=args.session_id, transcript_path=args.transcript_path)
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -2155,6 +2250,19 @@ def _build_parser() -> argparse.ArgumentParser:
     p_record = sub.add_parser("record", help="Print a scope's record (contributions + judgments).")
     p_record.add_argument("scope_id")
     p_record.set_defaults(func=cmd_record)
+
+    p_status = sub.add_parser(
+        "status",
+        help="Show per-scope memory-freshness (read-vs-contribute staleness, issue #110).",
+    )
+    p_status.add_argument(
+        "--window-days",
+        type=int,
+        default=None,
+        dest="window_days",
+        help="Recency window in days for the staleness metric (default: 30).",
+    )
+    p_status.set_defaults(func=cmd_status)
 
     # -------------------------------------------------------------------
     # strata operator — ADR 0008 D1's local entry surface: publish/supersede/
@@ -2397,6 +2505,21 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_unregister.set_defaults(func=cmd_unregister)
+
+    # -------------------------------------------------------------------
+    # Hidden engine subcommands for the freshness Stop-hook (issue #112).
+    # help=SUPPRESS: invoked by the installed hook wrapper and its spawned
+    # evaluator, not by users. Kept on the `strata` CLI so PATH resolution
+    # matches the installed engine (`strata-mcp`) and there is one shipped
+    # implementation for every installer to point at.
+    # -------------------------------------------------------------------
+    p_fresh_hook = sub.add_parser("freshness-hook", help=argparse.SUPPRESS)
+    p_fresh_hook.set_defaults(func=cmd_freshness_hook)
+
+    p_fresh_eval = sub.add_parser("freshness-evaluator", help=argparse.SUPPRESS)
+    p_fresh_eval.add_argument("--session-id", dest="session_id", required=True)
+    p_fresh_eval.add_argument("--transcript-path", dest="transcript_path", required=True)
+    p_fresh_eval.set_defaults(func=cmd_freshness_evaluator)
 
     return parser
 

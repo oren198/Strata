@@ -198,19 +198,21 @@ This section is for users who have **an existing project** and want to add Strat
 Two universal commands, then you're ready:
 
 ```bash
-pipx install memfleet      # install strata in an isolated env; puts strata + strata-mcp on PATH
+pipx install strata-mem    # install strata in an isolated env; puts strata + strata-mcp on PATH
 cd /path/to/your/project
 strata register              # idempotent: creates .strata/, seeds fleet.yaml, wires Claude Code
 ```
 
-> **PyPI distribution name vs. import/CLI names.** Strata is published to
-> PyPI as **`memfleet`**, matching the hosted platform at memfleet.com
-> (the name `strata` was already taken by an
-> unrelated, dormant package — see
-> [issue #49](https://github.com/oren198/Strata/issues/49)). Everything you
+> **PyPI distribution name vs. import/CLI names.** The Strata engine is
+> published to PyPI as **`strata-mem`** (the name `strata` was already taken
+> by an unrelated, dormant package — see
+> [issue #49](https://github.com/oren198/Strata/issues/49); the engine/cloud
+> packaging split is
+> [ADR 0009](docs/adr/0009-packaging-engine-client-split.md)). Everything you
 > actually type stays `strata`: `import strata` in Python, and the
 > `strata` / `strata-mcp` console scripts on your PATH. Only the
-> `pipx install` / `pip install` argument differs.
+> `pipx install` / `pip install` argument differs. The `memfleet` distribution
+> name belongs to the separate cloud client (memfleet.com), not the engine.
 
 ### What `strata register` does
 
@@ -221,8 +223,12 @@ strata register              # idempotent: creates .strata/, seeds fleet.yaml, w
 3. Seeds `.strata/fleet.yaml` from a minimal template (1 scope, ready to edit).
 4. Copies the `strata`, `strata-worker`, and `strata-inspect` skills to `.claude/skills/`.
 5. Merges a `strata` entry into `.claude/settings.json`'s `mcpServers` block.
+6. Installs the freshness `Stop`-hook: copies `.claude/hooks/strata-stop-hook`
+   and merges a `hooks.Stop` entry into `.claude/settings.json` (see
+   [Memory-freshness Stop-hook](#memory-freshness-stop-hook)).
 
 Run it again at any time — it skips everything that already exists and reports what it kept.
+Every step is additive: your own `mcpServers`, `hooks`, skills, and `fleet.yaml` are never overwritten.
 
 ### After registration
 
@@ -259,7 +265,7 @@ scope that resolves storage from `config.toml` as usual.
 
 ### Checking for skill updates
 
-After `pipx upgrade memfleet`, run:
+After `pipx upgrade strata-mem`, run:
 
 ```bash
 strata register --diff       # shows what would change if you re-ran register
@@ -267,6 +273,66 @@ strata register --diff       # shows what would change if you re-ran register
 
 Review the diff and copy the pieces you want manually. Strata never silently
 overwrites skills or settings you've already customised.
+
+### Memory-freshness Stop-hook
+
+Reading fleet memory and never writing back lets a scope's memory quietly go
+stale. `strata register` wires a Claude Code `Stop` hook that closes that loop
+at each turn end. It is engine-owned (shipped as package data, installed like
+the skills) and strictly additive — your own `Stop` hooks are left untouched.
+
+**How it works.** At every turn end the hook reads the session's mechanical
+read/contribute counters (the `.strata/sessions/` state files — no judge, no
+memory write). When a session has read fleet memory a few times and recorded
+nothing back, the *gate* opens. What happens then depends on the mode:
+
+- **Default (background) mode.** The hook does **not** block your prompt. It
+  spawns a detached, headless *evaluator* and returns immediately. The evaluator
+  reads the session transcript tail and decides whether the session produced a
+  memory-worthy outcome: if so it drafts a contribution and submits it through
+  the **normal judged path** — the scope-manager gates admission exactly as it
+  does for a contribution you write yourself; if not, it records a mechanical
+  decline. Either outcome resets the session's counters, so you are nudged at
+  most once per stale stretch, never per turn. The evaluator is best-effort:
+  no `.strata` project, no session state, no API key, or any error all degrade
+  to a silent no-op. It never writes memory without judgment — only the decline
+  is mechanical.
+
+- **Strict (blocking) mode** — opt in with `STRATA_FRESHNESS_STRICT=1`. Instead
+  of spawning an evaluator, the hook blocks the stop **once** with a
+  contribute-or-decline instruction fed back to the agent, then lets it proceed
+  (it respects Claude Code's `stop_hook_active` flag, so it never loops). This
+  is more insistent but interrupts interactive use, so it is off by default.
+
+At most one evaluator runs per session at a time (a lockfile beside the session
+state, with a stale-lock TTL), and the gate is always checked before spawning.
+
+**Environment variables:**
+
+| Variable | Effect |
+|---|---|
+| `STRATA_FRESHNESS_STRICT` | `1` switches the hook to strict (blocking) mode. Unset/anything else = default background mode. |
+| `STRATA_EVALUATOR_MODEL` | Overrides the evaluator's drafting model (default `claude-haiku-4-5-20251001`). The scope-manager that *judges* the draft is unaffected. |
+
+**Non-Claude-Code harnesses.** The hook is a documented contract, not magic —
+this is the mechanism's honest limit. Any harness that can run a command at
+turn end can reproduce it:
+
+1. At each turn boundary, run `strata freshness-hook`, passing a JSON object on
+   stdin with at least `transcript_path` (path to the session transcript) and
+   `stop_hook_active` (whether the stop was already blocked once this turn).
+2. Ensure the session's identity env vars (`STRATA_AGENT_SCOPE`,
+   `STRATA_AGENT_SKILL`, `STRATA_AGENT_SESSION_ID`) are set the same way the MCP
+   server sees them — the hook keys the session state by `STRATA_AGENT_SESSION_ID`.
+3. In default mode the command exits `0` and (when the gate is open) spawns the
+   detached evaluator itself. In strict mode it prints a
+   `{"decision":"block","reason":"…"}` JSON object on stdout that your harness
+   must feed back to the agent and honour as a one-time block.
+
+Harnesses that cannot run a turn-end command get none of this automatically —
+the substrate (the `#110` counters, `strata_session_stats`, the read-time
+nudge) still works, but the turn-boundary evaluator does not fire without a hook
+to trigger it.
 
 ### No Python 3.11+ globally? Use `--bootstrap-venv`
 
@@ -303,7 +369,11 @@ What it does, step by step:
 3. Removes each of the `strata`, `strata-worker`, and `strata-inspect` skills
    **only if byte-identical to the shipped version**. A modified or
    older-version skill is left alone and reported.
-4. Leaves your `.strata/` workspace untouched — that is memory, not wiring.
+4. Removes the freshness `Stop`-hook — both the `hooks.Stop` entry from
+   `.claude/settings.json` (only when it byte-matches what register wrote; your
+   own `Stop` hooks are preserved) and the `.claude/hooks/strata-stop-hook`
+   script (only when byte-identical to the shipped version).
+5. Leaves your `.strata/` workspace untouched — that is memory, not wiring.
    Pass `--purge-data` to remove it too (`--dry-run --purge-data` previews the
    purge without deleting).
 
@@ -450,6 +520,8 @@ is present, the first three are ignored for the MCP server (project config wins)
 | `STRATA_AGENT_SESSION_ID` | (auto) | Session identifier — auto-generated when absent |
 | `STRATA_MANAGER_MODEL` | `claude-haiku-4-5` | Model used by scope-managers |
 | `STRATA_ANTHROPIC_API_KEY` | (unset) | Optional; falls back to `ANTHROPIC_API_KEY` |
+| `STRATA_FRESHNESS_STRICT` | (unset) | `1` switches the freshness `Stop`-hook to strict (blocking) mode ([details](#memory-freshness-stop-hook)) |
+| `STRATA_EVALUATOR_MODEL` | `claude-haiku-4-5-20251001` | Model the freshness evaluator drafts with (the judge is unaffected) |
 
 A local `.env` file is loaded automatically.
 

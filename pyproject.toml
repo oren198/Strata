@@ -3,8 +3,8 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "memfleet"
-version = "1.6.1"
+name = "strata-mem"
+version = "1.6.2"
 description = "Shared memory for agent fleets."
 requires-python = ">=3.11"
 dependencies = [
@@ -39,6 +39,7 @@ include = [
     "src/strata/_skills/**/*",
     "src/strata/_migrations/**/*",
     "src/strata/_templates/**/*",
+    "src/strata/_hooks/**/*",
     "src/strata/_ui/**/*",
 ]
 

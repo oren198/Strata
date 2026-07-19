@@ -298,6 +298,15 @@ def _load_mcp_module(db_path: str, summaries_dir: str, fleet_yaml_path: str):
     mod._record_store = RecordStore(db_path)
     mod._summary_store = SummaryStore(summaries_dir)
 
+    # Session-state substrate (issue #110): reads/contributions are recorded into
+    # a per-session JSON file beside the summaries dir. Wire it the way
+    # _set_paths/_init_stores would in production so the read/contribute tools
+    # can update it.
+    from strata.session_state import SessionStateStore, sessions_dir_for
+
+    mod._sessions_dir = str(sessions_dir_for(summaries_dir))
+    mod._session_store = SessionStateStore(mod._sessions_dir)
+
     return mod
 
 
@@ -2083,3 +2092,374 @@ def test_strata_withdraw_unknown_item_raises_runtimeerror(tmp_path: Path) -> Non
     ):
         mod._summary_store = SummaryStore(summaries_dir)
         mod.strata_withdraw("pub_does_not_exist")
+
+
+# ---------------------------------------------------------------------------
+# Issue #110: per-session asymmetry counters + read receipts (mechanical)
+# ---------------------------------------------------------------------------
+
+
+def test_read_scope_summary_increments_session_reads(tmp_path: Path) -> None:
+    """A summary read increments the session's reads counter and per-scope receipt."""
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fleet_yaml(tmp_path)
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+    SummaryStore(summaries_dir).write("g_arch", _make_summary("g_arch", "ctx"))
+    fleet = FleetConfig.load(fleet_path)
+
+    scope_p, skill_p, session_p = _patch_agent_binding(mod, scope="g_backend", session_id="sess_r")
+    with scope_p, skill_p, session_p, patch.object(mod, "_load_fleet", return_value=fleet):
+        mod.strata_read_scope_summary("g_arch")
+        mod.strata_read_scope_summary("g_arch")
+
+    # The state file exists, is readable, and records both reads of g_arch.
+    state = mod._session_store.read("sess_r")
+    assert state is not None
+    assert state.reads == 2
+    assert state.contributions == 0
+    assert state.declines == 0
+    assert state.reads_by_scope["g_arch"].count == 2
+    assert state.reads_by_scope["g_arch"].last_read_at != ""
+
+
+def test_read_perspective_records_read_for_target_scope(tmp_path: Path) -> None:
+    """A perspective read is attributed to its target scope only, not its ancestors."""
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fleet_yaml(tmp_path)
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+    fleet = FleetConfig.load(fleet_path)
+
+    scope_p, skill_p, session_p = _patch_agent_binding(mod, scope="g_backend", session_id="sess_p")
+    with scope_p, skill_p, session_p, patch.object(mod, "_load_fleet", return_value=fleet):
+        mod.strata_read_perspective("g_backend")
+
+    state = mod._session_store.read("sess_p")
+    assert state is not None
+    assert state.reads == 1
+    # g_backend is the target; g_arch (its ancestor layer) is NOT attributed a read.
+    assert set(state.reads_by_scope) == {"g_backend"}
+
+
+def test_session_stats_tool_returns_counters(tmp_path: Path) -> None:
+    """strata_session_stats returns the live counters; zeroed before any activity."""
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fleet_yaml(tmp_path)
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+    SummaryStore(summaries_dir).write("g_arch", _make_summary("g_arch", "ctx"))
+    fleet = FleetConfig.load(fleet_path)
+
+    scope_p, skill_p, session_p = _patch_agent_binding(mod, scope="g_backend", session_id="sess_s")
+    with scope_p, skill_p, session_p, patch.object(mod, "_load_fleet", return_value=fleet):
+        # Before any read, the self-query returns zeroed counters (never errors).
+        empty = mod.strata_session_stats()
+        assert empty["reads"] == 0
+        assert empty["session_id"] == "sess_s"
+
+        mod.strata_read_scope_summary("g_arch")
+        stats = mod.strata_session_stats()
+
+    assert stats["reads"] == 1
+    assert stats["contributions"] == 0
+    assert stats["reads_by_scope"]["g_arch"]["count"] == 1
+
+
+def test_accepted_contribution_increments_session_counter(tmp_path: Path) -> None:
+    """An accepted contribution bumps the session's contributions counter (release valve)."""
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fleet_yaml(tmp_path)
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+    fleet = FleetConfig.load(fleet_path)
+
+    fake_judgment = MagicMock()
+    fake_judgment.decision = "accept_as_context"
+    fake_judgment.reasoning = "ok"
+    fake_judgment.new_summary = _make_summary("g_arch", "updated")
+
+    scope_p, skill_p, session_p = _patch_agent_binding(mod, scope="g_backend", session_id="sess_c")
+    with (
+        scope_p,
+        skill_p,
+        session_p,
+        patch.object(mod, "_load_fleet", return_value=fleet),
+        patch("strata.scope_manager.ScopeManager.judge", return_value=fake_judgment),
+        patch("anthropic.Anthropic", return_value=MagicMock()),
+    ):
+        mod.strata_contribute(
+            scope_id="g_arch",
+            content="Use structured logging.",
+            proposed_classification="context",
+            subject=None,
+            supersedes=None,
+        )
+
+    state = mod._session_store.read("sess_c")
+    assert state is not None
+    assert state.contributions == 1
+
+
+def test_declined_contribution_does_not_increment_counter(tmp_path: Path) -> None:
+    """A scope-manager decline is not an accepted contribution — no counter bump."""
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fleet_yaml(tmp_path)
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+    fleet = FleetConfig.load(fleet_path)
+
+    fake_judgment = MagicMock()
+    fake_judgment.decision = "decline"
+    fake_judgment.reasoning = "not memory-worthy"
+    fake_judgment.new_summary = None
+
+    scope_p, skill_p, session_p = _patch_agent_binding(mod, scope="g_backend", session_id="sess_d")
+    with (
+        scope_p,
+        skill_p,
+        session_p,
+        patch.object(mod, "_load_fleet", return_value=fleet),
+        patch("strata.scope_manager.ScopeManager.judge", return_value=fake_judgment),
+        patch("anthropic.Anthropic", return_value=MagicMock()),
+    ):
+        mod.strata_contribute(
+            scope_id="g_arch",
+            content="trivia",
+            proposed_classification="context",
+            subject=None,
+            supersedes=None,
+        )
+
+    # A decline creates no session file (no counters ever incremented) — or, if
+    # one exists, contributions is still 0. Either way contributions must be 0.
+    state = mod._session_store.read("sess_d")
+    assert state is None or state.contributions == 0
+
+
+# ---------------------------------------------------------------------------
+# Issue #111: strata_session_closeout (mechanical decline) + read-time nudge
+# + contribution-norm instructions
+# ---------------------------------------------------------------------------
+
+
+def _seed_and_read(mod, fleet, *, scope: str, session_id: str, times: int) -> list[dict]:
+    """Read g_arch's summary *times* times as *scope*/*session_id*; return the results.
+
+    Every read increments the session's reads counter, so this walks the session
+    up to (and past) the nudge threshold deterministically.
+    """
+    scope_p, skill_p, session_p = _patch_agent_binding(mod, scope=scope, session_id=session_id)
+    results: list[dict] = []
+    with scope_p, skill_p, session_p, patch.object(mod, "_load_fleet", return_value=fleet):
+        for _ in range(times):
+            results.append(mod.strata_read_scope_summary("g_arch"))
+    return results
+
+
+def test_closeout_records_decline_without_building_judge(tmp_path: Path) -> None:
+    """strata_session_closeout records a decline as a pure session-state write.
+
+    The mechanical decline path must never construct the scope-manager or the
+    Anthropic judge client — patching both to raise proves neither is touched.
+    """
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fleet_yaml(tmp_path)
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+
+    scope_p, skill_p, session_p = _patch_agent_binding(mod, scope="g_backend", session_id="sess_co")
+    with (
+        scope_p,
+        skill_p,
+        session_p,
+        patch.object(
+            mod,
+            "_build_scope_manager",
+            side_effect=AssertionError("closeout must never build a scope manager"),
+        ),
+        patch(
+            "anthropic.Anthropic",
+            side_effect=AssertionError("closeout must never construct a judge client"),
+        ),
+    ):
+        result = mod.strata_session_closeout(reason="read-only investigation, nothing decided")
+
+    assert result["session_id"] == "sess_co"
+    assert result["declines"] == 1
+    assert result["contributions"] == 0
+
+    state = mod._session_store.read("sess_co")
+    assert state is not None
+    assert state.declines == 1
+
+
+def test_no_nudge_below_threshold(tmp_path: Path) -> None:
+    """Reads below the threshold carry no nudge — the early-read silence (#111)."""
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fleet_yaml(tmp_path)
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+    SummaryStore(summaries_dir).write("g_arch", _make_summary("g_arch", "ctx"))
+    fleet = FleetConfig.load(fleet_path)
+
+    results = _seed_and_read(mod, fleet, scope="g_backend", session_id="sess_nb", times=2)
+
+    assert all("nudge" not in r for r in results)
+
+
+def test_nudge_appears_at_threshold_with_current_counts(tmp_path: Path) -> None:
+    """At the threshold the nudge fires and names the CURRENT read count."""
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fleet_yaml(tmp_path)
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+    SummaryStore(summaries_dir).write("g_arch", _make_summary("g_arch", "ctx"))
+    fleet = FleetConfig.load(fleet_path)
+
+    results = _seed_and_read(mod, fleet, scope="g_backend", session_id="sess_th", times=3)
+
+    # First two reads (below threshold) stay silent; the third fires.
+    assert "nudge" not in results[0]
+    assert "nudge" not in results[1]
+    nudge = results[2]["nudge"]
+    # Names the current count and points at the two release valves. Base tier
+    # (not yet escalated) — the escalation marker is absent.
+    assert "3" in nudge
+    assert "strata_session_closeout" in nudge
+    assert "strata_contribute" in nudge
+    assert "stale" not in nudge
+
+
+def test_nudge_escalates_at_higher_threshold(tmp_path: Path) -> None:
+    """Once reads reach the escalation threshold the wording sharpens."""
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fleet_yaml(tmp_path)
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+    SummaryStore(summaries_dir).write("g_arch", _make_summary("g_arch", "ctx"))
+    fleet = FleetConfig.load(fleet_path)
+
+    results = _seed_and_read(mod, fleet, scope="g_backend", session_id="sess_esc", times=6)
+
+    base_nudge = results[2]["nudge"]  # reads == 3, base tier
+    escalated = results[5]["nudge"]  # reads == 6, escalated tier
+
+    assert "6" in escalated
+    assert "stale" in escalated  # escalation marker, absent from the base tier
+    assert escalated != base_nudge
+
+
+def test_nudge_silent_after_contribution(tmp_path: Path) -> None:
+    """An accepted contribution resets the asymmetry and quiets the nudge."""
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fleet_yaml(tmp_path)
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+    SummaryStore(summaries_dir).write("g_arch", _make_summary("g_arch", "ctx"))
+    fleet = FleetConfig.load(fleet_path)
+
+    # Read to the threshold: the last read carries a nudge.
+    pre = _seed_and_read(mod, fleet, scope="g_backend", session_id="sess_ac", times=3)
+    assert "nudge" in pre[-1]
+
+    fake_judgment = MagicMock()
+    fake_judgment.decision = "accept_as_context"
+    fake_judgment.reasoning = "ok"
+    fake_judgment.new_summary = _make_summary("g_arch", "updated")
+
+    scope_p, skill_p, session_p = _patch_agent_binding(mod, scope="g_backend", session_id="sess_ac")
+    with (
+        scope_p,
+        skill_p,
+        session_p,
+        patch.object(mod, "_load_fleet", return_value=fleet),
+        patch("strata.scope_manager.ScopeManager.judge", return_value=fake_judgment),
+        patch("anthropic.Anthropic", return_value=MagicMock()),
+    ):
+        mod.strata_contribute(
+            scope_id="g_arch",
+            content="Structured logging is the standard.",
+            proposed_classification="context",
+        )
+        after = mod.strata_read_scope_summary("g_arch")
+
+    assert "nudge" not in after
+
+
+def test_nudge_silent_after_closeout(tmp_path: Path) -> None:
+    """A mechanical closeout resets the asymmetry and quiets the nudge."""
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fleet_yaml(tmp_path)
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+    SummaryStore(summaries_dir).write("g_arch", _make_summary("g_arch", "ctx"))
+    fleet = FleetConfig.load(fleet_path)
+
+    # Read to the threshold: the last read carries a nudge.
+    pre = _seed_and_read(mod, fleet, scope="g_backend", session_id="sess_cn", times=3)
+    assert "nudge" in pre[-1]
+
+    scope_p, skill_p, session_p = _patch_agent_binding(mod, scope="g_backend", session_id="sess_cn")
+    with scope_p, skill_p, session_p, patch.object(mod, "_load_fleet", return_value=fleet):
+        closeout = mod.strata_session_closeout(reason="nothing to record")
+        after = mod.strata_read_scope_summary("g_arch")
+
+    assert closeout["declines"] == 1
+    assert "nudge" not in after
+
+
+def test_nudge_rides_perspective_and_record_reads(tmp_path: Path) -> None:
+    """The nudge is not summary-only: it rides perspective reads and record reads.
+
+    A perspective read increments the counter like a summary read; a record read
+    is a forensic view that does NOT increment (issue #110) but still surfaces
+    the nudge once the session already crossed the threshold.
+    """
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fleet_yaml(tmp_path)
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+    SummaryStore(summaries_dir).write("g_backend", _make_summary("g_backend", "ctx"))
+    fleet = FleetConfig.load(fleet_path)
+
+    scope_p, skill_p, session_p = _patch_agent_binding(mod, scope="g_backend", session_id="sess_pr")
+    with scope_p, skill_p, session_p, patch.object(mod, "_load_fleet", return_value=fleet):
+        # Three perspective reads take the session to the threshold.
+        persp = [mod.strata_read_perspective("g_backend") for _ in range(3)]
+        record = mod.strata_read_scope_record("g_backend")
+
+    assert "nudge" not in persp[0]
+    assert "nudge" in persp[2]
+    assert "3" in persp[2]["nudge"]
+
+    # The record read carries the nudge but did not itself bump the counter.
+    assert "nudge" in record
+    assert "3" in record["nudge"]
+    assert mod._session_store.read("sess_pr").reads == 3
+
+
+def test_instructions_declare_contribution_norm(tmp_path: Path) -> None:
+    """The MCP server's initialize-handshake instructions carry the contribution norm."""
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fleet_yaml(tmp_path)
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+
+    instructions = mod.mcp.instructions or ""
+    assert "strata_session_closeout" in instructions
+    assert "strata_contribute" in instructions
+    assert "contribute" in instructions.lower()

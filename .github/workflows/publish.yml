@@ -6,12 +6,12 @@
 # release runs this workflow):
 #
 #   On https://pypi.org, register a trusted publisher for a project named
-#   `memfleet` pointing at:
+#   `strata-mem` pointing at:
 #     - Owner/repo:        oren198/Strata
 #     - Workflow filename: publish.yml
 #     - Environment name:  pypi
 #
-#   (If the `memfleet` project doesn't exist on PyPI yet, PyPI supports
+#   (If the `strata-mem` project doesn't exist on PyPI yet, PyPI supports
 #   "pending publisher" registration ahead of the first publish — same
 #   settings, done from https://pypi.org/manage/account/publishing/.)
 #
@@ -62,7 +62,7 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: pypi
-      url: https://pypi.org/project/memfleet/
+      url: https://pypi.org/project/strata-mem/
     permissions:
       id-token: write
     steps:

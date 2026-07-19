@@ -61,6 +61,12 @@ from strata.project_config import (
 )
 from strata.publication import PublishedItem, propose_publish, propose_withdraw, read_publication
 from strata.record_store import ContributorRef, RecordStore
+from strata.session_state import (
+    SessionState,
+    SessionStateStore,
+    compute_nudge,
+    sessions_dir_for,
+)
 from strata.settings import get_settings
 from strata.summary_store import ScopeSummary, SummaryStore
 
@@ -88,16 +94,22 @@ _logger = logging.getLogger("strata.mcp")
 _db_path: str = ""
 _summaries_dir: str = ""
 _fleet_yaml_path: str = ""
+_sessions_dir: str = ""
 _record_store: RecordStore | None = None
 _summary_store: SummaryStore | None = None
+_session_store: SessionStateStore | None = None
 
 
 def _set_paths(paths: StoragePaths) -> None:
     """Publish resolved storage paths to the module globals (no I/O)."""
-    global _db_path, _summaries_dir, _fleet_yaml_path
+    global _db_path, _summaries_dir, _fleet_yaml_path, _sessions_dir
     _db_path = paths.db_path
     _summaries_dir = paths.summaries_dir
     _fleet_yaml_path = paths.fleet_yaml_path
+    # Session state is runtime state, not memory — derived from the summaries
+    # dir (the shared runtime anchor) so it lands beside it under .strata/
+    # (issue #110; see strata.session_state.sessions_dir_for).
+    _sessions_dir = str(sessions_dir_for(paths.summaries_dir))
 
 
 def _init_stores() -> None:
@@ -105,10 +117,84 @@ def _init_stores() -> None:
 
     Applies pending migrations so the DB is ready before the first tool call.
     """
-    global _record_store, _summary_store
+    global _record_store, _summary_store, _session_store
     run_migrations(_db_path)
     _record_store = RecordStore(_db_path)
     _summary_store = SummaryStore(_summaries_dir)
+    _session_store = SessionStateStore(_sessions_dir)
+
+
+def _record_read(scope_id: str) -> None:
+    """Record one perspective/summary read for this session (best-effort, #110).
+
+    The per-session asymmetry counters and per-scope read receipts are a
+    mechanical measurement substrate: a failure to update them must never break
+    the read the agent actually asked for, so any storage error is logged and
+    swallowed rather than raised.
+    """
+    if _session_store is None:
+        return
+    try:
+        _session_store.record_read(_AGENT_SESSION_ID, scope_id)
+    except OSError as exc:  # pragma: no cover - defensive; disk failure only
+        _logger.warning("failed to record read receipt for session %r: %s", _AGENT_SESSION_ID, exc)
+
+
+def _record_accepted_contribution(decision: str) -> None:
+    """Record an accepted contribution act for this session (best-effort, #110).
+
+    Only an accepted verdict (directive or context) is the asymmetry's release
+    valve; a decline is the scope-manager rejecting the proposal, not the session
+    contributing. Same best-effort discipline as :func:`_record_read`.
+    """
+    if _session_store is None or decision not in ("accept_as_directive", "accept_as_context"):
+        return
+    try:
+        _session_store.record_contribution(_AGENT_SESSION_ID)
+    except OSError as exc:  # pragma: no cover - defensive; disk failure only
+        _logger.warning(
+            "failed to record contribution counter for session %r: %s", _AGENT_SESSION_ID, exc
+        )
+
+
+def _record_decline() -> SessionState | None:
+    """Record one explicit mechanical "nothing to record" decline (#111).
+
+    The decline path is purely a session-state write — the asymmetry's release
+    valve, exactly like a read receipt (issue #109): no judge, no admission
+    decision, nothing enters memory. Best-effort like the other counters
+    (:func:`_record_read`): a disk failure is logged and swallowed rather than
+    failing the closeout the agent asked for. Returns the updated state (or
+    ``None`` when the store is unavailable or the write failed) so the caller can
+    report the now-reset counters.
+    """
+    if _session_store is None:
+        return None
+    try:
+        return _session_store.record_decline(_AGENT_SESSION_ID)
+    except OSError as exc:  # pragma: no cover - defensive; disk failure only
+        _logger.warning("failed to record decline for session %r: %s", _AGENT_SESSION_ID, exc)
+        return None
+
+
+def _attach_nudge(result: dict) -> dict:
+    """Attach the stateful read-time nudge to a read tool's response (#111).
+
+    The nudge rides in a dedicated ``"nudge"`` key that is present ONLY when the
+    session's asymmetry (the #110 counters) warrants one — additive, so the base
+    response shape consumers already parse is never disturbed. The policy
+    (thresholds, wording) is engine-owned in :func:`strata.session_state.compute_nudge`;
+    this only reads the current counters and, when a line comes back, tacks it on.
+
+    Best-effort: a missing or unreadable session store simply yields no nudge,
+    never an error on the read the agent actually asked for.
+    """
+    if _session_store is None:
+        return result
+    nudge = compute_nudge(_session_store.read(_AGENT_SESSION_ID))
+    if nudge is not None:
+        result["nudge"] = nudge
+    return result
 
 
 def _build_scope_manager():
@@ -486,7 +572,11 @@ mcp = FastMCP(
     instructions=(
         "Tools for reading from and contributing to the Strata fleet memory. "
         "Use strata_read_perspective before acting, contribute observations as "
-        "context, and contribute binding decisions as directives only when warranted."
+        "context, and contribute binding decisions as directives only when warranted. "
+        "Before finishing, contribute the session's outcomes back with "
+        "strata_contribute; if there is genuinely nothing to record, call "
+        "strata_session_closeout so an empty session stays distinguishable from a "
+        "forgotten one."
     ),
 )
 
@@ -505,6 +595,12 @@ def strata_contribute(
     supersedes: str | None = None,
 ) -> dict:
     """Submit a contribution to a scope's scope-manager for judgment.
+
+    This is how a session gives back what it learned: before finishing, record
+    the session's outcomes here so the fleet's memory reflects what actually
+    happened. If there is genuinely nothing to record, call
+    ``strata_session_closeout`` instead — leaving a session that consumed memory
+    silent lets that memory quietly go stale.
 
     A contribution is a proposal — not a direct write.  The scope-manager
     judges it and decides whether to accept it as a directive (binding for the
@@ -605,6 +701,10 @@ def strata_contribute(
             "call strata_contribute again, which would duplicate it."
         ) from exc
 
+    # Asymmetry release valve (#110): an accepted contribution resets the
+    # read/contribute gap for this session; a decline does not.
+    _record_accepted_contribution(outcome.decision)
+
     return {
         "contribution_id": outcome.contribution_id,
         "judgment": {
@@ -668,6 +768,13 @@ def strata_rejudge(contribution_id: str) -> dict:
 
     manager = _build_scope_manager()
 
+    # Whether a verdict already existed (issue #57 idempotency). Captured before
+    # re-judging so the asymmetry counter (#110) only counts the verdict once:
+    # a re-judge that merely replays an existing verdict must not re-fire the
+    # release valve for a contribution the original strata_contribute already
+    # counted.
+    already_judged = _record_store.get_judgment(contribution_id) is not None
+
     try:
         outcome = rejudge_contribution(
             contribution_id,
@@ -684,6 +791,11 @@ def strata_rejudge(contribution_id: str) -> dict:
             "judgment-attempt-failed event; call strata_rejudge again once the "
             "scope-manager is available."
         ) from exc
+
+    # Asymmetry release valve (#110): count only a verdict this re-judge is the
+    # first to record — the recovery of a previously-failed contribution.
+    if not already_judged:
+        _record_accepted_contribution(outcome.decision)
 
     return {
         "contribution_id": outcome.contribution_id,
@@ -926,20 +1038,26 @@ def strata_read_scope_summary(scope_id: str | None = None) -> dict:
     if scope is None:
         raise RuntimeError(f"Scope not found: {scope_id!r}")
 
+    # Read receipt (#110): a summary read consumes this scope's memory — count it
+    # toward the session asymmetry counters and the per-scope staleness metric.
+    _record_read(scope_id)
+
     # ADR 0007 D4: a chain-referenced peer (not the bound scope, not an
     # ancestor) is entitled for its OUTWARD FACE, never its internal summary.
     chain_ids = {s.id for s in fleet.entitlement_view(_AGENT_SCOPE).chain}
     if scope_id not in chain_ids:
         items = read_publication(scope_id, summaries_dir=_summaries_dir)
-        return {
-            "scope_id": scope_id,
-            "relation": "peer_reference",
-            "publication": {"items": [_publication_item_dict(i) for i in items]},
-        }
+        return _attach_nudge(
+            {
+                "scope_id": scope_id,
+                "relation": "peer_reference",
+                "publication": {"items": [_publication_item_dict(i) for i in items]},
+            }
+        )
 
     existing = _summary_store.read(scope_id)
     if existing is not None:
-        return existing.model_dump()
+        return _attach_nudge(existing.model_dump())
 
     # Scope exists but has no summary yet — return a synthesized empty
     # summary. version=0 + exists=False mark it as synthesized so it's never
@@ -952,7 +1070,7 @@ def strata_read_scope_summary(scope_id: str | None = None) -> dict:
         version=0,
         exists=False,
     )
-    return empty.model_dump()
+    return _attach_nudge(empty.model_dump())
 
 
 # ---------------------------------------------------------------------------
@@ -1015,6 +1133,11 @@ def strata_read_perspective(scope_id: str | None = None) -> dict:
     if scope is None:
         raise RuntimeError(f"Scope not found: {scope_id!r}")
 
+    # Read receipt (#110): a perspective read is attributed to its TARGET scope
+    # (the scope whose perspective was requested), not fanned out to every
+    # ancestor layer — "read this scope's perspective" is the metric's unit.
+    _record_read(scope_id)
+
     # Composition (ordering, relation labelling, the synthesized-empty-
     # summary fallback) lives in strata.perspective — the importable library
     # primitive (issue #83A) — not here. This tool's job is entitlement plus
@@ -1035,12 +1158,14 @@ def strata_read_perspective(scope_id: str | None = None) -> dict:
     def _publication_reader(peer_scope_id: str) -> list:
         return read_publication(peer_scope_id, summaries_dir=_summaries_dir)
 
-    return compose_perspective(
-        scope_id,
-        fleet=fleet,
-        summary_store=_summary_store,
-        operator_reader=_operator_reader,
-        publication_reader=_publication_reader,
+    return _attach_nudge(
+        compose_perspective(
+            scope_id,
+            fleet=fleet,
+            summary_store=_summary_store,
+            operator_reader=_operator_reader,
+            publication_reader=_publication_reader,
+        )
     )
 
 
@@ -1130,12 +1255,108 @@ def strata_read_scope_record(scope_id: str | None = None) -> dict:
     judgments = _record_store.list_judgments(scope_id=scope_id)
     judgment_attempts = _record_store.list_judgment_attempts(scope_id=scope_id)
 
+    # The record is a forensic view, not memory consumption, so reading it does
+    # not increment the read counter (#110). It still surfaces the nudge when the
+    # session already crossed the threshold on its perspective/summary reads.
+    return _attach_nudge(
+        {
+            "contributions": [asdict(c) for c in contributions],
+            "judgments": [asdict(j) for j in judgments],
+            # Failed-judgment events (issue #57): a contribution with attempts but
+            # no judgment is pending, distinguishable in the forensic view.
+            "judgment_attempts": [asdict(a) for a in judgment_attempts],
+        }
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tool: strata_session_stats (issue #110 — the session's cheap self-query)
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def strata_session_stats() -> dict:
+    """Return this session's mechanical read/contribute asymmetry counters.
+
+    A cheap, mechanical self-query (issue #110): the MCP server tracks, per
+    session, how many perspective/summary reads, accepted contribution acts, and
+    explicit declines this session has performed. These counters never judge what
+    is memory-worthy — the model always makes that call. They exist so a later
+    nudge (#111) has something specific to say ("this session has read N
+    perspectives and contributed nothing yet") and so a turn-boundary hook (#112)
+    can read the same state cheaply.
+
+    ``declines`` stays ``0`` until WP2 adds the ``strata_session_closeout`` tool;
+    the field is present now so the shape is stable across work packages.
+
+    Returns:
+        ``session_id``, ``reads``, ``contributions``, ``declines``, and
+        ``reads_by_scope`` (scope_id → ``{count, last_read_at}``). A session that
+        has done nothing yet returns zeroed counters, never an error.
+    """
+    if _session_store is not None:
+        state = _session_store.read(_AGENT_SESSION_ID)
+        if state is not None:
+            return state.model_dump()
     return {
-        "contributions": [asdict(c) for c in contributions],
-        "judgments": [asdict(j) for j in judgments],
-        # Failed-judgment events (issue #57): a contribution with attempts but
-        # no judgment is pending, distinguishable in the forensic view.
-        "judgment_attempts": [asdict(a) for a in judgment_attempts],
+        "session_id": _AGENT_SESSION_ID,
+        "reads": 0,
+        "contributions": 0,
+        "declines": 0,
+        "reads_by_scope": {},
+        "updated_at": "",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Tool: strata_session_closeout (issue #111 — the mechanical decline path)
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def strata_session_closeout(reason: str) -> dict:
+    """Record that this session has nothing to contribute — a MECHANICAL act.
+
+    Call this before finishing when the session read from the fleet's memory but
+    genuinely has no outcome to record. It is recorded exactly like a read
+    receipt: NO scope-manager, NO judge call, NO admission decision, zero
+    judge-token cost, and nothing enters any scope's memory (issue #109). It only
+    increments this session's mechanical ``declines`` counter — the asymmetry's
+    release valve — which resets the read/contribute gap and silences the
+    read-time nudge for the rest of the session.
+
+    This exists so *forgot* and *nothing happened* stay distinguishable, and so
+    being honest about an empty session is free: a real contribution pays for
+    judgment, an honest "nothing to record" does not. Prefer ``strata_contribute``
+    whenever the session produced anything worth remembering; reach for this only
+    when it truly did not.
+
+    Per-session and repeatable: each call records one decline (that is fine).
+
+    Args:
+        reason: A short, required statement of why there is nothing to record
+            (e.g. "read-only investigation, no decisions made"). Requiring it
+            keeps the decline a deliberate act rather than a reflex; it is not
+            written into any scope's memory.
+
+    Returns:
+        This session's now-reset counters — ``session_id``, ``reads``,
+        ``contributions``, ``declines`` (now incremented), ``reads_by_scope``,
+        and ``updated_at`` — the same shape as ``strata_session_stats``.
+    """
+    _logger.info("session %r closeout: %s", _AGENT_SESSION_ID, reason)
+    state = _record_decline()
+    if state is not None:
+        return state.model_dump()
+    # Store unavailable or the write failed (best-effort, like the read
+    # receipts): report zeroed counters rather than failing the closeout.
+    return {
+        "session_id": _AGENT_SESSION_ID,
+        "reads": 0,
+        "contributions": 0,
+        "declines": 0,
+        "reads_by_scope": {},
+        "updated_at": "",
     }
 
 
