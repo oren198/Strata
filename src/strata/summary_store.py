@@ -187,8 +187,7 @@ def _render_summary(summary: ScopeSummary) -> str:
                 )
             else:
                 lines.append(
-                    f"- source: scope={directive.source_scope_id}"
-                    f" · at={directive.created_at}"
+                    f"- source: scope={directive.source_scope_id} · at={directive.created_at}"
                 )
             lines.append("")
             # Blockquote every line so multi-line directives round-trip

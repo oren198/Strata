@@ -174,9 +174,7 @@ class TestResolveSkill:
 
     def test_row4_no_skills_explicit_skill_passes_through(self) -> None:
         """Row 4 with an explicit --skill on an unrestricted scope: accepted as-is."""
-        assert (
-            resolve_skill(_SCOPE_NO_SKILLS, "code-writer", interactive=False) == "code-writer"
-        )
+        assert resolve_skill(_SCOPE_NO_SKILLS, "code-writer", interactive=False) == "code-writer"
 
     def test_skill_flag_no_permitted_list_accepted(self) -> None:
         """--skill accepted when permitted_skills is None (no restriction)."""

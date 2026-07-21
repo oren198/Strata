@@ -571,9 +571,7 @@ def _render_contributor(contributor) -> str:  # noqa: ANN001 — ContributorRef,
     their own.
     """
     if contributor.skill:
-        return (
-            f"skill={contributor.skill} scope={contributor.scope_id} at={contributor.ts}"
-        )
+        return f"skill={contributor.skill} scope={contributor.scope_id} at={contributor.ts}"
     return f"scope={contributor.scope_id} at={contributor.ts}"
 
 
@@ -590,9 +588,7 @@ def _render_recent_contributions(contributions: list[Contribution]) -> str:
         else:
             by = c.contributor.scope_id
         lines.append(
-            f"[{c.id}] {c.proposed_classification}"
-            f" by {by}"
-            f" at {c.contributor.ts}: {c.content!r}"
+            f"[{c.id}] {c.proposed_classification} by {by} at {c.contributor.ts}: {c.content!r}"
         )
     return "\n".join(lines)
 
