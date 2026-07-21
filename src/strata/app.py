@@ -143,10 +143,15 @@ def get_fleet_config(request: Request) -> FleetConfig:
 
 
 class ContributorRefBody(BaseModel):
-    """Provenance metadata supplied by the contributing agent."""
+    """Provenance metadata supplied by the contributing agent.
+
+    ``skill`` is optional (issue #121): agent identity is scope + session, and
+    a skill either carries a body or is omitted — a bare name adds nothing, so
+    a skill-less binding sends no ``skill`` (or ``null``).
+    """
 
     scope_id: str
-    skill: str
+    skill: str | None = None
     session_id: str
     ts: str
 

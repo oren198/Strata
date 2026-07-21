@@ -57,7 +57,7 @@ def resolve_skill(
     requested_skill: str | None,
     *,
     interactive: bool,
-) -> str:
+) -> str | None:
     """Resolve the skill for a session against *scope*, following the ADR 0002 table.
 
     Args:
@@ -66,13 +66,15 @@ def resolve_skill(
         interactive:     True when sys.stdin.isatty() — allows prompting.
 
     Returns:
-        The resolved skill name.
+        The resolved skill name, or ``None`` when the scope declares no skills
+        and none was requested (issue #121 — a skill carries a body or it is
+        omitted; a bare name adds nothing over the agent id/name already in
+        provenance).
 
     Raises:
-        SkillResolutionError: When the scope declares no skills (neither row),
-            or when the user is not in an interactive context and skill cannot
-            be determined unambiguously, or when --skill is not in
-            permitted_skills.
+        SkillResolutionError: When the scope declares ``permitted_skills`` but
+            no ``default_skill`` and the user is not in an interactive context,
+            or when an explicit --skill is not in ``permitted_skills``.
     """
     default = scope.get("default_skill")
     permitted = scope.get("permitted_skills")
@@ -101,8 +103,11 @@ def resolve_skill(
             )
         return _prompt_skill(scope_id, permitted)
 
-    # Row 4: neither set → error.
-    raise SkillResolutionError(f"Scope {scope_id!r} declares no skills.")
+    # Row 4: neither set and none requested → no skill (issue #121). The
+    # binding is scope + session; the agent's identity is already carried in
+    # provenance, so an unrestricted scope launches skill-less rather than
+    # forcing a name that means nothing.
+    return None
 
 
 def _prompt_skill(scope_id: str, permitted: list[str]) -> str:
@@ -178,22 +183,28 @@ def parse_strata_role(path: Path) -> tuple[str, str | None]:
 # ---------------------------------------------------------------------------
 
 
-def make_session_id(scope_id: str, skill: str, *, ts: datetime | None = None) -> str:
+def make_session_id(scope_id: str, skill: str | None, *, ts: datetime | None = None) -> str:
     """Generate a session ID in the pinned format from ADR 0003.
 
-    Format: ``sess_<scope>_<skill>_<YYYYMMDD-HHMMSS>``
+    Format: ``sess_<scope>_<skill>_<YYYYMMDD-HHMMSS>``, or, when the session
+    carries no skill (issue #121), ``sess_<scope>_<YYYYMMDD-HHMMSS>`` — the
+    skill segment is omitted rather than filled with an empty or ``None``
+    token, keeping the id self-documenting either way.
 
     Args:
         scope_id: The target scope's ID.
-        skill:    The resolved skill name.
+        skill:    The resolved skill name, or ``None`` for a skill-less session.
         ts:       Optional UTC datetime to use (defaults to now in UTC).
 
     Returns:
-        A session ID string, e.g. ``sess_g_arch_code-writer_20260527-134215``.
+        A session ID string, e.g. ``sess_g_arch_code-writer_20260527-134215``
+        (with skill) or ``sess_g_arch_20260527-134215`` (without).
     """
     if ts is None:
         ts = datetime.now(tz=UTC)
     timestamp = ts.strftime("%Y%m%d-%H%M%S")
+    if skill is None:
+        return f"sess_{scope_id}_{timestamp}"
     return f"sess_{scope_id}_{skill}_{timestamp}"
 
 

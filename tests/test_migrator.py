@@ -87,6 +87,7 @@ def test_full_chain_drops_fleet_tables_and_preserves_record(tmp_path: Path) -> N
         "0003_judgment_attempts.sql",
         "0004_operator.sql",
         "0005_publication.sql",
+        "0006_optional_skill.sql",
     ]
 
     # Fleet tables gone.
@@ -121,6 +122,137 @@ def test_full_chain_drops_fleet_tables_and_preserves_record(tmp_path: Path) -> N
     assert fk_violations == []
 
 
+def test_0006_makes_skill_nullable_and_preserves_rows(tmp_path: Path) -> None:
+    """0006 rebuilds contributions + publication_acts with skill nullable while
+    preserving every existing row, self-reference, and dependent judgment/attempt
+    (issue #121).
+
+    Seeds real data through 0005 (skill NOT NULL still), then applies 0006 and
+    checks: existing skill values survive verbatim, a skill-less row can now be
+    inserted, and the self-referential + FK graph stays intact.
+    """
+    db_path = str(tmp_path / "skill.db")
+    migrations_dir = Path(__file__).resolve().parent.parent / "src" / "strata" / "_migrations"
+
+    # Apply 0001..0005 only (skill columns still NOT NULL there).
+    through_0005 = tmp_path / "through_0005"
+    through_0005.mkdir()
+    for f in sorted(migrations_dir.glob("*.sql")):
+        if f.name.startswith("0006"):
+            continue
+        (through_0005 / f.name).write_text(f.read_text())
+    run_migrations(db_path, migrations_dir=through_0005)
+
+    conn = sqlite3.connect(db_path)
+    conn.execute("PRAGMA foreign_keys = ON")
+    # A supersession chain (c_2 -> c_1), a judgment and a failed attempt.
+    conn.execute(
+        """INSERT INTO contributions
+        (id, scope_id, content, proposed_classification, subject, supersedes,
+         contributor_scope_id, contributor_skill, contributor_session_id, contributor_ts)
+        VALUES ('c_1', 'g_a', 'v1', 'directive', NULL, NULL,
+                'g_a', 'code-writer', 's_1', '2026-07-21T00:00:00Z')"""
+    )
+    conn.execute(
+        """INSERT INTO contributions
+        (id, scope_id, content, proposed_classification, subject, supersedes,
+         contributor_scope_id, contributor_skill, contributor_session_id, contributor_ts)
+        VALUES ('c_2', 'g_a', 'v2', 'directive', NULL, 'c_1',
+                'g_a', 'code-writer', 's_1', '2026-07-21T01:00:00Z')"""
+    )
+    conn.execute(
+        "INSERT INTO judgments (id, contribution_id, decision, judged_by) VALUES (?, ?, ?, ?)",
+        ("j_1", "c_1", "accept_as_directive", "scope-manager"),
+    )
+    conn.execute(
+        "INSERT INTO judgment_attempts (id, contribution_id, error_class) VALUES (?, ?, ?)",
+        ("ja_1", "c_2", "ValueError"),
+    )
+    # A publish + withdraw chain (pub_2 withdraws pub_1) and a judgment.
+    conn.execute(
+        """INSERT INTO publication_acts
+        (id, scope_id, act, kind, content, subject, anchors, withdraws, "trigger",
+         proposer_scope_id, proposer_skill, proposer_session_id, proposer_ts)
+        VALUES ('pub_1', 'g_a', 'publish', 'directive', 'x', NULL, '[]', NULL, NULL,
+                'g_a', 'scope-manager', 's_1', '2026-07-21T00:00:00Z')"""
+    )
+    conn.execute(
+        """INSERT INTO publication_acts
+        (id, scope_id, act, kind, content, subject, anchors, withdraws, "trigger",
+         proposer_scope_id, proposer_skill, proposer_session_id, proposer_ts)
+        VALUES ('pub_2', 'g_a', 'withdraw', NULL, NULL, NULL, NULL, 'pub_1', NULL,
+                'g_a', 'scope-manager', 's_1', '2026-07-21T02:00:00Z')"""
+    )
+    conn.execute(
+        "INSERT INTO publication_judgments (id, act_id, decision, judged_by) VALUES (?, ?, ?, ?)",
+        ("pubj_1", "pub_1", "accept", "scope-manager"),
+    )
+    conn.commit()
+    conn.close()
+
+    # Apply 0006.
+    applied = run_migrations(db_path, migrations_dir=migrations_dir)
+    assert applied == ["0006_optional_skill.sql"]
+
+    conn = sqlite3.connect(db_path)
+    conn.execute("PRAGMA foreign_keys = ON")
+    try:
+        # Existing rows + self-references + skill values preserved verbatim.
+        assert conn.execute(
+            "SELECT id, supersedes, contributor_skill FROM contributions ORDER BY id"
+        ).fetchall() == [("c_1", None, "code-writer"), ("c_2", "c_1", "code-writer")]
+        assert conn.execute("SELECT id, contribution_id FROM judgments").fetchall() == [
+            ("j_1", "c_1")
+        ]
+        assert conn.execute("SELECT id, contribution_id FROM judgment_attempts").fetchall() == [
+            ("ja_1", "c_2")
+        ]
+        assert conn.execute(
+            "SELECT id, withdraws, proposer_skill FROM publication_acts ORDER BY id"
+        ).fetchall() == [("pub_1", None, "scope-manager"), ("pub_2", "pub_1", "scope-manager")]
+        assert conn.execute("SELECT id, act_id FROM publication_judgments").fetchall() == [
+            ("pubj_1", "pub_1")
+        ]
+
+        # Skill columns are now nullable — a skill-less row inserts cleanly.
+        conn.execute(
+            """INSERT INTO contributions
+            (id, scope_id, content, proposed_classification, subject, supersedes,
+             contributor_scope_id, contributor_skill, contributor_session_id, contributor_ts)
+            VALUES ('c_ns', 'g_a', 'no skill', 'context', NULL, NULL,
+                    'g_a', NULL, 's_1', '2026-07-21T03:00:00Z')"""
+        )
+        conn.execute(
+            """INSERT INTO publication_acts
+            (id, scope_id, act, kind, content, subject, anchors, withdraws, "trigger",
+             proposer_scope_id, proposer_skill, proposer_session_id, proposer_ts)
+            VALUES ('pub_ns', 'g_a', 'publish', 'context', 'y', NULL, '[]', NULL, NULL,
+                    'g_a', NULL, 's_1', '2026-07-21T04:00:00Z')"""
+        )
+        conn.commit()
+        assert conn.execute(
+            "SELECT contributor_skill FROM contributions WHERE id = 'c_ns'"
+        ).fetchone() == (None,)
+        assert conn.execute(
+            "SELECT proposer_skill FROM publication_acts WHERE id = 'pub_ns'"
+        ).fetchone() == (None,)
+
+        # contributor_scope_id / proposer_scope_id stay NOT NULL — identity is
+        # still mandatory (issue #121).
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                """INSERT INTO contributions
+                (id, scope_id, content, proposed_classification, subject, supersedes,
+                 contributor_scope_id, contributor_skill, contributor_session_id, contributor_ts)
+                VALUES ('c_bad', 'g_a', 'x', 'context', NULL, NULL,
+                        NULL, NULL, 's_1', '2026-07-21T05:00:00Z')"""
+            )
+
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+    finally:
+        conn.close()
+
+
 def test_idempotent_reapply(tmp_path: Path) -> None:
     """Re-running migrations after a full apply is a no-op."""
     db_path = str(tmp_path / "idempotent.db")
@@ -133,6 +265,7 @@ def test_idempotent_reapply(tmp_path: Path) -> None:
         "0003_judgment_attempts.sql",
         "0004_operator.sql",
         "0005_publication.sql",
+        "0006_optional_skill.sql",
     ]
 
     second = run_migrations(db_path, migrations_dir=migrations_dir)
@@ -334,6 +467,7 @@ def test_crash_at_tracking_insert_rolls_back_script_too(
         "0003_judgment_attempts.sql",
         "0004_operator.sql",
         "0005_publication.sql",
+        "0006_optional_skill.sql",
     ]
 
 

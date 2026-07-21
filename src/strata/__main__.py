@@ -522,9 +522,16 @@ def cmd_summary(args: argparse.Namespace) -> int:
             print(f"### [{d.id}] {d.content}")
             if d.subject:
                 print(f"- subject: {d.subject}")
-            print(
-                f"- source: scope={d.source_scope_id} · skill={d.source_skill} · at={d.created_at}"
-            )
+            # Skill is optional (issue #121): show the scope alone when absent,
+            # never the literal "None".
+            if d.source_skill:
+                source = (
+                    f"- source: scope={d.source_scope_id} · skill={d.source_skill}"
+                    f" · at={d.created_at}"
+                )
+            else:
+                source = f"- source: scope={d.source_scope_id} · at={d.created_at}"
+            print(source)
         print()
         print("## Context")
         print(summary.context or "_(none yet)_")
@@ -576,7 +583,13 @@ def cmd_record(args: argparse.Namespace) -> int:
                 )
             print(f"  · {c.id}  [{c.proposed_classification:9s} → {verdict}]")
             contributor = c.contributor
-            print(f"      by {contributor.skill}@{contributor.scope_id} at {contributor.ts}")
+            # Skill is optional (issue #121): render the scope alone when the
+            # contribution carries no skill, never "None@scope".
+            if contributor.skill:
+                by = f"{contributor.skill}@{contributor.scope_id}"
+            else:
+                by = contributor.scope_id
+            print(f"      by {by} at {contributor.ts}")
             if c.subject:
                 print(f"      subject: {c.subject}")
             if c.supersedes:
@@ -1457,7 +1470,13 @@ def cmd_launch(args: argparse.Namespace) -> int:
     # -----------------------------------------------------------------------
     env = os.environ.copy()
     env["STRATA_AGENT_SCOPE"] = scope_data["id"]
-    env["STRATA_AGENT_SKILL"] = skill
+    # Skill is optional (issue #121): when the scope declares none and none was
+    # requested, resolve_skill returns None — leave STRATA_AGENT_SKILL unset
+    # rather than exporting an empty value, so the binding carries no skill.
+    if skill is not None:
+        env["STRATA_AGENT_SKILL"] = skill
+    else:
+        env.pop("STRATA_AGENT_SKILL", None)
     env["STRATA_AGENT_SESSION_ID"] = session_id
 
     try:

@@ -103,11 +103,14 @@ class ContributorRef:
     """Provenance metadata for a contribution.
 
     Captures the contributing agent's ``(scope, skill, session, timestamp)``
-    triple as required by CONTEXT.md § Provenance.
+    provenance as required by CONTEXT.md § Provenance. ``skill`` is optional
+    (issue #121): agent identity is scope + session, and a skill carries a
+    body or it is omitted — so a skill-less binding records ``skill=None``
+    rather than a bare placeholder name.
     """
 
     scope_id: str
-    skill: str
+    skill: str | None
     session_id: str
     ts: str
 

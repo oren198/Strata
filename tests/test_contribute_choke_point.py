@@ -65,10 +65,10 @@ def _fleet(root: Path) -> FleetConfig:
     return FleetConfig.load(path)
 
 
-def _contributor() -> ContributorRef:
+def _contributor(skill: str | None = "strata-developer") -> ContributorRef:
     return ContributorRef(
         scope_id="g_root",
-        skill="strata-developer",
+        skill=skill,
         session_id="sess_test",
         ts="2026-07-10T00:00:00+00:00",
     )
@@ -126,6 +126,48 @@ class _AccumulatingManager:
         )
 
 
+class _SkillEchoManager:
+    """A scope-manager fake that accepts as a directive, echoing the
+    contributor's skill (possibly ``None``) into the directive's
+    ``source_skill`` — so a skill-less contribution round-trips as a
+    skill-less directive (issue #121)."""
+
+    def judge(
+        self,
+        *,
+        scope,
+        stratum,
+        parent_summary,
+        current_summary,
+        recent_contributions,
+        new_contribution,
+        summary_max_words,
+        entitlement,
+        operator_memory=None,
+        current_publication=None,
+        peer_publications=None,
+    ):  # noqa: ANN001, ANN201, E501
+        directive = Directive(
+            id=new_contribution.id,
+            content=new_contribution.content,
+            subject=new_contribution.subject,
+            source_scope_id=scope.id,
+            source_skill=new_contribution.contributor.skill,
+            created_at="2026-07-10T00:00:00+00:00",
+        )
+        summary = ScopeSummary(
+            scope_id=scope.id,
+            directives=[directive],
+            context="",
+            updated_at="2026-07-10T00:00:00+00:00",
+        )
+        return ScopeManagerJudgment(
+            decision="accept_as_directive",
+            reasoning="accepted",
+            new_summary=summary,
+        )
+
+
 class _FailingManager:
     """A scope-manager fake whose ``judge`` always raises *exc*."""
 
@@ -134,6 +176,60 @@ class _FailingManager:
 
     def judge(self, **_kwargs):  # noqa: ANN003, ANN201
         raise self._exc
+
+
+# ---------------------------------------------------------------------------
+# Issue #121 — skill is optional end-to-end
+# ---------------------------------------------------------------------------
+
+
+def test_skilless_contribution_accepted_end_to_end(tmp_path: Path) -> None:
+    """A contribution whose contributor carries no skill is accepted, recorded,
+    and composed into the summary — with no ``None`` placeholder anywhere
+    (issue #121).
+
+    Exercises the full choke point (append -> judge -> record-judgment ->
+    summary-write) with the stub-judge seam the other tests use.
+    """
+    db_path = str(tmp_path / "strata.db")
+    run_migrations(db_path)
+    fleet = _fleet(tmp_path)
+    summary_store = SummaryStore(str(tmp_path / "summaries"))
+    scope = fleet.get_scope("g_root")
+    stratum = fleet.strata[0]
+
+    with RecordStore(db_path) as rs:
+        outcome = run_contribution(
+            scope=scope,
+            stratum=stratum,
+            content="a skill-less observation",
+            proposed_classification="directive",
+            subject="topic",
+            supersedes=None,
+            contributor=_contributor(skill=None),
+            fleet=fleet,
+            record_store=rs,
+            summary_store=summary_store,
+            scope_manager=_SkillEchoManager(),
+            summary_max_words=500,
+        )
+        assert outcome.decision == "accept_as_directive"
+
+        # The record preserves the skill-less provenance verbatim (None, not "").
+        stored = rs.get_contribution(outcome.contribution_id)
+        assert stored is not None
+        assert stored.contributor.skill is None
+        assert stored.contributor.scope_id == "g_root"
+
+    # The summary composed the directive with no skill, and the on-disk
+    # markdown never renders the literal "None" or a bare "skill=".
+    final = summary_store.read("g_root")
+    assert final is not None
+    assert len(final.directives) == 1
+    assert final.directives[0].source_skill is None
+    raw = summary_store.path_for("g_root").read_text(encoding="utf-8")
+    assert "skill=" not in raw
+    assert "None" not in raw
 
 
 # ---------------------------------------------------------------------------

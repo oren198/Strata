@@ -47,6 +47,11 @@ Add a new CLI subcommand: **`strata launch [scope_id]`**.
    **The skill is never inferred from the scope name.** Skills and
    scopes are orthogonal in CONTEXT.md — a skill is *what this agent
    does*, a scope is *where it sits*.
+
+   **Skill is optional (issue #121).** When a scope declares neither
+   `default_skill` nor `permitted_skills` and no `--skill` is given,
+   `resolve_skill` returns `None` and the session binds with no skill —
+   `STRATA_AGENT_SKILL` is left unset. See the amendment below.
 3. **Auto-generate session ID** as
    `sess_<scope>_<skill>_<YYYYMMDD-HHMMSS>` — the timestamp format is
    pinned (compact, unambiguous, lexicographically sortable). Example:
@@ -144,3 +149,28 @@ workaround for missing MCP plumbing.
 - Rebinding within a running CC session (forbidden by the model).
 - Multi-fleet support (one backend per launch is enough for V1.2).
 - Discovery of multiple backends on a network.
+
+## Amendment — skill is optional (issue #121)
+
+**Date:** 2026-07-21
+
+The "neither field set" cell of ADR 0002's resolution table changes from
+an error to a skill-less binding:
+
+| `default_skill` | `permitted_skills` | Was | Now |
+|---|---|---|---|
+| unset | unset | error: "scope X declares no skills" | resolves to no skill (`None`) — `STRATA_AGENT_SKILL` left unset |
+
+Rationale (owner ruling): memory must not float, but provenance already
+carries the agent's scope and session, so a bare skill **name** adds
+nothing over identity that is already recorded — either a skill carries a
+body or it is omitted. `resolve_skill` therefore returns `None` for an
+unrestricted scope with no `--skill`, and a skill-less binding travels
+end-to-end: `contributor.skill` / `source_skill` are optional through the
+contribution schema, the scope-manager's prompt and summary bookkeeping,
+and the record/CLI display (which show the agent's scope alone, never the
+literal "None"). Agent identity — scope and session — remains mandatory.
+Scopes that **do** declare `default_skill`/`permitted_skills` keep today's
+semantics unchanged, including the permitted-list check on an explicit
+`--skill`; an explicit `--skill` on an unrestricted scope still binds that
+skill.
