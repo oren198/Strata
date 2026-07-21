@@ -165,8 +165,12 @@ def test_unknown_scope_message_lists_available_scopes(tmp_path: Path, capsys) ->
 
 
 def test_no_skill_exits_with_message(tmp_path: Path) -> None:
-    """Condition 3b failure: STRATA_AGENT_SKILL empty → sys.exit(1)."""
-    fleet = _make_fleet_with_skills(tmp_path)
+    """Condition 3b failure: STRATA_AGENT_SKILL empty on a skill-declaring scope → sys.exit(1).
+
+    Issue #121: a scope that DECLARES skills keeps today's "skill required"
+    semantics; only an unrestricted scope may bind skill-less.
+    """
+    fleet = _make_fleet_with_skills(tmp_path, permitted_skills=["strata-worker"])
 
     with pytest.raises(SystemExit) as exc_info:
         _validate_binding(
@@ -181,7 +185,7 @@ def test_no_skill_exits_with_message(tmp_path: Path) -> None:
 
 def test_no_skill_message_mentions_skill_export(tmp_path: Path, capsys) -> None:
     """Condition 3b failure message must mention STRATA_AGENT_SKILL."""
-    fleet = _make_fleet_with_skills(tmp_path)
+    fleet = _make_fleet_with_skills(tmp_path, permitted_skills=["strata-worker"])
 
     with pytest.raises(SystemExit):
         _validate_binding(
@@ -193,6 +197,24 @@ def test_no_skill_message_mentions_skill_export(tmp_path: Path, capsys) -> None:
 
     captured = capsys.readouterr()
     assert "STRATA_AGENT_SKILL" in captured.err
+
+
+def test_no_skill_on_unrestricted_scope_is_accepted(tmp_path: Path) -> None:
+    """Issue #121: a scope declaring no skills may bind skill-less — no exit.
+
+    The scope is confirmed unrestricted (no default_skill, no
+    permitted_skills), so the missing STRATA_AGENT_SKILL is waived rather
+    than a refuse-to-start failure.
+    """
+    fleet = _make_fleet_with_skills(tmp_path, permitted_skills=None)
+
+    # Must NOT raise SystemExit.
+    _validate_binding(
+        fleet,
+        scope="g_root",
+        skill=None,
+        project_config_found=True,
+    )
 
 
 # ---------------------------------------------------------------------------

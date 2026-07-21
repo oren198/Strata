@@ -347,6 +347,42 @@ class TestContribute:
             contributions = rs.list_contributions(scope_id=scope_id)
             assert any(c.id == contribution_id for c in contributions)
 
+    def test_accept_contribution_without_skill(self, client):
+        """A contributor body carrying no skill is accepted and recorded as
+        skill=None (issue #121) — the skill field is optional in the schema.
+        """
+        scope_id = "g_active"
+        summary = _make_summary(scope_id, "accept_as_directive")
+        client.mock_manager.judge.return_value = _make_judgment(
+            decision="accept_as_directive",
+            summary=summary,
+        )
+
+        resp = client.post(
+            "/contribute",
+            json={
+                "scope_id": scope_id,
+                "content": "a skill-less observation",
+                "proposed_classification": "directive",
+                "subject": "topic",
+                "supersedes": None,
+                # No "skill" key at all — provenance is scope + session.
+                "contributor": {
+                    "scope_id": "g_seed01",
+                    "session_id": "sess_001",
+                    "ts": "2026-05-23T20:00:00Z",
+                },
+            },
+        )
+        assert resp.status_code == 200
+        contribution_id = resp.json()["contribution_id"]
+
+        with RecordStore(client.db_path) as rs:
+            stored = rs.get_contribution(contribution_id)
+        assert stored is not None
+        assert stored.contributor.skill is None
+        assert stored.contributor.scope_id == "g_seed01"
+
     def test_accept_as_context(self, client):
         """accept_as_context — 200, summary_updated=True."""
         scope_id = "g_active"

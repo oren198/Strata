@@ -23,7 +23,7 @@ def _make_directive(
     content: str = "use gRPC, not REST",
     subject: str | None = "rpc-protocol",
     source_scope_id: str = "g_arch",
-    source_skill: str = "architect",
+    source_skill: str | None = "architect",
     created_at: str = "2026-05-23T10:00:00Z",
 ) -> Directive:
     return Directive(
@@ -295,6 +295,47 @@ def test_directive_id_preserved_on_round_trip(tmp_path: Path) -> None:
     assert result is not None
     assert len(result.directives) == 1
     assert result.directives[0].id == "c_abc123"
+
+
+def test_skilless_directive_round_trip_shows_no_none(tmp_path: Path) -> None:
+    """A directive with ``source_skill=None`` (issue #121) round-trips exactly,
+    and the on-disk markdown omits the skill segment rather than rendering
+    ``skill=None``.
+    """
+    store = SummaryStore(str(tmp_path))
+    directive = _make_directive(id="c_noskill", source_skill=None)
+    summary = ScopeSummary(
+        scope_id="g_x",
+        directives=[directive],
+        context="",
+        updated_at="2026-07-21T12:00:00Z",
+    )
+    store.write("g_x", summary)
+
+    raw = store.path_for("g_x").read_text(encoding="utf-8")
+    # The source line carries the scope but no skill segment; never "None".
+    assert "scope=g_arch" in raw
+    assert "skill=" not in raw
+    assert "None" not in raw
+
+    result = store.read("g_x")
+    assert result is not None
+    assert len(result.directives) == 1
+    assert result.directives[0].source_skill is None
+    # The scope and timestamp still round-trip intact alongside the absent skill.
+    assert result.directives[0].source_scope_id == "g_arch"
+    assert result.directives[0].created_at == "2026-05-23T10:00:00Z"
+
+
+def test_directive_with_skill_still_renders_skill_segment(tmp_path: Path) -> None:
+    """A skill-bearing directive keeps the ``skill=`` segment (no regression)."""
+    store = SummaryStore(str(tmp_path))
+    store.write("g_y", _make_summary(scope_id="g_y", directives=[_make_directive()]))
+    raw = store.path_for("g_y").read_text(encoding="utf-8")
+    assert "skill=architect" in raw
+    result = store.read("g_y")
+    assert result is not None
+    assert result.directives[0].source_skill == "architect"
 
 
 # ---------------------------------------------------------------------------

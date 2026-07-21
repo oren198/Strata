@@ -33,6 +33,9 @@ from strata.scope_manager import (
     PublicationJudgment,
     ScopeManager,
     ScopeManagerJudgment,
+    _build_user_message,
+    _render_contributor,
+    _render_recent_contributions,
     _summary_word_count,
 )
 from strata.summary_store import Directive, ScopeSummary
@@ -103,6 +106,113 @@ def _fake_response(tool_input: dict) -> MagicMock:
     response = MagicMock()
     response.content = [block]
     return response
+
+
+# ---------------------------------------------------------------------------
+# Issue #121 — skill optional in provenance rendering + parse
+# ---------------------------------------------------------------------------
+
+
+def _skilless_contributor() -> ContributorRef:
+    return ContributorRef(
+        scope_id="g_def456",
+        skill=None,
+        session_id="sess_001",
+        ts="2026-05-01T10:00:00+00:00",
+    )
+
+
+def test_render_contributor_omits_skill_when_absent() -> None:
+    """A skill-less contributor renders the scope alone, never ``skill=None``."""
+    rendered = _render_contributor(_skilless_contributor())
+    assert "skill=" not in rendered
+    assert "None" not in rendered
+    assert "scope=g_def456" in rendered
+
+
+def test_render_contributor_includes_skill_when_present() -> None:
+    """A skill-bearing contributor keeps the ``skill=`` field (no regression)."""
+    rendered = _render_contributor(CONTRIBUTOR)
+    assert "skill=code-writer" in rendered
+    assert "scope=g_def456" in rendered
+
+
+def test_render_recent_contributions_skilless_shows_scope_alone() -> None:
+    """The recent-contributions slice renders ``by <scope>`` for a skill-less item."""
+    contribution = Contribution(
+        id="c_ns",
+        scope_id=SCOPE.id,
+        content="observation",
+        proposed_classification="context",
+        subject=None,
+        supersedes=None,
+        contributor=_skilless_contributor(),
+        created_at="2026-05-01T10:00:00+00:00",
+    )
+    rendered = _render_recent_contributions([contribution])
+    assert "by g_def456" in rendered
+    assert "@" not in rendered
+    assert "None" not in rendered
+
+
+def test_build_user_message_skilless_contributor_has_no_none() -> None:
+    """The full judge user message never renders a ``None`` skill placeholder."""
+    contribution = Contribution(
+        id="c_msg",
+        scope_id=SCOPE.id,
+        content="a skill-less contribution",
+        proposed_classification="directive",
+        subject="topic",
+        supersedes=None,
+        contributor=_skilless_contributor(),
+        created_at="2026-05-01T10:00:00+00:00",
+    )
+    message = _build_user_message(
+        scope=SCOPE,
+        stratum=STRATUM,
+        parent_summary=None,
+        current_summary=None,
+        recent_contributions=[],
+        new_contribution=contribution,
+    )
+    # The contributor line shows the scope, not a skill=None token.
+    assert "skill=None" not in message
+    assert "scope=g_def456" in message
+
+
+def test_parse_judgment_accepts_directive_without_source_skill() -> None:
+    """A judge payload whose directive omits ``source_skill`` parses to None (issue #121)."""
+    tool_input = {
+        "decision": "accept_as_directive",
+        "reasoning": "accepted",
+        "new_summary": {
+            "directives": [
+                {
+                    "id": NEW_CONTRIBUTION.id,
+                    "content": NEW_CONTRIBUTION.content,
+                    "subject": NEW_CONTRIBUTION.subject,
+                    "source_scope_id": SCOPE.id,
+                    # no source_skill key at all
+                    "created_at": NEW_CONTRIBUTION.created_at,
+                },
+            ],
+            "context": "",
+        },
+    }
+    judgment = ScopeManager._parse_judgment(
+        scope=SCOPE, tool_use_block=_fake_response(tool_input).content[0]
+    )
+    assert judgment.new_summary is not None
+    assert judgment.new_summary.directives[0].source_skill is None
+
+
+def test_judge_tool_source_skill_is_optional() -> None:
+    """The JUDGE_TOOL schema no longer requires ``source_skill`` (issue #121)."""
+    directive_schema = JUDGE_TOOL["input_schema"]["properties"]["new_summary"]["properties"][
+        "directives"
+    ]["items"]
+    assert "source_skill" not in directive_schema["required"]
+    assert directive_schema["properties"]["source_skill"]["type"] == ["string", "null"]
 
 
 def _accept_directive_input() -> dict:

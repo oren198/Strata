@@ -107,11 +107,17 @@ scopes:
 | set | set, includes default | uses `default_skill`; `--skill X` allowed if X ∈ list | uses `default_skill` |
 | unset | set | prompts user to pick from list | error |
 | set | set, *excludes* default | **error at YAML load** (drift) | **error at YAML load** |
-| unset | unset | error: "scope X declares no skills" | error: "scope X declares no skills" |
+| unset | unset | resolves to no skill (`None`) — skill-less binding; `--skill X` still binds X | resolves to no skill (`None`) |
 
 The drift case (default not in permitted list) is a hard load-time
 error so misconfigurations surface at backend start, not at session
 launch.
+
+The last row (neither field set) resolves to a **skill-less binding**
+(`resolve_skill` returns `None`) rather than an error — see issue #121
+and ADR 0003 § "Amendment — skill is optional (issue #121)." An
+explicit `--skill` on such an unrestricted scope still binds that skill;
+the permitted-list check is unchanged for scopes that declare one.
 
 ### Validation invariants
 

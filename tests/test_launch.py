@@ -160,15 +160,23 @@ class TestResolveSkill:
             skill = resolve_skill(_SCOPE_PERMITTED_ONLY, None, interactive=True)
         assert skill == "evidence-summarizer"
 
-    def test_row4_no_skills_raises(self) -> None:
-        """Row 4: neither default_skill nor permitted_skills → error."""
-        with pytest.raises(SkillResolutionError, match="declares no skills"):
-            resolve_skill(_SCOPE_NO_SKILLS, None, interactive=True)
+    def test_row4_no_skills_resolves_none(self) -> None:
+        """Row 4 (issue #121): neither default_skill nor permitted_skills → None.
 
-    def test_row4_no_skills_non_tty_raises(self) -> None:
-        """Row 4 (non-TTY): same error."""
-        with pytest.raises(SkillResolutionError, match="declares no skills"):
-            resolve_skill(_SCOPE_NO_SKILLS, None, interactive=False)
+        A skill carries a body or it is omitted; an unrestricted scope binds
+        skill-less rather than raising (was SkillResolutionError before #121).
+        """
+        assert resolve_skill(_SCOPE_NO_SKILLS, None, interactive=True) is None
+
+    def test_row4_no_skills_non_tty_resolves_none(self) -> None:
+        """Row 4 (non-TTY): same — None, regardless of TTY."""
+        assert resolve_skill(_SCOPE_NO_SKILLS, None, interactive=False) is None
+
+    def test_row4_no_skills_explicit_skill_passes_through(self) -> None:
+        """Row 4 with an explicit --skill on an unrestricted scope: accepted as-is."""
+        assert (
+            resolve_skill(_SCOPE_NO_SKILLS, "code-writer", interactive=False) == "code-writer"
+        )
 
     def test_skill_flag_no_permitted_list_accepted(self) -> None:
         """--skill accepted when permitted_skills is None (no restriction)."""
@@ -587,17 +595,37 @@ class TestLaunchStrataRole:
 
 
 class TestLaunchNoSkills:
-    def test_scope_declares_no_skills_exits_nonzero(
+    def test_scope_declares_no_skills_launches_skill_less(
         self, fleet_env, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        """Scope with no default_skill and no permitted_skills → exit 1."""
+        """Scope with no default_skill and no permitted_skills → launches skill-less.
+
+        Issue #121: an unrestricted scope no longer errors. The launch
+        proceeds, STRATA_AGENT_SKILL is left UNSET (never an empty or "None"
+        placeholder), and the session id omits the skill segment.
+        """
         fleet_env([_SCOPE_NO_SKILLS])
         with patch("strata.__main__.exec_claude", return_value=0) as mock_exec:
             rc = main(["launch", "g_arch"])
-        assert rc == 1
-        mock_exec.assert_not_called()
-        err = capsys.readouterr().err
-        assert "declares no skills" in err
+        assert rc == 0
+        mock_exec.assert_called_once()
+        (env,) = mock_exec.call_args[0]
+        assert env["STRATA_AGENT_SCOPE"] == "g_arch"
+        assert "STRATA_AGENT_SKILL" not in env
+        # Session id: sess_<scope>_<YYYYMMDD-HHMMSS>, no skill segment.
+        assert env["STRATA_AGENT_SESSION_ID"].startswith("sess_g_arch_")
+        assert "code-writer" not in env["STRATA_AGENT_SESSION_ID"]
+
+    def test_scope_declares_no_skills_explicit_skill_still_binds(
+        self, fleet_env, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """An explicit --skill on an unrestricted scope passes through (issue #121)."""
+        fleet_env([_SCOPE_NO_SKILLS])
+        with patch("strata.__main__.exec_claude", return_value=0) as mock_exec:
+            rc = main(["launch", "g_arch", "--skill", "code-writer"])
+        assert rc == 0
+        (env,) = mock_exec.call_args[0]
+        assert env["STRATA_AGENT_SKILL"] == "code-writer"
 
 
 # ---------------------------------------------------------------------------

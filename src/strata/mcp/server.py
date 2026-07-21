@@ -215,11 +215,13 @@ def _build_scope_manager():
 
 
 # Agent provenance — recorded on every contribution.
-# STRATA_AGENT_SCOPE and STRATA_AGENT_SKILL have no defaults;
-# _validate_binding() enforces they are set before mcp.run().
-# STRATA_AGENT_SESSION_ID is optional; generate one when absent.
+# STRATA_AGENT_SCOPE has no default; _validate_binding() enforces it is set
+# before mcp.run(). STRATA_AGENT_SKILL is optional (issue #121) — an
+# unrestricted scope may bind skill-less, so an unset/empty value maps to
+# None (no skill in provenance), never a placeholder. STRATA_AGENT_SESSION_ID
+# is optional; generate one when absent.
 _AGENT_SCOPE: str = os.environ.get("STRATA_AGENT_SCOPE", "")
-_AGENT_SKILL: str = os.environ.get("STRATA_AGENT_SKILL", "")
+_AGENT_SKILL: str | None = os.environ.get("STRATA_AGENT_SKILL") or None
 _AGENT_SESSION_ID: str = os.environ.get("STRATA_AGENT_SESSION_ID", f"sess_{uuid.uuid4().hex[:8]}")
 
 # ---------------------------------------------------------------------------
@@ -450,7 +452,7 @@ def _check_entitled_write(fleet: FleetConfig, scope_id: str) -> None:
 def _validate_binding(
     fleet: FleetConfig | None,
     scope: str,
-    skill: str,
+    skill: str | None,
     *,
     project_config_found: bool = False,
     searched_paths: list[str] | None = None,
@@ -469,9 +471,12 @@ def _validate_binding(
     1. ``.strata/config.toml`` resolvable via walk-up.
     2. ``STRATA_AGENT_SCOPE`` env var set.
     3. Scope exists in fleet config.
-    4. ``STRATA_AGENT_SKILL`` env var set.
+    4. ``STRATA_AGENT_SKILL`` env var set — required only when the scope
+       *declares* skills (``default_skill`` or ``permitted_skills``). An
+       unrestricted scope may bind skill-less (issue #121); a scope that
+       expresses skill expectations keeps today's semantics.
     5. ``STRATA_AGENT_SKILL`` is in the scope's ``permitted_skills`` (when
-       that list is non-empty).
+       that list is non-empty and a skill is set).
 
     Args:
         fleet:                 The loaded FleetConfig, or ``None`` if check 1
@@ -479,7 +484,8 @@ def _validate_binding(
                                against). Checks 3 + 5 are skipped when fleet
                                is None.
         scope:                 Value of ``STRATA_AGENT_SCOPE`` (may be empty).
-        skill:                 Value of ``STRATA_AGENT_SKILL`` (may be empty).
+        skill:                 Value of ``STRATA_AGENT_SKILL`` (may be empty
+                               or None — optional per issue #121).
         project_config_found:  True when ``.strata/config.toml`` was located.
         searched_paths:        Paths that were searched (for the error
                                message when config not found).
@@ -530,13 +536,23 @@ def _validate_binding(
                 f"fleet.yaml."
             )
 
-    # 4. STRATA_AGENT_SKILL must be set.
-    if not skill:
+    # 4. STRATA_AGENT_SKILL must be set — waived only when the scope is
+    #    positively confirmed to declare no skills (no default_skill, no
+    #    permitted_skills). Such an unrestricted scope may bind skill-less
+    #    (issue #121). A scope that declares skills keeps today's "skill
+    #    required" semantics, and an unknown/unresolved scope still surfaces
+    #    the skill remediation alongside the config/scope ones (ADR 0005
+    #    Decision 5 — report every setup gap in one pass).
+    scope_waives_skill = scope_obj is not None and not (
+        scope_obj.default_skill or scope_obj.permitted_skills
+    )
+    if not skill and not scope_waives_skill:
         errors.append(
             "STRATA_AGENT_SKILL is not set.\n"
             "  Set it before launching Claude Code:\n"
             "    export STRATA_AGENT_SCOPE=<scope_id>\n"
             "    export STRATA_AGENT_SKILL=<skill_name>\n"
+            "  (Optional only for scopes that declare no skills — issue #121.)\n"
             "  See README.md § 'Quick Start for an existing project' for the full setup."
         )
 

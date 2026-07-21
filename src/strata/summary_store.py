@@ -47,8 +47,11 @@ class Directive(BaseModel):
     source_scope_id: str
     """The scope where this directive was published."""
 
-    source_skill: str
-    """The skill of the agent that published this directive."""
+    source_skill: str | None = None
+    """The skill of the agent that published this directive, or ``None`` when
+    the contribution carried no skill (issue #121) — provenance is scope +
+    session; a bare skill name adds nothing, so it is omitted rather than
+    stored as a placeholder."""
 
     created_at: str
     """ISO 8601 timestamp of when the directive was created."""
@@ -127,7 +130,11 @@ _DIRECTIVE_HEADING_RE = re.compile(r"^###\s+\[([^\]]+)\]\s*(.*)")
 # Matches:  - subject: value
 _SUBJECT_LINE_RE = re.compile(r"^-\s+subject:\s*(.*)")
 # Matches:  - source: scope=... · skill=... · at=...
-_SOURCE_LINE_RE = re.compile(r"^-\s+source:\s+scope=([^\s·]+)\s+·\s+skill=([^\s·]+)\s+·\s+at=(.+)")
+# The skill segment is optional (issue #121) — a skill-less directive renders
+# ``- source: scope=... · at=...`` and group(2) comes back None.
+_SOURCE_LINE_RE = re.compile(
+    r"^-\s+source:\s+scope=([^\s·]+)(?:\s+·\s+skill=([^\s·]+))?\s+·\s+at=(.+)"
+)
 # Matches:  > blockquote body
 _BLOCKQUOTE_RE = re.compile(r"^>\s*(.*)")
 
@@ -169,11 +176,20 @@ def _render_summary(summary: ScopeSummary) -> str:
             lines.append(f"### [{directive.id}] {heading_content}")
             subject_value = directive.subject if directive.subject is not None else ""
             lines.append(f"- subject: {subject_value}")
-            lines.append(
-                f"- source: scope={directive.source_scope_id}"
-                f" · skill={directive.source_skill}"
-                f" · at={directive.created_at}"
-            )
+            # Skill is optional (issue #121): omit the skill segment entirely
+            # when absent rather than emitting ``skill=None``, so round-tripping
+            # never resurrects a placeholder name.
+            if directive.source_skill:
+                lines.append(
+                    f"- source: scope={directive.source_scope_id}"
+                    f" · skill={directive.source_skill}"
+                    f" · at={directive.created_at}"
+                )
+            else:
+                lines.append(
+                    f"- source: scope={directive.source_scope_id}"
+                    f" · at={directive.created_at}"
+                )
             lines.append("")
             # Blockquote every line so multi-line directives round-trip
             # instead of being truncated to their first line.
@@ -246,7 +262,9 @@ def _parse_summary(text: str) -> ScopeSummary:
                 content=content,
                 subject=cur_subject if cur_subject else None,
                 source_scope_id=cur_source_scope or "",
-                source_skill=cur_source_skill or "",
+                # None (no skill segment on the source line) is a legitimate
+                # value now (issue #121), distinct from an empty placeholder.
+                source_skill=cur_source_skill,
                 created_at=cur_created_at or "",
             )
         )

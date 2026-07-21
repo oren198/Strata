@@ -109,14 +109,16 @@ JUDGE_TOOL: dict = {
                                 "content": {"type": "string"},
                                 "subject": {"type": ["string", "null"]},
                                 "source_scope_id": {"type": "string"},
-                                "source_skill": {"type": "string"},
+                                # Optional (issue #121): a directive whose
+                                # originating contribution carried no skill has
+                                # none to cite. Omit rather than invent one.
+                                "source_skill": {"type": ["string", "null"]},
                                 "created_at": {"type": "string"},
                             },
                             "required": [
                                 "id",
                                 "content",
                                 "source_scope_id",
-                                "source_skill",
                                 "created_at",
                             ],
                         },
@@ -560,15 +562,36 @@ class BootstrapJudgment(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+def _render_contributor(contributor) -> str:  # noqa: ANN001 — ContributorRef, avoids import cycle
+    """Render a contribution's provenance line for the judge (issue #121).
+
+    Skill is optional: when the contributor carries one, render
+    ``skill=<x> scope=<y> at=<z>``; when it does not, drop the skill field
+    entirely rather than emit ``skill=None`` — the scope + timestamp stand on
+    their own.
+    """
+    if contributor.skill:
+        return (
+            f"skill={contributor.skill} scope={contributor.scope_id} at={contributor.ts}"
+        )
+    return f"scope={contributor.scope_id} at={contributor.ts}"
+
+
 def _render_recent_contributions(contributions: list[Contribution]) -> str:
     """Render the recent-contributions slice for the user message."""
     if not contributions:
         return "(none)"
     lines: list[str] = []
     for c in contributions:
+        # Skill is optional (issue #121): render the scope alone when absent,
+        # never "None@scope".
+        if c.contributor.skill:
+            by = f"{c.contributor.skill}@{c.contributor.scope_id}"
+        else:
+            by = c.contributor.scope_id
         lines.append(
             f"[{c.id}] {c.proposed_classification}"
-            f" by {c.contributor.skill}@{c.contributor.scope_id}"
+            f" by {by}"
             f" at {c.contributor.ts}: {c.content!r}"
         )
     return "\n".join(lines)
@@ -739,9 +762,9 @@ def _build_user_message(
         f"- proposed classification: {new_contribution.proposed_classification}\n"
         f"- subject: {new_contribution.subject or '(none)'}\n"
         f"- supersedes: {new_contribution.supersedes or '(none)'}\n"
-        f"- contributor: skill={contributor.skill}"
-        f" scope={contributor.scope_id}"
-        f" at={contributor.ts}\n"
+        # Skill is optional (issue #121): show scope alone when absent so the
+        # judge never sees a literal "None".
+        f"- contributor: {_render_contributor(contributor)}\n"
         "- content:\n"
         f"    {new_contribution.content}\n"
         "\n"
@@ -1111,7 +1134,9 @@ class ScopeManager:
                     content=d["content"],
                     subject=d.get("subject"),
                     source_scope_id=d["source_scope_id"],
-                    source_skill=d["source_skill"],
+                    # Optional (issue #121) — absent when the source
+                    # contribution carried no skill.
+                    source_skill=d.get("source_skill"),
                     created_at=d["created_at"],
                 )
             )
