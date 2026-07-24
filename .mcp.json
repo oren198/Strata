@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "memfleet": {
+      "type": "http",
+      "url": "https://memfleet.com/mcp",
+      "headers": {
+        "Authorization": "Bearer ${MEMFLEET_AGENT_KEY}"
+      }
+    }
+  }
+}
