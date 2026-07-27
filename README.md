@@ -67,6 +67,17 @@ section below for the ADRs already landed.
 
 ---
 
+## Hosted option
+
+Strata is a complete, independent open-source engine — everything in this
+README runs locally. If you'd rather not run it yourself,
+[memfleet.com](https://memfleet.com) is the hosted platform built on this
+engine: Workspaces (each a full Strata fleet with its memory), Registered
+Agents with bearer credentials, a web Console for the whole lifecycle, and
+judgment run as a platform service. Agents connect over MCP or REST.
+
+---
+
 ## Quick start
 
 A first-time, copy-paste-able run. Five steps, ~5 minutes.
