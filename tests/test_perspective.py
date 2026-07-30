@@ -16,8 +16,12 @@ Tests:
    an empty default changes nothing; an unknown scope id raises ValueError.
 4. compose_perspective raises ValueError for an unknown scope_id target.
 
+5. ADR 0010 typed edges: an inverted-authored fleet composes ancestor
+   layers, and cross-stratum reference layers join the same referenced-
+   scopes block as same-stratum peer references.
+
 Vocabulary follows CONTEXT.md verbatim: scope, stratum, perspective, scope
-summary, directive, context, intra-stratum edge (peer reference).
+summary, directive, context, chain edge, reference edge, peer reference.
 """
 
 from __future__ import annotations
@@ -669,3 +673,175 @@ def test_publication_reader_does_not_affect_extra_context_scopes(tmp_path: Path)
     assert extra_layer["relation"] == "extra_context"
     assert "publication" not in extra_layer
     assert "summary" in extra_layer
+
+
+# ---------------------------------------------------------------------------
+# ADR 0010 — typed edges (issue #127, closing issue #123)
+#
+# Composition itself did not change: entitlement_view widened, so cross-stratum
+# reference layers arrive in the same referenced-scopes block, with the same
+# publication-only, non-binding payload. These tests hold that line, and pin
+# the headline #123 fix live — a fleet whose every edge is authored top-down
+# now composes ancestor layers instead of nothing.
+# ---------------------------------------------------------------------------
+
+
+def _make_typed_fleet_yaml(tmp_path: Path, edges: list[dict], name: str) -> Path:
+    """Write a 3-stratum fleet with *edges* verbatim and return its path."""
+    fleet = {
+        "strata": [
+            {"id": "L0", "name": "executive", "ordinal": 0},
+            {"id": "L1", "name": "function", "ordinal": 1},
+            {"id": "L2", "name": "team", "ordinal": 2},
+        ],
+        "scopes": [
+            {"id": "g_exec", "name": "Executive", "stratum_id": "L0"},
+            {"id": "g_funcA", "name": "Function A", "stratum_id": "L1"},
+            {"id": "g_funcB", "name": "Function B", "stratum_id": "L1"},
+            {"id": "g_teamX", "name": "Team X", "stratum_id": "L2"},
+            {"id": "g_teamY", "name": "Team Y", "stratum_id": "L2"},
+        ],
+        "edges": edges,
+    }
+    fleet_path = tmp_path / name
+    fleet_path.write_text(yaml.dump(fleet, default_flow_style=False), encoding="utf-8")
+    return fleet_path
+
+
+def test_inverted_authored_fleet_composes_ancestor_layers(tmp_path: Path) -> None:
+    """The issue #123 shape composes: every edge authored top-down, ancestors still arrive.
+
+    Before ADR 0010 each of these edges derived nothing at all — no ancestry,
+    no reference, no layer — so every scope's perspective was silently
+    self-only and a directive published at g_exec never reached anyone.
+    """
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_typed_fleet_yaml(
+        tmp_path,
+        [
+            {"from": "g_exec", "to": "g_funcA"},
+            {"from": "g_funcA", "to": "g_teamX"},
+        ],
+        "inverted-fleet.yaml",
+    )
+    store = SummaryStore(summaries_dir)
+    store.write("g_exec", _make_summary("g_exec", "executive context"))
+    store.write("g_funcA", _make_summary("g_funcA", "function A context"))
+    store.write("g_teamX", _make_summary("g_teamX", "team X context"))
+    fleet = FleetConfig.load(fleet_path)
+
+    result = compose_perspective("g_teamX", fleet=fleet, summary_store=store)
+
+    assert [
+        (layer["scope_id"], layer["relation"], layer["binding"]) for layer in result["layers"]
+    ] == [
+        ("g_exec", "ancestor", True),
+        ("g_funcA", "ancestor", True),
+        ("g_teamX", "self", True),
+    ]
+    layers_by_id = {layer["scope_id"]: layer for layer in result["layers"]}
+    assert layers_by_id["g_exec"]["summary"]["context"] == "executive context"
+    assert layers_by_id["g_funcA"]["summary"]["context"] == "function A context"
+
+    # The middle scope inherits its own ancestor from the same inverted edge.
+    mid = compose_perspective("g_funcA", fleet=fleet, summary_store=store)
+    assert [(layer["scope_id"], layer["relation"]) for layer in mid["layers"]] == [
+        ("g_exec", "ancestor"),
+        ("g_funcA", "self"),
+    ]
+
+
+def test_cross_stratum_reference_composes_publication_only(tmp_path: Path) -> None:
+    """The uncle case composes into the referenced-scopes block, non-binding, no summary."""
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_typed_fleet_yaml(
+        tmp_path,
+        [
+            {"from": "g_funcA", "to": "g_exec"},
+            {"from": "g_teamX", "to": "g_funcA"},
+            # The uncle: two strata up, not on g_teamX's chain.
+            {"from": "g_teamX", "to": "g_funcB", "kind": "reference"},
+        ],
+        "uncle-fleet.yaml",
+    )
+    store = SummaryStore(summaries_dir)
+    for scope_id in ("g_exec", "g_funcA", "g_funcB", "g_teamX"):
+        store.write(scope_id, _make_summary(scope_id, f"{scope_id} internal context"))
+    fleet = FleetConfig.load(fleet_path)
+
+    item = PublishedItem(
+        id="pub_b1",
+        kind="context",
+        content="Function B's outward face.",
+        subject="interfaces",
+        anchors=["subject:interfaces"],
+        published_at="2026-07-30T00:00:00+00:00",
+    )
+    result = compose_perspective(
+        "g_teamX",
+        fleet=fleet,
+        summary_store=store,
+        publication_reader=_make_publication_reader({"g_funcB": [item]}),
+    )
+
+    assert [
+        (layer["scope_id"], layer["relation"], layer["binding"]) for layer in result["layers"]
+    ] == [
+        ("g_exec", "ancestor", True),
+        ("g_funcA", "ancestor", True),
+        ("g_teamX", "self", True),
+        ("g_funcB", "peer_reference", False),
+    ]
+
+    uncle_layer = result["layers"][-1]
+    # Provenance carries the referenced scope's own stratum, not the reader's.
+    assert uncle_layer["stratum_id"] == "L1"
+    assert "summary" not in uncle_layer
+    assert uncle_layer["publication"]["items"][0]["content"] == "Function B's outward face."
+    assert "g_funcB internal context" not in str(result)
+
+
+def test_chain_parent_and_several_references_compose_sorted_after_self(tmp_path: Path) -> None:
+    """One chain parent plus same-stratum, upward and downward references, all in one block."""
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_typed_fleet_yaml(
+        tmp_path,
+        [
+            {"from": "g_funcA", "to": "g_exec"},
+            # Same-stratum (the peer reference), untyped.
+            {"from": "g_funcA", "to": "g_funcB"},
+            # Downward, to a scope on no chain of g_funcA's.
+            {"from": "g_funcA", "to": "g_teamY", "kind": "reference"},
+            {"from": "g_teamX", "to": "g_exec", "kind": "reference"},
+        ],
+        "fanout-fleet.yaml",
+    )
+    store = SummaryStore(summaries_dir)
+    for scope_id in ("g_exec", "g_funcA", "g_funcB", "g_teamY"):
+        store.write(scope_id, _make_summary(scope_id, f"{scope_id} internal context"))
+    fleet = FleetConfig.load(fleet_path)
+
+    result = compose_perspective(
+        "g_funcA",
+        fleet=fleet,
+        summary_store=store,
+        publication_reader=_make_publication_reader({}),
+    )
+
+    # Ancestors, then self, then every reference sorted by scope id.
+    assert [
+        (layer["scope_id"], layer["relation"], layer["binding"]) for layer in result["layers"]
+    ] == [
+        ("g_exec", "ancestor", True),
+        ("g_funcA", "self", True),
+        ("g_funcB", "peer_reference", False),
+        ("g_teamY", "peer_reference", False),
+    ]
+    layers_by_id = {layer["scope_id"]: layer for layer in result["layers"]}
+    assert layers_by_id["g_funcB"]["stratum_id"] == "L1"
+    assert layers_by_id["g_teamY"]["stratum_id"] == "L2"
+    for referenced in ("g_funcB", "g_teamY"):
+        assert layers_by_id[referenced]["publication"] == {"items": []}
+        assert "summary" not in layers_by_id[referenced]
+    # g_teamX references g_exec, not g_funcA — direction is referencer→referenced.
+    assert "g_teamX" not in layers_by_id

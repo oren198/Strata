@@ -11,8 +11,16 @@ delegates to :func:`compose_perspective` after its own entitlement checks.
 Implements the shipped contract from ADR 0006 D3 (peer-reference composition)
 and D4 (reconciliation with the #48 read surface): layers compose root-first
 — inter-stratum ancestors, then the requested scope's own layer, then
-chain-referenced peers (one hop via intra-stratum edges, sorted by scope id
-for deterministic order).
+chain-referenced scopes (one hop via reference edges, sorted by scope id for
+deterministic order).
+
+ADR 0010 (typed edges, issue #127) reaches this module without changing a
+line of composition: reference edges now join any scope pair at any stratum
+distance, so ``FleetConfig.entitlement_view`` returns cross-stratum
+references alongside same-stratum peers and they compose in the same block,
+with the same publication-only, non-binding payload, each layer labelled with
+the referenced scope's own stratum. Ancestor layers are unaffected — they
+follow chain edges, and only chain edges bind.
 
 This branch (S2.1) was a byte-identical extraction plus one additive,
 library-only parameter (``extra_context_scopes``) — nothing about layer
@@ -44,7 +52,8 @@ layer: operator memory binds a *chain*, and a peer's chain is not this
 reader's to compose.
 
 Vocabulary follows CONTEXT.md verbatim: scope, stratum, perspective, scope
-summary, directive, context, intra-stratum edge (peer reference), operator.
+summary, directive, context, chain edge, reference edge, peer reference,
+operator.
 """
 
 from __future__ import annotations
@@ -180,18 +189,21 @@ def compose_perspective(
     A perspective assembles (CONTEXT.md § Perspective): the scope's own
     summary, the summaries of every inter-stratum ancestor up to the root,
     and — ADR 0006 D3, delivering the referenced scope's **publication** per
-    the ADR 0007 D4 amendment — the outward face of any peer scopes
-    referenced (one hop, via an intra-stratum edge) by a scope on that
-    chain. Layers are ordered root-first: ancestors first, then the
-    requested scope's own layer, then referenced-peer layers (sorted by
-    scope id for deterministic ordering).
+    the ADR 0007 D4 amendment — the outward face of any scopes referenced
+    (one hop, via a reference edge) by a scope on that chain. Layers are
+    ordered root-first: ancestors first, then the requested scope's own
+    layer, then referenced-scope layers (sorted by scope id for deterministic
+    ordering).
 
     Every layer carries ``relation`` (``"self"``, ``"ancestor"``, or
     ``"peer_reference"``) and ``binding`` (``True`` for self/ancestor layers,
-    ``False`` for peer layers). Peer layers are **context only** — nothing in
-    them binds the reader. Peer-of-peer references are not traversed: only
-    edges whose source scope is itself on the chain count (one hop, per
-    ``FleetConfig.entitlement_view``).
+    ``False`` for reference layers). Reference layers are **context only** —
+    nothing in them binds the reader, at any stratum distance: a reference
+    edge to a scope two strata up is exactly as non-binding as a same-stratum
+    peer reference (ADR 0010 D2), and each layer is labelled with the
+    referenced scope's own stratum. References-of-references are not
+    traversed: only edges whose source scope is itself on the chain count
+    (one hop, per ``FleetConfig.entitlement_view``).
 
     Peer layer payload (ADR 0007 D4 — the ADR 0006 D3 amendment):
 
@@ -295,9 +307,10 @@ def compose_perspective(
             }
         )
 
-    # ADR 0006 D3: append one layer per peer referenced (one hop) by any
-    # scope on the chain. Reuses FleetConfig.entitlement_view rather than
-    # re-deriving peer logic — sorted by scope id for deterministic order.
+    # ADR 0006 D3: append one layer per scope referenced (one hop) by any
+    # scope on the chain — every reference edge, same-stratum or not
+    # (ADR 0010 D2). Reuses FleetConfig.entitlement_view rather than
+    # re-deriving reference logic — sorted by scope id for deterministic order.
     view = fleet.entitlement_view(scope_id)
     for s in sorted(view.referenced_peers, key=lambda peer: peer.id):
         peer_layer: dict = {

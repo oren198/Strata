@@ -264,10 +264,11 @@ def _publication_item_dict(item: PublishedItem) -> dict:
 # ancestor-chain computation alone and never grows. The read side now splits
 # in two (ADR 0006 D3/D4, shipped): a chain-only surface for records and
 # perspective targets, and a wider context surface — chain plus
-# chain-referenced peer scopes (one hop, via intra-stratum edges) — for scope
-# summary reads and perspective peer layers. Sideways knowledge flow still
-# never extends to writes: it stays gated behind ratification or a
-# context-only reference edge, never a direct write.
+# chain-referenced scopes (one hop, via reference edges at any stratum
+# distance — ADR 0010 D2) — for scope summary reads and perspective reference
+# layers. Sideways knowledge flow still never extends to writes: it stays
+# gated behind ratification or a context-only reference edge, never a direct
+# write.
 # ---------------------------------------------------------------------------
 
 
@@ -276,10 +277,10 @@ def _binding_surface_scope_ids(fleet: FleetConfig) -> set[str]:
 
     This is the shared computation behind the chain-only entitlement surfaces
     (_entitled_scope_ids for records/perspective targets,
-    _entitled_write_scope_ids for writes). Intra-stratum peers are never
-    included here — a peer's memory binds this agent only if a common
-    ancestor's scope-manager ratifies it into a directive. (Chain-referenced
-    peers still reach this agent through the wider *context* surface — see
+    _entitled_write_scope_ids for writes). Referenced scopes are never
+    included here — a referenced scope's memory binds this agent only if a
+    common ancestor's scope-manager ratifies it into a directive. (They still
+    reach this agent through the wider *context* surface — see
     _context_surface_scope_ids — but never through this binding surface.)
     """
     ancestors = fleet.inter_stratum_ancestors(_AGENT_SCOPE)
@@ -336,7 +337,7 @@ def _check_entitled(fleet: FleetConfig, scope_id: str) -> None:
             "Records and perspective targets stay chain-only: a record "
             "audits the authority that binds you, and a perspective is "
             "composed for your own chain, not a peer's. A scope reachable "
-            "only through a peer reference informs you via "
+            "only through a reference edge informs you via "
             "strata_read_scope_summary and as a non-binding peer_reference "
             "layer inside your own perspective (ADR 0006 D3/D4) — never as "
             "its own record or perspective target."
@@ -355,10 +356,10 @@ def _check_entitled(fleet: FleetConfig, scope_id: str) -> None:
 def _context_surface_scope_ids(fleet: FleetConfig) -> set[str]:
     """Return the scope ids entitled for scope summary reads.
 
-    The context surface is this agent's chain-only surface plus every peer
-    scope referenced (one hop, via an intra-stratum edge) by a scope on that
-    chain — computed via ``fleet.entitlement_view(_AGENT_SCOPE)`` so peer
-    logic lives in exactly one place.
+    The context surface is this agent's chain-only surface plus every scope
+    referenced (one hop, via a reference edge at any stratum distance) by a
+    scope on that chain — computed via ``fleet.entitlement_view(_AGENT_SCOPE)``
+    so reference logic lives in exactly one place.
     """
     view = fleet.entitlement_view(_AGENT_SCOPE)
     return {s.id for s in view.chain} | {s.id for s in view.referenced_peers}
@@ -377,11 +378,10 @@ def _check_entitled_context(fleet: FleetConfig, scope_id: str) -> None:
         raise RuntimeError(
             f"scope {scope_id!r} is outside your entitled context surface "
             f"(your scope {_AGENT_SCOPE!r}, its inter-stratum ancestors, and "
-            "any peer scope referenced by a scope on that chain via an "
-            "intra-stratum edge). Unreferenced peer scopes and descendants "
-            "are not directly readable — legitimizing a knowledge flow "
-            "between scopes is a reviewed reference edge in fleet.yaml, not "
-            "a workaround here."
+            "any scope referenced by a scope on that chain via a reference "
+            "edge). Unreferenced scopes and descendants are not directly "
+            "readable — legitimizing a knowledge flow between scopes is a "
+            "reviewed reference edge in fleet.yaml, not a workaround here."
         )
 
 
@@ -1001,7 +1001,7 @@ def strata_withdraw(item_id: str) -> dict:
 
 @mcp.tool()
 def strata_read_scope_summary(scope_id: str | None = None) -> dict:
-    """Return the scope summary for the given scope — or a peer's publication.
+    """Return the scope summary for the given scope — or a referenced scope's publication.
 
     For your own bound scope or an inter-stratum ancestor, this returns the
     scope summary: the curated, condensed working view of a scope, maintained
@@ -1009,22 +1009,22 @@ def strata_read_scope_summary(scope_id: str | None = None) -> dict:
     that propagate to all descendant scopes) and context (non-binding
     observations and knowledge).
 
-    For a chain-referenced PEER scope (ADR 0007 D4: the ADR 0006 D3
-    amendment), this returns that peer's **publication** instead — its
-    curated, judged outward face — never its internal summary. The entitled
-    content for a peer was always "its outward face" (CONTEXT.md §
-    Intra-stratum edge: "what a peer reference delivers is the referenced
-    scope's publication — never its full internal summary"); the face just
-    became a real, judged artifact rather than the whole internal summary.
+    For a chain-REFERENCED scope (ADR 0007 D4: the ADR 0006 D3 amendment),
+    this returns that scope's **publication** instead — its curated, judged
+    outward face — never its internal summary. The entitled content across a
+    reference was always "its outward face" (CONTEXT.md § Reference edge:
+    "what a reference edge delivers is the referenced scope's publication —
+    never its full internal summary"); the face just became a real, judged
+    artifact rather than the whole internal summary.
 
     Args:
         scope_id: The scope whose summary (or publication) to read (e.g.
             ``g_arch``). Defaults to this agent's bound scope. An explicit
             scope_id must be within this agent's entitled *context* surface
             (ADR 0006 D3/D4): the bound scope, one of its inter-stratum
-            ancestors, or a peer scope referenced by a scope on that chain
-            via an intra-stratum edge. Unreferenced peers and descendants are
-            not directly readable.
+            ancestors, or a scope referenced by a scope on that chain via a
+            reference edge. Unreferenced scopes and descendants are not
+            directly readable.
 
     Returns:
         For own scope / ancestor: parsed scope summary — ``scope_id``,
@@ -1034,11 +1034,11 @@ def strata_read_scope_summary(scope_id: str | None = None) -> dict:
         from a real first write (``version=1``, ``exists=True``); see
         :class:`strata.summary_store.ScopeSummary` (issue #59).
 
-        For a chain-referenced peer: ``{"scope_id": ..., "relation":
+        For a chain-referenced scope: ``{"scope_id": ..., "relation":
         "peer_reference", "publication": {"items": [<item dicts: id, kind,
-        content, subject, anchors, published_at>]}}``. A peer that has
-        published nothing returns ``{"items": []}`` — the honestly empty
-        face.
+        content, subject, anchors, published_at>]}}``. A referenced scope
+        that has published nothing returns ``{"items": []}`` — the honestly
+        empty face.
 
     Raises:
         RuntimeError: If the scope does not exist, or if scope_id is outside
@@ -1058,7 +1058,7 @@ def strata_read_scope_summary(scope_id: str | None = None) -> dict:
     # toward the session asymmetry counters and the per-scope staleness metric.
     _record_read(scope_id)
 
-    # ADR 0007 D4: a chain-referenced peer (not the bound scope, not an
+    # ADR 0007 D4: a chain-referenced scope (not the bound scope, not an
     # ancestor) is entitled for its OUTWARD FACE, never its internal summary.
     chain_ids = {s.id for s in fleet.entitlement_view(_AGENT_SCOPE).chain}
     if scope_id not in chain_ids:
@@ -1101,22 +1101,23 @@ def strata_read_perspective(scope_id: str | None = None) -> dict:
     A perspective is a composed, provenance-preserving view of: the scope's
     own summary, all inter-stratum ancestor summaries up to the root, and —
     ADR 0006 D3, delivering the referenced scope's **publication** per the
-    ADR 0007 D4 amendment — the outward face of any peer scopes referenced
-    (one hop, via an intra-stratum edge) by a scope on that chain. Layers are
-    ordered root-first: ancestors first, then the requested scope's own
-    layer, then referenced-peer layers (sorted by scope id for deterministic
-    ordering).
+    ADR 0007 D4 amendment — the outward face of any scopes referenced (one
+    hop, via a reference edge) by a scope on that chain. Layers are ordered
+    root-first: ancestors first, then the requested scope's own layer, then
+    referenced-scope layers (sorted by scope id for deterministic ordering).
 
     Every layer carries ``relation`` (``"self"``, ``"ancestor"``, or
     ``"peer_reference"``) and ``binding`` (``True`` for self/ancestor layers,
-    ``False`` for peer layers). Peer layers are **context only** — nothing in
-    them binds the reader. Self/ancestor layers carry that scope's full
-    ``summary``; peer layers carry that peer's CURRENT ``publication``
-    (``{"items": [...]}``, verbatim, never that peer's internal summary — a
-    peer that has published nothing gets an empty ``items`` list, the
-    honestly empty face). Peer-of-peer references are not traversed: only
-    edges whose source scope is itself on the chain count (one hop, per
-    ``FleetConfig.entitlement_view``).
+    ``False`` for reference layers). Reference layers are **context only** —
+    nothing in them binds the reader, whether the referenced scope sits on
+    your own stratum, above it, or below it (ADR 0010 D2); each is labelled
+    with that scope's own stratum. Self/ancestor layers carry that scope's
+    full ``summary``; reference layers carry the referenced scope's CURRENT
+    ``publication`` (``{"items": [...]}``, verbatim, never its internal
+    summary — a scope that has published nothing gets an empty ``items``
+    list, the honestly empty face). References-of-references are not
+    traversed: only edges whose source scope is itself on the chain count
+    (one hop, per ``FleetConfig.entitlement_view``).
 
     If a chain scope has no summary on disk yet, its layer is still included
     with empty directives and context so that the structure is visible; that
@@ -1198,11 +1199,14 @@ def strata_list_scopes() -> dict:
     the agent always sees the current fleet topology.
 
     Use this to understand the fleet's structure — which scopes exist, how
-    they are arranged into strata, and which inter-stratum and intra-stratum
-    edges connect them.
+    they are arranged into strata, and which chain and reference edges
+    connect them.
 
     Returns:
         Fleet config: ``strata`` (list), ``scopes`` (list), ``edges`` (list).
+        Each edge carries ``kind`` — ``"chain"`` (binding; ``from_scope_id``
+        is always the child) or ``"reference"`` (non-binding; ``from_scope_id``
+        references ``to_scope_id``).
     """
     fleet = _load_fleet()
 
@@ -1213,7 +1217,9 @@ def strata_list_scopes() -> dict:
     return {
         "strata": [s.model_dump() for s in fleet.strata],
         "scopes": [s.model_dump() for s in active],
-        "edges": [{"from_scope_id": e.from_, "to_scope_id": e.to} for e in active_edges],
+        "edges": [
+            {"from_scope_id": e.from_, "to_scope_id": e.to, "kind": e.kind} for e in active_edges
+        ],
     }
 
 
@@ -1270,6 +1276,7 @@ def strata_read_scope_record(scope_id: str | None = None) -> dict:
     contributions = _record_store.list_contributions(scope_id=scope_id)
     judgments = _record_store.list_judgments(scope_id=scope_id)
     judgment_attempts = _record_store.list_judgment_attempts(scope_id=scope_id)
+    contribution_states = _record_store.list_contribution_states(scope_id=scope_id)
 
     # The record is a forensic view, not memory consumption, so reading it does
     # not increment the read counter (#110). It still surfaces the nudge when the
@@ -1281,6 +1288,9 @@ def strata_read_scope_record(scope_id: str | None = None) -> dict:
             # Failed-judgment events (issue #57): a contribution with attempts but
             # no judgment is pending, distinguishable in the forensic view.
             "judgment_attempts": [asdict(a) for a in judgment_attempts],
+            # Per-contribution state (issue #118): judged / judge_failed /
+            # pending, so "the judge errored" never reads as "still in flight".
+            "contribution_states": [asdict(s) for s in contribution_states],
         }
     )
 
