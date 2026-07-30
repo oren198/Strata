@@ -168,6 +168,78 @@ validates is meaningless.** Every edge that loads derives something —
 ancestry or a composed publication — and any edge that would derive nothing
 is refused at load with an error that says which kind the author meant.
 
+### D5. Load-lenient, write-strict — untyped kinds resolve per child scope
+
+D3 and D4 as first implemented inferred each untyped edge's kind from that
+edge alone. That is wrong, and it broke live fleets on upgrade.
+
+A fleet holding a formerly-inert inverted edge **alongside** a correct parent
+edge onto the same child loaded fine before this ADR — the old single-parent
+counter keyed off authored direction, so it saw only the correct edge and the
+inverted one contributed nothing. Under per-edge inference both resolve to
+chain edges, the child has two parents, and `FleetConfig.load` raises. The
+config does not load at all, so every fleet-backed read fails, not just the
+one relationship. The smallest reproduction:
+
+```yaml
+strata: [{id: L0, ordinal: 0}, {id: L1, ordinal: 1}]
+scopes: [{id: g_a, stratum_id: L0}, {id: g_b, stratum_id: L0}, {id: g_c, stratum_id: L1}]
+edges:
+  - {from: g_c, to: g_a}   # correct child→parent — honoured before this ADR
+  - {from: g_b, to: g_c}   # inverted — inert before this ADR
+```
+
+The principle this violated, which outranks every other decision here:
+**data that loaded yesterday must load today.** An engine upgrade may add
+meaning to stored data; it may never make stored data unreadable. A fleet
+definition is operator-authored state, and the engine does not get to reject
+it retroactively because the engine learned something new.
+
+So an untyped **adjacent** edge is no longer resolvable on its own. Whether
+it is a chain edge depends on what else points at the same child, and
+resolution happens **per child scope**:
+
+1. Untyped adjacent edges are grouped by their child (the higher-ordinal
+   endpoint). Each is either *authored-upward* (`from` is the child — what
+   pre-ADR-0010 loads honoured) or *authored-inverted* (inert before this
+   ADR).
+2. An authored-upward edge takes that child's chain slot. Legacy data can
+   hold at most one, because the old check enforced exactly that.
+3. An authored-inverted edge **promotes** into the chain slot only when the
+   slot is free — no upward edge, no declared `kind: chain` — **and** it is
+   the only inverted candidate for that child. This is D4's #123 fix,
+   unchanged.
+4. Every other inverted candidate **demotes** to a reference. Two candidates
+   competing for a free slot means both demote: the engine never guesses
+   which one the author meant. The child then stays parentless — exactly its
+   behaviour before the upgrade — while both edges still deliver a
+   publication. Strictly more than the inert edges gave, and never wrong.
+5. An **explicitly declared** `kind: chain` keeps the strict rules. Two
+   declared chains onto one child is still `multiple_inter_stratum_parents`;
+   a declared non-adjacent chain is still `chain_edge_not_adjacent`.
+   Strictness moves to where intent was declared.
+
+A demoted edge is oriented **child→would-be-parent**, not left as authored.
+The author drew a downward flow; demotion keeps that flow and lowers its
+strength from binding to informative, so the child reads that scope's
+publication. Preserving the authored `from`→`to` instead would reverse the
+flow the author asked for, which is a worse answer than the inert edge was.
+
+The write path completes the story. `_canonicalize` (in memory) applies this
+resolution; `_canonicalize_raw_edges` (every mutation) additionally
+**materializes** `kind: reference` on demoted edges. A file that has been
+mutated once no longer depends on the resolution rules to mean what it means
+— it says so — and reloading it yields the same shape from an explicit
+declaration. Legacy files converge on self-describing form as they are
+edited, and nothing has to be migrated to get there.
+
+The two halves, named so they are not traded against each other later:
+**load is lenient** (an ambiguous untyped edge degrades to the weaker kind,
+never to an error) and **write is strict** (whatever the engine resolved
+becomes explicit on disk the next time anything writes). Invariant 9's error
+therefore fires only for declared chains, or for the two-authored-upward
+shape that failed the same check before this ADR.
+
 ---
 
 ## Alternatives considered
@@ -194,6 +266,21 @@ is refused at load with an error that says which kind the author meant.
   distinct from a peer reference). Rejected on the simplicity principle: it
   carries the same payload with the same non-binding force, so a separate
   kind would be a name for a stratum distance, not for a behaviour.
+- **Resolve untyped adjacent edges per edge, and tell operators to fix the
+  fleets that stop loading** (what D3/D4 did before D5). Rejected on the
+  upgrade invariant: a config-only change that makes an engine refuse
+  previously-valid stored data is a data-loss event from the operator's side,
+  however clean the resulting model is. The engine has enough information to
+  degrade the ambiguous edge safely, so it must.
+- **Promote the inverted edge and demote the correct one** when both point at
+  one child. Rejected: the correctly authored edge is the one the previous
+  engine honoured, so honouring it is what keeps behaviour continuous. The
+  inverted edge never bound anything, and turning it into the binding one
+  would silently re-parent a live scope.
+- **Keep a demoted edge's authored `from`→`to` direction.** Rejected — see
+  D5. The author drew a flow; reversing it is a worse answer than the inert
+  edge, because it would compose a publication into the scope that was meant
+  to be the *source*.
 - **Reject reference cycles.** Believed harmless and confirmed so: a
   reference composes one hop from the reader's chain and delivers a
   publication that binds nothing, so A↔B means each sees the other's
@@ -231,7 +318,13 @@ is refused at load with an error that says which kind the author meant.
   being inert* changes behaviour on upgrade: descendants start inheriting
   ancestor layers. This is the intended fix, and there is no way to make it
   both a fix and a no-op — but it is a behaviour change on load, and release
-  notes must say so.
+  notes must say so. Note the bound D5 puts on it: the change is confined to
+  edges that were unambiguous. Where an inert edge competed with a real one,
+  the existing parent wins and the inert edge becomes a reference.
+- Untyped adjacent edges are no longer independently readable — you cannot
+  tell what one means without looking at the others pointing at the same
+  child. That is inherent to keeping legacy fleets loading, and the write
+  path pays it down: any mutation makes the resolution explicit on disk.
 - Two names now describe one thing at the same stratum (peer reference,
   reference edge). Kept deliberately — the peer case is the common one and
   the existing vocabulary — at the cost of a synonym in the glossary.
