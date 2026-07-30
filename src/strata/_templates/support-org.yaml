@@ -38,6 +38,8 @@ edges:
     to: g_head_support
   - from: g_tier2
     to: g_head_support
-  # Peer reference: tier-2 reads context from tier-1
+  # Peer reference (a reference edge on one stratum): tier-2 reads tier-1's
+  # publication — context only, never binding.
   - from: g_tier2
     to: g_tier1
+    kind: reference

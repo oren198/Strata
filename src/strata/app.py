@@ -69,6 +69,7 @@ from strata.publication import (
     read_publication,
 )
 from strata.record_store import (
+    JUDGE_FAILED,
     Contribution,
     ContributorRef,
     RecordStore,
@@ -291,10 +292,18 @@ def _judge_and_record(
         # Record the failure as an event against the contribution — never as a
         # fabricated verdict (issue #57) — then surface it with the
         # contribution id so a retry routes to re-judge, not a duplicate.
+        #
+        # judge() exhausts its own corrective re-asks before it raises (the
+        # #113 parse re-ask, the #63 overflow re-ask), so reaching here means
+        # the judge run is over: mark the event JUDGE_FAILED (issue #118) so
+        # read surfaces render "attempted, judge errored" instead of leaving
+        # the contribution indistinguishable from one still in flight. The
+        # marker is mechanical — no judge or LLM call is made to write it.
         record_store.record_judgment_attempt(
             contribution_id=contribution.id,
             error_class=type(exc).__name__,
             message=str(exc),
+            outcome=JUDGE_FAILED,
         )
         raise JudgeUnavailable(contribution.id, type(exc).__name__, str(exc)) from exc
 
@@ -670,7 +679,13 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
         return {
             "strata": [s.model_dump() for s in fleet.strata],
             "scopes": [s.model_dump() for s in active],
-            "edges": [{"from_scope_id": e.from_, "to_scope_id": e.to} for e in active_edges],
+            # ``kind`` (ADR 0010) tells a client which edges bind: a chain
+            # edge always runs child→parent after load canonicalization, a
+            # reference edge always runs referencer→referenced.
+            "edges": [
+                {"from_scope_id": e.from_, "to_scope_id": e.to, "kind": e.kind}
+                for e in active_edges
+            ],
         }
 
     # -----------------------------------------------------------------------
@@ -733,6 +748,7 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
         contributions = record_store.list_contributions(scope_id=scope_id)
         judgments = record_store.list_judgments(scope_id=scope_id)
         judgment_attempts = record_store.list_judgment_attempts(scope_id=scope_id)
+        contribution_states = record_store.list_contribution_states(scope_id=scope_id)
 
         from dataclasses import asdict
 
@@ -742,6 +758,9 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
             # Failed-judgment events (issue #57): let the forensic view mark a
             # pending contribution as "(pending — N failed attempts)".
             "judgment_attempts": [asdict(a) for a in judgment_attempts],
+            # The derived per-contribution state (issue #118) so a client renders
+            # "attempted, judge errored" without re-deriving the three-way join.
+            "contribution_states": [asdict(s) for s in contribution_states],
         }
 
     return application

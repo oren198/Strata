@@ -614,7 +614,7 @@ def _render_entitlement(entitlement: EntitlementView) -> str:
         "- Scopes below this scope (entitled — evidence proposed upward for "
         "this scope to judge on its merits):\n"
         f"    {_render_entitlement_group(entitlement.descendants)}\n"
-        "- Peer scopes referenced by this chain (entitled for CONTEXT only):\n"
+        "- Scopes referenced by this chain (entitled for CONTEXT only):\n"
         f"    {_render_entitlement_group(entitlement.referenced_peers)}\n"
         "- All other scopes in this fleet, including archived ones (NOT "
         "entitled — material substantively originating from these must not "

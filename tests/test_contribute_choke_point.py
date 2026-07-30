@@ -44,7 +44,7 @@ from strata.app import (  # noqa: E402
 from strata.fleet_config import FleetConfig  # noqa: E402
 from strata.migrator import run_migrations  # noqa: E402
 from strata.publication import read_publication  # noqa: E402
-from strata.record_store import ContributorRef, RecordStore  # noqa: E402
+from strata.record_store import JUDGE_FAILED, ContributorRef, RecordStore  # noqa: E402
 from strata.scope_manager import ScopeManagerJudgment  # noqa: E402
 from strata.summary_store import Directive, ScopeSummary, SummaryStore  # noqa: E402
 
@@ -849,3 +849,148 @@ def test_run_contribution_passes_current_publication_to_judge(tmp_path: Path) ->
     assert [i.id for i in manager.received_current_publication] == [item.id]
     # No referenced peers in this single-scope fleet — an empty list, not None.
     assert manager.received_peer_publications == []
+
+
+# ---------------------------------------------------------------------------
+# Issue #118 — the mechanical failed-judgment marker, end to end
+# ---------------------------------------------------------------------------
+
+
+def test_terminal_judge_failure_marks_the_attempt_and_reads_as_judge_errored(
+    tmp_path: Path,
+) -> None:
+    """A judge() failure through the real choke point produces the marker row.
+
+    ``judge()`` exhausts its own corrective re-asks (#113's parse re-ask,
+    #63's overflow re-ask) before it raises, so reaching the choke point's
+    handler means the judge run is over. The attempt is marked JUDGE_FAILED
+    and the contribution reads as "attempted, judge errored" — not as one
+    still in flight (issue #118).
+    """
+    db_path, fleet, summary_store = _setup(tmp_path)
+    scope = fleet.get_scope("g_root")
+    stratum = fleet.strata[0]
+    manager = _FailingManager(ValueError("new_summary was a string, twice"))
+
+    with pytest.raises(JudgeUnavailable), RecordStore(db_path) as rs:
+        run_contribution(
+            scope=scope,
+            stratum=stratum,
+            content="the judge could not parse this one",
+            proposed_classification="context",
+            subject=None,
+            supersedes=None,
+            contributor=_contributor(),
+            fleet=fleet,
+            record_store=rs,
+            summary_store=summary_store,
+            scope_manager=manager,
+            summary_max_words=500,
+        )
+
+    with RecordStore(db_path) as rs:
+        (attempt,) = rs.list_judgment_attempts(scope_id="g_root")
+        (state,) = rs.list_contribution_states(scope_id="g_root")
+        judgments = rs.list_judgments(scope_id="g_root")
+
+    assert attempt.outcome == JUDGE_FAILED
+    assert attempt.error_class == "ValueError"
+
+    assert state.state == "judge_failed"
+    assert state.error_class == "ValueError"
+    assert "new_summary was a string" in (state.error_message or "")
+    # Still no verdict: the marker is an event, never a fabricated decision.
+    assert state.decision is None
+    assert judgments == []
+    # And nothing uncurated reached readers.
+    assert summary_store.read("g_root") is None
+
+
+def test_marker_path_makes_no_judge_call_and_only_grows_the_record(tmp_path: Path) -> None:
+    """Recording the marker is mechanical, and the record only ever grows.
+
+    Two failures then a successful re-judge: every step appends rows and
+    rewrites none, and the contribution ends up judged rather than stuck at
+    the marker — a re-judge is never blocked by it.
+    """
+    db_path, fleet, summary_store = _setup(tmp_path)
+    scope = fleet.get_scope("g_root")
+    stratum = fleet.strata[0]
+
+    class _CountingFailingManager(_FailingManager):
+        """Counts judge() calls so the marker path can be shown to make none."""
+
+        calls = 0
+
+        def judge(self, **kwargs):  # noqa: ANN003, ANN201
+            type(self).calls += 1
+            return super().judge(**kwargs)
+
+    manager = _CountingFailingManager(ValueError("LLM unavailable"))
+
+    def _row_counts() -> tuple[int, int, int]:
+        with RecordStore(db_path) as rs:
+            return (
+                len(rs.list_contributions(scope_id="g_root")),
+                len(rs.list_judgments(scope_id="g_root")),
+                len(rs.list_judgment_attempts(scope_id="g_root")),
+            )
+
+    with pytest.raises(JudgeUnavailable) as exc_info, RecordStore(db_path) as rs:
+        run_contribution(
+            scope=scope,
+            stratum=stratum,
+            content="first try",
+            proposed_classification="context",
+            subject=None,
+            supersedes=None,
+            contributor=_contributor(),
+            fleet=fleet,
+            record_store=rs,
+            summary_store=summary_store,
+            scope_manager=manager,
+            summary_max_words=500,
+        )
+    contribution_id = exc_info.value.contribution_id
+
+    # judge() ran exactly once — the marker itself cost no judge call.
+    assert _CountingFailingManager.calls == 1
+    after_first = _row_counts()
+    assert after_first == (1, 0, 1)
+
+    # A failing re-judge appends a second marked attempt; nothing is rewritten.
+    with pytest.raises(JudgeUnavailable), RecordStore(db_path) as rs:
+        rejudge_contribution(
+            contribution_id,
+            fleet=fleet,
+            record_store=rs,
+            summary_store=summary_store,
+            scope_manager=manager,
+            summary_max_words=500,
+        )
+    after_retry = _row_counts()
+    assert after_retry == (1, 0, 2)
+
+    # The marker never occupies the judgment slot: a working judge still lands
+    # a verdict, and the two marked attempts stay on the record beside it.
+    with RecordStore(db_path) as rs:
+        outcome = rejudge_contribution(
+            contribution_id,
+            fleet=fleet,
+            record_store=rs,
+            summary_store=summary_store,
+            scope_manager=_AccumulatingManager(delay=0.0),
+            summary_max_words=500,
+        )
+    assert outcome.decision == "accept_as_directive"
+
+    final = _row_counts()
+    assert final == (1, 1, 2)
+    # Every count is monotonic across the whole sequence.
+    for before, after in ((after_first, after_retry), (after_retry, final)):
+        assert all(b <= a for b, a in zip(before, after, strict=True))
+
+    with RecordStore(db_path) as rs:
+        (state,) = rs.list_contribution_states(scope_id="g_root")
+    assert state.state == "judged"
+    assert state.failed_attempts == 2

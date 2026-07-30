@@ -10,7 +10,7 @@ from unittest.mock import patch
 import pytest
 
 from strata.__main__ import main
-from strata.record_store import ContributorRef, RecordStore
+from strata.record_store import JUDGE_FAILED, ContributorRef, RecordStore
 from strata.summary_store import Directive, ScopeSummary, SummaryStore
 
 
@@ -312,6 +312,60 @@ def test_record_marks_pending_with_failed_attempt_count(
     assert "(pending — 2 failed attempts)" in out
     assert "(pending)" in out  # the never-judged contribution has no attempts
     assert "accept_as_directive" in out  # c_ok is judged
+
+
+def test_record_distinguishes_judge_errored_from_pending(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`strata record` renders "judge errored" apart from "pending" (issue #118).
+
+    Three contributions on one scope: one whose judge run ended in failure
+    (the mechanical marker), one still without a verdict, and one judged. The
+    first must not read like the second — that indistinguishability is the
+    whole issue.
+    """
+    _seed_fleet(tmp_path, monkeypatch)
+    db_path = tmp_path / "test.db"
+
+    def _contribute(rs: RecordStore, content: str):
+        return rs.append_contribution(
+            scope_id="g_arch",
+            content=content,
+            proposed_classification="context",
+            subject=None,
+            supersedes=None,
+            contributor=ContributorRef(
+                scope_id="g_arch", skill="architect", session_id="s", ts="t"
+            ),
+        )
+
+    with RecordStore(str(db_path)) as rs:
+        c_errored = _contribute(rs, "the judge blew up on this")
+        _contribute(rs, "no verdict yet")
+        c_ok = _contribute(rs, "accepted")
+
+        rs.record_judgment(
+            contribution_id=c_ok.id, decision="accept_as_context", judged_by="scope-manager"
+        )
+        rs.record_judgment_attempt(
+            contribution_id=c_errored.id,
+            error_class="ValueError",
+            message="new_summary was a string",
+            outcome=JUDGE_FAILED,
+        )
+
+    rc = main(["record", "g_arch"])
+    assert rc == 0
+    out = capsys.readouterr().out
+
+    assert "(judge errored — ValueError)" in out
+    # The forensic detail and the recovery route travel with it.
+    assert "new_summary was a string" in out
+    assert "strata_rejudge" in out
+    # And it is NOT rendered as pending.
+    assert "(pending)" in out  # the never-judged one still is
+    assert "(pending — " not in out
+    assert "accept_as_context" in out
 
 
 def test_scopes_invalid_fleet_config_returns_1(

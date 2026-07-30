@@ -25,7 +25,8 @@ agent that judges the contribution as a binding *directive*, non-binding
 append-only **record** (audit trail) and a **scope summary** (the curated
 working view). When an agent reads, it gets a **perspective**: a composed,
 provenance-labelled view of its own scope summary plus inherited scopes up
-the strata. Directives flow down; peer references carry context only.
+the strata. Chain edges carry directives down and bind; reference edges
+carry the referenced scope's publication across, and never bind.
 
 The V1 architecture decision is documented in
 [`docs/adr/0001-v1-architecture.md`](docs/adr/0001-v1-architecture.md).
@@ -318,6 +319,20 @@ nothing back, the *gate* opens. What happens then depends on the mode:
 At most one evaluator runs per session at a time (a lockfile beside the session
 state, with a stale-lock TTL), and the gate is always checked before spawning.
 
+**Windows: session-state counters are not cross-process locked.** The MCP server
+and the detached evaluator both read-modify-write the same `.strata/sessions/`
+state file. On POSIX each update takes an advisory `fcntl.flock` on a
+per-session `<session_id>.json.lock` file, so concurrent updates serialize and
+no increment is lost. Windows has no `fcntl`, and Strata deliberately does not
+substitute `msvcrt.locking` (it locks byte ranges and cannot wait on another
+process, so emulating an advisory lock means a spin-and-retry loop — a wrong
+lock is worse than a documented absence of one) and pulls in no dependency for
+it. On Windows the update therefore runs unlocked: writes stay atomic, so a file
+is never torn or corrupted, but two simultaneous updates can lose one
+increment. Nothing judged or memory-bearing rides on these counters — they are
+the mechanical substrate for the read-time nudge and this hook — so the worst
+case is one nudge firing a turn early or a turn late.
+
 **Environment variables:**
 
 | Variable | Effect |
@@ -609,15 +624,16 @@ the backend is up or down.
 > `strata_read_scope_record` default to your bound scope
 > (`STRATA_AGENT_SCOPE`) when called with no `scope_id`. An explicit
 > `scope_id` for `strata_read_scope_summary` reaches your bound scope, its
-> inter-stratum ancestors, and any peer scope referenced by a scope on that
-> chain via an intra-stratum edge (context surface); `strata_read_scope_record`
-> and `strata_read_perspective`'s target stay chain-only — records audit the
-> authority that binds you, and a perspective composes your own chain, not a
-> peer's. `strata_read_perspective` itself composes those same
-> chain-referenced peers in as labelled, non-binding `peer_reference` layers
-> (`binding: false`) alongside the chain's `self`/`ancestor` layers
-> (`binding: true`) — a peer's directives inform the reader but never bind
-> them. Unreferenced peers and descendants stay refused everywhere.
+> inter-stratum ancestors, and any scope referenced by a scope on that chain
+> via a reference edge — at any stratum distance, per ADR 0010 (context
+> surface); `strata_read_scope_record` and `strata_read_perspective`'s target
+> stay chain-only — records audit the authority that binds you, and a
+> perspective composes your own chain, not a peer's. `strata_read_perspective`
+> itself composes those same chain-referenced scopes in as labelled,
+> non-binding `peer_reference` layers (`binding: false`) alongside the chain's
+> `self`/`ancestor` layers (`binding: true`) — a referenced scope's directives
+> inform the reader but never bind them. Unreferenced scopes and descendants
+> stay refused everywhere.
 > This supersedes the old HTTP-parity note for `strata_read_scope_record`:
 > it now loads the fleet on every call to run this check, so reading your
 > own scope's record while it has no rows still returns the empty record

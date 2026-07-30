@@ -19,7 +19,7 @@ from pathlib import Path
 import pytest
 
 from strata.migrator import run_migrations
-from strata.record_store import ContributorRef, RecordStore
+from strata.record_store import JUDGE_FAILED, ContributorRef, RecordStore
 
 # ---------------------------------------------------------------------------
 # Shared helpers
@@ -288,3 +288,124 @@ def test_fleet_tables_absent_after_migration(tmp_path: Path) -> None:
     assert "edges" not in tables, "edges table must be absent after 0002 migration"
     assert "contributions" in tables
     assert "judgments" in tables
+
+
+# ---------------------------------------------------------------------------
+# Scenario 9 — the mechanical failed-judgment marker (issue #118)
+# ---------------------------------------------------------------------------
+
+
+def _contribute(rs: RecordStore, content: str) -> str:
+    """Append a contribution to g_ceo and return its id."""
+    return rs.append_contribution(
+        scope_id="g_ceo",
+        content=content,
+        proposed_classification="context",
+        subject=None,
+        supersedes=None,
+        contributor=_CONTRIBUTOR,
+    ).id
+
+
+def test_judge_failed_marker_round_trips_and_rejects_other_values(tmp_path: Path) -> None:
+    """The marker persists on the attempt; the column admits nothing else."""
+    with _open_store(str(tmp_path / "strata.db")) as rs:
+        cid = _contribute(rs, "judged later, maybe")
+
+        unmarked = rs.record_judgment_attempt(
+            contribution_id=cid, error_class="TimeoutError", message="slow"
+        )
+        marked = rs.record_judgment_attempt(
+            contribution_id=cid,
+            error_class="ValueError",
+            message="unparseable payload",
+            outcome=JUDGE_FAILED,
+        )
+
+        # An attempt says nothing about terminality unless it is marked.
+        assert unmarked.outcome is None
+        assert marked.outcome == JUDGE_FAILED
+        assert [a.outcome for a in rs.list_judgment_attempts(scope_id="g_ceo")] == [
+            None,
+            JUDGE_FAILED,
+        ]
+
+        # The marker is the only value the record's vocabulary admits here.
+        with pytest.raises(sqlite3.IntegrityError):
+            rs.record_judgment_attempt(
+                contribution_id=cid,
+                error_class="ValueError",
+                message="boom",
+                outcome="declined_by_judge",  # type: ignore[arg-type]
+            )
+
+
+def test_contribution_states_separate_judge_failed_from_pending(tmp_path: Path) -> None:
+    """The three states issue #118 exists to distinguish, on one scope's record."""
+    with _open_store(str(tmp_path / "strata.db")) as rs:
+        judged = _contribute(rs, "accepted")
+        errored = _contribute(rs, "the judge blew up")
+        in_flight = _contribute(rs, "no verdict yet")
+
+        rs.record_judgment(
+            contribution_id=judged, decision="accept_as_context", judged_by="scope-manager"
+        )
+        rs.record_judgment_attempt(
+            contribution_id=errored,
+            error_class="ValueError",
+            message="unparseable payload",
+            outcome=JUDGE_FAILED,
+        )
+
+        states = {s.contribution_id: s for s in rs.list_contribution_states(scope_id="g_ceo")}
+
+    assert states[judged].state == "judged"
+    assert states[judged].decision == "accept_as_context"
+
+    # The point of the issue: "attempted, judge errored" is not "pending", and
+    # it carries the error so a host can say what went wrong.
+    assert states[errored].state == "judge_failed"
+    assert states[errored].decision is None
+    assert states[errored].error_class == "ValueError"
+    assert states[errored].error_message == "unparseable payload"
+    assert states[errored].failed_at is not None
+
+    assert states[in_flight].state == "pending"
+    assert states[in_flight].failed_attempts == 0
+
+
+def test_contribution_state_of_a_pre_marker_orphan_stays_pending(tmp_path: Path) -> None:
+    """Unmarked attempts (every row written before #118) are never claimed terminal.
+
+    The record is append-only and is not rewritten to make a read surface
+    tidier: an orphan keeps reading as pending, with its attempt count intact.
+    """
+    with _open_store(str(tmp_path / "strata.db")) as rs:
+        orphan = _contribute(rs, "stranded on 2026-07-17")
+        rs.record_judgment_attempt(contribution_id=orphan, error_class="ValueError")
+        rs.record_judgment_attempt(contribution_id=orphan, error_class="APIError")
+
+        (state,) = rs.list_contribution_states(scope_id="g_ceo")
+
+    assert state.state == "pending"
+    assert state.failed_attempts == 2
+    assert state.error_class is None
+
+
+def test_a_successful_rejudge_outranks_an_earlier_marker(tmp_path: Path) -> None:
+    """A verdict wins: a contribution re-judged after a failure is judged, not errored."""
+    with _open_store(str(tmp_path / "strata.db")) as rs:
+        cid = _contribute(rs, "failed once, then judged")
+        rs.record_judgment_attempt(
+            contribution_id=cid, error_class="ValueError", outcome=JUDGE_FAILED
+        )
+        rs.record_judgment(
+            contribution_id=cid, decision="accept_as_directive", judged_by="scope-manager"
+        )
+
+        (state,) = rs.list_contribution_states(scope_id="g_ceo")
+
+    assert state.state == "judged"
+    assert state.decision == "accept_as_directive"
+    # The failed attempt is still on the record — the marker is not erased.
+    assert state.failed_attempts == 1

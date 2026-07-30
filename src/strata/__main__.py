@@ -474,7 +474,7 @@ def cmd_scopes(args: argparse.Namespace) -> int:
         print()
         print(f"Edges ({len(active_edges)}):")
         for e in active_edges:
-            print(f"  {e.from_:12s} → {e.to}")
+            print(f"  {e.from_:12s} → {e.to:12s}  {e.kind or ''}")
     return 0
 
 
@@ -556,31 +556,36 @@ def cmd_record(args: argparse.Namespace) -> int:
 
         contributions = stores.record_store.list_contributions(scope_id=args.scope_id)
         judgments = stores.record_store.list_judgments(scope_id=args.scope_id)
-        judgment_attempts = stores.record_store.list_judgment_attempts(scope_id=args.scope_id)
+        states = {
+            s.contribution_id: s
+            for s in stores.record_store.list_contribution_states(scope_id=args.scope_id)
+        }
 
         print(f"Scope: {args.scope_id}")
         print(f"Contributions: {len(contributions)}")
         print(f"Judgments:     {len(judgments)}")
         print()
-        judgments_by_contrib = {j.contribution_id: j for j in judgments}
-        # Count failed-judgment events per contribution (issue #57) so a pending
-        # contribution that hit a judge() failure reads as "(pending — N failed
-        # attempts)" rather than a bare "(pending)" — a verdict is never
-        # fabricated, so the forensic view distinguishes "never judged" from
-        # "judgment attempted and failed".
-        attempts_by_contrib: dict[str, int] = {}
-        for a in judgment_attempts:
-            cid = a.contribution_id
-            attempts_by_contrib[cid] = attempts_by_contrib.get(cid, 0) + 1
         for c in contributions:
-            judgment = judgments_by_contrib.get(c.id)
-            if judgment is not None:
-                verdict = judgment.decision
-            else:
-                n = attempts_by_contrib.get(c.id, 0)
+            # The three states the library derives (issue #118): a verdict, the
+            # mechanical judge-failed marker, or neither. "judge errored" is what
+            # #118 exists for — a contribution the judge tried and failed to
+            # judge must not read as one still in flight. A verdict is never
+            # fabricated for it; it stays re-judgeable.
+            #
+            # Failed attempts recorded before the marker existed keep the #57
+            # rendering — "(pending — N failed attempts)" — because nothing
+            # observed that those runs ended, and the record is not rewritten to
+            # pretend otherwise.
+            state = states.get(c.id)
+            if state is None or state.state == "pending":
+                n = state.failed_attempts if state is not None else 0
                 verdict = (
                     f"(pending — {n} failed attempt{'s' if n != 1 else ''})" if n else "(pending)"
                 )
+            elif state.state == "judge_failed":
+                verdict = f"(judge errored — {state.error_class})"
+            else:
+                verdict = str(state.decision)
             print(f"  · {c.id}  [{c.proposed_classification:9s} → {verdict}]")
             contributor = c.contributor
             # Skill is optional (issue #121): render the scope alone when the
@@ -594,6 +599,9 @@ def cmd_record(args: argparse.Namespace) -> int:
                 print(f"      subject: {c.subject}")
             if c.supersedes:
                 print(f"      supersedes: {c.supersedes}")
+            if state is not None and state.state == "judge_failed":
+                print(f"      judge failed at {state.failed_at}: {state.error_message}")
+                print("      re-judge with the strata_rejudge MCP tool")
             # Indent multi-line content.
             for line in c.content.splitlines():
                 print(f"      | {line}")

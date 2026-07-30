@@ -88,6 +88,7 @@ def test_full_chain_drops_fleet_tables_and_preserves_record(tmp_path: Path) -> N
         "0004_operator.sql",
         "0005_publication.sql",
         "0006_optional_skill.sql",
+        "0007_failed_judgment_marker.sql",
     ]
 
     # Fleet tables gone.
@@ -253,6 +254,74 @@ def test_0006_makes_skill_nullable_and_preserves_rows(tmp_path: Path) -> None:
         conn.close()
 
 
+def test_0007_adds_judge_failed_marker_and_leaves_existing_attempts_null(
+    tmp_path: Path,
+) -> None:
+    """0007 adds judgment_attempts.outcome without touching the rows already there.
+
+    Seeds an attempt through 0006 (before the marker existed — a pre-#118
+    orphan), applies 0007, and checks: the existing row keeps outcome NULL
+    rather than being back-filled, the marker can be written on new rows, and
+    the CHECK admits nothing but 'judge_failed'.
+    """
+    db_path = str(tmp_path / "marker.db")
+    migrations_dir = Path(__file__).resolve().parent.parent / "src" / "strata" / "_migrations"
+
+    # Apply 0001..0006 only — judgment_attempts has no outcome column there.
+    through_0006 = tmp_path / "through_0006"
+    through_0006.mkdir()
+    for f in sorted(migrations_dir.glob("*.sql")):
+        if f.name.startswith("0007"):
+            continue
+        (through_0006 / f.name).write_text(f.read_text())
+    run_migrations(db_path, migrations_dir=through_0006)
+
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            """
+            INSERT INTO contributions (
+                id, scope_id, content, proposed_classification,
+                contributor_scope_id, contributor_skill,
+                contributor_session_id, contributor_ts
+            ) VALUES ('c_1', 'g_a', 'stranded', 'directive', 'g_a', 'architect', 's', 't')
+            """
+        )
+        conn.execute(
+            "INSERT INTO judgment_attempts (id, contribution_id, error_class, message) "
+            "VALUES ('ja_old', 'c_1', 'ValueError', 'boom')"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    applied = run_migrations(db_path, migrations_dir=migrations_dir)
+    assert applied == ["0007_failed_judgment_marker.sql"]
+
+    conn = sqlite3.connect(db_path)
+    try:
+        columns = {r[1] for r in conn.execute("PRAGMA table_info(judgment_attempts)").fetchall()}
+        assert "outcome" in columns
+
+        # The pre-existing attempt is preserved verbatim and NOT back-filled:
+        # nothing observed that its judge run ended, so nothing claims it did.
+        assert conn.execute("SELECT id, outcome FROM judgment_attempts").fetchall() == [
+            ("ja_old", None)
+        ]
+
+        conn.execute(
+            "INSERT INTO judgment_attempts (id, contribution_id, error_class, outcome) "
+            "VALUES ('ja_new', 'c_1', 'ValueError', 'judge_failed')"
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO judgment_attempts (id, contribution_id, error_class, outcome) "
+                "VALUES ('ja_bad', 'c_1', 'ValueError', 'decline')"
+            )
+    finally:
+        conn.close()
+
+
 def test_idempotent_reapply(tmp_path: Path) -> None:
     """Re-running migrations after a full apply is a no-op."""
     db_path = str(tmp_path / "idempotent.db")
@@ -266,6 +335,7 @@ def test_idempotent_reapply(tmp_path: Path) -> None:
         "0004_operator.sql",
         "0005_publication.sql",
         "0006_optional_skill.sql",
+        "0007_failed_judgment_marker.sql",
     ]
 
     second = run_migrations(db_path, migrations_dir=migrations_dir)
@@ -468,6 +538,7 @@ def test_crash_at_tracking_insert_rolls_back_script_too(
         "0004_operator.sql",
         "0005_publication.sql",
         "0006_optional_skill.sql",
+        "0007_failed_judgment_marker.sql",
     ]
 
 
