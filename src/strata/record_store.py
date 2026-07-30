@@ -3,7 +3,11 @@
 This module owns all SQLite access.  It is the authoritative source of truth for:
   - The **record**: the append-only, immutable log of every contribution ever
     accepted into a scope (see CONTEXT.md § Record).
-  - Judgments: the scope-manager's verdict on each contribution.
+  - Judgments: the scope-manager's verdict on each contribution, plus the
+    failed-judgment *events* that are deliberately not verdicts — carrying
+    the mechanical ``judge_failed`` marker (issue #118) when the judge run
+    ended in failure, so "attempted, judge errored" is legible on a read
+    surface instead of looking like "no verdict yet".
   - The operator's own record (``operator_acts``) and retirement events
     (``retirements``) — ADR 0008. Two separate tables because the operator
     acts in two capacities: writing the operator stratum itself (not judged,
@@ -152,6 +156,14 @@ class Judgment:
     created_at: str
 
 
+#: The mechanical failed-judgment marker (issue #118).  Written on a
+#: :class:`JudgmentAttempt` when the scope-manager's ``judge()`` call failed and
+#: its own corrective re-asks are exhausted, so the judge run is over and the
+#: contribution is stranded until an explicit re-judge.  Mechanical: no judge or
+#: LLM decides this, and it is NOT a verdict — see :class:`JudgmentAttempt`.
+JUDGE_FAILED = "judge_failed"
+
+
 @dataclass(frozen=True)
 class JudgmentAttempt:
     """A record of the scope-manager's judgment *failing* on a contribution.
@@ -162,6 +174,11 @@ class JudgmentAttempt:
     here rather than fabricated as a ``decline``.  Append-only: a contribution
     may accumulate several attempts and still, later, gain exactly one
     judgment once a re-judge succeeds.
+
+    ``outcome`` is :data:`JUDGE_FAILED` when this attempt ended the judge run
+    (issue #118), and ``None`` when nothing asserts that it did — every row
+    written before the marker existed, so an orphan from before #118 is never
+    retroactively claimed to have failed terminally.
     """
 
     id: str
@@ -169,6 +186,41 @@ class JudgmentAttempt:
     error_class: str
     message: str | None
     attempted_at: str
+    outcome: Literal["judge_failed"] | None = None
+
+
+@dataclass(frozen=True)
+class ContributionState:
+    """One contribution's judgment state, derived for read surfaces (issue #118).
+
+    Not a stored row — a read-time join over the contribution, its judgment,
+    and its judgment attempts, so every host renders the same three states
+    instead of each re-deriving them:
+
+    - ``judged`` — a verdict exists; ``decision`` carries it.
+    - ``judge_failed`` — no verdict, and an attempt carries the mechanical
+      :data:`JUDGE_FAILED` marker: the judge was attempted and errored, and
+      nothing further will happen without an explicit re-judge.
+      ``error_class`` / ``error_message`` / ``failed_at`` describe the last
+      such failure.
+    - ``pending`` — no verdict and no marker: judgment is in flight, has never
+      been attempted, or the contribution is a pre-#118 orphan whose attempts
+      predate the marker.  ``failed_attempts`` still counts its attempts
+      (issue #57), so an orphan reads as "pending, N failed attempts" rather
+      than being retroactively declared terminal.
+
+    ``failed_attempts`` counts every attempt event on the contribution,
+    marked or not — including attempts that a later successful re-judge
+    superseded, which is why it is meaningful even in the ``judged`` state.
+    """
+
+    contribution_id: str
+    state: Literal["judged", "judge_failed", "pending"]
+    decision: Literal["accept_as_directive", "accept_as_context", "decline"] | None
+    failed_attempts: int
+    error_class: str | None
+    error_message: str | None
+    failed_at: str | None
 
 
 @dataclass(frozen=True)
@@ -560,6 +612,7 @@ class RecordStore:
         contribution_id: str,
         error_class: str,
         message: str | None = None,
+        outcome: Literal["judge_failed"] | None = None,
     ) -> JudgmentAttempt:
         """Record a failed scope-manager judgment as an event on the contribution.
 
@@ -573,25 +626,30 @@ class RecordStore:
             error_class:     The failing exception's class name (e.g.
                              ``'AuthenticationError'``, ``'ValueError'``).
             message:         Optional free-text detail (the exception message).
+            outcome:         :data:`JUDGE_FAILED` to mark this attempt as the
+                             end of the judge run (issue #118) — mechanical, no
+                             judge involved.  ``None`` (the default) records the
+                             attempt without claiming the run ended.
 
         Returns:
             The newly recorded :class:`JudgmentAttempt`.
 
         Raises:
-            sqlite3.IntegrityError: If *contribution_id* does not exist (FK).
+            sqlite3.IntegrityError: If *contribution_id* does not exist (FK), or
+                *outcome* is neither ``None`` nor :data:`JUDGE_FAILED` (CHECK).
         """
         attempt_id = _new_judgment_attempt_id()
         self._conn.execute(
             """
-            INSERT INTO judgment_attempts (id, contribution_id, error_class, message)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO judgment_attempts (id, contribution_id, error_class, message, outcome)
+            VALUES (?, ?, ?, ?, ?)
             """,
-            (attempt_id, contribution_id, error_class, message),
+            (attempt_id, contribution_id, error_class, message, outcome),
         )
         self._conn.commit()
         row = self._conn.execute(
             """
-            SELECT id, contribution_id, error_class, message, attempted_at
+            SELECT id, contribution_id, error_class, message, attempted_at, outcome
             FROM judgment_attempts WHERE id = ?
             """,
             (attempt_id,),
@@ -607,7 +665,8 @@ class RecordStore:
         """
         rows = self._conn.execute(
             """
-            SELECT a.id, a.contribution_id, a.error_class, a.message, a.attempted_at
+            SELECT a.id, a.contribution_id, a.error_class, a.message,
+                   a.attempted_at, a.outcome
             FROM judgment_attempts a
             JOIN contributions c ON a.contribution_id = c.id
             WHERE c.scope_id = ?
@@ -616,6 +675,57 @@ class RecordStore:
             (scope_id,),
         ).fetchall()
         return [JudgmentAttempt(**dict(row)) for row in rows]
+
+    # ------------------------------------------------------------------
+    # Contribution states (the derived read surface — issue #118)
+    # ------------------------------------------------------------------
+
+    def list_contribution_states(self, *, scope_id: str) -> list[ContributionState]:
+        """Return each contribution's judgment state for *scope_id*, oldest first.
+
+        The library answer to issue #118: hosts rendering a record (the CLI's
+        ``strata record``, the Console's record and activity surfaces) need to
+        tell "the judge errored on this" apart from "no verdict yet", and
+        deriving that from three parallel lists is a join every host would
+        otherwise reinvent — and get subtly different.
+
+        Reads only; the record is untouched.  See :class:`ContributionState` for
+        what each state means.
+        """
+        contributions = self.list_contributions(scope_id=scope_id)
+        judgments = {j.contribution_id: j for j in self.list_judgments(scope_id=scope_id)}
+        attempts_by_contribution: dict[str, list[JudgmentAttempt]] = {}
+        for attempt in self.list_judgment_attempts(scope_id=scope_id):
+            attempts_by_contribution.setdefault(attempt.contribution_id, []).append(attempt)
+
+        states: list[ContributionState] = []
+        for contribution in contributions:
+            attempts = attempts_by_contribution.get(contribution.id, [])
+            judgment = judgments.get(contribution.id)
+            # A verdict always wins: a contribution that failed twice and was
+            # then re-judged successfully is judged, not judge_failed.
+            if judgment is not None:
+                state: Literal["judged", "judge_failed", "pending"] = "judged"
+            elif any(a.outcome == JUDGE_FAILED for a in attempts):
+                state = "judge_failed"
+            else:
+                state = "pending"
+            last_failure = next(
+                (a for a in reversed(attempts) if a.outcome == JUDGE_FAILED),
+                None,
+            )
+            states.append(
+                ContributionState(
+                    contribution_id=contribution.id,
+                    state=state,
+                    decision=judgment.decision if judgment is not None else None,
+                    failed_attempts=len(attempts),
+                    error_class=last_failure.error_class if last_failure is not None else None,
+                    error_message=last_failure.message if last_failure is not None else None,
+                    failed_at=last_failure.attempted_at if last_failure is not None else None,
+                )
+            )
+        return states
 
     # ------------------------------------------------------------------
     # Operator acts (the operator's own record — ADR 0008 D1)

@@ -16,7 +16,10 @@ Two pieces live here:
    consumer-side hook (#112) can read one small JSON file cheaply, and so the
    session itself can query its own counts (``strata_session_stats``). The file
    is written atomically (tmp + :func:`os.replace`) because a hook may read it
-   concurrently with an MCP write.
+   concurrently with an MCP write, and each read-modify-write is serialized
+   across processes by an advisory lock on a per-session lock file (issue #119)
+   because the MCP server and the detached background evaluator (#112) both
+   mutate it.
 
    Alongside the flat counters the file keeps a per-scope read receipt
    (``reads_by_scope``: ``count`` + ``last_read_at``). Local Strata has no
@@ -44,6 +47,7 @@ from __future__ import annotations
 
 import json
 import os
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -52,7 +56,24 @@ from typing import TYPE_CHECKING
 from pydantic import BaseModel, Field
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
+
     from strata.record_store import RecordStore
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover — Windows has no fcntl
+    # Windows keeps the pre-#119 behaviour: the read-modify-write runs unlocked,
+    # so two concurrent writers can still lose an increment. Deliberately NOT
+    # papered over with ``msvcrt.locking`` — that locks byte ranges of an open
+    # file and cannot express "wait for the other process", so emulating an
+    # advisory lock with it means a spin-and-retry loop, and a wrong lock is
+    # worse than a documented absence of one. These counters are a best-effort
+    # mechanical substrate for the read-time nudge (#111) and the turn-boundary
+    # hook (#112): nothing judged or memory-bearing depends on them, and the
+    # cost of a lost increment is at most one premature or late nudge. See
+    # README § "Windows: session-state counters are not cross-process locked".
+    fcntl = None  # type: ignore[assignment]
 
 # The window (in days) the staleness metric looks back over by default. "Over a
 # window" (issue #110 deliverable 2): reads older than this never count toward
@@ -151,9 +172,12 @@ class SessionStateStore:
     :class:`strata.summary_store.SummaryStore`.
 
     The record helpers are read-modify-write: they load the current state (or a
-    fresh one), mutate a counter, and atomically rewrite. The MCP server is a
-    single process, so no cross-process lock is needed; the atomic rename is only
-    to protect a concurrent *reader* (the hook).
+    fresh one), mutate a counter, and atomically rewrite. Since #112 there are
+    TWO writing processes — the MCP server and the detached background evaluator
+    — so each read-modify-write runs under an advisory lock on a per-session lock
+    file (issue #119). The atomic rename and the lock answer different problems:
+    the rename stops a concurrent *reader* (the #112 hook) from seeing a partial
+    file, the lock stops a concurrent *writer* from losing the other's increment.
     """
 
     def __init__(self, sessions_dir: str | Path) -> None:
@@ -168,6 +192,45 @@ class SessionStateStore:
     def path_for(self, session_id: str) -> Path:
         """Return the deterministic path for *session_id*'s state file (no I/O)."""
         return self._dir / f"{session_id}.json"
+
+    def lock_path_for(self, session_id: str) -> Path:
+        """Return the path of *session_id*'s advisory lock file (no I/O).
+
+        A separate file rather than the state file itself: :meth:`_write` replaces
+        the state file by rename, so a lock held on the state file's inode would
+        stop guarding it the moment a writer swapped a new inode in. The suffix
+        keeps it out of :meth:`all_states`' ``*.json`` scan and distinct from the
+        evaluator's own ``.json.eval.lock`` (:mod:`strata.freshness`).
+        """
+        return self._dir / f"{session_id}.json.lock"
+
+    @contextmanager
+    def _locked(self, session_id: str) -> Iterator[None]:
+        """Hold *session_id*'s advisory write lock for the duration of the block.
+
+        Serializes the read-modify-write across processes (issue #119) so the
+        MCP server and the detached evaluator cannot both read the same counters,
+        each increment their own copy, and have the second write erase the first.
+        The whole load → mutate → tmp-write → :func:`os.replace` sequence must
+        run inside the block; only holding it over the write would still lose the
+        update.
+
+        Degrades to a no-op where :mod:`fcntl` is unavailable (Windows) — see
+        this module's import guard.
+        """
+        if fcntl is None:
+            yield
+            return
+        path = self.lock_path_for(session_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # "a" creates the lock file without truncating an existing one, so two
+        # processes racing to create it both end up holding the same inode.
+        with path.open("a", encoding="utf-8") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
     def read(self, session_id: str) -> SessionState | None:
         """Return the parsed :class:`SessionState`, or ``None`` if absent/corrupt.
@@ -215,25 +278,27 @@ class SessionStateStore:
         Increments the flat ``reads`` counter and the per-scope receipt.
         """
         ts = (now or datetime.now(UTC)).isoformat()
-        state = self.read(session_id) or SessionState(session_id=session_id)
-        state.reads += 1
-        receipt = state.reads_by_scope.get(scope_id)
-        if receipt is None:
-            state.reads_by_scope[scope_id] = ScopeReadReceipt(count=1, last_read_at=ts)
-        else:
-            receipt.count += 1
-            receipt.last_read_at = ts
-        state.updated_at = ts
-        self._write(state)
+        with self._locked(session_id):
+            state = self.read(session_id) or SessionState(session_id=session_id)
+            state.reads += 1
+            receipt = state.reads_by_scope.get(scope_id)
+            if receipt is None:
+                state.reads_by_scope[scope_id] = ScopeReadReceipt(count=1, last_read_at=ts)
+            else:
+                receipt.count += 1
+                receipt.last_read_at = ts
+            state.updated_at = ts
+            self._write(state)
         return state
 
     def record_contribution(self, session_id: str, *, now: datetime | None = None) -> SessionState:
         """Record one accepted contribution act by *session_id* (the release valve)."""
         ts = (now or datetime.now(UTC)).isoformat()
-        state = self.read(session_id) or SessionState(session_id=session_id)
-        state.contributions += 1
-        state.updated_at = ts
-        self._write(state)
+        with self._locked(session_id):
+            state = self.read(session_id) or SessionState(session_id=session_id)
+            state.contributions += 1
+            state.updated_at = ts
+            self._write(state)
         return state
 
     def record_decline(self, session_id: str, *, now: datetime | None = None) -> SessionState:
@@ -243,17 +308,26 @@ class SessionStateStore:
         contract is complete for WP2 (#111).
         """
         ts = (now or datetime.now(UTC)).isoformat()
-        state = self.read(session_id) or SessionState(session_id=session_id)
-        state.declines += 1
-        state.updated_at = ts
-        self._write(state)
+        with self._locked(session_id):
+            state = self.read(session_id) or SessionState(session_id=session_id)
+            state.declines += 1
+            state.updated_at = ts
+            self._write(state)
         return state
 
     def _write(self, state: SessionState) -> None:
-        """Atomically persist *state* (tmp sibling + :func:`os.replace`)."""
+        """Atomically persist *state* (tmp sibling + :func:`os.replace`).
+
+        The tmp sibling carries the writing process's pid: where the advisory
+        lock is unavailable (Windows) two writers otherwise share one tmp name,
+        and the first ``os.replace`` renames the file out from under the second,
+        which then fails with ``FileNotFoundError``. A per-writer tmp name keeps
+        that degraded path to its documented cost — a lost increment — instead of
+        an exception out of an ordinary read.
+        """
         final = self.path_for(state.session_id)
         final.parent.mkdir(parents=True, exist_ok=True)
-        tmp = final.with_suffix(".json.tmp")
+        tmp = final.with_suffix(f".json.{os.getpid()}.tmp")
         tmp.write_text(json.dumps(state.model_dump(), indent=2), encoding="utf-8")
         os.replace(tmp, final)
 
