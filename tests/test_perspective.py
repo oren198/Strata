@@ -845,3 +845,56 @@ def test_chain_parent_and_several_references_compose_sorted_after_self(tmp_path:
         assert "summary" not in layers_by_id[referenced]
     # g_teamX references g_exec, not g_funcA — direction is referencer→referenced.
     assert "g_teamX" not in layers_by_id
+
+
+def test_demoted_legacy_edge_composes_as_a_reference_layer(tmp_path: Path) -> None:
+    """A legacy fleet's formerly-inert edge composes as a reference layer (ADR 0010 D5).
+
+    The fleet holds a correct parent edge and, onto the same child, an edge
+    authored the other way — inert before ADR 0010, and a load error under
+    per-edge inference. Per-child resolution keeps it loading: the correct
+    edge is the chain, the other demotes to a reference, and the child reads
+    that scope's publication instead of inheriting from it.
+    """
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_typed_fleet_yaml(
+        tmp_path,
+        [
+            {"from": "g_funcA", "to": "g_exec"},
+            {"from": "g_teamX", "to": "g_funcA"},
+            {"from": "g_funcB", "to": "g_teamX"},
+        ],
+        "legacy-fleet.yaml",
+    )
+    store = SummaryStore(summaries_dir)
+    for scope_id in ("g_exec", "g_funcA", "g_funcB", "g_teamX"):
+        store.write(scope_id, _make_summary(scope_id, f"{scope_id} internal context"))
+    fleet = FleetConfig.load(fleet_path)
+
+    item = PublishedItem(
+        id="pub_b1",
+        kind="context",
+        content="Function B's outward face.",
+        subject="status",
+        anchors=["subject:status"],
+        published_at="2026-07-30T00:00:00+00:00",
+    )
+    result = compose_perspective(
+        "g_teamX",
+        fleet=fleet,
+        summary_store=store,
+        publication_reader=_make_publication_reader({"g_funcB": [item]}),
+    )
+
+    assert [
+        (layer["scope_id"], layer["relation"], layer["binding"]) for layer in result["layers"]
+    ] == [
+        ("g_exec", "ancestor", True),
+        ("g_funcA", "ancestor", True),
+        ("g_teamX", "self", True),
+        ("g_funcB", "peer_reference", False),
+    ]
+    demoted_layer = result["layers"][-1]
+    assert "summary" not in demoted_layer
+    assert demoted_layer["publication"]["items"][0]["content"] == "Function B's outward face."
+    assert "g_funcB internal context" not in str(result)

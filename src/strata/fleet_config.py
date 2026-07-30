@@ -14,9 +14,10 @@ Edges come in exactly two kinds (ADR 0010): a **chain edge** binds a scope to
 its single parent in the stratum immediately above, and a **reference edge**
 links any scope pair at any stratum distance, carrying the referenced scope's
 publication only. ``kind`` is optional in the file — an untyped edge is
-inferred from the stratum distance — and ``load`` materializes the inferred
-kind and orients every chain edge child→parent, so no edge that validates is
-meaningless.
+inferred, adjacent ones per child scope rather than per edge (ADR 0010 D5) —
+and ``load`` materializes the inferred kind and orients every chain edge
+child→parent, so no edge that validates is meaningless and no fleet that
+loaded before ADR 0010 stops loading after it.
 
 Vocabulary follows CONTEXT.md verbatim: stratum, scope, edge, chain edge,
 reference edge, peer reference, fleet.
@@ -89,18 +90,21 @@ class Edge(BaseModel):
 
     ``from_`` maps to the YAML key ``from`` (a Python keyword) via the alias.
 
-    ``kind`` is optional in ``fleet.yaml``. An untyped edge takes its kind
-    from the stratum distance of its endpoints — same stratum → ``reference``
-    (the peer reference), adjacent strata → ``chain`` — and a wider distance
-    has no default at all: it must be declared ``reference`` explicitly
-    (ADR 0010 D4). :meth:`FleetConfig.load` materializes the inferred kind, so
-    every edge on a loaded config carries an explicit ``kind``; on disk the
-    key stays optional.
+    ``kind`` is optional in ``fleet.yaml``. An untyped edge on one stratum is
+    a ``reference`` (the peer reference); one spanning two or more strata has
+    no default at all and must be declared ``reference`` explicitly
+    (ADR 0010 D4). An untyped edge between *adjacent* strata is a chain-edge
+    candidate, and which candidate actually binds is decided per child scope,
+    not per edge — see :func:`_resolve_edges` (ADR 0010 D5). A candidate that
+    does not get the slot resolves to a ``reference``.
+    :meth:`FleetConfig.load` materializes the resolved kind, so every edge on
+    a loaded config carries an explicit ``kind``; on disk the key stays
+    optional until a mutation makes a demotion explicit.
 
     For a chain edge, ``from_``/``to`` as authored say nothing: the parent is
     the lower-ordinal endpoint either way, and ``load`` canonicalizes the edge
-    to child→parent. For a reference edge, direction is the whole meaning —
-    ``from_`` references ``to``.
+    to child→parent. For a declared reference edge, direction is the whole
+    meaning — ``from_`` references ``to``.
     """
 
     from_: Annotated[str, Field(alias="from")]
@@ -111,13 +115,19 @@ class Edge(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Edge kind helpers (ADR 0010)
+# Edge kind resolution (ADR 0010)
 #
 # Every question about an edge — is it binding, who is the parent, does it
 # compose a publication — reduces to its kind plus the stratum ordinals of its
-# endpoints. These helpers derive both from ordinals rather than trusting the
-# authored direction, so they answer identically on a canonicalized config and
+# endpoints. Resolution derives both from ordinals rather than trusting the
+# authored direction, so it answers identically on a canonicalized config and
 # on one built directly (``FleetConfig(...)`` skips validation).
+#
+# An untyped adjacent edge cannot be resolved on its own: whether it is this
+# child's chain edge depends on what else points at the same child. Resolution
+# is therefore per CHILD SCOPE, not per edge (ADR 0010 D5, "load-lenient,
+# write-strict") — that is what keeps a fleet that loaded before ADR 0010
+# loading after it.
 # ---------------------------------------------------------------------------
 
 
@@ -132,76 +142,146 @@ def _scope_ordinals(config: FleetConfig) -> dict[str, int]:
     return {s.id: ordinals[s.stratum_id] for s in config.scopes if s.stratum_id in ordinals}
 
 
-def _effective_kind(edge: Edge, ordinals: dict[str, int]) -> EdgeKind | None:
-    """Return *edge*'s kind — declared if it has one, inferred from the distance if not.
-
-    Returns ``None`` only when the kind cannot be established at all: an
-    endpoint that resolves to no ordinal, or an untyped edge spanning two or
-    more strata (which :func:`_validate` refuses outright — no untyped edge
-    that loads is ever meaningless).
-    """
-    from_ordinal = ordinals.get(edge.from_)
-    to_ordinal = ordinals.get(edge.to)
-    if from_ordinal is None or to_ordinal is None:
-        return None
-    if edge.kind is not None:
-        return edge.kind
-    distance = abs(from_ordinal - to_ordinal)
-    if distance == 0:
-        return "reference"
-    if distance == 1:
-        return "chain"
-    return None
-
-
 def _chain_endpoints(edge: Edge, ordinals: dict[str, int]) -> tuple[str, str]:
     """Return *edge*'s ``(child, parent)`` scope ids, regardless of how it was authored.
 
     The parent of a chain edge is its lower-ordinal endpoint — ordinal 0 is
     the broadest stratum (ADR 0002) — so direction carries no information and
     an inverted edge means exactly what a correctly authored one means
-    (issue #123). Only meaningful for an edge whose effective kind is
-    ``chain``.
+    (issue #123). Only meaningful for an edge between adjacent strata.
     """
     if ordinals[edge.to] < ordinals[edge.from_]:
         return edge.from_, edge.to
     return edge.to, edge.from_
 
 
+@dataclass(frozen=True)
+class _ResolvedEdge:
+    """One edge's effective meaning, once the whole fleet has been considered.
+
+    ``kind`` is ``None`` only when the edge derives nothing at all — an
+    endpoint with no ordinal, or an untyped edge spanning two or more strata
+    (which :func:`_validate` refuses outright).
+
+    ``from_``/``to`` are the *effective* endpoints: a chain edge always runs
+    child→parent, and so does a demoted edge (see ``demoted``). Every other
+    edge keeps the direction it was authored with, because for a reference
+    edge direction is the whole meaning.
+
+    ``demoted`` marks an untyped adjacent edge that did not get its child's
+    chain slot and resolved to a reference instead. The write path
+    materializes ``kind: reference`` for exactly these, so a mutated file
+    stops depending on the resolution rules and says what it means.
+    """
+
+    kind: EdgeKind | None
+    from_: str
+    to: str
+    demoted: bool
+
+
+def _resolve_edges(config: FleetConfig) -> list[_ResolvedEdge]:
+    """Resolve every edge's effective kind and direction, in ``config.edges`` order.
+
+    Declared kinds are honoured as declared. Untyped edges are inferred, and
+    the adjacent ones are inferred **per child scope** rather than per edge
+    (ADR 0010 D5):
+
+    1. An untyped adjacent edge authored upward (``from`` is the child) takes
+       that child's chain slot. This is precisely what pre-ADR-0010 loads
+       honoured, so a fleet that loaded then still loads now.
+    2. An untyped adjacent edge authored inverted — inert before ADR 0010 —
+       promotes into the chain slot only when the slot is free and it is the
+       sole candidate for that child (the issue #123 fix).
+    3. Any other inverted candidate demotes to a reference. Two candidates
+       and an empty slot means both demote: the engine never guesses which
+       one the author meant, so the child stays parentless exactly as it was
+       before the upgrade, while both edges still deliver a publication —
+       strictly more than the inert edge gave, and never wrong.
+
+    A demoted edge keeps the direction of flow the author drew, at
+    non-binding strength: the would-be child references the would-be parent,
+    so it reads that scope's publication. Reversing it to the authored
+    ``from``→``to`` would invert the flow the author asked for.
+    """
+    ordinals = _scope_ordinals(config)
+    resolved: list[_ResolvedEdge | None] = [None] * len(config.edges)
+
+    # Pass 1 — everything decidable from one edge alone. What is left over is
+    # the untyped adjacent edges, collected per child for pass 2.
+    declared_chain_children: set[str] = set()
+    candidates: dict[str, list[int]] = {}
+    for i, edge in enumerate(config.edges):
+        from_ordinal = ordinals.get(edge.from_)
+        to_ordinal = ordinals.get(edge.to)
+        if from_ordinal is None or to_ordinal is None:
+            resolved[i] = _ResolvedEdge(None, edge.from_, edge.to, False)
+            continue
+        distance = abs(from_ordinal - to_ordinal)
+        if edge.kind == "chain":
+            child, parent = _chain_endpoints(edge, ordinals)
+            declared_chain_children.add(child)
+            resolved[i] = _ResolvedEdge("chain", child, parent, False)
+        elif edge.kind == "reference" or distance == 0:
+            resolved[i] = _ResolvedEdge("reference", edge.from_, edge.to, False)
+        elif distance == 1:
+            child, _parent = _chain_endpoints(edge, ordinals)
+            candidates.setdefault(child, []).append(i)
+        else:
+            resolved[i] = _ResolvedEdge(None, edge.from_, edge.to, False)
+
+    # Pass 2 — the untyped adjacent edges, decided per child.
+    for child, indices in candidates.items():
+        upward = {i for i in indices if config.edges[i].from_ == child}
+        inverted = [i for i in indices if i not in upward]
+        slot_free = not upward and child not in declared_chain_children
+        promoted = inverted[0] if slot_free and len(inverted) == 1 else None
+        for i in indices:
+            child_id, parent_id = _chain_endpoints(config.edges[i], ordinals)
+            if i in upward or i == promoted:
+                resolved[i] = _ResolvedEdge("chain", child_id, parent_id, False)
+            else:
+                resolved[i] = _ResolvedEdge("reference", child_id, parent_id, True)
+
+    # Both passes together assign every index, so this narrows the type rather
+    # than filtering anything out. If a future branch ever left one unassigned,
+    # the shortened list would trip every caller's ``zip(..., strict=True)``.
+    return [r for r in resolved if r is not None]
+
+
 def _canonicalize(config: FleetConfig) -> None:
-    """Materialize every edge's effective kind and orient chain edges child→parent.
+    """Materialize every edge's resolved kind and direction on the in-memory model.
 
     Applied by :meth:`FleetConfig.load` after validation so consumers read one
     shape: ``kind`` is always set, and a chain edge's ``from_`` is always the
-    child. Edges whose kind cannot be established are left untouched for the
-    caller that built the config without validating it.
+    child. Edges that resolve to nothing are left untouched for the caller
+    that built the config without validating it.
     """
-    ordinals = _scope_ordinals(config)
-    for edge in config.edges:
-        kind = _effective_kind(edge, ordinals)
-        if kind is None:
+    for edge, resolution in zip(config.edges, _resolve_edges(config), strict=True):
+        if resolution.kind is None:
             continue
-        edge.kind = kind
-        if kind == "chain":
-            edge.from_, edge.to = _chain_endpoints(edge, ordinals)
+        edge.kind = resolution.kind
+        edge.from_, edge.to = resolution.from_, resolution.to
 
 
 def _canonicalize_raw_edges(config: FleetConfig, raw_edges: list) -> None:
-    """Orient every chain edge child→parent in the raw YAML entries, in place.
+    """Write each edge's resolved direction — and any demoted kind — into the raw entries.
 
     Every mutation runs this before writing, so an inverted chain edge is
     corrected on disk the first time anything else in the file changes and
-    ``fleet.yaml`` never drifts from what the loaded config means. The
-    declared ``kind`` is left exactly as authored: an inferred kind stays
-    inferred on disk.
+    ``fleet.yaml`` never drifts from what the loaded config means. A demoted
+    edge additionally gains an explicit ``kind: reference``, so the file stops
+    relying on the per-child resolution rules to mean what it means and
+    converges on a self-describing form (ADR 0010 D5). An inferred kind that
+    was not demoted stays inferred on disk.
     """
-    ordinals = _scope_ordinals(config)
-    for edge, entry in zip(config.edges, raw_edges, strict=True):
-        if not isinstance(entry, dict) or _effective_kind(edge, ordinals) != "chain":
+    for resolution, entry in zip(_resolve_edges(config), raw_edges, strict=True):
+        if not isinstance(entry, dict) or resolution.kind is None:
             continue
-        child_id, parent_id = _chain_endpoints(edge, ordinals)
-        entry["from" if "from" in entry else "from_"] = child_id
-        entry["to"] = parent_id
+        entry["from" if "from" in entry else "from_"] = resolution.from_
+        entry["to"] = resolution.to
+        if resolution.demoted:
+            entry["kind"] = "reference"
 
 
 @dataclass(frozen=True)
@@ -333,37 +413,53 @@ class FleetConfig(BaseModel):
         Reference edges are never followed here, at any stratum distance: a
         reference delivers the referenced scope's publication, never ancestry.
         """
-        ordinals = _scope_ordinals(self)
         scope_map = {s.id: s for s in self.scopes}
 
         if scope_id not in scope_map:
             return None
 
-        for edge in self.edges:
-            if _effective_kind(edge, ordinals) != "chain":
-                continue
-            child_id, parent_id = _chain_endpoints(edge, ordinals)
-            if child_id == scope_id:
-                return scope_map[parent_id]
+        parent_id = self._chain_parent_ids().get(scope_id)
+        return scope_map.get(parent_id) if parent_id is not None else None
 
-        return None
+    def _chain_parent_ids(self) -> dict[str, str]:
+        """Map each scope id to its chain parent's id, from one resolution pass.
+
+        Callers that walk many chains — the ancestor walk, and
+        :meth:`entitlement_view`'s descendant scan — build this once instead of
+        re-resolving every edge at every hop, which is what would otherwise
+        make those walks quadratic in fleet size. First chain edge wins, so an
+        unvalidated config with two parents resolves the same way the
+        edge-order scan did.
+        """
+        parents: dict[str, str] = {}
+        for resolution in _resolve_edges(self):
+            if resolution.kind == "chain":
+                parents.setdefault(resolution.from_, resolution.to)
+        return parents
 
     def inter_stratum_ancestors(self, scope_id: str) -> list[Scope]:
         """Return the ancestor chain from root (L0) down to *scope_id*'s parent.
 
-        Follows chain edges only, hop by hop through
-        :meth:`inter_stratum_parent`. Returns an empty list when *scope_id* is
-        a root scope (no chain edge to a parent).  The requested scope itself
-        is NOT included — callers append it.
+        Follows chain edges only. Returns an empty list when *scope_id* is a
+        root scope (no chain edge to a parent).  The requested scope itself is
+        NOT included — callers append it.
         """
+        scope_map = {s.id: s for s in self.scopes}
+        parents = self._chain_parent_ids()
+
         ancestors: list[Scope] = []
+        # A chain edge's parent always sits on a strictly lower ordinal, so a
+        # validated fleet cannot loop; the seen set keeps the walk total on a
+        # config built without validation.
+        seen: set[str] = {scope_id}
         current_id = scope_id
-        while True:
-            parent = self.inter_stratum_parent(current_id)
+        while (parent_id := parents.get(current_id)) is not None and parent_id not in seen:
+            parent = scope_map.get(parent_id)
             if parent is None:
                 break
             ancestors.append(parent)
-            current_id = parent.id
+            seen.add(parent_id)
+            current_id = parent_id
         # Chain is built deepest-first; reverse to get root-first order.
         ancestors.reverse()
         return ancestors
@@ -383,7 +479,6 @@ class FleetConfig(BaseModel):
             any chain scope, at any stratum distance), and ``others``
             (everything else, archived scopes included).
         """
-        ordinals = _scope_ordinals(self)
         scope_map = {s.id: s for s in self.scopes}
 
         scope = scope_map.get(scope_id)
@@ -395,14 +490,24 @@ class FleetConfig(BaseModel):
         # through the judged scope (any depth). These are the agents ADR 0006
         # D1 permits to propose upward into this scope, so the judge must see
         # them as entitled evidence sources, never as foreign material.
+        # One shared parent map, walked per candidate — re-deriving each
+        # candidate's full ancestor list here would re-resolve every edge once
+        # per hop, per scope in the fleet.
+        parents = self._chain_parent_ids()
         descendant_ids: set[str] = set()
         descendants: list[Scope] = []
         for candidate in self.scopes:
             if candidate.id in chain_ids or candidate.status != "active":
                 continue
-            if any(a.id == scope_id for a in self.inter_stratum_ancestors(candidate.id)):
-                descendant_ids.add(candidate.id)
-                descendants.append(candidate)
+            walked: set[str] = {candidate.id}
+            cursor = parents.get(candidate.id)
+            while cursor is not None and cursor not in walked:
+                if cursor == scope_id:
+                    descendant_ids.add(candidate.id)
+                    descendants.append(candidate)
+                    break
+                walked.add(cursor)
+                cursor = parents.get(cursor)
 
         # Reference edges out of any chain scope, one hop (ADR 0010 D2). Every
         # stratum distance counts, not only the same-stratum peer reference:
@@ -412,16 +517,18 @@ class FleetConfig(BaseModel):
         # ancestor is entitled more strongly than any reference could make it.
         referenced_peer_ids: list[str] = []
         seen: set[str] = set()
-        for edge in self.edges:
-            if edge.from_ not in chain_ids or edge.to in chain_ids or edge.to in seen:
+        for resolution in _resolve_edges(self):
+            if resolution.kind != "reference":
                 continue
-            if _effective_kind(edge, ordinals) != "reference":
+            if resolution.from_ not in chain_ids or resolution.to in chain_ids:
                 continue
-            target_scope = scope_map.get(edge.to)
+            if resolution.to in seen:
+                continue
+            target_scope = scope_map.get(resolution.to)
             if target_scope is None or target_scope.status != "active":
                 continue
-            seen.add(edge.to)
-            referenced_peer_ids.append(edge.to)
+            seen.add(resolution.to)
+            referenced_peer_ids.append(resolution.to)
 
         referenced_peers = [scope_map[sid] for sid in referenced_peer_ids]
 
@@ -577,7 +684,12 @@ class FleetConfig(BaseModel):
 def _validate(config: FleetConfig) -> None:
     """Validate all load-time invariants from ADR 0002 (8 original), ADR 0004 (1 new),
     ADR 0008 (1 new — reserved stratum label), and ADR 0010 (invariants 7 and 9
-    restated per edge kind).
+    restated per edge kind, and checked against the resolved kinds rather than
+    the authored ones).
+
+    Load-lenient, write-strict (ADR 0010 D5): invariant 9 fires only where the
+    fleet declares two parents outright, because per-child resolution has
+    already demoted every untyped candidate that could not have the slot.
 
     Pure: raises :class:`FleetConfigError` on the first failure and never
     mutates *config*. Canonicalization is :func:`_canonicalize`'s job, applied
@@ -673,9 +785,11 @@ def _validate(config: FleetConfig) -> None:
     # 7. Every edge's kind must be one the stratum distance can carry
     #    (ADR 0010 D1/D4). A chain edge binds adjacent strata and nothing
     #    else; a reference edge spans any distance. An untyped edge is
-    #    inferred — same stratum → reference, adjacent → chain — and a wider
-    #    distance has no default, so the author is told which kind to declare
-    #    rather than handed an edge that derives nothing (issue #123).
+    #    inferred — same stratum → reference, adjacent → chain or, when it
+    #    loses the contest for its child's chain slot, reference (ADR 0010 D5)
+    #    — and a wider distance has no default, so the author is told which
+    #    kind to declare rather than handed an edge that derives nothing
+    #    (issue #123).
     ordinals = _scope_ordinals(config)
     for edge in config.edges:
         from_ordinal = ordinals[edge.from_]
@@ -723,16 +837,22 @@ def _validate(config: FleetConfig) -> None:
     # 9. Each scope may have at most one chain edge to a parent. Multiple such
     #    edges would create ambiguity about which scope carries the
     #    authoritative parent perspective (ADR 0004 D4). Counted on the
-    #    EFFECTIVE relationship, not the authored direction: before ADR 0010
-    #    an inverted edge counted as nothing at all, so a scope could hold one
-    #    inverted and one correct parent edge and pass (issue #123). The error
-    #    names both offending edges as written, so the author can find them.
+    #    RESOLVED relationship, so an inverted edge counts exactly like a
+    #    correctly authored one (issue #123).
+    #
+    #    Reaching two here means the fleet says two things at once where the
+    #    author declared intent, because per-child resolution (ADR 0010 D5)
+    #    already demoted every untyped edge that could not have the slot.
+    #    What is left is a declared `kind: chain` colliding with another
+    #    parent edge, or two untyped edges both authored upward — the shape
+    #    that failed this same check before ADR 0010, so refusing it breaks
+    #    nothing that used to load. The error names both offending edges as
+    #    written, so the author can find them.
     chain_parent_edges: dict[str, list[Edge]] = {}
-    for edge in config.edges:
-        if _effective_kind(edge, ordinals) != "chain":
+    for edge, resolution in zip(config.edges, _resolve_edges(config), strict=True):
+        if resolution.kind != "chain":
             continue
-        child_id, _parent_id = _chain_endpoints(edge, ordinals)
-        chain_parent_edges.setdefault(child_id, []).append(edge)
+        chain_parent_edges.setdefault(resolution.from_, []).append(edge)
     for scope_id, edges in chain_parent_edges.items():
         if len(edges) > 1:
             listed = ", ".join(f"{e.from_} -> {e.to}" for e in edges)

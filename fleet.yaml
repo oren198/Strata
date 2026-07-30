@@ -18,6 +18,12 @@
 #                          scopes share a stratum (the peer reference). Must be
 #                          written out to span two or more strata.
 #
+#              A scope has at most one chain edge to a parent. If several
+#              untyped adjacent edges point at the same scope, only one can be
+#              its chain edge — the one written child -> parent wins, and the
+#              rest become reference edges rather than a load error. Write
+#              `kind:` on them to say what you meant.
+#
 # Scope lifecycle:
 #   status: active    (default) — accepts contributions, visible to /scopes
 #   status: archived  — rejects new contributions; kept for historical provenance
