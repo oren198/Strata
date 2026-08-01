@@ -1,0 +1,43 @@
+-- Strata migration: make a failed judgment's OUTCOME legible (issue #118).
+--
+-- 0003 made a judge() failure an EVENT on the contribution rather than a
+-- fabricated verdict (issue #57). That is correct provenance and does not
+-- change here. What it left unsaid is whether the judge run was OVER: on
+-- every record surface a contribution with no judgment row reads the same
+-- whether the judge is working on it right now or errored two days ago, so
+-- stranded contributions render as eternally pending.
+--
+-- This adds the missing marker as an explicit outcome on the attempt event:
+--
+--   outcome IS NULL          the attempt was recorded, but nothing asserts
+--                            the judge run ended there. Every row written
+--                            before this migration, and the shape any future
+--                            mid-run attempt site would use.
+--   outcome = 'judge_failed' MECHANICAL marker: the scope-manager's judge()
+--                            call failed and its own corrective re-asks
+--                            (issue #113's parse re-ask, issue #63's overflow
+--                            re-ask) are exhausted. No judge or LLM is
+--                            involved in writing this — the failing error
+--                            class and message are already on the row.
+--
+-- Why here and NOT as a judgments row with a 'judge_failed' decision, which
+-- issue #118 also floats: judgments.contribution_id is UNIQUE, so a marker
+-- row there would permanently occupy the contribution's one judgment slot and
+-- make strata_rejudge a no-op — the exact recovery path 0003 exists to keep
+-- open. It would also put a non-verdict in the verdict table, which 0003
+-- forbids by construction. The attempts table is where a non-verdict may
+-- legally live, so the marker goes on the attempt.
+--
+-- EXISTING ORPHANS ARE LEFT AS THEY ARE. The record is append-only and never
+-- rewritten (CONTEXT.md § Record), and back-filling 'judge_failed' onto rows
+-- whose terminality nothing observed would be inventing history to make a
+-- read surface tidier. They keep outcome NULL, read as pending, and — since
+-- #57 — still show their failed-attempt count on the record surfaces. New
+-- terminal failures carry the marker from here on.
+--
+-- Additive ALTER rather than the drop-and-rebuild pattern 0002/0006 use: no
+-- constraint is being loosened and no table references judgment_attempts, so
+-- there is nothing for a rebuild to protect.
+
+ALTER TABLE judgment_attempts
+    ADD COLUMN outcome TEXT CHECK (outcome IS NULL OR outcome = 'judge_failed');

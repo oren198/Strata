@@ -114,8 +114,12 @@ def test_export_edge_key_mapping(tmp_path: Path) -> None:
     assert "to" in edge
     assert "from_scope_id" not in edge
     assert "to_scope_id" not in edge
-    assert edge["from"] == "s_ceo"
-    assert edge["to"] == "s_eng"
+    # The V1 row is stored parent→child ('s_ceo' → 's_eng'); the export is a
+    # write path, so it emits the chain edge canonically, child→parent
+    # (ADR 0010 D3). Exporting it as authored would produce exactly the inert
+    # fleet of issue #123 — validating, and deriving no ancestry at all.
+    assert edge["from"] == "s_eng"
+    assert edge["to"] == "s_ceo"
 
 
 def test_export_scopes_omit_skill_fields(tmp_path: Path) -> None:
@@ -384,3 +388,19 @@ def test_cli_export_fleet_invalid_data(tmp_path: Path, capsys: pytest.CaptureFix
     captured = capsys.readouterr()
     assert "stratum_distance_violation" in captured.err
     assert not out.exists()
+
+
+def test_export_produces_a_fleet_that_composes(tmp_path: Path) -> None:
+    """The exported fleet derives real ancestry, not an inert edge (ADR 0010, issue #123)."""
+    db_path = str(tmp_path / "v1.db")
+    _build_v1_db(db_path, tmp_path)
+    _seed_fleet(db_path)
+
+    out = tmp_path / "fleet.yaml"
+    export_fleet(db_path, out)
+
+    config = FleetConfig.load(out)
+    parent = config.inter_stratum_parent("s_eng")
+    assert parent is not None
+    assert parent.id == "s_ceo"
+    assert config.inter_stratum_parent("s_ceo") is None

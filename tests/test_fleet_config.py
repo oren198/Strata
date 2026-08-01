@@ -2,9 +2,12 @@
 
 Covers all 8 load-time invariants (each with a failing case and a passing
 counterpart), the scope lifecycle (status defaulting and archived behaviour),
-per-scope skill declaration fields, and the mutation API.
+per-scope skill declaration fields, the mutation API, and ADR 0010's typed
+edges (kind inference, chain canonicalization, the effective single-parent
+rule, and reference edges at any stratum distance).
 
-Vocabulary follows CONTEXT.md: stratum, scope, edge, fleet.
+Vocabulary follows CONTEXT.md: stratum, scope, edge, chain edge, reference
+edge, peer reference, fleet.
 """
 
 from __future__ import annotations
@@ -13,6 +16,7 @@ import textwrap
 from pathlib import Path
 
 import pytest
+import yaml
 
 from strata.fleet_config import FleetConfig, FleetConfigError
 
@@ -1014,3 +1018,706 @@ def test_reserved_stratum_check_runs_before_duplicate_check(tmp_path: Path) -> N
     with pytest.raises(FleetConfigError) as exc_info:
         FleetConfig.load(_write(tmp_path, bad))
     assert exc_info.value.kind == "reserved_stratum_id"
+
+
+# ---------------------------------------------------------------------------
+# ADR 0010 — typed edges (issue #127, closing issue #123)
+# ---------------------------------------------------------------------------
+
+_TYPED_EDGE_STRATA = """
+strata:
+  - id: L0
+    name: Executive
+    ordinal: 0
+  - id: L1
+    name: Function
+    ordinal: 1
+  - id: L2
+    name: Team
+    ordinal: 2
+
+scopes:
+  - id: g_exec
+    name: Executive
+    stratum_id: L0
+  - id: g_funcA
+    name: Function A
+    stratum_id: L1
+  - id: g_funcB
+    name: Function B
+    stratum_id: L1
+  - id: g_teamX
+    name: Team X
+    stratum_id: L2
+  - id: g_teamY
+    name: Team Y
+    stratum_id: L2
+"""
+
+#: The issue #123 shape: every edge authored top-down (from = the broader
+#: scope), which used to derive nothing at all.
+_INVERTED_EDGES = """
+edges:
+  - from: g_exec
+    to: g_funcA
+  - from: g_funcA
+    to: g_teamX
+"""
+
+
+def _typed_fleet(tmp_path: Path, edges: str, name: str = "fleet.yaml") -> Path:
+    """Write a fleet.yaml combining the shared typed-edge scopes with *edges*."""
+    return _write(tmp_path, _TYPED_EDGE_STRATA + textwrap.dedent(edges), name)
+
+
+def test_untyped_adjacent_edge_is_a_chain_edge(tmp_path: Path) -> None:
+    """An untyped edge between adjacent strata means a chain edge (ADR 0010 D4)."""
+    config = FleetConfig.load(
+        _typed_fleet(
+            tmp_path,
+            """
+            edges:
+              - from: g_funcA
+                to: g_exec
+            """,
+        )
+    )
+
+    assert [(e.from_, e.to, e.kind) for e in config.edges] == [("g_funcA", "g_exec", "chain")]
+
+
+def test_untyped_same_stratum_edge_is_a_reference_edge(tmp_path: Path) -> None:
+    """An untyped edge within one stratum means a reference edge — the peer reference."""
+    config = FleetConfig.load(
+        _typed_fleet(
+            tmp_path,
+            """
+            edges:
+              - from: g_funcA
+                to: g_funcB
+            """,
+        )
+    )
+
+    assert [(e.from_, e.to, e.kind) for e in config.edges] == [("g_funcA", "g_funcB", "reference")]
+    # A reference edge is never ancestry, and its direction is preserved.
+    assert config.inter_stratum_parent("g_funcA") is None
+    assert [s.id for s in config.entitlement_view("g_funcA").referenced_peers] == ["g_funcB"]
+
+
+def test_untyped_distance_two_edge_rejected_naming_reference(tmp_path: Path) -> None:
+    """An untyped edge spanning two strata has no default — the error names the fix."""
+    with pytest.raises(FleetConfigError) as exc_info:
+        FleetConfig.load(
+            _typed_fleet(
+                tmp_path,
+                """
+                edges:
+                  - from: g_teamX
+                    to: g_exec
+                """,
+            )
+        )
+
+    assert exc_info.value.kind == "stratum_distance_violation"
+    assert "g_teamX" in exc_info.value.message
+    assert "g_exec" in exc_info.value.message
+    assert "kind: reference" in exc_info.value.message
+
+
+def test_inverted_authored_chain_edge_is_canonicalized(tmp_path: Path) -> None:
+    """A top-down authored adjacent edge loads as a chain edge oriented child→parent.
+
+    This is issue #123's headline fix at the config layer: the authored
+    direction of a chain edge carries no meaning, so an inverted fleet
+    derives exactly what a correctly authored one derives.
+    """
+    config = FleetConfig.load(_typed_fleet(tmp_path, _INVERTED_EDGES))
+
+    assert [(e.from_, e.to, e.kind) for e in config.edges] == [
+        ("g_funcA", "g_exec", "chain"),
+        ("g_teamX", "g_funcA", "chain"),
+    ]
+    assert config.inter_stratum_parent("g_teamX").id == "g_funcA"
+    assert [s.id for s in config.inter_stratum_ancestors("g_teamX")] == ["g_exec", "g_funcA"]
+    # The inverted authoring never made the broader scope anyone's child.
+    assert config.inter_stratum_parent("g_exec") is None
+
+
+def test_explicit_chain_edge_spanning_two_strata_rejected(tmp_path: Path) -> None:
+    """A declared chain edge is legal only between adjacent strata."""
+    with pytest.raises(FleetConfigError) as exc_info:
+        FleetConfig.load(
+            _typed_fleet(
+                tmp_path,
+                """
+                edges:
+                  - from: g_teamX
+                    to: g_exec
+                    kind: chain
+                """,
+            )
+        )
+
+    assert exc_info.value.kind == "chain_edge_not_adjacent"
+    assert "kind: reference" in exc_info.value.message
+
+
+def test_explicit_chain_edge_within_one_stratum_rejected(tmp_path: Path) -> None:
+    """A declared chain edge between two scopes on one stratum has no parent to name."""
+    with pytest.raises(FleetConfigError) as exc_info:
+        FleetConfig.load(
+            _typed_fleet(
+                tmp_path,
+                """
+                edges:
+                  - from: g_funcA
+                    to: g_funcB
+                    kind: chain
+                """,
+            )
+        )
+
+    assert exc_info.value.kind == "chain_edge_not_adjacent"
+
+
+def test_reference_edge_spans_any_distance_in_both_directions(tmp_path: Path) -> None:
+    """A declared reference edge is legal upward at any distance, and downward."""
+    config = FleetConfig.load(
+        _typed_fleet(
+            tmp_path,
+            """
+            edges:
+              - from: g_teamX
+                to: g_funcA
+              - from: g_teamX
+                to: g_exec
+                kind: reference
+              - from: g_exec
+                to: g_teamY
+                kind: reference
+            """,
+        )
+    )
+
+    assert [(e.from_, e.to, e.kind) for e in config.edges] == [
+        ("g_teamX", "g_funcA", "chain"),
+        ("g_teamX", "g_exec", "reference"),
+        ("g_exec", "g_teamY", "reference"),
+    ]
+    # Neither reference is ancestry: g_teamX's parent is still its chain edge.
+    assert config.inter_stratum_parent("g_teamX").id == "g_funcA"
+    assert config.inter_stratum_parent("g_teamY") is None
+
+
+def test_downward_reference_entitles_the_referencing_scope(tmp_path: Path) -> None:
+    """A downward reference entitles the referencing scope to the referenced publication."""
+    config = FleetConfig.load(
+        _typed_fleet(
+            tmp_path,
+            """
+            edges:
+              - from: g_funcA
+                to: g_exec
+              - from: g_teamX
+                to: g_funcA
+              - from: g_exec
+                to: g_teamY
+                kind: reference
+            """,
+        )
+    )
+
+    assert [s.id for s in config.entitlement_view("g_exec").referenced_peers] == ["g_teamY"]
+    # Direction is load-bearing: g_teamY references nothing back.
+    assert config.entitlement_view("g_teamY").referenced_peers == []
+
+
+def test_reference_cycle_is_legal(tmp_path: Path) -> None:
+    """Reference edges may form cycles — nothing binds, so there is nothing to resolve."""
+    config = FleetConfig.load(
+        _typed_fleet(
+            tmp_path,
+            """
+            edges:
+              - from: g_funcA
+                to: g_funcB
+              - from: g_funcB
+                to: g_funcA
+              - from: g_teamX
+                to: g_exec
+                kind: reference
+              - from: g_exec
+                to: g_teamX
+                kind: reference
+            """,
+        )
+    )
+
+    assert [s.id for s in config.entitlement_view("g_funcA").referenced_peers] == ["g_funcB"]
+    assert [s.id for s in config.entitlement_view("g_funcB").referenced_peers] == ["g_funcA"]
+    assert [s.id for s in config.entitlement_view("g_teamX").referenced_peers] == ["g_exec"]
+    assert [s.id for s in config.entitlement_view("g_exec").referenced_peers] == ["g_teamX"]
+
+
+@pytest.mark.parametrize("kind_line", ["", "    kind: chain", "    kind: reference"])
+def test_self_edge_rejected_for_every_kind(tmp_path: Path, kind_line: str) -> None:
+    """A scope may not edge to itself, typed or untyped, chain or reference."""
+    with pytest.raises(FleetConfigError) as exc_info:
+        FleetConfig.load(
+            _typed_fleet(
+                tmp_path,
+                "\nedges:\n  - from: g_funcA\n    to: g_funcA\n" + kind_line + "\n",
+            )
+        )
+
+    assert exc_info.value.kind == "self_loop"
+    assert "g_funcA" in exc_info.value.message
+
+
+def test_two_explicit_chain_edges_rejected_naming_both(tmp_path: Path) -> None:
+    """Two DECLARED chain edges onto one child are two parents, and the error names both.
+
+    Strictness lives where intent is declared (ADR 0010 D5): an untyped edge
+    that cannot have the slot demotes silently, but `kind: chain` said what it
+    meant and the fleet cannot honour both.
+    """
+    with pytest.raises(FleetConfigError) as exc_info:
+        FleetConfig.load(
+            _typed_fleet(
+                tmp_path,
+                """
+                edges:
+                  - from: g_funcA
+                    to: g_teamX
+                    kind: chain
+                  - from: g_teamX
+                    to: g_funcB
+                    kind: chain
+                """,
+            )
+        )
+
+    assert exc_info.value.kind == "multiple_inter_stratum_parents"
+    message = exc_info.value.message
+    assert "g_teamX" in message
+    # Both offending edges are named as written, so the author can find them.
+    assert "g_funcA -> g_teamX" in message
+    assert "g_teamX -> g_funcB" in message
+
+
+def test_chain_parent_plus_several_references_all_resolve(tmp_path: Path) -> None:
+    """One scope carries one chain parent and any number of references at once."""
+    config = FleetConfig.load(
+        _typed_fleet(
+            tmp_path,
+            """
+            edges:
+              - from: g_funcA
+                to: g_exec
+              - from: g_funcA
+                to: g_teamX
+              - from: g_funcA
+                to: g_funcB
+              - from: g_funcA
+                to: g_teamY
+                kind: reference
+            """,
+        )
+    )
+
+    # The edge to g_teamX canonicalizes into g_teamX's chain edge to a parent;
+    # only the upward one is g_funcA's own parent.
+    assert config.inter_stratum_parent("g_funcA").id == "g_exec"
+    assert config.inter_stratum_parent("g_teamX").id == "g_funcA"
+    view = config.entitlement_view("g_funcA")
+    assert [s.id for s in view.referenced_peers] == ["g_funcB", "g_teamY"]
+
+
+def test_cross_stratum_reference_reaches_the_whole_chain(tmp_path: Path) -> None:
+    """The uncle case: a reference on the chain entitles the scope reading that chain."""
+    config = FleetConfig.load(
+        _typed_fleet(
+            tmp_path,
+            """
+            edges:
+              - from: g_funcA
+                to: g_exec
+              - from: g_teamX
+                to: g_funcA
+              - from: g_teamX
+                to: g_funcB
+                kind: reference
+            """,
+        )
+    )
+
+    view = config.entitlement_view("g_teamX")
+    assert [s.id for s in view.chain] == ["g_exec", "g_funcA", "g_teamX"]
+    assert [s.id for s in view.referenced_peers] == ["g_funcB"]
+    assert not any(s.id == "g_funcB" for s in view.others)
+
+
+def test_referenced_descendant_is_both_referenced_and_a_descendant(tmp_path: Path) -> None:
+    """A referenced descendant keeps both entitlements — read access and upward standing."""
+    config = FleetConfig.load(
+        _typed_fleet(
+            tmp_path,
+            """
+            edges:
+              - from: g_funcA
+                to: g_exec
+              - from: g_teamX
+                to: g_funcA
+              - from: g_exec
+                to: g_teamX
+                kind: reference
+            """,
+        )
+    )
+
+    view = config.entitlement_view("g_exec")
+    assert [s.id for s in view.referenced_peers] == ["g_teamX"]
+    assert "g_teamX" in {s.id for s in view.descendants}
+    assert not any(s.id == "g_teamX" for s in view.others)
+
+
+def test_add_edge_writes_a_chain_edge_child_to_parent(tmp_path: Path) -> None:
+    """add_edge canonicalizes on the way to disk, whichever order it was called with."""
+    path = _typed_fleet(tmp_path, "\nedges: []\n")
+    config = FleetConfig.load(path)
+
+    config.add_edge(from_scope_id="g_exec", to_scope_id="g_funcA")
+
+    assert [(e.from_, e.to, e.kind) for e in config.edges] == [("g_funcA", "g_exec", "chain")]
+    reloaded = FleetConfig.load(path)
+    assert [(e.from_, e.to) for e in reloaded.edges] == [("g_funcA", "g_exec")]
+
+
+def test_add_edge_declares_the_kind_it_was_given(tmp_path: Path) -> None:
+    """An explicit kind reaches disk and survives a reload."""
+    path = _typed_fleet(tmp_path, "\nedges: []\n")
+    config = FleetConfig.load(path)
+
+    config.add_edge(from_scope_id="g_teamX", to_scope_id="g_exec", kind="reference")
+
+    reloaded = FleetConfig.load(path)
+    assert [(e.from_, e.to, e.kind) for e in reloaded.edges] == [("g_teamX", "g_exec", "reference")]
+
+
+def test_any_mutation_canonicalizes_an_inverted_edge_on_disk(tmp_path: Path) -> None:
+    """The file catches up with the loaded meaning the next time anything writes it."""
+    path = _typed_fleet(tmp_path, _INVERTED_EDGES)
+    config = FleetConfig.load(path)
+
+    config.add_scope(id="g_teamZ", name="Team Z", stratum_id="L2")
+
+    reloaded = FleetConfig.load(path)
+    assert [(e.from_, e.to) for e in reloaded.edges] == [
+        ("g_funcA", "g_exec"),
+        ("g_teamX", "g_funcA"),
+    ]
+    # Canonicalizing orientation never invents a `kind` the author did not write.
+    assert "kind:" not in path.read_text(encoding="utf-8")
+
+
+def test_adjacent_strata_reference_edge_is_not_a_parent(tmp_path: Path) -> None:
+    """`kind: reference` on an adjacent pair references — it does not bind.
+
+    The distance alone would have inferred a chain edge, so this is the case
+    where the declared kind is the only thing distinguishing "informs me"
+    from "binds me".
+    """
+    config = FleetConfig.load(
+        _typed_fleet(
+            tmp_path,
+            """
+            edges:
+              - from: g_teamX
+                to: g_funcA
+              - from: g_teamX
+                to: g_funcB
+                kind: reference
+            """,
+        )
+    )
+
+    assert config.inter_stratum_parent("g_teamX").id == "g_funcA"
+    view = config.entitlement_view("g_teamX")
+    assert [s.id for s in view.chain] == ["g_funcA", "g_teamX"]
+    assert [s.id for s in view.referenced_peers] == ["g_funcB"]
+
+
+def test_second_parent_is_avoidable_by_declaring_a_reference(tmp_path: Path) -> None:
+    """Two adjacent edges out of one scope are legal once one declares itself a reference.
+
+    Untyped, this pair is the two-parents error; declaring the second one a
+    reference is the fix the error message names.
+    """
+    untyped = """
+        edges:
+          - from: g_teamX
+            to: g_funcA
+          - from: g_teamX
+            to: g_funcB
+        """
+    with pytest.raises(FleetConfigError) as exc_info:
+        FleetConfig.load(_typed_fleet(tmp_path, untyped))
+    assert exc_info.value.kind == "multiple_inter_stratum_parents"
+    assert "kind: reference" in exc_info.value.message
+
+    config = FleetConfig.load(
+        _typed_fleet(
+            tmp_path,
+            """
+            edges:
+              - from: g_teamX
+                to: g_funcA
+              - from: g_teamX
+                to: g_funcB
+                kind: reference
+            """,
+            name="typed.yaml",
+        )
+    )
+    assert [(e.from_, e.to, e.kind) for e in config.edges] == [
+        ("g_teamX", "g_funcA", "chain"),
+        ("g_teamX", "g_funcB", "reference"),
+    ]
+
+
+# ---------------------------------------------------------------------------
+# ADR 0010 D5 — load-lenient, write-strict.
+#
+# The upgrade invariant: data that LOADED yesterday must LOAD today. An engine
+# upgrade may add meaning to stored data, never make it unreadable. Resolving
+# untyped adjacent edges per CHILD rather than per edge is what holds that
+# line — a legacy fleet carrying a formerly-inert inverted edge alongside a
+# correct parent edge kept loading, because the inverted one demotes to a
+# reference instead of becoming a second parent.
+# ---------------------------------------------------------------------------
+
+
+def test_legacy_correct_plus_inverted_onto_one_child_still_loads(tmp_path: Path) -> None:
+    """Shape (a): the correct edge keeps the chain slot; the inverted one demotes.
+
+    This exact fleet loaded fine before ADR 0010 (the old counter saw only the
+    correctly authored edge) and must keep loading.
+    """
+    config = FleetConfig.load(
+        _typed_fleet(
+            tmp_path,
+            """
+            edges:
+              - from: g_teamX
+                to: g_funcA
+              - from: g_funcB
+                to: g_teamX
+            """,
+        )
+    )
+
+    assert [(e.from_, e.to, e.kind) for e in config.edges] == [
+        ("g_teamX", "g_funcA", "chain"),
+        # Demoted, and oriented so the flow the author drew survives: g_teamX
+        # reads g_funcB's publication rather than the reverse.
+        ("g_teamX", "g_funcB", "reference"),
+    ]
+    assert config.inter_stratum_parent("g_teamX").id == "g_funcA"
+    view = config.entitlement_view("g_teamX")
+    assert [s.id for s in view.chain] == ["g_funcA", "g_teamX"]
+    assert [s.id for s in view.referenced_peers] == ["g_funcB"]
+
+
+def test_legacy_two_inverted_onto_one_child_still_loads(tmp_path: Path) -> None:
+    """Shape (b): with no correct edge and two candidates, both demote and neither guesses.
+
+    The child stays parentless — exactly its pre-ADR-0010 chain behaviour —
+    while gaining both publications, which is strictly more than the inert
+    edges delivered and never wrong.
+    """
+    config = FleetConfig.load(
+        _typed_fleet(
+            tmp_path,
+            """
+            edges:
+              - from: g_funcA
+                to: g_teamX
+              - from: g_funcB
+                to: g_teamX
+            """,
+        )
+    )
+
+    assert [(e.from_, e.to, e.kind) for e in config.edges] == [
+        ("g_teamX", "g_funcA", "reference"),
+        ("g_teamX", "g_funcB", "reference"),
+    ]
+    assert config.inter_stratum_parent("g_teamX") is None
+    assert config.inter_stratum_ancestors("g_teamX") == []
+    view = config.entitlement_view("g_teamX")
+    assert [s.id for s in view.chain] == ["g_teamX"]
+    assert [s.id for s in view.referenced_peers] == ["g_funcA", "g_funcB"]
+
+
+def test_legacy_single_inverted_still_promotes_to_chain(tmp_path: Path) -> None:
+    """Shape (c): a sole inverted candidate into an empty slot still promotes (#123)."""
+    config = FleetConfig.load(_typed_fleet(tmp_path, _INVERTED_EDGES))
+
+    assert [(e.from_, e.to, e.kind) for e in config.edges] == [
+        ("g_funcA", "g_exec", "chain"),
+        ("g_teamX", "g_funcA", "chain"),
+    ]
+    assert [s.id for s in config.inter_stratum_ancestors("g_teamX")] == ["g_exec", "g_funcA"]
+
+
+def test_declared_chain_keeps_the_slot_against_an_inverted_untyped_edge(tmp_path: Path) -> None:
+    """A declared chain occupies the slot, so an inverted untyped candidate demotes."""
+    config = FleetConfig.load(
+        _typed_fleet(
+            tmp_path,
+            """
+            edges:
+              - from: g_teamX
+                to: g_funcA
+                kind: chain
+              - from: g_funcB
+                to: g_teamX
+            """,
+        )
+    )
+
+    assert [(e.from_, e.to, e.kind) for e in config.edges] == [
+        ("g_teamX", "g_funcA", "chain"),
+        ("g_teamX", "g_funcB", "reference"),
+    ]
+    assert config.inter_stratum_parent("g_teamX").id == "g_funcA"
+
+
+def test_demoted_edge_composes_as_a_reference_layer(tmp_path: Path) -> None:
+    """The demoted edge is a real reference: it reaches the entitled context surface."""
+    config = FleetConfig.load(
+        _typed_fleet(
+            tmp_path,
+            """
+            edges:
+              - from: g_funcA
+                to: g_exec
+              - from: g_teamX
+                to: g_funcA
+              - from: g_funcB
+                to: g_teamX
+            """,
+        )
+    )
+
+    view = config.entitlement_view("g_teamX")
+    assert [s.id for s in view.chain] == ["g_exec", "g_funcA", "g_teamX"]
+    assert [s.id for s in view.referenced_peers] == ["g_funcB"]
+    # The demoted scope is entitled, so it never reads as foreign material.
+    assert not any(s.id == "g_funcB" for s in view.others)
+
+
+def test_mutation_materializes_a_demoted_kind_on_disk(tmp_path: Path) -> None:
+    """A write through any mutator persists `kind: reference` on the demoted edge.
+
+    The file stops depending on the resolution rules to mean what it means:
+    reloading it yields the same shape from an explicit declaration.
+    """
+    path = _typed_fleet(
+        tmp_path,
+        """
+        edges:
+          - from: g_teamX
+            to: g_funcA
+          - from: g_funcB
+            to: g_teamX
+        """,
+    )
+    config = FleetConfig.load(path)
+
+    config.add_scope(id="g_teamZ", name="Team Z", stratum_id="L2")
+
+    raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    assert raw["edges"] == [
+        {"from": "g_teamX", "to": "g_funcA"},
+        {"from": "g_teamX", "to": "g_funcB", "kind": "reference"},
+    ]
+    reloaded = FleetConfig.load(path)
+    assert [(e.from_, e.to, e.kind) for e in reloaded.edges] == [
+        ("g_teamX", "g_funcA", "chain"),
+        ("g_teamX", "g_funcB", "reference"),
+    ]
+    assert reloaded.inter_stratum_parent("g_teamX").id == "g_funcA"
+
+
+def test_reported_upgrade_hazard_fleet_loads(tmp_path: Path) -> None:
+    """The reported shape: a formerly-inert inverted edge no longer bricks the load.
+
+    Two root-stratum scopes, one child; the child has a correct parent edge and
+    is also the target of an inverted edge from the other root scope. Under
+    per-edge inference this raised multiple_inter_stratum_parents and every
+    fleet-backed read failed.
+    """
+    path = _write(
+        tmp_path,
+        """
+        strata:
+          - id: L0
+            name: Executive
+            ordinal: 0
+          - id: L1
+            name: Function
+            ordinal: 1
+        scopes:
+          - id: g_a
+            name: A
+            stratum_id: L0
+          - id: g_b
+            name: B
+            stratum_id: L0
+          - id: g_c
+            name: C
+            stratum_id: L1
+        edges:
+          - from: g_c
+            to: g_a
+          - from: g_b
+            to: g_c
+        """,
+    )
+
+    config = FleetConfig.load(path)
+
+    assert config.inter_stratum_parent("g_c").id == "g_a"
+    assert [s.id for s in config.entitlement_view("g_c").referenced_peers] == ["g_b"]
+
+
+def test_add_edge_untyped_onto_a_taken_slot_becomes_a_reference(tmp_path: Path) -> None:
+    """add_edge follows the same per-child resolution, and writes the demotion out.
+
+    A caller that means "this binds" says so with ``kind="chain"`` and gets the
+    two-parents error instead.
+    """
+    path = _typed_fleet(
+        tmp_path,
+        """
+        edges:
+          - from: g_teamX
+            to: g_funcA
+        """,
+    )
+    config = FleetConfig.load(path)
+
+    config.add_edge(from_scope_id="g_funcB", to_scope_id="g_teamX")
+
+    assert [(e.from_, e.to, e.kind) for e in config.edges] == [
+        ("g_teamX", "g_funcA", "chain"),
+        ("g_teamX", "g_funcB", "reference"),
+    ]
+    raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    assert raw["edges"][1] == {"from": "g_teamX", "to": "g_funcB", "kind": "reference"}
+
+    with pytest.raises(FleetConfigError) as exc_info:
+        config.add_edge(from_scope_id="g_teamX", to_scope_id="g_funcB", kind="chain")
+    assert exc_info.value.kind == "multiple_inter_stratum_parents"

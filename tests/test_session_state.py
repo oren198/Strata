@@ -1,14 +1,18 @@
 """Tests for the session-state substrate and the staleness metric (issue #110).
 
 Covers the library layer directly (no MCP server): the atomic per-session state
-file, the counter mutations, and the mechanical per-scope staleness metric
-derived from a constructed record + receipt fixture.
+file, the counter mutations, the cross-process write lock (issue #119), and the
+mechanical per-scope staleness metric derived from a constructed record +
+receipt fixture.
 """
 
 from __future__ import annotations
 
+import multiprocessing
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+
+import pytest
 
 from strata.migrator import run_migrations
 from strata.record_store import ContributorRef, RecordStore
@@ -105,15 +109,27 @@ def test_record_contribution_and_decline(tmp_path: Path) -> None:
 
 
 def test_write_is_atomic_no_tmp_left_behind(tmp_path: Path) -> None:
-    """After a write only the final JSON file exists; the .tmp sibling is gone."""
+    """After a write only the final JSON file (+ its lock file) exists; no .tmp."""
     sessions = tmp_path / "sessions"
     store = SessionStateStore(sessions)
     store.record_read("s1", "g_arch")
 
     files = sorted(p.name for p in sessions.iterdir())
-    assert files == ["s1.json"]
+    # The advisory lock file (issue #119) is expected alongside the state file;
+    # the .tmp sibling of the atomic write is not.
+    assert not any(name.endswith(".tmp") for name in files)
+    assert "s1.json" in files
     # The file is valid JSON that round-trips through the model.
     assert store.read("s1") is not None
+
+
+def test_lock_file_is_excluded_from_the_state_scan(tmp_path: Path) -> None:
+    """The lock file must not be mistaken for a session state file."""
+    store = SessionStateStore(tmp_path / "sessions")
+    store.record_read("s1", "g_arch")
+
+    assert store.lock_path_for("s1").name == "s1.json.lock"
+    assert [s.session_id for s in store.all_states()] == ["s1"]
 
 
 def test_read_missing_or_corrupt_returns_none(tmp_path: Path) -> None:
@@ -125,6 +141,68 @@ def test_read_missing_or_corrupt_returns_none(tmp_path: Path) -> None:
     assert store.read("bad") is None
     # A corrupt file is also skipped by the bulk scan rather than raising.
     assert store.all_states() == []
+
+
+# ---------------------------------------------------------------------------
+# Cross-process write lock (issue #119)
+# ---------------------------------------------------------------------------
+
+# Sized so a lost update is near-certain without the lock: each iteration is two
+# full read-modify-write cycles on the same file, so four processes spend almost
+# all of their time inside the window the lock closes.
+_HAMMER_PROCESSES = 4
+_HAMMER_ITERATIONS = 60
+
+
+def _hammer_session_state(sessions_dir: str, session_id: str, iterations: int) -> None:
+    """Increment ``reads`` and ``declines`` *iterations* times from this process.
+
+    Module-level (not a closure) so it survives being handed to a child process,
+    and it builds its own store: each writer is a separate process with its own
+    interpreter state, exactly like the MCP server and the detached evaluator.
+    """
+    store = SessionStateStore(sessions_dir)
+    for _ in range(iterations):
+        store.record_read(session_id, "g_arch")
+        store.record_decline(session_id)
+
+
+@pytest.mark.skipif(
+    "fork" not in multiprocessing.get_all_start_methods(),
+    reason="needs fork to run the writers as real processes; the lock is a no-op there anyway",
+)
+def test_concurrent_processes_lose_no_increments(tmp_path: Path) -> None:
+    """Two writing PROCESSES end with the exact sum of their increments (issue #119).
+
+    The regression this pins: ``SessionStateStore`` read-modify-writes the whole
+    file, and since #112 the MCP server and the detached background evaluator do
+    it concurrently. ``os.replace`` makes each write atomic, so the file is never
+    torn — but without a lock the loser of a race writes a state it read *before*
+    the winner's increment, and that increment is gone. Threads would not prove
+    it: the GIL is not what is missing, cross-process serialization is.
+    """
+    sessions = tmp_path / "sessions"
+    ctx = multiprocessing.get_context("fork")
+    workers = [
+        ctx.Process(
+            target=_hammer_session_state,
+            args=(str(sessions), "s_race", _HAMMER_ITERATIONS),
+        )
+        for _ in range(_HAMMER_PROCESSES)
+    ]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(timeout=60)
+
+    assert [w.exitcode for w in workers] == [0] * _HAMMER_PROCESSES
+
+    expected = _HAMMER_PROCESSES * _HAMMER_ITERATIONS
+    state = SessionStateStore(sessions).read("s_race")
+    assert state is not None
+    assert state.reads == expected
+    assert state.declines == expected
+    assert state.reads_by_scope["g_arch"].count == expected
 
 
 # ---------------------------------------------------------------------------

@@ -23,22 +23,48 @@ The set of strata is defined by the fleet (e.g. `executive` → `function` →
 `team` → `individual`); strata are named layers, not depths. Above the
 broadest stratum sits the implicit **operator** stratum (see Operator).
 
-## Inter-stratum edge
+## Edge
+
+A link between two scopes. Every edge is of exactly one **kind** — a **chain
+edge** or a **reference edge** — and that kind determines everything the edge
+carries. No other relation between scopes exists.
+
+## Chain edge (inter-stratum edge)
 
 The edge from a scope to its single parent scope in the stratum immediately
-above. Every scope has **exactly one** inter-stratum parent (except the root).
-Carries both directives and context downward.
+above. Every scope has **at most one** chain edge to a parent — a scope
+without one is a root of its own chain. Carries both directives and context
+downward, **binding** the scope and all its descendants.
 
-## Intra-stratum edge (peer reference)
+A chain edge's parent is its lower-ordinal endpoint; the direction it is
+written in carries no meaning and none is inferred from it. Legal only
+between **adjacent** strata: authority passes through each stratum in turn,
+never skipping one.
 
-A reference from one scope to another scope on the **same** stratum. A scope
-may have any number of peer references; together they form a DAG within the
-stratum. Carries **context only** — directives published in a peer scope do
-not bind the reader. What a peer reference delivers is the referenced
-scope's **publication** — its curated outward face — never its full internal
-summary. To make a peer's standard binding, it must be ratified into a
-common ancestor scope (i.e. published as a directive at a stratum above
-both).
+## Reference edge
+
+A link from one scope to another scope anywhere in the fleet — the same
+stratum, any distance above, or below. A scope may have any number of
+reference edges. Direction means exactly one thing: the scope the edge is
+written *from* references the scope it is written *to*.
+
+Carries **context only** — directives published in the referenced scope do
+not bind the reader, at any stratum distance. What a reference edge delivers
+is the referenced scope's **publication** — its curated outward face — never
+its full internal summary and never its operator memory. To make a
+referenced scope's standard binding, it must be ratified into a common
+ancestor scope (i.e. published as a directive at a stratum above both).
+
+Reference edges may form cycles. Two scopes referencing each other simply
+means each reads the other's publication; nothing binds and nothing
+propagates, so there is no cycle to resolve.
+
+## Peer reference (intra-stratum edge)
+
+The same-stratum case of a **reference edge**: a reference from one scope to
+another on the same stratum. Named separately because it is the common case
+and the one the fleet's own structure suggests; it carries exactly what any
+other reference edge carries.
 
 ## Agent
 
@@ -246,7 +272,7 @@ assembles:
 
 - The agent's own **scope summary**,
 - The summaries of every inter-stratum ancestor up to the root,
-- The **publications** of any peer scopes referenced by scopes on that chain.
+- The **publications** of any scopes referenced by scopes on that chain.
 
 Each piece in the perspective is labelled with the scope it came from —
 composition is **provenance-preserving**, not flattened. Directives compose
@@ -257,7 +283,7 @@ context never overrides a directive.
 
 A kind of long-term memory representing a **binding** decision — what the
 fleet (or a sub-region of it) has resolved to do or to treat as true.
-Directives propagate down through inter-stratum edges and bind every
+Directives propagate down through chain edges and bind every
 descendant scope. When two directives conflict, the one from the broader
 (higher) stratum wins; a descendant may refine within an inherited directive
 but may not contradict it.
@@ -265,10 +291,10 @@ but may not contradict it.
 ## Context
 
 A kind of long-term memory representing observation, working state, or
-non-binding knowledge. Context propagates along both inter-stratum edges
-(downward) and intra-stratum peer references (across). When two pieces of
-context conflict, the one from the scope closest to the reader wins. Context
-never overrides a directive.
+non-binding knowledge. Context propagates along both chain edges (downward)
+and reference edges (to the referencing scope). When two pieces of context
+conflict, the one from the scope closest to the reader wins. Context never
+overrides a directive.
 
 ## Authority
 

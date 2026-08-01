@@ -38,6 +38,8 @@ edges:
     to: g_pi
   - from: g_researcher_b
     to: g_pi
-  # Peer reference: researchers share context
+  # Peer reference (a reference edge on one stratum): researcher A reads
+  # researcher B's publication — context only, never binding.
   - from: g_researcher_a
     to: g_researcher_b
+    kind: reference

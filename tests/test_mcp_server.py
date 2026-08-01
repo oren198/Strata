@@ -1285,7 +1285,12 @@ def test_entitled_no_argument_returns_bound_scope_data(tmp_path: Path) -> None:
     assert perspective_result["scope_id"] == "g_team"
     assert perspective_result["layers"][-1]["scope_id"] == "g_team"
 
-    assert record_result == {"contributions": [], "judgments": [], "judgment_attempts": []}
+    assert record_result == {
+        "contributions": [],
+        "judgments": [],
+        "judgment_attempts": [],
+        "contribution_states": [],
+    }
 
 
 def test_entitled_ancestor_read_allowed(tmp_path: Path) -> None:
@@ -1371,7 +1376,12 @@ def test_entitled_own_empty_record_returns_empty_shape(tmp_path: Path) -> None:
     ):
         result = mod.strata_read_scope_record("g_team")
 
-    assert result == {"contributions": [], "judgments": [], "judgment_attempts": []}
+    assert result == {
+        "contributions": [],
+        "judgments": [],
+        "judgment_attempts": [],
+        "contribution_states": [],
+    }
 
 
 # ---------------------------------------------------------------------------
