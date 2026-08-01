@@ -14,7 +14,7 @@ dependencies = [
     "pydantic",
     "pydantic-settings",
     "pyyaml",
-    "mcp>=1.28,<2",
+    "mcp >=1.28,<2",
 ]
 
 [project.scripts]
