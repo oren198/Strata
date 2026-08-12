@@ -56,8 +56,30 @@ from pydantic import BaseModel, Field
 
 from strata.fleet_config import EntitlementView, Scope, Stratum
 from strata.operator import OperatorItem
-from strata.record_store import Contribution
+from strata.record_store import Contribution, RecentContribution
 from strata.summary_store import Directive, ScopeSummary, _render_summary
+
+# ---------------------------------------------------------------------------
+# Recency-window constants (ADR 0011 D2)
+# ---------------------------------------------------------------------------
+
+#: How many of the newest window rows keep their full verbatim text — the
+#: "resubmitted moments later" case, where phrasing-level comparison earns its
+#: cost. The engine default behind :attr:`strata.settings.Settings.window_verbatim_tail`.
+WINDOW_VERBATIM_TAIL = 3
+
+#: Length of a digest row's mechanical content excerpt, in characters.
+WINDOW_CONTENT_PREFIX_CHARS = 200
+
+#: Hard ceiling on the whole RECENT CONTRIBUTIONS block, in CHARACTERS — the
+#: row count and this budget bound the window, whichever bites first.
+#: Characters, not tokens: ADR 0004 D5's rationale binds here too, and the
+#: manager loop has no tokenizer round-trip to spend.
+WINDOW_MAX_CHARS = 8000
+
+#: Appended to a content excerpt the prefix cut, so a truncated row is never
+#: mistaken for the whole contribution.
+WINDOW_TRUNCATION_MARKER = "…[truncated]"
 
 
 class _PublishedItemLike(Protocol):
@@ -364,6 +386,26 @@ operator directive op_1a2b3c4d)." The authoritative operator layer
 composes into every perspective verbatim regardless of what any summary
 says; attribution is what keeps an echo detectable, not what makes it
 authoritative.
+
+The RECENT CONTRIBUTIONS block is a MECHANICAL DIGEST of this scope's last
+few contributions, oldest first — built from the record, not written by
+anyone. Each row is `[id] at=<timestamp> subject=<subject> state=<state>
+decision=<decision> reasoning=<the verdict explanation written when that row
+was judged> content=<the contribution's text>`. A `judged` row carries its
+decision and reasoning; a `pending` or `judge_failed` row shows `(none)` in
+those columns — `pending` includes the contribution you are judging right
+now, which is in the record before you see it — that row is always an excerpt,
+since its full text is the NEW CONTRIBUTION block below. Only the newest few
+PRIOR rows carry full content; every older row's `content` is a fixed-length
+excerpt, cut with a truncation marker, and rows beyond the block's character
+budget are dropped oldest-first with a line saying how many. Use this block for RECENCY CHECKS
+only: is this contribution a duplicate of something just recorded, does a
+`supersedes` id it names actually exist here, does it contradict material
+recorded moments ago. It is not the scope's memory — the CURRENT SUMMARY is —
+and a declined row is not evidence for anything except that it was declined.
+An excerpt is a prefix, not a claim about the whole contribution: where a
+truncated row makes a duplicate call genuinely uncertain, judge the
+contribution on its merits rather than declining on a partial match.
 
 When a PARENT SCOPE SUMMARY is provided in the user message:
 - Inherited parent directives reach this scope's summary MECHANICALLY: the
@@ -957,22 +999,93 @@ def _render_contributor(contributor) -> str:  # noqa: ANN001 — ContributorRef,
     return f"scope={contributor.scope_id} at={contributor.ts}"
 
 
-def _render_recent_contributions(contributions: list[Contribution]) -> str:
-    """Render the recent-contributions slice for the user message."""
-    if not contributions:
+def _content_excerpt(content: str) -> str:
+    """Return *content* cut to :data:`WINDOW_CONTENT_PREFIX_CHARS`, marked if cut.
+
+    Mechanical, not summarised: a fixed-length prefix of the bytes the
+    contribution actually carried (ADR 0011 D2). Reasoning alone justifies a
+    verdict without restating the claim, and ``subject`` is optional, so
+    without this excerpt a subject-less declined row would be nearly empty
+    exactly where duplicate detection needs content.
+    """
+    if len(content) <= WINDOW_CONTENT_PREFIX_CHARS:
+        return content
+    return content[:WINDOW_CONTENT_PREFIX_CHARS] + WINDOW_TRUNCATION_MARKER
+
+
+def _render_digest_row(row: RecentContribution, *, verbatim: bool) -> str:
+    """Render one recency-window row (ADR 0011 D2).
+
+    The row is ``(contribution id, subject, timestamp, state, decision,
+    judgment reasoning, content)``. A ``judged`` row carries its decision and
+    the reasoning written when it was judged; a ``pending`` or ``judge_failed``
+    row renders its state with those two columns empty — including the
+    contribution currently under judgment, which the window always contains.
+
+    *verbatim* keeps the full content (the newest few rows); otherwise the
+    content is the mechanical excerpt.
+    """
+    c = row.contribution
+    content = c.content if verbatim else _content_excerpt(c.content)
+    return (
+        f"[{c.id}] at={c.created_at} subject={c.subject or '(none)'} "
+        f"state={row.state} decision={row.decision or '(none)'} "
+        f"reasoning={row.judgment_notes or '(none)'} "
+        f"content={content!r}"
+    )
+
+
+def _render_recent_contributions(
+    rows: Sequence[RecentContribution],
+    *,
+    verbatim_tail: int = WINDOW_VERBATIM_TAIL,
+    max_chars: int = WINDOW_MAX_CHARS,
+    self_contribution_id: str | None = None,
+) -> str:
+    """Render the RECENT CONTRIBUTIONS digest for the user message (ADR 0011 D2).
+
+    *rows* arrive oldest-first (as
+    :meth:`~strata.record_store.RecordStore.list_recent_contributions` returns
+    them) and render oldest-first. The newest *verbatim_tail* rows keep their
+    full text; every older row is a digest row.
+
+    *self_contribution_id* is the contribution being judged, which is in its own
+    window (it is appended to the record before the window is read). It always
+    renders as a digest row, however new it is: its full text is already in the
+    message as the NEW CONTRIBUTION block, and the verbatim tail exists for
+    comparison against PRIOR contributions — spending a slot on the self row
+    would both duplicate it and cost the judge a real one.
+
+    Rows are measured newest-first against *max_chars*, so a window too big for
+    the budget loses its OLDEST rows — the ones recency checks need least — and
+    the block says how many it dropped rather than shrinking silently. The
+    newest row always renders, even alone over budget: a window with no recent
+    row in it is worse than an over-budget one.
+    """
+    if not rows:
         return "(none)"
-    lines: list[str] = []
-    for c in contributions:
-        # Skill is optional (issue #121): render the scope alone when absent,
-        # never "None@scope".
-        if c.contributor.skill:
-            by = f"{c.contributor.skill}@{c.contributor.scope_id}"
-        else:
-            by = c.contributor.scope_id
-        lines.append(
-            f"[{c.id}] {c.proposed_classification} by {by} at {c.contributor.ts}: {c.content!r}"
+
+    rendered: list[str] = []
+    used = 0
+    verbatim_used = 0
+    for row in reversed(rows):
+        is_self = self_contribution_id is not None and row.contribution.id == self_contribution_id
+        verbatim = not is_self and verbatim_used < verbatim_tail
+        line = _render_digest_row(row, verbatim=verbatim)
+        if rendered and used + len(line) + 1 > max_chars:
+            break
+        used += len(line) + 1
+        verbatim_used += verbatim
+        rendered.append(line)
+    rendered.reverse()
+
+    dropped = len(rows) - len(rendered)
+    if dropped:
+        rendered.insert(
+            0,
+            f"({dropped} older contribution(s) omitted — window character budget)",
         )
-    return "\n".join(lines)
+    return "\n".join(rendered)
 
 
 def _render_entitlement_group(scopes: list[Scope]) -> str:
@@ -1084,7 +1197,7 @@ def _build_user_message(
     stratum: Stratum,
     parent_summary: ScopeSummary | None,
     current_summary: ScopeSummary | None,
-    recent_contributions: list[Contribution],
+    recent_contributions: Sequence[RecentContribution],
     new_contribution: Contribution,
     summary_max_words: int = 500,
     entitlement: EntitlementView | None = None,
@@ -1092,6 +1205,7 @@ def _build_user_message(
     current_publication: Sequence[_PublishedItemLike] | None = None,
     peer_publications: Sequence[tuple[str, Sequence[_PublishedItemLike]]] | None = None,
     amendment_context_only: bool = False,
+    window_verbatim_tail: int = WINDOW_VERBATIM_TAIL,
 ) -> str:
     """Compose the (non-cached) per-call user message."""
     if current_summary is not None:
@@ -1099,7 +1213,11 @@ def _build_user_message(
     else:
         rendered_summary = "(this scope has no summary yet)"
 
-    recent_block = _render_recent_contributions(recent_contributions)
+    recent_block = _render_recent_contributions(
+        recent_contributions,
+        verbatim_tail=window_verbatim_tail,
+        self_contribution_id=new_contribution.id,
+    )
     contributor = new_contribution.contributor
 
     operator_block = _render_operator_memory(operator_memory)
@@ -1149,7 +1267,8 @@ def _build_user_message(
         f"{rendered_summary}\n"
         "---\n"
         "\n"
-        "RECENT CONTRIBUTIONS (oldest first, for context):\n"
+        "RECENT CONTRIBUTIONS (oldest first — mechanical digest; the newest "
+        f"{window_verbatim_tail} PRIOR contributions carry full content):\n"
         f"{recent_block}\n"
         "\n"
         "NEW CONTRIBUTION TO JUDGE:\n"
@@ -1203,7 +1322,7 @@ class ScopeManager:
         stratum: Stratum,
         parent_summary: ScopeSummary | None = None,
         current_summary: ScopeSummary | None,
-        recent_contributions: list[Contribution],
+        recent_contributions: Sequence[RecentContribution],
         new_contribution: Contribution,
         summary_max_words: int = 500,
         entitlement: EntitlementView | None = None,
@@ -1211,6 +1330,7 @@ class ScopeManager:
         current_publication: Sequence[_PublishedItemLike] | None = None,
         peer_publications: Sequence[tuple[str, Sequence[_PublishedItemLike]]] | None = None,
         amendment_context_only: bool = False,
+        window_verbatim_tail: int = WINDOW_VERBATIM_TAIL,
     ) -> ScopeManagerJudgment:
         """Judge a new contribution against the scope's current state.
 
@@ -1229,9 +1349,14 @@ class ScopeManager:
                                   — the manager does not traverse the graph.
             current_summary:      The scope's current summary, or ``None``
                                   for a fresh scope with no prior summary.
-            recent_contributions: Ordered slice of recent contributions
-                                  (oldest-first) providing trend/context to
-                                  the model.
+            recent_contributions: The scope's recency window (ADR 0011 D2) —
+                                  oldest-first
+                                  :class:`~strata.record_store.RecentContribution`
+                                  rows from
+                                  :meth:`~strata.record_store.RecordStore.list_recent_contributions`,
+                                  rendered as a mechanical digest for recency
+                                  checks (duplicates, ``supersedes`` targets,
+                                  contradictions with just-recorded material).
             new_contribution:     The contribution to be judged.
             summary_max_words:    Maximum word count for the amended summary
                                   (ADR 0004 D5).  Rendered as a BUDGET line in
@@ -1277,6 +1402,12 @@ class ScopeManager:
                                   block and drops any ``append``/``publish``
                                   op from the amendment, so a refresh can
                                   only amend context and retire or supersede.
+            window_verbatim_tail: How many of the newest window rows keep
+                                  their full verbatim text (ADR 0011 D2);
+                                  everything older renders as a digest row.
+                                  Defaults to :data:`WINDOW_VERBATIM_TAIL`;
+                                  callers holding settings pass
+                                  ``settings.window_verbatim_tail``.
 
         Returns:
             A :class:`ScopeManagerJudgment` with the verdict, reasoning, the
@@ -1332,6 +1463,7 @@ class ScopeManager:
             peer_publications=peer_publications,
             operator_memory=operator_memory,
             amendment_context_only=amendment_context_only,
+            window_verbatim_tail=window_verbatim_tail,
         )
 
         # Build the system prompt with cache_control on the last text block

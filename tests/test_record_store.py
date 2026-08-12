@@ -409,3 +409,116 @@ def test_a_successful_rejudge_outranks_an_earlier_marker(tmp_path: Path) -> None
     assert state.decision == "accept_as_directive"
     # The failed attempt is still on the record — the marker is not erased.
     assert state.failed_attempts == 1
+
+
+# ---------------------------------------------------------------------------
+# Scenario 11 — the recency window read (ADR 0011 D2)
+# ---------------------------------------------------------------------------
+
+
+def test_recent_contributions_pair_each_state_with_its_own_notes(tmp_path: Path) -> None:
+    """The window's whole reason to exist: state and judgment notes, together.
+
+    A judged row carries its decision and the notes written when it was judged;
+    a judge_failed row and a pending row carry neither — and the pending row is
+    the contribution currently under judgment, appended to the record before the
+    window is read.
+    """
+    with _open_store(str(tmp_path / "strata.db")) as rs:
+        judged = _contribute(rs, "accepted a while ago")
+        errored = _contribute(rs, "the judge blew up")
+        under_judgment = _contribute(rs, "the contribution being judged right now")
+
+        rs.record_judgment(
+            contribution_id=judged,
+            decision="accept_as_context",
+            judged_by="scope-manager",
+            notes="Accepted: adds a fact the context section lacked.",
+        )
+        rs.record_judgment_attempt(
+            contribution_id=errored,
+            error_class="ValueError",
+            message="unparseable payload",
+            outcome=JUDGE_FAILED,
+        )
+
+        rows = {
+            r.contribution.id: r
+            for r in rs.list_recent_contributions(scope_id="g_ceo", limit=20)
+        }
+
+    assert rows[judged].state == "judged"
+    assert rows[judged].decision == "accept_as_context"
+    assert rows[judged].judgment_notes == "Accepted: adds a fact the context section lacked."
+
+    assert rows[errored].state == "judge_failed"
+    assert rows[errored].decision is None
+    assert rows[errored].judgment_notes is None
+
+    assert rows[under_judgment].state == "pending"
+    assert rows[under_judgment].decision is None
+    assert rows[under_judgment].judgment_notes is None
+    # The contribution's own bytes travel with the row — the digest's content
+    # excerpt is cut from these, not from anything the judge wrote.
+    assert rows[under_judgment].contribution.content == "the contribution being judged right now"
+
+
+def test_recent_contributions_window_takes_the_newest_and_returns_oldest_first(
+    tmp_path: Path,
+) -> None:
+    """Newest-first retrieval, oldest-first result — the order the digest renders in.
+
+    Ascending order plus a limit would pin the manager to a permanently stale
+    slice; that is why :meth:`list_contributions` retrieves descending too.
+    """
+    with _open_store(str(tmp_path / "strata.db")) as rs:
+        for i in range(8):
+            _contribute(rs, f"contribution {i}")
+
+        window = rs.list_recent_contributions(scope_id="g_ceo", limit=3)
+
+    assert [r.contribution.content for r in window] == [
+        "contribution 5",
+        "contribution 6",
+        "contribution 7",
+    ]
+
+
+def test_recent_contributions_are_scoped(tmp_path: Path) -> None:
+    """One scope's window never contains another scope's record."""
+    with _open_store(str(tmp_path / "strata.db")) as rs:
+        mine = _contribute(rs, "mine")
+        rs.append_contribution(
+            scope_id="g_other",
+            content="not mine",
+            proposed_classification="context",
+            subject=None,
+            supersedes=None,
+            contributor=_CONTRIBUTOR,
+        )
+
+        window = rs.list_recent_contributions(scope_id="g_ceo", limit=20)
+
+    assert [r.contribution.id for r in window] == [mine]
+
+
+def test_recent_contributions_agree_with_contribution_states(tmp_path: Path) -> None:
+    """The windowed read and the #118 read surface never disagree about a state."""
+    with _open_store(str(tmp_path / "strata.db")) as rs:
+        judged = _contribute(rs, "judged")
+        orphan = _contribute(rs, "attempted, unmarked")
+        rs.record_judgment(
+            contribution_id=judged, decision="decline", judged_by="scope-manager", notes="no"
+        )
+        # Unmarked attempts predate the marker (#118) and are never claimed
+        # terminal — the window must reach the same verdict as the read surface.
+        rs.record_judgment_attempt(contribution_id=orphan, error_class="APIError")
+
+        states = {s.contribution_id: s.state for s in rs.list_contribution_states(scope_id="g_ceo")}
+        window = {
+            r.contribution.id: r.state
+            for r in rs.list_recent_contributions(scope_id="g_ceo", limit=20)
+        }
+
+    assert window == states
+    assert window[orphan] == "pending"

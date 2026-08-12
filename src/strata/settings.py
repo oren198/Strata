@@ -52,6 +52,11 @@ class Settings(BaseSettings):
     )
     manager_model: str = Field(default="claude-haiku-4-5")
     summary_max_words: int = Field(default=500, ge=1)
+    # ADR 0011 D2: how many of the newest contributions in the scope-manager's
+    # recency window keep their full verbatim text. Everything older renders as
+    # a mechanical digest row. Raise it when phrasing-level duplicate detection
+    # needs more than the digest carries.
+    window_verbatim_tail: int = Field(default=3, ge=0)
     anthropic_api_key: str | None = Field(default=None)
 
     @model_validator(mode="after")

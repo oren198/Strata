@@ -74,7 +74,7 @@ from strata.record_store import (
     ContributorRef,
     RecordStore,
 )
-from strata.scope_manager import ScopeManager, ScopeManagerJudgment
+from strata.scope_manager import WINDOW_VERBATIM_TAIL, ScopeManager, ScopeManagerJudgment
 from strata.settings import Settings, get_settings
 from strata.summary_store import ScopeSummary, SummaryStore
 
@@ -239,6 +239,7 @@ def _judge_and_record(
     summary_store: SummaryStore,
     scope_manager: ScopeManager,
     summary_max_words: int,
+    window_verbatim_tail: int = WINDOW_VERBATIM_TAIL,
 ) -> ContributionOutcome:
     """Judge *contribution* against the scope's current state and persist the result.
 
@@ -248,7 +249,11 @@ def _judge_and_record(
     event and raises :class:`JudgeUnavailable`; no judgment row is written.
     """
     current_summary = summary_store.read(scope.id)
-    recent_contributions = record_store.list_contributions(scope_id=scope.id, limit=20)
+    # ADR 0011 D2: the recency window is a mechanical digest built from the
+    # record — (contribution, state, judgment notes) triples, not verbatim
+    # text. The contribution under judgment was appended before this read, so
+    # it is in its own window as a `pending` row.
+    recent_contributions = record_store.list_recent_contributions(scope_id=scope.id, limit=20)
 
     # Resolve the inter-stratum parent's summary for manager context (ADR 0004
     # Decision 2). The caller does the graph traversal; the manager is a pure
@@ -287,6 +292,7 @@ def _judge_and_record(
             operator_memory=operator_memory,
             current_publication=current_publication,
             peer_publications=peer_publications,
+            window_verbatim_tail=window_verbatim_tail,
         )
     except Exception as exc:
         # Record the failure as an event against the contribution — never as a
@@ -398,6 +404,7 @@ def run_contribution(
     summary_store: SummaryStore,
     scope_manager: ScopeManager,
     summary_max_words: int,
+    window_verbatim_tail: int = WINDOW_VERBATIM_TAIL,
 ) -> ContributionOutcome:
     """Append a contribution and judge it under the scope's serialization lock.
 
@@ -436,6 +443,7 @@ def run_contribution(
             summary_store=summary_store,
             scope_manager=scope_manager,
             summary_max_words=summary_max_words,
+            window_verbatim_tail=window_verbatim_tail,
         )
 
 
@@ -447,6 +455,7 @@ def rejudge_contribution(
     summary_store: SummaryStore,
     scope_manager: ScopeManager,
     summary_max_words: int,
+    window_verbatim_tail: int = WINDOW_VERBATIM_TAIL,
 ) -> ContributionOutcome:
     """Idempotently (re-)judge a contribution that has no verdict yet (issue #57).
 
@@ -500,6 +509,7 @@ def rejudge_contribution(
             summary_store=summary_store,
             scope_manager=scope_manager,
             summary_max_words=summary_max_words,
+            window_verbatim_tail=window_verbatim_tail,
         )
 
 
@@ -646,6 +656,7 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
                 summary_store=summary_store,
                 scope_manager=scope_manager,
                 summary_max_words=request_settings.summary_max_words,
+                window_verbatim_tail=request_settings.window_verbatim_tail,
             )
         except sqlite3.IntegrityError as exc:
             # The only FK on contributions is supersedes → contributions(id):

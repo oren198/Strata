@@ -703,6 +703,7 @@ def strata_contribute(
             summary_store=_summary_store,
             scope_manager=manager,
             summary_max_words=_settings.summary_max_words,
+            window_verbatim_tail=_settings.window_verbatim_tail,
         )
     except JudgeUnavailable as exc:
         # The contribution and a judgment-attempt-failed event are already in
@@ -799,6 +800,7 @@ def strata_rejudge(contribution_id: str) -> dict:
             summary_store=_summary_store,
             scope_manager=manager,
             summary_max_words=_settings.summary_max_words,
+            window_verbatim_tail=_settings.window_verbatim_tail,
         )
     except JudgeUnavailable as exc:
         raise RuntimeError(

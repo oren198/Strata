@@ -1092,6 +1092,7 @@ def _refresh_scope(
     summary_store: SummaryStore,
     manager: ScopeManager,
     summary_max_words: int,
+    window_verbatim_tail: int | None = None,
     _visited: set[str] | None = None,
 ) -> None:
     """Refresh the summary for *scope_id*: mechanical splice, then one LLM call.
@@ -1113,7 +1114,15 @@ def _refresh_scope(
     from datetime import UTC, datetime
 
     from strata.record_store import ContributorRef
+    from strata.scope_manager import WINDOW_VERBATIM_TAIL
     from strata.summary_store import ScopeSummary, splice_parent_directives
+
+    # The engine default when the caller has no settings in hand (ADR 0011 D2).
+    # Resolved here rather than in the signature: scope_manager owns the
+    # constant, and importing it eagerly would pull the Anthropic SDK into
+    # every CLI start.
+    if window_verbatim_tail is None:
+        window_verbatim_tail = WINDOW_VERBATIM_TAIL
 
     if _visited is None:
         _visited = set()
@@ -1164,6 +1173,7 @@ def _refresh_scope(
                 summary_store=summary_store,
                 manager=manager,
                 summary_max_words=summary_max_words,
+                window_verbatim_tail=window_verbatim_tail,
                 _visited=_visited,
             )
 
@@ -1174,7 +1184,9 @@ def _refresh_scope(
 
     # Now refresh this scope
     current_summary = summary_store.read(scope_id)
-    recent_contributions = record_store.list_contributions(scope_id=scope_id, limit=20)
+    # ADR 0011 D2: the mechanical recency digest, same windowed read the
+    # contribute path uses.
+    recent_contributions = record_store.list_recent_contributions(scope_id=scope_id, limit=20)
 
     ts = datetime.now(tz=UTC).isoformat()
 
@@ -1222,6 +1234,7 @@ def _refresh_scope(
         recent_contributions=recent_contributions,
         new_contribution=refresh_contribution,
         summary_max_words=summary_max_words,
+        window_verbatim_tail=window_verbatim_tail,
         entitlement=fleet_config.entitlement_view(scope_id),
         operator_memory=operator_memory_binding(
             scope_id, fleet=fleet_config, summaries_dir=summary_store.summaries_dir
@@ -1329,6 +1342,7 @@ def _run_manager_refresh(scope_id: str, *, skip: bool = False) -> None:
                     summary_store=summary_store,
                     manager=manager,
                     summary_max_words=settings.summary_max_words,
+                    window_verbatim_tail=settings.window_verbatim_tail,
                     _visited=visited,
                 )
             else:
@@ -1344,6 +1358,7 @@ def _run_manager_refresh(scope_id: str, *, skip: bool = False) -> None:
                             summary_store=summary_store,
                             manager=manager,
                             summary_max_words=settings.summary_max_words,
+                            window_verbatim_tail=settings.window_verbatim_tail,
                             _visited=visited,
                         )
 
@@ -1363,6 +1378,7 @@ def _run_manager_refresh(scope_id: str, *, skip: bool = False) -> None:
                 summary_store=summary_store,
                 manager=manager,
                 summary_max_words=settings.summary_max_words,
+                window_verbatim_tail=settings.window_verbatim_tail,
                 _visited=visited,
             )
 

@@ -21,7 +21,7 @@ import pytest
 from strata.fleet_config import EntitlementView, Scope, Stratum
 from strata.operator import OperatorItem
 from strata.publication import PublishedItem
-from strata.record_store import Contribution, ContributorRef
+from strata.record_store import Contribution, ContributorRef, RecentContribution
 from strata.scope_manager import (
     _BOOTSTRAP_SYSTEM_PROMPT,
     _PUBLICATION_SYSTEM_PROMPT,
@@ -29,6 +29,10 @@ from strata.scope_manager import (
     BOOTSTRAP_JUDGE_TOOL,
     JUDGE_TOOL,
     PUBLICATION_JUDGE_TOOL,
+    WINDOW_CONTENT_PREFIX_CHARS,
+    WINDOW_MAX_CHARS,
+    WINDOW_TRUNCATION_MARKER,
+    WINDOW_VERBATIM_TAIL,
     BootstrapJudgment,
     PublicationJudgment,
     ScopeManager,
@@ -92,6 +96,15 @@ RECENT_CONTRIBUTION = Contribution(
     created_at="2026-04-15T08:00:00+00:00",
 )
 
+# ADR 0011 D2: the judge's recency window is (contribution, state,
+# judgment-notes) triples, not verbatim contributions.
+RECENT_ROW = RecentContribution(
+    contribution=RECENT_CONTRIBUTION,
+    state="judged",
+    decision="accept_as_context",
+    judgment_notes="Accepted as context: an observation, not a binding rule.",
+)
+
 # ---------------------------------------------------------------------------
 # Helper — build a fake Anthropic response carrying one tool_use block
 # ---------------------------------------------------------------------------
@@ -137,22 +150,297 @@ def test_render_contributor_includes_skill_when_present() -> None:
     assert "scope=g_def456" in rendered
 
 
-def test_render_recent_contributions_skilless_shows_scope_alone() -> None:
-    """The recent-contributions slice renders ``by <scope>`` for a skill-less item."""
-    contribution = Contribution(
-        id="c_ns",
+def test_digest_row_never_renders_a_none_placeholder() -> None:
+    """A subject-less, unjudged row renders sentinels, never a literal ``None`` (issue #121)."""
+    row = _row(_window_contribution("c_ns", "observation", subject=None), state="pending")
+    rendered = _render_recent_contributions([row])
+    assert "None" not in rendered
+    assert "subject=(none)" in rendered
+
+
+# ---------------------------------------------------------------------------
+# ADR 0011 D2 — the mechanical recency digest
+# ---------------------------------------------------------------------------
+
+
+def _window_contribution(cid: str, content: str, *, subject: str | None = "topic") -> Contribution:
+    """A window contribution, distinguishable by id and content."""
+    return Contribution(
+        id=cid,
         scope_id=SCOPE.id,
-        content="observation",
+        content=content,
         proposed_classification="context",
-        subject=None,
+        subject=subject,
         supersedes=None,
-        contributor=_skilless_contributor(),
+        contributor=CONTRIBUTOR,
+        created_at="2026-04-15T08:00:00+00:00",
+    )
+
+
+def _row(
+    contribution: Contribution,
+    *,
+    state: str = "judged",
+    decision: str | None = "accept_as_context",
+    notes: str | None = "Accepted: adds a fact the context lacked.",
+) -> RecentContribution:
+    """One window row; the defaults describe a judged row."""
+    if state != "judged":
+        decision, notes = None, None
+    return RecentContribution(
+        contribution=contribution,
+        state=state,  # type: ignore[arg-type]
+        decision=decision,  # type: ignore[arg-type]
+        judgment_notes=notes,
+    )
+
+
+def test_judged_digest_row_carries_its_decision_and_reasoning() -> None:
+    """A judged row shows the verdict and the notes written when it was judged."""
+    row = _row(_window_contribution("c_j", "a judged contribution"))
+    rendered = _render_recent_contributions([row], verbatim_tail=0)
+
+    assert "[c_j]" in rendered
+    assert "state=judged" in rendered
+    assert "decision=accept_as_context" in rendered
+    assert "reasoning=Accepted: adds a fact the context lacked." in rendered
+    assert "at=2026-04-15T08:00:00+00:00" in rendered
+    assert "subject=topic" in rendered
+
+
+def test_pending_and_judge_failed_rows_render_state_with_empty_reasoning() -> None:
+    """The two unjudged states show their state and nothing in the verdict columns.
+
+    Both are routine in the window — ``pending`` includes the contribution
+    under judgment, appended to the record before the window is read.
+    """
+    rendered = _render_recent_contributions(
+        [
+            _row(_window_contribution("c_p", "still in flight"), state="pending"),
+            _row(_window_contribution("c_f", "the judge blew up"), state="judge_failed"),
+        ],
+        verbatim_tail=0,
+    )
+    pending_line, failed_line = rendered.splitlines()
+
+    assert "state=pending" in pending_line
+    assert "decision=(none)" in pending_line
+    assert "reasoning=(none)" in pending_line
+
+    assert "state=judge_failed" in failed_line
+    assert "decision=(none)" in failed_line
+    assert "reasoning=(none)" in failed_line
+
+
+def test_content_prefix_truncates_at_the_constant_with_a_marker() -> None:
+    """A long contribution renders a fixed-length excerpt, visibly cut."""
+    content = "x" * (WINDOW_CONTENT_PREFIX_CHARS + 500)
+    rendered = _render_recent_contributions(
+        [_row(_window_contribution("c_long", content))], verbatim_tail=0
+    )
+
+    assert WINDOW_TRUNCATION_MARKER in rendered
+    assert "x" * WINDOW_CONTENT_PREFIX_CHARS in rendered
+    # The excerpt is a prefix, not the whole thing: one character past the
+    # constant must not have survived.
+    assert "x" * (WINDOW_CONTENT_PREFIX_CHARS + 1) not in rendered
+
+
+def test_short_content_passes_through_whole_and_unmarked() -> None:
+    """Content within the prefix length is rendered entire, with no marker."""
+    content = "a short observation about naming"
+    rendered = _render_recent_contributions(
+        [_row(_window_contribution("c_short", content))], verbatim_tail=0
+    )
+
+    assert content in rendered
+    assert WINDOW_TRUNCATION_MARKER not in rendered
+
+
+def test_verbatim_tail_keeps_the_newest_rows_whole() -> None:
+    """The newest ``window_verbatim_tail`` rows keep full text; older ones digest."""
+    long_content = ["".join(f"{i}" * (WINDOW_CONTENT_PREFIX_CHARS + 50)) for i in range(5)]
+    rows = [_row(_window_contribution(f"c_{i}", long_content[i])) for i in range(5)]
+
+    rendered = _render_recent_contributions(rows, verbatim_tail=2)
+    lines = rendered.splitlines()
+
+    # Oldest three are excerpts...
+    for line in lines[:3]:
+        assert WINDOW_TRUNCATION_MARKER in line
+    # ...the newest two are verbatim.
+    for line, content in zip(lines[3:], long_content[3:], strict=True):
+        assert WINDOW_TRUNCATION_MARKER not in line
+        assert content in line
+
+
+def test_self_row_never_takes_a_verbatim_slot() -> None:
+    """The contribution under judgment is a digest row, however new it is.
+
+    It is in its own window (appended to the record before the window is read),
+    but its full text is already in the message as the NEW CONTRIBUTION block —
+    a verbatim slot spent on it would duplicate it AND cost the judge a real
+    prior contribution to compare against.
+    """
+    long = "s" * (WINDOW_CONTENT_PREFIX_CHARS + 50)
+    rows = [
+        _row(_window_contribution("c_prior", long)),
+        _row(_window_contribution("c_self", long), state="pending"),
+    ]
+
+    rendered = _render_recent_contributions(
+        rows, verbatim_tail=3, self_contribution_id="c_self"
+    )
+    prior_line, self_line = rendered.splitlines()
+
+    assert "[c_self]" in self_line
+    assert WINDOW_TRUNCATION_MARKER in self_line
+    # ...and the slot it did not take went to the prior row.
+    assert WINDOW_TRUNCATION_MARKER not in prior_line
+
+
+def test_verbatim_slots_go_to_the_newest_prior_rows() -> None:
+    """With the self row present, the tail's slots land on the newest PRIOR rows."""
+    contents = [f"{i}" * (WINDOW_CONTENT_PREFIX_CHARS + 50) for i in range(5)]
+    rows = [_row(_window_contribution(f"c_{i}", contents[i])) for i in range(5)]
+    rows.append(_row(_window_contribution("c_self", "z" * 400), state="pending"))
+
+    rendered = _render_recent_contributions(
+        rows, verbatim_tail=3, self_contribution_id="c_self"
+    )
+    lines = rendered.splitlines()
+
+    # Oldest two priors are excerpts, the newest three priors are verbatim...
+    assert all(WINDOW_TRUNCATION_MARKER in line for line in lines[:2])
+    for line, content in zip(lines[2:5], contents[2:5], strict=True):
+        assert WINDOW_TRUNCATION_MARKER not in line
+        assert content in line
+    # ...and the self row is still an excerpt despite being the newest of all.
+    assert "[c_self]" in lines[5]
+    assert WINDOW_TRUNCATION_MARKER in lines[5]
+
+
+def test_verbatim_tail_default_matches_the_adr() -> None:
+    """The named default is 3 (ADR 0011 D2), and the setting's default agrees."""
+    from strata.settings import Settings
+
+    assert WINDOW_VERBATIM_TAIL == 3
+    assert Settings().window_verbatim_tail == WINDOW_VERBATIM_TAIL
+
+
+def test_character_budget_drops_oldest_rows_and_says_it_did() -> None:
+    """N rows or the character budget, whichever bites first — oldest go first.
+
+    The cut is visible in the block: a window that silently shrank would let
+    the judge treat a truncated window as the whole recent record.
+    """
+    rows = [
+        _row(_window_contribution(f"c_{i:02d}", "y" * (WINDOW_CONTENT_PREFIX_CHARS - 20)))
+        for i in range(60)
+    ]
+
+    rendered = _render_recent_contributions(rows, verbatim_tail=0)
+
+    assert len(rendered) <= WINDOW_MAX_CHARS + 100  # + the omission line
+    assert "omitted — window character budget" in rendered
+    # The newest row survives; the oldest is the one that went.
+    assert "[c_59]" in rendered
+    assert "[c_00]" not in rendered
+
+
+def test_character_budget_always_keeps_the_newest_row() -> None:
+    """A single row larger than the whole budget still renders — an empty window is worse."""
+    rows = [_row(_window_contribution("c_huge", "z" * (WINDOW_MAX_CHARS * 2)))]
+
+    rendered = _render_recent_contributions(rows, verbatim_tail=1)
+
+    assert "[c_huge]" in rendered
+
+
+def test_digest_row_carries_the_id_a_supersedes_reference_needs() -> None:
+    """Duplicate and supersedes checks survive the digest: the id is column one.
+
+    The judge verifies a contribution's ``supersedes`` target against what the
+    window shows; an excerpt-only row would still have to name the row's id.
+    """
+    row = _row(
+        _window_contribution("c_target", "b" * (WINDOW_CONTENT_PREFIX_CHARS + 100)),
+        decision="accept_as_directive",
+    )
+    rendered = _render_recent_contributions([row], verbatim_tail=0)
+
+    assert "[c_target]" in rendered
+    assert WINDOW_TRUNCATION_MARKER in rendered  # content cut, id intact
+
+
+def test_empty_window_renders_the_sentinel() -> None:
+    """A scope with no record yet renders ``(none)``, not an empty block."""
+    assert _render_recent_contributions([]) == "(none)"
+
+
+def test_user_message_digest_block_announces_the_verbatim_tail() -> None:
+    """The rendered block tells the judge how many rows carry full content."""
+    message = _build_user_message(
+        scope=SCOPE,
+        stratum=STRATUM,
+        parent_summary=None,
+        current_summary=None,
+        recent_contributions=[RECENT_ROW],
+        new_contribution=NEW_CONTRIBUTION,
+        window_verbatim_tail=2,
+    )
+
+    assert (
+        "RECENT CONTRIBUTIONS (oldest first — mechanical digest; the newest 2 PRIOR"
+        in message
+    )
+    assert "[c_prev01]" in message
+    assert "state=judged" in message
+
+
+def test_user_message_renders_the_judged_contribution_as_a_digest_row() -> None:
+    """The wiring check: the self row is excerpted in the block, whole below it.
+
+    ``_build_user_message`` must pass the new contribution's id to the renderer
+    — without it the row being judged would silently claim a verbatim slot and
+    the prompt would carry its text twice.
+    """
+    long_content = "q" * (WINDOW_CONTENT_PREFIX_CHARS + 300)
+    judged = Contribution(
+        id="c_under_judgment",
+        scope_id=SCOPE.id,
+        content=long_content,
+        proposed_classification="context",
+        subject="topic",
+        supersedes=None,
+        contributor=CONTRIBUTOR,
         created_at="2026-05-01T10:00:00+00:00",
     )
-    rendered = _render_recent_contributions([contribution])
-    assert "by g_def456" in rendered
-    assert "@" not in rendered
-    assert "None" not in rendered
+    message = _build_user_message(
+        scope=SCOPE,
+        stratum=STRATUM,
+        parent_summary=None,
+        current_summary=None,
+        # The window contains the contribution under judgment, as it always
+        # does: it is appended to the record before the window is read.
+        recent_contributions=[RECENT_ROW, _row(judged, state="pending")],
+        new_contribution=judged,
+    )
+    digest_block, new_contribution_block = message.split("NEW CONTRIBUTION TO JUDGE:")
+
+    assert "[c_under_judgment]" in digest_block
+    assert WINDOW_TRUNCATION_MARKER in digest_block
+    assert long_content not in digest_block
+    # The full text is in the prompt exactly once, where it belongs.
+    assert long_content in new_contribution_block
+
+
+def test_system_prompt_describes_the_digest_and_its_purpose() -> None:
+    """The judge is told what a row is, that the newest are verbatim, and what it is for."""
+    assert "MECHANICAL DIGEST" in _SYSTEM_PROMPT
+    assert "RECENCY CHECKS" in _SYSTEM_PROMPT
+    assert "judge_failed" in _SYSTEM_PROMPT
+    assert "truncation marker" in _SYSTEM_PROMPT
 
 
 def test_build_user_message_skilless_contributor_has_no_none() -> None:
@@ -289,7 +577,7 @@ def test_accept_as_directive_parses_correctly() -> None:
         scope=SCOPE,
         stratum=STRATUM,
         current_summary=CURRENT_SUMMARY,
-        recent_contributions=[RECENT_CONTRIBUTION],
+        recent_contributions=[RECENT_ROW],
         new_contribution=NEW_CONTRIBUTION,
     )
 
@@ -473,7 +761,7 @@ def test_user_message_contains_scope_and_contribution_details() -> None:
         scope=SCOPE,
         stratum=STRATUM,
         current_summary=CURRENT_SUMMARY,
-        recent_contributions=[RECENT_CONTRIBUTION],
+        recent_contributions=[RECENT_ROW],
         new_contribution=NEW_CONTRIBUTION,
     )
 
@@ -991,7 +1279,7 @@ def test_stringified_directive_ops_is_coerced() -> None:
         scope=SCOPE,
         stratum=STRATUM,
         current_summary=CURRENT_SUMMARY,
-        recent_contributions=[RECENT_CONTRIBUTION],
+        recent_contributions=[RECENT_ROW],
         new_contribution=NEW_CONTRIBUTION,
     )
 

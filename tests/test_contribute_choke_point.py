@@ -102,6 +102,7 @@ class _AccumulatingManager:
         operator_memory=None,
         current_publication=None,
         peer_publications=None,
+        window_verbatim_tail=None,
     ):  # noqa: ANN001, ANN201, E501
         existing = list(current_summary.directives) if current_summary is not None else []
         time.sleep(self.delay)
@@ -146,6 +147,7 @@ class _SkillEchoManager:
         operator_memory=None,
         current_publication=None,
         peer_publications=None,
+        window_verbatim_tail=None,
     ):  # noqa: ANN001, ANN201, E501
         directive = Directive(
             id=new_contribution.id,
@@ -503,6 +505,7 @@ class _CapturingManager:
         operator_memory=None,
         current_publication=None,
         peer_publications=None,
+        window_verbatim_tail=None,
     ):  # noqa: ANN001, ANN201, E501
         self.received_operator_memory = operator_memory
         return ScopeManagerJudgment(
@@ -1236,3 +1239,76 @@ def test_dropped_op_is_noted_in_the_judgment_record(tmp_path: Path) -> None:
         assert "retire(c_ghost)" in judgment.notes
         # The caller's own outcome carries the verdict unchanged.
         assert outcome.reasoning == "recording the observation"
+
+
+# ---------------------------------------------------------------------------
+# ADR 0011 D2 — the recency window the choke point hands the judge
+# ---------------------------------------------------------------------------
+
+
+class _WindowCapturingManager:
+    """A scope-manager fake that records the recency window it was handed."""
+
+    def __init__(self) -> None:
+        self.windows: list[list] = []
+
+    def judge(self, *, scope, new_contribution, recent_contributions, **_kwargs):  # noqa: ANN001, ANN201
+        self.windows.append(list(recent_contributions))
+        return ScopeManagerJudgment(
+            decision="accept_as_context",
+            reasoning="recorded",
+            new_summary=ScopeSummary(
+                scope_id=scope.id,
+                directives=[],
+                context=new_contribution.content,
+                updated_at="2026-08-12T00:00:00+00:00",
+            ),
+            new_context=new_contribution.content,
+        )
+
+
+def test_window_carries_state_and_notes_with_the_judged_row(tmp_path: Path) -> None:
+    """The judge's window is (contribution, state, judgment-notes) triples (ADR 0011 D2).
+
+    The contribution under judgment is appended to the record BEFORE the window
+    is read, so it is always in its own window — as a `pending` row, since its
+    verdict does not exist yet. The one before it is `judged` and carries the
+    notes recorded for it.
+    """
+    db_path, fleet, summary_store = _setup(tmp_path)
+    scope = fleet.get_scope("g_root")
+    stratum = fleet.strata[0]
+    manager = _WindowCapturingManager()
+
+    with RecordStore(db_path) as rs:
+        for content in ("first observation", "second observation"):
+            run_contribution(
+                scope=scope,
+                stratum=stratum,
+                content=content,
+                proposed_classification="context",
+                subject=None,
+                supersedes=None,
+                contributor=_contributor(),
+                fleet=fleet,
+                record_store=rs,
+                summary_store=summary_store,
+                scope_manager=manager,
+                summary_max_words=500,
+            )
+
+    first_window, second_window = manager.windows
+
+    # A scope's very first contribution sees itself, pending, and nothing else.
+    assert [r.state for r in first_window] == ["pending"]
+    assert first_window[0].contribution.content == "first observation"
+    assert first_window[0].judgment_notes is None
+
+    # The second call's window is oldest-first: the now-judged first
+    # contribution with its notes, then itself, still pending.
+    assert [r.state for r in second_window] == ["judged", "pending"]
+    assert second_window[0].contribution.content == "first observation"
+    assert second_window[0].decision == "accept_as_context"
+    assert second_window[0].judgment_notes == "recorded"
+    assert second_window[1].contribution.content == "second observation"
+    assert second_window[1].decision is None
