@@ -23,10 +23,14 @@ from strata.operator import OperatorItem
 from strata.publication import PublishedItem
 from strata.record_store import Contribution, ContributorRef, RecentContribution
 from strata.scope_manager import (
+    _BATCH_SYSTEM_PROMPT,
     _BOOTSTRAP_SYSTEM_PROMPT,
     _PUBLICATION_SYSTEM_PROMPT,
     _SYSTEM_PROMPT,
     BOOTSTRAP_JUDGE_TOOL,
+    JUDGE_BATCH_MAX_TOKENS_PER_EXTRA,
+    JUDGE_BATCH_TOOL,
+    JUDGE_MAX_TOKENS,
     JUDGE_TOOL,
     PUBLICATION_JUDGE_TOOL,
     WINDOW_CONTENT_PREFIX_CHARS,
@@ -37,6 +41,8 @@ from strata.scope_manager import (
     PublicationJudgment,
     ScopeManager,
     ScopeManagerJudgment,
+    _batch_max_tokens,
+    _build_batch_user_message,
     _build_user_message,
     _render_contributor,
     _render_recent_contributions,
@@ -289,7 +295,7 @@ def test_self_row_never_takes_a_verbatim_slot() -> None:
     ]
 
     rendered = _render_recent_contributions(
-        rows, verbatim_tail=3, self_contribution_id="c_self"
+        rows, verbatim_tail=3, self_contribution_ids=["c_self"]
     )
     prior_line, self_line = rendered.splitlines()
 
@@ -306,7 +312,7 @@ def test_verbatim_slots_go_to_the_newest_prior_rows() -> None:
     rows.append(_row(_window_contribution("c_self", "z" * 400), state="pending"))
 
     rendered = _render_recent_contributions(
-        rows, verbatim_tail=3, self_contribution_id="c_self"
+        rows, verbatim_tail=3, self_contribution_ids=["c_self"]
     )
     lines = rendered.splitlines()
 
@@ -2766,3 +2772,659 @@ def test_system_prompt_budget_rule_names_the_two_levers() -> None:
 def test_system_prompt_withdraw_rule_is_phrased_against_the_amendment() -> None:
     flat = " ".join(_SYSTEM_PROMPT.split())
     assert "THE AMENDMENT YOU ARE SUBMITTING DROPS or CONTRADICTS" in flat
+
+
+# ---------------------------------------------------------------------------
+# ADR 0011 D3 — batch judgment: one call, per-contribution verdicts
+# ---------------------------------------------------------------------------
+
+
+SECOND_CONTRIBUTION = Contribution(
+    id="c_002def",
+    scope_id=SCOPE.id,
+    content="Integration tests run on every pull request.",
+    proposed_classification="directive",
+    subject="ci",
+    supersedes=None,
+    contributor=CONTRIBUTOR,
+    created_at="2026-05-01T10:00:05+00:00",
+)
+
+THIRD_CONTRIBUTION = Contribution(
+    id="c_003ghi",
+    scope_id=SCOPE.id,
+    content="Someone else's internal notes, offered here.",
+    proposed_classification="context",
+    subject=None,
+    supersedes=None,
+    contributor=CONTRIBUTOR,
+    created_at="2026-05-01T10:00:09+00:00",
+)
+
+BATCH = [NEW_CONTRIBUTION, SECOND_CONTRIBUTION, THIRD_CONTRIBUTION]
+
+
+def _batch_input(
+    *,
+    verdicts: list[dict] | None = None,
+    directive_ops: list[dict] | None = None,
+    new_context: str | None = "Context after the whole batch.",
+) -> dict:
+    """A ``submit_batch_judgment`` payload accepting the first two, declining the third."""
+    if verdicts is None:
+        verdicts = [
+            {
+                "contribution_id": NEW_CONTRIBUTION.id,
+                "decision": "accept_as_directive",
+                "reasoning": "an enforceable standard",
+            },
+            {
+                "contribution_id": SECOND_CONTRIBUTION.id,
+                "decision": "accept_as_directive",
+                "reasoning": "also enforceable",
+            },
+            {
+                "contribution_id": THIRD_CONTRIBUTION.id,
+                "decision": "decline",
+                "reasoning": "material originating outside this scope's entitlement",
+            },
+        ]
+    if directive_ops is None:
+        directive_ops = [
+            {"op": "append", "contribution_id": NEW_CONTRIBUTION.id},
+            {"op": "append", "contribution_id": SECOND_CONTRIBUTION.id},
+        ]
+    return {
+        "verdicts": verdicts,
+        "directive_ops": directive_ops,
+        "new_context": new_context,
+    }
+
+
+def _judge_batch(mock_client: MagicMock, contributions=BATCH, **kwargs):  # noqa: ANN001, ANN003
+    manager = ScopeManager(client=mock_client)
+    return manager.judge_batch(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contributions=contributions,
+        **kwargs,
+    )
+
+
+# -- tool schema ------------------------------------------------------------
+
+
+def test_batch_tool_carries_per_contribution_verdicts_and_one_amendment() -> None:
+    schema = JUDGE_BATCH_TOOL["input_schema"]
+    assert JUDGE_BATCH_TOOL["name"] == "submit_batch_judgment"
+    assert schema["required"] == ["verdicts", "directive_ops", "new_context"]
+    verdict = schema["properties"]["verdicts"]["items"]
+    assert verdict["required"] == ["contribution_id", "decision", "reasoning"]
+    assert verdict["properties"]["decision"]["enum"] == [
+        "accept_as_directive",
+        "accept_as_context",
+        "decline",
+    ]
+    # ONE amendment for the batch — never a summary, never one amendment each.
+    assert "new_summary" not in schema["properties"]
+    assert schema["properties"]["new_context"]["type"] == ["string", "null"]
+    assert "decision" not in schema["properties"]
+    assert "reasoning" not in schema["properties"]
+
+
+def test_batch_tool_ops_carry_contribution_id_and_match_the_single_tool_otherwise() -> None:
+    """The ops schema is derived from JUDGE_TOOL, so the two cannot drift."""
+    batch_op = JUDGE_BATCH_TOOL["input_schema"]["properties"]["directive_ops"]["items"]
+    single_op = JUDGE_TOOL["input_schema"]["properties"]["directive_ops"]["items"]
+    # Required on EVERY op: an op that names no batch member would have its
+    # record consequences attributed by guesswork.
+    assert batch_op["properties"]["contribution_id"]["type"] == "string"
+    assert set(batch_op["properties"]) - set(single_op["properties"]) == {"contribution_id"}
+    for field, spec in single_op["properties"].items():
+        assert batch_op["properties"][field] == spec
+    assert batch_op["required"] == [*single_op["required"], "contribution_id"]
+    assert single_op["required"] == ["op"]
+
+
+def test_batch_system_prompt_extends_the_judging_prompt_with_the_batch_rules() -> None:
+    assert _BATCH_SYSTEM_PROMPT.startswith(_SYSTEM_PROMPT)
+    flat = " ".join(_BATCH_SYSTEM_PROMPT.split())
+    assert "Process them SEQUENTIALLY, in the order listed" in flat
+    assert "one declined contribution never costs the rest their verdicts" in flat
+    assert (
+        "EVERY op — `append`, `publish`, `supersede`, `retire` — MUST carry the "
+        "`contribution_id` of the batch member that motivated it" in flat
+    )
+    assert "a guessed attribution would be a permanent lie about provenance" in flat
+    assert "call the `submit_batch_judgment` tool exactly once" in flat
+
+
+# -- the batch user message -------------------------------------------------
+
+
+def test_batch_user_message_lists_the_contributions_in_arrival_order() -> None:
+    message = _build_batch_user_message(
+        scope=SCOPE,
+        stratum=STRATUM,
+        parent_summary=None,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contributions=BATCH,
+    )
+    assert "NEW CONTRIBUTIONS TO JUDGE (3, in arrival order" in message
+    positions = [message.index(f"CONTRIBUTION {i} OF 3:") for i in (1, 2, 3)]
+    assert positions == sorted(positions)
+    for contribution in BATCH:
+        assert f"- id: {contribution.id}" in message
+        assert contribution.content in message
+    assert message.rstrip().endswith("Call `submit_batch_judgment` exactly once.")
+
+
+def test_batch_members_never_take_a_verbatim_window_slot() -> None:
+    """Every contribution under judgment renders as a digest row (ADR 0011 D2/D3)."""
+    rows = [
+        RecentContribution(contribution=c, state="pending", decision=None, judgment_notes=None)
+        for c in BATCH
+    ]
+    message = _build_batch_user_message(
+        scope=SCOPE,
+        stratum=STRATUM,
+        parent_summary=None,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=rows,
+        new_contributions=BATCH,
+        window_verbatim_tail=3,
+    )
+    window = message.split("RECENT CONTRIBUTIONS")[1].split("NEW CONTRIBUTIONS")[0]
+    # The digest rows quote a fixed-length excerpt; the full text appears only
+    # in the contributions block below.
+    for contribution in BATCH:
+        assert f"[{contribution.id}]" in window
+    assert window.count(NEW_CONTRIBUTION.content) == 0 or len(
+        NEW_CONTRIBUTION.content
+    ) <= WINDOW_CONTENT_PREFIX_CHARS
+
+
+# -- one call, per-contribution verdicts ------------------------------------
+
+
+def test_batch_returns_one_verdict_per_contribution_and_one_amendment() -> None:
+    mock_client = MagicMock()
+    mock_client.messages.create.return_value = _fake_response(_batch_input())
+
+    judgment = _judge_batch(mock_client)
+
+    assert mock_client.messages.create.call_count == 1
+    assert [(v.contribution_id, v.decision) for v in judgment.verdicts] == [
+        (NEW_CONTRIBUTION.id, "accept_as_directive"),
+        (SECOND_CONTRIBUTION.id, "accept_as_directive"),
+        (THIRD_CONTRIBUTION.id, "decline"),
+    ]
+    # ONE amended summary: the pre-existing directive untouched, both accepted
+    # contributions admitted from their own bytes, the declined one absent.
+    assert judgment.new_summary is not None
+    assert [d.id for d in judgment.new_summary.directives] == [
+        EXISTING_DIRECTIVE.id,
+        NEW_CONTRIBUTION.id,
+        SECOND_CONTRIBUTION.id,
+    ]
+    assert judgment.new_summary.directives[0] == EXISTING_DIRECTIVE
+    assert judgment.new_summary.directives[1].content == NEW_CONTRIBUTION.content
+    assert judgment.new_summary.directives[2].content == SECOND_CONTRIBUTION.content
+    assert judgment.new_summary.context == "Context after the whole batch."
+
+
+def test_batch_uses_the_batch_tool_and_scales_max_tokens_with_the_batch() -> None:
+    mock_client = MagicMock()
+    mock_client.messages.create.return_value = _fake_response(_batch_input())
+
+    _judge_batch(mock_client)
+
+    kwargs = mock_client.messages.create.call_args.kwargs
+    assert kwargs["tool_choice"]["name"] == "submit_batch_judgment"
+    assert kwargs["tools"][0]["name"] == "submit_batch_judgment"
+    assert kwargs["system"][0]["text"] == _BATCH_SYSTEM_PROMPT
+    # Base budget for the first contribution, an increment for each extra.
+    assert kwargs["max_tokens"] == _batch_max_tokens(3)
+    assert _batch_max_tokens(1) == JUDGE_MAX_TOKENS
+    assert _batch_max_tokens(5) == JUDGE_MAX_TOKENS + 4 * JUDGE_BATCH_MAX_TOKENS_PER_EXTRA
+
+
+def test_declined_member_does_not_poison_the_batch() -> None:
+    """Each verdict stands on its own; the decline admits nothing and blocks nothing."""
+    mock_client = MagicMock()
+    mock_client.messages.create.return_value = _fake_response(_batch_input())
+
+    judgment = _judge_batch(mock_client)
+
+    declined = judgment.verdicts[-1]
+    assert declined.decision == "decline"
+    assert declined.reasoning == "material originating outside this scope's entitlement"
+    assert [v.contribution_id for v in judgment.accepted_verdicts] == [
+        NEW_CONTRIBUTION.id,
+        SECOND_CONTRIBUTION.id,
+    ]
+    assert THIRD_CONTRIBUTION.id not in [d.id for d in judgment.new_summary.directives]
+    # Each accepted member's own reasoning is readable by id; the declined one
+    # owns nothing in the amendment.
+    assert judgment.verdict_reasoning(NEW_CONTRIBUTION.id) == "an enforceable standard"
+    assert judgment.verdict_reasoning(SECOND_CONTRIBUTION.id) == "also enforceable"
+    assert judgment.batch_reasoning == (
+        f"[{NEW_CONTRIBUTION.id}] an enforceable standard; "
+        f"[{SECOND_CONTRIBUTION.id}] also enforceable"
+    )
+
+
+def test_batch_of_one_is_exactly_the_single_call() -> None:
+    """A batch of one takes the single path — same tool, same prompt, same budget."""
+    mock_client = MagicMock()
+    mock_client.messages.create.return_value = _fake_response(_accept_directive_input())
+
+    judgment = _judge_batch(mock_client, contributions=[NEW_CONTRIBUTION])
+
+    kwargs = mock_client.messages.create.call_args.kwargs
+    assert kwargs["tool_choice"]["name"] == "submit_judgment"
+    assert kwargs["tools"][0]["name"] == "submit_judgment"
+    assert kwargs["system"][0]["text"] == _SYSTEM_PROMPT
+    assert kwargs["max_tokens"] == JUDGE_MAX_TOKENS
+    assert "NEW CONTRIBUTION TO JUDGE" in kwargs["messages"][0]["content"]
+    assert "submit_batch_judgment" not in kwargs["messages"][0]["content"]
+
+    # ...wrapped in the batch shape, so one caller can drive both modes.
+    assert [(v.contribution_id, v.decision) for v in judgment.verdicts] == [
+        (NEW_CONTRIBUTION.id, "accept_as_directive")
+    ]
+    assert judgment.record_notes_for(NEW_CONTRIBUTION.id) == judgment.verdicts[0].reasoning
+    assert [d.id for d in judgment.new_summary.directives] == [
+        EXISTING_DIRECTIVE.id,
+        NEW_CONTRIBUTION.id,
+    ]
+
+
+def test_empty_batch_is_rejected() -> None:
+    mock_client = MagicMock()
+    with pytest.raises(ValueError, match="at least one contribution"):
+        _judge_batch(mock_client, contributions=[])
+
+
+# -- publish attribution ----------------------------------------------------
+
+
+def test_publish_op_admits_the_contribution_its_contribution_id_names() -> None:
+    """The binding applies to the named contribution, not to the batch's first."""
+    mock_client = MagicMock()
+    mock_client.messages.create.return_value = _fake_response(
+        _batch_input(
+            verdicts=[
+                {
+                    "contribution_id": NEW_CONTRIBUTION.id,
+                    "decision": "accept_as_context",
+                    "reasoning": "informative only",
+                },
+                {
+                    "contribution_id": SECOND_CONTRIBUTION.id,
+                    "decision": "accept_as_directive",
+                    "reasoning": "ratified in this scope's words",
+                },
+                {
+                    "contribution_id": THIRD_CONTRIBUTION.id,
+                    "decision": "decline",
+                    "reasoning": "not entitled",
+                },
+            ],
+            directive_ops=[
+                {
+                    "op": "publish",
+                    "contribution_id": SECOND_CONTRIBUTION.id,
+                    "content": "CI runs the integration suite on every pull request.",
+                    "subject": "ci-policy",
+                }
+            ],
+        )
+    )
+
+    judgment = _judge_batch(mock_client)
+
+    admitted = judgment.new_summary.directives[-1]
+    assert admitted.id == SECOND_CONTRIBUTION.id
+    assert admitted.content == "CI runs the integration suite on every pull request."
+    assert admitted.subject == "ci-policy"
+    assert admitted.created_at == SECOND_CONTRIBUTION.created_at
+
+
+# -- correctives ------------------------------------------------------------
+
+
+def test_missing_verdict_triggers_one_parse_reask() -> None:
+    """Every contribution needs a verdict; a missing one is a parse failure."""
+    incomplete = _batch_input(
+        verdicts=[
+            {
+                "contribution_id": NEW_CONTRIBUTION.id,
+                "decision": "accept_as_directive",
+                "reasoning": "fine",
+            }
+        ],
+        directive_ops=[{"op": "append", "contribution_id": NEW_CONTRIBUTION.id}],
+    )
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [
+        _fake_response(incomplete),
+        _fake_response(_batch_input()),
+    ]
+
+    judgment = _judge_batch(mock_client)
+
+    assert mock_client.messages.create.call_count == 2
+    followup = mock_client.messages.create.call_args_list[1].kwargs["messages"][-1]
+    text = [b for b in followup["content"] if b["type"] == "text"][0]["text"]
+    assert "could not be parsed" in text
+    assert "no verdict for" in text
+    assert SECOND_CONTRIBUTION.id in text
+    assert len(judgment.verdicts) == 3
+
+
+def test_second_parse_failure_propagates_never_a_second_retry() -> None:
+    """The #113 one-retry discipline holds in batch mode too."""
+    broken = _batch_input(verdicts=[])
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [_fake_response(broken), _fake_response(broken)]
+
+    with pytest.raises(ValueError, match="no verdict for"):
+        _judge_batch(mock_client)
+
+    assert mock_client.messages.create.call_count == 2
+
+
+def test_op_admitting_a_declined_contribution_is_a_parse_failure() -> None:
+    """An admitting op that contradicts its own verdict never applies."""
+    contradictory = _batch_input(
+        directive_ops=[{"op": "append", "contribution_id": THIRD_CONTRIBUTION.id}]
+    )
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [
+        _fake_response(contradictory),
+        _fake_response(_batch_input()),
+    ]
+
+    judgment = _judge_batch(mock_client)
+
+    text = [
+        b
+        for b in mock_client.messages.create.call_args_list[1].kwargs["messages"][-1]["content"]
+        if b["type"] == "text"
+    ][0]["text"]
+    assert "append op attributed to contribution" in text
+    assert "which this batch declined" in text
+    assert [d.id for d in judgment.new_summary.directives] == [
+        EXISTING_DIRECTIVE.id,
+        NEW_CONTRIBUTION.id,
+        SECOND_CONTRIBUTION.id,
+    ]
+
+
+def test_missing_contribution_id_gets_one_corrective_then_drop_and_note() -> None:
+    """An op naming no batch member is invalid — one corrective, then dropped."""
+    unattributed = _batch_input(
+        directive_ops=[
+            {"op": "append", "contribution_id": NEW_CONTRIBUTION.id},
+            {"op": "append"},
+        ]
+    )
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [
+        _fake_response(unattributed),
+        _fake_response(unattributed),
+    ]
+
+    judgment = _judge_batch(mock_client)
+
+    assert mock_client.messages.create.call_count == 2
+    text = [
+        b
+        for b in mock_client.messages.create.call_args_list[1].kwargs["messages"][-1]["content"]
+        if b["type"] == "text"
+    ][0]["text"]
+    assert "EVERY op needs a `contribution_id` naming the batch member" in text
+    assert NEW_CONTRIBUTION.id in text
+    # The verdicts survive; only the unattributed op is gone.
+    assert [v.decision for v in judgment.verdicts] == [
+        "accept_as_directive",
+        "accept_as_directive",
+        "decline",
+    ]
+    assert judgment.dropped_ops == ["append"]
+    assert [d.id for d in judgment.new_summary.directives] == [
+        EXISTING_DIRECTIVE.id,
+        NEW_CONTRIBUTION.id,
+    ]
+
+
+def test_lifecycle_op_without_a_contribution_id_is_dropped_too() -> None:
+    """The requirement covers retire and supersede, not just the admitting ops."""
+    unattributed_retire = _batch_input(
+        directive_ops=[
+            {"op": "append", "contribution_id": NEW_CONTRIBUTION.id},
+            {"op": "retire", "id": EXISTING_DIRECTIVE.id},
+        ]
+    )
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [
+        _fake_response(unattributed_retire),
+        _fake_response(unattributed_retire),
+    ]
+
+    judgment = _judge_batch(mock_client)
+
+    assert mock_client.messages.create.call_count == 2
+    # The retire never applied, so the directive stays and NO Retirement is owed.
+    assert judgment.retired_directive_ids == []
+    assert judgment.dropped_ops == [f"retire({EXISTING_DIRECTIVE.id})"]
+    assert EXISTING_DIRECTIVE.id in [d.id for d in judgment.new_summary.directives]
+    # The drop is noted on every accepted member — no member is falsely named
+    # as the owner of an op that named none.
+    for contribution_id in (NEW_CONTRIBUTION.id, SECOND_CONTRIBUTION.id):
+        assert f"retire({EXISTING_DIRECTIVE.id})" in judgment.record_notes_for(contribution_id)
+
+
+def test_lifecycle_op_attributed_to_a_declined_member_is_a_parse_failure() -> None:
+    """No op belongs to a contribution the batch declined — retire included."""
+    contradictory = _batch_input(
+        directive_ops=[
+            {"op": "append", "contribution_id": NEW_CONTRIBUTION.id},
+            {
+                "op": "retire",
+                "id": EXISTING_DIRECTIVE.id,
+                "contribution_id": THIRD_CONTRIBUTION.id,
+            },
+        ]
+    )
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [
+        _fake_response(contradictory),
+        _fake_response(_batch_input()),
+    ]
+
+    judgment = _judge_batch(mock_client)
+
+    text = [
+        b
+        for b in mock_client.messages.create.call_args_list[1].kwargs["messages"][-1]["content"]
+        if b["type"] == "text"
+    ][0]["text"]
+    assert "retire op attributed to contribution" in text
+    assert "which this batch declined" in text
+    assert judgment.dropped_ops == []
+
+
+def test_unknown_contribution_id_gets_one_corrective_then_drop_and_note() -> None:
+    """J5 in batch shape: a bad id costs its op, never anyone's verdict."""
+    ghost = _batch_input(
+        directive_ops=[
+            {"op": "append", "contribution_id": NEW_CONTRIBUTION.id},
+            {"op": "append", "contribution_id": "c_not_in_this_batch"},
+        ]
+    )
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [_fake_response(ghost), _fake_response(ghost)]
+
+    judgment = _judge_batch(mock_client)
+
+    # Exactly one corrective, listing both id spaces.
+    assert mock_client.messages.create.call_count == 2
+    text = [
+        b
+        for b in mock_client.messages.create.call_args_list[1].kwargs["messages"][-1]["content"]
+        if b["type"] == "text"
+    ][0]["text"]
+    assert "c_not_in_this_batch" in text
+    assert "EVERY op needs a `contribution_id` naming the batch member" in text
+    assert EXISTING_DIRECTIVE.id in text
+
+    # Every verdict survives; only the bad op is gone.
+    assert [v.decision for v in judgment.verdicts] == [
+        "accept_as_directive",
+        "accept_as_directive",
+        "decline",
+    ]
+    assert judgment.dropped_ops == ["append(contribution=c_not_in_this_batch)"]
+    assert [d.id for d in judgment.new_summary.directives] == [
+        EXISTING_DIRECTIVE.id,
+        NEW_CONTRIBUTION.id,
+    ]
+    # The op named no member of this batch, so its note goes to every accepted
+    # member rather than falsely naming one of them as its owner.
+    for contribution_id, reasoning in (
+        (NEW_CONTRIBUTION.id, "an enforceable standard"),
+        (SECOND_CONTRIBUTION.id, "also enforceable"),
+    ):
+        notes = judgment.record_notes_for(contribution_id)
+        assert notes.startswith(reasoning)
+        assert "append(contribution=c_not_in_this_batch)" in notes
+    # The declined member's row carries no amendment note at all.
+    assert judgment.record_notes_for(THIRD_CONTRIBUTION.id) == (
+        "material originating outside this scope's entitlement"
+    )
+
+
+def test_invalid_directive_id_in_a_batch_is_dropped_and_noted_on_its_own_op() -> None:
+    """A retire naming an unknown directive: one corrective, then drop-and-note."""
+    ghost_retire = _batch_input(
+        directive_ops=[
+            {"op": "append", "contribution_id": NEW_CONTRIBUTION.id},
+            {"op": "retire", "id": "c_ghost", "contribution_id": SECOND_CONTRIBUTION.id},
+        ]
+    )
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [
+        _fake_response(ghost_retire),
+        _fake_response(ghost_retire),
+    ]
+
+    judgment = _judge_batch(mock_client)
+
+    dropped = f"retire(c_ghost, contribution={SECOND_CONTRIBUTION.id})"
+    assert judgment.dropped_ops == [dropped]
+    assert judgment.retired_directive_ids == []
+    assert [d.id for d in judgment.new_summary.directives] == [
+        EXISTING_DIRECTIVE.id,
+        NEW_CONTRIBUTION.id,
+    ]
+    # The op named its member, so the note lands on that member's row alone.
+    assert dropped in judgment.record_notes_for(SECOND_CONTRIBUTION.id)
+    assert judgment.record_notes_for(NEW_CONTRIBUTION.id) == "an enforceable standard"
+
+
+def test_batch_overflow_triggers_one_corrective_naming_the_batch_tool() -> None:
+    """The #63 re-ask applies to the batch amendment, with the same one retry."""
+    long_context = " ".join(f"word{i}" for i in range(60))
+    over = _batch_input(new_context=long_context)
+    fits = _batch_input(new_context="Short.")
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [_fake_response(over), _fake_response(fits)]
+
+    judgment = _judge_batch(mock_client, summary_max_words=50)
+
+    assert mock_client.messages.create.call_count == 2
+    text = [
+        b
+        for b in mock_client.messages.create.call_args_list[1].kwargs["messages"][-1]["content"]
+        if b["type"] == "text"
+    ][0]["text"]
+    assert "over the BUDGET of 50 words" in text
+    assert "Call submit_batch_judgment again with the SAME decisions" in text
+    assert judgment.new_summary.context == "Short."
+
+
+def test_all_declined_batch_amends_nothing() -> None:
+    """A batch that declines everything writes no amendment — as one decline does."""
+    all_declined = _batch_input(
+        verdicts=[
+            {"contribution_id": c.id, "decision": "decline", "reasoning": "no"} for c in BATCH
+        ],
+        directive_ops=[],
+        new_context=None,
+    )
+    mock_client = MagicMock()
+    mock_client.messages.create.return_value = _fake_response(all_declined)
+
+    judgment = _judge_batch(mock_client)
+
+    assert judgment.new_summary is None
+    assert judgment.accepted_verdicts == []
+    assert judgment.batch_reasoning == ""
+    assert mock_client.messages.create.call_count == 1
+
+
+def test_all_declined_batch_carrying_an_amendment_is_a_parse_failure() -> None:
+    contradictory = _batch_input(
+        verdicts=[
+            {"contribution_id": c.id, "decision": "decline", "reasoning": "no"} for c in BATCH
+        ],
+        directive_ops=[],
+        new_context="but here is a rewrite anyway",
+    )
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [
+        _fake_response(contradictory),
+        _fake_response(contradictory),
+    ]
+
+    with pytest.raises(ValueError, match="declined every contribution"):
+        _judge_batch(mock_client)
+
+
+def test_batch_verdicts_are_returned_in_arrival_order_however_they_came_back() -> None:
+    """The record's order is arrival order; the payload's ordering adds nothing."""
+    shuffled = _batch_input()
+    shuffled["verdicts"] = list(reversed(shuffled["verdicts"]))
+    mock_client = MagicMock()
+    mock_client.messages.create.return_value = _fake_response(shuffled)
+
+    judgment = _judge_batch(mock_client)
+
+    assert [v.contribution_id for v in judgment.verdicts] == [c.id for c in BATCH]
+
+
+def test_batch_stringified_payload_is_coerced_like_the_single_path() -> None:
+    """Issue #113's stringification failure mode reaches the batch fields too."""
+    payload = _batch_input()
+    stringified = {
+        "verdicts": json.dumps(payload["verdicts"]),
+        "directive_ops": json.dumps(payload["directive_ops"]),
+        "new_context": payload["new_context"],
+    }
+    mock_client = MagicMock()
+    mock_client.messages.create.return_value = _fake_response(stringified)
+
+    judgment = _judge_batch(mock_client)
+
+    assert mock_client.messages.create.call_count == 1
+    assert [v.contribution_id for v in judgment.verdicts] == [c.id for c in BATCH]
+    assert [d.id for d in judgment.new_summary.directives] == [
+        EXISTING_DIRECTIVE.id,
+        NEW_CONTRIBUTION.id,
+        SECOND_CONTRIBUTION.id,
+    ]

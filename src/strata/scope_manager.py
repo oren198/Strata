@@ -16,6 +16,12 @@ Responsibilities
   and ``updated_at``. Directives no op names are carried across as the same
   rows: preservation is structural, not a prompt obligation.
 
+:meth:`ScopeManager.judge_batch` (ADR 0011 D3) judges several contributions in
+one call — one verdict each, in arrival order, plus ONE cumulative amendment,
+where an ``append``/``publish`` names the contribution it admits. It is
+strictly additive: single-contribution judgment stays the default, and a batch
+of one delegates to :meth:`ScopeManager.judge` unchanged.
+
 This module is a **pure judgment service** — it has no persistence logic.
 The caller is responsible for wiring the returned judgment to
 :func:`~strata.record_store.RecordStore.record_judgment` and
@@ -46,10 +52,11 @@ Vocabulary follows ``CONTEXT.md`` verbatim:
 
 from __future__ import annotations
 
+import copy
 import json
-from collections.abc import Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from datetime import UTC, datetime
-from typing import Literal, Protocol
+from typing import Literal, Protocol, TypeVar
 
 import anthropic
 from pydantic import BaseModel, Field
@@ -80,6 +87,25 @@ WINDOW_MAX_CHARS = 8000
 #: Appended to a content excerpt the prefix cut, so a truncated row is never
 #: mistaken for the whole contribution.
 WINDOW_TRUNCATION_MARKER = "…[truncated]"
+
+# ---------------------------------------------------------------------------
+# Batch-judgment bounds (ADR 0011 D3)
+# ---------------------------------------------------------------------------
+
+#: Output-token ceiling for a judgment call carrying ONE contribution: one
+#: reasoning plus one amendment, the budget every judgment has had.
+JUDGE_MAX_TOKENS = 4096
+
+#: Added to :data:`JUDGE_MAX_TOKENS` for each contribution in a batch beyond
+#: the first. A batch adds exactly one ``{decision, reasoning}`` verdict per
+#: extra contribution — the amendment stays single — so the increment covers a
+#: verdict several times over rather than scaling the whole ceiling with N.
+JUDGE_BATCH_MAX_TOKENS_PER_EXTRA = 512
+
+
+def _batch_max_tokens(batch_size: int) -> int:
+    """Return the output-token ceiling for a batch of *batch_size* (ADR 0011 D3)."""
+    return JUDGE_MAX_TOKENS + JUDGE_BATCH_MAX_TOKENS_PER_EXTRA * max(0, batch_size - 1)
 
 
 class _PublishedItemLike(Protocol):
@@ -195,6 +221,80 @@ JUDGE_TOOL: dict = {
         "required": ["decision", "reasoning", "directive_ops", "new_context"],
     },
 }
+
+
+def _build_batch_judge_tool() -> dict:
+    """Derive the batch tool schema from :data:`JUDGE_TOOL` (ADR 0011 D3).
+
+    Derived rather than written out a second time so the ops schema cannot
+    drift between the two modes: the batch tool is the same amendment (one
+    ``directive_ops`` list, one ``new_context``, one ``withdraw_published``)
+    with two differences — the single ``decision``/``reasoning`` pair becomes
+    a ``verdicts`` array, one entry per contribution, and every op gains a
+    ``contribution_id`` so an ``append`` or ``publish`` says WHICH
+    contribution it admits (with several in play, "the triggering
+    contribution" names nothing).
+    """
+    op_schema = copy.deepcopy(JUDGE_TOOL["input_schema"]["properties"]["directive_ops"])
+    op_schema["items"]["properties"]["contribution_id"] = {
+        "type": "string",
+        "description": (
+            "REQUIRED on EVERY op in batch mode: the id of the contribution that "
+            "motivated this op — the one an append or publish admits, and the one "
+            "whose acceptance made a supersede or retire the right move. Exactly as "
+            "listed in NEW CONTRIBUTIONS TO JUDGE, and one you accepted in `verdicts`."
+        ),
+    }
+    op_schema["items"]["required"] = [*op_schema["items"]["required"], "contribution_id"]
+    op_schema["description"] = (
+        "ADR 0011 D1/D3: the ONE cumulative amendment for the whole batch — "
+        "operations on the directives list, in the order you applied them. "
+        "Existing directives are never re-emitted; a directive no op names is "
+        "preserved by the engine byte for byte. Empty or null when the batch "
+        "amends no directive."
+    )
+    schema = copy.deepcopy(JUDGE_TOOL["input_schema"])
+    schema["properties"].pop("decision")
+    schema["properties"].pop("reasoning")
+    schema["properties"]["directive_ops"] = op_schema
+    schema["properties"]["verdicts"] = {
+        "type": "array",
+        "description": (
+            "One verdict per contribution in NEW CONTRIBUTIONS TO JUDGE, in that "
+            "same arrival order. Every contribution gets exactly one verdict; a "
+            "decline on one says nothing about the others."
+        ),
+        "items": {
+            "type": "object",
+            "properties": {
+                "contribution_id": {
+                    "type": "string",
+                    "description": "The contribution this verdict judges, exactly as listed.",
+                },
+                "decision": {
+                    "type": "string",
+                    "enum": ["accept_as_directive", "accept_as_context", "decline"],
+                },
+                "reasoning": {
+                    "type": "string",
+                    "description": "One or two sentences explaining THIS contribution's verdict.",
+                },
+            },
+            "required": ["contribution_id", "decision", "reasoning"],
+        },
+    }
+    schema["required"] = ["verdicts", "directive_ops", "new_context"]
+    return {
+        "name": "submit_batch_judgment",
+        "description": (
+            "Submit one verdict per new contribution in this batch, plus the single "
+            "cumulative amendment to apply to the scope summary."
+        ),
+        "input_schema": schema,
+    }
+
+
+JUDGE_BATCH_TOOL: dict = _build_batch_judge_tool()
 
 # ---------------------------------------------------------------------------
 # Publication judge tools (ADR 0007 D2/D4, static — eligible for prompt
@@ -475,6 +575,44 @@ one-or-two-sentence reasoning. When declining, submit no amendment:
 `directive_ops` empty or null, and `new_context` null.\
 """
 
+#: Appended to :data:`_SYSTEM_PROMPT` for a batch call (ADR 0011 D3). The
+#: judging rules above are unchanged — batching changes how many contributions
+#: one call carries and how the verdicts and the amendment are shaped, never
+#: what makes a contribution admissible.
+_BATCH_MODE_PROMPT = """\
+BATCH MODE. This message carries SEVERAL new contributions, listed in arrival
+order, and you judge all of them in this one call:
+- Process them SEQUENTIALLY, in the order listed: judge the first against the
+  CURRENT SUMMARY, the second against the summary as your amendment for the
+  first would leave it, and so on. The verdicts must be the ones you would
+  reach judging them one at a time in that order.
+- Return one verdict per contribution in `verdicts`, each naming its
+  `contribution_id` exactly as listed, with its own decision and its own
+  reasoning. A decline on one contribution says nothing about the others —
+  each is judged on its own merits, and one declined contribution never
+  costs the rest their verdicts.
+- Return ONE cumulative amendment for the whole batch: a single
+  `directive_ops` list, in the order you applied the ops, and a single
+  `new_context` — the context section as it should stand once every
+  contribution you accepted here is incorporated.
+- EVERY op — `append`, `publish`, `supersede`, `retire` — MUST carry the
+  `contribution_id` of the batch member that motivated it: the one an
+  `append` or `publish` admits, and the one whose acceptance made a
+  `supersede` or a `retire` the right move. You process the members in order
+  and know which one each op came from, so say so: the retirement and
+  withdrawal rows written from these ops are permanent record entries, and a
+  guessed attribution would be a permanent lie about provenance. Name only
+  ids from this batch, and only ones you ACCEPTED — an op attributed to a
+  contribution you declined contradicts your own verdict.
+- The BUDGET applies to the summary once the whole amendment is applied, and
+  the RECENT CONTRIBUTIONS digest shows every contribution in this batch as a
+  `pending` row (they are in the record before you see them).
+
+You must call the `submit_batch_judgment` tool exactly once.\
+"""
+
+_BATCH_SYSTEM_PROMPT = f"{_SYSTEM_PROMPT}\n\n{_BATCH_MODE_PROMPT}"
+
 # ---------------------------------------------------------------------------
 # Publication system prompt (ADR 0007 D2, static — eligible for prompt
 # caching). A SEPARATE, smaller prompt from _SYSTEM_PROMPT — deliberately:
@@ -650,10 +788,30 @@ class DirectiveOp(BaseModel):
     id: str | None = None
     """``supersede`` / ``retire`` only: the directive id being removed."""
 
+    contribution_id: str | None = None
+    """BATCH mode only: the batch member this op is attributed to.
+
+    ADR 0011 D3: a batch carries several contributions, so "the triggering
+    contribution" names nothing — EVERY op says which member motivated it, the
+    one an ``append``/``publish`` admits and the one whose acceptance made a
+    ``supersede``/``retire`` the right move. Attribution is never inferred: the
+    ``Retirement`` rows and publication withdrawals built from these ops are
+    permanent record entries, and a guessed owner would be a permanent
+    misstatement of provenance. ``None`` on the single-contribution path, where
+    the binding is implicit and stays that way.
+    """
+
     def describe(self) -> str:
-        """Render this op for a record note (dropped-op accounting)."""
+        """Render this op for a record note (dropped-op accounting).
+
+        Shows the directive the op targets and, in batch mode, the
+        contribution it is attributed to — the two id spaces an op can get
+        wrong, so the record note says which one it was.
+        """
         target = self.id or self.supersedes
-        return f"{self.op}({target})" if target else self.op
+        attribution = f"contribution={self.contribution_id}" if self.contribution_id else None
+        parts = [part for part in (target, attribution) if part]
+        return f"{self.op}({', '.join(parts)})" if parts else self.op
 
 
 #: Ops whose target directive id must exist in the current summary.
@@ -663,6 +821,11 @@ _ID_ADDRESSED_OPS = ("supersede", "retire")
 _ADMITTING_OPS = ("append", "publish")
 
 _OP_KINDS = (*_ADMITTING_OPS, *_ID_ADDRESSED_OPS)
+
+#: The three verdicts a contribution can receive, as the tool schema enumerates
+#: them — checked by hand on the batch path, where one bad verdict must not
+#: take the whole payload down through a pydantic error.
+_BATCH_DECISIONS = ("accept_as_directive", "accept_as_context", "decline")
 
 
 def _parse_directive_ops(raw_ops) -> list[DirectiveOp]:  # noqa: ANN001 — raw tool-call field
@@ -709,6 +872,9 @@ def _parse_directive_ops(raw_ops) -> list[DirectiveOp]:  # noqa: ANN001 — raw 
             subject=entry.get("subject"),
             supersedes=entry.get("supersedes"),
             id=entry.get("id"),
+            # Batch mode only (ADR 0011 D3); absent, and unused, on the
+            # single-contribution path, where the binding stays implicit.
+            contribution_id=entry.get("contribution_id"),
         )
         if op.op == "publish" and not (op.content or "").strip():
             raise ValueError(
@@ -729,6 +895,81 @@ def _parse_directive_ops(raw_ops) -> list[DirectiveOp]:  # noqa: ANN001 — raw 
             "retirement — use a retire op instead."
         )
     return ops
+
+
+def _parse_batch_verdicts(raw_verdicts, *, batch_ids: Sequence[str]) -> list[BatchVerdict]:  # noqa: ANN001 — raw tool-call field
+    """Parse ``verdicts`` of a ``submit_batch_judgment`` payload (ADR 0011 D3).
+
+    Every contribution in the batch must carry exactly one verdict. A verdict
+    for a contribution outside the batch, a duplicate verdict, or a missing
+    one is a structural failure of the whole response — some real contribution
+    would be left without a verdict — so it raises and routes to the parse
+    re-ask rather than to the invalid-id corrective, which exists to save a
+    verdict, not to invent one.
+
+    The verdicts are returned in ARRIVAL order regardless of the order they
+    came back in: the batch's order is the record's order, and the payload's
+    ordering carries no information the ``contribution_id`` does not.
+
+    Raises:
+        ValueError: with a message the parse re-ask can echo back.
+    """
+    if isinstance(raw_verdicts, str):
+        raw_verdicts = _coerce_json_list(
+            raw_verdicts,
+            "submit_batch_judgment returned verdicts as an unparseable string.",
+        )
+    if not isinstance(raw_verdicts, list):
+        raise ValueError(
+            "submit_batch_judgment returned verdicts as neither a list nor a string; "
+            "it is one verdict object per contribution in the batch."
+        )
+
+    rendered_batch = ", ".join(batch_ids)
+    by_id: dict[str, BatchVerdict] = {}
+    for entry in raw_verdicts:
+        if isinstance(entry, str):
+            entry = _coerce_json_object(
+                entry,
+                "submit_batch_judgment returned a verdict as an unparseable string.",
+            )
+        if not isinstance(entry, dict):
+            raise ValueError("submit_batch_judgment returned a verdict that is not an object.")
+        contribution_id = entry.get("contribution_id")
+        if contribution_id not in batch_ids:
+            raise ValueError(
+                f"submit_batch_judgment returned a verdict for {contribution_id!r}, which is "
+                f"not a contribution in this batch. The contributions to judge are: "
+                f"{rendered_batch}."
+            )
+        if contribution_id in by_id:
+            raise ValueError(
+                f"submit_batch_judgment returned two verdicts for {contribution_id!r}; "
+                "each contribution gets exactly one."
+            )
+        decision = entry.get("decision")
+        if decision not in _BATCH_DECISIONS:
+            raise ValueError(
+                f"submit_batch_judgment returned an unknown decision {decision!r} for "
+                f"{contribution_id}; expected one of {', '.join(_BATCH_DECISIONS)}."
+            )
+        reasoning = entry.get("reasoning")
+        if not isinstance(reasoning, str):
+            raise ValueError(
+                f"submit_batch_judgment returned no reasoning for {contribution_id}; "
+                "every verdict carries its own one-or-two-sentence explanation."
+            )
+        by_id[contribution_id] = BatchVerdict(
+            contribution_id=contribution_id, decision=decision, reasoning=reasoning
+        )
+
+    missing = [cid for cid in batch_ids if cid not in by_id]
+    if missing:
+        raise ValueError(
+            f"submit_batch_judgment returned no verdict for {', '.join(missing)}. Every "
+            f"contribution in the batch needs exactly one verdict: {rendered_batch}."
+        )
+    return [by_id[cid] for cid in batch_ids]
 
 
 def _parse_new_context(raw_context) -> str | None:  # noqa: ANN001 — raw tool-call field
@@ -756,7 +997,10 @@ def _op_target_id(op: DirectiveOp) -> str | None:
 
 
 def _partition_ops(
-    ops: Sequence[DirectiveOp], current_summary: ScopeSummary | None
+    ops: Sequence[DirectiveOp],
+    current_summary: ScopeSummary | None,
+    *,
+    batch_ids: Collection[str] | None = None,
 ) -> tuple[list[DirectiveOp], list[DirectiveOp]]:
     """Split *ops* into (applicable, naming-an-invalid-id).
 
@@ -765,11 +1009,23 @@ def _partition_ops(
     earlier op in the same amendment — cannot be applied. Ops are walked in
     order against a working set of available ids so a second op targeting the
     same directive is caught as well.
+
+    *batch_ids* switches on the batch mode's second id space (ADR 0011 D3):
+    EVERY op must name the batch member that motivated it, so an op whose
+    ``contribution_id`` is missing, unknown, or not an accepted member of the
+    batch is invalid for the same reason and takes the same route — one
+    corrective re-ask, then drop-and-note. Attribution is not guessed: the
+    retirement and withdrawal rows these ops produce are permanent record
+    entries, and a mechanically inferred owner would be a permanent lie about
+    provenance.
     """
     available = {d.id for d in current_summary.directives} if current_summary is not None else set()
     applicable: list[DirectiveOp] = []
     invalid: list[DirectiveOp] = []
     for op in ops:
+        if batch_ids is not None and op.contribution_id not in batch_ids:
+            invalid.append(op)
+            continue
         target = _op_target_id(op)
         if target is None:
             applicable.append(op)
@@ -780,6 +1036,31 @@ def _partition_ops(
         else:
             invalid.append(op)
     return applicable, invalid
+
+
+def _mint_directive(op: DirectiveOp, contribution: Contribution) -> Directive:
+    """Build the directive row an ``append``/``publish`` op admits.
+
+    ADR 0011 D1: the row is minted from *contribution* — its id and
+    provenance always, and for ``append`` its content and subject verbatim, so
+    the judge restates nothing. A ``publish`` carries the judge's own text and
+    may override the subject; an omitted subject keeps the contribution's own
+    tag rather than dropping it.
+    """
+    if op.op == "append":
+        content = contribution.content
+        subject = contribution.subject
+    else:
+        content = op.content or ""
+        subject = op.subject if op.subject is not None else contribution.subject
+    return Directive(
+        id=contribution.id,
+        content=content,
+        subject=subject,
+        source_scope_id=contribution.contributor.scope_id,
+        source_skill=contribution.contributor.skill,
+        created_at=contribution.created_at,
+    )
 
 
 def _apply_amendment(
@@ -808,32 +1089,7 @@ def _apply_amendment(
     directives = list(current_summary.directives) if current_summary is not None else []
     removed = {target for op in ops if (target := _op_target_id(op)) is not None}
 
-    admitted: list[Directive] = []
-    for op in ops:
-        if op.op == "append":
-            admitted.append(
-                Directive(
-                    id=contribution.id,
-                    content=contribution.content,
-                    subject=contribution.subject,
-                    source_scope_id=contribution.contributor.scope_id,
-                    source_skill=contribution.contributor.skill,
-                    created_at=contribution.created_at,
-                )
-            )
-        elif op.op == "publish":
-            admitted.append(
-                Directive(
-                    id=contribution.id,
-                    content=op.content or "",
-                    # An omitted subject keeps the contribution's own tag
-                    # rather than dropping it; the judge overrides by naming one.
-                    subject=op.subject if op.subject is not None else contribution.subject,
-                    source_scope_id=contribution.contributor.scope_id,
-                    source_skill=contribution.contributor.skill,
-                    created_at=contribution.created_at,
-                )
-            )
+    admitted = [_mint_directive(op, contribution) for op in ops if op.op in _ADMITTING_OPS]
 
     kept = [d for d in directives if d.id not in removed]
     context = current_summary.context if current_summary is not None else ""
@@ -848,20 +1104,62 @@ def _apply_amendment(
     )
 
 
-class ScopeManagerJudgment(BaseModel):
-    """The scope-manager's structured verdict on a contribution.
+def _apply_batch_amendment(
+    *,
+    scope: Scope,
+    current_summary: ScopeSummary | None,
+    contributions: Mapping[str, Contribution],
+    ops: Sequence[DirectiveOp],
+    new_context: str | None,
+) -> ScopeSummary:
+    """Apply one batch's cumulative amendment to *current_summary* (ADR 0011 D3).
 
-    Returned by :meth:`ScopeManager.judge`.  When ``decision`` is
-    ``"decline"``, the amendment is empty and ``new_summary`` is ``None``.
-    When accepting, ``directive_ops`` and ``new_context`` carry the judged
-    amendment (ADR 0011 D1) and ``new_summary`` carries the result of
-    applying it to the current summary (with ``scope_id`` and ``updated_at``
-    filled in server-side).
+    :func:`_apply_amendment` with the implicit binding made explicit: each
+    ``append``/``publish`` mints its row from the contribution its
+    ``contribution_id`` names, so a batch's several admissions land as several
+    rows with their own ids and provenance. Everything else is identical —
+    directives no op names are carried across as the very same rows, and a
+    ``new_context`` of ``None`` leaves the context untouched.
+
+    An op naming a contribution outside *contributions* admits nothing here —
+    there are no bytes to mint a row from. It is skipped, and the invalid-id
+    corrective then re-asks for it once and drops-and-notes it, which is where
+    such an op is accounted for.
     """
+    directives = list(current_summary.directives) if current_summary is not None else []
+    removed = {target for op in ops if (target := _op_target_id(op)) is not None}
 
-    decision: Literal["accept_as_directive", "accept_as_context", "decline"]
-    reasoning: str
-    """Brief explanation of the verdict — written to the judgment record."""
+    admitted: list[Directive] = []
+    for op in ops:
+        if op.op not in _ADMITTING_OPS:
+            continue
+        contribution = contributions.get(op.contribution_id or "")
+        if contribution is None:
+            continue
+        admitted.append(_mint_directive(op, contribution))
+
+    kept = [d for d in directives if d.id not in removed]
+    context = current_summary.context if current_summary is not None else ""
+    if new_context is not None:
+        context = new_context
+
+    return ScopeSummary(
+        scope_id=scope.id,
+        directives=[*kept, *admitted],
+        context=context,
+        updated_at=datetime.now(tz=UTC).isoformat(),
+    )
+
+
+class _AmendmentJudgment(BaseModel):
+    """The judged amendment, shared by the single and batch judgments (ADR 0011).
+
+    One amendment per call either way: the ops, the rewritten context, the
+    summary they produce, whatever the engine dropped, and any published items
+    the amendment invalidates. What differs between the two modes is the
+    verdict side — one decision here, a list of them in
+    :class:`ScopeManagerBatchJudgment` — never the amendment's shape.
+    """
 
     new_summary: ScopeSummary | None
     """The amended scope summary when accepting; ``None`` when declining."""
@@ -923,6 +1221,61 @@ class ScopeManagerJudgment(BaseModel):
         """
         return [op.id for op in self.directive_ops if op.op == "retire" and op.id]
 
+    def directive_removals(self) -> list[tuple[str, str | None]]:
+        """``(directive id removed, the op's contribution attribution)`` pairs.
+
+        The attribution is ``None`` on the single-contribution path, where the
+        judged contribution owns every op implicitly; in a batch it is the
+        member the op names (ADR 0011 D3), which is what a mechanically
+        propagated withdrawal records as its trigger.
+        """
+        return [
+            (target, op.contribution_id)
+            for op in self.directive_ops
+            if (target := _op_target_id(op)) is not None
+        ]
+
+    def directive_retirements(self) -> list[tuple[str, str | None]]:
+        """``(directive id retired, the op's contribution attribution)`` pairs."""
+        return [
+            (op.id, op.contribution_id)
+            for op in self.directive_ops
+            if op.op == "retire" and op.id
+        ]
+
+
+#: Either judgment shape — what :meth:`ScopeManager._call_with_correctives`
+#: drives without caring which of the two it is holding.
+_JudgmentT = TypeVar("_JudgmentT", bound=_AmendmentJudgment)
+
+
+def _with_dropped_note(reasoning: str, dropped_ops: Sequence[str]) -> str:
+    """Return *reasoning* plus the mechanical note naming the dropped ops.
+
+    One rendering, used by both judgment shapes, so a batch member's judgment
+    row reads exactly like a single contribution's would.
+    """
+    if not dropped_ops:
+        return reasoning
+    dropped = ", ".join(dropped_ops)
+    return f"{reasoning} [Dropped amendment op(s), not applied: {dropped}.]"
+
+
+class ScopeManagerJudgment(_AmendmentJudgment):
+    """The scope-manager's structured verdict on a contribution.
+
+    Returned by :meth:`ScopeManager.judge`.  When ``decision`` is
+    ``"decline"``, the amendment is empty and ``new_summary`` is ``None``.
+    When accepting, ``directive_ops`` and ``new_context`` carry the judged
+    amendment (ADR 0011 D1) and ``new_summary`` carries the result of
+    applying it to the current summary (with ``scope_id`` and ``updated_at``
+    filled in server-side).
+    """
+
+    decision: Literal["accept_as_directive", "accept_as_context", "decline"]
+    reasoning: str
+    """Brief explanation of the verdict — written to the judgment record."""
+
     @property
     def record_notes(self) -> str:
         """The verdict text written to the judgment record.
@@ -931,10 +1284,82 @@ class ScopeManagerJudgment(BaseModel):
         not apply (see :attr:`dropped_ops`) — the record has to show which
         part of the amendment the engine dropped.
         """
-        if not self.dropped_ops:
-            return self.reasoning
-        dropped = ", ".join(self.dropped_ops)
-        return f"{self.reasoning} [Dropped amendment op(s), not applied: {dropped}.]"
+        return _with_dropped_note(self.reasoning, self.dropped_ops)
+
+
+class BatchVerdict(BaseModel):
+    """One contribution's verdict inside a batch judgment (ADR 0011 D3).
+
+    The verdict half of what :meth:`ScopeManager.judge` returns for a single
+    contribution, carried per contribution: each one lands in the record as
+    its own judgment row against its own contribution id, so the record's
+    shape is untouched by batching.
+    """
+
+    contribution_id: str
+    decision: Literal["accept_as_directive", "accept_as_context", "decline"]
+    reasoning: str
+    """Brief explanation of THIS contribution's verdict."""
+
+
+class ScopeManagerBatchJudgment(_AmendmentJudgment):
+    """The scope-manager's verdicts on a batch, plus its one amendment (ADR 0011 D3).
+
+    ``verdicts`` is ordered by arrival, one entry per contribution in the
+    batch. The amendment fields are the batch's single cumulative amendment —
+    one ``new_summary``, hence one summary write and one ``version`` increment
+    however many contributions the batch accepted.
+
+    Every op carries the batch member that motivated it, so the record
+    pointers built from the amendment — a ``Retirement`` row's reason, a
+    mechanical withdrawal's trigger, a dropped op's note — read that member
+    off the op instead of inferring an owner. Nothing about ownership is
+    guessed here: those rows are permanent, and a guess would be a permanent
+    misstatement of provenance.
+    """
+
+    verdicts: list[BatchVerdict] = Field(default_factory=list)
+
+    dropped_ops_by_contribution: dict[str, list[str]] = Field(default_factory=dict)
+    """Dropped ops (rendered) keyed by the contribution whose record notes them."""
+
+    @property
+    def accepted_verdicts(self) -> list[BatchVerdict]:
+        """The batch's accept verdicts, in arrival order."""
+        return [v for v in self.verdicts if v.decision != "decline"]
+
+    def verdict_reasoning(self, contribution_id: str) -> str:
+        """The reasoning of *contribution_id*'s verdict, or ``""`` if it has none.
+
+        What an op attributed to that member records as its explanation — a
+        ``Retirement`` row's reason, say. Read off the op's own attribution,
+        never inferred from position in the batch.
+        """
+        verdict = next((v for v in self.verdicts if v.contribution_id == contribution_id), None)
+        return verdict.reasoning if verdict is not None else ""
+
+    @property
+    def batch_reasoning(self) -> str:
+        """The whole batch's accepted reasoning, member by member.
+
+        For the one consequence that belongs to no single member: a
+        ``withdraw_published`` verdict is submitted against the amendment as a
+        whole, so its record carries every accepted member's reasoning rather
+        than a guess at which one meant it.
+        """
+        return "; ".join(f"[{v.contribution_id}] {v.reasoning}" for v in self.accepted_verdicts)
+
+    def record_notes_for(self, contribution_id: str) -> str:
+        """The verdict text written to *contribution_id*'s judgment row.
+
+        That contribution's own reasoning, plus the mechanical note for any op
+        the engine dropped on its behalf — the same rendering a
+        single-contribution judgment writes.
+        """
+        verdict = next((v for v in self.verdicts if v.contribution_id == contribution_id), None)
+        reasoning = verdict.reasoning if verdict is not None else ""
+        dropped = self.dropped_ops_by_contribution.get(contribution_id, [])
+        return _with_dropped_note(reasoning, dropped)
 
 
 class PublicationJudgment(BaseModel):
@@ -1040,7 +1465,7 @@ def _render_recent_contributions(
     *,
     verbatim_tail: int = WINDOW_VERBATIM_TAIL,
     max_chars: int = WINDOW_MAX_CHARS,
-    self_contribution_id: str | None = None,
+    self_contribution_ids: Collection[str] | None = None,
 ) -> str:
     """Render the RECENT CONTRIBUTIONS digest for the user message (ADR 0011 D2).
 
@@ -1049,12 +1474,13 @@ def _render_recent_contributions(
     them) and render oldest-first. The newest *verbatim_tail* rows keep their
     full text; every older row is a digest row.
 
-    *self_contribution_id* is the contribution being judged, which is in its own
-    window (it is appended to the record before the window is read). It always
-    renders as a digest row, however new it is: its full text is already in the
-    message as the NEW CONTRIBUTION block, and the verbatim tail exists for
-    comparison against PRIOR contributions — spending a slot on the self row
-    would both duplicate it and cost the judge a real one.
+    *self_contribution_ids* are the contributions being judged in this call —
+    one ordinarily, several in batch mode (ADR 0011 D3) — each of which is in
+    its own window (they are appended to the record before the window is
+    read). They always render as digest rows, however new they are: their full
+    text is already in the message as the NEW CONTRIBUTION block, and the
+    verbatim tail exists for comparison against PRIOR contributions — spending
+    a slot on a self row would both duplicate it and cost the judge a real one.
 
     Rows are measured newest-first against *max_chars*, so a window too big for
     the budget loses its OLDEST rows — the ones recency checks need least — and
@@ -1065,11 +1491,12 @@ def _render_recent_contributions(
     if not rows:
         return "(none)"
 
+    self_ids = set(self_contribution_ids or ())
     rendered: list[str] = []
     used = 0
     verbatim_used = 0
     for row in reversed(rows):
-        is_self = self_contribution_id is not None and row.contribution.id == self_contribution_id
+        is_self = row.contribution.id in self_ids
         verbatim = not is_self and verbatim_used < verbatim_tail
         line = _render_digest_row(row, verbatim=verbatim)
         if rendered and used + len(line) + 1 > max_chars:
@@ -1191,14 +1618,29 @@ def _render_peer_publications(
     return "\n".join(lines) + "\n\n"
 
 
-def _build_user_message(
+def _render_contribution_block(contribution: Contribution) -> str:
+    """Render one contribution's fields for the judge, id first."""
+    return (
+        f"- id: {contribution.id}\n"
+        f"- proposed classification: {contribution.proposed_classification}\n"
+        f"- subject: {contribution.subject or '(none)'}\n"
+        f"- supersedes: {contribution.supersedes or '(none)'}\n"
+        # Skill is optional (issue #121): show scope alone when absent so the
+        # judge never sees a literal "None".
+        f"- contributor: {_render_contributor(contribution.contributor)}\n"
+        "- content:\n"
+        f"    {contribution.content}\n"
+    )
+
+
+def _build_judge_preamble(
     *,
     scope: Scope,
     stratum: Stratum,
     parent_summary: ScopeSummary | None,
     current_summary: ScopeSummary | None,
     recent_contributions: Sequence[RecentContribution],
-    new_contribution: Contribution,
+    judged_contribution_ids: Collection[str],
     summary_max_words: int = 500,
     entitlement: EntitlementView | None = None,
     operator_memory: list[tuple[str, list[OperatorItem]]] | None = None,
@@ -1207,7 +1649,13 @@ def _build_user_message(
     amendment_context_only: bool = False,
     window_verbatim_tail: int = WINDOW_VERBATIM_TAIL,
 ) -> str:
-    """Compose the (non-cached) per-call user message."""
+    """Compose everything in the user message ahead of the contributions to judge.
+
+    Shared by the single-contribution message (:func:`_build_user_message`)
+    and the batch message (:func:`_build_batch_user_message`, ADR 0011 D3) —
+    the scope's rendered state is identical either way; only the block of
+    contributions under judgment differs.
+    """
     if current_summary is not None:
         rendered_summary = _render_summary(current_summary)
     else:
@@ -1216,9 +1664,8 @@ def _build_user_message(
     recent_block = _render_recent_contributions(
         recent_contributions,
         verbatim_tail=window_verbatim_tail,
-        self_contribution_id=new_contribution.id,
+        self_contribution_ids=judged_contribution_ids,
     )
-    contributor = new_contribution.contributor
 
     operator_block = _render_operator_memory(operator_memory)
 
@@ -1270,19 +1717,100 @@ def _build_user_message(
         "RECENT CONTRIBUTIONS (oldest first — mechanical digest; the newest "
         f"{window_verbatim_tail} PRIOR contributions carry full content):\n"
         f"{recent_block}\n"
+    )
+
+
+def _build_user_message(
+    *,
+    scope: Scope,
+    stratum: Stratum,
+    parent_summary: ScopeSummary | None,
+    current_summary: ScopeSummary | None,
+    recent_contributions: Sequence[RecentContribution],
+    new_contribution: Contribution,
+    summary_max_words: int = 500,
+    entitlement: EntitlementView | None = None,
+    operator_memory: list[tuple[str, list[OperatorItem]]] | None = None,
+    current_publication: Sequence[_PublishedItemLike] | None = None,
+    peer_publications: Sequence[tuple[str, Sequence[_PublishedItemLike]]] | None = None,
+    amendment_context_only: bool = False,
+    window_verbatim_tail: int = WINDOW_VERBATIM_TAIL,
+) -> str:
+    """Compose the (non-cached) per-call user message for a single contribution."""
+    preamble = _build_judge_preamble(
+        scope=scope,
+        stratum=stratum,
+        parent_summary=parent_summary,
+        current_summary=current_summary,
+        recent_contributions=recent_contributions,
+        judged_contribution_ids=[new_contribution.id],
+        summary_max_words=summary_max_words,
+        entitlement=entitlement,
+        operator_memory=operator_memory,
+        current_publication=current_publication,
+        peer_publications=peer_publications,
+        amendment_context_only=amendment_context_only,
+        window_verbatim_tail=window_verbatim_tail,
+    )
+    return (
+        f"{preamble}"
         "\n"
         "NEW CONTRIBUTION TO JUDGE:\n"
-        f"- id: {new_contribution.id}\n"
-        f"- proposed classification: {new_contribution.proposed_classification}\n"
-        f"- subject: {new_contribution.subject or '(none)'}\n"
-        f"- supersedes: {new_contribution.supersedes or '(none)'}\n"
-        # Skill is optional (issue #121): show scope alone when absent so the
-        # judge never sees a literal "None".
-        f"- contributor: {_render_contributor(contributor)}\n"
-        "- content:\n"
-        f"    {new_contribution.content}\n"
+        f"{_render_contribution_block(new_contribution)}"
         "\n"
         "Judge it. Call `submit_judgment` exactly once."
+    )
+
+
+def _build_batch_user_message(
+    *,
+    scope: Scope,
+    stratum: Stratum,
+    parent_summary: ScopeSummary | None,
+    current_summary: ScopeSummary | None,
+    recent_contributions: Sequence[RecentContribution],
+    new_contributions: Sequence[Contribution],
+    summary_max_words: int = 500,
+    entitlement: EntitlementView | None = None,
+    operator_memory: list[tuple[str, list[OperatorItem]]] | None = None,
+    current_publication: Sequence[_PublishedItemLike] | None = None,
+    peer_publications: Sequence[tuple[str, Sequence[_PublishedItemLike]]] | None = None,
+    window_verbatim_tail: int = WINDOW_VERBATIM_TAIL,
+) -> str:
+    """Compose the per-call user message for a BATCH of contributions (ADR 0011 D3).
+
+    The contributions render in arrival order and are numbered, so the order
+    the judge must process them in is unmissable; everything above them is the
+    same rendered scope state a single-contribution call gets.
+    """
+    preamble = _build_judge_preamble(
+        scope=scope,
+        stratum=stratum,
+        parent_summary=parent_summary,
+        current_summary=current_summary,
+        recent_contributions=recent_contributions,
+        judged_contribution_ids=[c.id for c in new_contributions],
+        summary_max_words=summary_max_words,
+        entitlement=entitlement,
+        operator_memory=operator_memory,
+        current_publication=current_publication,
+        peer_publications=peer_publications,
+        window_verbatim_tail=window_verbatim_tail,
+    )
+    blocks = "\n".join(
+        f"CONTRIBUTION {position} OF {len(new_contributions)}:\n"
+        f"{_render_contribution_block(contribution)}"
+        for position, contribution in enumerate(new_contributions, start=1)
+    )
+    return (
+        f"{preamble}"
+        "\n"
+        f"NEW CONTRIBUTIONS TO JUDGE ({len(new_contributions)}, in arrival order — "
+        "judge each in turn against the summary as your amendment for the ones "
+        "before it would leave it):\n"
+        f"{blocks}"
+        "\n"
+        "Judge them. Call `submit_batch_judgment` exactly once."
     )
 
 
@@ -1466,11 +1994,89 @@ class ScopeManager:
             window_verbatim_tail=window_verbatim_tail,
         )
 
-        # Build the system prompt with cache_control on the last text block
+        def _parse(block) -> ScopeManagerJudgment:  # noqa: ANN001 — tool_use block
+            return self._parse_judgment(
+                scope=scope,
+                tool_use_block=block,
+                current_summary=current_summary,
+                new_contribution=new_contribution,
+                amendment_context_only=amendment_context_only,
+            )
+
+        def _invalid_ops(judgment: ScopeManagerJudgment) -> list[DirectiveOp]:
+            _, invalid = _partition_ops(judgment.directive_ops, current_summary)
+            return invalid
+
+        def _invalid_corrective(invalid_ops: Sequence[DirectiveOp]) -> str:
+            valid_ids = (
+                [d.id for d in current_summary.directives] if current_summary is not None else []
+            )
+            rendered_valid = (
+                ", ".join(valid_ids) if valid_ids else "(none — this summary has no directives)"
+            )
+            return (
+                "Your amendment names directive ids that are not in this scope's "
+                f"summary: {', '.join(op.describe() for op in invalid_ops)}. The "
+                f"directive ids you may name are: {rendered_valid}. Call "
+                "submit_judgment again with the SAME verdict, naming only ids from "
+                "that list — or leaving those ops out if none of them applies."
+            )
+
+        def _drop_invalid(judgment: ScopeManagerJudgment) -> ScopeManagerJudgment:
+            return self._drop_invalid_ops(
+                judgment,
+                scope=scope,
+                current_summary=current_summary,
+                new_contribution=new_contribution,
+            )
+
+        return self._call_with_correctives(
+            user_message=user_message,
+            system_prompt=_SYSTEM_PROMPT,
+            tool=JUDGE_TOOL,
+            max_tokens=JUDGE_MAX_TOKENS,
+            summary_max_words=summary_max_words,
+            parse=_parse,
+            invalid_ops=_invalid_ops,
+            invalid_corrective=_invalid_corrective,
+            drop_invalid=_drop_invalid,
+            verdict_noun="verdict",
+            decision_noun="decision",
+            schema_reminder=(
+                "`directive_ops` a list of op objects (each with an `op` field), "
+                "not a string and not strings, and `new_context` a string or null."
+            ),
+        )
+
+    def _call_with_correctives(
+        self,
+        *,
+        user_message: str,
+        system_prompt: str,
+        tool: dict,
+        max_tokens: int,
+        summary_max_words: int,
+        parse: Callable[[object], _JudgmentT],
+        invalid_ops: Callable[[_JudgmentT], list[DirectiveOp]],
+        invalid_corrective: Callable[[Sequence[DirectiveOp]], str],
+        drop_invalid: Callable[[_JudgmentT], _JudgmentT],
+        verdict_noun: str,
+        decision_noun: str,
+        schema_reminder: str,
+    ) -> _JudgmentT:
+        """Run one judgment call and its three correctives, one retry each.
+
+        The orchestration both judgment modes share (ADR 0011 D1/D3): the
+        forced tool call, the parse re-ask (#113), the invalid-id corrective
+        with its drop-and-note fallback, and the overflow re-ask (#63). What
+        differs between a single contribution and a batch is the tool, the
+        prompt, and how a payload is parsed and its ids validated — all passed
+        in — never the one-retry discipline, which lives here once.
+        """
         system: list[dict] = [
             {
                 "type": "text",
-                "text": _SYSTEM_PROMPT,
+                "text": system_prompt,
                 "cache_control": {"type": "ephemeral"},
             }
         ]
@@ -1478,21 +2084,22 @@ class ScopeManager:
         # Tool list with cache_control applied to the tool definition
         tools: list[dict] = [
             {
-                **JUDGE_TOOL,
+                **tool,
                 "cache_control": {"type": "ephemeral"},
             }
         ]
+        tool_name = tool["name"]
 
         def _call(messages: list[dict]):
             try:
                 return self._client.messages.create(
                     model=self._model,
-                    max_tokens=4096,
+                    max_tokens=max_tokens,
                     system=system,
                     tools=tools,
                     tool_choice={
                         "type": "tool",
-                        "name": "submit_judgment",
+                        "name": tool_name,
                         # Exactly one tool_use block per response: the retry
                         # turn echoes response.content with a single
                         # tool_result, which the API rejects if the model
@@ -1506,15 +2113,6 @@ class ScopeManager:
                     "Anthropic rejected the API key — check ANTHROPIC_API_KEY "
                     "(or STRATA_ANTHROPIC_API_KEY)."
                 ) from exc
-
-        def _parse(block) -> ScopeManagerJudgment:  # noqa: ANN001 — tool_use block
-            return self._parse_judgment(
-                scope=scope,
-                tool_use_block=block,
-                current_summary=current_summary,
-                new_contribution=new_contribution,
-                amendment_context_only=amendment_context_only,
-            )
 
         def _corrective_turn(previous_response, previous_block, text: str) -> list[dict]:  # noqa: ANN001
             """Build the follow-up turn echoing the previous response plus *text*."""
@@ -1540,7 +2138,7 @@ class ScopeManager:
         response = _call(first_messages)
         tool_use_block = self._extract_tool_use_block(response)
         try:
-            judgment = _parse(tool_use_block)
+            judgment = parse(tool_use_block)
         except ValueError as parse_error:
             # Parse re-ask (issue #113): the first payload did not parse —
             # a stringified directive_ops (or op entry) instead of the
@@ -1552,11 +2150,9 @@ class ScopeManager:
             # below. A second parse failure is NOT caught here: it propagates
             # as the ValueError, so there is never more than one retry.
             corrective_text = (
-                f"Your submit_judgment call could not be parsed: {parse_error} "
-                "Call submit_judgment again with the SAME verdict, returning the "
-                "amendment as the structures the tool schema defines — "
-                "`directive_ops` a list of op objects (each with an `op` field), "
-                "not a string and not strings, and `new_context` a string or null."
+                f"Your {tool_name} call could not be parsed: {parse_error} "
+                f"Call {tool_name} again with the SAME {verdict_noun}, returning the "
+                f"amendment as the structures the tool schema defines — {schema_reminder}"
             )
             retry_messages = [
                 *first_messages,
@@ -1564,36 +2160,24 @@ class ScopeManager:
             ]
             response = _call(retry_messages)
             tool_use_block = self._extract_tool_use_block(response)
-            judgment = _parse(tool_use_block)
+            judgment = parse(tool_use_block)
             # Chain the correctives below onto this turn: their follow-ups
             # must build on the retry's conversation, not the discarded first
             # turn.
             first_messages = retry_messages
 
         # Invalid-id corrective (ADR 0011 D1): an op naming a directive id
-        # that is not in the current summary gets exactly ONE corrective
+        # that is not in the current summary — or, in a batch, a contribution
+        # id that is not in the batch (D3) — gets exactly ONE corrective
         # re-ask listing the valid ids. If the second attempt still names an
         # invalid id, the bad op is dropped and noted — never routed to the
         # parse-failure path, which would convert a hallucinated id into a
         # stranded, unjudged contribution.
-        _, invalid_ops = _partition_ops(judgment.directive_ops, current_summary)
-        if invalid_ops:
-            valid_ids = (
-                [d.id for d in current_summary.directives] if current_summary is not None else []
-            )
-            rendered_valid = (
-                ", ".join(valid_ids) if valid_ids else "(none — this summary has no directives)"
-            )
-            invalid_text = (
-                "Your amendment names directive ids that are not in this scope's "
-                f"summary: {', '.join(op.describe() for op in invalid_ops)}. The "
-                f"directive ids you may name are: {rendered_valid}. Call "
-                "submit_judgment again with the SAME verdict, naming only ids from "
-                "that list — or leaving those ops out if none of them applies."
-            )
+        invalid = invalid_ops(judgment)
+        if invalid:
             retry_messages = [
                 *first_messages,
-                *_corrective_turn(response, tool_use_block, invalid_text),
+                *_corrective_turn(response, tool_use_block, invalid_corrective(invalid)),
             ]
             # Best-effort, exactly as the overflow retry below: the FIRST
             # judgment is authoritative, and a bad op must never cost the
@@ -1601,7 +2185,7 @@ class ScopeManager:
             try:
                 retry_response = _call(retry_messages)
                 retry_block = self._extract_tool_use_block(retry_response)
-                retry_judgment = _parse(retry_block)
+                retry_judgment = parse(retry_block)
             except Exception:  # noqa: BLE001 — deliberate: retry is best-effort
                 retry_judgment = None
             if retry_judgment is not None and retry_judgment.new_summary is not None:
@@ -1609,14 +2193,9 @@ class ScopeManager:
                 response = retry_response
                 tool_use_block = retry_block
                 first_messages = retry_messages
-                _, invalid_ops = _partition_ops(judgment.directive_ops, current_summary)
-            if invalid_ops:
-                judgment = self._drop_invalid_ops(
-                    judgment,
-                    scope=scope,
-                    current_summary=current_summary,
-                    new_contribution=new_contribution,
-                )
+                invalid = invalid_ops(judgment)
+            if invalid:
+                judgment = drop_invalid(judgment)
 
         # Overflow re-ask (issue #63): the LLM was told the BUDGET but nothing
         # enforced it.  Give it exactly one corrective follow-up call if the
@@ -1627,7 +2206,7 @@ class ScopeManager:
                 overflow_text = (
                     f"With your amendment applied this summary is {word_count} words "
                     f"— over the BUDGET of {summary_max_words} words. Call "
-                    "submit_judgment again with the SAME decision and an amendment "
+                    f"{tool_name} again with the SAME {decision_noun} and an amendment "
                     f"that fits within {summary_max_words} words: `retire` directives "
                     "that no longer earn their words, and/or return a shorter "
                     "`new_context`. Directives you do not name stay exactly as they "
@@ -1649,26 +2228,306 @@ class ScopeManager:
                 try:
                     second_response = _call(second_messages)
                     second_block = self._extract_tool_use_block(second_response)
-                    second_judgment = _parse(second_block)
+                    second_judgment = parse(second_block)
                     # A retry that resolves the budget by naming a bad id is
                     # still subject to D1's drop-and-note rule — never a
                     # second corrective, never a lost verdict.
-                    _, second_invalid = _partition_ops(
-                        second_judgment.directive_ops, current_summary
-                    )
-                    if second_invalid:
-                        second_judgment = self._drop_invalid_ops(
-                            second_judgment,
-                            scope=scope,
-                            current_summary=current_summary,
-                            new_contribution=new_contribution,
-                        )
+                    if invalid_ops(second_judgment):
+                        second_judgment = drop_invalid(second_judgment)
                 except Exception:  # noqa: BLE001 — deliberate: retry is best-effort
                     second_judgment = None
                 if second_judgment is not None and second_judgment.new_summary is not None:
                     judgment = second_judgment
 
         return judgment
+
+    def judge_batch(
+        self,
+        *,
+        scope: Scope,
+        stratum: Stratum,
+        parent_summary: ScopeSummary | None = None,
+        current_summary: ScopeSummary | None,
+        recent_contributions: Sequence[RecentContribution],
+        new_contributions: Sequence[Contribution],
+        summary_max_words: int = 500,
+        entitlement: EntitlementView | None = None,
+        operator_memory: list[tuple[str, list[OperatorItem]]] | None = None,
+        current_publication: Sequence[_PublishedItemLike] | None = None,
+        peer_publications: Sequence[tuple[str, Sequence[_PublishedItemLike]]] | None = None,
+        window_verbatim_tail: int = WINDOW_VERBATIM_TAIL,
+    ) -> ScopeManagerBatchJudgment:
+        """Judge several new contributions, in arrival order, in ONE call (ADR 0011 D3).
+
+        Makes exactly one Anthropic API call using forced
+        ``submit_batch_judgment`` tool use, and returns one verdict per
+        contribution plus the batch's single cumulative amendment — hence one
+        amended summary, one summary write, one ``version`` increment, however
+        many of the contributions were accepted. The judge processes them
+        sequentially inside the call, each against the summary as amended by
+        its predecessors, so the verdicts are the ones serial judgment would
+        produce; one declined contribution never costs the others theirs.
+
+        A batch of ONE is not batched at all: it delegates to :meth:`judge`
+        and wraps the result, so the single-contribution call — its tool
+        schema, its prompt, its record rows — stays exactly what it was, and
+        batching remains strictly additive.
+
+        Args:
+            new_contributions: The contributions to judge, in ARRIVAL order —
+                the order the record appended them, which is the order the
+                judge must process them in. Every other argument means exactly
+                what it means on :meth:`judge`.
+
+        Returns:
+            A :class:`ScopeManagerBatchJudgment`.
+
+        Raises:
+            ValueError: *new_contributions* is empty, the model response is
+                missing the ``tool_use`` block, or the payload is
+                structurally unusable after its one corrective re-ask (a
+                missing or duplicated verdict, an op admitting a declined
+                contribution, an amendment on an all-declined batch).
+            RuntimeError: No Anthropic API key is configured.
+        """
+        self._check_api_key()
+        if not new_contributions:
+            raise ValueError("judge_batch requires at least one contribution to judge.")
+
+        if len(new_contributions) == 1:
+            only = new_contributions[0]
+            judgment = self.judge(
+                scope=scope,
+                stratum=stratum,
+                parent_summary=parent_summary,
+                current_summary=current_summary,
+                recent_contributions=recent_contributions,
+                new_contribution=only,
+                summary_max_words=summary_max_words,
+                entitlement=entitlement,
+                operator_memory=operator_memory,
+                current_publication=current_publication,
+                peer_publications=peer_publications,
+                window_verbatim_tail=window_verbatim_tail,
+            )
+            return ScopeManagerBatchJudgment(
+                verdicts=[
+                    BatchVerdict(
+                        contribution_id=only.id,
+                        decision=judgment.decision,
+                        reasoning=judgment.reasoning,
+                    )
+                ],
+                new_summary=judgment.new_summary,
+                directive_ops=judgment.directive_ops,
+                new_context=judgment.new_context,
+                dropped_ops=judgment.dropped_ops,
+                dropped_ops_by_contribution=(
+                    {only.id: list(judgment.dropped_ops)} if judgment.dropped_ops else {}
+                ),
+                withdraw_published=judgment.withdraw_published,
+            )
+
+        contributions = {c.id: c for c in new_contributions}
+        batch_ids = list(contributions)
+
+        user_message = _build_batch_user_message(
+            scope=scope,
+            stratum=stratum,
+            parent_summary=parent_summary,
+            current_summary=current_summary,
+            recent_contributions=recent_contributions,
+            new_contributions=new_contributions,
+            summary_max_words=summary_max_words,
+            entitlement=entitlement,
+            current_publication=current_publication,
+            peer_publications=peer_publications,
+            operator_memory=operator_memory,
+            window_verbatim_tail=window_verbatim_tail,
+        )
+
+        def _parse(block) -> ScopeManagerBatchJudgment:  # noqa: ANN001 — tool_use block
+            return self._parse_batch_judgment(
+                scope=scope,
+                tool_use_block=block,
+                current_summary=current_summary,
+                contributions=contributions,
+            )
+
+        def _invalid_ops(judgment: ScopeManagerBatchJudgment) -> list[DirectiveOp]:
+            _, invalid = _partition_ops(
+                judgment.directive_ops, current_summary, batch_ids=batch_ids
+            )
+            return invalid
+
+        def _invalid_corrective(invalid_ops: Sequence[DirectiveOp]) -> str:
+            valid_ids = (
+                [d.id for d in current_summary.directives] if current_summary is not None else []
+            )
+            rendered_valid = (
+                ", ".join(valid_ids) if valid_ids else "(none — this summary has no directives)"
+            )
+            return (
+                "Your amendment names ids that are not valid here: "
+                f"{', '.join(op.describe() for op in invalid_ops)}. EVERY op needs a "
+                "`contribution_id` naming the batch member that motivated it, from "
+                f"this list: {', '.join(batch_ids)} — and only a member you accepted. "
+                "The directive ids you may name in a supersede or retire are: "
+                f"{rendered_valid}. Call submit_batch_judgment again with the SAME "
+                "verdicts, naming only ids from those lists — or leaving those ops out "
+                "if none of them applies."
+            )
+
+        def _drop_invalid(judgment: ScopeManagerBatchJudgment) -> ScopeManagerBatchJudgment:
+            return self._drop_invalid_batch_ops(
+                judgment,
+                scope=scope,
+                current_summary=current_summary,
+                contributions=contributions,
+            )
+
+        return self._call_with_correctives(
+            user_message=user_message,
+            system_prompt=_BATCH_SYSTEM_PROMPT,
+            tool=JUDGE_BATCH_TOOL,
+            max_tokens=_batch_max_tokens(len(new_contributions)),
+            summary_max_words=summary_max_words,
+            parse=_parse,
+            invalid_ops=_invalid_ops,
+            invalid_corrective=_invalid_corrective,
+            drop_invalid=_drop_invalid,
+            verdict_noun="verdicts",
+            decision_noun="decisions",
+            schema_reminder=(
+                "`verdicts` a list of verdict objects (each with `contribution_id`, "
+                "`decision`, and `reasoning`), `directive_ops` a list of op objects "
+                "(each with an `op` field, and a `contribution_id` on every append and "
+                "publish), neither of them a string nor strings, and `new_context` a "
+                "string or null."
+            ),
+        )
+
+    @staticmethod
+    def _parse_batch_judgment(
+        *,
+        scope: Scope,
+        tool_use_block,  # noqa: ANN001 — Anthropic content block
+        current_summary: ScopeSummary | None,
+        contributions: Mapping[str, Contribution],
+    ) -> ScopeManagerBatchJudgment:
+        """Validate a ``submit_batch_judgment`` payload and apply its amendment.
+
+        The batch counterpart of :meth:`_parse_judgment`, with the same
+        division of labour: structural failures raise (and get the one parse
+        re-ask), while ops naming an id that merely does not exist are left
+        for the invalid-id corrective, which drops and notes them rather than
+        stranding a contribution.
+
+        Raises:
+            ValueError: a missing, duplicated, or unknown verdict; an
+                ``append``/``publish`` with no ``contribution_id``; an op
+                admitting a contribution this batch declined; or an amendment
+                on a batch that declined everything.
+        """
+        raw: dict = tool_use_block.input
+        batch_ids = list(contributions)
+
+        verdicts = _parse_batch_verdicts(raw.get("verdicts"), batch_ids=batch_ids)
+        ops = _parse_directive_ops(raw.get("directive_ops"))
+        new_context = _parse_new_context(raw.get("new_context"))
+
+        # ADR 0007 D3/D5, exactly as on the single path: always a list, never
+        # None, so callers never need a null-check.
+        withdraw_published = [str(x) for x in (raw.get("withdraw_published") or []) if x]
+
+        accepted = {v.contribution_id for v in verdicts if v.decision != "decline"}
+        if not accepted:
+            # Every contribution declined: the same consistency rule a single
+            # decline obeys — a declined contribution amends nothing, and a
+            # batch of declines amends nothing either.
+            if ops or new_context is not None:
+                raise ValueError(
+                    "submit_batch_judgment declined every contribution in the batch but "
+                    "returned an amendment (directive_ops or new_context). Declined "
+                    "contributions must not amend the summary."
+                )
+            return ScopeManagerBatchJudgment(
+                verdicts=verdicts,
+                new_summary=None,
+                withdraw_published=withdraw_published,
+            )
+
+        for op in ops:
+            if op.contribution_id in contributions and op.contribution_id not in accepted:
+                raise ValueError(
+                    f"submit_batch_judgment returned an {op.op} op attributed to "
+                    f"contribution {op.contribution_id}, which this batch declined. A "
+                    "declined contribution amends nothing, so no op belongs to it."
+                )
+
+        new_summary = _apply_batch_amendment(
+            scope=scope,
+            current_summary=current_summary,
+            contributions=contributions,
+            ops=ops,
+            new_context=new_context,
+        )
+
+        return ScopeManagerBatchJudgment(
+            verdicts=verdicts,
+            new_summary=new_summary,
+            directive_ops=ops,
+            new_context=new_context,
+            withdraw_published=withdraw_published,
+        )
+
+    @staticmethod
+    def _drop_invalid_batch_ops(
+        judgment: ScopeManagerBatchJudgment,
+        *,
+        scope: Scope,
+        current_summary: ScopeSummary | None,
+        contributions: Mapping[str, Contribution],
+    ) -> ScopeManagerBatchJudgment:
+        """Return *judgment* with invalid-id ops dropped and the rest applied.
+
+        ADR 0011 D1's fallback after the single corrective re-ask, carried to
+        the batch: the bad op goes, the remaining amendment applies, and the
+        drop is noted on the judgment row of the member the op names. An op
+        dropped BECAUSE its attribution is missing or unknown names no member,
+        so its note goes to every accepted member's row — the record still
+        shows the drop, and no contribution is falsely named as its owner. No
+        verdict is touched.
+        """
+        applicable, invalid = _partition_ops(
+            judgment.directive_ops, current_summary, batch_ids=list(contributions)
+        )
+        if not invalid:
+            return judgment
+
+        owners = {cid: list(ops) for cid, ops in judgment.dropped_ops_by_contribution.items()}
+        for op in invalid:
+            if op.contribution_id in contributions:
+                note_targets = [op.contribution_id]
+            else:
+                note_targets = [v.contribution_id for v in judgment.accepted_verdicts]
+            for target in note_targets:
+                owners.setdefault(target, []).append(op.describe())
+
+        return judgment.model_copy(
+            update={
+                "directive_ops": applicable,
+                "dropped_ops": [*judgment.dropped_ops, *(op.describe() for op in invalid)],
+                "dropped_ops_by_contribution": owners,
+                "new_summary": _apply_batch_amendment(
+                    scope=scope,
+                    current_summary=current_summary,
+                    contributions=contributions,
+                    ops=applicable,
+                    new_context=judgment.new_context,
+                ),
+            }
+        )
 
     @staticmethod
     def _drop_invalid_ops(

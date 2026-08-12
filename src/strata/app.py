@@ -45,7 +45,7 @@ from __future__ import annotations
 import importlib.resources
 import pathlib
 import sqlite3
-from collections.abc import AsyncGenerator, Generator
+from collections.abc import AsyncGenerator, Generator, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -59,7 +59,10 @@ from pydantic import BaseModel
 
 from strata import __version__
 from strata.fleet_config import FleetConfig, Scope, Stratum
+from strata.locks import BATCH_CAP, QUEUE_WAIT_TIMEOUT_S, QueueTicket
+from strata.locks import scope_append_lock as _scope_append_lock
 from strata.locks import scope_lock as _scope_lock
+from strata.locks import scope_queue as _scope_queue
 from strata.migrator import run_migrations
 from strata.operator import operator_memory_binding
 from strata.project_config import StoragePaths, resolve_storage_paths
@@ -72,9 +75,15 @@ from strata.record_store import (
     JUDGE_FAILED,
     Contribution,
     ContributorRef,
+    RecentContribution,
     RecordStore,
 )
-from strata.scope_manager import WINDOW_VERBATIM_TAIL, ScopeManager, ScopeManagerJudgment
+from strata.scope_manager import (
+    WINDOW_VERBATIM_TAIL,
+    ScopeManager,
+    ScopeManagerBatchJudgment,
+    ScopeManagerJudgment,
+)
 from strata.settings import Settings, get_settings
 from strata.summary_store import ScopeSummary, SummaryStore
 
@@ -212,7 +221,7 @@ class ContributionOutcome:
 
 
 class JudgeUnavailable(Exception):
-    """Raised when the scope-manager's ``judge()`` fails during a contribution.
+    """Raised when the scope-manager's judgment fails during a contribution.
 
     The contribution is already in the record (issue #57 — the record never
     lies) and a judgment-attempt-failed *event* has been recorded against it,
@@ -221,6 +230,11 @@ class JudgeUnavailable(Exception):
     ``contribution_id`` so the caller routes a retry to re-judge
     (``strata_rejudge`` / :func:`rejudge_contribution`) instead of appending a
     duplicate contribution.
+
+    Still exactly one contribution per error under ADR 0011 D3: a failed BATCH
+    call raises one of these per member, each carrying its own contribution id
+    and each with its own attempt row, so every waiting caller learns which
+    contribution of its own to re-judge — never someone else's.
     """
 
     def __init__(self, contribution_id: str, error_class: str, message: str) -> None:
@@ -229,30 +243,36 @@ class JudgeUnavailable(Exception):
         super().__init__(message)
 
 
-def _judge_and_record(
+@dataclass
+class _JudgeInputs:
+    """The scope state one judgment call is judged against.
+
+    Read once per call — per BATCH on the coalescing path (ADR 0011 D3), which
+    is what makes N contributions cost one prompt instead of N.
+    """
+
+    current_summary: ScopeSummary | None
+    parent_summary: ScopeSummary | None
+    recent_contributions: list[RecentContribution]
+    entitlement: object
+    operator_memory: list
+    current_publication: list
+    peer_publications: list
+
+
+def _read_judge_inputs(
     *,
-    contribution: Contribution,
     scope: Scope,
-    stratum: Stratum,
     fleet: FleetConfig,
     record_store: RecordStore,
     summary_store: SummaryStore,
-    scope_manager: ScopeManager,
-    summary_max_words: int,
-    window_verbatim_tail: int = WINDOW_VERBATIM_TAIL,
-) -> ContributionOutcome:
-    """Judge *contribution* against the scope's current state and persist the result.
-
-    The caller MUST hold ``_scope_lock(scope.id)`` — this reads the current
-    summary, judges, records the judgment, and writes the summary as one
-    serialized unit. On judge failure it records a judgment-attempt-failed
-    event and raises :class:`JudgeUnavailable`; no judgment row is written.
-    """
+) -> _JudgeInputs:
+    """Read everything the scope-manager judges against, under the caller's lock."""
     current_summary = summary_store.read(scope.id)
     # ADR 0011 D2: the recency window is a mechanical digest built from the
     # record — (contribution, state, judgment notes) triples, not verbatim
-    # text. The contribution under judgment was appended before this read, so
-    # it is in its own window as a `pending` row.
+    # text. The contributions under judgment were appended before this read, so
+    # they are in their own window as `pending` rows.
     recent_contributions = record_store.list_recent_contributions(scope_id=scope.id, limit=20)
 
     # Resolve the inter-stratum parent's summary for manager context (ADR 0004
@@ -278,20 +298,54 @@ def _judge_and_record(
         (peer.id, read_publication(peer.id, summaries_dir=str(summary_store.summaries_dir)))
         for peer in sorted(entitlement.referenced_peers, key=lambda s: s.id)
     ]
+    return _JudgeInputs(
+        current_summary=current_summary,
+        parent_summary=parent_summary,
+        recent_contributions=recent_contributions,
+        entitlement=entitlement,
+        operator_memory=operator_memory,
+        current_publication=current_publication,
+        peer_publications=peer_publications,
+    )
+
+
+def _judge_and_record(
+    *,
+    contribution: Contribution,
+    scope: Scope,
+    stratum: Stratum,
+    fleet: FleetConfig,
+    record_store: RecordStore,
+    summary_store: SummaryStore,
+    scope_manager: ScopeManager,
+    summary_max_words: int,
+    window_verbatim_tail: int = WINDOW_VERBATIM_TAIL,
+) -> ContributionOutcome:
+    """Judge *contribution* against the scope's current state and persist the result.
+
+    The caller MUST hold ``_scope_lock(scope.id)`` — this reads the current
+    summary, judges, records the judgment, and writes the summary as one
+    serialized unit. On judge failure it records a judgment-attempt-failed
+    event and raises :class:`JudgeUnavailable`; no judgment row is written.
+    """
+    inputs = _read_judge_inputs(
+        scope=scope, fleet=fleet, record_store=record_store, summary_store=summary_store
+    )
+    parent_summary = inputs.parent_summary
 
     try:
         judgment: ScopeManagerJudgment = scope_manager.judge(
             scope=scope,
             stratum=stratum,
             parent_summary=parent_summary,
-            current_summary=current_summary,
-            recent_contributions=recent_contributions,
+            current_summary=inputs.current_summary,
+            recent_contributions=inputs.recent_contributions,
             new_contribution=contribution,
             summary_max_words=summary_max_words,
-            entitlement=entitlement,
-            operator_memory=operator_memory,
-            current_publication=current_publication,
-            peer_publications=peer_publications,
+            entitlement=inputs.entitlement,
+            operator_memory=inputs.operator_memory,
+            current_publication=inputs.current_publication,
+            peer_publications=inputs.peer_publications,
             window_verbatim_tail=window_verbatim_tail,
         )
     except Exception as exc:
@@ -324,63 +378,19 @@ def _judge_and_record(
 
     summary_updated = False
     if judgment.decision != "decline" and judgment.new_summary is not None:
-        # Stamp the parent-summary version the judgment was built from, so
-        # staleness stays detectable without re-running the LLM (ADR 0004 D4).
-        to_write = judgment.new_summary.model_copy(
-            update={"parent_version": parent_summary.version if parent_summary else None}
+        # Single path: the one judged contribution owns the whole amendment —
+        # the implicit binding ADR 0011 D3 leaves exactly as it was.
+        _write_amendment(
+            judgment,
+            scope=scope,
+            record_store=record_store,
+            summary_store=summary_store,
+            parent_summary=parent_summary,
+            retirements=[(d, judgment.reasoning) for d in judgment.retired_directive_ids],
+            removals=[(d, contribution.id) for d in judgment.removed_directive_ids],
+            withdraw_reasoning=judgment.reasoning,
         )
-        summary_store.write(scope.id, to_write)
         summary_updated = True
-
-        # ADR 0011 D1: a `retire` op removes a directive with no replacement,
-        # so no contribution row carries the explanation — the retirement
-        # event does (CONTEXT.md § Retirement), in the shape ADR 0008 D4
-        # reserved for exactly this scope-manager explicit-retire. Superseded
-        # directives get none: their explanation is the incoming directive's
-        # own supersedes reference.
-        for directive_id in judgment.retired_directive_ids:
-            record_store.append_retirement(
-                scope_id=scope.id,
-                directive_id=directive_id,
-                retired_by="scope-manager",
-                reason=judgment.reasoning,
-            )
-
-        # ADR 0007 D3 — staleness propagation, two paths, both under the
-        # lock this function's caller already holds:
-        #
-        # 1. Judged propagation (D3/D5): the judge itself named published
-        #    items whose belief this rewrite drops or contradicts. Each
-        #    withdrawal carries the SAME judged_by/reasoning as this
-        #    contribution's own judgment — it was judged, just as part of
-        #    this call rather than a fresh one.
-        if judgment.withdraw_published:
-            apply_judged_withdrawals(
-                scope.id,
-                judgment.withdraw_published,
-                judged_by="scope-manager",
-                reasoning=judgment.reasoning,
-                record_store=record_store,
-                summaries_dir=str(summary_store.summaries_dir),
-            )
-
-        # 2. Mechanical propagation (D3): any published item anchored ONLY to
-        #    directives that just left the summary is withdrawn, no LLM in the
-        #    loop. The removed ids come straight off the amendment's
-        #    supersede/retire ops (ADR 0011 D1) — the ops ARE the removal, so
-        #    there is no longer anything to diff between two summary
-        #    generations.
-        new_directive_ids = {d.id for d in judgment.new_summary.directives}
-        removed_directive_ids = set(judgment.removed_directive_ids)
-        if removed_directive_ids:
-            propagate_directive_removals(
-                scope.id,
-                removed_directive_ids,
-                contribution.id,
-                surviving_directive_ids=new_directive_ids,
-                record_store=record_store,
-                summaries_dir=str(summary_store.summaries_dir),
-            )
 
     return ContributionOutcome(
         contribution_id=contribution.id,
@@ -388,6 +398,251 @@ def _judge_and_record(
         reasoning=judgment.reasoning,
         summary_updated=summary_updated,
     )
+
+
+def _write_amendment(
+    judgment: ScopeManagerJudgment | ScopeManagerBatchJudgment,
+    *,
+    scope: Scope,
+    record_store: RecordStore,
+    summary_store: SummaryStore,
+    parent_summary: ScopeSummary | None,
+    retirements: Sequence[tuple[str, str]],
+    removals: Sequence[tuple[str, str]],
+    withdraw_reasoning: str,
+) -> None:
+    """Write an accepted amendment's summary and everything that follows from it.
+
+    One amendment, one summary write — so a batch of N accepts bumps
+    ``version`` once (ADR 0011 D3), exactly as one accept does. The caller
+    MUST hold ``_scope_lock(scope.id)``.
+
+    The three record consequences carry attribution the CALLER resolved, since
+    only it knows which contribution owns each op: *retirements* are
+    ``(directive_id, reason)`` pairs, *removals* are ``(directive_id,
+    trigger_contribution_id)`` pairs, and *withdraw_reasoning* explains the
+    judged withdrawals. On the single path all three come from the one judged
+    contribution; in a batch each op names its own member (ADR 0011 D3), and
+    nothing is inferred — a ``Retirement`` row and a withdraw act are
+    permanent, so a guessed owner would be a permanent misstatement of
+    provenance.
+    """
+    assert judgment.new_summary is not None  # noqa: S101 — caller-checked invariant
+    # Stamp the parent-summary version the judgment was built from, so
+    # staleness stays detectable without re-running the LLM (ADR 0004 D4).
+    to_write = judgment.new_summary.model_copy(
+        update={"parent_version": parent_summary.version if parent_summary else None}
+    )
+    summary_store.write(scope.id, to_write)
+
+    # ADR 0011 D1: a `retire` op removes a directive with no replacement,
+    # so no contribution row carries the explanation — the retirement
+    # event does (CONTEXT.md § Retirement), in the shape ADR 0008 D4
+    # reserved for exactly this scope-manager explicit-retire. Superseded
+    # directives get none: their explanation is the incoming directive's
+    # own supersedes reference.
+    for directive_id, reason in retirements:
+        record_store.append_retirement(
+            scope_id=scope.id,
+            directive_id=directive_id,
+            retired_by="scope-manager",
+            reason=reason,
+        )
+
+    # ADR 0007 D3 — staleness propagation, two paths, both under the
+    # lock this function's caller already holds:
+    #
+    # 1. Judged propagation (D3/D5): the judge itself named published
+    #    items whose belief this rewrite drops or contradicts. Each
+    #    withdrawal carries the SAME judged_by/reasoning as the judgment it
+    #    came with — it was judged, just as part of that call rather than a
+    #    fresh one.
+    if judgment.withdraw_published:
+        apply_judged_withdrawals(
+            scope.id,
+            judgment.withdraw_published,
+            judged_by="scope-manager",
+            reasoning=withdraw_reasoning,
+            record_store=record_store,
+            summaries_dir=str(summary_store.summaries_dir),
+        )
+
+    # 2. Mechanical propagation (D3): any published item anchored ONLY to
+    #    directives that just left the summary is withdrawn, no LLM in the
+    #    loop. The removed ids come straight off the amendment's
+    #    supersede/retire ops (ADR 0011 D1) — the ops ARE the removal, so
+    #    there is no longer anything to diff between two summary
+    #    generations. Removals are grouped by the contribution each op names,
+    #    so every withdraw act's trigger is the contribution that actually
+    #    motivated it.
+    surviving = {d.id for d in judgment.new_summary.directives}
+    by_trigger: dict[str, set[str]] = {}
+    for directive_id, trigger_contribution_id in removals:
+        by_trigger.setdefault(trigger_contribution_id, set()).add(directive_id)
+    for trigger_contribution_id, directive_ids in by_trigger.items():
+        propagate_directive_removals(
+            scope.id,
+            directive_ids,
+            trigger_contribution_id,
+            surviving_directive_ids=surviving,
+            record_store=record_store,
+            summaries_dir=str(summary_store.summaries_dir),
+        )
+
+
+def _judge_batch_and_record(
+    *,
+    contributions: Sequence[Contribution],
+    scope: Scope,
+    stratum: Stratum,
+    fleet: FleetConfig,
+    record_store: RecordStore,
+    summary_store: SummaryStore,
+    scope_manager: ScopeManager,
+    summary_max_words: int,
+    window_verbatim_tail: int = WINDOW_VERBATIM_TAIL,
+) -> list[ContributionOutcome | JudgeUnavailable]:
+    """Judge a batch of contributions in ONE call and persist the results (ADR 0011 D3).
+
+    *contributions* are in arrival order — the order the record appended them.
+    Returns one result per contribution, in that same order: its
+    :class:`ContributionOutcome`, or its own :class:`JudgeUnavailable` when the
+    call failed, so the drain can hand each waiting caller its own result. This
+    function never raises for a judge failure; it returns it, per member.
+
+    A batch of ONE takes the single-contribution path verbatim
+    (:func:`_judge_and_record`): same tool schema, same prompt, same record
+    rows. Batching is additive, never a replacement.
+
+    Each verdict lands as its own judgment row against its own contribution id
+    (the UNIQUE constraint is untouched), and a failed call writes one
+    judgment-attempt row per member (issues #57/#118). The whole batch produces
+    exactly ONE summary write.
+
+    The caller MUST hold ``_scope_lock(scope.id)``.
+    """
+    if len(contributions) == 1:
+        try:
+            return [
+                _judge_and_record(
+                    contribution=contributions[0],
+                    scope=scope,
+                    stratum=stratum,
+                    fleet=fleet,
+                    record_store=record_store,
+                    summary_store=summary_store,
+                    scope_manager=scope_manager,
+                    summary_max_words=summary_max_words,
+                    window_verbatim_tail=window_verbatim_tail,
+                )
+            ]
+        except JudgeUnavailable as exc:
+            return [exc]
+
+    inputs = _read_judge_inputs(
+        scope=scope, fleet=fleet, record_store=record_store, summary_store=summary_store
+    )
+
+    try:
+        batch: ScopeManagerBatchJudgment = scope_manager.judge_batch(
+            scope=scope,
+            stratum=stratum,
+            parent_summary=inputs.parent_summary,
+            current_summary=inputs.current_summary,
+            recent_contributions=inputs.recent_contributions,
+            new_contributions=list(contributions),
+            summary_max_words=summary_max_words,
+            entitlement=inputs.entitlement,
+            operator_memory=inputs.operator_memory,
+            current_publication=inputs.current_publication,
+            peer_publications=inputs.peer_publications,
+            window_verbatim_tail=window_verbatim_tail,
+        )
+    except Exception as exc:  # noqa: BLE001 — every member needs its own error
+        # One failed call strands the whole batch, so each member gets the
+        # same treatment a single failed judgment gets: its own
+        # judgment-attempt row marked JUDGE_FAILED (issues #57/#118), and its
+        # own error carrying its own contribution id, so its caller re-judges
+        # its own contribution rather than someone else's.
+        return _fail_batch(contributions, exc, record_store=record_store, outcome=JUDGE_FAILED)
+
+    # One judgment row per verdict, against its own contribution id, in
+    # arrival order — the record's shape does not know this was a batch.
+    for verdict in batch.verdicts:
+        record_store.record_judgment(
+            contribution_id=verdict.contribution_id,
+            decision=verdict.decision,
+            judged_by="scope-manager",
+            notes=batch.record_notes_for(verdict.contribution_id),
+        )
+
+    summary_updated = False
+    if batch.accepted_verdicts and batch.new_summary is not None:
+        # Every op names the batch member that motivated it (ADR 0011 D3), so
+        # each retirement's reason and each withdrawal's trigger come off the
+        # op itself — the record never guesses which contribution meant it.
+        retirements = [
+            (directive_id, batch.verdict_reasoning(contribution_id or ""))
+            for directive_id, contribution_id in batch.directive_retirements()
+        ]
+        removals = [
+            (directive_id, contribution_id or "")
+            for directive_id, contribution_id in batch.directive_removals()
+        ]
+        _write_amendment(
+            batch,
+            scope=scope,
+            record_store=record_store,
+            summary_store=summary_store,
+            parent_summary=inputs.parent_summary,
+            retirements=retirements,
+            removals=removals,
+            # A withdraw_published verdict is submitted against the amendment
+            # as a whole, so it carries every accepted member's reasoning
+            # rather than a guess at which one meant it.
+            withdraw_reasoning=batch.batch_reasoning,
+        )
+        summary_updated = True
+
+    return [
+        ContributionOutcome(
+            contribution_id=verdict.contribution_id,
+            decision=verdict.decision,
+            reasoning=verdict.reasoning,
+            # A declined member did not update the summary, whatever its
+            # batch-mates did — the same thing a single decline reports.
+            summary_updated=summary_updated and verdict.decision != "decline",
+        )
+        for verdict in batch.verdicts
+    ]
+
+
+def _fail_batch(
+    contributions: Sequence[Contribution],
+    exc: Exception,
+    *,
+    record_store: RecordStore,
+    outcome: str | None,
+) -> list[ContributionOutcome | JudgeUnavailable]:
+    """Record an attempt row per member and return each member's own error.
+
+    *outcome* is :data:`JUDGE_FAILED` when the judge itself ran and failed
+    (the judge run is over — issue #118), and ``None`` when the judgment was
+    never attempted for these contributions, which leaves them reading as
+    ``pending`` with a failed attempt rather than terminally failed.
+    """
+    error_class = type(exc).__name__
+    message = str(exc)
+    results: list[ContributionOutcome | JudgeUnavailable] = []
+    for contribution in contributions:
+        record_store.record_judgment_attempt(
+            contribution_id=contribution.id,
+            error_class=error_class,
+            message=message,
+            outcome=outcome,
+        )
+        results.append(JudgeUnavailable(contribution.id, error_class, message))
+    return results
 
 
 def run_contribution(
@@ -405,27 +660,36 @@ def run_contribution(
     scope_manager: ScopeManager,
     summary_max_words: int,
     window_verbatim_tail: int = WINDOW_VERBATIM_TAIL,
+    batch_cap: int = BATCH_CAP,
+    queue_timeout_s: float = QUEUE_WAIT_TIMEOUT_S,
 ) -> ContributionOutcome:
-    """Append a contribution and judge it under the scope's serialization lock.
+    """Append a contribution to the record and get it judged (ADR 0011 D3).
 
-    Fixes issue #38: the whole record-append -> read-summary -> judge ->
-    record-judgment -> summary-write sequence runs under ``_scope_lock``, so two
-    concurrent contributions to the same scope are judged and written one after
-    the other. Each accepted judgment's content reaches the summary; the record
-    carries both. The append runs inside the lock too, so the manager always
-    judges against a summary consistent with every already-recorded judgment.
+    The append and the enqueue run under ``_scope_append_lock`` — a short hold
+    that makes record order arrival order — and the judgment runs under
+    ``_scope_lock``, the same lock the operator correction primitives take, so
+    a scope's summary is still always explainable by its record (issue #38,
+    ADR 0008 D4). Splitting the two is what lets a contribution arriving while
+    a judgment is in flight QUEUE instead of blocking: this caller then either
+    becomes the drain worker — judging everything queued, up to *batch_cap*, in
+    one call (ADR 0011 D3) — or waits for its own verdict from the batch that
+    includes it.
+
+    What a caller sees is unchanged: its own :class:`ContributionOutcome`, or
+    its own :class:`JudgeUnavailable` carrying its own contribution id.
 
     Callers validate the scope (exists / active / entitled) before calling.
 
     Raises:
-        JudgeUnavailable: the scope-manager's judge() call failed. The
-            contribution and a judgment-attempt-failed event are already in the
-            record; retry via :func:`rejudge_contribution`, never a fresh
-            contribute (which would duplicate the contribution).
+        JudgeUnavailable: the scope-manager's judgment failed, or the wait for
+            it expired. The contribution and a judgment-attempt event are
+            already in the record; retry via :func:`rejudge_contribution`,
+            never a fresh contribute (which would duplicate the contribution).
         sqlite3.IntegrityError: *supersedes* references a missing contribution
             (a client-input error the caller maps to its surface's error shape).
     """
-    with _scope_lock(scope.id):
+    queue = _scope_queue(scope.id)
+    with _scope_append_lock(scope.id):
         contribution = record_store.append_contribution(
             scope_id=scope.id,
             content=content,
@@ -434,17 +698,125 @@ def run_contribution(
             supersedes=supersedes,
             contributor=contributor,
         )
-        return _judge_and_record(
-            contribution=contribution,
-            scope=scope,
-            stratum=stratum,
-            fleet=fleet,
-            record_store=record_store,
-            summary_store=summary_store,
-            scope_manager=scope_manager,
-            summary_max_words=summary_max_words,
-            window_verbatim_tail=window_verbatim_tail,
+        ticket = queue.enqueue(contribution.id, contribution)
+
+    while True:
+        try:
+            turn = queue.await_turn(ticket, timeout=queue_timeout_s)
+        except TimeoutError as exc:
+            # A wedged drain fails loudly rather than hanging this caller
+            # forever. The contribution stays in the record, unjudged and
+            # re-judgeable: the attempt row is written WITHOUT the
+            # JUDGE_FAILED marker, since no judge run ended here (issue #118).
+            queue.abandon(ticket)
+            (error,) = _fail_batch([contribution], exc, record_store=record_store, outcome=None)
+            raise error from exc
+
+        if turn == "settled":
+            return _unwrap_ticket(ticket)
+
+        # This caller is now the drain worker. It judges whatever is queued —
+        # its own contribution among them, unless another drain already took
+        # it, in which case the batch it takes may be empty and it goes back
+        # to waiting.
+        try:
+            batch = queue.take_batch(batch_cap)
+            if batch:
+                _drain_batch(
+                    batch,
+                    queue=queue,
+                    scope=scope,
+                    stratum=stratum,
+                    fleet=fleet,
+                    record_store=record_store,
+                    summary_store=summary_store,
+                    scope_manager=scope_manager,
+                    summary_max_words=summary_max_words,
+                    window_verbatim_tail=window_verbatim_tail,
+                )
+        finally:
+            # Always hand the role back, even if the drain broke: the next
+            # caller takes it and judges what is still queued.
+            queue.release_drain()
+
+        if ticket.settled:
+            return _unwrap_ticket(ticket)
+
+
+def _drain_batch(
+    batch: Sequence[QueueTicket],
+    *,
+    queue,  # noqa: ANN001 — strata.locks.ScopeWorkQueue, typed loosely to avoid a cycle
+    scope: Scope,
+    stratum: Stratum,
+    fleet: FleetConfig,
+    record_store: RecordStore,
+    summary_store: SummaryStore,
+    scope_manager: ScopeManager,
+    summary_max_words: int,
+    window_verbatim_tail: int,
+) -> None:
+    """Judge one taken batch and publish each member's result (ADR 0011 D3).
+
+    The judgment runs under ``_scope_lock``; the results are published AFTER
+    that lock is released, so the summary lock and the queue's own condition
+    are never held at the same time and cannot deadlock.
+
+    Every taken ticket is settled before this returns — with its outcome, or,
+    if the drain itself broke, with its own error. A taken ticket must never be
+    left waiting on a batch nobody will judge again.
+    """
+    contributions = [ticket.payload for ticket in batch]
+    try:
+        with _scope_lock(scope.id):
+            results = _judge_batch_and_record(
+                contributions=contributions,
+                scope=scope,
+                stratum=stratum,
+                fleet=fleet,
+                record_store=record_store,
+                summary_store=summary_store,
+                scope_manager=scope_manager,
+                summary_max_words=summary_max_words,
+                window_verbatim_tail=window_verbatim_tail,
+            )
+    except Exception as exc:  # noqa: BLE001 — the drain broke, not the judge
+        # Not a judge failure (those come back as results): the drain itself
+        # failed — a store error, a bug. The waiters still get their own
+        # errors and their own attempt rows, best-effort, and the drain's own
+        # caller sees the original exception.
+        try:
+            results = _fail_batch(contributions, exc, record_store=record_store, outcome=None)
+        except Exception:  # noqa: BLE001 — the record is unreachable too
+            results = [
+                JudgeUnavailable(ticket.key, type(exc).__name__, str(exc)) for ticket in batch
+            ]
+        queue.settle_batch(
+            batch, {ticket.key: result for ticket, result in zip(batch, results, strict=True)}
         )
+        raise
+
+    queue.settle_batch(
+        batch, {ticket.key: result for ticket, result in zip(batch, results, strict=True)}
+    )
+
+
+def _unwrap_ticket(ticket: QueueTicket) -> ContributionOutcome:
+    """Return the ticket's outcome, or raise the error published for it.
+
+    Each waiting caller gets its OWN result: its outcome, or its own
+    :class:`JudgeUnavailable` carrying its own contribution id (ADR 0011 D3).
+    """
+    result = ticket.result
+    if isinstance(result, JudgeUnavailable):
+        raise result
+    if not isinstance(result, ContributionOutcome):  # pragma: no cover — defensive
+        raise JudgeUnavailable(
+            ticket.key,
+            "DrainPublishedNothing",
+            f"The judgment queue settled contribution {ticket.key} with no result.",
+        )
+    return result
 
 
 def rejudge_contribution(
@@ -657,6 +1029,7 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
                 scope_manager=scope_manager,
                 summary_max_words=request_settings.summary_max_words,
                 window_verbatim_tail=request_settings.window_verbatim_tail,
+                batch_cap=request_settings.judgment_batch_cap,
             )
         except sqlite3.IntegrityError as exc:
             # The only FK on contributions is supersedes → contributions(id):
