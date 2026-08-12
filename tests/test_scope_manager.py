@@ -38,7 +38,7 @@ from strata.scope_manager import (
     _render_recent_contributions,
     _summary_word_count,
 )
-from strata.summary_store import Directive, ScopeSummary
+from strata.summary_store import Directive, ScopeSummary, _render_summary
 
 # ---------------------------------------------------------------------------
 # Fixtures — shared domain objects
@@ -180,66 +180,69 @@ def test_build_user_message_skilless_contributor_has_no_none() -> None:
     assert "scope=g_def456" in message
 
 
-def test_parse_judgment_accepts_directive_without_source_skill() -> None:
-    """A judge payload whose directive omits ``source_skill`` parses to None (issue #121)."""
+def test_append_op_builds_directive_without_source_skill() -> None:
+    """A skill-less contribution appends a directive whose source_skill is None (issue #121).
+
+    The engine builds the directive row from the contribution itself
+    (ADR 0011 D1), so the optional skill travels from the contributor's
+    provenance rather than from anything the judge writes.
+    """
+    contribution = Contribution(
+        id="c_ns2",
+        scope_id=SCOPE.id,
+        content="A skill-less directive.",
+        proposed_classification="directive",
+        subject="topic",
+        supersedes=None,
+        contributor=_skilless_contributor(),
+        created_at="2026-05-01T10:00:00+00:00",
+    )
     tool_input = {
         "decision": "accept_as_directive",
         "reasoning": "accepted",
-        "new_summary": {
-            "directives": [
-                {
-                    "id": NEW_CONTRIBUTION.id,
-                    "content": NEW_CONTRIBUTION.content,
-                    "subject": NEW_CONTRIBUTION.subject,
-                    "source_scope_id": SCOPE.id,
-                    # no source_skill key at all
-                    "created_at": NEW_CONTRIBUTION.created_at,
-                },
-            ],
-            "context": "",
-        },
+        "directive_ops": [{"op": "append"}],
+        "new_context": "",
     }
     judgment = ScopeManager._parse_judgment(
-        scope=SCOPE, tool_use_block=_fake_response(tool_input).content[0]
+        scope=SCOPE,
+        tool_use_block=_fake_response(tool_input).content[0],
+        current_summary=None,
+        new_contribution=contribution,
     )
     assert judgment.new_summary is not None
     assert judgment.new_summary.directives[0].source_skill is None
+    assert judgment.new_summary.directives[0].content == contribution.content
 
 
-def test_judge_tool_source_skill_is_optional() -> None:
-    """The JUDGE_TOOL schema no longer requires ``source_skill`` (issue #121)."""
-    directive_schema = JUDGE_TOOL["input_schema"]["properties"]["new_summary"]["properties"][
-        "directives"
-    ]["items"]
-    assert "source_skill" not in directive_schema["required"]
-    assert directive_schema["properties"]["source_skill"]["type"] == ["string", "null"]
+def test_judge_tool_no_longer_carries_new_summary() -> None:
+    """ADR 0011 D1: submit_judgment returns an amendment, never a rewritten summary."""
+    schema = JUDGE_TOOL["input_schema"]
+    assert "new_summary" not in schema["properties"]
+    assert "new_summary" not in schema["required"]
+    assert schema["required"] == ["decision", "reasoning", "directive_ops", "new_context"]
+
+
+def test_judge_tool_directive_ops_schema_lists_the_four_ops() -> None:
+    """The amendment's op vocabulary is exactly append/publish/supersede/retire."""
+    ops_schema = JUDGE_TOOL["input_schema"]["properties"]["directive_ops"]
+    assert ops_schema["type"] == ["array", "null"]
+    item = ops_schema["items"]
+    assert item["properties"]["op"]["enum"] == ["append", "publish", "supersede", "retire"]
+    # Only `op` is structurally required: append carries no fields at all.
+    assert item["required"] == ["op"]
+    for field in ("content", "subject", "supersedes", "id"):
+        assert item["properties"][field]["type"] == ["string", "null"]
+    assert JUDGE_TOOL["input_schema"]["properties"]["new_context"]["type"] == ["string", "null"]
 
 
 def _accept_directive_input() -> dict:
     return {
         "decision": "accept_as_directive",
         "reasoning": "The contribution establishes a clear, enforceable coding standard.",
-        "new_summary": {
-            "directives": [
-                {
-                    "id": EXISTING_DIRECTIVE.id,
-                    "content": EXISTING_DIRECTIVE.content,
-                    "subject": EXISTING_DIRECTIVE.subject,
-                    "source_scope_id": EXISTING_DIRECTIVE.source_scope_id,
-                    "source_skill": EXISTING_DIRECTIVE.source_skill,
-                    "created_at": EXISTING_DIRECTIVE.created_at,
-                },
-                {
-                    "id": NEW_CONTRIBUTION.id,
-                    "content": NEW_CONTRIBUTION.content,
-                    "subject": NEW_CONTRIBUTION.subject,
-                    "source_scope_id": SCOPE.id,
-                    "source_skill": CONTRIBUTOR.skill,
-                    "created_at": NEW_CONTRIBUTION.created_at,
-                },
-            ],
-            "context": "The architecture team favours minimal abstractions with full type safety.",
-        },
+        "directive_ops": [{"op": "append"}],
+        "new_context": (
+            "The architecture team favours minimal abstractions with full type safety."
+        ),
     }
 
 
@@ -247,19 +250,8 @@ def _accept_context_input() -> dict:
     return {
         "decision": "accept_as_context",
         "reasoning": "The contribution is informative but not binding.",
-        "new_summary": {
-            "directives": [
-                {
-                    "id": EXISTING_DIRECTIVE.id,
-                    "content": EXISTING_DIRECTIVE.content,
-                    "subject": EXISTING_DIRECTIVE.subject,
-                    "source_scope_id": EXISTING_DIRECTIVE.source_scope_id,
-                    "source_skill": EXISTING_DIRECTIVE.source_skill,
-                    "created_at": EXISTING_DIRECTIVE.created_at,
-                }
-            ],
-            "context": "Updated context with new observations.",
-        },
+        "directive_ops": [],
+        "new_context": "Updated context with new observations.",
     }
 
 
@@ -267,7 +259,8 @@ def _decline_input() -> dict:
     return {
         "decision": "decline",
         "reasoning": "The contribution duplicates an existing directive.",
-        "new_summary": None,
+        "directive_ops": None,
+        "new_context": None,
     }
 
 
@@ -309,6 +302,14 @@ def test_accept_as_directive_parses_correctly() -> None:
     # The newly accepted contribution should appear as a directive
     directive_ids = [d.id for d in judgment.new_summary.directives]
     assert NEW_CONTRIBUTION.id in directive_ids
+    # ...built from the contribution verbatim, not restated by the judge.
+    appended = judgment.new_summary.directives[-1]
+    assert appended.content == NEW_CONTRIBUTION.content
+    assert appended.subject == NEW_CONTRIBUTION.subject
+    assert appended.source_scope_id == CONTRIBUTOR.scope_id
+    assert appended.source_skill == CONTRIBUTOR.skill
+    # ...and the existing directive is carried across untouched.
+    assert judgment.new_summary.directives[0] == EXISTING_DIRECTIVE
 
 
 # ---------------------------------------------------------------------------
@@ -331,6 +332,8 @@ def test_accept_as_context_parses_correctly() -> None:
     assert judgment.new_summary is not None
     assert judgment.new_summary.scope_id == SCOPE.id
     assert judgment.new_summary.context == "Updated context with new observations."
+    # An amendment with no directive op leaves the directives list alone.
+    assert judgment.new_summary.directives == [EXISTING_DIRECTIVE]
 
 
 # ---------------------------------------------------------------------------
@@ -354,18 +357,37 @@ def test_decline_returns_no_summary() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Test 4: decline with non-null new_summary → ValueError
+# Test 4: decline carrying an amendment → ValueError
 # ---------------------------------------------------------------------------
 
 
-def test_decline_with_nonnull_summary_raises() -> None:
+def test_decline_with_new_context_raises() -> None:
+    """A declined contribution must not amend the summary (ADR 0011 D1)."""
     bad_input = {
         "decision": "decline",
         "reasoning": "Declining.",
-        "new_summary": {
-            "directives": [],
-            "context": "Should not be here.",
-        },
+        "directive_ops": [],
+        "new_context": "Should not be here.",
+    }
+    manager, _ = _make_manager(bad_input)
+
+    with pytest.raises(ValueError, match="decline"):
+        manager.judge(
+            scope=SCOPE,
+            stratum=STRATUM,
+            current_summary=CURRENT_SUMMARY,
+            recent_contributions=[],
+            new_contribution=NEW_CONTRIBUTION,
+        )
+
+
+def test_decline_with_directive_ops_raises() -> None:
+    """The same inconsistency check covers directive ops, not just context."""
+    bad_input = {
+        "decision": "decline",
+        "reasoning": "Declining.",
+        "directive_ops": [{"op": "retire", "id": EXISTING_DIRECTIVE.id}],
+        "new_context": None,
     }
     manager, _ = _make_manager(bad_input)
 
@@ -380,26 +402,36 @@ def test_decline_with_nonnull_summary_raises() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Test 5: accept_as_directive with new_summary=None → ValueError
+# Test 5: an accept always yields a summary, even on an empty amendment
 # ---------------------------------------------------------------------------
 
 
-def test_accept_with_null_summary_raises() -> None:
-    bad_input = {
-        "decision": "accept_as_directive",
-        "reasoning": "Accepting.",
-        "new_summary": None,
-    }
-    manager, _ = _make_manager(bad_input)
+def test_accept_with_empty_amendment_still_produces_a_summary() -> None:
+    """An accept never comes back without a summary to write.
 
-    with pytest.raises(ValueError, match="accept_as_directive"):
-        manager.judge(
-            scope=SCOPE,
-            stratum=STRATUM,
-            current_summary=CURRENT_SUMMARY,
-            recent_contributions=[],
-            new_contribution=NEW_CONTRIBUTION,
-        )
+    Under ADR 0011 D1 the judge can accept while amending nothing; the engine
+    still produces the amended summary (here: the current one, unchanged), so
+    the caller always has something to write and a version to bump.
+    """
+    empty_amendment = {
+        "decision": "accept_as_context",
+        "reasoning": "Accepting; nothing to change.",
+        "directive_ops": None,
+        "new_context": None,
+    }
+    manager, _ = _make_manager(empty_amendment)
+
+    judgment = manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+    )
+
+    assert judgment.new_summary is not None
+    assert judgment.new_summary.directives == CURRENT_SUMMARY.directives
+    assert judgment.new_summary.context == CURRENT_SUMMARY.context
 
 
 # ---------------------------------------------------------------------------
@@ -638,23 +670,12 @@ def test_parent_directive_content_in_user_message() -> None:
 
 
 def _summary_input_with_context(context: str) -> dict:
-    """An accept_as_directive payload whose summary context is *context*."""
+    """An accept_as_directive payload whose amended context is *context*."""
     return {
         "decision": "accept_as_directive",
         "reasoning": "The contribution establishes a clear, enforceable coding standard.",
-        "new_summary": {
-            "directives": [
-                {
-                    "id": EXISTING_DIRECTIVE.id,
-                    "content": EXISTING_DIRECTIVE.content,
-                    "subject": EXISTING_DIRECTIVE.subject,
-                    "source_scope_id": EXISTING_DIRECTIVE.source_scope_id,
-                    "source_skill": EXISTING_DIRECTIVE.source_skill,
-                    "created_at": EXISTING_DIRECTIVE.created_at,
-                },
-            ],
-            "context": context,
-        },
+        "directive_ops": [],
+        "new_context": context,
     }
 
 
@@ -733,8 +754,12 @@ def test_over_budget_triggers_one_corrective_retry() -> None:
     text_blocks = [b for b in followup_user_turn["content"] if b["type"] == "text"]
     assert len(text_blocks) == 1
     assert "BUDGET" in text_blocks[0]["text"]
-    assert "VERBATIM" in text_blocks[0]["text"]
     assert str(small_budget) in text_blocks[0]["text"]
+    # ADR 0011 D1: the corrective asks for the two levers that now exist —
+    # retire ops and a shorter context — not for a rewritten summary.
+    assert "`retire`" in text_blocks[0]["text"]
+    assert "`new_context`" in text_blocks[0]["text"]
+    assert "do not restate them" in text_blocks[0]["text"]
 
     # The returned judgment reflects the SECOND response, not the first.
     assert judgment.new_summary is not None
@@ -828,7 +853,12 @@ def test_retry_decline_keeps_first_judgment() -> None:
     """A formatting re-ask must never flip an accept into a decline."""
     over_budget_context = " ".join(f"word{i}" for i in range(20))
     first_input = _summary_input_with_context(over_budget_context)
-    decline_input = {"decision": "decline", "reasoning": "changed my mind", "new_summary": None}
+    decline_input = {
+        "decision": "decline",
+        "reasoning": "changed my mind",
+        "directive_ops": None,
+        "new_context": None,
+    }
 
     mock_client = MagicMock()
     mock_client.messages.create.side_effect = [
@@ -925,7 +955,7 @@ def test_tool_choice_disables_parallel_tool_use() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Issue #113 — new_summary returned as a JSON-encoded string
+# Issue #113 — the amendment returned as a JSON-encoded string
 # ---------------------------------------------------------------------------
 
 
@@ -934,16 +964,26 @@ def _tool_use_block(tool_input: dict) -> MagicMock:
     return _fake_response(tool_input).content[0]
 
 
-def test_stringified_new_summary_is_coerced() -> None:
-    """A new_summary arriving as a JSON string is decoded, not crashed on.
+def _parse(tool_input: dict, *, current_summary: ScopeSummary | None = CURRENT_SUMMARY):
+    """Drive _parse_judgment directly against this suite's fixtures."""
+    return ScopeManager._parse_judgment(
+        scope=SCOPE,
+        tool_use_block=_tool_use_block(tool_input),
+        current_summary=current_summary,
+        new_contribution=NEW_CONTRIBUTION,
+    )
 
-    Test (a): the model stringified the whole new_summary object. The parse
-    coerces it back and succeeds on the first call — no re-ask needed.
+
+def test_stringified_directive_ops_is_coerced() -> None:
+    """directive_ops arriving as a JSON string is decoded, not crashed on.
+
+    Test (a): the model stringified the whole ops list. The parse coerces it
+    back and succeeds on the first call — no re-ask needed.
     """
     valid = _accept_directive_input()
     stringified_input = {
         **valid,
-        "new_summary": json.dumps(valid["new_summary"]),
+        "directive_ops": json.dumps(valid["directive_ops"]),
     }
     manager, mock_client = _make_manager(stringified_input)
 
@@ -962,22 +1002,22 @@ def test_stringified_new_summary_is_coerced() -> None:
     assert NEW_CONTRIBUTION.id in [d.id for d in judgment.new_summary.directives]
 
 
-def test_stringified_directive_entry_is_coerced() -> None:
-    """A single directive entry arriving as a JSON string is decoded."""
+def test_stringified_op_entry_is_coerced() -> None:
+    """A single op entry arriving as a JSON string is decoded."""
     valid = _accept_directive_input()
-    directives = valid["new_summary"]["directives"]
-    # Stringify only the first directive entry, leave the second as an object.
-    directives[0] = json.dumps(directives[0])
-    block = _tool_use_block(valid)
+    valid["directive_ops"] = [
+        json.dumps({"op": "supersede", "id": EXISTING_DIRECTIVE.id}),
+        {"op": "append"},
+    ]
 
-    judgment = ScopeManager._parse_judgment(scope=SCOPE, tool_use_block=block)
+    judgment = _parse(valid)
 
     assert judgment.new_summary is not None
-    assert len(judgment.new_summary.directives) == 2
+    assert [d.id for d in judgment.new_summary.directives] == [NEW_CONTRIBUTION.id]
 
 
-def test_garbage_string_new_summary_raises_clean_valueerror() -> None:
-    """Test (b): an unparseable new_summary string is a clean ValueError.
+def test_garbage_string_directive_ops_raises_clean_valueerror() -> None:
+    """Test (b): an unparseable directive_ops string is a clean ValueError.
 
     The pre-fix bug was an ``AttributeError: 'str' object has no attribute
     'get'`` escaping from the parse path. The coercion must convert that into
@@ -986,44 +1026,45 @@ def test_garbage_string_new_summary_raises_clean_valueerror() -> None:
     bad_input = {
         "decision": "accept_as_directive",
         "reasoning": "The contribution is a clear standard.",
-        "new_summary": "I could not fit the summary into JSON, sorry.",
+        "directive_ops": "I could not fit the ops into JSON, sorry.",
+        "new_context": "",
     }
-    block = _tool_use_block(bad_input)
 
-    with pytest.raises(ValueError, match="new_summary as an unparseable string"):
-        ScopeManager._parse_judgment(scope=SCOPE, tool_use_block=block)
+    with pytest.raises(ValueError, match="directive_ops as an unparseable string"):
+        _parse(bad_input)
 
 
-def test_garbage_string_new_summary_not_attributeerror() -> None:
+def test_garbage_string_directive_ops_not_attributeerror() -> None:
     """The failure mode is a ValueError, never the original AttributeError."""
     bad_input = {
         "decision": "accept_as_directive",
         "reasoning": "The contribution is a clear standard.",
-        "new_summary": "not json",
+        "directive_ops": "not json",
+        "new_context": "",
     }
-    block = _tool_use_block(bad_input)
 
     try:
-        ScopeManager._parse_judgment(scope=SCOPE, tool_use_block=block)
+        _parse(bad_input)
     except ValueError:
         pass
     except AttributeError as exc:  # pragma: no cover - regression guard
         pytest.fail(f"parse leaked AttributeError instead of ValueError: {exc}")
     else:  # pragma: no cover - must raise
-        pytest.fail("expected a ValueError for a garbage new_summary string")
+        pytest.fail("expected a ValueError for a garbage directive_ops string")
 
 
 def test_first_parse_failure_triggers_one_corrective_reask() -> None:
     """Test (c): a stringified first payload triggers exactly one re-ask.
 
-    First response returns new_summary as a garbage string (unparseable);
+    First response returns directive_ops as a garbage string (unparseable);
     the manager sends one corrective follow-up echoing the error, and the
     second (well-formed) response parses successfully. Exactly two API calls.
     """
     garbage_input = {
         "decision": "accept_as_directive",
         "reasoning": "The contribution is a clear standard.",
-        "new_summary": "oops, this should have been an object",
+        "directive_ops": "oops, this should have been a list",
+        "new_context": "",
     }
     good_input = _accept_directive_input()
 
@@ -1070,7 +1111,8 @@ def test_second_parse_failure_does_not_loop() -> None:
     garbage_input = {
         "decision": "accept_as_directive",
         "reasoning": "The contribution is a clear standard.",
-        "new_summary": "still not an object",
+        "directive_ops": "still not a list",
+        "new_context": "",
     }
 
     mock_client = MagicMock()
@@ -1080,7 +1122,7 @@ def test_second_parse_failure_does_not_loop() -> None:
     ]
     manager = ScopeManager(client=mock_client)
 
-    with pytest.raises(ValueError, match="new_summary as an unparseable string"):
+    with pytest.raises(ValueError, match="directive_ops as an unparseable string"):
         manager.judge(
             scope=SCOPE,
             stratum=STRATUM,
@@ -1096,7 +1138,7 @@ def test_second_parse_failure_does_not_loop() -> None:
 def test_parse_reask_then_overflow_reask_chain() -> None:
     """A parse re-ask and the overflow re-ask are independent single retries.
 
-    First response is an unparseable new_summary string (parse re-ask); the
+    First response is an unparseable directive_ops string (parse re-ask); the
     corrective response parses but is over budget (overflow re-ask); the third
     response fits. The overflow follow-up must build on the corrective turn,
     not the discarded first turn — three calls, final judgment is the third.
@@ -1104,7 +1146,8 @@ def test_parse_reask_then_overflow_reask_chain() -> None:
     garbage_input = {
         "decision": "accept_as_directive",
         "reasoning": "The contribution is a clear standard.",
-        "new_summary": "not an object",
+        "directive_ops": "not a list",
+        "new_context": "",
     }
     over_budget_input = _summary_input_with_context(" ".join(f"word{i}" for i in range(20)))
     fitting_input = _summary_input_with_context("Condensed.")
@@ -1793,3 +1836,645 @@ def test_bootstrap_system_prompt_states_conservative_default() -> None:
     flat = " ".join(_BOOTSTRAP_SYSTEM_PROMPT.split())
     assert "conservative" in flat.lower()
     assert "initial" in flat.lower() or "INITIAL" in flat
+
+
+# ---------------------------------------------------------------------------
+# ADR 0011 D1 — amendment ops: existing directives are never re-emitted
+# ---------------------------------------------------------------------------
+
+
+def _second_directive() -> Directive:
+    return Directive(
+        id="c_old002",
+        content="Prefer composition over inheritance.",
+        subject="design",
+        source_scope_id=SCOPE.id,
+        source_skill="architect",
+        created_at="2026-04-02T09:00:00+00:00",
+    )
+
+
+def _summary_with(*directives: Directive, context: str = "Existing context.") -> ScopeSummary:
+    return ScopeSummary(
+        scope_id=SCOPE.id,
+        directives=list(directives),
+        context=context,
+        updated_at="2026-04-01T09:00:00+00:00",
+    )
+
+
+def _contribution(
+    contribution_id: str, content: str, *, subject: str | None = None
+) -> Contribution:
+    return Contribution(
+        id=contribution_id,
+        scope_id=SCOPE.id,
+        content=content,
+        proposed_classification="directive",
+        subject=subject,
+        supersedes=None,
+        contributor=CONTRIBUTOR,
+        created_at="2026-05-02T10:00:00+00:00",
+    )
+
+
+def test_j1_untouched_directive_rows_are_byte_identical_across_judgments() -> None:
+    """J1 — structural preservation: rows no op names come out byte-identical.
+
+    Three accepted judgments in a row (append, publish, retire), each judged
+    against the summary the previous one produced. The bystander directive is
+    never named by an op, so its rendered bytes must be the same after each.
+    """
+    bystander = EXISTING_DIRECTIVE
+    doomed = _second_directive()
+    summary = _summary_with(bystander, doomed)
+
+    def rendered_row(s: ScopeSummary) -> str:
+        return _render_summary(
+            ScopeSummary(
+                scope_id=s.scope_id,
+                directives=[d for d in s.directives if d.id == bystander.id],
+                context="",
+                updated_at="fixed",
+            )
+        )
+
+    baseline = rendered_row(summary)
+
+    amendments = [
+        ({"op": "append"}, _contribution("c_a1", "First new rule.")),
+        (
+            {"op": "publish", "content": "Ratified: keep interfaces narrow."},
+            _contribution("c_a2", "Several teams keep interfaces narrow."),
+        ),
+        ({"op": "retire", "id": doomed.id}, _contribution("c_a3", "That rule is obsolete.")),
+    ]
+
+    for op, contribution in amendments:
+        manager, _ = _make_manager(
+            {
+                "decision": "accept_as_directive",
+                "reasoning": "judged",
+                "directive_ops": [op],
+                "new_context": "Context rewritten again.",
+            }
+        )
+        judgment = manager.judge(
+            scope=SCOPE,
+            stratum=STRATUM,
+            current_summary=summary,
+            recent_contributions=[],
+            new_contribution=contribution,
+        )
+        assert judgment.new_summary is not None
+        summary = judgment.new_summary
+        assert rendered_row(summary) == baseline
+        assert bystander in summary.directives
+
+
+def test_append_op_uses_the_contribution_verbatim() -> None:
+    """`append` copies content, id, subject, and provenance — the judge writes nothing."""
+    contribution = _contribution("c_app1", "Ship behind a flag.", subject="rollout")
+    judgment = ScopeManager._parse_judgment(
+        scope=SCOPE,
+        tool_use_block=_tool_use_block(
+            {
+                "decision": "accept_as_directive",
+                "reasoning": "clear standard",
+                "directive_ops": [{"op": "append"}],
+                "new_context": "ctx",
+            }
+        ),
+        current_summary=_summary_with(EXISTING_DIRECTIVE),
+        new_contribution=contribution,
+    )
+
+    assert judgment.new_summary is not None
+    appended = judgment.new_summary.directives[-1]
+    assert appended.id == contribution.id
+    assert appended.content == contribution.content
+    assert appended.subject == "rollout"
+    assert appended.source_scope_id == CONTRIBUTOR.scope_id
+    assert appended.source_skill == CONTRIBUTOR.skill
+    assert appended.created_at == contribution.created_at
+
+
+def test_publish_op_admits_judge_text_under_the_contribution_id() -> None:
+    """`publish` carries the judge's wording but mints the id from the contribution."""
+    contribution = _contribution("c_pub1", "Three teams now do X.", subject="pattern")
+    judgment = ScopeManager._parse_judgment(
+        scope=SCOPE,
+        tool_use_block=_tool_use_block(
+            {
+                "decision": "accept_as_directive",
+                "reasoning": "ratifying an accumulated pattern",
+                "directive_ops": [
+                    {"op": "publish", "content": "All teams do X (per operator directive op_1)."}
+                ],
+                "new_context": "ctx",
+            }
+        ),
+        current_summary=_summary_with(EXISTING_DIRECTIVE),
+        new_contribution=contribution,
+    )
+
+    assert judgment.new_summary is not None
+    published = judgment.new_summary.directives[-1]
+    assert published.id == contribution.id
+    assert published.content == "All teams do X (per operator directive op_1)."
+    # An omitted subject keeps the contribution's own tag rather than dropping it.
+    assert published.subject == "pattern"
+
+
+def test_publish_op_without_content_is_a_parse_error() -> None:
+    with pytest.raises(ValueError, match="publish op with no content"):
+        _parse(
+            {
+                "decision": "accept_as_directive",
+                "reasoning": "r",
+                "directive_ops": [{"op": "publish", "content": "   "}],
+                "new_context": None,
+            }
+        )
+
+
+def test_retire_op_without_id_is_a_parse_error() -> None:
+    with pytest.raises(ValueError, match="retire op with no id"):
+        _parse(
+            {
+                "decision": "accept_as_directive",
+                "reasoning": "r",
+                "directive_ops": [{"op": "retire"}],
+                "new_context": None,
+            }
+        )
+
+
+def test_unknown_op_is_a_parse_error() -> None:
+    with pytest.raises(ValueError, match="unknown directive op"):
+        _parse(
+            {
+                "decision": "accept_as_directive",
+                "reasoning": "r",
+                "directive_ops": [{"op": "rewrite"}],
+                "new_context": None,
+            }
+        )
+
+
+def test_supersede_paired_with_append_replaces_the_named_directive() -> None:
+    """Supersession replaces: the old row leaves, the new contribution lands."""
+    contribution = _contribution("c_sup1", "Use kebab-case for all identifiers.")
+    judgment = ScopeManager._parse_judgment(
+        scope=SCOPE,
+        tool_use_block=_tool_use_block(
+            {
+                "decision": "accept_as_directive",
+                "reasoning": "replaces the naming rule",
+                "directive_ops": [
+                    {"op": "append"},
+                    {"op": "supersede", "id": EXISTING_DIRECTIVE.id},
+                ],
+                "new_context": "ctx",
+            }
+        ),
+        current_summary=_summary_with(EXISTING_DIRECTIVE, _second_directive()),
+        new_contribution=contribution,
+    )
+
+    assert judgment.new_summary is not None
+    ids = [d.id for d in judgment.new_summary.directives]
+    assert EXISTING_DIRECTIVE.id not in ids
+    assert ids == ["c_old002", contribution.id]
+    # No tombstone, and no retirement event: a superseded directive's
+    # explanation is the incoming directive's own supersedes reference.
+    assert judgment.removed_directive_ids == [EXISTING_DIRECTIVE.id]
+    assert judgment.retired_directive_ids == []
+
+
+def test_publish_supersedes_reference_removes_the_named_directive() -> None:
+    """`publish` carrying a supersedes reference removes what it replaces."""
+    contribution = _contribution("c_sup2", "Teams keep converging on one naming rule.")
+    judgment = ScopeManager._parse_judgment(
+        scope=SCOPE,
+        tool_use_block=_tool_use_block(
+            {
+                "decision": "accept_as_directive",
+                "reasoning": "ratified in this scope's own wording",
+                "directive_ops": [
+                    {
+                        "op": "publish",
+                        "content": "Identifiers are kebab-case.",
+                        "supersedes": EXISTING_DIRECTIVE.id,
+                    }
+                ],
+                "new_context": None,
+            }
+        ),
+        current_summary=_summary_with(EXISTING_DIRECTIVE),
+        new_contribution=contribution,
+    )
+
+    assert judgment.new_summary is not None
+    assert [d.id for d in judgment.new_summary.directives] == [contribution.id]
+    assert judgment.removed_directive_ids == [EXISTING_DIRECTIVE.id]
+
+
+def test_unpaired_supersede_is_rejected_at_parse() -> None:
+    """A supersede with nothing to replace with is a retirement wearing the wrong name."""
+    with pytest.raises(ValueError, match="unpaired supersede"):
+        _parse(
+            {
+                "decision": "accept_as_context",
+                "reasoning": "dropping the old rule",
+                "directive_ops": [{"op": "supersede", "id": EXISTING_DIRECTIVE.id}],
+                "new_context": "ctx",
+            }
+        )
+
+
+def test_unpaired_supersede_gets_the_parse_reask_then_propagates() -> None:
+    """The #113 one-retry discipline covers it: one corrective, then the error stands."""
+    unpaired = {
+        "decision": "accept_as_context",
+        "reasoning": "dropping the old rule",
+        "directive_ops": [{"op": "supersede", "id": EXISTING_DIRECTIVE.id}],
+        "new_context": "ctx",
+    }
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [
+        _fake_response(unpaired),
+        _fake_response(unpaired),
+    ]
+    manager = ScopeManager(client=mock_client)
+
+    with pytest.raises(ValueError, match="unpaired supersede"):
+        manager.judge(
+            scope=SCOPE,
+            stratum=STRATUM,
+            current_summary=CURRENT_SUMMARY,
+            recent_contributions=[],
+            new_contribution=NEW_CONTRIBUTION,
+        )
+
+    assert mock_client.messages.create.call_count == 2
+
+
+def test_retire_op_removes_the_directive_and_is_reported_for_the_record() -> None:
+    """`retire` removes with no replacement; the caller records the retirement event."""
+    judgment = ScopeManager._parse_judgment(
+        scope=SCOPE,
+        tool_use_block=_tool_use_block(
+            {
+                "decision": "accept_as_context",
+                "reasoning": "the naming rule no longer applies",
+                "directive_ops": [{"op": "retire", "id": EXISTING_DIRECTIVE.id}],
+                "new_context": "ctx",
+            }
+        ),
+        current_summary=_summary_with(EXISTING_DIRECTIVE, _second_directive()),
+        new_contribution=NEW_CONTRIBUTION,
+    )
+
+    assert judgment.new_summary is not None
+    assert [d.id for d in judgment.new_summary.directives] == ["c_old002"]
+    assert judgment.retired_directive_ids == [EXISTING_DIRECTIVE.id]
+    assert judgment.removed_directive_ids == [EXISTING_DIRECTIVE.id]
+
+
+def test_null_new_context_leaves_the_context_untouched() -> None:
+    """An omitted context section is not an emptied one."""
+    judgment = ScopeManager._parse_judgment(
+        scope=SCOPE,
+        tool_use_block=_tool_use_block(
+            {
+                "decision": "accept_as_directive",
+                "reasoning": "nothing to add to the digest",
+                "directive_ops": [{"op": "append"}],
+                "new_context": None,
+            }
+        ),
+        current_summary=CURRENT_SUMMARY,
+        new_contribution=NEW_CONTRIBUTION,
+    )
+
+    assert judgment.new_summary is not None
+    assert judgment.new_summary.context == CURRENT_SUMMARY.context
+
+
+# ---------------------------------------------------------------------------
+# ADR 0011 D1 — invalid ids: one corrective, then drop-and-note
+# ---------------------------------------------------------------------------
+
+
+def _retire_input(directive_id: str, *, reasoning: str = "retiring") -> dict:
+    return {
+        "decision": "accept_as_context",
+        "reasoning": reasoning,
+        "directive_ops": [{"op": "retire", "id": directive_id}],
+        "new_context": "Context after the retirement.",
+    }
+
+
+def test_invalid_id_triggers_one_corrective_listing_the_valid_ids() -> None:
+    """The corrective names the offending op and every id the judge may name."""
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [
+        _fake_response(_retire_input("c_hallucinated")),
+        _fake_response(_retire_input(EXISTING_DIRECTIVE.id)),
+    ]
+    manager = ScopeManager(client=mock_client)
+
+    judgment = manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+    )
+
+    assert mock_client.messages.create.call_count == 2
+    followup = mock_client.messages.create.call_args_list[1].kwargs["messages"][-1]
+    text = [b for b in followup["content"] if b["type"] == "text"][0]["text"]
+    assert "c_hallucinated" in text
+    assert EXISTING_DIRECTIVE.id in text
+    assert "not in this scope's summary" in text
+    # The corrective is NOT the #113 stringified-payload wording.
+    assert "could not be parsed" not in text
+
+    # The corrected amendment applies in full — nothing dropped.
+    assert judgment.dropped_ops == []
+    assert judgment.retired_directive_ids == [EXISTING_DIRECTIVE.id]
+    assert judgment.record_notes == judgment.reasoning
+
+
+def test_invalid_id_twice_drops_the_op_and_notes_it_without_losing_the_verdict() -> None:
+    """J5 — drop-and-note: the bad op goes, the rest applies, the verdict survives."""
+    first = {
+        "decision": "accept_as_directive",
+        "reasoning": "admitting the new rule and retiring a stale one",
+        "directive_ops": [{"op": "append"}, {"op": "retire", "id": "c_ghost"}],
+        "new_context": "Context after the amendment.",
+    }
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [
+        _fake_response(first),
+        _fake_response(first),  # still names the ghost id
+    ]
+    manager = ScopeManager(client=mock_client)
+
+    judgment = manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+    )
+
+    # Exactly one corrective — never a loop, never a parse failure.
+    assert mock_client.messages.create.call_count == 2
+    assert judgment.decision == "accept_as_directive"
+    assert judgment.new_summary is not None
+
+    # The rest of the amendment applied: the contribution is admitted, the
+    # existing directive is untouched, the context is rewritten.
+    ids = [d.id for d in judgment.new_summary.directives]
+    assert ids == [EXISTING_DIRECTIVE.id, NEW_CONTRIBUTION.id]
+    assert judgment.new_summary.context == "Context after the amendment."
+
+    # The dropped op is noted in what the record gets.
+    assert judgment.dropped_ops == ["retire(c_ghost)"]
+    assert judgment.retired_directive_ids == []
+    assert "retire(c_ghost)" in judgment.record_notes
+    assert judgment.reasoning in judgment.record_notes
+
+
+def test_invalid_id_corrective_failure_still_returns_the_first_verdict() -> None:
+    """A bad op never costs the contribution its verdict, even if the retry errors."""
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [
+        _fake_response(_retire_input("c_ghost", reasoning="retiring a stale rule")),
+        RuntimeError("api unavailable"),
+    ]
+    manager = ScopeManager(client=mock_client)
+
+    judgment = manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+    )
+
+    assert judgment.decision == "accept_as_context"
+    assert judgment.new_summary is not None
+    assert judgment.new_summary.directives == CURRENT_SUMMARY.directives
+    assert judgment.dropped_ops == ["retire(c_ghost)"]
+
+
+def test_already_retired_id_named_twice_is_invalid() -> None:
+    """The second op targeting the same directive is an already-retired id."""
+    twice = {
+        "decision": "accept_as_context",
+        "reasoning": "retiring",
+        "directive_ops": [
+            {"op": "retire", "id": EXISTING_DIRECTIVE.id},
+            {"op": "retire", "id": EXISTING_DIRECTIVE.id},
+        ],
+        "new_context": "ctx",
+    }
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [_fake_response(twice), _fake_response(twice)]
+    manager = ScopeManager(client=mock_client)
+
+    judgment = manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+    )
+
+    assert judgment.retired_directive_ids == [EXISTING_DIRECTIVE.id]
+    assert judgment.dropped_ops == [f"retire({EXISTING_DIRECTIVE.id})"]
+
+
+def test_overflow_retry_may_retire_to_fit() -> None:
+    """The overflow corrective's lever works: the retry retires and the summary fits."""
+    long_context = " ".join(f"word{i}" for i in range(40))
+    first = {
+        "decision": "accept_as_context",
+        "reasoning": "recording the observation",
+        "directive_ops": [],
+        "new_context": long_context,
+    }
+    second = {
+        "decision": "accept_as_context",
+        "reasoning": "recording the observation",
+        "directive_ops": [{"op": "retire", "id": EXISTING_DIRECTIVE.id}],
+        "new_context": "Short.",
+    }
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [_fake_response(first), _fake_response(second)]
+    manager = ScopeManager(client=mock_client)
+
+    judgment = manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+        summary_max_words=5,
+    )
+
+    assert mock_client.messages.create.call_count == 2
+    assert judgment.new_summary is not None
+    assert judgment.new_summary.directives == []
+    assert judgment.retired_directive_ids == [EXISTING_DIRECTIVE.id]
+    assert _summary_word_count(judgment.new_summary) <= 5
+
+
+def test_overflow_retry_refusing_to_retire_keeps_the_over_budget_summary() -> None:
+    """Keep-first: an over-budget summary beats a destroyed judgment."""
+    long_context = " ".join(f"word{i}" for i in range(40))
+    over_budget = {
+        "decision": "accept_as_context",
+        "reasoning": "recording the observation",
+        "directive_ops": [],
+        "new_context": long_context,
+    }
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [
+        _fake_response(over_budget),
+        RuntimeError("api unavailable"),
+    ]
+    manager = ScopeManager(client=mock_client)
+
+    judgment = manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+        summary_max_words=5,
+    )
+
+    assert judgment.decision == "accept_as_context"
+    assert judgment.new_summary is not None
+    assert judgment.new_summary.context == long_context
+    assert judgment.new_summary.directives == CURRENT_SUMMARY.directives
+
+
+# ---------------------------------------------------------------------------
+# ADR 0011 D4 — the refresh amendment is context + lifecycle ops only
+# ---------------------------------------------------------------------------
+
+
+def test_refresh_block_rendered_when_amendment_is_context_only() -> None:
+    message = _build_user_message(
+        scope=SCOPE,
+        stratum=STRATUM,
+        parent_summary=PARENT_SUMMARY,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+        amendment_context_only=True,
+    )
+    assert "MANAGER REFRESH" in message
+    assert "already been incorporated" in message
+
+    ordinary = _build_user_message(
+        scope=SCOPE,
+        stratum=STRATUM,
+        parent_summary=PARENT_SUMMARY,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+    )
+    assert "MANAGER REFRESH" not in ordinary
+
+
+def test_context_only_amendment_drops_append_and_publish_ops() -> None:
+    """A refresh may amend context and retire, but never admit a directive."""
+    manager, _ = _make_manager(
+        {
+            "decision": "accept_as_context",
+            "reasoning": "refreshed against the parent",
+            "directive_ops": [
+                {"op": "append"},
+                {"op": "publish", "content": "Something new."},
+                {"op": "retire", "id": EXISTING_DIRECTIVE.id},
+            ],
+            "new_context": "Reconciled context.",
+        }
+    )
+
+    judgment = manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+        amendment_context_only=True,
+    )
+
+    assert judgment.new_summary is not None
+    assert judgment.new_summary.directives == []
+    assert judgment.new_summary.context == "Reconciled context."
+    assert [op.op for op in judgment.directive_ops] == ["retire"]
+    assert judgment.dropped_ops == ["append", "publish"]
+    assert "append" in judgment.record_notes
+
+
+# ---------------------------------------------------------------------------
+# ADR 0011 D1/D4 — system prompt contract
+# ---------------------------------------------------------------------------
+
+
+def test_system_prompt_states_the_amendment_contract() -> None:
+    flat = " ".join(_SYSTEM_PROMPT.split())
+    assert "you do NOT rewrite the summary" in flat
+    assert "`directive_ops`" in flat
+    assert "`new_context`" in flat
+    assert "preserved by the engine byte for byte" in flat
+    for op in ("`append`", "`publish`", "`supersede`", "`retire`"):
+        assert op in flat
+
+
+def test_system_prompt_encodes_the_append_versus_publish_rule() -> None:
+    flat = " ".join(_SYSTEM_PROMPT.split())
+    assert (
+        "APPEND unless the binding text must differ from the contribution's text; "
+        "if it must, PUBLISH, and say why in your reasoning" in flat
+    )
+
+
+def test_system_prompt_rejects_unpaired_supersede() -> None:
+    flat = " ".join(_SYSTEM_PROMPT.split())
+    assert "unpaired `supersede` is a retirement wearing the wrong name" in flat
+
+
+def test_system_prompt_narrows_operator_attribution_to_publish_or_context() -> None:
+    """ADR 0011 D1: an unattributed operator echo may not be appended."""
+    flat = " ".join(_SYSTEM_PROMPT.split())
+    assert "must never be `append`ed" in flat
+    assert "`publish` it with the attribution written in" in flat
+    assert "or carry it in `new_context` with the attribution" in flat
+
+
+def test_system_prompt_no_longer_asks_the_judge_to_quote_parent_directives() -> None:
+    """ADR 0011 D4 deletes the parent-quoting rule — the splice is mechanical."""
+    flat = " ".join(_SYSTEM_PROMPT.split())
+    assert "quote any parent directives VERBATIM" not in flat
+    assert "MECHANICALLY" in flat
+    assert "never `append` or `publish` a parent directive" in flat
+
+
+def test_system_prompt_budget_rule_names_the_two_levers() -> None:
+    flat = " ".join(_SYSTEM_PROMPT.split())
+    assert "a directive leaves the summary only through a `retire` or a `supersede` op" in flat
+
+
+def test_system_prompt_withdraw_rule_is_phrased_against_the_amendment() -> None:
+    flat = " ".join(_SYSTEM_PROMPT.split())
+    assert "THE AMENDMENT YOU ARE SUBMITTING DROPS or CONTRADICTS" in flat

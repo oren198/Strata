@@ -73,6 +73,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 from strata.fleet_config import FleetConfig  # noqa: E402
 from strata.migrator import run_migrations  # noqa: E402
 from strata.record_store import ContributorRef, RecordStore  # noqa: E402
+from strata.scope_manager import ScopeManagerJudgment  # noqa: E402
 from strata.summary_store import ScopeSummary, SummaryStore  # noqa: E402
 
 # ---------------------------------------------------------------------------
@@ -327,10 +328,11 @@ def test_contribute_writes_to_record_store_without_http(tmp_path: Path) -> None:
     fleet = FleetConfig.load(fleet_path)
 
     # We mock the scope-manager so we don't need a real Anthropic key.
-    fake_judgment = MagicMock()
-    fake_judgment.decision = "accept_as_context"
-    fake_judgment.reasoning = "Valid observation."
-    fake_judgment.new_summary = _make_summary("g_arch", "updated context")
+    fake_judgment = ScopeManagerJudgment(
+        decision="accept_as_context",
+        reasoning="Valid observation.",
+        new_summary=_make_summary("g_arch", "updated context"),
+    )
 
     with (
         patch.object(mod, "_AGENT_SCOPE", "g_backend"),
@@ -1463,10 +1465,11 @@ def test_contribute_within_write_surface_allowed(tmp_path: Path, target_scope_id
     mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
     fleet = FleetConfig.load(fleet_path)
 
-    fake_judgment = MagicMock()
-    fake_judgment.decision = "accept_as_context"
-    fake_judgment.reasoning = "Valid observation."
-    fake_judgment.new_summary = _make_summary(target_scope_id, "updated context")
+    fake_judgment = ScopeManagerJudgment(
+        decision="accept_as_context",
+        reasoning="Valid observation.",
+        new_summary=_make_summary(target_scope_id, "updated context"),
+    )
 
     scope_p, skill_p, session_p = _patch_agent_binding(mod, scope="g_team")
     with (
@@ -1703,10 +1706,11 @@ def test_contribute_passes_entitlement_view_to_judge(tmp_path: Path) -> None:
     mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
     fleet = FleetConfig.load(fleet_path)
 
-    fake_judgment = MagicMock()
-    fake_judgment.decision = "accept_as_context"
-    fake_judgment.reasoning = "Valid observation."
-    fake_judgment.new_summary = _make_summary("g_arch", "updated context")
+    fake_judgment = ScopeManagerJudgment(
+        decision="accept_as_context",
+        reasoning="Valid observation.",
+        new_summary=_make_summary("g_arch", "updated context"),
+    )
 
     judge_spy = MagicMock(return_value=fake_judgment)
 
@@ -1828,10 +1832,11 @@ def test_strata_rejudge_recovers_pending_then_idempotent(tmp_path: Path) -> None
         assert rs.list_judgments(scope_id="g_backend") == []
 
     # 2. First re-judge: the scope-manager is back — it judges and updates state.
-    good_judgment = MagicMock()
-    good_judgment.decision = "accept_as_context"
-    good_judgment.reasoning = "recovered"
-    good_judgment.new_summary = _make_summary("g_backend", "recovered context")
+    good_judgment = ScopeManagerJudgment(
+        decision="accept_as_context",
+        reasoning="recovered",
+        new_summary=_make_summary("g_backend", "recovered context"),
+    )
 
     scope_p2, skill_p2, session_p2 = _patch_agent_binding(mod, scope="g_backend")
     with (
@@ -2188,10 +2193,11 @@ def test_accepted_contribution_increments_session_counter(tmp_path: Path) -> Non
     mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
     fleet = FleetConfig.load(fleet_path)
 
-    fake_judgment = MagicMock()
-    fake_judgment.decision = "accept_as_context"
-    fake_judgment.reasoning = "ok"
-    fake_judgment.new_summary = _make_summary("g_arch", "updated")
+    fake_judgment = ScopeManagerJudgment(
+        decision="accept_as_context",
+        reasoning="ok",
+        new_summary=_make_summary("g_arch", "updated"),
+    )
 
     scope_p, skill_p, session_p = _patch_agent_binding(mod, scope="g_backend", session_id="sess_c")
     with (
@@ -2224,10 +2230,11 @@ def test_declined_contribution_does_not_increment_counter(tmp_path: Path) -> Non
     mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
     fleet = FleetConfig.load(fleet_path)
 
-    fake_judgment = MagicMock()
-    fake_judgment.decision = "decline"
-    fake_judgment.reasoning = "not memory-worthy"
-    fake_judgment.new_summary = None
+    fake_judgment = ScopeManagerJudgment(
+        decision="decline",
+        reasoning="not memory-worthy",
+        new_summary=None,
+    )
 
     scope_p, skill_p, session_p = _patch_agent_binding(mod, scope="g_backend", session_id="sess_d")
     with (
@@ -2383,10 +2390,11 @@ def test_nudge_silent_after_contribution(tmp_path: Path) -> None:
     pre = _seed_and_read(mod, fleet, scope="g_backend", session_id="sess_ac", times=3)
     assert "nudge" in pre[-1]
 
-    fake_judgment = MagicMock()
-    fake_judgment.decision = "accept_as_context"
-    fake_judgment.reasoning = "ok"
-    fake_judgment.new_summary = _make_summary("g_arch", "updated")
+    fake_judgment = ScopeManagerJudgment(
+        decision="accept_as_context",
+        reasoning="ok",
+        new_summary=_make_summary("g_arch", "updated"),
+    )
 
     scope_p, skill_p, session_p = _patch_agent_binding(mod, scope="g_backend", session_id="sess_ac")
     with (

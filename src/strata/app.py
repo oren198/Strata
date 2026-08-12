@@ -311,7 +311,9 @@ def _judge_and_record(
         contribution_id=contribution.id,
         decision=judgment.decision,
         judged_by="scope-manager",
-        notes=judgment.reasoning,
+        # The judge's reasoning, plus the mechanical note for any amendment op
+        # the engine dropped (ADR 0011 D1) — the record shows what applied.
+        notes=judgment.record_notes,
     )
 
     summary_updated = False
@@ -323,6 +325,20 @@ def _judge_and_record(
         )
         summary_store.write(scope.id, to_write)
         summary_updated = True
+
+        # ADR 0011 D1: a `retire` op removes a directive with no replacement,
+        # so no contribution row carries the explanation — the retirement
+        # event does (CONTEXT.md § Retirement), in the shape ADR 0008 D4
+        # reserved for exactly this scope-manager explicit-retire. Superseded
+        # directives get none: their explanation is the incoming directive's
+        # own supersedes reference.
+        for directive_id in judgment.retired_directive_ids:
+            record_store.append_retirement(
+                scope_id=scope.id,
+                directive_id=directive_id,
+                retired_by="scope-manager",
+                reason=judgment.reasoning,
+            )
 
         # ADR 0007 D3 — staleness propagation, two paths, both under the
         # lock this function's caller already holds:
@@ -342,14 +358,14 @@ def _judge_and_record(
                 summaries_dir=str(summary_store.summaries_dir),
             )
 
-        # 2. Mechanical propagation (D3): diff surviving directive ids —
-        #    any published item anchored ONLY to directives that just
-        #    vanished from the summary is withdrawn, no LLM in the loop.
-        previous_directive_ids = (
-            {d.id for d in current_summary.directives} if current_summary is not None else set()
-        )
+        # 2. Mechanical propagation (D3): any published item anchored ONLY to
+        #    directives that just left the summary is withdrawn, no LLM in the
+        #    loop. The removed ids come straight off the amendment's
+        #    supersede/retire ops (ADR 0011 D1) — the ops ARE the removal, so
+        #    there is no longer anything to diff between two summary
+        #    generations.
         new_directive_ids = {d.id for d in judgment.new_summary.directives}
-        removed_directive_ids = previous_directive_ids - new_directive_ids
+        removed_directive_ids = set(judgment.removed_directive_ids)
         if removed_directive_ids:
             propagate_directive_removals(
                 scope.id,

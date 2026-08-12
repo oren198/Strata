@@ -45,7 +45,7 @@ from strata.fleet_config import FleetConfig  # noqa: E402
 from strata.migrator import run_migrations  # noqa: E402
 from strata.publication import read_publication  # noqa: E402
 from strata.record_store import JUDGE_FAILED, ContributorRef, RecordStore  # noqa: E402
-from strata.scope_manager import ScopeManagerJudgment  # noqa: E402
+from strata.scope_manager import DirectiveOp, ScopeManagerJudgment  # noqa: E402
 from strata.summary_store import Directive, ScopeSummary, SummaryStore  # noqa: E402
 
 # ---------------------------------------------------------------------------
@@ -645,20 +645,31 @@ def _seed_publish_act(
     return item
 
 
-class _DirectiveDroppingManager:
-    """A scope-manager fake whose rewrite drops the existing directive (mechanical propagation)."""
+class _DirectiveRetiringManager:
+    """A scope-manager fake whose amendment retires the existing directive.
+
+    Under ADR 0011 D1 a directive leaves the summary only through an
+    id-addressed op, and the mechanical propagation reads the removed ids off
+    those ops — so the fake has to carry the ``retire`` op, not merely a
+    summary that no longer lists the directive.
+    """
+
+    def __init__(self, directive_id: str) -> None:
+        self._directive_id = directive_id
 
     def judge(self, *, scope, new_contribution, **_kwargs):  # noqa: ANN001, ANN201
         summary = ScopeSummary(
             scope_id=scope.id,
             directives=[],  # the existing directive is gone
-            context="rewritten, directive dropped",
+            context="amended, directive retired",
             updated_at="2026-07-12T00:00:00+00:00",
         )
         return ScopeManagerJudgment(
             decision="accept_as_context",
-            reasoning="rewrite drops the directive",
+            reasoning="the directive no longer applies",
             new_summary=summary,
+            directive_ops=[DirectiveOp(op="retire", id=self._directive_id)],
+            new_context="amended, directive retired",
         )
 
 
@@ -708,7 +719,7 @@ def test_mechanical_propagation_withdraws_item_on_accepted_rewrite(tmp_path: Pat
             fleet=fleet,
             record_store=rs,
             summary_store=summary_store,
-            scope_manager=_DirectiveDroppingManager(),
+            scope_manager=_DirectiveRetiringManager("c_existing1"),
             summary_max_words=500,
         )
 
@@ -994,3 +1005,234 @@ def test_marker_path_makes_no_judge_call_and_only_grows_the_record(tmp_path: Pat
         (state,) = rs.list_contribution_states(scope_id="g_root")
     assert state.state == "judged"
     assert state.failed_attempts == 2
+
+
+# ---------------------------------------------------------------------------
+# ADR 0011 D1 — the amendment's ops reach the record: retirement events, the
+# ops-sourced propagation source, and the dropped-op note.
+# ---------------------------------------------------------------------------
+
+
+class _AmendingManager:
+    """A scope-manager fake returning a fixed amendment plus its applied summary."""
+
+    def __init__(
+        self,
+        *,
+        ops: list[DirectiveOp],
+        directives: list[Directive],
+        dropped_ops: list[str] | None = None,
+        reasoning: str = "amended",
+    ) -> None:
+        self._ops = ops
+        self._directives = directives
+        self._dropped_ops = dropped_ops or []
+        self._reasoning = reasoning
+
+    def judge(self, *, scope, new_contribution, **_kwargs):  # noqa: ANN001, ANN201
+        return ScopeManagerJudgment(
+            decision="accept_as_context",
+            reasoning=self._reasoning,
+            new_summary=ScopeSummary(
+                scope_id=scope.id,
+                directives=self._directives,
+                context="amended",
+                updated_at="2026-08-12T00:00:00+00:00",
+            ),
+            directive_ops=self._ops,
+            new_context="amended",
+            dropped_ops=self._dropped_ops,
+        )
+
+
+def _existing_directive(directive_id: str = "c_existing1") -> Directive:
+    return Directive(
+        id=directive_id,
+        content="Existing directive.",
+        subject=None,
+        source_scope_id="g_root",
+        source_skill="strata-developer",
+        created_at="2026-07-10T00:00:00+00:00",
+    )
+
+
+def _run(tmp_path: Path, manager, *, seeded: list[Directive] | None = None):  # noqa: ANN001
+    """Seed a summary, run one contribution through the choke point.
+
+    Returns ``(db_path, outcome, summary_store)`` — the record store is closed,
+    so a caller that wants to inspect the record opens its own.
+    """
+    db_path = str(tmp_path / "strata.db")
+    run_migrations(db_path)
+    fleet = _fleet(tmp_path)
+    summary_store = SummaryStore(str(tmp_path / "summaries"))
+    scope = fleet.get_scope("g_root")
+    stratum = fleet.strata[0]
+
+    if seeded is not None:
+        summary_store.write(
+            "g_root",
+            ScopeSummary(
+                scope_id="g_root",
+                directives=seeded,
+                context="",
+                updated_at="2026-07-10T00:00:00+00:00",
+            ),
+        )
+
+    with RecordStore(db_path) as rs:
+        outcome = run_contribution(
+            scope=scope,
+            stratum=stratum,
+            content="an observation",
+            proposed_classification="context",
+            subject=None,
+            supersedes=None,
+            contributor=_contributor(),
+            fleet=fleet,
+            record_store=rs,
+            summary_store=summary_store,
+            scope_manager=manager,
+            summary_max_words=500,
+        )
+    return db_path, outcome, summary_store
+
+
+def test_retire_op_appends_a_retirement_row_by_the_scope_manager(tmp_path: Path) -> None:
+    """A `retire` op lands as a Retirement event with retired_by='scope-manager'."""
+    directive = _existing_directive()
+    manager = _AmendingManager(
+        ops=[DirectiveOp(op="retire", id=directive.id)],
+        directives=[],
+        reasoning="the rule no longer applies",
+    )
+    db_path, outcome, summary_store = _run(tmp_path, manager, seeded=[directive])
+
+    with RecordStore(db_path) as rs:
+        retirements = rs.list_retirements(scope_id="g_root")
+        assert len(retirements) == 1
+        assert retirements[0].directive_id == directive.id
+        assert retirements[0].retired_by == "scope-manager"
+        assert retirements[0].reason == "the rule no longer applies"
+
+    # No tombstone in the summary (CONTEXT.md § Retirement).
+    written = summary_store.read("g_root")
+    assert written is not None
+    assert written.directives == []
+    assert outcome.summary_updated is True
+
+
+def test_supersede_op_removes_without_a_retirement_row(tmp_path: Path) -> None:
+    """Supersession's explanation is the incoming directive, not a Retirement row."""
+    old = _existing_directive()
+    replacement = Directive(
+        id="c_new1",
+        content="Replacement directive.",
+        subject=None,
+        source_scope_id="g_root",
+        source_skill="strata-developer",
+        created_at="2026-08-12T00:00:00+00:00",
+    )
+    manager = _AmendingManager(
+        ops=[DirectiveOp(op="append"), DirectiveOp(op="supersede", id=old.id)],
+        directives=[replacement],
+    )
+    db_path, _outcome, summary_store = _run(tmp_path, manager, seeded=[old])
+
+    with RecordStore(db_path) as rs:
+        assert rs.list_retirements(scope_id="g_root") == []
+
+    written = summary_store.read("g_root")
+    assert written is not None
+    assert [d.id for d in written.directives] == ["c_new1"]
+
+
+def test_mechanical_propagation_reads_removed_ids_from_the_ops(tmp_path: Path) -> None:
+    """The withdrawal fires off the supersede op, not off a summary diff.
+
+    The amendment's applied summary still lists a directive with the same id
+    (a supersession that keeps the id would be a strange but harmless case);
+    what makes the published item stale is the op naming it, and the ops are
+    now the only source the propagation reads.
+    """
+    db_path = str(tmp_path / "strata.db")
+    run_migrations(db_path)
+    fleet = _fleet(tmp_path)
+    summary_store = SummaryStore(str(tmp_path / "summaries"))
+    scope = fleet.get_scope("g_root")
+    stratum = fleet.strata[0]
+
+    directive = _existing_directive()
+    summary_store.write(
+        "g_root",
+        ScopeSummary(
+            scope_id="g_root",
+            directives=[directive],
+            context="",
+            updated_at="2026-07-10T00:00:00+00:00",
+        ),
+    )
+
+    with RecordStore(db_path) as rs:
+        item = _seed_publish_act(
+            rs,
+            summary_store.summaries_dir,
+            "g_root",
+            kind="directive",
+            content="Published version of the directive.",
+            anchors=[f"directive:{directive.id}"],
+        )
+
+        outcome = run_contribution(
+            scope=scope,
+            stratum=stratum,
+            content="a replacement rule",
+            proposed_classification="directive",
+            subject=None,
+            supersedes=None,
+            contributor=_contributor(),
+            fleet=fleet,
+            record_store=rs,
+            summary_store=summary_store,
+            scope_manager=_AmendingManager(
+                ops=[DirectiveOp(op="append"), DirectiveOp(op="supersede", id=directive.id)],
+                directives=[
+                    Directive(
+                        id="c_replacement",
+                        content="Replacement directive.",
+                        subject=None,
+                        source_scope_id="g_root",
+                        source_skill="strata-developer",
+                        created_at="2026-08-12T00:00:00+00:00",
+                    )
+                ],
+            ),
+            summary_max_words=500,
+        )
+
+        assert read_publication("g_root", summaries_dir=str(summary_store.summaries_dir)) == []
+        withdraw_act = next(
+            a for a in rs.list_publication_acts(scope_id="g_root") if a.act == "withdraw"
+        )
+        assert withdraw_act.withdraws == item.id
+        assert withdraw_act.trigger == outcome.contribution_id
+
+
+def test_dropped_op_is_noted_in_the_judgment_record(tmp_path: Path) -> None:
+    """The record shows which part of the amendment the engine dropped."""
+    manager = _AmendingManager(
+        ops=[],
+        directives=[],
+        dropped_ops=["retire(c_ghost)"],
+        reasoning="recording the observation",
+    )
+    db_path, outcome, _summary_store = _run(tmp_path, manager)
+
+    with RecordStore(db_path) as rs:
+        judgment = rs.get_judgment(outcome.contribution_id)
+        assert judgment is not None
+        assert judgment.notes is not None
+        assert "recording the observation" in judgment.notes
+        assert "retire(c_ghost)" in judgment.notes
+        # The caller's own outcome carries the verdict unchanged.
+        assert outcome.reasoning == "recording the observation"

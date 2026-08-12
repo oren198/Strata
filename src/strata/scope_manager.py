@@ -9,9 +9,12 @@ Responsibilities
 - Build the system prompt (static; cached) and the per-call user message.
 - Call ``client.messages.create`` with forced ``submit_judgment`` tool use.
 - Parse and validate the tool-call response.
-- Wrap the LLM-provided directives + context into a complete
+- Apply the judged **amendment** (ADR 0011 D1 — id-addressed
+  :class:`DirectiveOp` operations plus a rewritten context section)
+  mechanically to the current summary, producing the complete
   :class:`~strata.summary_store.ScopeSummary` with server-side ``scope_id``
-  and ``updated_at``.
+  and ``updated_at``. Directives no op names are carried across as the same
+  rows: preservation is structural, not a prompt obligation.
 
 This module is a **pure judgment service** — it has no persistence logic.
 The caller is responsible for wiring the returned judgment to
@@ -83,7 +86,7 @@ JUDGE_TOOL: dict = {
     "name": "submit_judgment",
     "description": (
         "Submit the scope-manager's verdict on the new contribution and, "
-        "if accepting, the rewritten scope summary."
+        "if accepting, the amendment to apply to the scope summary."
     ),
     "input_schema": {
         "type": "object",
@@ -96,48 +99,78 @@ JUDGE_TOOL: dict = {
                 "type": "string",
                 "description": "One or two sentences explaining the verdict.",
             },
-            "new_summary": {
-                "type": ["object", "null"],
-                "description": "Required when accepting; must be null when declining.",
-                "properties": {
-                    "directives": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "id": {"type": "string"},
-                                "content": {"type": "string"},
-                                "subject": {"type": ["string", "null"]},
-                                "source_scope_id": {"type": "string"},
-                                # Optional (issue #121): a directive whose
-                                # originating contribution carried no skill has
-                                # none to cite. Omit rather than invent one.
-                                "source_skill": {"type": ["string", "null"]},
-                                "created_at": {"type": "string"},
-                            },
-                            "required": [
-                                "id",
-                                "content",
-                                "source_scope_id",
-                                "created_at",
-                            ],
+            "directive_ops": {
+                "type": ["array", "null"],
+                "description": (
+                    "ADR 0011 D1: operations on the directives list. Existing directives "
+                    "are never re-emitted — a directive no op names is preserved by the "
+                    "engine byte for byte. Empty or null when the amendment touches no "
+                    "directive; must be empty or null when declining."
+                ),
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "op": {
+                            "type": "string",
+                            "enum": ["append", "publish", "supersede", "retire"],
+                            "description": (
+                                "append: admit this contribution as a directive in its own "
+                                "words (the engine builds the row from the contribution — "
+                                "write no text). publish: admit a directive in your words "
+                                "(requires content). supersede: remove the directive named "
+                                "by id, replaced by the directive this amendment admits "
+                                "(valid only alongside an append or a publish). retire: "
+                                "remove the directive named by id with no replacement."
+                            ),
+                        },
+                        "content": {
+                            "type": ["string", "null"],
+                            "description": "publish only: the directive text, in your words.",
+                        },
+                        "subject": {
+                            "type": ["string", "null"],
+                            "description": (
+                                "publish only: subject tag. Omit to keep the "
+                                "contribution's own subject."
+                            ),
+                        },
+                        "supersedes": {
+                            "type": ["string", "null"],
+                            "description": (
+                                "publish only: the id of the directive this published "
+                                "directive replaces, if any."
+                            ),
+                        },
+                        "id": {
+                            "type": ["string", "null"],
+                            "description": (
+                                "supersede / retire only: the id of the directive to "
+                                "remove, exactly as it appears in the CURRENT SUMMARY."
+                            ),
                         },
                     },
-                    "context": {"type": "string"},
+                    "required": ["op"],
                 },
-                "required": ["directives", "context"],
+            },
+            "new_context": {
+                "type": ["string", "null"],
+                "description": (
+                    "ADR 0011 D1: the rewritten context section only — the whole digest, "
+                    "condensed. Null leaves the context exactly as it stands; must be null "
+                    "when declining."
+                ),
             },
             "withdraw_published": {
                 "type": ["array", "null"],
                 "items": {"type": "string"},
                 "description": (
                     "ADR 0007 D3/D5: published item ids (from THIS SCOPE'S PUBLICATION, "
-                    "when rendered) to withdraw because this rewrite drops or contradicts "
+                    "when rendered) to withdraw because this amendment drops or contradicts "
                     "the belief behind them. Omit or null when nothing needs withdrawing."
                 ),
             },
         },
-        "required": ["decision", "reasoning", "new_summary"],
+        "required": ["decision", "reasoning", "directive_ops", "new_context"],
     },
 }
 
@@ -262,14 +295,42 @@ STEP 2 — CLASSIFICATION. Concepts you must know (from CONTEXT.md):
   directive (ratification) when accumulated evidence warrants.
 - If the contribution carries a "supersedes" reference, treat it as
   explicit replacement intent — but use your own judgment.
-- When accepting, REWRITE the entire summary reflecting the new state.
-  Preserve existing directives unless this contribution supersedes them.
-  Update the context digest to incorporate the new contribution's
-  observations (and to retire stale ones).
-- Source citations already present in the current summary — "according to
-  <scope>" on publication-derived material, "per operator directive <id>"
-  on operator echoes — are load-bearing provenance and are PART of the
-  material they attribute. Carry each one into the rewritten summary
+- When accepting, you do NOT rewrite the summary. You submit an AMENDMENT:
+  `directive_ops` (operations on the directives list) and `new_context`
+  (the context section, rewritten). Every existing directive you do not
+  name in an op is preserved by the engine byte for byte — never re-emit
+  one, and never restate one to "keep" it.
+- The four directive ops:
+  - `append` — {"op": "append"}: admit this contribution as a directive in
+    ITS OWN WORDS. The engine builds the directive row from the
+    contribution's verbatim content, id, subject, and provenance; you write
+    no directive text at all. This is the default op.
+  - `publish` — {"op": "publish", "content": ..., "subject": ...
+    (optional), "supersedes": ... (optional)}: admit a directive in YOUR
+    words. Use it only where the binding text MUST differ from the
+    contribution's text: ratification (consolidating a pattern across
+    several prior contributions into one directive published with this
+    scope's authority), local wording of a directive originating at this
+    scope, or attribution that has to be written INTO the text. The
+    decision rule: APPEND unless the binding text must differ from the
+    contribution's text; if it must, PUBLISH, and say why in your
+    reasoning.
+  - `supersede` — {"op": "supersede", "id": <directive id>}: remove that
+    directive because the directive this amendment admits replaces it.
+    Valid ONLY in an amendment that also carries an `append` or a
+    `publish` — supersession replaces, so an unpaired `supersede` is a
+    retirement wearing the wrong name and is rejected.
+  - `retire` — {"op": "retire", "id": <directive id>}: remove that
+    directive with no replacement. The retirement is recorded in the
+    scope's record; no tombstone stays in the summary.
+  Name only directive ids that appear in the CURRENT SUMMARY rendered
+  below, each at most once.
+- `new_context` is the whole context section, rewritten: incorporate the new
+  contribution's observations and drop stale ones. Null leaves the context
+  exactly as it stands. Source citations already present in the context —
+  "according to <scope>" on publication-derived material, "per operator
+  directive <id>" on operator echoes — are load-bearing provenance and are
+  PART of the material they attribute. Carry each one into `new_context`
   attached to its material, whatever this contribution is about: keeping
   the substance while dropping its citation is a wrong rewrite.
 
@@ -286,17 +347,18 @@ countermanding what the operator directive establishes is. Operator
 directives are NEVER copied into the scope's summary — not into its
 directives list (the operator layer composes into perspectives verbatim on
 its own, ADR 0008 D2; copying one in, or reusing its op_ id as a summary
-directive id, makes it masquerade as ratified scope memory) — this is the
-OPPOSITE of the parent-directive rule below, which quotes PARENT directives
-verbatim. When you incorporate operator-consistent material into the
-rewritten summary — an echo of an operator directive's substance, whether
-in a locally-worded directive of this scope's own or in the context digest
-— the attribution "per operator directive <id>" (substituting the real id)
-is PART of the echoed text itself: write it into the rewritten summary
-adjacent to the echoed material, so the echo stays visible and never
-masquerades as native scope memory. Citing the id in your reasoning does
-NOT satisfy this — reasoning is never composed into anyone's perspective;
-the summary is. A correct
+directive id, makes it masquerade as ratified scope memory). When you
+incorporate operator-consistent material into the summary — an echo of an
+operator directive's substance — the attribution "per operator directive
+<id>" (substituting the real id) is PART of the echoed text itself, so it
+must be written into text you author: a `publish`ed directive of this
+scope's own, or `new_context`. An `append` is byte-exact, so there is
+nowhere in it to put the attribution: an operator echo whose own bytes do
+NOT carry the attribution must never be `append`ed — `publish` it with the
+attribution written in, or carry it in `new_context` with the attribution,
+so the echo stays visible and never masquerades as native scope memory.
+Citing the id in your reasoning does NOT satisfy this — reasoning is never
+composed into anyone's perspective; the summary is. A correct
 context line looks like: "Deploy freezes remain in effect through Q3 (per
 operator directive op_1a2b3c4d)." The authoritative operator layer
 composes into every perspective verbatim regardless of what any summary
@@ -304,40 +366,51 @@ says; attribution is what keeps an echo detectable, not what makes it
 authoritative.
 
 When a PARENT SCOPE SUMMARY is provided in the user message:
-- Your directives section must quote any parent directives VERBATIM (no
-  paraphrase) so that inherited binding decisions are preserved exactly.
-  Locally-added directives (originating at this scope) are your own to
-  word as you see fit.
-- Context from the parent may be paraphrased or summarised into this
-  scope's context digest, but must not contradict or override it.
-- Do not copy directives from the parent that are already listed in the
-  current summary — preserve them as-is.
+- Inherited parent directives reach this scope's summary MECHANICALLY: the
+  engine copies parent directive rows in byte-exactly, ids and provenance
+  preserved (ADR 0011 D4). They are not yours to admit — never `append` or
+  `publish` a parent directive, and never name one in a `supersede` or
+  `retire` op.
+- Context from the parent may be paraphrased or summarised into
+  `new_context`, but must not contradict or override it.
+
+When a MANAGER REFRESH block is present in the user message: the parent's
+directives have already been spliced into this scope's summary
+mechanically, so there is nothing for you to copy. Your amendment may carry
+only `new_context` and lifecycle ops (`supersede`, `retire`) — reconciling
+the context digest with the refreshed parent state is the only part of a
+refresh that is judgment. `append` and `publish` ops are dropped.
 
 When a BUDGET is given in the user message:
-- Directives are never trimmed below visibility — each directive must
-  remain complete and individually identifiable in the rewritten summary.
-- The context section absorbs the squeeze: condense or abbreviate context
-  prose to stay within the budget while keeping all directives intact.
+- The budget counts the context words plus every directive's content words,
+  as the summary stands AFTER your amendment is applied.
+- Directives are never trimmed below visibility — a directive leaves the
+  summary only through a `retire` or a `supersede` op, never by being
+  shortened, reworded, or quietly left out.
+- The context section absorbs the squeeze: condense or abbreviate
+  `new_context` to stay within the budget, and `retire` directives that no
+  longer earn their words.
 - Citations ("according to <scope>", "per operator directive <id>") are
   never what gets condensed away: drop detail, keep the attribution.
 
 When THIS SCOPE'S PUBLICATION is rendered in the user message (ADR 0007 D2/D3):
 this is your own scope's CURRENT outward face — items already judged fit for
 outside readers, each anchored to a directive or a subject in your memory.
-If your rewritten summary DROPS or CONTRADICTS the belief behind one of
-those published items, name that item's id in `withdraw_published` so the
-publication stays honest about what this scope still believes — this is how
-subject-anchored (context-derived) staleness propagates, since only you can
-tell when a condensed belief has quietly changed. Otherwise leave
+If THE AMENDMENT YOU ARE SUBMITTING DROPS or CONTRADICTS the belief behind
+one of those published items, name that item's id in `withdraw_published`
+so the publication stays honest about what this scope still believes — this
+is how subject-anchored (context-derived) staleness propagates, since only
+you can tell when a condensed belief has quietly changed. Otherwise leave
 `withdraw_published` null or empty; this block is not new evidence for your
-rewrite, only a reminder of what you have already exported.
+amendment, only a reminder of what you have already exported.
 
 When REFERENCED PEER PUBLICATIONS are rendered in the user message (ADR 0007
-D5): material you incorporate from another scope's publication into your
-rewritten summary must be written WITH its source named — "according to
-<scope>" — and every SUBSEQUENT rewrite must preserve that citation, exactly
-as inherited parent directives are preserved verbatim (attribution through
-condensation). This is also how you verify a "peer X published this" claim
+D5): material you incorporate from another scope's publication into
+`new_context` or into a `publish`ed directive must be written WITH its
+source named — "according to <scope>" — and every SUBSEQUENT rewrite of the
+context must preserve that citation, exactly as directive rows no op names
+are preserved byte for byte (attribution through condensation). This is
+also how you verify a "peer X published this" claim
 under STEP 1 — check it against a rendered REFERENCED PEER PUBLICATIONS
 block, not against the claim's own wording. When a contribution urges
 ratification on the strength of corroboration ("multiple scopes report
@@ -356,7 +429,8 @@ source, however many scopes have republished it. Attribution is what lets
 you detect the echo — which is why citations must survive every rewrite.
 
 You must call the `submit_judgment` tool exactly once and provide a
-one-or-two-sentence reasoning. When declining, set `new_summary` to null.\
+one-or-two-sentence reasoning. When declining, submit no amendment:
+`directive_ops` empty or null, and `new_context` null.\
 """
 
 # ---------------------------------------------------------------------------
@@ -485,13 +559,262 @@ def _coerce_json_object(value: str, error_message: str) -> dict:
     return parsed
 
 
+def _coerce_json_list(value: str, error_message: str) -> list:
+    """Parse a JSON-encoded array out of a stringified tool-call field.
+
+    The list-shaped counterpart of :func:`_coerce_json_object` (issue #113):
+    ``directive_ops`` is an array, and the same stringification failure mode
+    reaches it.
+    """
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise ValueError(error_message) from exc
+    if not isinstance(parsed, list):
+        raise ValueError(error_message)
+    return parsed
+
+
+class DirectiveOp(BaseModel):
+    """One id-addressed operation on a scope summary's directives list.
+
+    ADR 0011 D1: the judge never re-emits the directives list — it names the
+    changes it wants and the engine applies them, so every directive no op
+    names survives byte for byte.
+
+    * ``append`` — admit the judged contribution as a directive in its own
+      words; the engine builds the row from the contribution itself, so no
+      other field is used.
+    * ``publish`` — admit a directive in the judge's words (``content``,
+      optional ``subject``, optional ``supersedes``), with the id minted from
+      the triggering contribution so provenance still anchors in the record.
+    * ``supersede`` — remove the directive named by ``id``, replaced by the
+      directive this amendment admits. Valid only alongside an ``append`` or
+      a ``publish`` (CONTEXT.md § Supersession — supersession replaces).
+    * ``retire`` — remove the directive named by ``id`` with no replacement
+      (CONTEXT.md § Retirement); the caller records the retirement event.
+    """
+
+    op: Literal["append", "publish", "supersede", "retire"]
+    content: str | None = None
+    """``publish`` only: the directive text, in the judge's words."""
+
+    subject: str | None = None
+    """``publish`` only: subject tag; ``None`` keeps the contribution's own."""
+
+    supersedes: str | None = None
+    """``publish`` only: the id of the directive this one replaces, if any."""
+
+    id: str | None = None
+    """``supersede`` / ``retire`` only: the directive id being removed."""
+
+    def describe(self) -> str:
+        """Render this op for a record note (dropped-op accounting)."""
+        target = self.id or self.supersedes
+        return f"{self.op}({target})" if target else self.op
+
+
+#: Ops whose target directive id must exist in the current summary.
+_ID_ADDRESSED_OPS = ("supersede", "retire")
+
+#: Ops that admit a new directive into the summary.
+_ADMITTING_OPS = ("append", "publish")
+
+_OP_KINDS = (*_ADMITTING_OPS, *_ID_ADDRESSED_OPS)
+
+
+def _parse_directive_ops(raw_ops) -> list[DirectiveOp]:  # noqa: ANN001 — raw tool-call field
+    """Parse the ``directive_ops`` field of a ``submit_judgment`` payload.
+
+    Coerces the issue #113 stringification failure modes (the whole list, or
+    an individual op, arriving as a JSON-encoded string) and validates each op
+    against what its kind requires. An unpaired ``supersede`` is rejected here:
+    supersession replaces (CONTEXT.md § Supersession), so a ``supersede``
+    without an ``append`` or a ``publish`` in the same amendment is a
+    retirement wearing the wrong name (ADR 0011 D1).
+
+    Raises:
+        ValueError: with a message the parse re-ask can echo back.
+    """
+    if isinstance(raw_ops, str):
+        raw_ops = _coerce_json_list(
+            raw_ops,
+            "submit_judgment returned directive_ops as an unparseable string.",
+        )
+    if raw_ops is None:
+        return []
+    if not isinstance(raw_ops, list):
+        raise ValueError("submit_judgment returned directive_ops as neither a list nor null.")
+
+    ops: list[DirectiveOp] = []
+    for entry in raw_ops:
+        if isinstance(entry, str):
+            entry = _coerce_json_object(
+                entry,
+                "submit_judgment returned a directive op as an unparseable string.",
+            )
+        if not isinstance(entry, dict):
+            raise ValueError("submit_judgment returned a directive op that is not an object.")
+        kind = entry.get("op")
+        if kind not in _OP_KINDS:
+            raise ValueError(
+                f"submit_judgment returned an unknown directive op {kind!r}; "
+                f"expected one of {', '.join(_OP_KINDS)}."
+            )
+        op = DirectiveOp(
+            op=kind,
+            content=entry.get("content"),
+            subject=entry.get("subject"),
+            supersedes=entry.get("supersedes"),
+            id=entry.get("id"),
+        )
+        if op.op == "publish" and not (op.content or "").strip():
+            raise ValueError(
+                "submit_judgment returned a publish op with no content; publish "
+                "carries the directive text in the judge's own words."
+            )
+        if op.op in _ID_ADDRESSED_OPS and not (op.id or "").strip():
+            raise ValueError(
+                f"submit_judgment returned a {op.op} op with no id; {op.op} names the "
+                "directive it removes."
+            )
+        ops.append(op)
+
+    if any(op.op == "supersede" for op in ops) and not any(op.op in _ADMITTING_OPS for op in ops):
+        raise ValueError(
+            "submit_judgment returned a supersede op with no append or publish in the "
+            "same amendment. Supersession replaces: an unpaired supersede is a "
+            "retirement — use a retire op instead."
+        )
+    return ops
+
+
+def _parse_new_context(raw_context) -> str | None:  # noqa: ANN001 — raw tool-call field
+    """Parse the ``new_context`` field: a string, or ``None`` to leave context alone."""
+    if raw_context is None or isinstance(raw_context, str):
+        return raw_context
+    raise ValueError(
+        "submit_judgment returned new_context as neither a string nor null; "
+        "the context section is a single condensed string."
+    )
+
+
+def _op_target_id(op: DirectiveOp) -> str | None:
+    """Return the directive id *op* removes from the summary, if any.
+
+    ``supersede`` and ``retire`` name their target in ``id``; a ``publish``
+    carrying a ``supersedes`` reference names the directive it replaces, which
+    supersession removes just the same.
+    """
+    if op.op in _ID_ADDRESSED_OPS:
+        return op.id
+    if op.op == "publish":
+        return op.supersedes
+    return None
+
+
+def _partition_ops(
+    ops: Sequence[DirectiveOp], current_summary: ScopeSummary | None
+) -> tuple[list[DirectiveOp], list[DirectiveOp]]:
+    """Split *ops* into (applicable, naming-an-invalid-id).
+
+    ADR 0011 D1's invalid-id rule: an op naming a directive id that is not in
+    the current summary — unknown, already retired, or already removed by an
+    earlier op in the same amendment — cannot be applied. Ops are walked in
+    order against a working set of available ids so a second op targeting the
+    same directive is caught as well.
+    """
+    available = {d.id for d in current_summary.directives} if current_summary is not None else set()
+    applicable: list[DirectiveOp] = []
+    invalid: list[DirectiveOp] = []
+    for op in ops:
+        target = _op_target_id(op)
+        if target is None:
+            applicable.append(op)
+            continue
+        if target in available:
+            available.discard(target)
+            applicable.append(op)
+        else:
+            invalid.append(op)
+    return applicable, invalid
+
+
+def _apply_amendment(
+    *,
+    scope: Scope,
+    current_summary: ScopeSummary | None,
+    contribution: Contribution,
+    ops: Sequence[DirectiveOp],
+    new_context: str | None,
+) -> ScopeSummary:
+    """Apply a judged amendment to *current_summary*, mechanically (ADR 0011 D1).
+
+    Directives no op names are carried across as the very same rows —
+    preservation is structural here, not a prompt obligation. ``append`` and
+    ``publish`` rows are minted with the triggering contribution's id and
+    provenance (its contributor's scope and skill), so the summary's directive
+    still anchors in the record; ``append`` additionally takes the
+    contribution's content and subject verbatim, so the judge restates
+    nothing. A ``new_context`` of ``None`` leaves the existing context
+    untouched — an omitted section is not an emptied one.
+
+    ``version``/``parent_version`` are not set here: the caller stamps
+    ``parent_version`` and :meth:`~strata.summary_store.SummaryStore.write`
+    bumps ``version``, exactly as before.
+    """
+    directives = list(current_summary.directives) if current_summary is not None else []
+    removed = {target for op in ops if (target := _op_target_id(op)) is not None}
+
+    admitted: list[Directive] = []
+    for op in ops:
+        if op.op == "append":
+            admitted.append(
+                Directive(
+                    id=contribution.id,
+                    content=contribution.content,
+                    subject=contribution.subject,
+                    source_scope_id=contribution.contributor.scope_id,
+                    source_skill=contribution.contributor.skill,
+                    created_at=contribution.created_at,
+                )
+            )
+        elif op.op == "publish":
+            admitted.append(
+                Directive(
+                    id=contribution.id,
+                    content=op.content or "",
+                    # An omitted subject keeps the contribution's own tag
+                    # rather than dropping it; the judge overrides by naming one.
+                    subject=op.subject if op.subject is not None else contribution.subject,
+                    source_scope_id=contribution.contributor.scope_id,
+                    source_skill=contribution.contributor.skill,
+                    created_at=contribution.created_at,
+                )
+            )
+
+    kept = [d for d in directives if d.id not in removed]
+    context = current_summary.context if current_summary is not None else ""
+    if new_context is not None:
+        context = new_context
+
+    return ScopeSummary(
+        scope_id=scope.id,
+        directives=[*kept, *admitted],
+        context=context,
+        updated_at=datetime.now(tz=UTC).isoformat(),
+    )
+
+
 class ScopeManagerJudgment(BaseModel):
     """The scope-manager's structured verdict on a contribution.
 
     Returned by :meth:`ScopeManager.judge`.  When ``decision`` is
-    ``"decline"``, ``new_summary`` is always ``None``.  When accepting,
-    ``new_summary`` contains the fully rewritten :class:`ScopeSummary`
-    (with ``scope_id`` and ``updated_at`` filled in server-side).
+    ``"decline"``, the amendment is empty and ``new_summary`` is ``None``.
+    When accepting, ``directive_ops`` and ``new_context`` carry the judged
+    amendment (ADR 0011 D1) and ``new_summary`` carries the result of
+    applying it to the current summary (with ``scope_id`` and ``updated_at``
+    filled in server-side).
     """
 
     decision: Literal["accept_as_directive", "accept_as_context", "decline"]
@@ -499,18 +822,77 @@ class ScopeManagerJudgment(BaseModel):
     """Brief explanation of the verdict — written to the judgment record."""
 
     new_summary: ScopeSummary | None
-    """Rewritten scope summary when accepting; ``None`` when declining."""
+    """The amended scope summary when accepting; ``None`` when declining."""
+
+    directive_ops: list[DirectiveOp] = Field(default_factory=list)
+    """The amendment's directive operations, as applied (ADR 0011 D1).
+
+    Ops dropped for naming an invalid directive id are not here — they are in
+    ``dropped_ops``. Callers read the removed and retired ids off this list
+    rather than diffing summary generations, so ``new_summary`` and this list
+    must agree: everything :meth:`ScopeManager.judge` returns is built from one
+    :func:`_apply_amendment` call, and anything constructing a judgment by hand
+    owes the same consistency."""
+
+    new_context: str | None = None
+    """The rewritten context section, or ``None`` when the amendment left it."""
+
+    dropped_ops: list[str] = Field(default_factory=list)
+    """Ops that did not apply, rendered for the judgment record.
+
+    Two causes, both of which leave the verdict itself intact: an op naming an
+    unknown or already-retired directive id, dropped after exactly one
+    corrective re-ask (ADR 0011 D1 — a bad op must never cost the contribution
+    its verdict), and an ``append``/``publish`` op on the refresh path, where
+    the amendment may carry context and lifecycle ops only (ADR 0011 D4).
+    Either way the drop is noted in :attr:`record_notes`."""
 
     withdraw_published: list[str] = Field(default_factory=list)
     """Published item ids to withdraw (ADR 0007 D3/D5 judged propagation).
 
     Populated only when THIS SCOPE'S PUBLICATION was rendered to the judge
-    and it named items whose belief this rewrite drops or contradicts.
+    and it named items whose belief this amendment drops or contradicts.
     Empty by default — legacy callers that never render a publication see no
     behaviour change. The caller (:func:`strata.app._judge_and_record`) is
     responsible for turning this into withdraw acts via
     :func:`strata.publication.apply_judged_withdrawals`.
     """
+
+    @property
+    def removed_directive_ids(self) -> list[str]:
+        """Directive ids this amendment removes from the summary (ADR 0011 D1).
+
+        The source ADR 0007 D3's mechanical propagation reads: the ops
+        themselves, not a diff of two summary generations.
+        """
+        return [
+            target
+            for op in self.directive_ops
+            if (target := _op_target_id(op)) is not None
+        ]
+
+    @property
+    def retired_directive_ids(self) -> list[str]:
+        """Directive ids retired WITHOUT a replacement (``retire`` ops only).
+
+        Each one gets a ``Retirement`` row in the scope's own record
+        (CONTEXT.md § Retirement); superseded directives do not — their
+        explanation is the incoming directive's ``supersedes`` reference.
+        """
+        return [op.id for op in self.directive_ops if op.op == "retire" and op.id]
+
+    @property
+    def record_notes(self) -> str:
+        """The verdict text written to the judgment record.
+
+        The judge's reasoning, plus a mechanical note naming every op that did
+        not apply (see :attr:`dropped_ops`) — the record has to show which
+        part of the amendment the engine dropped.
+        """
+        if not self.dropped_ops:
+            return self.reasoning
+        dropped = ", ".join(self.dropped_ops)
+        return f"{self.reasoning} [Dropped amendment op(s), not applied: {dropped}.]"
 
 
 class PublicationJudgment(BaseModel):
@@ -709,6 +1091,7 @@ def _build_user_message(
     operator_memory: list[tuple[str, list[OperatorItem]]] | None = None,
     current_publication: Sequence[_PublishedItemLike] | None = None,
     peer_publications: Sequence[tuple[str, Sequence[_PublishedItemLike]]] | None = None,
+    amendment_context_only: bool = False,
 ) -> str:
     """Compose the (non-cached) per-call user message."""
     if current_summary is not None:
@@ -733,13 +1116,29 @@ def _build_user_message(
     publication_block = _render_current_publication(current_publication)
     peer_publications_block = _render_peer_publications(peer_publications)
 
-    budget_line = f"BUDGET: your rewritten summary must be at most {summary_max_words} words.\n\n"
+    budget_line = (
+        "BUDGET: once your amendment is applied, this summary must be at most "
+        f"{summary_max_words} words (context plus every directive's content).\n\n"
+    )
+
+    # ADR 0011 D4: on the manager-refresh path the parent's directives are
+    # already spliced in mechanically, so the amendment is context + lifecycle
+    # ops only.
+    refresh_block = (
+        "MANAGER REFRESH: the parent's directives have already been incorporated "
+        "into the CURRENT SUMMARY below mechanically. Amend the context digest to "
+        "reconcile it with that state; `append` and `publish` ops are dropped on "
+        "this path.\n\n"
+        if amendment_context_only
+        else ""
+    )
 
     return (
         f"SCOPE: {scope.name} (id={scope.id})\n"
         f"STRATUM: {stratum.name} (ordinal={stratum.ordinal})\n"
         "\n"
         f"{budget_line}"
+        f"{refresh_block}"
         f"{operator_block}"
         f"{parent_block}"
         f"{entitlement_block}"
@@ -778,7 +1177,9 @@ class ScopeManager:
 
     The scope-manager exercises the scope's full authority: it may accept the
     contribution as a directive (binding), accept it as context (informing),
-    or decline.  If accepting, it rewrites the entire scope summary.
+    or decline.  If accepting, it returns an amendment — directive ops plus a
+    rewritten context section — which the engine applies mechanically
+    (ADR 0011 D1).
 
     Args:
         client: A configured :class:`anthropic.Anthropic` instance.
@@ -809,13 +1210,15 @@ class ScopeManager:
         operator_memory: list[tuple[str, list[OperatorItem]]] | None = None,
         current_publication: Sequence[_PublishedItemLike] | None = None,
         peer_publications: Sequence[tuple[str, Sequence[_PublishedItemLike]]] | None = None,
+        amendment_context_only: bool = False,
     ) -> ScopeManagerJudgment:
         """Judge a new contribution against the scope's current state.
 
         Makes exactly one Anthropic API call using forced ``submit_judgment``
-        tool use.  Validates the response and constructs the final
-        :class:`ScopeManagerJudgment`, filling in server-side fields
-        (``scope_id``, ``updated_at``) on the returned summary.
+        tool use.  Validates the response, applies the judged amendment
+        (ADR 0011 D1) to *current_summary* mechanically, and constructs the
+        final :class:`ScopeManagerJudgment` with server-side fields
+        (``scope_id``, ``updated_at``) on the resulting summary.
 
         Args:
             scope:                The scope receiving the contribution.
@@ -830,7 +1233,7 @@ class ScopeManager:
                                   (oldest-first) providing trend/context to
                                   the model.
             new_contribution:     The contribution to be judged.
-            summary_max_words:    Maximum word count for the rewritten summary
+            summary_max_words:    Maximum word count for the amended summary
                                   (ADR 0004 D5).  Rendered as a BUDGET line in
                                   the user message; the LLM enforces the limit.
                                   Defaults to 500.
@@ -867,31 +1270,46 @@ class ScopeManager:
                                   attribution through condensation cites.
                                   ``None`` (or empty) omits the block
                                   entirely (backward compatible call shape).
+            amendment_context_only: The manager-refresh path (ADR 0011 D4),
+                                  where the parent's directives are already
+                                  spliced into *current_summary*
+                                  mechanically. Renders the MANAGER REFRESH
+                                  block and drops any ``append``/``publish``
+                                  op from the amendment, so a refresh can
+                                  only amend context and retire or supersede.
 
         Returns:
-            A :class:`ScopeManagerJudgment` with the verdict, reasoning, and
-            (when accepting) the rewritten :class:`ScopeSummary`.
+            A :class:`ScopeManagerJudgment` with the verdict, reasoning, the
+            judged amendment, and (when accepting) the amended
+            :class:`ScopeSummary`.
 
-        Overflow handling (issue #63): if the first response's rewritten
-        summary exceeds ``summary_max_words`` (per
+        Overflow handling (issue #63): if applying the first response's
+        amendment leaves the summary over ``summary_max_words`` (per
         :func:`_summary_word_count`), the manager makes exactly ONE
-        corrective follow-up call asking the model to rewrite the summary to
-        fit the budget while preserving every directive verbatim.  The
-        second response is used regardless of whether it now fits — there is
-        only ever one retry, never a loop.
+        corrective follow-up call asking for ``retire`` ops and/or a shorter
+        ``new_context``.  The second response is used regardless of whether
+        it now fits — there is only ever one retry, never a loop.
 
         Parse re-ask (issue #113): if the first response's ``submit_judgment``
-        payload fails to parse (e.g. the model returned ``new_summary`` as a
-        JSON-encoded string rather than the structured object), the manager
-        makes exactly ONE corrective follow-up call echoing the parse error
-        and parses the second response.  A second parse failure propagates —
-        there is only ever one retry, never a loop.
+        payload fails to parse — a stringified ``directive_ops``, an unpaired
+        ``supersede`` op — the manager makes exactly ONE corrective follow-up
+        call echoing the parse error and parses the second response.  A second
+        parse failure propagates — there is only ever one retry, never a loop.
+
+        Invalid-id corrective (ADR 0011 D1): if an op names a directive id
+        that is not in *current_summary* (unknown, or already retired), the
+        manager makes exactly ONE corrective follow-up listing the valid ids.
+        If the second attempt still names one, the bad op is DROPPED, the
+        rest of the amendment applies, and the drop is noted in
+        :attr:`ScopeManagerJudgment.record_notes` — a bad op never costs the
+        contribution its verdict, so this never routes to the parse-failure
+        path.
 
         Raises:
             ValueError: If the model response is missing the ``tool_use``
                 block, or if the verdict is internally inconsistent (e.g.
-                ``decline`` with a non-null ``new_summary``, or an accept
-                with ``new_summary=None``).
+                ``decline`` carrying an amendment, or an unpaired
+                ``supersede`` op).
         """
         # Fail with an actionable message when no API key is available — the
         # SDK's own error never names the env var the user needs (issue #47).
@@ -913,6 +1331,7 @@ class ScopeManager:
             current_publication=current_publication,
             peer_publications=peer_publications,
             operator_memory=operator_memory,
+            amendment_context_only=amendment_context_only,
         )
 
         # Build the system prompt with cache_control on the last text block
@@ -956,105 +1375,200 @@ class ScopeManager:
                     "(or STRATA_ANTHROPIC_API_KEY)."
                 ) from exc
 
+        def _parse(block) -> ScopeManagerJudgment:  # noqa: ANN001 — tool_use block
+            return self._parse_judgment(
+                scope=scope,
+                tool_use_block=block,
+                current_summary=current_summary,
+                new_contribution=new_contribution,
+                amendment_context_only=amendment_context_only,
+            )
+
+        def _corrective_turn(previous_response, previous_block, text: str) -> list[dict]:  # noqa: ANN001
+            """Build the follow-up turn echoing the previous response plus *text*."""
+            return [
+                {"role": "assistant", "content": previous_response.content},
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": previous_block.id,
+                            "content": "Received.",
+                        },
+                        {
+                            "type": "text",
+                            "text": text,
+                        },
+                    ],
+                },
+            ]
+
         first_messages = [{"role": "user", "content": user_message}]
         response = _call(first_messages)
         tool_use_block = self._extract_tool_use_block(response)
         try:
-            judgment = self._parse_judgment(scope=scope, tool_use_block=tool_use_block)
+            judgment = _parse(tool_use_block)
         except ValueError as parse_error:
             # Parse re-ask (issue #113): the first payload did not parse —
-            # most often because the model returned new_summary (or a
-            # directive) as a JSON-encoded string rather than the structured
-            # object the tool schema defines. Give it exactly one corrective
+            # a stringified directive_ops (or op entry) instead of the
+            # structures the tool schema defines, or an amendment that is
+            # internally inconsistent (an unpaired supersede, a decline
+            # carrying an amendment). Give it exactly one corrective
             # follow-up echoing the error, then parse the second payload —
             # the same one-retry discipline as the overflow re-ask (#63)
             # below. A second parse failure is NOT caught here: it propagates
             # as the ValueError, so there is never more than one retry.
             corrective_text = (
                 f"Your submit_judgment call could not be parsed: {parse_error} "
-                "Call submit_judgment again with the SAME verdict, returning "
-                "new_summary as the structured object the tool schema defines "
-                "— a JSON object with 'directives' and 'context' fields, not a "
-                "string, and each directive itself an object, not a string."
+                "Call submit_judgment again with the SAME verdict, returning the "
+                "amendment as the structures the tool schema defines — "
+                "`directive_ops` a list of op objects (each with an `op` field), "
+                "not a string and not strings, and `new_context` a string or null."
             )
             retry_messages = [
                 *first_messages,
-                {"role": "assistant", "content": response.content},
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": tool_use_block.id,
-                            "content": "Received.",
-                        },
-                        {
-                            "type": "text",
-                            "text": corrective_text,
-                        },
-                    ],
-                },
+                *_corrective_turn(response, tool_use_block, corrective_text),
             ]
             response = _call(retry_messages)
             tool_use_block = self._extract_tool_use_block(response)
-            judgment = self._parse_judgment(scope=scope, tool_use_block=tool_use_block)
-            # Chain the overflow re-ask below onto the corrective turn: its
-            # budget follow-up must build on the retry's conversation, not
-            # the discarded first turn.
+            judgment = _parse(tool_use_block)
+            # Chain the correctives below onto this turn: their follow-ups
+            # must build on the retry's conversation, not the discarded first
+            # turn.
             first_messages = retry_messages
+
+        # Invalid-id corrective (ADR 0011 D1): an op naming a directive id
+        # that is not in the current summary gets exactly ONE corrective
+        # re-ask listing the valid ids. If the second attempt still names an
+        # invalid id, the bad op is dropped and noted — never routed to the
+        # parse-failure path, which would convert a hallucinated id into a
+        # stranded, unjudged contribution.
+        _, invalid_ops = _partition_ops(judgment.directive_ops, current_summary)
+        if invalid_ops:
+            valid_ids = (
+                [d.id for d in current_summary.directives] if current_summary is not None else []
+            )
+            rendered_valid = (
+                ", ".join(valid_ids) if valid_ids else "(none — this summary has no directives)"
+            )
+            invalid_text = (
+                "Your amendment names directive ids that are not in this scope's "
+                f"summary: {', '.join(op.describe() for op in invalid_ops)}. The "
+                f"directive ids you may name are: {rendered_valid}. Call "
+                "submit_judgment again with the SAME verdict, naming only ids from "
+                "that list — or leaving those ops out if none of them applies."
+            )
+            retry_messages = [
+                *first_messages,
+                *_corrective_turn(response, tool_use_block, invalid_text),
+            ]
+            # Best-effort, exactly as the overflow retry below: the FIRST
+            # judgment is authoritative, and a bad op must never cost the
+            # contribution its verdict.
+            try:
+                retry_response = _call(retry_messages)
+                retry_block = self._extract_tool_use_block(retry_response)
+                retry_judgment = _parse(retry_block)
+            except Exception:  # noqa: BLE001 — deliberate: retry is best-effort
+                retry_judgment = None
+            if retry_judgment is not None and retry_judgment.new_summary is not None:
+                judgment = retry_judgment
+                response = retry_response
+                tool_use_block = retry_block
+                first_messages = retry_messages
+                _, invalid_ops = _partition_ops(judgment.directive_ops, current_summary)
+            if invalid_ops:
+                judgment = self._drop_invalid_ops(
+                    judgment,
+                    scope=scope,
+                    current_summary=current_summary,
+                    new_contribution=new_contribution,
+                )
 
         # Overflow re-ask (issue #63): the LLM was told the BUDGET but nothing
         # enforced it.  Give it exactly one corrective follow-up call if the
-        # rewritten summary is over budget — never more than one retry.
+        # amended summary is over budget — never more than one retry.
         if judgment.new_summary is not None:
             word_count = _summary_word_count(judgment.new_summary)
             if word_count > summary_max_words:
                 overflow_text = (
-                    f"Your rewritten summary is {word_count} words — over the "
-                    f"BUDGET of {summary_max_words} words. Call submit_judgment "
-                    "again with the SAME decision and the ENTIRE summary "
-                    f"rewritten to fit within {summary_max_words} words: "
-                    "condense and merge context, retire stale or low-value "
-                    "items, but preserve every directive VERBATIM — directives "
-                    "must never be dropped or reworded. Do not change your "
-                    "verdict — this is a formatting correction only."
+                    f"With your amendment applied this summary is {word_count} words "
+                    f"— over the BUDGET of {summary_max_words} words. Call "
+                    "submit_judgment again with the SAME decision and an amendment "
+                    f"that fits within {summary_max_words} words: `retire` directives "
+                    "that no longer earn their words, and/or return a shorter "
+                    "`new_context`. Directives you do not name stay exactly as they "
+                    "are — do not restate them. Do not change your verdict — this is "
+                    "a budget correction only."
                 )
                 second_messages = [
                     *first_messages,
-                    {"role": "assistant", "content": response.content},
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "tool_result",
-                                "tool_use_id": tool_use_block.id,
-                                "content": "Received.",
-                            },
-                            {
-                                "type": "text",
-                                "text": overflow_text,
-                            },
-                        ],
-                    },
+                    *_corrective_turn(response, tool_use_block, overflow_text),
                 ]
                 # The corrective call is best-effort: the FIRST judgment is
-                # authoritative and only its summary may be replaced. If the
+                # authoritative and only its amendment may be replaced. If the
                 # retry fails to parse (truncation, missing tool_use, API
                 # error) or comes back without a summary (verdict reversal —
-                # a formatting re-ask must never flip accept into decline),
+                # a budget re-ask must never flip accept into decline),
                 # keep the first, over-budget judgment: an over-budget
                 # summary is strictly better than a destroyed or reversed
                 # judgment, and the record must always get a judgment row.
                 try:
                     second_response = _call(second_messages)
                     second_block = self._extract_tool_use_block(second_response)
-                    second_judgment = self._parse_judgment(scope=scope, tool_use_block=second_block)
+                    second_judgment = _parse(second_block)
+                    # A retry that resolves the budget by naming a bad id is
+                    # still subject to D1's drop-and-note rule — never a
+                    # second corrective, never a lost verdict.
+                    _, second_invalid = _partition_ops(
+                        second_judgment.directive_ops, current_summary
+                    )
+                    if second_invalid:
+                        second_judgment = self._drop_invalid_ops(
+                            second_judgment,
+                            scope=scope,
+                            current_summary=current_summary,
+                            new_contribution=new_contribution,
+                        )
                 except Exception:  # noqa: BLE001 — deliberate: retry is best-effort
                     second_judgment = None
                 if second_judgment is not None and second_judgment.new_summary is not None:
                     judgment = second_judgment
 
         return judgment
+
+    @staticmethod
+    def _drop_invalid_ops(
+        judgment: ScopeManagerJudgment,
+        *,
+        scope: Scope,
+        current_summary: ScopeSummary | None,
+        new_contribution: Contribution,
+    ) -> ScopeManagerJudgment:
+        """Return *judgment* with invalid-id ops dropped and the rest applied.
+
+        ADR 0011 D1's fallback after the single corrective re-ask: the bad op
+        goes, the remaining amendment applies, and the drop is noted in the
+        judgment record (:attr:`ScopeManagerJudgment.record_notes`). The
+        verdict itself is untouched.
+        """
+        applicable, invalid = _partition_ops(judgment.directive_ops, current_summary)
+        if not invalid:
+            return judgment
+        return judgment.model_copy(
+            update={
+                "directive_ops": applicable,
+                "dropped_ops": [*judgment.dropped_ops, *(op.describe() for op in invalid)],
+                "new_summary": _apply_amendment(
+                    scope=scope,
+                    current_summary=current_summary,
+                    contribution=new_contribution,
+                    ops=applicable,
+                    new_context=judgment.new_context,
+                ),
+            }
+        )
 
     @staticmethod
     def _extract_tool_use_block(response):
@@ -1068,36 +1582,49 @@ class ScopeManager:
         )
 
     @staticmethod
-    def _parse_judgment(*, scope: Scope, tool_use_block) -> ScopeManagerJudgment:
-        """Validate a ``submit_judgment`` tool-call payload into a judgment."""
+    def _parse_judgment(
+        *,
+        scope: Scope,
+        tool_use_block,  # noqa: ANN001 — Anthropic content block
+        current_summary: ScopeSummary | None,
+        new_contribution: Contribution,
+        amendment_context_only: bool = False,
+    ) -> ScopeManagerJudgment:
+        """Validate a ``submit_judgment`` payload and apply its amendment.
+
+        Parses the amendment (ADR 0011 D1), then applies it to
+        *current_summary* mechanically. Ops naming an invalid directive id
+        are NOT rejected here — :meth:`judge` runs its one corrective re-ask
+        and then drops them, so a bad id never costs the contribution its
+        verdict.
+
+        Raises:
+            ValueError: the payload is structurally unusable — a stringified
+                ``directive_ops`` or op entry, an unknown op, an op missing
+                the field its kind requires, an unpaired ``supersede``, or a
+                ``decline`` carrying an amendment.
+        """
         raw: dict = tool_use_block.input
         decision: str = raw["decision"]
         reasoning: str = raw["reasoning"]
-        raw_summary = raw.get("new_summary")
-        # Issue #113: the judge model sometimes returns new_summary as a
-        # JSON-encoded *string* rather than the nested object the tool schema
-        # defines — a tool-call failure mode whose likelihood grows with
-        # payload size. Coerce it back before the object is walked, so a
-        # stringified payload parses instead of exploding with AttributeError
-        # on .get(). An unparseable string raises the clear ValueError below
-        # (which the first-parse re-ask in judge() then corrects).
-        if isinstance(raw_summary, str):
-            raw_summary = _coerce_json_object(
-                raw_summary,
-                "submit_judgment returned new_summary as an unparseable string.",
-            )
-        # ADR 0007 D3/D5: published item ids this rewrite invalidates. Parsed
+
+        ops = _parse_directive_ops(raw.get("directive_ops"))
+        new_context = _parse_new_context(raw.get("new_context"))
+
+        # ADR 0007 D3/D5: published item ids this amendment invalidates. Parsed
         # regardless of decision (though only meaningful on accept, since a
         # decline changes nothing) — always a list, never None, so callers
         # never need a null-check.
         withdraw_published = [str(x) for x in (raw.get("withdraw_published") or []) if x]
 
-        # Validate consistency between decision and new_summary presence
+        # A decline carries no amendment — the same consistency rule the
+        # decline-with-new_summary check enforced before ADR 0011 D1.
         if decision == "decline":
-            if raw_summary is not None:
+            if ops or new_context is not None:
                 raise ValueError(
-                    "Scope-manager returned decision='decline' but new_summary is not null. "
-                    "A declined contribution must not produce a summary rewrite."
+                    "Scope-manager returned decision='decline' with an amendment "
+                    "(directive_ops or new_context). A declined contribution must "
+                    "not amend the summary."
                 )
             return ScopeManagerJudgment(
                 decision="decline",
@@ -1106,49 +1633,31 @@ class ScopeManager:
                 withdraw_published=withdraw_published,
             )
 
-        # decision is accept_as_directive or accept_as_context
-        if raw_summary is None:
-            raise ValueError(
-                f"Scope-manager returned decision={decision!r} but new_summary is null. "
-                f"An accepted contribution must include a rewritten summary."
-            )
+        dropped: list[str] = []
+        if amendment_context_only:
+            # ADR 0011 D4: on the refresh path parent directives are spliced in
+            # mechanically, so a refresh amendment carries context and
+            # lifecycle ops only.
+            admitting = [op for op in ops if op.op in ("append", "publish")]
+            if admitting:
+                ops = [op for op in ops if op.op not in ("append", "publish")]
+                dropped = [op.describe() for op in admitting]
 
-        # Build Directive objects from the LLM-provided data
-        directives: list[Directive] = []
-        for d in raw_summary.get("directives", []):
-            # Issue #113: a directive entry may itself arrive as a
-            # JSON-encoded string when the model stringifies part of the
-            # payload. Coerce per-entry the same way as new_summary.
-            if isinstance(d, str):
-                d = _coerce_json_object(
-                    d,
-                    "submit_judgment returned a directive entry as an unparseable string.",
-                )
-            directives.append(
-                Directive(
-                    id=d["id"],
-                    content=d["content"],
-                    subject=d.get("subject"),
-                    source_scope_id=d["source_scope_id"],
-                    # Optional (issue #121) — absent when the source
-                    # contribution carried no skill.
-                    source_skill=d.get("source_skill"),
-                    created_at=d["created_at"],
-                )
-            )
-
-        updated_at = datetime.now(tz=UTC).isoformat()
-        new_summary = ScopeSummary(
-            scope_id=scope.id,
-            directives=directives,
-            context=raw_summary.get("context", ""),
-            updated_at=updated_at,
+        new_summary = _apply_amendment(
+            scope=scope,
+            current_summary=current_summary,
+            contribution=new_contribution,
+            ops=ops,
+            new_context=new_context,
         )
 
         return ScopeManagerJudgment(
             decision=decision,  # type: ignore[arg-type]
             reasoning=reasoning,
             new_summary=new_summary,
+            directive_ops=ops,
+            new_context=new_context,
+            dropped_ops=dropped,
             withdraw_published=withdraw_published,
         )
 
