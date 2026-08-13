@@ -437,8 +437,10 @@ STEP 2 — CLASSIFICATION. Concepts you must know (from CONTEXT.md):
   its own merits exactly as if it named nothing. If you admit it, emit the
   `append` or `publish` with NO `supersede` op and no `supersedes` field —
   a reference that resolves to nothing removes nothing — and note the
-  unresolvable reference in your reasoning. Decline only when the content
-  itself deserves declining.
+  unresolvable reference in your reasoning. NEVER repoint the reference at
+  a directive you infer was meant: the contributor names removals, not
+  you, and a guessed removal deletes memory nobody asked to delete.
+  Decline only when the content itself deserves declining.
 - When accepting, you do NOT rewrite the summary. You submit an AMENDMENT:
   `directive_ops` (operations on the directives list) and `new_context`
   (the context section, rewritten). Every existing directive you do not
@@ -462,7 +464,9 @@ STEP 2 — CLASSIFICATION. Concepts you must know (from CONTEXT.md):
     text. That sentence is not optional decoration: it is the only audit
     trail for a directive the record cannot match byte for byte, so a
     `publish` whose reasoning does not carry it is a `publish` you should
-    not have made.
+    not have made. Concretely: whenever any op is `publish`, begin your
+    reasoning with "Publishing because ..." and complete the sentence with
+    why the bytes could not serve.
   - `supersede` — {"op": "supersede", "id": <directive id>}: remove that
     directive because the directive this amendment admits replaces it.
     `supersede` NEVER appears alone — it rides in the same amendment as
