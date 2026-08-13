@@ -1744,22 +1744,30 @@ def test_contributions_arriving_during_a_judgment_are_judged_in_one_batch(
         time.sleep(0.005)
 
     # Three more arrive while it runs — they queue instead of blocking on it.
-    queued, queued_errors = _spawn_contributions(
-        contents=["queued one", "queued two", "queued three"],
-        scope=scope,
-        stratum=stratum,
-        fleet=fleet,
-        db_path=db_path,
-        summary_store=summary_store,
-        manager=manager,
-    )
-    _wait_for_pending(scope_id, 3)
+    # Spawned one at a time, each confirmed queued before the next starts:
+    # the assertions below pin ARRIVAL order, and three threads started
+    # together arrive in scheduler order, not spawn order.
+    queued: list[threading.Thread] = []
+    queued_error_lists = []
+    for n, content in enumerate(["queued one", "queued two", "queued three"], start=1):
+        threads, errors = _spawn_contributions(
+            contents=[content],
+            scope=scope,
+            stratum=stratum,
+            fleet=fleet,
+            db_path=db_path,
+            summary_store=summary_store,
+            manager=manager,
+        )
+        queued.extend(threads)
+        queued_error_lists.append(errors)
+        _wait_for_pending(scope_id, n)
 
     gate.set()
     for thread in [*first, *queued]:
         thread.join(timeout=15.0)
     assert first_errors == []
-    assert queued_errors == []
+    assert [e for errors in queued_error_lists for e in errors] == []
 
     # The three queued contributions were judged in ONE call, in arrival order.
     assert len(manager.batch_calls) == 1

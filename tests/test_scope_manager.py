@@ -1716,10 +1716,16 @@ def test_system_prompt_declines_contradiction_citing_operator_directive() -> Non
 
 
 def test_system_prompt_requires_per_operator_directive_attribution() -> None:
-    """Echoing operator-consistent material must be attributed in the summary."""
+    """Echoing operator-consistent material must be attributed in the summary.
+
+    The obligation lives in RULE 2 of the amendment contract (promoted there
+    after an eval pass measured 0.0 on attribution while the rule sat in a
+    paragraph judges never registered), so the pins follow it to its new home.
+    """
     flat = " ".join(_SYSTEM_PROMPT.split())
     assert "per operator directive <id>" in flat
-    assert "never masquerades as native scope memory" in flat
+    assert "RULE 2 — EVERY OPERATOR ECHO CARRIES ITS ATTRIBUTION" in flat
+    assert "an unattributed echo masquerades as native scope memory" in flat
 
 
 def test_system_prompt_operator_memory_precedes_parent_summary_guidance() -> None:
@@ -2736,10 +2742,16 @@ def test_system_prompt_states_the_amendment_contract() -> None:
 
 
 def test_system_prompt_encodes_the_append_versus_publish_rule() -> None:
+    """The decision rule, with the publish-reason obligation stated as a MUST.
+
+    "say why in your reasoning" measured as present in only one publish out of
+    three; the rule now names the exact sentence a publish reasoning owes.
+    """
     flat = " ".join(_SYSTEM_PROMPT.split())
     assert (
         "APPEND unless the binding text must differ from the contribution's text; "
-        "if it must, PUBLISH, and say why in your reasoning" in flat
+        "if it must, PUBLISH — and your reasoning MUST name why the contribution's "
+        "own bytes could not serve as the directive text" in flat
     )
 
 
@@ -2772,6 +2784,91 @@ def test_system_prompt_budget_rule_names_the_two_levers() -> None:
 def test_system_prompt_withdraw_rule_is_phrased_against_the_amendment() -> None:
     flat = " ".join(_SYSTEM_PROMPT.split())
     assert "THE AMENDMENT YOU ARE SUBMITTING DROPS or CONTRADICTS" in flat
+
+
+# ---------------------------------------------------------------------------
+# ADR 0011 D1 — prompt hardening against the four obligations the first
+# A-suite pass measured leaking. Machinery scored 1.0 throughout; these are
+# the PROMPT-borne rules, so the contract is pinned on the prompt text.
+# ---------------------------------------------------------------------------
+
+
+def test_system_prompt_promotes_operator_echo_attribution_to_a_top_level_rule() -> None:
+    """Target 1 (measured 0.0): attribution is a numbered rule, worked and named.
+
+    Two things the buried paragraph lacked: a concrete echo sentence with the
+    attribution written in, and the failure mode said plainly. The ADR 0008 D2
+    never-copy rule sits immediately beside it, equally prominent.
+    """
+    flat = " ".join(_SYSTEM_PROMPT.split())
+    assert "RULE 1 — NEVER COPY AN OPERATOR DIRECTIVE (ADR 0008 D2)" in flat
+    assert "RULE 2 — EVERY OPERATOR ECHO CARRIES ITS ATTRIBUTION" in flat
+    # The worked micro-example: an echo sentence carrying its attribution.
+    assert (
+        '"Deploy freezes remain in effect through Q3 — per operator '
+        'directive op_1a2b3c4d."' in flat
+    )
+    # The failure mode, stated plainly.
+    assert "an unattributed echo masquerades as native scope memory" in flat
+    # Reasoning is not a place to put attribution — only authored summary text is.
+    assert "Citing the id in your reasoning does NOT satisfy this" in flat
+    # Both rules are adjacent, and both land before the OPERATOR MEMORY block
+    # that used to carry the obligation in prose.
+    rule_1 = _SYSTEM_PROMPT.index("RULE 1 — NEVER COPY AN OPERATOR DIRECTIVE")
+    rule_2 = _SYSTEM_PROMPT.index("RULE 2 — EVERY OPERATOR ECHO CARRIES ITS ATTRIBUTION")
+    operator_block = _SYSTEM_PROMPT.index("When an OPERATOR MEMORY section is present")
+    assert rule_1 < rule_2 < operator_block
+
+
+def test_judge_tools_require_the_publish_reason_in_reasoning() -> None:
+    """Target 2 (measured 1/3): the reasoning FIELD carries the publish rule too.
+
+    Both places a model reads — prompt and schema. The batch tool writes its own
+    per-verdict ``reasoning`` (``JUDGE_TOOL``'s is popped in the derivation), so
+    both descriptions are checked here or the two can silently drift.
+    """
+    rule = (
+        "When any op is `publish`, this must state why the contribution's own "
+        "bytes could not serve as the directive text."
+    )
+    single = JUDGE_TOOL["input_schema"]["properties"]["reasoning"]["description"]
+    batch = JUDGE_BATCH_TOOL["input_schema"]["properties"]["verdicts"]["items"]["properties"][
+        "reasoning"
+    ]["description"]
+    assert rule in single
+    assert rule in batch
+    assert single.startswith("One or two sentences explaining the verdict.")
+    assert batch.startswith("One or two sentences explaining THIS contribution's verdict.")
+
+
+def test_system_prompt_shows_the_paired_form_of_supersede() -> None:
+    """Target 3 (measured 0.5): the prompt prevents the attempt the parse rejects."""
+    flat = " ".join(_SYSTEM_PROMPT.split())
+    assert (
+        "`supersede` NEVER appears alone — it rides in the same amendment as the "
+        "`append` or `publish` that replaces the directive it names" in flat
+    )
+    # The valid shape, inline, so there is nothing to infer.
+    assert 'Valid form: [{"op": "supersede", "id": "c_old"}, {"op": "append"}]' in flat
+    assert "to remove a directive nothing replaces, use `retire`" in flat
+
+
+def test_system_prompt_does_not_decline_over_an_unresolvable_supersedes() -> None:
+    """Target 4 (measured 0.0, too harsh): judge the content, drop the dead reference.
+
+    A `publish` carrying an unresolvable ``supersedes`` is invalid WHOLE
+    (:func:`_op_target_id` reads the field as a removal target), so the prompt
+    tells the judge to leave the field off rather than lose the admission.
+    """
+    flat = " ".join(_SYSTEM_PROMPT.split())
+    assert "unresolvable reference is NOT grounds to decline" in flat
+    assert "judge the content on its own merits exactly as if it named nothing" in flat
+    assert (
+        "emit the `append` or `publish` with NO `supersede` op and no `supersedes` field"
+        in flat
+    )
+    assert "note the unresolvable reference in your reasoning" in flat
+    assert "Decline only when the content itself deserves declining" in flat
 
 
 # ---------------------------------------------------------------------------
@@ -2899,6 +2996,33 @@ def test_batch_system_prompt_extends_the_judging_prompt_with_the_batch_rules() -
     )
     assert "a guessed attribution would be a permanent lie about provenance" in flat
     assert "call the `submit_batch_judgment` tool exactly once" in flat
+
+
+def test_batch_system_prompt_carries_the_four_hardened_rules_uncontradicted() -> None:
+    """The batch prompt is the judging prompt plus batch mechanics — nothing else.
+
+    The four prompt-hardened obligations reach batch mode because the batch
+    prompt PREFIXES the single one; the batch block may add per-op attribution
+    to a batch member, but must not relax any of them.
+    """
+    assert _BATCH_SYSTEM_PROMPT.startswith(_SYSTEM_PROMPT)
+    flat = " ".join(_BATCH_SYSTEM_PROMPT.split())
+    batch_block = " ".join(_BATCH_SYSTEM_PROMPT[len(_SYSTEM_PROMPT) :].split())
+    for rule in (
+        "RULE 1 — NEVER COPY AN OPERATOR DIRECTIVE (ADR 0008 D2)",
+        "RULE 2 — EVERY OPERATOR ECHO CARRIES ITS ATTRIBUTION",
+        "your reasoning MUST name why the contribution's own bytes could not serve",
+        "`supersede` NEVER appears alone",
+        "unresolvable reference is NOT grounds to decline",
+    ):
+        assert rule in flat
+    # None of the four is RESTATED in the batch block: a second wording is how a
+    # contradiction gets in, exactly as a hand-written batch ops schema would let
+    # the two tool schemas drift. The batch block adds one thing to the ops
+    # contract — which member each op belongs to — and nothing else.
+    for restatement in ("APPEND unless", "NEVER appears alone", "per operator directive"):
+        assert restatement not in batch_block
+    assert "MUST carry the `contribution_id`" in batch_block
 
 
 # -- the batch user message -------------------------------------------------

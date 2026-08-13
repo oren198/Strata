@@ -130,6 +130,16 @@ class _PublishedItemLike(Protocol):
 # Tool definition (static — eligible for prompt caching)
 # ---------------------------------------------------------------------------
 
+#: Appended to the ``reasoning`` description of BOTH judge tools (ADR 0011 D1).
+#: A shared constant rather than two literals: the publish-reason obligation is
+#: one rule, and the batch tool writes its own per-verdict ``reasoning`` field
+#: instead of inheriting :data:`JUDGE_TOOL`'s, so nothing else stops the two
+#: from drifting apart.
+_PUBLISH_REASON_RULE = (
+    "When any op is `publish`, this must state why the contribution's own "
+    "bytes could not serve as the directive text."
+)
+
 JUDGE_TOOL: dict = {
     "name": "submit_judgment",
     "description": (
@@ -145,7 +155,9 @@ JUDGE_TOOL: dict = {
             },
             "reasoning": {
                 "type": "string",
-                "description": "One or two sentences explaining the verdict.",
+                "description": (
+                    f"One or two sentences explaining the verdict. {_PUBLISH_REASON_RULE}"
+                ),
             },
             "directive_ops": {
                 "type": ["array", "null"],
@@ -277,7 +289,10 @@ def _build_batch_judge_tool() -> dict:
                 },
                 "reasoning": {
                     "type": "string",
-                    "description": "One or two sentences explaining THIS contribution's verdict.",
+                    "description": (
+                        "One or two sentences explaining THIS contribution's verdict. "
+                        f"{_PUBLISH_REASON_RULE}"
+                    ),
                 },
             },
             "required": ["contribution_id", "decision", "reasoning"],
@@ -416,7 +431,14 @@ STEP 2 — CLASSIFICATION. Concepts you must know (from CONTEXT.md):
   in either direction, including upgrading peer-submitted context into a
   directive (ratification) when accumulated evidence warrants.
 - If the contribution carries a "supersedes" reference, treat it as
-  explicit replacement intent — but use your own judgment.
+  explicit replacement intent — but use your own judgment. When the id it
+  names is NOT in the CURRENT SUMMARY (unknown, or already retired), that
+  unresolvable reference is NOT grounds to decline: judge the content on
+  its own merits exactly as if it named nothing. If you admit it, emit the
+  `append` or `publish` with NO `supersede` op and no `supersedes` field —
+  a reference that resolves to nothing removes nothing — and note the
+  unresolvable reference in your reasoning. Decline only when the content
+  itself deserves declining.
 - When accepting, you do NOT rewrite the summary. You submit an AMENDMENT:
   `directive_ops` (operations on the directives list) and `new_context`
   (the context section, rewritten). Every existing directive you do not
@@ -435,13 +457,20 @@ STEP 2 — CLASSIFICATION. Concepts you must know (from CONTEXT.md):
     scope's authority), local wording of a directive originating at this
     scope, or attribution that has to be written INTO the text. The
     decision rule: APPEND unless the binding text must differ from the
-    contribution's text; if it must, PUBLISH, and say why in your
-    reasoning.
+    contribution's text; if it must, PUBLISH — and your reasoning MUST
+    name why the contribution's own bytes could not serve as the directive
+    text. That sentence is not optional decoration: it is the only audit
+    trail for a directive the record cannot match byte for byte, so a
+    `publish` whose reasoning does not carry it is a `publish` you should
+    not have made.
   - `supersede` — {"op": "supersede", "id": <directive id>}: remove that
     directive because the directive this amendment admits replaces it.
-    Valid ONLY in an amendment that also carries an `append` or a
-    `publish` — supersession replaces, so an unpaired `supersede` is a
-    retirement wearing the wrong name and is rejected.
+    `supersede` NEVER appears alone — it rides in the same amendment as
+    the `append` or `publish` that replaces the directive it names. Valid
+    form: [{"op": "supersede", "id": "c_old"}, {"op": "append"}].
+    Supersession replaces, so an unpaired `supersede` is a retirement
+    wearing the wrong name and is rejected at parse; to remove a directive
+    nothing replaces, use `retire`.
   - `retire` — {"op": "retire", "id": <directive id>}: remove that
     directive with no replacement. The retirement is recorded in the
     scope's record; no tombstone stays in the summary.
@@ -456,6 +485,32 @@ STEP 2 — CLASSIFICATION. Concepts you must know (from CONTEXT.md):
   attached to its material, whatever this contribution is about: keeping
   the substance while dropping its citation is a wrong rewrite.
 
+TWO RULES GOVERN EVERY AMENDMENT WHERE OPERATOR MEMORY IS IN PLAY. Check
+both before you submit:
+
+RULE 1 — NEVER COPY AN OPERATOR DIRECTIVE (ADR 0008 D2). Operator
+directives are never copied into this scope's summary: the operator layer
+composes into every perspective verbatim on its own. Do not `append` or
+`publish` one, and never reuse its `op_` id as a summary directive id — a
+copied operator directive masquerades as ratified scope memory.
+
+RULE 2 — EVERY OPERATOR ECHO CARRIES ITS ATTRIBUTION (ADR 0008 D3, as
+narrowed by ADR 0011 D1). Whenever material you admit echoes the SUBSTANCE
+of an operator directive, the attribution "per operator directive <id>"
+(substituting the real id) is PART of the echoed text and must be written
+INTO text you author — a `publish`ed directive of this scope's own, or
+`new_context`. An `append` is byte-exact, so there is nowhere in it to put
+the attribution: an operator echo whose own bytes do NOT carry the
+attribution must never be `append`ed — `publish` it with the attribution
+written in, or carry it in `new_context` with the attribution. Citing the
+id in your reasoning does NOT satisfy this — reasoning is never composed
+into anyone's perspective; the summary is. Worked example — operator
+directive op_1a2b3c4d freezes deploys through Q3, and the context line you
+write is: "Deploy freezes remain in effect through Q3 — per operator
+directive op_1a2b3c4d." The failure mode, plainly: an unattributed echo
+masquerades as native scope memory, and no reader can then tell what this
+scope decided from what the operator decreed.
+
 When an OPERATOR MEMORY section is present in the user message (ADR 0008 D3):
 this is verbatim operator memory binding this scope — attached here or at
 any inter-stratum ancestor. The operator occupies the implicit stratum above
@@ -465,27 +520,12 @@ CONTRADICTS an operator directive listed there must be DECLINED, citing that
 operator directive's id in your reasoning. Refinement WITHIN an inherited
 operator directive remains legitimate, exactly as with any inherited
 directive — narrowing detail is not contradiction, but reversing or
-countermanding what the operator directive establishes is. Operator
-directives are NEVER copied into the scope's summary — not into its
-directives list (the operator layer composes into perspectives verbatim on
-its own, ADR 0008 D2; copying one in, or reusing its op_ id as a summary
-directive id, makes it masquerade as ratified scope memory). When you
-incorporate operator-consistent material into the summary — an echo of an
-operator directive's substance — the attribution "per operator directive
-<id>" (substituting the real id) is PART of the echoed text itself, so it
-must be written into text you author: a `publish`ed directive of this
-scope's own, or `new_context`. An `append` is byte-exact, so there is
-nowhere in it to put the attribution: an operator echo whose own bytes do
-NOT carry the attribution must never be `append`ed — `publish` it with the
-attribution written in, or carry it in `new_context` with the attribution,
-so the echo stays visible and never masquerades as native scope memory.
-Citing the id in your reasoning does NOT satisfy this — reasoning is never
-composed into anyone's perspective; the summary is. A correct
-context line looks like: "Deploy freezes remain in effect through Q3 (per
-operator directive op_1a2b3c4d)." The authoritative operator layer
-composes into every perspective verbatim regardless of what any summary
-says; attribution is what keeps an echo detectable, not what makes it
-authoritative.
+countermanding what the operator directive establishes is. RULES 1 and 2
+above govern everything that may reach the summary from that block: never
+copy an operator directive, and never let an echo of one enter
+unattributed. The authoritative operator layer composes into every
+perspective verbatim regardless of what any summary says; attribution is
+what keeps an echo detectable, not what makes it authoritative.
 
 The RECENT CONTRIBUTIONS block is a MECHANICAL DIGEST of this scope's last
 few contributions, oldest first — built from the record, not written by
