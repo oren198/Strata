@@ -2060,3 +2060,128 @@ def test_batch_record_pointers_name_the_op_s_own_contribution(tmp_path: Path) ->
     written = summary_store.read("g_root")
     assert [d.content for d in written.directives] == ["motivating rule", "unrelated rule"]
     assert written.version == 2  # the seeded write, then ONE write for the batch
+
+
+class _TwoMemberRemovingBatchManager:
+    """A batch fake where each member un-anchors a DIFFERENT published item.
+
+    Member A retires ``directive_a``; member B supersedes ``directive_b`` with
+    its own admission. The batch writes ONE summary, so both per-trigger
+    propagation calls see the same surviving set — the shape issue #137
+    mis-attributed.
+    """
+
+    def __init__(self, directive_a: str, directive_b: str) -> None:
+        self._directive_a = directive_a
+        self._directive_b = directive_b
+
+    def judge_batch(self, *, scope, current_summary, new_contributions, **_kwargs):  # noqa: ANN001, ANN201
+        member_a, member_b = new_contributions
+        ops = [
+            DirectiveOp(op="append", contribution_id=member_a.id),
+            DirectiveOp(op="retire", id=self._directive_a, contribution_id=member_a.id),
+            DirectiveOp(op="append", contribution_id=member_b.id),
+            DirectiveOp(op="supersede", id=self._directive_b, contribution_id=member_b.id),
+        ]
+        return ScopeManagerBatchJudgment(
+            verdicts=[
+                BatchVerdict(
+                    contribution_id=c.id,
+                    decision="accept_as_directive",
+                    reasoning=f"accepted: {c.content}",
+                )
+                for c in new_contributions
+            ],
+            new_summary=_apply_batch_amendment(
+                scope=scope,
+                current_summary=current_summary,
+                contributions={c.id: c for c in new_contributions},
+                ops=ops,
+                new_context="amended by the batch",
+            ),
+            directive_ops=ops,
+            new_context="amended by the batch",
+        )
+
+
+def test_batch_withdrawals_are_attributed_per_member(tmp_path: Path) -> None:
+    """Two members un-anchor two items in one batch; each withdrawal names its own member.
+
+    Issue #137: the batch writes ONE summary, so every per-trigger propagation
+    call sees the same post-write state. Attribution therefore has to come off
+    the ids each member removed — otherwise the first member's call sweeps
+    everything the whole batch un-anchored and stamps it all with that first
+    member's contribution id.
+    """
+    db_path = str(tmp_path / "strata.db")
+    run_migrations(db_path)
+    fleet = _fleet(tmp_path, scope_id="g_root")
+    summary_store = SummaryStore(str(tmp_path / "summaries"))
+    scope = fleet.get_scope("g_root")
+    stratum = fleet.strata[0]
+
+    directive_a = _existing_directive("c_dirA")
+    directive_b = _existing_directive("c_dirB")
+    summary_store.write(
+        "g_root",
+        ScopeSummary(
+            scope_id="g_root",
+            directives=[directive_a, directive_b],
+            context="",
+            updated_at="2026-07-10T00:00:00+00:00",
+        ),
+    )
+
+    with RecordStore(db_path) as rs:
+        item_a = _seed_publish_act(
+            rs,
+            summary_store.summaries_dir,
+            "g_root",
+            kind="directive",
+            content="Published off member A's directive.",
+            anchors=[f"directive:{directive_a.id}"],
+        )
+        item_b = _seed_publish_act(
+            rs,
+            summary_store.summaries_dir,
+            "g_root",
+            kind="directive",
+            content="Published off member B's directive.",
+            anchors=[f"directive:{directive_b.id}"],
+        )
+        contributions = [
+            rs.append_contribution(
+                scope_id="g_root",
+                content=content,
+                proposed_classification="directive",
+                subject=None,
+                supersedes=None,
+                contributor=_contributor(),
+            )
+            for content in ("member A retires one", "member B supersedes the other")
+        ]
+        member_a, member_b = contributions
+        with _scope_lock("g_root"):
+            results = _judge_batch_and_record(
+                contributions=contributions,
+                scope=scope,
+                stratum=stratum,
+                fleet=fleet,
+                record_store=rs,
+                summary_store=summary_store,
+                scope_manager=_TwoMemberRemovingBatchManager(directive_a.id, directive_b.id),
+                summary_max_words=500,
+            )
+
+        assert [r.decision for r in results] == ["accept_as_directive"] * 2
+
+        triggers = {
+            a.withdraws: a.trigger
+            for a in rs.list_publication_acts(scope_id="g_root")
+            if a.act == "withdraw"
+        }
+        assert triggers == {item_a.id: member_a.id, item_b.id: member_b.id}
+
+    assert read_publication("g_root", summaries_dir=str(summary_store.summaries_dir)) == []
+    # Still ONE summary write for the whole batch (the seeded write, then it).
+    assert summary_store.read("g_root").version == 2
