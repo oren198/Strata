@@ -443,8 +443,7 @@ def test_recent_contributions_pair_each_state_with_its_own_notes(tmp_path: Path)
         )
 
         rows = {
-            r.contribution.id: r
-            for r in rs.list_recent_contributions(scope_id="g_ceo", limit=20)
+            r.contribution.id: r for r in rs.list_recent_contributions(scope_id="g_ceo", limit=20)
         }
 
     assert rows[judged].state == "judged"

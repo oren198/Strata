@@ -294,9 +294,7 @@ def test_self_row_never_takes_a_verbatim_slot() -> None:
         _row(_window_contribution("c_self", long), state="pending"),
     ]
 
-    rendered = _render_recent_contributions(
-        rows, verbatim_tail=3, self_contribution_ids=["c_self"]
-    )
+    rendered = _render_recent_contributions(rows, verbatim_tail=3, self_contribution_ids=["c_self"])
     prior_line, self_line = rendered.splitlines()
 
     assert "[c_self]" in self_line
@@ -311,9 +309,7 @@ def test_verbatim_slots_go_to_the_newest_prior_rows() -> None:
     rows = [_row(_window_contribution(f"c_{i}", contents[i])) for i in range(5)]
     rows.append(_row(_window_contribution("c_self", "z" * 400), state="pending"))
 
-    rendered = _render_recent_contributions(
-        rows, verbatim_tail=3, self_contribution_ids=["c_self"]
-    )
+    rendered = _render_recent_contributions(rows, verbatim_tail=3, self_contribution_ids=["c_self"])
     lines = rendered.splitlines()
 
     # Oldest two priors are excerpts, the newest three priors are verbatim...
@@ -396,10 +392,7 @@ def test_user_message_digest_block_announces_the_verbatim_tail() -> None:
         window_verbatim_tail=2,
     )
 
-    assert (
-        "RECENT CONTRIBUTIONS (oldest first — mechanical digest; the newest 2 PRIOR"
-        in message
-    )
+    assert "RECENT CONTRIBUTIONS (oldest first — mechanical digest; the newest 2 PRIOR" in message
     assert "[c_prev01]" in message
     assert "state=judged" in message
 
@@ -2805,8 +2798,7 @@ def test_system_prompt_promotes_operator_echo_attribution_to_a_top_level_rule() 
     assert "RULE 2 — EVERY OPERATOR ECHO CARRIES ITS ATTRIBUTION" in flat
     # The worked micro-example: an echo sentence carrying its attribution.
     assert (
-        '"Deploy freezes remain in effect through Q3 — per operator '
-        'directive op_1a2b3c4d."' in flat
+        '"Deploy freezes remain in effect through Q3 — per operator directive op_1a2b3c4d."' in flat
     )
     # The failure mode, stated plainly.
     assert "an unattributed echo masquerades as native scope memory" in flat
@@ -2863,10 +2855,7 @@ def test_system_prompt_does_not_decline_over_an_unresolvable_supersedes() -> Non
     flat = " ".join(_SYSTEM_PROMPT.split())
     assert "unresolvable reference is NOT grounds to decline" in flat
     assert "judge the content on its own merits exactly as if it named nothing" in flat
-    assert (
-        "emit the `append` or `publish` with NO `supersede` op and no `supersedes` field"
-        in flat
-    )
+    assert "emit the `append` or `publish` with NO `supersede` op and no `supersedes` field" in flat
     assert "note the unresolvable reference in your reasoning" in flat
     assert "Decline only when the content itself deserves declining" in flat
 
@@ -3066,9 +3055,10 @@ def test_batch_members_never_take_a_verbatim_window_slot() -> None:
     # in the contributions block below.
     for contribution in BATCH:
         assert f"[{contribution.id}]" in window
-    assert window.count(NEW_CONTRIBUTION.content) == 0 or len(
-        NEW_CONTRIBUTION.content
-    ) <= WINDOW_CONTENT_PREFIX_CHARS
+    assert (
+        window.count(NEW_CONTRIBUTION.content) == 0
+        or len(NEW_CONTRIBUTION.content) <= WINDOW_CONTENT_PREFIX_CHARS
+    )
 
 
 # -- one call, per-contribution verdicts ------------------------------------

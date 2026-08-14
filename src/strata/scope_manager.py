@@ -1249,11 +1249,7 @@ class _AmendmentJudgment(BaseModel):
         The source ADR 0007 D3's mechanical propagation reads: the ops
         themselves, not a diff of two summary generations.
         """
-        return [
-            target
-            for op in self.directive_ops
-            if (target := _op_target_id(op)) is not None
-        ]
+        return [target for op in self.directive_ops if (target := _op_target_id(op)) is not None]
 
     @property
     def retired_directive_ids(self) -> list[str]:
@@ -1282,9 +1278,7 @@ class _AmendmentJudgment(BaseModel):
     def directive_retirements(self) -> list[tuple[str, str | None]]:
         """``(directive id retired, the op's contribution attribution)`` pairs."""
         return [
-            (op.id, op.contribution_id)
-            for op in self.directive_ops
-            if op.op == "retire" and op.id
+            (op.id, op.contribution_id) for op in self.directive_ops if op.op == "retire" and op.id
         ]
 
 

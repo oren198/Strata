@@ -1919,9 +1919,7 @@ def test_a_wedged_drain_fails_the_waiter_loudly_and_leaves_it_re_judgeable(
     assert states[error.contribution_id].failed_attempts == 1
     assert [a.outcome for a in attempts if a.contribution_id == error.contribution_id] == [None]
     # The abandoned ticket was not judged on nobody's behalf.
-    assert error.contribution_id not in {
-        cid for call in manager.batch_calls for cid in call
-    }
+    assert error.contribution_id not in {cid for call in manager.batch_calls for cid in call}
 
 
 def test_judgment_still_runs_under_the_summary_lock(tmp_path: Path) -> None:
@@ -1935,9 +1933,7 @@ def test_judgment_still_runs_under_the_summary_lock(tmp_path: Path) -> None:
 
     class _LockObservingManager(_ScriptedBatchManager):
         def judge(self, *, scope, **kwargs):  # noqa: ANN001, ANN003, ANN201
-            observed.append(
-                (_scope_lock(scope.id).locked(), scope_append_lock(scope.id).locked())
-            )
+            observed.append((_scope_lock(scope.id).locked(), scope_append_lock(scope.id).locked()))
             return super().judge(scope=scope, **kwargs)
 
     _contribute(tmp_path, ["under the lock"], manager=_LockObservingManager())
@@ -1963,9 +1959,7 @@ class _AttributedRetiringBatchManager:
     def judge_batch(self, *, scope, current_summary, new_contributions, **_kwargs):  # noqa: ANN001, ANN201
         motivating = new_contributions[0]
         ops = [DirectiveOp(op="append", contribution_id=c.id) for c in new_contributions]
-        ops.append(
-            DirectiveOp(op="retire", id=self._directive_id, contribution_id=motivating.id)
-        )
+        ops.append(DirectiveOp(op="retire", id=self._directive_id, contribution_id=motivating.id))
         return ScopeManagerBatchJudgment(
             verdicts=[
                 BatchVerdict(
