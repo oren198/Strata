@@ -54,6 +54,7 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 from collections.abc import Callable, Collection, Mapping, Sequence
 from datetime import UTC, datetime
 from typing import Literal, Protocol, TypeVar
@@ -513,7 +514,11 @@ directive op_1a2b3c4d freezes deploys through Q3, and the context line you
 write is: "Deploy freezes remain in effect through Q3 — per operator
 directive op_1a2b3c4d." The failure mode, plainly: an unattributed echo
 masquerades as native scope memory, and no reader can then tell what this
-scope decided from what the operator decreed.
+scope decided from what the operator decreed. Final check before submitting
+an accept while OPERATOR MEMORY is present: if the substance you admit
+echoes an operator directive, confirm the exact phrase "per operator
+directive <id>" appears in the text your amendment authors — not only in
+your reasoning.
 
 When an OPERATOR MEMORY section is present in the user message (ADR 0008 D3):
 this is verbatim operator memory binding this scope — attached here or at
@@ -1286,6 +1291,69 @@ class _AmendmentJudgment(BaseModel):
 #: drives without caring which of the two it is holding.
 _JudgmentT = TypeVar("_JudgmentT", bound=_AmendmentJudgment)
 
+#: The two verdicts that admit material into the summary — the only ones an
+#: unattributed echo can hide in (a decline amends nothing).
+_ACCEPT_DECISIONS = ("accept_as_directive", "accept_as_context")
+
+
+def _attribution_pattern(operator_id: str) -> re.Pattern[str]:
+    """The attribution phrase RULE 2 requires for *operator_id*, as a matcher.
+
+    Whitespace between the words is free (a wrapped line still attributes) and
+    case is ignored; the id itself is matched literally.
+    """
+    return re.compile(rf"per\s+operator\s+directive\s+{re.escape(operator_id)}", re.IGNORECASE)
+
+
+def _amendment_summary_text(judgment: _AmendmentJudgment, contribution: Contribution) -> str:
+    """Every piece of text this amendment sends to the summary.
+
+    The three places admitted material can land (ADR 0011 D1): the rewritten
+    context, a ``publish``ed directive's content, and — because an ``append``
+    admits the contribution's own bytes — the contribution's content. The
+    reasoning is deliberately absent: it is written to the record, never
+    composed into anyone's perspective.
+    """
+    parts: list[str] = []
+    if judgment.new_context is not None:
+        parts.append(judgment.new_context)
+    for op in judgment.directive_ops:
+        if op.op == "publish" and op.content:
+            parts.append(op.content)
+        elif op.op == "append":
+            parts.append(contribution.content)
+    return "\n".join(parts)
+
+
+def _unattributed_operator_echoes(
+    judgment: ScopeManagerJudgment,
+    *,
+    operator_directive_ids: Sequence[str],
+    contribution: Contribution,
+) -> list[str]:
+    """Operator directive ids this accept cites in reasoning but never attributes.
+
+    The mechanical half of RULE 2 (ADR 0008 D3, as narrowed by ADR 0011 D1):
+    the judge names an operator directive as it explains an accept, so the
+    admitted material echoes it, yet no text the amendment sends to the
+    summary carries "per operator directive <id>". Citing the id in the
+    reasoning is exactly what does NOT satisfy the rule, so the reasoning is
+    the signal here and never the place the attribution may live.
+
+    Only rendered *directive* items are checked: the required phrase names a
+    directive, and demanding it for an operator context item would have the
+    judge write a false label.
+    """
+    if not operator_directive_ids or judgment.decision not in _ACCEPT_DECISIONS:
+        return []
+    admitted = _amendment_summary_text(judgment, contribution)
+    return [
+        operator_id
+        for operator_id in dict.fromkeys(operator_directive_ids)
+        if operator_id in judgment.reasoning
+        and not _attribution_pattern(operator_id).search(admitted)
+    ]
+
 
 def _with_dropped_note(reasoning: str, dropped_ops: Sequence[str]) -> str:
     """Return *reasoning* plus the mechanical note naming the dropped ops.
@@ -2002,6 +2070,16 @@ class ScopeManager:
         contribution its verdict, so this never routes to the parse-failure
         path.
 
+        Unattributed-echo corrective (ADR 0008 D3, as narrowed by ADR 0011
+        D1): if an accept's reasoning names a rendered operator directive but
+        no text the amendment sends to the summary carries "per operator
+        directive <id>", the manager makes exactly ONE corrective follow-up
+        asking for the attribution in the authored text. It is best-effort and
+        text-only — the retry is adopted only if it parses, still amends, and
+        keeps the same decision, so an attribution re-ask can never flip a
+        verdict. It runs before the overflow re-ask, so a corrective rewrite is
+        still budget-checked.
+
         Raises:
             ValueError: If the model response is missing the ``tool_use``
                 block, or if the verdict is internally inconsistent (e.g.
@@ -2068,6 +2146,39 @@ class ScopeManager:
                 new_contribution=new_contribution,
             )
 
+        # The operator directives actually rendered to this call — the only
+        # ids a reasoning citation can be checked against (ADR 0008 D3).
+        operator_directive_ids = [
+            item.id
+            for _attachment_scope_id, items in (operator_memory or [])
+            for item in items
+            if item.kind == "directive"
+        ]
+
+        def _attribution_gaps(judgment: ScopeManagerJudgment) -> list[str]:
+            return _unattributed_operator_echoes(
+                judgment,
+                operator_directive_ids=operator_directive_ids,
+                contribution=new_contribution,
+            )
+
+        def _attribution_corrective(gap_ids: Sequence[str]) -> str:
+            return (
+                f"Your reasoning cites operator directive(s) {', '.join(gap_ids)}, but "
+                "no text your amendment sends to the summary carries the attribution "
+                "'per operator directive <id>'. RULE 2: when admitted material echoes "
+                "the substance of an operator directive, the attribution phrase is "
+                "PART of the echoed text and must appear in text you author — a "
+                "`publish`ed directive's content or `new_context`; reasoning is never "
+                "composed into any perspective. Call submit_judgment again with the "
+                "SAME decision: if the admitted material echoes the operator "
+                "directive, rewrite the amendment so the attribution phrase appears "
+                "in the authored text (an `append` whose bytes lack the attribution "
+                "becomes a `publish` with the attribution written in); if it "
+                "genuinely does not echo the operator directive, return the same "
+                "amendment unchanged."
+            )
+
         return self._call_with_correctives(
             user_message=user_message,
             system_prompt=_SYSTEM_PROMPT,
@@ -2084,6 +2195,8 @@ class ScopeManager:
                 "`directive_ops` a list of op objects (each with an `op` field), "
                 "not a string and not strings, and `new_context` a string or null."
             ),
+            attribution_gaps=_attribution_gaps,
+            attribution_corrective=_attribution_corrective,
         )
 
     def _call_with_correctives(
@@ -2101,15 +2214,23 @@ class ScopeManager:
         verdict_noun: str,
         decision_noun: str,
         schema_reminder: str,
+        attribution_gaps: Callable[[_JudgmentT], list[str]] | None = None,
+        attribution_corrective: Callable[[Sequence[str]], str] | None = None,
     ) -> _JudgmentT:
-        """Run one judgment call and its three correctives, one retry each.
+        """Run one judgment call and its correctives, one retry each.
 
         The orchestration both judgment modes share (ADR 0011 D1/D3): the
         forced tool call, the parse re-ask (#113), the invalid-id corrective
-        with its drop-and-note fallback, and the overflow re-ask (#63). What
-        differs between a single contribution and a batch is the tool, the
-        prompt, and how a payload is parsed and its ids validated — all passed
-        in — never the one-retry discipline, which lives here once.
+        with its drop-and-note fallback, the unattributed-echo corrective
+        (ADR 0008 D3) when the caller wires the detection in, and the overflow
+        re-ask (#63). What differs between a single contribution and a batch is
+        the tool, the prompt, and how a payload is parsed and its ids validated
+        — all passed in — never the one-retry discipline, which lives here
+        once.
+
+        *attribution_gaps* and *attribution_corrective* are supplied together
+        or not at all; leaving both ``None`` skips the echo check entirely,
+        which is what the batch path does.
         """
         system: list[dict] = [
             {
@@ -2234,6 +2355,46 @@ class ScopeManager:
                 invalid = invalid_ops(judgment)
             if invalid:
                 judgment = drop_invalid(judgment)
+
+        # Unattributed-echo corrective (ADR 0008 D3, as narrowed by ADR 0011
+        # D1): the reasoning names an operator directive to explain an accept,
+        # but nothing the amendment sends to the summary carries "per operator
+        # directive <id>" — an echo that would enter as native scope memory.
+        # Exactly ONE re-ask, and it runs BEFORE the budget check below so a
+        # corrective rewrite is still measured against the BUDGET.
+        if attribution_gaps is not None and attribution_corrective is not None:
+            gaps = attribution_gaps(judgment)
+            if gaps:
+                retry_messages = [
+                    *first_messages,
+                    *_corrective_turn(response, tool_use_block, attribution_corrective(gaps)),
+                ]
+                # Best-effort, exactly as the two retries around it: the FIRST
+                # judgment stands if this one cannot be had.
+                try:
+                    retry_response = _call(retry_messages)
+                    retry_block = self._extract_tool_use_block(retry_response)
+                    retry_judgment = parse(retry_block)
+                except Exception:  # noqa: BLE001 — deliberate: retry is best-effort
+                    retry_judgment = None
+                # An attribution re-ask corrects TEXT, never a verdict: a retry
+                # that comes back with a different decision (or no summary) is
+                # discarded whole. Only the single-judgment path wires this in,
+                # and its judgment shape carries exactly one decision.
+                if (
+                    retry_judgment is not None
+                    and retry_judgment.new_summary is not None
+                    and getattr(retry_judgment, "decision", None)
+                    == getattr(judgment, "decision", None)
+                ):
+                    # A rewrite that resolves the attribution by naming a bad
+                    # id is still subject to D1's drop-and-note rule.
+                    if invalid_ops(retry_judgment):
+                        retry_judgment = drop_invalid(retry_judgment)
+                    judgment = retry_judgment
+                    response = retry_response
+                    tool_use_block = retry_block
+                    first_messages = retry_messages
 
         # Overflow re-ask (issue #63): the LLM was told the BUDGET but nothing
         # enforced it.  Give it exactly one corrective follow-up call if the

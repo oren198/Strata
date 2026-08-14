@@ -2659,6 +2659,234 @@ def test_overflow_retry_refusing_to_retire_keeps_the_over_budget_summary() -> No
 
 
 # ---------------------------------------------------------------------------
+# ADR 0008 D3 — the unattributed-echo corrective: an accept whose reasoning
+# cites an operator directive it never attributes in the admitted text
+# ---------------------------------------------------------------------------
+
+OPERATOR_MEMORY = [("g_exec", [OPERATOR_DIRECTIVE])]
+
+_CITING_REASONING = f"Consistent with operator directive {OPERATOR_DIRECTIVE.id}; recording it."
+
+ATTRIBUTED_CONTEXT = (
+    f"Services stay on TLS 1.3 or later — per operator directive {OPERATOR_DIRECTIVE.id}."
+)
+
+UNATTRIBUTED_CONTEXT = "Services stay on TLS 1.3 or later."
+
+
+def _echo_input(
+    *,
+    context: str,
+    decision: str = "accept_as_context",
+    reasoning: str = _CITING_REASONING,
+    ops: list[dict] | None = None,
+) -> dict:
+    """An accept payload whose reasoning cites the operator directive."""
+    return {
+        "decision": decision,
+        "reasoning": reasoning,
+        "directive_ops": ops or [],
+        "new_context": context,
+    }
+
+
+def _judge_with_operator_memory(
+    mock_client: MagicMock,
+    *,
+    summary_max_words: int = 500,
+) -> ScopeManagerJudgment:
+    return ScopeManager(client=mock_client).judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+        operator_memory=OPERATOR_MEMORY,
+        summary_max_words=summary_max_words,
+    )
+
+
+def test_unattributed_echo_triggers_one_corrective_naming_the_operator_directive() -> None:
+    """O3: reasoning cites the operator directive, admitted text does not — one re-ask."""
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [
+        _fake_response(_echo_input(context=UNATTRIBUTED_CONTEXT)),
+        _fake_response(_echo_input(context=ATTRIBUTED_CONTEXT)),
+    ]
+
+    judgment = _judge_with_operator_memory(mock_client)
+
+    assert mock_client.messages.create.call_count == 2
+    followup = mock_client.messages.create.call_args_list[1].kwargs["messages"][-1]
+    text = [b for b in followup["content"] if b["type"] == "text"][0]["text"]
+    assert OPERATOR_DIRECTIVE.id in text
+    assert "per operator directive <id>" in text
+    assert "RULE 2" in text
+    # Not one of the other correctives' wordings.
+    assert "could not be parsed" not in text
+    assert "BUDGET" not in text
+
+    # The attributed rewrite is what lands in the summary.
+    assert judgment.new_summary is not None
+    assert judgment.new_summary.context == ATTRIBUTED_CONTEXT
+
+
+def test_unattributed_echo_corrective_failure_keeps_the_first_judgment() -> None:
+    """Keep-first: a retry that cannot be had never costs the contribution its verdict."""
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [
+        _fake_response(_echo_input(context=UNATTRIBUTED_CONTEXT)),
+        RuntimeError("api unavailable"),
+    ]
+
+    judgment = _judge_with_operator_memory(mock_client)
+
+    assert mock_client.messages.create.call_count == 2
+    assert judgment.decision == "accept_as_context"
+    assert judgment.new_summary is not None
+    assert judgment.new_summary.context == UNATTRIBUTED_CONTEXT
+
+
+def test_unattributed_echo_corrective_may_not_flip_the_verdict() -> None:
+    """An attribution re-ask corrects text only: a retry changing the decision is discarded."""
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [
+        _fake_response(_echo_input(context=UNATTRIBUTED_CONTEXT)),
+        _fake_response(_echo_input(context=ATTRIBUTED_CONTEXT, decision="accept_as_directive")),
+    ]
+
+    judgment = _judge_with_operator_memory(mock_client)
+
+    assert mock_client.messages.create.call_count == 2
+    assert judgment.decision == "accept_as_context"
+    assert judgment.new_summary is not None
+    assert judgment.new_summary.context == UNATTRIBUTED_CONTEXT
+
+
+def test_attributed_echo_makes_exactly_one_call() -> None:
+    """The attribution is already in the authored text — nothing to correct."""
+    manager, mock_client = _make_manager(_echo_input(context=ATTRIBUTED_CONTEXT))
+
+    judgment = manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+        operator_memory=OPERATOR_MEMORY,
+    )
+
+    assert mock_client.messages.create.call_count == 1
+    assert judgment.new_summary is not None
+    assert judgment.new_summary.context == ATTRIBUTED_CONTEXT
+
+
+def test_decline_citing_an_operator_directive_gets_no_corrective() -> None:
+    """A decline admits nothing, so there is no echo to attribute."""
+    manager, mock_client = _make_manager(
+        {
+            "decision": "decline",
+            "reasoning": (
+                f"Contradicts operator directive {OPERATOR_DIRECTIVE.id}, which binds this scope."
+            ),
+            "directive_ops": [],
+            "new_context": None,
+        }
+    )
+
+    judgment = manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+        operator_memory=OPERATOR_MEMORY,
+    )
+
+    assert mock_client.messages.create.call_count == 1
+    assert judgment.decision == "decline"
+    assert judgment.new_summary is None
+
+
+def test_no_operator_memory_rendered_gets_no_corrective() -> None:
+    """Nothing was rendered, so an id-shaped string in the reasoning proves nothing."""
+    manager, mock_client = _make_manager(_echo_input(context=UNATTRIBUTED_CONTEXT))
+
+    judgment = manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+    )
+
+    assert mock_client.messages.create.call_count == 1
+    assert judgment.new_summary is not None
+    assert judgment.new_summary.context == UNATTRIBUTED_CONTEXT
+
+
+def test_appended_contribution_bytes_carrying_the_attribution_get_no_corrective() -> None:
+    """An `append` admits the contribution's own bytes — those count as admitted text."""
+    attributed_contribution = _contribution(
+        "c_att1",
+        f"Services stay on TLS 1.3 or later, per operator directive {OPERATOR_DIRECTIVE.id}.",
+        subject="tls",
+    )
+    manager, mock_client = _make_manager(
+        {
+            "decision": "accept_as_directive",
+            "reasoning": _CITING_REASONING,
+            "directive_ops": [{"op": "append"}],
+            "new_context": None,
+        }
+    )
+
+    judgment = manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=attributed_contribution,
+        operator_memory=OPERATOR_MEMORY,
+    )
+
+    assert mock_client.messages.create.call_count == 1
+    assert judgment.new_summary is not None
+    assert judgment.new_summary.directives[-1].content == attributed_contribution.content
+
+
+def test_attribution_corrective_rewrite_is_still_budget_checked() -> None:
+    """Ordering: the attribution re-ask runs first, so its rewrite can still overflow."""
+    over_budget_context = ATTRIBUTED_CONTEXT + " " + " ".join(f"word{i}" for i in range(40))
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [
+        _fake_response(_echo_input(context="Attribution pending here.")),
+        _fake_response(_echo_input(context=over_budget_context)),
+        _fake_response(_echo_input(context=ATTRIBUTED_CONTEXT)),
+    ]
+
+    # EXISTING_DIRECTIVE is 5 words: the first and third contexts fit, the
+    # attribution rewrite does not.
+    judgment = _judge_with_operator_memory(mock_client, summary_max_words=20)
+
+    assert mock_client.messages.create.call_count == 3
+    attribution_followup = mock_client.messages.create.call_args_list[1].kwargs["messages"][-1]
+    attribution_text = [b for b in attribution_followup["content"] if b["type"] == "text"][0][
+        "text"
+    ]
+    assert OPERATOR_DIRECTIVE.id in attribution_text
+
+    overflow_messages = mock_client.messages.create.call_args_list[2].kwargs["messages"]
+    overflow_text = [b for b in overflow_messages[-1]["content"] if b["type"] == "text"][0]["text"]
+    assert "BUDGET" in overflow_text
+    # The overflow follow-up chains onto the attribution turn, not the first.
+    assert len(overflow_messages) == 5
+
+    assert judgment.new_summary is not None
+    assert judgment.new_summary.context == ATTRIBUTED_CONTEXT
+
+
+# ---------------------------------------------------------------------------
 # ADR 0011 D4 — the refresh amendment is context + lifecycle ops only
 # ---------------------------------------------------------------------------
 
