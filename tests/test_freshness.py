@@ -43,6 +43,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from strata import freshness  # noqa: E402
 from strata.migrator import run_migrations  # noqa: E402
+from strata.scope_manager import ScopeManagerJudgment  # noqa: E402
 from strata.session_state import (  # noqa: E402
     NUDGE_MIN_READS,
     SessionStateStore,
@@ -330,20 +331,19 @@ def test_no_project_is_silent_noop(tmp_path: Path, monkeypatch) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _fake_accept_judgment() -> MagicMock:
-    judgment = MagicMock()
-    judgment.decision = "accept_as_context"
-    judgment.reasoning = "worth remembering"
-    judgment.new_summary = ScopeSummary(
-        scope_id="g_root",
-        directives=[],
-        context="updated",
-        updated_at="2026-07-18T00:00:00+00:00",
-        version=1,
-        exists=True,
+def _fake_accept_judgment() -> ScopeManagerJudgment:
+    return ScopeManagerJudgment(
+        decision="accept_as_context",
+        reasoning="worth remembering",
+        new_summary=ScopeSummary(
+            scope_id="g_root",
+            directives=[],
+            context="updated",
+            updated_at="2026-07-18T00:00:00+00:00",
+            version=1,
+            exists=True,
+        ),
     )
-    judgment.withdraw_published = []
-    return judgment
 
 
 def test_evaluator_draft_submitted_through_judged_path(tmp_path: Path, monkeypatch) -> None:

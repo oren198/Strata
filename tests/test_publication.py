@@ -640,6 +640,72 @@ def test_mechanical_propagation_fires_when_the_last_anchor_vanishes_in_a_later_e
     assert withdraw_act.trigger == "c_trigger2"
 
 
+def test_mechanical_propagation_attributes_each_item_to_its_own_trigger(
+    record_store, summaries_dir
+) -> None:
+    # Issue #137: ONE amendment can remove directives on behalf of several
+    # contributions (a batch — ADR 0011 D3), and it writes ONE summary, so
+    # every per-trigger call below sees the SAME surviving set. Only the
+    # removed ids tell the calls apart: each item must be withdrawn by the
+    # trigger that removed ITS anchor, not by whichever call ran first.
+    px = _seed_published_item(
+        record_store,
+        summaries_dir,
+        "g_team",
+        content="Anchored to member A's directive.",
+        anchors=["directive:c_dirA"],
+    )
+    py = _seed_published_item(
+        record_store,
+        summaries_dir,
+        "g_team",
+        content="Anchored to member B's directive.",
+        anchors=["directive:c_dirB"],
+    )
+    pz = _seed_published_item(
+        record_store,
+        summaries_dir,
+        "g_team",
+        content="Anchored to a directive the amendment left alone.",
+        anchors=["directive:c_dirC"],
+    )
+
+    # The post-write summary of the whole amendment: A's and B's directives
+    # are both gone, c_dirC still stands.
+    surviving = {"c_dirC"}
+
+    first = propagate_directive_removals(
+        "g_team",
+        {"c_dirA"},
+        "c_memberA",
+        surviving_directive_ids=surviving,
+        record_store=record_store,
+        summaries_dir=summaries_dir,
+    )
+    second = propagate_directive_removals(
+        "g_team",
+        {"c_dirB"},
+        "c_memberB",
+        surviving_directive_ids=surviving,
+        record_store=record_store,
+        summaries_dir=summaries_dir,
+    )
+
+    # A's call takes only A's item, even though B's is already un-anchored.
+    assert [i.id for i in first] == [px.id]
+    assert [i.id for i in second] == [py.id]
+
+    # The item with a surviving anchor is untouched by both calls.
+    assert [i.id for i in read_publication("g_team", summaries_dir=summaries_dir)] == [pz.id]
+
+    triggers = {
+        a.withdraws: a.trigger
+        for a in record_store.list_publication_acts(scope_id="g_team")
+        if a.act == "withdraw"
+    }
+    assert triggers == {px.id: "c_memberA", py.id: "c_memberB"}
+
+
 def test_mechanical_propagation_noop_for_empty_publication(record_store, summaries_dir) -> None:
     assert (
         propagate_directive_removals(

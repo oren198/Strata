@@ -164,6 +164,14 @@ class Judgment:
 JUDGE_FAILED = "judge_failed"
 
 
+#: The engine default for the recency window (ADR 0011 D2): how many of the
+#: newest contributions :meth:`RecordStore.list_recent_contributions` returns
+#: to the judgment and refresh paths.  Deployments override it via
+#: ``Settings.recency_window_size`` (``STRATA_RECENCY_WINDOW_SIZE``); this
+#: constant is the fallback for library callers with no settings in hand.
+RECENCY_WINDOW_SIZE = 20
+
+
 @dataclass(frozen=True)
 class JudgmentAttempt:
     """A record of the scope-manager's judgment *failing* on a contribution.
@@ -221,6 +229,30 @@ class ContributionState:
     error_class: str | None
     error_message: str | None
     failed_at: str | None
+
+
+@dataclass(frozen=True)
+class RecentContribution:
+    """One row of a scope's recency window (ADR 0011 D2).
+
+    The (contribution, state, judgment-notes) triple the scope-manager's
+    RECENT CONTRIBUTIONS digest is built from — assembled by
+    :meth:`RecordStore.list_recent_contributions`, which is the only read that
+    carries the judgment's notes and the contribution's state together.
+
+    ``state`` and ``decision`` mean exactly what they mean on
+    :class:`ContributionState`; ``judgment_notes`` is the verdict explanation
+    the judge wrote when this row was judged — written once and stored
+    immutably, so nothing in the digest can drift. Both ``decision`` and
+    ``judgment_notes`` are ``None`` for a ``pending`` or ``judge_failed`` row,
+    which the window routinely contains — including the contribution currently
+    under judgment, appended to the record before the window is read.
+    """
+
+    contribution: Contribution
+    state: Literal["judged", "judge_failed", "pending"]
+    decision: Literal["accept_as_directive", "accept_as_context", "decline"] | None
+    judgment_notes: str | None
 
 
 @dataclass(frozen=True)
@@ -727,6 +759,54 @@ class RecordStore:
             )
         return states
 
+    def list_recent_contributions(
+        self,
+        *,
+        scope_id: str,
+        limit: int,
+    ) -> list[RecentContribution]:
+        """Return the newest *limit* contributions of *scope_id* with their state.
+
+        The windowed read ADR 0011 D2's recency digest needs: no existing read
+        carries a contribution's judgment notes and its state together.
+        :meth:`list_contributions` has the window but no verdict;
+        :meth:`list_contribution_states` has the state but neither the notes nor
+        a window — it joins the scope's WHOLE record, which is the cost this
+        window exists to avoid.
+
+        Retrieval is newest-first (the same ``ORDER BY ... DESC LIMIT``
+        recency window :meth:`list_contributions` uses, for the same reason:
+        ascending order plus a limit would pin the manager to a permanently
+        stale slice), and the result is returned **oldest-first** — the order
+        the digest renders in.
+
+        Args:
+            scope_id: The scope whose record to window.
+            limit:    How many of the newest contributions to return.
+
+        Returns:
+            Oldest-first list of :class:`RecentContribution` rows.
+        """
+        rows = self._conn.execute(
+            """
+            SELECT c.id, c.scope_id, c.content, c.proposed_classification,
+                   c.subject, c.supersedes,
+                   c.contributor_scope_id, c.contributor_skill,
+                   c.contributor_session_id, c.contributor_ts,
+                   c.created_at,
+                   j.decision AS decision, j.notes AS judgment_notes,
+                   (SELECT COUNT(*) FROM judgment_attempts a
+                     WHERE a.contribution_id = c.id AND a.outcome = ?) AS failed_marks
+            FROM contributions c
+            LEFT JOIN judgments j ON j.contribution_id = c.id
+            WHERE c.scope_id = ?
+            ORDER BY c.created_at DESC, c.rowid DESC
+            LIMIT ?
+            """,
+            (JUDGE_FAILED, scope_id, limit),
+        ).fetchall()
+        return [_recent_contribution_from_row(row) for row in reversed(rows)]
+
     # ------------------------------------------------------------------
     # Operator acts (the operator's own record — ADR 0008 D1)
     # ------------------------------------------------------------------
@@ -1108,6 +1188,38 @@ def _contribution_from_row(row: sqlite3.Row) -> Contribution:
         ts=d.pop("contributor_ts"),
     )
     return Contribution(**d, contributor=contributor)
+
+
+def _recent_contribution_from_row(row: sqlite3.Row) -> RecentContribution:
+    """Map a row of the recency-window join to a :class:`RecentContribution`.
+
+    The state derivation mirrors :meth:`RecordStore.list_contribution_states`
+    exactly — a verdict always wins, a ``judge_failed`` marker comes next, and
+    everything else is ``pending`` — so the two surfaces can never disagree
+    about what a contribution's state is.
+    """
+    d = dict(row)
+    decision = d.pop("decision")
+    judgment_notes = d.pop("judgment_notes")
+    failed_marks = d.pop("failed_marks")
+    contributor = ContributorRef(
+        scope_id=d.pop("contributor_scope_id"),
+        skill=d.pop("contributor_skill"),
+        session_id=d.pop("contributor_session_id"),
+        ts=d.pop("contributor_ts"),
+    )
+    if decision is not None:
+        state: Literal["judged", "judge_failed", "pending"] = "judged"
+    elif failed_marks:
+        state = "judge_failed"
+    else:
+        state = "pending"
+    return RecentContribution(
+        contribution=Contribution(**d, contributor=contributor),
+        state=state,
+        decision=decision,
+        judgment_notes=judgment_notes,
+    )
 
 
 def _publication_act_from_row(row: sqlite3.Row) -> PublicationAct:

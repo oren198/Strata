@@ -715,3 +715,174 @@ def test_refresh_does_not_crash_when_parent_summary_deleted(
     assert "g_child" in judge_scopes, (
         f"Expected g_child refresh after the deleted-parent-summary recovery: {judge_scopes}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Test 8 — ADR 0011 D4: parent directives are spliced in mechanically and the
+# refresh amendment is context-only
+# ---------------------------------------------------------------------------
+
+
+def _two_stratum_fleet(tmp_path: Path) -> Path:
+    return _write_fleet(
+        tmp_path,
+        """
+        strata:
+          - id: L0
+            name: Root
+            ordinal: 0
+          - id: L1
+            name: Child
+            ordinal: 1
+        scopes:
+          - id: g_root
+            name: Root Scope
+            stratum_id: L0
+          - id: g_child
+            name: Child Scope
+            stratum_id: L1
+        edges:
+          - from: g_child
+            to: g_root
+        """,
+    )
+
+
+def _refresh_child(tmp_path: Path, *, child_summary: ScopeSummary | None) -> tuple[Any, Any]:
+    """Run ``_refresh_scope`` for g_child against a parent holding one directive.
+
+    Returns ``(written_child_summary, judge_call_kwargs)``.
+    """
+    from strata.__main__ import _refresh_scope
+    from strata.fleet_config import FleetConfig
+    from strata.migrator import run_migrations
+    from strata.record_store import RecordStore
+    from strata.scope_manager import ScopeManagerJudgment
+
+    fleet_yaml = _two_stratum_fleet(tmp_path)
+    db_path = str(tmp_path / "test.db")
+    run_migrations(db_path)
+    store = SummaryStore(str(tmp_path / "summaries"))
+
+    parent_directive = Directive(
+        id="c_parent_rule",
+        content="All services must ship behind a flag.\nNo exceptions.",
+        subject="rollout",
+        source_scope_id="g_root",
+        source_skill="scope-manager",
+        created_at="2026-05-31T09:00:00Z",
+    )
+    store.write(
+        "g_root",
+        ScopeSummary(
+            scope_id="g_root",
+            directives=[parent_directive],
+            context="Root context.",
+            updated_at="2026-05-31T10:00:00Z",
+        ),
+    )
+    if child_summary is not None:
+        store.write("g_child", child_summary)
+
+    def fake_judge(**kwargs: Any) -> ScopeManagerJudgment:
+        # Stand in for the engine's mechanical apply: an amendment that only
+        # rewrites the context leaves the directives list exactly as the judge
+        # received it.
+        received = kwargs["current_summary"]
+        return ScopeManagerJudgment(
+            decision="accept_as_context",
+            reasoning="Reconciled the digest with the refreshed parent state.",
+            new_summary=received.model_copy(update={"context": "Reconciled context."}),
+            new_context="Reconciled context.",
+        )
+
+    mock_manager = MagicMock()
+    mock_manager.judge.side_effect = fake_judge
+
+    with RecordStore(db_path) as record_store:
+        _refresh_scope(
+            "g_child",
+            fleet_config=FleetConfig.load(fleet_yaml),
+            record_store=record_store,
+            summary_store=store,
+            manager=mock_manager,
+            summary_max_words=500,
+        )
+
+    written = store.read("g_child")
+    call = next(c for c in mock_manager.judge.call_args_list if c.kwargs["scope"].id == "g_child")
+    return written, call.kwargs
+
+
+def test_refresh_splices_parent_directive_byte_exactly(tmp_path: Path) -> None:
+    """A stale child picks up the parent's directive verbatim — ids, provenance, bytes."""
+    stale_child = ScopeSummary(
+        scope_id="g_child",
+        directives=[
+            _make_directive(id="c_local", content="Local rule.", source_scope_id="g_child")
+        ],
+        context="Child context.",
+        updated_at="2026-05-31T10:00:00Z",
+        parent_version=0,
+    )
+
+    written, judge_kwargs = _refresh_child(tmp_path, child_summary=stale_child)
+
+    assert written is not None
+    spliced = next(d for d in written.directives if d.id == "c_parent_rule")
+    assert spliced.content == "All services must ship behind a flag.\nNo exceptions."
+    assert spliced.subject == "rollout"
+    assert spliced.source_scope_id == "g_root"
+    assert spliced.source_skill == "scope-manager"
+    assert spliced.created_at == "2026-05-31T09:00:00Z"
+    # The child's own directive survives untouched.
+    assert any(d.id == "c_local" for d in written.directives)
+    # The judge saw the already-spliced summary — it had nothing to copy.
+    assert any(d.id == "c_parent_rule" for d in judge_kwargs["current_summary"].directives)
+
+
+def test_refresh_judge_call_is_context_only(tmp_path: Path) -> None:
+    """ADR 0011 D4: the refresh amendment may carry only context and lifecycle ops."""
+    stale_child = ScopeSummary(
+        scope_id="g_child",
+        directives=[],
+        context="Child context.",
+        updated_at="2026-05-31T10:00:00Z",
+        parent_version=0,
+    )
+
+    _written, judge_kwargs = _refresh_child(tmp_path, child_summary=stale_child)
+
+    assert judge_kwargs["amendment_context_only"] is True
+
+
+def test_refresh_splices_into_a_child_with_no_summary_yet(tmp_path: Path) -> None:
+    """A child that has never been written still inherits the parent's directives."""
+    written, _judge_kwargs = _refresh_child(tmp_path, child_summary=None)
+
+    assert written is not None
+    assert [d.id for d in written.directives] == ["c_parent_rule"]
+    assert written.context == "Reconciled context."
+
+
+def test_refresh_records_the_judgment_trail(tmp_path: Path) -> None:
+    """The refresh contribution and its judgment still land in the record."""
+    from strata.record_store import RecordStore
+
+    _written, _judge_kwargs = _refresh_child(
+        tmp_path,
+        child_summary=ScopeSummary(
+            scope_id="g_child",
+            directives=[],
+            context="Child context.",
+            updated_at="2026-05-31T10:00:00Z",
+            parent_version=0,
+        ),
+    )
+
+    with RecordStore(str(tmp_path / "test.db")) as rs:
+        contributions = rs.list_contributions(scope_id="g_child")
+        assert [c.subject for c in contributions] == ["manager-refresh"]
+        judgments = rs.list_judgments(scope_id="g_child")
+        assert len(judgments) == 1
+        assert judgments[0].judged_by == "scope-manager"

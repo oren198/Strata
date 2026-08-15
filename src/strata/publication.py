@@ -672,21 +672,30 @@ def propagate_directive_removals(
 ) -> list[PublishedItem]:
     """Mechanically withdraw published items none of whose anchors still stand.
 
-    ADR 0007 D3's mechanical path: no LLM in the loop. An item survives if
-    ANY of its anchors still stands — any ``subject:`` anchor, or any
-    ``directive:`` anchor whose id is in *surviving_directive_ids* (the
-    directive ids present in the scope's summary AFTER this event's write).
-    Only a directive-only-anchored item with no surviving anchor is
-    withdrawn.
+    ADR 0007 D3's mechanical path: no LLM in the loop. A directive-only-
+    anchored item is withdrawn only when BOTH hold:
 
-    Vanishing is checked against the summary's CURRENT state, not against
+    (a) at least one of its anchors is in *removed_directive_ids* — the ids
+        THIS call removed; and
+    (b) none of its anchors still stands — it has no ``subject:`` anchor, and
+        no ``directive:`` anchor whose id is in *surviving_directive_ids*
+        (the ids present in the scope's summary AFTER this event's write).
+
+    (b) is the ADR's rule that an item lives while ANY anchor lives, checked
+    against the summary's CURRENT state rather than against
     *removed_directive_ids* alone: a multi-anchored item loses its anchors
-    across SEPARATE supersession/retirement events, and the ADR's rule —
-    "withdraws any published item whose anchors all vanished" — must fire on
-    the event that removes the LAST one, regardless of when the others went.
-    *removed_directive_ids* is the change that triggered this call; it
-    gates the fast path and is what makes the withdrawal attributable to
-    *trigger_id*.
+    across SEPARATE supersession/retirement events, and "withdraws any
+    published item whose anchors all vanished" must fire on the event that
+    removes the LAST one, regardless of when the others went.
+
+    (a) is what makes the withdrawal attributable to *trigger_id*. ONE
+    amendment can remove directives on behalf of several contributions (a
+    batch — ADR 0011 D3), and every per-trigger call then sees the same
+    post-write summary, so (b) alone cannot tell those calls apart: the first
+    would sweep every item the whole amendment un-anchored and stamp them all
+    with the first trigger. Under (a) an item is swept by the call for the
+    trigger that removed one of ITS anchors, so each withdraw act names the
+    member that actually motivated it (ADR 0011 D3's attribution obligation).
 
     The caller MUST already hold ``strata.locks.scope_lock(scope_id)`` — this
     is called from the three choke points that remove a directive from a
@@ -703,7 +712,9 @@ def propagate_directive_removals(
     Args:
         scope_id: The publishing scope whose directives changed.
         removed_directive_ids: Directive ids that just left the scope's
-            summary (superseded or retired).
+            summary (superseded or retired) on *trigger_id*'s behalf —
+            condition (a). In a batch this is one member's ops, not the
+            whole amendment's.
         trigger_id: The record id of the triggering event (a contribution id
             or an operator retirement id) — carried on each withdraw act.
         surviving_directive_ids: Directive ids present in the scope's summary
@@ -720,13 +731,14 @@ def propagate_directive_removals(
     if not current_publication:
         return []
 
+    removed = set(removed_directive_ids)
     surviving = set(surviving_directive_ids)
     to_withdraw: list[PublishedItem] = []
     for item in current_publication:
         if not _is_directive_only_anchor_set(item.anchors):
             continue
         directive_ids = {_anchor_directive_id(a) for a in item.anchors}
-        if not (directive_ids & surviving):
+        if (directive_ids & removed) and not (directive_ids & surviving):
             to_withdraw.append(item)
 
     if not to_withdraw:

@@ -1092,19 +1092,40 @@ def _refresh_scope(
     summary_store: SummaryStore,
     manager: ScopeManager,
     summary_max_words: int,
+    window_verbatim_tail: int | None = None,
+    recency_window_size: int | None = None,
     _visited: set[str] | None = None,
 ) -> None:
-    """Refresh the summary for *scope_id* via one scope-manager LLM call.
+    """Refresh the summary for *scope_id*: mechanical splice, then one LLM call.
 
     Recursively refreshes stale ancestors first (root-first order).  Uses a
     ``_visited`` set to guard against cycles (which validation prevents, but
     this is defensive).
 
+    ADR 0011 D4 splits the refresh in two: the parent's directives are
+    incorporated MECHANICALLY (:func:`~strata.summary_store.splice_parent_directives`
+    — byte-exact, ids and provenance preserved, no LLM), and the judge call
+    that follows reconciles the context digest with that refreshed state. Its
+    amendment may carry only ``new_context`` and lifecycle ops. The refresh
+    contribution and its judgment are recorded exactly as before: the summary
+    never moves without a record trail.
+
     ADR 0004 Decision 4 — last-write-wins; no lock.
     """
     from datetime import UTC, datetime
 
-    from strata.record_store import ContributorRef
+    from strata.record_store import RECENCY_WINDOW_SIZE, ContributorRef
+    from strata.scope_manager import WINDOW_VERBATIM_TAIL
+    from strata.summary_store import ScopeSummary, splice_parent_directives
+
+    # The engine defaults when the caller has no settings in hand (ADR 0011 D2).
+    # Resolved here rather than in the signature: scope_manager owns the
+    # verbatim-tail constant, and importing it eagerly would pull the Anthropic
+    # SDK into every CLI start.
+    if window_verbatim_tail is None:
+        window_verbatim_tail = WINDOW_VERBATIM_TAIL
+    if recency_window_size is None:
+        recency_window_size = RECENCY_WINDOW_SIZE
 
     if _visited is None:
         _visited = set()
@@ -1155,6 +1176,8 @@ def _refresh_scope(
                 summary_store=summary_store,
                 manager=manager,
                 summary_max_words=summary_max_words,
+                window_verbatim_tail=window_verbatim_tail,
+                recency_window_size=recency_window_size,
                 _visited=_visited,
             )
 
@@ -1165,18 +1188,35 @@ def _refresh_scope(
 
     # Now refresh this scope
     current_summary = summary_store.read(scope_id)
-    recent_contributions = record_store.list_contributions(scope_id=scope_id, limit=20)
+    # ADR 0011 D2: the mechanical recency digest, same windowed read the
+    # contribute path uses.
+    recent_contributions = record_store.list_recent_contributions(
+        scope_id=scope_id, limit=recency_window_size
+    )
+
+    ts = datetime.now(tz=UTC).isoformat()
+
+    # ADR 0011 D4: incorporate the parent's directives mechanically, before
+    # the judge sees anything. A child with no summary of its own still gets
+    # them — that is what makes a fresh child inherit on its first launch.
+    if parent_summary is not None and parent_summary.directives:
+        base_summary = (
+            current_summary
+            if current_summary is not None
+            else ScopeSummary(scope_id=scope_id, directives=[], context="", updated_at=ts)
+        )
+        current_summary = splice_parent_directives(base_summary, parent_summary)
 
     # The refresh request is itself a contribution: it is appended to the
     # record BEFORE judgment and its judgment is recorded after, so the
     # summary never changes without a record trail ("the record is sacred" —
     # ROADMAP principle 4; CONTEXT.md § Contribution).
-    ts = datetime.now(tz=UTC).isoformat()
     refresh_contribution = record_store.append_contribution(
         scope_id=scope_id,
         content=(
             "[Manager refresh triggered by strata launch"
-            " — rewrite summary incorporating current state.]"
+            " — parent directives already incorporated mechanically;"
+            " reconcile the context digest with the refreshed state.]"
         ),
         proposed_classification="context",
         subject="manager-refresh",
@@ -1200,17 +1240,20 @@ def _refresh_scope(
         recent_contributions=recent_contributions,
         new_contribution=refresh_contribution,
         summary_max_words=summary_max_words,
+        window_verbatim_tail=window_verbatim_tail,
         entitlement=fleet_config.entitlement_view(scope_id),
         operator_memory=operator_memory_binding(
             scope_id, fleet=fleet_config, summaries_dir=summary_store.summaries_dir
         ),
+        # ADR 0011 D4 — the refresh amendment is context + lifecycle ops only.
+        amendment_context_only=True,
     )
 
     record_store.record_judgment(
         contribution_id=refresh_contribution.id,
         decision=judgment.decision,
         judged_by="scope-manager",
-        notes=judgment.reasoning,
+        notes=judgment.record_notes,
     )
 
     if judgment.new_summary is not None:
@@ -1218,6 +1261,15 @@ def _refresh_scope(
         parent_ver = parent_summary.version if parent_summary is not None else None
         to_write = judgment.new_summary.model_copy(update={"parent_version": parent_ver})
         summary_store.write(scope_id, to_write)
+        # A retire op removes a directive with no replacement, so the record
+        # carries a retirement event for it (ADR 0011 D1).
+        for directive_id in judgment.retired_directive_ids:
+            record_store.append_retirement(
+                scope_id=scope_id,
+                directive_id=directive_id,
+                retired_by="scope-manager",
+                reason=judgment.reasoning,
+            )
         print(f"  [refresh] scope {scope_id!r} summary updated", file=sys.stderr)
 
 
@@ -1296,6 +1348,8 @@ def _run_manager_refresh(scope_id: str, *, skip: bool = False) -> None:
                     summary_store=summary_store,
                     manager=manager,
                     summary_max_words=settings.summary_max_words,
+                    window_verbatim_tail=settings.window_verbatim_tail,
+                    recency_window_size=settings.recency_window_size,
                     _visited=visited,
                 )
             else:
@@ -1311,6 +1365,7 @@ def _run_manager_refresh(scope_id: str, *, skip: bool = False) -> None:
                             summary_store=summary_store,
                             manager=manager,
                             summary_max_words=settings.summary_max_words,
+                            window_verbatim_tail=settings.window_verbatim_tail,
                             _visited=visited,
                         )
 
@@ -1330,6 +1385,8 @@ def _run_manager_refresh(scope_id: str, *, skip: bool = False) -> None:
                 summary_store=summary_store,
                 manager=manager,
                 summary_max_words=settings.summary_max_words,
+                window_verbatim_tail=settings.window_verbatim_tail,
+                recency_window_size=settings.recency_window_size,
                 _visited=visited,
             )
 

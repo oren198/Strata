@@ -27,7 +27,7 @@ from strata.app import create_app, get_scope_manager
 from strata.migrator import run_migrations
 from strata.project_config import resolve_storage_paths
 from strata.record_store import ContributorRef, RecordStore
-from strata.scope_manager import ScopeManager
+from strata.scope_manager import ScopeManager, ScopeManagerJudgment
 from strata.settings import Settings
 from strata.summary_store import Directive, ScopeSummary, SummaryStore
 
@@ -227,10 +227,11 @@ def parent_child_client(tmp_path: Path):
     )
     application = create_app(settings=settings)
 
-    judgment = MagicMock()
-    judgment.decision = "accept_as_context"
-    judgment.reasoning = "fine"
-    judgment.new_summary = _summary("g_child", "child ctx")
+    judgment = ScopeManagerJudgment(
+        decision="accept_as_context",
+        reasoning="fine",
+        new_summary=_summary("g_child", "child ctx"),
+    )
     mock_manager = MagicMock(spec=ScopeManager)
     mock_manager.judge.return_value = judgment
     application.dependency_overrides[get_scope_manager] = lambda: mock_manager
@@ -416,10 +417,11 @@ def test_refresh_scope_writes_record_trail(tmp_path: Path) -> None:
     )
     fleet = FleetConfig.load(tmp_path / "fleet.yaml")
 
-    judgment = MagicMock()
-    judgment.decision = "accept_as_context"
-    judgment.reasoning = "refresh"
-    judgment.new_summary = _summary("g_root", "refreshed")
+    judgment = ScopeManagerJudgment(
+        decision="accept_as_context",
+        reasoning="refresh",
+        new_summary=_summary("g_root", "refreshed"),
+    )
     manager = MagicMock()
     manager.judge.return_value = judgment
 

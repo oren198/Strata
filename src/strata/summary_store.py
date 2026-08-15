@@ -119,6 +119,46 @@ class ScopeSummary(BaseModel):
     :meth:`SummaryStore.write` always forces this to ``True``."""
 
 
+def splice_parent_directives(summary: ScopeSummary, parent_summary: ScopeSummary) -> ScopeSummary:
+    """Copy new or changed parent directive rows into *summary*, byte-exactly.
+
+    ADR 0011 D4: inherited directives reach a child summary mechanically, not
+    by asking an LLM to quote them — ids, content, and provenance are carried
+    across as the parent's own rows, so the class of paraphrase bugs the
+    prompt's old "quote parent directives VERBATIM" rule guarded against
+    cannot occur.
+
+    A parent directive the child does not have is appended (parent order,
+    after the child's existing rows); one the child has under the same id but
+    with different bytes is replaced by the parent's row — the parent is
+    authoritative for it (CONTEXT.md § Directive: broader stratum wins). The
+    child's own local directives are untouched, and a parent directive that
+    has since left the parent's summary is NOT removed here: removing a
+    directive is a retirement, and retirement is a judged, recorded act.
+
+    Returns *summary* unchanged (the same object) when there is nothing to
+    splice, so a caller can tell a no-op refresh by identity.
+    """
+    if not parent_summary.directives:
+        return summary
+
+    by_id = {d.id: index for index, d in enumerate(summary.directives)}
+    directives = list(summary.directives)
+    changed = False
+    for parent_directive in parent_summary.directives:
+        index = by_id.get(parent_directive.id)
+        if index is None:
+            directives.append(parent_directive)
+            changed = True
+        elif directives[index] != parent_directive:
+            directives[index] = parent_directive
+            changed = True
+
+    if not changed:
+        return summary
+    return summary.model_copy(update={"directives": directives})
+
+
 # ---------------------------------------------------------------------------
 # Markdown serialisation helpers
 # ---------------------------------------------------------------------------
