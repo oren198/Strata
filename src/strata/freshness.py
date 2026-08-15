@@ -651,6 +651,7 @@ def _submit_judged_contribution(draft: EvaluatorDraft, *, env: dict[str, str]) -
             scope_manager=manager,
             summary_max_words=settings.summary_max_words,
             window_verbatim_tail=settings.window_verbatim_tail,
+            recency_window_size=settings.recency_window_size,
             batch_cap=settings.judgment_batch_cap,
         )
     return outcome.decision

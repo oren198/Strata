@@ -57,6 +57,11 @@ class Settings(BaseSettings):
     # a mechanical digest row. Raise it when phrasing-level duplicate detection
     # needs more than the digest carries.
     window_verbatim_tail: int = Field(default=3, ge=0)
+    # ADR 0011 D2: how many of the newest contributions the recency window
+    # spans — the windowed record read the judgment and refresh paths hand the
+    # scope-manager. Raise it when judgment needs deeper record history in
+    # view; lower it to shrink the prompt.
+    recency_window_size: int = Field(default=20, ge=1)
     # ADR 0011 D3: how many queued contributions one judgment call may carry.
     # A cap keeps the prompt bounded and keeps a failed call from stranding
     # more than a cap's worth of contributions at once. 1 disables coalescing

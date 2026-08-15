@@ -1093,6 +1093,7 @@ def _refresh_scope(
     manager: ScopeManager,
     summary_max_words: int,
     window_verbatim_tail: int | None = None,
+    recency_window_size: int | None = None,
     _visited: set[str] | None = None,
 ) -> None:
     """Refresh the summary for *scope_id*: mechanical splice, then one LLM call.
@@ -1113,16 +1114,18 @@ def _refresh_scope(
     """
     from datetime import UTC, datetime
 
-    from strata.record_store import ContributorRef
+    from strata.record_store import RECENCY_WINDOW_SIZE, ContributorRef
     from strata.scope_manager import WINDOW_VERBATIM_TAIL
     from strata.summary_store import ScopeSummary, splice_parent_directives
 
-    # The engine default when the caller has no settings in hand (ADR 0011 D2).
+    # The engine defaults when the caller has no settings in hand (ADR 0011 D2).
     # Resolved here rather than in the signature: scope_manager owns the
-    # constant, and importing it eagerly would pull the Anthropic SDK into
-    # every CLI start.
+    # verbatim-tail constant, and importing it eagerly would pull the Anthropic
+    # SDK into every CLI start.
     if window_verbatim_tail is None:
         window_verbatim_tail = WINDOW_VERBATIM_TAIL
+    if recency_window_size is None:
+        recency_window_size = RECENCY_WINDOW_SIZE
 
     if _visited is None:
         _visited = set()
@@ -1174,6 +1177,7 @@ def _refresh_scope(
                 manager=manager,
                 summary_max_words=summary_max_words,
                 window_verbatim_tail=window_verbatim_tail,
+                recency_window_size=recency_window_size,
                 _visited=_visited,
             )
 
@@ -1186,7 +1190,9 @@ def _refresh_scope(
     current_summary = summary_store.read(scope_id)
     # ADR 0011 D2: the mechanical recency digest, same windowed read the
     # contribute path uses.
-    recent_contributions = record_store.list_recent_contributions(scope_id=scope_id, limit=20)
+    recent_contributions = record_store.list_recent_contributions(
+        scope_id=scope_id, limit=recency_window_size
+    )
 
     ts = datetime.now(tz=UTC).isoformat()
 
@@ -1343,6 +1349,7 @@ def _run_manager_refresh(scope_id: str, *, skip: bool = False) -> None:
                     manager=manager,
                     summary_max_words=settings.summary_max_words,
                     window_verbatim_tail=settings.window_verbatim_tail,
+                    recency_window_size=settings.recency_window_size,
                     _visited=visited,
                 )
             else:
@@ -1379,6 +1386,7 @@ def _run_manager_refresh(scope_id: str, *, skip: bool = False) -> None:
                 manager=manager,
                 summary_max_words=settings.summary_max_words,
                 window_verbatim_tail=settings.window_verbatim_tail,
+                recency_window_size=settings.recency_window_size,
                 _visited=visited,
             )
 

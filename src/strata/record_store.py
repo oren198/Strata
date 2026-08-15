@@ -164,6 +164,14 @@ class Judgment:
 JUDGE_FAILED = "judge_failed"
 
 
+#: The engine default for the recency window (ADR 0011 D2): how many of the
+#: newest contributions :meth:`RecordStore.list_recent_contributions` returns
+#: to the judgment and refresh paths.  Deployments override it via
+#: ``Settings.recency_window_size`` (``STRATA_RECENCY_WINDOW_SIZE``); this
+#: constant is the fallback for library callers with no settings in hand.
+RECENCY_WINDOW_SIZE = 20
+
+
 @dataclass(frozen=True)
 class JudgmentAttempt:
     """A record of the scope-manager's judgment *failing* on a contribution.

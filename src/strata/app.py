@@ -73,6 +73,7 @@ from strata.publication import (
 )
 from strata.record_store import (
     JUDGE_FAILED,
+    RECENCY_WINDOW_SIZE,
     Contribution,
     ContributorRef,
     RecentContribution,
@@ -266,6 +267,7 @@ def _read_judge_inputs(
     fleet: FleetConfig,
     record_store: RecordStore,
     summary_store: SummaryStore,
+    recency_window_size: int = RECENCY_WINDOW_SIZE,
 ) -> _JudgeInputs:
     """Read everything the scope-manager judges against, under the caller's lock."""
     current_summary = summary_store.read(scope.id)
@@ -273,7 +275,9 @@ def _read_judge_inputs(
     # record — (contribution, state, judgment notes) triples, not verbatim
     # text. The contributions under judgment were appended before this read, so
     # they are in their own window as `pending` rows.
-    recent_contributions = record_store.list_recent_contributions(scope_id=scope.id, limit=20)
+    recent_contributions = record_store.list_recent_contributions(
+        scope_id=scope.id, limit=recency_window_size
+    )
 
     # Resolve the inter-stratum parent's summary for manager context (ADR 0004
     # Decision 2). The caller does the graph traversal; the manager is a pure
@@ -320,6 +324,7 @@ def _judge_and_record(
     scope_manager: ScopeManager,
     summary_max_words: int,
     window_verbatim_tail: int = WINDOW_VERBATIM_TAIL,
+    recency_window_size: int = RECENCY_WINDOW_SIZE,
 ) -> ContributionOutcome:
     """Judge *contribution* against the scope's current state and persist the result.
 
@@ -329,7 +334,11 @@ def _judge_and_record(
     event and raises :class:`JudgeUnavailable`; no judgment row is written.
     """
     inputs = _read_judge_inputs(
-        scope=scope, fleet=fleet, record_store=record_store, summary_store=summary_store
+        scope=scope,
+        fleet=fleet,
+        record_store=record_store,
+        summary_store=summary_store,
+        recency_window_size=recency_window_size,
     )
     parent_summary = inputs.parent_summary
 
@@ -501,6 +510,7 @@ def _judge_batch_and_record(
     scope_manager: ScopeManager,
     summary_max_words: int,
     window_verbatim_tail: int = WINDOW_VERBATIM_TAIL,
+    recency_window_size: int = RECENCY_WINDOW_SIZE,
 ) -> list[ContributionOutcome | JudgeUnavailable]:
     """Judge a batch of contributions in ONE call and persist the results (ADR 0011 D3).
 
@@ -534,13 +544,18 @@ def _judge_batch_and_record(
                     scope_manager=scope_manager,
                     summary_max_words=summary_max_words,
                     window_verbatim_tail=window_verbatim_tail,
+                    recency_window_size=recency_window_size,
                 )
             ]
         except JudgeUnavailable as exc:
             return [exc]
 
     inputs = _read_judge_inputs(
-        scope=scope, fleet=fleet, record_store=record_store, summary_store=summary_store
+        scope=scope,
+        fleet=fleet,
+        record_store=record_store,
+        summary_store=summary_store,
+        recency_window_size=recency_window_size,
     )
 
     try:
@@ -660,6 +675,7 @@ def run_contribution(
     scope_manager: ScopeManager,
     summary_max_words: int,
     window_verbatim_tail: int = WINDOW_VERBATIM_TAIL,
+    recency_window_size: int = RECENCY_WINDOW_SIZE,
     batch_cap: int = BATCH_CAP,
     queue_timeout_s: float = QUEUE_WAIT_TIMEOUT_S,
 ) -> ContributionOutcome:
@@ -733,6 +749,7 @@ def run_contribution(
                     scope_manager=scope_manager,
                     summary_max_words=summary_max_words,
                     window_verbatim_tail=window_verbatim_tail,
+                    recency_window_size=recency_window_size,
                 )
         finally:
             # Always hand the role back, even if the drain broke: the next
@@ -755,6 +772,7 @@ def _drain_batch(
     scope_manager: ScopeManager,
     summary_max_words: int,
     window_verbatim_tail: int,
+    recency_window_size: int = RECENCY_WINDOW_SIZE,
 ) -> None:
     """Judge one taken batch and publish each member's result (ADR 0011 D3).
 
@@ -779,6 +797,7 @@ def _drain_batch(
                 scope_manager=scope_manager,
                 summary_max_words=summary_max_words,
                 window_verbatim_tail=window_verbatim_tail,
+                recency_window_size=recency_window_size,
             )
     except Exception as exc:  # noqa: BLE001 — the drain broke, not the judge
         # Not a judge failure (those come back as results): the drain itself
@@ -828,6 +847,7 @@ def rejudge_contribution(
     scope_manager: ScopeManager,
     summary_max_words: int,
     window_verbatim_tail: int = WINDOW_VERBATIM_TAIL,
+    recency_window_size: int = RECENCY_WINDOW_SIZE,
 ) -> ContributionOutcome:
     """Idempotently (re-)judge a contribution that has no verdict yet (issue #57).
 
@@ -882,6 +902,7 @@ def rejudge_contribution(
             scope_manager=scope_manager,
             summary_max_words=summary_max_words,
             window_verbatim_tail=window_verbatim_tail,
+            recency_window_size=recency_window_size,
         )
 
 
@@ -1029,6 +1050,7 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
                 scope_manager=scope_manager,
                 summary_max_words=request_settings.summary_max_words,
                 window_verbatim_tail=request_settings.window_verbatim_tail,
+                recency_window_size=request_settings.recency_window_size,
                 batch_cap=request_settings.judgment_batch_cap,
             )
         except sqlite3.IntegrityError as exc:

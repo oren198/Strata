@@ -330,6 +330,15 @@ def test_verbatim_tail_default_matches_the_adr() -> None:
     assert Settings().window_verbatim_tail == WINDOW_VERBATIM_TAIL
 
 
+def test_recency_window_default_matches_the_adr() -> None:
+    """The named default is 20 (ADR 0011 D2), and the setting's default agrees."""
+    from strata.record_store import RECENCY_WINDOW_SIZE
+    from strata.settings import Settings
+
+    assert RECENCY_WINDOW_SIZE == 20
+    assert Settings().recency_window_size == RECENCY_WINDOW_SIZE
+
+
 def test_character_budget_drops_oldest_rows_and_says_it_did() -> None:
     """N rows or the character budget, whichever bites first — oldest go first.
 

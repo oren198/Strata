@@ -704,6 +704,7 @@ def strata_contribute(
             scope_manager=manager,
             summary_max_words=_settings.summary_max_words,
             window_verbatim_tail=_settings.window_verbatim_tail,
+            recency_window_size=_settings.recency_window_size,
             batch_cap=_settings.judgment_batch_cap,
         )
     except JudgeUnavailable as exc:
@@ -802,6 +803,7 @@ def strata_rejudge(contribution_id: str) -> dict:
             scope_manager=manager,
             summary_max_words=_settings.summary_max_words,
             window_verbatim_tail=_settings.window_verbatim_tail,
+            recency_window_size=_settings.recency_window_size,
         )
     except JudgeUnavailable as exc:
         raise RuntimeError(
