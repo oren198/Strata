@@ -521,3 +521,316 @@ def test_recent_contributions_agree_with_contribution_states(tmp_path: Path) -> 
 
     assert window == states
     assert window[orphan] == "pending"
+
+
+# ---------------------------------------------------------------------------
+# Scenario 12 — the paged record read and the by-id lookup (issue #130)
+# ---------------------------------------------------------------------------
+
+
+def test_record_page_default_size_matches_the_setting() -> None:
+    """The named engine default and the setting's default agree.
+
+    Library callers with no settings in hand get :data:`RECORD_PAGE_SIZE`;
+    deployments get ``Settings.record_page_size``. If the two ever drift, the
+    same call means two different page sizes depending on which door it came
+    through.
+    """
+    from strata.record_store import RECORD_PAGE_SIZE
+    from strata.settings import Settings
+
+    assert RECORD_PAGE_SIZE == 20
+    assert Settings().record_page_size == RECORD_PAGE_SIZE
+
+
+def test_record_page_starts_at_the_newest_contribution(tmp_path: Path) -> None:
+    """An unadorned page is the newest slice — the recency bias is the point."""
+    with _open_store(str(tmp_path / "strata.db")) as rs:
+        for i in range(5):
+            _contribute(rs, f"contribution {i}")
+
+        page = rs.page_record(scope_id="g_ceo", limit=2)
+
+    assert [c.content for c in page.contributions] == ["contribution 4", "contribution 3"]
+    assert page.limit == 2
+    assert page.total == 5
+
+
+def test_record_pages_walk_the_whole_record_newest_to_oldest(tmp_path: Path) -> None:
+    """Paging to exhaustion covers the record exactly once, newest first.
+
+    The stability property pagination lives or dies on: at a page boundary an
+    unstable order silently drops or repeats a contribution, and the caller
+    never learns it happened.
+    """
+    with _open_store(str(tmp_path / "strata.db")) as rs:
+        appended = [_contribute(rs, f"contribution {i}") for i in range(7)]
+
+        walked: list[str] = []
+        cursors: list[str | None] = []
+        cursor: str | None = None
+        while True:
+            cursors.append(cursor)
+            page = rs.page_record(scope_id="g_ceo", limit=3, before_id=cursor)
+            walked.extend(c.id for c in page.contributions)
+            cursor = page.next_before_id
+            if cursor is None:
+                break
+
+    assert walked == list(reversed(appended))
+    # 3 + 3 + 1: each cursor is the previous page's last (oldest) row, and the
+    # last page reports None rather than leaving the caller to infer the end
+    # from a short page.
+    assert cursors == [None, appended[4], appended[1]]
+
+
+def test_a_contribution_appended_mid_walk_never_shifts_a_page(tmp_path: Path) -> None:
+    """The test that justifies a cursor over an offset (issue #130).
+
+    Pages descend from the newest row and the record grows at that end. Under
+    an OFFSET, a contribution appended mid-walk pushes every later page down by
+    one and the boundary silently repeats a row. The cursor anchors on a
+    contribution rather than a position, so the new row lands above the walk and
+    the walk is untouched: no repeat, no drop, no shift.
+    """
+    with _open_store(str(tmp_path / "strata.db")) as rs:
+        original = [_contribute(rs, f"contribution {i}") for i in range(6)]
+
+        first = rs.page_record(scope_id="g_ceo", limit=2)
+        # Newest-first as the record stood when the walk began.
+        before_append = [c.id for c in reversed(rs.list_contributions(scope_id="g_ceo"))]
+        # A concurrent contributor writes while the walk is between pages.
+        appended = _contribute(rs, "appended mid-walk")
+        after_append = [c.id for c in reversed(rs.list_contributions(scope_id="g_ceo"))]
+
+        second = rs.page_record(scope_id="g_ceo", limit=2, before_id=first.next_before_id)
+        third = rs.page_record(scope_id="g_ceo", limit=2, before_id=second.next_before_id)
+
+    walked = [c.id for c in first.contributions + second.contributions + third.contributions]
+
+    assert walked == list(reversed(original))
+    assert len(walked) == len(set(walked)), "a page boundary repeated a contribution"
+    assert appended not in walked, "the mid-walk append leaked into a page already passed"
+    assert third.next_before_id is None
+
+    # The same three pages walked by OFFSET instead — page 1 taken before the
+    # append, pages 2 and 3 after it, which is exactly how a real walk races a
+    # concurrent contributor. The failure this proves is not hypothetical.
+    offset_walk = before_append[0:2] + after_append[2:4] + after_append[4:6]
+    assert len(offset_walk) != len(set(offset_walk)), (
+        "the offset walk was expected to repeat a row; if it no longer does, "
+        "the cursor's justification needs rechecking"
+    )
+    # The repeat is concrete: the append shifted every row down one, so the
+    # last row of page 1 comes back as the first row of page 2.
+    assert offset_walk[1] == offset_walk[2] == original[4]
+    # And the offset walk drops the record's oldest row while repeating another.
+    assert original[0] not in offset_walk
+
+
+def test_record_page_wider_than_the_record_exhausts_it(tmp_path: Path) -> None:
+    """A page wider than the record is the whole record, and there is no next page."""
+    with _open_store(str(tmp_path / "strata.db")) as rs:
+        for i in range(3):
+            _contribute(rs, f"contribution {i}")
+
+        page = rs.page_record(scope_id="g_ceo", limit=100)
+
+    assert len(page.contributions) == 3
+    assert page.total == 3
+    assert page.next_before_id is None
+
+
+def test_record_page_exactly_the_size_of_the_record_reports_no_next_page(
+    tmp_path: Path,
+) -> None:
+    """The off-by-one boundary: a full page that exhausts the record is the last one."""
+    with _open_store(str(tmp_path / "strata.db")) as rs:
+        for i in range(3):
+            _contribute(rs, f"contribution {i}")
+
+        page = rs.page_record(scope_id="g_ceo", limit=3)
+
+    assert len(page.contributions) == 3
+    assert page.next_before_id is None
+
+
+def test_record_page_of_an_empty_record_is_empty_not_an_error(tmp_path: Path) -> None:
+    """An empty record pages to an empty page — the same shape, zero rows."""
+    with _open_store(str(tmp_path / "strata.db")) as rs:
+        page = rs.page_record(scope_id="g_ceo")
+
+    assert page.contributions == []
+    assert page.judgments == []
+    assert page.judgment_attempts == []
+    assert page.contribution_states == []
+    assert page.total == 0
+    assert page.next_before_id is None
+
+
+def test_a_cursor_on_the_oldest_row_yields_an_empty_last_page(tmp_path: Path) -> None:
+    """Paging past the oldest contribution is exhaustion, not a failure."""
+    with _open_store(str(tmp_path / "strata.db")) as rs:
+        oldest = _contribute(rs, "the oldest")
+        _contribute(rs, "the newest")
+
+        page = rs.page_record(scope_id="g_ceo", limit=2, before_id=oldest)
+
+    assert page.contributions == []
+    assert page.total == 2
+    assert page.next_before_id is None
+
+
+def test_record_page_rejects_a_limit_below_one_and_a_foreign_cursor(tmp_path: Path) -> None:
+    """Out-of-range paging arguments fail loudly instead of silently paging wrong.
+
+    A cursor naming a contribution in another scope's record is the dangerous
+    case: silently ignoring it would restart the walk at the newest row and
+    duplicate a whole page.
+    """
+    with _open_store(str(tmp_path / "strata.db")) as rs:
+        _contribute(rs, "mine")
+        elsewhere = rs.append_contribution(
+            scope_id="g_other",
+            content="not mine",
+            proposed_classification="context",
+            subject=None,
+            supersedes=None,
+            contributor=_CONTRIBUTOR,
+        ).id
+
+        with pytest.raises(ValueError, match="limit must be >= 1"):
+            rs.page_record(scope_id="g_ceo", limit=0)
+        with pytest.raises(ValueError, match="before_id is not a contribution"):
+            rs.page_record(scope_id="g_ceo", before_id="c_does_not_exist")
+        with pytest.raises(ValueError, match="before_id is not a contribution"):
+            rs.page_record(scope_id="g_ceo", before_id=elsewhere)
+
+
+def test_record_page_carries_only_its_own_contributions_judgments(tmp_path: Path) -> None:
+    """A page is internally complete: nothing on it refers to a row it does not carry."""
+    with _open_store(str(tmp_path / "strata.db")) as rs:
+        older = _contribute(rs, "judged, on the older page")
+        newer = _contribute(rs, "judged, on the newest page")
+        rs.record_judgment(
+            contribution_id=older,
+            decision="accept_as_context",
+            judged_by="scope-manager",
+            notes="older",
+        )
+        rs.record_judgment(
+            contribution_id=newer,
+            decision="decline",
+            judged_by="scope-manager",
+            notes="newer",
+        )
+        rs.record_judgment_attempt(
+            contribution_id=older, error_class="APIError", outcome=JUDGE_FAILED
+        )
+
+        page = rs.page_record(scope_id="g_ceo", limit=1)
+
+    assert [c.id for c in page.contributions] == [newer]
+    assert [j.contribution_id for j in page.judgments] == [newer]
+    assert page.judgment_attempts == []
+    assert [s.contribution_id for s in page.contribution_states] == [newer]
+
+
+def test_record_pages_are_scoped(tmp_path: Path) -> None:
+    """One scope's pages never contain another scope's record."""
+    with _open_store(str(tmp_path / "strata.db")) as rs:
+        mine = _contribute(rs, "mine")
+        rs.append_contribution(
+            scope_id="g_other",
+            content="not mine",
+            proposed_classification="context",
+            subject=None,
+            supersedes=None,
+            contributor=_CONTRIBUTOR,
+        )
+
+        page = rs.page_record(scope_id="g_ceo")
+
+    assert [c.id for c in page.contributions] == [mine]
+    assert page.total == 1
+
+
+def test_record_page_states_agree_with_the_whole_record_states(tmp_path: Path) -> None:
+    """The paged read and the #118 read surface never disagree about a state."""
+    with _open_store(str(tmp_path / "strata.db")) as rs:
+        judged = _contribute(rs, "judged")
+        errored = _contribute(rs, "the judge blew up")
+        _contribute(rs, "no verdict yet")
+        rs.record_judgment(
+            contribution_id=judged, decision="decline", judged_by="scope-manager", notes="no"
+        )
+        rs.record_judgment_attempt(
+            contribution_id=errored, error_class="ValueError", outcome=JUDGE_FAILED
+        )
+
+        states = {s.contribution_id: s.state for s in rs.list_contribution_states(scope_id="g_ceo")}
+        first = rs.page_record(scope_id="g_ceo", limit=2)
+        rest = rs.page_record(scope_id="g_ceo", limit=2, before_id=first.next_before_id)
+        paged = {s.contribution_id: s.state for s in first.contribution_states} | {
+            s.contribution_id: s.state for s in rest.contribution_states
+        }
+
+    assert paged == states
+
+
+def test_record_entry_carries_the_verdict_and_its_notes(tmp_path: Path) -> None:
+    """The by-id hit: one contribution, its state, and what the scope-manager said."""
+    with _open_store(str(tmp_path / "strata.db")) as rs:
+        cid = _contribute(rs, "the contribution I submitted")
+        rs.record_judgment(
+            contribution_id=cid,
+            decision="accept_as_directive",
+            judged_by="scope-manager",
+            notes="Accepted: binds the scope's descendants.",
+        )
+
+        entry = rs.get_record_entry(cid)
+
+    assert entry is not None
+    assert entry.contribution.content == "the contribution I submitted"
+    assert entry.state.state == "judged"
+    assert entry.state.decision == "accept_as_directive"
+    assert entry.judgment is not None
+    assert entry.judgment.notes == "Accepted: binds the scope's descendants."
+    assert entry.judgment_attempts == []
+
+
+def test_record_entry_of_a_failed_judgment_has_no_verdict(tmp_path: Path) -> None:
+    """judge_failed and pending both read as "no verdict" — with the failure legible."""
+    with _open_store(str(tmp_path / "strata.db")) as rs:
+        errored = _contribute(rs, "the judge blew up")
+        pending = _contribute(rs, "no verdict yet")
+        rs.record_judgment_attempt(
+            contribution_id=errored,
+            error_class="APIError",
+            message="upstream timeout",
+            outcome=JUDGE_FAILED,
+        )
+
+        failed_entry = rs.get_record_entry(errored)
+        pending_entry = rs.get_record_entry(pending)
+
+    assert failed_entry is not None
+    assert failed_entry.state.state == "judge_failed"
+    assert failed_entry.judgment is None
+    assert failed_entry.state.error_class == "APIError"
+    assert failed_entry.state.error_message == "upstream timeout"
+    assert [a.error_class for a in failed_entry.judgment_attempts] == ["APIError"]
+
+    assert pending_entry is not None
+    assert pending_entry.state.state == "pending"
+    assert pending_entry.judgment is None
+    assert pending_entry.judgment_attempts == []
+
+
+def test_record_entry_of_an_unknown_id_is_none(tmp_path: Path) -> None:
+    """The by-id miss: a clean None, matching get_contribution and get_judgment."""
+    with _open_store(str(tmp_path / "strata.db")) as rs:
+        _contribute(rs, "a real contribution")
+
+        assert rs.get_record_entry("c_does_not_exist") is None

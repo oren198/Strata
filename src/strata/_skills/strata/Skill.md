@@ -64,7 +64,8 @@ target stay chain-only (issue #48; ADR 0006 D3/D4).
 | `strata_list_scopes()` | Show the fleet |
 | `strata_read_scope_summary(scope_id=None)` | Peek at a scope's current state |
 | `strata_read_perspective(scope_id=None)` | Composed view: this scope's summary + every inter-stratum ancestor's summary, ordered root-first |
-| `strata_read_scope_record(scope_id=None)` | Forensic — every contribution + judgment |
+| `strata_read_scope_record(scope_id=None, limit=None, before_id=None)` | Forensic — newest page of contributions + judgments. Walk older pages with `before_id` |
+| `strata_read_contribution(contribution_id)` | One contribution's state and verdict — the cheap by-id check |
 
 ## What you do NOT do here
 

@@ -35,7 +35,13 @@ GET /scopes/{scope_id}/summary
     ``exists=True``); 404 if the scope is unknown.
 
 GET /scopes/{scope_id}/record
-    Return the contribution record + judgments for a scope (forensic view).
+    Return one page of the contribution record + judgments for a scope
+    (forensic view), newest first.  Bounded by default (issue #130): walk
+    older pages with ``before_id``, sized by ``limit``.
+
+GET /scopes/{scope_id}/record/{contribution_id}
+    Return one contribution with its state, verdict, and judgment attempts
+    (issue #130) — the cheap "what happened to this contribution?" read.
 
 Vocabulary follows CONTEXT.md verbatim.
 """
@@ -1156,33 +1162,104 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
     def get_scope_record(
         scope_id: str,
         request: Request,
+        limit: int | None = None,
+        before_id: str | None = None,
         record_store: RecordStore = Depends(get_record_store),
+        settings: Settings = Depends(get_settings),
     ) -> dict:
-        """Return contributions and judgments for a scope (forensic view).
+        """Return one page of a scope's contribution record (forensic view).
 
-        Returns 404 if the scope is not in the FleetConfig.
+        Bounded by default (issue #130): an unadorned call returns the newest
+        page, not the whole record, which only ever grows. Walk back with
+        ``before_id`` — the previous response's ``page.next_before_id`` —
+        until that is null. ``limit`` defaults to
+        ``settings.record_page_size``. Judgments, attempts, and states are
+        restricted to the page's own contributions.
+
+        Returns 404 if the scope is not in the FleetConfig, and 422 if the
+        paging arguments are out of range (including a ``before_id`` that is
+        not a contribution in this scope).
         """
         fleet: FleetConfig = request.app.state.fleet_config
         scope = fleet.get_scope(scope_id)
         if scope is None:
             raise HTTPException(status_code=404, detail=f"Scope not found: {scope_id!r}")
 
-        contributions = record_store.list_contributions(scope_id=scope_id)
-        judgments = record_store.list_judgments(scope_id=scope_id)
-        judgment_attempts = record_store.list_judgment_attempts(scope_id=scope_id)
-        contribution_states = record_store.list_contribution_states(scope_id=scope_id)
+        try:
+            page = record_store.page_record(
+                scope_id=scope_id,
+                limit=limit if limit is not None else settings.record_page_size,
+                before_id=before_id,
+            )
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail={"error": "invalid_page", "detail": str(exc)},
+            ) from exc
 
         from dataclasses import asdict
 
         return {
-            "contributions": [asdict(c) for c in contributions],
-            "judgments": [asdict(j) for j in judgments],
+            "contributions": [asdict(c) for c in page.contributions],
+            "judgments": [asdict(j) for j in page.judgments],
             # Failed-judgment events (issue #57): let the forensic view mark a
             # pending contribution as "(pending — N failed attempts)".
-            "judgment_attempts": [asdict(a) for a in judgment_attempts],
+            "judgment_attempts": [asdict(a) for a in page.judgment_attempts],
             # The derived per-contribution state (issue #118) so a client renders
             # "attempted, judge errored" without re-deriving the three-way join.
-            "contribution_states": [asdict(s) for s in contribution_states],
+            "contribution_states": [asdict(s) for s in page.contribution_states],
+            # next_before_id is None once the record is exhausted — the signal a
+            # client pages until, rather than guessing from a short page.
+            "page": {
+                "limit": page.limit,
+                "total": page.total,
+                "next_before_id": page.next_before_id,
+            },
+        }
+
+    # -----------------------------------------------------------------------
+    # GET /scopes/{scope_id}/record/{contribution_id}
+    # -----------------------------------------------------------------------
+
+    @application.get("/scopes/{scope_id}/record/{contribution_id}")
+    def get_record_entry(
+        scope_id: str,
+        contribution_id: str,
+        request: Request,
+        record_store: RecordStore = Depends(get_record_store),
+    ) -> dict:
+        """Return one contribution with its state, verdict, and judgment attempts.
+
+        The by-id read of the record (issue #130) — "did this contribution get
+        judged, and what did the scope-manager say?" answered without pulling
+        the scope's record. ``judgment`` is null unless the state is
+        ``judged``: only a verdict carries the judge's notes.
+
+        Returns 404 if the scope is not in the FleetConfig, or if the
+        contribution is unknown or belongs to another scope.
+        """
+        fleet: FleetConfig = request.app.state.fleet_config
+        scope = fleet.get_scope(scope_id)
+        if scope is None:
+            raise HTTPException(status_code=404, detail=f"Scope not found: {scope_id!r}")
+
+        entry = record_store.get_record_entry(contribution_id)
+        # A contribution in another scope's record is "not found" here, never
+        # served: the record is owned per-scope, so reading it through the
+        # wrong scope's path must not reach across.
+        if entry is None or entry.contribution.scope_id != scope_id:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Contribution not found: {contribution_id!r}",
+            )
+
+        from dataclasses import asdict
+
+        return {
+            "contribution": asdict(entry.contribution),
+            "state": asdict(entry.state),
+            "judgment": asdict(entry.judgment) if entry.judgment is not None else None,
+            "judgment_attempts": [asdict(a) for a in entry.judgment_attempts],
         }
 
     return application

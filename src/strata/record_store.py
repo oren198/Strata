@@ -172,6 +172,17 @@ JUDGE_FAILED = "judge_failed"
 RECENCY_WINDOW_SIZE = 20
 
 
+#: The engine default for a record page (issue #130): how many contributions
+#: one :meth:`RecordStore.page_record` page carries when the caller does not
+#: name a size.  20 matches the recency window the judgment path already reads
+#: (:data:`RECENCY_WINDOW_SIZE`) — the same "how much recent record is worth
+#: looking at" answer, asked by a reader instead of a judge.  Deployments
+#: override it via ``Settings.record_page_size``
+#: (``STRATA_RECORD_PAGE_SIZE``); this constant is the fallback for library
+#: callers with no settings in hand.
+RECORD_PAGE_SIZE = 20
+
+
 @dataclass(frozen=True)
 class JudgmentAttempt:
     """A record of the scope-manager's judgment *failing* on a contribution.
@@ -253,6 +264,69 @@ class RecentContribution:
     state: Literal["judged", "judge_failed", "pending"]
     decision: Literal["accept_as_directive", "accept_as_context", "decline"] | None
     judgment_notes: str | None
+
+
+@dataclass(frozen=True)
+class RecordEntry:
+    """Everything the record holds on ONE contribution (issue #130).
+
+    The by-id read of a scope's record: the contribution, its derived
+    :class:`ContributionState`, its verdict if it has one, and every
+    judgment-attempt event on it.  Assembled by
+    :meth:`RecordStore.get_record_entry`.
+
+    Exists so "did the contribution I submitted get judged, and what did the
+    scope-manager say?" costs one lookup instead of the whole record.
+    ``judgment`` is ``None`` in the ``pending`` and ``judge_failed`` states —
+    a verdict is the only thing that carries the judge's notes, and neither
+    state has one.
+    """
+
+    contribution: Contribution
+    state: ContributionState
+    judgment: Judgment | None
+    judgment_attempts: list[JudgmentAttempt]
+
+
+@dataclass(frozen=True)
+class RecordPage:
+    """One page of a scope's record, newest first (issue #130).
+
+    The record is append-only and only ever grows, so a whole-record read is
+    unbounded by construction.  A page carries the same four parallel lists a
+    whole-record read does — with ``judgments``, ``judgment_attempts``, and
+    ``contribution_states`` restricted to the page's own contributions, so a
+    page is internally complete and nothing on it refers to a row the caller
+    cannot see.
+
+    Paging is **cursor-based**, not offset-based, and that is load-bearing
+    rather than stylistic.  Pages descend from the newest contribution, and
+    the record grows at that end: under an offset, a contribution appended
+    mid-walk shifts every later page down one and the page boundary silently
+    repeats a row.  A cursor anchors on the last (oldest) row of the page just
+    returned and asks for rows strictly older than it, so a concurrent append
+    lands above the walk and cannot disturb it.  The anchor is the composite
+    ``(created_at, rowid)`` of that row, addressed by its contribution id —
+    ``rowid`` breaks same-second ties, which a bare timestamp cursor would
+    straddle.
+
+    ``next_before_id`` is the cursor for the following page: the id of this
+    page's last contribution, or ``None`` once the record is exhausted.
+    ``total`` counts the scope's whole record, not the page.
+
+    ``contributions`` (and ``contribution_states``, which parallels it) are
+    newest-first; ``judgments`` and ``judgment_attempts`` are supporting rows
+    joined by contribution id and stay in their own chronological order, which
+    is how a failure history reads.
+    """
+
+    contributions: list[Contribution]
+    judgments: list[Judgment]
+    judgment_attempts: list[JudgmentAttempt]
+    contribution_states: list[ContributionState]
+    limit: int
+    total: int
+    next_before_id: str | None
 
 
 @dataclass(frozen=True)
@@ -730,34 +804,180 @@ class RecordStore:
         for attempt in self.list_judgment_attempts(scope_id=scope_id):
             attempts_by_contribution.setdefault(attempt.contribution_id, []).append(attempt)
 
-        states: list[ContributionState] = []
-        for contribution in contributions:
-            attempts = attempts_by_contribution.get(contribution.id, [])
-            judgment = judgments.get(contribution.id)
-            # A verdict always wins: a contribution that failed twice and was
-            # then re-judged successfully is judged, not judge_failed.
-            if judgment is not None:
-                state: Literal["judged", "judge_failed", "pending"] = "judged"
-            elif any(a.outcome == JUDGE_FAILED for a in attempts):
-                state = "judge_failed"
-            else:
-                state = "pending"
-            last_failure = next(
-                (a for a in reversed(attempts) if a.outcome == JUDGE_FAILED),
-                None,
+        return [
+            _derive_contribution_state(
+                contribution.id,
+                judgments.get(contribution.id),
+                attempts_by_contribution.get(contribution.id, []),
             )
-            states.append(
-                ContributionState(
-                    contribution_id=contribution.id,
-                    state=state,
-                    decision=judgment.decision if judgment is not None else None,
-                    failed_attempts=len(attempts),
-                    error_class=last_failure.error_class if last_failure is not None else None,
-                    error_message=last_failure.message if last_failure is not None else None,
-                    failed_at=last_failure.attempted_at if last_failure is not None else None,
+            for contribution in contributions
+        ]
+
+    def page_record(
+        self,
+        *,
+        scope_id: str,
+        limit: int = RECORD_PAGE_SIZE,
+        before_id: str | None = None,
+    ) -> RecordPage:
+        """Return one page of *scope_id*'s record, newest first (issue #130).
+
+        The bounded counterpart to the four whole-record reads
+        (:meth:`list_contributions`, :meth:`list_judgments`,
+        :meth:`list_judgment_attempts`, :meth:`list_contribution_states`),
+        which a host otherwise has to call in full and zip itself.  The record
+        only ever grows, so on a long-lived scope those reads return the entire
+        log every time — the cost this page exists to bound.  The whole record
+        stays reachable by paging until ``next_before_id`` is ``None``; nothing
+        is hidden, only chunked.
+
+        Retrieval and presentation are both newest-first: the reader of a
+        forensic record almost always wants what just happened, and the first
+        page with no cursor is exactly that.  (This is where the page differs
+        from :meth:`list_recent_contributions`, which retrieves newest-first
+        but flips to oldest-first because a *digest* renders that way.)
+
+        Ordering is ``created_at DESC, rowid DESC``, and paging walks it by
+        cursor rather than by offset — see :class:`RecordPage` for why an
+        offset is unsafe at the growing end of an append-only log.  The cursor
+        resolves *before_id* to that row's ``(created_at, rowid)`` and returns
+        rows strictly older than it, so same-second ties are decided by
+        ``rowid`` instead of being straddled.
+
+        Args:
+            scope_id:  The scope whose record to page.
+            limit:     Page size.  Defaults to :data:`RECORD_PAGE_SIZE`;
+                       deployments pass ``settings.record_page_size``.
+            before_id: Cursor — return contributions strictly older than this
+                       one.  ``None`` (the default) starts at the newest.
+                       Pass the previous page's ``next_before_id``.
+
+        Returns:
+            One :class:`RecordPage`.  A cursor on the record's oldest row is
+            not an error: it yields an empty page with ``next_before_id``
+            ``None``.
+
+        Raises:
+            ValueError: If *limit* is below 1, or *before_id* is not a
+                contribution in this scope's record — a stale or foreign
+                cursor is told so rather than silently paging from the top.
+        """
+        if limit < 1:
+            raise ValueError(f"limit must be >= 1, got {limit!r}")
+
+        total = self._conn.execute(
+            "SELECT COUNT(*) FROM contributions WHERE scope_id = ?",
+            (scope_id,),
+        ).fetchone()[0]
+
+        base = """
+            SELECT id, scope_id, content, proposed_classification,
+                   subject, supersedes,
+                   contributor_scope_id, contributor_skill,
+                   contributor_session_id, contributor_ts,
+                   created_at
+            FROM contributions
+            WHERE scope_id = ?
+        """
+        params: list[object] = [scope_id]
+        if before_id is not None:
+            anchor = self._conn.execute(
+                "SELECT created_at, rowid FROM contributions WHERE id = ? AND scope_id = ?",
+                (before_id, scope_id),
+            ).fetchone()
+            if anchor is None:
+                raise ValueError(f"before_id is not a contribution in {scope_id!r}: {before_id!r}")
+            base += " AND (created_at < ? OR (created_at = ? AND rowid < ?))"
+            params.extend([anchor["created_at"], anchor["created_at"], anchor["rowid"]])
+        # One row beyond the page: its presence is what distinguishes "more to
+        # come" from "exhausted", without a second count against the cursor.
+        base += " ORDER BY created_at DESC, rowid DESC LIMIT ?"
+        params.append(limit + 1)
+
+        rows = self._conn.execute(base, params).fetchall()
+        has_more = len(rows) > limit
+        contributions = [_contribution_from_row(row) for row in rows[:limit]]
+
+        contribution_ids = [c.id for c in contributions]
+        judgments = self._judgments_for(contribution_ids)
+        judgment_attempts = self._judgment_attempts_for(contribution_ids)
+        judgment_by_contribution = {j.contribution_id: j for j in judgments}
+        attempts_by_contribution: dict[str, list[JudgmentAttempt]] = {}
+        for attempt in judgment_attempts:
+            attempts_by_contribution.setdefault(attempt.contribution_id, []).append(attempt)
+
+        return RecordPage(
+            contributions=contributions,
+            judgments=judgments,
+            judgment_attempts=judgment_attempts,
+            contribution_states=[
+                _derive_contribution_state(
+                    c.id,
+                    judgment_by_contribution.get(c.id),
+                    attempts_by_contribution.get(c.id, []),
                 )
-            )
-        return states
+                for c in contributions
+            ],
+            limit=limit,
+            total=total,
+            next_before_id=contributions[-1].id if has_more else None,
+        )
+
+    def get_record_entry(self, contribution_id: str) -> RecordEntry | None:
+        """Return the record's whole entry for *contribution_id*, or ``None`` if absent.
+
+        The by-id read of the record (issue #130): one contribution with its
+        state, its verdict, and its judgment-attempt events.  Answers "what
+        happened to the contribution I submitted?" without paging the scope's
+        record looking for it — the read a contributor makes after a submission
+        whose outcome it never saw.
+
+        ``None`` for an unknown id, matching :meth:`get_contribution` and
+        :meth:`get_judgment`: a caller-supplied id may legitimately not exist.
+        """
+        contribution = self.get_contribution(contribution_id)
+        if contribution is None:
+            return None
+        judgment = self.get_judgment(contribution_id)
+        judgment_attempts = self._judgment_attempts_for([contribution_id])
+        return RecordEntry(
+            contribution=contribution,
+            state=_derive_contribution_state(contribution_id, judgment, judgment_attempts),
+            judgment=judgment,
+            judgment_attempts=judgment_attempts,
+        )
+
+    def _judgments_for(self, contribution_ids: list[str]) -> list[Judgment]:
+        """Return the judgments on *contribution_ids*, oldest verdict first."""
+        if not contribution_ids:
+            return []
+        placeholders = ", ".join("?" for _ in contribution_ids)
+        rows = self._conn.execute(
+            f"""
+            SELECT id, contribution_id, decision, judged_by, notes, created_at
+            FROM judgments
+            WHERE contribution_id IN ({placeholders})
+            ORDER BY created_at ASC, rowid ASC
+            """,
+            contribution_ids,
+        ).fetchall()
+        return [Judgment(**dict(row)) for row in rows]
+
+    def _judgment_attempts_for(self, contribution_ids: list[str]) -> list[JudgmentAttempt]:
+        """Return the judgment-attempt events on *contribution_ids*, oldest first."""
+        if not contribution_ids:
+            return []
+        placeholders = ", ".join("?" for _ in contribution_ids)
+        rows = self._conn.execute(
+            f"""
+            SELECT id, contribution_id, error_class, message, attempted_at, outcome
+            FROM judgment_attempts
+            WHERE contribution_id IN ({placeholders})
+            ORDER BY attempted_at ASC, rowid ASC
+            """,
+            contribution_ids,
+        ).fetchall()
+        return [JudgmentAttempt(**dict(row)) for row in rows]
 
     def list_recent_contributions(
         self,
@@ -1176,6 +1396,42 @@ class RecordStore:
 # ---------------------------------------------------------------------------
 # Row → model helpers
 # ---------------------------------------------------------------------------
+
+
+def _derive_contribution_state(
+    contribution_id: str,
+    judgment: Judgment | None,
+    attempts: list[JudgmentAttempt],
+) -> ContributionState:
+    """Derive one contribution's :class:`ContributionState` from its verdict and attempts.
+
+    The single derivation behind every state-carrying read
+    (:meth:`RecordStore.list_contribution_states`,
+    :meth:`RecordStore.page_record`, :meth:`RecordStore.get_record_entry`), so
+    a whole-record read, a page, and a by-id lookup can never disagree about
+    what a contribution's state is.
+    """
+    # A verdict always wins: a contribution that failed twice and was then
+    # re-judged successfully is judged, not judge_failed.
+    if judgment is not None:
+        state: Literal["judged", "judge_failed", "pending"] = "judged"
+    elif any(a.outcome == JUDGE_FAILED for a in attempts):
+        state = "judge_failed"
+    else:
+        state = "pending"
+    last_failure = next(
+        (a for a in reversed(attempts) if a.outcome == JUDGE_FAILED),
+        None,
+    )
+    return ContributionState(
+        contribution_id=contribution_id,
+        state=state,
+        decision=judgment.decision if judgment is not None else None,
+        failed_attempts=len(attempts),
+        error_class=last_failure.error_class if last_failure is not None else None,
+        error_message=last_failure.message if last_failure is not None else None,
+        failed_at=last_failure.attempted_at if last_failure is not None else None,
+    )
 
 
 def _contribution_from_row(row: sqlite3.Row) -> Contribution:

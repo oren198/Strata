@@ -1292,6 +1292,10 @@ def test_entitled_no_argument_returns_bound_scope_data(tmp_path: Path) -> None:
         "judgments": [],
         "judgment_attempts": [],
         "contribution_states": [],
+        # The record read is bounded by default (issue #130); an empty record
+        # still reports its page, so "empty" and "first page of many" are
+        # never confused.
+        "page": {"limit": mod._settings.record_page_size, "total": 0, "next_before_id": None},
     }
 
 
@@ -1383,6 +1387,8 @@ def test_entitled_own_empty_record_returns_empty_shape(tmp_path: Path) -> None:
         "judgments": [],
         "judgment_attempts": [],
         "contribution_states": [],
+        # Bounded by default (issue #130) — the empty shape now names its page.
+        "page": {"limit": mod._settings.record_page_size, "total": 0, "next_before_id": None},
     }
 
 
@@ -2481,3 +2487,189 @@ def test_instructions_declare_contribution_norm(tmp_path: Path) -> None:
     assert "strata_session_closeout" in instructions
     assert "strata_contribute" in instructions
     assert "contribute" in instructions.lower()
+
+
+# ---------------------------------------------------------------------------
+# Test 38: the paged record read and the by-id lookup (issue #130)
+# ---------------------------------------------------------------------------
+
+
+def _seed_contributions(db_path: str, scope_id: str, count: int) -> list[str]:
+    """Append *count* contributions to *scope_id* and return their ids, oldest first."""
+    contributor = _make_contributor()
+    with RecordStore(db_path) as rs:
+        return [
+            rs.append_contribution(
+                scope_id=scope_id,
+                content=f"contribution {i}",
+                proposed_classification="context",
+                subject=None,
+                supersedes=None,
+                contributor=contributor,
+            ).id
+            for i in range(count)
+        ]
+
+
+def _record_reader(tmp_path: Path, fleet_path: Path) -> tuple[object, str]:
+    """Load the MCP module against a fresh migrated DB; return ``(module, db_path)``."""
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+    return mod, db_path
+
+
+def test_read_scope_record_is_bounded_by_default(tmp_path: Path) -> None:
+    """The breaking change issue #130 asks for: an unadorned call is the newest page.
+
+    The unbounded default was the bug — a whole-record read overflows the
+    tool-result limit of the agents the forensic view exists for.
+    """
+    fleet_path = _make_fleet_yaml(tmp_path)
+    mod, db_path = _record_reader(tmp_path, fleet_path)
+    expected = _seed_contributions(db_path, "g_backend", 5)
+    mod._record_store = RecordStore(db_path)
+
+    fleet = FleetConfig.load(fleet_path)
+    with (
+        patch.object(mod, "_AGENT_SCOPE", "g_backend"),
+        patch.object(mod, "_load_fleet", return_value=fleet),
+    ):
+        default_page = mod.strata_read_scope_record("g_backend")
+        small_page = mod.strata_read_scope_record("g_backend", limit=2)
+
+    # The default page size comes from settings, never a literal at the call site.
+    assert default_page["page"]["limit"] == mod._settings.record_page_size
+    assert default_page["page"]["total"] == 5
+    # Newest first — the forensic reader almost always wants what just happened.
+    assert [c["id"] for c in small_page["contributions"]] == [expected[4], expected[3]]
+    assert small_page["page"]["next_before_id"] == expected[3]
+
+
+def test_read_scope_record_pages_walk_the_whole_record(tmp_path: Path) -> None:
+    """Walking before_id until it is null covers the record exactly once."""
+    fleet_path = _make_fleet_yaml(tmp_path)
+    mod, db_path = _record_reader(tmp_path, fleet_path)
+    expected = _seed_contributions(db_path, "g_backend", 5)
+    mod._record_store = RecordStore(db_path)
+
+    fleet = FleetConfig.load(fleet_path)
+    walked: list[str] = []
+    with (
+        patch.object(mod, "_AGENT_SCOPE", "g_backend"),
+        patch.object(mod, "_load_fleet", return_value=fleet),
+    ):
+        cursor = None
+        while True:
+            page = mod.strata_read_scope_record("g_backend", limit=2, before_id=cursor)
+            walked.extend(c["id"] for c in page["contributions"])
+            cursor = page["page"]["next_before_id"]
+            if cursor is None:
+                break
+
+    assert walked == list(reversed(expected))
+
+
+def test_read_scope_record_rejects_out_of_range_paging(tmp_path: Path) -> None:
+    """A limit below 1 and a stale cursor both fail loudly."""
+    fleet_path = _make_fleet_yaml(tmp_path)
+    mod, db_path = _record_reader(tmp_path, fleet_path)
+    mod._record_store = RecordStore(db_path)
+
+    fleet = FleetConfig.load(fleet_path)
+    with (
+        patch.object(mod, "_AGENT_SCOPE", "g_backend"),
+        patch.object(mod, "_load_fleet", return_value=fleet),
+    ):
+        with pytest.raises(RuntimeError, match="Invalid record page"):
+            mod.strata_read_scope_record("g_backend", limit=0)
+        with pytest.raises(RuntimeError, match="before_id is not a contribution"):
+            mod.strata_read_scope_record("g_backend", before_id="c_does_not_exist")
+
+
+def test_read_contribution_returns_state_and_verdict(tmp_path: Path) -> None:
+    """The by-id hit: one contribution, its state, and the scope-manager's notes."""
+    fleet_path = _make_fleet_yaml(tmp_path)
+    mod, db_path = _record_reader(tmp_path, fleet_path)
+    (contribution_id,) = _seed_contributions(db_path, "g_backend", 1)
+    with RecordStore(db_path) as rs:
+        rs.record_judgment(
+            contribution_id=contribution_id,
+            decision="accept_as_context",
+            judged_by="scope-manager",
+            notes="Accepted: adds a fact the context section lacked.",
+        )
+    mod._record_store = RecordStore(db_path)
+
+    fleet = FleetConfig.load(fleet_path)
+    with (
+        patch.object(mod, "_AGENT_SCOPE", "g_backend"),
+        patch.object(mod, "_load_fleet", return_value=fleet),
+    ):
+        result = mod.strata_read_contribution(contribution_id)
+
+    assert result["contribution"]["id"] == contribution_id
+    assert result["state"]["state"] == "judged"
+    assert result["judgment"]["decision"] == "accept_as_context"
+    assert result["judgment"]["notes"] == "Accepted: adds a fact the context section lacked."
+    assert result["judgment_attempts"] == []
+
+
+def test_read_contribution_marks_a_failed_judgment(tmp_path: Path) -> None:
+    """judge_failed carries no verdict — "the judge errored" never reads as "in flight"."""
+    fleet_path = _make_fleet_yaml(tmp_path)
+    mod, db_path = _record_reader(tmp_path, fleet_path)
+    (contribution_id,) = _seed_contributions(db_path, "g_backend", 1)
+    with RecordStore(db_path) as rs:
+        rs.record_judgment_attempt(
+            contribution_id=contribution_id,
+            error_class="APIError",
+            message="upstream timeout",
+            outcome="judge_failed",
+        )
+    mod._record_store = RecordStore(db_path)
+
+    fleet = FleetConfig.load(fleet_path)
+    with (
+        patch.object(mod, "_AGENT_SCOPE", "g_backend"),
+        patch.object(mod, "_load_fleet", return_value=fleet),
+    ):
+        result = mod.strata_read_contribution(contribution_id)
+
+    assert result["state"]["state"] == "judge_failed"
+    assert result["state"]["error_class"] == "APIError"
+    assert result["judgment"] is None
+    assert [a["error_class"] for a in result["judgment_attempts"]] == ["APIError"]
+
+
+def test_read_contribution_raises_for_an_unknown_id(tmp_path: Path) -> None:
+    """The by-id miss raises the record's existing not-found idiom."""
+    fleet_path = _make_fleet_yaml(tmp_path)
+    mod, db_path = _record_reader(tmp_path, fleet_path)
+    mod._record_store = RecordStore(db_path)
+
+    fleet = FleetConfig.load(fleet_path)
+    with (
+        patch.object(mod, "_AGENT_SCOPE", "g_backend"),
+        patch.object(mod, "_load_fleet", return_value=fleet),
+        pytest.raises(RuntimeError, match="Contribution not found"),
+    ):
+        mod.strata_read_contribution("c_does_not_exist")
+
+
+def test_read_contribution_refuses_a_contribution_outside_the_entitled_surface(
+    tmp_path: Path,
+) -> None:
+    """The by-id lookup never reaches a record the scope read cannot (issue #48)."""
+    fleet_path = _make_peer_composition_fleet_yaml(tmp_path)
+    mod, db_path = _record_reader(tmp_path, fleet_path)
+    (peer_contribution,) = _seed_contributions(db_path, "g_peer_a", 1)
+    mod._record_store = RecordStore(db_path)
+
+    fleet = FleetConfig.load(fleet_path)
+    with (
+        patch.object(mod, "_AGENT_SCOPE", "g_team"),
+        patch.object(mod, "_load_fleet", return_value=fleet),
+        pytest.raises(RuntimeError, match="outside your entitled surface"),
+    ):
+        mod.strata_read_contribution(peer_contribution)

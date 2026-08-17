@@ -62,6 +62,12 @@ class Settings(BaseSettings):
     # scope-manager. Raise it when judgment needs deeper record history in
     # view; lower it to shrink the prompt.
     recency_window_size: int = Field(default=20, ge=1)
+    # Issue #130: how many contributions one page of a record read carries.
+    # The record is append-only and only ever grows, so an unbounded read is
+    # unbounded by construction; a page bounds the response without hiding
+    # anything — the rest is one cursor away. Raise it to walk a long record in
+    # fewer round trips; lower it to fit a tighter response budget.
+    record_page_size: int = Field(default=20, ge=1)
     # ADR 0011 D3: how many queued contributions one judgment call may carry.
     # A cap keeps the prompt bounded and keeps a failed call from stranding
     # more than a cap's worth of contributions at once. 1 disables coalescing

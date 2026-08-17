@@ -219,6 +219,66 @@ def test_record_renders_contributions_and_judgments(
     assert "use gRPC" in out
 
 
+def test_record_is_bounded_by_default_and_names_the_next_page(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``strata record`` prints one page, newest first, and how to see older ones.
+
+    The CLI is a host onto the record like any other (issue #130): printing all
+    of an append-only log was unbounded by construction.
+    """
+    _seed_fleet(tmp_path, monkeypatch)
+    db_path = tmp_path / "test.db"
+    contributor = ContributorRef(
+        scope_id="g_arch", skill="architect", session_id="sess_x", ts="2026-05-23T20:00:00Z"
+    )
+    with RecordStore(str(db_path)) as rs:
+        ids = [
+            rs.append_contribution(
+                scope_id="g_arch",
+                content=f"contribution {i}",
+                proposed_classification="context",
+                subject=None,
+                supersedes=None,
+                contributor=contributor,
+            ).id
+            for i in range(4)
+        ]
+
+    rc = main(["record", "g_arch", "--limit", "2"])
+    assert rc == 0
+    out = capsys.readouterr().out
+
+    # The newest two, and neither of the older two.
+    assert "Contributions: 2 of 4 (newest first)" in out
+    assert ids[3] in out
+    assert ids[2] in out
+    assert ids[1] not in out
+    assert ids[0] not in out
+    # The cursor for the next page is the exact command to run.
+    assert f"strata record g_arch --before {ids[2]}" in out
+
+    # Following that cursor yields the older two and no next-page line.
+    rc = main(["record", "g_arch", "--limit", "2", "--before", ids[2]])
+    assert rc == 0
+    older = capsys.readouterr().out
+    assert ids[1] in older
+    assert ids[0] in older
+    assert "--before" not in older
+
+
+def test_record_rejects_a_stale_cursor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A cursor that names no contribution in the scope fails instead of restarting."""
+    _seed_fleet(tmp_path, monkeypatch)
+
+    rc = main(["record", "g_arch", "--before", "c_does_not_exist"])
+
+    assert rc == 1
+    assert "before_id is not a contribution" in capsys.readouterr().err
+
+
 def test_status_renders_per_scope_staleness_metric(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
