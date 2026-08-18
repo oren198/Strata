@@ -9,8 +9,10 @@ receipt fixture.
 from __future__ import annotations
 
 import multiprocessing
+import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 
@@ -19,10 +21,15 @@ from strata.record_store import ContributorRef, RecordStore
 from strata.session_state import (
     DEFAULT_STALENESS_WINDOW_DAYS,
     SessionStateStore,
+    _last_accepted_contribution_at,
+    _parse_ts,
     compute_fleet_staleness,
     compute_scope_staleness,
     sessions_dir_for,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 # ---------------------------------------------------------------------------
 # Fixtures / helpers
@@ -291,4 +298,169 @@ def test_compute_fleet_staleness_preserves_order_and_default_window(tmp_path: Pa
     assert metrics[0].window_days == DEFAULT_STALENESS_WINDOW_DAYS
     assert metrics[0].reads_since_last_contribution == 1
     assert metrics[1].reads_since_last_contribution == 0
+    rs.close()
+
+
+# ---------------------------------------------------------------------------
+# Last accepted contribution — bounded query vs. the whole-record scan
+# ---------------------------------------------------------------------------
+
+
+def _append(rs: RecordStore, scope_id: str, content: str) -> str:
+    """Append an unjudged contribution to *scope_id*; return its id."""
+    return rs.append_contribution(
+        scope_id=scope_id,
+        content=content,
+        proposed_classification="context",
+        subject=None,
+        supersedes=None,
+        contributor=_contributor(),
+    ).id
+
+
+def _set_created_at(db_path: str, contribution_id: str, created_at: str) -> None:
+    """Force a contribution's record timestamp.
+
+    ``contributions.created_at`` defaults to ``datetime('now')``, so appends
+    inside one test are seconds apart at best — a fixture that needs a chosen
+    order, or a deliberate same-second tie, has to write the column.
+    """
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        "UPDATE contributions SET created_at = ? WHERE id = ?", (created_at, contribution_id)
+    )
+    conn.commit()
+    conn.close()
+
+
+def _legacy_last_accepted_contribution_at(
+    scope_id: str, *, record_store: RecordStore
+) -> tuple[str | None, datetime | None]:
+    """The superseded whole-record scan, kept as the equivalence oracle.
+
+    Pulls every contribution and every judgment for the scope and picks the
+    newest accepted one in Python — what
+    :func:`strata.session_state._last_accepted_contribution_at` did before the
+    record grew a bounded query for it.
+    """
+    accepted = frozenset({"accept_as_directive", "accept_as_context"})
+    contributions = record_store.list_contributions(scope_id=scope_id)
+    judgments = {j.contribution_id: j for j in record_store.list_judgments(scope_id=scope_id)}
+
+    latest_raw: str | None = None
+    latest_parsed: datetime | None = None
+    for contribution in contributions:
+        judgment = judgments.get(contribution.id)
+        if judgment is None or judgment.decision not in accepted:
+            continue
+        parsed = _parse_ts(contribution.created_at)
+        if parsed is None:
+            continue
+        if latest_parsed is None or parsed > latest_parsed:
+            latest_parsed = parsed
+            latest_raw = contribution.created_at
+    return latest_raw, latest_parsed
+
+
+def _case_no_contributions(rs: RecordStore, db_path: str) -> str | None:
+    """A scope whose record is empty."""
+    return None
+
+
+def _case_no_judgments(rs: RecordStore, db_path: str) -> str | None:
+    """Contributions that carry no verdict at all — pending, not accepted."""
+    _append(rs, "g_x", "awaiting judgment")
+    _append(rs, "g_x", "also awaiting judgment")
+    return None
+
+
+def _case_declined_only(rs: RecordStore, db_path: str) -> str | None:
+    """Every contribution declined — a decline is not an acceptance."""
+    for content in ("junk", "more junk"):
+        cid = _append(rs, "g_x", content)
+        rs.record_judgment(contribution_id=cid, decision="decline", judged_by="scope-manager")
+    return None
+
+
+def _case_accepted_then_declined(rs: RecordStore, db_path: str) -> str | None:
+    """The newest contribution is declined; the answer is the older accepted one."""
+    accepted = _append(rs, "g_x", "accepted")
+    _set_created_at(db_path, accepted, "2026-05-01 10:00:00")
+    rs.record_judgment(
+        contribution_id=accepted, decision="accept_as_directive", judged_by="scope-manager"
+    )
+
+    declined = _append(rs, "g_x", "declined later")
+    _set_created_at(db_path, declined, "2026-05-02 10:00:00")
+    rs.record_judgment(contribution_id=declined, decision="decline", judged_by="scope-manager")
+
+    pending = _append(rs, "g_x", "unjudged, later still")
+    _set_created_at(db_path, pending, "2026-05-03 10:00:00")
+    return "2026-05-01 10:00:00"
+
+
+def _case_several_accepted_newest_wins(rs: RecordStore, db_path: str) -> str | None:
+    """Several acceptances out of insertion order — the newest one wins."""
+    for content, created_at in (
+        ("middle", "2026-05-02 10:00:00"),
+        ("newest", "2026-05-03 10:00:00"),
+        ("oldest", "2026-05-01 10:00:00"),
+    ):
+        cid = _append(rs, "g_x", content)
+        _set_created_at(db_path, cid, created_at)
+        rs.record_judgment(
+            contribution_id=cid, decision="accept_as_context", judged_by="scope-manager"
+        )
+    return "2026-05-03 10:00:00"
+
+
+def _case_same_second_tie(rs: RecordStore, db_path: str) -> str | None:
+    """Two acceptances sharing one second — the rowid tie-break decides."""
+    for content in ("first this second", "second this second"):
+        cid = _append(rs, "g_x", content)
+        _set_created_at(db_path, cid, "2026-05-04 10:00:00")
+        rs.record_judgment(
+            contribution_id=cid, decision="accept_as_directive", judged_by="scope-manager"
+        )
+    return "2026-05-04 10:00:00"
+
+
+def _case_other_scope_only(rs: RecordStore, db_path: str) -> str | None:
+    """An acceptance in a different scope never answers for this one."""
+    cid = _append(rs, "g_other", "not this scope")
+    rs.record_judgment(contribution_id=cid, decision="accept_as_context", judged_by="scope-manager")
+    return None
+
+
+@pytest.mark.parametrize(
+    "build_case",
+    [
+        _case_no_contributions,
+        _case_no_judgments,
+        _case_declined_only,
+        _case_accepted_then_declined,
+        _case_several_accepted_newest_wins,
+        _case_same_second_tie,
+        _case_other_scope_only,
+    ],
+    ids=lambda fn: fn.__name__.removeprefix("_case_"),
+)
+def test_last_accepted_matches_the_whole_record_scan(
+    tmp_path: Path, build_case: Callable[[RecordStore, str], str | None]
+) -> None:
+    """The bounded query answers exactly what the whole-record scan answered.
+
+    The scan is the oracle (:func:`_legacy_last_accepted_contribution_at`); the
+    expected timestamp each case names pins the answer down absolutely, so a
+    matching pair of wrong implementations still fails.
+    """
+    db_path = str(tmp_path / "strata.db")
+    rs = _record_store(tmp_path)
+    expected_raw = build_case(rs, db_path)
+
+    got = _last_accepted_contribution_at("g_x", record_store=rs)
+
+    assert got == _legacy_last_accepted_contribution_at("g_x", record_store=rs)
+    assert got[0] == expected_raw
+    assert got[1] == (None if expected_raw is None else _parse(expected_raw))
     rs.close()

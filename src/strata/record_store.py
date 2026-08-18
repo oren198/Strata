@@ -164,6 +164,12 @@ class Judgment:
 JUDGE_FAILED = "judge_failed"
 
 
+# The verdicts that count as an *accepted* contribution.  A ``decline`` is the
+# scope-manager rejecting a proposal — it never enters the scope summary, so it
+# is not an acceptance.
+_ACCEPTED_DECISIONS = frozenset({"accept_as_directive", "accept_as_context"})
+
+
 #: The engine default for the recency window (ADR 0011 D2): how many of the
 #: newest contributions :meth:`RecordStore.list_recent_contributions` returns
 #: to the judgment and refresh paths.  Deployments override it via
@@ -1026,6 +1032,48 @@ class RecordStore:
             (JUDGE_FAILED, scope_id, limit),
         ).fetchall()
         return [_recent_contribution_from_row(row) for row in reversed(rows)]
+
+    def get_latest_accepted_contribution(self, *, scope_id: str) -> Contribution | None:
+        """Return *scope_id*'s newest accepted contribution, or ``None`` if it has none.
+
+        "Accepted" is the verdict accepting the contribution as a directive or
+        as context; a ``decline`` is not one, and neither is an unjudged or
+        judge-failed contribution (no verdict at all).  The freshness metric
+        (:mod:`strata.session_state`) asks this to date a scope's last update —
+        one row, so it must not cost a whole-record read: the record only ever
+        grows, and zipping every contribution against every judgment in Python
+        to find one row is the cost this query exists to bound.
+
+        Ordering is ``created_at DESC, rowid DESC`` — the record's total order
+        (see :meth:`page_record`), so a same-second tie resolves to the row
+        appended last rather than to an arbitrary one.
+
+        Args:
+            scope_id: The scope whose record to search.
+
+        Returns:
+            The newest accepted :class:`Contribution`, or ``None``.
+        """
+        decisions = tuple(_ACCEPTED_DECISIONS)
+        placeholders = ", ".join("?" for _ in decisions)
+        row = self._conn.execute(
+            f"""
+            SELECT c.id, c.scope_id, c.content, c.proposed_classification,
+                   c.subject, c.supersedes,
+                   c.contributor_scope_id, c.contributor_skill,
+                   c.contributor_session_id, c.contributor_ts,
+                   c.created_at
+            FROM contributions c
+            JOIN judgments j ON j.contribution_id = c.id
+            WHERE c.scope_id = ? AND j.decision IN ({placeholders})
+            ORDER BY c.created_at DESC, c.rowid DESC
+            LIMIT 1
+            """,
+            (scope_id, *decisions),
+        ).fetchone()
+        if row is None:
+            return None
+        return _contribution_from_row(row)
 
     # ------------------------------------------------------------------
     # Operator acts (the operator's own record — ADR 0008 D1)

@@ -834,3 +834,62 @@ def test_record_entry_of_an_unknown_id_is_none(tmp_path: Path) -> None:
         _contribute(rs, "a real contribution")
 
         assert rs.get_record_entry("c_does_not_exist") is None
+
+
+# ---------------------------------------------------------------------------
+# Scenario — the latest accepted contribution (bounded freshness query)
+# ---------------------------------------------------------------------------
+
+
+def test_latest_accepted_contribution_skips_declines_and_unjudged(tmp_path: Path) -> None:
+    """Only a verdict accepting the contribution counts; a newer decline does not."""
+    with _open_store(str(tmp_path / "strata.db")) as rs:
+        accepted = _contribute(rs, "the last thing this scope agreed")
+        rs.record_judgment(
+            contribution_id=accepted, decision="accept_as_context", judged_by="scope-manager"
+        )
+        declined = _contribute(rs, "rejected proposal")
+        rs.record_judgment(contribution_id=declined, decision="decline", judged_by="scope-manager")
+        errored = _contribute(rs, "the judge blew up")
+        rs.record_judgment_attempt(
+            contribution_id=errored, error_class="APIError", outcome=JUDGE_FAILED
+        )
+        _contribute(rs, "no verdict yet")
+
+        latest = rs.get_latest_accepted_contribution(scope_id="g_ceo")
+
+    assert latest is not None
+    assert latest.id == accepted
+
+
+def test_latest_accepted_contribution_is_none_without_one(tmp_path: Path) -> None:
+    """A scope with no accepted contribution — and a foreign scope's — answers None."""
+    with _open_store(str(tmp_path / "strata.db")) as rs:
+        declined = _contribute(rs, "rejected proposal")
+        rs.record_judgment(contribution_id=declined, decision="decline", judged_by="scope-manager")
+
+        assert rs.get_latest_accepted_contribution(scope_id="g_ceo") is None
+        assert rs.get_latest_accepted_contribution(scope_id="g_empty") is None
+
+
+def test_latest_accepted_contribution_breaks_a_same_second_tie_by_rowid(tmp_path: Path) -> None:
+    """Same-second acceptances resolve to the row appended last, per the record's order."""
+    db_path = str(tmp_path / "strata.db")
+    with _open_store(db_path) as rs:
+        ids = []
+        for content in ("first this second", "second this second"):
+            cid = _contribute(rs, content)
+            rs.record_judgment(
+                contribution_id=cid, decision="accept_as_directive", judged_by="scope-manager"
+            )
+            ids.append(cid)
+        # created_at defaults to datetime('now'), so a tie has to be written.
+        conn = sqlite3.connect(db_path)
+        conn.execute("UPDATE contributions SET created_at = '2026-05-04 10:00:00'")
+        conn.commit()
+        conn.close()
+
+        latest = rs.get_latest_accepted_contribution(scope_id="g_ceo")
+
+    assert latest is not None
+    assert latest.id == ids[-1]
