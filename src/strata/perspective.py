@@ -3,8 +3,8 @@
 Extracted from ``strata.mcp.server`` (plan item S2.1): perspective
 composition — layer ordering, relation labelling, and the synthesized-empty-
 summary fallback — used to live only inside the ``strata_read_perspective``
-MCP tool, which ADR 0001 documents as "not cleanly importable." Hosting
-consumers (e.g. strata-web) had no choice but to copy the logic by hand. This
+MCP tool, which ADR 0001 documents as "not cleanly importable." Consumers
+embedding the engine had no choice but to copy the logic by hand. This
 module is now the single place composition lives; ``strata.mcp.server``
 delegates to :func:`compose_perspective` after its own entitlement checks.
 

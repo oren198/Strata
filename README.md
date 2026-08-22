@@ -68,17 +68,6 @@ section below for the ADRs already landed.
 
 ---
 
-## Hosted option
-
-Strata is a complete, independent open-source engine — everything in this
-README runs locally. If you'd rather not run it yourself,
-[memfleet.com](https://memfleet.com) is the hosted platform built on this
-engine: Workspaces (each a full Strata fleet with its memory), Registered
-Agents with bearer credentials, a web Console for the whole lifecycle, and
-judgment run as a platform service. Agents connect over MCP or REST.
-
----
-
 ## Quick start
 
 A first-time, copy-paste-able run. Five steps, ~5 minutes.
@@ -218,13 +207,11 @@ strata register              # idempotent: creates .strata/, seeds fleet.yaml, w
 > **PyPI distribution name vs. import/CLI names.** The Strata engine is
 > published to PyPI as **`strata-mem`** (the name `strata` was already taken
 > by an unrelated, dormant package — see
-> [issue #49](https://github.com/oren198/Strata/issues/49); the engine/cloud
-> packaging split is
+> [issue #49](https://github.com/oren198/Strata/issues/49); the decision is
 > [ADR 0009](docs/adr/0009-packaging-engine-client-split.md)). Everything you
 > actually type stays `strata`: `import strata` in Python, and the
 > `strata` / `strata-mcp` console scripts on your PATH. Only the
-> `pipx install` / `pip install` argument differs. The `memfleet` distribution
-> name belongs to the separate cloud client (memfleet.com), not the engine.
+> `pipx install` / `pip install` argument differs.
 
 ### What `strata register` does
 
