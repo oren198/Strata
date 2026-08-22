@@ -1580,8 +1580,8 @@ _PROJECT_MARKERS = (".git", "pyproject.toml", "package.json", "Cargo.toml", "go.
 
 # The additive-merge constants and machinery (_MCP_ENTRY, _GITIGNORE_MARKER,
 # _GITIGNORE_BLOCK, _CONFIG_TOML, the settings merge, skill copy, and --diff
-# rendering) live in strata.install — the documented import surface the
-# memfleet cloud client reuses (ADR 0009 D3). Imported at the top of this
+# rendering) live in strata.install — the documented public import surface
+# (ADR 0009 D3). Imported at the top of this
 # module; strata register below is built on them so the rules exist once.
 
 

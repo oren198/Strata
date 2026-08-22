@@ -26,8 +26,7 @@ Three owner rulings bind this mechanism:
 
 1. **Judge-aware from day one.** Scope-managers see the operator memory
    binding their scope when judging, and decline contributions that
-   contradict it. Judge-blind (the strata-web#37 prototype) is rejected as
-   the landing state.
+   contradict it. Judge-blind is rejected as the landing state.
 2. **The operator reads everything** — every scope's summary and record.
 3. **Manual correction.** The operator may supersede or retire any scope's
    memory in person, recorded under operator provenance; scope-managers
@@ -40,11 +39,11 @@ the operator rather than eroding it.
 
 What this ADR decides is the mechanism: where operator memory lives, how it
 composes, how judges see it, and what shape corrections take — all landing
-inside the #83 library primitives so no consumer (MCP server, CLI, Console,
-strata-web) re-implements any of it. strata-web's hand-rolled operator
-writes (`judged_by='operator'`, decision literals, supersedes-FK — the
-highest silent-drift risk its design review found) are the shape this ADR
-takes ownership of.
+inside the #83 library primitives so nothing outside them (MCP server, CLI,
+Console) re-implements any of it. Hand-rolled operator writes
+(`judged_by='operator'`, decision literals, supersedes-FK — the highest
+silent-drift risk design review found) are the shape this ADR takes
+ownership of.
 
 A distinction the rulings imply, named here because the storage follows
 from it: the operator acts in **two different capacities**.
@@ -91,8 +90,7 @@ every scope already has:
 Entry surfaces: the acts are **library primitives** (#83), fronted in
 vanilla Strata by a CLI subcommand group (`strata operator publish |
 supersede | retire | show`) — Strata must work fully locally — and consumed
-by hosting platforms through their adapters (strata-web#16 tracker). No
-agent-facing MCP surface: agents are never the operator.
+by hosting platforms through their own adapters. No agent-facing MCP surface: agents are never the operator.
 
 ### D2. Composition — a verbatim, labelled layer above its attachment point
 
@@ -162,9 +160,9 @@ primitives, defined by Strata's contract:
   future scope-manager explicit-retire can reuse.)
 
 Both leave the summary explainable by the record (the #38 invariant), run
-under the per-scope serialization lock, and are exactly the operations
-strata-web hand-rolled and must delete in favour of these primitives
-(#83B). Operator acts on the *operator stratum* (D1) never enter a scope's
+under the per-scope serialization lock, and are exactly the operations a
+consumer would otherwise hand-roll and must delete in favour of these
+primitives (#83B). Operator acts on the *operator stratum* (D1) never enter a scope's
 record — two capacities, two records, per the Context distinction.
 
 ### D5. The operator reads everything
@@ -179,7 +177,7 @@ steering are the operator's job and the operator answers for the fleet.
 
 A library helper derives, from the operator record: layer size (items,
 words, per attachment scope and total) and churn (acts per trailing
-period). Consoles surface it (strata-web W3.2); vanilla Strata prints it in
+period). Consoles surface it; vanilla Strata prints it in
 `strata operator show`. The doctrine reading is documented with the
 numbers: operator memory should be small, rare, and mostly stable — a fleet
 steered day-to-day through this layer has replaced the self-correcting
@@ -199,7 +197,7 @@ it must be able to tell the operator it is wrong.
 ## Alternatives Considered
 
 - **Judge-blind composition** (compose the layer read-only, keep judges
-  unaware — the strata-web#37 prototype). Rejected by owner ruling: a judge
+  unaware). Rejected by owner ruling: a judge
   that cannot see operator memory accepts contributions that contradict it,
   planting incoherence into every reader's perspective and forcing readers
   to resolve conflicts the judgment loop exists to prevent.
@@ -242,7 +240,7 @@ it must be able to tell the operator it is wrong.
   authority is delegated, and the delegator is now a first-class,
   accountable, composable layer — with no new precedence rule, no new
   memory kind, and no `fleet.yaml` change.
-- strata-web deletes its highest-risk hand-rolled semantics (#83B) and every
+- A consumer deletes its highest-risk hand-rolled semantics (#83B); every
   future consumer gets operator features by calling the library.
 - The record explains everything the operator does, in both capacities —
   corrections are auditable per scope, stratum acts per attachment point.
@@ -264,8 +262,8 @@ it must be able to tell the operator it is wrong.
   judged contribution rewrites it. Accepted: correctness of the ruling
   beats cosmetic coherence, and the next rewrite reconciles.
 - No agent-facing surface means operator acts require the CLI or a console —
-  deliberate, but it makes the Console work (strata-web#16/W3.2) the
-  usability path for non-terminal operators.
+  deliberate, but it makes console work the usability path for non-terminal
+  operators.
 
 ---
 
@@ -296,5 +294,5 @@ it must be able to tell the operator it is wrong.
 3. **S2.2 / #91** — this mechanism: operator record + layer + judge-aware
    rendering + D4 primitives; migration picks up #76 first; O-family lands
    in the same release.
-4. strata-web adopts through the adapter (#16 → W3.2), deleting its copied
-   operator-write semantics (#83B) and the `OPERATOR_SKILL` residual.
+4. Consumers adopt through their own adapter, deleting any copied
+   operator-write semantics (#83B).
