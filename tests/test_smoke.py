@@ -4,7 +4,7 @@
 def test_module_imports():
     import strata
 
-    assert strata.__version__ == "1.8.0"
+    assert strata.__version__ == "1.9.0"
 
 
 def test_version_matches_distribution_metadata() -> None:
