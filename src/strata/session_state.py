@@ -35,7 +35,7 @@ Two pieces live here:
 3. **The read-time nudge policy** — the thresholds and wording behind the MCP
    server's stateful read-time nudge (issue #111). Engine-owned so every host
    inherits one policy rather than reinventing it: the local MCP server reads it
-   here, and a hosted host (strata-web) derives the same counters and applies the
+   here, and a remotely-served host derives the same counters and applies the
    same policy rather than growing its own. Pure function of the counters; it
    never judges, never writes.
 
@@ -440,8 +440,8 @@ def compute_fleet_staleness(
 ) -> list[ScopeStaleness]:
     """Compute :func:`compute_scope_staleness` for each scope, preserving order.
 
-    The library entry point hosts (strata-web, ADR 0005) render from: they get
-    the metric per scope without reaching into the record or session internals.
+    The library entry point hosts render from: they get the metric per scope
+    without reaching into the record or session internals.
     """
     now = now or datetime.now(UTC)
     return [
