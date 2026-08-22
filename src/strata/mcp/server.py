@@ -1234,13 +1234,31 @@ def strata_list_scopes() -> dict:
 
 
 @mcp.tool()
-def strata_read_scope_record(scope_id: str | None = None) -> dict:
-    """Return the immutable contribution record for a scope (forensic view).
+def strata_read_scope_record(
+    scope_id: str | None = None,
+    limit: int | None = None,
+    before_id: str | None = None,
+) -> dict:
+    """Return one page of a scope's immutable contribution record (forensic view).
 
     The record is the append-only log of every write ever accepted into the
     scope, including the scope-manager's judgment on each contribution.  Use
     this for debugging, accountability investigation, or understanding the
     history behind the current scope summary.
+
+    BOUNDED BY DEFAULT (issue #130): an unadorned call returns the NEWEST page,
+    not the whole record. The record only ever grows, so a whole-scope read of
+    a long-lived scope runs to megabytes and overflows the tool-result limit of
+    the very agents this view exists for. Nothing is hidden — walk back through
+    older pages with before_id until ``page.next_before_id`` is null.
+
+    Two cheaper reads to prefer over walking this one:
+      - To check ONE contribution — "did the contribution I submitted get
+        judged, and what did the scope-manager say?" — call
+        strata_read_contribution. It answers in a few hundred bytes and is the
+        right tool after a strata_contribute call whose outcome you never saw.
+      - To CONSUME memory rather than audit it, call strata_read_perspective.
+        The record is forensic; the perspective is the working view.
 
     Migration note (issue #48 supersedes the earlier HTTP-parity note): this
     tool used to skip fleet loading entirely and return an empty record for
@@ -1264,13 +1282,24 @@ def strata_read_scope_record(scope_id: str | None = None) -> dict:
             (issue #48) — a peer scope is not readable here even when it is
             referenced by your chain and its summary is otherwise readable
             (ADR 0006 D4).
+        limit: Page size. Defaults to the configured record page size.
+        before_id: Cursor for older pages — pass the previous response's
+            ``page.next_before_id``, and stop when that is null. Paging is
+            stable under concurrent contributions: the cursor anchors on a
+            contribution, so a contribution appended mid-walk lands above the
+            walk and can neither shift nor repeat a row already returned.
 
     Returns:
-        ``contributions`` (list) and ``judgments`` (list).
+        ``contributions``, ``judgments``, ``judgment_attempts``, and
+        ``contribution_states`` (lists) covering this page's contributions
+        only, newest first, plus a ``page`` block carrying ``limit``,
+        ``total`` (the whole record's size), and ``next_before_id`` (null on
+        the last page).
 
     Raises:
         RuntimeError: If scope_id is outside this agent's entitled
-            (chain-only) surface.
+            (chain-only) surface, or the paging arguments are out of range —
+            including a before_id that is not a contribution in this scope.
     """
     fleet = _load_fleet()
 
@@ -1278,24 +1307,91 @@ def strata_read_scope_record(scope_id: str | None = None) -> dict:
         scope_id = _AGENT_SCOPE
     _check_entitled(fleet, scope_id)
 
-    contributions = _record_store.list_contributions(scope_id=scope_id)
-    judgments = _record_store.list_judgments(scope_id=scope_id)
-    judgment_attempts = _record_store.list_judgment_attempts(scope_id=scope_id)
-    contribution_states = _record_store.list_contribution_states(scope_id=scope_id)
+    try:
+        page = _record_store.page_record(
+            scope_id=scope_id,
+            limit=limit if limit is not None else _settings.record_page_size,
+            before_id=before_id,
+        )
+    except ValueError as exc:
+        raise RuntimeError(f"Invalid record page: {exc}") from exc
 
     # The record is a forensic view, not memory consumption, so reading it does
     # not increment the read counter (#110). It still surfaces the nudge when the
     # session already crossed the threshold on its perspective/summary reads.
     return _attach_nudge(
         {
-            "contributions": [asdict(c) for c in contributions],
-            "judgments": [asdict(j) for j in judgments],
+            "contributions": [asdict(c) for c in page.contributions],
+            "judgments": [asdict(j) for j in page.judgments],
             # Failed-judgment events (issue #57): a contribution with attempts but
             # no judgment is pending, distinguishable in the forensic view.
-            "judgment_attempts": [asdict(a) for a in judgment_attempts],
+            "judgment_attempts": [asdict(a) for a in page.judgment_attempts],
             # Per-contribution state (issue #118): judged / judge_failed /
             # pending, so "the judge errored" never reads as "still in flight".
-            "contribution_states": [asdict(s) for s in contribution_states],
+            "contribution_states": [asdict(s) for s in page.contribution_states],
+            # next_before_id is null once the record is exhausted — page until
+            # then rather than inferring the end from a short page.
+            "page": {
+                "limit": page.limit,
+                "total": page.total,
+                "next_before_id": page.next_before_id,
+            },
+        }
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tool: strata_read_contribution (issue #130 — the by-id record read)
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def strata_read_contribution(contribution_id: str) -> dict:
+    """Return one contribution with its state, verdict, and judgment attempts.
+
+    The cheap answer to "what happened to the contribution I submitted?" — the
+    read to make when a strata_contribute call never returned its outcome (the
+    client timed out, the session was interrupted): the contribution may well
+    have landed and been judged, and calling strata_contribute again would
+    duplicate it. This costs a few hundred bytes where the same question asked
+    through strata_read_scope_record costs the scope's whole record.
+
+    The three states are the ones the record distinguishes (issues #57, #118):
+    ``judged`` (a verdict exists — ``judgment`` carries the decision and the
+    scope-manager's notes), ``judge_failed`` (the judge was attempted and
+    errored; nothing more happens without strata_rejudge), and ``pending``
+    (judgment is in flight or was never attempted).
+
+    Read surface: the contribution's own scope must be within this agent's
+    entitled (chain-only) surface, exactly as strata_read_scope_record requires
+    (issue #48) — a by-id lookup never reaches a record the scope read cannot.
+
+    Args:
+        contribution_id: The id returned by strata_contribute (``c_``-prefixed).
+
+    Returns:
+        ``contribution``, ``state`` (the derived state block), ``judgment``
+        (null unless the state is ``judged``), and ``judgment_attempts``.
+
+    Raises:
+        RuntimeError: If the contribution is unknown, or its scope is outside
+            this agent's entitled (chain-only) surface.
+    """
+    fleet = _load_fleet()
+
+    entry = _record_store.get_record_entry(contribution_id)
+    if entry is None:
+        raise RuntimeError(f"Contribution not found: {contribution_id!r}")
+    _check_entitled(fleet, entry.contribution.scope_id)
+
+    # Forensic, like the scope record read: no read counter increment (#110),
+    # but the nudge still rides along.
+    return _attach_nudge(
+        {
+            "contribution": asdict(entry.contribution),
+            "state": asdict(entry.state),
+            "judgment": asdict(entry.judgment) if entry.judgment is not None else None,
+            "judgment_attempts": [asdict(a) for a in entry.judgment_attempts],
         }
     )
 

@@ -94,7 +94,8 @@ perspective — a peer's directives never bind you, only inform you.
 | `strata_read_scope_summary(scope_id=None)` | To consult an ancestor scope explicitly. |
 | `strata_contribute(scope_id, content, proposed_classification, subject, supersedes)` | Per triggers above — **frequently**. |
 | `strata_list_scopes()` | When you need to understand fleet structure. |
-| `strata_read_scope_record(scope_id=None)` | Forensic — full contribution + judgment log. Rare. |
+| `strata_read_scope_record(scope_id=None, limit=None, before_id=None)` | Forensic — newest page of the contribution + judgment log. Rare; `before_id` walks older pages. |
+| `strata_read_contribution(contribution_id)` | To check one contribution's state and verdict — e.g. when a `strata_contribute` call never returned its outcome. |
 
 ## What you do NOT do
 

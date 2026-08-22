@@ -213,9 +213,9 @@ command. (Mass auto-bootstrap was rejected — see Alternatives.)
 Inside the #83 library primitives, not beside them: `compose_perspective`
 carries the peer-publication layers (and ADR 0008's operator layers); the
 publish/withdraw/propagation operations are engine (library) functions the
-MCP server, the CLI, and any hosting consumer (strata-web) call. No consumer
-re-implements publication semantics; strata-web adopts purely through its
-adapter (strata-web#40/#41).
+MCP server, the CLI, and any embedding consumer call. No consumer
+re-implements publication semantics; consumers adopt purely through their
+own adapter.
 
 ---
 
@@ -327,5 +327,4 @@ adapter (strata-web#40/#41).
 3. **S2.3 / #90** — the publication channel per this ADR, inside the
    primitive; any migration picks up #76 first; P-family lands in the same
    release.
-4. strata-web adopts via its adapter (strata-web#40, #41) after the Strata
-   release pins.
+4. Consumers adopt via their own adapter once the release pins.

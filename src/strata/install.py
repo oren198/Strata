@@ -11,9 +11,9 @@ operations Strata performs when it wires itself into a foreign project:
 
 The rules live here, once. ``strata register`` (:mod:`strata.__main__`) is
 built on this module rather than re-implementing them, and ADR 0009 D3 makes
-this boundary the sanctioned dependency for the ``memfleet`` cloud client
-(strata-web ``client/``): the client reuses these additive-merge semantics
-instead of forking them, so there is exactly one implementation. Everything
+this boundary a supported public import surface: a tool that installs Strata
+wiring into a project reuses these additive-merge semantics instead of forking
+them, so there is exactly one implementation. Everything
 here is import-name / CLI-name agnostic — it operates on the engine's install
 artifacts (the ``strata`` MCP server entry, the ``strata*`` skills), which are
 unchanged by the ADR 0009 distribution rename.

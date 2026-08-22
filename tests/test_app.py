@@ -480,6 +480,119 @@ class TestScopeRecord:
         assert len(data["judgments"]) == 2
 
 
+def _seed_record(client, count: int, scope_id: str = "g_active") -> list[str]:
+    """Contribute *count* judged contributions and return their ids, oldest first."""
+    ids: list[str] = []
+    for i in range(count):
+        client.mock_manager.judge.return_value = _make_judgment(
+            decision="accept_as_directive",
+            summary=_make_summary(scope_id, "accept_as_directive"),
+        )
+        resp = client.post(
+            "/contribute",
+            json={
+                "scope_id": scope_id,
+                "content": f"contribution {i}",
+                "proposed_classification": "directive",
+                "contributor": _CONTRIBUTOR_BODY,
+            },
+        )
+        assert resp.status_code == 200
+        ids.append(resp.json()["contribution_id"])
+    return ids
+
+
+class TestScopeRecordPaging:
+    """GET /scopes/{scope_id}/record is bounded by default (issue #130)."""
+
+    def test_unadorned_read_returns_the_newest_page(self, client):
+        """The breaking change the issue asks for: a default read is a page, not a dump."""
+        expected = _seed_record(client, 3)
+
+        data = client.get("/scopes/g_active/record?limit=2").json()
+
+        assert [c["id"] for c in data["contributions"]] == [expected[2], expected[1]]
+        assert data["page"]["limit"] == 2
+        assert data["page"]["total"] == 3
+        assert data["page"]["next_before_id"] == expected[1]
+
+    def test_default_limit_comes_from_settings_never_a_literal(self, client):
+        _seed_record(client, 2)
+
+        data = client.get("/scopes/g_active/record").json()
+
+        assert data["page"]["limit"] == Settings().record_page_size
+
+    def test_pages_walk_the_whole_record_newest_first(self, client):
+        expected = _seed_record(client, 5)
+
+        walked: list[str] = []
+        url = "/scopes/g_active/record?limit=2"
+        while True:
+            data = client.get(url).json()
+            walked.extend(c["id"] for c in data["contributions"])
+            cursor = data["page"]["next_before_id"]
+            if cursor is None:
+                break
+            url = f"/scopes/g_active/record?limit=2&before_id={cursor}"
+
+        assert walked == list(reversed(expected))
+
+    def test_page_wider_than_the_record_exhausts_it(self, client):
+        _seed_record(client, 2)
+
+        data = client.get("/scopes/g_active/record?limit=100").json()
+
+        assert len(data["contributions"]) == 2
+        assert data["page"]["next_before_id"] is None
+
+    def test_empty_record_pages_to_an_empty_page(self, client):
+        data = client.get("/scopes/g_active/record?limit=2").json()
+
+        assert data["contributions"] == []
+        assert data["page"] == {"limit": 2, "total": 0, "next_before_id": None}
+
+    def test_out_of_range_limit_is_422(self, client):
+        resp = client.get("/scopes/g_active/record?limit=0")
+
+        assert resp.status_code == 422
+        assert resp.json()["detail"]["error"] == "invalid_page"
+
+    def test_unknown_cursor_is_422(self, client):
+        """A stale cursor is told so, never silently restarted at the newest row."""
+        resp = client.get("/scopes/g_active/record?before_id=c_does_not_exist")
+
+        assert resp.status_code == 422
+        assert resp.json()["detail"]["error"] == "invalid_page"
+
+
+class TestRecordEntry:
+    """GET /scopes/{scope_id}/record/{contribution_id} (issue #130)."""
+
+    def test_by_id_returns_the_state_and_the_verdict(self, client):
+        (contribution_id,) = _seed_record(client, 1)
+
+        resp = client.get(f"/scopes/g_active/record/{contribution_id}")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["contribution"]["id"] == contribution_id
+        assert data["state"]["state"] == "judged"
+        assert data["state"]["decision"] == "accept_as_directive"
+        assert data["judgment"]["decision"] == "accept_as_directive"
+        assert data["judgment_attempts"] == []
+
+    def test_unknown_contribution_is_404(self, client):
+        resp = client.get("/scopes/g_active/record/c_does_not_exist")
+
+        assert resp.status_code == 404
+
+    def test_missing_scope_returns_404(self, client):
+        resp = client.get("/scopes/g_nonexistent/record/c_whatever")
+
+        assert resp.status_code == 404
+
+
 class TestSettings:
     """Settings env-var override."""
 

@@ -35,7 +35,7 @@ Two pieces live here:
 3. **The read-time nudge policy** — the thresholds and wording behind the MCP
    server's stateful read-time nudge (issue #111). Engine-owned so every host
    inherits one policy rather than reinventing it: the local MCP server reads it
-   here, and a hosted host (strata-web) derives the same counters and applies the
+   here, and a remotely-served host derives the same counters and applies the
    same policy rather than growing its own. Pure function of the counters; it
    never judges, never writes.
 
@@ -80,11 +80,6 @@ except ImportError:  # pragma: no cover — Windows has no fcntl
 # the metric, so a scope that was busy months ago and is quiet now does not read
 # as perpetually stale.
 DEFAULT_STALENESS_WINDOW_DAYS = 30
-
-# Decisions that count as an *accepted* contribution (the release valve for the
-# asymmetry). A ``decline`` verdict is the scope-manager rejecting a proposal —
-# it is not an accepted contribution and does not reset the read/contribute gap.
-_ACCEPTED_DECISIONS = frozenset({"accept_as_directive", "accept_as_context"})
 
 
 # ---------------------------------------------------------------------------
@@ -377,26 +372,16 @@ def _last_accepted_contribution_at(
 ) -> tuple[str | None, datetime | None]:
     """Return the (raw, parsed) timestamp of *scope_id*'s last accepted contribution.
 
-    Joins the scope's contributions against their judgments and takes the most
-    recent contribution whose verdict accepted it (as a directive or as context).
-    Returns ``(None, None)`` when the scope has no accepted contribution.
+    The record answers this with one bounded query
+    (:meth:`~strata.record_store.RecordStore.get_latest_accepted_contribution`)
+    rather than a whole-record scan — the metric is derived on demand and the
+    record only ever grows. Returns ``(None, None)`` when the scope has no
+    accepted contribution.
     """
-    contributions = record_store.list_contributions(scope_id=scope_id)
-    judgments = {j.contribution_id: j for j in record_store.list_judgments(scope_id=scope_id)}
-
-    latest_raw: str | None = None
-    latest_parsed: datetime | None = None
-    for contribution in contributions:
-        judgment = judgments.get(contribution.id)
-        if judgment is None or judgment.decision not in _ACCEPTED_DECISIONS:
-            continue
-        parsed = _parse_ts(contribution.created_at)
-        if parsed is None:
-            continue
-        if latest_parsed is None or parsed > latest_parsed:
-            latest_parsed = parsed
-            latest_raw = contribution.created_at
-    return latest_raw, latest_parsed
+    contribution = record_store.get_latest_accepted_contribution(scope_id=scope_id)
+    if contribution is None:
+        return None, None
+    return contribution.created_at, _parse_ts(contribution.created_at)
 
 
 def compute_scope_staleness(
@@ -455,8 +440,8 @@ def compute_fleet_staleness(
 ) -> list[ScopeStaleness]:
     """Compute :func:`compute_scope_staleness` for each scope, preserving order.
 
-    The library entry point hosts (strata-web, ADR 0005) render from: they get
-    the metric per scope without reaching into the record or session internals.
+    The library entry point hosts render from: they get the metric per scope
+    without reaching into the record or session internals.
     """
     now = now or datetime.now(UTC)
     return [

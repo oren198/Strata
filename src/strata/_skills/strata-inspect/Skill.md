@@ -28,7 +28,11 @@ has the full glossary — read it when present.
    - "What does scope X currently hold?" → `strata_read_scope_summary(X)`.
      Render directives as a list, context as prose.
    - "What's been contributed to scope X?" → `strata_read_scope_record(X)`.
-     Show contributions with their judgments, oldest first.
+     Returns the NEWEST page, not the whole record; show contributions with
+     their judgments and page back with `before_id` if the user needs older
+     ones.
+   - "Did contribution `c_…` get judged?" → `strata_read_contribution(c_…)`.
+     One contribution's state and verdict; never page the whole record for it.
    - "Who decided Y?" → load the relevant scope's record and find the
      contribution whose content matches. Report contributor, timestamp,
      classification, judgment, and any supersedes link.
@@ -50,7 +54,8 @@ than guessing at its content.
 | `strata_list_scopes()` | Fleet overview |
 | `strata_read_scope_summary(scope_id=None)` | A scope's curated current state |
 | `strata_read_perspective(scope_id=None)` | Composed view: this scope's summary + every inter-stratum ancestor's summary, ordered root-first |
-| `strata_read_scope_record(scope_id=None)` | Full append-only contribution + judgment log |
+| `strata_read_scope_record(scope_id=None, limit=None, before_id=None)` | Newest page of the append-only contribution + judgment log; `before_id` walks older pages |
+| `strata_read_contribution(contribution_id)` | One contribution with its state, verdict, and judgment attempts |
 
 ## What you do NOT do
 

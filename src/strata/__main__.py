@@ -539,7 +539,13 @@ def cmd_summary(args: argparse.Namespace) -> int:
 
 
 def cmd_record(args: argparse.Namespace) -> int:
-    """Print a scope's record (all contributions + their judgments) — embedded read."""
+    """Print one page of a scope's record (contributions + judgments) — embedded read.
+
+    Bounded by default (issue #130), like every other door onto the record: the
+    newest page, walked back with ``--before``.  The record only ever grows, so
+    printing all of it was unbounded by construction.
+    """
+    from strata.settings import get_settings
     from strata.stores import EmbeddedStoreError, open_embedded_stores
 
     try:
@@ -554,15 +560,21 @@ def cmd_record(args: argparse.Namespace) -> int:
             print(f"Scope not found: {args.scope_id}", file=sys.stderr)
             return 1
 
-        contributions = stores.record_store.list_contributions(scope_id=args.scope_id)
-        judgments = stores.record_store.list_judgments(scope_id=args.scope_id)
-        states = {
-            s.contribution_id: s
-            for s in stores.record_store.list_contribution_states(scope_id=args.scope_id)
-        }
+        limit = args.limit if args.limit is not None else get_settings().record_page_size
+        try:
+            page = stores.record_store.page_record(
+                scope_id=args.scope_id, limit=limit, before_id=args.before
+            )
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+
+        contributions = page.contributions
+        judgments = page.judgments
+        states = {s.contribution_id: s for s in page.contribution_states}
 
         print(f"Scope: {args.scope_id}")
-        print(f"Contributions: {len(contributions)}")
+        print(f"Contributions: {len(contributions)} of {page.total} (newest first)")
         print(f"Judgments:     {len(judgments)}")
         print()
         for c in contributions:
@@ -606,6 +618,11 @@ def cmd_record(args: argparse.Namespace) -> int:
             for line in c.content.splitlines():
                 print(f"      | {line}")
             print()
+
+        # Name the exact next command rather than leaving the reader to work
+        # the cursor out — the older pages are one keystroke away, not hidden.
+        if page.next_before_id is not None:
+            print(f"Older: strata record {args.scope_id} --before {page.next_before_id}")
     return 0
 
 
@@ -1563,8 +1580,8 @@ _PROJECT_MARKERS = (".git", "pyproject.toml", "package.json", "Cargo.toml", "go.
 
 # The additive-merge constants and machinery (_MCP_ENTRY, _GITIGNORE_MARKER,
 # _GITIGNORE_BLOCK, _CONFIG_TOML, the settings merge, skill copy, and --diff
-# rendering) live in strata.install — the documented import surface the
-# memfleet cloud client reuses (ADR 0009 D3). Imported at the top of this
+# rendering) live in strata.install — the documented public import surface
+# (ADR 0009 D3). Imported at the top of this
 # module; strata register below is built on them so the rules exist once.
 
 
@@ -2331,8 +2348,21 @@ def _build_parser() -> argparse.ArgumentParser:
     p_summary.add_argument("scope_id")
     p_summary.set_defaults(func=cmd_summary)
 
-    p_record = sub.add_parser("record", help="Print a scope's record (contributions + judgments).")
+    p_record = sub.add_parser(
+        "record", help="Print a page of a scope's record (contributions + judgments)."
+    )
     p_record.add_argument("scope_id")
+    p_record.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Contributions per page (default: STRATA_RECORD_PAGE_SIZE).",
+    )
+    p_record.add_argument(
+        "--before",
+        default=None,
+        help="Cursor: show contributions older than this contribution id.",
+    )
     p_record.set_defaults(func=cmd_record)
 
     p_status = sub.add_parser(
