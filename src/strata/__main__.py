@@ -709,7 +709,6 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     """
     from strata.bootstrap import load_fleet_config
     from strata.fleet_config import FleetConfigError
-    from strata.migrator import run_migrations
     from strata.project_config import ProjectConfigError, resolve_storage_paths
 
     checks: list[Check] = []
@@ -743,7 +742,15 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         )
 
     # -----------------------------------------------------------------------
-    # 2. DB reachable and migrated.
+    # 2. DB reachable and migrated. Read-only and diagnostic only — this must
+    # never create or write to the DB it is inspecting. A doctor run in an
+    # unregistered directory is exactly the scenario where a user wants to
+    # find out what's wrong, not have ./strata.db silently materialize as a
+    # side effect of asking. If the file is absent, report that and stop —
+    # no connection is opened. If it exists, open it in SQLite's read-only
+    # URI mode (never sqlite3.connect(path), which auto-creates) and compare
+    # its applied-migrations table against the bundled migration files,
+    # without applying anything.
     # -----------------------------------------------------------------------
     if paths is None:
         checks.append(
@@ -755,29 +762,72 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             )
         )
     else:
-        try:
-            run_migrations(paths.db_path)
-        except (OSError, sqlite3.Error) as exc:
+        db_file = Path(paths.db_path)
+        if not db_file.exists():
             checks.append(
                 Check(
                     name="Database",
                     kind="hard",
                     passed=False,
                     message=(
-                        f"cannot open or migrate {paths.db_path}: {exc} — check the path "
-                        "exists and is writable."
+                        f"no database at {db_file} — run 'strata start' or 'strata register' "
+                        "to create and migrate it (doctor never creates it)."
                     ),
                 )
             )
         else:
-            checks.append(
-                Check(
-                    name="Database",
-                    kind="hard",
-                    passed=True,
-                    message=f"reachable and migrated ({paths.db_path})",
+            from strata.migrator import _default_migrations_dir  # noqa: PLC0415
+
+            conn: sqlite3.Connection | None = None
+            try:
+                conn = sqlite3.connect(f"file:{db_file}?mode=ro", uri=True)
+                try:
+                    applied = {
+                        row[0] for row in conn.execute("SELECT name FROM _migrations").fetchall()
+                    }
+                except sqlite3.OperationalError:
+                    # No _migrations table yet — nothing has been applied.
+                    applied = set()
+                available = {p.name for p in _default_migrations_dir().glob("*.sql")}
+                pending = sorted(available - applied)
+            except sqlite3.Error as exc:
+                checks.append(
+                    Check(
+                        name="Database",
+                        kind="hard",
+                        passed=False,
+                        message=(
+                            f"cannot open {db_file} read-only: {exc} — check it is a valid "
+                            "Strata SQLite database."
+                        ),
+                    )
                 )
-            )
+            else:
+                if pending:
+                    checks.append(
+                        Check(
+                            name="Database",
+                            kind="hard",
+                            passed=False,
+                            message=(
+                                f"reachable but {len(pending)} migration(s) pending: "
+                                f"{', '.join(pending)} — run 'strata migrate' or 'strata "
+                                "start' to apply them."
+                            ),
+                        )
+                    )
+                else:
+                    checks.append(
+                        Check(
+                            name="Database",
+                            kind="hard",
+                            passed=True,
+                            message=f"reachable and migrated ({db_file})",
+                        )
+                    )
+            finally:
+                if conn is not None:
+                    conn.close()
 
     # -----------------------------------------------------------------------
     # 3. fleet.yaml valid.
@@ -957,21 +1007,40 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         )
 
     # -----------------------------------------------------------------------
-    # 7. Skills present.
+    # 7. Skills present AND matching the shipped version (drift detection,
+    # same semantics as the Stop-hook check: present-but-differs gets its own
+    # plain-language line; skill_matches_shipped returning None means the
+    # shipped reference couldn't be read, so — per its own docstring
+    # ("treat conservatively as leave it") — that skill counts as a pass).
     # -----------------------------------------------------------------------
     claude_skills_dir = project_root / ".claude" / "skills"
-    missing_skills = [
-        name for name in SKILL_NAMES if not (claude_skills_dir / name / "Skill.md").exists()
-    ]
-    if missing_skills:
+    missing_skills: list[str] = []
+    mismatched_skills: list[str] = []
+    for name in SKILL_NAMES:
+        skill_md = claude_skills_dir / name / "Skill.md"
+        if not skill_md.exists():
+            missing_skills.append(name)
+            continue
+        if _skill_matches_shipped(skill_md, name) is False:
+            mismatched_skills.append(name)
+
+    if missing_skills or mismatched_skills:
+        problems = []
+        if missing_skills:
+            problems.append(f"missing: {', '.join(missing_skills)}")
+        if mismatched_skills:
+            problems.append(
+                f"stale (does not match the shipped version): {', '.join(mismatched_skills)}"
+            )
         checks.append(
             Check(
                 name="Skills",
                 kind="hard",
                 passed=False,
                 message=(
-                    f"missing: {', '.join(missing_skills)} — run 'strata register' to copy "
-                    "them into .claude/skills/."
+                    "; ".join(problems) + " — run 'strata register' to copy missing skills into "
+                    ".claude/skills/, or 'strata register --diff' to see what changed in "
+                    "the stale ones before deciding whether to restore them."
                 ),
             )
         )
@@ -981,7 +1050,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                 name="Skills",
                 kind="hard",
                 passed=True,
-                message=f"all {len(SKILL_NAMES)} present in .claude/skills/",
+                message=f"all {len(SKILL_NAMES)} present and match the shipped version",
             )
         )
 

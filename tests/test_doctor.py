@@ -138,6 +138,43 @@ def test_doctor_flags_unreachable_db(
     assert "database" in lower
 
 
+def test_doctor_flags_absent_db_without_creating_it(
+    registered_project: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """No DB yet is a reported failure, not something doctor fixes by creating it."""
+    db_path = registered_project / ".strata" / "strata.db"
+    db_path.unlink()
+    for wal_suffix in ("-wal", "-shm"):
+        sibling = Path(str(db_path) + wal_suffix)
+        if sibling.exists():
+            sibling.unlink()
+
+    rc, output = _run_doctor(capsys)
+
+    assert rc == 1
+    lower = output.lower()
+    assert "database" in lower
+    assert "no database" in lower
+    assert "strata start" in lower or "strata register" in lower
+    assert not db_path.exists(), "strata doctor must never create the DB it is diagnosing"
+
+
+def test_doctor_does_not_create_db_in_unregistered_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """The primary use case — doctor in a broken/unregistered project — must not
+    write ./strata.db as a side effect of diagnosing that nothing is set up."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("STRATA_DB_PATH", raising=False)
+    monkeypatch.delenv("STRATA_FLEET_CONFIG", raising=False)
+
+    rc, output = _run_doctor(capsys)
+
+    assert rc == 1
+    assert not (tmp_path / "strata.db").exists()
+    assert not list(tmp_path.glob("*.db"))
+
+
 # ---------------------------------------------------------------------------
 # 3. fleet.yaml valid.
 # ---------------------------------------------------------------------------
@@ -263,6 +300,24 @@ def test_doctor_flags_missing_skill(
     lower = output.lower()
     assert "skill" in lower
     assert "strata-worker" in lower
+    assert "register" in lower
+
+
+def test_doctor_flags_tampered_skill(
+    registered_project: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """A Skill.md present but edited/stale must be flagged, not silently pass
+    (skill_matches_shipped drift detection — same semantics as the Stop hook)."""
+    skill_md = registered_project / ".claude" / "skills" / "strata-worker" / "Skill.md"
+    skill_md.write_text("# Tampered\nThis is not the shipped skill content.\n", encoding="utf-8")
+
+    rc, output = _run_doctor(capsys)
+
+    assert rc == 1
+    lower = output.lower()
+    assert "skill" in lower
+    assert "strata-worker" in lower
+    assert "stale" in lower or "does not match" in lower
     assert "register" in lower
 
 
