@@ -35,7 +35,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from strata import install  # noqa: E402
-from strata.__main__ import cmd_register  # noqa: E402
+from strata.__main__ import cmd_register, cmd_unregister  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -47,13 +47,30 @@ def _init_project(tmp_path: Path) -> None:
 
 
 def _register(
-    tmp_path: Path, *, harness: str = "claude-code", diff: bool = False
+    tmp_path: Path,
+    *,
+    harness: str = "claude-code",
+    diff: bool = False,
+    bootstrap_venv: bool = False,
 ) -> int:
     return cmd_register(
         argparse.Namespace(
             path=str(tmp_path),
             diff=diff,
-            bootstrap_venv=False,
+            bootstrap_venv=bootstrap_venv,
+            harness=harness,
+        )
+    )
+
+
+def _unregister(
+    tmp_path: Path, *, harness: str = "claude-code", dry_run: bool = False
+) -> int:
+    return cmd_unregister(
+        argparse.Namespace(
+            path=str(tmp_path),
+            dry_run=dry_run,
+            purge_data=False,
             harness=harness,
         )
     )
@@ -294,3 +311,180 @@ def test_register_harness_codex_rejects_invalid_settings_json_independently(
     assert install.codex_mcp_present(
         (codex_home / "config.toml").read_text(encoding="utf-8")
     )
+
+
+# ---------------------------------------------------------------------------
+# install.remove_codex_mcp_server / remove_codex_freshness_hook
+# ---------------------------------------------------------------------------
+
+
+def test_remove_codex_mcp_server_removes_canonical_block() -> None:
+    text, _ = install.merge_codex_mcp_server("")
+    new_text, status = install.remove_codex_mcp_server(text)
+    assert status == "removed"
+    assert install.codex_mcp_present(new_text) is False
+    assert new_text == ""
+
+
+def test_remove_codex_mcp_server_leaves_edited_block() -> None:
+    text, _ = install.merge_codex_mcp_server("")
+    edited = text.replace('command = "strata-mcp"', 'command = "strata-mcp-edited"')
+    new_text, status = install.remove_codex_mcp_server(edited)
+    assert status == "edited"
+    assert new_text == edited  # left in place, untouched
+
+
+def test_remove_codex_mcp_server_absent() -> None:
+    new_text, status = install.remove_codex_mcp_server("")
+    assert status == "absent"
+    assert new_text == ""
+
+
+def test_remove_codex_mcp_server_absent_when_register_left_a_users_manual_entry() -> None:
+    # register never wrote our marker here (a manual `codex mcp add` entry
+    # was already present, so merge_codex_mcp_server was a no-op) — unregister
+    # must not touch it: nothing to remove, byte-identical round-trip.
+    manual = (
+        "[mcp_servers.strata]\n"
+        'command = "strata-mcp"\n\n'
+        "[mcp_servers.strata.env]\n"
+        'STRATA_AGENT_SCOPE = "g_root"\n'
+    )
+    new_text, status = install.remove_codex_mcp_server(manual)
+    assert status == "absent"
+    assert new_text == manual
+
+
+def test_remove_codex_mcp_server_preserves_other_content() -> None:
+    existing = '[model]\nname = "gpt-5"\n'
+    text, _ = install.merge_codex_mcp_server(existing)
+    new_text, status = install.remove_codex_mcp_server(text)
+    assert status == "removed"
+    assert new_text == existing  # byte-identical round-trip
+
+
+def test_remove_codex_freshness_hook_removes_canonical_block() -> None:
+    text, _ = install.merge_codex_freshness_hook("")
+    new_text, status = install.remove_codex_freshness_hook(text)
+    assert status == "removed"
+    assert install.codex_hook_present(new_text) is False
+    assert new_text == ""
+
+
+def test_remove_codex_freshness_hook_leaves_edited_block() -> None:
+    text, _ = install.merge_codex_freshness_hook("")
+    edited = text.replace("timeout = 30", "timeout = 60")
+    new_text, status = install.remove_codex_freshness_hook(edited)
+    assert status == "edited"
+    assert new_text == edited
+
+
+def test_remove_codex_freshness_hook_absent() -> None:
+    new_text, status = install.remove_codex_freshness_hook("")
+    assert status == "absent"
+    assert new_text == ""
+
+
+def test_remove_codex_freshness_hook_preserves_users_own_stop_hook() -> None:
+    user_hook = (
+        "[[hooks.Stop]]\n[[hooks.Stop.hooks]]\ntype = \"command\"\ncommand = \"my-hook.sh\"\n"
+    )
+    text, _ = install.merge_codex_freshness_hook(user_hook)
+    new_text, status = install.remove_codex_freshness_hook(text)
+    assert status == "removed"
+    assert new_text == user_hook  # only ours removed, byte-identical round-trip
+
+
+# ---------------------------------------------------------------------------
+# strata unregister --harness codex — integration
+# ---------------------------------------------------------------------------
+
+
+def test_unregister_harness_codex_removes_canonical_wiring(
+    tmp_path: Path, codex_home: Path
+) -> None:
+    _init_project(tmp_path)
+    _register(tmp_path, harness="codex")
+    assert _unregister(tmp_path, harness="codex") == 0
+
+    text = (codex_home / "config.toml").read_text(encoding="utf-8")
+    assert install.codex_mcp_present(text) is False
+    assert install.codex_hook_present(text) is False
+
+
+def test_unregister_harness_codex_round_trips_a_users_preexisting_config(
+    tmp_path: Path, codex_home: Path
+) -> None:
+    _init_project(tmp_path)
+    codex_home.mkdir(parents=True)
+    original = '[model]\nname = "gpt-5"\n\n[mcp_servers.other-tool]\ncommand = "other-bin"\n'
+    (codex_home / "config.toml").write_text(original, encoding="utf-8")
+
+    _register(tmp_path, harness="codex")
+    assert _unregister(tmp_path, harness="codex") == 0
+
+    text = (codex_home / "config.toml").read_text(encoding="utf-8")
+    assert text == original  # byte-identical round-trip
+
+
+def test_unregister_harness_codex_leaves_edited_block_and_exits_1(
+    tmp_path: Path, codex_home: Path
+) -> None:
+    _init_project(tmp_path)
+    _register(tmp_path, harness="codex")
+    config = codex_home / "config.toml"
+    edited = config.read_text(encoding="utf-8").replace(
+        'command = "strata-mcp"', 'command = "strata-mcp-edited"'
+    )
+    config.write_text(edited, encoding="utf-8")
+
+    assert _unregister(tmp_path, harness="codex") == 1
+    assert config.read_text(encoding="utf-8") == edited  # left in place
+
+
+def test_unregister_harness_codex_absent_is_noop(tmp_path: Path, codex_home: Path) -> None:
+    _init_project(tmp_path)
+    assert _unregister(tmp_path, harness="codex") == 0
+    assert not (codex_home / "config.toml").exists()
+
+
+def test_unregister_harness_codex_does_not_touch_claude_settings(
+    tmp_path: Path, codex_home: Path
+) -> None:
+    _init_project(tmp_path)
+    _register(tmp_path)  # default (claude-code) wiring present
+    _register(tmp_path, harness="codex")
+    before = (tmp_path / ".claude" / "settings.json").read_text(encoding="utf-8")
+
+    assert _unregister(tmp_path, harness="codex") == 0
+
+    after = (tmp_path / ".claude" / "settings.json").read_text(encoding="utf-8")
+    assert after == before  # claude-code wiring untouched by a codex-harness unregister
+
+
+def test_unregister_harness_codex_dry_run_writes_nothing(
+    tmp_path: Path, codex_home: Path
+) -> None:
+    _init_project(tmp_path)
+    _register(tmp_path, harness="codex")
+    before = (codex_home / "config.toml").read_text(encoding="utf-8")
+
+    assert _unregister(tmp_path, harness="codex", dry_run=True) == 0
+
+    assert (codex_home / "config.toml").read_text(encoding="utf-8") == before
+
+
+# ---------------------------------------------------------------------------
+# --bootstrap-venv + --harness codex — notice, not a silent no-op
+# ---------------------------------------------------------------------------
+
+
+def test_register_bootstrap_venv_with_codex_harness_prints_skip_notice(
+    tmp_path: Path, codex_home: Path, capsys: pytest.CaptureFixture
+) -> None:
+    _init_project(tmp_path)
+    assert _register(tmp_path, harness="codex", bootstrap_venv=True) == 0
+    out = capsys.readouterr().out
+    assert "--bootstrap-venv" in out
+    assert "codex" in out.lower()
+    assert not (tmp_path / ".strata" / ".venv").exists()

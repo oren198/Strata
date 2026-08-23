@@ -65,8 +65,10 @@ __all__ = [
     "codex_config_path",
     "codex_mcp_present",
     "merge_codex_mcp_server",
+    "remove_codex_mcp_server",
     "codex_hook_present",
     "merge_codex_freshness_hook",
+    "remove_codex_freshness_hook",
 ]
 
 # ---------------------------------------------------------------------------
@@ -666,3 +668,50 @@ def merge_codex_freshness_hook(config_text: str) -> tuple[str, bool]:
     if codex_hook_present(config_text):
         return config_text, False
     return _append_block(config_text, CODEX_HOOK_BLOCK), True
+
+
+def _remove_block(config_text: str, block: str, marker: str) -> tuple[str, str]:
+    """Remove *block* from *config_text* only if it still byte-matches.
+
+    Mirrors :func:`remove_gitignore_block`'s verbatim-block-then-marker-only
+    fallback, applied to Codex's ``config.toml`` text.
+
+    Returns ``(new_text, status)`` where *status* is one of:
+
+    - ``"removed"`` — the verbatim managed block was found and stripped,
+      along with the blank-line separator :func:`_append_block` prepends, so
+      surrounding lines stay byte-identical.
+    - ``"edited"``  — the managed marker is present but the block no longer
+      matches verbatim (the user edited inside it); *config_text* is
+      returned unchanged.
+    - ``"absent"``  — no managed marker at all — including the case where
+      register found a *user's own* pre-existing entry and left it untouched
+      without ever writing our marker, so there is nothing for us to remove.
+    """
+    if block in config_text:
+        sep_block = "\n" + block
+        if sep_block in config_text:
+            return config_text.replace(sep_block, "", 1), "removed"
+        return config_text.replace(block, "", 1), "removed"
+    if marker in config_text:
+        return config_text, "edited"
+    return config_text, "absent"
+
+
+def remove_codex_mcp_server(config_text: str) -> tuple[str, str]:
+    """Remove Strata's managed ``[mcp_servers.strata]`` block from *config_text*.
+
+    The reverse of :func:`merge_codex_mcp_server`, honouring the
+    strict-additive rule in reverse: removed only when it still byte-matches
+    :data:`CODEX_MCP_BLOCK`. See :func:`_remove_block` for the status values.
+    """
+    return _remove_block(config_text, CODEX_MCP_BLOCK, CODEX_MCP_MARKER)
+
+
+def remove_codex_freshness_hook(config_text: str) -> tuple[str, str]:
+    """Remove Strata's managed ``hooks.Stop`` block from *config_text*.
+
+    The reverse of :func:`merge_codex_freshness_hook`; see :func:`_remove_block`
+    for the status values.
+    """
+    return _remove_block(config_text, CODEX_HOOK_BLOCK, CODEX_HOOK_MARKER)

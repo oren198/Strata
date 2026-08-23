@@ -114,6 +114,12 @@ from strata.install import (
     merge_codex_mcp_server as _merge_codex_mcp_server,
 )
 from strata.install import (
+    remove_codex_freshness_hook as _remove_codex_freshness_hook,
+)
+from strata.install import (
+    remove_codex_mcp_server as _remove_codex_mcp_server,
+)
+from strata.install import (
     remove_gitignore_block as _remove_gitignore_block,
 )
 from strata.install import (
@@ -2715,6 +2721,19 @@ def _build_parser() -> argparse.ArgumentParser:
             "Also delete the .strata/ workspace (fleet.yaml, DB, summaries, "
             "config.toml). Off by default — that data is memory, not wiring. "
             "Combine with --dry-run to preview what would be purged."
+        ),
+    )
+    p_unregister.add_argument(
+        "--harness",
+        dest="harness",
+        choices=("claude-code", "codex"),
+        default="claude-code",
+        help=(
+            "Which harness's wiring to reverse (default: claude-code). 'codex' "
+            "removes the [mcp_servers.strata] table and freshness Stop-hook "
+            "block from the Codex CLI's config.toml instead of "
+            ".claude/settings.json — only when they still byte-match what "
+            "`strata register --harness codex` wrote."
         ),
     )
     p_unregister.set_defaults(func=cmd_unregister)
