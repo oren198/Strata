@@ -16,6 +16,11 @@ dependencies = [
     "pyyaml",
     "mcp >=1.28,<2",
 ]
+readme = "README.md"
+
+[project.urls]
+Homepage = "https://github.com/oren198/Strata"
+Repository = "https://github.com/oren198/Strata"
 
 [project.scripts]
 strata = "strata.__main__:main"
