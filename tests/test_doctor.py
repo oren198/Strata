@@ -96,6 +96,7 @@ def test_doctor_all_checks_pass(registered_project: Path, capsys: pytest.Capture
     assert "stop hook" in lower
     assert "skill" in lower
     assert "binding" in lower
+    assert "session id" in lower
 
 
 # ---------------------------------------------------------------------------
@@ -296,16 +297,19 @@ def test_doctor_flags_missing_skill_env(
     assert "strata_agent_skill" in lower
 
 
-def test_doctor_flags_missing_session_id_env(
+def test_doctor_warns_but_passes_on_missing_session_id_env(
     registered_project: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
 ) -> None:
+    """STRATA_AGENT_SESSION_ID is auto-generated at runtime when absent (mirrors
+    strata.mcp.server) — an operator's shell will almost never export it, so its
+    absence must warn, not fail `strata doctor`'s exit code."""
     monkeypatch.delenv("STRATA_AGENT_SESSION_ID", raising=False)
 
     rc, output = _run_doctor(capsys)
 
-    assert rc == 1
+    assert rc == 0
     lower = output.lower()
-    assert "binding" in lower
+    assert "session id" in lower
     assert "strata_agent_session_id" in lower
 
 

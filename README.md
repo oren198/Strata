@@ -184,6 +184,7 @@ The UI tab will reflect the change within ~5 seconds (it polls).
 
 | Symptom | Fix |
 |---|---|
+| Anything looks broken and you're not sure why | Run `strata doctor` first — it checks config, DB, `fleet.yaml`, Claude Code wiring, and agent binding in one pass and names the fix for each failure. |
 | `strata: command not found` | You didn't run `make install`, or your venv isn't activated. Re-run `make install`. |
 | `Address already in use` on port 8000 | Another process owns the port. Either stop it or run `strata start --port 8001`. |
 | `strata scopes` says `Connection refused` | The backend isn't running. Start it with `strata start` in another terminal. |
@@ -247,6 +248,11 @@ The MCP server starts with `strata-mcp` (on your PATH from pipx). It reads
 `.strata/config.toml` automatically — no `STRATA_DB_PATH` or `STRATA_FLEET_CONFIG`
 env vars needed. If binding is wrong (scope unknown, skill not permitted), the
 server exits immediately with an actionable message.
+
+Something not working? Run `strata doctor` — it checks your project config,
+DB, `fleet.yaml`, Claude Code wiring (MCP entry, Stop hook, skills), and
+agent binding env vars in one pass, entirely offline (no backend needs to be
+running), and tells you exactly what to fix.
 
 ### `.strata/config.toml` vs `.strata-role`
 
@@ -410,6 +416,7 @@ strata record  <scope_id>  # every contribution + judgment in the scope's record
 ### Advanced subcommands
 
 ```bash
+strata doctor                                    # diagnose config/DB/fleet/wiring/binding, offline
 strata migrate                                  # apply pending SQLite migrations only
 strata bootstrap --config path/to/fleet.yaml    # validate a fleet YAML (no DB writes)
 strata start --reload                           # uvicorn auto-reload (dev mode)
