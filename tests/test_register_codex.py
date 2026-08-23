@@ -200,6 +200,18 @@ def test_register_harness_codex_writes_config_toml(
     assert install.codex_hook_present(text)
 
 
+def test_register_harness_codex_prints_progress_without_crashing(
+    tmp_path: Path, codex_home: Path, capsys: pytest.CaptureFixture
+) -> None:
+    # Regression: codex_config_path() lives outside project_root (unlike
+    # every other register artifact), so the progress-line renderer must not
+    # assume it's a subpath of project_root (Path.relative_to raises if so).
+    _init_project(tmp_path)
+    assert _register(tmp_path, harness="codex") == 0
+    out = capsys.readouterr().out
+    assert str(codex_home / "config.toml") in out
+
+
 def test_register_harness_codex_is_idempotent(
     tmp_path: Path, codex_home: Path
 ) -> None:

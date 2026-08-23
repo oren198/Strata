@@ -359,6 +359,83 @@ This creates `.strata/.venv/` with strata installed, and updates `.claude/settin
 to point at the absolute venv path. The `.strata/.venv/` directory is gitignored
 automatically. Note: this downloads ~100MB of Python deps.
 
+### Using Strata with Codex CLI
+
+```bash
+strata register --harness codex
+```
+
+This does the same per-project setup as plain `strata register` (`.strata/`,
+`fleet.yaml`, `.gitignore`), but instead of wiring `.claude/settings.json` it
+merges Strata's config into the **OpenAI Codex CLI**'s own config file —
+`$CODEX_HOME/config.toml`, which defaults to `~/.codex/config.toml`. That is a
+user-level file, not a per-project one, matching how Codex's own `codex mcp
+add` manages it. Like `strata register` for Claude Code, the merge is
+strictly additive and idempotent: your existing `config.toml` — comments,
+other `mcp_servers` entries, everything — is left untouched, and re-running
+`strata register --harness codex` is a no-op.
+
+**What this gives you, and how confident to be in each part:**
+
+- **MCP memory tools — read → contribute → judged verdict.** Confirmed
+  operational. Codex CLI's support for `[mcp_servers.<name>]` in `config.toml`
+  is verified hands-on against codex-cli 0.149.0: `codex mcp add` round-trips
+  through `config.toml` and back out through `codex mcp list` / `codex mcp
+  get` byte-for-byte, and register writes exactly that shape. Once you fill in
+  the identity env vars (see below) and Codex's MCP client spawns
+  `strata-mcp`, the memory tools it exposes (read, contribute, and the
+  scope-manager's judged-admission path) are the same embedded engine every
+  other harness talks to — nothing Codex-specific about *those*.
+
+  One thing you must do by hand: **Codex does not interpolate `${VAR}`-style
+  values inside `config.toml`** — env values are literal TOML strings, not
+  shell-expanded. So register ships the merged block with empty placeholders:
+
+  ```toml
+  [mcp_servers.strata.env]
+  STRATA_AGENT_SCOPE = ""
+  STRATA_AGENT_SKILL = ""
+  STRATA_AGENT_SESSION_ID = ""
+  ```
+
+  Fill these in with real values before running `codex` (or edit them per
+  project/session — this file is user-level, so if you work across multiple
+  Strata projects with Codex you'll want to keep them current, or maintain a
+  `<repo>/.codex/config.toml` override — Codex's docs list that as a read
+  location for trusted projects, though `strata register --harness codex`
+  itself only writes the global file today).
+
+- **Turn-boundary freshness hook — pending live verification.** Register also
+  merges a `[[hooks.Stop]]` block that runs `strata freshness-hook` at the end
+  of each turn, following the same contract documented above under
+  "Non-Claude-Code harnesses" (stdin JSON with `transcript_path` and
+  `stop_hook_active`; the identity env vars set the same way the MCP server
+  sees them). This is schema-verified only: `codex exec --strict-config`
+  accepts the block without rejecting it, confirming codex-cli 0.149.0
+  understands the shape — but no session with real OpenAI credentials has
+  ever actually triggered it, so whether the hook process fires at all, and
+  whether it inherits `STRATA_AGENT_*` from the Codex process it's spawned
+  from, is **not confirmed**. Until you've verified this yourself (see the
+  checklist an operator runs through below), treat the turn-boundary nudge as
+  absent for Codex — the MCP path above works without it.
+
+```toml
+# what strata register --harness codex merges into config.toml
+[mcp_servers.strata]
+command = "strata-mcp"
+
+[mcp_servers.strata.env]
+STRATA_AGENT_SCOPE = ""
+STRATA_AGENT_SKILL = ""
+STRATA_AGENT_SESSION_ID = ""
+
+[[hooks.Stop]]
+[[hooks.Stop.hooks]]
+type = "command"
+command = "strata freshness-hook"
+timeout = 30
+```
+
 ### Undoing it: `strata unregister`
 
 `strata unregister` reverses register's wiring. Like register, it is strictly

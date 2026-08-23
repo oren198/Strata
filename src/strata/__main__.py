@@ -1886,18 +1886,23 @@ def cmd_register(args: argparse.Namespace) -> int:
         # — live firing and STRATA_AGENT_* env inheritance are pending
         # live verification, and the merged block says so on its face.
         # ---------------------------------------------------------------
+        # codex_config lives under $CODEX_HOME (default ~/.codex), NOT under
+        # project_root — unlike every other artifact register touches, so it
+        # cannot go through the project-relative _act() helper above
+        # (Path.relative_to would raise). Render its lines directly, against
+        # the absolute path, via the same render_action_line used everywhere
+        # else for consistent [would create/update]/kept-user's wording.
         codex_config = _codex_config_path()
         existing_codex_text = (
             codex_config.read_text(encoding="utf-8") if codex_config.exists() else ""
         )
 
+        def _act_codex(action: str, *, skipped: bool) -> None:
+            print(render_action_line(action, codex_config, diff_mode=diff_mode, skipped=skipped))
+
         mcp_already = _codex_mcp_present(existing_codex_text)
         merged_text, mcp_added = _merge_codex_mcp_server(existing_codex_text)
-        _act(
-            "merged strata into" if mcp_added else "skip",
-            codex_config,
-            skipped=not mcp_added,
-        )
+        _act_codex("merged strata into" if mcp_added else "skip", skipped=not mcp_added)
         if mcp_already and not mcp_added:
             print(
                 "    (an [mcp_servers.strata] table already exists in Codex's config — "
@@ -1906,9 +1911,8 @@ def cmd_register(args: argparse.Namespace) -> int:
 
         hook_already = _codex_hook_present(merged_text)
         merged_text, hook_added = _merge_codex_freshness_hook(merged_text)
-        _act(
+        _act_codex(
             "merged freshness Stop hook into" if hook_added else "skip Stop hook in",
-            codex_config,
             skipped=not hook_added,
         )
         if hook_already and not hook_added:
