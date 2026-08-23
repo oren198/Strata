@@ -115,7 +115,9 @@ class _MarkerManager:
         )
 
 
-def _hammer(db_path: str, fleet_path: str, worker_id: int, n: int, out_q: multiprocessing.Queue) -> None:
+def _hammer(
+    db_path: str, fleet_path: str, worker_id: int, n: int, out_q: multiprocessing.Queue
+) -> None:
     """Run in a fresh OS process: contribute *n* times to the shared scope.
 
     Everything is re-opened from scratch here (fresh imports, fresh store
@@ -129,11 +131,17 @@ def _hammer(db_path: str, fleet_path: str, worker_id: int, n: int, out_q: multip
 
     from strata.app import run_contribution  # noqa: PLC0415
     from strata.fleet_config import FleetConfig as _FleetConfig  # noqa: PLC0415
+    from strata.locks import configure_lock_dir  # noqa: PLC0415
     from strata.record_store import ContributorRef as _ContributorRef  # noqa: PLC0415
     from strata.record_store import RecordStore as _RecordStore  # noqa: PLC0415
     from strata.summary_store import SummaryStore as _SummaryStore  # noqa: PLC0415
 
     try:
+        # Mirrors the real wiring (strata.mcp.server._init_stores /
+        # strata.app.create_app's lifespan): every process that touches this
+        # DB configures the same ``<db_dir>/.locks`` directory before doing
+        # any contribute work, so the flock actually spans the two processes.
+        configure_lock_dir(_Path(db_path).parent / ".locks")
         fleet = _FleetConfig.load(_Path(fleet_path))
         summary_store = _SummaryStore(str(_Path(db_path).parent / "summaries"))
         scope = fleet.get_scope(SCOPE_ID)

@@ -65,7 +65,7 @@ from pydantic import BaseModel
 
 from strata import __version__
 from strata.fleet_config import FleetConfig, Scope, Stratum
-from strata.locks import BATCH_CAP, QUEUE_WAIT_TIMEOUT_S, QueueTicket
+from strata.locks import BATCH_CAP, QUEUE_WAIT_TIMEOUT_S, QueueTicket, configure_lock_dir
 from strata.locks import scope_append_lock as _scope_append_lock
 from strata.locks import scope_lock as _scope_lock
 from strata.locks import scope_queue as _scope_queue
@@ -935,6 +935,11 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
         effective = resolved_settings if resolved_settings is not None else get_settings()
         paths = resolve_storage_paths(effective)
         run_migrations(paths.db_path)
+        # Cross-process scope lock directory (issue #19, ADR 0012): the
+        # Console backend is its own OS process, separate from every
+        # ``strata-mcp`` session process, so it must agree on the same
+        # ``<db_dir>/.locks`` the MCP server derives in ``_init_stores``.
+        configure_lock_dir(pathlib.Path(paths.db_path).parent / ".locks")
         # SummaryStore.__init__ creates summaries_dir on construct; ensure it
         # exists by instantiating one here.
         SummaryStore(paths.summaries_dir)
