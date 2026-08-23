@@ -135,20 +135,24 @@ def _storage_paths():
     exactly as the MCP server and the backend resolve them, so no two entry
     points can ever operate on different state.
 
-    Also configures the cross-process scope lock directory (issue #19, ADR
-    0012) as ``<db_dir>/.locks`` — every CLI subcommand resolves its storage
-    paths through this one function, including the operator corrections
-    (``strata operator supersede`` / ``retire`` / ``publish``) and
-    ``strata publication bootstrap``, which all take :func:`strata.locks.scope_lock`
-    and must agree with any concurrently running ``strata-mcp`` session (or
-    the Console backend, or the freshness evaluator) on the same lock files.
+    A pure resolver, deliberately: it is called eagerly by ``_build_parser``
+    on EVERY ``main()`` invocation just to render ``--db``'s help text
+    (``_db_path_default``), before any subcommand is chosen — so it must
+    never have a side effect keyed to "the paths this run will actually
+    use". :func:`strata.locks.configure_lock_dir` (issue #19, ADR 0012) used
+    to be called here and that is exactly the bug it caused: this function
+    runs against the real cwd on invocations that never touch a scope lock
+    at all (``strata --help``, `pytest` collecting the CLI test module),
+    silently pointing the process-global lock directory at whatever the
+    caller's cwd happened to be. The actual lock-dir wiring for every CLI
+    command that can take ``scope_lock`` — ``strata operator
+    publish``/``supersede``/``retire``, ``strata publication bootstrap`` —
+    lives in :func:`strata.stores.open_embedded_stores`, the store-init path
+    those commands actually call; see its docstring.
     """
-    from strata.locks import configure_lock_dir
     from strata.project_config import resolve_storage_paths
 
-    paths = resolve_storage_paths()
-    configure_lock_dir(Path(paths.db_path).parent / ".locks")
-    return paths
+    return resolve_storage_paths()
 
 
 def _db_path_default() -> str:

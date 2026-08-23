@@ -19,14 +19,46 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
+import strata.locks as locks  # noqa: E402
 from strata.locks import (  # noqa: E402
     BATCH_CAP,
     ScopeWorkQueue,
+    configure_lock_dir,
     scope_append_lock,
     scope_lock,
     scope_queue,
 )
 from strata.settings import Settings  # noqa: E402
+
+# ---------------------------------------------------------------------------
+# Cross-process lock-dir global — must not leak between tests (fix-round 2)
+# ---------------------------------------------------------------------------
+
+
+def test_lock_dir_starts_unconfigured() -> None:
+    """The root ``conftest.py`` autouse fixture resets ``_lock_dir`` to
+    ``None`` before every test — so no matter what a PRIOR test in this
+    process configured (see the next test, which deliberately leaves it
+    set), this test must see the unconfigured default. Without the fixture,
+    a test that calls :func:`configure_lock_dir` leaks a process-global
+    pointing at ITS ``tmp_path`` into every test that runs after it — the
+    exact bug that put ``.locks/g_split.summary.lock`` /
+    ``.locks/g_team.summary.lock`` at the repo root during a full-suite run
+    (fix-round 2), because a later test with no storage-path override
+    resolved against the real cwd while inheriting a stale ``_lock_dir``.
+    """
+    assert locks._lock_dir is None
+
+
+def test_configure_lock_dir_would_leak_without_the_autouse_reset(tmp_path: Path) -> None:
+    """Configure the global and leave it set — proving the PREVIOUS test
+    passing is the autouse fixture's doing, not coincidence. Order matters:
+    this test runs after ``test_lock_dir_starts_unconfigured`` in file
+    order, so if the fixture were removed, THIS test's leftover state would
+    leak into whatever runs after it instead.
+    """
+    configure_lock_dir(tmp_path / ".locks")
+    assert locks._lock_dir == tmp_path / ".locks"
 
 
 def _queue() -> ScopeWorkQueue:

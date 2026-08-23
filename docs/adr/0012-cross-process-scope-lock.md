@@ -110,19 +110,37 @@ issue filed yet).
   passes; the full suite has no regressions.
 - Every process that opens a project's DB must call `configure_lock_dir`
   before doing contribute or operator-correction work. All four current
-  entry points that can take `scope_lock` do this at store init: the MCP
-  server's `_init_stores`, the Console backend's `create_app` lifespan, the
-  CLI's `open_embedded_stores` (operator publish/supersede/retire,
-  publication bootstrap) and its `_storage_paths` helper, and the
-  freshness evaluator's `_submit_judged_contribution`. Nothing currently
-  guards a *new* entry point from skipping this call — it is not enforced
-  by a type or a runtime check, only by every present call site routing
-  through one of those shared store-init functions. A new write-capable
-  entry point that opens its own `RecordStore`/`SummaryStore` without going
-  through one of them would silently degrade to in-process-only locking
-  (the D4 behaviour) rather than fail loudly; `tests/test_cli.py` and
-  `tests/test_freshness.py` each assert a lock file appears after one such
-  operation as a regression guard on the entry points that exist today.
+  entry points that can take `scope_lock` do this AT STORE INIT — the one
+  moment each already knows the paths it will actually use for this run:
+  the MCP server's `_init_stores`, the Console backend's `create_app`
+  lifespan, the CLI's `open_embedded_stores` (the store-init path behind
+  `strata operator publish`/`supersede`/`retire` and `strata publication
+  bootstrap`), and the freshness evaluator's `_submit_judged_contribution`.
+  Deliberately NOT in `strata.__main__._storage_paths` — that function is
+  a pure path *resolver*, called eagerly on every `main()` invocation
+  (including ones that never take a lock, like `--help`) just to render
+  `--db`'s help text; configuring the lock dir there was tried and reverted
+  (fix-round 2) because it fired against whatever the caller's cwd
+  happened to be on every invocation, not just the ones that go on to take
+  a lock, and leaked a stale value into later test runs in the same
+  process. Nothing currently guards a *new* entry point from skipping this
+  call — it is not enforced by a type or a runtime check, only by every
+  present call site routing through one of those four store-init
+  functions. A new write-capable entry point that opens its own
+  `RecordStore`/`SummaryStore` without going through one of them would
+  silently degrade to in-process-only locking (the D4 behaviour) rather
+  than fail loudly; `tests/test_cli.py` and `tests/test_freshness.py` each
+  assert a lock file appears after one such operation as a regression guard
+  on the entry points that exist today.
+- `strata.locks._lock_dir` is a process-global, so tests must reset it
+  between runs (the root `conftest.py`'s autouse `_reset_lock_dir` fixture)
+  or a test that calls `configure_lock_dir` leaks its `tmp_path` into every
+  test that runs after it in the same pytest process — including one that
+  resolves storage paths against the real cwd, which then silently creates
+  lock files outside any test's own directory. This is exactly the
+  mechanism that put stray lock files at the repo root during a full-suite
+  run before the fixture existed (fix-round 2); the fix is the reset
+  fixture, not a `.gitignore` entry.
 - Cross-process coalescing does not happen — see "Known limit" above.
 - `fcntl.flock(..., LOCK_EX)` has no timeout, unlike the queue's own
   `QUEUE_WAIT_TIMEOUT_S` for same-process waiters. A process that dies or
