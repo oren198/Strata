@@ -513,6 +513,39 @@ def test_operator_publish_and_show(
     assert "Operator acts:" in show_all_out
 
 
+def test_operator_publish_configures_cross_process_lock_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``strata operator publish`` takes ``scope_lock``, which must flock a
+    per-scope file next to the DB (issue #19, ADR 0012) — this is the CLI's
+    own operator-correction race the ADR names, so ``open_embedded_stores``
+    (the store-init path every ``strata operator``/``publication`` command
+    shares) must configure the lock directory before the write happens.
+    """
+    _seed_fleet(tmp_path, monkeypatch)
+    db_path = tmp_path / "test.db"
+    lock_file = db_path.parent / ".locks" / "operator:g_ceo.summary.lock"
+    assert not lock_file.exists()
+
+    rc = main(
+        [
+            "operator",
+            "publish",
+            "g_ceo",
+            "--kind",
+            "directive",
+            "--content",
+            "All services must use TLS 1.3.",
+            "--subject",
+            "tls",
+        ]
+    )
+    assert rc == 0
+    capsys.readouterr()
+
+    assert lock_file.exists(), f"expected `strata operator publish` to have flocked {lock_file}"
+
+
 def test_operator_publish_unknown_scope_returns_1(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

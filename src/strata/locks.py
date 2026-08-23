@@ -154,6 +154,7 @@ class _ScopeFileLock:
     def __enter__(self) -> _ScopeFileLock:
         self._lock.acquire()
         if fcntl is not None and _lock_dir is not None:
+            handle = None
             try:
                 path = _lock_file_path(self._scope_id, self._suffix)
                 path.parent.mkdir(parents=True, exist_ok=True)
@@ -164,17 +165,31 @@ class _ScopeFileLock:
                 handle = path.open("a", encoding="utf-8")
                 fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
             except BaseException:
+                # A failure between opening the file and the flock actually
+                # landing (e.g. the flock call itself raising) must not leak
+                # the fd — close it here before propagating, then release
+                # the threading lock the same as any other failed acquire.
+                if handle is not None:
+                    handle.close()
                 self._lock.release()
                 raise
             self._fh = handle
         return self
 
     def __exit__(self, *exc_info: object) -> None:
-        if self._fh is not None:
-            fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
-            self._fh.close()
-            self._fh = None
-        self._lock.release()
+        try:
+            if self._fh is not None:
+                try:
+                    fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
+                finally:
+                    self._fh.close()
+                    self._fh = None
+        finally:
+            # However LOCK_UN / close went, the threading lock must still be
+            # released — an exception here otherwise leaves this scope's
+            # threading lock held forever, wedging every same-process caller
+            # behind a flock-unlock failure that had nothing to do with them.
+            self._lock.release()
 
 
 # scope_id -> Lock, guarded by one registry lock. Module-level so every code

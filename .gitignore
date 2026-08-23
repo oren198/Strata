@@ -18,3 +18,7 @@ venv/
 # run in this repo) — per-machine state, never committed.
 .strata/
 summaries/
+# Cross-process scope lock files (issue #19, ADR 0012) — created next to
+# whatever DB path a session resolves to, including the repo root when a
+# stray test run resolves paths against the actual cwd.
+.locks/

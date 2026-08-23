@@ -602,6 +602,7 @@ def _submit_judged_contribution(draft: EvaluatorDraft, *, env: dict[str, str]) -
 
     from strata.app import run_contribution  # noqa: PLC0415
     from strata.fleet_config import FleetConfig  # noqa: PLC0415
+    from strata.locks import configure_lock_dir  # noqa: PLC0415
     from strata.project_config import resolve_storage_paths  # noqa: PLC0415
     from strata.record_store import ContributorRef, RecordStore  # noqa: PLC0415
     from strata.scope_manager import ScopeManager  # noqa: PLC0415
@@ -614,6 +615,12 @@ def _submit_judged_contribution(draft: EvaluatorDraft, *, env: dict[str, str]) -
 
     settings = get_settings()
     paths = resolve_storage_paths(settings)
+    # Cross-process scope lock directory (issue #19, ADR 0012): the
+    # evaluator is a detached process, spawned separately per Stop hook, so
+    # it is itself a concurrent contributor and must agree with every
+    # ``strata-mcp`` session and the Console backend on the same
+    # ``<db_dir>/.locks`` before it can call run_contribution below.
+    configure_lock_dir(Path(paths.db_path).parent / ".locks")
     fleet = FleetConfig.load(Path(paths.fleet_yaml_path))
 
     scope = fleet.get_scope(scope_id)

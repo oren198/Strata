@@ -75,6 +75,24 @@ same scope keep the pre-#19 behaviour: a lost update is possible, at most
 once per race, and the contribution itself is never lost (it is always in
 the record; only the summary's reflection of it can be superseded).
 
+**Known limit — coalescing (ADR 0011 D3) does not cross the process
+boundary.** `ScopeWorkQueue` (`scope_queue`, `locks.py`) is a plain
+in-memory, per-process registry: several contributions arriving at one
+scope in the SAME process can be judged in one call, but a contribution
+queued in process A and one queued in process B never share a batch —
+there is no cross-process equivalent of the queue, only of the two locks
+around it. Concretely: process A's drain takes `scope_lock` and holds it
+across its judge call; any contribution process B enqueues meanwhile
+serialises behind that flock, and once B acquires it, B runs its own
+complete judge call rather than joining A's batch. So two processes
+contributing to one scope at the same time still get full correctness (D1
+above) but pay one full judgment round-trip **per process**, not the single
+coalesced call same-process contributions would get. This is accepted as
+the shape of the problem this ADR solves — it fixes the lost-update
+correctness bug, not judgment throughput — and is a candidate for a
+follow-up if cross-process coalescing turns out to matter in practice (no
+issue filed yet).
+
 ## Alternatives rejected
 
 - **A lock-coordinator daemon.** Rejected under D3 — it reintroduces the
@@ -91,10 +109,32 @@ the record; only the summary's reflection of it can be superseded).
 - `tests/test_interprocess_locks.py` (two real OS processes, one scope)
   passes; the full suite has no regressions.
 - Every process that opens a project's DB must call `configure_lock_dir`
-  before doing contribute or operator-correction work — both current entry
-  points (`strata-mcp`, the Console backend) do this at store init. A future
-  entry point that skips it degrades to in-process-only locking (the D4
-  behaviour), not a crash.
+  before doing contribute or operator-correction work. All four current
+  entry points that can take `scope_lock` do this at store init: the MCP
+  server's `_init_stores`, the Console backend's `create_app` lifespan, the
+  CLI's `open_embedded_stores` (operator publish/supersede/retire,
+  publication bootstrap) and its `_storage_paths` helper, and the
+  freshness evaluator's `_submit_judged_contribution`. Nothing currently
+  guards a *new* entry point from skipping this call — it is not enforced
+  by a type or a runtime check, only by every present call site routing
+  through one of those shared store-init functions. A new write-capable
+  entry point that opens its own `RecordStore`/`SummaryStore` without going
+  through one of them would silently degrade to in-process-only locking
+  (the D4 behaviour) rather than fail loudly; `tests/test_cli.py` and
+  `tests/test_freshness.py` each assert a lock file appears after one such
+  operation as a regression guard on the entry points that exist today.
+- Cross-process coalescing does not happen — see "Known limit" above.
+- `fcntl.flock(..., LOCK_EX)` has no timeout, unlike the queue's own
+  `QUEUE_WAIT_TIMEOUT_S` for same-process waiters. A process that dies or
+  hangs while holding a scope's flock (killed mid-judgment, wedged on the
+  judge call) stalls every OTHER process's `scope_lock`/`scope_append_lock`
+  on that scope indefinitely — there is no equivalent of the queue's
+  "fail loudly after 300s" for the cross-process case. Accepted as designed,
+  matching the precedent `strata.session_state`'s existing cross-process
+  lock already sets (issue #119): the OS releases an `flock` automatically
+  when the holding process exits (even a crash), so the practical exposure
+  is a hang while the process is still alive, not a permanently stuck lock
+  file surviving the process.
 - On Windows, cross-process races over one scope remain possible; the README
   documents this the same way it already documents the session-state
   degrade.

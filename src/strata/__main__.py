@@ -134,10 +134,21 @@ def _storage_paths():
     ``.strata/config.toml`` (walk-up discovery) wins over env-var settings,
     exactly as the MCP server and the backend resolve them, so no two entry
     points can ever operate on different state.
+
+    Also configures the cross-process scope lock directory (issue #19, ADR
+    0012) as ``<db_dir>/.locks`` — every CLI subcommand resolves its storage
+    paths through this one function, including the operator corrections
+    (``strata operator supersede`` / ``retire`` / ``publish``) and
+    ``strata publication bootstrap``, which all take :func:`strata.locks.scope_lock`
+    and must agree with any concurrently running ``strata-mcp`` session (or
+    the Console backend, or the freshness evaluator) on the same lock files.
     """
+    from strata.locks import configure_lock_dir
     from strata.project_config import resolve_storage_paths
 
-    return resolve_storage_paths()
+    paths = resolve_storage_paths()
+    configure_lock_dir(Path(paths.db_path).parent / ".locks")
+    return paths
 
 
 def _db_path_default() -> str:

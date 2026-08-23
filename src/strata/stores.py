@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from strata.fleet_config import FleetConfig, FleetConfigError
+from strata.locks import configure_lock_dir
 from strata.migrator import run_migrations
 from strata.project_config import resolve_storage_paths
 from strata.record_store import RecordStore
@@ -61,6 +62,12 @@ def open_embedded_stores() -> EmbeddedStores:
     ``fleet.yaml`` first (so a missing/invalid config fails fast with an
     actionable message before touching the DB), migrate the SQLite DB, then
     open ``RecordStore`` and ``SummaryStore`` directly — no backend involved.
+    Also configures the cross-process scope lock directory (issue #19, ADR
+    0012) as ``<db_dir>/.locks``, the same derivation ``_init_stores`` uses —
+    this is what makes ``strata operator publish`` / ``supersede`` /
+    ``retire`` and ``strata publication bootstrap`` (the CLI's own
+    :func:`strata.locks.scope_lock` callers) take the flock rather than
+    running unlocked against a concurrently running ``strata-mcp`` session.
 
     Raises:
         EmbeddedStoreError: with a print-ready message when the fleet config
@@ -81,6 +88,7 @@ def open_embedded_stores() -> EmbeddedStores:
         raise EmbeddedStoreError(f"Fleet config invalid [{exc.kind}]: {exc.message}") from exc
 
     run_migrations(paths.db_path)
+    configure_lock_dir(Path(paths.db_path).parent / ".locks")
     record_store = RecordStore(paths.db_path)
     summary_store = SummaryStore(paths.summaries_dir)
     return EmbeddedStores(

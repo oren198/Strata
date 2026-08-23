@@ -391,6 +391,14 @@ def test_evaluator_draft_submitted_through_judged_path(tmp_path: Path, monkeypat
     assert freshness.gate_open(state) is False
     # The lock is released after the run.
     assert not freshness.evaluator_lock_path(store, _SESSION_ID).exists()
+    # The evaluator is a detached process — a concurrent contributor in its
+    # own right — so it must configure the cross-process scope lock
+    # directory (issue #19, ADR 0012) before calling run_contribution, the
+    # same way strata-mcp's _init_stores does. The summary lock is held
+    # (and its file created) around the judge call above, so its lock file
+    # must exist next to the DB once the run completes.
+    lock_file = Path(paths["db"]).parent / ".locks" / "g_root.summary.lock"
+    assert lock_file.exists(), f"expected the evaluator to have flocked {lock_file}"
 
 
 def test_evaluator_nothing_records_decline_without_judge(tmp_path: Path, monkeypatch) -> None:
