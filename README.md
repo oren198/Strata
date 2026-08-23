@@ -377,19 +377,25 @@ other `mcp_servers` entries, everything — is left untouched, and re-running
 
 **What this gives you, and how confident to be in each part:**
 
-- **MCP memory tools — read → contribute → judged verdict.** Confirmed
-  operational. Codex CLI's support for `[mcp_servers.<name>]` in `config.toml`
-  is verified hands-on against codex-cli 0.149.0: `codex mcp add` round-trips
-  through `config.toml` and back out through `codex mcp list` / `codex mcp
-  get` byte-for-byte, and register writes exactly that shape. Once you fill in
-  the identity env vars (see below) and Codex's MCP client spawns
-  `strata-mcp`, the memory tools it exposes (read, contribute, and the
-  scope-manager's judged-admission path) are the same embedded engine every
-  other harness talks to — nothing Codex-specific about *those*.
+- **MCP config — verified; the live read → contribute → judged-verdict flow
+  is not yet run.** Codex CLI's support for `[mcp_servers.<name>]` in
+  `config.toml` is verified hands-on against codex-cli 0.149.0: `codex mcp
+  add` round-trips through `config.toml` and back out through `codex mcp
+  list` / `codex mcp get` byte-for-byte, and `strata register --harness
+  codex` writes exactly that shape — confirmed against a real codex-cli
+  0.149.0 binary, not just the docs. What that proves is that Codex's MCP
+  client will find and launch `strata-mcp` with the configured env. It does
+  **not** prove the full memory flow works, because no session with real
+  OpenAI credentials has driven `strata-mcp`'s tools from inside Codex — that
+  is the first item on the live-verification checklist an operator with
+  credentials needs to run (see the engine's `task-6.2-report.md` for the
+  exact steps).
 
-  One thing you must do by hand: **Codex does not interpolate `${VAR}`-style
-  values inside `config.toml`** — env values are literal TOML strings, not
-  shell-expanded. So register ships the merged block with empty placeholders:
+  Two things to know before you rely on this:
+
+  **Codex does not interpolate `${VAR}`-style values inside `config.toml`** —
+  env values are literal TOML strings, not shell-expanded. So register ships
+  the merged block with empty placeholders:
 
   ```toml
   [mcp_servers.strata.env]
@@ -403,7 +409,17 @@ other `mcp_servers` entries, everything — is left untouched, and re-running
   Strata projects with Codex you'll want to keep them current, or maintain a
   `<repo>/.codex/config.toml` override — Codex's docs list that as a read
   location for trusted projects, though `strata register --harness codex`
-  itself only writes the global file today).
+  itself only writes the global file today). **`STRATA_AGENT_SESSION_ID` is
+  the sharpest edge here**: session state is keyed by it, so a fixed literal
+  value would merge every Codex session's freshness counters into one — there
+  is currently no verified mechanism for Codex to hand a fresh, per-session
+  value into a literal `config.toml` string. Leave it blank (or accept that
+  merged-counter behavior) until this is resolved. It is also unverified
+  whether Codex's MCP subprocess additionally inherits the *launching*
+  process's environment on top of these literal `env` values, or replaces it
+  — if it inherits, a literal empty string here could shadow a real value you
+  exported before running `codex`. Both are live-verification checklist
+  items.
 
 - **Turn-boundary freshness hook — pending live verification.** Register also
   merges a `[[hooks.Stop]]` block that runs `strata freshness-hook` at the end
@@ -415,9 +431,14 @@ other `mcp_servers` entries, everything — is left untouched, and re-running
   understands the shape — but no session with real OpenAI credentials has
   ever actually triggered it, so whether the hook process fires at all, and
   whether it inherits `STRATA_AGENT_*` from the Codex process it's spawned
-  from, is **not confirmed**. Until you've verified this yourself (see the
-  checklist an operator runs through below), treat the turn-boundary nudge as
-  absent for Codex — the MCP path above works without it.
+  from, is **not confirmed**. Until an operator with real OpenAI credentials
+  verifies this (see the live-verification checklist in the engine's
+  `task-6.2-report.md`), treat the turn-boundary nudge as absent for Codex —
+  the MCP config above is independently useful without it.
+
+  **`strata unregister` does not yet reverse this wiring.** To remove it by
+  hand: `codex mcp remove strata`, then delete the `# Strata freshness hook —
+  managed by ...` block from `config.toml` yourself.
 
 ```toml
 # what strata register --harness codex merges into config.toml
