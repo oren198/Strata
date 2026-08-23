@@ -29,6 +29,7 @@ Vocabulary follows CONTEXT.md exactly: scope, fleet, skill, scope-manager.
 from __future__ import annotations
 
 import copy
+import os
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -57,6 +58,15 @@ __all__ = [
     "hook_matches_shipped",
     "remove_gitignore_block",
     "render_action_line",
+    "CODEX_MCP_MARKER",
+    "CODEX_MCP_BLOCK",
+    "CODEX_HOOK_MARKER",
+    "CODEX_HOOK_BLOCK",
+    "codex_config_path",
+    "codex_mcp_present",
+    "merge_codex_mcp_server",
+    "codex_hook_present",
+    "merge_codex_freshness_hook",
 ]
 
 # ---------------------------------------------------------------------------
@@ -494,3 +504,165 @@ def render_action_line(
     if diff_mode:
         return f"  [unchanged]  {rel_path}" if skipped else f"  [would create/update]  {rel_path}"
     return f"  kept user's {rel_path}" if skipped else f"  {action}: {rel_path}"
+
+
+# ---------------------------------------------------------------------------
+# Codex CLI config.toml — additive TOML-text merge (Task 6.2, local-launch-bar)
+#
+# Source of truth: docs/marketing/CODEX-surface-2026-08.md (verified against
+# OpenAI's Codex docs and reproduced hands-on against codex-cli 0.149.0,
+# 2026-08-23). Only claims that document marks [verified] are built as
+# "operational"; the Stop-hook block below is schema-verified only — the
+# marketing doc could not confirm a plain command-type Stop hook actually
+# fires or inherits the launching process's STRATA_AGENT_* env (no OpenAI
+# credentials in that sandbox) — so it ships labelled "pending live
+# verification" both in this module and in the merged TOML text itself.
+#
+# Codex's `config.toml` is unstructured TOML with user comments and tables
+# register must not disturb, and this project has no TOML *writer* dependency
+# (only stdlib `tomllib`, read-only). So — mirroring the existing
+# GITIGNORE_BLOCK convention above rather than the JSON deep-merge used for
+# settings.json — Codex's config is merged as an additive text append: a
+# canonical block, appended once, detected by a marker so a re-run is a
+# no-op and the user's own tables/comments are never rewritten.
+# ---------------------------------------------------------------------------
+
+#: Marker comment identifying Strata's managed `[mcp_servers.strata]` block.
+#: Detected as a plain substring (mirrors GITIGNORE_MARKER) so a user's own,
+#: unrelated `mcp_servers` tables are never mistaken for ours.
+CODEX_MCP_MARKER = "# Strata — managed by `strata register --harness codex`"
+
+#: [verified] TOML shape — reproduced byte-for-byte by `codex mcp add` against
+#: codex-cli 0.149.0 (CODEX-surface-2026-08.md #1). MCP `env` values are
+#: literal TOML strings (no `${VAR}` interpolation is documented anywhere in
+#: the MCP config reference) so the identity vars ship as empty placeholders:
+#: fill them in by hand, or export them before launching `codex` and rely on
+#: the *unverified* assumption that Codex's MCP subprocess inherits the
+#: launching process's environment on top of these literal values.
+CODEX_MCP_BLOCK = f"""\
+{CODEX_MCP_MARKER}
+[mcp_servers.strata]
+command = "strata-mcp"
+
+[mcp_servers.strata.env]
+STRATA_AGENT_SCOPE = ""
+STRATA_AGENT_SKILL = ""
+STRATA_AGENT_SESSION_ID = ""
+"""
+
+#: Marker comment identifying Strata's managed `hooks.Stop` block.
+CODEX_HOOK_MARKER = "# Strata freshness hook — managed by `strata register --harness codex`"
+
+#: [schema-verified, live firing NOT verified] — `codex exec --strict-config`
+#: accepted this exact `[[hooks.Stop]]` / `[[hooks.Stop.hooks]]` shape on
+#: codex-cli 0.149.0 without rejecting it (CODEX-surface-2026-08.md #2), which
+#: confirms the binary understands the schema. It does NOT confirm the hook
+#: process actually runs at `Stop`, nor that it inherits STRATA_AGENT_* env —
+#: the findings sandbox had no OpenAI credentials, so no turn ever completed.
+#: `[features] hooks = true` is deliberately omitted: codex-cli 0.149.0 ships
+#: hooks on by default, and re-declaring a plain `[features]` table here would
+#: conflict with (TOML forbids redefining) a user's own `[features]` table if
+#: one already exists in their config.
+CODEX_HOOK_BLOCK = f"""\
+{CODEX_HOOK_MARKER}
+# Schema accepted by `codex exec --strict-config` (codex-cli 0.149.0). Live
+# Stop-hook firing and STRATA_AGENT_* env inheritance are NOT verified — see
+# README "Using Strata with Codex CLI" before relying on this in production.
+[[hooks.Stop]]
+[[hooks.Stop.hooks]]
+type = "command"
+command = "strata freshness-hook"
+timeout = 30
+"""
+
+
+def codex_config_path() -> Path:
+    """Resolve the Codex CLI config file: ``$CODEX_HOME/config.toml``.
+
+    Defaults to ``~/.codex/config.toml`` when ``$CODEX_HOME`` is unset — the
+    verified default confirmed hands-on against codex-cli 0.149.0
+    (CODEX-surface-2026-08.md #1: ``codex mcp add`` writes here; CLI
+    management "only manages the ``~/.codex/config.toml`` (global) server
+    table by default in this version"). Project-scoped
+    ``<repo>/.codex/config.toml`` is documented as also read for trusted
+    projects, but is not what ``codex mcp add``/register targets here.
+    """
+    codex_home = os.environ.get("CODEX_HOME")
+    base = Path(codex_home) if codex_home else Path.home() / ".codex"
+    return base / "config.toml"
+
+
+def _append_block(config_text: str, block: str) -> str:
+    """Append *block* to *config_text*, matching GITIGNORE_BLOCK's separator rule."""
+    prefix = config_text
+    if prefix and not prefix.endswith("\n"):
+        prefix += "\n"
+    if prefix:
+        prefix += "\n"
+    return prefix + block
+
+
+def codex_mcp_present(config_text: str) -> bool:
+    """Return whether a Strata ``[mcp_servers.strata]`` table is already present.
+
+    Tries a real TOML parse first (via stdlib ``tomllib``) so a user who ran
+    `codex mcp add strata ...` by hand — with different ``command``/``env``
+    values, no marker comment — is still recognised and left untouched.
+    Falls back to the :data:`CODEX_MCP_MARKER` substring (mirrors
+    :data:`GITIGNORE_MARKER`) when the text does not parse as TOML (e.g. a
+    mid-edit file), so register still refuses to double-append.
+    """
+    import tomllib  # noqa: PLC0415
+
+    try:
+        data = tomllib.loads(config_text) if config_text.strip() else {}
+        servers = data.get("mcp_servers")
+        if isinstance(servers, dict) and "strata" in servers:
+            return True
+    except tomllib.TOMLDecodeError:
+        pass
+    return CODEX_MCP_MARKER in config_text
+
+
+def merge_codex_mcp_server(config_text: str) -> tuple[str, bool]:
+    """Additively append :data:`CODEX_MCP_BLOCK` to *config_text*.
+
+    Strictly additive, text-level (ADR 0005 Decision 6, applied to a config
+    format this project has no TOML writer for): every existing table,
+    comment, and blank line in *config_text* is preserved byte-for-byte; the
+    Strata block is appended only when :func:`codex_mcp_present` is false.
+
+    Returns:
+        ``(new_text, added)`` — *added* is ``True`` if the block was
+        appended, ``False`` (with *new_text* == *config_text*) if a Strata
+        (or user-written) ``[mcp_servers.strata]`` entry already existed.
+    """
+    if codex_mcp_present(config_text):
+        return config_text, False
+    return _append_block(config_text, CODEX_MCP_BLOCK), True
+
+
+def codex_hook_present(config_text: str) -> bool:
+    """Return whether Strata's managed ``hooks.Stop`` block is already present.
+
+    Detected by the :data:`CODEX_HOOK_MARKER` substring — a text-level marker
+    (like :func:`codex_mcp_present`'s fallback) because ``[[hooks.Stop]]`` is
+    a TOML array-of-tables: a plain structural parse can't tell "ours" apart
+    from a user's own Stop hook entries the way a single-occurrence table can.
+    """
+    return CODEX_HOOK_MARKER in config_text
+
+
+def merge_codex_freshness_hook(config_text: str) -> tuple[str, bool]:
+    """Additively append :data:`CODEX_HOOK_BLOCK` to *config_text*.
+
+    Strictly additive: a user's own ``[[hooks.Stop]]`` entries are untouched —
+    TOML array-of-tables let both coexist — and the Strata block is appended
+    only once (idempotent re-merge).
+
+    Returns:
+        ``(new_text, added)`` — as :func:`merge_codex_mcp_server`.
+    """
+    if codex_hook_present(config_text):
+        return config_text, False
+    return _append_block(config_text, CODEX_HOOK_BLOCK), True
