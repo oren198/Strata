@@ -387,9 +387,7 @@ other `mcp_servers` entries, everything — is left untouched, and re-running
   client will find and launch `strata-mcp` with the configured env. It does
   **not** prove the full memory flow works, because no session with real
   OpenAI credentials has driven `strata-mcp`'s tools from inside Codex — that
-  is the first item on the live-verification checklist an operator with
-  credentials needs to run (see the engine's `task-6.2-report.md` for the
-  exact steps).
+  is item 1 in the live-verification checklist below.
 
   Two things to know before you rely on this:
 
@@ -419,7 +417,7 @@ other `mcp_servers` entries, everything — is left untouched, and re-running
   process's environment on top of these literal `env` values, or replaces it
   — if it inherits, a literal empty string here could shadow a real value you
   exported before running `codex`. Both are live-verification checklist
-  items.
+  items (2 and 4 below).
 
 - **Turn-boundary freshness hook — pending live verification.** Register also
   merges a `[[hooks.Stop]]` block that runs `strata freshness-hook` at the end
@@ -432,13 +430,14 @@ other `mcp_servers` entries, everything — is left untouched, and re-running
   ever actually triggered it, so whether the hook process fires at all, and
   whether it inherits `STRATA_AGENT_*` from the Codex process it's spawned
   from, is **not confirmed**. Until an operator with real OpenAI credentials
-  verifies this (see the live-verification checklist in the engine's
-  `task-6.2-report.md`), treat the turn-boundary nudge as absent for Codex —
-  the MCP config above is independently useful without it.
+  verifies this (checklist items 3 and 4 below), treat the turn-boundary
+  nudge as absent for Codex — the MCP config above is independently useful
+  without it.
 
-  **`strata unregister` does not yet reverse this wiring.** To remove it by
-  hand: `codex mcp remove strata`, then delete the `# Strata freshness hook —
-  managed by ...` block from `config.toml` yourself.
+  `strata unregister --harness codex` reverses this wiring the same way
+  `strata unregister` reverses the Claude Code wiring — only when the
+  `[mcp_servers.strata]` table and the hooks.Stop block still byte-match what
+  register wrote; an edited block is reported and left in place.
 
 ```toml
 # what strata register --harness codex merges into config.toml
@@ -456,6 +455,59 @@ type = "command"
 command = "strata freshness-hook"
 timeout = 30
 ```
+
+**Live-verification checklist.** Everything above the line is either
+verified against a real codex-cli 0.149.0 binary or clearly labelled as
+schema-only. The gaps only real OpenAI credentials can close — run these, in
+order, in a scratch project, if you're the first to turn this on for real:
+
+1. **MCP end-to-end (read → contribute → judged verdict).** Run
+   `strata register` then `strata register --harness codex` in a git repo,
+   fill in `STRATA_AGENT_SCOPE` / `STRATA_AGENT_SKILL` in
+   `~/.codex/config.toml` (leave `STRATA_AGENT_SESSION_ID` blank for now —
+   see item 4), then start `codex` in that directory and ask it to read
+   Strata's fleet memory and then contribute something back. **Go:** the read
+   returns real scope memory and the contribution gets an admitted/declined
+   verdict from the scope-manager (check `.strata/strata.db` or the
+   contribution log, not just "the tool call didn't error"). **No-go:** the
+   MCP tools don't appear, or errors on connect — check `codex mcp get
+   strata` first for a config problem before assuming the memory flow itself
+   is broken.
+2. **Env overlay vs. replace.** Before running `codex`, `export
+   STRATA_AGENT_SCOPE=canary-value` in your shell, but leave the
+   `config.toml` entry as register's empty string. From inside Codex, have
+   it call a tool that reveals what `strata-mcp` actually received for that
+   var (temporarily log the server's received env on startup). **If empty:**
+   the literal `env` table replaces the inherited environment — filling in
+   literal values in `config.toml` is correct and sufficient, no further
+   action needed. **If `canary-value`:** Codex overlays config `env` onto an
+   inherited environment, so an empty-string literal *shadows* a real
+   exported value — remove the placeholder keys from `config.toml` instead
+   of leaving them blank, and rely on exporting the vars before launching
+   `codex`.
+3. **Stop hook fires at all.** Temporarily swap `command = "strata
+   freshness-hook"` for a debug script that dumps its stdin and
+   `os.environ` to a file, complete one real Codex turn end-to-end (a prompt
+   that gets a real response and stops), then check the file. **Go:** the
+   file exists, and its JSON contains `transcript_path` (pointing at a real,
+   readable `.jsonl` rollout file matching the session id in the Codex
+   banner) and `stop_hook_active`. **No-go:** no file at all — the hook
+   never fired; treat the turn-boundary path as non-functional and keep it
+   documented as schema-verified-only.
+4. **Env inheritance in the hook subprocess.** Using the same debug capture
+   from item 3, check whether `STRATA_AGENT_SCOPE` / `STRATA_AGENT_SKILL` /
+   `STRATA_AGENT_SESSION_ID` (exported in the shell that launched `codex`)
+   show up in the hook process's environment. **Go:** they're all present —
+   export a real per-session `STRATA_AGENT_SESSION_ID` before each `codex`
+   session and the freshness hook keys session state correctly. **No-go:**
+   they're missing — there is no way to key session state correctly for this
+   path yet; leave the merged Stop-hook block installed-but-inert (or remove
+   it with `strata unregister --harness codex`) until a delivery mechanism
+   exists.
+5. **Write down the answer.** Whatever items 1–4 find, update this section
+   (and `docs/marketing/CODEX-surface-2026-08.md` in the marketing repo, if
+   you have access to it) so the "pending live verification" labels reflect
+   reality instead of staying permanently hedged.
 
 ### Undoing it: `strata unregister`
 
@@ -487,6 +539,12 @@ What it does, step by step:
 5. Leaves your `.strata/` workspace untouched — that is memory, not wiring.
    Pass `--purge-data` to remove it too (`--dry-run --purge-data` previews the
    purge without deleting).
+
+With `--harness codex` (matching `strata register --harness codex`), steps 2–4
+above are replaced by the reverse of the Codex merge: the `[mcp_servers.strata]`
+table and the freshness `hooks.Stop` block are removed from
+`$CODEX_HOME/config.toml` only when each still byte-matches what register
+wrote; `.claude/settings.json` is untouched. Steps 1 and 5 are unchanged.
 
 **Exit code:** `0` on success, including when there is nothing to do (running
 it on an unregistered project is a safe no-op). It exits `1` when something you

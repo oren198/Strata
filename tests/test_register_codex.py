@@ -430,6 +430,9 @@ def test_unregister_harness_codex_round_trips_a_users_preexisting_config(
 def test_unregister_harness_codex_leaves_edited_block_and_exits_1(
     tmp_path: Path, codex_home: Path
 ) -> None:
+    # Editing only the mcp block: the (untouched) freshness-hook block is
+    # still removed independently, mirroring the Claude-Code settings.json
+    # unregister's per-entry granularity — only the edited entry is left.
     _init_project(tmp_path)
     _register(tmp_path, harness="codex")
     config = codex_home / "config.toml"
@@ -439,7 +442,9 @@ def test_unregister_harness_codex_leaves_edited_block_and_exits_1(
     config.write_text(edited, encoding="utf-8")
 
     assert _unregister(tmp_path, harness="codex") == 1
-    assert config.read_text(encoding="utf-8") == edited  # left in place
+    remaining = config.read_text(encoding="utf-8")
+    assert 'command = "strata-mcp-edited"' in remaining  # edited mcp block left in place
+    assert install.codex_hook_present(remaining) is False  # unrelated hook block still removed
 
 
 def test_unregister_harness_codex_absent_is_noop(tmp_path: Path, codex_home: Path) -> None:
