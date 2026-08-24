@@ -39,7 +39,12 @@ from strata.__main__ import _build_parser, cmd_register, cmd_unregister
 
 
 def _register_args(path: str) -> argparse.Namespace:
-    return argparse.Namespace(path=path, diff=False, bootstrap_venv=False, python=None)
+    # harness pinned to claude-code (the shape a parsed --harness claude-code
+    # flag now takes) so this setup helper never falls through to real-machine
+    # harness detection — see tests/test_register_multi_harness.py for that.
+    return argparse.Namespace(
+        path=path, diff=False, bootstrap_venv=False, python=None, harness=["claude-code"]
+    )
 
 
 def _unregister_args(

@@ -53,12 +53,15 @@ def _register(
     diff: bool = False,
     bootstrap_venv: bool = False,
 ) -> int:
+    # A parsed `--harness NAME` flag now yields a list (action="append");
+    # wrap the single-harness convenience param the same way so these tests
+    # exercise exactly the explicit-flags resolution path, never detection.
     return cmd_register(
         argparse.Namespace(
             path=str(tmp_path),
             diff=diff,
             bootstrap_venv=bootstrap_venv,
-            harness=harness,
+            harness=[harness],
         )
     )
 

@@ -38,13 +38,21 @@ def _make_args(
     diff: bool = False,
     bootstrap_venv: bool = False,
 ):
-    """Build a minimal argparse Namespace for cmd_register."""
+    """Build a minimal argparse Namespace for cmd_register.
+
+    ``harness`` is pinned to ``["claude-code"]`` (the shape a parsed
+    ``--harness claude-code`` flag now takes) so these single-harness tests
+    never fall through to real-machine detection, which would fan out onto
+    whatever harnesses happen to be installed on the machine running the
+    suite (see tests/test_register_multi_harness.py for detection coverage).
+    """
     import argparse
 
     return argparse.Namespace(
         path=path,
         diff=diff,
         bootstrap_venv=bootstrap_venv,
+        harness=["claude-code"],
     )
 
 
@@ -446,7 +454,9 @@ def test_existing_strata_dir_without_config_toml_rejected(tmp_path: Path, capsys
     strata_dir.mkdir()
     (strata_dir / "some-other-tool.txt").write_text("not strata", encoding="utf-8")
 
-    args = argparse.Namespace(path=str(tmp_path), diff=False, bootstrap_venv=False, python=None)
+    args = argparse.Namespace(
+        path=str(tmp_path), diff=False, bootstrap_venv=False, python=None, harness=["claude-code"]
+    )
     rc = cmd_register(args)
 
     assert rc == 1
@@ -468,7 +478,9 @@ def test_existing_strata_dir_with_config_toml_proceeds(tmp_path: Path) -> None:
         encoding="utf-8",
     )
 
-    args = argparse.Namespace(path=str(tmp_path), diff=False, bootstrap_venv=False, python=None)
+    args = argparse.Namespace(
+        path=str(tmp_path), diff=False, bootstrap_venv=False, python=None, harness=["claude-code"]
+    )
     rc = cmd_register(args)
 
     assert rc == 0
@@ -508,7 +520,9 @@ def test_v1_2_shape_mcp_entry_warns(tmp_path: Path, capsys) -> None:
         encoding="utf-8",
     )
 
-    args = argparse.Namespace(path=str(tmp_path), diff=False, bootstrap_venv=False, python=None)
+    args = argparse.Namespace(
+        path=str(tmp_path), diff=False, bootstrap_venv=False, python=None, harness=["claude-code"]
+    )
     rc = cmd_register(args)
 
     assert rc == 0
@@ -534,7 +548,9 @@ def test_v3_shape_mcp_entry_no_warning(tmp_path: Path, capsys) -> None:
         encoding="utf-8",
     )
 
-    args = argparse.Namespace(path=str(tmp_path), diff=False, bootstrap_venv=False, python=None)
+    args = argparse.Namespace(
+        path=str(tmp_path), diff=False, bootstrap_venv=False, python=None, harness=["claude-code"]
+    )
     rc = cmd_register(args)
 
     assert rc == 0

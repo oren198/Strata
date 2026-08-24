@@ -38,7 +38,13 @@ def _init_project(tmp_path: Path) -> None:
 
 
 def _register(tmp_path: Path, *, diff: bool = False) -> int:
-    return cmd_register(argparse.Namespace(path=str(tmp_path), diff=diff, bootstrap_venv=False))
+    # harness pinned to claude-code so this setup helper never falls through
+    # to real-machine harness detection.
+    return cmd_register(
+        argparse.Namespace(
+            path=str(tmp_path), diff=diff, bootstrap_venv=False, harness=["claude-code"]
+        )
+    )
 
 
 def _unregister(tmp_path: Path, *, purge_data: bool = False, dry_run: bool = False) -> int:
