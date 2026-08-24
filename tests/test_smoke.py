@@ -2,9 +2,11 @@
 
 
 def test_module_imports():
+    import re
+
     import strata
 
-    assert strata.__version__ == "1.9.0"
+    assert re.fullmatch(r"\d+\.\d+\.\d+", strata.__version__)
 
 
 def test_version_matches_distribution_metadata() -> None:
