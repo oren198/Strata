@@ -2,8 +2,8 @@
 // Strata · root app. Reducer + routing + backend polling.
 // Screens: graph (default) · scope detail (drill-in) · settings.
 //
-// Judgment stays automatic; the one exception is the operator's own
-// supersede/retire actions in the scope-detail screen (P5), on exception.
+// Judgment stays automatic; the operator steps in only when something needs
+// correcting, via the supersede/retire actions in the scope-detail screen (P5).
 // ─────────────────────────────────────────────────────────────────────
 
 const PALETTE = ["#c026d3", "#16a34a", "#ca8a04", "#7c3aed", "#2563eb", "#dc2626", "#0891b2", "#65a30d", "#db2777"];

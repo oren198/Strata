@@ -1,11 +1,12 @@
 // ─────────────────────────────────────────────────────────────────────
 // Strata · operator actions (P5).
 //
-// Judgment stays automatic; these two modals are the one exception, on
-// exception: an in-person correction to a scope's own summary, exercising
-// the operator's authority in place of the standing delegate (the
-// scope-manager). No standing "operator mode" toggle — each action sits
-// behind its own confirm-shaped modal, and is gone the moment it closes.
+// Judgment stays automatic; these two modals are for when the operator
+// steps in to make an in-person correction to a scope's own summary,
+// exercising the operator's authority in place of the standing delegate
+// (the scope-manager). No standing "operator mode" toggle — each action
+// sits behind its own confirm-shaped modal, and is gone the moment it
+// closes.
 //
 // Both call straight into the same library functions the command line
 // calls (`strata operator supersede` / `strata operator retire`), under

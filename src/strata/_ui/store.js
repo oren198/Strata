@@ -104,7 +104,7 @@
       if (resp.status === 404) return null;
       throw new Error(`GET /scopes/${scope_id}/summary returned ${resp.status}`);
     }
-    return resp.json(); // { scope_id, directives, context, updated_at }
+    return resp.json(); // { scope_id, directives, context, updated_at, retirements }
   }
 
   // Fetch one page of a scope's declined contributions (UI-only endpoint).

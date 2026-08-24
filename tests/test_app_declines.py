@@ -209,3 +209,17 @@ def test_declines_endpoint_reports_mechanical_decline_counter(client, tmp_path):
     assert body["mechanical_declines"]["window_days"] == 30
     # Never a record entry:
     assert all("mechanical" not in d for d in body["declines"])
+
+
+def test_declines_endpoint_mechanical_counter_excludes_sessions_that_also_contributed(client):
+    """A session that declined AND contributed did not 'record nothing' — matches /staleness's
+    closeout bucket, which only counts a session as a closeout when it has zero contributions."""
+    from strata.session_state import SessionStateStore, sessions_dir_for
+
+    sessions = SessionStateStore(sessions_dir_for(client.summaries_dir))
+    sessions.record_read("sess_a", "g_active")
+    sessions.record_decline("sess_a")
+    sessions.record_contribution("sess_a")   # same session also contributed
+
+    body = client.get("/scopes/g_active/declines").json()
+    assert body["mechanical_declines"]["sessions_that_read_and_recorded_nothing"] == 0

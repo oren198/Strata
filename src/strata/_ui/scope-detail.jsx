@@ -4,9 +4,10 @@
 // Opened by double-clicking a scope bubble in the graph.
 //
 // Judgment stays automatic — ordinary memory writes flow through
-// `strata.contribute`. The one operator exception, on an exception: Replace
-// and Retire actions on a directive, an in-person correction to the scope's
-// own summary, behind a confirm dialog (no standing operator-mode toggle).
+// `strata.contribute`. The operator steps in only when something needs
+// correcting: Replace and Retire actions on a directive, an in-person
+// correction to the scope's own summary, behind a confirm dialog (no
+// standing operator-mode toggle).
 // ─────────────────────────────────────────────────────────────────────
 
 function ScopeDetail({ scope_id, state, dispatch, onBack, onFlash, embedded = false }) {
@@ -287,7 +288,7 @@ function BackendScopeSummary({ scope, summary, loading, error, onRefetch, onFlas
             {retirements.map((r) => (
               <li key={r.id} className="at-caption" style={{ color: "var(--at-muted)" }}>
                 <code style={{ fontFamily: "var(--font-mono)" }}>{r.directive_id}</code>
-                {" retired "}{window.humanAgo ? window.humanAgo(r.created_at) : r.created_at}
+                {" retired "}{humanAgo(r.created_at)}
                 {r.reason ? ` — ${r.reason}` : ""}
               </li>
             ))}

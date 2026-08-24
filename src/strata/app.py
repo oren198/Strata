@@ -1513,6 +1513,8 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
         for state in session_store.all_states():
             if state.declines <= 0:
                 continue
+            if state.contributions > 0:
+                continue
             receipt = state.reads_by_scope.get(scope_id)
             if receipt is None:
                 continue
