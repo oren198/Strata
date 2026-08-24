@@ -650,8 +650,8 @@ strata launch --harness claude-code             # start this harness regardless 
 2. Otherwise, the project's recorded default — see `strata set-default-harness`
    below. If `.strata/config.toml` names a harness Strata doesn't know (a
    hand-edited value, or one written by a newer Strata version), it prints a
-   one-line warning to stderr naming the bad value and falls back to the next
-   step rather than launching the wrong thing silently.
+   one-line warning to stderr naming the bad value and falls back to
+   `claude-code` rather than launching the wrong thing silently.
 3. Otherwise, if exactly one harness is currently wired in this project
    (checked the same way `strata unregister`'s default resolves), that one.
 4. Otherwise, `claude-code` — today's behavior, unchanged.
