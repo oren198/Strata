@@ -4,7 +4,7 @@
 // and refused, with the reason it gave. UI-only — this view's fetch never
 // runs on the contribute/judge path.
 //
-// Layout ported from GateActivityTile's decline block (pulse-row /
+// Layout ported from the Console's decline-teaser tile (pulse-row /
 // pulse-row-head / pulse-quote, "What judgment kept out"), promoted from a
 // 3-row teaser to the whole page.
 // ─────────────────────────────────────────────────────────────────────
