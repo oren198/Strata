@@ -490,9 +490,10 @@ After step 3, edit `fleet.yaml` by hand to add per-scope skill declarations
 ### Strata Console UI
 
 Open <http://127.0.0.1:8000/> while the backend is running — a graph and list
-view of the current fleet state, polling every 5 s, plus five operator proof
-surfaces described in [`docs/console.md`](docs/console.md) and the
-[Console](#console) section below. Automatic memory writes (accept/decline)
+view of the current fleet state, polling every 5 s, plus four new tabs and an
+in-place operator-correction surface described in
+[`docs/console.md`](docs/console.md) and the [Console](#console) section
+below. Automatic memory writes (accept/decline)
 still flow only through `strata.contribute`; the Console's own write path is
 limited to the two in-person operator corrections (Replace / Retire a
 directive), each behind a confirm dialog. To point the UI at a non-default
@@ -525,8 +526,8 @@ strata start
 ...then open <http://127.0.0.1:8000/ui/index.html> in a browser. The Console
 is local-only — it talks to the backend `strata start` just launched on your
 own machine, nothing external. Alongside the memory graph and settings, it
-has five tabs; see [`docs/console.md`](docs/console.md) for the full
-description of each:
+has four new tabs, plus in-place Replace/Retire actions in the scope drawer;
+see [`docs/console.md`](docs/console.md) for the full description of each:
 
 - **Turned down** — every contribution the scope-manager refused for a
   scope, with the reason given, plus a separate mechanical count of sessions

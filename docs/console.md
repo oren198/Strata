@@ -3,10 +3,12 @@
 The Console is the local, browser-based operator view that ships with Strata
 (`strata start`, then open `http://127.0.0.1:8000/`). It runs entirely
 against your own machine — no external service, no account, nothing hosted.
-Five tabs sit alongside the existing memory graph and settings views: **Turned
-down**, **Freshness**, **Record**, **View as**, and **Operator corrections**
-(labelled "Replace"/"Retire" in the UI). Each is described below: what it
-shows, where the number comes from, and what it proves.
+Four new tabs sit alongside the existing memory graph and settings tabs:
+**Turned down**, **Freshness**, **Record**, and **View as**. A fifth surface,
+**Operator corrections** (the "Replace" / "Retire" actions), is not a tab —
+it lives in place, as row-level actions on a directive inside the existing
+scope drawer (the memory graph's scope detail view). All five are described
+below: what each shows, where the number comes from, and what it proves.
 
 The Console's endpoints (`GET /scopes/{id}/declines`, `GET /staleness`,
 `GET /scopes/{id}/record`, `GET /scopes/{id}/record/{contribution_id}`,
@@ -112,3 +114,9 @@ Because the Console can now write, the badge in the top-right corner reads
 `operator`, not `read-only` — that badge is the standing signal that this is
 a local, single-operator surface that can make changes, not a warning that
 something is misconfigured.
+
+Retired directives stay visible on the scope ("retired here"), read from the
+same scope summary response as everything else in the drawer, but that list
+is capped at the 50 most recent retirements for the scope — older ones stay
+in the record and are still retired, they just drop off this convenience
+list.
