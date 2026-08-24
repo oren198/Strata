@@ -149,6 +149,14 @@
     return resp.json();
   }
 
+  // Compose a scope's perspective as an agent bound to it would receive it.
+  async function fetchPerspective(scope_id) {
+    const base = getApiBase();
+    const resp = await fetch(`${base}/scopes/${encodeURIComponent(scope_id)}/perspective`);
+    if (!resp.ok) throw new Error(`GET /scopes/${scope_id}/perspective returned ${resp.status}`);
+    return resp.json();
+  }
+
   // Helpers used in graph layout.
   function stratumIndex(state, stratum_id) {
     return state.strata.findIndex((s) => s.id === stratum_id);
@@ -172,6 +180,7 @@
     fetchStaleness,
     fetchScopeRecord,
     fetchRecordEntry,
+    fetchPerspective,
     stratumIndex,
     edgeAllowed,
     loadPrefs,

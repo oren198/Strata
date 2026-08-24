@@ -217,6 +217,10 @@ function App() {
           <RecordTrailView state={state} scopeId={openScopeId || state.scopes[0]?.id} onSelectScope={setOpenScopeId} />
         )}
 
+        {tab === "view-as" && (
+          <ViewAsView state={state} scopeId={openScopeId || state.scopes[0]?.id} onSelectScope={setOpenScopeId} />
+        )}
+
         {tab === "settings" && (
           <SettingsScreen state={state} dispatch={dispatch} onFlash={flash} />
         )}
@@ -308,6 +312,13 @@ function TopBar({ tab, onTab, dark, onToggleDark }) {
         >
           <Icon name="scroll-text" size={13} style={{ marginRight: 6, verticalAlign: "-2px" }} />
           Record
+        </button>
+        <button
+          className={"at-tab" + (tab === "view-as" ? " active" : "")}
+          onClick={() => onTab("view-as")}
+        >
+          <Icon name="eye" size={13} style={{ marginRight: 6, verticalAlign: "-2px" }} />
+          View as
         </button>
         <button
           className={"at-tab" + (tab === "settings" ? " active" : "")}

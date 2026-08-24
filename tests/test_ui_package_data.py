@@ -35,6 +35,7 @@ _UI_FILES = [
     "declines.jsx",
     "freshness.jsx",
     "record-trail.jsx",
+    "view-as.jsx",
     "tweaks-panel.jsx",
     "store.js",
     "atlas.css",

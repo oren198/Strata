@@ -49,6 +49,7 @@ Vocabulary follows CONTEXT.md verbatim.
 from __future__ import annotations
 
 import importlib.resources
+import json
 import pathlib
 import sqlite3
 from collections.abc import AsyncGenerator, Generator, Sequence
@@ -70,7 +71,8 @@ from strata.locks import scope_append_lock as _scope_append_lock
 from strata.locks import scope_lock as _scope_lock
 from strata.locks import scope_queue as _scope_queue
 from strata.migrator import run_migrations
-from strata.operator import operator_memory_binding
+from strata.operator import operator_memory_binding, read_operator_layer
+from strata.perspective import compose_perspective
 from strata.project_config import StoragePaths, resolve_storage_paths
 from strata.publication import (
     apply_judged_withdrawals,
@@ -161,6 +163,18 @@ def _parse_iso(value: str) -> datetime | None:
         return datetime.fromisoformat(value)
     except (TypeError, ValueError):
         return None
+
+
+#: Characters per token in the Console's rough weight estimate. Deliberately a
+#: constant, not a tokenizer: the Console must work offline with no model call and
+#: no extra dependency, and the number's job is comparing layers to each other, not
+#: predicting a bill. Every surface that shows it says "est.".
+_CHARS_PER_TOKEN = 4
+
+
+def _estimate_tokens(text: str) -> int:
+    """Return a rough token estimate for *text* (UI-only, never used to judge)."""
+    return (len(text) + _CHARS_PER_TOKEN - 1) // _CHARS_PER_TOKEN
 
 
 def get_anthropic_client(
@@ -1280,6 +1294,74 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
             exists=False,
         )
         return empty.model_dump()
+
+    # -----------------------------------------------------------------------
+    # GET /scopes/{scope_id}/perspective
+    # -----------------------------------------------------------------------
+
+    @application.get("/scopes/{scope_id}/perspective")
+    def get_scope_perspective(
+        scope_id: str,
+        request: Request,
+        summary_store: SummaryStore = Depends(get_summary_store),
+    ) -> dict:
+        """Return the composed perspective *scope_id* would receive, with token weights.
+
+        Wires ``compose_perspective`` with the operator and publication readers
+        exactly as the MCP server does (``strata/mcp/server.py``) — an operator
+        inspecting "what does this agent actually see" must see operator
+        layers and peer publications, never the legacy whole-face shape. The
+        session nudge (``_attach_nudge``) is deliberately not applied: the
+        nudge is a session-facing artefact and the Console is not a session.
+
+        Each layer gets a ``token_estimate`` (see ``_estimate_tokens``) computed
+        over its serialised payload — the structured text that actually reaches
+        the agent, not just its free-text fields — and the response carries a
+        ``token_estimate_total`` plus a ``token_estimate_method`` note that this
+        is an estimate, not a tokenizer count.
+
+        Returns 404 if the scope is not in the FleetConfig.
+        """
+        fleet: FleetConfig = request.app.state.fleet_config
+        scope = fleet.get_scope(scope_id)
+        if scope is None:
+            raise HTTPException(status_code=404, detail=f"Scope not found: {scope_id!r}")
+
+        def _operator_reader(attachment_scope_id: str) -> list:
+            return read_operator_layer(
+                attachment_scope_id, summaries_dir=str(summary_store.summaries_dir)
+            )
+
+        def _publication_reader(peer_scope_id: str) -> list:
+            return read_publication(
+                peer_scope_id, summaries_dir=str(summary_store.summaries_dir)
+            )
+
+        try:
+            composed = compose_perspective(
+                scope_id,
+                fleet=fleet,
+                summary_store=summary_store,
+                operator_reader=_operator_reader,
+                publication_reader=_publication_reader,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+        total = 0
+        for layer in composed["layers"]:
+            payload = layer.get("summary") or layer.get("publication") or layer.get(
+                "operator_memory"
+            )
+            estimate = _estimate_tokens(json.dumps(payload, sort_keys=True))
+            layer["token_estimate"] = estimate
+            total += estimate
+
+        composed["token_estimate_total"] = total
+        composed["token_estimate_method"] = (
+            "characters divided by 4 — an estimate, not a tokenizer"
+        )
+        return composed
 
     # -----------------------------------------------------------------------
     # GET /scopes/{scope_id}/record
