@@ -18,3 +18,21 @@ venv/
 # run in this repo) — per-machine state, never committed.
 .strata/
 summaries/
+
+# Environment, not project: a workspace using Strata on itself keeps its own
+# fleet, DB, session state, and register-installed wiring — none of it ships.
+fleet.yaml
+/strata.db
+/.locks/
+.strata/
+.claude/settings.json
+.claude/settings.local.json
+.claude/hooks/
+.claude/skills/strata/
+.claude/skills/strata-worker/
+.claude/skills/strata-inspect/
+.claude/skills/architect/
+.venv-strata/
+*.local-backup
+.backup-*/
+.mcp.json
