@@ -58,7 +58,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Literal
 
 import anthropic
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -91,7 +91,12 @@ from strata.scope_manager import (
     ScopeManagerBatchJudgment,
     ScopeManagerJudgment,
 )
-from strata.session_state import DEFAULT_STALENESS_WINDOW_DAYS, SessionStateStore, sessions_dir_for
+from strata.session_state import (
+    DEFAULT_STALENESS_WINDOW_DAYS,
+    SessionStateStore,
+    compute_fleet_staleness,
+    sessions_dir_for,
+)
 from strata.settings import Settings, get_settings
 from strata.summary_store import ScopeSummary, SummaryStore
 
@@ -1143,6 +1148,99 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
                 {"from_scope_id": e.from_, "to_scope_id": e.to, "kind": e.kind}
                 for e in active_edges
             ],
+        }
+
+    # -----------------------------------------------------------------------
+    # GET /staleness
+    # -----------------------------------------------------------------------
+
+    @application.get("/staleness")
+    def get_staleness(
+        request: Request,
+        window_days: int = Query(default=30, ge=1),
+        scope_id: str | None = None,
+        record_store: RecordStore = Depends(get_record_store),
+        summary_store: SummaryStore = Depends(get_summary_store),
+        session_store: SessionStateStore = Depends(get_session_store),
+    ) -> dict:
+        """Return the fleet-wide staleness view (P2 proof surface).
+
+        UI-only. No engine flow reads this; the metric itself lives in
+        ``session_state.compute_fleet_staleness`` and is unchanged by this
+        route.
+
+        Returns 404 if ``scope_id`` is given but is not an active scope.
+        """
+        fleet: FleetConfig = request.app.state.fleet_config
+        active = fleet.active_scopes()
+
+        if scope_id is not None:
+            active = [s for s in active if s.id == scope_id]
+            if not active:
+                raise HTTPException(status_code=404, detail=f"Scope not found: {scope_id!r}")
+
+        scope_ids = [s.id for s in active]
+        staleness = compute_fleet_staleness(
+            scope_ids,
+            record_store=record_store,
+            session_store=session_store,
+            window_days=window_days,
+        )
+        by_id = {s.id: s for s in active}
+
+        rows = []
+        for metric in staleness:
+            scope = by_id[metric.scope_id]
+            summary = summary_store.read(metric.scope_id)
+            summary_version = summary.version if summary is not None else 0
+            summary_updated_at = summary.updated_at if summary is not None else None
+
+            if summary_version == 0:
+                state = "no_memory"
+            elif metric.reads_since_last_contribution > 0:
+                state = "stale"
+            else:
+                state = "fresh"
+
+            rows.append(
+                {
+                    "scope_id": metric.scope_id,
+                    "name": scope.name,
+                    "stratum_id": scope.stratum_id,
+                    "reads_since_last_contribution": metric.reads_since_last_contribution,
+                    "last_accepted_contribution_at": metric.last_accepted_contribution_at,
+                    "summary_version": summary_version,
+                    "summary_updated_at": summary_updated_at,
+                    "state": state,
+                }
+            )
+
+        rows.sort(key=lambda r: (-r["reads_since_last_contribution"], r["scope_id"]))
+
+        window_start = datetime.now(tz=UTC) - timedelta(days=window_days)
+        contributions = 0
+        closeouts = 0
+        silent_readers = 0
+        for state_row in session_store.all_states():
+            updated_at = _parse_iso(state_row.updated_at)
+            if updated_at is None or updated_at < window_start:
+                continue
+            if state_row.contributions > 0:
+                contributions += 1
+            elif state_row.declines > 0:
+                closeouts += 1
+            elif state_row.reads > 0:
+                silent_readers += 1
+
+        return {
+            "window_days": window_days,
+            "generated_at": datetime.now(tz=UTC).isoformat(),
+            "scopes": rows,
+            "session_outcomes": {
+                "contributions": contributions,
+                "closeouts": closeouts,
+                "silent_readers": silent_readers,
+            },
         }
 
     # -----------------------------------------------------------------------
