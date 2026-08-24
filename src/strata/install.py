@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import copy
 import os
+import re
 import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -72,6 +73,8 @@ __all__ = [
     "remove_codex_freshness_hook",
     "KNOWN_HARNESSES",
     "detect_harnesses",
+    "set_default_harness",
+    "read_default_harness",
 ]
 
 # ---------------------------------------------------------------------------
@@ -748,3 +751,85 @@ def detect_harnesses(home: Path | None = None, path_env: str | None = None) -> l
     if shutil.which("codex", path=path_env) or (home / ".codex").exists():
         detected.append("codex")
     return detected
+
+
+# ---------------------------------------------------------------------------
+# .strata/config.toml — [launch] table (default harness, Task 4)
+# ---------------------------------------------------------------------------
+
+#: Regex matching a top-level ``[launch]`` table header line.
+_LAUNCH_HEADER_RE = re.compile(r"(?m)^\[launch\][ \t]*$")
+
+#: Regex matching any top-level table (or array-of-tables) header line —
+#: used to find where an existing ``[launch]`` table's body ends.
+_TOP_LEVEL_HEADER_RE = re.compile(r"(?m)^\[")
+
+#: Regex matching a ``default_harness = ...`` key line inside a table body.
+_DEFAULT_HARNESS_KEY_RE = re.compile(r"(?m)^default_harness[ \t]*=.*$")
+
+
+def set_default_harness(config_text: str, name: str) -> str:
+    """Set ``default_harness = "<name>"`` under a ``[launch]`` table.
+
+    Read-modify-write, textual (mirrors the Codex config mergers above —
+    this project has no TOML writer): every existing table, comment, and
+    blank line in *config_text* is preserved byte-for-byte outside the
+    ``[launch]`` table's ``default_harness`` line.
+
+    - No ``[launch]`` table present: one is appended at the end (via the same
+      blank-line separator rule as :func:`_append_block`).
+    - ``[launch]`` present, no ``default_harness`` key: the key is appended
+      inside the existing table body.
+    - ``[launch]`` present with a ``default_harness`` key: that line is
+      replaced in place — re-running never duplicates the table or the key.
+
+    Args:
+        config_text: The current ``.strata/config.toml`` contents.
+        name: The harness name to record (validated by the caller against
+            :data:`KNOWN_HARNESSES`).
+
+    Returns:
+        The new config text.
+    """
+    new_line = f'default_harness = "{name}"'
+
+    header_match = _LAUNCH_HEADER_RE.search(config_text)
+    if header_match is None:
+        block = f"[launch]\n{new_line}\n"
+        return _append_block(config_text, block)
+
+    body_start = header_match.end()
+    next_header = _TOP_LEVEL_HEADER_RE.search(config_text, body_start + 1)
+    body_end = next_header.start() if next_header else len(config_text)
+    body = config_text[body_start:body_end]
+
+    key_match = _DEFAULT_HARNESS_KEY_RE.search(body)
+    if key_match is not None:
+        new_body = body[: key_match.start()] + new_line + body[key_match.end() :]
+    else:
+        new_body = body
+        if new_body and not new_body.endswith("\n"):
+            new_body += "\n"
+        new_body += new_line + "\n"
+
+    return config_text[:body_start] + new_body + config_text[body_end:]
+
+
+def read_default_harness(config_text: str) -> str | None:
+    """Return the ``[launch].default_harness`` value from *config_text*, or ``None``.
+
+    Parses via ``tomllib`` (validation, not the write path — writes stay
+    textual, see :func:`set_default_harness`). Returns ``None`` when the
+    table/key is absent or the TOML fails to parse (e.g. mid-edit).
+    """
+    import tomllib  # noqa: PLC0415
+
+    try:
+        data = tomllib.loads(config_text) if config_text.strip() else {}
+    except tomllib.TOMLDecodeError:
+        return None
+    launch = data.get("launch")
+    if not isinstance(launch, dict):
+        return None
+    value = launch.get("default_harness")
+    return value if isinstance(value, str) else None

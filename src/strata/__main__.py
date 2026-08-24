@@ -2517,6 +2517,48 @@ def _rmdir_if_empty(directory: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# strata set-default-harness (Task 4) — records what `strata launch` starts.
+# ---------------------------------------------------------------------------
+
+
+def cmd_set_default_harness(args: argparse.Namespace) -> int:
+    """Write ``default_harness`` under ``[launch]`` in ``.strata/config.toml``.
+
+    Validates *args.harness_name* against :data:`install.KNOWN_HARNESSES`
+    (exit 2 + the valid list otherwise) and requires a registered workspace
+    (exit 1 + "run 'strata register' first" otherwise). The write is a
+    textual read-modify-write (:func:`install.set_default_harness`): every
+    other line in ``config.toml`` — including a pre-existing ``[launch]``
+    table's other keys — survives byte-for-byte; a re-run replaces the value
+    in place rather than duplicating the table.
+    """
+    name: str = args.harness_name
+    if name not in install.KNOWN_HARNESSES:
+        print(
+            f"Unknown harness {name!r}. Valid harnesses: {', '.join(install.KNOWN_HARNESSES)}",
+            file=sys.stderr,
+        )
+        return 2
+
+    path_arg: str | None = getattr(args, "path", None)
+    project_root = Path(path_arg).resolve() if path_arg else Path.cwd().resolve()
+    config_path = project_root / ".strata" / "config.toml"
+    if not config_path.exists():
+        print(
+            f"No .strata/config.toml found at {project_root} — run 'strata register' first.",
+            file=sys.stderr,
+        )
+        return 1
+
+    current_text = config_path.read_text(encoding="utf-8")
+    new_text = install.set_default_harness(current_text, name)
+    config_path.write_text(new_text, encoding="utf-8")
+
+    print(f"default harness: {name} (used by 'strata launch')")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # strata freshness-hook / freshness-evaluator — the turn-boundary contribution
 # Stop-hook and its detached background evaluator (issue #112, WP3). Hidden
 # subcommands: they are the engine the installed `.claude/hooks/strata-stop-hook`
@@ -2911,6 +2953,29 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_unregister.set_defaults(func=cmd_unregister)
+
+    p_set_default_harness = sub.add_parser(
+        "set-default-harness",
+        help="Record which harness `strata launch` starts by default.",
+        description=(
+            "Write default_harness under [launch] in .strata/config.toml, so "
+            "`strata launch` knows which harness to start without a --harness "
+            "flag every time. Requires a registered workspace "
+            "(`strata register` first)."
+        ),
+    )
+    p_set_default_harness.add_argument(
+        "harness_name",
+        metavar="NAME",
+        help=f"Harness to make the default. One of: {', '.join(install.KNOWN_HARNESSES)}.",
+    )
+    p_set_default_harness.add_argument(
+        "path",
+        nargs="?",
+        default=None,
+        help="Project root directory (default: current working directory).",
+    )
+    p_set_default_harness.set_defaults(func=cmd_set_default_harness)
 
     # -------------------------------------------------------------------
     # Hidden engine subcommands for the freshness Stop-hook (issue #112).
