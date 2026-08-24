@@ -1446,7 +1446,8 @@ def _resolve_launch_harness(args: argparse.Namespace, project_root: Path | None)
 
     1. An explicit ``--harness`` flag wins outright.
     2. Else the project's recorded default (``strata set-default-harness``),
-       read via :func:`strata.project_config.read_default_harness`.
+       read via :func:`strata.project_config.read_default_harness` — only
+       when it names a harness Strata actually knows (see below).
     3. Else, when exactly one harness is WIRED in this project (see
        :func:`_wired_harnesses` — the same marker check as ``strata
        unregister``'s default), that one.
@@ -1457,6 +1458,14 @@ def _resolve_launch_harness(args: argparse.Namespace, project_root: Path | None)
     dev usage) — falls back to the current working directory so steps 2–3
     still have somewhere to look; both degrade gracefully to "not found"
     when nothing is there, landing on claude-code exactly as before.
+
+    A recorded default that names a harness outside
+    :data:`install.KNOWN_HARNESSES` (a hand-edited ``config.toml``, or one
+    written by a future Strata version this one predates) is not silently
+    treated as claude-code — it prints a one-line notice to stderr naming
+    the bad value and falls back to claude-code explicitly, so a typo in
+    ``default_harness`` is visible instead of quietly launching the wrong
+    thing with no explanation.
     """
     explicit: str | None = getattr(args, "harness", None)
     if explicit is not None:
@@ -1468,7 +1477,14 @@ def _resolve_launch_harness(args: argparse.Namespace, project_root: Path | None)
 
     default = read_default_harness(effective_root)
     if default is not None:
-        return default
+        if default in install.KNOWN_HARNESSES:
+            return default
+        print(
+            f"default harness {default!r} in .strata/config.toml is not one of: "
+            f"{', '.join(install.KNOWN_HARNESSES)} — launching claude-code",
+            file=sys.stderr,
+        )
+        return "claude-code"
 
     wired = _wired_harnesses(effective_root)
     if len(wired) == 1:

@@ -757,15 +757,38 @@ def detect_harnesses(home: Path | None = None, path_env: str | None = None) -> l
 # .strata/config.toml — [launch] table (default harness, Task 4)
 # ---------------------------------------------------------------------------
 
-#: Regex matching a top-level ``[launch]`` table header line.
-_LAUNCH_HEADER_RE = re.compile(r"(?m)^\[launch\][ \t]*$")
+#: Regex matching a top-level ``[launch]`` table header line. The trailing
+#: ``\r?`` matters: without it, a CRLF-authored ``config.toml`` (Windows is a
+#: supported platform) leaves the header unmatched — ``$`` in MULTILINE mode
+#: only matches immediately before ``\n``, and a bare ``[ \t]*`` does not
+#: consume the ``\r`` that sits between ``[launch]`` and that ``\n`` — so the
+#: whole function fell through to "no table found" and appended a *second*
+#: ``[launch]`` table on every CRLF file (reported in review).
+_LAUNCH_HEADER_RE = re.compile(r"(?m)^\[launch\][ \t]*\r?$")
 
 #: Regex matching any top-level table (or array-of-tables) header line —
-#: used to find where an existing ``[launch]`` table's body ends.
+#: used to find where an existing ``[launch]`` table's body ends. Unaffected
+#: by CRLF: ``^`` in MULTILINE mode matches right after a ``\n`` regardless
+#: of what precedes it.
 _TOP_LEVEL_HEADER_RE = re.compile(r"(?m)^\[")
 
-#: Regex matching a ``default_harness = ...`` key line inside a table body.
-_DEFAULT_HARNESS_KEY_RE = re.compile(r"(?m)^default_harness[ \t]*=.*$")
+#: Regex matching a ``default_harness = ...`` key line inside a table body,
+#: stopping before any ``\r``/``\n`` rather than consuming them (``[^\r\n]*``
+#: instead of ``.*$``): a trailing ``\r`` must NOT be swallowed into the
+#: match, or replacing it turns that one line's CRLF into a bare LF and the
+#: file's line-ending style stops being byte-preserved.
+_DEFAULT_HARNESS_KEY_RE = re.compile(r"(?m)^default_harness[ \t]*=[^\r\n]*")
+
+
+def _detect_newline(text: str) -> str:
+    """Return the line-ending style already used in *text*.
+
+    ``"\\r\\n"`` if any CRLF pair is present, else ``"\\n"``. Content this
+    module *adds* (a fresh ``[launch]`` table, a fresh ``default_harness``
+    key) uses this so a CRLF file stays CRLF throughout, not just on the
+    lines it already had.
+    """
+    return "\r\n" if "\r\n" in text else "\n"
 
 
 def set_default_harness(config_text: str, name: str) -> str:
@@ -774,7 +797,8 @@ def set_default_harness(config_text: str, name: str) -> str:
     Read-modify-write, textual (mirrors the Codex config mergers above —
     this project has no TOML writer): every existing table, comment, and
     blank line in *config_text* is preserved byte-for-byte outside the
-    ``[launch]`` table's ``default_harness`` line.
+    ``[launch]`` table's ``default_harness`` line — including its line-ending
+    style (CRLF in, CRLF out; see :func:`_detect_newline`).
 
     - No ``[launch]`` table present: one is appended at the end (via the same
       blank-line separator rule as :func:`_append_block`).
@@ -792,11 +816,17 @@ def set_default_harness(config_text: str, name: str) -> str:
         The new config text.
     """
     new_line = f'default_harness = "{name}"'
+    nl = _detect_newline(config_text)
 
     header_match = _LAUNCH_HEADER_RE.search(config_text)
     if header_match is None:
-        block = f"[launch]\n{new_line}\n"
-        return _append_block(config_text, block)
+        prefix = config_text
+        if prefix and not prefix.endswith("\n"):
+            prefix += nl
+        if prefix:
+            prefix += nl
+        block = f"[launch]{nl}{new_line}{nl}"
+        return prefix + block
 
     body_start = header_match.end()
     next_header = _TOP_LEVEL_HEADER_RE.search(config_text, body_start + 1)
@@ -809,8 +839,8 @@ def set_default_harness(config_text: str, name: str) -> str:
     else:
         new_body = body
         if new_body and not new_body.endswith("\n"):
-            new_body += "\n"
-        new_body += new_line + "\n"
+            new_body += nl
+        new_body += new_line + nl
 
     return config_text[:body_start] + new_body + config_text[body_end:]
 

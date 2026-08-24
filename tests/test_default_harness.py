@@ -131,6 +131,55 @@ class TestInstallSetDefaultHarnessTextual:
         assert 'default_harness = "claude-code"' not in new_text
 
 
+class TestSetDefaultHarnessCrlf:
+    """Regression: a CRLF-authored config.toml (Windows) must round-trip
+    without duplicating the [launch] table and without the write path
+    silently rewriting other lines' CRLF endings to bare LF (review fix)."""
+
+    def test_crlf_launch_table_matched_not_duplicated(self) -> None:
+        text = 'foo = 1\r\n\r\n[launch]\r\ndefault_harness = "claude-code"\r\n'
+        new_text = install.set_default_harness(text, "codex")
+        assert new_text.count("[launch]") == 1
+        assert new_text.count("default_harness") == 1
+        assert 'default_harness = "codex"' in new_text
+        assert 'default_harness = "claude-code"' not in new_text
+
+    def test_crlf_run_twice_stays_single_table_single_key(self) -> None:
+        text = 'foo = 1\r\n\r\n[launch]\r\ndefault_harness = "claude-code"\r\n'
+        once = install.set_default_harness(text, "codex")
+        twice = install.set_default_harness(once, "codex")
+        assert twice.count("[launch]") == 1
+        assert twice.count("default_harness") == 1
+
+    def test_crlf_other_bytes_preserved(self) -> None:
+        text = 'foo = 1\r\n\r\n[launch]\r\ndefault_harness = "claude-code"\r\n'
+        new_text = install.set_default_harness(text, "codex")
+        assert new_text.startswith("foo = 1\r\n\r\n[launch]\r\n")
+
+    def test_crlf_no_bare_lf_introduced(self) -> None:
+        """Every newline in a CRLF-only input stays CRLF in the output."""
+        text = 'foo = 1\r\n\r\n[launch]\r\ndefault_harness = "claude-code"\r\n'
+        new_text = install.set_default_harness(text, "codex")
+        # Strip every CRLF pair; nothing but the pair-halves should remain,
+        # i.e. no lone "\n" survives once every "\r\n" is removed.
+        assert "\n" not in new_text.replace("\r\n", "")
+
+    def test_crlf_appends_new_key_with_crlf(self) -> None:
+        text = "foo = 1\r\n\r\n[launch]\r\nother_key = 1\r\n"
+        new_text = install.set_default_harness(text, "codex")
+        assert new_text.count("[launch]") == 1
+        assert 'default_harness = "codex"' in new_text
+        assert "\n" not in new_text.replace("\r\n", "")
+
+    def test_crlf_no_launch_table_appends_with_crlf(self) -> None:
+        text = "foo = 1\r\nbar = 2\r\n"
+        new_text = install.set_default_harness(text, "codex")
+        assert new_text.startswith(text)
+        assert "[launch]" in new_text
+        assert 'default_harness = "codex"' in new_text
+        assert "\n" not in new_text.replace("\r\n", "")
+
+
 class TestReadDefaultHarness:
     def test_absent_config_returns_none(self, tmp_path: Path) -> None:
         assert _read_project_default_harness(tmp_path) is None

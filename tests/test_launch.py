@@ -694,6 +694,21 @@ class TestResolveLaunchHarness:
         args = argparse.Namespace(harness=None)
         assert _resolve_launch_harness(args, Path("/does/not/matter")) == "claude-code"
 
+    def test_unknown_recorded_default_warns_and_falls_back_to_claude_code(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """A hand-edited/future-version default_harness must not silently
+        launch claude-code with no explanation (review fix)."""
+        monkeypatch.setattr("strata.project_config.read_default_harness", lambda root: "gpt5")
+        monkeypatch.setattr("strata.__main__._wired_harnesses", lambda root: ["codex"])
+        args = argparse.Namespace(harness=None)
+        result = _resolve_launch_harness(args, Path("/does/not/matter"))
+        assert result == "claude-code"
+        err = capsys.readouterr().err
+        assert "gpt5" in err
+        assert "claude-code" in err
+        assert "codex" in err
+
     def test_none_project_root_falls_back_to_cwd(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """project_root None (unregistered/env-driven) degrades to cwd-rooted lookups."""
         seen: list[Path] = []
