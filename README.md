@@ -705,6 +705,20 @@ patterns into `directive`s that bind everyone below. Watch the state
 evolve in <http://127.0.0.1:8000/> (the Console UI) or run `strata
 summary g_arch` from a fourth terminal.
 
+**Several terminals on one machine are safe, even without the backend
+running.** Every `claude` session above talks to its own `strata-mcp`
+process, and two of those processes — or a process and the optional Console
+backend — can end up contributing to the same scope at the same time. Each
+holds its own per-scope lock file under `.strata/.locks/` for the moment it
+takes to append a contribution and, separately, for the moment it takes to
+judge one — the OS enforces that only one process holds a given lock file at
+a time, so two contributions to the same scope can never interleave and
+leave the summary out of sync with the record (ADR 0012). Nothing extra to
+start or configure: the lock files are created on demand next to your
+`strata.db`, so this holds whether or not `strata start` is running.
+(Windows: `strata-mcp` still serializes concurrent contributions inside one
+process; across processes it does not — see ADR 0012.)
+
 ---
 
 ## Git workflow

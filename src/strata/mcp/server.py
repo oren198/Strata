@@ -50,6 +50,7 @@ import yaml
 from mcp.server.fastmcp import FastMCP
 
 from strata.fleet_config import FleetConfig, FleetConfigError
+from strata.locks import configure_lock_dir
 from strata.migrator import run_migrations
 from strata.operator import read_operator_layer
 from strata.perspective import compose_perspective
@@ -116,9 +117,15 @@ def _init_stores() -> None:
     """Initialise storage-backed singletons — called AFTER binding validation.
 
     Applies pending migrations so the DB is ready before the first tool call.
+    Also configures the cross-process scope lock directory (issue #19, ADR
+    0012) as ``<db_dir>/.locks`` — deriving it from ``_db_path`` here, rather
+    than a separate setting, is what makes every ``strata-mcp`` process (and
+    the Console backend, via ``create_app``) that touches the same project's
+    DB agree on the same lock files.
     """
     global _record_store, _summary_store, _session_store
     run_migrations(_db_path)
+    configure_lock_dir(Path(_db_path).parent / ".locks")
     _record_store = RecordStore(_db_path)
     _summary_store = SummaryStore(_summaries_dir)
     _session_store = SessionStateStore(_sessions_dir)
