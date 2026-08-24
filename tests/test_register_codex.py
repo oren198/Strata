@@ -67,12 +67,15 @@ def _register(
 
 
 def _unregister(tmp_path: Path, *, harness: str = "claude-code", dry_run: bool = False) -> int:
+    # A parsed `--harness NAME` flag now yields a list (action="append"), same
+    # shape as register's; wrap the single-harness convenience param the same
+    # way so these tests exercise exactly the explicit-flags resolution path.
     return cmd_unregister(
         argparse.Namespace(
             path=str(tmp_path),
             dry_run=dry_run,
             purge_data=False,
-            harness=harness,
+            harness=[harness],
         )
     )
 

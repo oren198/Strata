@@ -2153,16 +2153,25 @@ def cmd_register(args: argparse.Namespace) -> int:
 
 
 def cmd_unregister(args: argparse.Namespace) -> int:
-    """Reverse `strata register`'s wiring — issue #53.
+    """Reverse `strata register`'s wiring — issue #53; harness-symmetric (Task 3).
 
     Removes each artifact register wired ONLY when it still byte-matches what
     register would have written; user-edited artifacts are reported and left
     in place (ADR 0005 Decision 6, applied in reverse). Steps:
 
-    1. `.gitignore` managed block   (removed verbatim, other lines untouched).
-    2. `mcpServers.strata` entry     (removed only if == the canonical entry).
-    3. the three vendored skills      (removed only if byte-identical to shipped).
-    4. `.strata/` data                (left alone unless --purge-data).
+    1. `.gitignore` managed block     (removed verbatim, other lines untouched).
+    2. per resolved harness: claude-code's `mcpServers.strata` entry + Stop
+       hook, or codex's `[mcp_servers.strata]` table + Stop-hook block
+       (each removed only if == the canonical entry it was merged with).
+    3. the three vendored skills        (claude-code only; removed only if
+       byte-identical to shipped).
+    4. `.strata/` data                  (left alone unless --purge-data).
+
+    Harness resolution (symmetric with, but not identical to, register's):
+    explicit `--harness` flags -> exactly those; no flags -> every harness
+    whose wiring markers are currently present (what's WIRED, not what's
+    installed/detected). A harness named explicitly but not wired prints a
+    skip line and does not fail the run.
 
     --dry-run prints every action and touches nothing. Idempotent: an
     already-clean project reports "nothing to do" per item and exits 0.
@@ -2177,7 +2186,43 @@ def cmd_unregister(args: argparse.Namespace) -> int:
     project_root = Path(path_arg).resolve() if path_arg else Path.cwd().resolve()
     dry_run: bool = getattr(args, "dry_run", False)
     purge_data: bool = getattr(args, "purge_data", False)
-    harness: str = getattr(args, "harness", None) or "claude-code"
+
+    # -----------------------------------------------------------------------
+    # Resolve which harness(es) to reverse (Task 3, multi-harness parity).
+    # Unlike register (which defaults to everything *detected*), unregister
+    # defaults to everything *wired* — what register's markers show is
+    # actually present in this project, not what's installed on the machine.
+    # Explicit --harness flags always win outright, even naming a harness
+    # with nothing wired (that just prints a skip line below).
+    # -----------------------------------------------------------------------
+    def _claude_code_wired() -> bool:
+        settings_json = project_root / ".claude" / "settings.json"
+        if not settings_json.exists():
+            return False
+        try:
+            data = json.loads(settings_json.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            # Corrupt JSON is not proof there's nothing to reverse — treat it
+            # as conservatively "possibly wired" so the real claude-code step
+            # runs and reports the actual problem, instead of this marker
+            # check silently downgrading a corruption into a skip line.
+            return True
+        return _mcp_server_present(data) or _stop_hook_present(data)
+
+    def _codex_wired() -> bool:
+        codex_config = _codex_config_path()
+        if not codex_config.exists():
+            return False
+        text = codex_config.read_text(encoding="utf-8")
+        return _codex_mcp_present(text) or _codex_hook_present(text)
+
+    _WIRED_CHECK = {"claude-code": _claude_code_wired, "codex": _codex_wired}
+
+    harness_flags: list[str] | None = getattr(args, "harness", None)
+    if harness_flags:
+        resolved_harnesses: list[str] = list(harness_flags)
+    else:
+        resolved_harnesses = [h for h in install.KNOWN_HARNESSES if _WIRED_CHECK[h]()]
 
     # Tracks whether any artifact the user asked to remove was left in place
     # (edited/modified) — drives the exit-1 partial-completion signal.
@@ -2231,7 +2276,7 @@ def cmd_unregister(args: argparse.Namespace) -> int:
         else:  # absent
             _ok(".gitignore: nothing to do (no managed Strata block)")
 
-    if harness == "claude-code":
+    def _unregister_claude_code() -> None:
         # -----------------------------------------------------------------------
         # Step 2: `.claude/settings.json` — the `mcpServers.strata` entry and the
         # freshness `hooks.Stop` entry (issue #112). Both removed only when they
@@ -2368,7 +2413,7 @@ def cmd_unregister(args: argparse.Namespace) -> int:
             _rmdir_if_empty(claude_hooks_dir)
             _rmdir_if_empty(project_root / ".claude")
 
-    elif harness == "codex":
+    def _unregister_codex() -> None:
         # ---------------------------------------------------------------
         # Step 2 (codex): reverse of `strata register --harness codex` —
         # the [mcp_servers.strata] table and freshness hooks.Stop block in
@@ -2412,6 +2457,24 @@ def cmd_unregister(args: argparse.Namespace) -> int:
 
             if codex_changed and not dry_run:
                 codex_config.write_text(codex_text, encoding="utf-8")
+
+    # -----------------------------------------------------------------------
+    # Per-harness reversal loop (Task 3, multi-harness parity): mirrors
+    # register's per-harness loop, one `== NAME ==` header per resolved
+    # harness. A harness that was named explicitly (or, on the no-flags
+    # path, would not have been resolved at all) but has nothing wired
+    # prints a single skip line instead of running its reversal steps.
+    # -----------------------------------------------------------------------
+    _UNREGISTER_STEP = {
+        "claude-code": _unregister_claude_code,
+        "codex": _unregister_codex,
+    }
+    for _harness in resolved_harnesses:
+        print(f"\n== {_harness} ==")
+        if _WIRED_CHECK[_harness]():
+            _UNREGISTER_STEP[_harness]()
+        else:
+            _ok(f"{_harness}: nothing to do (not wired — nothing for unregister to reverse)")
 
     # -----------------------------------------------------------------------
     # Step 4: `.strata/` data — memory, not wiring.
@@ -2798,7 +2861,9 @@ def _build_parser() -> argparse.ArgumentParser:
             "since edited (the .gitignore block, the mcpServers.strata entry, a "
             "vendored skill) are reported and left in place. Your project's "
             "memory under .strata/ (fleet.yaml, DB, summaries, config.toml) is "
-            "left untouched unless you pass --purge-data. "
+            "left untouched unless you pass --purge-data. With no --harness flag, "
+            "every harness that is actually wired is reversed (see --harness); "
+            "a harness named explicitly but not wired just prints a skip line. "
             "Exit code: 0 on success including nothing-to-do; 1 when something "
             "you asked to remove was left in place because it had been edited, "
             "so scripts can detect the partial case."
@@ -2829,10 +2894,14 @@ def _build_parser() -> argparse.ArgumentParser:
     p_unregister.add_argument(
         "--harness",
         dest="harness",
-        choices=("claude-code", "codex"),
-        default="claude-code",
+        action="append",
+        choices=install.KNOWN_HARNESSES,
+        default=None,
         help=(
-            "Which harness's wiring to reverse (default: claude-code). 'codex' "
+            "Harness to reverse (repeatable). Default: every harness that is "
+            "actually WIRED in this project (not every harness installed on "
+            "this machine — see `strata register`'s default) — a harness "
+            "named explicitly but not wired just prints a skip line. 'codex' "
             "removes the [mcp_servers.strata] table and freshness Stop-hook "
             "block from the Codex CLI's config.toml instead of "
             ".claude/settings.json — only when they still byte-match what "
