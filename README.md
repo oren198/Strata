@@ -489,7 +489,15 @@ After step 3, edit `fleet.yaml` by hand to add per-scope skill declarations
 
 ### Strata Console UI
 
-Open <http://127.0.0.1:8000/> while the backend is running — a read-only graph and list view of the current fleet state, polling every 5 s. All memory mutations flow through `strata.contribute`; the UI has no write path in V1. To point the UI at a non-default backend, edit the `<meta name="strata-api-base" content="...">` tag in `src/strata/_ui/index.html`.
+Open <http://127.0.0.1:8000/> while the backend is running — a graph and list
+view of the current fleet state, polling every 5 s, plus five operator proof
+surfaces described in [`docs/console.md`](docs/console.md) and the
+[Console](#console) section below. Automatic memory writes (accept/decline)
+still flow only through `strata.contribute`; the Console's own write path is
+limited to the two in-person operator corrections (Replace / Retire a
+directive), each behind a confirm dialog. To point the UI at a non-default
+backend, edit the `<meta name="strata-api-base" content="...">` tag in
+`src/strata/_ui/index.html`.
 
 ### Run the tests
 
@@ -505,6 +513,34 @@ Anthropic API:
 ```bash
 STRATA_RUN_INTEGRATION=1 ANTHROPIC_API_KEY=... pytest tests/test_scope_manager.py -v
 ```
+
+---
+
+## Console
+
+```bash
+strata start
+```
+
+...then open <http://127.0.0.1:8000/ui/index.html> in a browser. The Console
+is local-only — it talks to the backend `strata start` just launched on your
+own machine, nothing external. Alongside the memory graph and settings, it
+has five tabs; see [`docs/console.md`](docs/console.md) for the full
+description of each:
+
+- **Turned down** — every contribution the scope-manager refused for a
+  scope, with the reason given, plus a separate mechanical count of sessions
+  that read the scope and recorded nothing.
+- **Freshness** — every active scope ranked by how many sessions have read
+  it since anything new was accepted, with a fleet-wide breakdown of
+  sessions that contributed, closed out with nothing to record, or read
+  silently.
+- **Record** — one scope's full append-only contribution record, newest
+  first, in plain language.
+- **View as** — exactly what an agent bound to a scope receives on a read,
+  broken into layers with a rough token-weight estimate for each.
+- **Operator corrections** — replace or retire one of a scope's own
+  directives in person, each action behind a confirm dialog.
 
 ---
 
