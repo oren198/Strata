@@ -98,6 +98,53 @@ def test_version_flag(capsys: pytest.CaptureFixture[str]) -> None:
     assert "strata " in captured.out
 
 
+def test_version_flag_survives_deleted_cwd(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``strata --version`` must not crash when ``Path.cwd()`` raises.
+
+    Parser construction eagerly resolves storage-path defaults for ``--db``'s
+    help text, before any subcommand — including a bare ``--version`` or
+    ``--help`` call. If the shell's cwd has been deleted (e.g. a removed git
+    worktree), ``Path.cwd()`` raises ``FileNotFoundError`` and previously
+    took the whole parser-construction step down with it. That must never
+    happen: parser construction has to tolerate any failure in the default
+    resolvers and fall back to a plain help string instead.
+    """
+    from strata import __main__ as main_mod
+
+    def _raise_cwd():
+        raise FileNotFoundError("cwd deleted")
+
+    monkeypatch.setattr(main_mod.Path, "cwd", staticmethod(_raise_cwd))
+
+    with pytest.raises(SystemExit) as ei:
+        main(["--version"])
+    assert ei.value.code == 0
+    captured = capsys.readouterr()
+    from strata import __version__
+
+    assert f"strata {__version__}" in captured.out
+
+
+def test_help_flag_survives_deleted_cwd(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``strata --help`` must not crash when ``Path.cwd()`` raises."""
+    from strata import __main__ as main_mod
+
+    def _raise_cwd():
+        raise FileNotFoundError("cwd deleted")
+
+    monkeypatch.setattr(main_mod.Path, "cwd", staticmethod(_raise_cwd))
+
+    with pytest.raises(SystemExit) as ei:
+        main(["--help"])
+    assert ei.value.code == 0
+    captured = capsys.readouterr()
+    assert "Strata — shared memory for agent fleets." in captured.out
+
+
 def test_migrate_calls_runner(tmp_path, capsys: pytest.CaptureFixture[str]) -> None:
     """``strata migrate --db <path>`` calls the migrations runner."""
     db_path = str(tmp_path / "test.db")
