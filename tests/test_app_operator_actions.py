@@ -249,19 +249,45 @@ def test_operator_route_takes_no_lock_of_its_own(client, monkeypatch):
     """The endpoint must delegate to operator_supersede/retire for locking — see D5/D16 of
     the plan and the route docstrings in strata/app.py: exactly ONE scope_lock acquisition
     per call, taken by the library function itself. A future endpoint-level re-wrap (a
-    reentrancy hazard, since scope_lock is not reentrant) would show two and fail this."""
+    reentrancy hazard, since scope_lock is not reentrant) would show two and fail this.
+
+    The stub must be installed at every name the lock is reachable through — `scope_lock`
+    is imported by value (``from strata.locks import scope_lock``), so patching
+    ``strata.locks.scope_lock`` alone leaves the names already bound inside
+    ``strata.operator`` (used by ``operator_supersede``/``operator_retire``) and
+    ``strata.app`` (bound as ``_scope_lock``, the name an endpoint-level re-wrap would
+    reach for) untouched. It also must NOT delegate to the real lock: `scope_lock` is not
+    reentrant, so a genuine double-acquire inside one thread would hang the test instead of
+    failing it — the stub is a recording no-op, standing in for the real lock entirely.
+    """
+    import strata.app as app_module
+    import strata.locks as locks_module
     import strata.operator as operator_module
 
     did = _seed_directive(client)
 
     acquisitions = []
-    real_scope_lock = operator_module.scope_lock
+
+    class _FakeLock:
+        def __init__(self, scope_id):
+            self.scope_id = scope_id
+
+        def __enter__(self):
+            acquisitions.append(self.scope_id)
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
 
     def _counting_scope_lock(scope_id):
-        acquisitions.append(scope_id)
-        return real_scope_lock(scope_id)
+        return _FakeLock(scope_id)
 
+    # Patch every name scope_lock is reachable through, not just the one call site the
+    # library happens to take today — a re-wrap in app.py would reach `_scope_lock`, not
+    # `strata.operator.scope_lock`.
+    monkeypatch.setattr(locks_module, "scope_lock", _counting_scope_lock)
     monkeypatch.setattr(operator_module, "scope_lock", _counting_scope_lock)
+    monkeypatch.setattr(app_module, "_scope_lock", _counting_scope_lock)
 
     resp = client.post(f"/scopes/g_active/directives/{did}/retire", json={"reason": "counted"})
     assert resp.status_code == 200
