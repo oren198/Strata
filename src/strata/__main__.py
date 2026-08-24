@@ -92,6 +92,15 @@ from strata.install import (
     render_action_line,
 )
 from strata.install import (
+    codex_config_path as _codex_config_path,
+)
+from strata.install import (
+    codex_hook_present as _codex_hook_present,
+)
+from strata.install import (
+    codex_mcp_present as _codex_mcp_present,
+)
+from strata.install import (
     hook_matches_shipped as _hook_matches_shipped,
 )
 from strata.install import (
@@ -99,6 +108,18 @@ from strata.install import (
 )
 from strata.install import (
     mcp_server_present as _mcp_server_present,
+)
+from strata.install import (
+    merge_codex_freshness_hook as _merge_codex_freshness_hook,
+)
+from strata.install import (
+    merge_codex_mcp_server as _merge_codex_mcp_server,
+)
+from strata.install import (
+    remove_codex_freshness_hook as _remove_codex_freshness_hook,
+)
+from strata.install import (
+    remove_codex_mcp_server as _remove_codex_mcp_server,
 )
 from strata.install import (
     remove_gitignore_block as _remove_gitignore_block,
@@ -2129,6 +2150,7 @@ def cmd_register(args: argparse.Namespace) -> int:
     project_root = Path(path_arg).resolve() if path_arg else Path.cwd().resolve()
     diff_mode: bool = getattr(args, "diff", False)
     bootstrap_venv: bool = getattr(args, "bootstrap_venv", False)
+    harness: str = getattr(args, "harness", None) or "claude-code"
 
     # -----------------------------------------------------------------------
     # Step 1: Require a project marker.
@@ -2230,113 +2252,190 @@ def cmd_register(args: argparse.Namespace) -> int:
                 )
         _act("seeded", fleet_yaml)
 
-    # -----------------------------------------------------------------------
-    # Step 6: Copy canonical skills to .claude/skills/ (skip each if exists).
-    # -----------------------------------------------------------------------
-    claude_skills_dir = project_root / ".claude" / "skills"
-    skills_root = importlib.resources.files("strata") / "_skills"
-    for skill_name in SKILL_NAMES:
-        dest_skill_dir = claude_skills_dir / skill_name
-        copied = copy_skill(skills_root, skill_name, claude_skills_dir, dry_run=diff_mode)
-        _act("copied" if copied else "skip", dest_skill_dir, skipped=not copied)
-
-    # -----------------------------------------------------------------------
-    # Step 6b: Copy the freshness Stop-hook script to .claude/hooks/ (issue #112).
-    # Additive like the skills — an existing script is kept.
-    # -----------------------------------------------------------------------
-    claude_hooks_dir = project_root / ".claude" / "hooks"
-    hooks_root = importlib.resources.files("strata") / "_hooks"
-    dest_hook = claude_hooks_dir / _HOOK_SCRIPT_NAME
-    hook_copied = copy_hook(hooks_root, claude_hooks_dir, dry_run=diff_mode)
-    _act("copied" if hook_copied else "skip", dest_hook, skipped=not hook_copied)
-
-    # -----------------------------------------------------------------------
-    # Step 7: Merge strata into .claude/settings.json — the mcpServers block and
-    # the freshness hooks.Stop entry (issue #112), both strictly additive.
-    # -----------------------------------------------------------------------
-    settings_json = project_root / ".claude" / "settings.json"
     settings_unreadable = False
-    if settings_json.exists():
-        try:
-            settings_data: dict = json.loads(settings_json.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as exc:
-            # NEVER fall through to a write here: writing with an empty dict
-            # would replace the user's entire settings file with just the
-            # strata entry. Skip the merge outright and fail the run so the
-            # user notices ("never overwrite user state" — ADR 0005 D6).
-            print(
-                f"  {_glyph('fail')} .claude/settings.json exists but is not valid JSON ({exc}).\n"
-                "    Fix the file, then re-run `strata register` to add the strata "
-                "mcpServers entry.",
-                file=sys.stderr,
-            )
-            settings_unreadable = True
-            settings_data = {}
-    else:
-        settings_data = {}
 
-    settings_changed = False
-    mcp_servers: dict = settings_data.get("mcpServers", {})
-    if settings_unreadable:
-        pass  # merge skipped — reported above; register exits non-zero below
-    elif _mcp_server_present(settings_data):
-        _act("skip", settings_json, skipped=True)
-        # Stale-shape detection (ADR 0005 Decision 6): warn if the existing
-        # strata mcpServer entry is V1.2-shape (broken on V1.3). Keeps the
-        # strict-additive contract — we never overwrite — but surfaces the
-        # upgrade-path issue at register time, when the user is in fix-mind.
-        existing = mcp_servers["strata"]
-        if isinstance(existing, dict) and _is_v1_2_shape_mcp_entry(existing):
-            print(
-                f"  {_glyph('warn')} WARNING: your existing strata mcpServer entry is "
-                "V1.2-shape and will silently",
-                file=sys.stderr,
-            )
-            print(
-                "    fail on V1.3 (the `mcp_server` Python module no longer exists; "
-                "`STRATA_BACKEND_URL` is unused).",
-                file=sys.stderr,
-            )
-            print(
-                f"    The canonical V1.3 entry is: {json.dumps(_MCP_ENTRY)}",
-                file=sys.stderr,
-            )
-            print(
-                "    Strata never overwrites your settings — run `strata register --diff` to "
-                "see the canonical,",
-                file=sys.stderr,
-            )
-            print(
-                "    then update .claude/settings.json by hand.",
-                file=sys.stderr,
-            )
-    else:
-        merge_mcp_server(settings_data)
-        settings_changed = True
-        _act("merged strata into", settings_json)
+    if harness == "claude-code":
+        # -------------------------------------------------------------------
+        # Step 6: Copy canonical skills to .claude/skills/ (skip each if exists).
+        # -------------------------------------------------------------------
+        claude_skills_dir = project_root / ".claude" / "skills"
+        skills_root = importlib.resources.files("strata") / "_skills"
+        for skill_name in SKILL_NAMES:
+            dest_skill_dir = claude_skills_dir / skill_name
+            copied = copy_skill(skills_root, skill_name, claude_skills_dir, dry_run=diff_mode)
+            _act("copied" if copied else "skip", dest_skill_dir, skipped=not copied)
 
-    # Step 7b: additively merge the freshness hooks.Stop entry (issue #112).
-    # A user's own Stop hooks — and every other settings key — are preserved;
-    # the Strata group is appended only when absent.
-    if not settings_unreadable:
-        if _stop_hook_present(settings_data):
-            _act("skip Stop hook in", settings_json, skipped=True)
+        # -------------------------------------------------------------------
+        # Step 6b: Copy the freshness Stop-hook script to .claude/hooks/ (issue #112).
+        # Additive like the skills — an existing script is kept.
+        # -------------------------------------------------------------------
+        claude_hooks_dir = project_root / ".claude" / "hooks"
+        hooks_root = importlib.resources.files("strata") / "_hooks"
+        dest_hook = claude_hooks_dir / _HOOK_SCRIPT_NAME
+        hook_copied = copy_hook(hooks_root, claude_hooks_dir, dry_run=diff_mode)
+        _act("copied" if hook_copied else "skip", dest_hook, skipped=not hook_copied)
+
+        # -------------------------------------------------------------------
+        # Step 7: Merge strata into .claude/settings.json — the mcpServers block and
+        # the freshness hooks.Stop entry (issue #112), both strictly additive.
+        # -------------------------------------------------------------------
+        settings_json = project_root / ".claude" / "settings.json"
+        if settings_json.exists():
+            try:
+                settings_data: dict = json.loads(settings_json.read_text(encoding="utf-8"))
+            except json.JSONDecodeError as exc:
+                # NEVER fall through to a write here: writing with an empty dict
+                # would replace the user's entire settings file with just the
+                # strata entry. Skip the merge outright and fail the run so the
+                # user notices ("never overwrite user state" — ADR 0005 D6).
+                print(
+                    f"  {_glyph('fail')} .claude/settings.json exists but is not valid JSON "
+                    f"({exc}).\n"
+                    "    Fix the file, then re-run `strata register` to add the strata "
+                    "mcpServers entry.",
+                    file=sys.stderr,
+                )
+                settings_unreadable = True
+                settings_data = {}
         else:
-            merge_stop_hook(settings_data)
+            settings_data = {}
+
+        settings_changed = False
+        mcp_servers: dict = settings_data.get("mcpServers", {})
+        if settings_unreadable:
+            pass  # merge skipped — reported above; register exits non-zero below
+        elif _mcp_server_present(settings_data):
+            _act("skip", settings_json, skipped=True)
+            # Stale-shape detection (ADR 0005 Decision 6): warn if the existing
+            # strata mcpServer entry is V1.2-shape (broken on V1.3). Keeps the
+            # strict-additive contract — we never overwrite — but surfaces the
+            # upgrade-path issue at register time, when the user is in fix-mind.
+            existing = mcp_servers["strata"]
+            if isinstance(existing, dict) and _is_v1_2_shape_mcp_entry(existing):
+                print(
+                    f"  {_glyph('warn')} WARNING: your existing strata mcpServer entry is "
+                    "V1.2-shape and will silently",
+                    file=sys.stderr,
+                )
+                print(
+                    "    fail on V1.3 (the `mcp_server` Python module no longer exists; "
+                    "`STRATA_BACKEND_URL` is unused).",
+                    file=sys.stderr,
+                )
+                print(
+                    f"    The canonical V1.3 entry is: {json.dumps(_MCP_ENTRY)}",
+                    file=sys.stderr,
+                )
+                print(
+                    "    Strata never overwrites your settings — run `strata register --diff` "
+                    "to see the canonical,",
+                    file=sys.stderr,
+                )
+                print(
+                    "    then update .claude/settings.json by hand.",
+                    file=sys.stderr,
+                )
+        else:
+            merge_mcp_server(settings_data)
             settings_changed = True
-            _act("merged Stop hook into", settings_json)
+            _act("merged strata into", settings_json)
 
-    # One write for both additive merges — so an existing mcpServers entry that
-    # was skipped still gets the new Stop hook, and bootstrap-venv (step 8) reads
-    # the up-to-date file back.
-    if settings_changed and not diff_mode:
-        (project_root / ".claude").mkdir(parents=True, exist_ok=True)
-        settings_json.write_text(json.dumps(settings_data, indent=2) + "\n", encoding="utf-8")
+        # Step 7b: additively merge the freshness hooks.Stop entry (issue #112).
+        # A user's own Stop hooks — and every other settings key — are preserved;
+        # the Strata group is appended only when absent.
+        if not settings_unreadable:
+            if _stop_hook_present(settings_data):
+                _act("skip Stop hook in", settings_json, skipped=True)
+            else:
+                merge_stop_hook(settings_data)
+                settings_changed = True
+                _act("merged Stop hook into", settings_json)
+
+        # One write for both additive merges — so an existing mcpServers entry that
+        # was skipped still gets the new Stop hook, and bootstrap-venv (step 8) reads
+        # the up-to-date file back.
+        if settings_changed and not diff_mode:
+            (project_root / ".claude").mkdir(parents=True, exist_ok=True)
+            settings_json.write_text(json.dumps(settings_data, indent=2) + "\n", encoding="utf-8")
+
+    elif harness == "codex":
+        # ---------------------------------------------------------------
+        # Step 6/7 (codex): merge the [mcp_servers.strata] table and the
+        # freshness hooks.Stop block into Codex's own config.toml — never
+        # into .claude/settings.json (out of scope for this harness; a
+        # broken .claude/settings.json in the same repo must not block a
+        # codex-only registration — see test_register_codex.py).
+        #
+        # Only claims what docs/marketing/CODEX-surface-2026-08.md marks
+        # [verified]: the MCP table shape and location are verified
+        # hands-on against codex-cli 0.149.0; the Stop-hook block is
+        # schema-verified only (accepted by `codex exec --strict-config`)
+        # — live firing and STRATA_AGENT_* env inheritance are pending
+        # live verification, and the merged block says so on its face.
+        # ---------------------------------------------------------------
+        # codex_config lives under $CODEX_HOME (default ~/.codex), NOT under
+        # project_root — unlike every other artifact register touches, so it
+        # cannot go through the project-relative _act() helper above
+        # (Path.relative_to would raise). Render its lines directly, against
+        # the absolute path, via the same render_action_line used everywhere
+        # else for consistent [would create/update]/kept-user's wording.
+        codex_config = _codex_config_path()
+        existing_codex_text = (
+            codex_config.read_text(encoding="utf-8") if codex_config.exists() else ""
+        )
+
+        def _act_codex(action: str, *, skipped: bool) -> None:
+            print(render_action_line(action, codex_config, diff_mode=diff_mode, skipped=skipped))
+
+        mcp_already = _codex_mcp_present(existing_codex_text)
+        merged_text, mcp_added = _merge_codex_mcp_server(existing_codex_text)
+        _act_codex("merged strata into" if mcp_added else "skip", skipped=not mcp_added)
+        if mcp_already and not mcp_added:
+            print(
+                "    (an [mcp_servers.strata] table already exists in Codex's config — "
+                "left untouched)"
+            )
+
+        hook_already = _codex_hook_present(merged_text)
+        merged_text, hook_added = _merge_codex_freshness_hook(merged_text)
+        _act_codex(
+            "merged freshness Stop hook into" if hook_added else "skip Stop hook in",
+            skipped=not hook_added,
+        )
+        if hook_already and not hook_added:
+            print("    (a Strata Stop-hook block already exists in Codex's config — left as-is)")
+
+        if not diff_mode and (mcp_added or hook_added):
+            codex_config.parent.mkdir(parents=True, exist_ok=True)
+            codex_config.write_text(merged_text, encoding="utf-8")
+
+        print(
+            "\n  Codex config: fill in STRATA_AGENT_SCOPE / STRATA_AGENT_SKILL / "
+            "STRATA_AGENT_SESSION_ID under\n"
+            f"  [mcp_servers.strata.env] in {codex_config} before running `codex` "
+            "(MCP env values are literal\n"
+            "  TOML strings — Codex does not interpolate them). The Stop-hook block "
+            "is schema-verified only;\n"
+            '  see README "Using Strata with Codex CLI" for exactly what is and '
+            "isn't proven to work."
+        )
 
     # -----------------------------------------------------------------------
-    # Step 8: bootstrap-venv (if requested).
+    # Step 8: bootstrap-venv (if requested; Claude-Code-only — updates
+    # .claude/settings.json to point at the venv's strata-mcp). Codex has no
+    # equivalent step (its config.toml `command` is resolved on PATH like
+    # Claude Code's default, not pointed at a project-local venv), so make
+    # the skip explicit rather than silently doing nothing.
     # -----------------------------------------------------------------------
-    if bootstrap_venv:
+    if bootstrap_venv and harness == "codex":
+        print(
+            "\n  --bootstrap-venv skipped: it only wires .claude/settings.json for "
+            "Claude Code — there is no\n"
+            "  codex-harness equivalent yet. Install strata normally (pipx/pip) so "
+            "`strata-mcp` and `strata`\n"
+            "  are on PATH for the Codex config register wrote."
+        )
+    if bootstrap_venv and harness == "claude-code":
         venv_dir = strata_dir / ".venv"
         venv_strata_mcp = venv_dir / "bin" / "strata-mcp"
         if diff_mode:
@@ -2458,7 +2557,11 @@ def cmd_register(args: argparse.Namespace) -> int:
         print(f"  1. Edit {fleet_yaml.relative_to(project_root)} for your team's structure")
         print(f"  2. export STRATA_AGENT_SCOPE={first_scope}")
         print("     export STRATA_AGENT_SKILL=<your-skill>")
-        print("  3. Open Claude Code in this directory: claude")
+        if harness == "codex":
+            print(f"  3. Fill in the env values in {_codex_config_path()}")
+            print("  4. Open Codex CLI in this directory: codex")
+        else:
+            print("  3. Open Claude Code in this directory: claude")
 
     if settings_unreadable:
         print(
@@ -2517,6 +2620,7 @@ def cmd_unregister(args: argparse.Namespace) -> int:
     project_root = Path(path_arg).resolve() if path_arg else Path.cwd().resolve()
     dry_run: bool = getattr(args, "dry_run", False)
     purge_data: bool = getattr(args, "purge_data", False)
+    harness: str = getattr(args, "harness", None) or "claude-code"
 
     # Tracks whether any artifact the user asked to remove was left in place
     # (edited/modified) — drives the exit-1 partial-completion signal.
@@ -2570,137 +2674,187 @@ def cmd_unregister(args: argparse.Namespace) -> int:
         else:  # absent
             _ok(".gitignore: nothing to do (no managed Strata block)")
 
-    # -----------------------------------------------------------------------
-    # Step 2: `.claude/settings.json` — the `mcpServers.strata` entry and the
-    # freshness `hooks.Stop` entry (issue #112). Both removed only when they
-    # still byte-match what register wrote; one write persists both removals.
-    # -----------------------------------------------------------------------
-    settings_json = project_root / ".claude" / "settings.json"
-    if not settings_json.exists():
-        _ok(".claude/settings.json: nothing to do (no settings.json)")
-    else:
-        try:
-            settings_data: dict = json.loads(settings_json.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as exc:
-            _left(
-                f".claude/settings.json: not valid JSON ({exc}) — left untouched "
-                "(fix it, then re-run)"
-            )
-            settings_data = None  # type: ignore[assignment]
-
-        if settings_data is not None:
-            settings_changed = False
-
-            # mcpServers.strata entry.
-            mcp_servers = settings_data.get("mcpServers")
-            entry = mcp_servers.get("strata") if isinstance(mcp_servers, dict) else None
-            if entry is None:
-                _ok(".claude/settings.json: nothing to do (no mcpServers.strata entry)")
-            elif entry == _MCP_ENTRY:
-                del mcp_servers["strata"]
-                # Register creates the mcpServers block when absent; if strata
-                # was its only key, drop the now-empty block so a project that
-                # had no mcpServers before register round-trips byte-for-byte.
-                if not mcp_servers:
-                    del settings_data["mcpServers"]
-                settings_changed = True
-                _ok(f".claude/settings.json: {_would('remove', 'removed')} mcpServers.strata entry")
-            else:
+    if harness == "claude-code":
+        # -----------------------------------------------------------------------
+        # Step 2: `.claude/settings.json` — the `mcpServers.strata` entry and the
+        # freshness `hooks.Stop` entry (issue #112). Both removed only when they
+        # still byte-match what register wrote; one write persists both removals.
+        # -----------------------------------------------------------------------
+        settings_json = project_root / ".claude" / "settings.json"
+        if not settings_json.exists():
+            _ok(".claude/settings.json: nothing to do (no settings.json)")
+        else:
+            try:
+                settings_data: dict = json.loads(settings_json.read_text(encoding="utf-8"))
+            except json.JSONDecodeError as exc:
                 _left(
-                    ".claude/settings.json: mcpServers.strata entry was edited "
-                    "(differs from the canonical entry) — left in place"
+                    f".claude/settings.json: not valid JSON ({exc}) — left untouched "
+                    "(fix it, then re-run)"
+                )
+                settings_data = None  # type: ignore[assignment]
+
+            if settings_data is not None:
+                settings_changed = False
+
+                # mcpServers.strata entry.
+                mcp_servers = settings_data.get("mcpServers")
+                entry = mcp_servers.get("strata") if isinstance(mcp_servers, dict) else None
+                if entry is None:
+                    _ok(".claude/settings.json: nothing to do (no mcpServers.strata entry)")
+                elif entry == _MCP_ENTRY:
+                    del mcp_servers["strata"]
+                    # Register creates the mcpServers block when absent; if strata
+                    # was its only key, drop the now-empty block so a project that
+                    # had no mcpServers before register round-trips byte-for-byte.
+                    if not mcp_servers:
+                        del settings_data["mcpServers"]
+                    settings_changed = True
+                    _ok(
+                        f".claude/settings.json: {_would('remove', 'removed')} "
+                        "mcpServers.strata entry"
+                    )
+                else:
+                    _left(
+                        ".claude/settings.json: mcpServers.strata entry was edited "
+                        "(differs from the canonical entry) — left in place"
+                    )
+
+                # Freshness hooks.Stop entry (issue #112) — same byte-identity rule;
+                # remove_stop_hook drops emptied Stop/hooks containers so a project
+                # with no hooks before register round-trips byte-for-byte.
+                hook_status = _remove_stop_hook(settings_data)
+                if hook_status == "removed":
+                    settings_changed = True
+                    _ok(f".claude/settings.json: {_would('remove', 'removed')} freshness Stop hook")
+                elif hook_status == "edited":
+                    _left(
+                        ".claude/settings.json: freshness Stop hook was edited "
+                        "(differs from the canonical entry) — left in place"
+                    )
+                else:  # absent
+                    _ok(".claude/settings.json: nothing to do (no freshness Stop hook)")
+
+                if settings_changed and not dry_run:
+                    settings_json.write_text(
+                        json.dumps(settings_data, indent=2) + "\n", encoding="utf-8"
+                    )
+                if settings_changed and not settings_data:
+                    # The file is now an empty object. Register creates settings.json
+                    # when absent, but that origin is not detectable from content, so
+                    # the empty file is left rather than risk deleting one the user
+                    # created — mirroring the empty-.gitignore treatment.
+                    _ok(
+                        ".claude/settings.json: now an empty object — left in place "
+                        "(register's authorship is not detectable)"
+                    )
+
+        # -----------------------------------------------------------------------
+        # Step 3: the three vendored skills.
+        # -----------------------------------------------------------------------
+        claude_skills_dir = project_root / ".claude" / "skills"
+        for skill_name in ["strata", "strata-worker", "strata-inspect"]:
+            skill_dir = claude_skills_dir / skill_name
+            skill_md = skill_dir / "Skill.md"
+            if not skill_dir.exists():
+                _ok(f"skill {skill_name}: nothing to do (not installed)")
+                continue
+            match = _skill_matches_shipped(skill_md, skill_name) if skill_md.exists() else False
+            if match is True:
+                if not dry_run:
+                    skill_md.unlink()
+                    # Remove the skill directory only if register's Skill.md was
+                    # its sole content; never delete other files the user added.
+                    _rmdir_if_empty(skill_dir)
+                _ok(f"skill {skill_name}: {_would('remove', 'removed')} (matched shipped version)")
+            elif match is None:
+                _left(
+                    f"skill {skill_name}: could not read the shipped reference to compare "
+                    "— left in place"
+                )
+            else:  # False — differs
+                _left(
+                    f"skill {skill_name}: modified or from an older Strata version "
+                    "(differs from shipped) — left in place"
                 )
 
-            # Freshness hooks.Stop entry (issue #112) — same byte-identity rule;
-            # remove_stop_hook drops emptied Stop/hooks containers so a project
-            # with no hooks before register round-trips byte-for-byte.
-            hook_status = _remove_stop_hook(settings_data)
-            if hook_status == "removed":
-                settings_changed = True
-                _ok(f".claude/settings.json: {_would('remove', 'removed')} freshness Stop hook")
-            elif hook_status == "edited":
+        # -----------------------------------------------------------------------
+        # Step 3b: the vendored freshness Stop-hook script (issue #112).
+        # -----------------------------------------------------------------------
+        claude_hooks_dir = project_root / ".claude" / "hooks"
+        hook_script = claude_hooks_dir / _HOOK_SCRIPT_NAME
+        if not hook_script.exists():
+            _ok(f"hook {_HOOK_SCRIPT_NAME}: nothing to do (not installed)")
+        else:
+            hook_match = _hook_matches_shipped(hook_script)
+            if hook_match is True:
+                if not dry_run:
+                    hook_script.unlink()
+                _ok(
+                    f"hook {_HOOK_SCRIPT_NAME}: {_would('remove', 'removed')} "
+                    "(matched shipped version)"
+                )
+            elif hook_match is None:
                 _left(
-                    ".claude/settings.json: freshness Stop hook was edited "
+                    f"hook {_HOOK_SCRIPT_NAME}: could not read the shipped reference to compare "
+                    "— left in place"
+                )
+            else:  # False — differs
+                _left(
+                    f"hook {_HOOK_SCRIPT_NAME}: modified or from an older Strata version "
+                    "(differs from shipped) — left in place"
+                )
+
+        # Tidy up register-created empty parent dirs so a clean unregister restores
+        # the tree exactly. Only ever removes directories that are already empty.
+        if not dry_run:
+            _rmdir_if_empty(claude_skills_dir)
+            _rmdir_if_empty(claude_hooks_dir)
+            _rmdir_if_empty(project_root / ".claude")
+
+    elif harness == "codex":
+        # ---------------------------------------------------------------
+        # Step 2 (codex): reverse of `strata register --harness codex` —
+        # the [mcp_servers.strata] table and freshness hooks.Stop block in
+        # $CODEX_HOME/config.toml, each removed only when it still
+        # byte-matches what register wrote (same rule as the Claude-Code
+        # settings.json entries above). .claude/settings.json is untouched
+        # by this harness, by design (see cmd_register).
+        # ---------------------------------------------------------------
+        codex_config = _codex_config_path()
+        if not codex_config.exists():
+            _ok(f"{codex_config}: nothing to do (no Codex config.toml)")
+        else:
+            codex_text = codex_config.read_text(encoding="utf-8")
+            codex_changed = False
+
+            new_text, mcp_status = _remove_codex_mcp_server(codex_text)
+            if mcp_status == "removed":
+                codex_text = new_text
+                codex_changed = True
+                _ok(f"{codex_config}: {_would('remove', 'removed')} [mcp_servers.strata] table")
+            elif mcp_status == "edited":
+                _left(
+                    f"{codex_config}: [mcp_servers.strata] table was edited "
                     "(differs from the canonical entry) — left in place"
                 )
             else:  # absent
-                _ok(".claude/settings.json: nothing to do (no freshness Stop hook)")
+                _ok(f"{codex_config}: nothing to do (no [mcp_servers.strata] table)")
 
-            if settings_changed and not dry_run:
-                settings_json.write_text(
-                    json.dumps(settings_data, indent=2) + "\n", encoding="utf-8"
+            new_text, hook_status = _remove_codex_freshness_hook(codex_text)
+            if hook_status == "removed":
+                codex_text = new_text
+                codex_changed = True
+                _ok(f"{codex_config}: {_would('remove', 'removed')} freshness Stop-hook block")
+            elif hook_status == "edited":
+                _left(
+                    f"{codex_config}: freshness Stop-hook block was edited "
+                    "(differs from the canonical entry) — left in place"
                 )
-            if settings_changed and not settings_data:
-                # The file is now an empty object. Register creates settings.json
-                # when absent, but that origin is not detectable from content, so
-                # the empty file is left rather than risk deleting one the user
-                # created — mirroring the empty-.gitignore treatment.
-                _ok(
-                    ".claude/settings.json: now an empty object — left in place "
-                    "(register's authorship is not detectable)"
-                )
+            else:  # absent
+                _ok(f"{codex_config}: nothing to do (no freshness Stop-hook block)")
 
-    # -----------------------------------------------------------------------
-    # Step 3: the three vendored skills.
-    # -----------------------------------------------------------------------
-    claude_skills_dir = project_root / ".claude" / "skills"
-    for skill_name in ["strata", "strata-worker", "strata-inspect"]:
-        skill_dir = claude_skills_dir / skill_name
-        skill_md = skill_dir / "Skill.md"
-        if not skill_dir.exists():
-            _ok(f"skill {skill_name}: nothing to do (not installed)")
-            continue
-        match = _skill_matches_shipped(skill_md, skill_name) if skill_md.exists() else False
-        if match is True:
-            if not dry_run:
-                skill_md.unlink()
-                # Remove the skill directory only if register's Skill.md was
-                # its sole content; never delete other files the user added.
-                _rmdir_if_empty(skill_dir)
-            _ok(f"skill {skill_name}: {_would('remove', 'removed')} (matched shipped version)")
-        elif match is None:
-            _left(
-                f"skill {skill_name}: could not read the shipped reference to compare "
-                "— left in place"
-            )
-        else:  # False — differs
-            _left(
-                f"skill {skill_name}: modified or from an older Strata version "
-                "(differs from shipped) — left in place"
-            )
-
-    # -----------------------------------------------------------------------
-    # Step 3b: the vendored freshness Stop-hook script (issue #112).
-    # -----------------------------------------------------------------------
-    claude_hooks_dir = project_root / ".claude" / "hooks"
-    hook_script = claude_hooks_dir / _HOOK_SCRIPT_NAME
-    if not hook_script.exists():
-        _ok(f"hook {_HOOK_SCRIPT_NAME}: nothing to do (not installed)")
-    else:
-        hook_match = _hook_matches_shipped(hook_script)
-        if hook_match is True:
-            if not dry_run:
-                hook_script.unlink()
-            _ok(
-                f"hook {_HOOK_SCRIPT_NAME}: {_would('remove', 'removed')} (matched shipped version)"
-            )
-        elif hook_match is None:
-            _left(
-                f"hook {_HOOK_SCRIPT_NAME}: could not read the shipped reference to compare "
-                "— left in place"
-            )
-        else:  # False — differs
-            _left(
-                f"hook {_HOOK_SCRIPT_NAME}: modified or from an older Strata version "
-                "(differs from shipped) — left in place"
-            )
-
-    # Tidy up register-created empty parent dirs so a clean unregister restores
-    # the tree exactly. Only ever removes directories that are already empty.
-    if not dry_run:
-        _rmdir_if_empty(claude_skills_dir)
-        _rmdir_if_empty(claude_hooks_dir)
-        _rmdir_if_empty(project_root / ".claude")
+            if codex_changed and not dry_run:
+                codex_config.write_text(codex_text, encoding="utf-8")
 
     # -----------------------------------------------------------------------
     # Step 4: `.strata/` data — memory, not wiring.
@@ -3061,6 +3215,19 @@ def _build_parser() -> argparse.ArgumentParser:
             "3.10 interpreter."
         ),
     )
+    p_register.add_argument(
+        "--harness",
+        dest="harness",
+        choices=("claude-code", "codex"),
+        default="claude-code",
+        help=(
+            "Target harness (default: claude-code). 'codex' merges Strata's "
+            "[mcp_servers.strata] table and freshness Stop-hook block into the "
+            "Codex CLI's own config.toml instead of .claude/settings.json; the "
+            "Stop-hook wiring is schema-verified only (see README 'Using Strata "
+            "with Codex CLI')."
+        ),
+    )
     p_register.set_defaults(func=cmd_register)
 
     p_unregister = sub.add_parser(
@@ -3103,6 +3270,19 @@ def _build_parser() -> argparse.ArgumentParser:
             "Also delete the .strata/ workspace (fleet.yaml, DB, summaries, "
             "config.toml). Off by default — that data is memory, not wiring. "
             "Combine with --dry-run to preview what would be purged."
+        ),
+    )
+    p_unregister.add_argument(
+        "--harness",
+        dest="harness",
+        choices=("claude-code", "codex"),
+        default="claude-code",
+        help=(
+            "Which harness's wiring to reverse (default: claude-code). 'codex' "
+            "removes the [mcp_servers.strata] table and freshness Stop-hook "
+            "block from the Codex CLI's config.toml instead of "
+            ".claude/settings.json — only when they still byte-match what "
+            "`strata register --harness codex` wrote."
         ),
     )
     p_unregister.set_defaults(func=cmd_unregister)
