@@ -15,6 +15,8 @@ runnable. Subcommands:
                            with STRATA_AGENT_* env vars set (ADR 0003).
 * ``strata export-fleet`` — read V1 fleet tables and write fleet.yaml for
                            the V1 → V1.2 upgrade path.
+* ``strata doctor``       — diagnose a project's config/DB/fleet/install
+                           wiring/agent binding in one offline pass.
 
 All commands — including the inspection commands (``scopes``, ``summary``,
 ``record``) and ``launch`` — read ``fleet.yaml`` and the record/summary
@@ -691,6 +693,470 @@ def cmd_status(args: argparse.Namespace) -> int:
             last = m.last_accepted_contribution_at or "(none)"
             print(f"  {m.scope_id:{id_width}}  {m.reads_since_last_contribution:<19}  {last}")
     return 0
+
+
+# ---------------------------------------------------------------------------
+# strata doctor — diagnose a registered project's wiring (Task 2.1,
+# local-launch-bar plan).
+#
+# Entirely offline (ADR 0004 D1): reads files, opens the SQLite DB directly,
+# and inspects fleet.yaml/env vars. Never makes an HTTP request — no backend
+# needs to be running. One line per check with a pass/fail glyph; every
+# failure line says how to fix it. Exits 0 when every check passes, 1
+# otherwise (mirrors `strata start`'s preflight, see `strata.preflight`).
+# ---------------------------------------------------------------------------
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    """Diagnose a project's Strata wiring: config, DB, fleet, install, binding.
+
+    Checks (independent — one broken piece never masks the others):
+
+    1. Project config (``.strata/config.toml``) resolvable.
+    2. DB reachable and migrated.
+    3. ``fleet.yaml`` valid.
+    4. MCP server entry present in ``.claude/settings.json``.
+    5. Stop hook script present and matching the shipped version.
+    6. ``hooks.Stop`` entry present in ``.claude/settings.json``.
+    7. Skills present in ``.claude/skills/``.
+    8. Binding env vars (``STRATA_AGENT_SCOPE`` / ``_SKILL`` / ``_SESSION_ID``)
+       set and valid against the fleet.
+    """
+    from strata.bootstrap import load_fleet_config
+    from strata.fleet_config import FleetConfigError
+    from strata.project_config import ProjectConfigError, resolve_storage_paths
+
+    checks: list[Check] = []
+
+    # -----------------------------------------------------------------------
+    # 1. Project config resolvable.
+    # -----------------------------------------------------------------------
+    paths = None
+    try:
+        paths = resolve_storage_paths()
+    except ProjectConfigError as exc:
+        checks.append(
+            Check(
+                name="Project config",
+                kind="hard",
+                passed=False,
+                message=(
+                    f"{exc.message} — fix .strata/config.toml by hand, or remove it and "
+                    "run 'strata register' to recreate it."
+                ),
+            )
+        )
+    else:
+        checks.append(
+            Check(
+                name="Project config",
+                kind="hard",
+                passed=True,
+                message=f"resolved via {paths.source} ({paths.fleet_yaml_path})",
+            )
+        )
+
+    # -----------------------------------------------------------------------
+    # 2. DB reachable and migrated. Read-only and diagnostic only — this must
+    # never create or write to the DB it is inspecting. A doctor run in an
+    # unregistered directory is exactly the scenario where a user wants to
+    # find out what's wrong, not have ./strata.db silently materialize as a
+    # side effect of asking. If the file is absent, report that and stop —
+    # no connection is opened. If it exists, open it in SQLite's read-only
+    # URI mode (never sqlite3.connect(path), which auto-creates) and compare
+    # its applied-migrations table against the bundled migration files,
+    # without applying anything.
+    # -----------------------------------------------------------------------
+    if paths is None:
+        checks.append(
+            Check(
+                name="Database",
+                kind="hard",
+                passed=False,
+                message="skipped — fix the project config check above first.",
+            )
+        )
+    else:
+        db_file = Path(paths.db_path)
+        if not db_file.exists():
+            checks.append(
+                Check(
+                    name="Database",
+                    kind="hard",
+                    passed=False,
+                    message=(
+                        f"no database at {db_file} — run 'strata start' or 'strata register' "
+                        "to create and migrate it (doctor never creates it)."
+                    ),
+                )
+            )
+        else:
+            from strata.migrator import _default_migrations_dir  # noqa: PLC0415
+
+            conn: sqlite3.Connection | None = None
+            try:
+                conn = sqlite3.connect(f"file:{db_file}?mode=ro", uri=True)
+                try:
+                    applied = {
+                        row[0] for row in conn.execute("SELECT name FROM _migrations").fetchall()
+                    }
+                except sqlite3.OperationalError:
+                    # No _migrations table yet — nothing has been applied.
+                    applied = set()
+                available = {p.name for p in _default_migrations_dir().glob("*.sql")}
+                pending = sorted(available - applied)
+            except sqlite3.Error as exc:
+                checks.append(
+                    Check(
+                        name="Database",
+                        kind="hard",
+                        passed=False,
+                        message=(
+                            f"cannot open {db_file} read-only: {exc} — check it is a valid "
+                            "Strata SQLite database."
+                        ),
+                    )
+                )
+            else:
+                if pending:
+                    checks.append(
+                        Check(
+                            name="Database",
+                            kind="hard",
+                            passed=False,
+                            message=(
+                                f"reachable but {len(pending)} migration(s) pending: "
+                                f"{', '.join(pending)} — run 'strata migrate' or 'strata "
+                                "start' to apply them."
+                            ),
+                        )
+                    )
+                else:
+                    checks.append(
+                        Check(
+                            name="Database",
+                            kind="hard",
+                            passed=True,
+                            message=f"reachable and migrated ({db_file})",
+                        )
+                    )
+            finally:
+                if conn is not None:
+                    conn.close()
+
+    # -----------------------------------------------------------------------
+    # 3. fleet.yaml valid.
+    # -----------------------------------------------------------------------
+    fleet_config: FleetConfig | None = None
+    if paths is None:
+        checks.append(
+            Check(
+                name="Fleet config",
+                kind="hard",
+                passed=False,
+                message="skipped — fix the project config check above first.",
+            )
+        )
+    else:
+        fleet_path = Path(paths.fleet_yaml_path)
+        if not fleet_path.exists():
+            checks.append(
+                Check(
+                    name="Fleet config",
+                    kind="hard",
+                    passed=False,
+                    message=(
+                        f"no fleet.yaml found at {fleet_path} — run 'strata register' to "
+                        "seed one, or restore it from version control."
+                    ),
+                )
+            )
+        else:
+            try:
+                fleet_config = load_fleet_config(fleet_path)
+            except (FleetConfigError, FileNotFoundError) as exc:
+                checks.append(
+                    Check(
+                        name="Fleet config",
+                        kind="hard",
+                        passed=False,
+                        message=f"invalid: {exc} — fix {fleet_path} and re-run.",
+                    )
+                )
+            else:
+                checks.append(
+                    Check(
+                        name="Fleet config",
+                        kind="hard",
+                        passed=True,
+                        message=f"valid ({len(fleet_config.scopes)} scope(s))",
+                    )
+                )
+
+    # -----------------------------------------------------------------------
+    # Read .claude/settings.json once for checks 4 and 6.
+    # -----------------------------------------------------------------------
+    project_root = (
+        paths.project_root if (paths is not None and paths.project_root is not None) else Path.cwd()
+    )
+    settings_json = project_root / ".claude" / "settings.json"
+    settings_data: dict = {}
+    settings_error: str | None = None
+    if settings_json.exists():
+        try:
+            settings_data = json.loads(settings_json.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            settings_error = str(exc)
+
+    # -----------------------------------------------------------------------
+    # 4. MCP server entry present.
+    # -----------------------------------------------------------------------
+    if settings_error is not None:
+        checks.append(
+            Check(
+                name="MCP server entry",
+                kind="hard",
+                passed=False,
+                message=(
+                    f".claude/settings.json is not valid JSON ({settings_error}) — fix the "
+                    "file, then run 'strata register' to add the strata entry."
+                ),
+            )
+        )
+    elif _mcp_server_present(settings_data):
+        checks.append(
+            Check(
+                name="MCP server entry",
+                kind="hard",
+                passed=True,
+                message="present in .claude/settings.json",
+            )
+        )
+    else:
+        checks.append(
+            Check(
+                name="MCP server entry",
+                kind="hard",
+                passed=False,
+                message=(
+                    "missing from .claude/settings.json mcpServers — run 'strata register' "
+                    "to add it."
+                ),
+            )
+        )
+
+    # -----------------------------------------------------------------------
+    # 5. Stop hook script present and matching shipped.
+    # -----------------------------------------------------------------------
+    hook_script = project_root / ".claude" / "hooks" / _HOOK_SCRIPT_NAME
+    if not hook_script.exists():
+        checks.append(
+            Check(
+                name="Stop hook",
+                kind="hard",
+                passed=False,
+                message="script missing — run 'strata register' to restore it.",
+            )
+        )
+    else:
+        matches = _hook_matches_shipped(hook_script)
+        if matches is False:
+            checks.append(
+                Check(
+                    name="Stop hook",
+                    kind="hard",
+                    passed=False,
+                    message=(
+                        "script present but does not match the shipped version — run "
+                        "'strata register' to restore it (or keep it if you edited it "
+                        "intentionally)."
+                    ),
+                )
+            )
+        else:
+            note = "" if matches else " (shipped version unavailable to compare)"
+            checks.append(
+                Check(
+                    name="Stop hook",
+                    kind="hard",
+                    passed=True,
+                    message=f"script present{note}",
+                )
+            )
+
+    # -----------------------------------------------------------------------
+    # 6. hooks.Stop entry present.
+    # -----------------------------------------------------------------------
+    if settings_error is not None:
+        checks.append(
+            Check(
+                name="Stop hook entry",
+                kind="hard",
+                passed=False,
+                message=(
+                    f".claude/settings.json is not valid JSON ({settings_error}) — fix the "
+                    "file, then run 'strata register' to add the Stop hook entry."
+                ),
+            )
+        )
+    elif _stop_hook_present(settings_data):
+        checks.append(
+            Check(
+                name="Stop hook entry",
+                kind="hard",
+                passed=True,
+                message="present in .claude/settings.json hooks.Stop",
+            )
+        )
+    else:
+        checks.append(
+            Check(
+                name="Stop hook entry",
+                kind="hard",
+                passed=False,
+                message=(
+                    "missing from .claude/settings.json hooks.Stop — run 'strata register' "
+                    "to add it."
+                ),
+            )
+        )
+
+    # -----------------------------------------------------------------------
+    # 7. Skills present AND matching the shipped version (drift detection,
+    # same semantics as the Stop-hook check: present-but-differs gets its own
+    # plain-language line; skill_matches_shipped returning None means the
+    # shipped reference couldn't be read, so — per its own docstring
+    # ("treat conservatively as leave it") — that skill counts as a pass).
+    # -----------------------------------------------------------------------
+    claude_skills_dir = project_root / ".claude" / "skills"
+    missing_skills: list[str] = []
+    mismatched_skills: list[str] = []
+    for name in SKILL_NAMES:
+        skill_md = claude_skills_dir / name / "Skill.md"
+        if not skill_md.exists():
+            missing_skills.append(name)
+            continue
+        if _skill_matches_shipped(skill_md, name) is False:
+            mismatched_skills.append(name)
+
+    if missing_skills or mismatched_skills:
+        problems = []
+        if missing_skills:
+            problems.append(f"missing: {', '.join(missing_skills)}")
+        if mismatched_skills:
+            problems.append(
+                f"stale (does not match the shipped version): {', '.join(mismatched_skills)}"
+            )
+        checks.append(
+            Check(
+                name="Skills",
+                kind="hard",
+                passed=False,
+                message=(
+                    "; ".join(problems) + " — run 'strata register' to copy missing skills into "
+                    ".claude/skills/, or 'strata register --diff' to see what changed in "
+                    "the stale ones before deciding whether to restore them."
+                ),
+            )
+        )
+    else:
+        checks.append(
+            Check(
+                name="Skills",
+                kind="hard",
+                passed=True,
+                message=f"all {len(SKILL_NAMES)} present and match the shipped version",
+            )
+        )
+
+    # -----------------------------------------------------------------------
+    # 8. Binding env vars set and valid against the fleet.
+    # -----------------------------------------------------------------------
+    scope = os.environ.get("STRATA_AGENT_SCOPE", "")
+    skill = os.environ.get("STRATA_AGENT_SKILL", "")
+    session_id = os.environ.get("STRATA_AGENT_SESSION_ID", "")
+    binding_problems: list[str] = []
+
+    if not scope:
+        binding_problems.append("STRATA_AGENT_SCOPE is not set")
+
+    scope_obj = None
+    if fleet_config is not None and scope:
+        scope_obj = fleet_config.get_scope(scope)
+        if scope_obj is None:
+            available = ", ".join(s.id for s in fleet_config.active_scopes())
+            binding_problems.append(
+                f"scope {scope!r} not found in fleet.yaml (available: {available or '(none)'})"
+            )
+
+    # A scope that declares no skills (no default_skill, no permitted_skills)
+    # may bind skill-less — mirrors strata.mcp.server._validate_binding.
+    scope_waives_skill = scope_obj is not None and not (
+        scope_obj.default_skill or scope_obj.permitted_skills
+    )
+    if not skill and not scope_waives_skill:
+        binding_problems.append("STRATA_AGENT_SKILL is not set")
+
+    if scope_obj is not None and skill:
+        permitted = scope_obj.permitted_skills or []
+        if permitted and skill not in permitted:
+            binding_problems.append(
+                f"skill {skill!r} is not permitted for scope {scope!r} "
+                f"(permitted: {', '.join(permitted)})"
+            )
+
+    if binding_problems:
+        checks.append(
+            Check(
+                name="Agent binding",
+                kind="hard",
+                passed=False,
+                message=(
+                    "; ".join(binding_problems)
+                    + " — export STRATA_AGENT_SCOPE / STRATA_AGENT_SKILL before launching, "
+                    "matching fleet.yaml."
+                ),
+            )
+        )
+    else:
+        skill_note = f", STRATA_AGENT_SKILL={skill!r}" if skill else ""
+        checks.append(
+            Check(
+                name="Agent binding",
+                kind="hard",
+                passed=True,
+                message=f"STRATA_AGENT_SCOPE={scope!r} valid{skill_note}",
+            )
+        )
+
+    # STRATA_AGENT_SESSION_ID is auto-generated when absent (mirrors
+    # strata.mcp.server: `os.environ.get("STRATA_AGENT_SESSION_ID", f"sess_{uuid4()...}")`)
+    # — an operator's shell will almost never have it exported, so its absence is
+    # informational, not a setup problem. Soft check: warns, never fails the run.
+    if session_id:
+        checks.append(
+            Check(
+                name="Agent session ID",
+                kind="soft",
+                passed=True,
+                message=f"STRATA_AGENT_SESSION_ID={session_id!r}",
+            )
+        )
+    else:
+        checks.append(
+            Check(
+                name="Agent session ID",
+                kind="soft",
+                passed=False,
+                message=(
+                    "STRATA_AGENT_SESSION_ID is not set — fine for `strata doctor` itself "
+                    "(one is auto-generated per session); set it explicitly only if you "
+                    "want stable session tracking across restarts."
+                ),
+            )
+        )
+
+    return _run_preflight(checks)
 
 
 # ---------------------------------------------------------------------------
@@ -2392,6 +2858,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Recency window in days for the staleness metric (default: 30).",
     )
     p_status.set_defaults(func=cmd_status)
+
+    p_doctor = sub.add_parser(
+        "doctor",
+        help="Diagnose a project's Strata wiring: config, DB, fleet, install, binding.",
+    )
+    p_doctor.set_defaults(func=cmd_doctor)
 
     # -------------------------------------------------------------------
     # strata operator — ADR 0008 D1's local entry surface: publish/supersede/
