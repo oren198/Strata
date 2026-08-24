@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import copy
 import os
+import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -69,6 +70,8 @@ __all__ = [
     "codex_hook_present",
     "merge_codex_freshness_hook",
     "remove_codex_freshness_hook",
+    "KNOWN_HARNESSES",
+    "detect_harnesses",
 ]
 
 # ---------------------------------------------------------------------------
@@ -715,3 +718,33 @@ def remove_codex_freshness_hook(config_text: str) -> tuple[str, str]:
     for the status values.
     """
     return _remove_block(config_text, CODEX_HOOK_BLOCK, CODEX_HOOK_MARKER)
+
+
+# ---------------------------------------------------------------------------
+# Harness detection
+# ---------------------------------------------------------------------------
+
+#: The harnesses Strata knows how to wire, in the order ``detect_harnesses``
+#: and ``strata register``/``strata unregister`` report and act on them.
+KNOWN_HARNESSES: tuple[str, ...] = ("claude-code", "codex")
+
+
+def detect_harnesses(home: Path | None = None, path_env: str | None = None) -> list[str]:
+    """Return the subset of :data:`KNOWN_HARNESSES` installed on this machine.
+
+    A harness is detected if either its CLI binary is found on *path_env*
+    (``claude`` / ``codex``) or its config directory exists under *home*
+    (``~/.claude`` / ``~/.codex``). *home* defaults to ``Path.home()`` and
+    *path_env* defaults to the real ``PATH`` — parameters exist so tests never
+    depend on the real machine.
+
+    Returns harnesses in :data:`KNOWN_HARNESSES` order, not detection order.
+    """
+    if home is None:
+        home = Path.home()
+    detected = []
+    if shutil.which("claude", path=path_env) or (home / ".claude").exists():
+        detected.append("claude-code")
+    if shutil.which("codex", path=path_env) or (home / ".codex").exists():
+        detected.append("codex")
+    return detected
