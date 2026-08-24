@@ -242,10 +242,15 @@ def test_plain_unregister_reverses_every_wired_harness(
     assert _unregister(tmp_path, purge_data=True) == 0
 
     settings = tmp_path / ".claude" / "settings.json"
-    if settings.exists():
-        data = __import__("json").loads(settings.read_text(encoding="utf-8"))
-        assert install.mcp_server_present(data) is False
-        assert install.stop_hook_present(data) is False
+    # register always creates settings.json when merging claude-code wiring,
+    # and unregister leaves the (now-empty) file in place rather than delete
+    # it (its register-authorship isn't detectable from content alone) — so
+    # it must still exist here; assert unconditionally rather than gating on
+    # existence, which would silently vacuous-pass if it were ever missing.
+    assert settings.exists()
+    data = __import__("json").loads(settings.read_text(encoding="utf-8"))
+    assert install.mcp_server_present(data) is False
+    assert install.stop_hook_present(data) is False
 
     codex_config = codex_home / "config.toml"
     assert codex_config.exists()
@@ -276,17 +281,18 @@ def test_plain_unregister_round_trips_preexisting_user_content(
         "theme": "dark",
         "mcpServers": {"other-tool": {"command": "other-tool-bin"}},
     }
-    (claude_dir / "settings.json").write_text(
-        _json.dumps(original_settings, indent=2) + "\n", encoding="utf-8"
-    )
+    # Written in register's own writer format (json.dumps(indent=2) + a
+    # trailing newline) so the round trip below can be compared byte-exact,
+    # the same idiom test_unregister.py's clean-round-trip test uses.
+    settings_json = claude_dir / "settings.json"
+    original_settings_text = _json.dumps(original_settings, indent=2) + "\n"
+    settings_json.write_text(original_settings_text, encoding="utf-8")
 
     assert _register(tmp_path) == 0
     assert _unregister(tmp_path, purge_data=True) == 0
 
     assert (codex_home / "config.toml").read_text(encoding="utf-8") == original_codex
-    on_disk_settings = _json.loads((claude_dir / "settings.json").read_text(encoding="utf-8"))
-    assert on_disk_settings["theme"] == "dark"
-    assert on_disk_settings["mcpServers"] == {"other-tool": {"command": "other-tool-bin"}}
+    assert settings_json.read_text(encoding="utf-8") == original_settings_text
 
 
 # (b) --harness codex leaves claude wiring intact
@@ -367,3 +373,42 @@ def test_unregister_corrupt_settings_json_is_not_downgraded_to_a_skip(
     assert rc == 1
     err = capsys.readouterr().err
     assert "not valid json" in err.lower()
+
+
+def test_unregister_explicit_harness_cleans_up_half_wired_project(
+    tmp_path: Path, codex_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An explicitly-named harness must be reversible even when its
+    settings.json markers are gone but its skills/hook script remain.
+
+    Reproduces the review scenario: register claude-code, then hand-delete
+    the mcpServers.strata + Stop hook entries from settings.json (as if the
+    user had cleaned those up by hand) while the vendored skills and hook
+    script are still on disk. `unregister --harness claude-code` must still
+    remove them — the marker gate governs default (no-flags) *resolution*
+    only, not whether an explicitly-named harness's helper actually runs.
+    """
+    _init_project(tmp_path)
+    monkeypatch.setattr(install, "detect_harnesses", lambda: ["claude-code"])
+    assert _register(tmp_path, harness=["claude-code"]) == 0
+
+    settings_json = tmp_path / ".claude" / "settings.json"
+    import json as _json
+
+    data = _json.loads(settings_json.read_text(encoding="utf-8"))
+    data.pop("mcpServers", None)
+    data.pop("hooks", None)
+    settings_json.write_text(_json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    assert install.mcp_server_present(data) is False
+    assert install.stop_hook_present(data) is False
+
+    skill_dir = tmp_path / ".claude" / "skills" / "strata"
+    hook_script = tmp_path / ".claude" / "hooks" / install.HOOK_SCRIPT_NAME
+    assert skill_dir.exists()
+    assert hook_script.exists()
+
+    rc = _unregister(tmp_path, harness=["claude-code"])
+
+    assert rc == 0
+    assert not skill_dir.exists()
+    assert not hook_script.exists()

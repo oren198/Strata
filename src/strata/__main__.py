@@ -2461,9 +2461,14 @@ def cmd_unregister(args: argparse.Namespace) -> int:
     # -----------------------------------------------------------------------
     # Per-harness reversal loop (Task 3, multi-harness parity): mirrors
     # register's per-harness loop, one `== NAME ==` header per resolved
-    # harness. A harness that was named explicitly (or, on the no-flags
-    # path, would not have been resolved at all) but has nothing wired
-    # prints a single skip line instead of running its reversal steps.
+    # harness. Every resolved harness's helper runs unconditionally — the
+    # marker gate (_WIRED_CHECK, above) only decides *resolution* on the
+    # no-flags path (which harnesses to include at all); it is deliberately
+    # NOT re-checked here. An explicitly-named harness must still be
+    # reversible even when its settings.json/config.toml entries were
+    # hand-deleted but its skills/hook script remain — the per-harness
+    # helpers already print their own per-artifact "nothing to do" lines,
+    # which is what satisfies a named-but-unwired harness's "skip line".
     # -----------------------------------------------------------------------
     _UNREGISTER_STEP = {
         "claude-code": _unregister_claude_code,
@@ -2471,10 +2476,7 @@ def cmd_unregister(args: argparse.Namespace) -> int:
     }
     for _harness in resolved_harnesses:
         print(f"\n== {_harness} ==")
-        if _WIRED_CHECK[_harness]():
-            _UNREGISTER_STEP[_harness]()
-        else:
-            _ok(f"{_harness}: nothing to do (not wired — nothing for unregister to reverse)")
+        _UNREGISTER_STEP[_harness]()
 
     # -----------------------------------------------------------------------
     # Step 4: `.strata/` data — memory, not wiring.
