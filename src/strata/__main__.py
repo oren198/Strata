@@ -108,10 +108,16 @@ from strata.install import (
     mcp_server_present as _mcp_server_present,
 )
 from strata.install import (
+    merge_agents_md as _merge_agents_md,
+)
+from strata.install import (
     merge_codex_freshness_hook as _merge_codex_freshness_hook,
 )
 from strata.install import (
     merge_codex_mcp_server as _merge_codex_mcp_server,
+)
+from strata.install import (
+    remove_agents_md as _remove_agents_md,
 )
 from strata.install import (
     remove_codex_freshness_hook as _remove_codex_freshness_hook,
@@ -2026,6 +2032,21 @@ def cmd_register(args: argparse.Namespace) -> int:
             codex_config.parent.mkdir(parents=True, exist_ok=True)
             codex_config.write_text(merged_text, encoding="utf-8")
 
+        # Codex has no skills mechanism (unlike Claude Code's
+        # .claude/skills/) — seed the same memory-move guidance into the
+        # project's own AGENTS.md instead, additively (Task 6, harness
+        # parity).
+        agents_md = project_root / "AGENTS.md"
+        existing_agents_text = agents_md.read_text(encoding="utf-8") if agents_md.exists() else ""
+        new_agents_text, agents_added = _merge_agents_md(existing_agents_text)
+        _act(
+            "merged strata into" if agents_added else "skip",
+            agents_md,
+            skipped=not agents_added,
+        )
+        if not diff_mode and agents_added:
+            agents_md.write_text(new_agents_text, encoding="utf-8")
+
         print(
             "\n  Codex config: fill in STRATA_AGENT_SCOPE / STRATA_AGENT_SKILL / "
             "STRATA_AGENT_SESSION_ID under\n"
@@ -2546,6 +2567,27 @@ def cmd_unregister(args: argparse.Namespace) -> int:
 
             if codex_changed and not dry_run:
                 codex_config.write_text(codex_text, encoding="utf-8")
+
+        # Reverse of the AGENTS.md seed in `strata register --harness codex`
+        # (Task 6, harness parity). AGENTS.md lives at the project root, not
+        # under $CODEX_HOME, unlike config.toml above.
+        agents_md = project_root / "AGENTS.md"
+        if not agents_md.exists():
+            _ok(f"{agents_md}: nothing to do (no AGENTS.md)")
+        else:
+            agents_text = agents_md.read_text(encoding="utf-8")
+            new_agents_text, agents_status = _remove_agents_md(agents_text)
+            if agents_status == "removed":
+                _ok(f"{agents_md}: {_would('remove', 'removed')} the Strata block")
+                if not dry_run:
+                    agents_md.write_text(new_agents_text, encoding="utf-8")
+            elif agents_status == "edited":
+                _left(
+                    f"{agents_md}: Strata block was edited "
+                    "(differs from the canonical block) — left in place"
+                )
+            else:  # absent
+                _ok(f"{agents_md}: nothing to do (no Strata block)")
 
     # -----------------------------------------------------------------------
     # Per-harness reversal loop (Task 3, multi-harness parity): mirrors

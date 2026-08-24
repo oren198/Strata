@@ -75,6 +75,10 @@ __all__ = [
     "detect_harnesses",
     "set_default_harness",
     "read_default_harness",
+    "AGENTS_MD_MARKER",
+    "agents_md_present",
+    "merge_agents_md",
+    "remove_agents_md",
 ]
 
 # ---------------------------------------------------------------------------
@@ -721,6 +725,66 @@ def remove_codex_freshness_hook(config_text: str) -> tuple[str, str]:
     for the status values.
     """
     return _remove_block(config_text, CODEX_HOOK_BLOCK, CODEX_HOOK_MARKER)
+
+
+# ---------------------------------------------------------------------------
+# AGENTS.md — additive marker-block merge (Task 6, harness parity: the
+# Codex-harness analogue of the Claude Code skills — Codex has no skills
+# mechanism, so guidance is seeded into the project's AGENTS.md instead).
+#
+# Same convention as GITIGNORE_BLOCK / CODEX_MCP_BLOCK above: the managed
+# block is appended once, detected by a marker, so a re-run is a no-op and
+# any of the user's own AGENTS.md content is never rewritten.
+# ---------------------------------------------------------------------------
+
+#: Marker identifying Strata's managed AGENTS.md block. An HTML comment so it
+#: renders invisibly wherever AGENTS.md is displayed, and is unlikely to
+#: collide with a user's own prose the way a bare "# Strata" heading might.
+AGENTS_MD_MARKER = "<!-- strata:begin -->"
+
+
+def _shipped_agents_md_block() -> str:
+    """Read the canonical AGENTS.md block from package data.
+
+    Mirrors :func:`hook_matches_shipped`'s ``importlib.resources`` lookup —
+    the block lives once, as package data under ``strata/_templates``,
+    rather than duplicated as a Python string constant.
+    """
+    import importlib.resources  # noqa: PLC0415
+
+    shipped = importlib.resources.files("strata") / "_templates" / "AGENTS-strata.md"
+    return shipped.read_text(encoding="utf-8")
+
+
+def agents_md_present(text: str) -> bool:
+    """Return whether Strata's managed AGENTS.md block marker is present in *text*."""
+    return AGENTS_MD_MARKER in text
+
+
+def merge_agents_md(existing_text: str) -> tuple[str, bool]:
+    """Additively append the canonical Strata block to *existing_text*.
+
+    Strictly additive (ADR 0005 Decision 6): every existing line in
+    *existing_text* is preserved byte-for-byte; the Strata block is appended
+    only when :func:`agents_md_present` is false.
+
+    Returns:
+        ``(new_text, added)`` — *added* is ``True`` if the block was
+        appended, ``False`` (with *new_text* == *existing_text*) if a Strata
+        block was already present.
+    """
+    if agents_md_present(existing_text):
+        return existing_text, False
+    return _append_block(existing_text, _shipped_agents_md_block()), True
+
+
+def remove_agents_md(existing_text: str) -> tuple[str, str]:
+    """Remove Strata's managed AGENTS.md block from *existing_text*.
+
+    The reverse of :func:`merge_agents_md`; see :func:`_remove_block` for the
+    ``"removed"`` / ``"edited"`` / ``"absent"`` status semantics.
+    """
+    return _remove_block(existing_text, _shipped_agents_md_block(), AGENTS_MD_MARKER)
 
 
 # ---------------------------------------------------------------------------
