@@ -63,9 +63,7 @@ def _register(
     )
 
 
-def _unregister(
-    tmp_path: Path, *, harness: str = "claude-code", dry_run: bool = False
-) -> int:
+def _unregister(tmp_path: Path, *, harness: str = "claude-code", dry_run: bool = False) -> int:
     return cmd_unregister(
         argparse.Namespace(
             path=str(tmp_path),
@@ -126,15 +124,12 @@ def test_merge_codex_mcp_server_is_idempotent() -> None:
 
 
 def test_merge_codex_mcp_server_preserves_existing_content() -> None:
-    existing = (
-        '[mcp_servers.other-tool]\ncommand = "other-tool-bin"\n\n'
-        "[model]\nname = \"gpt-5\"\n"
-    )
+    existing = '[mcp_servers.other-tool]\ncommand = "other-tool-bin"\n\n[model]\nname = "gpt-5"\n'
     text, added = install.merge_codex_mcp_server(existing)
     assert added is True
-    assert '[mcp_servers.other-tool]' in text
+    assert "[mcp_servers.other-tool]" in text
     assert 'command = "other-tool-bin"' in text
-    assert '[model]' in text
+    assert "[model]" in text
     assert 'name = "gpt-5"' in text
     assert "[mcp_servers.strata]" in text
 
@@ -181,10 +176,7 @@ def test_merge_codex_freshness_hook_is_idempotent() -> None:
 
 def test_merge_codex_freshness_hook_preserves_existing_hooks() -> None:
     existing = (
-        "[[hooks.Stop]]\n"
-        "[[hooks.Stop.hooks]]\n"
-        'type = "command"\n'
-        'command = "my-other-hook.sh"\n'
+        '[[hooks.Stop]]\n[[hooks.Stop.hooks]]\ntype = "command"\ncommand = "my-other-hook.sh"\n'
     )
     text, added = install.merge_codex_freshness_hook(existing)
     assert added is True
@@ -204,9 +196,7 @@ def test_merge_codex_freshness_hook_labelled_pending_verification() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_register_harness_codex_writes_config_toml(
-    tmp_path: Path, codex_home: Path
-) -> None:
+def test_register_harness_codex_writes_config_toml(tmp_path: Path, codex_home: Path) -> None:
     _init_project(tmp_path)
     assert _register(tmp_path, harness="codex") == 0
 
@@ -229,9 +219,7 @@ def test_register_harness_codex_prints_progress_without_crashing(
     assert str(codex_home / "config.toml") in out
 
 
-def test_register_harness_codex_is_idempotent(
-    tmp_path: Path, codex_home: Path
-) -> None:
+def test_register_harness_codex_is_idempotent(tmp_path: Path, codex_home: Path) -> None:
     _init_project(tmp_path)
     assert _register(tmp_path, harness="codex") == 0
     config = codex_home / "config.toml"
@@ -256,7 +244,7 @@ def test_register_harness_codex_preserves_user_codex_config(
 
     text = (codex_home / "config.toml").read_text(encoding="utf-8")
     assert 'name = "gpt-5"' in text
-    assert '[mcp_servers.other-tool]' in text
+    assert "[mcp_servers.other-tool]" in text
     assert 'command = "other-bin"' in text
     assert install.codex_mcp_present(text)
 
@@ -281,9 +269,7 @@ def test_register_harness_codex_still_creates_strata_project_state(
     assert (tmp_path / ".strata" / "fleet.yaml").exists()
 
 
-def test_register_harness_codex_diff_mode_does_not_write(
-    tmp_path: Path, codex_home: Path
-) -> None:
+def test_register_harness_codex_diff_mode_does_not_write(tmp_path: Path, codex_home: Path) -> None:
     _init_project(tmp_path)
     assert _register(tmp_path, harness="codex", diff=True) == 0
     assert not (codex_home / "config.toml").exists()
@@ -308,9 +294,7 @@ def test_register_harness_codex_rejects_invalid_settings_json_independently(
     (claude_dir / "settings.json").write_text("{not valid json", encoding="utf-8")
 
     assert _register(tmp_path, harness="codex") == 0
-    assert install.codex_mcp_present(
-        (codex_home / "config.toml").read_text(encoding="utf-8")
-    )
+    assert install.codex_mcp_present((codex_home / "config.toml").read_text(encoding="utf-8"))
 
 
 # ---------------------------------------------------------------------------
@@ -386,9 +370,7 @@ def test_remove_codex_freshness_hook_absent() -> None:
 
 
 def test_remove_codex_freshness_hook_preserves_users_own_stop_hook() -> None:
-    user_hook = (
-        "[[hooks.Stop]]\n[[hooks.Stop.hooks]]\ntype = \"command\"\ncommand = \"my-hook.sh\"\n"
-    )
+    user_hook = '[[hooks.Stop]]\n[[hooks.Stop.hooks]]\ntype = "command"\ncommand = "my-hook.sh"\n'
     text, _ = install.merge_codex_freshness_hook(user_hook)
     new_text, status = install.remove_codex_freshness_hook(text)
     assert status == "removed"
@@ -467,9 +449,7 @@ def test_unregister_harness_codex_does_not_touch_claude_settings(
     assert after == before  # claude-code wiring untouched by a codex-harness unregister
 
 
-def test_unregister_harness_codex_dry_run_writes_nothing(
-    tmp_path: Path, codex_home: Path
-) -> None:
+def test_unregister_harness_codex_dry_run_writes_nothing(tmp_path: Path, codex_home: Path) -> None:
     _init_project(tmp_path)
     _register(tmp_path, harness="codex")
     before = (codex_home / "config.toml").read_text(encoding="utf-8")

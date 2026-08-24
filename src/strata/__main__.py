@@ -1935,7 +1935,7 @@ def cmd_register(args: argparse.Namespace) -> int:
             "(MCP env values are literal\n"
             "  TOML strings — Codex does not interpolate them). The Stop-hook block "
             "is schema-verified only;\n"
-            "  see README \"Using Strata with Codex CLI\" for exactly what is and "
+            '  see README "Using Strata with Codex CLI" for exactly what is and '
             "isn't proven to work."
         )
 
