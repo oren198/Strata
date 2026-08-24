@@ -3,10 +3,10 @@
 All settings are prefixed ``STRATA_`` in the environment.  The ``db_path``
 and ``summaries_dir`` values may also be set via ``.env`` files.
 
-The ``anthropic_api_key`` field accepts ``STRATA_ANTHROPIC_API_KEY``.  As a
-convenience, if that variable is absent the validator falls back to the bare
-``ANTHROPIC_API_KEY`` variable (the convention used by the Anthropic SDK and
-most tooling).
+The ``anthropic_api_key`` field accepts either ``STRATA_ANTHROPIC_API_KEY``
+or the bare ``ANTHROPIC_API_KEY`` (the convention used by the Anthropic SDK
+and most tooling) — from process env *or* a ``.env`` file. The prefixed name
+wins when both are set.
 
 The fleet config path is read from ``STRATA_FLEET_CONFIG`` (an explicit
 alias, not the auto-generated ``STRATA_FLEET_YAML_PATH``) so that the CLI,
@@ -24,7 +24,7 @@ from __future__ import annotations
 import functools
 import os
 
-from pydantic import Field, model_validator
+from pydantic import AliasChoices, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -73,11 +73,28 @@ class Settings(BaseSettings):
     # more than a cap's worth of contributions at once. 1 disables coalescing
     # — every contribution is judged on its own, as before this ADR.
     judgment_batch_cap: int = Field(default=5, ge=1)
-    anthropic_api_key: str | None = Field(default=None)
+    # An explicit validation_alias (rather than the auto-generated
+    # STRATA_ANTHROPIC_API_KEY-only mapping) so the bare ANTHROPIC_API_KEY
+    # spelling — the convention used by the Anthropic SDK and most tooling —
+    # is honored from *both* process env and the .env file, not just process
+    # env. Order matters: STRATA_ANTHROPIC_API_KEY is tried first, so it
+    # wins when both are set. Before this, a bare `ANTHROPIC_API_KEY=...`
+    # line in .env was silently ignored — pydantic-settings only mapped the
+    # prefixed name from the env file, and the runtime fallback below only
+    # ever read live process env, never .env.
+    anthropic_api_key: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("STRATA_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY"),
+    )
 
     @model_validator(mode="after")
     def _fallback_api_key(self) -> Settings:
-        """If ``STRATA_ANTHROPIC_API_KEY`` is unset, fall back to ``ANTHROPIC_API_KEY``."""
+        """Last-resort fallback: read bare ``ANTHROPIC_API_KEY`` from process env.
+
+        The ``validation_alias`` above already covers both spellings from
+        both env-var and .env sources; this only matters if some other
+        settings-construction path (e.g. explicit kwargs) bypassed that.
+        """
         if self.anthropic_api_key is None:
             self.anthropic_api_key = os.environ.get("ANTHROPIC_API_KEY")
         return self
