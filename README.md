@@ -201,7 +201,7 @@ Two universal commands, then you're ready:
 ```bash
 pipx install strata-mem    # install strata in an isolated env; puts strata + strata-mcp on PATH
 cd /path/to/your/project
-strata register              # idempotent: creates .strata/, seeds fleet.yaml, wires Claude Code
+strata register              # idempotent: creates .strata/, seeds fleet.yaml, wires every harness it finds
 ```
 
 > **PyPI distribution name vs. import/CLI names.** The Strata engine is
@@ -215,19 +215,38 @@ strata register              # idempotent: creates .strata/, seeds fleet.yaml, w
 
 ### What `strata register` does
 
-`strata register` is strictly additive — it never overwrites files you've already edited:
+`strata register` is strictly additive — it never overwrites files you've already edited.
+
+By default it wires **every harness it finds on this machine**: it detects
+Claude Code (the `claude` binary on `PATH`, or a `~/.claude` directory) and
+Codex CLI (the `codex` binary, or `~/.codex`) independently, and wires
+whichever of those are present — one or both. Pass `--harness claude-code`
+or `--harness codex` (repeatable) to narrow to specific harnesses instead of
+detecting. If neither is detected (a bare CI machine, a container), it wires
+Claude Code anyway, with the notice `no harness detected on this machine —
+wiring claude-code (the default)` — today's behavior, unchanged.
+
+The common setup runs once regardless of which harnesses are resolved:
 
 1. Creates `.strata/` directory and `config.toml` (relative paths, portable workspace).
 2. Appends a `# Strata` block to `.gitignore` (ignores the DB and venv, never `fleet.yaml`).
 3. Seeds `.strata/fleet.yaml` from a minimal template (1 scope, ready to edit).
-4. Copies the `strata`, `strata-worker`, and `strata-inspect` skills to `.claude/skills/`.
-5. Merges a `strata` entry into `.claude/settings.json`'s `mcpServers` block.
-6. Installs the freshness `Stop`-hook: copies `.claude/hooks/strata-stop-hook`
-   and merges a `hooks.Stop` entry into `.claude/settings.json` (see
-   [Memory-freshness Stop-hook](#memory-freshness-stop-hook)).
+
+Then, per resolved harness:
+
+- **claude-code** — copies the `strata`, `strata-worker`, and `strata-inspect`
+  skills to `.claude/skills/`; merges a `strata` entry into
+  `.claude/settings.json`'s `mcpServers` block; installs the freshness
+  `Stop`-hook (copies `.claude/hooks/strata-stop-hook` and merges a
+  `hooks.Stop` entry into `.claude/settings.json` — see
+  [Memory-freshness Stop-hook](#memory-freshness-stop-hook)).
+- **codex** — merges Strata into Codex CLI's own `config.toml` and seeds
+  `AGENTS.md` with a short memory-moves block — see
+  [Using Strata with Codex CLI](#using-strata-with-codex-cli).
 
 Run it again at any time — it skips everything that already exists and reports what it kept.
-Every step is additive: your own `mcpServers`, `hooks`, skills, and `fleet.yaml` are never overwritten.
+Every step is additive: your own `mcpServers`, `hooks`, skills, `AGENTS.md` content, and
+`fleet.yaml` are never overwritten.
 
 ### After registration
 
@@ -365,15 +384,32 @@ automatically. Note: this downloads ~100MB of Python deps.
 strata register --harness codex
 ```
 
-This does the same per-project setup as plain `strata register` (`.strata/`,
-`fleet.yaml`, `.gitignore`), but instead of wiring `.claude/settings.json` it
-merges Strata's config into the **OpenAI Codex CLI**'s own config file —
+Plain `strata register` already wires Codex when it detects it on the
+machine (see [What `strata register` does](#what-strata-register-does)); use
+`--harness codex` to wire Codex specifically, regardless of what else is
+detected — for example on a machine that also has Claude Code installed but
+you only want the Codex wiring right now.
+
+The Codex wiring does the same per-project setup as plain `strata register`
+(`.strata/`, `fleet.yaml`, `.gitignore`), but instead of (or in addition to,
+when both harnesses are resolved) wiring `.claude/settings.json` it merges
+Strata's config into the **OpenAI Codex CLI**'s own config file —
 `$CODEX_HOME/config.toml`, which defaults to `~/.codex/config.toml`. That is a
 user-level file, not a per-project one, matching how Codex's own `codex mcp
 add` manages it. Like `strata register` for Claude Code, the merge is
 strictly additive and idempotent: your existing `config.toml` — comments,
 other `mcp_servers` entries, everything — is left untouched, and re-running
 `strata register --harness codex` is a no-op.
+
+It also seeds the project's `AGENTS.md` with a short, marker-fenced block —
+Codex has no skills mechanism equivalent to `.claude/skills/`, so this is
+where the same read-before-working / contribute-back / judged-verdict
+guidance lives for Codex sessions. A fresh `AGENTS.md` is created if none
+exists; an existing one keeps its own content byte-identical, with the
+Strata block appended. `strata unregister --harness codex` removes only that
+block, and only when it still byte-matches what register wrote — content you
+added elsewhere in the file, or edits inside the block itself, are reported
+and left in place.
 
 **What this gives you, and how confident to be in each part:**
 
@@ -522,6 +558,17 @@ strata unregister --dry-run     # preview every action, write nothing
 strata unregister --purge-data  # also delete .strata/ (fleet.yaml, DB, summaries)
 ```
 
+By default it reverses **every harness that is actually wired in this
+project** — determined by checking for register's markers in each harness's
+files, not by what's installed on the machine (that asymmetry with
+register's "wire everything detected" default is deliberate: a plain
+`unregister` should never touch a harness this project never registered).
+Pass `--harness claude-code` or `--harness codex` (repeatable) to narrow to
+specific harnesses instead. A harness named explicitly that turns out not to
+be wired still runs its normal per-artifact checks — each step reports
+"nothing to do" and the run exits 0, so `--harness codex` is always safe to
+run even against a project that never wired Codex.
+
 What it does, step by step:
 
 1. Removes the managed `# Strata` block from `.gitignore`, leaving every other
@@ -540,11 +587,15 @@ What it does, step by step:
    Pass `--purge-data` to remove it too (`--dry-run --purge-data` previews the
    purge without deleting).
 
-With `--harness codex` (matching `strata register --harness codex`), steps 2–4
-above are replaced by the reverse of the Codex merge: the `[mcp_servers.strata]`
-table and the freshness `hooks.Stop` block are removed from
-`$CODEX_HOME/config.toml` only when each still byte-matches what register
-wrote; `.claude/settings.json` is untouched. Steps 1 and 5 are unchanged.
+For the Codex harness (resolved by default when Codex is wired, or via
+`--harness codex`), steps 2–4 above are replaced by the reverse of the Codex
+wiring: the `[mcp_servers.strata]` table and the freshness `hooks.Stop` block
+are removed from `$CODEX_HOME/config.toml` only when each still byte-matches
+what register wrote, and the marker-fenced Strata block is removed from the
+project's `AGENTS.md`, again only when unedited; `.claude/settings.json` is
+untouched. Steps 1 and 5 are unchanged. When both harnesses are resolved
+(the default on a machine with both wired), both sets of steps run, one
+after the other.
 
 **Exit code:** `0` on success, including when there is nothing to do (running
 it on an unregistered project is a safe no-op). It exits `1` when something you
@@ -588,7 +639,48 @@ strata launch g_arch                            # use default_skill from fleet.y
 strata launch g_arch --skill evidence-summarizer  # override skill
 strata launch g_arch --session my-sess          # override auto-generated session ID
 strata launch                                   # pick from interactive list, or use .strata-role
+strata launch --harness claude-code             # start this harness regardless of the default
 ```
+
+#### Which harness `strata launch` starts
+
+`strata launch` resolves which harness to start, in order:
+
+1. An explicit `--harness` flag wins outright.
+2. Otherwise, the project's recorded default — see `strata set-default-harness`
+   below. If `.strata/config.toml` names a harness Strata doesn't know (a
+   hand-edited value, or one written by a newer Strata version), it prints a
+   one-line warning to stderr naming the bad value and falls back to the next
+   step rather than launching the wrong thing silently.
+3. Otherwise, if exactly one harness is currently wired in this project
+   (checked the same way `strata unregister`'s default resolves), that one.
+4. Otherwise, `claude-code` — today's behavior, unchanged.
+
+`claude-code` continues through the flow described above. `codex` is
+schema-verified but not live-verified (see
+[Using Strata with Codex CLI](#using-strata-with-codex-cli)), so
+`strata launch --harness codex` — or a project whose default/only-wired
+harness resolves to codex — exits `1` with:
+
+> Codex launch is not wired yet: Codex's MCP env delivery is still being
+> verified live (see README, 'Using Strata with Codex CLI'). Start codex
+> manually after filling in the `[mcp_servers.strata.env]` values.
+
+#### `strata set-default-harness` — record which harness launch starts
+
+```bash
+strata set-default-harness codex        # strata launch now starts codex by default
+strata set-default-harness claude-code  # switch back
+```
+
+Writes `default_harness = "NAME"` under a `[launch]` table in
+`.strata/config.toml`, read-modify-write: every other line in the file —
+including a pre-existing `[launch]` table's other keys — is preserved
+byte-for-byte, and re-running replaces the value in place instead of
+duplicating the table. An unknown harness name exits `2` with the list of
+valid harnesses; running it before `strata register` exits `1` with
+`run 'strata register' first`. On success it prints
+`default harness: NAME (used by 'strata launch')`.
 
 #### `.strata-role` — per-project default binding
 
