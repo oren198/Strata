@@ -105,6 +105,19 @@
     return resp.json(); // { scope_id, directives, context, updated_at }
   }
 
+  // Fetch one page of a scope's declined contributions (UI-only endpoint).
+  async function fetchScopeDeclines(scope_id, { limit, before_id } = {}) {
+    const base = getApiBase();
+    const qs = new URLSearchParams();
+    if (limit) qs.set("limit", String(limit));
+    if (before_id) qs.set("before_id", before_id);
+    const suffix = qs.toString() ? `?${qs}` : "";
+    const url = `${base}/scopes/${encodeURIComponent(scope_id)}/declines${suffix}`;
+    const resp = await fetch(url);
+    if (!resp.ok) throw new Error(`GET /scopes/${scope_id}/declines returned ${resp.status}`);
+    return resp.json();
+  }
+
   // Helpers used in graph layout.
   function stratumIndex(state, stratum_id) {
     return state.strata.findIndex((s) => s.id === stratum_id);
@@ -124,6 +137,7 @@
     makeEmpty,
     fetchFleet,
     fetchScopeSummary,
+    fetchScopeDeclines,
     stratumIndex,
     edgeAllowed,
     loadPrefs,

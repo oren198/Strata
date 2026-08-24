@@ -205,6 +205,10 @@ function App() {
           </>
         )}
 
+        {tab === "declined" && (
+          <DeclinesView state={state} scopeId={openScopeId || state.scopes[0]?.id} onSelectScope={setOpenScopeId} />
+        )}
+
         {tab === "settings" && (
           <SettingsScreen state={state} dispatch={dispatch} onFlash={flash} />
         )}
@@ -275,6 +279,13 @@ function TopBar({ tab, onTab, dark, onToggleDark }) {
         >
           <Icon name="git-fork" size={13} style={{ marginRight: 6, verticalAlign: "-2px" }} />
           Memory graph
+        </button>
+        <button
+          className={"at-tab" + (tab === "declined" ? " active" : "")}
+          onClick={() => onTab("declined")}
+        >
+          <Icon name="x-circle" size={13} style={{ marginRight: 6, verticalAlign: "-2px" }} />
+          Turned down
         </button>
         <button
           className={"at-tab" + (tab === "settings" ? " active" : "")}

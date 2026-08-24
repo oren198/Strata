@@ -31,6 +31,8 @@ _UI_FILES = [
     "graph.jsx",
     "scope-detail.jsx",
     "settings.jsx",
+    "format.jsx",
+    "declines.jsx",
     "tweaks-panel.jsx",
     "store.js",
     "atlas.css",
