@@ -5,9 +5,7 @@
 // what was refused. UI-only — this view's fetch never runs on the
 // contribute/judge path.
 //
-// Layout ported from the Console's activity feed (accordion rows, one open
-// at a time), with the hosted event types (agent registrations, key
-// revocations, quota, legacy operator writes) and retirements left out —
+// Layout: accordion rows, one open at a time. Retirements are left out —
 // this page renders one scope's contribution record only.
 // ─────────────────────────────────────────────────────────────────────
 

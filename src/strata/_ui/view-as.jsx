@@ -6,12 +6,11 @@
 // layer, each showing a rough token weight and its share of the whole.
 //
 // Token weights here are a UI-only estimate (characters / 4) — never a
-// tokenizer, never used to judge anything. Standing rule carried over from
-// the hosted console's account meter: never render a forecast, a
-// burn-down, a run-rate, or "days remaining". Nothing local has a budget,
-// so an account-meter's quota concept and role="progressbar" are not
-// ported here — this bar only ever answers "what does this scope actually
-// read, and how heavy is each part."
+// tokenizer, never used to judge anything. Standing rule: never render a
+// forecast, a burn-down, a run-rate, or "days remaining". Nothing local has
+// a budget, so no meter concept and no role="progressbar" are used here —
+// this bar only ever answers "what does this scope actually read, and how
+// heavy is each part."
 // ─────────────────────────────────────────────────────────────────────
 
 const RELATION_META = {

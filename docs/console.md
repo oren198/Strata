@@ -45,9 +45,7 @@ contribution is "Fresh"; anything else is "Stale". A big number here means
 agents keep leaning on memory nobody has updated.
 
 The view offers a 7 / 30 / 90 day window and accepts any window of 1 day or
-more (there is no upper limit). This is a deliberate difference from Strata's
-hosted counterpart, which clamps its window to 30 days because its read
-receipts are pruned at that age. **Session-state files here currently have no
+more (there is no upper limit). **Session-state files here currently have no
 retention policy** — they are never pruned — so a very large window reaches
 back as far as those files go. This is flagged as a known future concern, not
 a defect: nothing today deletes old session state, so nothing today bounds
