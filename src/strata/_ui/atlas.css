@@ -323,3 +323,33 @@
   margin-right: 6px;
   vertical-align: -1px;
 }
+
+.activity-row {
+  border-top: 1px solid var(--at-rule-soft);
+}
+
+.activity-row-toggle {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  width: 100%;
+  padding: 10px 4px;
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+}
+
+.activity-row-toggle:hover {
+  background: var(--at-highlight);
+}
+
+.activity-row-detail {
+  padding: 2px 4px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}

@@ -127,6 +127,28 @@
     return resp.json();
   }
 
+  // Fetch one page of a scope's record (newest first). Walk back with before_id.
+  async function fetchScopeRecord(scope_id, { limit, before_id } = {}) {
+    const base = getApiBase();
+    const qs = new URLSearchParams();
+    if (limit) qs.set("limit", String(limit));
+    if (before_id) qs.set("before_id", before_id);
+    const suffix = qs.toString() ? `?${qs}` : "";
+    const resp = await fetch(`${base}/scopes/${encodeURIComponent(scope_id)}/record${suffix}`);
+    if (!resp.ok) throw new Error(`GET /scopes/${scope_id}/record returned ${resp.status}`);
+    return resp.json();
+  }
+
+  // Fetch one record entry with its verdict and failed attempts.
+  async function fetchRecordEntry(scope_id, contribution_id) {
+    const base = getApiBase();
+    const resp = await fetch(
+      `${base}/scopes/${encodeURIComponent(scope_id)}/record/${encodeURIComponent(contribution_id)}`
+    );
+    if (!resp.ok) throw new Error(`GET record entry returned ${resp.status}`);
+    return resp.json();
+  }
+
   // Helpers used in graph layout.
   function stratumIndex(state, stratum_id) {
     return state.strata.findIndex((s) => s.id === stratum_id);
@@ -148,6 +170,8 @@
     fetchScopeSummary,
     fetchScopeDeclines,
     fetchStaleness,
+    fetchScopeRecord,
+    fetchRecordEntry,
     stratumIndex,
     edgeAllowed,
     loadPrefs,

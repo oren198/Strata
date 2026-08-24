@@ -213,6 +213,10 @@ function App() {
           <FreshnessView state={state} onOpenScope={(id) => { setTab("graph"); setView("list"); setOpenScopeId(id); }} />
         )}
 
+        {tab === "record" && (
+          <RecordTrailView state={state} scopeId={openScopeId || state.scopes[0]?.id} onSelectScope={setOpenScopeId} />
+        )}
+
         {tab === "settings" && (
           <SettingsScreen state={state} dispatch={dispatch} onFlash={flash} />
         )}
@@ -297,6 +301,13 @@ function TopBar({ tab, onTab, dark, onToggleDark }) {
         >
           <Icon name="thermometer" size={13} style={{ marginRight: 6, verticalAlign: "-2px" }} />
           Freshness
+        </button>
+        <button
+          className={"at-tab" + (tab === "record" ? " active" : "")}
+          onClick={() => onTab("record")}
+        >
+          <Icon name="scroll-text" size={13} style={{ marginRight: 6, verticalAlign: "-2px" }} />
+          Record
         </button>
         <button
           className={"at-tab" + (tab === "settings" ? " active" : "")}
