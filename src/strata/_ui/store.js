@@ -1,6 +1,8 @@
 // ─────────────────────────────────────────────────────────────────────
 // Strata · store.
-// V1 is read-only. Mutations land via the backend bootstrap and CC contribute tool.
+// Mostly read-only: judgment stays automatic. The one exception is the
+// operator's own supersede/retire actions (P5) — an in-person correction to
+// a scope's own summary, on exception, never the ordinary contribute path.
 //
 // Data model mirrors the backend API shapes:
 //   strata  — ordered horizontal lanes. {id, name}
@@ -102,7 +104,91 @@
       if (resp.status === 404) return null;
       throw new Error(`GET /scopes/${scope_id}/summary returned ${resp.status}`);
     }
-    return resp.json(); // { scope_id, directives, context, updated_at }
+    return resp.json(); // { scope_id, directives, context, updated_at, retirements }
+  }
+
+  // Fetch one page of a scope's declined contributions (UI-only endpoint).
+  async function fetchScopeDeclines(scope_id, { limit, before_id } = {}) {
+    const base = getApiBase();
+    const qs = new URLSearchParams();
+    if (limit) qs.set("limit", String(limit));
+    if (before_id) qs.set("before_id", before_id);
+    const suffix = qs.toString() ? `?${qs}` : "";
+    const url = `${base}/scopes/${encodeURIComponent(scope_id)}/declines${suffix}`;
+    const resp = await fetch(url);
+    if (!resp.ok) throw new Error(`GET /scopes/${scope_id}/declines returned ${resp.status}`);
+    return resp.json();
+  }
+
+  // Fetch the fleet-wide staleness metric (UI-only endpoint).
+  async function fetchStaleness({ window_days } = {}) {
+    const base = getApiBase();
+    const qs = window_days ? `?window_days=${window_days}` : "";
+    const resp = await fetch(`${base}/staleness${qs}`);
+    if (!resp.ok) throw new Error(`GET /staleness returned ${resp.status}`);
+    return resp.json();
+  }
+
+  // Fetch one page of a scope's record (newest first). Walk back with before_id.
+  async function fetchScopeRecord(scope_id, { limit, before_id } = {}) {
+    const base = getApiBase();
+    const qs = new URLSearchParams();
+    if (limit) qs.set("limit", String(limit));
+    if (before_id) qs.set("before_id", before_id);
+    const suffix = qs.toString() ? `?${qs}` : "";
+    const resp = await fetch(`${base}/scopes/${encodeURIComponent(scope_id)}/record${suffix}`);
+    if (!resp.ok) throw new Error(`GET /scopes/${scope_id}/record returned ${resp.status}`);
+    return resp.json();
+  }
+
+  // Fetch one record entry with its verdict and failed attempts.
+  async function fetchRecordEntry(scope_id, contribution_id) {
+    const base = getApiBase();
+    const resp = await fetch(
+      `${base}/scopes/${encodeURIComponent(scope_id)}/record/${encodeURIComponent(contribution_id)}`
+    );
+    if (!resp.ok) throw new Error(`GET record entry returned ${resp.status}`);
+    return resp.json();
+  }
+
+  // Compose a scope's perspective as an agent bound to it would receive it.
+  async function fetchPerspective(scope_id) {
+    const base = getApiBase();
+    const resp = await fetch(`${base}/scopes/${encodeURIComponent(scope_id)}/perspective`);
+    if (!resp.ok) throw new Error(`GET /scopes/${scope_id}/perspective returned ${resp.status}`);
+    return resp.json();
+  }
+
+  async function _post(url, payload) {
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const data = await resp.json().catch(() => null);
+    if (!resp.ok) {
+      const detail = data && data.detail;
+      throw new Error(typeof detail === "string" ? detail : `Request failed (${resp.status})`);
+    }
+    return data;
+  }
+
+  // Operator correction, in person: replace a directive in a scope's summary.
+  async function supersedeDirective(scope_id, directive_id, { content, subject }) {
+    const base = getApiBase();
+    return _post(
+      `${base}/scopes/${encodeURIComponent(scope_id)}/directives/${encodeURIComponent(directive_id)}/supersede`,
+      { content, subject: subject || null },
+    );
+  }
+
+  // Operator retirement, in person: withdraw a directive, no replacement.
+  async function retireDirective(scope_id, directive_id, { reason }) {
+    const base = getApiBase();
+    return _post(
+      `${base}/scopes/${encodeURIComponent(scope_id)}/directives/${encodeURIComponent(directive_id)}/retire`,
+      { reason: reason || null },
+    );
   }
 
   // Helpers used in graph layout.
@@ -124,6 +210,13 @@
     makeEmpty,
     fetchFleet,
     fetchScopeSummary,
+    fetchScopeDeclines,
+    fetchStaleness,
+    fetchScopeRecord,
+    fetchRecordEntry,
+    fetchPerspective,
+    supersedeDirective,
+    retireDirective,
     stratumIndex,
     edgeAllowed,
     loadPrefs,

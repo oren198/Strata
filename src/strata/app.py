@@ -49,19 +49,20 @@ Vocabulary follows CONTEXT.md verbatim.
 from __future__ import annotations
 
 import importlib.resources
+import json
 import pathlib
 import sqlite3
 from collections.abc import AsyncGenerator, Generator, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Literal
 
 import anthropic
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 
 from strata import __version__
 from strata.fleet_config import FleetConfig, Scope, Stratum
@@ -70,7 +71,8 @@ from strata.locks import scope_append_lock as _scope_append_lock
 from strata.locks import scope_lock as _scope_lock
 from strata.locks import scope_queue as _scope_queue
 from strata.migrator import run_migrations
-from strata.operator import operator_memory_binding
+from strata.operator import operator_memory_binding, read_operator_layer
+from strata.perspective import compose_perspective
 from strata.project_config import StoragePaths, resolve_storage_paths
 from strata.publication import (
     apply_judged_withdrawals,
@@ -91,6 +93,12 @@ from strata.scope_manager import (
     ScopeManagerBatchJudgment,
     ScopeManagerJudgment,
 )
+from strata.session_state import (
+    DEFAULT_STALENESS_WINDOW_DAYS,
+    SessionStateStore,
+    compute_fleet_staleness,
+    sessions_dir_for,
+)
 from strata.settings import Settings, get_settings
 from strata.summary_store import ScopeSummary, SummaryStore
 
@@ -98,6 +106,14 @@ from strata.summary_store import ScopeSummary, SummaryStore
 # _skills/ / _migrations/ / _templates/), so the static mount works regardless
 # of cwd and in wheel installs (pipx, ADR 0005 / issue #65).
 _UI_DIR = pathlib.Path(str(importlib.resources.files("strata"))) / "_ui"
+
+# GET /scopes/{scope_id}/summary's "retirements" key (P5) is bounded like the
+# record page (issue #130's rationale, applied here): a long-lived scope's
+# retirement history only ever grows, and every summary GET carries it, so an
+# unbounded list would bloat a call that fires far more often than a record
+# page walk. Newest-first, capped — older retirements stay in the record,
+# reachable there, just not repeated on every summary fetch.
+_SUMMARY_RETIREMENTS_LIMIT = 50
 
 # ---------------------------------------------------------------------------
 # Dependency providers
@@ -132,6 +148,41 @@ def get_summary_store(
 ) -> SummaryStore:
     """Return a :class:`SummaryStore` for the configured summaries directory."""
     return SummaryStore(paths.summaries_dir)
+
+
+def get_session_store(
+    paths: StoragePaths = Depends(get_storage_paths),
+) -> SessionStateStore:
+    """Return the per-session state store (UI-only reads: staleness + closeout counters).
+
+    Session state is runtime measurement, never memory (see session_state.py's module
+    docstring). Nothing in the contribute/judge path reads it through this provider.
+    """
+    return SessionStateStore(sessions_dir_for(paths.summaries_dir))
+
+
+def _parse_iso(value: str) -> datetime | None:
+    """Parse an ISO-8601 timestamp, returning ``None`` on failure rather than raising.
+
+    Used only by UI-only reads (the mechanical-declines counter): a malformed
+    or missing timestamp on disk should degrade the count, never break the read.
+    """
+    try:
+        return datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+
+
+#: Characters per token in the Console's rough weight estimate. Deliberately a
+#: constant, not a tokenizer: the Console must work offline with no model call and
+#: no extra dependency, and the number's job is comparing layers to each other, not
+#: predicting a bill. Every surface that shows it says "est.".
+_CHARS_PER_TOKEN = 4
+
+
+def _estimate_tokens(text: str) -> int:
+    """Return a rough token estimate for *text* (UI-only, never used to judge)."""
+    return (len(text) + _CHARS_PER_TOKEN - 1) // _CHARS_PER_TOKEN
 
 
 def get_anthropic_client(
@@ -197,6 +248,26 @@ class ContributeResponse(BaseModel):
 
     contribution_id: str
     judgment: JudgmentResult
+
+
+class SupersedeDirectiveRequest(BaseModel):
+    """Operator correction in person (ADR 0008 D4) — verbatim replacement text."""
+
+    content: str = Field(min_length=1)
+    subject: str | None = None
+
+    @field_validator("content")
+    @classmethod
+    def _not_blank(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("content must not be blank")
+        return v
+
+
+class RetireDirectiveRequest(BaseModel):
+    """Operator retirement in person (ADR 0008 D4) — no replacement memory enters."""
+
+    reason: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -1122,6 +1193,99 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
         }
 
     # -----------------------------------------------------------------------
+    # GET /staleness
+    # -----------------------------------------------------------------------
+
+    @application.get("/staleness")
+    def get_staleness(
+        request: Request,
+        window_days: int = Query(default=30, ge=1),
+        scope_id: str | None = None,
+        record_store: RecordStore = Depends(get_record_store),
+        summary_store: SummaryStore = Depends(get_summary_store),
+        session_store: SessionStateStore = Depends(get_session_store),
+    ) -> dict:
+        """Return the fleet-wide staleness view (P2 proof surface).
+
+        UI-only. No engine flow reads this; the metric itself lives in
+        ``session_state.compute_fleet_staleness`` and is unchanged by this
+        route.
+
+        Returns 404 if ``scope_id`` is given but is not an active scope.
+        """
+        fleet: FleetConfig = request.app.state.fleet_config
+        active = fleet.active_scopes()
+
+        if scope_id is not None:
+            active = [s for s in active if s.id == scope_id]
+            if not active:
+                raise HTTPException(status_code=404, detail=f"Scope not found: {scope_id!r}")
+
+        scope_ids = [s.id for s in active]
+        staleness = compute_fleet_staleness(
+            scope_ids,
+            record_store=record_store,
+            session_store=session_store,
+            window_days=window_days,
+        )
+        by_id = {s.id: s for s in active}
+
+        rows = []
+        for metric in staleness:
+            scope = by_id[metric.scope_id]
+            summary = summary_store.read(metric.scope_id)
+            summary_version = summary.version if summary is not None else 0
+            summary_updated_at = summary.updated_at if summary is not None else None
+
+            if summary_version == 0:
+                state = "no_memory"
+            elif metric.reads_since_last_contribution > 0:
+                state = "stale"
+            else:
+                state = "fresh"
+
+            rows.append(
+                {
+                    "scope_id": metric.scope_id,
+                    "name": scope.name,
+                    "stratum_id": scope.stratum_id,
+                    "reads_since_last_contribution": metric.reads_since_last_contribution,
+                    "last_accepted_contribution_at": metric.last_accepted_contribution_at,
+                    "summary_version": summary_version,
+                    "summary_updated_at": summary_updated_at,
+                    "state": state,
+                }
+            )
+
+        rows.sort(key=lambda r: (-r["reads_since_last_contribution"], r["scope_id"]))
+
+        window_start = datetime.now(tz=UTC) - timedelta(days=window_days)
+        contributions = 0
+        closeouts = 0
+        silent_readers = 0
+        for state_row in session_store.all_states():
+            updated_at = _parse_iso(state_row.updated_at)
+            if updated_at is None or updated_at < window_start:
+                continue
+            if state_row.contributions > 0:
+                contributions += 1
+            elif state_row.declines > 0:
+                closeouts += 1
+            elif state_row.reads > 0:
+                silent_readers += 1
+
+        return {
+            "window_days": window_days,
+            "generated_at": datetime.now(tz=UTC).isoformat(),
+            "scopes": rows,
+            "session_outcomes": {
+                "contributions": contributions,
+                "closeouts": closeouts,
+                "silent_readers": silent_readers,
+            },
+        }
+
+    # -----------------------------------------------------------------------
     # GET /scopes/{scope_id}/summary
     # -----------------------------------------------------------------------
 
@@ -1130,20 +1294,32 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
         scope_id: str,
         request: Request,
         summary_store: SummaryStore = Depends(get_summary_store),
+        record_store: RecordStore = Depends(get_record_store),
     ) -> dict:
         """Return the scope summary.
 
         Returns 200 with an empty summary if the scope exists but has no summary
         yet.  Returns 404 if the scope is not in the FleetConfig.
+
+        Carries a ``retirements`` key — the scope's own retirement events
+        (ADR 0008 D4), newest first and capped at
+        ``_SUMMARY_RETIREMENTS_LIMIT``, so the Console can show "retired
+        here" without a second round trip. Retirements are events, not
+        contributions, so they never appear in ``GET .../record``.
         """
+        from dataclasses import asdict
+
         fleet: FleetConfig = request.app.state.fleet_config
         scope = fleet.get_scope(scope_id)
         if scope is None:
             raise HTTPException(status_code=404, detail=f"Scope not found: {scope_id!r}")
 
+        all_retirements = list(reversed(record_store.list_retirements(scope_id=scope_id)))
+        retirements = [asdict(r) for r in all_retirements[:_SUMMARY_RETIREMENTS_LIMIT]]
+
         existing = summary_store.read(scope_id)
         if existing is not None:
-            return existing.model_dump()
+            return {**existing.model_dump(), "retirements": retirements}
 
         # Scope exists but has no summary yet — return a synthesized empty
         # summary. version=0 + exists=False mark it as synthesized so it's
@@ -1157,7 +1333,71 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
             version=0,
             exists=False,
         )
-        return empty.model_dump()
+        return {**empty.model_dump(), "retirements": retirements}
+
+    # -----------------------------------------------------------------------
+    # GET /scopes/{scope_id}/perspective
+    # -----------------------------------------------------------------------
+
+    @application.get("/scopes/{scope_id}/perspective")
+    def get_scope_perspective(
+        scope_id: str,
+        request: Request,
+        summary_store: SummaryStore = Depends(get_summary_store),
+    ) -> dict:
+        """Return the composed perspective *scope_id* would receive, with token weights.
+
+        Wires ``compose_perspective`` with the operator and publication readers
+        exactly as the MCP server does (``strata/mcp/server.py``) — an operator
+        inspecting "what does this agent actually see" must see operator
+        layers and peer publications, never the legacy whole-face shape. The
+        session nudge (``_attach_nudge``) is deliberately not applied: the
+        nudge is a session-facing artefact and the Console is not a session.
+
+        Each layer gets a ``token_estimate`` (see ``_estimate_tokens``) computed
+        over its serialised payload — the structured text that actually reaches
+        the agent, not just its free-text fields — and the response carries a
+        ``token_estimate_total`` plus a ``token_estimate_method`` note that this
+        is an estimate, not a tokenizer count.
+
+        Returns 404 if the scope is not in the FleetConfig.
+        """
+        fleet: FleetConfig = request.app.state.fleet_config
+        scope = fleet.get_scope(scope_id)
+        if scope is None:
+            raise HTTPException(status_code=404, detail=f"Scope not found: {scope_id!r}")
+
+        def _operator_reader(attachment_scope_id: str) -> list:
+            return read_operator_layer(
+                attachment_scope_id, summaries_dir=str(summary_store.summaries_dir)
+            )
+
+        def _publication_reader(peer_scope_id: str) -> list:
+            return read_publication(peer_scope_id, summaries_dir=str(summary_store.summaries_dir))
+
+        try:
+            composed = compose_perspective(
+                scope_id,
+                fleet=fleet,
+                summary_store=summary_store,
+                operator_reader=_operator_reader,
+                publication_reader=_publication_reader,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+        total = 0
+        for layer in composed["layers"]:
+            payload = (
+                layer.get("summary") or layer.get("publication") or layer.get("operator_memory")
+            )
+            estimate = _estimate_tokens(json.dumps(payload, sort_keys=True))
+            layer["token_estimate"] = estimate
+            total += estimate
+
+        composed["token_estimate_total"] = total
+        composed["token_estimate_method"] = "characters divided by 4 — an estimate, not a tokenizer"
+        return composed
 
     # -----------------------------------------------------------------------
     # GET /scopes/{scope_id}/record
@@ -1223,6 +1463,98 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
         }
 
     # -----------------------------------------------------------------------
+    # GET /scopes/{scope_id}/declines
+    # -----------------------------------------------------------------------
+
+    @application.get("/scopes/{scope_id}/declines")
+    def get_scope_declines(
+        scope_id: str,
+        request: Request,
+        limit: int | None = None,
+        before_id: str | None = None,
+        record_store: RecordStore = Depends(get_record_store),
+        session_store: SessionStateStore = Depends(get_session_store),
+        settings: Settings = Depends(get_settings),
+    ) -> dict:
+        """Return one page of a scope's declined contributions, with the judge's reasons.
+
+        UI-only proof surface (constraint G1): nothing in the contribute/judge
+        engine flow reads this. Bounded and cursor-paged exactly like
+        ``GET /scopes/{scope_id}/record`` — see :meth:`RecordStore.page_declines`.
+
+        Also reports ``mechanical_declines``: the count of sessions that read
+        this scope inside the staleness window and ended having recorded
+        nothing — an honest closeout signal, not a count of declines *of this
+        scope*, and never rendered as record entries (see D2).
+
+        Returns 404 if the scope is not in the FleetConfig, and 422 if the
+        paging arguments are out of range (including a ``before_id`` that is
+        not a declined contribution in this scope).
+        """
+        fleet: FleetConfig = request.app.state.fleet_config
+        scope = fleet.get_scope(scope_id)
+        if scope is None:
+            raise HTTPException(status_code=404, detail=f"Scope not found: {scope_id!r}")
+
+        try:
+            page = record_store.page_declines(
+                scope_id=scope_id,
+                limit=limit if limit is not None else settings.record_page_size,
+                before_id=before_id,
+            )
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail={"error": "invalid_page", "detail": str(exc)},
+            ) from exc
+
+        window_start = datetime.now(tz=UTC) - timedelta(days=DEFAULT_STALENESS_WINDOW_DAYS)
+        mechanical = 0
+        for state in session_store.all_states():
+            if state.declines <= 0:
+                continue
+            if state.contributions > 0:
+                continue
+            receipt = state.reads_by_scope.get(scope_id)
+            if receipt is None:
+                continue
+            read_at = _parse_iso(receipt.last_read_at)
+            if read_at is not None and read_at >= window_start:
+                mechanical += 1
+
+        return {
+            "scope_id": scope_id,
+            "declines": [
+                {
+                    "contribution_id": entry.contribution.id,
+                    "content": entry.contribution.content,
+                    "subject": entry.contribution.subject,
+                    "proposed_classification": entry.contribution.proposed_classification,
+                    "contributor": {
+                        "scope_id": entry.contribution.contributor.scope_id,
+                        "skill": entry.contribution.contributor.skill,
+                        "session_id": entry.contribution.contributor.session_id,
+                        "ts": entry.contribution.contributor.ts,
+                    },
+                    "created_at": entry.contribution.created_at,
+                    "reason": entry.judgment.notes,
+                    "judged_by": entry.judgment.judged_by,
+                    "judged_at": entry.judgment.created_at,
+                }
+                for entry in page.declines
+            ],
+            "mechanical_declines": {
+                "sessions_that_read_and_recorded_nothing": mechanical,
+                "window_days": DEFAULT_STALENESS_WINDOW_DAYS,
+            },
+            "page": {
+                "limit": page.limit,
+                "total": page.total,
+                "next_before_id": page.next_before_id,
+            },
+        }
+
+    # -----------------------------------------------------------------------
     # GET /scopes/{scope_id}/record/{contribution_id}
     # -----------------------------------------------------------------------
 
@@ -1266,6 +1598,105 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
             "judgment": asdict(entry.judgment) if entry.judgment is not None else None,
             "judgment_attempts": [asdict(a) for a in entry.judgment_attempts],
         }
+
+    # -----------------------------------------------------------------------
+    # POST /scopes/{scope_id}/directives/{directive_id}/supersede
+    # POST /scopes/{scope_id}/directives/{directive_id}/retire
+    #
+    # One-click operator correction, in person (ADR 0008 D4) — the Console
+    # surface for `strata operator supersede` / `strata operator retire`.
+    # Both routes handle c_ native-directive ids only; op_ operator-stratum
+    # ids stay a command-line-only capacity (ADR 0008 D1, this task's D5).
+    # -----------------------------------------------------------------------
+
+    def _reject_operator_stratum_id(directive_id: str) -> None:
+        if not directive_id.startswith("c_"):
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "This action corrects a scope's own directive. Operator-stratum "
+                    "items (ids starting with 'op_') are managed from the command line."
+                ),
+            )
+
+    @application.post("/scopes/{scope_id}/directives/{directive_id}/supersede")
+    def supersede_directive(
+        scope_id: str,
+        directive_id: str,
+        body: SupersedeDirectiveRequest,
+        request: Request,
+        record_store: RecordStore = Depends(get_record_store),
+        summary_store: SummaryStore = Depends(get_summary_store),
+    ) -> dict:
+        """Operator correction, in person (ADR 0008 D4) — Console surface for
+        ``strata operator supersede``.
+
+        Delegates straight to :func:`strata.operator.operator_supersede`, which takes
+        :func:`strata.locks.scope_lock` itself — the SAME cross-process per-scope lock
+        (ADR 0012) the CLI and the contribute path take. This route deliberately takes
+        NO lock of its own. UI-only surface (constraint G1): no engine flow calls it.
+        """
+        from strata.operator import operator_supersede
+
+        _reject_operator_stratum_id(directive_id)
+        fleet: FleetConfig = request.app.state.fleet_config
+        try:
+            new_directive = operator_supersede(
+                scope_id,
+                directive_id,
+                body.content,
+                body.subject,
+                fleet=fleet,
+                record_store=record_store,
+                summary_store=summary_store,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc.args[0])) from exc
+        return {
+            "scope_id": scope_id,
+            "superseded_directive_id": directive_id,
+            "directive": new_directive.model_dump(),
+        }
+
+    @application.post("/scopes/{scope_id}/directives/{directive_id}/retire")
+    def retire_directive(
+        scope_id: str,
+        directive_id: str,
+        body: RetireDirectiveRequest,
+        request: Request,
+        record_store: RecordStore = Depends(get_record_store),
+        summary_store: SummaryStore = Depends(get_summary_store),
+    ) -> dict:
+        """Operator retirement, in person (ADR 0008 D4) — Console surface for
+        ``strata operator retire``.
+
+        Delegates straight to :func:`strata.operator.operator_retire`, which takes
+        :func:`strata.locks.scope_lock` itself — the SAME cross-process per-scope lock
+        (ADR 0012) the CLI and the contribute path take. This route deliberately takes
+        NO lock of its own. UI-only surface (constraint G1): no engine flow calls it.
+        """
+        from dataclasses import asdict
+
+        from strata.operator import operator_retire
+
+        _reject_operator_stratum_id(directive_id)
+        fleet: FleetConfig = request.app.state.fleet_config
+        try:
+            retirement = operator_retire(
+                scope_id,
+                directive_id,
+                body.reason,
+                fleet=fleet,
+                record_store=record_store,
+                summary_store=summary_store,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc.args[0])) from exc
+        return {"scope_id": scope_id, "retirement": asdict(retirement)}
 
     return application
 
