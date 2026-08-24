@@ -62,7 +62,7 @@ import anthropic
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 
 from strata import __version__
 from strata.fleet_config import FleetConfig, Scope, Stratum
@@ -240,6 +240,26 @@ class ContributeResponse(BaseModel):
 
     contribution_id: str
     judgment: JudgmentResult
+
+
+class SupersedeDirectiveRequest(BaseModel):
+    """Operator correction in person (ADR 0008 D4) — verbatim replacement text."""
+
+    content: str = Field(min_length=1)
+    subject: str | None = None
+
+    @field_validator("content")
+    @classmethod
+    def _not_blank(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("content must not be blank")
+        return v
+
+
+class RetireDirectiveRequest(BaseModel):
+    """Operator retirement in person (ADR 0008 D4) — no replacement memory enters."""
+
+    reason: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -1266,20 +1286,32 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
         scope_id: str,
         request: Request,
         summary_store: SummaryStore = Depends(get_summary_store),
+        record_store: RecordStore = Depends(get_record_store),
     ) -> dict:
         """Return the scope summary.
 
         Returns 200 with an empty summary if the scope exists but has no summary
         yet.  Returns 404 if the scope is not in the FleetConfig.
+
+        Carries a ``retirements`` key — the scope's own retirement events
+        (ADR 0008 D4), newest first, so the Console can show "retired here"
+        without a second round trip. Retirements are events, not
+        contributions, so they never appear in ``GET .../record``.
         """
+        from dataclasses import asdict
+
         fleet: FleetConfig = request.app.state.fleet_config
         scope = fleet.get_scope(scope_id)
         if scope is None:
             raise HTTPException(status_code=404, detail=f"Scope not found: {scope_id!r}")
 
+        retirements = [
+            asdict(r) for r in reversed(record_store.list_retirements(scope_id=scope_id))
+        ]
+
         existing = summary_store.read(scope_id)
         if existing is not None:
-            return existing.model_dump()
+            return {**existing.model_dump(), "retirements": retirements}
 
         # Scope exists but has no summary yet — return a synthesized empty
         # summary. version=0 + exists=False mark it as synthesized so it's
@@ -1293,7 +1325,7 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
             version=0,
             exists=False,
         )
-        return empty.model_dump()
+        return {**empty.model_dump(), "retirements": retirements}
 
     # -----------------------------------------------------------------------
     # GET /scopes/{scope_id}/perspective
@@ -1333,9 +1365,7 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
             )
 
         def _publication_reader(peer_scope_id: str) -> list:
-            return read_publication(
-                peer_scope_id, summaries_dir=str(summary_store.summaries_dir)
-            )
+            return read_publication(peer_scope_id, summaries_dir=str(summary_store.summaries_dir))
 
         try:
             composed = compose_perspective(
@@ -1350,17 +1380,15 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
 
         total = 0
         for layer in composed["layers"]:
-            payload = layer.get("summary") or layer.get("publication") or layer.get(
-                "operator_memory"
+            payload = (
+                layer.get("summary") or layer.get("publication") or layer.get("operator_memory")
             )
             estimate = _estimate_tokens(json.dumps(payload, sort_keys=True))
             layer["token_estimate"] = estimate
             total += estimate
 
         composed["token_estimate_total"] = total
-        composed["token_estimate_method"] = (
-            "characters divided by 4 — an estimate, not a tokenizer"
-        )
+        composed["token_estimate_method"] = "characters divided by 4 — an estimate, not a tokenizer"
         return composed
 
     # -----------------------------------------------------------------------
@@ -1560,6 +1588,105 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
             "judgment": asdict(entry.judgment) if entry.judgment is not None else None,
             "judgment_attempts": [asdict(a) for a in entry.judgment_attempts],
         }
+
+    # -----------------------------------------------------------------------
+    # POST /scopes/{scope_id}/directives/{directive_id}/supersede
+    # POST /scopes/{scope_id}/directives/{directive_id}/retire
+    #
+    # One-click operator correction, in person (ADR 0008 D4) — the Console
+    # surface for `strata operator supersede` / `strata operator retire`.
+    # Both routes handle c_ native-directive ids only; op_ operator-stratum
+    # ids stay a command-line-only capacity (ADR 0008 D1, this task's D5).
+    # -----------------------------------------------------------------------
+
+    def _reject_operator_stratum_id(directive_id: str) -> None:
+        if not directive_id.startswith("c_"):
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "This action corrects a scope's own directive. Operator-stratum "
+                    "items (ids starting with 'op_') are managed from the command line."
+                ),
+            )
+
+    @application.post("/scopes/{scope_id}/directives/{directive_id}/supersede")
+    def supersede_directive(
+        scope_id: str,
+        directive_id: str,
+        body: SupersedeDirectiveRequest,
+        request: Request,
+        record_store: RecordStore = Depends(get_record_store),
+        summary_store: SummaryStore = Depends(get_summary_store),
+    ) -> dict:
+        """Operator correction, in person (ADR 0008 D4) — Console surface for
+        ``strata operator supersede``.
+
+        Delegates straight to :func:`strata.operator.operator_supersede`, which takes
+        :func:`strata.locks.scope_lock` itself — the SAME cross-process per-scope lock
+        (ADR 0012) the CLI and the contribute path take. This route deliberately takes
+        NO lock of its own. UI-only surface (constraint G1): no engine flow calls it.
+        """
+        from strata.operator import operator_supersede
+
+        _reject_operator_stratum_id(directive_id)
+        fleet: FleetConfig = request.app.state.fleet_config
+        try:
+            new_directive = operator_supersede(
+                scope_id,
+                directive_id,
+                body.content,
+                body.subject,
+                fleet=fleet,
+                record_store=record_store,
+                summary_store=summary_store,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc.args[0])) from exc
+        return {
+            "scope_id": scope_id,
+            "superseded_directive_id": directive_id,
+            "directive": new_directive.model_dump(),
+        }
+
+    @application.post("/scopes/{scope_id}/directives/{directive_id}/retire")
+    def retire_directive(
+        scope_id: str,
+        directive_id: str,
+        body: RetireDirectiveRequest,
+        request: Request,
+        record_store: RecordStore = Depends(get_record_store),
+        summary_store: SummaryStore = Depends(get_summary_store),
+    ) -> dict:
+        """Operator retirement, in person (ADR 0008 D4) — Console surface for
+        ``strata operator retire``.
+
+        Delegates straight to :func:`strata.operator.operator_retire`, which takes
+        :func:`strata.locks.scope_lock` itself — the SAME cross-process per-scope lock
+        (ADR 0012) the CLI and the contribute path take. This route deliberately takes
+        NO lock of its own. UI-only surface (constraint G1): no engine flow calls it.
+        """
+        from dataclasses import asdict
+
+        from strata.operator import operator_retire
+
+        _reject_operator_stratum_id(directive_id)
+        fleet: FleetConfig = request.app.state.fleet_config
+        try:
+            retirement = operator_retire(
+                scope_id,
+                directive_id,
+                body.reason,
+                fleet=fleet,
+                record_store=record_store,
+                summary_store=summary_store,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc.args[0])) from exc
+        return {"scope_id": scope_id, "retirement": asdict(retirement)}
 
     return application
 

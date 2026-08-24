@@ -1,6 +1,8 @@
 // ─────────────────────────────────────────────────────────────────────
 // Strata · store.
-// V1 is read-only. Mutations land via the backend bootstrap and CC contribute tool.
+// Mostly read-only: judgment stays automatic. The one exception is the
+// operator's own supersede/retire actions (P5) — an in-person correction to
+// a scope's own summary, on exception, never the ordinary contribute path.
 //
 // Data model mirrors the backend API shapes:
 //   strata  — ordered horizontal lanes. {id, name}
@@ -157,6 +159,38 @@
     return resp.json();
   }
 
+  async function _post(url, payload) {
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const data = await resp.json().catch(() => null);
+    if (!resp.ok) {
+      const detail = data && data.detail;
+      throw new Error(typeof detail === "string" ? detail : `Request failed (${resp.status})`);
+    }
+    return data;
+  }
+
+  // Operator correction, in person: replace a directive in a scope's summary.
+  async function supersedeDirective(scope_id, directive_id, { content, subject }) {
+    const base = getApiBase();
+    return _post(
+      `${base}/scopes/${encodeURIComponent(scope_id)}/directives/${encodeURIComponent(directive_id)}/supersede`,
+      { content, subject: subject || null },
+    );
+  }
+
+  // Operator retirement, in person: withdraw a directive, no replacement.
+  async function retireDirective(scope_id, directive_id, { reason }) {
+    const base = getApiBase();
+    return _post(
+      `${base}/scopes/${encodeURIComponent(scope_id)}/directives/${encodeURIComponent(directive_id)}/retire`,
+      { reason: reason || null },
+    );
+  }
+
   // Helpers used in graph layout.
   function stratumIndex(state, stratum_id) {
     return state.strata.findIndex((s) => s.id === stratum_id);
@@ -181,6 +215,8 @@
     fetchScopeRecord,
     fetchRecordEntry,
     fetchPerspective,
+    supersedeDirective,
+    retireDirective,
     stratumIndex,
     edgeAllowed,
     loadPrefs,

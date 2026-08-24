@@ -29,6 +29,7 @@ _UI_FILES = [
     "app.jsx",
     "atoms.jsx",
     "graph.jsx",
+    "operator-actions.jsx",
     "scope-detail.jsx",
     "settings.jsx",
     "format.jsx",

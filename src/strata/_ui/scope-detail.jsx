@@ -3,8 +3,10 @@
 // Two columns: Backend summary (directives + context) · Scope settings.
 // Opened by double-clicking a scope bubble in the graph.
 //
-// V1 is read-only. Mutations land via the backend bootstrap and CC contribute tool.
-// Memory writes flow through `strata.contribute` — see the README.
+// Judgment stays automatic — ordinary memory writes flow through
+// `strata.contribute`. The one operator exception, on an exception: Replace
+// and Retire actions on a directive, an in-person correction to the scope's
+// own summary, behind a confirm dialog (no standing operator-mode toggle).
 // ─────────────────────────────────────────────────────────────────────
 
 function ScopeDetail({ scope_id, state, dispatch, onBack, onFlash, embedded = false }) {
@@ -14,6 +16,15 @@ function ScopeDetail({ scope_id, state, dispatch, onBack, onFlash, embedded = fa
   const [summary, setSummary] = React.useState(null);
   const [summaryLoading, setSummaryLoading] = React.useState(false);
   const [summaryError, setSummaryError] = React.useState(null);
+
+  const refetchSummary = React.useCallback(() => {
+    if (!scope_id) return;
+    setSummaryLoading(true);
+    setSummaryError(null);
+    return STRATA_STORE.fetchScopeSummary(scope_id)
+      .then((data) => { setSummary(data); setSummaryLoading(false); })
+      .catch((err) => { setSummaryError(err.message); setSummaryLoading(false); });
+  }, [scope_id]);
 
   React.useEffect(() => {
     if (!scope_id) return;
@@ -82,6 +93,8 @@ function ScopeDetail({ scope_id, state, dispatch, onBack, onFlash, embedded = fa
             summary={summary}
             loading={summaryLoading}
             error={summaryError}
+            onRefetch={refetchSummary}
+            onFlash={onFlash}
           />
         </Panel>
 
@@ -161,7 +174,16 @@ function ScopeDetail({ scope_id, state, dispatch, onBack, onFlash, embedded = fa
 // ─────────────────────────────────────────────────────────────────────
 // BackendScopeSummary — renders the directives + context from the backend.
 // ─────────────────────────────────────────────────────────────────────
-function BackendScopeSummary({ scope, summary, loading, error }) {
+function BackendScopeSummary({ scope, summary, loading, error, onRefetch, onFlash }) {
+  const [supersedeTarget, setSupersedeTarget] = React.useState(null);
+  const [retireTarget, setRetireTarget] = React.useState(null);
+
+  const handleDone = React.useCallback(() => {
+    setSupersedeTarget(null);
+    setRetireTarget(null);
+    if (onRefetch) onRefetch();
+  }, [onRefetch]);
+
   if (loading) {
     return (
       <div style={{ color: "var(--at-muted)", fontSize: 13, padding: "20px 0", textAlign: "center" }}>
@@ -192,7 +214,7 @@ function BackendScopeSummary({ scope, summary, loading, error }) {
     );
   }
 
-  const { directives = [], context = "", updated_at } = summary;
+  const { directives = [], context = "", updated_at, retirements = [] } = summary;
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 18 }}>
@@ -219,20 +241,59 @@ function BackendScopeSummary({ scope, summary, loading, error }) {
                 border: "1px solid var(--at-rule)",
                 borderLeft: `3px solid ${scope.color}`,
                 borderRadius: 8, padding: "10px 12px",
+                display: "flex", alignItems: "flex-start", gap: 8,
               }}>
-                {d.subject && (
-                  <div style={{ fontSize: 12, fontWeight: 600, color: "var(--at-ink)", marginBottom: 4 }}>
-                    {d.subject}
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  {d.subject && (
+                    <div style={{ fontSize: 12, fontWeight: 600, color: "var(--at-ink)", marginBottom: 4 }}>
+                      {d.subject}
+                    </div>
+                  )}
+                  <div style={{ fontSize: 13, color: "var(--at-ink-soft)", lineHeight: 1.5, whiteSpace: "pre-wrap" }}>
+                    {d.content || d}
+                  </div>
+                </div>
+                {d.id && (
+                  <div style={{ display: "flex", gap: 2, flexShrink: 0 }}>
+                    <IconBtn
+                      name="replace"
+                      label="Replace"
+                      onClick={() => setSupersedeTarget(d)}
+                    />
+                    <IconBtn
+                      name="archive"
+                      label="Retire"
+                      danger
+                      onClick={() => setRetireTarget(d)}
+                    />
                   </div>
                 )}
-                <div style={{ fontSize: 13, color: "var(--at-ink-soft)", lineHeight: 1.5, whiteSpace: "pre-wrap" }}>
-                  {d.content || d}
-                </div>
               </li>
             ))}
           </ul>
         )}
       </div>
+
+      {/* Retired here */}
+      {retirements.length > 0 && (
+        <div>
+          <div style={{
+            fontSize: 11, fontWeight: 600, color: "var(--at-muted)",
+            textTransform: "uppercase", letterSpacing: "0.1em", marginBottom: 8,
+          }}>
+            Retired here
+          </div>
+          <ul style={{ listStyle: "none", padding: 0, margin: 0, display: "flex", flexDirection: "column", gap: 4 }}>
+            {retirements.map((r) => (
+              <li key={r.id} className="at-caption" style={{ color: "var(--at-muted)" }}>
+                <code style={{ fontFamily: "var(--font-mono)" }}>{r.directive_id}</code>
+                {" retired "}{window.humanAgo ? window.humanAgo(r.created_at) : r.created_at}
+                {r.reason ? ` — ${r.reason}` : ""}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
 
       {/* Context */}
       <div>
@@ -261,6 +322,23 @@ function BackendScopeSummary({ scope, summary, loading, error }) {
           Updated {new Date(updated_at).toLocaleString()}
         </div>
       )}
+
+      <window.SupersedeModal
+        open={!!supersedeTarget}
+        scopeId={scope.id}
+        directive={supersedeTarget}
+        onClose={() => setSupersedeTarget(null)}
+        onDone={handleDone}
+        onFlash={onFlash}
+      />
+      <window.RetireModal
+        open={!!retireTarget}
+        scopeId={scope.id}
+        directive={retireTarget}
+        onClose={() => setRetireTarget(null)}
+        onDone={handleDone}
+        onFlash={onFlash}
+      />
     </div>
   );
 }

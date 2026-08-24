@@ -2,7 +2,8 @@
 // Strata · root app. Reducer + routing + backend polling.
 // Screens: graph (default) · scope detail (drill-in) · settings.
 //
-// V1 is read-only. Mutations land via the backend bootstrap and CC contribute tool.
+// Judgment stays automatic; the one exception is the operator's own
+// supersede/retire actions in the scope-detail screen (P5), on exception.
 // ─────────────────────────────────────────────────────────────────────
 
 const PALETTE = ["#c026d3", "#16a34a", "#ca8a04", "#7c3aed", "#2563eb", "#dc2626", "#0891b2", "#65a30d", "#db2777"];
@@ -331,7 +332,11 @@ function TopBar({ tab, onTab, dark, onToggleDark }) {
 
       <div style={{ flex: 1 }} />
 
-      {/* Read-only badge */}
+      {/* Console mode badge — the Console is no longer read-only: an
+          operator can replace or retire a directive in person (P5).
+          Judgment itself stays automatic; there is no standing
+          "operator mode" toggle (ruling D16) — this pill just names who
+          this Console speaks for. */}
       <span style={{
         fontSize: 10, fontFamily: "var(--font-mono)",
         color: "var(--at-muted)",
@@ -339,7 +344,7 @@ function TopBar({ tab, onTab, dark, onToggleDark }) {
         border: "1px solid var(--at-rule)",
         letterSpacing: "0.06em", textTransform: "uppercase",
       }}>
-        read-only
+        {"operator"}
       </span>
 
       <button
