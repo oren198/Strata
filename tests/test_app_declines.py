@@ -121,16 +121,24 @@ def test_declines_endpoint_returns_judge_reasons(client):
 
     with RecordStore(client.db_path) as store:
         c = store.append_contribution(
-            scope_id="g_active", content="use REST",
-            proposed_classification="directive", subject="rpc",
+            scope_id="g_active",
+            content="use REST",
+            proposed_classification="directive",
+            subject="rpc",
             supersedes=None,
-            contributor=ContributorRef(scope_id="g_active", skill="architect",
-                                       session_id="sess_1",
-                                       ts="2026-08-20T10:00:00+00:00"),
+            contributor=ContributorRef(
+                scope_id="g_active",
+                skill="architect",
+                session_id="sess_1",
+                ts="2026-08-20T10:00:00+00:00",
+            ),
         )
-        store.record_judgment(contribution_id=c.id, decision="decline",
-                              judged_by="scope-manager",
-                              notes="Contradicts the standing gRPC directive.")
+        store.record_judgment(
+            contribution_id=c.id,
+            decision="decline",
+            judged_by="scope-manager",
+            notes="Contradicts the standing gRPC directive.",
+        )
 
     resp = client.get("/scopes/g_active/declines")
     assert resp.status_code == 200
@@ -152,13 +160,24 @@ def test_declines_endpoint_omits_accepted(client):
 
     with RecordStore(client.db_path) as store:
         c = store.append_contribution(
-            scope_id="g_active", content="use gRPC",
-            proposed_classification="directive", subject=None, supersedes=None,
-            contributor=ContributorRef(scope_id="g_active", skill="architect",
-                                       session_id="s", ts="2026-08-20T10:00:00+00:00"),
+            scope_id="g_active",
+            content="use gRPC",
+            proposed_classification="directive",
+            subject=None,
+            supersedes=None,
+            contributor=ContributorRef(
+                scope_id="g_active",
+                skill="architect",
+                session_id="s",
+                ts="2026-08-20T10:00:00+00:00",
+            ),
         )
-        store.record_judgment(contribution_id=c.id, decision="accept_as_directive",
-                              judged_by="scope-manager", notes="Good.")
+        store.record_judgment(
+            contribution_id=c.id,
+            decision="accept_as_directive",
+            judged_by="scope-manager",
+            notes="Good.",
+        )
 
     body = client.get("/scopes/g_active/declines").json()
     assert body["declines"] == []
@@ -170,13 +189,18 @@ def test_declines_endpoint_reports_null_reason_as_null(client):
 
     with RecordStore(client.db_path) as store:
         c = store.append_contribution(
-            scope_id="g_active", content="vague", proposed_classification="context",
-            subject=None, supersedes=None,
-            contributor=ContributorRef(scope_id="g_active", skill=None,
-                                       session_id="s", ts="2026-08-20T10:00:00+00:00"),
+            scope_id="g_active",
+            content="vague",
+            proposed_classification="context",
+            subject=None,
+            supersedes=None,
+            contributor=ContributorRef(
+                scope_id="g_active", skill=None, session_id="s", ts="2026-08-20T10:00:00+00:00"
+            ),
         )
-        store.record_judgment(contribution_id=c.id, decision="decline",
-                              judged_by="scope-manager", notes=None)
+        store.record_judgment(
+            contribution_id=c.id, decision="decline", judged_by="scope-manager", notes=None
+        )
 
     body = client.get("/scopes/g_active/declines").json()
     assert body["declines"][0]["reason"] is None
@@ -200,9 +224,9 @@ def test_declines_endpoint_reports_mechanical_decline_counter(client, tmp_path):
     sessions = SessionStateStore(sessions_dir_for(client.summaries_dir))
     sessions.record_read("sess_a", "g_active")
     sessions.record_decline("sess_a")
-    sessions.record_read("sess_b", "g_active")   # read, no decline
+    sessions.record_read("sess_b", "g_active")  # read, no decline
     sessions.record_read("sess_c", "g_other")
-    sessions.record_decline("sess_c")            # declined, never read g_active
+    sessions.record_decline("sess_c")  # declined, never read g_active
 
     body = client.get("/scopes/g_active/declines").json()
     assert body["mechanical_declines"]["sessions_that_read_and_recorded_nothing"] == 1
@@ -219,7 +243,7 @@ def test_declines_endpoint_mechanical_counter_excludes_sessions_that_also_contri
     sessions = SessionStateStore(sessions_dir_for(client.summaries_dir))
     sessions.record_read("sess_a", "g_active")
     sessions.record_decline("sess_a")
-    sessions.record_contribution("sess_a")   # same session also contributed
+    sessions.record_contribution("sess_a")  # same session also contributed
 
     body = client.get("/scopes/g_active/declines").json()
     assert body["mechanical_declines"]["sessions_that_read_and_recorded_nothing"] == 0

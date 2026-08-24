@@ -136,13 +136,24 @@ def test_staleness_counts_sessions_reading_since_last_accepted(client):
 
     with RecordStore(client.db_path) as store:
         c = store.append_contribution(
-            scope_id="g_active", content="use gRPC",
-            proposed_classification="directive", subject=None, supersedes=None,
-            contributor=ContributorRef(scope_id="g_active", skill="architect",
-                                       session_id="s0", ts="2026-08-01T12:00:00+00:00"),
+            scope_id="g_active",
+            content="use gRPC",
+            proposed_classification="directive",
+            subject=None,
+            supersedes=None,
+            contributor=ContributorRef(
+                scope_id="g_active",
+                skill="architect",
+                session_id="s0",
+                ts="2026-08-01T12:00:00+00:00",
+            ),
         )
-        store.record_judgment(contribution_id=c.id, decision="accept_as_directive",
-                              judged_by="scope-manager", notes="ok")
+        store.record_judgment(
+            contribution_id=c.id,
+            decision="accept_as_directive",
+            judged_by="scope-manager",
+            notes="ok",
+        )
 
     sessions = SessionStateStore(sessions_dir_for(client.summaries_dir))
     sessions.record_read("s1", "g_active")
@@ -167,6 +178,7 @@ def test_staleness_lists_only_active_scopes(client):
 
 def test_staleness_sorted_worst_first(client):
     from strata.session_state import SessionStateStore, sessions_dir_for
+
     sessions = SessionStateStore(sessions_dir_for(client.summaries_dir))
     for i in range(3):
         sessions.record_read(f"s{i}", "g_active")
@@ -192,10 +204,17 @@ def test_state_is_fresh_then_stale_once_a_session_reads(client):
     # passed in, so two writes are needed to land at version=2.
     _store = SummaryStore(client.summaries_dir)
     for _ in range(2):
-        _store.write("g_active", ScopeSummary(
-            scope_id="g_active", directives=[], context="something",
-            updated_at="2026-08-01T12:00:00+00:00", version=2, exists=True,
-        ))
+        _store.write(
+            "g_active",
+            ScopeSummary(
+                scope_id="g_active",
+                directives=[],
+                context="something",
+                updated_at="2026-08-01T12:00:00+00:00",
+                version=2,
+                exists=True,
+            ),
+        )
     row = {s["scope_id"]: s for s in client.get("/staleness").json()["scopes"]}["g_active"]
     assert row["summary_version"] == 2
     assert row["state"] == "fresh"
@@ -207,6 +226,7 @@ def test_state_is_fresh_then_stale_once_a_session_reads(client):
 
 def test_session_outcomes_buckets_are_disjoint(client):
     from strata.session_state import SessionStateStore, sessions_dir_for
+
     sessions = SessionStateStore(sessions_dir_for(client.summaries_dir))
 
     sessions.record_read("s_contrib", "g_active")
@@ -223,7 +243,9 @@ def test_session_outcomes_buckets_are_disjoint(client):
 
 def test_session_outcomes_is_all_zero_with_no_sessions(client):
     assert client.get("/staleness").json()["session_outcomes"] == {
-        "contributions": 0, "closeouts": 0, "silent_readers": 0,
+        "contributions": 0,
+        "closeouts": 0,
+        "silent_readers": 0,
     }
 
 

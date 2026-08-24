@@ -129,7 +129,7 @@ def client(tmp_path):
 def test_perspective_returns_chain_root_first_with_relations(client):
     body = client.get("/scopes/g_child/perspective").json()
     assert body["scope_id"] == "g_child"
-    relations = [(l["scope_id"], l["relation"]) for l in body["layers"]]
+    relations = [(layer["scope_id"], layer["relation"]) for layer in body["layers"]]
     assert relations[0] == ("g_root", "ancestor")
     assert ("g_child", "self") in relations
     assert ("g_peer", "peer_reference") in relations
@@ -137,7 +137,7 @@ def test_perspective_returns_chain_root_first_with_relations(client):
 
 def test_peer_layers_carry_publication_not_summary(client):
     body = client.get("/scopes/g_child/perspective").json()
-    peer = next(l for l in body["layers"] if l["relation"] == "peer_reference")
+    peer = next(layer for layer in body["layers"] if layer["relation"] == "peer_reference")
     assert "publication" in peer
     assert "summary" not in peer
     assert peer["binding"] is False
@@ -145,22 +145,30 @@ def test_peer_layers_carry_publication_not_summary(client):
 
 def test_every_layer_carries_a_token_estimate_and_they_sum(client):
     body = client.get("/scopes/g_child/perspective").json()
-    assert all(isinstance(l["token_estimate"], int) for l in body["layers"])
-    assert body["token_estimate_total"] == sum(l["token_estimate"] for l in body["layers"])
+    assert all(isinstance(layer["token_estimate"], int) for layer in body["layers"])
+    assert body["token_estimate_total"] == sum(layer["token_estimate"] for layer in body["layers"])
     assert "estimate" in body["token_estimate_method"]
 
 
 def test_token_estimate_grows_with_content(client):
     from strata.summary_store import ScopeSummary, SummaryStore
+
     store = SummaryStore(client.summaries_dir)
     before = client.get("/scopes/g_child/perspective").json()
-    self_before = next(l for l in before["layers"] if l["relation"] == "self")
-    store.write("g_child", ScopeSummary(
-        scope_id="g_child", directives=[], context="x" * 4000,
-        updated_at="2026-08-24T09:00:00+00:00", version=1, exists=True,
-    ))
+    self_before = next(layer for layer in before["layers"] if layer["relation"] == "self")
+    store.write(
+        "g_child",
+        ScopeSummary(
+            scope_id="g_child",
+            directives=[],
+            context="x" * 4000,
+            updated_at="2026-08-24T09:00:00+00:00",
+            version=1,
+            exists=True,
+        ),
+    )
     after = client.get("/scopes/g_child/perspective").json()
-    self_after = next(l for l in after["layers"] if l["relation"] == "self")
+    self_after = next(layer for layer in after["layers"] if layer["relation"] == "self")
     assert self_after["token_estimate"] >= self_before["token_estimate"] + 900
 
 

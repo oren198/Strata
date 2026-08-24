@@ -918,13 +918,17 @@ class TestPageDeclines:
             subject=None,
             supersedes=None,
             contributor=ContributorRef(
-                scope_id=scope_id, skill="architect",
-                session_id="sess_1", ts="2026-08-20T10:00:00+00:00",
+                scope_id=scope_id,
+                skill="architect",
+                session_id="sess_1",
+                ts="2026-08-20T10:00:00+00:00",
             ),
         )
         store.record_judgment(
-            contribution_id=c.id, decision="decline",
-            judged_by="scope-manager", notes=reason,
+            contribution_id=c.id,
+            decision="decline",
+            judged_by="scope-manager",
+            notes=reason,
         )
         return c
 
@@ -932,19 +936,27 @@ class TestPageDeclines:
         self._decline(store, "g_a", "first bad idea", "Contradicts the gRPC directive.")
         self._decline(store, "g_a", "second bad idea", "Duplicates an existing directive.")
         accepted = store.append_contribution(
-            scope_id="g_a", content="good idea", proposed_classification="directive",
-            subject=None, supersedes=None,
-            contributor=ContributorRef(scope_id="g_a", skill="architect",
-                                       session_id="s", ts="2026-08-20T10:00:00+00:00"),
+            scope_id="g_a",
+            content="good idea",
+            proposed_classification="directive",
+            subject=None,
+            supersedes=None,
+            contributor=ContributorRef(
+                scope_id="g_a", skill="architect", session_id="s", ts="2026-08-20T10:00:00+00:00"
+            ),
         )
-        store.record_judgment(contribution_id=accepted.id,
-                              decision="accept_as_directive",
-                              judged_by="scope-manager", notes="Fine.")
+        store.record_judgment(
+            contribution_id=accepted.id,
+            decision="accept_as_directive",
+            judged_by="scope-manager",
+            notes="Fine.",
+        )
 
         page = store.page_declines(scope_id="g_a")
 
         assert [e.contribution.content for e in page.declines] == [
-            "second bad idea", "first bad idea",
+            "second bad idea",
+            "first bad idea",
         ]
         assert page.declines[0].judgment.notes == "Duplicates an existing directive."
         assert page.total == 2

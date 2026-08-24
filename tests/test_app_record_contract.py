@@ -120,30 +120,52 @@ def client(tmp_path):
 
 def _seed(client, n):
     from strata.record_store import ContributorRef, RecordStore
+
     ids = []
     with RecordStore(client.db_path) as store:
         for i in range(n):
             c = store.append_contribution(
-                scope_id="g_active", content=f"contribution {i}",
-                proposed_classification="directive", subject=None, supersedes=None,
-                contributor=ContributorRef(scope_id="g_active", skill="architect",
-                                           session_id="s", ts="2026-08-20T10:00:00+00:00"),
+                scope_id="g_active",
+                content=f"contribution {i}",
+                proposed_classification="directive",
+                subject=None,
+                supersedes=None,
+                contributor=ContributorRef(
+                    scope_id="g_active",
+                    skill="architect",
+                    session_id="s",
+                    ts="2026-08-20T10:00:00+00:00",
+                ),
             )
             ids.append(c.id)
-        store.record_judgment(contribution_id=ids[0], decision="decline",
-                              judged_by="scope-manager", notes="No.")
+        store.record_judgment(
+            contribution_id=ids[0], decision="decline", judged_by="scope-manager", notes="No."
+        )
     return ids
 
 
 def test_record_page_carries_every_key_the_trail_renders(client):
     _seed(client, 3)
     body = client.get("/scopes/g_active/record").json()
-    assert set(body) >= {"contributions", "judgments", "judgment_attempts",
-                         "contribution_states", "page"}
+    assert set(body) >= {
+        "contributions",
+        "judgments",
+        "judgment_attempts",
+        "contribution_states",
+        "page",
+    }
     assert set(body["page"]) == {"limit", "total", "next_before_id"}
     c0 = body["contributions"][0]
-    assert set(c0) >= {"id", "scope_id", "content", "proposed_classification",
-                       "subject", "supersedes", "contributor", "created_at"}
+    assert set(c0) >= {
+        "id",
+        "scope_id",
+        "content",
+        "proposed_classification",
+        "subject",
+        "supersedes",
+        "contributor",
+        "created_at",
+    }
     assert set(c0["contributor"]) == {"scope_id", "skill", "session_id", "ts"}
     st = body["contribution_states"][0]
     assert "contribution_id" in st and "state" in st
@@ -156,8 +178,7 @@ def test_record_page_walks_back_with_next_before_id(client):
     assert first["page"]["total"] == 5
     cursor = first["page"]["next_before_id"]
     assert cursor is not None
-    second = client.get("/scopes/g_active/record",
-                        params={"limit": 2, "before_id": cursor}).json()
+    second = client.get("/scopes/g_active/record", params={"limit": 2, "before_id": cursor}).json()
     seen = {c["id"] for c in first["contributions"]}
     assert not seen & {c["id"] for c in second["contributions"]}
 
