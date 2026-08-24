@@ -106,6 +106,29 @@ class TestSetDefaultHarnessCli:
         assert 'default_harness = "codex"' in text
         assert _read_project_default_harness(tmp_path) == "codex"
 
+    def test_on_disk_crlf_config_round_trips_through_real_cli(self, tmp_path: Path) -> None:
+        """Path.read_text/write_text universal-newline translation strips \\r
+        before install.set_default_harness's CRLF-aware regexes ever see it
+        (reproduced live: a CRLF file on disk came back all-LF through the
+        CLI command even though the text-level function is CRLF-aware).
+        Reading/writing bytes directly at the CLI boundary must preserve the
+        on-disk CRLF style end to end (final fix wave, item 2)."""
+        _init_project(tmp_path)
+        _register(tmp_path)
+        config_path = tmp_path / ".strata" / "config.toml"
+        crlf_text = install.CONFIG_TOML.replace("\n", "\r\n")
+        config_path.write_bytes(crlf_text.encode("utf-8"))
+
+        rc = _set_default_harness(tmp_path, "codex")
+
+        assert rc == 0
+        raw = config_path.read_bytes()
+        assert b"\r\n" in raw
+        assert b"[launch]" in raw
+        text = raw.decode("utf-8")
+        assert text.count("[launch]") == 1
+        assert 'default_harness = "codex"' in text
+
 
 class TestInstallSetDefaultHarnessTextual:
     def test_no_launch_table_appends_one(self) -> None:

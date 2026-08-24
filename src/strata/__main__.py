@@ -90,6 +90,9 @@ from strata.install import (
     render_action_line,
 )
 from strata.install import (
+    agents_md_present as _agents_md_present,
+)
+from strata.install import (
     codex_config_path as _codex_config_path,
 )
 from strata.install import (
@@ -2037,7 +2040,10 @@ def cmd_register(args: argparse.Namespace) -> int:
         # project's own AGENTS.md instead, additively (Task 6, harness
         # parity).
         agents_md = project_root / "AGENTS.md"
-        existing_agents_text = agents_md.read_text(encoding="utf-8") if agents_md.exists() else ""
+        # read_bytes, not read_text: text-mode I/O strips \r via universal
+        # newline translation before it ever reaches the CRLF-preserving
+        # merge logic (final fix wave, item 2).
+        existing_agents_text = agents_md.read_bytes().decode("utf-8") if agents_md.exists() else ""
         new_agents_text, agents_added = _merge_agents_md(existing_agents_text)
         _act(
             "merged strata into" if agents_added else "skip",
@@ -2045,7 +2051,7 @@ def cmd_register(args: argparse.Namespace) -> int:
             skipped=not agents_added,
         )
         if not diff_mode and agents_added:
-            agents_md.write_text(new_agents_text, encoding="utf-8")
+            agents_md.write_bytes(new_agents_text.encode("utf-8"))
 
         print(
             "\n  Codex config: fill in STRATA_AGENT_SCOPE / STRATA_AGENT_SKILL / "
@@ -2079,12 +2085,19 @@ def cmd_register(args: argparse.Namespace) -> int:
     # the skip explicit rather than silently doing nothing.
     # -----------------------------------------------------------------------
     if bootstrap_venv and "codex" in resolved_harnesses:
+        # Worded to stay accurate on a both-harness machine: --bootstrap-venv
+        # as a whole is NOT skipped there — it still runs, just below, for
+        # claude-code. Only the codex-specific step (there is no
+        # codex-harness venv equivalent) is skipped (final fix wave, item 3:
+        # the old "--bootstrap-venv skipped" phrasing read as if the whole
+        # flag were a no-op even while the claude-code venv was created).
         print(
-            "\n  --bootstrap-venv skipped: it only wires .claude/settings.json for "
-            "Claude Code — there is no\n"
-            "  codex-harness equivalent yet. Install strata normally (pipx/pip) so "
-            "`strata-mcp` and `strata`\n"
-            "  are on PATH for the Codex config register wrote."
+            "\n  --bootstrap-venv: codex has no venv-wiring equivalent yet — skipping "
+            "that step for codex only (not the rest of --bootstrap-venv). It only "
+            "wires .claude/settings.json for\n"
+            "  Claude Code; install strata normally (pipx/pip) so `strata-mcp` and "
+            "`strata` are on PATH for\n"
+            "  the Codex config register wrote."
         )
     if bootstrap_venv and "claude-code" in resolved_harnesses:
         settings_json = project_root / ".claude" / "settings.json"
@@ -2259,6 +2272,13 @@ def _wired_harnesses(project_root: Path) -> list[str]:
     Shared by ``strata unregister``'s default harness resolution (Task 3) and
     ``strata launch``'s "exactly one harness wired" fallback (Task 5) — one
     definition of "wired" only.
+
+    Codex is machine-scoped (``$CODEX_HOME/config.toml`` is shared by every
+    project on the box), so its config alone is not project evidence: codex
+    counts as WIRED here only when the machine config tables are present
+    *and* this project's ``AGENTS.md`` carries the strata marker block
+    (controller ruling, harness-parity final fix wave — see
+    ``_codex_wired`` below).
     """
     import json  # noqa: PLC0415
 
@@ -2275,11 +2295,26 @@ def _wired_harnesses(project_root: Path) -> list[str]:
         return _mcp_server_present(data) or _stop_hook_present(data)
 
     def _codex_wired() -> bool:
+        # Codex "wiredness" must be project-scoped, not machine-scoped
+        # (controller ruling, harness-parity final fix wave): config.toml
+        # lives under $CODEX_HOME — a machine-level file shared by every
+        # project on the box — so its presence alone is not evidence THIS
+        # project registered codex. Require the project-local AGENTS.md
+        # marker block too, the project-side evidence register wrote here.
+        # This gate applies only to the no-flags default resolution shared
+        # by unregister and launch's single-wired fallback; an explicit
+        # `--harness codex` bypasses _wired_harnesses entirely and keeps
+        # its unconditional-cleanup behavior (Task 3).
         codex_config = _codex_config_path()
         if not codex_config.exists():
             return False
         text = codex_config.read_text(encoding="utf-8")
-        return _codex_mcp_present(text) or _codex_hook_present(text)
+        if not (_codex_mcp_present(text) or _codex_hook_present(text)):
+            return False
+        agents_md = project_root / "AGENTS.md"
+        if not agents_md.exists():
+            return False
+        return _agents_md_present(agents_md.read_text(encoding="utf-8"))
 
     checks = {"claude-code": _claude_code_wired, "codex": _codex_wired}
     return [h for h in install.KNOWN_HARNESSES if checks[h]()]
@@ -2575,12 +2610,14 @@ def cmd_unregister(args: argparse.Namespace) -> int:
         if not agents_md.exists():
             _ok(f"{agents_md}: nothing to do (no AGENTS.md)")
         else:
-            agents_text = agents_md.read_text(encoding="utf-8")
+            # read_bytes/write_bytes, not read_text/write_text — see the
+            # matching comment in _register_codex (final fix wave, item 2).
+            agents_text = agents_md.read_bytes().decode("utf-8")
             new_agents_text, agents_status = _remove_agents_md(agents_text)
             if agents_status == "removed":
                 _ok(f"{agents_md}: {_would('remove', 'removed')} the Strata block")
                 if not dry_run:
-                    agents_md.write_text(new_agents_text, encoding="utf-8")
+                    agents_md.write_bytes(new_agents_text.encode("utf-8"))
             elif agents_status == "edited":
                 _left(
                     f"{agents_md}: Strata block was edited "
@@ -2681,9 +2718,14 @@ def cmd_set_default_harness(args: argparse.Namespace) -> int:
         )
         return 1
 
-    current_text = config_path.read_text(encoding="utf-8")
+    # read_bytes/write_bytes, not read_text/write_text: text-mode I/O does
+    # universal-newline translation, which strips \r out of a CRLF file
+    # before set_default_harness's CRLF-aware regexes ever see it — silently
+    # neutering the CRLF preservation those regexes are built for (final fix
+    # wave, item 2).
+    current_text = config_path.read_bytes().decode("utf-8")
     new_text = install.set_default_harness(current_text, name)
-    config_path.write_text(new_text, encoding="utf-8")
+    config_path.write_bytes(new_text.encode("utf-8"))
 
     print(f"default harness: {name} (used by 'strata launch')")
     return 0

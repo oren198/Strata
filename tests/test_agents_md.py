@@ -248,6 +248,50 @@ def test_unregister_harness_codex_dry_run_writes_nothing_to_agents_md(
 
 
 # ---------------------------------------------------------------------------
+# CRLF round-trip through the real CLI (final fix wave, item 2).
+#
+# Path.read_text/write_text universal-newline translation strips \r before
+# any CRLF-aware code runs, so an on-disk CRLF AGENTS.md silently came back
+# all-LF (or mixed) through register/unregister. The three in-scope I/O
+# sites must read/write raw bytes instead.
+# ---------------------------------------------------------------------------
+
+
+def test_register_preserves_on_disk_crlf_agents_md(tmp_path: Path, codex_home: Path) -> None:
+    _init_project(tmp_path)
+    agents_md = tmp_path / "AGENTS.md"
+    crlf_text = "# My project\r\n\r\nSome existing notes.\r\n"
+    agents_md.write_bytes(crlf_text.encode("utf-8"))
+
+    assert _register(tmp_path, harness="codex") == 0
+
+    raw = agents_md.read_bytes()
+    # The user's own pre-existing lines must still be CRLF-terminated.
+    assert b"# My project\r\n\r\nSome existing notes.\r\n" in raw
+    assert install.agents_md_present(raw.decode("utf-8"))
+
+
+def test_unregister_preserves_on_disk_crlf_agents_md(tmp_path: Path, codex_home: Path) -> None:
+    _init_project(tmp_path)
+    agents_md = tmp_path / "AGENTS.md"
+    # A CRLF-authored AGENTS.md with the user's own pre-existing content,
+    # then register's own LF-style shipped block appended on top of it
+    # (merge_agents_md/_append_block don't rewrite the file's own newline
+    # style — only set_default_harness's TOML writer does). This is what a
+    # real Windows-authored AGENTS.md + `register --harness codex` produces.
+    user_crlf = "# My project\r\n\r\nSome existing notes.\r\n"
+    shipped_block = install.merge_agents_md("")[0]
+    agents_md.write_bytes((user_crlf + "\n" + shipped_block).encode("utf-8"))
+
+    assert _unregister(tmp_path, harness="codex") == 0
+
+    raw = agents_md.read_bytes()
+    assert not install.agents_md_present(raw.decode("utf-8"))
+    # The user's own CRLF-terminated lines must survive byte-for-byte.
+    assert b"# My project\r\n\r\nSome existing notes.\r\n" in raw
+
+
+# ---------------------------------------------------------------------------
 # Template content — plain-language guardrails (no consumer names)
 # ---------------------------------------------------------------------------
 

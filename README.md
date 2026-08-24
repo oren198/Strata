@@ -563,6 +563,13 @@ project** — determined by checking for register's markers in each harness's
 files, not by what's installed on the machine (that asymmetry with
 register's "wire everything detected" default is deliberate: a plain
 `unregister` should never touch a harness this project never registered).
+For Codex specifically, `$CODEX_HOME/config.toml` is a machine-level file
+shared by every project on the box, so its markers alone aren't proof this
+project registered Codex — "wired" for Codex additionally requires this
+project's `AGENTS.md` to carry the Strata marker block register seeds. A
+machine with a stale/foreign Codex config but no such block in this
+project's `AGENTS.md` is left untouched by a plain `unregister`; pass
+`--harness codex` explicitly to clean it up anyway.
 Pass `--harness claude-code` or `--harness codex` (repeatable) to narrow to
 specific harnesses instead. A harness named explicitly that turns out not to
 be wired still runs its normal per-artifact checks — each step reports
@@ -653,7 +660,10 @@ strata launch --harness claude-code             # start this harness regardless 
    one-line warning to stderr naming the bad value and falls back to
    `claude-code` rather than launching the wrong thing silently.
 3. Otherwise, if exactly one harness is currently wired in this project
-   (checked the same way `strata unregister`'s default resolves), that one.
+   (checked the same way `strata unregister`'s default resolves — for
+   Codex, that means both the machine's `$CODEX_HOME/config.toml` markers
+   AND this project's `AGENTS.md` marker block, not the machine config
+   alone), that one.
 4. Otherwise, `claude-code` — today's behavior, unchanged.
 
 `claude-code` continues through the flow described above. `codex` is
