@@ -732,7 +732,7 @@ is present, the first three are ignored for the MCP server (project config wins)
 | `STRATA_AGENT_SKILL` | (required) | The skill identifier for provenance — MCP server refuses to start if unset |
 | `STRATA_AGENT_SESSION_ID` | (auto) | Session identifier — auto-generated when absent |
 | `STRATA_MANAGER_MODEL` | `claude-haiku-4-5` | Model used by scope-managers |
-| `STRATA_ANTHROPIC_API_KEY` | (unset) | Optional; falls back to `ANTHROPIC_API_KEY` |
+| `STRATA_ANTHROPIC_API_KEY` | (unset) | Optional; `ANTHROPIC_API_KEY` (bare, unprefixed) also works — either name can be set in the shell or in `.env`; the prefixed one wins if both are set |
 | `STRATA_FRESHNESS_STRICT` | (unset) | `1` switches the freshness `Stop`-hook to strict (blocking) mode ([details](#memory-freshness-stop-hook)) |
 | `STRATA_EVALUATOR_MODEL` | `claude-haiku-4-5-20251001` | Model the freshness evaluator drafts with (the judge is unaffected) |
 
