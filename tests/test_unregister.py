@@ -39,11 +39,13 @@ from strata.__main__ import _build_parser, cmd_register, cmd_unregister
 
 
 def _register_args(path: str) -> argparse.Namespace:
-    # harness pinned to claude-code (the shape a parsed --harness claude-code
-    # flag now takes) so this setup helper never falls through to real-machine
-    # harness detection — see tests/test_register_multi_harness.py for that.
+    # harness left unset: the autouse isolation guard in tests/conftest.py
+    # patches install.detect_harnesses() to return [] by default, so this
+    # setup helper still falls back to claude-code-only without its own pin
+    # — see tests/test_register_multi_harness.py for detection coverage
+    # itself.
     return argparse.Namespace(
-        path=path, diff=False, bootstrap_venv=False, python=None, harness=["claude-code"]
+        path=path, diff=False, bootstrap_venv=False, python=None, harness=None
     )
 
 
