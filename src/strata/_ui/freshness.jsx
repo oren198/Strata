@@ -5,9 +5,9 @@
 // UI-only — this view's fetch never runs on the contribute/judge path; the
 // metric itself lives in session_state.compute_fleet_staleness.
 //
-// Ported from strata-web's FreshnessTile.tsx / ScopeHealthStrip.tsx /
-// SessionOutcomesTile.tsx, with the tenant link removed and the local
-// "sessions, not agents" session_outcomes shape (see task-2 brief).
+// Layout ported from the Console's staleness tiles, with the tenant link
+// removed and the local "sessions, not agents" session_outcomes shape (see
+// task-2 brief).
 // ─────────────────────────────────────────────────────────────────────
 
 function FreshnessView({ state, onOpenScope }) {
