@@ -65,7 +65,7 @@ if TYPE_CHECKING:
     from strata.scope_manager import ScopeManager
     from strata.summary_store import ScopeSummary, SummaryStore
 
-from strata import DISTRIBUTION_NAME, __version__
+from strata import DISTRIBUTION_NAME, __version__, install
 from strata.install import (
     CONFIG_TOML as _CONFIG_TOML,
 )
@@ -90,6 +90,9 @@ from strata.install import (
     render_action_line,
 )
 from strata.install import (
+    agents_md_present as _agents_md_present,
+)
+from strata.install import (
     codex_config_path as _codex_config_path,
 )
 from strata.install import (
@@ -108,10 +111,16 @@ from strata.install import (
     mcp_server_present as _mcp_server_present,
 )
 from strata.install import (
+    merge_agents_md as _merge_agents_md,
+)
+from strata.install import (
     merge_codex_freshness_hook as _merge_codex_freshness_hook,
 )
 from strata.install import (
     merge_codex_mcp_server as _merge_codex_mcp_server,
+)
+from strata.install import (
+    remove_agents_md as _remove_agents_md,
 )
 from strata.install import (
     remove_codex_freshness_hook as _remove_codex_freshness_hook,
@@ -1429,10 +1438,79 @@ def _run_manager_refresh(scope_id: str, *, skip: bool = False) -> None:
             )
 
 
+#: Codex launch is schema-verified but not live-verified (README, "Using
+#: Strata with Codex CLI") — `strata launch` refuses honestly rather than
+#: handing off to a binding that has never been confirmed to actually work.
+_CODEX_LAUNCH_NOT_WIRED_MESSAGE = (
+    "Codex launch is not wired yet: Codex's MCP env delivery is still being "
+    "verified live (see README, 'Using Strata with Codex CLI'). Start codex "
+    "manually after filling in the [mcp_servers.strata.env] values."
+)
+
+
+def _resolve_launch_harness(args: argparse.Namespace, project_root: Path | None) -> str:
+    """Resolve which harness ``strata launch`` should start (Task 5).
+
+    Resolution order:
+
+    1. An explicit ``--harness`` flag wins outright.
+    2. Else the project's recorded default (``strata set-default-harness``),
+       read via :func:`strata.project_config.read_default_harness` — only
+       when it names a harness Strata actually knows (see below).
+    3. Else, when exactly one harness is WIRED in this project (see
+       :func:`_wired_harnesses` — the same marker check as ``strata
+       unregister``'s default), that one.
+    4. Else ``"claude-code"`` — today's behavior, unchanged.
+
+    *project_root* is ``None`` when the project isn't registered via
+    ``.strata/config.toml`` (e.g. env-var-driven ``STRATA_FLEET_CONFIG``
+    dev usage) — falls back to the current working directory so steps 2–3
+    still have somewhere to look; both degrade gracefully to "not found"
+    when nothing is there, landing on claude-code exactly as before.
+
+    A recorded default that names a harness outside
+    :data:`install.KNOWN_HARNESSES` (a hand-edited ``config.toml``, or one
+    written by a future Strata version this one predates) is not silently
+    treated as claude-code — it prints a one-line notice to stderr naming
+    the bad value and falls back to claude-code explicitly, so a typo in
+    ``default_harness`` is visible instead of quietly launching the wrong
+    thing with no explanation.
+    """
+    explicit: str | None = getattr(args, "harness", None)
+    if explicit is not None:
+        return explicit
+
+    from strata.project_config import read_default_harness
+
+    effective_root = project_root if project_root is not None else Path.cwd().resolve()
+
+    default = read_default_harness(effective_root)
+    if default is not None:
+        if default in install.KNOWN_HARNESSES:
+            return default
+        print(
+            f"default harness {default!r} in .strata/config.toml is not one of: "
+            f"{', '.join(install.KNOWN_HARNESSES)} — launching claude-code",
+            file=sys.stderr,
+        )
+        return "claude-code"
+
+    wired = _wired_harnesses(effective_root)
+    if len(wired) == 1:
+        return wired[0]
+
+    return "claude-code"
+
+
 def cmd_launch(args: argparse.Namespace) -> int:
     """Validate scope, resolve skill, and exec ``claude`` with STRATA_AGENT_* set.
 
-    Steps (per ADR 0003 + ADR 0004 D1/D4 + issue #45):
+    Steps (per ADR 0003 + ADR 0004 D1/D4 + issue #45; harness resolution —
+    Task 5 — added as Step 0):
+    0. Resolve which harness to start (see :func:`_resolve_launch_harness`).
+       ``codex`` refuses honestly (exit 1) rather than handing off to a
+       binding that isn't live-verified; ``claude-code`` continues below,
+       unchanged.
     1. Preflight — prerequisite hygiene checks, reported in the same pass as
        fleet-resolution failures (all problems in one run, matching the MCP
        server's refuse-to-start style).
@@ -1448,6 +1526,16 @@ def cmd_launch(args: argparse.Namespace) -> int:
     from strata.fleet_config import FleetConfig, FleetConfigError
 
     # -----------------------------------------------------------------------
+    # Step 0: Resolve harness (Task 5). Computed before preflight/fleet load
+    # so an unwired codex refusal never depends on — or trips over — either.
+    # -----------------------------------------------------------------------
+    paths = _storage_paths()
+    harness = _resolve_launch_harness(args, paths.project_root)
+    if harness == "codex":
+        print(_CODEX_LAUNCH_NOT_WIRED_MESSAGE, file=sys.stderr)
+        return 1
+
+    # -----------------------------------------------------------------------
     # Step 1: Preflight + fleet resolution — one pass, all failures reported.
     # -----------------------------------------------------------------------
     preflight_rc = 0
@@ -1457,7 +1545,6 @@ def cmd_launch(args: argparse.Namespace) -> int:
     # -----------------------------------------------------------------------
     # Step 2: Load active scopes from fleet.yaml (no backend required).
     # -----------------------------------------------------------------------
-    paths = _storage_paths()
     fleet_path = Path(paths.fleet_yaml_path)
     fleet_error: str | None = None
     active_scopes: list[dict] = []
@@ -1669,7 +1756,23 @@ def cmd_register(args: argparse.Namespace) -> int:
     project_root = Path(path_arg).resolve() if path_arg else Path.cwd().resolve()
     diff_mode: bool = getattr(args, "diff", False)
     bootstrap_venv: bool = getattr(args, "bootstrap_venv", False)
-    harness: str = getattr(args, "harness", None) or "claude-code"
+
+    # -----------------------------------------------------------------------
+    # Resolve which harness(es) to wire (Task 2, multi-harness parity):
+    # explicit --harness flags win outright; otherwise detect what's
+    # installed on this machine; if detection finds nothing, fall back to
+    # claude-code (today's default) with a one-line notice so a bare CI
+    # machine keeps working exactly as before.
+    # -----------------------------------------------------------------------
+    harness_flags: list[str] | None = getattr(args, "harness", None)
+    no_harness_notice = False
+    if harness_flags:
+        resolved_harnesses: list[str] = list(harness_flags)
+    else:
+        resolved_harnesses = install.detect_harnesses()
+        if not resolved_harnesses:
+            resolved_harnesses = ["claude-code"]
+            no_harness_notice = True
 
     # -----------------------------------------------------------------------
     # Step 1: Require a project marker.
@@ -1712,6 +1815,8 @@ def cmd_register(args: argparse.Namespace) -> int:
         print(f"strata register --diff  (dry-run, no writes)\nProject root: {project_root}")
     else:
         print(f"strata register\nProject root: {project_root}")
+    if no_harness_notice:
+        print("no harness detected on this machine — wiring claude-code (the default)")
 
     # -----------------------------------------------------------------------
     # Step 2: Create .strata/ directory.
@@ -1773,7 +1878,9 @@ def cmd_register(args: argparse.Namespace) -> int:
 
     settings_unreadable = False
 
-    if harness == "claude-code":
+    def _register_claude_code() -> None:
+        nonlocal settings_unreadable
+
         # -------------------------------------------------------------------
         # Step 6: Copy canonical skills to .claude/skills/ (skip each if exists).
         # -------------------------------------------------------------------
@@ -1877,7 +1984,7 @@ def cmd_register(args: argparse.Namespace) -> int:
             (project_root / ".claude").mkdir(parents=True, exist_ok=True)
             settings_json.write_text(json.dumps(settings_data, indent=2) + "\n", encoding="utf-8")
 
-    elif harness == "codex":
+    def _register_codex() -> None:
         # ---------------------------------------------------------------
         # Step 6/7 (codex): merge the [mcp_servers.strata] table and the
         # freshness hooks.Stop block into Codex's own config.toml — never
@@ -1928,6 +2035,24 @@ def cmd_register(args: argparse.Namespace) -> int:
             codex_config.parent.mkdir(parents=True, exist_ok=True)
             codex_config.write_text(merged_text, encoding="utf-8")
 
+        # Codex has no skills mechanism (unlike Claude Code's
+        # .claude/skills/) — seed the same memory-move guidance into the
+        # project's own AGENTS.md instead, additively (Task 6, harness
+        # parity).
+        agents_md = project_root / "AGENTS.md"
+        # read_bytes, not read_text: text-mode I/O strips \r via universal
+        # newline translation before it ever reaches the CRLF-preserving
+        # merge logic (final fix wave, item 2).
+        existing_agents_text = agents_md.read_bytes().decode("utf-8") if agents_md.exists() else ""
+        new_agents_text, agents_added = _merge_agents_md(existing_agents_text)
+        _act(
+            "merged strata into" if agents_added else "skip",
+            agents_md,
+            skipped=not agents_added,
+        )
+        if not diff_mode and agents_added:
+            agents_md.write_bytes(new_agents_text.encode("utf-8"))
+
         print(
             "\n  Codex config: fill in STRATA_AGENT_SCOPE / STRATA_AGENT_SKILL / "
             "STRATA_AGENT_SESSION_ID under\n"
@@ -1940,21 +2065,42 @@ def cmd_register(args: argparse.Namespace) -> int:
         )
 
     # -----------------------------------------------------------------------
+    # Per-harness wiring loop (Task 2, multi-harness parity): runs the
+    # extracted wiring block for every resolved harness, each announced with
+    # a `== NAME ==` header so --diff / register output stays legible when
+    # more than one harness is wired in a single run.
+    # -----------------------------------------------------------------------
+    for _harness in resolved_harnesses:
+        print(f"\n== {_harness} ==")
+        if _harness == "claude-code":
+            _register_claude_code()
+        elif _harness == "codex":
+            _register_codex()
+
+    # -----------------------------------------------------------------------
     # Step 8: bootstrap-venv (if requested; Claude-Code-only — updates
     # .claude/settings.json to point at the venv's strata-mcp). Codex has no
     # equivalent step (its config.toml `command` is resolved on PATH like
     # Claude Code's default, not pointed at a project-local venv), so make
     # the skip explicit rather than silently doing nothing.
     # -----------------------------------------------------------------------
-    if bootstrap_venv and harness == "codex":
+    if bootstrap_venv and "codex" in resolved_harnesses:
+        # Worded to stay accurate on a both-harness machine: --bootstrap-venv
+        # as a whole is NOT skipped there — it still runs, just below, for
+        # claude-code. Only the codex-specific step (there is no
+        # codex-harness venv equivalent) is skipped (final fix wave, item 3:
+        # the old "--bootstrap-venv skipped" phrasing read as if the whole
+        # flag were a no-op even while the claude-code venv was created).
         print(
-            "\n  --bootstrap-venv skipped: it only wires .claude/settings.json for "
-            "Claude Code — there is no\n"
-            "  codex-harness equivalent yet. Install strata normally (pipx/pip) so "
-            "`strata-mcp` and `strata`\n"
-            "  are on PATH for the Codex config register wrote."
+            "\n  --bootstrap-venv: codex has no venv-wiring equivalent yet — skipping "
+            "that step for codex only (not the rest of --bootstrap-venv). It only "
+            "wires .claude/settings.json for\n"
+            "  Claude Code; install strata normally (pipx/pip) so `strata-mcp` and "
+            "`strata` are on PATH for\n"
+            "  the Codex config register wrote."
         )
-    if bootstrap_venv and harness == "claude-code":
+    if bootstrap_venv and "claude-code" in resolved_harnesses:
+        settings_json = project_root / ".claude" / "settings.json"
         venv_dir = strata_dir / ".venv"
         venv_strata_mcp = venv_dir / "bin" / "strata-mcp"
         if diff_mode:
@@ -2076,11 +2222,15 @@ def cmd_register(args: argparse.Namespace) -> int:
         print(f"  1. Edit {fleet_yaml.relative_to(project_root)} for your team's structure")
         print(f"  2. export STRATA_AGENT_SCOPE={first_scope}")
         print("     export STRATA_AGENT_SKILL=<your-skill>")
-        if harness == "codex":
-            print(f"  3. Fill in the env values in {_codex_config_path()}")
-            print("  4. Open Codex CLI in this directory: codex")
-        else:
-            print("  3. Open Claude Code in this directory: claude")
+        next_step = 3
+        if "claude-code" in resolved_harnesses:
+            print(f"  {next_step}. Open Claude Code in this directory: claude")
+            next_step += 1
+        if "codex" in resolved_harnesses:
+            print(f"  {next_step}. Fill in the env values in {_codex_config_path()}")
+            next_step += 1
+            print(f"  {next_step}. Open Codex CLI in this directory: codex")
+            next_step += 1
 
     if settings_unreadable:
         print(
@@ -2114,17 +2264,82 @@ def cmd_register(args: argparse.Namespace) -> int:
 # per item and exits 0 (idempotent).
 
 
+def _wired_harnesses(project_root: Path) -> list[str]:
+    """Return every harness in :data:`install.KNOWN_HARNESSES` order that is
+    currently WIRED in *project_root* — i.e. its markers are present in the
+    files ``strata register`` writes, not merely installed on this machine.
+
+    Shared by ``strata unregister``'s default harness resolution (Task 3) and
+    ``strata launch``'s "exactly one harness wired" fallback (Task 5) — one
+    definition of "wired" only.
+
+    Codex is machine-scoped (``$CODEX_HOME/config.toml`` is shared by every
+    project on the box), so its config alone is not project evidence: codex
+    counts as WIRED here only when the machine config tables are present
+    *and* this project's ``AGENTS.md`` carries the strata marker block
+    (controller ruling, harness-parity final fix wave — see
+    ``_codex_wired`` below).
+    """
+    import json  # noqa: PLC0415
+
+    def _claude_code_wired() -> bool:
+        settings_json = project_root / ".claude" / "settings.json"
+        if not settings_json.exists():
+            return False
+        try:
+            data = json.loads(settings_json.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            # Corrupt JSON is not proof there's nothing wired — treat it as
+            # conservatively "possibly wired".
+            return True
+        return _mcp_server_present(data) or _stop_hook_present(data)
+
+    def _codex_wired() -> bool:
+        # Codex "wiredness" must be project-scoped, not machine-scoped
+        # (controller ruling, harness-parity final fix wave): config.toml
+        # lives under $CODEX_HOME — a machine-level file shared by every
+        # project on the box — so its presence alone is not evidence THIS
+        # project registered codex. Require the project-local AGENTS.md
+        # marker block too, the project-side evidence register wrote here.
+        # This gate applies only to the no-flags default resolution shared
+        # by unregister and launch's single-wired fallback; an explicit
+        # `--harness codex` bypasses _wired_harnesses entirely and keeps
+        # its unconditional-cleanup behavior (Task 3).
+        codex_config = _codex_config_path()
+        if not codex_config.exists():
+            return False
+        text = codex_config.read_text(encoding="utf-8")
+        if not (_codex_mcp_present(text) or _codex_hook_present(text)):
+            return False
+        agents_md = project_root / "AGENTS.md"
+        if not agents_md.exists():
+            return False
+        return _agents_md_present(agents_md.read_text(encoding="utf-8"))
+
+    checks = {"claude-code": _claude_code_wired, "codex": _codex_wired}
+    return [h for h in install.KNOWN_HARNESSES if checks[h]()]
+
+
 def cmd_unregister(args: argparse.Namespace) -> int:
-    """Reverse `strata register`'s wiring — issue #53.
+    """Reverse `strata register`'s wiring — issue #53; harness-symmetric (Task 3).
 
     Removes each artifact register wired ONLY when it still byte-matches what
     register would have written; user-edited artifacts are reported and left
     in place (ADR 0005 Decision 6, applied in reverse). Steps:
 
-    1. `.gitignore` managed block   (removed verbatim, other lines untouched).
-    2. `mcpServers.strata` entry     (removed only if == the canonical entry).
-    3. the three vendored skills      (removed only if byte-identical to shipped).
-    4. `.strata/` data                (left alone unless --purge-data).
+    1. `.gitignore` managed block     (removed verbatim, other lines untouched).
+    2. per resolved harness: claude-code's `mcpServers.strata` entry + Stop
+       hook, or codex's `[mcp_servers.strata]` table + Stop-hook block
+       (each removed only if == the canonical entry it was merged with).
+    3. the three vendored skills        (claude-code only; removed only if
+       byte-identical to shipped).
+    4. `.strata/` data                  (left alone unless --purge-data).
+
+    Harness resolution (symmetric with, but not identical to, register's):
+    explicit `--harness` flags -> exactly those; no flags -> every harness
+    whose wiring markers are currently present (what's WIRED, not what's
+    installed/detected). A harness named explicitly but not wired prints a
+    skip line and does not fail the run.
 
     --dry-run prints every action and touches nothing. Idempotent: an
     already-clean project reports "nothing to do" per item and exits 0.
@@ -2139,7 +2354,20 @@ def cmd_unregister(args: argparse.Namespace) -> int:
     project_root = Path(path_arg).resolve() if path_arg else Path.cwd().resolve()
     dry_run: bool = getattr(args, "dry_run", False)
     purge_data: bool = getattr(args, "purge_data", False)
-    harness: str = getattr(args, "harness", None) or "claude-code"
+
+    # -----------------------------------------------------------------------
+    # Resolve which harness(es) to reverse (Task 3, multi-harness parity).
+    # Unlike register (which defaults to everything *detected*), unregister
+    # defaults to everything *wired* — what register's markers show is
+    # actually present in this project, not what's installed on the machine.
+    # Explicit --harness flags always win outright, even naming a harness
+    # with nothing wired (that just prints a skip line below).
+    # -----------------------------------------------------------------------
+    harness_flags: list[str] | None = getattr(args, "harness", None)
+    if harness_flags:
+        resolved_harnesses: list[str] = list(harness_flags)
+    else:
+        resolved_harnesses = _wired_harnesses(project_root)
 
     # Tracks whether any artifact the user asked to remove was left in place
     # (edited/modified) — drives the exit-1 partial-completion signal.
@@ -2193,7 +2421,7 @@ def cmd_unregister(args: argparse.Namespace) -> int:
         else:  # absent
             _ok(".gitignore: nothing to do (no managed Strata block)")
 
-    if harness == "claude-code":
+    def _unregister_claude_code() -> None:
         # -----------------------------------------------------------------------
         # Step 2: `.claude/settings.json` — the `mcpServers.strata` entry and the
         # freshness `hooks.Stop` entry (issue #112). Both removed only when they
@@ -2330,7 +2558,7 @@ def cmd_unregister(args: argparse.Namespace) -> int:
             _rmdir_if_empty(claude_hooks_dir)
             _rmdir_if_empty(project_root / ".claude")
 
-    elif harness == "codex":
+    def _unregister_codex() -> None:
         # ---------------------------------------------------------------
         # Step 2 (codex): reverse of `strata register --harness codex` —
         # the [mcp_servers.strata] table and freshness hooks.Stop block in
@@ -2375,6 +2603,49 @@ def cmd_unregister(args: argparse.Namespace) -> int:
             if codex_changed and not dry_run:
                 codex_config.write_text(codex_text, encoding="utf-8")
 
+        # Reverse of the AGENTS.md seed in `strata register --harness codex`
+        # (Task 6, harness parity). AGENTS.md lives at the project root, not
+        # under $CODEX_HOME, unlike config.toml above.
+        agents_md = project_root / "AGENTS.md"
+        if not agents_md.exists():
+            _ok(f"{agents_md}: nothing to do (no AGENTS.md)")
+        else:
+            # read_bytes/write_bytes, not read_text/write_text — see the
+            # matching comment in _register_codex (final fix wave, item 2).
+            agents_text = agents_md.read_bytes().decode("utf-8")
+            new_agents_text, agents_status = _remove_agents_md(agents_text)
+            if agents_status == "removed":
+                _ok(f"{agents_md}: {_would('remove', 'removed')} the Strata block")
+                if not dry_run:
+                    agents_md.write_bytes(new_agents_text.encode("utf-8"))
+            elif agents_status == "edited":
+                _left(
+                    f"{agents_md}: Strata block was edited "
+                    "(differs from the canonical block) — left in place"
+                )
+            else:  # absent
+                _ok(f"{agents_md}: nothing to do (no Strata block)")
+
+    # -----------------------------------------------------------------------
+    # Per-harness reversal loop (Task 3, multi-harness parity): mirrors
+    # register's per-harness loop, one `== NAME ==` header per resolved
+    # harness. Every resolved harness's helper runs unconditionally — the
+    # marker gate (_WIRED_CHECK, above) only decides *resolution* on the
+    # no-flags path (which harnesses to include at all); it is deliberately
+    # NOT re-checked here. An explicitly-named harness must still be
+    # reversible even when its settings.json/config.toml entries were
+    # hand-deleted but its skills/hook script remain — the per-harness
+    # helpers already print their own per-artifact "nothing to do" lines,
+    # which is what satisfies a named-but-unwired harness's "skip line".
+    # -----------------------------------------------------------------------
+    _UNREGISTER_STEP = {
+        "claude-code": _unregister_claude_code,
+        "codex": _unregister_codex,
+    }
+    for _harness in resolved_harnesses:
+        print(f"\n== {_harness} ==")
+        _UNREGISTER_STEP[_harness]()
+
     # -----------------------------------------------------------------------
     # Step 4: `.strata/` data — memory, not wiring.
     # -----------------------------------------------------------------------
@@ -2411,6 +2682,53 @@ def _rmdir_if_empty(directory: Path) -> None:
             directory.rmdir()
     except OSError:
         pass
+
+
+# ---------------------------------------------------------------------------
+# strata set-default-harness (Task 4) — records what `strata launch` starts.
+# ---------------------------------------------------------------------------
+
+
+def cmd_set_default_harness(args: argparse.Namespace) -> int:
+    """Write ``default_harness`` under ``[launch]`` in ``.strata/config.toml``.
+
+    Validates *args.harness_name* against :data:`install.KNOWN_HARNESSES`
+    (exit 2 + the valid list otherwise) and requires a registered workspace
+    (exit 1 + "run 'strata register' first" otherwise). The write is a
+    textual read-modify-write (:func:`install.set_default_harness`): every
+    other line in ``config.toml`` — including a pre-existing ``[launch]``
+    table's other keys — survives byte-for-byte; a re-run replaces the value
+    in place rather than duplicating the table.
+    """
+    name: str = args.harness_name
+    if name not in install.KNOWN_HARNESSES:
+        print(
+            f"Unknown harness {name!r}. Valid harnesses: {', '.join(install.KNOWN_HARNESSES)}",
+            file=sys.stderr,
+        )
+        return 2
+
+    path_arg: str | None = getattr(args, "path", None)
+    project_root = Path(path_arg).resolve() if path_arg else Path.cwd().resolve()
+    config_path = project_root / ".strata" / "config.toml"
+    if not config_path.exists():
+        print(
+            f"No .strata/config.toml found at {project_root} — run 'strata register' first.",
+            file=sys.stderr,
+        )
+        return 1
+
+    # read_bytes/write_bytes, not read_text/write_text: text-mode I/O does
+    # universal-newline translation, which strips \r out of a CRLF file
+    # before set_default_harness's CRLF-aware regexes ever see it — silently
+    # neutering the CRLF preservation those regexes are built for (final fix
+    # wave, item 2).
+    current_text = config_path.read_bytes().decode("utf-8")
+    new_text = install.set_default_harness(current_text, name)
+    config_path.write_bytes(new_text.encode("utf-8"))
+
+    print(f"default harness: {name} (used by 'strata launch')")
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -2667,6 +2985,19 @@ def _build_parser() -> argparse.ArgumentParser:
         dest="skip_preflight",
         help="Bypass all preflight prerequisite checks.",
     )
+    p_launch.add_argument(
+        "--harness",
+        dest="harness",
+        choices=install.KNOWN_HARNESSES,
+        default=None,
+        help=(
+            "Harness to start. Default: the project's recorded default "
+            "(`strata set-default-harness`); else the single harness wired in "
+            "this project, if exactly one is; else claude-code. 'codex' "
+            "currently exits 1 — Codex launch is schema-verified but not "
+            "live-verified (see README 'Using Strata with Codex CLI')."
+        ),
+    )
     p_launch.set_defaults(func=cmd_launch)
 
     p_export = sub.add_parser(
@@ -2731,14 +3062,17 @@ def _build_parser() -> argparse.ArgumentParser:
     p_register.add_argument(
         "--harness",
         dest="harness",
-        choices=("claude-code", "codex"),
-        default="claude-code",
+        action="append",
+        choices=install.KNOWN_HARNESSES,
+        default=None,
         help=(
-            "Target harness (default: claude-code). 'codex' merges Strata's "
-            "[mcp_servers.strata] table and freshness Stop-hook block into the "
-            "Codex CLI's own config.toml instead of .claude/settings.json; the "
-            "Stop-hook wiring is schema-verified only (see README 'Using Strata "
-            "with Codex CLI')."
+            "Harness to wire (repeatable). Default: every harness detected on "
+            "this machine (claude-code and/or codex); if none are detected, "
+            "claude-code is wired anyway with a one-line notice. 'codex' merges "
+            "Strata's [mcp_servers.strata] table and freshness Stop-hook block "
+            "into the Codex CLI's own config.toml instead of "
+            ".claude/settings.json; the Stop-hook wiring is schema-verified "
+            "only (see README 'Using Strata with Codex CLI')."
         ),
     )
     p_register.set_defaults(func=cmd_register)
@@ -2757,7 +3091,9 @@ def _build_parser() -> argparse.ArgumentParser:
             "since edited (the .gitignore block, the mcpServers.strata entry, a "
             "vendored skill) are reported and left in place. Your project's "
             "memory under .strata/ (fleet.yaml, DB, summaries, config.toml) is "
-            "left untouched unless you pass --purge-data. "
+            "left untouched unless you pass --purge-data. With no --harness flag, "
+            "every harness that is actually wired is reversed (see --harness); "
+            "a harness named explicitly but not wired just prints a skip line. "
             "Exit code: 0 on success including nothing-to-do; 1 when something "
             "you asked to remove was left in place because it had been edited, "
             "so scripts can detect the partial case."
@@ -2788,10 +3124,14 @@ def _build_parser() -> argparse.ArgumentParser:
     p_unregister.add_argument(
         "--harness",
         dest="harness",
-        choices=("claude-code", "codex"),
-        default="claude-code",
+        action="append",
+        choices=install.KNOWN_HARNESSES,
+        default=None,
         help=(
-            "Which harness's wiring to reverse (default: claude-code). 'codex' "
+            "Harness to reverse (repeatable). Default: every harness that is "
+            "actually WIRED in this project (not every harness installed on "
+            "this machine — see `strata register`'s default) — a harness "
+            "named explicitly but not wired just prints a skip line. 'codex' "
             "removes the [mcp_servers.strata] table and freshness Stop-hook "
             "block from the Codex CLI's config.toml instead of "
             ".claude/settings.json — only when they still byte-match what "
@@ -2799,6 +3139,29 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_unregister.set_defaults(func=cmd_unregister)
+
+    p_set_default_harness = sub.add_parser(
+        "set-default-harness",
+        help="Record which harness `strata launch` starts by default.",
+        description=(
+            "Write default_harness under [launch] in .strata/config.toml, so "
+            "`strata launch` knows which harness to start without a --harness "
+            "flag every time. Requires a registered workspace "
+            "(`strata register` first)."
+        ),
+    )
+    p_set_default_harness.add_argument(
+        "harness_name",
+        metavar="NAME",
+        help=f"Harness to make the default. One of: {', '.join(install.KNOWN_HARNESSES)}.",
+    )
+    p_set_default_harness.add_argument(
+        "path",
+        nargs="?",
+        default=None,
+        help="Project root directory (default: current working directory).",
+    )
+    p_set_default_harness.set_defaults(func=cmd_set_default_harness)
 
     # -------------------------------------------------------------------
     # Hidden engine subcommands for the freshness Stop-hook (issue #112).

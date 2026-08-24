@@ -12,6 +12,7 @@ real process is spawned. The platform-specific handoff inside ``exec_claude``
 
 from __future__ import annotations
 
+import argparse
 import os
 import signal
 from datetime import UTC, datetime
@@ -21,7 +22,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import yaml
 
-from strata.__main__ import main
+from strata.__main__ import _resolve_launch_harness, main
 from strata.launch import (
     SkillResolutionError,
     StrataRoleParseError,
@@ -646,6 +647,151 @@ class TestSessionIdViaCLI:
         ts_part = sid.split("_")[-1]
         assert len(ts_part) == 15  # YYYYMMDD-HHMMSS
         assert ts_part[8] == "-"
+
+
+# ---------------------------------------------------------------------------
+# Harness resolution (Task 5) — --harness flag, the recorded default, the
+# single-wired fallback, and claude-code as the last resort.
+# ---------------------------------------------------------------------------
+
+
+class TestResolveLaunchHarness:
+    """Unit tests for _resolve_launch_harness(); seams monkeypatched, no I/O."""
+
+    def test_explicit_flag_wins_over_everything(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("strata.project_config.read_default_harness", lambda root: "codex")
+        monkeypatch.setattr("strata.__main__._wired_harnesses", lambda root: ["codex"])
+        args = argparse.Namespace(harness="claude-code")
+        assert _resolve_launch_harness(args, Path("/does/not/matter")) == "claude-code"
+
+    def test_recorded_default_beats_single_wired(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("strata.project_config.read_default_harness", lambda root: "codex")
+        monkeypatch.setattr("strata.__main__._wired_harnesses", lambda root: ["claude-code"])
+        args = argparse.Namespace(harness=None)
+        assert _resolve_launch_harness(args, Path("/does/not/matter")) == "codex"
+
+    def test_single_wired_beats_fallback(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("strata.project_config.read_default_harness", lambda root: None)
+        monkeypatch.setattr("strata.__main__._wired_harnesses", lambda root: ["codex"])
+        args = argparse.Namespace(harness=None)
+        assert _resolve_launch_harness(args, Path("/does/not/matter")) == "codex"
+
+    def test_falls_back_to_claude_code_when_nothing_resolves(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr("strata.project_config.read_default_harness", lambda root: None)
+        monkeypatch.setattr("strata.__main__._wired_harnesses", lambda root: [])
+        args = argparse.Namespace(harness=None)
+        assert _resolve_launch_harness(args, Path("/does/not/matter")) == "claude-code"
+
+    def test_falls_back_to_claude_code_when_multiple_wired(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr("strata.project_config.read_default_harness", lambda root: None)
+        monkeypatch.setattr(
+            "strata.__main__._wired_harnesses", lambda root: ["claude-code", "codex"]
+        )
+        args = argparse.Namespace(harness=None)
+        assert _resolve_launch_harness(args, Path("/does/not/matter")) == "claude-code"
+
+    def test_unknown_recorded_default_warns_and_falls_back_to_claude_code(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """A hand-edited/future-version default_harness must not silently
+        launch claude-code with no explanation (review fix)."""
+        monkeypatch.setattr("strata.project_config.read_default_harness", lambda root: "gpt5")
+        monkeypatch.setattr("strata.__main__._wired_harnesses", lambda root: ["codex"])
+        args = argparse.Namespace(harness=None)
+        result = _resolve_launch_harness(args, Path("/does/not/matter"))
+        assert result == "claude-code"
+        err = capsys.readouterr().err
+        assert "gpt5" in err
+        assert "claude-code" in err
+        assert "codex" in err
+
+    def test_none_project_root_falls_back_to_cwd(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """project_root None (unregistered/env-driven) degrades to cwd-rooted lookups."""
+        seen: list[Path] = []
+
+        def _fake_read(root: Path) -> str | None:
+            seen.append(root)
+            return None
+
+        monkeypatch.setattr("strata.project_config.read_default_harness", _fake_read)
+        monkeypatch.setattr("strata.__main__._wired_harnesses", lambda root: [])
+        args = argparse.Namespace(harness=None)
+        assert _resolve_launch_harness(args, None) == "claude-code"
+        assert seen == [Path.cwd().resolve()]
+
+
+class TestLaunchHarnessCli:
+    """CLI-level: --harness flag, codex's honest refusal, claude-code unchanged."""
+
+    def test_codex_default_exits_1_with_honest_message(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from strata import install
+
+        strata_dir = tmp_path / ".strata"
+        strata_dir.mkdir()
+        (strata_dir / "config.toml").write_text(
+            install.set_default_harness(install.CONFIG_TOML, "codex"),
+            encoding="utf-8",
+        )
+        with (
+            patch("pathlib.Path.cwd", return_value=tmp_path),
+            patch("strata.__main__.exec_claude") as mock_exec,
+        ):
+            rc = main(["launch", "g_arch"])
+        assert rc == 1
+        mock_exec.assert_not_called()
+        err = capsys.readouterr().err
+        assert "Codex launch is not wired yet" in err
+        assert "Using Strata with Codex CLI" in err
+        assert "[mcp_servers.strata.env]" in err
+
+    def test_harness_flag_codex_exits_1_even_with_no_config(
+        self, fleet_env, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """--harness codex refuses honestly even with no recorded default at all."""
+        fleet_env([_SCOPE_DEFAULT_ONLY])
+        with patch("strata.__main__.exec_claude") as mock_exec:
+            rc = main(["launch", "g_arch", "--harness", "codex"])
+        assert rc == 1
+        mock_exec.assert_not_called()
+        err = capsys.readouterr().err
+        assert "Codex launch is not wired yet" in err
+
+    def test_harness_flag_claude_code_launches_normally(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """--harness claude-code overrides a codex recorded default (flag beats config)."""
+        from strata import install
+
+        strata_dir = tmp_path / ".strata"
+        strata_dir.mkdir()
+        (strata_dir / "config.toml").write_text(
+            install.set_default_harness(install.CONFIG_TOML, "codex"),
+            encoding="utf-8",
+        )
+        _write_fleet(strata_dir, [_SCOPE_DEFAULT_ONLY])
+        with (
+            patch("pathlib.Path.cwd", return_value=tmp_path),
+            patch("strata.__main__.exec_claude", return_value=0) as mock_exec,
+        ):
+            rc = main(["launch", "g_arch", "--harness", "claude-code"])
+        assert rc == 0
+        mock_exec.assert_called_once()
+
+    def test_no_recorded_default_no_wiring_launches_claude_code_unchanged(
+        self, fleet_env, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """No --harness, no config.toml, nothing wired -> claude-code, today's behavior."""
+        fleet_env([_SCOPE_DEFAULT_ONLY])
+        with patch("strata.__main__.exec_claude", return_value=0) as mock_exec:
+            rc = main(["launch", "g_arch"])
+        assert rc == 0
+        mock_exec.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
