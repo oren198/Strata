@@ -209,6 +209,10 @@ function App() {
           <DeclinesView state={state} scopeId={openScopeId || state.scopes[0]?.id} onSelectScope={setOpenScopeId} />
         )}
 
+        {tab === "freshness" && (
+          <FreshnessView state={state} onOpenScope={(id) => { setTab("graph"); setView("list"); setOpenScopeId(id); }} />
+        )}
+
         {tab === "settings" && (
           <SettingsScreen state={state} dispatch={dispatch} onFlash={flash} />
         )}
@@ -286,6 +290,13 @@ function TopBar({ tab, onTab, dark, onToggleDark }) {
         >
           <Icon name="x-circle" size={13} style={{ marginRight: 6, verticalAlign: "-2px" }} />
           Turned down
+        </button>
+        <button
+          className={"at-tab" + (tab === "freshness" ? " active" : "")}
+          onClick={() => onTab("freshness")}
+        >
+          <Icon name="thermometer" size={13} style={{ marginRight: 6, verticalAlign: "-2px" }} />
+          Freshness
         </button>
         <button
           className={"at-tab" + (tab === "settings" ? " active" : "")}

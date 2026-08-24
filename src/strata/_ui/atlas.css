@@ -287,3 +287,39 @@
   color: var(--at-ink);
   font-size: 13px;
 }
+
+.scope-health-strip {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  width: 100%;
+  text-align: left;
+  padding: 12px 14px;
+  background: var(--at-surface);
+  border: 1px solid var(--at-rule);
+  border-radius: var(--at-radius-md);
+  cursor: pointer;
+}
+
+.pulse-stack {
+  display: flex;
+  height: 14px;
+  width: 100%;
+  border-radius: var(--at-radius-sm);
+  overflow: hidden;
+  background: var(--at-rule-soft);
+}
+
+.pulse-stack-part {
+  height: 100%;
+}
+
+.pulse-key {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+  margin-right: 6px;
+  vertical-align: -1px;
+}

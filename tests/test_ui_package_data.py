@@ -33,6 +33,7 @@ _UI_FILES = [
     "settings.jsx",
     "format.jsx",
     "declines.jsx",
+    "freshness.jsx",
     "tweaks-panel.jsx",
     "store.js",
     "atlas.css",

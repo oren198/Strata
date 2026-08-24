@@ -118,6 +118,15 @@
     return resp.json();
   }
 
+  // Fetch the fleet-wide staleness metric (UI-only endpoint).
+  async function fetchStaleness({ window_days } = {}) {
+    const base = getApiBase();
+    const qs = window_days ? `?window_days=${window_days}` : "";
+    const resp = await fetch(`${base}/staleness${qs}`);
+    if (!resp.ok) throw new Error(`GET /staleness returned ${resp.status}`);
+    return resp.json();
+  }
+
   // Helpers used in graph layout.
   function stratumIndex(state, stratum_id) {
     return state.strata.findIndex((s) => s.id === stratum_id);
@@ -138,6 +147,7 @@
     fetchFleet,
     fetchScopeSummary,
     fetchScopeDeclines,
+    fetchStaleness,
     stratumIndex,
     edgeAllowed,
     loadPrefs,
