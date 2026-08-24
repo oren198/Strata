@@ -107,6 +107,14 @@ from strata.summary_store import ScopeSummary, SummaryStore
 # of cwd and in wheel installs (pipx, ADR 0005 / issue #65).
 _UI_DIR = pathlib.Path(str(importlib.resources.files("strata"))) / "_ui"
 
+# GET /scopes/{scope_id}/summary's "retirements" key (P5) is bounded like the
+# record page (issue #130's rationale, applied here): a long-lived scope's
+# retirement history only ever grows, and every summary GET carries it, so an
+# unbounded list would bloat a call that fires far more often than a record
+# page walk. Newest-first, capped — older retirements stay in the record,
+# reachable there, just not repeated on every summary fetch.
+_SUMMARY_RETIREMENTS_LIMIT = 50
+
 # ---------------------------------------------------------------------------
 # Dependency providers
 # ---------------------------------------------------------------------------
@@ -1294,8 +1302,9 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
         yet.  Returns 404 if the scope is not in the FleetConfig.
 
         Carries a ``retirements`` key — the scope's own retirement events
-        (ADR 0008 D4), newest first, so the Console can show "retired here"
-        without a second round trip. Retirements are events, not
+        (ADR 0008 D4), newest first and capped at
+        ``_SUMMARY_RETIREMENTS_LIMIT``, so the Console can show "retired
+        here" without a second round trip. Retirements are events, not
         contributions, so they never appear in ``GET .../record``.
         """
         from dataclasses import asdict
@@ -1305,9 +1314,8 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
         if scope is None:
             raise HTTPException(status_code=404, detail=f"Scope not found: {scope_id!r}")
 
-        retirements = [
-            asdict(r) for r in reversed(record_store.list_retirements(scope_id=scope_id))
-        ]
+        all_retirements = list(reversed(record_store.list_retirements(scope_id=scope_id)))
+        retirements = [asdict(r) for r in all_retirements[:_SUMMARY_RETIREMENTS_LIMIT]]
 
         existing = summary_store.read(scope_id)
         if existing is not None:

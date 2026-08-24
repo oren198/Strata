@@ -225,3 +225,44 @@ def test_summary_lists_retirements(client):
     body = client.get("/scopes/g_active/summary").json()
     assert [r["directive_id"] for r in body["retirements"]] == [did]
     assert body["retirements"][0]["reason"] == "Gone."
+
+
+def test_summary_caps_the_retirements_list(client):
+    """A long-lived scope's retirement history must not bloat every summary GET."""
+    from strata.record_store import RecordStore
+
+    _seed_directive(client)
+    with RecordStore(client.db_path) as store:
+        for i in range(55):
+            store.append_retirement(
+                scope_id="g_active",
+                directive_id=f"c_fake{i:04d}",
+                retired_by="operator",
+                reason=None,
+            )
+
+    body = client.get("/scopes/g_active/summary").json()
+    assert len(body["retirements"]) == 50
+
+
+def test_operator_route_takes_no_lock_of_its_own(client, monkeypatch):
+    """The endpoint must delegate to operator_supersede/retire for locking — see D5/D16 of
+    the plan and the route docstrings in strata/app.py: exactly ONE scope_lock acquisition
+    per call, taken by the library function itself. A future endpoint-level re-wrap (a
+    reentrancy hazard, since scope_lock is not reentrant) would show two and fail this."""
+    import strata.operator as operator_module
+
+    did = _seed_directive(client)
+
+    acquisitions = []
+    real_scope_lock = operator_module.scope_lock
+
+    def _counting_scope_lock(scope_id):
+        acquisitions.append(scope_id)
+        return real_scope_lock(scope_id)
+
+    monkeypatch.setattr(operator_module, "scope_lock", _counting_scope_lock)
+
+    resp = client.post(f"/scopes/g_active/directives/{did}/retire", json={"reason": "counted"})
+    assert resp.status_code == 200
+    assert acquisitions == ["g_active"]

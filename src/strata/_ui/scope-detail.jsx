@@ -507,6 +507,14 @@ function SummaryExpandModal({ scopeId, state, dispatch, onClose, onOpenDetail, o
   const [summary, setSummary] = React.useState(null);
   const [summaryLoading, setSummaryLoading] = React.useState(false);
 
+  const refetchSummary = React.useCallback(() => {
+    if (!scopeId) return;
+    setSummaryLoading(true);
+    return STRATA_STORE.fetchScopeSummary(scopeId)
+      .then((data) => { setSummary(data); setSummaryLoading(false); })
+      .catch(() => { setSummaryLoading(false); });
+  }, [scopeId]);
+
   React.useEffect(() => {
     if (!scopeId) { setSummary(null); return; }
     let cancelled = false;
@@ -552,6 +560,8 @@ function SummaryExpandModal({ scopeId, state, dispatch, onClose, onOpenDetail, o
         summary={summary}
         loading={summaryLoading}
         error={null}
+        onRefetch={refetchSummary}
+        onFlash={onFlash}
       />
     </Modal>
   );
