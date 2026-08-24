@@ -54,7 +54,7 @@ import sqlite3
 from collections.abc import AsyncGenerator, Generator, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Literal
 
 import anthropic
@@ -91,6 +91,7 @@ from strata.scope_manager import (
     ScopeManagerBatchJudgment,
     ScopeManagerJudgment,
 )
+from strata.session_state import DEFAULT_STALENESS_WINDOW_DAYS, SessionStateStore, sessions_dir_for
 from strata.settings import Settings, get_settings
 from strata.summary_store import ScopeSummary, SummaryStore
 
@@ -132,6 +133,29 @@ def get_summary_store(
 ) -> SummaryStore:
     """Return a :class:`SummaryStore` for the configured summaries directory."""
     return SummaryStore(paths.summaries_dir)
+
+
+def get_session_store(
+    paths: StoragePaths = Depends(get_storage_paths),
+) -> SessionStateStore:
+    """Return the per-session state store (UI-only reads: staleness + closeout counters).
+
+    Session state is runtime measurement, never memory (see session_state.py's module
+    docstring). Nothing in the contribute/judge path reads it through this provider.
+    """
+    return SessionStateStore(sessions_dir_for(paths.summaries_dir))
+
+
+def _parse_iso(value: str) -> datetime | None:
+    """Parse an ISO-8601 timestamp, returning ``None`` on failure rather than raising.
+
+    Used only by UI-only reads (the mechanical-declines counter): a malformed
+    or missing timestamp on disk should degrade the count, never break the read.
+    """
+    try:
+        return datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def get_anthropic_client(
@@ -1215,6 +1239,96 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
             "contribution_states": [asdict(s) for s in page.contribution_states],
             # next_before_id is None once the record is exhausted — the signal a
             # client pages until, rather than guessing from a short page.
+            "page": {
+                "limit": page.limit,
+                "total": page.total,
+                "next_before_id": page.next_before_id,
+            },
+        }
+
+    # -----------------------------------------------------------------------
+    # GET /scopes/{scope_id}/declines
+    # -----------------------------------------------------------------------
+
+    @application.get("/scopes/{scope_id}/declines")
+    def get_scope_declines(
+        scope_id: str,
+        request: Request,
+        limit: int | None = None,
+        before_id: str | None = None,
+        record_store: RecordStore = Depends(get_record_store),
+        session_store: SessionStateStore = Depends(get_session_store),
+        settings: Settings = Depends(get_settings),
+    ) -> dict:
+        """Return one page of a scope's declined contributions, with the judge's reasons.
+
+        UI-only proof surface (constraint G1): nothing in the contribute/judge
+        engine flow reads this. Bounded and cursor-paged exactly like
+        ``GET /scopes/{scope_id}/record`` — see :meth:`RecordStore.page_declines`.
+
+        Also reports ``mechanical_declines``: the count of sessions that read
+        this scope inside the staleness window and ended having recorded
+        nothing — an honest closeout signal, not a count of declines *of this
+        scope*, and never rendered as record entries (see D2).
+
+        Returns 404 if the scope is not in the FleetConfig, and 422 if the
+        paging arguments are out of range (including a ``before_id`` that is
+        not a declined contribution in this scope).
+        """
+        fleet: FleetConfig = request.app.state.fleet_config
+        scope = fleet.get_scope(scope_id)
+        if scope is None:
+            raise HTTPException(status_code=404, detail=f"Scope not found: {scope_id!r}")
+
+        try:
+            page = record_store.page_declines(
+                scope_id=scope_id,
+                limit=limit if limit is not None else settings.record_page_size,
+                before_id=before_id,
+            )
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail={"error": "invalid_page", "detail": str(exc)},
+            ) from exc
+
+        window_start = datetime.now(tz=UTC) - timedelta(days=DEFAULT_STALENESS_WINDOW_DAYS)
+        mechanical = 0
+        for state in session_store.all_states():
+            if state.declines <= 0:
+                continue
+            receipt = state.reads_by_scope.get(scope_id)
+            if receipt is None:
+                continue
+            read_at = _parse_iso(receipt.last_read_at)
+            if read_at is not None and read_at >= window_start:
+                mechanical += 1
+
+        return {
+            "scope_id": scope_id,
+            "declines": [
+                {
+                    "contribution_id": entry.contribution.id,
+                    "content": entry.contribution.content,
+                    "subject": entry.contribution.subject,
+                    "proposed_classification": entry.contribution.proposed_classification,
+                    "contributor": {
+                        "scope_id": entry.contribution.contributor.scope_id,
+                        "skill": entry.contribution.contributor.skill,
+                        "session_id": entry.contribution.contributor.session_id,
+                        "ts": entry.contribution.contributor.ts,
+                    },
+                    "created_at": entry.contribution.created_at,
+                    "reason": entry.judgment.notes,
+                    "judged_by": entry.judgment.judged_by,
+                    "judged_at": entry.judgment.created_at,
+                }
+                for entry in page.declines
+            ],
+            "mechanical_declines": {
+                "sessions_that_read_and_recorded_nothing": mechanical,
+                "window_days": DEFAULT_STALENESS_WINDOW_DAYS,
+            },
             "page": {
                 "limit": page.limit,
                 "total": page.total,
