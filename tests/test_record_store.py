@@ -893,3 +893,87 @@ def test_latest_accepted_contribution_breaks_a_same_second_tie_by_rowid(tmp_path
 
     assert latest is not None
     assert latest.id == ids[-1]
+
+
+# ---------------------------------------------------------------------------
+# Scenario N — page_declines (UI-only proof surface)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def store(tmp_path: Path):
+    """A fresh, migrated RecordStore backed by its own SQLite file."""
+    with _open_store(str(tmp_path / "strata.db")) as rs:
+        yield rs
+
+
+class TestPageDeclines:
+    """RecordStore.page_declines — the UI-only declined-with-reasons read."""
+
+    def _decline(self, store, scope_id, content, reason):
+        c = store.append_contribution(
+            scope_id=scope_id,
+            content=content,
+            proposed_classification="directive",
+            subject=None,
+            supersedes=None,
+            contributor=ContributorRef(
+                scope_id=scope_id, skill="architect",
+                session_id="sess_1", ts="2026-08-20T10:00:00+00:00",
+            ),
+        )
+        store.record_judgment(
+            contribution_id=c.id, decision="decline",
+            judged_by="scope-manager", notes=reason,
+        )
+        return c
+
+    def test_returns_only_declines_newest_first_with_reasons(self, store):
+        self._decline(store, "g_a", "first bad idea", "Contradicts the gRPC directive.")
+        self._decline(store, "g_a", "second bad idea", "Duplicates an existing directive.")
+        accepted = store.append_contribution(
+            scope_id="g_a", content="good idea", proposed_classification="directive",
+            subject=None, supersedes=None,
+            contributor=ContributorRef(scope_id="g_a", skill="architect",
+                                       session_id="s", ts="2026-08-20T10:00:00+00:00"),
+        )
+        store.record_judgment(contribution_id=accepted.id,
+                              decision="accept_as_directive",
+                              judged_by="scope-manager", notes="Fine.")
+
+        page = store.page_declines(scope_id="g_a")
+
+        assert [e.contribution.content for e in page.declines] == [
+            "second bad idea", "first bad idea",
+        ]
+        assert page.declines[0].judgment.notes == "Duplicates an existing directive."
+        assert page.total == 2
+        assert page.next_before_id is None
+
+    def test_other_scopes_declines_are_not_returned(self, store):
+        self._decline(store, "g_a", "mine", "no")
+        self._decline(store, "g_b", "theirs", "no")
+        page = store.page_declines(scope_id="g_a")
+        assert len(page.declines) == 1
+        assert page.declines[0].contribution.scope_id == "g_a"
+
+    def test_pages_by_cursor_until_exhausted(self, store):
+        for i in range(5):
+            self._decline(store, "g_a", f"idea {i}", f"reason {i}")
+        first = store.page_declines(scope_id="g_a", limit=2)
+        assert len(first.declines) == 2
+        assert first.next_before_id == first.declines[-1].contribution.id
+        second = store.page_declines(scope_id="g_a", limit=2, before_id=first.next_before_id)
+        assert len(second.declines) == 2
+        third = store.page_declines(scope_id="g_a", limit=2, before_id=second.next_before_id)
+        assert len(third.declines) == 1
+        assert third.next_before_id is None
+
+    def test_limit_below_one_raises(self, store):
+        with pytest.raises(ValueError):
+            store.page_declines(scope_id="g_a", limit=0)
+
+    def test_foreign_cursor_raises(self, store):
+        self._decline(store, "g_a", "mine", "no")
+        with pytest.raises(ValueError):
+            store.page_declines(scope_id="g_a", before_id="c_doesnotexist")

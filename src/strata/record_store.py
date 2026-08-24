@@ -336,6 +336,39 @@ class RecordPage:
 
 
 @dataclass(frozen=True)
+class DeclinedEntry:
+    """One declined contribution paired with the judgment that declined it.
+
+    UI-only read (constraint G1): assembled by :meth:`RecordStore.page_declines`
+    for the Console's "turned down" proof surface. ``judgment.decision`` is
+    always ``"decline"``.
+    """
+
+    contribution: Contribution
+    judgment: Judgment
+
+
+@dataclass(frozen=True)
+class DeclinePage:
+    """One page of a scope's declined contributions, newest first (UI-only read).
+
+    The declined-with-reasons counterpart to :class:`RecordPage`: instead of
+    the whole record, only the contributions the scope-manager turned down,
+    each carrying the judgment that declined it (and therefore its reason).
+    Cursor semantics mirror :class:`RecordPage` exactly — see
+    :meth:`RecordStore.page_declines`.
+
+    No engine flow reads this: it exists solely so an operator can see what
+    was refused and why.
+    """
+
+    declines: list[DeclinedEntry]
+    limit: int
+    total: int
+    next_before_id: str | None
+
+
+@dataclass(frozen=True)
 class OperatorAct:
     """One act on the operator stratum itself (ADR 0008 D1).
 
@@ -929,6 +962,96 @@ class RecordStore:
             next_before_id=contributions[-1].id if has_more else None,
         )
 
+    def page_declines(
+        self,
+        *,
+        scope_id: str,
+        limit: int = RECORD_PAGE_SIZE,
+        before_id: str | None = None,
+    ) -> DeclinePage:
+        """Return one page of *scope_id*'s declined contributions, newest first.
+
+        UI-only read: nothing in the contribute/judge engine flow calls this
+        (constraint G1) — it exists so the Console's "turned down" proof
+        surface can show every refused contribution with the judge's stated
+        reason, without a host reconstructing the join itself.
+
+        Cursor semantics are identical to :meth:`page_record`: ordering is
+        ``contributions.created_at DESC, contributions.rowid DESC``, and
+        *before_id* resolves to that row's ``(created_at, rowid)`` anchor,
+        returning rows strictly older than it — see :class:`RecordPage` for
+        why an offset would be unsafe here too.
+
+        Args:
+            scope_id:  The scope whose declines to page.
+            limit:     Page size.  Defaults to :data:`RECORD_PAGE_SIZE`.
+            before_id: Cursor — return declines strictly older than this
+                       contribution.  ``None`` starts at the newest.
+
+        Returns:
+            One :class:`DeclinePage`.
+
+        Raises:
+            ValueError: If *limit* is below 1, or *before_id* is not a
+                declined contribution in this scope.
+        """
+        if limit < 1:
+            raise ValueError(f"limit must be >= 1, got {limit!r}")
+
+        total = self._conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM contributions c
+            JOIN judgments j ON j.contribution_id = c.id
+            WHERE c.scope_id = ? AND j.decision = 'decline'
+            """,
+            (scope_id,),
+        ).fetchone()[0]
+
+        base = """
+            SELECT c.id, c.scope_id, c.content, c.proposed_classification,
+                   c.subject, c.supersedes,
+                   c.contributor_scope_id, c.contributor_skill,
+                   c.contributor_session_id, c.contributor_ts,
+                   c.created_at,
+                   j.id AS judgment_id, j.decision, j.judged_by, j.notes,
+                   j.created_at AS judged_at
+            FROM contributions c
+            JOIN judgments j ON j.contribution_id = c.id
+            WHERE c.scope_id = ? AND j.decision = 'decline'
+        """
+        params: list[object] = [scope_id]
+        if before_id is not None:
+            anchor = self._conn.execute(
+                """
+                SELECT c.created_at, c.rowid
+                FROM contributions c
+                JOIN judgments j ON j.contribution_id = c.id
+                WHERE c.id = ? AND c.scope_id = ? AND j.decision = 'decline'
+                """,
+                (before_id, scope_id),
+            ).fetchone()
+            if anchor is None:
+                raise ValueError(
+                    f"before_id is not a declined contribution in {scope_id!r}: {before_id!r}"
+                )
+            base += " AND (c.created_at < ? OR (c.created_at = ? AND c.rowid < ?))"
+            params.extend([anchor["created_at"], anchor["created_at"], anchor["rowid"]])
+        base += " ORDER BY c.created_at DESC, c.rowid DESC LIMIT ?"
+        params.append(limit + 1)
+
+        rows = self._conn.execute(base, params).fetchall()
+        has_more = len(rows) > limit
+        page_rows = rows[:limit]
+        declines = [_declined_entry_from_row(row) for row in page_rows]
+
+        return DeclinePage(
+            declines=declines,
+            limit=limit,
+            total=total,
+            next_before_id=declines[-1].contribution.id if has_more else None,
+        )
+
     def get_record_entry(self, contribution_id: str) -> RecordEntry | None:
         """Return the record's whole entry for *contribution_id*, or ``None`` if absent.
 
@@ -1492,6 +1615,27 @@ def _contribution_from_row(row: sqlite3.Row) -> Contribution:
         ts=d.pop("contributor_ts"),
     )
     return Contribution(**d, contributor=contributor)
+
+
+def _declined_entry_from_row(row: sqlite3.Row) -> DeclinedEntry:
+    """Map one row of :meth:`RecordStore.page_declines`'s join to a :class:`DeclinedEntry`."""
+    d = dict(row)
+    judgment = Judgment(
+        id=d.pop("judgment_id"),
+        contribution_id=d["id"],
+        decision=d.pop("decision"),
+        judged_by=d.pop("judged_by"),
+        notes=d.pop("notes"),
+        created_at=d.pop("judged_at"),
+    )
+    contributor = ContributorRef(
+        scope_id=d.pop("contributor_scope_id"),
+        skill=d.pop("contributor_skill"),
+        session_id=d.pop("contributor_session_id"),
+        ts=d.pop("contributor_ts"),
+    )
+    contribution = Contribution(**d, contributor=contributor)
+    return DeclinedEntry(contribution=contribution, judgment=judgment)
 
 
 def _recent_contribution_from_row(row: sqlite3.Row) -> RecentContribution:
