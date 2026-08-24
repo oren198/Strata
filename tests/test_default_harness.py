@@ -13,7 +13,7 @@ starts by default, in a `[launch]` table under `.strata/config.toml`. It:
 - is idempotent: re-running replaces the value without duplicating the
   table or the key.
 
-`strata.install.read_default_harness` (text -> value) and
+`strata.install.read_default_harness_from_text` (text -> value) and
 `strata.project_config.read_default_harness` (project_root -> value) are
 covered directly too — Task 5 (`strata launch`) consumes the latter.
 """
@@ -212,4 +212,4 @@ class TestReadDefaultHarness:
         assert _read_project_default_harness(tmp_path) is None
 
     def test_malformed_toml_returns_none(self) -> None:
-        assert install.read_default_harness("not [ valid toml") is None
+        assert install.read_default_harness_from_text("not [ valid toml") is None

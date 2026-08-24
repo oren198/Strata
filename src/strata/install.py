@@ -74,7 +74,7 @@ __all__ = [
     "KNOWN_HARNESSES",
     "detect_harnesses",
     "set_default_harness",
-    "read_default_harness",
+    "read_default_harness_from_text",
     "AGENTS_MD_MARKER",
     "agents_md_present",
     "merge_agents_md",
@@ -909,12 +909,18 @@ def set_default_harness(config_text: str, name: str) -> str:
     return config_text[:body_start] + new_body + config_text[body_end:]
 
 
-def read_default_harness(config_text: str) -> str | None:
+def read_default_harness_from_text(config_text: str) -> str | None:
     """Return the ``[launch].default_harness`` value from *config_text*, or ``None``.
 
     Parses via ``tomllib`` (validation, not the write path — writes stay
     textual, see :func:`set_default_harness`). Returns ``None`` when the
     table/key is absent or the TOML fails to parse (e.g. mid-edit).
+
+    Named ``*_from_text`` (not ``read_default_harness``, final fix wave item
+    4) to disambiguate from :func:`strata.project_config.read_default_harness`
+    — same verb, different signature (config text vs. a project root path);
+    the two public functions shared one name across modules, which review
+    flagged as confusing at call sites and in stack traces.
     """
     import tomllib  # noqa: PLC0415
 
