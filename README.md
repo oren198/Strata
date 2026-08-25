@@ -8,9 +8,9 @@ A single agent rediscovers everything it needs. A fleet of agents working in
 isolation rediscovers everything every time, in parallel. Strata is the
 layer between them that lets a fleet's performance compound.
 
-> Read [`docs/philosophy.md`](docs/philosophy.md) for the full theoretical
+> Read [`docs/philosophy.md`](https://github.com/oren198/Strata/blob/main/docs/philosophy.md) for the full theoretical
 > grounding — the problem, why naive sharing fails, and the concepts the
-> design rests on. Read [`CONTEXT.md`](CONTEXT.md) for the canonical
+> design rests on. Read [`CONTEXT.md`](https://github.com/oren198/Strata/blob/main/CONTEXT.md) for the canonical
 > vocabulary all code uses (23 terms, no synonyms).
 
 ---
@@ -29,7 +29,7 @@ the strata. Chain edges carry directives down and bind; reference edges
 carry the referenced scope's publication across, and never bind.
 
 The V1 architecture decision is documented in
-[`docs/adr/0001-v1-architecture.md`](docs/adr/0001-v1-architecture.md).
+[`docs/adr/0001-v1-architecture.md`](https://github.com/oren198/Strata/blob/main/docs/adr/0001-v1-architecture.md).
 
 ---
 
@@ -42,14 +42,14 @@ frictionless Claude Code session binding (ADR 0003), a read-only
 browser-based Console, and a Claude Code MCP plugin + skills.
 
 **V1.2.1 shipped** — H2 foundations per
-[ADR 0004](docs/adr/0004-h2-foundations.md): embedded mode (the MCP
+[ADR 0004](https://github.com/oren198/Strata/blob/main/docs/adr/0004-h2-foundations.md): embedded mode (the MCP
 server operates directly on the record store; the FastAPI backend is the
 UI layer only), real perspective composition (the agent's read walks
 the inter-stratum ancestor chain), parent-aware scope-managers, and
 lazy refresh + bounded summaries via a pre-session hook.
 
 **V1.3 shipped** — brownfield install per
-[ADR 0005](docs/adr/0005-brownfield-install.md): `strata register` for
+[ADR 0005](https://github.com/oren198/Strata/blob/main/docs/adr/0005-brownfield-install.md): `strata register` for
 two-command onboarding of any foreign project, per-project
 `.strata/config.toml` discovery, `strata-mcp` console script (no more
 Python-path gymnastics), skills vendored as package data, preflight
@@ -61,7 +61,7 @@ inspection commands (`scopes` / `summary` / `record`) now read the record
 and summary stores directly instead of proxying through the Console
 backend, and the now-dead `STRATA_BACKEND_URL` was removed.
 
-What comes next is captured in [`docs/ROADMAP.md`](docs/ROADMAP.md) — the
+What comes next is captured in [`docs/ROADMAP.md`](https://github.com/oren198/Strata/blob/main/docs/ROADMAP.md) — the
 enduring design principles and the sequenced direction the project is
 heading. See also the [Architecture decisions](#architecture-decisions)
 section below for the ADRs already landed.
@@ -209,7 +209,7 @@ strata register              # idempotent: creates .strata/, seeds fleet.yaml, w
 > published to PyPI as **`strata-mem`** (the name `strata` was already taken
 > by an unrelated, dormant package — see
 > [issue #49](https://github.com/oren198/Strata/issues/49); the decision is
-> [ADR 0009](docs/adr/0009-packaging-engine-client-split.md)). Everything you
+> [ADR 0009](https://github.com/oren198/Strata/blob/main/docs/adr/0009-packaging-engine-client-split.md)). Everything you
 > actually type stays `strata`: `import strata` in Python, and the
 > `strata` / `strata-mcp` console scripts on your PATH. Only the
 > `pipx install` / `pip install` argument differs.
@@ -648,7 +648,7 @@ After step 3, edit `fleet.yaml` by hand to add per-scope skill declarations
 Open <http://127.0.0.1:8000/> while the backend is running — a graph and list
 view of the current fleet state, polling every 5 s, plus four new tabs and an
 in-place operator-correction surface described in
-[`docs/console.md`](docs/console.md) and the [Console](#console) section
+[`docs/console.md`](https://github.com/oren198/Strata/blob/main/docs/console.md) and the [Console](#console) section
 below. Automatic memory writes (accept/decline)
 still flow only through `strata.contribute`; the Console's own write path is
 limited to the two in-person operator corrections (Replace / Retire a
@@ -683,7 +683,7 @@ strata start
 is local-only — it talks to the backend `strata start` just launched on your
 own machine, nothing external. Alongside the memory graph and settings, it
 has four new tabs, plus in-place Replace/Retire actions in the scope drawer;
-see [`docs/console.md`](docs/console.md) for the full description of each:
+see [`docs/console.md`](https://github.com/oren198/Strata/blob/main/docs/console.md) for the full description of each:
 
 - **Turned down** — every contribution the scope-manager refused for a
   scope, with the reason given, plus a separate mechanical count of sessions
@@ -934,23 +934,23 @@ process; across processes it does not — see ADR 0012.)
 
 ADRs live under `docs/adr/`. Each captures a hard-to-reverse decision with
 context, alternatives, and consequences. The future direction —
-principles plus the next horizons — is in [`docs/ROADMAP.md`](docs/ROADMAP.md).
+principles plus the next horizons — is in [`docs/ROADMAP.md`](https://github.com/oren198/Strata/blob/main/docs/ROADMAP.md).
 
 Current ADRs:
 
-- [0001 — V1 architecture](docs/adr/0001-v1-architecture.md): local Python
+- [0001 — V1 architecture](https://github.com/oren198/Strata/blob/main/docs/adr/0001-v1-architecture.md): local Python
   backend, SQLite + markdown storage, Claude Code as the agent runtime,
   scope-manager hosted as backend-spawned Anthropic API calls.
-- [0002 — Fleet config source of truth](docs/adr/0002-fleet-config-source-of-truth.md):
+- [0002 — Fleet config source of truth](https://github.com/oren198/Strata/blob/main/docs/adr/0002-fleet-config-source-of-truth.md):
   `fleet.yaml` is canonical; SQLite holds only contributions and judgments;
   scope lifecycle (`active`/`archived`); per-scope skill declarations.
-- [0003 — `strata launch` CC binding](docs/adr/0003-strata-launch-cc-binding.md):
+- [0003 — `strata launch` CC binding](https://github.com/oren198/Strata/blob/main/docs/adr/0003-strata-launch-cc-binding.md):
   frictionless `(scope, skill, session_id)` binding via a single CLI command
   that validates, resolves, and `execvp`s `claude`.
-- [0004 — H2 foundations](docs/adr/0004-h2-foundations.md): embedded mode
+- [0004 — H2 foundations](https://github.com/oren198/Strata/blob/main/docs/adr/0004-h2-foundations.md): embedded mode
   (MCP server direct-store access), manager composition, lazy refresh, bounded
   summaries.
-- [0005 — Brownfield install](docs/adr/0005-brownfield-install.md): `strata register`
+- [0005 — Brownfield install](https://github.com/oren198/Strata/blob/main/docs/adr/0005-brownfield-install.md): `strata register`
   two-command onboarding, per-project `.strata/config.toml` discovery, `strata-mcp`
   console script, skills as package data, honest provenance enforcement.
 
@@ -958,4 +958,4 @@ Current ADRs:
 
 ## License
 
-See [`LICENSE`](LICENSE).
+See [`LICENSE`](https://github.com/oren198/Strata/blob/main/LICENSE).
