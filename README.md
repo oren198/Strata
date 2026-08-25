@@ -57,29 +57,33 @@ section below for the ADRs already landed.
 
 ## Quick start
 
-A first-time, copy-paste-able run. Five steps, ~5 minutes.
+The journey is the same everywhere Strata runs: **install with pipx, run
+`strata register` in your project, bind your session, and work.** The
+engine is embedded — the MCP server applies migrations and opens storage
+itself on first use, so nothing needs to be running in the background.
+`strata start` exists for one reason: the **Console**, a local web view of
+memory. Run it when you want to look at memory; stop it whenever — agents
+never depend on it (see [Console](#console) below).
+
+A first-time, copy-paste-able run. ~5 minutes.
 
 ### 1. Prerequisites
 
-- **Python 3.11 or newer.** Check: `python3 --version`. If your system Python is older, install 3.11+ via `pyenv`, your package manager, or [python.org](https://www.python.org/downloads/).
-- **`make`** (usually preinstalled on macOS/Linux; `xcode-select --install` on macOS if missing).
-- **An Anthropic API key.** Get one at <https://console.anthropic.com/>. It's only needed to make real scope-manager calls — the test suite mocks them, so you can run tests without it.
+- **Python 3.11 or newer**, only so `pipx` has an interpreter to build its isolated env from. Check: `python3 --version`. No Python? See [No Python 3.11+ globally?](#no-python-311-globally-use---bootstrap-venv).
+- **An Anthropic API key.** Get one at <https://console.anthropic.com/> — the scope-manager needs it to judge contributions.
 
-### 2. Clone and install
-
-```bash
-git clone https://github.com/oren198/Strata.git
-cd Strata
-make install        # editable install + dev extras
-```
-
-`make install` runs `pip install -e ".[dev]"`. If you prefer an isolated virtual environment first:
+### 2. Install and register
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate   # Windows: .venv\Scripts\activate
-make install
+pipx install strata-mem      # strata + strata-mcp on PATH, in an isolated env
+mkdir strata-quickstart && cd strata-quickstart
+strata register               # idempotent: creates .strata/, seeds fleet.yaml, wires the harness (Claude Code by default; --harness narrows to codex)
 ```
+
+See [What `strata register` does](#what-strata-register-does) for the full
+list of what this creates: a `.strata/` workspace, a starter `fleet.yaml`,
+the `strata` skills, an MCP server entry, and a freshness `Stop`-hook, all
+under `.claude/`.
 
 ### 3. Set your API key
 
@@ -89,94 +93,58 @@ Either export it in your shell:
 export ANTHROPIC_API_KEY=sk-ant-...
 ```
 
-…or create a `.env` file at the repo root (auto-loaded by the backend):
+…or create a `.env` file in the project (auto-loaded by every entry point —
+the MCP server, the CLI, and the optional Console backend all resolve
+settings the same way):
 
 ```
 ANTHROPIC_API_KEY=sk-ant-...
 ```
 
-Without a key you can still run `make test` and `make lint`, but live contributions will fail when the backend tries to call the model.
-
-### 4. Start everything with one command
+### 4. Edit your fleet
 
 ```bash
-strata start
+$EDITOR .strata/fleet.yaml
 ```
 
-This (a) applies SQLite migrations to `./strata.db`, (b) **auto-seeds `fleet.yaml`** from the bundled dev-team starter template because no `fleet.yaml` exists yet, and (c) launches the FastAPI server. Per ADR 0002, the backend then reads `fleet.yaml` directly into an in-memory `FleetConfig` mirror — there is no separate "bootstrap into DB" step.
+The seeded file has one scope (`g_root`) — add scopes, strata, and edges to
+match your team. Larger starter examples (a 3-lane dev-team layout, a
+research group, a support org) ship in `src/strata/_templates/` in this
+repo, for inspiration.
 
-**Success looks like this:**
-
-```
-seeded fleet.yaml from the default template; edit to suit
-
-Strata backend → http://127.0.0.1:8000
-Strata Console → http://127.0.0.1:8000/
-
-INFO:     Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)
-```
-
-Now open <http://127.0.0.1:8000/> in your browser — you should see the Strata Console with three lanes (Executive / Function / Team) and four scope bubbles (CEO, Engineering, Architect, Backend Dev). Leave `strata start` running.
-
-### 5. Make a contribution and watch memory update
-
-In a **second terminal** (the first is busy serving):
+### 5. Bind and work
 
 ```bash
-curl -s -X POST http://localhost:8000/contribute \
-  -H "Content-Type: application/json" \
-  -d '{
-    "scope_id": "g_arch",
-    "content": "all services use gRPC, not REST",
-    "proposed_classification": "directive",
-    "subject": "rpc-protocol",
-    "supersedes": null,
-    "contributor": {
-      "scope_id": "g_arch",
-      "skill": "architect",
-      "session_id": "sess_demo",
-      "ts": "2026-05-23T20:00:00Z"
-    }
-  }' | jq
+export STRATA_AGENT_SCOPE=g_root         # scope ID from your fleet.yaml
+export STRATA_AGENT_SKILL=strata-worker  # optional — a skill is not required (issue #121)
+
+claude
 ```
 
-Expected response (decision text may vary — the LLM judges):
+The MCP server validates the binding at startup and applies pending
+migrations on its first tool call — there's no separate setup command to
+run first. In the Claude Code session, invoke `/strata-worker` (or your own
+skill) to read the perspective and contribute back; see
+[Invoke a skill](#3-invoke-a-skill) below for what each shipped skill does.
 
-```json
-{
-  "contribution_id": "c_xxxxxx",
-  "judgment": {
-    "decision": "accept_as_directive",
-    "reasoning": "...",
-    "summary_updated": true
-  }
-}
-```
-
-Then inspect the result:
+Inspect what landed from a terminal at any time — this reads storage
+directly, so it works with or without the Console running:
 
 ```bash
-strata summary g_arch        # see the new directive in the curated summary
-cat summaries/g_arch.md      # same content as a markdown file
-strata record g_arch         # full contribution + judgment log
+strata scopes                # list the fleet's strata, scopes, edges
+strata summary g_root        # curated summary for a scope
+strata record g_root         # full contribution + judgment log
 ```
-
-The UI tab will reflect the change within ~5 seconds (it polls).
-
-### Stopping
-
-`Ctrl+C` in the terminal running `strata start`. State persists across restarts in `./strata.db` and `./summaries/`.
 
 ### Troubleshooting
 
 | Symptom | Fix |
 |---|---|
 | Anything looks broken and you're not sure why | Run `strata doctor` first — it checks config, DB, `fleet.yaml`, Claude Code wiring, and agent binding in one pass and names the fix for each failure. |
-| `strata: command not found` | You didn't run `make install`, or your venv isn't activated. Re-run `make install`. |
-| `Address already in use` on port 8000 | Another process owns the port. Either stop it or run `strata start --port 8001`. |
-| `strata scopes` says `Connection refused` | The backend isn't running. Start it with `strata start` in another terminal. |
-| Contribution returns 500 with `scope_manager_failure` | Your `ANTHROPIC_API_KEY` is missing or invalid. Check step 3. |
-| Want to start over with a fresh DB | `rm -f strata.db && rm -rf summaries/`, then `strata start` re-bootstraps. |
+| `strata: command not found` | `pipx install strata-mem` didn't complete, or your shell hasn't picked up the new PATH entry — open a new shell, or run `pipx ensurepath`. |
+| `claude` exits immediately with a binding error | `STRATA_AGENT_SCOPE` is unset or not in `.strata/fleet.yaml`, or `STRATA_AGENT_SKILL` isn't in that scope's `permitted_skills`. The error names which. |
+| A contribution comes back with `scope_manager_failure` | Your `ANTHROPIC_API_KEY` is missing or invalid. Check step 3. |
+| Want to start over with a fresh DB | `rm -f .strata/strata.db && rm -rf .strata/summaries/` — the next session re-creates them. |
 
 ---
 
@@ -189,7 +157,7 @@ Two universal commands, then you're ready:
 ```bash
 pipx install strata-mem    # install strata in an isolated env; puts strata + strata-mcp on PATH
 cd /path/to/your/project
-strata register              # idempotent: creates .strata/, seeds fleet.yaml, wires Claude Code
+strata register              # idempotent: creates .strata/, seeds fleet.yaml, wires the harness (Claude Code by default; --harness narrows to codex)
 ```
 
 > **PyPI distribution name vs. import/CLI names.** The Strata engine is
@@ -224,8 +192,8 @@ Every step is additive: your own `mcpServers`, `hooks`, skills, and `fleet.yaml`
 $EDITOR .strata/fleet.yaml
 
 # Set your scope binding in the shell that opens Claude Code
-export STRATA_AGENT_SCOPE=g_root       # scope ID from your fleet.yaml
-export STRATA_AGENT_SKILL=strata-worker  # your role name
+export STRATA_AGENT_SCOPE=g_root         # scope ID from your fleet.yaml
+export STRATA_AGENT_SKILL=strata-worker  # optional — a skill is not required (issue #121)
 
 # Open Claude Code — the MCP server validates the binding at startup
 claude
@@ -233,8 +201,13 @@ claude
 
 The MCP server starts with `strata-mcp` (on your PATH from pipx). It reads
 `.strata/config.toml` automatically — no `STRATA_DB_PATH` or `STRATA_FLEET_CONFIG`
-env vars needed. If binding is wrong (scope unknown, skill not permitted), the
-server exits immediately with an actionable message.
+env vars needed, and it applies pending migrations itself on first use — there
+is nothing separate to start. If binding is wrong (scope unknown, skill not
+permitted), the server exits immediately with an actionable message.
+
+Want to look at memory in a browser instead of (or alongside) working in
+Claude Code? Run `strata start` — see [Console](#console). It's optional and
+nothing else depends on it.
 
 Something not working? Run `strata doctor` — it checks your project config,
 DB, `fleet.yaml`, Claude Code wiring (MCP entry, Stop hook, skills), and
@@ -566,8 +539,6 @@ strata start --reload                           # uvicorn auto-reload (dev mode)
 strata start --port 8001                        # serve on a different port
 ```
 
-The original `make` targets (`make migrate`, `make bootstrap`, `make run`, `make test`, `make lint`, `make smoke`) still work and are useful when hacking on Strata itself.
-
 ### `strata launch` — frictionless CC session binding (ADR 0003)
 
 `strata launch [scope_id]` validates the target scope against `fleet.yaml`
@@ -643,32 +614,56 @@ directive), each behind a confirm dialog. To point the UI at a non-default
 backend, edit the `<meta name="strata-api-base" content="...">` tag in
 `src/strata/_ui/index.html`.
 
-### Run the tests
-
-```bash
-make test         # full suite (scope-manager mocked)
-make smoke        # end-to-end smoke (bootstrap → contribute → summary)
-make lint         # ruff check + ruff format --check
-```
-
-To run the (skipped-by-default) integration test that hits the real
-Anthropic API:
-
-```bash
-STRATA_RUN_INTEGRATION=1 ANTHROPIC_API_KEY=... pytest tests/test_scope_manager.py -v
-```
-
 ---
 
 ## Console
+
+`strata start` exists for exactly one reason: to serve the Console, a local
+web view of memory. Nothing else in Strata needs it running — the MCP server
+and CLI read and write storage directly, with or without a backend up.
 
 ```bash
 strata start
 ```
 
+**Success looks like this:**
+
+```
+  ✓ Python ≥ 3.11: Python 3.11.15
+  ✓ git on PATH: git found
+  ✓ write perms on data directory: . is writable
+  ✓ port 8000 available: port 8000 is free
+  ✓ ANTHROPIC_API_KEY: ANTHROPIC_API_KEY is set
+Applied 7 migration(s).
+seeded fleet.yaml from the default template; edit to suit
+
+Strata backend → http://127.0.0.1:8000
+Strata Console → http://127.0.0.1:8000/
+
+INFO:     Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)
+```
+
+The five `✓`/`⚠`/`✗` lines are preflight checks, run before anything else.
+`ANTHROPIC_API_KEY` is a **warning**, not a hard failure — if it's missing
+or only set in a `.env` file Strata can't find, you'll see:
+
+```
+  ⚠ ANTHROPIC_API_KEY: ANTHROPIC_API_KEY is not set. The scope-manager will not be able to judge contributions without it. Set the variable before running strata start.
+```
+
+`strata start` still starts in that case — memory *reads* work fine, only
+live scope-manager judgments fail. Fix it by exporting the variable or
+adding it to a `.env` file in the current directory (either the bare
+`ANTHROPIC_API_KEY` or the prefixed `STRATA_ANTHROPIC_API_KEY` spelling
+works — see [Environment variables](#environment-variables)); no restart
+needed beyond running `strata start` again.
+
 ...then open <http://127.0.0.1:8000/ui/index.html> in a browser. The Console
 is local-only — it talks to the backend `strata start` just launched on your
-own machine, nothing external. Alongside the memory graph and settings, it
+own machine, nothing external. Stop it with `Ctrl+C` whenever — state
+persists in `.strata/strata.db` and `.strata/summaries/` (or `./strata.db` /
+`./summaries/` outside a registered project) and nothing else depends on the
+Console being up. Alongside the memory graph and settings, it
 has four new tabs, plus in-place Replace/Retire actions in the scope drawer;
 see [`docs/console.md`](https://github.com/oren198/Strata/blob/main/docs/console.md) for the full description of each:
 
@@ -905,6 +900,46 @@ start or configure: the lock files are created on demand next to your
 `strata.db`, so this holds whether or not `strata start` is running.
 (Windows: `strata-mcp` still serializes concurrent contributions inside one
 process; across processes it does not — see ADR 0012.)
+
+---
+
+## Developing
+
+Working on Strata itself (not just using it) needs a clone of this repo,
+not a `pipx install`:
+
+```bash
+git clone https://github.com/oren198/Strata.git
+cd Strata
+make install        # editable install + dev extras (pip install -e ".[dev]")
+```
+
+If you prefer an isolated virtual environment first:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
+make install
+```
+
+### Run the tests
+
+```bash
+make test         # full suite (scope-manager mocked — no API key needed)
+make smoke        # end-to-end smoke (bootstrap → contribute → summary)
+make lint         # ruff check + ruff format --check
+```
+
+To run the (skipped-by-default) integration test that hits the real
+Anthropic API:
+
+```bash
+STRATA_RUN_INTEGRATION=1 ANTHROPIC_API_KEY=... pytest tests/test_scope_manager.py -v
+```
+
+The original `make` targets (`make migrate`, `make bootstrap`, `make run`,
+`make test`, `make lint`, `make smoke`) all still work against a repo clone
+and are the fastest path when hacking on Strata itself.
 
 ---
 
