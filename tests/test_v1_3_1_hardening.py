@@ -326,7 +326,7 @@ def test_register_never_destroys_invalid_settings_json(tmp_path: Path) -> None:
     original = '{"permissions": {"allow": ["Bash"]}, oops-not-json'
     (claude_dir / "settings.json").write_text(original, encoding="utf-8")
 
-    rc = main(["register", str(root)])
+    rc = main(["register", str(root), "--harness", "claude-code"])
 
     assert rc == 1
     assert (claude_dir / "settings.json").read_text(encoding="utf-8") == original, (
@@ -341,7 +341,7 @@ def test_register_gitignore_comment_is_not_the_marker(tmp_path: Path) -> None:
     root = _make_project(tmp_path)
     (root / ".gitignore").write_text("# Strata console output\n*.log\n", encoding="utf-8")
 
-    rc = main(["register", str(root)])
+    rc = main(["register", str(root), "--harness", "claude-code"])
 
     assert rc == 0
     content = (root / ".gitignore").read_text(encoding="utf-8")
@@ -354,9 +354,9 @@ def test_register_then_reregister_gitignore_idempotent(tmp_path: Path) -> None:
     from strata.__main__ import main
 
     root = _make_project(tmp_path)
-    assert main(["register", str(root)]) == 0
+    assert main(["register", str(root), "--harness", "claude-code"]) == 0
     once = (root / ".gitignore").read_text(encoding="utf-8")
-    assert main(["register", str(root)]) == 0
+    assert main(["register", str(root), "--harness", "claude-code"]) == 0
     twice = (root / ".gitignore").read_text(encoding="utf-8")
     assert once == twice
 
@@ -455,7 +455,7 @@ def test_register_diff_mode_writes_nothing(tmp_path: Path) -> None:
     from strata.__main__ import main
 
     root = _make_project(tmp_path)
-    rc = main(["register", str(root), "--diff"])
+    rc = main(["register", str(root), "--diff", "--harness", "claude-code"])
     assert rc == 0
     assert not (root / ".strata").exists()
     assert not (root / ".claude" / "settings.json").exists()
@@ -472,7 +472,7 @@ def test_register_valid_settings_json_merges_additively(tmp_path: Path) -> None:
         json.dumps({"permissions": {"allow": ["Bash"]}}), encoding="utf-8"
     )
 
-    rc = main(["register", str(root)])
+    rc = main(["register", str(root), "--harness", "claude-code"])
     assert rc == 0
     data = json.loads((claude_dir / "settings.json").read_text(encoding="utf-8"))
     assert data["permissions"] == {"allow": ["Bash"]}

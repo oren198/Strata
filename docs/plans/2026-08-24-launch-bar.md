@@ -35,7 +35,7 @@ anything.
 | 3. Local UI | Built — all five surfaces plus `docs/console.md` (PR #155). Merge condition: one manual browser click-through (no JS test harness exists, so the suite cannot prove the JSX renders). |
 | 4. Quickstart | Pending — run after the next PyPI release, since the quickstart installs from PyPI. Every stumble becomes a code fix (preferred) or a README fix. |
 | 5. strata-evals | Portability fixed and stranger docs merged (evals #24, #25). Before flipping public: rotate the leaked local bearer token, delete the two remote branches carrying infra references, then the operator flips visibility. |
-| Codex | Surface verified hands-on (MCP: solid; hooks: schema-verified). `strata register/unregister --harness codex` built (PR #153). Open: the live checklist in the README's Codex section — needs real credentials. |
+| Codex | Surface verified hands-on (MCP: solid; hooks: schema-verified). One journey across harnesses shipped: `strata register`/`unregister` wire and reverse every detected/wired harness by default (`--harness` narrows either), `strata set-default-harness` records which harness `strata launch` starts, and register seeds `AGENTS.md` guidance for Codex (the skills analogue). `strata launch --harness codex` still exits 1 honestly — the live checklist in the README's Codex section still needs real credentials. |
 
 ## Remaining work, in order
 

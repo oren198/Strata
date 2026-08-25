@@ -239,6 +239,17 @@ class TestCheckPortAvailable:
 
 
 class TestCheckAnthropicApiKey:
+    @pytest.fixture(autouse=True)
+    def _clear_settings_cache(self):
+        """The check now reads through get_settings()'s lru_cache singleton;
+        clear it around each test so one test's env doesn't leak into the next.
+        """
+        from strata.settings import get_settings
+
+        get_settings.cache_clear()
+        yield
+        get_settings.cache_clear()
+
     def test_passes_when_key_set(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Passes when ANTHROPIC_API_KEY is present in the environment."""
         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test-key")
@@ -259,6 +270,49 @@ class TestCheckAnthropicApiKey:
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
         monkeypatch.delenv("STRATA_ANTHROPIC_API_KEY", raising=False)
         check = _check_anthropic_api_key()
+        assert check.passed is False
+        assert check.kind == "soft"
+        assert "ANTHROPIC_API_KEY" in check.message
+
+
+class TestCheckAnthropicApiKeyDotEnv:
+    """The check consults settings resolution (get_settings), not raw process env,
+
+    so a bare ANTHROPIC_API_KEY line in a project's .env file — which
+    Settings already honors (see strata.settings) — stops the warning too,
+    not just a live process env var.
+    """
+
+    def test_passes_when_key_only_in_dotenv(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from strata.settings import get_settings
+
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("STRATA_ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / ".env").write_text("ANTHROPIC_API_KEY=sk-from-dotenv\n", encoding="utf-8")
+        get_settings.cache_clear()
+        try:
+            check = _check_anthropic_api_key()
+        finally:
+            get_settings.cache_clear()
+        assert check.passed is True
+        assert check.kind == "soft"
+
+    def test_fails_when_no_dotenv_and_no_env(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from strata.settings import get_settings
+
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("STRATA_ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.chdir(tmp_path)
+        get_settings.cache_clear()
+        try:
+            check = _check_anthropic_api_key()
+        finally:
+            get_settings.cache_clear()
         assert check.passed is False
         assert check.kind == "soft"
         assert "ANTHROPIC_API_KEY" in check.message

@@ -8,9 +8,9 @@ A single agent rediscovers everything it needs. A fleet of agents working in
 isolation rediscovers everything every time, in parallel. Strata is the
 layer between them that lets a fleet's performance compound.
 
-> Read [`docs/philosophy.md`](docs/philosophy.md) for the full theoretical
+> Read [`docs/philosophy.md`](https://github.com/oren198/Strata/blob/main/docs/philosophy.md) for the full theoretical
 > grounding — the problem, why naive sharing fails, and the concepts the
-> design rests on. Read [`CONTEXT.md`](CONTEXT.md) for the canonical
+> design rests on. Read [`CONTEXT.md`](https://github.com/oren198/Strata/blob/main/CONTEXT.md) for the canonical
 > vocabulary all code uses (23 terms, no synonyms).
 
 ---
@@ -18,8 +18,11 @@ layer between them that lets a fleet's performance compound.
 ## How Strata works
 
 Memory is organised into **scopes** arranged into ordered **strata**.
-Agents are sessions running a **skill**, bound to one scope. Every write is
-a **contribution** to the target scope's **scope-manager** — an LLM-driven
+Agents are running sessions bound to one scope; a skill is optional — a
+session's identity is its scope and session ID, and a skill only adds a
+declared role on top when one is set (issue #121 made skill-less bindings
+first-class). Every write is a **contribution** to the target scope's
+**scope-manager** — an LLM-driven
 agent that judges the contribution as a binding *directive*, non-binding
 *context*, or *declines* it. Each scope has two layers of memory: an
 append-only **record** (audit trail) and a **scope summary** (the curated
@@ -29,39 +32,23 @@ the strata. Chain edges carry directives down and bind; reference edges
 carry the referenced scope's publication across, and never bind.
 
 The V1 architecture decision is documented in
-[`docs/adr/0001-v1-architecture.md`](docs/adr/0001-v1-architecture.md).
+[`docs/adr/0001-v1-architecture.md`](https://github.com/oren198/Strata/blob/main/docs/adr/0001-v1-architecture.md).
 
 ---
 
 ## Status
 
-**V1.2 shipped.** Local Python service with SQLite + markdown storage,
-Anthropic-hosted scope-managers, FastAPI HTTP surface, file-canonical
-`fleet.yaml` with in-memory mirror (ADR 0002), `strata launch` for
-frictionless Claude Code session binding (ADR 0003), a read-only
-browser-based Console, and a Claude Code MCP plugin + skills.
+Strata is a local-first Python service: SQLite + markdown storage,
+Anthropic-hosted scope-managers, a FastAPI HTTP surface plus an embedded
+MCP mode that needs no backend running, file-canonical `fleet.yaml`, a
+read-only browser Console, and Claude Code / Codex CLI integration via
+`strata register` and `strata launch`. Two-command onboarding
+(`pipx install strata-mem` + `strata register`) wires up any existing
+project — skills, MCP server, and a freshness `Stop`-hook that nudges
+sessions to write back before they end — and `strata doctor` diagnoses
+the whole setup offline in one pass.
 
-**V1.2.1 shipped** — H2 foundations per
-[ADR 0004](docs/adr/0004-h2-foundations.md): embedded mode (the MCP
-server operates directly on the record store; the FastAPI backend is the
-UI layer only), real perspective composition (the agent's read walks
-the inter-stratum ancestor chain), parent-aware scope-managers, and
-lazy refresh + bounded summaries via a pre-session hook.
-
-**V1.3 shipped** — brownfield install per
-[ADR 0005](docs/adr/0005-brownfield-install.md): `strata register` for
-two-command onboarding of any foreign project, per-project
-`.strata/config.toml` discovery, `strata-mcp` console script (no more
-Python-path gymnastics), skills vendored as package data, preflight
-checks on `strata start` / `strata launch`, and honest provenance — the
-MCP server refuses to start without a valid scope binding.
-
-**V1.5 shipped** — embedded-mode cleanup (issues #64, #52): the CLI
-inspection commands (`scopes` / `summary` / `record`) now read the record
-and summary stores directly instead of proxying through the Console
-backend, and the now-dead `STRATA_BACKEND_URL` was removed.
-
-What comes next is captured in [`docs/ROADMAP.md`](docs/ROADMAP.md) — the
+What comes next is captured in [`docs/ROADMAP.md`](https://github.com/oren198/Strata/blob/main/docs/ROADMAP.md) — the
 enduring design principles and the sequenced direction the project is
 heading. See also the [Architecture decisions](#architecture-decisions)
 section below for the ADRs already landed.
@@ -70,29 +57,33 @@ section below for the ADRs already landed.
 
 ## Quick start
 
-A first-time, copy-paste-able run. Five steps, ~5 minutes.
+The journey is the same everywhere Strata runs: **install with pipx, run
+`strata register` in your project, bind your session, and work.** The
+engine is embedded — the MCP server applies migrations and opens storage
+itself on first use, so nothing needs to be running in the background.
+`strata start` exists for one reason: the **Console**, a local web view of
+memory. Run it when you want to look at memory; stop it whenever — agents
+never depend on it (see [Console](#console) below).
+
+A first-time, copy-paste-able run. ~5 minutes.
 
 ### 1. Prerequisites
 
-- **Python 3.11 or newer.** Check: `python3 --version`. If your system Python is older, install 3.11+ via `pyenv`, your package manager, or [python.org](https://www.python.org/downloads/).
-- **`make`** (usually preinstalled on macOS/Linux; `xcode-select --install` on macOS if missing).
-- **An Anthropic API key.** Get one at <https://console.anthropic.com/>. It's only needed to make real scope-manager calls — the test suite mocks them, so you can run tests without it.
+- **Python 3.11 or newer**, only so `pipx` has an interpreter to build its isolated env from. Check: `python3 --version`. No Python? See [No Python 3.11+ globally?](#no-python-311-globally-use---bootstrap-venv).
+- **An Anthropic API key.** Get one at <https://console.anthropic.com/> — the scope-manager needs it to judge contributions.
 
-### 2. Clone and install
-
-```bash
-git clone https://github.com/oren198/Strata.git
-cd Strata
-make install        # editable install + dev extras
-```
-
-`make install` runs `pip install -e ".[dev]"`. If you prefer an isolated virtual environment first:
+### 2. Install and register
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate   # Windows: .venv\Scripts\activate
-make install
+pipx install strata-mem      # strata + strata-mcp on PATH, in an isolated env
+mkdir strata-quickstart && cd strata-quickstart
+strata register               # idempotent: creates .strata/, seeds fleet.yaml, wires every harness it finds
 ```
+
+See [What `strata register` does](#what-strata-register-does) for the full
+list of what this creates: a `.strata/` workspace, a starter `fleet.yaml`,
+the `strata` skills, an MCP server entry, and a freshness `Stop`-hook, all
+under `.claude/`.
 
 ### 3. Set your API key
 
@@ -102,94 +93,58 @@ Either export it in your shell:
 export ANTHROPIC_API_KEY=sk-ant-...
 ```
 
-…or create a `.env` file at the repo root (auto-loaded by the backend):
+…or create a `.env` file in the project (auto-loaded by every entry point —
+the MCP server, the CLI, and the optional Console backend all resolve
+settings the same way):
 
 ```
 ANTHROPIC_API_KEY=sk-ant-...
 ```
 
-Without a key you can still run `make test` and `make lint`, but live contributions will fail when the backend tries to call the model.
-
-### 4. Start everything with one command
+### 4. Edit your fleet
 
 ```bash
-strata start
+$EDITOR .strata/fleet.yaml
 ```
 
-This (a) applies SQLite migrations to `./strata.db`, (b) **auto-seeds `fleet.yaml`** from the bundled dev-team starter template because no `fleet.yaml` exists yet, and (c) launches the FastAPI server. Per ADR 0002, the backend then reads `fleet.yaml` directly into an in-memory `FleetConfig` mirror — there is no separate "bootstrap into DB" step.
+The seeded file has one scope (`g_root`) — add scopes, strata, and edges to
+match your team. Larger starter examples (a 3-lane dev-team layout, a
+research group, a support org) ship in `src/strata/_templates/` in this
+repo, for inspiration.
 
-**Success looks like this:**
-
-```
-seeded fleet.yaml from the default template; edit to suit
-
-Strata backend → http://127.0.0.1:8000
-Strata Console → http://127.0.0.1:8000/
-
-INFO:     Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)
-```
-
-Now open <http://127.0.0.1:8000/> in your browser — you should see the Strata Console with three lanes (Executive / Function / Team) and four scope bubbles (CEO, Engineering, Architect, Backend Dev). Leave `strata start` running.
-
-### 5. Make a contribution and watch memory update
-
-In a **second terminal** (the first is busy serving):
+### 5. Bind and work
 
 ```bash
-curl -s -X POST http://localhost:8000/contribute \
-  -H "Content-Type: application/json" \
-  -d '{
-    "scope_id": "g_arch",
-    "content": "all services use gRPC, not REST",
-    "proposed_classification": "directive",
-    "subject": "rpc-protocol",
-    "supersedes": null,
-    "contributor": {
-      "scope_id": "g_arch",
-      "skill": "architect",
-      "session_id": "sess_demo",
-      "ts": "2026-05-23T20:00:00Z"
-    }
-  }' | jq
+export STRATA_AGENT_SCOPE=g_root         # scope ID from your fleet.yaml
+export STRATA_AGENT_SKILL=strata-worker  # optional — a skill is not required (issue #121)
+
+claude
 ```
 
-Expected response (decision text may vary — the LLM judges):
+The MCP server validates the binding at startup and applies pending
+migrations on its first tool call — there's no separate setup command to
+run first. In the Claude Code session, invoke `/strata-worker` (or your own
+skill) to read the perspective and contribute back; see
+[Invoke a skill](#3-invoke-a-skill) below for what each shipped skill does.
 
-```json
-{
-  "contribution_id": "c_xxxxxx",
-  "judgment": {
-    "decision": "accept_as_directive",
-    "reasoning": "...",
-    "summary_updated": true
-  }
-}
-```
-
-Then inspect the result:
+Inspect what landed from a terminal at any time — this reads storage
+directly, so it works with or without the Console running:
 
 ```bash
-strata summary g_arch        # see the new directive in the curated summary
-cat summaries/g_arch.md      # same content as a markdown file
-strata record g_arch         # full contribution + judgment log
+strata scopes                # list the fleet's strata, scopes, edges
+strata summary g_root        # curated summary for a scope
+strata record g_root         # full contribution + judgment log
 ```
-
-The UI tab will reflect the change within ~5 seconds (it polls).
-
-### Stopping
-
-`Ctrl+C` in the terminal running `strata start`. State persists across restarts in `./strata.db` and `./summaries/`.
 
 ### Troubleshooting
 
 | Symptom | Fix |
 |---|---|
 | Anything looks broken and you're not sure why | Run `strata doctor` first — it checks config, DB, `fleet.yaml`, Claude Code wiring, and agent binding in one pass and names the fix for each failure. |
-| `strata: command not found` | You didn't run `make install`, or your venv isn't activated. Re-run `make install`. |
-| `Address already in use` on port 8000 | Another process owns the port. Either stop it or run `strata start --port 8001`. |
-| `strata scopes` says `Connection refused` | The backend isn't running. Start it with `strata start` in another terminal. |
-| Contribution returns 500 with `scope_manager_failure` | Your `ANTHROPIC_API_KEY` is missing or invalid. Check step 3. |
-| Want to start over with a fresh DB | `rm -f strata.db && rm -rf summaries/`, then `strata start` re-bootstraps. |
+| `strata: command not found` | `pipx install strata-mem` didn't complete, or your shell hasn't picked up the new PATH entry — open a new shell, or run `pipx ensurepath`. |
+| `claude` exits immediately with a binding error | `STRATA_AGENT_SCOPE` is unset or not in `.strata/fleet.yaml`, or `STRATA_AGENT_SKILL` isn't in that scope's `permitted_skills`. The error names which. |
+| A contribution comes back with `scope_manager_failure` | Your `ANTHROPIC_API_KEY` is missing or invalid. Check step 3. |
+| Want to start over with a fresh DB | `rm -f .strata/strata.db && rm -rf .strata/summaries/` — the next session re-creates them. |
 
 ---
 
@@ -202,33 +157,52 @@ Two universal commands, then you're ready:
 ```bash
 pipx install strata-mem    # install strata in an isolated env; puts strata + strata-mcp on PATH
 cd /path/to/your/project
-strata register              # idempotent: creates .strata/, seeds fleet.yaml, wires Claude Code
+strata register              # idempotent: creates .strata/, seeds fleet.yaml, wires every harness it finds
 ```
 
 > **PyPI distribution name vs. import/CLI names.** The Strata engine is
 > published to PyPI as **`strata-mem`** (the name `strata` was already taken
 > by an unrelated, dormant package — see
 > [issue #49](https://github.com/oren198/Strata/issues/49); the decision is
-> [ADR 0009](docs/adr/0009-packaging-engine-client-split.md)). Everything you
+> [ADR 0009](https://github.com/oren198/Strata/blob/main/docs/adr/0009-packaging-engine-client-split.md)). Everything you
 > actually type stays `strata`: `import strata` in Python, and the
 > `strata` / `strata-mcp` console scripts on your PATH. Only the
 > `pipx install` / `pip install` argument differs.
 
 ### What `strata register` does
 
-`strata register` is strictly additive — it never overwrites files you've already edited:
+`strata register` is strictly additive — it never overwrites files you've already edited.
+
+By default it wires **every harness it finds on this machine**: it detects
+Claude Code (the `claude` binary on `PATH`, or a `~/.claude` directory) and
+Codex CLI (the `codex` binary, or `~/.codex`) independently, and wires
+whichever of those are present — one or both. Pass `--harness claude-code`
+or `--harness codex` (repeatable) to narrow to specific harnesses instead of
+detecting. If neither is detected (a bare CI machine, a container), it wires
+Claude Code anyway, with the notice `no harness detected on this machine —
+wiring claude-code (the default)` — today's behavior, unchanged.
+
+The common setup runs once regardless of which harnesses are resolved:
 
 1. Creates `.strata/` directory and `config.toml` (relative paths, portable workspace).
 2. Appends a `# Strata` block to `.gitignore` (ignores the DB and venv, never `fleet.yaml`).
 3. Seeds `.strata/fleet.yaml` from a minimal template (1 scope, ready to edit).
-4. Copies the `strata`, `strata-worker`, and `strata-inspect` skills to `.claude/skills/`.
-5. Merges a `strata` entry into `.claude/settings.json`'s `mcpServers` block.
-6. Installs the freshness `Stop`-hook: copies `.claude/hooks/strata-stop-hook`
-   and merges a `hooks.Stop` entry into `.claude/settings.json` (see
-   [Memory-freshness Stop-hook](#memory-freshness-stop-hook)).
+
+Then, per resolved harness:
+
+- **claude-code** — copies the `strata`, `strata-worker`, and `strata-inspect`
+  skills to `.claude/skills/`; merges a `strata` entry into
+  `.claude/settings.json`'s `mcpServers` block; installs the freshness
+  `Stop`-hook (copies `.claude/hooks/strata-stop-hook` and merges a
+  `hooks.Stop` entry into `.claude/settings.json` — see
+  [Memory-freshness Stop-hook](#memory-freshness-stop-hook)).
+- **codex** — merges Strata into Codex CLI's own `config.toml` and seeds
+  `AGENTS.md` with a short memory-moves block — see
+  [Using Strata with Codex CLI](#using-strata-with-codex-cli).
 
 Run it again at any time — it skips everything that already exists and reports what it kept.
-Every step is additive: your own `mcpServers`, `hooks`, skills, and `fleet.yaml` are never overwritten.
+Every step is additive: your own `mcpServers`, `hooks`, skills, `AGENTS.md` content, and
+`fleet.yaml` are never overwritten.
 
 ### After registration
 
@@ -237,8 +211,8 @@ Every step is additive: your own `mcpServers`, `hooks`, skills, and `fleet.yaml`
 $EDITOR .strata/fleet.yaml
 
 # Set your scope binding in the shell that opens Claude Code
-export STRATA_AGENT_SCOPE=g_root       # scope ID from your fleet.yaml
-export STRATA_AGENT_SKILL=strata-worker  # your role name
+export STRATA_AGENT_SCOPE=g_root         # scope ID from your fleet.yaml
+export STRATA_AGENT_SKILL=strata-worker  # optional — a skill is not required (issue #121)
 
 # Open Claude Code — the MCP server validates the binding at startup
 claude
@@ -246,8 +220,13 @@ claude
 
 The MCP server starts with `strata-mcp` (on your PATH from pipx). It reads
 `.strata/config.toml` automatically — no `STRATA_DB_PATH` or `STRATA_FLEET_CONFIG`
-env vars needed. If binding is wrong (scope unknown, skill not permitted), the
-server exits immediately with an actionable message.
+env vars needed, and it applies pending migrations itself on first use — there
+is nothing separate to start. If binding is wrong (scope unknown, skill not
+permitted), the server exits immediately with an actionable message.
+
+Want to look at memory in a browser instead of (or alongside) working in
+Claude Code? Run `strata start` — see [Console](#console). It's optional and
+nothing else depends on it.
 
 Something not working? Run `strata doctor` — it checks your project config,
 DB, `fleet.yaml`, Claude Code wiring (MCP entry, Stop hook, skills), and
@@ -371,15 +350,32 @@ automatically. Note: this downloads ~100MB of Python deps.
 strata register --harness codex
 ```
 
-This does the same per-project setup as plain `strata register` (`.strata/`,
-`fleet.yaml`, `.gitignore`), but instead of wiring `.claude/settings.json` it
-merges Strata's config into the **OpenAI Codex CLI**'s own config file —
+Plain `strata register` already wires Codex when it detects it on the
+machine (see [What `strata register` does](#what-strata-register-does)); use
+`--harness codex` to wire Codex specifically, regardless of what else is
+detected — for example on a machine that also has Claude Code installed but
+you only want the Codex wiring right now.
+
+The Codex wiring does the same per-project setup as plain `strata register`
+(`.strata/`, `fleet.yaml`, `.gitignore`), but instead of (or in addition to,
+when both harnesses are resolved) wiring `.claude/settings.json` it merges
+Strata's config into the **OpenAI Codex CLI**'s own config file —
 `$CODEX_HOME/config.toml`, which defaults to `~/.codex/config.toml`. That is a
 user-level file, not a per-project one, matching how Codex's own `codex mcp
 add` manages it. Like `strata register` for Claude Code, the merge is
 strictly additive and idempotent: your existing `config.toml` — comments,
 other `mcp_servers` entries, everything — is left untouched, and re-running
 `strata register --harness codex` is a no-op.
+
+It also seeds the project's `AGENTS.md` with a short, marker-fenced block —
+Codex has no skills mechanism equivalent to `.claude/skills/`, so this is
+where the same read-before-working / contribute-back / judged-verdict
+guidance lives for Codex sessions. A fresh `AGENTS.md` is created if none
+exists; an existing one keeps its own content byte-identical, with the
+Strata block appended. `strata unregister --harness codex` removes only that
+block, and only when it still byte-matches what register wrote — content you
+added elsewhere in the file, or edits inside the block itself, are reported
+and left in place.
 
 **What this gives you, and how confident to be in each part:**
 
@@ -528,6 +524,24 @@ strata unregister --dry-run     # preview every action, write nothing
 strata unregister --purge-data  # also delete .strata/ (fleet.yaml, DB, summaries)
 ```
 
+By default it reverses **every harness that is actually wired in this
+project** — determined by checking for register's markers in each harness's
+files, not by what's installed on the machine (that asymmetry with
+register's "wire everything detected" default is deliberate: a plain
+`unregister` should never touch a harness this project never registered).
+For Codex specifically, `$CODEX_HOME/config.toml` is a machine-level file
+shared by every project on the box, so its markers alone aren't proof this
+project registered Codex — "wired" for Codex additionally requires this
+project's `AGENTS.md` to carry the Strata marker block register seeds. A
+machine with a stale/foreign Codex config but no such block in this
+project's `AGENTS.md` is left untouched by a plain `unregister`; pass
+`--harness codex` explicitly to clean it up anyway.
+Pass `--harness claude-code` or `--harness codex` (repeatable) to narrow to
+specific harnesses instead. A harness named explicitly that turns out not to
+be wired still runs its normal per-artifact checks — each step reports
+"nothing to do" and the run exits 0, so `--harness codex` is always safe to
+run even against a project that never wired Codex.
+
 What it does, step by step:
 
 1. Removes the managed `# Strata` block from `.gitignore`, leaving every other
@@ -546,11 +560,15 @@ What it does, step by step:
    Pass `--purge-data` to remove it too (`--dry-run --purge-data` previews the
    purge without deleting).
 
-With `--harness codex` (matching `strata register --harness codex`), steps 2–4
-above are replaced by the reverse of the Codex merge: the `[mcp_servers.strata]`
-table and the freshness `hooks.Stop` block are removed from
-`$CODEX_HOME/config.toml` only when each still byte-matches what register
-wrote; `.claude/settings.json` is untouched. Steps 1 and 5 are unchanged.
+For the Codex harness (resolved by default when Codex is wired, or via
+`--harness codex`), steps 2–4 above are replaced by the reverse of the Codex
+wiring: the `[mcp_servers.strata]` table and the freshness `hooks.Stop` block
+are removed from `$CODEX_HOME/config.toml` only when each still byte-matches
+what register wrote, and the marker-fenced Strata block is removed from the
+project's `AGENTS.md`, again only when unedited; `.claude/settings.json` is
+untouched. Steps 1 and 5 are unchanged. When both harnesses are resolved
+(the default on a machine with both wired), both sets of steps run, one
+after the other.
 
 **Exit code:** `0` on success, including when there is nothing to do (running
 it on an unregistered project is a safe no-op). It exits `1` when something you
@@ -579,8 +597,6 @@ strata start --reload                           # uvicorn auto-reload (dev mode)
 strata start --port 8001                        # serve on a different port
 ```
 
-The original `make` targets (`make migrate`, `make bootstrap`, `make run`, `make test`, `make lint`, `make smoke`) still work and are useful when hacking on Strata itself.
-
 ### `strata launch` — frictionless CC session binding (ADR 0003)
 
 `strata launch [scope_id]` validates the target scope against `fleet.yaml`
@@ -595,7 +611,51 @@ strata launch g_arch                            # use default_skill from fleet.y
 strata launch g_arch --skill evidence-summarizer  # override skill
 strata launch g_arch --session my-sess          # override auto-generated session ID
 strata launch                                   # pick from interactive list, or use .strata-role
+strata launch --harness claude-code             # start this harness regardless of the default
 ```
+
+#### Which harness `strata launch` starts
+
+`strata launch` resolves which harness to start, in order:
+
+1. An explicit `--harness` flag wins outright.
+2. Otherwise, the project's recorded default — see `strata set-default-harness`
+   below. If `.strata/config.toml` names a harness Strata doesn't know (a
+   hand-edited value, or one written by a newer Strata version), it prints a
+   one-line warning to stderr naming the bad value and falls back to
+   `claude-code` rather than launching the wrong thing silently.
+3. Otherwise, if exactly one harness is currently wired in this project
+   (checked the same way `strata unregister`'s default resolves — for
+   Codex, that means both the machine's `$CODEX_HOME/config.toml` markers
+   AND this project's `AGENTS.md` marker block, not the machine config
+   alone), that one.
+4. Otherwise, `claude-code` — today's behavior, unchanged.
+
+`claude-code` continues through the flow described above. `codex` is
+schema-verified but not live-verified (see
+[Using Strata with Codex CLI](#using-strata-with-codex-cli)), so
+`strata launch --harness codex` — or a project whose default/only-wired
+harness resolves to codex — exits `1` with:
+
+> Codex launch is not wired yet: Codex's MCP env delivery is still being
+> verified live (see README, 'Using Strata with Codex CLI'). Start codex
+> manually after filling in the `[mcp_servers.strata.env]` values.
+
+#### `strata set-default-harness` — record which harness launch starts
+
+```bash
+strata set-default-harness codex        # strata launch now starts codex by default
+strata set-default-harness claude-code  # switch back
+```
+
+Writes `default_harness = "NAME"` under a `[launch]` table in
+`.strata/config.toml`, read-modify-write: every other line in the file —
+including a pre-existing `[launch]` table's other keys — is preserved
+byte-for-byte, and re-running replaces the value in place instead of
+duplicating the table. An unknown harness name exits `2` with the list of
+valid harnesses; running it before `strata register` exits `1` with
+`run 'strata register' first`. On success it prints
+`default harness: NAME (used by 'strata launch')`.
 
 #### `.strata-role` — per-project default binding
 
@@ -648,7 +708,7 @@ After step 3, edit `fleet.yaml` by hand to add per-scope skill declarations
 Open <http://127.0.0.1:8000/> while the backend is running — a graph and list
 view of the current fleet state, polling every 5 s, plus four new tabs and an
 in-place operator-correction surface described in
-[`docs/console.md`](docs/console.md) and the [Console](#console) section
+[`docs/console.md`](https://github.com/oren198/Strata/blob/main/docs/console.md) and the [Console](#console) section
 below. Automatic memory writes (accept/decline)
 still flow only through `strata.contribute`; the Console's own write path is
 limited to the two in-person operator corrections (Replace / Retire a
@@ -656,34 +716,68 @@ directive), each behind a confirm dialog. To point the UI at a non-default
 backend, edit the `<meta name="strata-api-base" content="...">` tag in
 `src/strata/_ui/index.html`.
 
-### Run the tests
-
-```bash
-make test         # full suite (scope-manager mocked)
-make smoke        # end-to-end smoke (bootstrap → contribute → summary)
-make lint         # ruff check + ruff format --check
-```
-
-To run the (skipped-by-default) integration test that hits the real
-Anthropic API:
-
-```bash
-STRATA_RUN_INTEGRATION=1 ANTHROPIC_API_KEY=... pytest tests/test_scope_manager.py -v
-```
-
 ---
 
 ## Console
+
+`strata start` exists for exactly one reason: to serve the Console, a local
+web view of memory. Nothing else in Strata needs it running — the MCP server
+and CLI read and write storage directly, with or without a backend up.
 
 ```bash
 strata start
 ```
 
+**Success looks like this**, run after the journey above (register, then
+bind and work) — migrations already applied and `fleet.yaml` already seeded
+by `strata register`, so `strata start` here just confirms the project
+config and serves:
+
+```
+using project config: /path/to/your/project/.strata/config.toml
+  ✓ Python ≥ 3.11: Python 3.11.15
+  ✓ git on PATH: git found
+  ✓ write perms on data directory: /path/to/your/project/.strata is writable
+  ✓ port 8000 available: port 8000 is free
+  ✓ ANTHROPIC_API_KEY: ANTHROPIC_API_KEY is set
+
+Strata backend → http://127.0.0.1:8000
+Strata Console → http://127.0.0.1:8000/
+
+INFO:     Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)
+```
+
+(Run `strata start` in a directory that was never `strata register`ed — the
+plain env-var-driven flow, no `.strata/config.toml` — and the first run
+instead prints `Applied N migration(s).` and `seeded fleet.yaml from the
+default template; edit to suit`, since nothing has touched storage yet
+there. A registered project never shows either line: `strata register`
+already seeded `fleet.yaml`, and the MCP server already applied migrations
+the first time you ran `claude`.)
+
+The `✓`/`⚠`/`✗` lines are preflight checks, run before anything else.
+`ANTHROPIC_API_KEY` is a **warning**, not a hard failure — if it's missing
+or only set in a `.env` file Strata can't find, you'll see:
+
+```
+  ⚠ ANTHROPIC_API_KEY: ANTHROPIC_API_KEY is not set. The scope-manager will not be able to judge contributions without it. Set the variable before running strata start.
+```
+
+`strata start` still starts in that case — memory *reads* work fine, only
+live scope-manager judgments fail. Fix it by exporting the variable or
+adding it to a `.env` file in the current directory (either the bare
+`ANTHROPIC_API_KEY` or the prefixed `STRATA_ANTHROPIC_API_KEY` spelling
+works — see [Environment variables](#environment-variables)); no restart
+needed beyond running `strata start` again.
+
 ...then open <http://127.0.0.1:8000/ui/index.html> in a browser. The Console
 is local-only — it talks to the backend `strata start` just launched on your
-own machine, nothing external. Alongside the memory graph and settings, it
+own machine, nothing external. Stop it with `Ctrl+C` whenever — state
+persists in `.strata/strata.db` and `.strata/summaries/` (or `./strata.db` /
+`./summaries/` outside a registered project) and nothing else depends on the
+Console being up. Alongside the memory graph and settings, it
 has four new tabs, plus in-place Replace/Retire actions in the scope drawer;
-see [`docs/console.md`](docs/console.md) for the full description of each:
+see [`docs/console.md`](https://github.com/oren198/Strata/blob/main/docs/console.md) for the full description of each:
 
 - **Turned down** — every contribution the scope-manager refused for a
   scope, with the reason given, plus a separate mechanical count of sessions
@@ -729,7 +823,7 @@ is present, the first three are ignored for the MCP server (project config wins)
 | `STRATA_SUMMARIES_DIR` | `./summaries` | Directory for per-scope summary files (overridden by `config.toml`) |
 | `STRATA_FLEET_CONFIG` | `./fleet.yaml` | Fleet YAML (overridden by `config.toml`) |
 | `STRATA_AGENT_SCOPE` | (required) | The scope this session acts at — MCP server refuses to start if unset |
-| `STRATA_AGENT_SKILL` | (required) | The skill identifier for provenance — MCP server refuses to start if unset |
+| `STRATA_AGENT_SKILL` | (optional) | The skill identifier for provenance — required only when the scope declares `default_skill`/`permitted_skills` in `fleet.yaml` (issue #121) |
 | `STRATA_AGENT_SESSION_ID` | (auto) | Session identifier — auto-generated when absent |
 | `STRATA_MANAGER_MODEL` | `claude-haiku-4-5` | Model used by scope-managers |
 | `STRATA_ANTHROPIC_API_KEY` | (unset) | Optional; `ANTHROPIC_API_KEY` (bare, unprefixed) also works — either name can be set in the shell or in `.env`; the prefixed one wins if both are set |
@@ -921,6 +1015,46 @@ process; across processes it does not — see ADR 0012.)
 
 ---
 
+## Developing
+
+Working on Strata itself (not just using it) needs a clone of this repo,
+not a `pipx install`:
+
+```bash
+git clone https://github.com/oren198/Strata.git
+cd Strata
+make install        # editable install + dev extras (pip install -e ".[dev]")
+```
+
+If you prefer an isolated virtual environment first:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
+make install
+```
+
+### Run the tests
+
+```bash
+make test         # full suite (scope-manager mocked — no API key needed)
+make smoke        # end-to-end smoke (bootstrap → contribute → summary)
+make lint         # ruff check + ruff format --check
+```
+
+To run the (skipped-by-default) integration test that hits the real
+Anthropic API:
+
+```bash
+STRATA_RUN_INTEGRATION=1 ANTHROPIC_API_KEY=... pytest tests/test_scope_manager.py -v
+```
+
+The original `make` targets (`make migrate`, `make bootstrap`, `make run`,
+`make test`, `make lint`, `make smoke`) all still work against a repo clone
+and are the fastest path when hacking on Strata itself.
+
+---
+
 ## Git workflow
 
 - `main` — the last verified version of Strata.
@@ -934,23 +1068,23 @@ process; across processes it does not — see ADR 0012.)
 
 ADRs live under `docs/adr/`. Each captures a hard-to-reverse decision with
 context, alternatives, and consequences. The future direction —
-principles plus the next horizons — is in [`docs/ROADMAP.md`](docs/ROADMAP.md).
+principles plus the next horizons — is in [`docs/ROADMAP.md`](https://github.com/oren198/Strata/blob/main/docs/ROADMAP.md).
 
 Current ADRs:
 
-- [0001 — V1 architecture](docs/adr/0001-v1-architecture.md): local Python
+- [0001 — V1 architecture](https://github.com/oren198/Strata/blob/main/docs/adr/0001-v1-architecture.md): local Python
   backend, SQLite + markdown storage, Claude Code as the agent runtime,
   scope-manager hosted as backend-spawned Anthropic API calls.
-- [0002 — Fleet config source of truth](docs/adr/0002-fleet-config-source-of-truth.md):
+- [0002 — Fleet config source of truth](https://github.com/oren198/Strata/blob/main/docs/adr/0002-fleet-config-source-of-truth.md):
   `fleet.yaml` is canonical; SQLite holds only contributions and judgments;
   scope lifecycle (`active`/`archived`); per-scope skill declarations.
-- [0003 — `strata launch` CC binding](docs/adr/0003-strata-launch-cc-binding.md):
+- [0003 — `strata launch` CC binding](https://github.com/oren198/Strata/blob/main/docs/adr/0003-strata-launch-cc-binding.md):
   frictionless `(scope, skill, session_id)` binding via a single CLI command
   that validates, resolves, and `execvp`s `claude`.
-- [0004 — H2 foundations](docs/adr/0004-h2-foundations.md): embedded mode
+- [0004 — H2 foundations](https://github.com/oren198/Strata/blob/main/docs/adr/0004-h2-foundations.md): embedded mode
   (MCP server direct-store access), manager composition, lazy refresh, bounded
   summaries.
-- [0005 — Brownfield install](docs/adr/0005-brownfield-install.md): `strata register`
+- [0005 — Brownfield install](https://github.com/oren198/Strata/blob/main/docs/adr/0005-brownfield-install.md): `strata register`
   two-command onboarding, per-project `.strata/config.toml` discovery, `strata-mcp`
   console script, skills as package data, honest provenance enforcement.
 
@@ -958,4 +1092,4 @@ Current ADRs:
 
 ## License
 
-See [`LICENSE`](LICENSE).
+See [`LICENSE`](https://github.com/oren198/Strata/blob/main/LICENSE).
