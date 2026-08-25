@@ -2090,7 +2090,8 @@ class ScopeManager:
         # SDK's own error never names the env var the user needs (issue #47).
         if getattr(self._client, "api_key", None) is None:
             raise RuntimeError(
-                "ANTHROPIC_API_KEY is not set — export it or add it to .env. "
+                "ANTHROPIC_API_KEY (or STRATA_ANTHROPIC_API_KEY) is not set — "
+                "export it or add either name to .env. "
                 "The scope-manager cannot judge contributions without it."
             )
 
@@ -2861,7 +2862,8 @@ class ScopeManager:
     def _check_api_key(self) -> None:
         if getattr(self._client, "api_key", None) is None:
             raise RuntimeError(
-                "ANTHROPIC_API_KEY is not set — export it or add it to .env. "
+                "ANTHROPIC_API_KEY (or STRATA_ANTHROPIC_API_KEY) is not set — "
+                "export it or add either name to .env. "
                 "The scope-manager cannot judge without it."
             )
 

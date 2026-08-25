@@ -193,6 +193,27 @@ def _fleet_config_default() -> str:
     return _storage_paths().fleet_yaml_path
 
 
+_UNRESOLVED_DEFAULT_HINT = "resolved from the project"
+
+
+def _default_hint(resolver) -> str:
+    """Render a default-value hint for argparse help text, never raising.
+
+    ``_build_parser`` calls ``_db_path_default``/``_fleet_config_default``
+    eagerly, before any subcommand is chosen, purely to render a couple of
+    ``--db``/``--config`` help strings — so a failure in that resolution
+    (e.g. ``Path.cwd()`` raising ``FileNotFoundError`` because the shell's
+    cwd was deleted, such as a removed git worktree) must never take down
+    parser construction itself. ``strata --version`` and ``strata --help``
+    have to work from anywhere, even a dead cwd. On any failure here, fall
+    back to a plain, non-specific hint instead of the resolved path.
+    """
+    try:
+        return resolver()
+    except Exception:
+        return _UNRESOLVED_DEFAULT_HINT
+
+
 def _resolve_fleet_config(explicit: str | None) -> str | None:
     """Pick the config path: explicit arg → Settings path.
 
@@ -2950,7 +2971,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_start.add_argument("--host", default="127.0.0.1")
     p_start.add_argument("--port", type=int, default=8000)
     p_start.add_argument("--reload", action="store_true", help="Enable uvicorn auto-reload.")
-    p_start.add_argument("--db", help=f"DB path (default: {_db_path_default()}).")
+    p_start.add_argument("--db", help=f"DB path (default: {_default_hint(_db_path_default)}).")
     p_start.add_argument(
         "--skip-upgrade-check",
         action="store_true",
@@ -2968,11 +2989,13 @@ def _build_parser() -> argparse.ArgumentParser:
     p_start.set_defaults(func=cmd_start)
 
     p_migrate = sub.add_parser("migrate", help="Apply pending SQLite migrations.")
-    p_migrate.add_argument("--db", help=f"DB path (default: {_db_path_default()}).")
+    p_migrate.add_argument("--db", help=f"DB path (default: {_default_hint(_db_path_default)}).")
     p_migrate.set_defaults(func=cmd_migrate)
 
     p_bootstrap = sub.add_parser("bootstrap", help="Validate fleet.yaml (no DB writes).")
-    p_bootstrap.add_argument("--config", help=f"Config path (default: {_fleet_config_default()}).")
+    p_bootstrap.add_argument(
+        "--config", help=f"Config path (default: {_default_hint(_fleet_config_default)})."
+    )
     p_bootstrap.add_argument("--db", help="Ignored (kept for backward compatibility).")
     p_bootstrap.set_defaults(func=cmd_bootstrap)
 
@@ -3160,10 +3183,10 @@ def _build_parser() -> argparse.ArgumentParser:
         "export-fleet",
         help="Export V1 fleet tables to fleet.yaml for V1.2 upgrade.",
     )
-    p_export.add_argument("--db", help=f"V1 DB path (default: {_db_path_default()}).")
+    p_export.add_argument("--db", help=f"V1 DB path (default: {_default_hint(_db_path_default)}).")
     p_export.add_argument(
         "--out",
-        help=f"Output fleet.yaml path (default: {_fleet_config_default()}).",
+        help=f"Output fleet.yaml path (default: {_default_hint(_fleet_config_default)}).",
     )
     p_export.add_argument(
         "--force",
