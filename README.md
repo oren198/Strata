@@ -728,16 +728,18 @@ and CLI read and write storage directly, with or without a backend up.
 strata start
 ```
 
-**Success looks like this:**
+**Success looks like this**, run after the journey above (register, then
+bind and work) — migrations already applied and `fleet.yaml` already seeded
+by `strata register`, so `strata start` here just confirms the project
+config and serves:
 
 ```
+using project config: /path/to/your/project/.strata/config.toml
   ✓ Python ≥ 3.11: Python 3.11.15
   ✓ git on PATH: git found
-  ✓ write perms on data directory: . is writable
+  ✓ write perms on data directory: /path/to/your/project/.strata is writable
   ✓ port 8000 available: port 8000 is free
   ✓ ANTHROPIC_API_KEY: ANTHROPIC_API_KEY is set
-Applied 7 migration(s).
-seeded fleet.yaml from the default template; edit to suit
 
 Strata backend → http://127.0.0.1:8000
 Strata Console → http://127.0.0.1:8000/
@@ -745,7 +747,15 @@ Strata Console → http://127.0.0.1:8000/
 INFO:     Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)
 ```
 
-The five `✓`/`⚠`/`✗` lines are preflight checks, run before anything else.
+(Run `strata start` in a directory that was never `strata register`ed — the
+plain env-var-driven flow, no `.strata/config.toml` — and the first run
+instead prints `Applied N migration(s).` and `seeded fleet.yaml from the
+default template; edit to suit`, since nothing has touched storage yet
+there. A registered project never shows either line: `strata register`
+already seeded `fleet.yaml`, and the MCP server already applied migrations
+the first time you ran `claude`.)
+
+The `✓`/`⚠`/`✗` lines are preflight checks, run before anything else.
 `ANTHROPIC_API_KEY` is a **warning**, not a hard failure — if it's missing
 or only set in a `.env` file Strata can't find, you'll see:
 

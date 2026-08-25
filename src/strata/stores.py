@@ -79,7 +79,7 @@ def open_embedded_stores() -> EmbeddedStores:
         raise EmbeddedStoreError(
             f"No fleet config found at {fleet_path}.\n"
             "  In a registered project: run `strata register` from the project root.\n"
-            "  In the Strata repo: run `strata start` once to seed fleet.yaml, "
+            "  In the Strata repo: run `strata register` from the repo root, "
             "or set STRATA_FLEET_CONFIG."
         )
     try:
