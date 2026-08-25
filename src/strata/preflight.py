@@ -188,8 +188,16 @@ def _lsof_port_info(port: int) -> str:
 
 
 def _check_anthropic_api_key() -> Check:
-    """ANTHROPIC_API_KEY (or STRATA_ANTHROPIC_API_KEY) should be set."""
-    key = os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("STRATA_ANTHROPIC_API_KEY")
+    """ANTHROPIC_API_KEY (or STRATA_ANTHROPIC_API_KEY) should be set.
+
+    Consults the settings resolution (``get_settings().anthropic_api_key``)
+    rather than raw process env, so a key set only in a project's ``.env``
+    file — which :class:`strata.settings.Settings` already honors for both
+    the prefixed and bare spellings — satisfies this check too.
+    """
+    from strata.settings import get_settings
+
+    key = get_settings().anthropic_api_key
     if not key:
         return Check(
             name="ANTHROPIC_API_KEY",
