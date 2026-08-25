@@ -18,8 +18,11 @@ layer between them that lets a fleet's performance compound.
 ## How Strata works
 
 Memory is organised into **scopes** arranged into ordered **strata**.
-Agents are sessions running a **skill**, bound to one scope. Every write is
-a **contribution** to the target scope's **scope-manager** — an LLM-driven
+Agents are running sessions bound to one scope; a skill is optional — a
+session's identity is its scope and session ID, and a skill only adds a
+declared role on top when one is set (issue #121 made skill-less bindings
+first-class). Every write is a **contribution** to the target scope's
+**scope-manager** — an LLM-driven
 agent that judges the contribution as a binding *directive*, non-binding
 *context*, or *declines* it. Each scope has two layers of memory: an
 append-only **record** (audit trail) and a **scope summary** (the curated
@@ -35,31 +38,15 @@ The V1 architecture decision is documented in
 
 ## Status
 
-**V1.2 shipped.** Local Python service with SQLite + markdown storage,
-Anthropic-hosted scope-managers, FastAPI HTTP surface, file-canonical
-`fleet.yaml` with in-memory mirror (ADR 0002), `strata launch` for
-frictionless Claude Code session binding (ADR 0003), a read-only
-browser-based Console, and a Claude Code MCP plugin + skills.
-
-**V1.2.1 shipped** — H2 foundations per
-[ADR 0004](https://github.com/oren198/Strata/blob/main/docs/adr/0004-h2-foundations.md): embedded mode (the MCP
-server operates directly on the record store; the FastAPI backend is the
-UI layer only), real perspective composition (the agent's read walks
-the inter-stratum ancestor chain), parent-aware scope-managers, and
-lazy refresh + bounded summaries via a pre-session hook.
-
-**V1.3 shipped** — brownfield install per
-[ADR 0005](https://github.com/oren198/Strata/blob/main/docs/adr/0005-brownfield-install.md): `strata register` for
-two-command onboarding of any foreign project, per-project
-`.strata/config.toml` discovery, `strata-mcp` console script (no more
-Python-path gymnastics), skills vendored as package data, preflight
-checks on `strata start` / `strata launch`, and honest provenance — the
-MCP server refuses to start without a valid scope binding.
-
-**V1.5 shipped** — embedded-mode cleanup (issues #64, #52): the CLI
-inspection commands (`scopes` / `summary` / `record`) now read the record
-and summary stores directly instead of proxying through the Console
-backend, and the now-dead `STRATA_BACKEND_URL` was removed.
+Strata is a local-first Python service: SQLite + markdown storage,
+Anthropic-hosted scope-managers, a FastAPI HTTP surface plus an embedded
+MCP mode that needs no backend running, file-canonical `fleet.yaml`, a
+read-only browser Console, and Claude Code / Codex CLI integration via
+`strata register` and `strata launch`. Two-command onboarding
+(`pipx install strata-mem` + `strata register`) wires up any existing
+project — skills, MCP server, and a freshness `Stop`-hook that nudges
+sessions to write back before they end — and `strata doctor` diagnoses
+the whole setup offline in one pass.
 
 What comes next is captured in [`docs/ROADMAP.md`](https://github.com/oren198/Strata/blob/main/docs/ROADMAP.md) — the
 enduring design principles and the sequenced direction the project is
@@ -729,7 +716,7 @@ is present, the first three are ignored for the MCP server (project config wins)
 | `STRATA_SUMMARIES_DIR` | `./summaries` | Directory for per-scope summary files (overridden by `config.toml`) |
 | `STRATA_FLEET_CONFIG` | `./fleet.yaml` | Fleet YAML (overridden by `config.toml`) |
 | `STRATA_AGENT_SCOPE` | (required) | The scope this session acts at — MCP server refuses to start if unset |
-| `STRATA_AGENT_SKILL` | (required) | The skill identifier for provenance — MCP server refuses to start if unset |
+| `STRATA_AGENT_SKILL` | (optional) | The skill identifier for provenance — required only when the scope declares `default_skill`/`permitted_skills` in `fleet.yaml` (issue #121) |
 | `STRATA_AGENT_SESSION_ID` | (auto) | Session identifier — auto-generated when absent |
 | `STRATA_MANAGER_MODEL` | `claude-haiku-4-5` | Model used by scope-managers |
 | `STRATA_ANTHROPIC_API_KEY` | (unset) | Optional; `ANTHROPIC_API_KEY` (bare, unprefixed) also works — either name can be set in the shell or in `.env`; the prefixed one wins if both are set |
