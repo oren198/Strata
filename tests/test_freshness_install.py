@@ -38,7 +38,12 @@ def _init_project(tmp_path: Path) -> None:
 
 
 def _register(tmp_path: Path, *, diff: bool = False) -> int:
-    return cmd_register(argparse.Namespace(path=str(tmp_path), diff=diff, bootstrap_venv=False))
+    # harness left unset: the autouse isolation guard in tests/conftest.py
+    # patches install.detect_harnesses() to return [] by default, so this
+    # setup helper still falls back to claude-code-only without its own pin.
+    return cmd_register(
+        argparse.Namespace(path=str(tmp_path), diff=diff, bootstrap_venv=False, harness=None)
+    )
 
 
 def _unregister(tmp_path: Path, *, purge_data: bool = False, dry_run: bool = False) -> int:

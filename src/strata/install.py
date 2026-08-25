@@ -30,6 +30,8 @@ from __future__ import annotations
 
 import copy
 import os
+import re
+import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -69,6 +71,14 @@ __all__ = [
     "codex_hook_present",
     "merge_codex_freshness_hook",
     "remove_codex_freshness_hook",
+    "KNOWN_HARNESSES",
+    "detect_harnesses",
+    "set_default_harness",
+    "read_default_harness_from_text",
+    "AGENTS_MD_MARKER",
+    "agents_md_present",
+    "merge_agents_md",
+    "remove_agents_md",
 ]
 
 # ---------------------------------------------------------------------------
@@ -715,3 +725,211 @@ def remove_codex_freshness_hook(config_text: str) -> tuple[str, str]:
     for the status values.
     """
     return _remove_block(config_text, CODEX_HOOK_BLOCK, CODEX_HOOK_MARKER)
+
+
+# ---------------------------------------------------------------------------
+# AGENTS.md — additive marker-block merge (Task 6, harness parity: the
+# Codex-harness analogue of the Claude Code skills — Codex has no skills
+# mechanism, so guidance is seeded into the project's AGENTS.md instead).
+#
+# Same convention as GITIGNORE_BLOCK / CODEX_MCP_BLOCK above: the managed
+# block is appended once, detected by a marker, so a re-run is a no-op and
+# any of the user's own AGENTS.md content is never rewritten.
+# ---------------------------------------------------------------------------
+
+#: Marker identifying Strata's managed AGENTS.md block. An HTML comment so it
+#: renders invisibly wherever AGENTS.md is displayed, and is unlikely to
+#: collide with a user's own prose the way a bare "# Strata" heading might.
+AGENTS_MD_MARKER = "<!-- strata:begin -->"
+
+
+def _shipped_agents_md_block() -> str:
+    """Read the canonical AGENTS.md block from package data.
+
+    Mirrors :func:`hook_matches_shipped`'s ``importlib.resources`` lookup —
+    the block lives once, as package data under ``strata/_templates``,
+    rather than duplicated as a Python string constant.
+    """
+    import importlib.resources  # noqa: PLC0415
+
+    shipped = importlib.resources.files("strata") / "_templates" / "AGENTS-strata.md"
+    return shipped.read_text(encoding="utf-8")
+
+
+def agents_md_present(text: str) -> bool:
+    """Return whether Strata's managed AGENTS.md block marker is present in *text*."""
+    return AGENTS_MD_MARKER in text
+
+
+def merge_agents_md(existing_text: str) -> tuple[str, bool]:
+    """Additively append the canonical Strata block to *existing_text*.
+
+    Strictly additive (ADR 0005 Decision 6): every existing line in
+    *existing_text* is preserved byte-for-byte; the Strata block is appended
+    only when :func:`agents_md_present` is false.
+
+    Returns:
+        ``(new_text, added)`` — *added* is ``True`` if the block was
+        appended, ``False`` (with *new_text* == *existing_text*) if a Strata
+        block was already present.
+    """
+    if agents_md_present(existing_text):
+        return existing_text, False
+    return _append_block(existing_text, _shipped_agents_md_block()), True
+
+
+def remove_agents_md(existing_text: str) -> tuple[str, str]:
+    """Remove Strata's managed AGENTS.md block from *existing_text*.
+
+    The reverse of :func:`merge_agents_md`; see :func:`_remove_block` for the
+    ``"removed"`` / ``"edited"`` / ``"absent"`` status semantics.
+    """
+    return _remove_block(existing_text, _shipped_agents_md_block(), AGENTS_MD_MARKER)
+
+
+# ---------------------------------------------------------------------------
+# Harness detection
+# ---------------------------------------------------------------------------
+
+#: The harnesses Strata knows how to wire, in the order ``detect_harnesses``
+#: and ``strata register``/``strata unregister`` report and act on them.
+KNOWN_HARNESSES: tuple[str, ...] = ("claude-code", "codex")
+
+
+def detect_harnesses(home: Path | None = None, path_env: str | None = None) -> list[str]:
+    """Return the subset of :data:`KNOWN_HARNESSES` installed on this machine.
+
+    A harness is detected if either its CLI binary is found on *path_env*
+    (``claude`` / ``codex``) or its config directory exists under *home*
+    (``~/.claude`` / ``~/.codex``). *home* defaults to ``Path.home()`` and
+    *path_env* defaults to the real ``PATH`` — parameters exist so tests never
+    depend on the real machine.
+
+    Returns harnesses in :data:`KNOWN_HARNESSES` order, not detection order.
+    """
+    if home is None:
+        home = Path.home()
+    detected = []
+    if shutil.which("claude", path=path_env) or (home / ".claude").exists():
+        detected.append("claude-code")
+    if shutil.which("codex", path=path_env) or (home / ".codex").exists():
+        detected.append("codex")
+    return detected
+
+
+# ---------------------------------------------------------------------------
+# .strata/config.toml — [launch] table (default harness, Task 4)
+# ---------------------------------------------------------------------------
+
+#: Regex matching a top-level ``[launch]`` table header line. The trailing
+#: ``\r?`` matters: without it, a CRLF-authored ``config.toml`` (Windows is a
+#: supported platform) leaves the header unmatched — ``$`` in MULTILINE mode
+#: only matches immediately before ``\n``, and a bare ``[ \t]*`` does not
+#: consume the ``\r`` that sits between ``[launch]`` and that ``\n`` — so the
+#: whole function fell through to "no table found" and appended a *second*
+#: ``[launch]`` table on every CRLF file (reported in review).
+_LAUNCH_HEADER_RE = re.compile(r"(?m)^\[launch\][ \t]*\r?$")
+
+#: Regex matching any top-level table (or array-of-tables) header line —
+#: used to find where an existing ``[launch]`` table's body ends. Unaffected
+#: by CRLF: ``^`` in MULTILINE mode matches right after a ``\n`` regardless
+#: of what precedes it.
+_TOP_LEVEL_HEADER_RE = re.compile(r"(?m)^\[")
+
+#: Regex matching a ``default_harness = ...`` key line inside a table body,
+#: stopping before any ``\r``/``\n`` rather than consuming them (``[^\r\n]*``
+#: instead of ``.*$``): a trailing ``\r`` must NOT be swallowed into the
+#: match, or replacing it turns that one line's CRLF into a bare LF and the
+#: file's line-ending style stops being byte-preserved.
+_DEFAULT_HARNESS_KEY_RE = re.compile(r"(?m)^default_harness[ \t]*=[^\r\n]*")
+
+
+def _detect_newline(text: str) -> str:
+    """Return the line-ending style already used in *text*.
+
+    ``"\\r\\n"`` if any CRLF pair is present, else ``"\\n"``. Content this
+    module *adds* (a fresh ``[launch]`` table, a fresh ``default_harness``
+    key) uses this so a CRLF file stays CRLF throughout, not just on the
+    lines it already had.
+    """
+    return "\r\n" if "\r\n" in text else "\n"
+
+
+def set_default_harness(config_text: str, name: str) -> str:
+    """Set ``default_harness = "<name>"`` under a ``[launch]`` table.
+
+    Read-modify-write, textual (mirrors the Codex config mergers above —
+    this project has no TOML writer): every existing table, comment, and
+    blank line in *config_text* is preserved byte-for-byte outside the
+    ``[launch]`` table's ``default_harness`` line — including its line-ending
+    style (CRLF in, CRLF out; see :func:`_detect_newline`).
+
+    - No ``[launch]`` table present: one is appended at the end (via the same
+      blank-line separator rule as :func:`_append_block`).
+    - ``[launch]`` present, no ``default_harness`` key: the key is appended
+      inside the existing table body.
+    - ``[launch]`` present with a ``default_harness`` key: that line is
+      replaced in place — re-running never duplicates the table or the key.
+
+    Args:
+        config_text: The current ``.strata/config.toml`` contents.
+        name: The harness name to record (validated by the caller against
+            :data:`KNOWN_HARNESSES`).
+
+    Returns:
+        The new config text.
+    """
+    new_line = f'default_harness = "{name}"'
+    nl = _detect_newline(config_text)
+
+    header_match = _LAUNCH_HEADER_RE.search(config_text)
+    if header_match is None:
+        prefix = config_text
+        if prefix and not prefix.endswith("\n"):
+            prefix += nl
+        if prefix:
+            prefix += nl
+        block = f"[launch]{nl}{new_line}{nl}"
+        return prefix + block
+
+    body_start = header_match.end()
+    next_header = _TOP_LEVEL_HEADER_RE.search(config_text, body_start + 1)
+    body_end = next_header.start() if next_header else len(config_text)
+    body = config_text[body_start:body_end]
+
+    key_match = _DEFAULT_HARNESS_KEY_RE.search(body)
+    if key_match is not None:
+        new_body = body[: key_match.start()] + new_line + body[key_match.end() :]
+    else:
+        new_body = body
+        if new_body and not new_body.endswith("\n"):
+            new_body += nl
+        new_body += new_line + nl
+
+    return config_text[:body_start] + new_body + config_text[body_end:]
+
+
+def read_default_harness_from_text(config_text: str) -> str | None:
+    """Return the ``[launch].default_harness`` value from *config_text*, or ``None``.
+
+    Parses via ``tomllib`` (validation, not the write path — writes stay
+    textual, see :func:`set_default_harness`). Returns ``None`` when the
+    table/key is absent or the TOML fails to parse (e.g. mid-edit).
+
+    Named ``*_from_text`` (not ``read_default_harness``, final fix wave item
+    4) to disambiguate from :func:`strata.project_config.read_default_harness`
+    — same verb, different signature (config text vs. a project root path);
+    the two public functions shared one name across modules, which review
+    flagged as confusing at call sites and in stack traces.
+    """
+    import tomllib  # noqa: PLC0415
+
+    try:
+        data = tomllib.loads(config_text) if config_text.strip() else {}
+    except tomllib.TOMLDecodeError:
+        return None
+    launch = data.get("launch")
+    if not isinstance(launch, dict):
+        return None
+    value = launch.get("default_harness")
+    return value if isinstance(value, str) else None

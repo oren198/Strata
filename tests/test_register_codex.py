@@ -53,23 +53,29 @@ def _register(
     diff: bool = False,
     bootstrap_venv: bool = False,
 ) -> int:
+    # A parsed `--harness NAME` flag now yields a list (action="append");
+    # wrap the single-harness convenience param the same way so these tests
+    # exercise exactly the explicit-flags resolution path, never detection.
     return cmd_register(
         argparse.Namespace(
             path=str(tmp_path),
             diff=diff,
             bootstrap_venv=bootstrap_venv,
-            harness=harness,
+            harness=[harness],
         )
     )
 
 
 def _unregister(tmp_path: Path, *, harness: str = "claude-code", dry_run: bool = False) -> int:
+    # A parsed `--harness NAME` flag now yields a list (action="append"), same
+    # shape as register's; wrap the single-harness convenience param the same
+    # way so these tests exercise exactly the explicit-flags resolution path.
     return cmd_unregister(
         argparse.Namespace(
             path=str(tmp_path),
             dry_run=dry_run,
             purge_data=False,
-            harness=harness,
+            harness=[harness],
         )
     )
 
@@ -473,3 +479,51 @@ def test_register_bootstrap_venv_with_codex_harness_prints_skip_notice(
     assert "--bootstrap-venv" in out
     assert "codex" in out.lower()
     assert not (tmp_path / ".strata" / ".venv").exists()
+
+
+def test_register_bootstrap_venv_both_harnesses_notice_matches_behavior(
+    tmp_path: Path, codex_home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """Regression (final fix wave, item 3): on a both-harness machine,
+    --bootstrap-venv prints a "skipped" notice yet still creates the venv
+    for claude-code — output and behavior disagreed. The notice must be
+    scoped to codex specifically, and the venv must still actually get
+    built for claude-code (real venv/pip calls are faked out here so the
+    test stays fast and offline)."""
+    import subprocess
+    import venv as venv_module
+
+    import strata.__main__ as main_mod
+
+    _init_project(tmp_path)
+
+    def _fake_venv_create(path: str, with_pip: bool = True, clear: bool = False) -> None:
+        bin_dir = Path(path) / "bin"
+        bin_dir.mkdir(parents=True, exist_ok=True)
+        (bin_dir / "strata-mcp").write_text("#!/bin/sh\n", encoding="utf-8")
+
+    # cmd_register does `import venv` / `import subprocess` locally, but that
+    # binds the same real stdlib module objects — patching them here still
+    # takes effect.
+    monkeypatch.setattr(venv_module, "create", _fake_venv_create)
+    monkeypatch.setattr(subprocess, "check_call", lambda *a, **k: 0)
+    monkeypatch.setattr(main_mod, "_self_install_spec", lambda: "strata")
+
+    rc = cmd_register(
+        argparse.Namespace(
+            path=str(tmp_path),
+            diff=False,
+            bootstrap_venv=True,
+            harness=["codex", "claude-code"],
+        )
+    )
+    assert rc == 0
+    out = capsys.readouterr().out.lower()
+
+    venv_bin = tmp_path / ".strata" / ".venv" / "bin" / "strata-mcp"
+    assert venv_bin.exists(), "claude-code's venv must still be built alongside the codex notice"
+    assert "creating .strata/.venv/" in out
+    # The codex notice must read as codex-specific, not as "the whole
+    # --bootstrap-venv step was skipped" — which the venv creation above
+    # disproves.
+    assert "skipping that step for codex only" in out

@@ -222,6 +222,30 @@ class StoragePaths:
     project_root: Path | None
 
 
+def read_default_harness(project_root: Path) -> str | None:
+    """Return the ``[launch].default_harness`` value from *project_root*'s config.
+
+    Reads ``<project_root>/.strata/config.toml`` and delegates the parse to
+    :func:`strata.install.read_default_harness_from_text`. Returns ``None``
+    when the project is not registered (no ``.strata/config.toml``), the file
+    cannot be read, or no ``default_harness`` was ever set — every case a
+    caller (``strata launch``'s harness resolution, Task 5) treats the same
+    way: fall through to the next resolution step.
+
+    Args:
+        project_root: The registered project's root directory (the directory
+            containing ``.strata/``).
+    """
+    from strata.install import read_default_harness_from_text as _read_default_harness_toml
+
+    config_path = Path(project_root) / ".strata" / "config.toml"
+    try:
+        text = config_path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    return _read_default_harness_toml(text)
+
+
 def resolve_storage_paths(
     settings: Settings | None = None,
     *,
