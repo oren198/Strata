@@ -92,6 +92,23 @@ def test_no_project_marker_message_lists_markers(tmp_path: Path, capsys) -> None
     assert ".git" in captured.err
 
 
+def test_no_project_marker_message_hints_git_init(tmp_path: Path, capsys) -> None:
+    """A fresh empty directory must not be a dead end: the guard stays (an
+    accidental $HOME registration must still fail), but the error names a
+    way forward for a genuinely fresh project.
+    """
+    args = _make_args(path=str(tmp_path))
+    rc = cmd_register(args)
+
+    assert rc == 1
+    captured = capsys.readouterr()
+    assert "git init" in captured.err
+    assert "pyproject.toml" in captured.err
+    assert "package.json" in captured.err
+    assert "Cargo.toml" in captured.err
+    assert "go.mod" in captured.err
+
+
 # ---------------------------------------------------------------------------
 # Test 2: Fresh project → creates all artifacts
 # ---------------------------------------------------------------------------

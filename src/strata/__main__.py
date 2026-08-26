@@ -2278,9 +2278,12 @@ def cmd_register(args: argparse.Namespace) -> int:
     # -----------------------------------------------------------------------
     if not any((project_root / m).exists() for m in _PROJECT_MARKERS):
         markers_str = ", ".join(_PROJECT_MARKERS)
+        markers_prose = ", ".join(_PROJECT_MARKERS[:-1]) + f", or {_PROJECT_MARKERS[-1]}"
         print(
             f"Not a project root — register from a directory containing one of: {markers_str}\n"
-            f"(checked: {project_root})",
+            f"(checked: {project_root})\n"
+            f"Starting fresh? Run `git init` first — a project root is anything with "
+            f"{markers_prose}.",
             file=sys.stderr,
         )
         return 1
