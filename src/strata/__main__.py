@@ -2722,16 +2722,21 @@ def cmd_register(args: argparse.Namespace) -> int:
         print()
         print("Done. Next steps:")
         print(f"  1. Edit {fleet_yaml.relative_to(project_root)} for your team's structure")
-        print(f"  2. export STRATA_AGENT_SCOPE={first_scope}")
-        print("     export STRATA_AGENT_SKILL=<your-skill>")
+        print()
+        print("  2. Bind your session — every agent works as one scope of the fleet:")
+        print(f"       export STRATA_AGENT_SCOPE={first_scope}")
+        print("       export STRATA_AGENT_SKILL=<your-skill>  # optional")
+        print("     or run `strata launch` to be prompted interactively")
+        print()
         next_step = 3
         if "claude-code" in resolved_harnesses:
             print(f"  {next_step}. Open Claude Code in this directory: claude")
             next_step += 1
         if "codex" in resolved_harnesses:
-            print(f"  {next_step}. Fill in the env values in {_codex_config_path()}")
-            next_step += 1
-            print(f"  {next_step}. Open Codex CLI in this directory: codex")
+            print(
+                f"  {next_step}. Fill in the env values in {_codex_config_path()}, "
+                "then open Codex CLI in this directory: codex"
+            )
             next_step += 1
 
     if settings_unreadable:
