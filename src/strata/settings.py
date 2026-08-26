@@ -125,23 +125,42 @@ class Settings(BaseSettings):
     def build_judge_client(self):  # -> anthropic.Anthropic
         """Construct the judge's Anthropic-Messages-API client.
 
-        The single place every ``anthropic.Anthropic(...)`` construction in
-        the codebase should go through, so the JUDGE_API_KEY / JUDGE_BASE_URL
-        wiring — and the deprecated ANTHROPIC_API_KEY fallback — lives in one
-        place. ``JUDGE_API_KEY`` wins when set; otherwise ``anthropic_api_key``
+        ``JUDGE_API_KEY`` wins when set; otherwise ``anthropic_api_key``
         (the old ``ANTHROPIC_API_KEY`` / ``STRATA_ANTHROPIC_API_KEY`` names)
-        is used as a working, deprecated fallback. ``base_url`` is passed only
-        when configured, so the client falls back to the SDK's own default
-        (the direct Anthropic API) otherwise. The endpoint must speak the
-        Anthropic Messages API — a router/proxy/self-hosted gateway that does
-        so works via JUDGE_BASE_URL.
+        is used as a working, deprecated fallback. Delegates the actual
+        construction to :func:`construct_judge_client` — see that function's
+        docstring for why it, not this method, is the single construction
+        site.
         """
-        import anthropic  # noqa: PLC0415
+        return construct_judge_client(
+            api_key=self.judge_api_key or self.anthropic_api_key,
+            base_url=self.judge_base_url,
+        )
 
-        kwargs: dict = {"api_key": self.judge_api_key or self.anthropic_api_key}
-        if self.judge_base_url:
-            kwargs["base_url"] = self.judge_base_url
-        return anthropic.Anthropic(**kwargs)
+
+def construct_judge_client(
+    *, api_key: str | None, base_url: str | None = None
+):  # -> anthropic.Anthropic
+    """Construct the judge's Anthropic-Messages-API client from a resolved
+    ``(api_key, base_url)`` pair.
+
+    The single place every ``anthropic.Anthropic(...)`` construction in the
+    codebase should go through — both :meth:`Settings.build_judge_client`
+    (which resolves credentials from a constructed ``Settings``) and callers
+    that resolve credentials their own way (e.g. the freshness evaluator,
+    which reads a raw subprocess env dict via
+    :func:`resolve_judge_credentials`) route through this one function, so
+    the kwarg-assembly logic — ``base_url`` passed only when configured —
+    lives in exactly one place. The endpoint must speak the Anthropic
+    Messages API — a router/proxy/self-hosted gateway that does so works via
+    JUDGE_BASE_URL.
+    """
+    import anthropic  # noqa: PLC0415
+
+    kwargs: dict = {"api_key": api_key}
+    if base_url:
+        kwargs["base_url"] = base_url
+    return anthropic.Anthropic(**kwargs)
 
 
 def resolve_judge_credentials(env: dict[str, str]) -> tuple[str | None, str | None]:

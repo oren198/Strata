@@ -732,12 +732,9 @@ def _default_draft_fn(
     if not api_key or not transcript_tail.strip():
         return None
     try:
-        import anthropic  # noqa: PLC0415
+        from strata.settings import construct_judge_client  # noqa: PLC0415
 
-        client_kwargs: dict = {"api_key": api_key}
-        if base_url:
-            client_kwargs["base_url"] = base_url
-        client = anthropic.Anthropic(**client_kwargs)
+        client = construct_judge_client(api_key=api_key, base_url=base_url)
         response = client.messages.create(
             model=model,
             max_tokens=1024,
