@@ -22,12 +22,15 @@ STRATA_FLEET_CONFIG
     Path to the fleet YAML file.  Default: ``./fleet.yaml``
 STRATA_AGENT_SCOPE
     The scope this agent is bound to (e.g. ``g_backend``).
-    Recorded in contribution provenance.  Required — server refuses to start
-    if unset (ADR 0005 Decision 5).
+    Recorded in contribution provenance.  Required when the fleet has 2+
+    scopes — the server refuses to start if unset (ADR 0005 Decision 5). When
+    the fleet has exactly one scope, an unset (or empty-string) value
+    auto-binds to it.
 STRATA_AGENT_SKILL
     The skill this agent is running (e.g. ``strata-developer``).
-    Recorded in contribution provenance.  Required — server refuses to start
-    if unset (ADR 0005 Decision 5).
+    Recorded in contribution provenance.  Required for a scope that declares
+    skills, unless the scope was auto-bound (single-scope fleet), in which
+    case its ``default_skill`` is used when this is unset.
 STRATA_AGENT_SESSION_ID
     Unique identifier for this session.
     Recorded in contribution provenance.  Optional — defaults to a generated
@@ -462,19 +465,31 @@ def _validate_binding(
     project_config_found: bool = False,
     searched_paths: list[str] | None = None,
     extra_errors: list[str] | None = None,
-) -> None:
+) -> tuple[str, str | None]:
     """Validate agent binding before starting the MCP server.
 
-    Runs all five checks independently, then reports every failure in a
-    single error message before ``sys.exit(1)`` (per ADR 0005 Decision 5 —
-    "all failures are reported in a single error message"). A user with
-    multiple missing pieces sees the complete remediation list in one pass
-    rather than fix-one-rerun-fix-next.
+    Runs all checks independently, then reports every failure in a single
+    error message before ``sys.exit(1)`` (per ADR 0005 Decision 5 — "all
+    failures are reported in a single error message"). A user with multiple
+    missing pieces sees the complete remediation list in one pass rather than
+    fix-one-rerun-fix-next.
 
     Checks (in order, outermost setup gap → innermost binding mismatch):
 
+    0. Single-scope auto-bind: an unset/empty ``STRATA_AGENT_SCOPE`` against a
+       fleet with exactly one active scope binds to that scope automatically
+       — a one-line notice on stderr names it (operator directive: a fresh
+       install must work with minimum friction). When the scope was
+       auto-bound and ``STRATA_AGENT_SKILL`` is also unset/empty, the scope's
+       ``default_skill`` (if any) is used the same way. An explicitly set
+       ``STRATA_AGENT_SCOPE`` is never touched by this — it behaves exactly
+       as before. Empty string counts as unset (Codex writes literal empty
+       env values into its config).
     1. ``.strata/config.toml`` resolvable via walk-up.
-    2. ``STRATA_AGENT_SCOPE`` env var set.
+    2. ``STRATA_AGENT_SCOPE`` env var set (after the auto-bind attempt above)
+       — unset/empty against a fleet with zero or 2+ active scopes is still
+       the actionable error, now naming the available scope IDs when there
+       are any.
     3. Scope exists in fleet config.
     4. ``STRATA_AGENT_SKILL`` env var set — required only when the scope
        *declares* skills (``default_skill`` or ``permitted_skills``). An
@@ -486,8 +501,8 @@ def _validate_binding(
     Args:
         fleet:                 The loaded FleetConfig, or ``None`` if check 1
                                failed (no config → no fleet to validate
-                               against). Checks 3 + 5 are skipped when fleet
-                               is None.
+                               against). Checks 0, 3 + 5 are skipped when
+                               fleet is None.
         scope:                 Value of ``STRATA_AGENT_SCOPE`` (may be empty).
         skill:                 Value of ``STRATA_AGENT_SKILL`` (may be empty
                                or None — optional per issue #121).
@@ -497,6 +512,11 @@ def _validate_binding(
         extra_errors:          Startup failures collected before binding
                                validation (malformed config/fleet files, issue
                                #46) — reported in the same aggregated message.
+
+    Returns:
+        ``(resolved_scope, resolved_skill)`` — the values the caller should
+        actually bind to. Identical to ``(scope, skill)`` unless auto-binding
+        applied. Never returns on failure — exits the process instead.
     """
     errors: list[str] = list(extra_errors) if extra_errors else []
 
@@ -515,10 +535,32 @@ def _validate_binding(
             "  from within the project directory."
         )
 
-    # 2. STRATA_AGENT_SCOPE must be set.
-    if not scope:
+    # 0. Single-scope auto-bind — before check 2 sees the scope as missing.
+    resolved_scope = scope
+    resolved_skill = skill
+    if not resolved_scope and fleet is not None:
+        sole = fleet.auto_bind_scope()
+        if sole is not None:
+            resolved_scope = sole.id
+            notice = (
+                f"Strata: STRATA_AGENT_SCOPE not set — auto-bound to {resolved_scope!r} "
+                "(the fleet's only scope)."
+            )
+            if not resolved_skill and sole.default_skill:
+                resolved_skill = sole.default_skill
+                notice += f" Using its default skill {resolved_skill!r}."
+            print(notice, file=sys.stderr)
+
+    # 2. STRATA_AGENT_SCOPE must be set (after the auto-bind attempt above).
+    if not resolved_scope:
+        available_line = ""
+        if fleet is not None:
+            available = [s.id for s in fleet.active_scopes()]
+            if available:
+                available_line = f"  Available scope IDs: {', '.join(available)}.\n"
         errors.append(
             "STRATA_AGENT_SCOPE is not set.\n"
+            f"{available_line}"
             "  Set it before launching Claude Code:\n"
             "    export STRATA_AGENT_SCOPE=<scope_id>\n"
             "    export STRATA_AGENT_SKILL=<skill_name>\n"
@@ -527,18 +569,18 @@ def _validate_binding(
 
     # 3. Scope must exist in fleet config (skip when fleet not loaded or scope unset).
     scope_obj = None
-    if fleet is not None and scope:
-        scope_obj = fleet.get_scope(scope)
+    if fleet is not None and resolved_scope:
+        scope_obj = fleet.get_scope(resolved_scope)
         if scope_obj is None:
             available = [s.id for s in fleet.active_scopes()]
             available_str = (
                 ", ".join(available) if available else "(none — fleet.yaml may be empty)"
             )
             errors.append(
-                f"scope {scope!r} not found in fleet config.\n"
+                f"scope {resolved_scope!r} not found in fleet config.\n"
                 f"  Available scope IDs: {available_str}\n"
-                f"  Update STRATA_AGENT_SCOPE to one of the above, or add scope {scope!r} to your "
-                f"fleet.yaml."
+                f"  Update STRATA_AGENT_SCOPE to one of the above, or add scope "
+                f"{resolved_scope!r} to your fleet.yaml."
             )
 
     # 4. STRATA_AGENT_SKILL must be set — waived only when the scope is
@@ -551,7 +593,7 @@ def _validate_binding(
     scope_waives_skill = scope_obj is not None and not (
         scope_obj.default_skill or scope_obj.permitted_skills
     )
-    if not skill and not scope_waives_skill:
+    if not resolved_skill and not scope_waives_skill:
         errors.append(
             "STRATA_AGENT_SKILL is not set.\n"
             "  Set it before launching Claude Code:\n"
@@ -562,12 +604,13 @@ def _validate_binding(
         )
 
     # 5. STRATA_AGENT_SKILL must be in permitted_skills (skip when scope or skill missing).
-    if scope_obj is not None and skill:
+    if scope_obj is not None and resolved_skill:
         permitted = scope_obj.permitted_skills or []
-        if permitted and skill not in permitted:
+        if permitted and resolved_skill not in permitted:
             errors.append(
-                f"skill {skill!r} is not in the permitted skills for scope {scope!r}.\n"
-                f"  Permitted skills for {scope!r}: {', '.join(permitted)}\n"
+                f"skill {resolved_skill!r} is not in the permitted skills for scope "
+                f"{resolved_scope!r}.\n"
+                f"  Permitted skills for {resolved_scope!r}: {', '.join(permitted)}\n"
                 f"  Update STRATA_AGENT_SKILL to one of the above, or update permitted_skills in "
                 f"fleet.yaml."
             )
@@ -582,6 +625,8 @@ def _validate_binding(
         body = "\n".join(f"\n[{i + 1}] {err}" for i, err in enumerate(errors))
         print(header + body, file=sys.stderr)
         sys.exit(1)
+
+    return resolved_scope, resolved_skill
 
 
 # ---------------------------------------------------------------------------
@@ -1547,7 +1592,11 @@ def main() -> None:
                 "  Fix fleet.yaml, then relaunch."
             )
 
-    _validate_binding(
+    # Rebind the module globals to the resolved (possibly auto-bound) scope
+    # and skill — every tool function below reads _AGENT_SCOPE / _AGENT_SKILL
+    # directly, so the auto-bind decision must land here before mcp.run().
+    global _AGENT_SCOPE, _AGENT_SKILL
+    _AGENT_SCOPE, _AGENT_SKILL = _validate_binding(
         fleet,
         _AGENT_SCOPE,
         _AGENT_SKILL,
