@@ -119,6 +119,13 @@ exactly one scope in the fleet, an unset `STRATA_AGENT_SCOPE` auto-binds to
 it (and its `default_skill`, when it has one) — you'll see a one-line notice
 naming the scope it bound to.
 
+That skill auto-fill only covers a scope with a `default_skill`. A scope
+that lists `permitted_skills` but no `default_skill` still needs an explicit
+`STRATA_AGENT_SKILL` even when it auto-binds — auto-bind picks the *scope*
+for you, not a skill choice among several permitted ones. (The seeded
+`g_root` template ships with a `default_skill`, so the quickstart itself
+never hits this.)
+
 ```bash
 claude
 ```
@@ -326,6 +333,25 @@ nothing back, the *gate* opens. What happens then depends on the mode:
 At most one evaluator runs per session at a time (a lockfile beside the session
 state, with a stale-lock TTL), and the gate is always checked before spawning.
 
+**Session identity without any export.** Session state is keyed by
+`STRATA_AGENT_SESSION_ID`. On the zero-export single-scope quickstart above,
+nothing sets it — so both the MCP server and this hook resolve the *same*
+deterministic fallback, `sess_auto_<parent pid>`, independently and with no
+IPC between them: Claude Code spawns `strata-mcp` and (via the shipped
+`strata-stop-hook` wrapper, which `exec`s straight into `strata
+freshness-hook` with no intervening shell) the hook process as its own
+direct children, so `os.getppid()` resolves to the same harness process's
+pid in both. Empty string counts as unset here too (Codex's registered
+config ships a literal empty `STRATA_AGENT_SESSION_ID`). This pairing
+assumes the harness spawns both processes directly — true for Claude Code
+today. A harness that instead routes hook invocations through a
+non-exec'ing intermediate shell (a fresh subshell per hook call rather than
+one that execs straight into the hook command) would see a different parent
+pid per invocation there, breaking the pairing — set
+`STRATA_AGENT_SESSION_ID` explicitly to sidestep that. (Reused pids are a
+theoretical edge case here, same as any pid-derived id; the session-state
+staleness handling already tolerates it.)
+
 **Windows: session-state counters are not cross-process locked.** The MCP server
 and the detached evaluator both read-modify-write the same `.strata/sessions/`
 state file. On POSIX each update takes an advisory `fcntl.flock` on a
@@ -354,9 +380,12 @@ turn end can reproduce it:
 1. At each turn boundary, run `strata freshness-hook`, passing a JSON object on
    stdin with at least `transcript_path` (path to the session transcript) and
    `stop_hook_active` (whether the stop was already blocked once this turn).
-2. Ensure the session's identity env vars (`STRATA_AGENT_SCOPE`,
-   `STRATA_AGENT_SKILL`, `STRATA_AGENT_SESSION_ID`) are set the same way the MCP
-   server sees them — the hook keys the session state by `STRATA_AGENT_SESSION_ID`.
+2. Set the session's identity env vars (`STRATA_AGENT_SCOPE`, `STRATA_AGENT_SKILL`,
+   `STRATA_AGENT_SESSION_ID`) the same way the MCP server sees them — the hook
+   keys the session state by `STRATA_AGENT_SESSION_ID`. Leaving it unset relies
+   on this harness spawning the hook the same direct-child way Claude Code does
+   (see "Session identity without any export" above); set it explicitly if that
+   assumption doesn't hold for your harness.
 3. In default mode the command exits `0` and (when the gate is open) spawns the
    detached evaluator itself. In strict mode it prints a
    `{"decision":"block","reason":"…"}` JSON object on stdout that your harness
@@ -872,7 +901,7 @@ server (project config wins):
 | `STRATA_FLEET_CONFIG` | `./fleet.yaml` | Fleet YAML (overridden by `config.toml`) |
 | `STRATA_AGENT_SCOPE` | (auto-bind) | The scope this session acts at. Required only when the fleet has 2+ scopes — with exactly one scope, an unset (or empty-string) value auto-binds to it and the server refuses to start only if the fleet has zero or 2+ scopes |
 | `STRATA_AGENT_SKILL` | (optional) | The skill identifier for provenance — required only when the scope declares `default_skill`/`permitted_skills` in `fleet.yaml`, unless the scope was auto-bound, in which case its `default_skill` fills this in when unset |
-| `STRATA_AGENT_SESSION_ID` | (auto) | Session identifier — auto-generated when absent |
+| `STRATA_AGENT_SESSION_ID` | (auto) | Session identifier. Absent or empty-string resolves to the deterministic `sess_auto_<parent pid>` (the freshness Stop hook resolves the same fallback independently — see [Memory-freshness Stop-hook](#memory-freshness-stop-hook)) |
 | `JUDGE_API_KEY` | (unset) | The judge's API key. `STRATA_JUDGE_API_KEY` also works and wins if both are set. Works against any endpoint that speaks the Anthropic Messages API. |
 | `JUDGE_BASE_URL` | (unset) | Optional. Points the judge at a router/proxy/self-hosted gateway instead of the direct Anthropic API — the endpoint must speak the Anthropic Messages API. `STRATA_JUDGE_BASE_URL` also works. |
 | `JUDGE_MODEL` | `claude-haiku-4-5` | Model used by the judge. `STRATA_MANAGER_MODEL` is the original name and still works (wins if both are set). |

@@ -33,8 +33,10 @@ STRATA_AGENT_SKILL
     case its ``default_skill`` is used when this is unset.
 STRATA_AGENT_SESSION_ID
     Unique identifier for this session.
-    Recorded in contribution provenance.  Optional — defaults to a generated
-    value when absent.
+    Recorded in contribution provenance.  Optional (empty string counts as
+    unset) — defaults to ``sess_auto_<parent pid>`` when absent, the same
+    deterministic fallback the freshness Stop hook computes independently
+    (see ``strata.session_state.resolve_agent_session_id``).
 """
 
 from __future__ import annotations
@@ -43,7 +45,6 @@ import logging
 import os
 import sqlite3
 import sys
-import uuid
 from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
@@ -69,6 +70,7 @@ from strata.session_state import (
     SessionState,
     SessionStateStore,
     compute_nudge,
+    resolve_agent_session_id,
     sessions_dir_for,
 )
 from strata.settings import get_settings
@@ -227,10 +229,14 @@ def _build_scope_manager():
 # before mcp.run(). STRATA_AGENT_SKILL is optional (issue #121) — an
 # unrestricted scope may bind skill-less, so an unset/empty value maps to
 # None (no skill in provenance), never a placeholder. STRATA_AGENT_SESSION_ID
-# is optional; generate one when absent.
+# is optional (empty string counts as unset); resolved once here, at import
+# time, via the same deterministic fallback the freshness Stop hook computes
+# independently (strata.session_state.resolve_agent_session_id — see its
+# docstring for why the two land on the same id with no IPC), and held
+# stable for this process's lifetime rather than recomputed per call.
 _AGENT_SCOPE: str = os.environ.get("STRATA_AGENT_SCOPE", "")
 _AGENT_SKILL: str | None = os.environ.get("STRATA_AGENT_SKILL") or None
-_AGENT_SESSION_ID: str = os.environ.get("STRATA_AGENT_SESSION_ID", f"sess_{uuid.uuid4().hex[:8]}")
+_AGENT_SESSION_ID: str = resolve_agent_session_id()
 
 # ---------------------------------------------------------------------------
 # Fleet config helper — re-read on every call that needs fleet info (ADR 0004

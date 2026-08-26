@@ -56,7 +56,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, TextIO
 
-from strata.session_state import NUDGE_MIN_READS, SessionStateStore, sessions_dir_for
+from strata.session_state import (
+    NUDGE_MIN_READS,
+    SessionStateStore,
+    resolve_agent_session_id,
+    sessions_dir_for,
+)
 
 if TYPE_CHECKING:
     from strata.session_state import SessionState
@@ -201,13 +206,14 @@ def resolve_session_store(env: dict[str, str]) -> SessionStateStore | None:
 def _strata_session_id(env: dict[str, str]) -> str:
     """Return the session id the #110 state file is keyed by.
 
-    The MCP server keys session state by ``STRATA_AGENT_SESSION_ID`` (or a
-    generated fallback when unset). The hook runs in the same Claude Code
-    process tree and inherits the same environment, so it resolves the id the
-    same way — an unset value yields ``""`` and the caller degrades to a no-op
-    (a generated MCP fallback id is not knowable from the hook).
+    The MCP server keys session state by ``STRATA_AGENT_SESSION_ID``, or the
+    same deterministic fallback (``sess_auto_<parent pid>``) when unset or
+    empty — see :func:`strata.session_state.resolve_agent_session_id` for why
+    this hook process and the MCP server process land on the identical id
+    with no IPC and no env var required (both are spawned directly by the
+    same harness process, so ``os.getppid()`` matches).
     """
-    return env.get("STRATA_AGENT_SESSION_ID", "")
+    return resolve_agent_session_id(env)
 
 
 # ---------------------------------------------------------------------------
@@ -362,9 +368,11 @@ def run_stop_hook(
     if store is None:
         return 0
 
+    # Always non-empty: an explicit STRATA_AGENT_SESSION_ID wins, and an
+    # unset/empty one resolves to the deterministic sess_auto_<parent pid>
+    # fallback (issue #112 gap — previously this returned "" here and the
+    # hook silently no-op'd for the entire zero-export launch path).
     session_id = _strata_session_id(env)  # type: ignore[arg-type]
-    if not session_id:
-        return 0
 
     state = store.read(session_id)
     if not gate_open(state):
@@ -549,7 +557,7 @@ def run_evaluator(
             store.record_decline(session_id, now=_as_dt(now))
             return "declined"
 
-        decision = _submit_judged_contribution(draft, env=env)  # type: ignore[arg-type]
+        decision = _submit_judged_contribution(draft, env=env, session_id=session_id)  # type: ignore[arg-type]
         if decision in ("accept_as_directive", "accept_as_context"):
             store.record_contribution(session_id, now=_as_dt(now))
             return "contributed"
@@ -592,13 +600,22 @@ def _resolve_draft_fn(env: dict[str, str], draft_fn: DraftFn | None) -> DraftFn:
     return functools.partial(_default_draft_fn, api_key=api_key, base_url=base_url, model=model)
 
 
-def _submit_judged_contribution(draft: EvaluatorDraft, *, env: dict[str, str]) -> str:
+def _submit_judged_contribution(
+    draft: EvaluatorDraft, *, env: dict[str, str], session_id: str
+) -> str:
     """Submit *draft* to the bound scope through the judged contribute path.
 
     Reuses :func:`strata.app.run_contribution` — the exact same
     append→judge→record→summary choke point the MCP ``strata_contribute`` tool
     uses — under the agent's own provenance (``STRATA_AGENT_*``). Returns the
     scope-manager's decision string.
+
+    *session_id* is the same id :func:`run_evaluator`'s caller already
+    resolved (:func:`strata.session_state.resolve_agent_session_id`) and is
+    keying the session-state store by — used verbatim for contributor
+    provenance here rather than re-derived from ``env["STRATA_AGENT_SESSION_ID"]``,
+    which would silently diverge to ``""`` whenever the session id was the
+    auto-generated fallback (env never carries it).
 
     Raises whatever the judged path raises (e.g. ``JudgeUnavailable``); the
     caller maps it to a mechanical decline so the gate still closes.
@@ -614,7 +631,7 @@ def _submit_judged_contribution(draft: EvaluatorDraft, *, env: dict[str, str]) -
 
     scope_id = env.get("STRATA_AGENT_SCOPE", "")
     skill = env.get("STRATA_AGENT_SKILL", "")
-    session = env.get("STRATA_AGENT_SESSION_ID", "")
+    session = session_id
 
     settings = get_settings()
     paths = resolve_storage_paths(settings)
