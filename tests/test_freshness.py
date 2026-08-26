@@ -423,6 +423,49 @@ def test_evaluator_draft_submitted_through_judged_path(tmp_path: Path, monkeypat
     assert lock_file.exists(), f"expected the evaluator to have flocked {lock_file}"
 
 
+def test_evaluator_auto_binds_scope_when_env_unset(tmp_path: Path, monkeypatch) -> None:
+    """A single-scope fleet auto-binds the evaluator's contribution even when
+    STRATA_AGENT_SCOPE is empty in its inherited env — the same rule the MCP
+    server applies, so the two never diverge on which scope a session binds
+    to."""
+    paths = _make_project(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    from strata.settings import get_settings
+
+    get_settings.cache_clear()
+    store = _session_store(paths)
+    _seed_reads(store, NUDGE_MIN_READS)
+
+    draft = freshness.EvaluatorDraft(
+        content="We chose sqlite for the record store.",
+        classification="context",
+        subject="storage",
+    )
+    draft_fn = MagicMock(return_value=draft)
+    judge = MagicMock(return_value=_fake_accept_judgment())
+
+    env = _env(paths)
+    env["STRATA_AGENT_SCOPE"] = ""  # unset — Codex writes literal empty values
+
+    with (
+        patch("strata.scope_manager.ScopeManager.judge", judge),
+        patch("anthropic.Anthropic", return_value=MagicMock()),
+    ):
+        outcome = freshness.run_evaluator(
+            session_id=_SESSION_ID,
+            transcript_path="/tmp/t.jsonl",
+            env=env,
+            draft_fn=draft_fn,
+        )
+
+    assert outcome == "contributed"
+    from strata.record_store import RecordStore
+
+    with RecordStore(paths["db"]) as rs:
+        contributions = rs.list_contributions(scope_id="g_root")
+    assert len(contributions) == 1
+
+
 def test_evaluator_nothing_records_decline_without_judge(tmp_path: Path, monkeypatch) -> None:
     paths = _make_project(tmp_path)
     monkeypatch.chdir(tmp_path)

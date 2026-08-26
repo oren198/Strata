@@ -626,6 +626,19 @@ def _submit_judged_contribution(draft: EvaluatorDraft, *, env: dict[str, str]) -
     configure_lock_dir(Path(paths.db_path).parent / ".locks")
     fleet = FleetConfig.load(Path(paths.fleet_yaml_path))
 
+    # Single-scope auto-bind (same rule as strata.mcp.server._validate_binding
+    # — both read STRATA_AGENT_SCOPE from the process environment and load
+    # the same fleet.yaml from disk, so the two land on the identical
+    # decision deterministically without any IPC between them). An unset or
+    # empty-string scope against a single-scope fleet binds to it, and its
+    # default_skill fills in an unset/empty skill the same way.
+    if not scope_id:
+        sole = fleet.auto_bind_scope()
+        if sole is not None:
+            scope_id = sole.id
+            if not skill and sole.default_skill:
+                skill = sole.default_skill
+
     scope = fleet.get_scope(scope_id)
     if scope is None or scope.status == "archived":
         raise RuntimeError(f"evaluator: bound scope {scope_id!r} is not contributable")
