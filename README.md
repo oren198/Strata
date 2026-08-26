@@ -101,10 +101,11 @@ as a deprecated fallback — see [Environment variables](#environment-variables)
 $EDITOR .strata/fleet.yaml
 ```
 
-The seeded file has one scope (`g_root`) — add scopes, strata, and edges to
-match your team. Larger starter examples (a 3-lane dev-team layout, a
-research group, a support org) ship in `src/strata/_templates/` in this
-repo, for inspiration. After hand-editing, validate with `strata bootstrap`;
+The seeded file has one scope, `g_root` — for the quickstart, keep it as
+is and bind to it in the next step; one scope is a complete, working
+setup. Grow the fleet later, when real roles emerge: add scopes, strata,
+and edges to match your team (larger starter examples ship in
+`src/strata/_templates/`). After hand-editing, validate with `strata bootstrap`;
 if a Console is already running, restart it to pick up the change — the
 Console's graph is how you *see* the result, not how you edit it.
 
