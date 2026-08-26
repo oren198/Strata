@@ -390,6 +390,80 @@ def test_archived_scope_excluded_from_active_scopes(tmp_path: Path) -> None:
     assert active[0].id == "g_active"
 
 
+def test_auto_bind_scope_returns_sole_active_scope(tmp_path: Path) -> None:
+    """A fleet with exactly one active scope auto-binds to it."""
+    yaml = """
+        strata:
+          - id: L0
+            name: Executive
+            ordinal: 0
+        scopes:
+          - id: g_root
+            name: Root
+            stratum_id: L0
+        edges: []
+    """
+    config = FleetConfig.load(_write(tmp_path, yaml))
+    scope = config.auto_bind_scope()
+    assert scope is not None
+    assert scope.id == "g_root"
+
+
+def test_auto_bind_scope_returns_none_for_multi_scope_fleet(tmp_path: Path) -> None:
+    """A fleet with 2+ active scopes has no auto-bind target."""
+    yaml = """
+        strata:
+          - id: L0
+            name: Executive
+            ordinal: 0
+        scopes:
+          - id: g_root
+            name: Root
+            stratum_id: L0
+          - id: g_arch
+            name: Arch
+            stratum_id: L0
+        edges: []
+    """
+    config = FleetConfig.load(_write(tmp_path, yaml))
+    assert config.auto_bind_scope() is None
+
+
+def test_auto_bind_scope_ignores_archived_scopes(tmp_path: Path) -> None:
+    """One active + one archived scope still auto-binds to the active one."""
+    yaml = """
+        strata:
+          - id: L0
+            name: Executive
+            ordinal: 0
+        scopes:
+          - id: g_active
+            name: Active
+            stratum_id: L0
+            status: active
+          - id: g_archived
+            name: Archived
+            stratum_id: L0
+            status: archived
+        edges: []
+    """
+    config = FleetConfig.load(_write(tmp_path, yaml))
+    scope = config.auto_bind_scope()
+    assert scope is not None
+    assert scope.id == "g_active"
+
+
+def test_auto_bind_scope_returns_none_for_empty_fleet(tmp_path: Path) -> None:
+    """A fleet with zero scopes has no auto-bind target."""
+    yaml = """
+        strata: []
+        scopes: []
+        edges: []
+    """
+    config = FleetConfig.load(_write(tmp_path, yaml))
+    assert config.auto_bind_scope() is None
+
+
 def test_get_scope_returns_archived_scope(tmp_path: Path) -> None:
     """get_scope finds an archived scope (it still exists in the config)."""
     yaml = """
