@@ -326,9 +326,37 @@ def test_doctor_flags_tampered_skill(
 # ---------------------------------------------------------------------------
 
 
-def test_doctor_flags_missing_scope_env(
+def test_doctor_auto_binds_missing_scope_env_on_single_scope_fleet(
     registered_project: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
 ) -> None:
+    """Single-scope auto-bind (operator directive): the seeded fleet has one
+    scope (g_root), so an unset STRATA_AGENT_SCOPE passes with a note rather
+    than failing — mirrors strata.mcp.server._validate_binding."""
+    monkeypatch.delenv("STRATA_AGENT_SCOPE", raising=False)
+    monkeypatch.delenv("STRATA_AGENT_SKILL", raising=False)
+
+    rc, output = _run_doctor(capsys)
+
+    assert rc == 0
+    lower = output.lower()
+    assert "binding" in lower
+    assert "g_root" in lower
+    assert "auto-bind" in lower
+
+
+def test_doctor_flags_missing_scope_env_on_multi_scope_fleet(
+    registered_project: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """Unset STRATA_AGENT_SCOPE against a 2+ scope fleet still fails — no
+    single scope to auto-bind to — and names the available scope IDs."""
+    fleet_yaml = registered_project / ".strata" / "fleet.yaml"
+    fleet_yaml.write_text(
+        "strata:\n  - id: L0\n    name: root\n    ordinal: 0\n"
+        "scopes:\n  - id: g_root\n    name: Root\n    stratum_id: L0\n"
+        "  - id: g_arch\n    name: Arch\n    stratum_id: L0\n"
+        "edges: []\n",
+        encoding="utf-8",
+    )
     monkeypatch.delenv("STRATA_AGENT_SCOPE", raising=False)
 
     rc, output = _run_doctor(capsys)
@@ -337,6 +365,8 @@ def test_doctor_flags_missing_scope_env(
     lower = output.lower()
     assert "binding" in lower
     assert "strata_agent_scope" in lower
+    assert "g_root" in lower
+    assert "g_arch" in lower
 
 
 def test_doctor_flags_missing_skill_env(

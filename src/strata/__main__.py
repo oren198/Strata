@@ -1122,14 +1122,34 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
     # -----------------------------------------------------------------------
     # 8. Binding env vars set and valid against the fleet.
+    #
+    # Single-scope auto-bind (mirrors strata.mcp.server._validate_binding):
+    # an unset/empty STRATA_AGENT_SCOPE against a fleet with exactly one
+    # active scope is not a failure here — it auto-binds, and the check
+    # passes with a note saying so. Unset/empty against 2+ scopes (or no
+    # fleet) keeps today's failure, naming the available scope IDs.
     # -----------------------------------------------------------------------
     scope = os.environ.get("STRATA_AGENT_SCOPE", "")
     skill = os.environ.get("STRATA_AGENT_SKILL", "")
     session_id = os.environ.get("STRATA_AGENT_SESSION_ID", "")
     binding_problems: list[str] = []
+    auto_bind_note = ""
+
+    if not scope and fleet_config is not None:
+        sole = fleet_config.auto_bind_scope()
+        if sole is not None:
+            scope = sole.id
+            auto_bind_note = f" (will auto-bind to {scope!r} — the fleet's only scope)"
+            if not skill and sole.default_skill:
+                skill = sole.default_skill
 
     if not scope:
-        binding_problems.append("STRATA_AGENT_SCOPE is not set")
+        available = ""
+        if fleet_config is not None:
+            ids = ", ".join(s.id for s in fleet_config.active_scopes())
+            if ids:
+                available = f" (available: {ids})"
+        binding_problems.append(f"STRATA_AGENT_SCOPE is not set{available}")
 
     scope_obj = None
     if fleet_config is not None and scope:
@@ -1176,7 +1196,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                 name="Agent binding",
                 kind="hard",
                 passed=True,
-                message=f"STRATA_AGENT_SCOPE={scope!r} valid{skill_note}",
+                message=f"STRATA_AGENT_SCOPE={scope!r} valid{skill_note}{auto_bind_note}",
             )
         )
 
