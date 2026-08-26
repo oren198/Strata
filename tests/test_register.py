@@ -67,6 +67,33 @@ def _init_project(tmp_path: Path) -> None:
     (tmp_path / ".git").mkdir()
 
 
+def _init_project_multi_scope(tmp_path: Path) -> None:
+    """Create a project with a .git marker AND a pre-seeded 2-scope
+    fleet.yaml — register never overwrites an existing fleet.yaml, so this
+    is how "Next steps" tests exercise the 2+ scope branch (auto-bind
+    doesn't apply, exports are still needed).
+
+    Also seeds config.toml so the pre-existing .strata/ dir still looks like
+    a Strata workspace (register's step 1b sanity check requires it)."""
+    (tmp_path / ".git").mkdir()
+    strata_dir = tmp_path / ".strata"
+    strata_dir.mkdir()
+    (strata_dir / "config.toml").write_text(
+        'db = ".strata/strata.db"\n'
+        'fleet_yaml = ".strata/fleet.yaml"\n'
+        'summaries_dir = ".strata/summaries"\n',
+        encoding="utf-8",
+    )
+    fleet = (
+        "strata:\n  - id: L0\n    name: root\n    ordinal: 0\n"
+        "scopes:\n"
+        "  - id: g_root\n    name: Root\n    stratum_id: L0\n"
+        "  - id: g_arch\n    name: Arch\n    stratum_id: L0\n"
+        "edges: []\n"
+    )
+    (strata_dir / "fleet.yaml").write_text(fleet, encoding="utf-8")
+
+
 # ---------------------------------------------------------------------------
 # Test 1: No project marker → exit 1
 # ---------------------------------------------------------------------------
@@ -605,11 +632,29 @@ def test_python_flag_default_is_none() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_next_steps_explains_binding_once(tmp_path: Path, capsys) -> None:
-    """The exports are shown once, framed as binding a session generically —
-    not tied to a specific harness — with the skill line marked optional.
-    """
+def test_next_steps_single_scope_needs_no_export(tmp_path: Path, capsys) -> None:
+    """Single-scope auto-bind (operator directive): the default seeded fleet
+    has exactly one scope, so a fresh install needs no export at all — the
+    bind step says the session is ready and names the scope it auto-binds
+    to."""
     _init_project(tmp_path)
+    _run_register(tmp_path)
+    captured = capsys.readouterr()
+
+    assert "you're ready" in captured.out.lower()
+    assert "g_root" in captured.out
+    assert "automatically" in captured.out
+    assert "STRATA_AGENT_SCOPE only when the fleet grows" in captured.out
+    # No exports required for the fresh single-scope path.
+    assert "export STRATA_AGENT_SCOPE=g_root" not in captured.out
+
+
+def test_next_steps_explains_binding_once_for_multi_scope_fleet(tmp_path: Path, capsys) -> None:
+    """A 2+ scope fleet keeps the export instructions — exports are shown
+    once, framed as binding a session generically — not tied to a specific
+    harness — with the skill line marked optional.
+    """
+    _init_project_multi_scope(tmp_path)
     _run_register(tmp_path)
     captured = capsys.readouterr()
 
@@ -620,9 +665,11 @@ def test_next_steps_explains_binding_once(tmp_path: Path, capsys) -> None:
     assert "optional" in captured.out
 
 
-def test_next_steps_offers_strata_launch(tmp_path: Path, capsys) -> None:
-    """An interactive alternative to hand-exporting the binding env vars."""
-    _init_project(tmp_path)
+def test_next_steps_offers_strata_launch_for_multi_scope_fleet(tmp_path: Path, capsys) -> None:
+    """An interactive alternative to hand-exporting the binding env vars —
+    only shown on the 2+ scope path (a single-scope fleet needs no binding
+    step at all)."""
+    _init_project_multi_scope(tmp_path)
     _run_register(tmp_path)
     captured = capsys.readouterr()
 
@@ -665,14 +712,35 @@ def test_next_steps_claude_code_open_line(tmp_path: Path, capsys, monkeypatch) -
     assert "claude" in captured.out.lower()
 
 
-def test_next_steps_codex_open_line_keeps_fill_in_caveat(
+def test_next_steps_codex_open_line_single_scope_can_stay_empty(
     tmp_path: Path, capsys, monkeypatch
 ) -> None:
-    """A wired codex harness keeps the fill-in-config caveat before 'codex' opens."""
+    """Single-scope auto-bind: a wired codex harness on the default seeded
+    (single-scope) fleet says the env values can stay empty, not that they
+    must be filled in."""
     from strata import install
 
     monkeypatch.setattr(install, "detect_harnesses", lambda: ["codex"])
     _init_project(tmp_path)
+    args = _make_args(path=str(tmp_path))
+    args.harness = ["codex"]
+    cmd_register(args)
+    captured = capsys.readouterr()
+
+    assert "can stay empty" in captured.out
+    assert "codex" in captured.out.lower()
+    assert "Fill in the env values" not in captured.out
+
+
+def test_next_steps_codex_open_line_keeps_fill_in_caveat_for_multi_scope_fleet(
+    tmp_path: Path, capsys, monkeypatch
+) -> None:
+    """A wired codex harness on a 2+ scope fleet keeps the fill-in-config
+    caveat before 'codex' opens."""
+    from strata import install
+
+    monkeypatch.setattr(install, "detect_harnesses", lambda: ["codex"])
+    _init_project_multi_scope(tmp_path)
     args = _make_args(path=str(tmp_path))
     args.harness = ["codex"]
     cmd_register(args)
