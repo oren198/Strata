@@ -197,21 +197,6 @@ def test_single_scope_fleet_auto_binds_when_scope_unset(tmp_path: Path) -> None:
     assert resolved_scope == "g_root"
 
 
-def test_single_scope_fleet_auto_binds_when_scope_empty_string(tmp_path: Path) -> None:
-    """Empty string is treated the same as unset for auto-binding (Codex writes
-    literal empty env values into its config)."""
-    fleet = _make_fleet_with_skills(tmp_path, permitted_skills=None)
-
-    resolved_scope, _resolved_skill = _validate_binding(
-        fleet,
-        scope="",
-        skill=None,
-        project_config_found=True,
-    )
-
-    assert resolved_scope == "g_root"
-
-
 def test_single_scope_fleet_auto_bind_prints_notice(tmp_path: Path, capsys) -> None:
     """A one-line notice on stderr names the auto-bound scope (never stdout —
     that's the MCP stdio protocol channel)."""

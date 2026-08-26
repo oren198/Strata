@@ -344,6 +344,26 @@ def test_doctor_auto_binds_missing_scope_env_on_single_scope_fleet(
     assert "auto-bind" in lower
 
 
+def test_doctor_auto_binds_empty_string_scope_env_on_single_scope_fleet(
+    registered_project: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """Empty string counts as unset — distinct from a missing env var, and
+    only observable at this os.environ-reading layer (not at
+    _validate_binding's, which only ever receives a plain string): Codex
+    writes a literal empty STRATA_AGENT_SCOPE into its config rather than
+    omitting the key. It must still auto-bind on the single-scope fleet."""
+    monkeypatch.setenv("STRATA_AGENT_SCOPE", "")
+    monkeypatch.setenv("STRATA_AGENT_SKILL", "")
+
+    rc, output = _run_doctor(capsys)
+
+    assert rc == 0
+    lower = output.lower()
+    assert "binding" in lower
+    assert "g_root" in lower
+    assert "auto-bind" in lower
+
+
 def test_doctor_flags_missing_scope_env_on_multi_scope_fleet(
     registered_project: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
 ) -> None:
