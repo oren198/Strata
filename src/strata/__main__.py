@@ -2121,12 +2121,15 @@ def cmd_launch(args: argparse.Namespace) -> int:
                     file=sys.stderr,
                 )
                 return 1
-        elif len(active_scopes) == 1:
+        elif (sole := fleet.auto_bind_scope()) is not None:
             # Single-scope fleet auto-bind (operator directive): with no
             # positional arg and no .strata-role, a fleet with exactly one
             # scope needs no picker — interactive or not — bind to it and
-            # say so, mirroring the MCP server's own auto-bind notice.
-            scope_data = active_scopes[0]
+            # say so, mirroring the MCP server's own auto-bind notice. Routes
+            # through FleetConfig.auto_bind_scope() — the single source of
+            # truth for this rule — rather than re-deriving it from
+            # active_scopes here.
+            scope_data = sole.model_dump()
             print(f"Only one scope in the fleet — binding to {scope_data['id']!r}.")
         else:
             # No positional arg, no .strata-role, 2+ scopes — need the
@@ -2406,30 +2409,37 @@ def cmd_register(args: argparse.Namespace) -> int:
                 )
         _act("seeded", fleet_yaml)
 
-    def _seeded_active_scope_ids() -> list[str]:
-        """Return the active scope IDs in *fleet_yaml*.
+    def _seeded_binding_hint() -> tuple[bool, str]:
+        """Return ``(single_scope, first_scope_id)`` for *fleet_yaml*.
 
-        Falls back to ``["g_root"]`` when the file cannot be read (e.g.
-        --diff on a project without a pre-existing fleet.yaml — nothing was
-        actually written) — both the copied template and the inline
-        fallback above seed exactly one scope, ``g_root``, so the fallback
-        matches what would land on disk on a real (non-diff) run.
+        Loads via ``FleetConfig.load`` and routes the single/multi decision
+        through ``FleetConfig.auto_bind_scope()`` — the same load path and
+        the same source of truth as every other auto-bind call site (MCP
+        server validation, the freshness evaluator, `strata doctor`, `strata
+        launch`), so this can never drift from them by re-deriving its own
+        active/archived status rule.
+
+        Falls back to ``(True, "g_root")`` only when there is nothing to
+        load: no file on disk (e.g. --diff on a project without a
+        pre-existing fleet.yaml — nothing was actually written) or a load
+        failure (a hand-edited fleet.yaml that fails validation must not
+        crash the next-steps printing) — both the copied template and the
+        inline fallback above seed exactly one scope, ``g_root``, so the
+        fallback matches what would land on disk on a real (non-diff) run.
         """
         if not fleet_yaml.exists():
-            return ["g_root"]
+            return True, "g_root"
         try:
-            import yaml  # noqa: PLC0415
+            from strata.fleet_config import FleetConfig  # noqa: PLC0415
 
-            fleet_data = yaml.safe_load(fleet_yaml.read_text(encoding="utf-8")) or {}
-            scopes = fleet_data.get("scopes") or []
-            ids = [
-                s.get("id")
-                for s in scopes
-                if isinstance(s, dict) and s.get("status", "active") == "active"
-            ]
-            return [i for i in ids if i] or ["g_root"]
+            loaded = FleetConfig.load(fleet_yaml)
+            sole = loaded.auto_bind_scope()
+            if sole is not None:
+                return True, sole.id
+            active = loaded.active_scopes()
+            return False, (active[0].id if active else "g_root")
         except Exception:  # noqa: BLE001
-            return ["g_root"]
+            return True, "g_root"
 
     settings_unreadable = False
 
@@ -2608,8 +2618,8 @@ def cmd_register(args: argparse.Namespace) -> int:
         if not diff_mode and agents_added:
             agents_md.write_bytes(new_agents_text.encode("utf-8"))
 
-        seeded_scope_ids = _seeded_active_scope_ids()
-        if len(seeded_scope_ids) == 1:
+        single_scope, first_scope = _seeded_binding_hint()
+        if single_scope:
             # Single-scope auto-bind (operator directive): the engine
             # auto-binds an empty STRATA_AGENT_SCOPE to the fleet's only
             # scope, so Codex's env values can stay exactly as seeded
@@ -2617,7 +2627,7 @@ def cmd_register(args: argparse.Namespace) -> int:
             print(
                 f"\n  Codex config: the env values under [mcp_servers.strata.env] in "
                 f"{codex_config}\n"
-                f"  can stay empty — the fleet has one scope ({seeded_scope_ids[0]!r}) and the "
+                f"  can stay empty — the fleet has one scope ({first_scope!r}) and the "
                 "engine auto-binds to\n"
                 "  it. Fill them in only once the fleet grows past one scope. The "
                 "Stop-hook block is schema-\n"
@@ -2776,9 +2786,7 @@ def cmd_register(args: argparse.Namespace) -> int:
     # Print next steps.
     # -----------------------------------------------------------------------
     if not diff_mode:
-        seeded_scope_ids = _seeded_active_scope_ids()
-        single_scope = len(seeded_scope_ids) == 1
-        first_scope = seeded_scope_ids[0]
+        single_scope, first_scope = _seeded_binding_hint()
 
         print()
         print("Done. Next steps:")
