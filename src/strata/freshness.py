@@ -400,8 +400,11 @@ def run_stop_hook(
 
 
 def _has_api_key(env: dict[str, str]) -> bool:
-    """Return whether an Anthropic API key is available for the evaluator."""
-    return bool(env.get("STRATA_ANTHROPIC_API_KEY") or env.get("ANTHROPIC_API_KEY"))
+    """Return whether a judge API key is available for the evaluator."""
+    from strata.settings import resolve_judge_credentials  # noqa: PLC0415
+
+    api_key, _base_url = resolve_judge_credentials(env)
+    return bool(api_key)
 
 
 # ---------------------------------------------------------------------------
@@ -582,9 +585,11 @@ def _resolve_draft_fn(env: dict[str, str], draft_fn: DraftFn | None) -> DraftFn:
         return draft_fn
     import functools  # noqa: PLC0415
 
+    from strata.settings import resolve_judge_credentials  # noqa: PLC0415
+
     model = env.get(EVALUATOR_MODEL_ENV) or DEFAULT_EVALUATOR_MODEL
-    api_key = env.get("STRATA_ANTHROPIC_API_KEY") or env.get("ANTHROPIC_API_KEY")
-    return functools.partial(_default_draft_fn, api_key=api_key, model=model)
+    api_key, base_url = resolve_judge_credentials(env)
+    return functools.partial(_default_draft_fn, api_key=api_key, base_url=base_url, model=model)
 
 
 def _submit_judged_contribution(draft: EvaluatorDraft, *, env: dict[str, str]) -> str:
@@ -598,8 +603,6 @@ def _submit_judged_contribution(draft: EvaluatorDraft, *, env: dict[str, str]) -
     Raises whatever the judged path raises (e.g. ``JudgeUnavailable``); the
     caller maps it to a mechanical decline so the gate still closes.
     """
-    import anthropic  # noqa: PLC0415
-
     from strata.app import run_contribution  # noqa: PLC0415
     from strata.fleet_config import FleetConfig  # noqa: PLC0415
     from strata.locks import configure_lock_dir  # noqa: PLC0415
@@ -639,7 +642,7 @@ def _submit_judged_contribution(draft: EvaluatorDraft, *, env: dict[str, str]) -
         ts=datetime.now(UTC).isoformat(),
     )
     manager = ScopeManager(
-        client=anthropic.Anthropic(api_key=settings.anthropic_api_key),
+        client=settings.build_judge_client(),
         model=settings.manager_model,
     )
     with RecordStore(paths.db_path) as record_store:
@@ -717,6 +720,7 @@ def _default_draft_fn(
     *,
     api_key: str | None,
     model: str,
+    base_url: str | None = None,
 ) -> EvaluatorDraft | None:
     """Model-backed drafter: ask the evaluator model for a structured verdict.
 
@@ -730,7 +734,10 @@ def _default_draft_fn(
     try:
         import anthropic  # noqa: PLC0415
 
-        client = anthropic.Anthropic(api_key=api_key)
+        client_kwargs: dict = {"api_key": api_key}
+        if base_url:
+            client_kwargs["base_url"] = base_url
+        client = anthropic.Anthropic(**client_kwargs)
         response = client.messages.create(
             model=model,
             max_tokens=1024,

@@ -1516,11 +1516,10 @@ def cmd_publication_bootstrap(args: argparse.Namespace) -> int:
     A one-shot, operator-initiated migration step: the scope-manager
     proposes an initial publication distilled from the scope's CURRENT
     summary, judged through the normal publication path. Requires
-    ``ANTHROPIC_API_KEY`` (or ``STRATA_ANTHROPIC_API_KEY``) — this is an LLM
-    judgment, not a mechanical copy.
+    ``JUDGE_API_KEY`` (or the deprecated ``ANTHROPIC_API_KEY`` /
+    ``STRATA_ANTHROPIC_API_KEY`` names) — this is an LLM judgment, not a
+    mechanical copy.
     """
-    import anthropic
-
     from strata.publication import bootstrap_publication
     from strata.scope_manager import ScopeManager
     from strata.settings import get_settings
@@ -1540,7 +1539,7 @@ def cmd_publication_bootstrap(args: argparse.Namespace) -> int:
 
         settings = get_settings()
         manager = ScopeManager(
-            client=anthropic.Anthropic(api_key=settings.anthropic_api_key),
+            client=settings.build_judge_client(),
             model=settings.manager_model,
         )
 
@@ -1829,13 +1828,11 @@ def _run_manager_refresh(scope_id: str, *, skip: bool = False) -> None:
     ancestors, then refreshes *scope_id* itself.  Skipped when:
 
     - ``skip`` is True (``--skip-refresh`` flag).
-    - No ``ANTHROPIC_API_KEY`` is available (soft — prints a warning).
+    - No judge API key is available (soft — prints a warning).
     - Any ancestor/scope is missing from the fleet config (non-fatal warning).
 
     ADR 0004 Decision 4 — last-write-wins, no lock.
     """
-    import anthropic
-
     from strata.fleet_config import FleetConfig
     from strata.record_store import RecordStore
     from strata.scope_manager import ScopeManager
@@ -1847,9 +1844,9 @@ def _run_manager_refresh(scope_id: str, *, skip: bool = False) -> None:
 
     settings = get_settings()
 
-    if not settings.anthropic_api_key:
+    if not (settings.judge_api_key or settings.anthropic_api_key):
         print(
-            "  [refresh] ANTHROPIC_API_KEY not set — skipping manager refresh",
+            "  [refresh] JUDGE_API_KEY not set — skipping manager refresh",
             file=sys.stderr,
         )
         return
@@ -1875,7 +1872,7 @@ def _run_manager_refresh(scope_id: str, *, skip: bool = False) -> None:
     db_path = paths.db_path
     summaries_dir = paths.summaries_dir
 
-    client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
+    client = settings.build_judge_client()
     manager = ScopeManager(client=client, model=settings.manager_model)
 
     with RecordStore(db_path) as record_store:

@@ -207,16 +207,14 @@ def _attach_nudge(result: dict) -> dict:
 def _build_scope_manager():
     """Construct a :class:`ScopeManager` bound to the configured model.
 
-    Imports anthropic + the scope-manager lazily (they pull in the Anthropic
-    SDK, which may not be configured in every env) and are only needed when a
+    Imports the scope-manager lazily (it pulls in the Anthropic SDK, which
+    may not be configured in every env) and is only needed when a
     contribution or re-judge actually invokes the judge.
     """
-    import anthropic  # noqa: PLC0415
-
     from strata.scope_manager import ScopeManager  # noqa: PLC0415
 
     return ScopeManager(
-        client=anthropic.Anthropic(api_key=_settings.anthropic_api_key),
+        client=_settings.build_judge_client(),
         model=_settings.manager_model,
     )
 

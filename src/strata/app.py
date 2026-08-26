@@ -188,8 +188,8 @@ def _estimate_tokens(text: str) -> int:
 def get_anthropic_client(
     settings: Settings = Depends(get_settings),
 ) -> anthropic.Anthropic:
-    """Return an :class:`anthropic.Anthropic` client using the configured API key."""
-    return anthropic.Anthropic(api_key=settings.anthropic_api_key)
+    """Return an :class:`anthropic.Anthropic` client using the configured judge key/base URL."""
+    return settings.build_judge_client()
 
 
 def get_scope_manager(
