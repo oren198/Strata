@@ -66,21 +66,65 @@ jobs:
           python -m venv /tmp/wheelenv
           /tmp/wheelenv/bin/pip install --quiet dist/*.whl
 
-      - name: strata register + refuse-to-start smoke (foreign project)
+      - name: strata register + single-scope auto-bind + refuse-to-start smoke (foreign project)
         run: |
           set -eu
           mkdir /tmp/foreign && cd /tmp/foreign && git init -q
           /tmp/wheelenv/bin/strata register
           test -f .strata/config.toml
           test -f .strata/fleet.yaml
-          # No binding → must exit 1 with the aggregated refuse-to-start
-          # message, NOT a traceback.
+
+          # --- Side 1: fresh single-scope fleet, no binding -----------------
+          # Single-scope auto-bind (operator directive): the seeded fleet has
+          # exactly one scope (g_root), so an unset STRATA_AGENT_SCOPE now
+          # auto-binds to it instead of refusing to start. Must print the
+          # auto-bind notice, never "refuses to start", and never a
+          # traceback. The stdio server exits 0 on closed stdin (verified
+          # locally against a wheel build of this branch: FastMCP's stdio
+          # transport treats EOF on stdin as a normal end-of-session, not a
+          # startup failure — there is nothing left to refuse to start once
+          # binding auto-resolves).
+          set +e
+          out=$(/tmp/wheelenv/bin/strata-mcp </dev/null 2>&1)
+          rc=$?
+          set -e
+          [ "$rc" -eq 0 ]
+          if echo "$out" | grep -q "refuses to start"; then
+            echo "strata-mcp refused to start on a single-scope fleet with no binding:"
+            echo "$out"; exit 1
+          fi
+          echo "$out" | grep -q "auto-bound to 'g_root'"
+          if echo "$out" | grep -q "Traceback"; then
+            echo "strata-mcp crashed with a traceback:"; echo "$out"; exit 1
+          fi
+
+          # --- Side 2: grow the fleet past one scope, no binding ------------
+          # Preserves the refuse-path coverage the old smoke had: once the
+          # fleet has 2+ scopes, auto-bind no longer applies and an unset
+          # STRATA_AGENT_SCOPE must exit 1 with the aggregated
+          # refuse-to-start message naming every available scope id, NOT a
+          # traceback. Edited via PyYAML (not a raw text append — the
+          # seeded scopes list sits before a trailing `edges: []`, so a
+          # naive append lands after it and produces invalid YAML) using
+          # the venv's own interpreter, since strata-mem depends on PyYAML.
+          /tmp/wheelenv/bin/python -c "
+          import yaml
+          path = '.strata/fleet.yaml'
+          with open(path) as f:
+              data = yaml.safe_load(f)
+          data['scopes'].append({'id': 'g_arch', 'name': 'Arch', 'stratum_id': 'L0'})
+          with open(path, 'w') as f:
+              yaml.dump(data, f)
+          "
+          /tmp/wheelenv/bin/strata bootstrap  # fails loudly if the edit produced invalid YAML
           set +e
           out=$(/tmp/wheelenv/bin/strata-mcp </dev/null 2>&1)
           rc=$?
           set -e
           [ "$rc" -eq 1 ]
           echo "$out" | grep -q "refuses to start"
+          echo "$out" | grep -q "g_root"
+          echo "$out" | grep -q "g_arch"
           if echo "$out" | grep -q "Traceback"; then
             echo "strata-mcp crashed with a traceback:"; echo "$out"; exit 1
           fi

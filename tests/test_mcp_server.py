@@ -312,6 +312,69 @@ def _load_mcp_module(db_path: str, summaries_dir: str, fleet_yaml_path: str):
 
 
 # ---------------------------------------------------------------------------
+# _AGENT_SESSION_ID resolution — the module-level constant must route
+# through the shared strata.session_state.resolve_agent_session_id fallback
+# (issue #112 gap: an unset/empty STRATA_AGENT_SESSION_ID must not collapse
+# to an empty session id, and must land on the same id the freshness Stop
+# hook computes independently for the same parent pid).
+# ---------------------------------------------------------------------------
+
+
+def test_agent_session_id_falls_back_deterministically_when_unset(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """An unset STRATA_AGENT_SESSION_ID resolves _AGENT_SESSION_ID to the
+    shared sess_auto_<parent pid> fallback at import time, matching what
+    strata.session_state.resolve_agent_session_id computes for the hook."""
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fleet_yaml(tmp_path)
+
+    monkeypatch.delenv("STRATA_AGENT_SESSION_ID", raising=False)
+    monkeypatch.setattr("os.getppid", lambda: 13131)
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+
+    assert mod._AGENT_SESSION_ID == "sess_auto_13131"
+
+    from strata.session_state import resolve_agent_session_id
+
+    # Same computation, same fixed ppid — the pairing the hook relies on.
+    assert resolve_agent_session_id({}) == mod._AGENT_SESSION_ID
+
+
+def test_agent_session_id_treats_empty_string_as_unset(tmp_path: Path, monkeypatch) -> None:
+    """Empty string counts as unset — Codex ships literal empty env values —
+    so _AGENT_SESSION_ID falls back the same way an absent var does, never
+    to an empty-string session id."""
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fleet_yaml(tmp_path)
+
+    monkeypatch.setenv("STRATA_AGENT_SESSION_ID", "")
+    monkeypatch.setattr("os.getppid", lambda: 24242)
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+
+    assert mod._AGENT_SESSION_ID == "sess_auto_24242"
+    assert mod._AGENT_SESSION_ID != ""
+
+
+def test_agent_session_id_explicit_value_unchanged(tmp_path: Path, monkeypatch) -> None:
+    """An explicit STRATA_AGENT_SESSION_ID is used verbatim — auto-fallback
+    never engages when one is set."""
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fleet_yaml(tmp_path)
+
+    monkeypatch.setenv("STRATA_AGENT_SESSION_ID", "sess_explicit")
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+
+    assert mod._AGENT_SESSION_ID == "sess_explicit"
+
+
+# ---------------------------------------------------------------------------
 # Test 1: strata_contribute writes to RecordStore without HTTP server
 # ---------------------------------------------------------------------------
 

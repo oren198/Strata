@@ -25,6 +25,7 @@ from strata.session_state import (
     _parse_ts,
     compute_fleet_staleness,
     compute_scope_staleness,
+    resolve_agent_session_id,
     sessions_dir_for,
 )
 
@@ -81,6 +82,54 @@ def test_sessions_dir_is_sibling_of_summaries() -> None:
     """The sessions dir lands beside the summaries dir under the runtime area."""
     assert sessions_dir_for("/proj/.strata/summaries") == Path("/proj/.strata/sessions")
     assert sessions_dir_for("./summaries") == Path("sessions")
+
+
+# ---------------------------------------------------------------------------
+# resolve_agent_session_id — shared deterministic fallback (issue #112 gap:
+# the MCP server and the freshness Stop hook must land on the identical
+# session id from an identical environment, with no IPC).
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_agent_session_id_explicit_value_used_verbatim() -> None:
+    """An explicit STRATA_AGENT_SESSION_ID is returned unchanged."""
+    env = {"STRATA_AGENT_SESSION_ID": "my-session"}
+    assert resolve_agent_session_id(env) == "my-session"
+
+
+def test_resolve_agent_session_id_falls_back_when_unset(monkeypatch) -> None:
+    """Unset STRATA_AGENT_SESSION_ID resolves to the deterministic
+    sess_auto_<parent pid> fallback, not an empty string."""
+    monkeypatch.setattr("os.getppid", lambda: 4242)
+    resolved = resolve_agent_session_id({})
+    assert resolved == "sess_auto_4242"
+
+
+def test_resolve_agent_session_id_treats_empty_string_as_unset(monkeypatch) -> None:
+    """Empty string counts as unset everywhere (Codex writes literal empty
+    env values into its config) — falls through to the same fallback as an
+    absent var, never an empty-string session id."""
+    monkeypatch.setattr("os.getppid", lambda: 4242)
+    env = {"STRATA_AGENT_SESSION_ID": ""}
+    resolved = resolve_agent_session_id(env)
+    assert resolved == "sess_auto_4242"
+    assert resolved != ""
+
+
+def test_resolve_agent_session_id_deterministic_for_same_ppid(monkeypatch) -> None:
+    """Two independent calls (standing in for the MCP server process and the
+    freshness Stop hook process) with the same parent pid land on the exact
+    same fallback id — the pairing the whole design depends on."""
+    monkeypatch.setattr("os.getppid", lambda: 9999)
+    mcp_side = resolve_agent_session_id({})
+    hook_side = resolve_agent_session_id({})
+    assert mcp_side == hook_side == "sess_auto_9999"
+
+
+def test_resolve_agent_session_id_defaults_to_os_environ(monkeypatch) -> None:
+    """With no env argument, os.environ is read (the real-process default)."""
+    monkeypatch.setenv("STRATA_AGENT_SESSION_ID", "from-environ")
+    assert resolve_agent_session_id() == "from-environ"
 
 
 # ---------------------------------------------------------------------------

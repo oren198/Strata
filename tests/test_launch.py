@@ -74,6 +74,15 @@ _SCOPE_NO_SKILLS: dict = {
     "permitted_skills": None,
 }
 
+_SCOPE_PERMITTED_ONLY_G_TEAM: dict = {
+    "id": "g_team",
+    "name": "Team",
+    "stratum_id": "L1",
+    "status": "active",
+    "default_skill": None,
+    "permitted_skills": ["code-writer"],
+}
+
 
 def _write_fleet(tmp_path: Path, scopes: list[dict]) -> Path:
     """Write a valid fleet.yaml containing *scopes* and return its path."""
@@ -379,11 +388,12 @@ class TestLaunchUnknownScope:
 
 
 class TestLaunchNonTTY:
-    def test_no_arg_no_role_non_tty_exits_nonzero(
+    def test_no_arg_no_role_non_tty_multi_scope_exits_nonzero(
         self, fleet_env, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        """Non-TTY + no positional arg + no .strata-role → exit 1, no input() call."""
-        fleet_env([_SCOPE_DEFAULT_ONLY])
+        """Non-TTY + no positional arg + no .strata-role + 2+ scopes → exit 1,
+        no input() call."""
+        fleet_env([_SCOPE_DEFAULT_ONLY, _SCOPE_PERMITTED_ONLY_G_TEAM])
         called_input = []
 
         def fake_input(prompt: str = "") -> str:
@@ -405,6 +415,34 @@ class TestLaunchNonTTY:
         err = capsys.readouterr().err
         assert "g_arch" in err
 
+    def test_no_arg_no_role_non_tty_single_scope_auto_binds(
+        self, fleet_env, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Single-scope auto-bind (operator directive): non-TTY + no positional
+        arg + no .strata-role, but the fleet has exactly one scope — no picker
+        needed, bind to it and say so."""
+        fleet_env([_SCOPE_DEFAULT_ONLY])
+        called_input = []
+
+        def fake_input(prompt: str = "") -> str:
+            called_input.append(prompt)
+            return "1"
+
+        with (
+            patch("strata.__main__.is_interactive", return_value=False),
+            patch("builtins.input", side_effect=fake_input),
+            patch("pathlib.Path.cwd", return_value=tmp_path),
+            patch("strata.__main__.exec_claude", return_value=0) as mock_exec,
+        ):
+            rc = main(["launch"])
+        assert rc == 0
+        assert called_input == [], "input() must not be called when auto-binding"
+        mock_exec.assert_called_once()
+        (env,) = mock_exec.call_args[0]
+        assert env["STRATA_AGENT_SCOPE"] == "g_arch"
+        out = capsys.readouterr().out
+        assert "g_arch" in out
+
 
 # ---------------------------------------------------------------------------
 # CLI integration — interactive picker
@@ -415,8 +453,9 @@ class TestLaunchPicker:
     def test_picker_resolves_scope_and_skill(
         self, fleet_env, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        """Interactive picker: user picks scope '1', skill resolved from default."""
-        fleet_env([_SCOPE_DEFAULT_ONLY])
+        """Interactive picker with 2+ scopes: user picks scope '1', skill
+        resolved from default."""
+        fleet_env([_SCOPE_DEFAULT_ONLY, _SCOPE_PERMITTED_ONLY_G_TEAM])
         with (
             patch("strata.__main__.is_interactive", return_value=True),
             patch("builtins.input", return_value="1"),
@@ -430,6 +469,27 @@ class TestLaunchPicker:
         assert env["STRATA_AGENT_SCOPE"] == "g_arch"
         assert env["STRATA_AGENT_SKILL"] == "code-writer"
         assert "STRATA_AGENT_SESSION_ID" in env
+
+    def test_single_scope_fleet_skips_picker(
+        self, fleet_env, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Single-scope auto-bind (operator directive): interactive session,
+        but the fleet has exactly one scope — no prompt_scope() call, no
+        input() call, bind straight to it."""
+        fleet_env([_SCOPE_DEFAULT_ONLY])
+        with (
+            patch("strata.__main__.is_interactive", return_value=True),
+            patch("builtins.input") as mock_input,
+            patch("pathlib.Path.cwd", return_value=tmp_path),
+            patch("strata.__main__.exec_claude", return_value=0) as mock_exec,
+        ):
+            rc = main(["launch"])
+        assert rc == 0
+        mock_input.assert_not_called()
+        mock_exec.assert_called_once()
+        (env,) = mock_exec.call_args[0]
+        assert env["STRATA_AGENT_SCOPE"] == "g_arch"
+        assert env["STRATA_AGENT_SKILL"] == "code-writer"
 
 
 # ---------------------------------------------------------------------------

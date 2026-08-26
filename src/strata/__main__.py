@@ -1122,14 +1122,34 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
     # -----------------------------------------------------------------------
     # 8. Binding env vars set and valid against the fleet.
+    #
+    # Single-scope auto-bind (mirrors strata.mcp.server._validate_binding):
+    # an unset/empty STRATA_AGENT_SCOPE against a fleet with exactly one
+    # active scope is not a failure here — it auto-binds, and the check
+    # passes with a note saying so. Unset/empty against 2+ scopes (or no
+    # fleet) keeps today's failure, naming the available scope IDs.
     # -----------------------------------------------------------------------
     scope = os.environ.get("STRATA_AGENT_SCOPE", "")
     skill = os.environ.get("STRATA_AGENT_SKILL", "")
     session_id = os.environ.get("STRATA_AGENT_SESSION_ID", "")
     binding_problems: list[str] = []
+    auto_bind_note = ""
+
+    if not scope and fleet_config is not None:
+        sole = fleet_config.auto_bind_scope()
+        if sole is not None:
+            scope = sole.id
+            auto_bind_note = f" (will auto-bind to {scope!r} — the fleet's only scope)"
+            if not skill and sole.default_skill:
+                skill = sole.default_skill
 
     if not scope:
-        binding_problems.append("STRATA_AGENT_SCOPE is not set")
+        available = ""
+        if fleet_config is not None:
+            ids = ", ".join(s.id for s in fleet_config.active_scopes())
+            if ids:
+                available = f" (available: {ids})"
+        binding_problems.append(f"STRATA_AGENT_SCOPE is not set{available}")
 
     scope_obj = None
     if fleet_config is not None and scope:
@@ -1176,7 +1196,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                 name="Agent binding",
                 kind="hard",
                 passed=True,
-                message=f"STRATA_AGENT_SCOPE={scope!r} valid{skill_note}",
+                message=f"STRATA_AGENT_SCOPE={scope!r} valid{skill_note}{auto_bind_note}",
             )
         )
 
@@ -2101,8 +2121,19 @@ def cmd_launch(args: argparse.Namespace) -> int:
                     file=sys.stderr,
                 )
                 return 1
+        elif (sole := fleet.auto_bind_scope()) is not None:
+            # Single-scope fleet auto-bind (operator directive): with no
+            # positional arg and no .strata-role, a fleet with exactly one
+            # scope needs no picker — interactive or not — bind to it and
+            # say so, mirroring the MCP server's own auto-bind notice. Routes
+            # through FleetConfig.auto_bind_scope() — the single source of
+            # truth for this rule — rather than re-deriving it from
+            # active_scopes here.
+            scope_data = sole.model_dump()
+            print(f"Only one scope in the fleet — binding to {scope_data['id']!r}.")
         else:
-            # No positional arg, no .strata-role — need interactive picker or fail.
+            # No positional arg, no .strata-role, 2+ scopes — need the
+            # interactive picker or fail.
             if not interactive:
                 print(
                     f"No scope specified and no .strata-role found. Valid scope IDs: {valid_ids}",
@@ -2378,6 +2409,38 @@ def cmd_register(args: argparse.Namespace) -> int:
                 )
         _act("seeded", fleet_yaml)
 
+    def _seeded_binding_hint() -> tuple[bool, str]:
+        """Return ``(single_scope, first_scope_id)`` for *fleet_yaml*.
+
+        Loads via ``FleetConfig.load`` and routes the single/multi decision
+        through ``FleetConfig.auto_bind_scope()`` — the same load path and
+        the same source of truth as every other auto-bind call site (MCP
+        server validation, the freshness evaluator, `strata doctor`, `strata
+        launch`), so this can never drift from them by re-deriving its own
+        active/archived status rule.
+
+        Falls back to ``(True, "g_root")`` only when there is nothing to
+        load: no file on disk (e.g. --diff on a project without a
+        pre-existing fleet.yaml — nothing was actually written) or a load
+        failure (a hand-edited fleet.yaml that fails validation must not
+        crash the next-steps printing) — both the copied template and the
+        inline fallback above seed exactly one scope, ``g_root``, so the
+        fallback matches what would land on disk on a real (non-diff) run.
+        """
+        if not fleet_yaml.exists():
+            return True, "g_root"
+        try:
+            from strata.fleet_config import FleetConfig  # noqa: PLC0415
+
+            loaded = FleetConfig.load(fleet_yaml)
+            sole = loaded.auto_bind_scope()
+            if sole is not None:
+                return True, sole.id
+            active = loaded.active_scopes()
+            return False, (active[0].id if active else "g_root")
+        except Exception:  # noqa: BLE001
+            return True, "g_root"
+
     settings_unreadable = False
 
     def _register_claude_code() -> None:
@@ -2555,16 +2618,33 @@ def cmd_register(args: argparse.Namespace) -> int:
         if not diff_mode and agents_added:
             agents_md.write_bytes(new_agents_text.encode("utf-8"))
 
-        print(
-            "\n  Codex config: fill in STRATA_AGENT_SCOPE / STRATA_AGENT_SKILL / "
-            "STRATA_AGENT_SESSION_ID under\n"
-            f"  [mcp_servers.strata.env] in {codex_config} before running `codex` "
-            "(MCP env values are literal\n"
-            "  TOML strings — Codex does not interpolate them). The Stop-hook block "
-            "is schema-verified only;\n"
-            '  see README "Using Strata with Codex CLI" for exactly what is and '
-            "isn't proven to work."
-        )
+        single_scope, first_scope = _seeded_binding_hint()
+        if single_scope:
+            # Single-scope auto-bind (operator directive): the engine
+            # auto-binds an empty STRATA_AGENT_SCOPE to the fleet's only
+            # scope, so Codex's env values can stay exactly as seeded
+            # (empty) — nothing to fill in for a fresh, single-scope fleet.
+            print(
+                f"\n  Codex config: the env values under [mcp_servers.strata.env] in "
+                f"{codex_config}\n"
+                f"  can stay empty — the fleet has one scope ({first_scope!r}) and the "
+                "engine auto-binds to\n"
+                "  it. Fill them in only once the fleet grows past one scope. The "
+                "Stop-hook block is schema-\n"
+                '  verified only; see README "Using Strata with Codex CLI" for exactly '
+                "what is and isn't proven to work."
+            )
+        else:
+            print(
+                "\n  Codex config: fill in STRATA_AGENT_SCOPE / STRATA_AGENT_SKILL / "
+                "STRATA_AGENT_SESSION_ID under\n"
+                f"  [mcp_servers.strata.env] in {codex_config} before running `codex` "
+                "(MCP env values are literal\n"
+                "  TOML strings — Codex does not interpolate them). The Stop-hook block "
+                "is schema-verified only;\n"
+                '  see README "Using Strata with Codex CLI" for exactly what is and '
+                "isn't proven to work."
+            )
 
     # -----------------------------------------------------------------------
     # Per-harness wiring loop (Task 2, multi-harness parity): runs the
@@ -2706,37 +2786,42 @@ def cmd_register(args: argparse.Namespace) -> int:
     # Print next steps.
     # -----------------------------------------------------------------------
     if not diff_mode:
-        # Determine the first scope ID from the seeded fleet.yaml.
-        first_scope = "g_root"
-        if fleet_yaml.exists():
-            try:
-                import yaml  # noqa: PLC0415
-
-                fleet_data = yaml.safe_load(fleet_yaml.read_text(encoding="utf-8"))
-                scopes = fleet_data.get("scopes", [])
-                if scopes:
-                    first_scope = scopes[0].get("id", "g_root")
-            except Exception:  # noqa: BLE001
-                pass
+        single_scope, first_scope = _seeded_binding_hint()
 
         print()
         print("Done. Next steps:")
         print(f"  1. Edit {fleet_yaml.relative_to(project_root)} for your team's structure")
         print()
-        print("  2. Bind your session — every agent works as one scope of the fleet:")
-        print(f"       export STRATA_AGENT_SCOPE={first_scope}")
-        print("       export STRATA_AGENT_SKILL=<your-skill>  # optional")
-        print("     or run `strata launch` to be prompted interactively")
+        if single_scope:
+            # Single-scope auto-bind (operator directive): a fresh install
+            # must work with minimum friction — the seeded fleet has one
+            # scope, so binding needs no export at all.
+            print(
+                f"  2. You're ready — open your harness; this session binds to "
+                f"{first_scope!r} automatically."
+            )
+            print("     Export STRATA_AGENT_SCOPE only when the fleet grows past one scope.")
+        else:
+            print("  2. Bind your session — every agent works as one scope of the fleet:")
+            print(f"       export STRATA_AGENT_SCOPE={first_scope}")
+            print("       export STRATA_AGENT_SKILL=<your-skill>  # optional")
+            print("     or run `strata launch` to be prompted interactively")
         print()
         next_step = 3
         if "claude-code" in resolved_harnesses:
             print(f"  {next_step}. Open Claude Code in this directory: claude")
             next_step += 1
         if "codex" in resolved_harnesses:
-            print(
-                f"  {next_step}. Fill in the env values in {_codex_config_path()}, "
-                "then open Codex CLI in this directory: codex"
-            )
+            if single_scope:
+                print(
+                    f"  {next_step}. Open Codex CLI in this directory: codex "
+                    f"(env values in {_codex_config_path()} can stay empty for now)"
+                )
+            else:
+                print(
+                    f"  {next_step}. Fill in the env values in {_codex_config_path()}, "
+                    "then open Codex CLI in this directory: codex"
+                )
             next_step += 1
 
     if settings_unreadable:

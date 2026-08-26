@@ -399,6 +399,28 @@ class FleetConfig(BaseModel):
         """Return only scopes with ``status == 'active'``."""
         return [s for s in self.scopes if s.status == "active"]
 
+    def auto_bind_scope(self) -> Scope | None:
+        """Return the fleet's sole active scope, or ``None`` when auto-binding
+        does not apply (zero or 2+ active scopes).
+
+        Single-scope auto-binding (operator directive: a fresh install must
+        work with minimum friction — the seeded fleet has one scope, so an
+        unset ``STRATA_AGENT_SCOPE`` resolves to it automatically). Uses
+        ``active_scopes()`` deliberately, not ``self.scopes``: an archived
+        scope sitting alongside one active scope must still auto-bind — an
+        archived scope was never a candidate binding target anyway.
+
+        This is the single source of truth for the auto-bind rule; every
+        call site (MCP server validation, the freshness evaluator, `strata
+        doctor`, `strata launch`, `strata register`'s next-steps output)
+        goes through this method so the decision can never drift between
+        them.
+        """
+        active = self.active_scopes()
+        if len(active) == 1:
+            return active[0]
+        return None
+
     def inter_stratum_parent(self, scope_id: str) -> Scope | None:
         """Return the single inter-stratum parent of *scope_id*, or ``None`` for root scopes.
 

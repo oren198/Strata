@@ -87,13 +87,42 @@ def _make_project(tmp_path: Path) -> dict[str, str]:
     }
 
 
+def _make_project_multi_scope(tmp_path: Path) -> dict[str, str]:
+    """Like _make_project, but seeds a 2-scope fleet — auto-bind never
+    applies here, so it's the negative-case fixture."""
+    strata_dir = tmp_path / ".strata"
+    strata_dir.mkdir()
+    (strata_dir / "config.toml").write_text(
+        'db = ".strata/strata.db"\n'
+        'fleet_yaml = ".strata/fleet.yaml"\n'
+        'summaries_dir = ".strata/summaries"\n',
+        encoding="utf-8",
+    )
+    fleet = {
+        "strata": [{"id": "L0", "name": "root", "ordinal": 0}],
+        "scopes": [
+            {"id": "g_root", "name": "Root", "stratum_id": "L0"},
+            {"id": "g_arch", "name": "Arch", "stratum_id": "L0"},
+        ],
+        "edges": [],
+    }
+    (strata_dir / "fleet.yaml").write_text(yaml.dump(fleet), encoding="utf-8")
+    db_path = str(strata_dir / "strata.db")
+    run_migrations(db_path)
+    return {
+        "db": db_path,
+        "fleet_yaml": str(strata_dir / "fleet.yaml"),
+        "summaries_dir": str(strata_dir / "summaries"),
+    }
+
+
 def _session_store(paths: dict[str, str]) -> SessionStateStore:
     return SessionStateStore(sessions_dir_for(paths["summaries_dir"]))
 
 
-def _seed_reads(store: SessionStateStore, n: int) -> None:
+def _seed_reads(store: SessionStateStore, n: int, *, session_id: str = _SESSION_ID) -> None:
     for _ in range(n):
-        store.record_read(_SESSION_ID, "g_root")
+        store.record_read(session_id, "g_root")
 
 
 def _hook_stdin(*, stop_hook_active: bool = False, transcript_path: str = "/tmp/t.jsonl") -> str:
@@ -177,6 +206,51 @@ def test_at_threshold_spawns_once(tmp_path: Path, monkeypatch) -> None:
     assert rc == 0
     assert len(spawns.calls) == 1
     assert spawns.calls[0][0] == _SESSION_ID
+
+
+def test_at_threshold_spawns_with_unset_session_id_via_deterministic_fallback(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Issue #112 gap, fixed: an unset STRATA_AGENT_SESSION_ID must no longer
+    make the hook silently no-op. It resolves to the deterministic
+    sess_auto_<parent pid> fallback (same as the MCP server would for the
+    same parent process) and the hook spawns on that id like any other."""
+    paths = _make_project(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("os.getppid", lambda: 55555)
+    fallback_id = "sess_auto_55555"
+    _seed_reads(_session_store(paths), NUDGE_MIN_READS, session_id=fallback_id)
+
+    env = _env(paths)
+    del env["STRATA_AGENT_SESSION_ID"]  # unset — the flagship zero-export path
+
+    spawns = _Spawns()
+    rc = freshness.run_stop_hook(_hook_stdin(), env=env, spawn_fn=spawns)
+
+    assert rc == 0
+    assert len(spawns.calls) == 1
+    assert spawns.calls[0][0] == fallback_id
+
+
+def test_at_threshold_spawns_with_empty_string_session_id(tmp_path: Path, monkeypatch) -> None:
+    """Empty string counts as unset — Codex ships a literal empty
+    STRATA_AGENT_SESSION_ID — so it falls back the same way an absent var
+    does, never keying session state by an empty-string filename."""
+    paths = _make_project(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("os.getppid", lambda: 55556)
+    fallback_id = "sess_auto_55556"
+    _seed_reads(_session_store(paths), NUDGE_MIN_READS, session_id=fallback_id)
+
+    env = _env(paths)
+    env["STRATA_AGENT_SESSION_ID"] = ""
+
+    spawns = _Spawns()
+    rc = freshness.run_stop_hook(_hook_stdin(), env=env, spawn_fn=spawns)
+
+    assert rc == 0
+    assert len(spawns.calls) == 1
+    assert spawns.calls[0][0] == fallback_id
 
 
 def test_contribution_present_does_not_spawn(tmp_path: Path, monkeypatch) -> None:
@@ -421,6 +495,141 @@ def test_evaluator_draft_submitted_through_judged_path(tmp_path: Path, monkeypat
     # must exist next to the DB once the run completes.
     lock_file = Path(paths["db"]).parent / ".locks" / "g_root.summary.lock"
     assert lock_file.exists(), f"expected the evaluator to have flocked {lock_file}"
+
+
+def test_evaluator_auto_binds_scope_when_env_unset(tmp_path: Path, monkeypatch) -> None:
+    """A single-scope fleet auto-binds the evaluator's contribution even when
+    STRATA_AGENT_SCOPE is empty in its inherited env — the same rule the MCP
+    server applies, so the two never diverge on which scope a session binds
+    to."""
+    paths = _make_project(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    from strata.settings import get_settings
+
+    get_settings.cache_clear()
+    store = _session_store(paths)
+    _seed_reads(store, NUDGE_MIN_READS)
+
+    draft = freshness.EvaluatorDraft(
+        content="We chose sqlite for the record store.",
+        classification="context",
+        subject="storage",
+    )
+    draft_fn = MagicMock(return_value=draft)
+    judge = MagicMock(return_value=_fake_accept_judgment())
+
+    env = _env(paths)
+    env["STRATA_AGENT_SCOPE"] = ""  # unset — Codex writes literal empty values
+
+    with (
+        patch("strata.scope_manager.ScopeManager.judge", judge),
+        patch("anthropic.Anthropic", return_value=MagicMock()),
+    ):
+        outcome = freshness.run_evaluator(
+            session_id=_SESSION_ID,
+            transcript_path="/tmp/t.jsonl",
+            env=env,
+            draft_fn=draft_fn,
+        )
+
+    assert outcome == "contributed"
+    from strata.record_store import RecordStore
+
+    with RecordStore(paths["db"]) as rs:
+        contributions = rs.list_contributions(scope_id="g_root")
+    assert len(contributions) == 1
+
+
+def test_evaluator_does_not_auto_bind_scope_on_multi_scope_fleet(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Negative case: a 2+ scope fleet has no auto-bind target, so an empty
+    STRATA_AGENT_SCOPE stays unresolved and the evaluator errors out to a
+    mechanical decline (never guesses a scope) — mirrors the MCP server's
+    refuse-to-start behavior for the same fleet shape."""
+    paths = _make_project_multi_scope(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    from strata.settings import get_settings
+
+    get_settings.cache_clear()
+    store = _session_store(paths)
+    _seed_reads(store, NUDGE_MIN_READS)
+
+    draft = freshness.EvaluatorDraft(
+        content="We chose sqlite for the record store.",
+        classification="context",
+        subject="storage",
+    )
+    draft_fn = MagicMock(return_value=draft)
+
+    env = _env(paths)
+    env["STRATA_AGENT_SCOPE"] = ""  # unset, and ambiguous against 2 scopes
+
+    outcome = freshness.run_evaluator(
+        session_id=_SESSION_ID,
+        transcript_path="/tmp/t.jsonl",
+        env=env,
+        draft_fn=draft_fn,
+    )
+
+    assert outcome == "error"
+    from strata.record_store import RecordStore
+
+    with RecordStore(paths["db"]) as rs:
+        assert rs.list_contributions(scope_id="g_root") == []
+        assert rs.list_contributions(scope_id="g_arch") == []
+    # The mechanical decline still reset the asymmetry, same as any other
+    # evaluator failure — the gate must not re-spawn every turn.
+    state = store.read(_SESSION_ID)
+    assert state.declines == 1
+
+
+def test_evaluator_contribution_provenance_uses_resolved_session_id_not_raw_env(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The contribution's provenance session id must be the session_id
+    run_evaluator was actually called with (the same id the hook resolved
+    and is keying session state by) — not re-derived from
+    env["STRATA_AGENT_SESSION_ID"], which is empty whenever that id came
+    from the deterministic sess_auto_<ppid> fallback rather than the env."""
+    paths = _make_project(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    from strata.settings import get_settings
+
+    get_settings.cache_clear()
+    fallback_id = "sess_auto_77777"
+    store = _session_store(paths)
+    _seed_reads(store, NUDGE_MIN_READS, session_id=fallback_id)
+
+    draft = freshness.EvaluatorDraft(
+        content="We chose sqlite for the record store.",
+        classification="context",
+        subject="storage",
+    )
+    draft_fn = MagicMock(return_value=draft)
+    judge = MagicMock(return_value=_fake_accept_judgment())
+
+    env = _env(paths)
+    del env["STRATA_AGENT_SESSION_ID"]  # never carries the auto fallback id
+
+    with (
+        patch("strata.scope_manager.ScopeManager.judge", judge),
+        patch("anthropic.Anthropic", return_value=MagicMock()),
+    ):
+        outcome = freshness.run_evaluator(
+            session_id=fallback_id,
+            transcript_path="/tmp/t.jsonl",
+            env=env,
+            draft_fn=draft_fn,
+        )
+
+    assert outcome == "contributed"
+    from strata.record_store import RecordStore
+
+    with RecordStore(paths["db"]) as rs:
+        contributions = rs.list_contributions(scope_id="g_root")
+    assert len(contributions) == 1
+    assert contributions[0].contributor.session_id == fallback_id
 
 
 def test_evaluator_nothing_records_decline_without_judge(tmp_path: Path, monkeypatch) -> None:

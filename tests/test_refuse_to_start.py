@@ -50,6 +50,21 @@ def _make_fleet_with_skills(
     return FleetConfig.load(fleet_path)
 
 
+def _make_two_scope_fleet(tmp_path: Path) -> FleetConfig:
+    """Build a FleetConfig with two scopes — auto-bind never applies here."""
+    data = {
+        "strata": [{"id": "L0", "name": "root", "ordinal": 0}],
+        "scopes": [
+            {"id": "g_root", "name": "Root", "stratum_id": "L0"},
+            {"id": "g_arch", "name": "Arch", "stratum_id": "L0"},
+        ],
+        "edges": [],
+    }
+    fleet_path = tmp_path / "fleet.yaml"
+    fleet_path.write_text(yaml.dump(data), encoding="utf-8")
+    return FleetConfig.load(fleet_path)
+
+
 # ---------------------------------------------------------------------------
 # Condition 1: project config not found → exit(1)
 # ---------------------------------------------------------------------------
@@ -87,13 +102,15 @@ def test_no_project_config_message_mentions_register(tmp_path: Path, capsys) -> 
 
 
 # ---------------------------------------------------------------------------
-# Condition 2: STRATA_AGENT_SCOPE not set → exit(1)
+# Condition 2: STRATA_AGENT_SCOPE not set, and no single-scope fleet to
+# auto-bind to → exit(1). A single-scope fleet is covered separately below
+# (single-scope auto-bind no longer exits here).
 # ---------------------------------------------------------------------------
 
 
 def test_no_scope_exits_with_message(tmp_path: Path) -> None:
-    """Condition 2 failure: STRATA_AGENT_SCOPE empty → sys.exit(1)."""
-    fleet = _make_fleet_with_skills(tmp_path)
+    """Condition 2 failure: STRATA_AGENT_SCOPE empty, 2+ scope fleet → sys.exit(1)."""
+    fleet = _make_two_scope_fleet(tmp_path)
 
     with pytest.raises(SystemExit) as exc_info:
         _validate_binding(
@@ -108,7 +125,7 @@ def test_no_scope_exits_with_message(tmp_path: Path) -> None:
 
 def test_no_scope_message_mentions_export(tmp_path: Path, capsys) -> None:
     """Condition 2 message must include export STRATA_AGENT_SCOPE instruction."""
-    fleet = _make_fleet_with_skills(tmp_path)
+    fleet = _make_two_scope_fleet(tmp_path)
 
     with pytest.raises(SystemExit):
         _validate_binding(
@@ -121,6 +138,157 @@ def test_no_scope_message_mentions_export(tmp_path: Path, capsys) -> None:
     captured = capsys.readouterr()
     assert "STRATA_AGENT_SCOPE" in captured.err
     assert "export" in captured.err
+
+
+def test_no_scope_message_lists_available_scopes_for_multi_scope_fleet(
+    tmp_path: Path, capsys
+) -> None:
+    """Task requirement: the unset-scope error names the valid scopes when
+    the fleet has 2+ of them (no single scope to auto-bind to)."""
+    fleet = _make_two_scope_fleet(tmp_path)
+
+    with pytest.raises(SystemExit):
+        _validate_binding(
+            fleet,
+            scope="",
+            skill="strata-worker",
+            project_config_found=True,
+        )
+
+    captured = capsys.readouterr()
+    assert "g_root" in captured.err
+    assert "g_arch" in captured.err
+
+
+def test_empty_string_scope_treated_as_unset_for_multi_scope_fleet(tmp_path: Path, capsys) -> None:
+    """Empty string counts as unset everywhere (Codex writes literal empty
+    env values) — a 2+ scope fleet still exits."""
+    fleet = _make_two_scope_fleet(tmp_path)
+
+    with pytest.raises(SystemExit) as exc_info:
+        _validate_binding(
+            fleet,
+            scope="",
+            skill="strata-worker",
+            project_config_found=True,
+        )
+
+    assert exc_info.value.code == 1
+
+
+# ---------------------------------------------------------------------------
+# Single-scope auto-bind: unset/empty STRATA_AGENT_SCOPE against a fleet
+# with exactly one active scope binds to it automatically, with a one-line
+# notice on stderr. An explicitly set scope is never touched by this.
+# ---------------------------------------------------------------------------
+
+
+def test_single_scope_fleet_auto_binds_when_scope_unset(tmp_path: Path) -> None:
+    """A single-scope fleet auto-binds — no exit — and returns the scope id."""
+    fleet = _make_fleet_with_skills(tmp_path, permitted_skills=None)
+
+    resolved_scope, _resolved_skill = _validate_binding(
+        fleet,
+        scope="",
+        skill=None,
+        project_config_found=True,
+    )
+
+    assert resolved_scope == "g_root"
+
+
+def test_single_scope_fleet_auto_bind_prints_notice(tmp_path: Path, capsys) -> None:
+    """A one-line notice on stderr names the auto-bound scope (never stdout —
+    that's the MCP stdio protocol channel)."""
+    fleet = _make_fleet_with_skills(tmp_path, permitted_skills=None)
+
+    _validate_binding(
+        fleet,
+        scope="",
+        skill=None,
+        project_config_found=True,
+    )
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "g_root" in captured.err
+    assert "auto-bound" in captured.err.lower()
+
+
+def test_single_scope_fleet_auto_binds_skill_to_default(tmp_path: Path) -> None:
+    """When the scope was auto-bound and skill is unset, resolve the scope's
+    default_skill (companion rule — otherwise a fresh install with a
+    default_skill-declaring seeded scope would still refuse to start)."""
+    data = {
+        "strata": [{"id": "L0", "name": "root", "ordinal": 0}],
+        "scopes": [
+            {
+                "id": "g_root",
+                "name": "Root",
+                "stratum_id": "L0",
+                "default_skill": "strata-worker",
+            }
+        ],
+        "edges": [],
+    }
+    fleet_path = tmp_path / "fleet.yaml"
+    fleet_path.write_text(yaml.dump(data), encoding="utf-8")
+    fleet = FleetConfig.load(fleet_path)
+
+    resolved_scope, resolved_skill = _validate_binding(
+        fleet,
+        scope="",
+        skill="",
+        project_config_found=True,
+    )
+
+    assert resolved_scope == "g_root"
+    assert resolved_skill == "strata-worker"
+
+
+def test_multi_scope_fleet_does_not_auto_bind(tmp_path: Path) -> None:
+    """A 2+ scope fleet still exits on unset scope — no auto-bind target."""
+    fleet = _make_two_scope_fleet(tmp_path)
+
+    with pytest.raises(SystemExit):
+        _validate_binding(
+            fleet,
+            scope="",
+            skill="strata-worker",
+            project_config_found=True,
+        )
+
+
+def test_explicit_scope_unchanged_by_auto_bind_logic(tmp_path: Path) -> None:
+    """An explicitly set STRATA_AGENT_SCOPE is returned unchanged — auto-bind
+    logic only ever engages when scope is unset/empty."""
+    fleet = _make_two_scope_fleet(tmp_path)
+
+    resolved_scope, resolved_skill = _validate_binding(
+        fleet,
+        scope="g_arch",
+        skill="strata-worker",
+        project_config_found=True,
+    )
+
+    assert resolved_scope == "g_arch"
+    assert resolved_skill == "strata-worker"
+
+
+def test_explicit_scope_no_auto_bind_notice_printed(tmp_path: Path, capsys) -> None:
+    """No auto-bind notice appears when the scope was explicitly set, even
+    against a single-scope fleet."""
+    fleet = _make_fleet_with_skills(tmp_path, permitted_skills=None)
+
+    _validate_binding(
+        fleet,
+        scope="g_root",
+        skill="strata-worker",
+        project_config_found=True,
+    )
+
+    captured = capsys.readouterr()
+    assert "auto-bound" not in captured.err.lower()
 
 
 # ---------------------------------------------------------------------------

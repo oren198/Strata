@@ -106,6 +106,55 @@ def sessions_dir_for(summaries_dir: str | Path) -> Path:
 
 
 # ---------------------------------------------------------------------------
+# Session id resolution — shared by the MCP server and the freshness Stop
+# hook (issue #112) so both land on the identical session id from an
+# identical environment, with no IPC and no env var required.
+# ---------------------------------------------------------------------------
+
+
+def resolve_agent_session_id(env: dict[str, str] | None = None) -> str:
+    """Return the session id this process's session state is keyed by.
+
+    ``STRATA_AGENT_SESSION_ID`` set to a non-empty value is returned as-is —
+    explicit binding is never touched by this. Empty string counts as unset
+    everywhere in Strata (Codex writes literal empty env values into its
+    config), so it falls through to the same auto-generated fallback as an
+    absent var.
+
+    The fallback — ``sess_auto_<parent pid>`` — is deterministic, not
+    random: the MCP server (``strata-mcp``) and the freshness Stop hook
+    (``strata freshness-hook``, invoked via ``exec`` from the shipped
+    ``strata-stop-hook`` shell wrapper — see ``src/strata/_hooks/``, no
+    intervening shell process survives) are both spawned directly by the
+    same harness process, so ``os.getppid()`` resolves to that harness
+    process's pid in both. Reading it independently in each process (no env
+    var, no file, no IPC) is how the two land on the identical session id
+    for the identical turn without coordinating.
+
+    This pairing relies on the harness spawning both the MCP server and the
+    hook as its own direct children — true for Claude Code today. A harness
+    that instead routes hook invocations through a non-exec'ing intermediate
+    shell (a fresh subshell per hook call, rather than exec'ing into the
+    hook command) would see a different, and possibly a different-every-turn,
+    parent pid there, breaking the pairing; set ``STRATA_AGENT_SESSION_ID``
+    explicitly to sidestep that.
+
+    A caveat shared with any pid-derived id: pids are reused by the OS over
+    time, so a stale session-state file from a past process that happened to
+    reuse this pid could in principle be picked back up. Session state's
+    normal TTL/staleness handling (the same handling that already tolerates
+    a crashed evaluator's stale lock — see ``EVALUATOR_LOCK_TTL_SECONDS`` in
+    ``strata.freshness``) is the acceptable mitigation; this is not treated
+    as a hard collision risk here.
+    """
+    env = os.environ if env is None else env
+    explicit = env.get("STRATA_AGENT_SESSION_ID", "")
+    if explicit:
+        return explicit
+    return f"sess_auto_{os.getppid()}"
+
+
+# ---------------------------------------------------------------------------
 # Session state model
 # ---------------------------------------------------------------------------
 
