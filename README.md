@@ -71,6 +71,9 @@ strata register                # idempotent: creates .strata/, seeds fleet.yaml,
 `pyproject.toml`, `package.json`, `Cargo.toml`, or `go.mod` in it. That's
 what `git init` above is for in a brand-new, empty directory; skip it if
 you're registering an existing project that already has one of those.
+Run it from a markerless directory in an interactive terminal and it asks
+before proceeding instead of refusing outright; pass `--yes` to skip that
+question (needed in scripts/CI, where there's no terminal to ask).
 
 See [What `strata register` does](#what-strata-register-does) for the full
 list of what this creates: a `.strata/` workspace, a starter `fleet.yaml`,
