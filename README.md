@@ -111,16 +111,25 @@ Console's graph is how you *see* the result, not how you edit it.
 
 ### 5. Bind and work
 
-Binding means setting the same three identity values every harness reads —
+Binding means every harness knowing the same three identity values —
 `STRATA_AGENT_SCOPE`, `STRATA_AGENT_SKILL` (optional), and
-`STRATA_AGENT_SESSION_ID` (auto-generated if omitted) — just delivered
-differently per harness: Claude Code inherits them from your shell's
-environment, so you export them before running `claude`; Codex CLI doesn't
-inherit your shell, so it reads them as config values instead (see
-[Using Strata with Codex CLI](#using-strata-with-codex-cli)). Either way
-it's the same identity, only the delivery mechanism differs.
+`STRATA_AGENT_SESSION_ID` (auto-generated if omitted). For the quickstart's
+seeded fleet (one scope, `g_root`) you don't need to set any of them: with
+exactly one scope in the fleet, an unset `STRATA_AGENT_SCOPE` auto-binds to
+it (and its `default_skill`, when it has one) — you'll see a one-line notice
+naming the scope it bound to.
 
-For Claude Code:
+```bash
+claude
+```
+
+That's it — nothing to export for a fresh, single-scope install. Once your
+fleet grows past one scope, binding becomes an explicit choice, delivered
+differently per harness: Claude Code inherits it from your shell's
+environment, so you export it before running `claude`; Codex CLI doesn't
+inherit your shell, so it reads it as a config value instead (see
+[Using Strata with Codex CLI](#using-strata-with-codex-cli)). Either way
+it's the same identity, only the delivery mechanism differs:
 
 ```bash
 export STRATA_AGENT_SCOPE=g_root         # scope ID from your fleet.yaml
@@ -131,7 +140,8 @@ claude
 
 Or skip the manual exports and run `strata launch` — it validates the scope,
 resolves the skill, generates a session ID, and starts your harness already
-bound (see [`strata launch`](#strata-launch--frictionless-cc-session-binding-adr-0003)
+bound (with a single-scope fleet it picks that scope without asking; see
+[`strata launch`](#strata-launch--frictionless-cc-session-binding-adr-0003)
 below).
 
 The MCP server validates the binding at startup and applies pending
@@ -155,7 +165,7 @@ strata record g_root         # full contribution + judgment log
 |---|---|
 | Anything looks broken and you're not sure why | Run `strata doctor` first — it checks config, DB, `fleet.yaml`, harness wiring, and agent binding in one pass and names the fix for each failure. |
 | `strata: command not found` | `pipx install strata-mem` didn't complete, or your shell hasn't picked up the new PATH entry — open a new shell, or run `pipx ensurepath`. |
-| `claude` exits immediately with a binding error | `STRATA_AGENT_SCOPE` is unset or not in `.strata/fleet.yaml`, or `STRATA_AGENT_SKILL` isn't in that scope's `permitted_skills`. The error names which. |
+| `claude` exits immediately with a binding error | With one scope in the fleet, an unset `STRATA_AGENT_SCOPE` auto-binds — this only fires once the fleet has 2+ scopes: `STRATA_AGENT_SCOPE` is unset (and ambiguous — the error lists the valid scope IDs) or not in `.strata/fleet.yaml`, or `STRATA_AGENT_SKILL` isn't in that scope's `permitted_skills`. The error names which. |
 | A contribution comes back with `scope_manager_failure` | Your judge API key is missing or invalid. Check step 3. |
 | Want to start over with a fresh DB | `rm -f .strata/strata.db && rm -rf .strata/summaries/` — the next session re-creates them. |
 
@@ -219,6 +229,15 @@ Every step is additive: your own `mcpServers`, `hooks`, skills, `AGENTS.md` cont
 ### After registration
 
 ```bash
+# The seeded fleet has one scope — open your harness straight away, no
+# exports needed: an unset STRATA_AGENT_SCOPE auto-binds to the fleet's
+# only scope.
+claude
+```
+
+Growing the fleet past one scope turns binding into an explicit choice:
+
+```bash
 # Edit your fleet to match your team, then validate it
 $EDITOR .strata/fleet.yaml
 strata bootstrap
@@ -236,8 +255,9 @@ claude
 The MCP server starts with `strata-mcp` (on your PATH from pipx). It reads
 `.strata/config.toml` automatically — no `STRATA_DB_PATH` or `STRATA_FLEET_CONFIG`
 env vars needed, and it applies pending migrations itself on first use — there
-is nothing separate to start. If binding is wrong (scope unknown, skill not
-permitted), the server exits immediately with an actionable message.
+is nothing separate to start. If binding is ambiguous (2+ scopes and none
+chosen) or wrong (scope unknown, skill not permitted), the server exits
+immediately with an actionable message.
 
 Want to look at memory in a browser instead of (or alongside) working in
 your harness? Run `strata start` — see [Console](#console). It's optional and
@@ -419,7 +439,14 @@ and left in place.
   STRATA_AGENT_SESSION_ID = ""
   ```
 
-  Fill these in with real values before running `codex` (or edit them per
+  On a fresh, single-scope fleet these empty placeholders are fine as-is —
+  an empty `STRATA_AGENT_SCOPE` auto-binds to the fleet's only scope (and
+  its `default_skill`, if it has one), the same way an unset shell env var
+  does for Claude Code. `STRATA_AGENT_SESSION_ID` stays blank either way
+  (see the sharpest-edge note below).
+
+  Once the fleet grows past one scope, fill these in with real values
+  before running `codex` (or edit them per
   project/session — this file is user-level, so if you work across multiple
   Strata projects with Codex you'll want to keep them current, or maintain a
   `<repo>/.codex/config.toml` override — Codex's docs list that as a read
@@ -628,6 +655,10 @@ strata launch g_arch --session my-sess          # override auto-generated sessio
 strata launch                                   # pick from interactive list, or use .strata-role
 strata launch --harness claude-code             # start this harness regardless of the default
 ```
+
+With no `scope_id`, no `.strata-role`, and a fleet with exactly one scope,
+`strata launch` skips the picker entirely — it binds to that scope and says
+so, the same single-scope auto-bind rule the MCP server applies.
 
 #### Which harness `strata launch` starts
 
@@ -839,8 +870,8 @@ server (project config wins):
 | `STRATA_DB_PATH` | `./strata.db` | SQLite path for the record store (overridden by `config.toml`) |
 | `STRATA_SUMMARIES_DIR` | `./summaries` | Directory for per-scope summary files (overridden by `config.toml`) |
 | `STRATA_FLEET_CONFIG` | `./fleet.yaml` | Fleet YAML (overridden by `config.toml`) |
-| `STRATA_AGENT_SCOPE` | (required) | The scope this session acts at — MCP server refuses to start if unset |
-| `STRATA_AGENT_SKILL` | (optional) | The skill identifier for provenance — required only when the scope declares `default_skill`/`permitted_skills` in `fleet.yaml` |
+| `STRATA_AGENT_SCOPE` | (auto-bind) | The scope this session acts at. Required only when the fleet has 2+ scopes — with exactly one scope, an unset (or empty-string) value auto-binds to it and the server refuses to start only if the fleet has zero or 2+ scopes |
+| `STRATA_AGENT_SKILL` | (optional) | The skill identifier for provenance — required only when the scope declares `default_skill`/`permitted_skills` in `fleet.yaml`, unless the scope was auto-bound, in which case its `default_skill` fills this in when unset |
 | `STRATA_AGENT_SESSION_ID` | (auto) | Session identifier — auto-generated when absent |
 | `JUDGE_API_KEY` | (unset) | The judge's API key. `STRATA_JUDGE_API_KEY` also works and wins if both are set. Works against any endpoint that speaks the Anthropic Messages API. |
 | `JUDGE_BASE_URL` | (unset) | Optional. Points the judge at a router/proxy/self-hosted gateway instead of the direct Anthropic API — the endpoint must speak the Anthropic Messages API. `STRATA_JUDGE_BASE_URL` also works. |
@@ -973,8 +1004,11 @@ created `.strata/` workspace is gitignored. The settings entry it merges is:
 }
 ```
 
-Set `STRATA_AGENT_SCOPE` and `STRATA_AGENT_SKILL` in the shell before launching
-`claude`. Storage paths are read from `.strata/config.toml`.
+The seeded fleet has one scope, so an unset `STRATA_AGENT_SCOPE` auto-binds
+to it (see [Bind and work](#5-bind-and-work) above) — nothing to export
+before launching `claude`. Once you add scopes, set `STRATA_AGENT_SCOPE` and
+`STRATA_AGENT_SKILL` in the shell before launching. Storage paths are read
+from `.strata/config.toml`.
 
 `STRATA_AGENT_SKILL` is a skill identifier recorded in provenance and
 **validated against the scope's `permitted_skills`** in `fleet.yaml` (when
