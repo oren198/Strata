@@ -50,7 +50,14 @@ class Settings(BaseSettings):
         default="./fleet.yaml",
         validation_alias="STRATA_FLEET_CONFIG",
     )
-    manager_model: str = Field(default="claude-haiku-4-5")
+    # Reachable as JUDGE_MODEL (provider-generic name) or the original
+    # STRATA_MANAGER_MODEL — both are listed explicitly because setting a
+    # validation_alias suppresses pydantic-settings' auto-generated
+    # STRATA_-prefixed mapping. STRATA_MANAGER_MODEL wins when both are set.
+    manager_model: str = Field(
+        default="claude-haiku-4-5",
+        validation_alias=AliasChoices("STRATA_MANAGER_MODEL", "JUDGE_MODEL"),
+    )
     summary_max_words: int = Field(default=500, ge=1)
     # ADR 0011 D2: how many of the newest contributions in the scope-manager's
     # recency window keep their full verbatim text. Everything older renders as
@@ -86,10 +93,24 @@ class Settings(BaseSettings):
         default=None,
         validation_alias=AliasChoices("STRATA_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY"),
     )
+    # Provider-generic judge configuration. JUDGE_API_KEY / JUDGE_BASE_URL
+    # let the judge point at any endpoint that speaks the Anthropic Messages
+    # API (a router, a proxy, a self-hosted gateway) — not only the direct
+    # Anthropic API. JUDGE_API_KEY wins over anthropic_api_key when both are
+    # set; see build_judge_client() below for the precedence.
+    judge_api_key: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("STRATA_JUDGE_API_KEY", "JUDGE_API_KEY"),
+    )
+    judge_base_url: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("STRATA_JUDGE_BASE_URL", "JUDGE_BASE_URL"),
+    )
 
     @model_validator(mode="after")
     def _fallback_api_key(self) -> Settings:
-        """Last-resort fallback: read bare ``ANTHROPIC_API_KEY`` from process env.
+        """Last-resort fallback: read bare ``ANTHROPIC_API_KEY``/``JUDGE_API_KEY``
+        from process env.
 
         The ``validation_alias`` above already covers both spellings from
         both env-var and .env sources; this only matters if some other
@@ -97,7 +118,70 @@ class Settings(BaseSettings):
         """
         if self.anthropic_api_key is None:
             self.anthropic_api_key = os.environ.get("ANTHROPIC_API_KEY")
+        if self.judge_api_key is None:
+            self.judge_api_key = os.environ.get("JUDGE_API_KEY")
         return self
+
+    def build_judge_client(self):  # -> anthropic.Anthropic
+        """Construct the judge's Anthropic-Messages-API client.
+
+        ``JUDGE_API_KEY`` wins when set; otherwise ``anthropic_api_key``
+        (the old ``ANTHROPIC_API_KEY`` / ``STRATA_ANTHROPIC_API_KEY`` names)
+        is used as a working, deprecated fallback. Delegates the actual
+        construction to :func:`construct_judge_client` — see that function's
+        docstring for why it, not this method, is the single construction
+        site.
+        """
+        return construct_judge_client(
+            api_key=self.judge_api_key or self.anthropic_api_key,
+            base_url=self.judge_base_url,
+        )
+
+
+def construct_judge_client(
+    *, api_key: str | None, base_url: str | None = None
+):  # -> anthropic.Anthropic
+    """Construct the judge's Anthropic-Messages-API client from a resolved
+    ``(api_key, base_url)`` pair.
+
+    The single place every ``anthropic.Anthropic(...)`` construction in the
+    codebase should go through — both :meth:`Settings.build_judge_client`
+    (which resolves credentials from a constructed ``Settings``) and callers
+    that resolve credentials their own way (e.g. the freshness evaluator,
+    which reads a raw subprocess env dict via
+    :func:`resolve_judge_credentials`) route through this one function, so
+    the kwarg-assembly logic — ``base_url`` passed only when configured —
+    lives in exactly one place. The endpoint must speak the Anthropic
+    Messages API — a router/proxy/self-hosted gateway that does so works via
+    JUDGE_BASE_URL.
+    """
+    import anthropic  # noqa: PLC0415
+
+    kwargs: dict = {"api_key": api_key}
+    if base_url:
+        kwargs["base_url"] = base_url
+    return anthropic.Anthropic(**kwargs)
+
+
+def resolve_judge_credentials(env: dict[str, str]) -> tuple[str | None, str | None]:
+    """Resolve ``(api_key, base_url)`` for the judge from a raw env mapping.
+
+    For callers that hold a raw ``env`` dict rather than a constructed
+    :class:`Settings` — e.g. the freshness evaluator, which runs as a
+    detached subprocess and reads its own env snapshot rather than
+    ``get_settings()``. Same precedence as :meth:`Settings.build_judge_client`:
+    ``JUDGE_API_KEY`` (either spelling) wins; the deprecated
+    ``ANTHROPIC_API_KEY`` / ``STRATA_ANTHROPIC_API_KEY`` names are a working
+    fallback.
+    """
+    api_key = (
+        env.get("STRATA_JUDGE_API_KEY")
+        or env.get("JUDGE_API_KEY")
+        or env.get("STRATA_ANTHROPIC_API_KEY")
+        or env.get("ANTHROPIC_API_KEY")
+    )
+    base_url = env.get("STRATA_JUDGE_BASE_URL") or env.get("JUDGE_BASE_URL")
+    return api_key, base_url
 
 
 @functools.lru_cache(maxsize=1)

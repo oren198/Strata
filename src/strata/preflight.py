@@ -188,32 +188,35 @@ def _lsof_port_info(port: int) -> str:
 
 
 def _check_anthropic_api_key() -> Check:
-    """ANTHROPIC_API_KEY (or STRATA_ANTHROPIC_API_KEY) should be set.
+    """JUDGE_API_KEY (or the deprecated ANTHROPIC_API_KEY / STRATA_ANTHROPIC_API_KEY
+    names) should be set.
 
-    Consults the settings resolution (``get_settings().anthropic_api_key``)
-    rather than raw process env, so a key set only in a project's ``.env``
-    file — which :class:`strata.settings.Settings` already honors for both
-    the prefixed and bare spellings — satisfies this check too.
+    Consults the settings resolution (``get_settings().judge_api_key`` /
+    ``.anthropic_api_key``) rather than raw process env, so a key set only in
+    a project's ``.env`` file — which :class:`strata.settings.Settings`
+    already honors for every accepted spelling — satisfies this check too.
     """
     from strata.settings import get_settings
 
-    key = get_settings().anthropic_api_key
+    settings = get_settings()
+    key = settings.judge_api_key or settings.anthropic_api_key
     if not key:
         return Check(
             name="ANTHROPIC_API_KEY",
             kind="soft",
             passed=False,
             message=(
-                "ANTHROPIC_API_KEY is not set. "
+                "JUDGE_API_KEY is not set. "
                 "The scope-manager will not be able to judge contributions without it. "
-                "Set the variable before running strata start."
+                "Set the variable (or the deprecated ANTHROPIC_API_KEY / "
+                "STRATA_ANTHROPIC_API_KEY) before running strata start."
             ),
         )
     return Check(
         name="ANTHROPIC_API_KEY",
         kind="soft",
         passed=True,
-        message="ANTHROPIC_API_KEY is set",
+        message="JUDGE_API_KEY is set",
     )
 
 

@@ -269,10 +269,22 @@ class TestCheckAnthropicApiKey:
         """Soft warning when neither API key variable is set."""
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
         monkeypatch.delenv("STRATA_ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("JUDGE_API_KEY", raising=False)
+        monkeypatch.delenv("STRATA_JUDGE_API_KEY", raising=False)
         check = _check_anthropic_api_key()
         assert check.passed is False
         assert check.kind == "soft"
-        assert "ANTHROPIC_API_KEY" in check.message
+        assert "JUDGE_API_KEY" in check.message
+
+    def test_passes_when_judge_api_key_set(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Passes when JUDGE_API_KEY (the provider-generic name) is present."""
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("STRATA_ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("STRATA_JUDGE_API_KEY", raising=False)
+        monkeypatch.setenv("JUDGE_API_KEY", "sk-judge-key")
+        check = _check_anthropic_api_key()
+        assert check.passed is True
+        assert check.kind == "soft"
 
 
 class TestCheckAnthropicApiKeyDotEnv:
@@ -307,6 +319,8 @@ class TestCheckAnthropicApiKeyDotEnv:
 
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
         monkeypatch.delenv("STRATA_ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("JUDGE_API_KEY", raising=False)
+        monkeypatch.delenv("STRATA_JUDGE_API_KEY", raising=False)
         monkeypatch.chdir(tmp_path)
         get_settings.cache_clear()
         try:
@@ -315,7 +329,7 @@ class TestCheckAnthropicApiKeyDotEnv:
             get_settings.cache_clear()
         assert check.passed is False
         assert check.kind == "soft"
-        assert "ANTHROPIC_API_KEY" in check.message
+        assert "JUDGE_API_KEY" in check.message
 
 
 # ---------------------------------------------------------------------------

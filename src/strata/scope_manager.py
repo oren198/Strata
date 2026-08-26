@@ -2087,11 +2087,11 @@ class ScopeManager:
                 ``supersede`` op).
         """
         # Fail with an actionable message when no API key is available — the
-        # SDK's own error never names the env var the user needs (issue #47).
+        # SDK's own error never names the env var the user needs.
         if getattr(self._client, "api_key", None) is None:
             raise RuntimeError(
-                "ANTHROPIC_API_KEY (or STRATA_ANTHROPIC_API_KEY) is not set — "
-                "export it or add either name to .env. "
+                "JUDGE_API_KEY is not set (ANTHROPIC_API_KEY / STRATA_ANTHROPIC_API_KEY "
+                "also work, deprecated) — export it or add it to .env. "
                 "The scope-manager cannot judge contributions without it."
             )
 
@@ -2270,8 +2270,8 @@ class ScopeManager:
                 )
             except anthropic.AuthenticationError as exc:
                 raise RuntimeError(
-                    "Anthropic rejected the API key — check ANTHROPIC_API_KEY "
-                    "(or STRATA_ANTHROPIC_API_KEY)."
+                    "The judge endpoint rejected the API key — check JUDGE_API_KEY "
+                    "(or the deprecated ANTHROPIC_API_KEY / STRATA_ANTHROPIC_API_KEY)."
                 ) from exc
 
         def _corrective_turn(previous_response, previous_block, text: str) -> list[dict]:  # noqa: ANN001
@@ -2862,8 +2862,8 @@ class ScopeManager:
     def _check_api_key(self) -> None:
         if getattr(self._client, "api_key", None) is None:
             raise RuntimeError(
-                "ANTHROPIC_API_KEY (or STRATA_ANTHROPIC_API_KEY) is not set — "
-                "export it or add either name to .env. "
+                "JUDGE_API_KEY is not set (ANTHROPIC_API_KEY / STRATA_ANTHROPIC_API_KEY "
+                "also work, deprecated) — export it or add it to .env. "
                 "The scope-manager cannot judge without it."
             )
 

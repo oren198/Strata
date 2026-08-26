@@ -346,6 +346,28 @@ def _fake_accept_judgment() -> ScopeManagerJudgment:
     )
 
 
+def test_default_draft_fn_constructs_client_through_shared_helper(monkeypatch) -> None:
+    """_default_draft_fn must route client construction through
+    strata.settings.construct_judge_client — the single construction site —
+    rather than calling anthropic.Anthropic(...) inline itself.
+    """
+    fake_client = MagicMock()
+    fake_client.messages.create.return_value = MagicMock(content=[])
+    construct = MagicMock(return_value=fake_client)
+    monkeypatch.setattr("strata.settings.construct_judge_client", construct)
+
+    result = freshness._default_draft_fn(
+        "some transcript tail",
+        api_key="the-api-key",
+        model="the-model",
+        base_url="https://router.example/v1",
+    )
+
+    construct.assert_called_once_with(api_key="the-api-key", base_url="https://router.example/v1")
+    fake_client.messages.create.assert_called_once()
+    assert result is None  # no tool_use block in the fake response
+
+
 def test_evaluator_draft_submitted_through_judged_path(tmp_path: Path, monkeypatch) -> None:
     paths = _make_project(tmp_path)
     monkeypatch.chdir(tmp_path)

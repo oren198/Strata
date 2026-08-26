@@ -92,6 +92,23 @@ def test_no_project_marker_message_lists_markers(tmp_path: Path, capsys) -> None
     assert ".git" in captured.err
 
 
+def test_no_project_marker_message_hints_git_init(tmp_path: Path, capsys) -> None:
+    """A fresh empty directory must not be a dead end: the guard stays (an
+    accidental $HOME registration must still fail), but the error names a
+    way forward for a genuinely fresh project.
+    """
+    args = _make_args(path=str(tmp_path))
+    rc = cmd_register(args)
+
+    assert rc == 1
+    captured = capsys.readouterr()
+    assert "git init" in captured.err
+    assert "pyproject.toml" in captured.err
+    assert "package.json" in captured.err
+    assert "Cargo.toml" in captured.err
+    assert "go.mod" in captured.err
+
+
 # ---------------------------------------------------------------------------
 # Test 2: Fresh project → creates all artifacts
 # ---------------------------------------------------------------------------
@@ -575,3 +592,91 @@ def test_python_flag_default_is_none() -> None:
     parser = _build_parser()
     args = parser.parse_args(["register"])
     assert args.python is None
+
+
+# ---------------------------------------------------------------------------
+# "Next steps" output — harness-agnostic, binding explained once.
+#
+# The prior copy read Claude-first: it printed the env exports, then a
+# claude-only "Open Claude Code" step, which made the exports look
+# claude-only even though codex binds through the same env vars (delivered
+# via its config.toml). The rewrite explains binding once, generically, then
+# lists one line per wired harness for how to open it.
+# ---------------------------------------------------------------------------
+
+
+def test_next_steps_explains_binding_once(tmp_path: Path, capsys) -> None:
+    """The exports are shown once, framed as binding a session generically —
+    not tied to a specific harness — with the skill line marked optional.
+    """
+    _init_project(tmp_path)
+    _run_register(tmp_path)
+    captured = capsys.readouterr()
+
+    assert "Bind your session" in captured.out
+    assert "every agent works as one scope of the fleet" in captured.out
+    assert "export STRATA_AGENT_SCOPE=" in captured.out
+    assert "export STRATA_AGENT_SKILL=" in captured.out
+    assert "optional" in captured.out
+
+
+def test_next_steps_offers_strata_launch(tmp_path: Path, capsys) -> None:
+    """An interactive alternative to hand-exporting the binding env vars."""
+    _init_project(tmp_path)
+    _run_register(tmp_path)
+    captured = capsys.readouterr()
+
+    assert "strata launch" in captured.out
+
+
+def test_next_steps_no_issue_references(tmp_path: Path, capsys) -> None:
+    """Operator-facing output must never carry internal issue numbers."""
+    _init_project(tmp_path)
+    _run_register(tmp_path)
+    captured = capsys.readouterr()
+    # Only inspect the "Next steps:" block — the tmp_path used by pytest can
+    # itself contain the substring "issue" (from this test's own name).
+    next_steps = captured.out.split("Next steps:", 1)[1]
+
+    assert "issue #" not in next_steps.lower()
+    assert "#1" not in next_steps
+
+
+def test_next_steps_edit_fleet_is_first(tmp_path: Path, capsys) -> None:
+    _init_project(tmp_path)
+    _run_register(tmp_path)
+    captured = capsys.readouterr()
+
+    assert "1. Edit" in captured.out
+    assert "fleet.yaml" in captured.out
+
+
+def test_next_steps_claude_code_open_line(tmp_path: Path, capsys, monkeypatch) -> None:
+    """A wired claude-code harness gets a line on how to open it."""
+    from strata import install
+
+    monkeypatch.setattr(install, "detect_harnesses", lambda: ["claude-code"])
+    _init_project(tmp_path)
+    args = _make_args(path=str(tmp_path))
+    args.harness = ["claude-code"]
+    cmd_register(args)
+    captured = capsys.readouterr()
+
+    assert "claude" in captured.out.lower()
+
+
+def test_next_steps_codex_open_line_keeps_fill_in_caveat(
+    tmp_path: Path, capsys, monkeypatch
+) -> None:
+    """A wired codex harness keeps the fill-in-config caveat before 'codex' opens."""
+    from strata import install
+
+    monkeypatch.setattr(install, "detect_harnesses", lambda: ["codex"])
+    _init_project(tmp_path)
+    args = _make_args(path=str(tmp_path))
+    args.harness = ["codex"]
+    cmd_register(args)
+    captured = capsys.readouterr()
+
+    assert "Fill in the env values" in captured.out
+    assert "codex" in captured.out.lower()
