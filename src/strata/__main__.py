@@ -2121,8 +2121,16 @@ def cmd_launch(args: argparse.Namespace) -> int:
                     file=sys.stderr,
                 )
                 return 1
+        elif len(active_scopes) == 1:
+            # Single-scope fleet auto-bind (operator directive): with no
+            # positional arg and no .strata-role, a fleet with exactly one
+            # scope needs no picker — interactive or not — bind to it and
+            # say so, mirroring the MCP server's own auto-bind notice.
+            scope_data = active_scopes[0]
+            print(f"Only one scope in the fleet — binding to {scope_data['id']!r}.")
         else:
-            # No positional arg, no .strata-role — need interactive picker or fail.
+            # No positional arg, no .strata-role, 2+ scopes — need the
+            # interactive picker or fail.
             if not interactive:
                 print(
                     f"No scope specified and no .strata-role found. Valid scope IDs: {valid_ids}",
