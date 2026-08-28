@@ -29,6 +29,7 @@ Vocabulary follows CONTEXT.md exactly: scope, fleet, skill, scope-manager.
 from __future__ import annotations
 
 import copy
+import hashlib
 import os
 import re
 import shutil
@@ -58,6 +59,13 @@ __all__ = [
     "remove_stop_hook",
     "copy_hook",
     "hook_matches_shipped",
+    "classify_skill_drift",
+    "self_update_skill",
+    "classify_hook_drift",
+    "self_update_hook",
+    "AGENTS_MD_END_MARKER",
+    "classify_agents_md_drift",
+    "self_update_agents_md_block",
     "remove_gitignore_block",
     "render_action_line",
     "CODEX_MCP_MARKER",
@@ -149,6 +157,110 @@ db = ".strata/strata.db"
 fleet_yaml = ".strata/fleet.yaml"
 summaries_dir = ".strata/summaries"
 """
+
+
+# ---------------------------------------------------------------------------
+# Self-update — three-state resolution for shipped artifacts (register's
+# self-update mechanism).
+#
+# ``strata register`` re-run today always keeps an existing managed artifact
+# (skills, the Stop-hook script, the AGENTS.md block) exactly as it found it
+# — so a guidance fix shipped in a new release never reaches an
+# already-registered project unless the user deletes the file by hand. This
+# table lets register tell "the shipped content changed since this file was
+# written, and the user never touched it" (safe to refresh) apart from "the
+# user edited this file" (never touch it, ever) — both of which today look
+# identical: `installed_text != shipped_text`.
+#
+# For each managed artifact this records:
+#
+# - ``"current"``: the sha256 of the content shipped by *this* release.
+# - ``"historical"``: the sha256 of every *previous* shipped version — an
+#   installed file whose hash lands in this set was written by an older
+#   `strata register` and never hand-edited, so it is safe to overwrite with
+#   the current shipped content.
+#
+# MAINTENANCE — read this before editing a shipped artifact:
+#
+#   Every release that changes a shipped artifact's content (a skill's
+#   ``Skill.md``, the Stop-hook script, or ``_templates/AGENTS-strata.md``)
+#   MUST, in the same change:
+#
+#     1. move that artifact's current ``"current"`` hash into its
+#        ``"historical"`` set, and
+#     2. replace ``"current"`` with the sha256 of the new content.
+#
+#   Forgetting step 1 means a project running the previous release's content
+#   forever reads as "user-edited" and register will never refresh it. The
+#   ``test_release_discipline_hashes_are_current`` test in
+#   ``tests/test_register_self_update.py`` fails the build if ``"current"``
+#   here doesn't match the artifact's actual shipped content — so this table
+#   can never silently go stale — but it cannot catch a forgotten step 1: it
+#   only proves the *current* recorded, not that the *previous* one moved to
+#   history. Do it by hand, every time.
+#
+# Hashes were extracted from the shipped content at tags v1.10.0, v1.10.1,
+# and v1.10.2 (`git show <tag>:<path>` — see the self-update PR for the
+# script). The AGENTS.md template first shipped in v1.10.1; v1.10.0 has no
+# entry to contribute. All three tags shipped byte-identical content for
+# every artifact except ``"strata"`` (the skill) and ``"agents-md"``, which
+# both changed again after v1.10.2 — the "current" values below reflect that
+# newer content.
+# ---------------------------------------------------------------------------
+
+_HISTORICAL_ARTIFACT_HASHES: dict[str, dict[str, object]] = {
+    "strata": {
+        "current": "81a0a8debdb183603a985459c17b7e4800e65a5f5ff7b9cb7c7f0526d133087c",
+        "historical": frozenset(
+            {"5865b8090923c1dd0d3f747490b006b4f0b3b4d18bceffb99ef7fb2fe9e577ab"}
+        ),
+    },
+    "strata-worker": {
+        "current": "2e2cb5d953d6e97377a347134ebbef989f85f53cb7604a50e53f2516153831e0",
+        "historical": frozenset(),
+    },
+    "strata-inspect": {
+        "current": "707793640183dfd5e503c57c48133c8d56747b74a49268bdd76b8cc77335f2ad",
+        "historical": frozenset(),
+    },
+    "strata-stop-hook": {
+        "current": "d950ad8fcf436069b49d247543ab6a4a2c98481d6ef853e5c78a5289e0f5c582",
+        "historical": frozenset(),
+    },
+    "agents-md": {
+        "current": "ceea6568ab9160d54f2d3edd7131bc9b3bf2a694832226e67e7553de7325825f",
+        "historical": frozenset(
+            {"f6df7e82395ba3199d3a52c1651db8afb93b2fdd139b496974f871d453535b68"}
+        ),
+    },
+}
+
+
+def _sha256_text(text: str) -> str:
+    """Return the hex sha256 digest of *text*, encoded as UTF-8."""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _historical_hashes(artifact_key: str) -> frozenset:
+    return _HISTORICAL_ARTIFACT_HASHES[artifact_key]["historical"]  # type: ignore[return-value]
+
+
+def _classify_drift(existing_text: str, shipped_text: str, artifact_key: str) -> str:
+    """Three-state classification shared by every self-update artifact type.
+
+    Returns:
+        - ``"match"``  — *existing_text* is byte-identical to *shipped_text*.
+        - ``"stale"``  — differs, but its hash is a known-historical shipped
+          hash for *artifact_key* — a previous `strata register` wrote it and
+          it was never hand-edited; safe to overwrite.
+        - ``"edited"`` — differs, and its hash isn't recognized — user-edited
+          (or from a release this table doesn't know about); never touched.
+    """
+    if existing_text == shipped_text:
+        return "match"
+    if _sha256_text(existing_text) in _historical_hashes(artifact_key):
+        return "stale"
+    return "edited"
 
 
 # ---------------------------------------------------------------------------
@@ -267,11 +379,70 @@ def copy_skill(
     return True
 
 
+def _read_shipped_skill_text(skill_name: str) -> str | None:
+    """Read the shipped ``Skill.md`` text for *skill_name*, or ``None`` if unreadable."""
+    import importlib.resources  # noqa: PLC0415
+
+    try:
+        shipped = importlib.resources.files("strata") / "_skills" / skill_name / "Skill.md"
+        return shipped.read_text(encoding="utf-8")
+    except (OSError, ModuleNotFoundError):
+        return None
+
+
+def classify_skill_drift(installed_md: Path, skill_name: str) -> str:
+    """Classify an installed skill's ``Skill.md`` against shipped + historical hashes.
+
+    The three-state resolution register's self-update mechanism is built on
+    (see :data:`_HISTORICAL_ARTIFACT_HASHES`). Returns one of:
+
+    - ``"match"``   — byte-identical to the currently shipped copy.
+    - ``"stale"``   — differs, but its hash is a known-historical shipped
+      hash — a previous ``strata register`` wrote it and it was never
+      hand-edited; safe to self-update.
+    - ``"edited"``  — differs, and its hash isn't recognized — user-edited;
+      never touched.
+    - ``"unknown"`` — the shipped reference or the installed file could not
+      be read, so no classification can be proven; treat conservatively like
+      ``"edited"`` (leave it).
+    """
+    shipped_text = _read_shipped_skill_text(skill_name)
+    if shipped_text is None:
+        return "unknown"
+    try:
+        installed_text = installed_md.read_text(encoding="utf-8")
+    except OSError:
+        return "unknown"
+    return _classify_drift(installed_text, shipped_text, skill_name)
+
+
+def self_update_skill(installed_md: Path, skill_name: str, *, dry_run: bool = False) -> str:
+    """Self-update *installed_md* to the current shipped content when it's stale.
+
+    Classifies via :func:`classify_skill_drift`; when the result is
+    ``"stale"`` the file is overwritten with the current shipped content
+    (unless *dry_run*, in which case nothing is written but the status is
+    still returned so the caller can report what would happen).
+    ``"match"``/``"edited"``/``"unknown"`` never write.
+
+    Returns:
+        The classification (``"match"``/``"stale"``/``"edited"``/``"unknown"``).
+    """
+    status = classify_skill_drift(installed_md, skill_name)
+    if status == "stale" and not dry_run:
+        shipped_text = _read_shipped_skill_text(skill_name)
+        if shipped_text is not None:
+            installed_md.write_text(shipped_text, encoding="utf-8")
+    return status
+
+
 def skill_matches_shipped(installed_md: Path, skill_name: str) -> bool | None:
     """Return whether an installed skill's ``Skill.md`` matches the shipped copy.
 
     The byte-identity check that lets ``strata unregister`` remove a skill only
-    when it still matches what register wrote.
+    when it still matches what register wrote. Built on
+    :func:`classify_skill_drift` so the two never diverge on what "matches"
+    means.
 
     Returns:
         - ``True``  — the installed ``Skill.md`` is byte-identical to the
@@ -282,18 +453,10 @@ def skill_matches_shipped(installed_md: Path, skill_name: str) -> bool | None:
         - ``None``  — the shipped reference could not be read, so a match
           cannot be proven; treat conservatively as "leave it".
     """
-    import importlib.resources  # noqa: PLC0415
-
-    try:
-        shipped = importlib.resources.files("strata") / "_skills" / skill_name / "Skill.md"
-        shipped_text = shipped.read_text(encoding="utf-8")
-    except (OSError, ModuleNotFoundError):
+    status = classify_skill_drift(installed_md, skill_name)
+    if status == "unknown":
         return None
-    try:
-        installed_text = installed_md.read_text(encoding="utf-8")
-    except OSError:
-        return None
-    return installed_text == shipped_text
+    return status == "match"
 
 
 # ---------------------------------------------------------------------------
@@ -431,30 +594,64 @@ def copy_hook(
     return True
 
 
+def _read_shipped_hook_text() -> str | None:
+    """Read the shipped Stop-hook script text, or ``None`` if unreadable."""
+    import importlib.resources  # noqa: PLC0415
+
+    try:
+        shipped = importlib.resources.files("strata") / "_hooks" / HOOK_SCRIPT_NAME
+        return shipped.read_text(encoding="utf-8")
+    except (OSError, ModuleNotFoundError):
+        return None
+
+
+def classify_hook_drift(installed_script: Path) -> str:
+    """Classify an installed hook script against shipped + historical hashes.
+
+    Mirrors :func:`classify_skill_drift`; see its docstring for the four
+    ``"match"``/``"stale"``/``"edited"``/``"unknown"`` states.
+    """
+    shipped_text = _read_shipped_hook_text()
+    if shipped_text is None:
+        return "unknown"
+    try:
+        installed_text = installed_script.read_text(encoding="utf-8")
+    except OSError:
+        return "unknown"
+    return _classify_drift(installed_text, shipped_text, "strata-stop-hook")
+
+
+def self_update_hook(installed_script: Path, *, dry_run: bool = False) -> str:
+    """Self-update *installed_script* to the current shipped content when stale.
+
+    Mirrors :func:`self_update_skill`. The executable bit is re-applied after
+    a write, matching :func:`copy_hook`.
+    """
+    status = classify_hook_drift(installed_script)
+    if status == "stale" and not dry_run:
+        shipped_text = _read_shipped_hook_text()
+        if shipped_text is not None:
+            installed_script.write_text(shipped_text, encoding="utf-8")
+            installed_script.chmod(0o755)
+    return status
+
+
 def hook_matches_shipped(installed_script: Path) -> bool | None:
     """Return whether an installed hook script matches the shipped copy.
 
     The byte-identity check (mirroring :func:`skill_matches_shipped`) that lets
     ``strata unregister`` remove the hook script only when it still matches what
-    register wrote.
+    register wrote. Built on :func:`classify_hook_drift`.
 
     Returns:
         - ``True``  — byte-identical to the shipped ``strata/_hooks`` copy.
         - ``False`` — it differs (user-edited, or an older Strata version).
         - ``None``  — the shipped reference could not be read; treat as "leave it".
     """
-    import importlib.resources  # noqa: PLC0415
-
-    try:
-        shipped = importlib.resources.files("strata") / "_hooks" / HOOK_SCRIPT_NAME
-        shipped_text = shipped.read_text(encoding="utf-8")
-    except (OSError, ModuleNotFoundError):
+    status = classify_hook_drift(installed_script)
+    if status == "unknown":
         return None
-    try:
-        installed_text = installed_script.read_text(encoding="utf-8")
-    except OSError:
-        return None
-    return installed_text == shipped_text
+    return status == "match"
 
 
 # ---------------------------------------------------------------------------
@@ -745,6 +942,14 @@ def remove_codex_freshness_hook(config_text: str) -> tuple[str, str]:
 #: collide with a user's own prose the way a bare "# Strata" heading might.
 AGENTS_MD_MARKER = "<!-- strata:begin -->"
 
+#: Closing marker of Strata's managed AGENTS.md block. Together with
+#: :data:`AGENTS_MD_MARKER` this brackets the block so it can be located and
+#: extracted even when its *content* has drifted from what's currently
+#: shipped (:func:`classify_agents_md_drift`) — the plain-marker check
+#: :func:`agents_md_present` only needs the begin marker, but locating the
+#: block's full extent to diff or replace it needs both ends.
+AGENTS_MD_END_MARKER = "<!-- strata:end -->"
+
 
 def _shipped_agents_md_block() -> str:
     """Read the canonical AGENTS.md block from package data.
@@ -788,6 +993,86 @@ def remove_agents_md(existing_text: str) -> tuple[str, str]:
     ``"removed"`` / ``"edited"`` / ``"absent"`` status semantics.
     """
     return _remove_block(existing_text, _shipped_agents_md_block(), AGENTS_MD_MARKER)
+
+
+def _extract_agents_md_block(text: str) -> str:
+    """Return the substring of *text* between Strata's begin/end markers
+    (inclusive), or ``""`` if the markers aren't both present.
+
+    Unlike the verbatim-block matching :func:`_remove_block` does, this finds
+    the block's extent by its markers alone — so it still locates an
+    installed block whose *content* has drifted from what's currently
+    shipped (an older `strata register` wrote it, or the user edited it).
+    """
+    start = text.find(AGENTS_MD_MARKER)
+    if start == -1:
+        return ""
+    end = text.find(AGENTS_MD_END_MARKER, start)
+    if end == -1:
+        return ""
+    end += len(AGENTS_MD_END_MARKER)
+    # The shipped block (as read from package data, and as merge_agents_md /
+    # _append_block write it) ends with a trailing "\n" after the end
+    # marker — that newline is part of the block's own content, not a
+    # separator the caller added. Include it here too when it's actually
+    # there, so a freshly-merged block's extent (and hash) matches the
+    # shipped block's exactly, rather than falling one byte short every
+    # time. A block whose trailing newline was stripped (a user edit) simply
+    # has nothing to include here — bounds-checked, never indexes past len().
+    if end < len(text) and text[end] == "\n":
+        end += 1
+    return text[start:end]
+
+
+def classify_agents_md_drift(existing_text: str) -> str:
+    """Classify AGENTS.md's managed block against shipped + historical hashes.
+
+    Block-level, not file-level: only the fenced block (between
+    :data:`AGENTS_MD_MARKER` and :data:`AGENTS_MD_END_MARKER`) is compared —
+    everything else in *existing_text* is the user's own content and is
+    never examined here.
+
+    Returns:
+        - ``"absent"``  — no managed block found (both markers missing, or
+          the end marker is missing so the block can't be bounded).
+        - ``"match"``   — the block is byte-identical to the currently
+          shipped block.
+        - ``"stale"``   — differs, but its hash is a known-historical
+          shipped hash — safe to self-update.
+        - ``"edited"``  — differs, and its hash isn't recognized —
+          user-edited; never touched.
+        - ``"unknown"`` — the shipped reference could not be read.
+    """
+    block = _extract_agents_md_block(existing_text)
+    if not block:
+        return "absent"
+    try:
+        shipped_block = _shipped_agents_md_block()
+    except (OSError, ModuleNotFoundError):
+        return "unknown"
+    return _classify_drift(block, shipped_block, "agents-md")
+
+
+def self_update_agents_md_block(existing_text: str) -> tuple[str, str]:
+    """Self-update AGENTS.md's managed block in place when it's stale.
+
+    Classifies via :func:`classify_agents_md_drift`. When the result is
+    ``"stale"``, the block substring is replaced with the current shipped
+    block — every byte of *existing_text* outside the fence (the user's own
+    AGENTS.md content) is untouched, reusing the same bracket-and-splice
+    approach as :func:`_remove_block` rather than rebuilding the file. Any
+    other status returns *existing_text* unchanged.
+
+    Returns:
+        ``(new_text, status)`` — *status* is one of the
+        :func:`classify_agents_md_drift` values.
+    """
+    status = classify_agents_md_drift(existing_text)
+    if status != "stale":
+        return existing_text, status
+    block = _extract_agents_md_block(existing_text)
+    shipped_block = _shipped_agents_md_block()
+    return existing_text.replace(block, shipped_block, 1), status
 
 
 # ---------------------------------------------------------------------------
