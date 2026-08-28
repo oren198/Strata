@@ -29,6 +29,34 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 from strata.__main__ import _build_parser, cmd_register
 
 # ---------------------------------------------------------------------------
+# Isolation: every existing register test in this file drives an interactive
+# TTY (isatty patched True) through to a successful register, which now also
+# reaches the end-of-register judge-key prompt. Two defaults keep that
+# reachable-but-irrelevant-to-most-tests path deterministic instead of
+# depending on whoever runs the suite:
+#
+# - getpass.getpass defaults to "" (skip) rather than reading real stdin.
+# - the four judge/anthropic env-var spellings are cleared, so a
+#   developer's own exported ANTHROPIC_API_KEY never makes "judge key:
+#   found" appear (or not) depending on whose machine runs this.
+#
+# tests/test_register_judge_key.py overrides both per-test as needed.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _default_no_judge_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("getpass.getpass", lambda prompt="": "")
+    for var in (
+        "JUDGE_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "STRATA_JUDGE_API_KEY",
+        "STRATA_ANTHROPIC_API_KEY",
+    ):
+        monkeypatch.delenv(var, raising=False)
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
