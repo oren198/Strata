@@ -21,7 +21,10 @@ unchanged by the ADR 0009 distribution rename.
 The additive rules themselves are ADR 0005 Decision 6 ("strictly additive —
 never overwrite user state"); the reverse operations (:func:`remove_gitignore_block`,
 :func:`skill_matches_shipped`) back ``strata unregister`` and only ever remove
-an artifact that still byte-matches what register wrote.
+an artifact that still byte-matches what the current release, or a known
+historical release, of register would have written (:data:`_HISTORICAL_ARTIFACT_HASHES`
+and ``_classify_drift`` — the same current-or-historical mechanism register's
+self-update already uses).
 
 Vocabulary follows CONTEXT.md exactly: scope, fleet, skill, scope-manager.
 """
@@ -48,6 +51,7 @@ __all__ = [
     "HOOK_STOP_ENTRY",
     "GITIGNORE_MARKER",
     "GITIGNORE_BLOCK",
+    "GITIGNORE_BLOCK_HISTORICAL",
     "CONFIG_TOML",
     "is_v1_2_shape_mcp_entry",
     "mcp_server_present",
@@ -70,12 +74,15 @@ __all__ = [
     "render_action_line",
     "CODEX_MCP_MARKER",
     "CODEX_MCP_BLOCK",
+    "CODEX_MCP_BLOCK_HISTORICAL",
     "CODEX_HOOK_MARKER",
     "CODEX_HOOK_BLOCK",
+    "CODEX_HOOK_BLOCK_HISTORICAL",
     "codex_config_path",
     "codex_mcp_present",
     "merge_codex_mcp_server",
     "remove_codex_mcp_server",
+    "strip_orphaned_mcp_strata_tables",
     "codex_hook_present",
     "merge_codex_freshness_hook",
     "remove_codex_freshness_hook",
@@ -148,6 +155,21 @@ GITIGNORE_BLOCK = """\
 .env
 # fleet.yaml is intentionally NOT listed above — commit it (it is your team's org chart).
 """
+
+#: Block text register wrote in every release through v1.10.2 (the ``.env``
+#: line was folded in at v1.10.3). ``strata unregister`` treats a project
+#: registered under one of those older releases the same as one registered
+#: under the current release: an unmodified historical block is OURS and is
+#: removed cleanly, not flagged as user-edited (round-4 unregister fix, bug
+#: B — a project registered under 1.10.2 and unregistered under 1.10.3 saw
+#: this exact block misclassified as "edited").
+GITIGNORE_BLOCK_HISTORICAL: tuple[str, ...] = (
+    "# Strata — managed by `strata register` — do not remove this line\n"
+    ".strata/.venv/\n"
+    ".strata/strata.db*\n"
+    ".strata/summaries/\n"
+    "# fleet.yaml is intentionally NOT listed above — commit it (it is your team's org chart).\n",
+)
 
 #: Default ``.strata/config.toml`` contents (relative, portable storage paths).
 CONFIG_TOML = """\
@@ -225,6 +247,24 @@ _HISTORICAL_ARTIFACT_HASHES: dict[str, dict[str, object]] = {
     },
     "strata-stop-hook": {
         "current": "d950ad8fcf436069b49d247543ab6a4a2c98481d6ef853e5c78a5289e0f5c582",
+        "historical": frozenset(),
+    },
+    "codex-mcp": {
+        # Round-4 unregister fix, bug B (release-discipline extension): the
+        # CODEX_MCP_BLOCK constant itself carries the current shipped text
+        # (and CODEX_MCP_BLOCK_HISTORICAL the historical text variants
+        # remove_codex_mcp_server tries), but this entry exists purely so
+        # test_release_discipline_hashes_are_current fails the build the
+        # same way it does for the skills/hook/AGENTS.md the moment
+        # CODEX_MCP_BLOCK's content changes without a historical entry being
+        # added — the exact class of bug this whole fix wave closed.
+        "current": "ffe7e644bb000b4d8ce5d154364c9646975aa0152494d7b46c3cb834056ef562",
+        "historical": frozenset(),
+    },
+    "codex-hook": {
+        # See "codex-mcp" above — same guardrail, for CODEX_HOOK_BLOCK /
+        # CODEX_HOOK_BLOCK_HISTORICAL.
+        "current": "df9f579f636015b4060cdabf01ee598698506c7011baba616e7b9ca1620768bf",
         "historical": frozenset(),
     },
     "agents-md": {
@@ -446,17 +486,21 @@ def skill_matches_shipped(installed_md: Path, skill_name: str) -> bool | None:
 
     Returns:
         - ``True``  — the installed ``Skill.md`` is byte-identical to the
-          version shipped in the running distribution
-          (``strata/_skills/<name>``); safe to delete.
-        - ``False`` — it differs (user-edited, or an older Strata version);
-          leave it and report.
+          version currently shipped in the running distribution
+          (``strata/_skills/<name>``), OR to a known-historical shipped
+          version (a previous ``strata register`` wrote it and it was never
+          hand-edited — round-4 unregister fix, bug B); safe to delete
+          either way.
+        - ``False`` — genuinely user-edited: it differs, and its hash isn't
+          recognized as any shipped version, current or historical; leave it
+          and report.
         - ``None``  — the shipped reference could not be read, so a match
           cannot be proven; treat conservatively as "leave it".
     """
     status = classify_skill_drift(installed_md, skill_name)
     if status == "unknown":
         return None
-    return status == "match"
+    return status in ("match", "stale")
 
 
 # ---------------------------------------------------------------------------
@@ -644,14 +688,18 @@ def hook_matches_shipped(installed_script: Path) -> bool | None:
     register wrote. Built on :func:`classify_hook_drift`.
 
     Returns:
-        - ``True``  — byte-identical to the shipped ``strata/_hooks`` copy.
-        - ``False`` — it differs (user-edited, or an older Strata version).
+        - ``True``  — byte-identical to the currently shipped
+          ``strata/_hooks`` copy, OR to a known-historical shipped version
+          (round-4 unregister fix, bug B, mirroring
+          :func:`skill_matches_shipped`).
+        - ``False`` — genuinely user-edited: it differs, and its hash isn't
+          recognized as any shipped version, current or historical.
         - ``None``  — the shipped reference could not be read; treat as "leave it".
     """
     status = classify_hook_drift(installed_script)
     if status == "unknown":
         return None
-    return status == "match"
+    return status in ("match", "stale")
 
 
 # ---------------------------------------------------------------------------
@@ -662,27 +710,23 @@ def hook_matches_shipped(installed_script: Path) -> bool | None:
 def remove_gitignore_block(text: str) -> tuple[str, str]:
     """Remove register's managed ``.gitignore`` block from *text*.
 
+    Tries the current :data:`GITIGNORE_BLOCK` first, then each block in
+    :data:`GITIGNORE_BLOCK_HISTORICAL` — a project registered under an older
+    Strata release wrote an older, still-unmodified block, and that is just
+    as much "ours" to remove as the current one (round-4 unregister fix, bug
+    B). See :func:`_remove_block` for the shared implementation.
+
     Returns ``(new_text, status)`` where *status* is one of:
 
-    - ``"removed"``  — the verbatim managed block was found and stripped, along
-      with the single blank-line separator register prepends, so the
-      surrounding lines stay byte-identical.
-    - ``"edited"``   — the managed marker line is present but the block no
-      longer matches verbatim (the user edited inside it); *text* is returned
-      unchanged so nothing user-authored is destroyed.
+    - ``"removed"``  — a verbatim managed block (current or historical) was
+      found and stripped, along with the single blank-line separator
+      register prepends, so the surrounding lines stay byte-identical.
+    - ``"edited"``   — the managed marker line is present but no known block
+      variant matches verbatim (the user edited inside it); *text* is
+      returned unchanged so nothing user-authored is destroyed.
     - ``"absent"``   — no managed marker at all; nothing to do.
     """
-    if GITIGNORE_BLOCK in text:
-        # Register appends "\n" + GITIGNORE_BLOCK (a blank-line separator
-        # before the block). Strip that separator too so a `.gitignore` that
-        # ended in a newline before register round-trips byte-for-byte.
-        sep_block = "\n" + GITIGNORE_BLOCK
-        if sep_block in text:
-            return text.replace(sep_block, "", 1), "removed"
-        return text.replace(GITIGNORE_BLOCK, "", 1), "removed"
-    if GITIGNORE_MARKER in text:
-        return text, "edited"
-    return text, "absent"
+    return _remove_block(text, (GITIGNORE_BLOCK, *GITIGNORE_BLOCK_HISTORICAL), GITIGNORE_MARKER)
 
 
 # ---------------------------------------------------------------------------
@@ -880,32 +924,53 @@ def merge_codex_freshness_hook(config_text: str) -> tuple[str, bool]:
     return _append_block(config_text, CODEX_HOOK_BLOCK), True
 
 
-def _remove_block(config_text: str, block: str, marker: str) -> tuple[str, str]:
-    """Remove *block* from *config_text* only if it still byte-matches.
+def _remove_block(config_text: str, blocks: tuple[str, ...], marker: str) -> tuple[str, str]:
+    """Remove the first of *blocks* that still byte-matches from *config_text*.
 
-    Mirrors :func:`remove_gitignore_block`'s verbatim-block-then-marker-only
-    fallback, applied to Codex's ``config.toml`` text.
+    *blocks* is ordered current-shipped-block first, then any known
+    historical shipped variants (round-4 unregister fix, bug B): a project
+    registered under an older Strata release wrote an older block, and that
+    is just as much "ours" as the current one — trying each in turn lets a
+    historical, unmodified block be recognized and removed cleanly instead of
+    misreported as user-edited. Mirrors :func:`remove_gitignore_block`'s
+    verbatim-block-then-marker-only fallback, applied to Codex's
+    ``config.toml`` text.
 
     Returns ``(new_text, status)`` where *status* is one of:
 
-    - ``"removed"`` — the verbatim managed block was found and stripped,
-      along with the blank-line separator :func:`_append_block` prepends, so
-      surrounding lines stay byte-identical.
-    - ``"edited"``  — the managed marker is present but the block no longer
-      matches verbatim (the user edited inside it); *config_text* is
+    - ``"removed"`` — a verbatim managed block (current or historical) was
+      found and stripped, along with the blank-line separator
+      :func:`_append_block` prepends, so surrounding lines stay
+      byte-identical.
+    - ``"edited"``  — the managed marker is present but no known block
+      variant matches verbatim (the user edited inside it); *config_text* is
       returned unchanged.
     - ``"absent"``  — no managed marker at all — including the case where
       register found a *user's own* pre-existing entry and left it untouched
       without ever writing our marker, so there is nothing for us to remove.
     """
-    if block in config_text:
-        sep_block = "\n" + block
-        if sep_block in config_text:
-            return config_text.replace(sep_block, "", 1), "removed"
-        return config_text.replace(block, "", 1), "removed"
+    for block in blocks:
+        if block in config_text:
+            sep_block = "\n" + block
+            if sep_block in config_text:
+                return config_text.replace(sep_block, "", 1), "removed"
+            return config_text.replace(block, "", 1), "removed"
     if marker in config_text:
         return config_text, "edited"
     return config_text, "absent"
+
+
+#: No Codex ``[mcp_servers.strata]`` block variant has shipped yet besides
+#: the current one (CODEX_MCP_BLOCK has been byte-identical across every
+#: release that has shipped Codex support) — kept as an explicit empty tuple,
+#: not a special case, so :func:`remove_codex_mcp_server` goes through the
+#: same current-or-historical mechanism every other managed block does
+#: (round-4 unregister fix, bug B: "wire the mechanism uniformly").
+CODEX_MCP_BLOCK_HISTORICAL: tuple[str, ...] = ()
+
+#: See :data:`CODEX_MCP_BLOCK_HISTORICAL` — same story for the freshness
+#: Stop-hook block.
+CODEX_HOOK_BLOCK_HISTORICAL: tuple[str, ...] = ()
 
 
 def remove_codex_mcp_server(config_text: str) -> tuple[str, str]:
@@ -913,9 +978,19 @@ def remove_codex_mcp_server(config_text: str) -> tuple[str, str]:
 
     The reverse of :func:`merge_codex_mcp_server`, honouring the
     strict-additive rule in reverse: removed only when it still byte-matches
-    :data:`CODEX_MCP_BLOCK`. See :func:`_remove_block` for the status values.
+    the current or a historical :data:`CODEX_MCP_BLOCK`. See
+    :func:`_remove_block` for the status values.
+
+    This removes only the canonical parent block. A third party (most
+    notably the Codex CLI itself, writing per-tool approval state) may have
+    since appended its own ``[mcp_servers.strata.*]`` subtables — those are
+    meaningless without this parent table and are swept up separately by
+    :func:`strip_orphaned_mcp_strata_tables`, which the caller runs only
+    after this function reports ``"removed"`` (round-4 unregister fix, bug A).
     """
-    return _remove_block(config_text, CODEX_MCP_BLOCK, CODEX_MCP_MARKER)
+    return _remove_block(
+        config_text, (CODEX_MCP_BLOCK, *CODEX_MCP_BLOCK_HISTORICAL), CODEX_MCP_MARKER
+    )
 
 
 def remove_codex_freshness_hook(config_text: str) -> tuple[str, str]:
@@ -924,7 +999,102 @@ def remove_codex_freshness_hook(config_text: str) -> tuple[str, str]:
     The reverse of :func:`merge_codex_freshness_hook`; see :func:`_remove_block`
     for the status values.
     """
-    return _remove_block(config_text, CODEX_HOOK_BLOCK, CODEX_HOOK_MARKER)
+    return _remove_block(
+        config_text, (CODEX_HOOK_BLOCK, *CODEX_HOOK_BLOCK_HISTORICAL), CODEX_HOOK_MARKER
+    )
+
+
+#: Matches a TOML table header line — either a plain table (``[name]``) or an
+#: array-of-tables (``[[name]]``, the shape :data:`CODEX_HOOK_BLOCK` itself
+#: uses for ``[[hooks.Stop]]``). Section boundaries in Codex's config.toml
+#: text are defined by *either* form; matching only ``[name]`` would let an
+#: adjacent ``[[...]]`` header get swallowed into a preceding orphaned
+#: ``mcp_servers.strata.*`` table's span instead of ending it.
+_TOML_TABLE_HEADER_RE = re.compile(r"^(\[\[?)([^\[\]]+)(\]\]?)[ \t]*$", re.MULTILINE)
+
+
+def _table_header_end(text: str, start: int, end: int) -> int:
+    """Shrink *end* leftward over trailing blank/comment-only lines.
+
+    Used when computing an orphaned table's removal span: the raw span runs
+    from one header up to the next header, but a trailing run of blank lines
+    and ``#`` comments right before that next header usually belongs to it
+    (e.g. a comment introducing the table that follows) rather than to the
+    orphaned table being swept away. Always leaves at least the header line
+    itself in the span.
+    """
+    lines = text[start:end].splitlines(keepends=True)
+    while len(lines) > 1:
+        stripped = lines[-1].strip()
+        if stripped == "" or stripped.startswith("#"):
+            lines.pop()
+            continue
+        break
+    return start + sum(len(line) for line in lines)
+
+
+def strip_orphaned_mcp_strata_tables(config_text: str) -> tuple[str, int]:
+    """Remove every remaining ``[mcp_servers.strata]`` / ``[mcp_servers.strata.*]``
+    table from *config_text*, plain or array-of-tables.
+
+    Call this only after :func:`remove_codex_mcp_server` has reported
+    ``"removed"`` for the canonical parent block — at that point the parent
+    is confirmed to be ours (it byte-matched the current or a historical
+    shipped block), so anything still named ``mcp_servers.strata`` or
+    ``mcp_servers.strata.<...>`` afterwards is meaningless without it. In
+    practice this is per-tool approval state the Codex CLI itself appends
+    during a live session (``[mcp_servers.strata.tools.<tool>]``) — left
+    behind by a plain-block-only removal, it orphans the ``strata`` MCP
+    server entry and Codex then refuses to start ("invalid transport in
+    mcp_servers.strata") — round-4 unregister fix, bug A.
+
+    A table that is *not* named ``mcp_servers.strata`` or a dotted child of
+    it — including a user's own hand-written ``[mcp_servers.strata]`` entry,
+    which :func:`remove_codex_mcp_server` never reports ``"removed"`` for in
+    the first place (no marker means nothing calls this function at all) —
+    is never touched.
+
+    Returns ``(new_text, removed_count)`` — *removed_count* is ``0`` (with
+    *new_text* == *config_text*) when nothing orphaned is found.
+    """
+
+    def _is_orphan(m: re.Match[str]) -> bool:
+        name = m.group(2).strip()
+        return name == "mcp_servers.strata" or name.startswith("mcp_servers.strata.")
+
+    headers = list(_TOML_TABLE_HEADER_RE.finditer(config_text))
+    spans: list[tuple[int, int]] = []
+    for i, m in enumerate(headers):
+        if not _is_orphan(m):
+            continue
+        start = m.start()
+        if i + 1 < len(headers):
+            raw_end = headers[i + 1].start()
+            next_is_orphan = _is_orphan(headers[i + 1])
+        else:
+            raw_end = len(config_text)
+            next_is_orphan = False
+        # Only trim trailing blank/comment lines back to the next KEPT
+        # header — when the next header is itself orphaned, the text
+        # between them is pure separator and belongs to neither side; leave
+        # it in the span so it disappears along with both removed tables
+        # instead of surviving as a dangling blank line.
+        end = raw_end if next_is_orphan else _table_header_end(config_text, start, raw_end)
+        spans.append((start, end))
+    if not spans:
+        return config_text, 0
+
+    new_text = config_text
+    for idx in range(len(spans) - 1, -1, -1):
+        start, end = spans[idx]
+        # Only the earliest span needs its own leading separator stripped —
+        # later spans in the list are contiguous with (or already swept up
+        # by) an earlier one, and removing this one first (reverse order)
+        # never shifts the still-untouched text before it.
+        if idx == 0 and start > 0 and new_text[start - 1] == "\n":
+            start -= 1
+        new_text = new_text[:start] + new_text[end:]
+    return new_text, len(spans)
 
 
 # ---------------------------------------------------------------------------
@@ -989,10 +1159,39 @@ def merge_agents_md(existing_text: str) -> tuple[str, bool]:
 def remove_agents_md(existing_text: str) -> tuple[str, str]:
     """Remove Strata's managed AGENTS.md block from *existing_text*.
 
-    The reverse of :func:`merge_agents_md`; see :func:`_remove_block` for the
-    ``"removed"`` / ``"edited"`` / ``"absent"`` status semantics.
+    The reverse of :func:`merge_agents_md`. Unlike the fixed-block matching
+    :func:`_remove_block` does elsewhere, this locates the installed block by
+    its begin/end markers (:func:`_extract_agents_md_block`) — so it finds
+    the block regardless of which shipped release wrote its *content* — then
+    classifies that exact content via :func:`classify_agents_md_drift`
+    (current-or-historical-shipped vs. genuinely user-edited). A project
+    registered under an older Strata release, whose block still matches what
+    that release shipped, is removed cleanly rather than misreported as
+    edited (round-4 unregister fix, bug B).
+
+    Returns ``(new_text, status)``:
+
+    - ``"removed"`` — the block matched the current or a historical shipped
+      version and was stripped, along with the blank-line separator
+      register prepends.
+    - ``"edited"``  — the begin marker is present but the block doesn't
+      classify as current-or-historical-shipped (user-edited, or the shipped
+      reference couldn't be read to prove it); *existing_text* is returned
+      unchanged.
+    - ``"absent"``  — no managed marker at all; nothing to do.
     """
-    return _remove_block(existing_text, _shipped_agents_md_block(), AGENTS_MD_MARKER)
+    block = _extract_agents_md_block(existing_text)
+    if not block:
+        if AGENTS_MD_MARKER in existing_text:
+            return existing_text, "edited"
+        return existing_text, "absent"
+    status = classify_agents_md_drift(existing_text)
+    if status not in ("match", "stale"):
+        return existing_text, "edited"
+    sep_block = "\n" + block
+    if sep_block in existing_text:
+        return existing_text.replace(sep_block, "", 1), "removed"
+    return existing_text.replace(block, "", 1), "removed"
 
 
 def _extract_agents_md_block(text: str) -> str:

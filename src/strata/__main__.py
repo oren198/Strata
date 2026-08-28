@@ -158,6 +158,9 @@ from strata.install import (
 from strata.install import (
     stop_hook_present as _stop_hook_present,
 )
+from strata.install import (
+    strip_orphaned_mcp_strata_tables as _strip_orphaned_mcp_strata_tables,
+)
 from strata.launch import (
     SkillResolutionError,
     StrataRoleParseError,
@@ -3176,15 +3179,26 @@ def cmd_unregister(args: argparse.Namespace) -> int:
     """Reverse `strata register`'s wiring — issue #53; harness-symmetric (Task 3).
 
     Removes each artifact register wired ONLY when it still byte-matches what
-    register would have written; user-edited artifacts are reported and left
-    in place (ADR 0005 Decision 6, applied in reverse). Steps:
+    the CURRENT or a known HISTORICAL release of register would have written
+    (round-4 unregister fix, bug B — the same current-or-historical mechanism
+    register's own self-update uses, so a project registered under an older
+    Strata release is never misreported as "edited" just because a newer
+    release ships different shipped content); genuinely user-edited
+    artifacts are reported and left in place (ADR 0005 Decision 6, applied in
+    reverse). Steps:
 
     1. `.gitignore` managed block     (removed verbatim, other lines untouched).
     2. per resolved harness: claude-code's `mcpServers.strata` entry + Stop
        hook, or codex's `[mcp_servers.strata]` table + Stop-hook block
-       (each removed only if == the canonical entry it was merged with).
+       (each removed only if == the canonical entry it was merged with; for
+       codex, removing the canonical `[mcp_servers.strata]` table also sweeps
+       up any `[mcp_servers.strata.*]` subtables a third party — most notably
+       the Codex CLI itself, writing per-tool approval state — appended
+       after it, which are meaningless without the parent and otherwise
+       orphan the entry and break Codex startup — round-4 unregister fix,
+       bug A).
     3. the three vendored skills        (claude-code only; removed only if
-       byte-identical to shipped).
+       byte-identical to the current or a historical shipped version).
     4. `.strata/` data                  (left alone unless --purge-data).
 
     Harness resolution (symmetric with, but not identical to, register's):
@@ -3430,7 +3444,23 @@ def cmd_unregister(args: argparse.Namespace) -> int:
             if mcp_status == "removed":
                 codex_text = new_text
                 codex_changed = True
-                _ok(f"{codex_config}: {_would('remove', 'removed')} [mcp_servers.strata] table")
+                # Sweep up any [mcp_servers.strata.*] subtables a third party
+                # (most notably the Codex CLI itself, writing per-tool
+                # approval state) appended after the canonical block — those
+                # are meaningless without the parent table we just confirmed
+                # is ours, and left behind they orphan the strata MCP server
+                # entry and break Codex startup (round-4 unregister fix, bug
+                # A). Only swept when the parent itself matched — a manual,
+                # unmarked [mcp_servers.strata] entry (and its subtables) is
+                # never touched, because mcp_status is "absent" for that case.
+                codex_text, orphaned = _strip_orphaned_mcp_strata_tables(codex_text)
+                if orphaned:
+                    _ok(
+                        f"{codex_config}: {_would('remove', 'removed')} [mcp_servers.strata] "
+                        f"and {orphaned} related table{'s' if orphaned != 1 else ''}"
+                    )
+                else:
+                    _ok(f"{codex_config}: {_would('remove', 'removed')} [mcp_servers.strata] table")
             elif mcp_status == "edited":
                 _left(
                     f"{codex_config}: [mcp_servers.strata] table was edited "

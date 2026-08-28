@@ -31,6 +31,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
+from strata import install
 from strata.__main__ import _build_parser, cmd_register, cmd_unregister
 
 # ---------------------------------------------------------------------------
@@ -407,6 +408,147 @@ def test_skill_dir_with_extra_user_file_is_preserved(tmp_path: Path, capsys) -> 
     # Skill.md removed (it matched shipped), but user file + dir survive.
     assert not (skill_dir / "Skill.md").exists()
     assert (skill_dir / "notes.md").read_text(encoding="utf-8") == "my notes\n"
+
+
+# ---------------------------------------------------------------------------
+# Acceptance criterion 6: historical shipped content is OURS, not "edited"
+# (round-4 unregister fix, bug B).
+#
+# Live sequence this reproduces: a project registered under v1.10.2 (whose
+# `.gitignore` block predates the `.env` line added at v1.10.3) was
+# unregistered under v1.10.3 — the block byte-matched what v1.10.2 shipped,
+# not what v1.10.3 ships, so it was flagged "edited — left in place" and
+# unregister exited 1. It is unmodified, historical-shipped content, not a
+# user edit, and must be removed cleanly.
+# ---------------------------------------------------------------------------
+
+
+def test_gitignore_historical_block_removed_cleanly_exit_0(tmp_path: Path) -> None:
+    """A block matching a historical (pre-v1.10.3) shipped version is OURS."""
+    _init_project(tmp_path)
+    cmd_register(_register_args(str(tmp_path)))
+
+    gitignore = tmp_path / ".gitignore"
+    current = gitignore.read_text(encoding="utf-8")
+    historical = current.replace(install.GITIGNORE_BLOCK, install.GITIGNORE_BLOCK_HISTORICAL[0])
+    assert historical != current  # sanity: the two blocks really do differ
+    gitignore.write_text(historical, encoding="utf-8")
+
+    rc = cmd_unregister(_unregister_args(str(tmp_path)))
+
+    assert rc == 0
+    assert install.GITIGNORE_MARKER not in gitignore.read_text(encoding="utf-8")
+
+
+def test_gitignore_historical_block_unit_level() -> None:
+    """install.remove_gitignore_block itself recognizes the historical block."""
+    text = "node_modules/\n" + install.GITIGNORE_BLOCK_HISTORICAL[0]
+    new_text, status = install.remove_gitignore_block(text)
+    assert status == "removed"
+    assert new_text == "node_modules/"
+
+
+def test_stale_skill_removed_cleanly_exit_0(tmp_path: Path) -> None:
+    """A Skill.md matching a historical shipped version is OURS, not edited.
+
+    Uses a synthetic historical-hash table entry (mirroring test_doctor.py's
+    `test_doctor_flags_stale_but_historical_skill_with_refresh_wording`)
+    rather than depending on git tag history being checked out.
+    """
+    import unittest.mock
+
+    _init_project(tmp_path)
+    cmd_register(_register_args(str(tmp_path)))
+
+    skill_md = tmp_path / ".claude" / "skills" / "strata-worker" / "Skill.md"
+    old_content = "# An old shipped strata-worker skill\nOlder guidance.\n"
+    old_hash = hashlib.sha256(old_content.encode("utf-8")).hexdigest()
+    skill_md.write_text(old_content, encoding="utf-8")
+
+    real_hashes = install._HISTORICAL_ARTIFACT_HASHES  # noqa: SLF001
+    patched = {
+        **real_hashes,
+        "strata-worker": {
+            "current": real_hashes["strata-worker"]["current"],
+            "historical": frozenset({old_hash}),
+        },
+    }
+    with unittest.mock.patch.object(install, "_HISTORICAL_ARTIFACT_HASHES", patched):
+        rc = cmd_unregister(_unregister_args(str(tmp_path)))
+
+    assert rc == 0
+    assert not skill_md.exists()
+
+
+def test_stale_hook_removed_cleanly_exit_0(tmp_path: Path) -> None:
+    """The freshness hook script matching a historical shipped version is OURS."""
+    import unittest.mock
+
+    _init_project(tmp_path)
+    cmd_register(_register_args(str(tmp_path)))
+
+    hook_script = tmp_path / ".claude" / "hooks" / "strata-stop-hook"
+    old_content = "#!/bin/sh\n# an old shipped freshness hook\nexit 0\n"
+    old_hash = hashlib.sha256(old_content.encode("utf-8")).hexdigest()
+    hook_script.write_text(old_content, encoding="utf-8")
+
+    real_hashes = install._HISTORICAL_ARTIFACT_HASHES  # noqa: SLF001
+    patched = {
+        **real_hashes,
+        "strata-stop-hook": {
+            "current": real_hashes["strata-stop-hook"]["current"],
+            "historical": frozenset({old_hash}),
+        },
+    }
+    with unittest.mock.patch.object(install, "_HISTORICAL_ARTIFACT_HASHES", patched):
+        rc = cmd_unregister(_unregister_args(str(tmp_path)))
+
+    assert rc == 0
+    assert not hook_script.exists()
+
+
+def test_mixed_historical_and_edited_artifacts_only_the_edited_one_is_flagged(
+    tmp_path: Path, capsys
+) -> None:
+    """One historical artifact + one genuinely-edited artifact in the same
+    run: exit 1 overall (the partial-completion signal), the historical one
+    is removed cleanly with no warning, and the warning names ONLY the
+    genuinely-edited one.
+    """
+    _init_project(tmp_path)
+    cmd_register(_register_args(str(tmp_path)))
+
+    # Historical, unmodified: the pre-v1.10.3 .gitignore block.
+    gitignore = tmp_path / ".gitignore"
+    current = gitignore.read_text(encoding="utf-8")
+    historical = current.replace(install.GITIGNORE_BLOCK, install.GITIGNORE_BLOCK_HISTORICAL[0])
+    assert historical != current
+    gitignore.write_text(historical, encoding="utf-8")
+
+    # Genuinely edited: a vendored skill.
+    skill_md = tmp_path / ".claude" / "skills" / "strata-worker" / "Skill.md"
+    edited = skill_md.read_text(encoding="utf-8") + "\n<!-- user tweak -->\n"
+    skill_md.write_text(edited, encoding="utf-8")
+
+    rc = cmd_unregister(_unregister_args(str(tmp_path)))
+
+    assert rc == 1
+
+    # The historical .gitignore block was removed cleanly — no complaint.
+    assert install.GITIGNORE_MARKER not in gitignore.read_text(encoding="utf-8")
+
+    # The genuinely-edited skill survived untouched.
+    assert skill_md.exists()
+    assert skill_md.read_text(encoding="utf-8") == edited
+
+    captured = capsys.readouterr()
+    # The warning names only the edited artifact.
+    assert "strata-worker" in captured.err
+    assert ".gitignore" not in captured.err
+    # The two unmodified skills, and the historical gitignore block, still
+    # got their clean "ok" treatment on stdout.
+    assert not (tmp_path / ".claude" / "skills" / "strata").exists()
+    assert not (tmp_path / ".claude" / "skills" / "strata-inspect").exists()
 
 
 # ---------------------------------------------------------------------------

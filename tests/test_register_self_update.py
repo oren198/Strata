@@ -32,11 +32,15 @@ Also covers:
   current shipped).
 
 Codex's `config.toml` blocks (`[mcp_servers.strata]`, `[[hooks.Stop]]`) are
-deliberately OUT of scope here: they're unstructured TOML, not something
-this project has ever needed to "refresh" in place, and they've never
-churned the way a skill or hook script has — low value for the added
-surface. AGENTS.md's block *is* in scope because it ships real prose
-guidance (same content class as the skills) that does churn.
+NOT self-updated in place the way skills/the hook script/AGENTS.md are —
+they're unstructured TOML, and register has never needed to "refresh" them.
+They ARE, however, covered by the release-discipline test below (round-4
+unregister fix, bug B): `remove_codex_mcp_server`/`remove_codex_freshness_hook`
+now recognize historical shipped block text the same way the other managed
+artifacts recognize historical shipped hashes, and that mechanism needs the
+same "current recorded hash actually matches shipped content" guardrail so a
+future release that changes either block can't silently reintroduce the bug
+by forgetting to record the old text as historical.
 
 Vocabulary: scope, fleet, skill, scope-manager.
 """
@@ -513,6 +517,42 @@ def test_release_discipline_hashes_are_current() -> None:
         "was not updated — move the old 'current' hash into 'historical' and "
         "record the new 'current'."
     )
+
+    # Round-4 unregister fix, bug B: the Codex config.toml blocks aren't
+    # self-updated, but remove_codex_mcp_server / remove_codex_freshness_hook
+    # now recognize historical shipped text the same way the artifacts above
+    # recognize historical shipped hashes — this table entry, and this
+    # assertion, are what force a future content change to be a deliberate,
+    # documented decision instead of a silent regression of bug B.
+    codex_mcp_hash = hashlib.sha256(install.CODEX_MCP_BLOCK.encode("utf-8")).hexdigest()
+    recorded_codex_mcp = install._HISTORICAL_ARTIFACT_HASHES["codex-mcp"]["current"]  # noqa: SLF001
+    assert codex_mcp_hash == recorded_codex_mcp, (
+        "shipped CODEX_MCP_BLOCK content changed but _HISTORICAL_ARTIFACT_HASHES "
+        "was not updated — move the old 'current' hash into 'historical', add the "
+        "old block text to CODEX_MCP_BLOCK_HISTORICAL, and record the new 'current'."
+    )
+
+    codex_hook_hash = hashlib.sha256(install.CODEX_HOOK_BLOCK.encode("utf-8")).hexdigest()
+    recorded_codex_hook = install._HISTORICAL_ARTIFACT_HASHES["codex-hook"]["current"]  # noqa: SLF001
+    assert codex_hook_hash == recorded_codex_hook, (
+        "shipped CODEX_HOOK_BLOCK content changed but _HISTORICAL_ARTIFACT_HASHES "
+        "was not updated — move the old 'current' hash into 'historical', add the "
+        "old block text to CODEX_HOOK_BLOCK_HISTORICAL, and record the new 'current'."
+    )
+
+
+def test_release_discipline_catches_a_codex_block_content_change() -> None:
+    """Proves the new codex-mcp/codex-hook guardrail is red-on-change, not
+    just green-by-construction: modifying CODEX_MCP_BLOCK without updating
+    the recorded hash must fail test_release_discipline_hashes_are_current.
+    """
+    modified = install.CODEX_MCP_BLOCK.replace('command = "strata-mcp"', 'command = "changed"')
+    modified_hash = hashlib.sha256(modified.encode("utf-8")).hexdigest()
+    recorded = install._HISTORICAL_ARTIFACT_HASHES["codex-mcp"]["current"]  # noqa: SLF001
+    assert modified_hash != recorded  # red: an unrecorded change is detected
+
+    unmodified_hash = hashlib.sha256(install.CODEX_MCP_BLOCK.encode("utf-8")).hexdigest()
+    assert unmodified_hash == recorded  # green: reverting restores the match
 
 
 # ---------------------------------------------------------------------------

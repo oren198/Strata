@@ -297,11 +297,15 @@ scope that resolves storage from `config.toml` as usual.
 After `pipx upgrade strata-mem`, run:
 
 ```bash
-strata register --diff       # shows what would change if you re-ran register
+strata register                # self-updates anything stale, in place
+strata register --diff         # preview first: shows what would change, writes nothing
 ```
 
-Review the diff and copy the pieces you want manually. Strata never silently
-overwrites skills or settings you've already customised.
+That's the whole story — no need to `unregister` first. Register self-updates
+each managed artifact (skills, the freshness hook script, the AGENTS.md
+block) in place when it's still exactly what a current or past `strata
+register` wrote and was never hand-edited; anything you've customised is
+left untouched and reported, never silently overwritten.
 
 ### Memory-freshness Stop-hook
 
@@ -440,9 +444,9 @@ where the same read-before-working / contribute-back / judged-verdict
 guidance lives for Codex sessions. A fresh `AGENTS.md` is created if none
 exists; an existing one keeps its own content byte-identical, with the
 Strata block appended. `strata unregister --harness codex` removes only that
-block, and only when it still byte-matches what register wrote — content you
-added elsewhere in the file, or edits inside the block itself, are reported
-and left in place.
+block, and only when it still byte-matches what the current or a past
+release of register wrote — content you added elsewhere in the file, or
+genuine edits inside the block itself, are reported and left in place.
 
 **What this gives you, and how confident to be in each part:**
 
@@ -513,7 +517,11 @@ and left in place.
   `strata unregister --harness codex` reverses this wiring the same way
   `strata unregister` reverses the Claude Code wiring — only when the
   `[mcp_servers.strata]` table and the hooks.Stop block still byte-match what
-  register wrote; an edited block is reported and left in place.
+  the current or a past release of register wrote; a genuinely edited block
+  is reported and left in place. Removing the `[mcp_servers.strata]` table
+  also sweeps up any `[mcp_servers.strata.*]` subtables Codex itself appends
+  during a live session (per-tool approval state) — left behind, those
+  orphan the entry and Codex fails to start.
 
 ```toml
 # what strata register --harness codex merges into config.toml
@@ -588,9 +596,9 @@ order, in a scratch project, if you're the first to turn this on for real:
 ### Undoing it: `strata unregister`
 
 `strata unregister` reverses register's wiring. Like register, it is strictly
-conservative — it removes each artifact **only when it still matches what
-register wrote**, and reports (leaving in place) anything you have since
-edited:
+conservative — it removes each artifact **only when it still matches what the
+current, or a past, release of register wrote**, and reports (leaving in
+place) anything you have genuinely edited since:
 
 ```bash
 strata unregister               # remove the wiring; keep your .strata/ memory

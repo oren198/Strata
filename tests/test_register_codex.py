@@ -353,6 +353,185 @@ def test_remove_codex_mcp_server_preserves_other_content() -> None:
     assert new_text == existing  # byte-identical round-trip
 
 
+# ---------------------------------------------------------------------------
+# install.strip_orphaned_mcp_strata_tables — round-4 unregister fix, bug A
+#
+# Live sequence this reproduces: register wrote [mcp_servers.strata] +
+# [mcp_servers.strata.env]; the Codex CLI itself later appended its own
+# [mcp_servers.strata.tools.<tool>] approval-state subtables during a live
+# session; `strata unregister --harness codex` removed only the canonical
+# block register wrote, leaving the tools.* subtables orphaned — Codex then
+# failed startup with "invalid transport in mcp_servers.strata".
+# ---------------------------------------------------------------------------
+
+
+def test_strip_orphaned_mcp_strata_tables_removes_codex_appended_tool_subtables() -> None:
+    # Simulates the parent block already having been removed by
+    # remove_codex_mcp_server, leaving only what Codex itself appended.
+    text = (
+        "[mcp_servers.strata.tools.read_file]\n"
+        "approved = true\n\n"
+        "[mcp_servers.strata.tools.write_file]\n"
+        "approved = false\n"
+    )
+    new_text, count = install.strip_orphaned_mcp_strata_tables(text)
+    assert count == 2
+    assert "mcp_servers.strata" not in new_text
+    assert new_text == ""
+
+
+def test_strip_orphaned_mcp_strata_tables_leaves_unrelated_tables_byte_identical() -> None:
+    text = (
+        '[model]\nname = "gpt-5"\n\n'
+        "[mcp_servers.strata.tools.read_file]\n"
+        "approved = true\n\n"
+        '[mcp_servers.other-tool]\ncommand = "other-bin"\n'
+    )
+    new_text, count = install.strip_orphaned_mcp_strata_tables(text)
+    assert count == 1
+    assert "mcp_servers.strata" not in new_text
+    assert (
+        new_text == '[model]\nname = "gpt-5"\n\n[mcp_servers.other-tool]\ncommand = "other-bin"\n'
+    )
+
+
+def test_strip_orphaned_mcp_strata_tables_does_not_swallow_array_of_tables_header() -> None:
+    # A [[hooks.Stop]] array-of-tables header (our own freshness-hook shape,
+    # or a user's) sitting right after an orphaned strata subtable must end
+    # that subtable's span, not get swallowed into it.
+    text = (
+        "[mcp_servers.strata.tools.read_file]\n"
+        "approved = true\n"
+        "[[hooks.Stop]]\n"
+        "[[hooks.Stop.hooks]]\n"
+        'type = "command"\n'
+        'command = "my-hook.sh"\n'
+    )
+    new_text, count = install.strip_orphaned_mcp_strata_tables(text)
+    assert count == 1
+    assert "mcp_servers.strata" not in new_text
+    assert (
+        new_text
+        == '[[hooks.Stop]]\n[[hooks.Stop.hooks]]\ntype = "command"\ncommand = "my-hook.sh"\n'
+    )
+
+
+def test_strip_orphaned_mcp_strata_tables_does_not_swallow_our_own_hook_block() -> None:
+    # CODEX_HOOK_BLOCK starts with comment lines (the marker + schema notes)
+    # before its own [[hooks.Stop]] header. An orphaned strata subtable
+    # sitting right before it must not swallow those comment lines into its
+    # removed span — that would corrupt the still-canonical hook block and
+    # break remove_codex_freshness_hook's own byte-match.
+    text = "[mcp_servers.strata.tools.read_file]\napproved = true\n" + install.CODEX_HOOK_BLOCK
+    new_text, count = install.strip_orphaned_mcp_strata_tables(text)
+    assert count == 1
+    assert "mcp_servers.strata" not in new_text
+    assert new_text == install.CODEX_HOOK_BLOCK
+    # The still-intact hook block remains removable by its own function.
+    _, hook_status = install.remove_codex_freshness_hook(new_text)
+    assert hook_status == "removed"
+
+
+def test_strip_orphaned_mcp_strata_tables_absent_is_noop() -> None:
+    text = '[model]\nname = "gpt-5"\n'
+    new_text, count = install.strip_orphaned_mcp_strata_tables(text)
+    assert count == 0
+    assert new_text == text
+
+
+def test_strip_orphaned_mcp_strata_tables_does_not_match_name_prefix_lookalikes() -> None:
+    # [mcp_servers.strataFOO] and [mcp_servers.strata2] are different table
+    # names — "mcp_servers.strata" is a substring of both, but neither is our
+    # table nor a dotted child of it (a dotted child always has a literal
+    # "." right after "strata"). A naive substring/prefix check would wrongly
+    # sweep these up; the boundary must be exact-name-or-dotted-child.
+    text = (
+        "[mcp_servers.strataFOO]\n"
+        'command = "unrelated-bin"\n\n'
+        "[mcp_servers.strata2]\n"
+        'command = "also-unrelated"\n'
+    )
+    new_text, count = install.strip_orphaned_mcp_strata_tables(text)
+    assert count == 0
+    assert new_text == text
+
+
+def test_unregister_harness_codex_leaves_name_prefix_lookalikes_byte_identical(
+    tmp_path: Path, codex_home: Path
+) -> None:
+    """CLI-level: a config carrying [mcp_servers.strataFOO] / [mcp_servers.strata2]
+    tables survives `strata unregister --harness codex` byte-identical."""
+    _init_project(tmp_path)
+    codex_home.mkdir(parents=True)
+    lookalikes = (
+        "[mcp_servers.strataFOO]\n"
+        'command = "unrelated-bin"\n\n'
+        "[mcp_servers.strata2]\n"
+        'command = "also-unrelated"\n'
+    )
+    config = codex_home / "config.toml"
+    config.write_text(lookalikes, encoding="utf-8")
+
+    _register(tmp_path, harness="codex")
+    assert _unregister(tmp_path, harness="codex") == 0
+
+    remaining = config.read_text(encoding="utf-8")
+    assert remaining == lookalikes  # byte-identical: our own entry round-tripped away cleanly
+
+
+def test_unregister_harness_codex_removes_orphaned_tool_subtables(
+    tmp_path: Path, codex_home: Path
+) -> None:
+    """The exact live scenario: register, then Codex appends tool-approval
+    subtables under our parent table, then unregister must remove the whole
+    subtree — zero mcp_servers.strata references left, Codex startup fixed.
+    """
+    _init_project(tmp_path)
+    _register(tmp_path, harness="codex")
+    config = codex_home / "config.toml"
+    # A user's own, unrelated table both before and after ours, to prove
+    # unrelated content is byte-preserved through the sweep.
+    before_text = '[model]\nname = "gpt-5"\n\n'
+    after_text = '\n[mcp_servers.other-tool]\ncommand = "other-bin"\n'
+    codex_appended = (
+        "[mcp_servers.strata.tools.read_file]\n"
+        "approved = true\n\n"
+        "[mcp_servers.strata.tools.write_file]\n"
+        "approved = false\n"
+    )
+    original = config.read_text(encoding="utf-8")
+    config.write_text(before_text + original + codex_appended + after_text, encoding="utf-8")
+
+    assert _unregister(tmp_path, harness="codex") == 0
+
+    remaining = config.read_text(encoding="utf-8")
+    assert "mcp_servers.strata" not in remaining
+    assert "[model]" in remaining
+    assert "[mcp_servers.other-tool]" in remaining
+
+
+def test_unregister_harness_codex_manual_entry_with_subtables_fully_untouched(
+    tmp_path: Path, codex_home: Path
+) -> None:
+    """A manually-created [mcp_servers.strata] entry (no register marker) —
+    including any subtables under it — is never touched by unregister."""
+    _init_project(tmp_path)
+    codex_home.mkdir(parents=True)
+    manual = (
+        "[mcp_servers.strata]\n"
+        'command = "strata-mcp"\n\n'
+        "[mcp_servers.strata.env]\n"
+        'STRATA_AGENT_SCOPE = "g_root"\n\n'
+        "[mcp_servers.strata.tools.read_file]\n"
+        "approved = true\n"
+    )
+    (codex_home / "config.toml").write_text(manual, encoding="utf-8")
+
+    assert _unregister(tmp_path, harness="codex") == 0
+
+    assert (codex_home / "config.toml").read_text(encoding="utf-8") == manual
+
+
 def test_remove_codex_freshness_hook_removes_canonical_block() -> None:
     text, _ = install.merge_codex_freshness_hook("")
     new_text, status = install.remove_codex_freshness_hook(text)
