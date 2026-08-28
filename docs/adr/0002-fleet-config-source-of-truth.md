@@ -223,3 +223,55 @@ become explicit application-layer validation.
 - Optimistic-concurrency revision tokens for concurrent UI clients.
 - Structured migration of `fleet.yaml` schema if it evolves
   non-additively.
+
+## Addendum (2026-08-28) — Lazy reload-on-read
+
+**Incident:** an agent added a scope to `fleet.yaml` mid-session; the
+already-running Console backend kept serving the fleet it had loaded at
+process startup ("`FleetConfig` mirror loaded once", Decision 2 above) —
+the new scope was invisible until the process restarted.
+
+**Decision:** fleet-reading requests and tool calls now reload
+`fleet.yaml` lazily, not once. Before serving any fleet-reading request
+(the FastAPI backend) or tool call (the MCP server), the reader stats
+the file's mtime + size. Unchanged since the last read → the cached
+`FleetConfig` is served with no re-parse. Changed → the file is reloaded
+through the full `FleetConfig.load` validation (every invariant above
+runs again). One class, `strata.fleet_reload.FleetReloader`, implements
+this once; both the FastAPI app (`app.state.fleet_reloader`) and the MCP
+server (its module-level singleton) wrap their `FleetConfig` in one
+rather than re-solving "did the file change" twice.
+
+This is deliberately **not** a filesystem watcher and **not** a
+background poller — no new process, no inotify dependency, no staleness
+window to reason about. The check is one `stat()` call, paid at the
+moment something actually needs the fleet, which is what "source of
+truth" already implied: the file was always authoritative, only the
+*timing* of when the mirror caught up was wrong.
+
+**Invalid file at reload time:** a `fleet.yaml` edit that fails to parse
+or fails a load-time invariant does not propagate to the caller once a
+good fleet has already been served — the reloader keeps serving the
+last known-good `FleetConfig` and records a plain-language warning
+(`FleetReloader.warning`) instead of turning a mid-edit typo into "every
+fleet-reading call now throws." The FastAPI backend surfaces this as a
+`fleet_file_warning` field on `GET /scopes` responses (`null` when
+nothing is wrong); the MCP server surfaces it as an additive
+`fleet_notice` key in tool output, and both sides log it to stderr. The
+first load (nothing valid cached yet) still raises — refuse-to-start and
+"no fleet to fall back to" behavior is unchanged.
+
+**Binding is no longer frozen with the fleet.** Before this addendum,
+an MCP session's `(scope, skill)` binding was fixed for the process's
+whole life, decided once at startup against whatever fleet existed
+then. `strata_bind` (Feature B alongside this addendum) lets a session
+rebind to a different scope at runtime, reusing this same reload path so
+a scope added moments ago is immediately bindable — closing the
+incident above without a restart. An **unchanged** binding stays valid
+across a reload exactly as before: this addendum only removes the
+"stuck with the startup snapshot" failure mode, it does not add any new
+invalidation of a binding nobody asked to change.
+
+`fleet.yaml` remains the single source of truth (Decision above,
+unchanged) — this addendum only changes how promptly the in-memory
+mirror notices it moved.
