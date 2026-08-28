@@ -15,6 +15,7 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
+import yaml
 from fastapi.testclient import TestClient
 
 from strata.app import create_app, get_scope_manager
@@ -206,6 +207,54 @@ class TestListScopes:
         assert data["strata"] == []
         assert data["scopes"] == []
         assert data["edges"] == []
+
+
+class TestLazyFleetReload:
+    """GET /scopes reloads fleet.yaml lazily (Feature A, ADR 0002 addendum).
+
+    The backend must not keep serving the fleet it loaded at process
+    startup forever — a scope added to fleet.yaml out of band must show up
+    on the next GET /scopes without a restart. An invalid edit must not
+    break subsequent reads; it must keep serving the last good fleet and
+    say so via ``fleet_file_warning``.
+    """
+
+    def test_added_scope_visible_on_next_read_without_restart(self, client, tmp_path):
+        resp = client.get("/scopes")
+        scope_ids = {s["id"] for s in resp.json()["scopes"]}
+        assert "g_new" not in scope_ids
+
+        fleet_path = tmp_path / "fleet.yaml"
+        raw = yaml.safe_load(fleet_path.read_text(encoding="utf-8"))
+        raw["scopes"].append(
+            {"id": "g_new", "name": "New Scope", "stratum_id": "L1", "status": "active"}
+        )
+        fleet_path.write_text(yaml.dump(raw, default_flow_style=False), encoding="utf-8")
+
+        resp2 = client.get("/scopes")
+        scope_ids2 = {s["id"] for s in resp2.json()["scopes"]}
+        assert "g_new" in scope_ids2, "GET /scopes did not pick up the fleet.yaml edit"
+        assert resp2.json()["fleet_file_warning"] is None
+
+    def test_invalid_edit_keeps_serving_last_good_fleet_with_warning(self, client, tmp_path):
+        resp = client.get("/scopes")
+        assert resp.json()["fleet_file_warning"] is None
+        good_scope_ids = {s["id"] for s in resp.json()["scopes"]}
+
+        fleet_path = tmp_path / "fleet.yaml"
+        fleet_path.write_text(
+            "strata:\n  - id: L0\n    name: Executive\n    ordinal: 0\n"
+            "scopes:\n  - id: g_active\n    name: bad\n    stratum_id: NOPE\n"
+            "edges: []\n",
+            encoding="utf-8",
+        )
+
+        resp2 = client.get("/scopes")
+        assert resp2.status_code == 200
+        scope_ids2 = {s["id"] for s in resp2.json()["scopes"]}
+        assert scope_ids2 == good_scope_ids, "invalid reload must keep serving the last good fleet"
+        assert resp2.json()["fleet_file_warning"] is not None
+        assert "fleet.yaml" in resp2.json()["fleet_file_warning"]
 
 
 class TestScopeSummary:

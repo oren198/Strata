@@ -4,10 +4,13 @@ Wires the record store, summary store, and scope-manager together behind a
 small REST API.  All endpoints return JSON.  Sync endpoints are used
 throughout — FastAPI mixes sync and async without issue.
 
-Fleet configuration is served from the in-memory :class:`FleetConfig` mirror
-loaded at startup from ``fleet.yaml`` (ADR 0002).  The ``strata``, ``scopes``,
-and ``edges`` SQLite tables are gone; scope-existence and active-status checks
-are enforced against the in-memory mirror at contribute time.
+Fleet configuration is served from an in-memory :class:`FleetConfig` mirror,
+lazily reloaded from ``fleet.yaml`` whenever the file's mtime/size changes
+(ADR 0002, addendum: lazy reload-on-read) via a
+:class:`~strata.fleet_reload.FleetReloader` held on ``app.state.fleet_reloader``.
+The ``strata``, ``scopes``, and ``edges`` SQLite tables are gone;
+scope-existence and active-status checks are enforced against the in-memory
+mirror at contribute time.
 
 Endpoints
 ---------
@@ -66,6 +69,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from strata import __version__
 from strata.fleet_config import FleetConfig, Scope, Stratum
+from strata.fleet_reload import FleetReloader
 from strata.locks import BATCH_CAP, QUEUE_WAIT_TIMEOUT_S, QueueTicket, configure_lock_dir
 from strata.locks import scope_append_lock as _scope_append_lock
 from strata.locks import scope_lock as _scope_lock
@@ -201,8 +205,14 @@ def get_scope_manager(
 
 
 def get_fleet_config(request: Request) -> FleetConfig:
-    """Return the in-memory :class:`FleetConfig` from app state."""
-    return request.app.state.fleet_config
+    """Return the current :class:`FleetConfig`, reloading fleet.yaml if it changed.
+
+    Delegates to the request's :class:`~strata.fleet_reload.FleetReloader`
+    (``app.state.fleet_reloader``) — the lazy-reload-on-read path shared with
+    the MCP server (ADR 0002 addendum). Every call here stats fleet.yaml
+    first; an unchanged file returns the cached config with no re-parse.
+    """
+    return request.app.state.fleet_reloader.get()
 
 
 # ---------------------------------------------------------------------------
@@ -1014,14 +1024,14 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
         # SummaryStore.__init__ creates summaries_dir on construct; ensure it
         # exists by instantiating one here.
         SummaryStore(paths.summaries_dir)
-        # Load the FleetConfig mirror from fleet.yaml and hold it on app.state.
+        # Hold a FleetReloader on app.state rather than a frozen FleetConfig
+        # snapshot (lazy reload-on-read, ADR 0002 addendum): every
+        # fleet-reading request stats fleet.yaml before serving, so a scope
+        # added to fleet.yaml after this process started becomes visible on
+        # the next request without a restart. An invalid file at reload time
+        # keeps serving the last good fleet — see get_fleet()/list_scopes_endpoint.
         fleet_path = pathlib.Path(paths.fleet_yaml_path)
-        if fleet_path.exists():
-            app.state.fleet_config = FleetConfig.load(fleet_path)
-        else:
-            # Start with an empty config when no fleet.yaml is present (e.g.
-            # test scenarios that don't need fleet config).
-            app.state.fleet_config = FleetConfig(strata=[], scopes=[], edges=[])
+        app.state.fleet_reloader = FleetReloader(fleet_path)
         yield
 
     application = FastAPI(
@@ -1075,7 +1085,7 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
         6. Persist the judgment.
         7. Persist the updated summary (if accepted).
         """
-        fleet: FleetConfig = request.app.state.fleet_config
+        fleet: FleetConfig = request.app.state.fleet_reloader.get()
 
         # Step 1: scope must exist in FleetConfig (invariant 9).
         scope = fleet.get_scope(body.scope_id)
@@ -1172,8 +1182,22 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
 
     @application.get("/scopes")
     def list_scopes_endpoint(request: Request) -> dict:
-        """Return active scopes and strata from the in-memory FleetConfig."""
-        fleet: FleetConfig = request.app.state.fleet_config
+        """Return active scopes and strata from the in-memory FleetConfig.
+
+        ``fleet_file_warning`` (Feature A, lazy reload — ADR 0002 addendum)
+        is present and non-null only when the most recent fleet.yaml reload
+        attempt failed: the response still carries the last KNOWN-GOOD fleet,
+        but the field names the reload failure in plain language, so an
+        operator watching the Console after an edit sees "your edit didn't
+        take" instead of silently stale data.
+        """
+        reloader: FleetReloader = request.app.state.fleet_reloader
+        # get_with_warning() rather than get()-then-.warning: the two-step
+        # form is not atomic under concurrent requests (another request could
+        # trigger a reload in between and change .warning out from under this
+        # one) — get_with_warning() returns the (fleet, warning) pair from a
+        # single lock acquisition.
+        fleet, warning = reloader.get_with_warning()
 
         active = fleet.active_scopes()
         # Edges involving only active scopes.
@@ -1190,6 +1214,7 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
                 {"from_scope_id": e.from_, "to_scope_id": e.to, "kind": e.kind}
                 for e in active_edges
             ],
+            "fleet_file_warning": warning,
         }
 
     # -----------------------------------------------------------------------
@@ -1213,7 +1238,7 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
 
         Returns 404 if ``scope_id`` is given but is not an active scope.
         """
-        fleet: FleetConfig = request.app.state.fleet_config
+        fleet: FleetConfig = request.app.state.fleet_reloader.get()
         active = fleet.active_scopes()
 
         if scope_id is not None:
@@ -1309,7 +1334,7 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
         """
         from dataclasses import asdict
 
-        fleet: FleetConfig = request.app.state.fleet_config
+        fleet: FleetConfig = request.app.state.fleet_reloader.get()
         scope = fleet.get_scope(scope_id)
         if scope is None:
             raise HTTPException(status_code=404, detail=f"Scope not found: {scope_id!r}")
@@ -1362,7 +1387,7 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
 
         Returns 404 if the scope is not in the FleetConfig.
         """
-        fleet: FleetConfig = request.app.state.fleet_config
+        fleet: FleetConfig = request.app.state.fleet_reloader.get()
         scope = fleet.get_scope(scope_id)
         if scope is None:
             raise HTTPException(status_code=404, detail=f"Scope not found: {scope_id!r}")
@@ -1425,7 +1450,7 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
         paging arguments are out of range (including a ``before_id`` that is
         not a contribution in this scope).
         """
-        fleet: FleetConfig = request.app.state.fleet_config
+        fleet: FleetConfig = request.app.state.fleet_reloader.get()
         scope = fleet.get_scope(scope_id)
         if scope is None:
             raise HTTPException(status_code=404, detail=f"Scope not found: {scope_id!r}")
@@ -1491,7 +1516,7 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
         paging arguments are out of range (including a ``before_id`` that is
         not a declined contribution in this scope).
         """
-        fleet: FleetConfig = request.app.state.fleet_config
+        fleet: FleetConfig = request.app.state.fleet_reloader.get()
         scope = fleet.get_scope(scope_id)
         if scope is None:
             raise HTTPException(status_code=404, detail=f"Scope not found: {scope_id!r}")
@@ -1575,7 +1600,7 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
         Returns 404 if the scope is not in the FleetConfig, or if the
         contribution is unknown or belongs to another scope.
         """
-        fleet: FleetConfig = request.app.state.fleet_config
+        fleet: FleetConfig = request.app.state.fleet_reloader.get()
         scope = fleet.get_scope(scope_id)
         if scope is None:
             raise HTTPException(status_code=404, detail=f"Scope not found: {scope_id!r}")
@@ -1639,7 +1664,7 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
         from strata.operator import operator_supersede
 
         _reject_operator_stratum_id(directive_id)
-        fleet: FleetConfig = request.app.state.fleet_config
+        fleet: FleetConfig = request.app.state.fleet_reloader.get()
         try:
             new_directive = operator_supersede(
                 scope_id,
@@ -1682,7 +1707,7 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
         from strata.operator import operator_retire
 
         _reject_operator_stratum_id(directive_id)
-        fleet: FleetConfig = request.app.state.fleet_config
+        fleet: FleetConfig = request.app.state.fleet_reloader.get()
         try:
             retirement = operator_retire(
                 scope_id,

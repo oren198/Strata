@@ -45,6 +45,7 @@ import logging
 import os
 import sqlite3
 import sys
+import threading
 from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
@@ -53,7 +54,8 @@ from typing import Literal
 import yaml
 from mcp.server.fastmcp import FastMCP
 
-from strata.fleet_config import FleetConfig, FleetConfigError
+from strata.fleet_config import FleetConfig, FleetConfigError, Scope
+from strata.fleet_reload import FleetReloader
 from strata.locks import configure_lock_dir
 from strata.migrator import run_migrations
 from strata.operator import read_operator_layer
@@ -200,13 +202,17 @@ def _attach_nudge(result: dict) -> dict:
 
     Best-effort: a missing or unreadable session store simply yields no nudge,
     never an error on the read the agent actually asked for.
+
+    Also attaches the fleet reload notice (Feature A) via
+    :func:`_attach_fleet_notice` — every read tool routes its response
+    through here, so this is the one place both additive notices are tacked
+    on for reads.
     """
-    if _session_store is None:
-        return result
-    nudge = compute_nudge(_session_store.read(_AGENT_SESSION_ID))
-    if nudge is not None:
-        result["nudge"] = nudge
-    return result
+    if _session_store is not None:
+        nudge = compute_nudge(_session_store.read(_AGENT_SESSION_ID))
+        if nudge is not None:
+            result["nudge"] = nudge
+    return _attach_fleet_notice(result)
 
 
 def _build_scope_manager():
@@ -238,26 +244,82 @@ _AGENT_SCOPE: str = os.environ.get("STRATA_AGENT_SCOPE", "")
 _AGENT_SKILL: str | None = os.environ.get("STRATA_AGENT_SKILL") or None
 _AGENT_SESSION_ID: str = resolve_agent_session_id()
 
+# Guards ONLY the (scope, skill) WRITE in strata_bind (Feature B), so a
+# concurrent strata_bind call can't interleave its two assignments with
+# another's (no torn write of the pair). It does NOT guard reads: every
+# other tool still reads _AGENT_SCOPE/_AGENT_SKILL as plain global lookups,
+# with no lock — today's single-request-at-a-time stdio server makes that
+# safe in practice, but it means this lock does not, by itself, rule out a
+# reader observing a half-updated pair if the server ever becomes
+# concurrent. What DOES rule that out today is strata_contribute/
+# strata_publish/strata_withdraw each snapshotting the binding into locals
+# in one step at the top of the call and using those locals throughout
+# (see their comments) — the lock and the snapshot are two different
+# defenses for two different halves of the problem: the lock serializes
+# strata_bind's own write, the snapshot keeps one call's authorize-then-
+# stamp sequence internally consistent even if a rebind lands between two
+# separate reads elsewhere. _AGENT_SESSION_ID is never touched by this lock
+# — binding to a new scope is the same session working differently, not a
+# new session (contributions already carry per-call provenance, so the
+# record stays truthful either way).
+_binding_lock = threading.Lock()
+
 # ---------------------------------------------------------------------------
-# Fleet config helper — re-read on every call that needs fleet info (ADR 0004
-# Decision 1): no mtime watcher, no IPC. The 8 load-time invariants run on
-# each read. Cheap: fleet.yaml is KB-range and parses fast.
+# Fleet config helper — lazy reload-on-read (ADR 0004 Decision 1 + ADR 0002
+# addendum): every call that needs fleet info stats fleet.yaml first via a
+# shared FleetReloader (strata.fleet_reload — the same class the FastAPI
+# backend uses on app.state.fleet_reloader). Unchanged file → cached config,
+# no re-parse. Changed file → reload through the normal 8+ load-time
+# invariants. An invalid file at reload time keeps serving the last good
+# fleet and records a warning on the reloader, surfaced to callers via
+# _attach_fleet_notice() rather than breaking every subsequent tool call.
 # ---------------------------------------------------------------------------
+
+_fleet_reloader: FleetReloader | None = None
+
+# Set by _load_fleet(), from the SAME get_with_warning() call that produced
+# the fleet it returned — never re-queried from the reloader separately
+# afterward. A get()-then-.warning two-step would race a concurrent reload
+# between the two reads; capturing the atomic pair here and having
+# _fleet_notice() read only this snapshot avoids that.
+_fleet_last_warning: str | None = None
 
 
 def _load_fleet() -> FleetConfig:
-    """Load and validate the fleet config from disk.
-
-    Re-reads fleet.yaml on every call so the MCP server always sees the
-    current config without IPC or a file-watcher.
+    """Return the current fleet config, reloading fleet.yaml only if it changed.
 
     Uses the effective fleet YAML path resolved at startup: project config
-    takes precedence over env-var settings (ADR 0005 Decision 2).
+    takes precedence over env-var settings (ADR 0005 Decision 2). The
+    reloader is (re)created if the resolved path has changed since the last
+    call — this only happens in tests, which reassign ``_fleet_yaml_path``
+    directly after import.
     """
+    global _fleet_reloader, _fleet_last_warning
     fleet_path = Path(_fleet_yaml_path)
-    if not fleet_path.exists():
-        return FleetConfig(strata=[], scopes=[], edges=[])
-    return FleetConfig.load(fleet_path)
+    if _fleet_reloader is None or _fleet_reloader.path != fleet_path:
+        _fleet_reloader = FleetReloader(fleet_path)
+    fleet, warning = _fleet_reloader.get_with_warning()
+    _fleet_last_warning = warning
+    return fleet
+
+
+def _fleet_notice() -> str | None:
+    """Return the fleet reload warning captured by the most recent :func:`_load_fleet` call."""
+    return _fleet_last_warning
+
+
+def _attach_fleet_notice(result: dict) -> dict:
+    """Attach a plain-language ``fleet_notice`` to a tool response when the last
+    fleet.yaml reload attempt failed (Feature A).
+
+    Additive, like :func:`_attach_nudge`: the key is present only when there
+    is something to say, so callers that don't check for it see no shape
+    change.
+    """
+    notice = _fleet_notice()
+    if notice is not None:
+        result["fleet_notice"] = notice
+    return result
 
 
 def _publication_item_dict(item: PublishedItem) -> dict:
@@ -286,8 +348,8 @@ def _publication_item_dict(item: PublishedItem) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def _binding_surface_scope_ids(fleet: FleetConfig) -> set[str]:
-    """Return this agent's bound scope plus its inter-stratum ancestor chain.
+def _binding_surface_scope_ids(fleet: FleetConfig, agent_scope: str) -> set[str]:
+    """Return *agent_scope* plus its inter-stratum ancestor chain.
 
     This is the shared computation behind the chain-only entitlement surfaces
     (_entitled_scope_ids for records/perspective targets,
@@ -296,9 +358,16 @@ def _binding_surface_scope_ids(fleet: FleetConfig) -> set[str]:
     common ancestor's scope-manager ratifies it into a directive. (They still
     reach this agent through the wider *context* surface — see
     _context_surface_scope_ids — but never through this binding surface.)
+
+    *agent_scope* is taken as an explicit parameter rather than read from the
+    ``_AGENT_SCOPE`` module global: a caller that both authorizes against the
+    binding and later stamps provenance with it (e.g. strata_contribute)
+    snapshots ``_AGENT_SCOPE`` into a local ONCE and threads that same value
+    through both, so a concurrent strata_bind rebind between the two can
+    never produce "authorized against scope X, stamped as scope Y."
     """
-    ancestors = fleet.inter_stratum_ancestors(_AGENT_SCOPE)
-    return {_AGENT_SCOPE, *(s.id for s in ancestors)}
+    ancestors = fleet.inter_stratum_ancestors(agent_scope)
+    return {agent_scope, *(s.id for s in ancestors)}
 
 
 # ---------------------------------------------------------------------------
@@ -313,41 +382,41 @@ def _binding_surface_scope_ids(fleet: FleetConfig) -> set[str]:
 # ---------------------------------------------------------------------------
 
 
-def _entitled_scope_ids(fleet: FleetConfig) -> set[str]:
+def _entitled_scope_ids(fleet: FleetConfig, agent_scope: str) -> set[str]:
     """Return the scope ids entitled for records and perspective targets.
 
-    The chain-only surface is this agent's bound scope (``_AGENT_SCOPE``)
-    plus its inter-stratum ancestor chain. Intra-stratum peers are
-    deliberately excluded here even when chain-referenced — a peer's record
-    is its own, and a peer is never a valid perspective target (ADR 0006
-    D4). Chain-referenced peers are readable via the wider context surface
-    (_check_entitled_context) and appear as non-binding layers inside a
-    perspective, never as the perspective's own target or record.
+    The chain-only surface is *agent_scope* plus its inter-stratum ancestor
+    chain. Intra-stratum peers are deliberately excluded here even when
+    chain-referenced — a peer's record is its own, and a peer is never a
+    valid perspective target (ADR 0006 D4). Chain-referenced peers are
+    readable via the wider context surface (_check_entitled_context) and
+    appear as non-binding layers inside a perspective, never as the
+    perspective's own target or record.
     """
-    return _binding_surface_scope_ids(fleet)
+    return _binding_surface_scope_ids(fleet, agent_scope)
 
 
-def _check_entitled(fleet: FleetConfig, scope_id: str) -> None:
-    """Raise RuntimeError if *scope_id* is outside the chain-only entitled surface.
+def _check_entitled(fleet: FleetConfig, agent_scope: str, scope_id: str) -> None:
+    """Raise RuntimeError if *scope_id* is outside *agent_scope*'s chain-only entitled surface.
 
     Used by strata_read_scope_record and the strata_read_perspective target
     (ADR 0006 D4) — both stay chain-only even after D3's context surface
     widened scope summary reads.
     """
-    if fleet.get_scope(_AGENT_SCOPE) is None:
+    if fleet.get_scope(agent_scope) is None:
         # Binding was valid at startup but the bound scope has since vanished
         # from fleet.yaml (rename/removal). Without this check the entitled
         # surface silently collapses and every read gets a misleading
         # peer-entitlement error.
         raise RuntimeError(
-            f"your bound scope {_AGENT_SCOPE!r} no longer exists in the fleet "
+            f"your bound scope {agent_scope!r} no longer exists in the fleet "
             "config — fleet.yaml changed since this session started. Restore "
             "the scope in fleet.yaml or relaunch with a valid binding."
         )
-    if scope_id not in _entitled_scope_ids(fleet):
+    if scope_id not in _entitled_scope_ids(fleet, agent_scope):
         raise RuntimeError(
             f"scope {scope_id!r} is outside your entitled surface "
-            f"(your scope {_AGENT_SCOPE!r} plus its inter-stratum ancestors). "
+            f"(your scope {agent_scope!r} plus its inter-stratum ancestors). "
             "Records and perspective targets stay chain-only: a record "
             "audits the authority that binds you, and a perspective is "
             "composed for your own chain, not a peer's. A scope reachable "
@@ -367,31 +436,31 @@ def _check_entitled(fleet: FleetConfig, scope_id: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _context_surface_scope_ids(fleet: FleetConfig) -> set[str]:
+def _context_surface_scope_ids(fleet: FleetConfig, agent_scope: str) -> set[str]:
     """Return the scope ids entitled for scope summary reads.
 
-    The context surface is this agent's chain-only surface plus every scope
-    referenced (one hop, via a reference edge at any stratum distance) by a
-    scope on that chain — computed via ``fleet.entitlement_view(_AGENT_SCOPE)``
+    The context surface is *agent_scope*'s chain-only surface plus every
+    scope referenced (one hop, via a reference edge at any stratum distance)
+    by a scope on that chain — computed via ``fleet.entitlement_view(agent_scope)``
     so reference logic lives in exactly one place.
     """
-    view = fleet.entitlement_view(_AGENT_SCOPE)
+    view = fleet.entitlement_view(agent_scope)
     return {s.id for s in view.chain} | {s.id for s in view.referenced_peers}
 
 
-def _check_entitled_context(fleet: FleetConfig, scope_id: str) -> None:
-    """Raise RuntimeError if *scope_id* is outside the entitled context surface."""
-    if fleet.get_scope(_AGENT_SCOPE) is None:
+def _check_entitled_context(fleet: FleetConfig, agent_scope: str, scope_id: str) -> None:
+    """Raise RuntimeError if *scope_id* is outside *agent_scope*'s entitled context surface."""
+    if fleet.get_scope(agent_scope) is None:
         # Same stale-binding hazard as the chain-only check.
         raise RuntimeError(
-            f"your bound scope {_AGENT_SCOPE!r} no longer exists in the fleet "
+            f"your bound scope {agent_scope!r} no longer exists in the fleet "
             "config — fleet.yaml changed since this session started. Restore "
             "the scope in fleet.yaml or relaunch with a valid binding."
         )
-    if scope_id not in _context_surface_scope_ids(fleet):
+    if scope_id not in _context_surface_scope_ids(fleet, agent_scope):
         raise RuntimeError(
             f"scope {scope_id!r} is outside your entitled context surface "
-            f"(your scope {_AGENT_SCOPE!r}, its inter-stratum ancestors, and "
+            f"(your scope {agent_scope!r}, its inter-stratum ancestors, and "
             "any scope referenced by a scope on that chain via a reference "
             "edge). Unreferenced scopes and descendants are not directly "
             "readable — legitimizing a knowledge flow between scopes is a "
@@ -415,47 +484,146 @@ def _check_entitled_context(fleet: FleetConfig, scope_id: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _entitled_write_scope_ids(fleet: FleetConfig) -> set[str]:
-    """Return the scope ids this agent is entitled to contribute to directly.
+def _entitled_write_scope_ids(fleet: FleetConfig, agent_scope: str) -> set[str]:
+    """Return the scope ids *agent_scope* is entitled to contribute to directly.
 
-    The entitled write surface is this agent's bound scope (``_AGENT_SCOPE``)
-    plus its inter-stratum ancestor chain — identical in shape to the read
-    surface today, computed via the same shared helper, but named separately
-    because the two are expected to diverge (ADR 0006 D1/D3/D4).
+    The entitled write surface is *agent_scope* plus its inter-stratum
+    ancestor chain — identical in shape to the read surface today, computed
+    via the same shared helper, but named separately because the two are
+    expected to diverge (ADR 0006 D1/D3/D4).
     """
-    return _binding_surface_scope_ids(fleet)
+    return _binding_surface_scope_ids(fleet, agent_scope)
 
 
-def _check_entitled_write(fleet: FleetConfig, scope_id: str) -> None:
-    """Raise RuntimeError if *scope_id* is outside the entitled write surface."""
-    if fleet.get_scope(_AGENT_SCOPE) is None:
+def _check_entitled_write(
+    fleet: FleetConfig,
+    agent_scope: str,
+    scope_id: str,
+    *,
+    agent_skill: str | None = None,
+    agent_session_id: str | None = None,
+) -> None:
+    """Raise RuntimeError if *scope_id* is outside *agent_scope*'s entitled write surface.
+
+    *agent_scope* (and, for the audit log line, *agent_skill*/
+    *agent_session_id*) are explicit parameters rather than reads of the
+    ``_AGENT_*`` module globals: a caller that goes on to stamp a
+    ``ContributorRef`` after this check (strata_contribute) snapshots the
+    binding into locals ONCE and passes the SAME values here, so the
+    authorization decision and the stamped provenance can never diverge even
+    if a concurrent ``strata_bind`` rebinds the session in between. Callers
+    that never stamp new provenance (strata_rejudge) may omit
+    *agent_skill*/*agent_session_id* — they only affect the log line.
+    """
+    if fleet.get_scope(agent_scope) is None:
         # Same stale-binding hazard as the read surface: without this check,
         # a bound scope removed from fleet.yaml mid-session would silently
         # collapse the write surface and every write would get a misleading
         # entitlement error instead of a rebind error.
         raise RuntimeError(
-            f"your bound scope {_AGENT_SCOPE!r} no longer exists in the fleet "
+            f"your bound scope {agent_scope!r} no longer exists in the fleet "
             "config — fleet.yaml changed since this session started. Restore "
             "the scope in fleet.yaml or relaunch with a valid binding."
         )
-    if scope_id not in _entitled_write_scope_ids(fleet):
+    if scope_id not in _entitled_write_scope_ids(fleet, agent_scope):
         _logger.warning(
             "contribution refused: contributor scope=%r skill=%r session=%r "
             "target scope=%r is outside the entitled write surface",
-            _AGENT_SCOPE,
-            _AGENT_SKILL,
-            _AGENT_SESSION_ID,
+            agent_scope,
+            agent_skill,
+            agent_session_id,
             scope_id,
         )
         raise RuntimeError(
             f"scope {scope_id!r} is outside your entitled write surface "
-            f"(your scope {_AGENT_SCOPE!r} plus its inter-stratum ancestors). "
+            f"(your scope {agent_scope!r} plus its inter-stratum ancestors). "
             "Contribute to your own scope, or propose upward to an ancestor "
             "scope — that is how memory legitimately moves toward broader "
             "authority. Sideways flow to a peer scope happens only through "
             "ratification into a shared ancestor scope, or a context-only "
             "reference edge — never a direct write."
         )
+
+
+# ---------------------------------------------------------------------------
+# Shared scope/skill checks — used by BOTH startup binding validation
+# (_validate_binding, below) and strata_bind (Feature B, a rebind at
+# runtime). One set of rules answers "is this scope real and is this skill
+# allowed for it" no matter which entry point is asking, so the two can never
+# drift into disagreeing about what a valid binding is.
+# ---------------------------------------------------------------------------
+
+
+def _scope_waives_skill(scope_obj: Scope) -> bool:
+    """True when *scope_obj* declares no skills at all.
+
+    Such an unrestricted scope (no ``default_skill``, no
+    ``permitted_skills``) may bind skill-less (issue #121) — a missing skill
+    is waived rather than refused.
+    """
+    return not (scope_obj.default_skill or scope_obj.permitted_skills)
+
+
+def _resolve_skill_default(scope_obj: Scope, skill: str | None) -> str | None:
+    """Return *skill*, or *scope_obj*'s ``default_skill`` when *skill* is unset.
+
+    The companion rule to single-scope auto-bind (startup, check 0 in
+    ``_validate_binding``): a scope that declares a ``default_skill`` may be
+    bound without naming one explicitly. Shared by startup auto-bind and
+    strata_bind so "what skill do I fall back to when none was given" has one
+    answer — a scope with a default_skill-only declaration (no
+    permitted_skills) never has to make an agent state the obvious.
+    """
+    return skill or scope_obj.default_skill
+
+
+def _check_scope_exists(
+    fleet: FleetConfig, scope_id: str, *, require_active: bool = False
+) -> tuple[Scope | None, str | None]:
+    """Return ``(scope_obj, None)`` if *scope_id* is a known — and, when
+    *require_active* is set, ``active`` — scope in *fleet*; else
+    ``(None, error)`` naming the available scope IDs.
+
+    *require_active* is the shared "an archived scope cannot be bound" rule:
+    used by both startup binding validation and strata_bind (Feature B) so
+    the two entry points agree on what a bindable scope is, not just on what
+    a valid scope id is.
+    """
+    scope_obj = fleet.get_scope(scope_id)
+    if scope_obj is None:
+        available = [s.id for s in fleet.active_scopes()]
+        available_str = ", ".join(available) if available else "(none — fleet.yaml may be empty)"
+        return None, (
+            f"scope {scope_id!r} not found in fleet config.\n"
+            f"  Available scope IDs: {available_str}\n"
+            f"  Update STRATA_AGENT_SCOPE to one of the above, or add scope "
+            f"{scope_id!r} to your fleet.yaml."
+        )
+    if require_active and scope_obj.status != "active":
+        available = [s.id for s in fleet.active_scopes()]
+        available_str = ", ".join(available) if available else "(none — fleet.yaml may be empty)"
+        return None, (
+            f"scope {scope_id!r} is archived and cannot be bound.\n"
+            f"  Available active scope IDs: {available_str}"
+        )
+    return scope_obj, None
+
+
+def _check_skill_permitted(scope_obj: Scope, scope_id: str, skill: str) -> str | None:
+    """Return an error string when *skill* is set but not in *scope_obj*'s
+    ``permitted_skills``. Empty/absent ``permitted_skills`` means any skill
+    is allowed, so this returns ``None`` in that case.
+    """
+    permitted = scope_obj.permitted_skills or []
+    if permitted and skill not in permitted:
+        return (
+            f"skill {skill!r} is not in the permitted skills for scope "
+            f"{scope_id!r}.\n"
+            f"  Permitted skills for {scope_id!r}: {', '.join(permitted)}\n"
+            f"  Update STRATA_AGENT_SKILL to one of the above, or update permitted_skills in "
+            f"fleet.yaml."
+        )
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -552,9 +720,10 @@ def _validate_binding(
                 f"Strata: STRATA_AGENT_SCOPE not set — auto-bound to {resolved_scope!r} "
                 "(the fleet's only scope)."
             )
-            if not resolved_skill and sole.default_skill:
-                resolved_skill = sole.default_skill
-                notice += f" Using its default skill {resolved_skill!r}."
+            new_skill = _resolve_skill_default(sole, resolved_skill)
+            if new_skill != resolved_skill:
+                notice += f" Using its default skill {new_skill!r}."
+            resolved_skill = new_skill
             print(notice, file=sys.stderr)
 
     # 2. STRATA_AGENT_SCOPE must be set (after the auto-bind attempt above).
@@ -573,21 +742,15 @@ def _validate_binding(
             "  See README.md § 'Quick Start for an existing project' for the full setup."
         )
 
-    # 3. Scope must exist in fleet config (skip when fleet not loaded or scope unset).
+    # 3. Scope must exist in fleet config and be active (skip when fleet not
+    #    loaded or scope unset). require_active=True is the same "archived
+    #    scopes cannot be bound" rule strata_bind enforces (Feature B) — one
+    #    shared check, not two independently-maintained rules.
     scope_obj = None
     if fleet is not None and resolved_scope:
-        scope_obj = fleet.get_scope(resolved_scope)
-        if scope_obj is None:
-            available = [s.id for s in fleet.active_scopes()]
-            available_str = (
-                ", ".join(available) if available else "(none — fleet.yaml may be empty)"
-            )
-            errors.append(
-                f"scope {resolved_scope!r} not found in fleet config.\n"
-                f"  Available scope IDs: {available_str}\n"
-                f"  Update STRATA_AGENT_SCOPE to one of the above, or add scope "
-                f"{resolved_scope!r} to your fleet.yaml."
-            )
+        scope_obj, exists_error = _check_scope_exists(fleet, resolved_scope, require_active=True)
+        if exists_error is not None:
+            errors.append(exists_error)
 
     # 4. STRATA_AGENT_SKILL must be set — waived only when the scope is
     #    positively confirmed to declare no skills (no default_skill, no
@@ -596,9 +759,7 @@ def _validate_binding(
     #    required" semantics, and an unknown/unresolved scope still surfaces
     #    the skill remediation alongside the config/scope ones (ADR 0005
     #    Decision 5 — report every setup gap in one pass).
-    scope_waives_skill = scope_obj is not None and not (
-        scope_obj.default_skill or scope_obj.permitted_skills
-    )
+    scope_waives_skill = scope_obj is not None and _scope_waives_skill(scope_obj)
     if not resolved_skill and not scope_waives_skill:
         errors.append(
             "STRATA_AGENT_SKILL is not set.\n"
@@ -611,15 +772,9 @@ def _validate_binding(
 
     # 5. STRATA_AGENT_SKILL must be in permitted_skills (skip when scope or skill missing).
     if scope_obj is not None and resolved_skill:
-        permitted = scope_obj.permitted_skills or []
-        if permitted and resolved_skill not in permitted:
-            errors.append(
-                f"skill {resolved_skill!r} is not in the permitted skills for scope "
-                f"{resolved_scope!r}.\n"
-                f"  Permitted skills for {resolved_scope!r}: {', '.join(permitted)}\n"
-                f"  Update STRATA_AGENT_SKILL to one of the above, or update permitted_skills in "
-                f"fleet.yaml."
-            )
+        skill_error = _check_skill_permitted(scope_obj, resolved_scope, resolved_skill)
+        if skill_error is not None:
+            errors.append(skill_error)
 
     if errors:
         # Report all failures in a single error message — the user sees the
@@ -648,9 +803,134 @@ mcp = FastMCP(
         "Before finishing, contribute the session's outcomes back with "
         "strata_contribute; if there is genuinely nothing to record, call "
         "strata_session_closeout so an empty session stays distinguishable from a "
-        "forgotten one."
+        "forgotten one. If a scope you need was just created (or you were bound to "
+        "the wrong one), call strata_bind to rebind this session to it — fleet.yaml "
+        "is re-read as part of that call, so a scope added moments ago is bindable "
+        "immediately, no restart required."
     ),
 )
+
+
+# ---------------------------------------------------------------------------
+# Tool: strata_bind
+#
+# Feature B: a session created a scope (or fleet.yaml was edited for some
+# other reason) and wants to work as that scope, without restarting the MCP
+# server — today's binding is otherwise fixed at process startup
+# (_validate_binding, above). This is the operator-facing incident this
+# feature exists to close.
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def strata_bind(scope_id: str, skill: str | None = None) -> dict:
+    """Rebind this session to a different scope (and optionally skill), right now.
+
+    Startup binds this session to ``STRATA_AGENT_SCOPE``/``STRATA_AGENT_SKILL``
+    once. This tool changes that binding mid-session — for the common case
+    where a scope was just added to fleet.yaml (by this session, an operator,
+    or another process) and isn't visible yet under the stale startup
+    binding, or where this session simply needs to act as a different scope
+    from here on.
+
+    Reloads fleet.yaml first (the same lazy reload-on-read path every other
+    tool call uses — Feature A), so a scope added moments ago is bindable
+    immediately, no server restart required. Validates exactly like startup
+    binding: the scope must exist and be active, and the skill (if given)
+    must be permitted for it — reusing the same checks startup binding runs,
+    so a binding accepted here is a binding accepted anywhere.
+
+    Your session id (``STRATA_AGENT_SESSION_ID``) NEVER changes — this is
+    the same session working as a different scope, not a new session.
+    Contributions already record their own scope/skill/session provenance
+    per call, so the record stays truthful regardless of how many times a
+    session rebinds.
+
+    On failure the binding is left completely unchanged — a rejected
+    strata_bind call never leaves you half-bound.
+
+    Args:
+        scope_id: The scope to bind to. Must exist in fleet.yaml and be
+            ``active`` (an archived scope cannot be bound).
+        skill: The skill to bind as, or omit it. When omitted and the scope
+            declares a ``default_skill``, that default is used (the same
+            companion rule startup auto-bind applies) — required only when
+            the scope declares skills (``default_skill`` or
+            ``permitted_skills``) and has no ``default_skill`` to fall back
+            on. When given, must be one of the scope's ``permitted_skills``
+            (any skill is allowed if that list is empty).
+
+    Returns:
+        ``scope_id``, ``skill``, ``session_id`` (the new binding — session_id
+        unchanged), and ``message`` (a one-line confirmation).
+
+    Raises:
+        RuntimeError: The scope does not exist, is archived, or the skill is
+            not permitted — the error lists the valid scopes/skills. The
+            binding is left unchanged in every failure case.
+    """
+    global _AGENT_SCOPE, _AGENT_SKILL
+
+    fleet = _load_fleet()
+    errors: list[str] = []
+
+    # require_active=True is the shared "archived scopes cannot be bound"
+    # rule — the same check startup binding runs (_validate_binding, above),
+    # not a parallel reimplementation of it.
+    scope_obj, exists_error = _check_scope_exists(fleet, scope_id, require_active=True)
+    resolved_skill = skill
+    if exists_error is not None:
+        errors.append(exists_error)
+    else:
+        assert scope_obj is not None
+        # Companion default-skill rule (shared with startup auto-bind, same
+        # helper): a scope with a default_skill may be bound without naming
+        # one, so an omitted skill is not automatically "requires a skill."
+        resolved_skill = _resolve_skill_default(scope_obj, skill)
+
+        if resolved_skill:
+            skill_error = _check_skill_permitted(scope_obj, scope_id, resolved_skill)
+            if skill_error is not None:
+                errors.append(skill_error)
+        elif not _scope_waives_skill(scope_obj):
+            errors.append(
+                f"scope {scope_id!r} declares skills (default_skill or "
+                "permitted_skills) but no skill was given.\n"
+                "  Pass skill=<one of its permitted skills>, or omit skill only "
+                "for an unrestricted scope."
+            )
+
+    if errors:
+        # Feature A: the exact incident this tool exists to close is a
+        # fleet.yaml edit that was invalid — silently kept serving the last
+        # good fleet — followed by a bind attempt for the scope that edit
+        # meant to add. Without the reload notice here, the refusal reads as
+        # "add the scope you just added"; with it, it explains WHY the scope
+        # is still invisible.
+        notice = _fleet_notice()
+        notice_line = f"\n(fleet reload warning: {notice})" if notice else ""
+        raise RuntimeError(
+            "strata_bind refused — binding unchanged (still "
+            f"scope={_AGENT_SCOPE!r}, skill={_AGENT_SKILL!r}):\n"
+            + "\n".join(f"- {e}" for e in errors)
+            + notice_line
+        )
+
+    with _binding_lock:
+        _AGENT_SCOPE = scope_id
+        _AGENT_SKILL = resolved_skill
+
+    result = {
+        "scope_id": _AGENT_SCOPE,
+        "skill": _AGENT_SKILL,
+        "session_id": _AGENT_SESSION_ID,
+        "message": (
+            f"Bound to {_AGENT_SCOPE!r}"
+            f"{f' with skill {_AGENT_SKILL!r}' if _AGENT_SKILL else ''}. "
+            f"Session id unchanged ({_AGENT_SESSION_ID!r})."
+        ),
+    }
+    return _attach_fleet_notice(result)
 
 
 # ---------------------------------------------------------------------------
@@ -712,6 +992,14 @@ def strata_contribute(
         RuntimeError: If the scope is not found, is archived, or is outside
             this agent's entitled write surface.
     """
+    # Snapshot the binding ONCE, into locals, and use these — never the
+    # _AGENT_* globals directly — for both the authorization check below and
+    # the provenance stamp on ContributorRef. Without this, a strata_bind
+    # rebind landing between the two (a future async server, a concurrent
+    # request) could authorize against one scope and stamp the contribution
+    # as a different one.
+    agent_scope, agent_skill, agent_session_id = _AGENT_SCOPE, _AGENT_SKILL, _AGENT_SESSION_ID
+
     fleet = _load_fleet()
 
     scope = fleet.get_scope(scope_id)
@@ -719,7 +1007,9 @@ def strata_contribute(
         raise RuntimeError(f"Scope not found: {scope_id!r}")
     if scope.status == "archived":
         raise RuntimeError(f"Scope is archived and not accepting contributions: {scope_id!r}")
-    _check_entitled_write(fleet, scope_id)
+    _check_entitled_write(
+        fleet, agent_scope, scope_id, agent_skill=agent_skill, agent_session_id=agent_session_id
+    )
 
     stratum = next((s for s in fleet.strata if s.id == scope.stratum_id), None)
     if stratum is None:
@@ -729,9 +1019,9 @@ def strata_contribute(
 
     ts = datetime.now(UTC).isoformat()
     contributor = ContributorRef(
-        scope_id=_AGENT_SCOPE,
-        skill=_AGENT_SKILL,
-        session_id=_AGENT_SESSION_ID,
+        scope_id=agent_scope,
+        skill=agent_skill,
+        session_id=agent_session_id,
         ts=ts,
     )
 
@@ -780,14 +1070,16 @@ def strata_contribute(
     # read/contribute gap for this session; a decline does not.
     _record_accepted_contribution(outcome.decision)
 
-    return {
-        "contribution_id": outcome.contribution_id,
-        "judgment": {
-            "decision": outcome.decision,
-            "reasoning": outcome.reasoning,
-            "summary_updated": outcome.summary_updated,
-        },
-    }
+    return _attach_fleet_notice(
+        {
+            "contribution_id": outcome.contribution_id,
+            "judgment": {
+                "decision": outcome.decision,
+                "reasoning": outcome.reasoning,
+                "summary_updated": outcome.summary_updated,
+            },
+        }
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -837,7 +1129,13 @@ def strata_rejudge(contribution_id: str) -> dict:
     contribution = _record_store.get_contribution(contribution_id)
     if contribution is None:
         raise RuntimeError(f"Contribution not found: {contribution_id!r}")
-    _check_entitled_write(fleet, contribution.scope_id)
+    _check_entitled_write(
+        fleet,
+        _AGENT_SCOPE,
+        contribution.scope_id,
+        agent_skill=_AGENT_SKILL,
+        agent_session_id=_AGENT_SESSION_ID,
+    )
 
     from strata.app import JudgeUnavailable, rejudge_contribution  # noqa: PLC0415
 
@@ -874,14 +1172,16 @@ def strata_rejudge(contribution_id: str) -> dict:
     if not already_judged:
         _record_accepted_contribution(outcome.decision)
 
-    return {
-        "contribution_id": outcome.contribution_id,
-        "judgment": {
-            "decision": outcome.decision,
-            "reasoning": outcome.reasoning,
-            "summary_updated": outcome.summary_updated,
-        },
-    }
+    return _attach_fleet_notice(
+        {
+            "contribution_id": outcome.contribution_id,
+            "judgment": {
+                "decision": outcome.decision,
+                "reasoning": outcome.reasoning,
+                "summary_updated": outcome.summary_updated,
+            },
+        }
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -944,17 +1244,21 @@ def strata_publish(
         RuntimeError: The bound scope is unknown, or the anchors fail
             structural validation.
     """
+    # Snapshot the binding ONCE — see strata_contribute for why (authorize
+    # and stamp must use the identical value, never two separate global reads).
+    agent_scope, agent_skill, agent_session_id = _AGENT_SCOPE, _AGENT_SKILL, _AGENT_SESSION_ID
+
     fleet = _load_fleet()
 
-    scope = fleet.get_scope(_AGENT_SCOPE)
+    scope = fleet.get_scope(agent_scope)
     if scope is None:
-        raise RuntimeError(f"Your bound scope {_AGENT_SCOPE!r} was not found in the fleet config.")
+        raise RuntimeError(f"Your bound scope {agent_scope!r} was not found in the fleet config.")
 
     ts = datetime.now(UTC).isoformat()
     proposer = ContributorRef(
-        scope_id=_AGENT_SCOPE,
-        skill=_AGENT_SKILL,
-        session_id=_AGENT_SESSION_ID,
+        scope_id=agent_scope,
+        skill=agent_skill,
+        session_id=agent_session_id,
         ts=ts,
     )
 
@@ -962,7 +1266,7 @@ def strata_publish(
 
     try:
         outcome = propose_publish(
-            _AGENT_SCOPE,
+            agent_scope,
             content,
             kind,
             subject,
@@ -976,14 +1280,16 @@ def strata_publish(
     except ValueError as exc:
         raise RuntimeError(str(exc)) from exc
 
-    return {
-        "act_id": outcome.act_id,
-        "judgment": {
-            "decision": outcome.decision,
-            "reasoning": outcome.reasoning,
-            "artifact_updated": outcome.artifact_updated,
-        },
-    }
+    return _attach_fleet_notice(
+        {
+            "act_id": outcome.act_id,
+            "judgment": {
+                "decision": outcome.decision,
+                "reasoning": outcome.reasoning,
+                "artifact_updated": outcome.artifact_updated,
+            },
+        }
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1016,17 +1322,20 @@ def strata_withdraw(item_id: str) -> dict:
         RuntimeError: The bound scope is unknown, or *item_id* is not in this
             scope's current publication.
     """
+    # Snapshot the binding ONCE — see strata_contribute for why.
+    agent_scope, agent_skill, agent_session_id = _AGENT_SCOPE, _AGENT_SKILL, _AGENT_SESSION_ID
+
     fleet = _load_fleet()
 
-    scope = fleet.get_scope(_AGENT_SCOPE)
+    scope = fleet.get_scope(agent_scope)
     if scope is None:
-        raise RuntimeError(f"Your bound scope {_AGENT_SCOPE!r} was not found in the fleet config.")
+        raise RuntimeError(f"Your bound scope {agent_scope!r} was not found in the fleet config.")
 
     ts = datetime.now(UTC).isoformat()
     proposer = ContributorRef(
-        scope_id=_AGENT_SCOPE,
-        skill=_AGENT_SKILL,
-        session_id=_AGENT_SESSION_ID,
+        scope_id=agent_scope,
+        skill=agent_skill,
+        session_id=agent_session_id,
         ts=ts,
     )
 
@@ -1034,7 +1343,7 @@ def strata_withdraw(item_id: str) -> dict:
 
     try:
         outcome = propose_withdraw(
-            _AGENT_SCOPE,
+            agent_scope,
             item_id,
             proposer,
             fleet=fleet,
@@ -1045,14 +1354,16 @@ def strata_withdraw(item_id: str) -> dict:
     except (ValueError, KeyError) as exc:
         raise RuntimeError(str(exc)) from exc
 
-    return {
-        "act_id": outcome.act_id,
-        "judgment": {
-            "decision": outcome.decision,
-            "reasoning": outcome.reasoning,
-            "artifact_updated": outcome.artifact_updated,
-        },
-    }
+    return _attach_fleet_notice(
+        {
+            "act_id": outcome.act_id,
+            "judgment": {
+                "decision": outcome.decision,
+                "reasoning": outcome.reasoning,
+                "artifact_updated": outcome.artifact_updated,
+            },
+        }
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1109,7 +1420,7 @@ def strata_read_scope_summary(scope_id: str | None = None) -> dict:
 
     if scope_id is None:
         scope_id = _AGENT_SCOPE
-    _check_entitled_context(fleet, scope_id)
+    _check_entitled_context(fleet, _AGENT_SCOPE, scope_id)
 
     scope = fleet.get_scope(scope_id)
     if scope is None:
@@ -1205,7 +1516,7 @@ def strata_read_perspective(scope_id: str | None = None) -> dict:
 
     if scope_id is None:
         scope_id = _AGENT_SCOPE
-    _check_entitled(fleet, scope_id)
+    _check_entitled(fleet, _AGENT_SCOPE, scope_id)
 
     scope = fleet.get_scope(scope_id)
     if scope is None:
@@ -1256,8 +1567,10 @@ def strata_read_perspective(scope_id: str | None = None) -> dict:
 def strata_list_scopes() -> dict:
     """Return the full fleet configuration: strata, scopes, and edges.
 
-    Re-reads fleet.yaml from disk on every call (ADR 0004 Decision 1) so
-    the agent always sees the current fleet topology.
+    Checks fleet.yaml for changes on every call and reloads if needed
+    (ADR 0004 Decision 1; ADR 0002 addendum — lazy reload-on-read) so the
+    agent always sees the current fleet topology, without re-parsing the
+    file when nothing changed.
 
     Use this to understand the fleet's structure — which scopes exist, how
     they are arranged into strata, and which chain and reference edges
@@ -1275,13 +1588,16 @@ def strata_list_scopes() -> dict:
     active_ids = {s.id for s in active}
     active_edges = [e for e in fleet.edges if e.from_ in active_ids and e.to in active_ids]
 
-    return {
-        "strata": [s.model_dump() for s in fleet.strata],
-        "scopes": [s.model_dump() for s in active],
-        "edges": [
-            {"from_scope_id": e.from_, "to_scope_id": e.to, "kind": e.kind} for e in active_edges
-        ],
-    }
+    return _attach_fleet_notice(
+        {
+            "strata": [s.model_dump() for s in fleet.strata],
+            "scopes": [s.model_dump() for s in active],
+            "edges": [
+                {"from_scope_id": e.from_, "to_scope_id": e.to, "kind": e.kind}
+                for e in active_edges
+            ],
+        }
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1361,7 +1677,7 @@ def strata_read_scope_record(
 
     if scope_id is None:
         scope_id = _AGENT_SCOPE
-    _check_entitled(fleet, scope_id)
+    _check_entitled(fleet, _AGENT_SCOPE, scope_id)
 
     try:
         page = _record_store.page_record(
@@ -1438,7 +1754,7 @@ def strata_read_contribution(contribution_id: str) -> dict:
     entry = _record_store.get_record_entry(contribution_id)
     if entry is None:
         raise RuntimeError(f"Contribution not found: {contribution_id!r}")
-    _check_entitled(fleet, entry.contribution.scope_id)
+    _check_entitled(fleet, _AGENT_SCOPE, entry.contribution.scope_id)
 
     # Forensic, like the scope record read: no read counter increment (#110),
     # but the nudge still rides along.
