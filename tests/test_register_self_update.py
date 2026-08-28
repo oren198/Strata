@@ -194,6 +194,44 @@ def test_skill_stale_historical_content_is_self_updated(tmp_path: Path) -> None:
     assert "shipped content changed" in out2
 
 
+def test_skill_stale_historical_content_under_diff_writes_nothing(tmp_path: Path) -> None:
+    """--diff must stay read-only for a stale-but-historical artifact too:
+    the classification and reporting run, but the file is never touched —
+    only the applied ("updated:") vs. read-only ("[would update]") wording
+    differs."""
+    _init_project(tmp_path)
+    rc, _ = _register(tmp_path, harness=["claude-code"])
+    assert rc == 0
+
+    skill_md = tmp_path / ".claude" / "skills" / "strata" / "Skill.md"
+    synthetic_old = "# Old strata skill content\nThis is a stale, unedited shipped version.\n"
+    synthetic_hash = hashlib.sha256(synthetic_old.encode("utf-8")).hexdigest()
+    skill_md.write_text(synthetic_old, encoding="utf-8")
+    before = skill_md.read_bytes()
+
+    real_hashes = install._HISTORICAL_ARTIFACT_HASHES  # noqa: SLF001
+    patched = {
+        **real_hashes,
+        "strata": {
+            "current": real_hashes["strata"]["current"],
+            "historical": frozenset({synthetic_hash}),
+        },
+    }
+    import unittest.mock
+
+    with unittest.mock.patch.object(install, "_HISTORICAL_ARTIFACT_HASHES", patched):
+        rc2, out2 = _register(tmp_path, harness=["claude-code"], diff=True)
+
+    assert rc2 == 0
+    # No write at all — byte-identical to the stale content written above,
+    # not to shipped content (that would prove --diff silently applied it).
+    assert skill_md.read_bytes() == before
+    assert skill_md.read_text(encoding="utf-8") != _shipped_skill_text("strata")
+    assert "[would update]" in out2
+    assert "shipped content changed" in out2
+    assert "updated:" not in out2
+
+
 def test_skill_edited_content_is_kept_with_note(tmp_path: Path) -> None:
     """Case 3: installed content doesn't match shipped and its hash isn't
     recognized as historical → user-edited: kept, with a diff note."""
@@ -305,6 +343,12 @@ def test_agents_md_matching_shipped_is_skipped(tmp_path: Path, codex_home: Path)
     assert rc2 == 0
     assert agents_md.read_bytes() == before
     assert "updated:" not in out2
+    # This is the discriminating assertion: an "edited" block also leaves
+    # the file byte-unchanged (register never overwrites case 3 either) and
+    # never prints "updated:" — so without this, the test above can't tell
+    # "match" apart from "edited". Only a genuine match skips silently, with
+    # no diff-from-shipped note attached to the AGENTS.md line.
+    assert "differs from shipped" not in out2
 
 
 def test_agents_md_stale_block_is_self_updated_preserving_outside_content(
