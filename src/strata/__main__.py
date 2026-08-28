@@ -2337,8 +2337,8 @@ def _offer_judge_key_capture(project_root: Path, *, skip_prompt: bool) -> None:
       TTY check). A non-empty answer is written to this project's
       ``.env`` (creating, appending, or replacing an existing
       JUDGE_API_KEY/ANTHROPIC_API_KEY line — see
-      :func:`strata.install.write_env_judge_key`); an empty answer (or
-      EOF, e.g. stdin closed mid-session) falls through to the
+      :func:`strata.install.write_env_judge_key`); an empty answer, EOF
+      (e.g. stdin closed mid-session), or Ctrl-C falls through to the
       how-to-add-it-later note below.
     - Non-interactive, or ``--yes`` → never prompts; prints the same note.
 
@@ -2364,7 +2364,7 @@ def _offer_judge_key_capture(project_root: Path, *, skip_prompt: bool) -> None:
             "Messages-API endpoint). Paste to store it in .env, or press Enter "
             "to skip: "
         )
-    except (EOFError, OSError):
+    except (EOFError, OSError, KeyboardInterrupt):
         value = ""
 
     value = value.strip()

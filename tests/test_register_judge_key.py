@@ -30,6 +30,7 @@ Vocabulary: scope, fleet, skill, scope-manager.
 from __future__ import annotations
 
 import argparse
+import stat
 import sys
 from pathlib import Path
 
@@ -178,6 +179,32 @@ def test_write_env_judge_key_does_not_touch_commented_line(tmp_path: Path) -> No
     )
 
 
+def test_write_env_judge_key_created_file_is_owner_only(tmp_path: Path) -> None:
+    """A freshly-created .env holds a secret — it must not inherit the
+    umask's world/group-readable default (commonly 0644); it must be 0600."""
+    env_path = tmp_path / ".env"
+
+    action = install.write_env_judge_key(env_path, "sk-ant-secret")
+
+    assert action == "created"
+    mode = stat.S_IMODE(env_path.stat().st_mode)
+    assert mode == 0o600
+
+
+def test_write_env_judge_key_leaves_existing_file_perms_alone(tmp_path: Path) -> None:
+    """Appending/replacing into a pre-existing .env must not touch its
+    permissions — that file is the user's own, with whatever mode they set."""
+    env_path = tmp_path / ".env"
+    env_path.write_bytes(b"OTHER=1\n")
+    env_path.chmod(0o644)
+
+    action = install.write_env_judge_key(env_path, "sk-ant-secret")
+
+    assert action == "appended"
+    mode = stat.S_IMODE(env_path.stat().st_mode)
+    assert mode == 0o644
+
+
 # ---------------------------------------------------------------------------
 # 3. End-to-end register: prompt appears only in the right conditions.
 # ---------------------------------------------------------------------------
@@ -236,6 +263,27 @@ def test_interactive_eof_on_getpass_treated_as_skip(tmp_path: Path, monkeypatch,
         raise EOFError
 
     monkeypatch.setattr("getpass.getpass", _raise_eof)
+
+    rc = _run_register(tmp_path)
+
+    assert rc == 0
+    assert not (tmp_path / ".env").exists()
+    captured = capsys.readouterr()
+    assert "unjudged" in captured.out
+
+
+def test_interactive_ctrl_c_on_getpass_treated_as_skip(tmp_path: Path, monkeypatch, capsys) -> None:
+    """Ctrl-C during the hidden-input prompt must not raise an unhandled
+    KeyboardInterrupt traceback — treated as skip, same as EOF, matching the
+    markerless prompt's graceful pattern."""
+    _init_project(tmp_path)
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+
+    def _raise_keyboard_interrupt(prompt: str = "") -> str:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("getpass.getpass", _raise_keyboard_interrupt)
 
     rc = _run_register(tmp_path)
 

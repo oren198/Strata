@@ -991,6 +991,13 @@ def write_env_judge_key(env_path: Path, key: str) -> str:
 
     if not env_path.exists():
         env_path.write_bytes((new_line + "\n").encode("utf-8"))
+        # A freshly-created .env holds a secret — it must not inherit the
+        # umask's default (commonly 0644, group/world-readable). Chmod
+        # immediately after the write, before anything else can read it.
+        # Only the create path touches permissions at all: append/replace
+        # below operate on a file the user already owns, with whatever
+        # mode they've already set — that's theirs to keep.
+        os.chmod(env_path, 0o600)
         return "created"
 
     existing = env_path.read_bytes().decode("utf-8")
