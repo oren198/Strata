@@ -52,7 +52,10 @@ from pathlib import Path
 from typing import Literal
 
 import yaml
+from mcp.server.elicitation import AcceptedElicitation
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ClientCapabilities, ElicitationCapability
+from pydantic import BaseModel, Field
 
 from strata.fleet_config import FleetConfig, FleetConfigError, Scope
 from strata.fleet_reload import FleetReloader
@@ -243,6 +246,29 @@ def _build_scope_manager():
 _AGENT_SCOPE: str = os.environ.get("STRATA_AGENT_SCOPE", "")
 _AGENT_SKILL: str | None = os.environ.get("STRATA_AGENT_SKILL") or None
 _AGENT_SESSION_ID: str = resolve_agent_session_id()
+
+# Soft-start state (dated addendum to ADR 0005 Decision 5 — see
+# docs/adr/0005-brownfield-install.md). A harness that swallows stderr (the
+# motivating incident: Codex and Claude Code both do) never shows a human
+# the refuse-to-start message, so the same aggregated failure list that used
+# to go to sys.exit(1) is instead captured here and handed back as the
+# result of every memory tool call until the session is bound — see
+# _require_bound_or_elicit(), below. Set once by main() before mcp.run();
+# left at its default (resolved, no errors) for every test that never calls
+# main(), which is what keeps the rest of this module's existing tests
+# behaving exactly as before.
+_UNRESOLVED: bool = False
+_STARTUP_ERRORS: list[str] = []
+
+# Change 2 (elicitation) latch: a client that declines or cancels once, or
+# whose answer fails to bind, should not be re-prompted on its very next
+# tool call in the same process — "one elicitation attempt per tool call at
+# most" (spec) reads as "don't nag" across a session's worth of calls too.
+# A capability-absent client is never latched here: there is nothing to
+# retry differently next time, so the (silent, free) capability check runs
+# again rather than being remembered as a decline. Cleared implicitly by any
+# successful bind (checked only while _UNRESOLVED is True).
+_ELICIT_DECLINED: bool = False
 
 # Guards ONLY the (scope, skill) WRITE in strata_bind (Feature B), so a
 # concurrent strata_bind call can't interleave its two assignments with
@@ -627,7 +653,7 @@ def _check_skill_permitted(scope_obj: Scope, scope_id: str, skill: str) -> str |
 
 
 # ---------------------------------------------------------------------------
-# Refuse-to-start validation (ADR 0005 Decision 5)
+# Startup validation (ADR 0005 Decision 5; soft-start dated addendum)
 # ---------------------------------------------------------------------------
 
 
@@ -639,14 +665,23 @@ def _validate_binding(
     project_config_found: bool = False,
     searched_paths: list[str] | None = None,
     extra_errors: list[str] | None = None,
-) -> tuple[str, str | None]:
+) -> tuple[str, str | None, list[str]]:
     """Validate agent binding before starting the MCP server.
 
-    Runs all checks independently, then reports every failure in a single
-    error message before ``sys.exit(1)`` (per ADR 0005 Decision 5 — "all
-    failures are reported in a single error message"). A user with multiple
-    missing pieces sees the complete remediation list in one pass rather than
-    fix-one-rerun-fix-next.
+    Runs all checks independently and returns every failure in one list (per
+    ADR 0005 Decision 5 — "all failures are reported in a single error
+    message"). A user with multiple missing pieces sees the complete
+    remediation list in one pass rather than fix-one-rerun-fix-next.
+
+    Soft-start (dated addendum, docs/adr/0005-brownfield-install.md): this
+    function no longer exits the process. A harness that swallows stderr
+    (Codex, Claude Code) never surfaces a sys.exit(1) message to the human
+    behind it — the motivating incident this addendum fixes. The caller
+    (main()) now always proceeds to mcp.run(); when the returned error list
+    is non-empty it stores the list and marks the session unresolved, and
+    every memory tool (except strata_bind, the recovery path) returns that
+    same list as its error result until the session is bound — see
+    _require_bound_or_elicit(), below.
 
     Checks (in order, outermost setup gap → innermost binding mismatch):
 
@@ -688,9 +723,10 @@ def _validate_binding(
                                #46) — reported in the same aggregated message.
 
     Returns:
-        ``(resolved_scope, resolved_skill)`` — the values the caller should
-        actually bind to. Identical to ``(scope, skill)`` unless auto-binding
-        applied. Never returns on failure — exits the process instead.
+        ``(resolved_scope, resolved_skill, errors)`` — the values the caller
+        should bind to (identical to ``(scope, skill)`` unless auto-binding
+        applied), and the list of validation failures (empty on success).
+        Always returns — soft-start never exits the process.
     """
     errors: list[str] = list(extra_errors) if extra_errors else []
 
@@ -777,17 +813,189 @@ def _validate_binding(
             errors.append(skill_error)
 
     if errors:
-        # Report all failures in a single error message — the user sees the
-        # complete remediation list in one pass.
+        # Still printed for a human who does read stderr (local dev) — but
+        # soft-start no longer exits on it; the same list also travels back
+        # via _STARTUP_ERRORS for every memory tool to report (see main()
+        # and _require_bound_or_elicit(), below).
         header = (
-            "Strata MCP server refuses to start — "
+            "Strata MCP server started but is not yet bound — "
             f"{len(errors)} validation {'failure' if len(errors) == 1 else 'failures'}:\n"
         )
         body = "\n".join(f"\n[{i + 1}] {err}" for i, err in enumerate(errors))
         print(header + body, file=sys.stderr)
-        sys.exit(1)
 
-    return resolved_scope, resolved_skill
+    return resolved_scope, resolved_skill, errors
+
+
+def _resolve_bind(
+    fleet: FleetConfig, scope_id: str, skill: str | None
+) -> tuple[str | None, list[str]]:
+    """Validate a candidate (scope_id, skill) binding against *fleet*.
+
+    The one rule for "is this a valid binding to rebind to right now",
+    shared by strata_bind (an explicit agent request) and the elicitation
+    fallback in _attempt_elicit_bind (an accepted scope pick) — so the two
+    entry points can never drift into disagreeing about what a valid
+    rebind is. Deliberately does NOT touch the _AGENT_SCOPE/_AGENT_SKILL
+    globals; callers apply the result themselves after deciding how to
+    react to a failure (raise vs. silently give up).
+
+    Returns:
+        ``(resolved_skill, errors)`` — ``errors`` is empty on success, and
+        ``resolved_skill`` is the skill to bind (including a resolved
+        ``default_skill`` when *skill* was omitted).
+    """
+    errors: list[str] = []
+    scope_obj, exists_error = _check_scope_exists(fleet, scope_id, require_active=True)
+    if exists_error is not None:
+        return None, [exists_error]
+
+    assert scope_obj is not None
+    # Companion default-skill rule (shared with startup auto-bind, same
+    # helper): a scope with a default_skill may be bound without naming
+    # one, so an omitted skill is not automatically "requires a skill."
+    resolved_skill = _resolve_skill_default(scope_obj, skill)
+
+    if resolved_skill:
+        skill_error = _check_skill_permitted(scope_obj, scope_id, resolved_skill)
+        if skill_error is not None:
+            errors.append(skill_error)
+    elif not _scope_waives_skill(scope_obj):
+        errors.append(
+            f"scope {scope_id!r} declares skills (default_skill or "
+            "permitted_skills) but no skill was given.\n"
+            "  Pass skill=<one of its permitted skills>, or omit skill only "
+            "for an unrestricted scope."
+        )
+
+    return resolved_skill, errors
+
+
+def _unresolved_message(fleet: FleetConfig | None) -> str:
+    """Build the error text a memory tool returns while the session is unbound.
+
+    Same content the refuse-to-start message used to print to stderr (now
+    unreadable inside a harness), plus the recovery instructions that are
+    new to soft-start: which scopes exist, and the two ways out —
+    strata_bind, or fixing the underlying env/config and calling
+    strata_bind again (it re-reads fleet.yaml itself).
+    """
+    header = (
+        "Strata MCP server started but this session is not yet bound — "
+        f"{len(_STARTUP_ERRORS)} startup validation "
+        f"{'failure' if len(_STARTUP_ERRORS) == 1 else 'failures'}:\n"
+    )
+    body = "\n".join(f"\n[{i + 1}] {err}" for i, err in enumerate(_STARTUP_ERRORS))
+
+    scope_ids = [s.id for s in fleet.active_scopes()] if fleet is not None else []
+    scopes_line = (
+        f"  Available scope IDs: {', '.join(scope_ids)}\n"
+        if scope_ids
+        else "  (no active scopes found in fleet.yaml)\n"
+    )
+    recovery = (
+        "\n\nTo recover without restarting this server:\n"
+        f"{scopes_line}"
+        "  Call strata_bind(scope_id=<one of the above>[, skill=<skill>]) to bind "
+        "this session now, or\n"
+        "  fix the underlying issue (create/edit fleet.yaml, set "
+        "STRATA_AGENT_SCOPE/STRATA_AGENT_SKILL) and call strata_bind again — "
+        "fleet.yaml is re-read as part of that call, so a fix made after startup "
+        "is bindable immediately."
+    )
+    return header + body + recovery
+
+
+class _ScopePick(BaseModel):
+    """Elicitation response schema (Change 2): the scope id the caller picked."""
+
+    scope_id: str = Field(description="The scope_id to bind this session to.")
+
+
+async def _attempt_elicit_bind(fleet: FleetConfig) -> bool:
+    """Try once to resolve the unbound session via server-initiated elicitation.
+
+    Change 2. Offers the caller a pick of the fleet's active scopes; an
+    accepted pick is bound via the exact same rule strata_bind enforces
+    (_resolve_bind, above) — "bind via the same path as strata_bind."
+
+    Tolerant of everything: no MCP session available, the client not
+    declaring the elicitation capability, the client declining/cancelling,
+    a validation failure on the picked scope, or any transport error —
+    every one of these returns False so the caller falls back to the plain
+    Change-1 error result. Never raises.
+    """
+    global _ELICIT_DECLINED
+
+    if _ELICIT_DECLINED:
+        return False
+
+    scopes = fleet.active_scopes()
+    if not scopes:
+        return False
+
+    try:
+        ctx = mcp.get_context()
+        request_context = ctx.request_context
+        if request_context is None:
+            return False
+        session = request_context.session
+        if not session.check_client_capability(
+            ClientCapabilities(elicitation=ElicitationCapability())
+        ):
+            return False
+
+        listing = "\n".join(f"- {s.id}: {s.name}" for s in sorted(scopes, key=lambda s: s.id))
+        message = (
+            "Strata is not yet bound to a scope for this session. Pick one to continue:\n" + listing
+        )
+
+        result = await ctx.elicit(message, _ScopePick)
+    except Exception:  # noqa: BLE001 - any elicitation failure falls back silently
+        return False
+
+    if not isinstance(result, AcceptedElicitation):
+        # DeclinedElicitation, CancelledElicitation, or an unexpected shape —
+        # latch so this process doesn't re-prompt the same client again.
+        _ELICIT_DECLINED = True
+        return False
+
+    picked_scope_id = result.data.scope_id
+    resolved_skill, errors = _resolve_bind(fleet, picked_scope_id, None)
+    if errors:
+        return False
+
+    global _AGENT_SCOPE, _AGENT_SKILL, _UNRESOLVED
+    with _binding_lock:
+        _AGENT_SCOPE = picked_scope_id
+        _AGENT_SKILL = resolved_skill
+        _UNRESOLVED = False
+    return True
+
+
+async def _require_bound_or_elicit() -> None:
+    """Guard called at the top of every memory tool except strata_bind.
+
+    A no-op — zero overhead — once the session is resolved (the common
+    case). While unresolved: tries exactly one elicitation attempt (Change
+    2) when the fleet itself loads fine (nothing to offer a pick of
+    otherwise); on any outcome other than a successful bind, raises with
+    the same aggregated startup-failure list plus recovery instructions
+    that used to only reach stderr (Change 1).
+    """
+    if not _UNRESOLVED:
+        return
+
+    fleet: FleetConfig | None
+    try:
+        fleet = _load_fleet()
+    except Exception:  # noqa: BLE001 - a fleet that still won't load has nothing to elicit
+        fleet = None
+
+    if fleet is not None and await _attempt_elicit_bind(fleet):
+        return
+
+    raise RuntimeError(_unresolved_message(fleet))
 
 
 # ---------------------------------------------------------------------------
@@ -869,36 +1077,22 @@ def strata_bind(scope_id: str, skill: str | None = None) -> dict:
             not permitted — the error lists the valid scopes/skills. The
             binding is left unchanged in every failure case.
     """
-    global _AGENT_SCOPE, _AGENT_SKILL
+    global _AGENT_SCOPE, _AGENT_SKILL, _UNRESOLVED
 
+    # This is THE recovery path for an unresolved session (Change 1), so it
+    # deliberately re-reads fleet.yaml itself (below) rather than trusting
+    # any cached startup fleet — a fleet fixed after startup must be
+    # bindable without a restart. It also never calls
+    # _require_bound_or_elicit(): eliciting from inside the tool that IS the
+    # elicitation's own bind target would be circular.
     fleet = _load_fleet()
-    errors: list[str] = []
 
     # require_active=True is the shared "archived scopes cannot be bound"
     # rule — the same check startup binding runs (_validate_binding, above),
-    # not a parallel reimplementation of it.
-    scope_obj, exists_error = _check_scope_exists(fleet, scope_id, require_active=True)
-    resolved_skill = skill
-    if exists_error is not None:
-        errors.append(exists_error)
-    else:
-        assert scope_obj is not None
-        # Companion default-skill rule (shared with startup auto-bind, same
-        # helper): a scope with a default_skill may be bound without naming
-        # one, so an omitted skill is not automatically "requires a skill."
-        resolved_skill = _resolve_skill_default(scope_obj, skill)
-
-        if resolved_skill:
-            skill_error = _check_skill_permitted(scope_obj, scope_id, resolved_skill)
-            if skill_error is not None:
-                errors.append(skill_error)
-        elif not _scope_waives_skill(scope_obj):
-            errors.append(
-                f"scope {scope_id!r} declares skills (default_skill or "
-                "permitted_skills) but no skill was given.\n"
-                "  Pass skill=<one of its permitted skills>, or omit skill only "
-                "for an unrestricted scope."
-            )
+    # not a parallel reimplementation of it. _resolve_bind is the same
+    # "is this a valid rebind" rule the elicitation fallback (Change 2)
+    # applies to an accepted scope pick.
+    resolved_skill, errors = _resolve_bind(fleet, scope_id, skill)
 
     if errors:
         # Feature A: the exact incident this tool exists to close is a
@@ -919,6 +1113,7 @@ def strata_bind(scope_id: str, skill: str | None = None) -> dict:
     with _binding_lock:
         _AGENT_SCOPE = scope_id
         _AGENT_SKILL = resolved_skill
+        _UNRESOLVED = False
 
     result = {
         "scope_id": _AGENT_SCOPE,
@@ -939,7 +1134,7 @@ def strata_bind(scope_id: str, skill: str | None = None) -> dict:
 
 
 @mcp.tool()
-def strata_contribute(
+async def strata_contribute(
     scope_id: str,
     content: str,
     proposed_classification: Literal["directive", "context"],
@@ -992,6 +1187,8 @@ def strata_contribute(
         RuntimeError: If the scope is not found, is archived, or is outside
             this agent's entitled write surface.
     """
+    await _require_bound_or_elicit()
+
     # Snapshot the binding ONCE, into locals, and use these — never the
     # _AGENT_* globals directly — for both the authorization check below and
     # the provenance stamp on ContributorRef. Without this, a strata_bind
@@ -1088,7 +1285,7 @@ def strata_contribute(
 
 
 @mcp.tool()
-def strata_rejudge(contribution_id: str) -> dict:
+async def strata_rejudge(contribution_id: str) -> dict:
     """Re-judge a contribution whose scope-manager judgment previously failed.
 
     Idempotent (issue #57): if the contribution already has a verdict, this is
@@ -1124,6 +1321,8 @@ def strata_rejudge(contribution_id: str) -> dict:
             (the contribution stays pending; a fresh judgment-attempt-failed
             event is recorded and you may re-judge again later).
     """
+    await _require_bound_or_elicit()
+
     fleet = _load_fleet()
 
     contribution = _record_store.get_contribution(contribution_id)
@@ -1197,7 +1396,7 @@ def strata_rejudge(contribution_id: str) -> dict:
 
 
 @mcp.tool()
-def strata_publish(
+async def strata_publish(
     content: str,
     kind: Literal["directive", "context"],
     anchors: list[str],
@@ -1244,6 +1443,8 @@ def strata_publish(
         RuntimeError: The bound scope is unknown, or the anchors fail
             structural validation.
     """
+    await _require_bound_or_elicit()
+
     # Snapshot the binding ONCE — see strata_contribute for why (authorize
     # and stamp must use the identical value, never two separate global reads).
     agent_scope, agent_skill, agent_session_id = _AGENT_SCOPE, _AGENT_SKILL, _AGENT_SESSION_ID
@@ -1298,7 +1499,7 @@ def strata_publish(
 
 
 @mcp.tool()
-def strata_withdraw(item_id: str) -> dict:
+async def strata_withdraw(item_id: str) -> dict:
     """Propose withdrawing a published item from this agent's bound scope's publication.
 
     Same proposal-not-write shape as ``strata_publish`` — the scope-manager
@@ -1322,6 +1523,8 @@ def strata_withdraw(item_id: str) -> dict:
         RuntimeError: The bound scope is unknown, or *item_id* is not in this
             scope's current publication.
     """
+    await _require_bound_or_elicit()
+
     # Snapshot the binding ONCE — see strata_contribute for why.
     agent_scope, agent_skill, agent_session_id = _AGENT_SCOPE, _AGENT_SKILL, _AGENT_SESSION_ID
 
@@ -1372,7 +1575,7 @@ def strata_withdraw(item_id: str) -> dict:
 
 
 @mcp.tool()
-def strata_read_scope_summary(scope_id: str | None = None) -> dict:
+async def strata_read_scope_summary(scope_id: str | None = None) -> dict:
     """Return the scope summary for the given scope — or a referenced scope's publication.
 
     For your own bound scope or an inter-stratum ancestor, this returns the
@@ -1416,6 +1619,8 @@ def strata_read_scope_summary(scope_id: str | None = None) -> dict:
         RuntimeError: If the scope does not exist, or if scope_id is outside
             this agent's entitled context surface.
     """
+    await _require_bound_or_elicit()
+
     fleet = _load_fleet()
 
     if scope_id is None:
@@ -1467,7 +1672,7 @@ def strata_read_scope_summary(scope_id: str | None = None) -> dict:
 
 
 @mcp.tool()
-def strata_read_perspective(scope_id: str | None = None) -> dict:
+async def strata_read_perspective(scope_id: str | None = None) -> dict:
     """Return this agent's perspective on the fleet's long-term memory.
 
     A perspective is a composed, provenance-preserving view of: the scope's
@@ -1512,6 +1717,8 @@ def strata_read_perspective(scope_id: str | None = None) -> dict:
         RuntimeError: If the scope is unknown, or if scope_id is outside this
             agent's entitled (chain-only) surface.
     """
+    await _require_bound_or_elicit()
+
     fleet = _load_fleet()
 
     if scope_id is None:
@@ -1564,7 +1771,7 @@ def strata_read_perspective(scope_id: str | None = None) -> dict:
 
 
 @mcp.tool()
-def strata_list_scopes() -> dict:
+async def strata_list_scopes() -> dict:
     """Return the full fleet configuration: strata, scopes, and edges.
 
     Checks fleet.yaml for changes on every call and reloads if needed
@@ -1582,6 +1789,8 @@ def strata_list_scopes() -> dict:
         is always the child) or ``"reference"`` (non-binding; ``from_scope_id``
         references ``to_scope_id``).
     """
+    await _require_bound_or_elicit()
+
     fleet = _load_fleet()
 
     active = fleet.active_scopes()
@@ -1606,7 +1815,7 @@ def strata_list_scopes() -> dict:
 
 
 @mcp.tool()
-def strata_read_scope_record(
+async def strata_read_scope_record(
     scope_id: str | None = None,
     limit: int | None = None,
     before_id: str | None = None,
@@ -1673,6 +1882,8 @@ def strata_read_scope_record(
             (chain-only) surface, or the paging arguments are out of range —
             including a before_id that is not a contribution in this scope.
     """
+    await _require_bound_or_elicit()
+
     fleet = _load_fleet()
 
     if scope_id is None:
@@ -1718,7 +1929,7 @@ def strata_read_scope_record(
 
 
 @mcp.tool()
-def strata_read_contribution(contribution_id: str) -> dict:
+async def strata_read_contribution(contribution_id: str) -> dict:
     """Return one contribution with its state, verdict, and judgment attempts.
 
     The cheap answer to "what happened to the contribution I submitted?" — the
@@ -1749,6 +1960,8 @@ def strata_read_contribution(contribution_id: str) -> dict:
         RuntimeError: If the contribution is unknown, or its scope is outside
             this agent's entitled (chain-only) surface.
     """
+    await _require_bound_or_elicit()
+
     fleet = _load_fleet()
 
     entry = _record_store.get_record_entry(contribution_id)
@@ -1774,7 +1987,7 @@ def strata_read_contribution(contribution_id: str) -> dict:
 
 
 @mcp.tool()
-def strata_session_stats() -> dict:
+async def strata_session_stats() -> dict:
     """Return this session's mechanical read/contribute asymmetry counters.
 
     A cheap, mechanical self-query (issue #110): the MCP server tracks, per
@@ -1793,6 +2006,8 @@ def strata_session_stats() -> dict:
         ``reads_by_scope`` (scope_id → ``{count, last_read_at}``). A session that
         has done nothing yet returns zeroed counters, never an error.
     """
+    await _require_bound_or_elicit()
+
     if _session_store is not None:
         state = _session_store.read(_AGENT_SESSION_ID)
         if state is not None:
@@ -1813,7 +2028,7 @@ def strata_session_stats() -> dict:
 
 
 @mcp.tool()
-def strata_session_closeout(reason: str) -> dict:
+async def strata_session_closeout(reason: str) -> dict:
     """Record that this session has nothing to contribute — a MECHANICAL act.
 
     Call this before finishing when the session read from the fleet's memory but
@@ -1843,6 +2058,8 @@ def strata_session_closeout(reason: str) -> dict:
         ``contributions``, ``declines`` (now incremented), ``reads_by_scope``,
         and ``updated_at`` — the same shape as ``strata_session_stats``.
     """
+    await _require_bound_or_elicit()
+
     _logger.info("session %r closeout: %s", _AGENT_SESSION_ID, reason)
     state = _record_decline()
     if state is not None:
@@ -1870,14 +2087,22 @@ def main() -> None:
     Startup order (issue #46 — nothing touches storage before validation):
 
     1. Resolve paths (project config walk-up; env fallback).
-    2. Load the fleet config — parse/invariant failures become refuse-to-start
+    2. Load the fleet config — parse/invariant failures become startup-error
        entries, not tracebacks.
     3. Validate the agent binding (scope, skill) — all failures aggregated.
-    4. Initialise storage (migrations, stores) — failures also render as a
-       refuse-to-start message.
-    5. Serve.
-
-    Any failure exits 1 with a single actionable message (ADR 0005 D5).
+    4. Initialise storage (migrations, stores) — a failure here is still
+       fatal (a corrupt DB or unwritable directory isn't something
+       strata_bind can recover from) and exits 1 with a single actionable
+       message.
+    5. Serve — always. Soft-start (dated addendum, ADR 0005 D5): binding
+       failures from step 3 (unbound multi-scope, unknown scope,
+       impermissible skill, missing/invalid fleet) no longer exit here. The
+       server completes the MCP handshake regardless, stores the aggregated
+       failure list, and every memory tool but strata_bind returns that list
+       as its error result until the session is bound — see
+       _require_bound_or_elicit(). A harness that swallows stderr (Codex,
+       Claude Code) otherwise leaves the human never seeing why nothing
+       works.
     """
     # Walk for the project config once at startup so we can show the user
     # exactly which paths we examined when validation fails.
@@ -1917,8 +2142,8 @@ def main() -> None:
     # Rebind the module globals to the resolved (possibly auto-bound) scope
     # and skill — every tool function below reads _AGENT_SCOPE / _AGENT_SKILL
     # directly, so the auto-bind decision must land here before mcp.run().
-    global _AGENT_SCOPE, _AGENT_SKILL
-    _AGENT_SCOPE, _AGENT_SKILL = _validate_binding(
+    global _AGENT_SCOPE, _AGENT_SKILL, _UNRESOLVED, _STARTUP_ERRORS
+    _AGENT_SCOPE, _AGENT_SKILL, _STARTUP_ERRORS = _validate_binding(
         fleet,
         _AGENT_SCOPE,
         _AGENT_SKILL,
@@ -1926,6 +2151,7 @@ def main() -> None:
         searched_paths=[str(p) for p in searched_paths_out],
         extra_errors=startup_errors,
     )
+    _UNRESOLVED = bool(_STARTUP_ERRORS)
 
     # Storage init after validation — failures here (unwritable directory,
     # corrupt DB) also render as a refuse-to-start message, not a traceback.

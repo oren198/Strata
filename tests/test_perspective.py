@@ -178,7 +178,7 @@ def _load_mcp_module(db_path: str, summaries_dir: str, fleet_yaml_path: str):
 # ---------------------------------------------------------------------------
 
 
-def test_golden_equivalence_mcp_tool_matches_compose_perspective(tmp_path: Path) -> None:
+async def test_golden_equivalence_mcp_tool_matches_compose_perspective(tmp_path: Path) -> None:
     """strata_read_perspective's dict equals compose_perspective's, pinned literally."""
     db_path = str(tmp_path / "strata.db")
     run_migrations(db_path)
@@ -220,7 +220,7 @@ def test_golden_equivalence_mcp_tool_matches_compose_perspective(tmp_path: Path)
     ):
         mock_dt.now.return_value = fixed_now
         mod._summary_store = store
-        tool_result = mod.strata_read_perspective("g_team")
+        tool_result = await mod.strata_read_perspective("g_team")
 
     assert tool_result == direct_result
 
