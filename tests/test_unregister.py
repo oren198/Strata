@@ -507,6 +507,50 @@ def test_stale_hook_removed_cleanly_exit_0(tmp_path: Path) -> None:
     assert not hook_script.exists()
 
 
+def test_mixed_historical_and_edited_artifacts_only_the_edited_one_is_flagged(
+    tmp_path: Path, capsys
+) -> None:
+    """One historical artifact + one genuinely-edited artifact in the same
+    run: exit 1 overall (the partial-completion signal), the historical one
+    is removed cleanly with no warning, and the warning names ONLY the
+    genuinely-edited one.
+    """
+    _init_project(tmp_path)
+    cmd_register(_register_args(str(tmp_path)))
+
+    # Historical, unmodified: the pre-v1.10.3 .gitignore block.
+    gitignore = tmp_path / ".gitignore"
+    current = gitignore.read_text(encoding="utf-8")
+    historical = current.replace(install.GITIGNORE_BLOCK, install.GITIGNORE_BLOCK_HISTORICAL[0])
+    assert historical != current
+    gitignore.write_text(historical, encoding="utf-8")
+
+    # Genuinely edited: a vendored skill.
+    skill_md = tmp_path / ".claude" / "skills" / "strata-worker" / "Skill.md"
+    edited = skill_md.read_text(encoding="utf-8") + "\n<!-- user tweak -->\n"
+    skill_md.write_text(edited, encoding="utf-8")
+
+    rc = cmd_unregister(_unregister_args(str(tmp_path)))
+
+    assert rc == 1
+
+    # The historical .gitignore block was removed cleanly — no complaint.
+    assert install.GITIGNORE_MARKER not in gitignore.read_text(encoding="utf-8")
+
+    # The genuinely-edited skill survived untouched.
+    assert skill_md.exists()
+    assert skill_md.read_text(encoding="utf-8") == edited
+
+    captured = capsys.readouterr()
+    # The warning names only the edited artifact.
+    assert "strata-worker" in captured.err
+    assert ".gitignore" not in captured.err
+    # The two unmodified skills, and the historical gitignore block, still
+    # got their clean "ok" treatment on stdout.
+    assert not (tmp_path / ".claude" / "skills" / "strata").exists()
+    assert not (tmp_path / ".claude" / "skills" / "strata-inspect").exists()
+
+
 # ---------------------------------------------------------------------------
 # Parser wiring
 # ---------------------------------------------------------------------------

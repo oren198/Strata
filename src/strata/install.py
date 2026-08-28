@@ -249,6 +249,24 @@ _HISTORICAL_ARTIFACT_HASHES: dict[str, dict[str, object]] = {
         "current": "d950ad8fcf436069b49d247543ab6a4a2c98481d6ef853e5c78a5289e0f5c582",
         "historical": frozenset(),
     },
+    "codex-mcp": {
+        # Round-4 unregister fix, bug B (release-discipline extension): the
+        # CODEX_MCP_BLOCK constant itself carries the current shipped text
+        # (and CODEX_MCP_BLOCK_HISTORICAL the historical text variants
+        # remove_codex_mcp_server tries), but this entry exists purely so
+        # test_release_discipline_hashes_are_current fails the build the
+        # same way it does for the skills/hook/AGENTS.md the moment
+        # CODEX_MCP_BLOCK's content changes without a historical entry being
+        # added — the exact class of bug this whole fix wave closed.
+        "current": "ffe7e644bb000b4d8ce5d154364c9646975aa0152494d7b46c3cb834056ef562",
+        "historical": frozenset(),
+    },
+    "codex-hook": {
+        # See "codex-mcp" above — same guardrail, for CODEX_HOOK_BLOCK /
+        # CODEX_HOOK_BLOCK_HISTORICAL.
+        "current": "df9f579f636015b4060cdabf01ee598698506c7011baba616e7b9ca1620768bf",
+        "historical": frozenset(),
+    },
     "agents-md": {
         "current": "ceea6568ab9160d54f2d3edd7131bc9b3bf2a694832226e67e7553de7325825f",
         "historical": frozenset(

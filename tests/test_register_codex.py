@@ -439,6 +439,46 @@ def test_strip_orphaned_mcp_strata_tables_absent_is_noop() -> None:
     assert new_text == text
 
 
+def test_strip_orphaned_mcp_strata_tables_does_not_match_name_prefix_lookalikes() -> None:
+    # [mcp_servers.strataFOO] and [mcp_servers.strata2] are different table
+    # names — "mcp_servers.strata" is a substring of both, but neither is our
+    # table nor a dotted child of it (a dotted child always has a literal
+    # "." right after "strata"). A naive substring/prefix check would wrongly
+    # sweep these up; the boundary must be exact-name-or-dotted-child.
+    text = (
+        "[mcp_servers.strataFOO]\n"
+        'command = "unrelated-bin"\n\n'
+        "[mcp_servers.strata2]\n"
+        'command = "also-unrelated"\n'
+    )
+    new_text, count = install.strip_orphaned_mcp_strata_tables(text)
+    assert count == 0
+    assert new_text == text
+
+
+def test_unregister_harness_codex_leaves_name_prefix_lookalikes_byte_identical(
+    tmp_path: Path, codex_home: Path
+) -> None:
+    """CLI-level: a config carrying [mcp_servers.strataFOO] / [mcp_servers.strata2]
+    tables survives `strata unregister --harness codex` byte-identical."""
+    _init_project(tmp_path)
+    codex_home.mkdir(parents=True)
+    lookalikes = (
+        "[mcp_servers.strataFOO]\n"
+        'command = "unrelated-bin"\n\n'
+        "[mcp_servers.strata2]\n"
+        'command = "also-unrelated"\n'
+    )
+    config = codex_home / "config.toml"
+    config.write_text(lookalikes, encoding="utf-8")
+
+    _register(tmp_path, harness="codex")
+    assert _unregister(tmp_path, harness="codex") == 0
+
+    remaining = config.read_text(encoding="utf-8")
+    assert remaining == lookalikes  # byte-identical: our own entry round-tripped away cleanly
+
+
 def test_unregister_harness_codex_removes_orphaned_tool_subtables(
     tmp_path: Path, codex_home: Path
 ) -> None:
