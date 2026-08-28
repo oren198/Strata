@@ -348,6 +348,22 @@ def _attach_fleet_notice(result: dict) -> dict:
     return result
 
 
+def _attach_unbound_notice(result: dict) -> dict:
+    """Attach a one-line ``unbound_notice`` when the session is still
+    unresolved (soft-start, Change 1) — for the pure fleet-topology tools
+    (currently only strata_list_scopes) that are deliberately NOT gated by
+    _require_bound_or_elicit: topology is not scoped memory, so an agent
+    helping the user bind can still see it, but the unbound state should
+    stay visible rather than silently look identical to a normal call.
+
+    Additive, like :func:`_attach_fleet_notice`: the key is present only
+    when there is something to say.
+    """
+    if _UNRESOLVED:
+        result["unbound_notice"] = "session not bound yet — bind with strata_bind(scope_id=...)"
+    return result
+
+
 def _publication_item_dict(item: PublishedItem) -> dict:
     """Verbatim item dict for a published item, as returned across MCP tool surfaces."""
     return {
@@ -901,7 +917,9 @@ def _unresolved_message(fleet: FleetConfig | None) -> str:
         "  fix the underlying issue (create/edit fleet.yaml, set "
         "STRATA_AGENT_SCOPE/STRATA_AGENT_SKILL) and call strata_bind again — "
         "fleet.yaml is re-read as part of that call, so a fix made after startup "
-        "is bindable immediately."
+        "is bindable immediately.\n"
+        "  strata_list_scopes works unbound too (fleet topology is not scoped "
+        "memory) if you need the full strata/scope/edge picture before picking."
     )
     return header + body + recovery
 
@@ -974,7 +992,12 @@ async def _attempt_elicit_bind(fleet: FleetConfig) -> bool:
 
 
 async def _require_bound_or_elicit() -> None:
-    """Guard called at the top of every memory tool except strata_bind.
+    """Guard called at the top of every tool that touches actual memory —
+    a scope's summary, record, perspective, or session state — except
+    strata_bind. Pure fleet-topology reads (currently only
+    strata_list_scopes) do NOT call this: topology is not scoped memory,
+    so an unbound agent helping the user bind can still see it — see
+    _attach_unbound_notice, its ungated counterpart.
 
     A no-op — zero overhead — once the session is resolved (the common
     case). While unresolved: tries exactly one elicitation attempt (Change
@@ -1771,7 +1794,7 @@ async def strata_read_perspective(scope_id: str | None = None) -> dict:
 
 
 @mcp.tool()
-async def strata_list_scopes() -> dict:
+def strata_list_scopes() -> dict:
     """Return the full fleet configuration: strata, scopes, and edges.
 
     Checks fleet.yaml for changes on every call and reloads if needed
@@ -1783,21 +1806,28 @@ async def strata_list_scopes() -> dict:
     they are arranged into strata, and which chain and reference edges
     connect them.
 
+    Works even while this session is unbound (soft-start, Change 1): fleet
+    topology is not scoped memory, so an agent helping the user pick a
+    scope to bind to can still see what's available — unlike every other
+    tool here, this one does NOT call _require_bound_or_elicit. While
+    unbound, the response carries an additional ``unbound_notice`` so that
+    state stays visible (_attach_unbound_notice) rather than looking like
+    an ordinary, fully-bound call.
+
     Returns:
         Fleet config: ``strata`` (list), ``scopes`` (list), ``edges`` (list).
         Each edge carries ``kind`` — ``"chain"`` (binding; ``from_scope_id``
         is always the child) or ``"reference"`` (non-binding; ``from_scope_id``
-        references ``to_scope_id``).
+        references ``to_scope_id``). ``unbound_notice`` is present only while
+        this session has not yet been bound.
     """
-    await _require_bound_or_elicit()
-
     fleet = _load_fleet()
 
     active = fleet.active_scopes()
     active_ids = {s.id for s in active}
     active_edges = [e for e in fleet.edges if e.from_ in active_ids and e.to in active_ids]
 
-    return _attach_fleet_notice(
+    result = _attach_fleet_notice(
         {
             "strata": [s.model_dump() for s in fleet.strata],
             "scopes": [s.model_dump() for s in active],
@@ -1807,6 +1837,7 @@ async def strata_list_scopes() -> dict:
             ],
         }
     )
+    return _attach_unbound_notice(result)
 
 
 # ---------------------------------------------------------------------------

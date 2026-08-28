@@ -623,7 +623,7 @@ async def test_list_scopes_re_reads_fleet_yaml_each_call(tmp_path: Path) -> None
     mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
 
     # First call — two scopes.
-    result1 = await mod.strata_list_scopes()
+    result1 = mod.strata_list_scopes()
     scope_ids_1 = {s["id"] for s in result1["scopes"]}
     assert "g_arch" in scope_ids_1
     assert "g_backend" in scope_ids_1
@@ -634,7 +634,7 @@ async def test_list_scopes_re_reads_fleet_yaml_each_call(tmp_path: Path) -> None
     fleet_path.write_text(yaml.dump(raw, default_flow_style=False), encoding="utf-8")
 
     # Second call — must reflect the addition without a restart.
-    result2 = await mod.strata_list_scopes()
+    result2 = mod.strata_list_scopes()
     scope_ids_2 = {s["id"] for s in result2["scopes"]}
     assert "g_frontend" in scope_ids_2, (
         "strata_list_scopes did not pick up fleet.yaml change between calls"
@@ -2769,7 +2769,7 @@ async def test_list_scopes_no_reparse_when_fleet_yaml_unchanged(
     mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
 
     # First call primes the reloader's cache.
-    await mod.strata_list_scopes()
+    mod.strata_list_scopes()
 
     calls = 0
     real_load = FleetConfig.load.__func__
@@ -2781,8 +2781,8 @@ async def test_list_scopes_no_reparse_when_fleet_yaml_unchanged(
 
     monkeypatch.setattr(FleetConfig, "load", classmethod(counting_load))
 
-    await mod.strata_list_scopes()
-    await mod.strata_list_scopes()
+    mod.strata_list_scopes()
+    mod.strata_list_scopes()
     assert calls == 0, "unchanged fleet.yaml must not be re-parsed"
 
 
@@ -2794,7 +2794,7 @@ async def test_invalid_fleet_edit_keeps_serving_last_good_fleet_with_notice(tmp_
 
     mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
 
-    good = await mod.strata_list_scopes()
+    good = mod.strata_list_scopes()
     assert "fleet_notice" not in good
     good_scope_ids = {s["id"] for s in good["scopes"]}
 
@@ -2806,7 +2806,7 @@ async def test_invalid_fleet_edit_keeps_serving_last_good_fleet_with_notice(tmp_
         encoding="utf-8",
     )
 
-    served = await mod.strata_list_scopes()
+    served = mod.strata_list_scopes()
     served_scope_ids = {s["id"] for s in served["scopes"]}
     assert served_scope_ids == good_scope_ids, "invalid edit must keep serving the last good fleet"
     assert "fleet_notice" in served
@@ -2960,7 +2960,7 @@ async def test_bind_refusal_mentions_active_fleet_reload_warning(tmp_path: Path)
     mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
     with patch.object(mod, "_AGENT_SCOPE", "g_backend"):
         # Prime the reloader with a good fleet.
-        await mod.strata_list_scopes()
+        mod.strata_list_scopes()
 
         # Corrupt the file the way the incident describes: an edit meant to
         # add a scope, but invalid — falls back silently to the last good
@@ -3133,7 +3133,7 @@ async def test_unbound_tool_call_returns_error_with_scopes_and_bind_mention(tmp_
         patch.object(mod, "_load_fleet", return_value=fleet),
         pytest.raises(RuntimeError) as exc_info,
     ):
-        await mod.strata_list_scopes()
+        await mod.strata_read_perspective()
 
     message = str(exc_info.value)
     assert "g_arch" in message
@@ -3185,8 +3185,89 @@ async def test_strata_bind_works_while_unresolved(tmp_path: Path) -> None:
         assert mod._UNRESOLVED is False
 
         # Bound now — a subsequent tool call must work, not error.
-        listing = await mod.strata_list_scopes()
+        listing = mod.strata_list_scopes()
         assert {s["id"] for s in listing["scopes"]} == {"g_arch", "g_backend"}
+
+
+# ---------------------------------------------------------------------------
+# Ungate audit follow-up: strata_list_scopes reads only fleet topology — no
+# scope's summary, record, perspective, or session state — so it works
+# unbound (controller ruling: topology is not scoped memory, and an agent
+# helping the user bind should be able to look at the fleet). Every other
+# gated tool stays gated (see test_unbound_tool_call_raises_for_every_
+# memory_tool_but_bind, above, and test_unbound_tool_call_returns_error_
+# with_scopes_and_bind_mention, which now exercises a genuine memory tool).
+# ---------------------------------------------------------------------------
+
+
+async def test_strata_list_scopes_works_unbound_and_carries_notice(tmp_path: Path) -> None:
+    """strata_list_scopes must NOT be gated: it returns the fleet topology
+    while unresolved, with a one-line unbound_notice appended so the state
+    stays visible rather than looking like an ordinary bound call."""
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fleet_yaml(tmp_path)  # g_arch, g_backend
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+    fleet = FleetConfig.load(fleet_path)
+
+    with (
+        patch.object(mod, "_AGENT_SCOPE", ""),
+        patch.object(mod, "_UNRESOLVED", True),
+        patch.object(mod, "_STARTUP_ERRORS", ["STRATA_AGENT_SCOPE is not set."]),
+        patch.object(mod, "_load_fleet", return_value=fleet),
+    ):
+        # Must NOT raise — pure topology reads work unbound.
+        result = mod.strata_list_scopes()
+
+    assert {s["id"] for s in result["scopes"]} == {"g_arch", "g_backend"}
+    assert "unbound_notice" in result
+    assert "strata_bind(scope_id=...)" in result["unbound_notice"]
+
+
+async def test_strata_list_scopes_has_no_notice_once_bound(tmp_path: Path) -> None:
+    """Once resolved, strata_list_scopes carries no unbound_notice — an
+    ordinary bound call must not look like it's still waiting on a bind."""
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fleet_yaml(tmp_path)
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+    fleet = FleetConfig.load(fleet_path)
+
+    with (
+        patch.object(mod, "_AGENT_SCOPE", "g_backend"),
+        patch.object(mod, "_UNRESOLVED", False),
+        patch.object(mod, "_load_fleet", return_value=fleet),
+    ):
+        result = mod.strata_list_scopes()
+
+    assert "unbound_notice" not in result
+
+
+async def test_unresolved_message_mentions_strata_list_scopes_works_unbound(
+    tmp_path: Path,
+) -> None:
+    """The gated-tool error text must reflect reality: strata_list_scopes no
+    longer needs strata_bind first, so the recovery text should point an
+    agent at it for the full fleet picture while still unbound."""
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fleet_yaml(tmp_path)
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+    fleet = FleetConfig.load(fleet_path)
+
+    with (
+        patch.object(mod, "_AGENT_SCOPE", ""),
+        patch.object(mod, "_UNRESOLVED", True),
+        patch.object(mod, "_STARTUP_ERRORS", ["STRATA_AGENT_SCOPE is not set."]),
+        patch.object(mod, "_load_fleet", return_value=fleet),
+        pytest.raises(RuntimeError) as exc_info,
+    ):
+        await mod.strata_read_perspective()
+
+    assert "strata_list_scopes" in str(exc_info.value)
 
 
 async def test_fleet_missing_at_startup_then_created_bindable_without_restart(
@@ -3207,7 +3288,7 @@ async def test_fleet_missing_at_startup_then_created_bindable_without_restart(
         patch.object(mod, "_STARTUP_ERRORS", [".strata/config.toml not found."]),
     ):
         with pytest.raises(RuntimeError):
-            await mod.strata_list_scopes()
+            await mod.strata_read_perspective()
 
         # Fleet created after startup, out of band — no server restart.
         fleet_data = {
@@ -3296,7 +3377,7 @@ async def test_elicitation_accept_binds_and_continues_original_call(tmp_path: Pa
         async with create_connected_server_and_client_session(
             mod.mcp, elicitation_callback=_elicit_accept_g_backend
         ) as client:
-            result = await client.call_tool("strata_list_scopes", {})
+            result = await client.call_tool("strata_read_perspective", {})
 
         assert result.isError is not True
         assert mod._AGENT_SCOPE == "g_backend"
@@ -3333,8 +3414,8 @@ async def test_elicitation_only_attempted_once_then_bound_calls_skip_it(tmp_path
         async with create_connected_server_and_client_session(
             mod.mcp, elicitation_callback=_counting_accept
         ) as client:
-            first = await client.call_tool("strata_list_scopes", {})
-            second = await client.call_tool("strata_list_scopes", {})
+            first = await client.call_tool("strata_read_perspective", {})
+            second = await client.call_tool("strata_read_perspective", {})
 
         assert first.isError is not True
         assert second.isError is not True
@@ -3368,7 +3449,7 @@ async def test_elicitation_accept_with_invalid_scope_falls_back_binding_unchange
         async with create_connected_server_and_client_session(
             mod.mcp, elicitation_callback=_accept_bad_scope
         ) as client:
-            result = await client.call_tool("strata_list_scopes", {})
+            result = await client.call_tool("strata_read_perspective", {})
 
         assert result.isError is True
         text = _result_text(result)
@@ -3397,7 +3478,7 @@ async def test_elicitation_decline_falls_back_to_unresolved_error(tmp_path: Path
         async with create_connected_server_and_client_session(
             mod.mcp, elicitation_callback=_elicit_decline
         ) as client:
-            result = await client.call_tool("strata_list_scopes", {})
+            result = await client.call_tool("strata_read_perspective", {})
 
         assert result.isError is True
         text = _result_text(result)
@@ -3426,7 +3507,7 @@ async def test_elicitation_missing_capability_falls_back_to_unresolved_error(
         patch.object(mod, "_STARTUP_ERRORS", ["STRATA_AGENT_SCOPE is not set."]),
     ):
         async with create_connected_server_and_client_session(mod.mcp) as client:
-            result = await client.call_tool("strata_list_scopes", {})
+            result = await client.call_tool("strata_read_perspective", {})
 
         assert result.isError is True
         text = _result_text(result)
