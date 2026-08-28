@@ -53,6 +53,7 @@ Vocabulary throughout follows ``CONTEXT.md``.
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import os
 import shutil
@@ -772,6 +773,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     7. Skills present in ``.claude/skills/``.
     8. Binding env vars (``STRATA_AGENT_SCOPE`` / ``_SKILL`` / ``_SESSION_ID``)
        set and valid against the fleet.
+    9. Judge key (``JUDGE_API_KEY`` / ``ANTHROPIC_API_KEY``) resolvable —
+       soft, like check 8's session-id half: never flips the exit code.
     """
     from strata.bootstrap import load_fleet_config
     from strata.fleet_config import FleetConfigError
@@ -1223,6 +1226,35 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                     "STRATA_AGENT_SESSION_ID is not set — fine for `strata doctor` itself "
                     "(one is auto-generated per session); set it explicitly only if you "
                     "want stable session tracking across restarts."
+                ),
+            )
+        )
+
+    # -----------------------------------------------------------------------
+    # 9. Judge key resolvable. Soft — like the session-id check above: a
+    # project can be fully wired and still have no judge key yet (the first
+    # contribution just sits unjudged until one is set). Never flips the
+    # exit code.
+    # -----------------------------------------------------------------------
+    if _judge_key_visible(project_root):
+        checks.append(
+            Check(
+                name="Judge key",
+                kind="soft",
+                passed=True,
+                message="resolved (JUDGE_API_KEY or ANTHROPIC_API_KEY)",
+            )
+        )
+    else:
+        checks.append(
+            Check(
+                name="Judge key",
+                kind="soft",
+                passed=False,
+                message=(
+                    "no judge key found — add JUDGE_API_KEY=... to .env in this "
+                    "project (or export it); contributions wait unjudged until "
+                    "then. `strata register` offers to capture it."
                 ),
             )
         )
@@ -2260,6 +2292,102 @@ def _self_install_spec() -> str | None:
     return None
 
 
+#: Printed instead of the interactive prompt whenever the judge key isn't
+#: visible yet and `strata register` can't (or shouldn't) ask for it:
+#: --yes, non-interactive, or the operator pressed Enter to skip. Kept as one
+#: constant so every one of those paths — and their tests — say exactly the
+#: same thing.
+_JUDGE_KEY_LATER_NOTE = (
+    "judge key: not set — add JUDGE_API_KEY=... to .env in this project "
+    "(or export it) when ready; contributions wait unjudged until then."
+)
+
+
+def _judge_key_visible(project_root: Path) -> bool:
+    """Return ``True`` if a judge/Anthropic API key already resolves for *project_root*.
+
+    Builds a throwaway :class:`~strata.settings.Settings` scoped to this
+    project's own ``.env`` rather than calling the cached
+    ``get_settings()`` singleton directly: that singleton is constructed
+    once per process and resolves its ``.env`` file relative to the
+    process's cwd, which is wrong whenever `register --path` targets a
+    directory other than cwd (and unworkable in tests that don't chdir).
+    The precedence itself — ``JUDGE_API_KEY`` wins, ``ANTHROPIC_API_KEY`` is
+    the fallback, either spelling, env or .env — is not reimplemented here;
+    it stays exactly what ``Settings`` already resolves.
+    """
+    from strata.settings import Settings  # noqa: PLC0415
+
+    settings = Settings(_env_file=project_root / ".env")
+    return bool(settings.judge_api_key or settings.anthropic_api_key)
+
+
+def _offer_judge_key_capture(project_root: Path, *, skip_prompt: bool) -> None:
+    """End-of-register step: offer to capture the judge key (operator-directed).
+
+    Motivated by a live failure — a project registered without a judge key,
+    so its first contribution sat unjudged with no obvious next step. Runs
+    only from the very end of a successful, non-diff `strata register`:
+
+    - A key is already visible (env or this project's ``.env``) → print
+      ``judge key: found`` and stop; nothing to ask.
+    - Otherwise, when both ends of the terminal are interactive and
+      ``--yes`` wasn't passed → prompt for the key with hidden input
+      (:func:`getpass.getpass`, mirroring the markerless-register prompt's
+      TTY check). A non-empty answer is written to this project's
+      ``.env`` (creating, appending, or replacing an existing
+      JUDGE_API_KEY/ANTHROPIC_API_KEY line — see
+      :func:`strata.install.write_env_judge_key`); an empty answer, EOF
+      (e.g. stdin closed mid-session), or Ctrl-C falls through to the
+      how-to-add-it-later note below.
+    - Non-interactive, or ``--yes`` → never prompts; prints the same note.
+
+    Before any write, checks that this project's ``.gitignore`` actually
+    covers ``.env`` (register's own GITIGNORE_BLOCK has covered it since
+    this feature shipped — see :data:`strata.install.GITIGNORE_BLOCK` — but
+    an already-registered project keeps whatever block it was seeded with,
+    and a user can always edit their .gitignore by hand). If it doesn't,
+    this warns loudly on stderr and still writes the key — skipping the
+    write would strand the operator worse than the warning does.
+    """
+    if _judge_key_visible(project_root):
+        print("judge key: found")
+        return
+
+    if skip_prompt or not (sys.stdin.isatty() and sys.stdout.isatty()):
+        print(_JUDGE_KEY_LATER_NOTE)
+        return
+
+    try:
+        value = getpass.getpass(
+            "Judge key — the LLM that reviews contributions (Anthropic, or any "
+            "Messages-API endpoint). Paste to store it in .env, or press Enter "
+            "to skip: "
+        )
+    except (EOFError, OSError, KeyboardInterrupt):
+        value = ""
+
+    value = value.strip()
+    if not value:
+        print(_JUDGE_KEY_LATER_NOTE)
+        return
+
+    gitignore_path = project_root / ".gitignore"
+    gitignore_text = gitignore_path.read_text(encoding="utf-8") if gitignore_path.exists() else ""
+    if not install.gitignore_covers_dotenv(gitignore_text):
+        print(
+            f"  {_glyph('fail')} WARNING: {gitignore_path} does not ignore `.env` — "
+            "the judge key just written there could be committed to version "
+            "control. Add a `.env` line to .gitignore.",
+            file=sys.stderr,
+        )
+
+    env_path = project_root / ".env"
+    action = install.write_env_judge_key(env_path, value)
+    verb = {"created": "wrote", "replaced": "updated", "appended": "appended to"}[action]
+    print(f"judge key: {verb} {env_path.relative_to(project_root)}")
+
+
 def cmd_register(args: argparse.Namespace) -> int:
     """Idempotent brownfield installer — per ADR 0005 Decision 4.
 
@@ -2845,6 +2973,16 @@ def cmd_register(args: argparse.Namespace) -> int:
                     "then open Codex CLI in this directory: codex"
                 )
             next_step += 1
+
+    # -----------------------------------------------------------------------
+    # Step 9: offer to capture the judge key. Only at the very end of a
+    # *successful* interactive register — --diff makes no writes, and a
+    # settings.json merge failure below means this run didn't fully
+    # succeed, so neither is "the end of a successful register".
+    # -----------------------------------------------------------------------
+    if not diff_mode and not settings_unreadable:
+        print()
+        _offer_judge_key_capture(project_root, skip_prompt=getattr(args, "yes", False))
 
     if settings_unreadable:
         print(

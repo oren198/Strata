@@ -316,3 +316,11 @@ def test_agents_md_template_mentions_env_binding() -> None:
     assert "STRATA_AGENT_SCOPE" in text
     assert "STRATA_AGENT_SKILL" in text
     assert "STRATA_AGENT_SESSION_ID" in text
+
+
+def test_agents_md_template_steers_to_mcp_tools_not_backend() -> None:
+    text, _ = install.merge_agents_md("")
+    assert "strata_read_perspective" in text
+    assert "strata_contribute" in text
+    assert "strata_rejudge" in text
+    assert "strata start" in text  # the never-run warning names the command

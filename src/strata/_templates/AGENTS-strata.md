@@ -12,6 +12,12 @@ across sessions.
   scope's manager before it counts as memory — propose freely, but the
   scope-manager decides what sticks.
 
+Memory access is only through the strata MCP tools `strata_read_perspective`,
+`strata_contribute`, and `strata_rejudge` (and their read-only siblings)
+exposed to this session — never run `strata start` or talk to its HTTP
+backend yourself; that process serves the human's Console UI only and is
+not part of your job.
+
 Your scope and role identity are bound through environment variables
 (`STRATA_AGENT_SCOPE`, `STRATA_AGENT_SKILL`, `STRATA_AGENT_SESSION_ID`) set
 before this session starts — do not hardcode them.
