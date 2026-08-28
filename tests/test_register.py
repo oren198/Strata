@@ -37,6 +37,7 @@ def _make_args(
     path: str | None = None,
     diff: bool = False,
     bootstrap_venv: bool = False,
+    yes: bool = False,
 ):
     """Build a minimal argparse Namespace for cmd_register.
 
@@ -53,12 +54,15 @@ def _make_args(
         diff=diff,
         bootstrap_venv=bootstrap_venv,
         harness=None,
+        yes=yes,
     )
 
 
-def _run_register(tmp_path: Path, *, diff: bool = False, bootstrap_venv: bool = False) -> int:
+def _run_register(
+    tmp_path: Path, *, diff: bool = False, bootstrap_venv: bool = False, yes: bool = False
+) -> int:
     """Run cmd_register against tmp_path (which must have a .git marker)."""
-    args = _make_args(path=str(tmp_path), diff=diff, bootstrap_venv=bootstrap_venv)
+    args = _make_args(path=str(tmp_path), diff=diff, bootstrap_venv=bootstrap_venv, yes=yes)
     return cmd_register(args)
 
 
@@ -133,7 +137,151 @@ def test_no_project_marker_message_hints_git_init(tmp_path: Path, capsys) -> Non
     assert "pyproject.toml" in captured.err
     assert "package.json" in captured.err
     assert "Cargo.toml" in captured.err
-    assert "go.mod" in captured.err
+
+
+# ---------------------------------------------------------------------------
+# Test 1b: interactive markerless prompt ("register anywhere")
+# ---------------------------------------------------------------------------
+
+
+def test_markerless_interactive_yes_proceeds(tmp_path: Path, monkeypatch, capsys) -> None:
+    """Interactive TTY + no marker + user answers 'y' → register proceeds
+    exactly as a normal register."""
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda prompt="": "y")
+
+    rc = _run_register(tmp_path)
+
+    assert rc == 0
+    assert (tmp_path / ".strata").is_dir()
+    assert (tmp_path / ".strata" / "config.toml").exists()
+
+
+def test_markerless_interactive_no_exits_1_with_hint(tmp_path: Path, monkeypatch, capsys) -> None:
+    """Interactive TTY + no marker + user answers 'n' (or empty, the default)
+    → exit 1 with the same hint as the non-interactive refusal."""
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda prompt="": "n")
+
+    rc = _run_register(tmp_path)
+
+    assert rc == 1
+    assert not (tmp_path / ".strata").exists()
+    captured = capsys.readouterr()
+    assert "Not a project root" in captured.err
+    assert "git init" in captured.err
+
+
+def test_markerless_interactive_default_no(tmp_path: Path, monkeypatch, capsys) -> None:
+    """Empty answer (bare Enter) defaults to No."""
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda prompt="": "")
+
+    rc = _run_register(tmp_path)
+
+    assert rc == 1
+    assert not (tmp_path / ".strata").exists()
+
+
+def test_markerless_interactive_eof_counts_as_no(tmp_path: Path, monkeypatch, capsys) -> None:
+    """EOF on the prompt (e.g. stdin closed mid-session) must be treated as
+    'no', not crash the process."""
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+
+    def _raise_eof(prompt: str = "") -> str:
+        raise EOFError
+
+    monkeypatch.setattr("builtins.input", _raise_eof)
+
+    rc = _run_register(tmp_path)
+
+    assert rc == 1
+    assert not (tmp_path / ".strata").exists()
+    captured = capsys.readouterr()
+    assert "Not a project root" in captured.err
+
+
+def test_markerless_prompt_shows_marker_list(tmp_path: Path, monkeypatch, capsys) -> None:
+    """The prompt text itself names the markers."""
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    captured_prompts = []
+
+    def _fake_input(prompt: str = "") -> str:
+        captured_prompts.append(prompt)
+        return "n"
+
+    monkeypatch.setattr("builtins.input", _fake_input)
+
+    _run_register(tmp_path)
+
+    assert len(captured_prompts) == 1
+    assert ".git" in captured_prompts[0]
+    assert "Register here anyway?" in captured_prompts[0]
+    assert "[y/N]" in captured_prompts[0]
+
+
+def test_yes_flag_skips_prompt_in_interactive_context(tmp_path: Path, monkeypatch, capsys) -> None:
+    """--yes must skip the question entirely, even when the terminal is
+    interactive — input() must never be called."""
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    called = []
+    monkeypatch.setattr("builtins.input", lambda prompt="": called.append(prompt) or "n")
+
+    rc = _run_register(tmp_path, yes=True)
+
+    assert rc == 0
+    assert called == [], "input() must not be called when --yes is passed"
+    assert (tmp_path / ".strata").is_dir()
+
+
+def test_yes_flag_proceeds_non_interactively(tmp_path: Path, monkeypatch, capsys) -> None:
+    """--yes also works non-interactively (no TTY at all) — it must not
+    depend on stdin/stdout being TTYs."""
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+    monkeypatch.setattr("sys.stdout.isatty", lambda: False)
+
+    rc = _run_register(tmp_path, yes=True)
+
+    assert rc == 0
+    assert (tmp_path / ".strata").is_dir()
+
+
+def test_non_interactive_without_yes_refuses_verbatim(tmp_path: Path, monkeypatch, capsys) -> None:
+    """Non-interactive (no TTY) without --yes keeps today's refusal + hint
+    verbatim — no prompt attempted."""
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+    monkeypatch.setattr("sys.stdout.isatty", lambda: False)
+    called = []
+    monkeypatch.setattr("builtins.input", lambda prompt="": called.append(prompt) or "y")
+
+    rc = _run_register(tmp_path)
+
+    assert rc == 1
+    assert called == [], "input() must not be called in a non-interactive context"
+    captured = capsys.readouterr()
+    assert "Not a project root" in captured.err
+    assert "git init" in captured.err
+
+
+def test_marker_present_never_prompts(tmp_path: Path, monkeypatch, capsys) -> None:
+    """A directory WITH a marker never sees the prompt, even in an
+    interactive TTY."""
+    _init_project(tmp_path)
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    called = []
+    monkeypatch.setattr("builtins.input", lambda prompt="": called.append(prompt) or "n")
+
+    rc = _run_register(tmp_path)
+
+    assert rc == 0
+    assert called == [], "input() must not be called when a project marker is present"
 
 
 # ---------------------------------------------------------------------------

@@ -2310,14 +2310,36 @@ def cmd_register(args: argparse.Namespace) -> int:
     if not any((project_root / m).exists() for m in _PROJECT_MARKERS):
         markers_str = ", ".join(_PROJECT_MARKERS)
         markers_prose = ", ".join(_PROJECT_MARKERS[:-1]) + f", or {_PROJECT_MARKERS[-1]}"
-        print(
+        refuse_message = (
             f"Not a project root — register from a directory containing one of: {markers_str}\n"
             f"(checked: {project_root})\n"
             f"Starting fresh? Run `git init` first — a project root is anything with "
-            f"{markers_prose}.",
-            file=sys.stderr,
+            f"{markers_prose}."
         )
-        return 1
+        skip_prompt: bool = getattr(args, "yes", False)
+        if not skip_prompt:
+            # Only ask when both ends of the terminal are interactive — a
+            # script piping stdout (or driven by a non-tty stdin) gets the
+            # unchanged refusal + hint instead of hanging on input().
+            if sys.stdin.isatty() and sys.stdout.isatty():
+                try:
+                    answer = (
+                        input(
+                            f"This directory has no project marker ({markers_str}). "
+                            f"Register here anyway? [y/N] "
+                        )
+                        .strip()
+                        .lower()
+                    )
+                except EOFError:
+                    answer = ""
+                if answer not in ("y", "yes"):
+                    print(refuse_message, file=sys.stderr)
+                    return 1
+                # else: fall through and register exactly as normal.
+            else:
+                print(refuse_message, file=sys.stderr)
+                return 1
 
     # -----------------------------------------------------------------------
     # Step 1b: .strata/ sanity check (ADR 0005 Decision 4).
@@ -3628,6 +3650,17 @@ def _build_parser() -> argparse.ArgumentParser:
         nargs="?",
         default=None,
         help="Project root directory (default: current working directory).",
+    )
+    p_register.add_argument(
+        "--yes",
+        dest="yes",
+        action="store_true",
+        help=(
+            "Skip the confirmation prompt when the directory has no project marker "
+            "(.git, pyproject.toml, package.json, Cargo.toml, go.mod) and register anyway. "
+            "Required for scripts/CI registering a markerless directory on purpose; "
+            "has no effect when a marker is already present."
+        ),
     )
     p_register.add_argument(
         "--diff",
