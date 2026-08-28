@@ -30,7 +30,9 @@ Strata is a **shared memory system for fleets of agents**.
    embedded — no backend process is involved. If the tool is unavailable,
    the Strata MCP server refused to start (its startup message names the
    fix — usually `STRATA_AGENT_SCOPE`/`STRATA_AGENT_SKILL` or a missing
-   `.strata/config.toml`); relay that to the user.
+   `.strata/config.toml`); relay that to the user. Never run `strata start`
+   yourself to fix this — that launches the Console backend for the human's
+   browser UI, not something your session needs.
 2. **Show the user the fleet**: report the strata, scopes, and edges from
    `strata_list_scopes`. Explain which scopes the user can act *as*.
 3. **Help the user pick a role**:
