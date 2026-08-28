@@ -36,6 +36,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
+from strata import install
 from strata.__main__ import cmd_doctor, cmd_register
 
 # ---------------------------------------------------------------------------
@@ -281,6 +282,39 @@ def test_doctor_flags_edited_stop_hook_script(
     assert "stop hook" in output.lower()
 
 
+def test_doctor_flags_stale_but_historical_stop_hook_script_with_refresh_wording(
+    registered_project: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """A hook script that matches a *known-historical* shipped version (an
+    older `strata register` wrote it, never hand-edited) is genuinely
+    different wording from a hand-edited one: point straight at
+    `strata register` to refresh it, no "or keep it if you edited it
+    intentionally" hedge — there's nothing to keep, it's just old."""
+    hook_script = registered_project / ".claude" / "hooks" / "strata-stop-hook"
+    old_content = "#!/bin/sh\n# an old shipped stop hook\nexit 0\n"
+    old_hash = __import__("hashlib").sha256(old_content.encode("utf-8")).hexdigest()
+    hook_script.write_text(old_content, encoding="utf-8")
+
+    real_hashes = install._HISTORICAL_ARTIFACT_HASHES  # noqa: SLF001
+    patched = {
+        **real_hashes,
+        "strata-stop-hook": {
+            "current": real_hashes["strata-stop-hook"]["current"],
+            "historical": frozenset({old_hash}),
+        },
+    }
+    import unittest.mock
+
+    with unittest.mock.patch.object(install, "_HISTORICAL_ARTIFACT_HASHES", patched):
+        rc, output = _run_doctor(capsys)
+
+    assert rc == 1
+    lower = output.lower()
+    assert "stop hook" in lower
+    assert "refresh" in lower
+    assert "or keep it if you edited it intentionally" not in lower
+
+
 # ---------------------------------------------------------------------------
 # 6. hooks.Stop entry present.
 # ---------------------------------------------------------------------------
@@ -339,6 +373,35 @@ def test_doctor_flags_tampered_skill(
     assert "strata-worker" in lower
     assert "stale" in lower or "does not match" in lower
     assert "register" in lower
+
+
+def test_doctor_flags_stale_but_historical_skill_with_refresh_wording(
+    registered_project: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """Same stale-vs-edited distinction as the Stop hook, for skills."""
+    skill_md = registered_project / ".claude" / "skills" / "strata-worker" / "Skill.md"
+    old_content = "# An old shipped strata-worker skill\nOlder guidance.\n"
+    old_hash = __import__("hashlib").sha256(old_content.encode("utf-8")).hexdigest()
+    skill_md.write_text(old_content, encoding="utf-8")
+
+    real_hashes = install._HISTORICAL_ARTIFACT_HASHES  # noqa: SLF001
+    patched = {
+        **real_hashes,
+        "strata-worker": {
+            "current": real_hashes["strata-worker"]["current"],
+            "historical": frozenset({old_hash}),
+        },
+    }
+    import unittest.mock
+
+    with unittest.mock.patch.object(install, "_HISTORICAL_ARTIFACT_HASHES", patched):
+        rc, output = _run_doctor(capsys)
+
+    assert rc == 1
+    lower = output.lower()
+    assert "skill" in lower
+    assert "strata-worker" in lower
+    assert "run 'strata register' to refresh" in lower
 
 
 # ---------------------------------------------------------------------------

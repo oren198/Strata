@@ -96,6 +96,12 @@ from strata.install import (
     agents_md_present as _agents_md_present,
 )
 from strata.install import (
+    classify_hook_drift as _classify_hook_drift,
+)
+from strata.install import (
+    classify_skill_drift as _classify_skill_drift,
+)
+from strata.install import (
     codex_config_path as _codex_config_path,
 )
 from strata.install import (
@@ -136,6 +142,15 @@ from strata.install import (
 )
 from strata.install import (
     remove_stop_hook as _remove_stop_hook,
+)
+from strata.install import (
+    self_update_agents_md_block as _self_update_agents_md_block,
+)
+from strata.install import (
+    self_update_hook as _self_update_hook,
+)
+from strata.install import (
+    self_update_skill as _self_update_skill,
 )
 from strata.install import (
     skill_matches_shipped as _skill_matches_shipped,
@@ -1013,8 +1028,25 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             )
         )
     else:
-        matches = _hook_matches_shipped(hook_script)
-        if matches is False:
+        # Three-state drift, not just matches/doesn't: a "stale" script (an
+        # older shipped version the user never touched) gets pointed at
+        # `strata register` to self-update it; a genuinely "edited" one
+        # keeps the "restore or keep" wording, since overwriting it is a
+        # real, deliberate choice for the operator to make.
+        hook_status = _classify_hook_drift(hook_script)
+        if hook_status == "stale":
+            checks.append(
+                Check(
+                    name="Stop hook",
+                    kind="hard",
+                    passed=False,
+                    message=(
+                        "script present but does not match the shipped version (an older "
+                        "shipped version) — run 'strata register' to refresh it."
+                    ),
+                )
+            )
+        elif hook_status == "edited":
             checks.append(
                 Check(
                     name="Stop hook",
@@ -1028,7 +1060,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                 )
             )
         else:
-            note = "" if matches else " (shipped version unavailable to compare)"
+            note = "" if hook_status == "match" else " (shipped version unavailable to compare)"
             checks.append(
                 Check(
                     name="Stop hook",
@@ -1077,26 +1109,38 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
     # -----------------------------------------------------------------------
     # 7. Skills present AND matching the shipped version (drift detection,
-    # same semantics as the Stop-hook check: present-but-differs gets its own
-    # plain-language line; skill_matches_shipped returning None means the
-    # shipped reference couldn't be read, so — per its own docstring
-    # ("treat conservatively as leave it") — that skill counts as a pass).
+    # same three-state semantics as the Stop-hook check above: a
+    # stale-but-never-edited skill (an older shipped version) points at
+    # `strata register` to self-update it; a genuinely edited one keeps the
+    # "compare with --diff before deciding" wording, since register never
+    # overwrites it on its own. classify_skill_drift returning "unknown"
+    # means the shipped reference couldn't be read, so — same conservative
+    # "leave it" rule as before — that skill counts as a pass.
     # -----------------------------------------------------------------------
     claude_skills_dir = project_root / ".claude" / "skills"
     missing_skills: list[str] = []
+    stale_skills: list[str] = []
     mismatched_skills: list[str] = []
     for name in SKILL_NAMES:
         skill_md = claude_skills_dir / name / "Skill.md"
         if not skill_md.exists():
             missing_skills.append(name)
             continue
-        if _skill_matches_shipped(skill_md, name) is False:
+        skill_status = _classify_skill_drift(skill_md, name)
+        if skill_status == "stale":
+            stale_skills.append(name)
+        elif skill_status == "edited":
             mismatched_skills.append(name)
 
-    if missing_skills or mismatched_skills:
+    if missing_skills or stale_skills or mismatched_skills:
         problems = []
         if missing_skills:
             problems.append(f"missing: {', '.join(missing_skills)}")
+        if stale_skills:
+            problems.append(
+                f"stale (an older shipped version): {', '.join(stale_skills)} — run "
+                "'strata register' to refresh"
+            )
         if mismatched_skills:
             problems.append(
                 f"stale (does not match the shipped version): {', '.join(mismatched_skills)}"
@@ -2494,6 +2538,33 @@ def cmd_register(args: argparse.Namespace) -> int:
         rel = Path(path).relative_to(project_root) if Path(path).is_absolute() else Path(path)
         print(render_action_line(action, rel, diff_mode=diff_mode, skipped=skipped))
 
+    def _report_self_update(path: str | Path, status: str) -> None:
+        """Print the register line for a managed artifact's self-update status.
+
+        *status* is one of the three-state values ``strata.install``'s
+        ``classify_*_drift``/``self_update_*`` functions return, restricted
+        to the two register ever needs to report here (``"match"`` is
+        handled by the ordinary ``_act("skip", ...)`` line, same as today):
+
+        - ``"stale"``  — the installed copy matched an older shipped version
+          and was never hand-edited; self-updated to current shipped content
+          (or, in ``--diff`` mode, would be).
+        - ``"edited"`` / ``"unknown"`` — left in place, same as a plain skip,
+          plus a one-line note pointing at ``--diff`` so the operator can see
+          what shipped content it's now behind.
+        """
+        rel = Path(path).relative_to(project_root) if Path(path).is_absolute() else Path(path)
+        if status == "stale":
+            if diff_mode:
+                print(f"  [would update]  {rel} (shipped content changed)")
+            else:
+                print(f"  updated: {rel} (shipped content changed)")
+        elif status == "edited":
+            _act("kept", path, skipped=True)
+            print("    (differs from shipped — see strata register --diff)")
+        else:  # "unknown" — shipped reference unreadable; can't prove anything
+            _act("skip", path, skipped=True)
+
     if diff_mode:
         print(f"strata register --diff  (dry-run, no writes)\nProject root: {project_root}")
     else:
@@ -2597,24 +2668,43 @@ def cmd_register(args: argparse.Namespace) -> int:
         nonlocal settings_unreadable
 
         # -------------------------------------------------------------------
-        # Step 6: Copy canonical skills to .claude/skills/ (skip each if exists).
+        # Step 6: Copy canonical skills to .claude/skills/ (skip each if
+        # exists — unless it's stale-but-never-edited, in which case it's
+        # self-updated to the current shipped content; see
+        # strata.install._HISTORICAL_ARTIFACT_HASHES).
         # -------------------------------------------------------------------
         claude_skills_dir = project_root / ".claude" / "skills"
         skills_root = importlib.resources.files("strata") / "_skills"
         for skill_name in SKILL_NAMES:
             dest_skill_dir = claude_skills_dir / skill_name
-            copied = copy_skill(skills_root, skill_name, claude_skills_dir, dry_run=diff_mode)
-            _act("copied" if copied else "skip", dest_skill_dir, skipped=not copied)
+            skill_md = dest_skill_dir / "Skill.md"
+            if not dest_skill_dir.exists():
+                copied = copy_skill(skills_root, skill_name, claude_skills_dir, dry_run=diff_mode)
+                _act("copied" if copied else "skip", dest_skill_dir, skipped=not copied)
+                continue
+            status = _self_update_skill(skill_md, skill_name, dry_run=diff_mode)
+            if status == "match":
+                _act("skip", dest_skill_dir, skipped=True)
+            else:
+                _report_self_update(skill_md, status)
 
         # -------------------------------------------------------------------
-        # Step 6b: Copy the freshness Stop-hook script to .claude/hooks/ (issue #112).
-        # Additive like the skills — an existing script is kept.
+        # Step 6b: Copy the freshness Stop-hook script to .claude/hooks/
+        # (issue #112). Additive like the skills — an existing, unmodified
+        # script is self-updated the same way; a hand-edited one is kept.
         # -------------------------------------------------------------------
         claude_hooks_dir = project_root / ".claude" / "hooks"
         hooks_root = importlib.resources.files("strata") / "_hooks"
         dest_hook = claude_hooks_dir / _HOOK_SCRIPT_NAME
-        hook_copied = copy_hook(hooks_root, claude_hooks_dir, dry_run=diff_mode)
-        _act("copied" if hook_copied else "skip", dest_hook, skipped=not hook_copied)
+        if not dest_hook.exists():
+            hook_copied = copy_hook(hooks_root, claude_hooks_dir, dry_run=diff_mode)
+            _act("copied" if hook_copied else "skip", dest_hook, skipped=not hook_copied)
+        else:
+            hook_status = _self_update_hook(dest_hook, dry_run=diff_mode)
+            if hook_status == "match":
+                _act("skip", dest_hook, skipped=True)
+            else:
+                _report_self_update(dest_hook, hook_status)
 
         # -------------------------------------------------------------------
         # Step 7: Merge strata into .claude/settings.json — the mcpServers block and
@@ -2759,14 +2849,24 @@ def cmd_register(args: argparse.Namespace) -> int:
         # newline translation before it ever reaches the CRLF-preserving
         # merge logic (final fix wave, item 2).
         existing_agents_text = agents_md.read_bytes().decode("utf-8") if agents_md.exists() else ""
-        new_agents_text, agents_added = _merge_agents_md(existing_agents_text)
-        _act(
-            "merged strata into" if agents_added else "skip",
-            agents_md,
-            skipped=not agents_added,
-        )
-        if not diff_mode and agents_added:
-            agents_md.write_bytes(new_agents_text.encode("utf-8"))
+        if _agents_md_present(existing_agents_text):
+            # The marker's already there — this is a self-update check, not
+            # a fresh merge. Block-level (see classify_agents_md_drift):
+            # only the fenced <!-- strata:begin -->...<!-- strata:end -->
+            # block is compared/replaced, so user content outside the fence
+            # is never touched.
+            updated_text, agents_status = _self_update_agents_md_block(existing_agents_text)
+            if agents_status == "match":
+                _act("skip", agents_md, skipped=True)
+            else:
+                _report_self_update(agents_md, agents_status)
+                if agents_status == "stale" and not diff_mode:
+                    agents_md.write_bytes(updated_text.encode("utf-8"))
+        else:
+            new_agents_text, agents_added = _merge_agents_md(existing_agents_text)
+            _act("merged strata into", agents_md, skipped=False)
+            if not diff_mode and agents_added:
+                agents_md.write_bytes(new_agents_text.encode("utf-8"))
 
         single_scope, first_scope = _seeded_binding_hint()
         if single_scope:
