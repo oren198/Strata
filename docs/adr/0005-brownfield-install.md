@@ -348,3 +348,64 @@ Three feature branches off `dev`, stacked sequentially:
 **V1.2.1** = branches 1 + 2 (closes ADR 0004, adds preflight
 hygiene).
 **V1.3** = branch 3 (ADR 0005 in full — the brownfield install).
+
+---
+
+## Amendment — soft-start: the refusal travels in tool results, not just stderr (2026-08-29)
+
+**The incident.** Decision 5's refuse-to-start validation worked exactly as
+designed and still failed the user: a fleet with 2+ scopes and an unbound
+session (or an unknown scope, an impermissible skill, or a missing/invalid
+fleet) printed the aggregated, actionable error to stderr and called
+`sys.exit(1)`. Both Codex and Claude Code — the two harnesses this server
+actually runs inside — swallow a failed MCP server's stderr entirely. The
+human never sees "valid scopes are …"; they see only an opaque "MCP
+handshake failed." Decision 5 assumed a human reads stderr. Running inside
+an agent harness, nobody does.
+
+**The fix.** The MCP server always completes the handshake now. Every
+startup validation failure that used to call `sys.exit(1)` — unbound
+multi-scope, unknown scope, impermissible skill, missing/invalid fleet
+config, missing `.strata/config.toml` — is instead aggregated into a
+startup-failure list, exactly as before, and stored on the running server.
+`main()` no longer exits on a binding failure; `_validate_binding` returns
+the list instead of calling `sys.exit`.
+
+Every memory tool except `strata_bind` checks this state first
+(`_require_bound_or_elicit`, `strata/mcp/server.py`): while unresolved, it
+returns that same aggregated list as its error result, appended with the
+recovery instructions that used to only reach stderr — which scopes exist,
+and that `strata_bind(scope_id=...)` (or fixing the underlying env/config
+and calling it again) resolves the session with no restart. An agent
+working inside a harness that hides stderr now reads the refusal exactly
+where it already reads every other tool result.
+
+`strata_bind` — Decision 5's own runtime-rebind companion, added after this
+ADR's initial acceptance — is untouched by this gate and is *the* recovery
+path: it re-reads `fleet.yaml` through the same reloader every other call
+uses, so a fleet fixed (or created) after startup is bindable immediately,
+matching the "no restart required" property `strata_bind` already had.
+
+**What still exits.** Storage initialisation failures (an unwritable
+directory, a corrupt DB) still call `sys.exit(1)`. Decision 5's binding
+checks are all recoverable via `strata_bind` once the server is running;
+a storage layer that cannot be opened is not — there is no tool call that
+fixes a corrupt SQLite file, so refusing to start is still the right
+answer there. Single-scope auto-bind (Decision 5, checked before the
+unset-scope failure) is unchanged: it never produced a failure to begin
+with.
+
+**Companion change (same session): elicitation.** When a tool is called
+unbound and the fleet itself loads fine, the server now attempts one
+server-initiated MCP elicitation first — offering the caller a pick of the
+fleet's scopes — before falling back to the aggregated error above. See
+`_attempt_elicit_bind` in `strata/mcp/server.py`. Tolerant by construction:
+a client that lacks the elicitation capability, declines, cancels, or hits
+a transport error falls back silently to the same error result a harness
+without elicitation support gets. This is genuinely conditional on client
+support — as of this addendum, the two harnesses this server ships for
+(Codex, Claude Code) are not known to implement server-initiated MCP
+elicitation, so in practice this path is dormant there today and the
+aggregated error result (the fix above) is what actually reaches an agent
+in either harness; the elicitation attempt is there for any client that
+does support it, present or future, and costs nothing when it isn't.
