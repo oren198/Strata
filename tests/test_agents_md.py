@@ -227,6 +227,61 @@ def test_unregister_harness_codex_leaves_edited_agents_md_block_and_exits_1(
     assert remaining == edited  # left in place, untouched
 
 
+# The exact AGENTS.md managed block v1.10.0-v1.10.2 shipped (obtained via
+# `git show v1.10.2:src/strata/_templates/AGENTS-strata.md`) — the content a
+# project registered under one of those releases actually has on disk today.
+# Content, not just its hash, is needed here to reproduce the live bug
+# (round-4 unregister fix, bug B): a project registered under v1.10.2,
+# unregistered under a later release, had this exact block flagged
+# "edited — left in place" because it no longer matched the *current*
+# shipped block — even though it was never hand-edited.
+_AGENTS_MD_BLOCK_V1_10_2 = (
+    "<!-- strata:begin -->\n"
+    "## Strata memory\n\n"
+    "Strata is a shared memory layer this project's agents read from and write to\n"
+    "across sessions.\n\n"
+    "- **Read before working.** At the start of a session, pull your scope's\n"
+    "  perspective before you act on anything.\n"
+    "- **Contribute what the next agent needs.** A decision, a finding, a gap —\n"
+    "  write it back. Nothing you don't contribute survives past this session.\n"
+    "- **Expect the judge's verdict.** Every contribution is reviewed by that\n"
+    "  scope's manager before it counts as memory — propose freely, but the\n"
+    "  scope-manager decides what sticks.\n\n"
+    "Your scope and role identity are bound through environment variables\n"
+    "(`STRATA_AGENT_SCOPE`, `STRATA_AGENT_SKILL`, `STRATA_AGENT_SESSION_ID`) set\n"
+    "before this session starts — do not hardcode them.\n"
+    "<!-- strata:end -->\n"
+)
+
+
+def test_agents_md_v1_10_2_fixture_matches_the_pinned_historical_hash() -> None:
+    """Guards the literal fixture above against a transcription mistake."""
+    import hashlib
+
+    digest = hashlib.sha256(_AGENTS_MD_BLOCK_V1_10_2.encode("utf-8")).hexdigest()
+    assert digest in install._historical_hashes("agents-md")  # noqa: SLF001
+
+
+def test_remove_agents_md_removes_historical_shipped_block() -> None:
+    """A block matching a historical shipped version is OURS, not edited."""
+    existing = "# My Project\n\n" + "\n" + _AGENTS_MD_BLOCK_V1_10_2
+    new_text, status = install.remove_agents_md(existing)
+    assert status == "removed"
+    assert new_text == "# My Project\n\n"
+
+
+def test_unregister_harness_codex_removes_historical_agents_md_block_exit_0(
+    tmp_path: Path, codex_home: Path
+) -> None:
+    """A project registered under v1.10.2 unregisters cleanly under current code."""
+    _init_project(tmp_path)
+    agents_md = tmp_path / "AGENTS.md"
+    agents_md.write_text(_AGENTS_MD_BLOCK_V1_10_2, encoding="utf-8")
+
+    assert _unregister(tmp_path, harness="codex") == 0
+    assert install.AGENTS_MD_MARKER not in agents_md.read_text(encoding="utf-8")
+
+
 def test_unregister_harness_codex_agents_md_absent_is_noop(
     tmp_path: Path, codex_home: Path
 ) -> None:
