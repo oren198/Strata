@@ -19,6 +19,8 @@ broken in an otherwise fully-registered project:
 7. skills present
 8. binding env vars (STRATA_AGENT_SCOPE / _SKILL / _SESSION_ID) set and
    valid against the fleet
+9. judge key (JUDGE_API_KEY / ANTHROPIC_API_KEY) resolvable — soft, never
+   flips the exit code (see tests/test_register_judge_key.py)
 
 Vocabulary: scope, fleet, skill, scope-manager.
 """
@@ -35,6 +37,24 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from strata.__main__ import cmd_doctor, cmd_register
+
+# ---------------------------------------------------------------------------
+# Isolation: clear judge/anthropic key env vars so the new "Judge key" check
+# (and register's own end-of-run note) behave the same regardless of
+# whoever's shell runs this suite.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _clear_judge_key_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    for var in (
+        "JUDGE_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "STRATA_JUDGE_API_KEY",
+        "STRATA_ANTHROPIC_API_KEY",
+    ):
+        monkeypatch.delenv(var, raising=False)
+
 
 # ---------------------------------------------------------------------------
 # Fixture: a fully-registered, fully-bound project — every check passes.

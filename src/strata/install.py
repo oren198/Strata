@@ -79,6 +79,8 @@ __all__ = [
     "agents_md_present",
     "merge_agents_md",
     "remove_agents_md",
+    "gitignore_covers_dotenv",
+    "write_env_judge_key",
 ]
 
 # ---------------------------------------------------------------------------
@@ -135,6 +137,7 @@ GITIGNORE_BLOCK = """\
 .strata/.venv/
 .strata/strata.db*
 .strata/summaries/
+.env
 # fleet.yaml is intentionally NOT listed above — commit it (it is your team's org chart).
 """
 
@@ -933,3 +936,73 @@ def read_default_harness_from_text(config_text: str) -> str | None:
         return None
     value = launch.get("default_harness")
     return value if isinstance(value, str) else None
+
+
+# ---------------------------------------------------------------------------
+# .env — judge key capture (register's end-of-run prompt).
+#
+# GITIGNORE_BLOCK above already lists `.env` (safety gate: a key must never
+# land in a project whose .gitignore does not cover it). This section is
+# defense in depth for a project registered *before* that line existed, or
+# one where a user's own .gitignore edit dropped it: the write still
+# happens (skipping it would strand the operator worse than a warning
+# would), but the caller is expected to check `gitignore_covers_dotenv`
+# first and warn loudly when it returns False.
+# ---------------------------------------------------------------------------
+
+#: Matches a `JUDGE_API_KEY=` or `ANTHROPIC_API_KEY=` assignment line (bare or
+#: STRATA_-prefixed), so an existing line under either spelling is replaced
+#: in place rather than growing a duplicate. Anchored so a commented-out line
+#: (`# JUDGE_API_KEY=...`) is left alone.
+_ENV_JUDGE_KEY_LINE_RE = re.compile(r"^(?:STRATA_)?(?:JUDGE_API_KEY|ANTHROPIC_API_KEY)=")
+
+
+def gitignore_covers_dotenv(gitignore_text: str) -> bool:
+    """Return ``True`` if *gitignore_text* has a line that ignores ``.env`` exactly.
+
+    A plain ``.env`` line (register's own GITIGNORE_BLOCK writes exactly
+    this) is matched; a pattern that merely happens to contain the
+    substring ``.env`` (e.g. a comment) is not — each line is matched
+    whole, after stripping surrounding whitespace. A broader pattern that
+    still covers ``.env`` (``*.env``, ``.env*``, a ``**``-glob) returns
+    ``False`` here — a known, accepted false-negative (spurious warning,
+    caller-side): the check is deliberately exact-line, not a glob matcher,
+    so it never mistakes an unrelated pattern for coverage it doesn't
+    actually provide.
+    """
+    return any(line.strip() == ".env" for line in gitignore_text.splitlines())
+
+
+def write_env_judge_key(env_path: Path, key: str) -> str:
+    """Write ``JUDGE_API_KEY=<key>`` into *env_path*, preserving everything else.
+
+    - If *env_path* does not exist, it is created with just this one line.
+    - If it exists and already has a line setting ``JUDGE_API_KEY`` or
+      ``ANTHROPIC_API_KEY`` (either spelling), that line is replaced in
+      place with the new ``JUDGE_API_KEY=<key>`` line — never duplicated.
+    - Otherwise the new line is appended, adding a newline first only if
+      the file doesn't already end with one.
+
+    All other content is preserved byte-for-byte (read and written with
+    explicit ``encoding="utf-8"`` and no newline translation on either
+    end). Returns ``"created"``, ``"replaced"``, or ``"appended"``.
+    """
+    new_line = f"JUDGE_API_KEY={key}"
+
+    if not env_path.exists():
+        env_path.write_bytes((new_line + "\n").encode("utf-8"))
+        return "created"
+
+    existing = env_path.read_bytes().decode("utf-8")
+    lines = existing.split("\n")
+    for i, line in enumerate(lines):
+        if _ENV_JUDGE_KEY_LINE_RE.match(line.strip()):
+            lines[i] = new_line
+            env_path.write_bytes("\n".join(lines).encode("utf-8"))
+            return "replaced"
+
+    prefix = existing
+    if prefix and not prefix.endswith("\n"):
+        prefix += "\n"
+    env_path.write_bytes((prefix + new_line + "\n").encode("utf-8"))
+    return "appended"
