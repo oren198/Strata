@@ -2736,3 +2736,197 @@ def test_read_contribution_refuses_a_contribution_outside_the_entitled_surface(
         pytest.raises(RuntimeError, match="outside your entitled surface"),
     ):
         mod.strata_read_contribution(peer_contribution)
+
+
+# ---------------------------------------------------------------------------
+# Feature A: lazy fleet reload (MCP side) — the reloader shared with the
+# FastAPI backend (strata.fleet_reload.FleetReloader). An invalid edit must
+# not break every subsequent tool call; it must keep serving the last good
+# fleet and surface a notice in tool output.
+# ---------------------------------------------------------------------------
+
+
+def test_list_scopes_no_reparse_when_fleet_yaml_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two calls with no file change between them must reload fleet.yaml only once."""
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fleet_yaml(tmp_path)
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+
+    # First call primes the reloader's cache.
+    mod.strata_list_scopes()
+
+    calls = 0
+    real_load = FleetConfig.load.__func__
+
+    def counting_load(cls, path):
+        nonlocal calls
+        calls += 1
+        return real_load(cls, path)
+
+    monkeypatch.setattr(FleetConfig, "load", classmethod(counting_load))
+
+    mod.strata_list_scopes()
+    mod.strata_list_scopes()
+    assert calls == 0, "unchanged fleet.yaml must not be re-parsed"
+
+
+def test_invalid_fleet_edit_keeps_serving_last_good_fleet_with_notice(tmp_path: Path) -> None:
+    """An invalid mid-session edit must not break every subsequent tool call."""
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fleet_yaml(tmp_path)
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+
+    good = mod.strata_list_scopes()
+    assert "fleet_notice" not in good
+    good_scope_ids = {s["id"] for s in good["scopes"]}
+
+    # Corrupt fleet.yaml: scope references an undefined stratum.
+    fleet_path.write_text(
+        "strata:\n  - id: L0\n    name: exec\n    ordinal: 0\n"
+        "scopes:\n  - id: g_arch\n    name: bad\n    stratum_id: NOPE\n"
+        "edges: []\n",
+        encoding="utf-8",
+    )
+
+    served = mod.strata_list_scopes()
+    served_scope_ids = {s["id"] for s in served["scopes"]}
+    assert served_scope_ids == good_scope_ids, "invalid edit must keep serving the last good fleet"
+    assert "fleet_notice" in served
+    assert "fleet.yaml" in served["fleet_notice"]
+
+
+# ---------------------------------------------------------------------------
+# Feature B: strata_bind — rebind this session to a different scope at
+# runtime, sharing Feature A's reload path so a scope added after server
+# init is bindable without a restart (the exact incident this closes).
+# ---------------------------------------------------------------------------
+
+
+def test_bind_to_scope_added_after_server_init_succeeds(tmp_path: Path) -> None:
+    """The incident: a scope added to fleet.yaml after the server started must be bindable."""
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fleet_yaml(tmp_path)
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+    with patch.object(mod, "_AGENT_SCOPE", "g_backend"):
+        # g_new does not exist yet — binding to it now must fail.
+        with pytest.raises(RuntimeError, match="not found"):
+            mod.strata_bind(scope_id="g_new")
+
+        # Add the scope to fleet.yaml out of band (no server restart).
+        raw = yaml.safe_load(fleet_path.read_text(encoding="utf-8"))
+        raw["scopes"].append({"id": "g_new", "name": "New Scope", "stratum_id": "L1"})
+        fleet_path.write_text(yaml.dump(raw, default_flow_style=False), encoding="utf-8")
+
+        result = mod.strata_bind(scope_id="g_new")
+
+        assert result["scope_id"] == "g_new"
+        assert mod._AGENT_SCOPE == "g_new"
+
+
+def test_bind_to_nonexistent_scope_lists_valid_scopes_and_leaves_binding_intact(
+    tmp_path: Path,
+) -> None:
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fleet_yaml(tmp_path)
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+    with patch.object(mod, "_AGENT_SCOPE", "g_backend"), patch.object(mod, "_AGENT_SKILL", None):
+        with pytest.raises(RuntimeError) as exc_info:
+            mod.strata_bind(scope_id="g_does_not_exist")
+
+        message = str(exc_info.value)
+        assert "g_arch" in message
+        assert "g_backend" in message
+        # Binding must be completely unchanged after a refused bind.
+        assert mod._AGENT_SCOPE == "g_backend"
+        assert mod._AGENT_SKILL is None
+
+
+def test_bind_enforces_skill_permission(tmp_path: Path) -> None:
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet = {
+        "strata": [{"id": "L0", "name": "exec", "ordinal": 0}],
+        "scopes": [
+            {
+                "id": "g_restricted",
+                "name": "Restricted",
+                "stratum_id": "L0",
+                "permitted_skills": ["strata-developer"],
+            }
+        ],
+        "edges": [],
+    }
+    fleet_path = tmp_path / "fleet.yaml"
+    fleet_path.write_text(yaml.dump(fleet, default_flow_style=False), encoding="utf-8")
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+    with patch.object(mod, "_AGENT_SCOPE", ""), patch.object(mod, "_AGENT_SKILL", None):
+        with pytest.raises(RuntimeError, match="permitted skills"):
+            mod.strata_bind(scope_id="g_restricted", skill="not-allowed")
+
+        result = mod.strata_bind(scope_id="g_restricted", skill="strata-developer")
+        assert result["skill"] == "strata-developer"
+        assert mod._AGENT_SKILL == "strata-developer"
+
+
+def test_bind_leaves_session_id_unchanged(tmp_path: Path) -> None:
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fleet_yaml(tmp_path)
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+    with (
+        patch.object(mod, "_AGENT_SCOPE", "g_backend"),
+        patch.object(mod, "_AGENT_SESSION_ID", "sess_stable"),
+    ):
+        result = mod.strata_bind(scope_id="g_arch")
+
+        assert result["session_id"] == "sess_stable"
+        assert mod._AGENT_SESSION_ID == "sess_stable"
+
+
+def test_contribution_after_bind_carries_new_scope_in_provenance(tmp_path: Path) -> None:
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fleet_yaml(tmp_path)
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+
+    fake_judgment = ScopeManagerJudgment(
+        decision="accept_as_context",
+        reasoning="fine",
+        new_summary=_make_summary("g_arch", "updated"),
+    )
+
+    with (
+        patch.object(mod, "_AGENT_SCOPE", "g_backend"),
+        patch.object(mod, "_AGENT_SKILL", "strata-developer"),
+        patch.object(mod, "_AGENT_SESSION_ID", "sess_bind_test"),
+        patch("strata.scope_manager.ScopeManager.judge", return_value=fake_judgment),
+        patch("anthropic.Anthropic", return_value=MagicMock()),
+    ):
+        bind_result = mod.strata_bind(scope_id="g_arch")
+        assert bind_result["scope_id"] == "g_arch"
+        assert mod._AGENT_SCOPE == "g_arch"
+
+        mod.strata_contribute(
+            scope_id="g_arch",
+            content="Bound to g_arch and contributing.",
+            proposed_classification="context",
+        )
+
+    with RecordStore(db_path) as rs:
+        contributions = rs.list_contributions(scope_id="g_arch")
+    assert len(contributions) == 1
+    assert contributions[0].contributor.scope_id == "g_arch"
+    assert contributions[0].contributor.session_id == "sess_bind_test"
