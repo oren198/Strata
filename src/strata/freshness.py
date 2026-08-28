@@ -645,10 +645,22 @@ def _submit_judged_contribution(
 
     # Single-scope auto-bind (same rule as strata.mcp.server._validate_binding
     # — both read STRATA_AGENT_SCOPE from the process environment and load
-    # the same fleet.yaml from disk, so the two land on the identical
-    # decision deterministically without any IPC between them). An unset or
-    # empty-string scope against a single-scope fleet binds to it, and its
-    # default_skill fills in an unset/empty skill the same way.
+    # the same fleet.yaml from disk). This still lands on the identical
+    # decision deterministically as the MCP session's STARTUP binding, without
+    # any IPC between them.
+    #
+    # It does NOT track a strata_bind rebind, though (ADR 0002 addendum): a
+    # strata_bind call only swaps the MCP server process's in-memory
+    # (scope, skill) globals — it never touches STRATA_AGENT_SCOPE/
+    # STRATA_AGENT_SKILL in this evaluator's environment, which is a separate,
+    # detached process spawned per Stop hook. So after a rebind, this
+    # evaluator keeps scoring freshness against the session's ORIGINAL
+    # startup binding until the session (and its env) is replaced by a
+    # restart — a real, accepted divergence, not a bug: fixing it would mean
+    # persisting the rebind somewhere this out-of-process evaluator can read
+    # it, which is out of scope for this addendum. An unset or empty-string
+    # scope against a single-scope fleet binds to it, and its default_skill
+    # fills in an unset/empty skill the same way.
     if not scope_id:
         sole = fleet.auto_bind_scope()
         if sole is not None:

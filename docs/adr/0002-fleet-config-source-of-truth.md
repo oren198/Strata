@@ -270,7 +270,13 @@ a scope added moments ago is immediately bindable — closing the
 incident above without a restart. An **unchanged** binding stays valid
 across a reload exactly as before: this addendum only removes the
 "stuck with the startup snapshot" failure mode, it does not add any new
-invalidation of a binding nobody asked to change.
+invalidation of a binding nobody asked to change. A `strata_bind` rebind
+is scoped to that one MCP session's in-process globals only — it does not
+persist anywhere an out-of-process reader could see, so the freshness
+Stop-hook evaluator (`strata.freshness`), which resolves its own binding
+from `STRATA_AGENT_SCOPE`/`STRATA_AGENT_SKILL` in a freshly spawned
+process's environment, keeps scoring against the session's original
+startup binding until the session restarts with a new environment.
 
 `fleet.yaml` remains the single source of truth (Decision above,
 unchanged) — this addendum only changes how promptly the in-memory

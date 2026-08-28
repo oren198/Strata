@@ -1192,7 +1192,12 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
         take" instead of silently stale data.
         """
         reloader: FleetReloader = request.app.state.fleet_reloader
-        fleet: FleetConfig = reloader.get()
+        # get_with_warning() rather than get()-then-.warning: the two-step
+        # form is not atomic under concurrent requests (another request could
+        # trigger a reload in between and change .warning out from under this
+        # one) — get_with_warning() returns the (fleet, warning) pair from a
+        # single lock acquisition.
+        fleet, warning = reloader.get_with_warning()
 
         active = fleet.active_scopes()
         # Edges involving only active scopes.
@@ -1209,7 +1214,7 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
                 {"from_scope_id": e.from_, "to_scope_id": e.to, "kind": e.kind}
                 for e in active_edges
             ],
-            "fleet_file_warning": reloader.warning,
+            "fleet_file_warning": warning,
         }
 
     # -----------------------------------------------------------------------

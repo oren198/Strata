@@ -328,6 +328,59 @@ def test_unknown_scope_message_lists_available_scopes(tmp_path: Path, capsys) ->
 
 
 # ---------------------------------------------------------------------------
+# Condition 3 (review follow-up): an archived scope cannot be bound at
+# startup either — the SAME rule strata_bind enforces (Feature B), via the
+# shared _check_scope_exists(require_active=True) helper, not a rule that
+# only strata_bind knows about.
+# ---------------------------------------------------------------------------
+
+
+def _make_fleet_with_archived_scope(tmp_path: Path) -> FleetConfig:
+    data = {
+        "strata": [{"id": "L0", "name": "root", "ordinal": 0}],
+        "scopes": [
+            {"id": "g_root", "name": "Root", "stratum_id": "L0", "status": "archived"},
+            {"id": "g_active", "name": "Active", "stratum_id": "L0"},
+        ],
+        "edges": [],
+    }
+    fleet_path = tmp_path / "fleet.yaml"
+    fleet_path.write_text(yaml.dump(data), encoding="utf-8")
+    return FleetConfig.load(fleet_path)
+
+
+def test_archived_scope_exits_with_message(tmp_path: Path) -> None:
+    """An archived scope must be refused at startup, exactly like strata_bind refuses it."""
+    fleet = _make_fleet_with_archived_scope(tmp_path)
+
+    with pytest.raises(SystemExit) as exc_info:
+        _validate_binding(
+            fleet,
+            scope="g_root",
+            skill=None,
+            project_config_found=True,
+        )
+
+    assert exc_info.value.code == 1
+
+
+def test_archived_scope_message_names_it_archived_and_lists_active(tmp_path: Path, capsys) -> None:
+    fleet = _make_fleet_with_archived_scope(tmp_path)
+
+    with pytest.raises(SystemExit):
+        _validate_binding(
+            fleet,
+            scope="g_root",
+            skill=None,
+            project_config_found=True,
+        )
+
+    captured = capsys.readouterr()
+    assert "archived" in captured.err
+    assert "g_active" in captured.err
+
+
+# ---------------------------------------------------------------------------
 # Condition 4a: STRATA_AGENT_SKILL not set → exit(1)
 # ---------------------------------------------------------------------------
 
