@@ -194,3 +194,64 @@ def test_file_appearing_after_missing_is_picked_up(tmp_path: Path) -> None:
     _write_fleet(fleet_path, ["g_a"])
     loaded = reloader.get()
     assert {s.id for s in loaded.scopes} == {"g_a"}
+
+
+def test_file_deleted_after_good_load_keeps_serving_and_sets_warning(tmp_path: Path) -> None:
+    """Deletion is a reload-time failure like any other — not a silent fallback."""
+    fleet_path = tmp_path / "fleet.yaml"
+    _write_fleet(fleet_path, ["g_a"])
+
+    reloader = FleetReloader(fleet_path)
+    good = reloader.get()
+    assert reloader.warning is None
+
+    fleet_path.unlink()
+
+    served = reloader.get()
+    assert served is good
+    assert {s.id for s in served.scopes} == {"g_a"}
+    assert reloader.warning is not None
+    assert "fleet.yaml" in reloader.warning
+
+
+def test_missing_file_from_the_start_sets_no_warning(tmp_path: Path) -> None:
+    """A fleet.yaml that never existed is a normal empty-fleet case, not a failure."""
+    fleet_path = tmp_path / "does_not_exist.yaml"
+    reloader = FleetReloader(fleet_path)
+    reloader.get()
+    assert reloader.warning is None
+
+
+# ---------------------------------------------------------------------------
+# Atomic (fleet, warning) pairs
+# ---------------------------------------------------------------------------
+
+
+def test_get_with_warning_returns_atomic_pair_on_success(tmp_path: Path) -> None:
+    fleet_path = tmp_path / "fleet.yaml"
+    _write_fleet(fleet_path, ["g_a"])
+
+    reloader = FleetReloader(fleet_path)
+    fleet, warning = reloader.get_with_warning()
+    assert {s.id for s in fleet.scopes} == {"g_a"}
+    assert warning is None
+
+
+def test_get_with_warning_returns_atomic_pair_on_failed_reload(tmp_path: Path) -> None:
+    fleet_path = tmp_path / "fleet.yaml"
+    _write_fleet(fleet_path, ["g_a"])
+
+    reloader = FleetReloader(fleet_path)
+    good, _ = reloader.get_with_warning()
+
+    raw = {
+        "strata": [{"id": "L0", "name": "top", "ordinal": 0}],
+        "scopes": [{"id": "g_a", "name": "g_a", "stratum_id": "NOPE"}],
+        "edges": [],
+    }
+    fleet_path.write_text(yaml.dump(raw, default_flow_style=False), encoding="utf-8")
+
+    fleet, warning = reloader.get_with_warning()
+    assert fleet is good
+    assert warning is not None
+    assert warning == reloader.warning
