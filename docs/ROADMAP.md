@@ -71,8 +71,10 @@ Nothing else here. Look forward.
   judgment; lazy ancestor refresh keeps stale summaries from compounding.
 - Delivered alongside: embedded mode (MCP server operates on the stores
   in-process; the backend is Console-UI-only), and brownfield install
-  (`strata register`, `.strata/config.toml`, refuse-to-start binding
-  validation).
+  (`strata register`, `.strata/config.toml`, soft-start binding validation
+  — an unresolved binding no longer exits the process; the server starts
+  and gates memory tools with an actionable error, recoverable via
+  `strata_bind`, until it's resolved).
 
 **Read side remaining** — the perspective itself is still concatenation,
 not selection: every ancestor layer arrives whole, and context is not

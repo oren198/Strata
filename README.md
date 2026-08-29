@@ -910,7 +910,7 @@ server (project config wins):
 | `STRATA_DB_PATH` | `./strata.db` | SQLite path for the record store (overridden by `config.toml`) |
 | `STRATA_SUMMARIES_DIR` | `./summaries` | Directory for per-scope summary files (overridden by `config.toml`) |
 | `STRATA_FLEET_CONFIG` | `./fleet.yaml` | Fleet YAML (overridden by `config.toml`) |
-| `STRATA_AGENT_SCOPE` | (auto-bind) | The scope this session acts at. Required only when the fleet has 2+ scopes — with exactly one scope, an unset (or empty-string) value auto-binds to it and the server refuses to start only if the fleet has zero or 2+ scopes |
+| `STRATA_AGENT_SCOPE` | (auto-bind) | The scope this session acts at. Required only when the fleet has 2+ scopes — with exactly one scope, an unset (or empty-string) value auto-binds to it. With zero or 2+ scopes and this unset, the server still starts (soft-start): every memory tool returns an actionable error until bound via `strata_bind`, or the process is restarted with this set |
 | `STRATA_AGENT_SKILL` | (optional) | The skill identifier for provenance — required only when the scope declares `default_skill`/`permitted_skills` in `fleet.yaml`, unless the scope was auto-bound, in which case its `default_skill` fills this in when unset |
 | `STRATA_AGENT_SESSION_ID` | (auto) | Session identifier. Absent or empty-string resolves to the deterministic `sess_auto_<parent pid>` (the freshness Stop hook resolves the same fallback independently — see [Memory-freshness Stop-hook](#memory-freshness-stop-hook)) |
 | `JUDGE_API_KEY` | (unset) | The judge's API key. `STRATA_JUDGE_API_KEY` also works and wins if both are set. Works against any endpoint that speaks the Anthropic Messages API. |
@@ -1028,8 +1028,10 @@ The backend is only required if you want the browser Console UI at
 
 After running `strata register`, `.claude/settings.json` already contains the
 correct `mcpServers.strata` entry. **This applies to the Strata repo itself
-too**: the MCP server refuses to start without a discoverable
-`.strata/config.toml` (ADR 0005 D5), so for developing on Strata run
+too**: without a discoverable `.strata/config.toml` the MCP server still
+starts (soft-start, ADR 0005 D5 dated addendum), but every memory tool stays
+gated with an actionable error naming the missing config until one exists
+and the server is restarted — so for developing on Strata run
 `strata register` once from the repo root — it is strictly additive, and the
 created `.strata/` workspace is gitignored. The settings entry it merges is:
 
@@ -1052,9 +1054,10 @@ from `.strata/config.toml`.
 
 `STRATA_AGENT_SKILL` is a skill identifier recorded in provenance and
 **validated against the scope's `permitted_skills`** in `fleet.yaml` (when
-that list is set, the MCP server refuses to start on a mismatch). It does
-not select a Claude Code skill file — **the same generic CC skill
-(`strata-worker`) works for any role at any scope**.
+that list is set and there's a mismatch, the server still starts — soft-start
+— but every memory tool stays gated until bound to a permitted skill via
+`strata_bind`). It does not select a Claude Code skill file — **the same
+generic CC skill (`strata-worker`) works for any role at any scope**.
 
 ### 3. Invoke a skill
 
