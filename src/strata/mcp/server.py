@@ -884,13 +884,15 @@ def _validate_binding(
         if fleet is not None:
             available = [s.id for s in fleet.active_scopes()]
             if available:
-                available_line = f"  Available scope IDs: {', '.join(available)}.\n"
+                available_line = f"  Available scopes: {', '.join(available)}.\n"
         binding_errors.append(
             "STRATA_AGENT_SCOPE is not set.\n"
             f"{available_line}"
-            "  Call strata_bind(scope_id=<one of the above>) to bind this session now, "
-            "or restart the server with STRATA_AGENT_SCOPE/STRATA_AGENT_SKILL set in its "
-            "environment (this is read once, at process start).\n"
+            "  Ask the user which scope this session should act as, then call "
+            "strata_bind with their choice — do not pick one yourself; binding "
+            "decides whose memory this session reads and writes. (Alternatively "
+            "the server can be restarted with STRATA_AGENT_SCOPE/STRATA_AGENT_SKILL "
+            "set in its environment — read once, at process start.)\n"
             "  See README.md § 'Quick Start for an existing project' for the full setup."
         )
 
@@ -915,9 +917,11 @@ def _validate_binding(
     if not resolved_skill and not scope_waives_skill:
         binding_errors.append(
             "STRATA_AGENT_SKILL is not set.\n"
-            "  Call strata_bind(scope_id=..., skill=<skill_name>) to bind this session "
-            "now, or restart the server with STRATA_AGENT_SCOPE/STRATA_AGENT_SKILL set "
-            "in its environment.\n"
+            "  Ask the user which scope (and skill, if they have one in mind) this "
+            "session should act as, then call strata_bind with their choice — do "
+            "not pick one yourself. (Alternatively the server can be restarted "
+            "with STRATA_AGENT_SCOPE/STRATA_AGENT_SKILL set in its environment — "
+            "read once, at process start.)\n"
             "  (A skill is optional when the scope declares none.)\n"
             "  See README.md § 'Quick Start for an existing project' for the full setup."
         )

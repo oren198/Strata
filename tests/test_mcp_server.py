@@ -3321,11 +3321,19 @@ async def test_reworded_bind_texts_route_through_the_user(tmp_path: Path) -> Non
         listing = mod.strata_list_scopes()
     assert "ask the user" in _normalize(listing["unbound_notice"])
 
-    # 2. The gated-tool unresolved error text (_unresolved_message).
+    # 2. The gated-tool unresolved error text (_unresolved_message) — the
+    # REAL per-failure strings _validate_binding builds, not a hand-written
+    # stand-in. A stand-in here is exactly what let the live-session
+    # finding slip past this guard originally: _validate_binding's own
+    # "STRATA_AGENT_SCOPE/SKILL is not set" items carried their own
+    # self-bind instruction, independent of _unresolved_message's wrapper
+    # text around them.
     with (
         patch.object(mod, "_AGENT_SCOPE", ""),
         patch.object(mod, "_UNRESOLVED", True),
-        patch.object(mod, "_STARTUP_ERRORS_BINDING", ["STRATA_AGENT_SCOPE is not set."]),
+        patch.object(
+            mod, "_STARTUP_ERRORS_BINDING", _validate_binding_scope_and_skill_errors(fleet)
+        ),
         patch.object(mod, "_load_fleet", return_value=fleet),
         pytest.raises(RuntimeError) as exc_info,
     ):
@@ -3670,6 +3678,67 @@ def _validate_binding_skill_error(fleet: FleetConfig) -> list[str]:
     return binding_errors
 
 
+def _validate_binding_scope_and_skill_errors(fleet: FleetConfig) -> list[str]:
+    """Build the real binding_errors list for BOTH STRATA_AGENT_SCOPE and
+    STRATA_AGENT_SKILL unset at once — the exact two-item shape from the
+    live-session finding ("[1] STRATA_AGENT_SCOPE is not set. ... [2]
+    STRATA_AGENT_SKILL is not set. ..."), so the guard test below exercises
+    the actual per-failure strings _validate_binding builds, not
+    hand-written stand-ins."""
+    from strata.mcp.server import _validate_binding
+
+    _scope, _skill, _config_errors, binding_errors = _validate_binding(
+        fleet,
+        scope="",
+        skill="",
+        project_config_found=True,
+    )
+    return binding_errors
+
+
+async def test_startup_validator_error_items_route_through_the_user(tmp_path: Path) -> None:
+    """Live-session finding: the per-failure strings _validate_binding
+    builds for an unset STRATA_AGENT_SCOPE and an unset STRATA_AGENT_SKILL
+    still read "Call strata_bind(scope_id=<one of the above>) to bind this
+    session now" / "Call strata_bind(scope_id=..., skill=...) to bind this
+    session now" — self-bind instructions that slipped past the earlier
+    rewording rounds because the existing guard test
+    (test_reworded_bind_texts_route_through_the_user) exercised a
+    hand-written stand-in string, never the real validator output.
+
+    This drives the REAL _validate_binding output — both failures at
+    once, matching the exact two-item shape the operator saw — through an
+    actual gated tool call, and asserts on the EXACT rendered surface: the
+    full error text contains "ask the user" (case-insensitive), and never
+    carries the old self-serve phrasing.
+    """
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fleet_yaml(tmp_path)  # g_arch, g_backend
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+    fleet = FleetConfig.load(fleet_path)
+    binding_errors = _validate_binding_scope_and_skill_errors(fleet)
+    assert len(binding_errors) == 2, "expected both the scope- and skill-unset items"
+
+    with (
+        patch.object(mod, "_AGENT_SCOPE", ""),
+        patch.object(mod, "_UNRESOLVED", True),
+        patch.object(mod, "_STARTUP_ERRORS_BINDING", binding_errors),
+        patch.object(mod, "_load_fleet", return_value=fleet),
+        pytest.raises(RuntimeError) as exc_info,
+    ):
+        await mod.strata_read_perspective()
+
+    rendered = _normalize(str(exc_info.value))
+    assert "ask the user" in rendered
+    # The exact self-serve phrasing the operator saw, gone from the
+    # rendered surface — not just softened elsewhere in the message.
+    assert "to bind this session now" not in rendered
+    assert "call strata_bind(scope_id=<one of the above>)" not in rendered
+    assert "call strata_bind(scope_id=..., skill=" not in rendered
+
+
 async def test_unbound_tool_call_raises_for_every_memory_tool_but_bind(tmp_path: Path) -> None:
     """Every memory tool but strata_bind is gated — not just one of them."""
     db_path = _make_db(tmp_path)
@@ -3913,6 +3982,76 @@ async def test_elicitation_accept_binds_and_continues_original_call(tmp_path: Pa
         assert result.isError is not True
         assert mod._AGENT_SCOPE == "g_backend"
         assert mod._UNRESOLVED is False
+
+
+async def test_elicitation_scope_pick_prompt_routes_through_the_user(tmp_path: Path) -> None:
+    """Item 3 re-verification: the scope-pick elicitation prompt sent to
+    the client (Change 2, _attempt_elicit_bind) must still frame this as a
+    question for the user, not an instruction the agent could satisfy on
+    its own judgment — captured and asserted on directly, not just eyeballed
+    in source, so a future edit can't silently drop the framing again."""
+    from mcp.shared.memory import create_connected_server_and_client_session
+
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fleet_yaml(tmp_path)  # g_arch, g_backend
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+    captured_messages: list[str] = []
+
+    async def _capture_and_decline(context, params):
+        captured_messages.append(params.message)
+        from mcp import types as mcp_types
+
+        return mcp_types.ElicitResult(action="decline")
+
+    with (
+        patch.object(mod, "_AGENT_SCOPE", ""),
+        patch.object(mod, "_UNRESOLVED", True),
+        patch.object(mod, "_STARTUP_ERRORS_BINDING", ["STRATA_AGENT_SCOPE is not set."]),
+    ):
+        async with create_connected_server_and_client_session(
+            mod.mcp, elicitation_callback=_capture_and_decline
+        ) as client:
+            await client.call_tool("strata_read_perspective", {})
+
+    assert captured_messages, "expected the elicitation prompt to have been sent"
+    assert "ask the user" in captured_messages[0].lower()
+
+
+async def test_elicitation_switch_confirm_prompt_is_a_direct_question(tmp_path: Path) -> None:
+    """Item 3 re-verification: the switch-confirmation elicitation prompt
+    (_attempt_elicit_switch_confirm) IS the ask-the-user mechanism itself —
+    it should read as a direct yes/no question to whoever answers it, never
+    as an instruction the agent could resolve on its own."""
+    from mcp.shared.memory import create_connected_server_and_client_session
+
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fleet_yaml(tmp_path)  # g_arch, g_backend
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+    captured_messages: list[str] = []
+
+    async def _capture_and_confirm(context, params):
+        captured_messages.append(params.message)
+        from mcp import types as mcp_types
+
+        return mcp_types.ElicitResult(action="accept", content={"confirm": True})
+
+    with patch.object(mod, "_AGENT_SCOPE", "g_arch"), patch.object(mod, "_AGENT_SKILL", None):
+        async with create_connected_server_and_client_session(
+            mod.mcp, elicitation_callback=_capture_and_confirm
+        ) as client:
+            await client.call_tool("strata_bind", {"scope_id": "g_backend"})
+
+    assert captured_messages, "expected the switch-confirmation prompt to have been sent"
+    prompt = captured_messages[0].lower()
+    assert "confirm" in prompt
+    assert "g_arch" in prompt
+    assert "g_backend" in prompt
+    # A direct question, not a self-bind instruction.
+    assert "call strata_bind" not in prompt
 
 
 async def test_elicitation_only_attempted_once_then_bound_calls_skip_it(tmp_path: Path) -> None:
