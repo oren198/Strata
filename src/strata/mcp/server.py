@@ -284,17 +284,32 @@ _UNRESOLVED: bool = False
 _STARTUP_ERRORS_CONFIG: list[str] = []
 _STARTUP_ERRORS_BINDING: list[str] = []
 
-# Change 2 (elicitation) latch: a client that declines, cancels, or times out
-# once should not be re-prompted (or, for a timeout, re-hung) on its very
-# next tool call in the same process — "one elicitation attempt per tool
-# call at most" (spec) reads as "don't nag" across a session's worth of
-# calls too. A capability-absent client is never latched here: there is
-# nothing to retry differently next time, so the (silent, free) capability
-# check runs again rather than being remembered as a decline. Cleared by a
-# successful bind, whether via strata_bind or an accepted elicitation — a
-# fresh binding means a fresh session as far as elicitation eligibility goes,
-# so a client that declined once isn't locked out forever by that one no.
-_ELICIT_DECLINED: bool = False
+# Change 2 (elicitation) memo: a client whose elicitation attempt comes back
+# anything other than an explicit accept (a protocol-level decline/cancel,
+# or a timeout) should not be re-prompted (or, for a timeout, re-hung) on
+# its very next tool call in the same process — "one elicitation attempt per
+# tool call at most" (spec) reads as "don't nag" across a session's worth of
+# calls too.
+#
+# Live Codex-replay finding: this flag must NEVER be read as "the user
+# declined." Codex 0.150.1 was observed declaring the elicitation
+# capability and auto-responding decline/cancel with no dialog ever shown to
+# a human — a protocol-level non-accept is indistinguishable from a real
+# human decline, so attributing it to "the user said no" is a misattribution
+# we can never safely make. This flag means only "elicitation appears
+# non-functional for this client right now — stop trying it and rely on the
+# plain text fallback (the aggregated startup-failure error, which already
+# tells an agent to ask the user and call strata_bind)." It never changes
+# what that fallback says.
+#
+# A capability-absent client is never latched here: there is nothing to
+# retry differently next time, so the (silent, free) capability check runs
+# again rather than being remembered as unavailable. Cleared by a successful
+# bind, whether via strata_bind or an accepted elicitation — a fresh binding
+# means a fresh session as far as elicitation eligibility goes, so a client
+# that came back non-accept once isn't locked out of elicitation forever by
+# that.
+_ELICIT_UNAVAILABLE: bool = False
 
 
 @dataclass
@@ -1107,7 +1122,9 @@ async def _send_elicitation(
     so request_read_timeout_seconds can be passed — see _ELICIT_TIMEOUT's
     docstring for why neither of those wrappers allows that. A timeout
     surfaces as an McpError, same as any other transport failure; every
-    caller treats that identically to an explicit decline.
+    caller treats that as elicitation-unavailable, never as the user's
+    answer — a protocol-level failure proves nothing about what (if
+    anything) a human decided.
     """
     result = await session.send_request(
         ServerRequest(
@@ -1172,14 +1189,17 @@ async def _attempt_elicit_bind(fleet: FleetConfig) -> bool:
     scope — every one of these returns False so the caller falls back to the
     plain Change-1 error result, without latching (nothing was actually
     asked of the client, so there's nothing to "not ask again"). A client
-    that DOES get asked and declines, cancels, or never answers within
-    _ELICIT_TIMEOUT is latched (_ELICIT_DECLINED) so this process doesn't
-    re-prompt (or re-hang on) the same unresponsive client on its very next
-    call. Never raises.
+    that DOES get asked and comes back anything other than an explicit
+    accept — a protocol-level decline or cancel, or a timeout — within
+    _ELICIT_TIMEOUT sets _ELICIT_UNAVAILABLE so this process doesn't
+    re-prompt (or re-hang on) the same client on its very next call. That
+    flag never changes what the fallback error says — see its module-level
+    docstring for why a non-accept must never be read as "the user
+    declined." Never raises.
     """
-    global _ELICIT_DECLINED
+    global _ELICIT_UNAVAILABLE
 
-    if _ELICIT_DECLINED:
+    if _ELICIT_UNAVAILABLE:
         return False
 
     scopes = fleet.active_scopes()
@@ -1202,16 +1222,22 @@ async def _attempt_elicit_bind(fleet: FleetConfig) -> bool:
         result = await _send_elicitation(session, message, _ScopePick, ctx.request_id)
     except Exception:
         # Covers a timeout (McpError, after _ELICIT_TIMEOUT) and any other
-        # transport failure once a request was actually sent to the client
-        # — treated exactly like an explicit decline (spec): latch so this
-        # process doesn't hang on, or re-prompt, the same client again.
-        _ELICIT_DECLINED = True
+        # transport failure once a request was actually sent to the client.
+        # Marked non-functional so this process doesn't hang on, or
+        # re-prompt, the same client again — NOT attributed to the user
+        # (nothing here proves a human ever saw a dialog).
+        _ELICIT_UNAVAILABLE = True
         return False
 
     if not isinstance(result, AcceptedElicitation):
-        # DeclinedElicitation, CancelledElicitation, or an unexpected shape —
-        # latch so this process doesn't re-prompt the same client again.
-        _ELICIT_DECLINED = True
+        # DeclinedElicitation, CancelledElicitation, or an unexpected shape.
+        # Live Codex-replay finding: a protocol-level decline/cancel can
+        # come back with no dialog ever shown to a human (an
+        # elicitation-capable client auto-responding), so this is marked
+        # "elicitation non-functional," never "the user declined" — the
+        # fallback below (the plain, class-aware unbound error) already
+        # asks the agent to ask the user; nothing here overrides that.
+        _ELICIT_UNAVAILABLE = True
         return False
 
     picked_scope_id = result.data.scope_id
@@ -1225,9 +1251,10 @@ async def _attempt_elicit_bind(fleet: FleetConfig) -> bool:
         _AGENT_SKILL = resolved_skill
         _STARTUP_ERRORS_BINDING = []
         _UNRESOLVED = bool(_STARTUP_ERRORS_CONFIG)
-        # A fresh binding clears the latch too — see its docstring (module
-        # top): a client that declined once isn't locked out forever by it.
-        _ELICIT_DECLINED = False
+        # A fresh binding clears the memo too — see its docstring (module
+        # top): a client marked non-functional once isn't locked out of
+        # elicitation forever by that.
+        _ELICIT_UNAVAILABLE = False
     return True
 
 
@@ -1264,32 +1291,50 @@ async def _require_bound_or_elicit() -> None:
     raise RuntimeError(_unresolved_message(fleet))
 
 
-async def _attempt_elicit_switch_confirm(
-    previous_scope_id: str, requested_scope_id: str
-) -> bool | None:
-    """Try once, via elicitation, to get the user's confirmation for
+async def _attempt_elicit_switch_confirm(previous_scope_id: str, requested_scope_id: str) -> bool:
+    """Try once, via elicitation, to get the user's DIRECT confirmation for
     switching this session's bound scope from *previous_scope_id* to
     *requested_scope_id* — the self-bind guard's Change-3 upgrade: where the
     client supports it, this REPLACES strata_bind's confirm= parameter
     dance.
 
-    Returns:
-        ``True`` — confirmed; the caller proceeds with the switch.
-        ``False`` — declined, cancelled, or timed out; the caller refuses
-            the switch without changing anything.
-        ``None`` — no MCP session, or the client doesn't declare the
-            elicitation capability; the caller falls back to the confirm=
-            parameter heads-up instead.
+    Live Codex-replay finding (bug): a real incident hit this exact path —
+    on the FIRST switch call, with no dialog ever shown to a human, the
+    result claimed ``switch_declined: True`` / "The user declined." Codex
+    0.150.1 evidently declares the elicitation capability and auto-responds
+    decline/cancel with no UI at all. A protocol-level decline is
+    INDISTINGUISHABLE from a real human decline over this wire protocol, so
+    treating "not accepted" as "the user said no" is a misattribution this
+    function must never make again.
 
-    Deliberately does NOT touch _ELICIT_DECLINED: unlike the scope-pick
-    elicitation (Change 2), this is per-call only — a user who declines a
-    switch right now may legitimately be asked again a moment later (they
-    might reconsider, or the agent might re-confirm after checking
-    something), so nothing here should lock a later attempt out.
+    Returns:
+        ``True`` — the client declared the elicitation capability, was
+            asked, and came back with an explicit ACCEPT carrying
+            ``confirm=True``. This is the ONLY outcome with any authority
+            to switch — an agent (or a client auto-responding on its
+            behalf) never gets to supply this answer; only a real ACCEPT
+            from the session can.
+        ``False`` — every other outcome, with no exceptions: no MCP
+            session, the client doesn't declare the capability, a
+            protocol-level decline or cancel, a timeout, a transport
+            error, or even an ACCEPT carrying ``confirm=False``. The
+            caller treats ``False`` uniformly — it falls straight through
+            to the standard announce-then-confirm two-step
+            (``_switch_pending_result``), which asks the user again on a
+            genuine follow-up call. That text-only path is exactly where a
+            real "no" and "the dialog never worked" both belong: either
+            way, the next right step is the same — ask the user directly,
+            then get a real second call.
+
+    Deliberately does NOT touch _ELICIT_UNAVAILABLE: unlike the scope-pick
+    elicitation (Change 2), this is per-call only — a user (or a client
+    that was simply having a bad moment) may legitimately answer the very
+    same switch differently a moment later, so nothing here should lock a
+    later attempt out.
     """
     capable = _elicitation_session_if_capable()
     if capable is None:
-        return None
+        return False
     ctx, session = capable
 
     message = (
@@ -1300,59 +1345,61 @@ async def _attempt_elicit_switch_confirm(
 
     try:
         result = await _send_elicitation(session, message, _SwitchConfirm, ctx.request_id)
-    except Exception:  # noqa: BLE001 - timeout/transport failure: treat as declined
+    except Exception:  # noqa: BLE001 - timeout/transport failure: not an answer, fall through
         return False
 
     if not isinstance(result, AcceptedElicitation):
+        # Protocol-level decline/cancel, or an unexpected shape — never
+        # attributed to the user (see the docstring above); falls through
+        # to the standard two-step exactly like every other non-accept.
         return False
     return bool(result.data.confirm)
 
 
-def _switch_pending_result(
-    previous_scope_id: str, requested_scope_id: str, *, declined: bool
-) -> dict:
+def _switch_pending_result(previous_scope_id: str, requested_scope_id: str) -> dict:
     """Build the heads-up result for an unconfirmed scope switch (self-bind
     guard) — the binding is left COMPLETELY unchanged in every case this
     builds a result for.
 
-    *declined* only changes the wording (an elicitation was actually sent
-    and the user said no / it timed out, vs. no confirmation was offered
-    yet); the caller-visible shape — ``switch_pending: True``, the
-    unchanged ``scope_id``/``skill`` — is identical either way, so an agent
-    can branch on the flag alone without parsing the message.
+    Live Codex-replay finding (bug fix): this used to take a *declined*
+    flag and, when true, say "The user declined. The binding stands." —
+    but a protocol-level elicitation decline/cancel/timeout is
+    indistinguishable from a real human "no" over the wire, so that wording
+    was a claim this function could not actually back up. There is now
+    exactly one message, used for every reason a switch isn't happening
+    yet: no confirmation offered, a client that can't be asked, or an
+    elicitation that came back anything other than an explicit accept.
+    Whatever the reason, the next right step is identical — ask the user
+    directly, then make a genuine follow-up call — so the result never
+    needs to distinguish them.
 
-    Reviewer follow-up: the ``declined`` branch used to hand the agent the
-    override recipe (``call strata_bind(..., confirm=True)``) right after
-    the user said no — an immediate, ready-to-use way around a "no" defeats
-    the whole point of asking. On a decline the binding simply stands; the
-    override path is not mentioned at all. A fresh ask starts the flow over
-    from a brand new user request, not from replaying this message.
+    Reviewer follow-up (still honored): this always hands over the
+    announce-then-confirm recipe rather than staying silent about it — that
+    is safe precisely because the message never claims the user already
+    answered "no." (An agent that actually got a real "no" from the user
+    simply doesn't call strata_bind again — nothing here can stop that.)
 
-    Live-test follow-up (two-step switch enforcement): the non-declined
-    ``detail`` now names the pending window explicitly — a bare
-    ``confirm=True`` is honored only on a FOLLOW-UP call naming this SAME
-    target within that window (see ``_PENDING_SWITCH`` and its docstring),
-    never on the call that first announces the switch. The wording says so,
-    so an agent reads this as "announce, then confirm on a second call,"
-    not as "just add confirm=True."
+    Live-test follow-up (two-step switch enforcement): the ``detail`` names
+    the pending window explicitly — a bare ``confirm=True`` is honored only
+    on a FOLLOW-UP call naming this SAME target within that window (see
+    ``_PENDING_SWITCH`` and its docstring), never on the call that first
+    announces the switch. The wording says so, so an agent reads this as
+    "announce, then confirm on a second call," not as "just add
+    confirm=True."
     """
-    if declined:
-        detail = "The user declined. The binding stands."
-    else:
-        minutes = int(_PENDING_SWITCH_WINDOW_SECONDS // 60)
-        detail = (
-            "Ask the user to confirm the switch, then call "
-            f"strata_bind(scope_id={requested_scope_id!r}, confirm=True) with "
-            f"their answer within {minutes} minutes — do not confirm this "
-            "yourself, and do not pass confirm=True on this same call; it is "
-            "only honored on a follow-up call naming this same target."
-        )
+    minutes = int(_PENDING_SWITCH_WINDOW_SECONDS // 60)
+    detail = (
+        "Ask the user to confirm the switch, then call "
+        f"strata_bind(scope_id={requested_scope_id!r}, confirm=True) with "
+        f"their answer within {minutes} minutes — do not confirm this "
+        "yourself, and do not pass confirm=True on this same call; it is "
+        "only honored on a follow-up call naming this same target."
+    )
     return {
         "scope_id": _AGENT_SCOPE,
         "skill": _AGENT_SKILL,
         "session_id": _AGENT_SESSION_ID,
         "switch_pending": True,
-        "switch_declined": declined,
         "message": (
             f"This session is bound to {previous_scope_id!r}; switching to "
             f"{requested_scope_id!r} changes whose memory it reads and writes. "
@@ -1446,9 +1493,14 @@ async def strata_bind(scope_id: str, skill: str | None = None, confirm: bool = F
     identity.) Where the client supports server-initiated MCP elicitation,
     this tool asks the user to confirm the switch itself, in the SAME call
     that first names it — that one round trip replaces the announce-then-
-    confirm dance entirely, since the user is answering directly, right
-    now. A decline there refuses the switch immediately, with the binding
-    left unchanged, exactly like an unconfirmed ``switch_pending`` result.
+    confirm dance entirely, ONLY when the response is an explicit accept
+    with ``confirm=True``. Anything else the elicitation comes back with
+    (a decline, a cancel, a timeout, or an accept with ``confirm=False``)
+    is never treated as the user's answer — a protocol-level decline can
+    come back with no dialog ever shown to a human — so it falls straight
+    through to the SAME announce-then-confirm ``switch_pending`` result an
+    unconfirmed call gets, binding left unchanged, ready for a genuine
+    follow-up call.
 
     On failure — an invalid scope/skill, or a switch pending confirmation —
     the binding is left completely unchanged.
@@ -1493,10 +1545,14 @@ async def strata_bind(scope_id: str, skill: str | None = None, confirm: bool = F
         binding — session_id unchanged), and ``message`` (a one-line
         confirmation, noting the identity change when this was a switch).
         On an unconfirmed switch: the binding UNCHANGED — same ``scope_id``/
-        ``skill`` as before this call — plus ``switch_pending: True``,
-        ``switch_declined`` (whether an elicitation was actually sent and
-        refused, vs. no confirmation offered yet), and a ``message``
-        explaining what to do next.
+        ``skill`` as before this call — plus ``switch_pending: True`` and a
+        ``message`` explaining what to do next (ask the user, then call
+        again with ``confirm=True``). This is the result for EVERY reason a
+        switch didn't happen yet — no confirmation offered, an elicitation
+        that came back anything other than an explicit accept, or a client
+        that can't be asked at all — never a claim that the user already
+        said no (a protocol-level elicitation decline is indistinguishable
+        from a real one, so this tool never attributes it to the user).
 
     Raises:
         RuntimeError: The scope does not exist, is archived, or the skill is
@@ -1504,7 +1560,7 @@ async def strata_bind(scope_id: str, skill: str | None = None, confirm: bool = F
             binding is left unchanged in every failure case.
     """
     global _AGENT_SCOPE, _AGENT_SKILL, _UNRESOLVED, _STARTUP_ERRORS_BINDING
-    global _ELICIT_DECLINED, _PENDING_SWITCH
+    global _ELICIT_UNAVAILABLE, _PENDING_SWITCH
 
     # This is THE recovery path for an unresolved session (Change 1), so it
     # deliberately re-reads fleet.yaml itself (below) rather than trusting
@@ -1558,28 +1614,33 @@ async def strata_bind(scope_id: str, skill: str | None = None, confirm: bool = F
     is_switch = not _UNRESOLVED and bool(previous_scope_id) and scope_id != previous_scope_id
 
     if is_switch:
-        switched_via_elicitation = False
-        if not confirm:
-            # This await deliberately happens OUTSIDE _binding_lock. A
-            # threading.Lock held across an `await` in this single-threaded
-            # asyncio server would risk a same-thread deadlock: a
-            # concurrent, synchronous lock.acquire() from another coroutine
-            # blocks the ONLY thread that could ever run this suspended
-            # coroutine again to release it. So the lock is only ever held
-            # for the synchronous pending-record and binding writes below,
-            # never spanning this call — leaving a narrow interleaving
-            # window, between this elicitation returning and the lock
-            # acquisition below, where a concurrent strata_bind call could
-            # read/write _PENDING_SWITCH first. Accepted as a narrow race on
-            # a server that in practice serves one request at a time; not
-            # solved here.
-            elicited = await _attempt_elicit_switch_confirm(previous_scope_id, scope_id)
-            if elicited is True:
-                switched_via_elicitation = True
-            elif elicited is False:
-                return _switch_pending_result(previous_scope_id, scope_id, declined=True)
-            # elicited is None: no session, or the client can't be asked —
-            # fall through to the announce-then-confirm dance below.
+        # This await deliberately happens OUTSIDE _binding_lock. A
+        # threading.Lock held across an `await` in this single-threaded
+        # asyncio server would risk a same-thread deadlock: a concurrent,
+        # synchronous lock.acquire() from another coroutine blocks the ONLY
+        # thread that could ever run this suspended coroutine again to
+        # release it. So the lock is only ever held for the synchronous
+        # pending-record and binding writes below, never spanning this
+        # call — leaving a narrow interleaving window, between this
+        # elicitation returning and the lock acquisition below, where a
+        # concurrent strata_bind call could read/write _PENDING_SWITCH
+        # first. Accepted as a narrow race on a server that in practice
+        # serves one request at a time; not solved here.
+        #
+        # Skipped entirely when confirm=True — this is the announce-then-
+        # confirm follow-up call, not a fresh ask.
+        #
+        # Live Codex-replay finding (bug fix): _attempt_elicit_switch_confirm
+        # returns True ONLY for an explicit accept — everything else (no
+        # session, no capability, a protocol-level decline/cancel, a
+        # timeout, a transport error, or even an accept carrying
+        # confirm=False) returns False and falls straight through to the
+        # announce-then-confirm two-step below, uniformly. A protocol-level
+        # decline is indistinguishable from a real human "no," so it is
+        # never treated as one here — see that function's docstring.
+        switched_via_elicitation = not confirm and await _attempt_elicit_switch_confirm(
+            previous_scope_id, scope_id
+        )
 
         if not switched_via_elicitation:
             # Two-step enforcement (live-test finding): a bare confirm=True
@@ -1606,7 +1667,7 @@ async def strata_bind(scope_id: str, skill: str | None = None, confirm: bool = F
                 )
                 if not pending_confirmed:
                     _PENDING_SWITCH = _PendingSwitch(target_scope_id=scope_id, requested_at=now)
-                    return _switch_pending_result(previous_scope_id, scope_id, declined=False)
+                    return _switch_pending_result(previous_scope_id, scope_id)
         # Confirmed — either an accepted elicitation or a matching,
         # unexpired announce-then-confirm pair. The pending record (if any)
         # is cleared below, along with every other successful-bind path.
@@ -1619,10 +1680,10 @@ async def strata_bind(scope_id: str, skill: str | None = None, confirm: bool = F
         # is deliberately left untouched here.
         _STARTUP_ERRORS_BINDING = []
         _UNRESOLVED = bool(_STARTUP_ERRORS_CONFIG)
-        # A fresh binding clears the elicitation-decline latch too — see its
-        # docstring (module top): a client that declined once isn't locked
-        # out forever by it.
-        _ELICIT_DECLINED = False
+        # A fresh binding clears the elicitation-unavailable memo too — see
+        # its docstring (module top): a client marked non-functional once
+        # isn't locked out of elicitation forever by that.
+        _ELICIT_UNAVAILABLE = False
         # Tidiness (reviewer hardening): clear any pending switch on ANY
         # successful bind — initial, same-scope no-op, confirmed switch, or
         # an elicitation-accepted switch. An announced target shouldn't

@@ -2966,7 +2966,7 @@ async def test_rebind_without_confirm_does_not_switch_and_returns_heads_up(
 
         # A clear, programmatically-detectable heads-up, not silence.
         assert result["switch_pending"] is True
-        assert result["switch_declined"] is False
+        assert "switch_declined" not in result
         assert "g_arch" in result["message"]
         assert "g_backend" in result["message"]
         assert "confirm" in result["message"].lower()
@@ -3101,25 +3101,24 @@ async def test_switch_pending_expires_after_window(tmp_path: Path) -> None:
         assert mod._PENDING_SWITCH.requested_at == now
 
 
-def test_switch_declined_message_has_no_override_recipe() -> None:
-    """Reviewer follow-up: handing the agent the override recipe (call again
-    with confirm=true) immediately after the user declined defeats the
-    consent design. A decline just says the user declined and the binding
-    stands — a fresh ask has to come from a NEW user request, not from this
-    message telling the agent how to route around a 'no'."""
+def test_switch_pending_message_never_claims_the_user_declined() -> None:
+    """Live Codex-replay finding (bug fix): _switch_pending_result used to
+    take a *declined* flag and, when true, say "The user declined. The
+    binding stands." — but a protocol-level elicitation decline/cancel/
+    timeout is indistinguishable from a real human "no" over the wire, so
+    that wording was a claim the function couldn't actually back up (the
+    live incident: a first-call switch attempt returned exactly this claim
+    with no dialog ever shown to a human). There is now exactly one
+    message, and it never asserts the user's answer either way — it always
+    hands over the announce-then-confirm recipe, which is safe precisely
+    because it never claims anyone already said no."""
     from strata.mcp.server import _switch_pending_result
 
-    declined = _switch_pending_result("g_arch", "g_backend", declined=True)
-    message = declined["message"].lower()
-    assert "declined" in message
-    assert "confirm=true" not in message
-    assert "call strata_bind" not in message
-
-    # The non-declined (no confirmation offered yet) heads-up is the one
-    # that's SUPPOSED to hand over the recipe — confirm this asymmetry is
-    # deliberate, not both branches accidentally losing it.
-    pending = _switch_pending_result("g_arch", "g_backend", declined=False)
-    assert "confirm=true" in pending["message"].lower()
+    pending = _switch_pending_result("g_arch", "g_backend")
+    message = pending["message"].lower()
+    assert "declined" not in message
+    assert "confirm=true" in message
+    assert "switch_declined" not in pending
 
 
 async def test_rebind_with_confirm_switches_and_notes_identity_change(tmp_path: Path) -> None:
@@ -3244,9 +3243,23 @@ async def test_rebind_elicitation_accept_switches(tmp_path: Path) -> None:
         assert mod._AGENT_SCOPE == "g_backend"
 
 
-async def test_rebind_elicitation_decline_refuses_without_changes(tmp_path: Path) -> None:
-    """A declined elicitation refuses the switch — binding left completely
-    unchanged, no confirm= param needed to reach that outcome."""
+async def _elicit_cancel(context, params):
+    from mcp import types as mcp_types
+
+    return mcp_types.ElicitResult(action="cancel")
+
+
+async def test_rebind_elicitation_protocol_decline_falls_through_to_two_step(
+    tmp_path: Path,
+) -> None:
+    """Live Codex-replay finding (the actual incident this fix closes): a
+    client that declares the elicitation capability and auto-responds
+    "decline" with NO dialog ever shown to a human (observed: Codex
+    v0.150.1) must NOT have that read as the user's answer. The switch call
+    must fall through to the standard announce-then-confirm two-step —
+    pending recorded, binding unchanged, heads-up text — with no claim that
+    the user declined anywhere in the result. A genuine follow-up call with
+    confirm=True then completes the switch."""
     from mcp.shared.memory import create_connected_server_and_client_session
 
     db_path = _make_db(tmp_path)
@@ -3264,17 +3277,89 @@ async def test_rebind_elicitation_decline_refuses_without_changes(tmp_path: Path
         assert result.isError is not True  # a heads-up result, not an error
         text = _result_text(result)
         assert "switch_pending" in text
-        assert "declined" in text.lower()
-        # Reviewer follow-up: no override recipe handed over right after a
-        # decline — that would defeat the point of asking.
-        assert "confirm=true" not in text.lower()
+        # The exact live-incident claim must never appear.
+        assert "declined" not in text.lower()
+        assert "switch_declined" not in text
+        assert "confirm=true" in text.lower()
+        assert mod._AGENT_SCOPE == "g_arch"
+        assert mod._PENDING_SWITCH is not None
+        assert mod._PENDING_SWITCH.target_scope_id == "g_backend"
+
+        # A genuine follow-up call (no elicitation session this time — a
+        # plain confirm=True naming the same, now-pending target) completes
+        # the switch. Still inside this `with` block, so _AGENT_SCOPE is
+        # still "g_arch" as the announced call left it.
+        confirmed = await mod.strata_bind(scope_id="g_backend", confirm=True)
+        assert confirmed["scope_id"] == "g_backend"
+        assert mod._AGENT_SCOPE == "g_backend"
+
+
+async def test_rebind_elicitation_protocol_cancel_falls_through_to_two_step(
+    tmp_path: Path,
+) -> None:
+    """Same finding, the other non-accept action: a client that
+    auto-cancels must be treated identically to a decline — dialog
+    unavailable, never attributed to the user."""
+    from mcp.shared.memory import create_connected_server_and_client_session
+
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fleet_yaml(tmp_path)
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+
+    with patch.object(mod, "_AGENT_SCOPE", "g_arch"), patch.object(mod, "_AGENT_SKILL", None):
+        async with create_connected_server_and_client_session(
+            mod.mcp, elicitation_callback=_elicit_cancel
+        ) as client:
+            result = await client.call_tool("strata_bind", {"scope_id": "g_backend"})
+
+        assert result.isError is not True
+        text = _result_text(result)
+        assert "switch_pending" in text
+        assert "declined" not in text.lower()
+        assert mod._AGENT_SCOPE == "g_arch"
+        assert mod._PENDING_SWITCH is not None
+        assert mod._PENDING_SWITCH.target_scope_id == "g_backend"
+
+
+async def test_rebind_elicitation_accept_confirm_false_also_falls_through(
+    tmp_path: Path,
+) -> None:
+    """Item 3 (accept is the only outcome with user authority): even an
+    explicit ACCEPT carrying confirm=False does not raise or claim a
+    special "declined" state — it falls through to the same two-step
+    heads-up as any other non-True outcome, uniformly."""
+
+    async def _accept_confirm_false(context, params):
+        from mcp import types as mcp_types
+
+        return mcp_types.ElicitResult(action="accept", content={"confirm": False})
+
+    from mcp.shared.memory import create_connected_server_and_client_session
+
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fleet_yaml(tmp_path)
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+
+    with patch.object(mod, "_AGENT_SCOPE", "g_arch"), patch.object(mod, "_AGENT_SKILL", None):
+        async with create_connected_server_and_client_session(
+            mod.mcp, elicitation_callback=_accept_confirm_false
+        ) as client:
+            result = await client.call_tool("strata_bind", {"scope_id": "g_backend"})
+
+        assert result.isError is not True
+        text = _result_text(result)
+        assert "switch_pending" in text
         assert mod._AGENT_SCOPE == "g_arch"
 
 
-async def test_rebind_elicitation_never_latches(tmp_path: Path) -> None:
-    """Unlike the scope-pick elicitation (Change 2), a declined switch
-    confirmation must NOT set _ELICIT_DECLINED — a user might legitimately
-    confirm the very same switch moments later."""
+async def test_rebind_elicitation_never_marks_unavailable(tmp_path: Path) -> None:
+    """Unlike the scope-pick elicitation (Change 2), a non-accepted switch
+    confirmation must NOT set _ELICIT_UNAVAILABLE — a user (or client) might
+    legitimately confirm the very same switch moments later."""
     db_path = _make_db(tmp_path)
     summaries_dir = str(tmp_path / "summaries")
     fleet_path = _make_fleet_yaml(tmp_path)
@@ -3291,7 +3376,7 @@ async def test_rebind_elicitation_never_latches(tmp_path: Path) -> None:
         ),
     ):
         await mod.strata_bind(scope_id="g_backend")
-        assert mod._ELICIT_DECLINED is False
+        assert mod._ELICIT_UNAVAILABLE is False
 
 
 def _normalize(text: str) -> str:
@@ -4230,13 +4315,14 @@ async def test_elicitation_never_attempted_from_within_strata_bind(tmp_path: Pat
 # ---------------------------------------------------------------------------
 
 
-async def test_elicitation_timeout_falls_back_like_decline_and_latches(tmp_path: Path) -> None:
+async def test_elicitation_timeout_falls_back_and_marks_unavailable(tmp_path: Path) -> None:
     """A capability-declaring client that never answers must not hang the
     tool call forever — _ELICIT_TIMEOUT bounds the wait via
     request_read_timeout_seconds threaded into session.send_request
-    (_send_scope_pick_elicitation), and expiry is treated exactly like an
-    explicit decline: silent fallback to the readable error, plus the same
-    latch (no re-prompt/re-hang on the very next call)."""
+    (_send_scope_pick_elicitation), and expiry is treated exactly like a
+    protocol-level non-accept: silent fallback to the readable error
+    (never a claim about what the user decided), plus the same
+    _ELICIT_UNAVAILABLE memo (no re-prompt/re-hang on the very next call)."""
     from datetime import timedelta
 
     import anyio
@@ -4273,22 +4359,23 @@ async def test_elicitation_timeout_falls_back_like_decline_and_latches(tmp_path:
             text = _result_text(result)
             assert "strata_bind" in text
 
-            # Latched exactly like a decline: a second unbound call must not
-            # hang out the same unresponsive client again.
+            # Marked non-functional exactly like a protocol decline: a
+            # second unbound call must not hang out the same unresponsive
+            # client again.
             second = await client.call_tool("strata_read_perspective", {})
             assert second.isError is True
 
-        assert mod._ELICIT_DECLINED is True
+        assert mod._ELICIT_UNAVAILABLE is True
         assert mod._AGENT_SCOPE == ""
 
 
-async def test_elicit_declined_latch_cleared_by_successful_bind(tmp_path: Path) -> None:
-    """The latch docstring's claim must be TRUE (review follow-up: it used
+async def test_elicit_unavailable_memo_cleared_by_successful_bind(tmp_path: Path) -> None:
+    """The memo docstring's claim must be TRUE (review follow-up: it used
     to say 'cleared implicitly by any successful bind' while nothing in the
-    code ever cleared it): a decline latches (no re-ask on the very next
-    call), and a subsequent successful strata_bind clears it — a client
-    that declined once isn't locked out of elicitation forever by that one
-    no."""
+    code ever cleared it): a protocol-level decline marks elicitation
+    non-functional (no re-ask on the very next call), and a subsequent
+    successful strata_bind clears it — a client marked non-functional once
+    isn't locked out of elicitation forever by that."""
     from mcp.shared.memory import create_connected_server_and_client_session
 
     db_path = _make_db(tmp_path)
@@ -4308,12 +4395,12 @@ async def test_elicit_declined_latch_cleared_by_successful_bind(tmp_path: Path) 
             result = await client.call_tool("strata_read_perspective", {})
             assert result.isError is True
 
-        assert mod._ELICIT_DECLINED is True
+        assert mod._ELICIT_UNAVAILABLE is True
 
-        # A later successful strata_bind clears the latch.
+        # A later successful strata_bind clears the memo.
         bind_result = await mod.strata_bind(scope_id="g_backend")
         assert bind_result["scope_id"] == "g_backend"
-        assert mod._ELICIT_DECLINED is False
+        assert mod._ELICIT_UNAVAILABLE is False
 
 
 async def test_config_class_failure_survives_a_successful_binding_class_bind(
