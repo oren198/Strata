@@ -3141,6 +3141,52 @@ async def test_unbound_tool_call_returns_error_with_scopes_and_bind_mention(tmp_
     assert "strata_bind" in message
 
 
+async def test_unbound_tool_call_error_carries_no_issue_references(tmp_path: Path) -> None:
+    """Operator-facing output must never carry internal issue numbers — the
+    same rule test_register.py's next-steps text enforces, and a QA-round-2
+    finding against a stale binding_errors string that used to say
+    '... issue #121.'"""
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fleet_yaml(tmp_path)  # g_arch, g_backend
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+    fleet = FleetConfig.load(fleet_path)
+
+    with (
+        patch.object(mod, "_AGENT_SCOPE", "g_backend"),
+        patch.object(mod, "_AGENT_SKILL", None),
+        patch.object(mod, "_UNRESOLVED", True),
+        # Exercise the real skill-unset message text, not a stand-in — this
+        # is the exact code path the leaked "issue #121" reference lived in.
+        patch.object(
+            mod,
+            "_STARTUP_ERRORS_BINDING",
+            _validate_binding_skill_error(fleet),
+        ),
+        patch.object(mod, "_load_fleet", return_value=fleet),
+        pytest.raises(RuntimeError) as exc_info,
+    ):
+        await mod.strata_read_perspective()
+
+    assert "issue #" not in str(exc_info.value).lower()
+
+
+def _validate_binding_skill_error(fleet: FleetConfig) -> list[str]:
+    """Build the real STRATA_AGENT_SKILL-unset binding_errors list for a
+    2+ scope fleet — used to prove the guard test above exercises the
+    actual message text, not a hand-written stand-in."""
+    from strata.mcp.server import _validate_binding
+
+    _scope, _skill, _config_errors, binding_errors = _validate_binding(
+        fleet,
+        scope="g_backend",
+        skill="",
+        project_config_found=True,
+    )
+    return binding_errors
+
+
 async def test_unbound_tool_call_raises_for_every_memory_tool_but_bind(tmp_path: Path) -> None:
     """Every memory tool but strata_bind is gated — not just one of them."""
     db_path = _make_db(tmp_path)

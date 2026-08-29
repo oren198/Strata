@@ -3723,7 +3723,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_status = sub.add_parser(
         "status",
-        help="Show per-scope memory-freshness (read-vs-contribute staleness, issue #110).",
+        help="Show per-scope memory-freshness (read-vs-contribute staleness).",
     )
     p_status.add_argument(
         "--window-days",
@@ -3983,7 +3983,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "Reverse `strata register` — remove the .gitignore block, the "
             "mcpServers.strata entry, and the vendored skills (only when "
-            "unmodified). Leaves .strata/ data unless --purge-data (issue #53)."
+            "unmodified). Leaves .strata/ data unless --purge-data."
         ),
         description=(
             "Reverse the wiring `strata register` added, honouring the "

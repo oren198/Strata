@@ -145,6 +145,27 @@ def test_help_flag_survives_deleted_cwd(
     assert "Strata — shared memory for agent fleets." in captured.out
 
 
+def test_help_text_carries_no_issue_references(capsys: pytest.CaptureFixture[str]) -> None:
+    """CLI --help output is operator-facing — it must never carry internal
+    issue numbers (same rule test_register.py's next-steps text enforces).
+
+    Covers the top-level help plus every subcommand's, since a subcommand's
+    own help= string only ever renders inside ITS --help, never the
+    top-level listing.
+    """
+    from strata.__main__ import _build_parser
+
+    parser = _build_parser()
+    subparsers_action = next(action for action in parser._actions if action.choices)
+    command_names = list(subparsers_action.choices)
+
+    for argv in [["--help"], *([name, "--help"] for name in command_names)]:
+        with pytest.raises(SystemExit):
+            main(argv)
+        captured = capsys.readouterr()
+        assert "issue #" not in captured.out.lower(), f"{argv} help text leaked an issue number"
+
+
 def test_migrate_calls_runner(tmp_path, capsys: pytest.CaptureFixture[str]) -> None:
     """``strata migrate --db <path>`` calls the migrations runner."""
     db_path = str(tmp_path / "test.db")

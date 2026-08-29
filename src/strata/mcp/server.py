@@ -870,7 +870,7 @@ def _validate_binding(
             "  Call strata_bind(scope_id=..., skill=<skill_name>) to bind this session "
             "now, or restart the server with STRATA_AGENT_SCOPE/STRATA_AGENT_SKILL set "
             "in its environment.\n"
-            "  (Optional only for scopes that declare no skills — issue #121.)\n"
+            "  (A skill is optional when the scope declares none.)\n"
             "  See README.md § 'Quick Start for an existing project' for the full setup."
         )
 
