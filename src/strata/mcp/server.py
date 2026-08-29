@@ -23,9 +23,11 @@ STRATA_FLEET_CONFIG
 STRATA_AGENT_SCOPE
     The scope this agent is bound to (e.g. ``g_backend``).
     Recorded in contribution provenance.  Required when the fleet has 2+
-    scopes — the server refuses to start if unset (ADR 0005 Decision 5). When
-    the fleet has exactly one scope, an unset (or empty-string) value
-    auto-binds to it.
+    scopes. When the fleet has exactly one scope, an unset (or empty-string)
+    value auto-binds to it. Otherwise (soft-start, ADR 0005 Decision 5,
+    dated addendum) the server still starts with an unset value — every
+    memory tool returns an actionable error until the session is bound via
+    ``strata_bind`` (or the process is restarted with this set).
 STRATA_AGENT_SKILL
     The skill this agent is running (e.g. ``strata-developer``).
     Recorded in contribution provenance.  Required for a scope that declares
@@ -47,14 +49,24 @@ import sqlite3
 import sys
 import threading
 from dataclasses import asdict
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Literal
 
 import yaml
-from mcp.server.elicitation import AcceptedElicitation
+from mcp.server.elicitation import AcceptedElicitation, CancelledElicitation, DeclinedElicitation
 from mcp.server.fastmcp import FastMCP
-from mcp.types import ClientCapabilities, ElicitationCapability
+from mcp.server.session import ServerSession
+from mcp.shared.message import ServerMessageMetadata
+from mcp.types import (
+    ClientCapabilities,
+    ElicitationCapability,
+    ElicitRequest,
+    ElicitRequestFormParams,
+    ElicitResult,
+    RequestId,
+    ServerRequest,
+)
 from pydantic import BaseModel, Field
 
 from strata.fleet_config import FleetConfig, FleetConfigError, Scope
@@ -67,7 +79,6 @@ from strata.project_config import (
     ProjectConfigError,
     StoragePaths,
     load_project_config,
-    resolve_storage_paths,
 )
 from strata.publication import PublishedItem, propose_publish, propose_withdraw, read_publication
 from strata.record_store import ContributorRef, RecordStore
@@ -250,24 +261,38 @@ _AGENT_SESSION_ID: str = resolve_agent_session_id()
 # Soft-start state (dated addendum to ADR 0005 Decision 5 — see
 # docs/adr/0005-brownfield-install.md). A harness that swallows stderr (the
 # motivating incident: Codex and Claude Code both do) never shows a human
-# the refuse-to-start message, so the same aggregated failure list that used
-# to go to sys.exit(1) is instead captured here and handed back as the
+# the refuse-to-start message, so the same aggregated failure lists that used
+# to go to sys.exit(1) are instead captured here and handed back as the
 # result of every memory tool call until the session is bound — see
 # _require_bound_or_elicit(), below. Set once by main() before mcp.run();
-# left at its default (resolved, no errors) for every test that never calls
-# main(), which is what keeps the rest of this module's existing tests
+# left at their defaults (resolved, no errors) for every test that never
+# calls main(), which is what keeps the rest of this module's existing tests
 # behaving exactly as before.
+#
+# Split into two classes (review follow-up — see _validate_binding's
+# docstring for the incident this closes): _STARTUP_ERRORS_CONFIG holds
+# failures strata_bind/elicitation can NEVER clear (a broken or missing
+# .strata/config.toml, or a broken fleet.yaml) — the server may be running
+# against the wrong storage source entirely, and the fix only takes effect
+# on the next restart. _STARTUP_ERRORS_BINDING holds failures they exist to
+# clear (which scope/skill this session acts as). _UNRESOLVED is kept as an
+# explicit, cheaply-checked bool — true whenever EITHER list is non-empty —
+# recomputed at every mutation site (main(), strata_bind, _attempt_elicit_bind)
+# rather than derived on every read.
 _UNRESOLVED: bool = False
-_STARTUP_ERRORS: list[str] = []
+_STARTUP_ERRORS_CONFIG: list[str] = []
+_STARTUP_ERRORS_BINDING: list[str] = []
 
-# Change 2 (elicitation) latch: a client that declines or cancels once, or
-# whose answer fails to bind, should not be re-prompted on its very next
-# tool call in the same process — "one elicitation attempt per tool call at
-# most" (spec) reads as "don't nag" across a session's worth of calls too.
-# A capability-absent client is never latched here: there is nothing to
-# retry differently next time, so the (silent, free) capability check runs
-# again rather than being remembered as a decline. Cleared implicitly by any
-# successful bind (checked only while _UNRESOLVED is True).
+# Change 2 (elicitation) latch: a client that declines, cancels, or times out
+# once should not be re-prompted (or, for a timeout, re-hung) on its very
+# next tool call in the same process — "one elicitation attempt per tool
+# call at most" (spec) reads as "don't nag" across a session's worth of
+# calls too. A capability-absent client is never latched here: there is
+# nothing to retry differently next time, so the (silent, free) capability
+# check runs again rather than being remembered as a decline. Cleared by a
+# successful bind, whether via strata_bind or an accepted elicitation — a
+# fresh binding means a fresh session as far as elicitation eligibility goes,
+# so a client that declined once isn't locked out forever by that one no.
 _ELICIT_DECLINED: bool = False
 
 # Guards ONLY the (scope, skill) WRITE in strata_bind (Feature B), so a
@@ -681,23 +706,44 @@ def _validate_binding(
     project_config_found: bool = False,
     searched_paths: list[str] | None = None,
     extra_errors: list[str] | None = None,
-) -> tuple[str, str | None, list[str]]:
+) -> tuple[str, str | None, list[str], list[str]]:
     """Validate agent binding before starting the MCP server.
 
-    Runs all checks independently and returns every failure in one list (per
-    ADR 0005 Decision 5 — "all failures are reported in a single error
-    message"). A user with multiple missing pieces sees the complete
-    remediation list in one pass rather than fix-one-rerun-fix-next.
+    Runs all checks independently and returns every failure, split into two
+    classes (per the review follow-up below), rather than first-failure-wins
+    — a user with multiple missing pieces sees the complete remediation list
+    in one pass.
 
     Soft-start (dated addendum, docs/adr/0005-brownfield-install.md): this
     function no longer exits the process. A harness that swallows stderr
     (Codex, Claude Code) never surfaces a sys.exit(1) message to the human
     behind it — the motivating incident this addendum fixes. The caller
-    (main()) now always proceeds to mcp.run(); when the returned error list
-    is non-empty it stores the list and marks the session unresolved, and
-    every memory tool (except strata_bind, the recovery path) returns that
-    same list as its error result until the session is bound — see
+    (main()) now always proceeds to mcp.run(); when either returned list is
+    non-empty it stores both and marks the session unresolved, and every
+    memory tool (except strata_bind, the recovery path) returns the relevant
+    list as its error result until the session is bound — see
     _require_bound_or_elicit(), below.
+
+    Two failure classes (review follow-up — the incident: strata_bind used to
+    clear EVERY startup failure, including ones it never actually fixed; with
+    a broken .strata/config.toml the server had already opened storage at the
+    env-fallback location, and a "successful" bind afterward would silently
+    commit memory there instead of the project's real store):
+
+    - **config-class** (``config_errors``, second-to-last returned list):
+      ``.strata/config.toml`` missing/invalid, or a broken fleet.yaml passed
+      in as ``extra_errors``. These mean the server may be running against
+      the WRONG storage source (or none at all) — nothing a scope pick can
+      fix, since the fix (creating/editing ``.strata/config.toml`` or
+      ``fleet.yaml``... the config.toml half, anyway) only takes effect on
+      the NEXT process start (it's read once, at import time — never
+      reload-on-read the way fleet.yaml is). strata_bind and elicitation
+      never clear these.
+    - **binding-class** (``binding_errors``, last returned list): which
+      scope/skill this session acts as. Checks 0, 2, 3, 4, 5 below. Live-
+      fixable without a restart via strata_bind (fleet.yaml IS reload-on-
+      read) or an accepted elicitation — clearing these is the whole point
+      of both.
 
     Checks (in order, outermost setup gap → innermost binding mismatch):
 
@@ -710,18 +756,18 @@ def _validate_binding(
        ``STRATA_AGENT_SCOPE`` is never touched by this — it behaves exactly
        as before. Empty string counts as unset (Codex writes literal empty
        env values into its config).
-    1. ``.strata/config.toml`` resolvable via walk-up.
+    1. ``.strata/config.toml`` resolvable via walk-up. **config-class.**
     2. ``STRATA_AGENT_SCOPE`` env var set (after the auto-bind attempt above)
        — unset/empty against a fleet with zero or 2+ active scopes is still
        the actionable error, now naming the available scope IDs when there
-       are any.
-    3. Scope exists in fleet config.
+       are any. binding-class.
+    3. Scope exists in fleet config. binding-class.
     4. ``STRATA_AGENT_SKILL`` env var set — required only when the scope
        *declares* skills (``default_skill`` or ``permitted_skills``). An
        unrestricted scope may bind skill-less (issue #121); a scope that
-       expresses skill expectations keeps today's semantics.
+       expresses skill expectations keeps today's semantics. binding-class.
     5. ``STRATA_AGENT_SKILL`` is in the scope's ``permitted_skills`` (when
-       that list is non-empty and a skill is set).
+       that list is non-empty and a skill is set). binding-class.
 
     Args:
         fleet:                 The loaded FleetConfig, or ``None`` if check 1
@@ -734,31 +780,36 @@ def _validate_binding(
         project_config_found:  True when ``.strata/config.toml`` was located.
         searched_paths:        Paths that were searched (for the error
                                message when config not found).
-        extra_errors:          Startup failures collected before binding
-                               validation (malformed config/fleet files, issue
-                               #46) — reported in the same aggregated message.
+        extra_errors:          Config-class startup failures collected before
+                               binding validation (malformed config.toml or
+                               fleet.yaml, issue #46) — reported alongside
+                               check 1 in ``config_errors``, never cleared by
+                               strata_bind/elicitation.
 
     Returns:
-        ``(resolved_scope, resolved_skill, errors)`` — the values the caller
-        should bind to (identical to ``(scope, skill)`` unless auto-binding
-        applied), and the list of validation failures (empty on success).
+        ``(resolved_scope, resolved_skill, config_errors, binding_errors)``
+        — the values the caller should bind to (identical to
+        ``(scope, skill)`` unless auto-binding applied), and the two
+        classified failure lists (each empty on success in that class).
         Always returns — soft-start never exits the process.
     """
-    errors: list[str] = list(extra_errors) if extra_errors else []
+    config_errors: list[str] = list(extra_errors) if extra_errors else []
+    binding_errors: list[str] = []
 
-    # 1. .strata/config.toml must be resolvable.
+    # 1. .strata/config.toml must be resolvable. config-class: fixing this
+    #    (creating/editing the file) only takes effect on the next restart.
     if not project_config_found:
         paths_str = (
             "\n  ".join(searched_paths)
             if searched_paths
             else "(no paths — walk-up search from CWD found nothing)"
         )
-        errors.append(
+        config_errors.append(
             ".strata/config.toml not found.\n"
             "  Strata looked for .strata/config.toml walking up from the current directory:\n"
             f"    {paths_str}\n"
-            "  Run `strata register` from your project root to create it, then open Claude Code\n"
-            "  from within the project directory."
+            "  Run `strata register` from your project root, then restart the server "
+            "(this is read once, at process start — a strata_bind call cannot pick it up)."
         )
 
     # 0. Single-scope auto-bind — before check 2 sees the scope as missing.
@@ -779,68 +830,72 @@ def _validate_binding(
             print(notice, file=sys.stderr)
 
     # 2. STRATA_AGENT_SCOPE must be set (after the auto-bind attempt above).
+    #    binding-class.
     if not resolved_scope:
         available_line = ""
         if fleet is not None:
             available = [s.id for s in fleet.active_scopes()]
             if available:
                 available_line = f"  Available scope IDs: {', '.join(available)}.\n"
-        errors.append(
+        binding_errors.append(
             "STRATA_AGENT_SCOPE is not set.\n"
             f"{available_line}"
-            "  Set it before launching Claude Code:\n"
-            "    export STRATA_AGENT_SCOPE=<scope_id>\n"
-            "    export STRATA_AGENT_SKILL=<skill_name>\n"
+            "  Call strata_bind(scope_id=<one of the above>) to bind this session now, "
+            "or restart the server with STRATA_AGENT_SCOPE/STRATA_AGENT_SKILL set in its "
+            "environment (this is read once, at process start).\n"
             "  See README.md § 'Quick Start for an existing project' for the full setup."
         )
 
     # 3. Scope must exist in fleet config and be active (skip when fleet not
     #    loaded or scope unset). require_active=True is the same "archived
     #    scopes cannot be bound" rule strata_bind enforces (Feature B) — one
-    #    shared check, not two independently-maintained rules.
+    #    shared check, not two independently-maintained rules. binding-class.
     scope_obj = None
     if fleet is not None and resolved_scope:
         scope_obj, exists_error = _check_scope_exists(fleet, resolved_scope, require_active=True)
         if exists_error is not None:
-            errors.append(exists_error)
+            binding_errors.append(exists_error)
 
     # 4. STRATA_AGENT_SKILL must be set — waived only when the scope is
     #    positively confirmed to declare no skills (no default_skill, no
     #    permitted_skills). Such an unrestricted scope may bind skill-less
     #    (issue #121). A scope that declares skills keeps today's "skill
     #    required" semantics, and an unknown/unresolved scope still surfaces
-    #    the skill remediation alongside the config/scope ones (ADR 0005
-    #    Decision 5 — report every setup gap in one pass).
+    #    the skill remediation alongside the scope one (all still reported in
+    #    one pass, just classified). binding-class.
     scope_waives_skill = scope_obj is not None and _scope_waives_skill(scope_obj)
     if not resolved_skill and not scope_waives_skill:
-        errors.append(
+        binding_errors.append(
             "STRATA_AGENT_SKILL is not set.\n"
-            "  Set it before launching Claude Code:\n"
-            "    export STRATA_AGENT_SCOPE=<scope_id>\n"
-            "    export STRATA_AGENT_SKILL=<skill_name>\n"
+            "  Call strata_bind(scope_id=..., skill=<skill_name>) to bind this session "
+            "now, or restart the server with STRATA_AGENT_SCOPE/STRATA_AGENT_SKILL set "
+            "in its environment.\n"
             "  (Optional only for scopes that declare no skills — issue #121.)\n"
             "  See README.md § 'Quick Start for an existing project' for the full setup."
         )
 
-    # 5. STRATA_AGENT_SKILL must be in permitted_skills (skip when scope or skill missing).
+    # 5. STRATA_AGENT_SKILL must be in permitted_skills (skip when scope or
+    #    skill missing). binding-class.
     if scope_obj is not None and resolved_skill:
         skill_error = _check_skill_permitted(scope_obj, resolved_scope, resolved_skill)
         if skill_error is not None:
-            errors.append(skill_error)
+            binding_errors.append(skill_error)
 
-    if errors:
+    all_errors = config_errors + binding_errors
+    if all_errors:
         # Still printed for a human who does read stderr (local dev) — but
-        # soft-start no longer exits on it; the same list also travels back
-        # via _STARTUP_ERRORS for every memory tool to report (see main()
-        # and _require_bound_or_elicit(), below).
+        # soft-start no longer exits on it; the same lists also travel back
+        # via _STARTUP_ERRORS_CONFIG/_STARTUP_ERRORS_BINDING for every memory
+        # tool to report (see main() and _require_bound_or_elicit(), below).
         header = (
             "Strata MCP server started but is not yet bound — "
-            f"{len(errors)} validation {'failure' if len(errors) == 1 else 'failures'}:\n"
+            f"{len(all_errors)} validation "
+            f"{'failure' if len(all_errors) == 1 else 'failures'}:\n"
         )
-        body = "\n".join(f"\n[{i + 1}] {err}" for i, err in enumerate(errors))
+        body = "\n".join(f"\n[{i + 1}] {err}" for i, err in enumerate(all_errors))
         print(header + body, file=sys.stderr)
 
-    return resolved_scope, resolved_skill, errors
+    return resolved_scope, resolved_skill, config_errors, binding_errors
 
 
 def _resolve_bind(
@@ -891,37 +946,59 @@ def _unresolved_message(fleet: FleetConfig | None) -> str:
     """Build the error text a memory tool returns while the session is unbound.
 
     Same content the refuse-to-start message used to print to stderr (now
-    unreadable inside a harness), plus the recovery instructions that are
-    new to soft-start: which scopes exist, and the two ways out —
-    strata_bind, or fixing the underlying env/config and calling
-    strata_bind again (it re-reads fleet.yaml itself).
+    unreadable inside a harness), plus recovery instructions that are new to
+    soft-start and class-aware (review follow-up): a config-class failure
+    (broken/missing .strata/config.toml, broken fleet.yaml) can only be
+    fixed by editing the file and restarting the process — strata_bind
+    can't touch it, so its section never mentions strata_bind. A
+    binding-class failure (which scope/skill) is strata_bind/elicitation-
+    eligible and says so. Either section is omitted when that class has no
+    failures, so a session left gated ONLY by a config-class problem after a
+    successful strata_bind never sees a stale "call strata_bind" line for a
+    binding that is already resolved.
     """
+    all_errors = _STARTUP_ERRORS_CONFIG + _STARTUP_ERRORS_BINDING
     header = (
         "Strata MCP server started but this session is not yet bound — "
-        f"{len(_STARTUP_ERRORS)} startup validation "
-        f"{'failure' if len(_STARTUP_ERRORS) == 1 else 'failures'}:\n"
+        f"{len(all_errors)} startup validation "
+        f"{'failure' if len(all_errors) == 1 else 'failures'}:\n"
     )
-    body = "\n".join(f"\n[{i + 1}] {err}" for i, err in enumerate(_STARTUP_ERRORS))
+    body = "\n".join(f"\n[{i + 1}] {err}" for i, err in enumerate(all_errors))
 
-    scope_ids = [s.id for s in fleet.active_scopes()] if fleet is not None else []
-    scopes_line = (
-        f"  Available scope IDs: {', '.join(scope_ids)}\n"
-        if scope_ids
-        else "  (no active scopes found in fleet.yaml)\n"
-    )
-    recovery = (
-        "\n\nTo recover without restarting this server:\n"
-        f"{scopes_line}"
-        "  Call strata_bind(scope_id=<one of the above>[, skill=<skill>]) to bind "
-        "this session now, or\n"
-        "  fix the underlying issue (create/edit fleet.yaml, set "
-        "STRATA_AGENT_SCOPE/STRATA_AGENT_SKILL) and call strata_bind again — "
-        "fleet.yaml is re-read as part of that call, so a fix made after startup "
-        "is bindable immediately.\n"
-        "  strata_list_scopes works unbound too (fleet topology is not scoped "
+    sections: list[str] = []
+    if _STARTUP_ERRORS_CONFIG:
+        sections.append(
+            "\n\nThe config/storage-source failure(s) above cannot be fixed by "
+            "strata_bind — the server may be reading (or about to read) the "
+            "wrong fleet.yaml or database entirely. Fix the file(s) named "
+            "above and restart the server; a strata_bind call in the "
+            "meantime cannot make this session's memory land in the right "
+            "place."
+        )
+    if _STARTUP_ERRORS_BINDING:
+        scope_ids = [s.id for s in fleet.active_scopes()] if fleet is not None else []
+        scopes_line = (
+            f"  Available scope IDs: {', '.join(scope_ids)}\n"
+            if scope_ids
+            else "  (no active scopes found in fleet.yaml)\n"
+        )
+        sections.append(
+            "\n\nTo recover the scope/skill binding without restarting this server:\n"
+            f"{scopes_line}"
+            "  Call strata_bind(scope_id=<one of the above>[, skill=<skill>]) to bind "
+            "this session now, or\n"
+            "  fix fleet.yaml (its scopes, its permitted_skills) and call strata_bind "
+            "again — fleet.yaml is re-read as part of that call, so a fix made after "
+            "startup is bindable immediately, or\n"
+            "  restart the server with STRATA_AGENT_SCOPE/STRATA_AGENT_SKILL set in its "
+            "environment (these are read once, at process start — setting them in your "
+            "shell after the server is already running has no effect on this session)."
+        )
+    sections.append(
+        "\n\n  strata_list_scopes works unbound too (fleet topology is not scoped "
         "memory) if you need the full strata/scope/edge picture before picking."
     )
-    return header + body + recovery
+    return header + body + "".join(sections)
 
 
 class _ScopePick(BaseModel):
@@ -930,18 +1007,73 @@ class _ScopePick(BaseModel):
     scope_id: str = Field(description="The scope_id to bind this session to.")
 
 
+# How long the server waits for a capability-declaring client to answer the
+# scope-pick elicitation before giving up. Context.elicit() / ServerSession.
+# elicit_form() (mcp/server/fastmcp/server.py, mcp/server/session.py) don't
+# expose a timeout parameter at all, even though the primitive underneath
+# both of them — BaseSession.send_request() (mcp/shared/session.py) — takes
+# one (request_read_timeout_seconds) and races it via anyio.fail_after,
+# raising McpError on expiry. Without threading one through here, a client
+# that declares the capability and then never answers hangs this tool call
+# forever. _send_scope_pick_elicitation, below, calls send_request directly
+# (bypassing the two convenience wrappers) so this timeout actually applies.
+_ELICIT_TIMEOUT = timedelta(seconds=120)
+
+
+async def _send_scope_pick_elicitation(
+    session: ServerSession, message: str, related_request_id: RequestId | None
+) -> AcceptedElicitation[_ScopePick] | DeclinedElicitation | CancelledElicitation:
+    """Send the scope-pick elicitation request with _ELICIT_TIMEOUT enforced.
+
+    Replicates what mcp.server.elicitation.elicit_with_validation +
+    ServerSession.elicit_form do internally (build an ElicitRequest, send it,
+    interpret the ElicitResult) but calls session.send_request(...) directly
+    so request_read_timeout_seconds can be passed — see _ELICIT_TIMEOUT's
+    docstring for why neither of those wrappers allows that. A timeout
+    surfaces as an McpError, same as any other transport failure; the caller
+    (_attempt_elicit_bind) treats that identically to an explicit decline.
+    """
+    result = await session.send_request(
+        ServerRequest(
+            ElicitRequest(
+                params=ElicitRequestFormParams(
+                    message=message,
+                    requestedSchema=_ScopePick.model_json_schema(),
+                ),
+            )
+        ),
+        ElicitResult,
+        request_read_timeout_seconds=_ELICIT_TIMEOUT,
+        metadata=ServerMessageMetadata(related_request_id=related_request_id),
+    )
+    if result.action == "accept" and result.content is not None:
+        return AcceptedElicitation(data=_ScopePick.model_validate(result.content))
+    elif result.action == "decline":
+        return DeclinedElicitation()
+    else:
+        return CancelledElicitation()
+
+
 async def _attempt_elicit_bind(fleet: FleetConfig) -> bool:
     """Try once to resolve the unbound session via server-initiated elicitation.
 
     Change 2. Offers the caller a pick of the fleet's active scopes; an
     accepted pick is bound via the exact same rule strata_bind enforces
-    (_resolve_bind, above) — "bind via the same path as strata_bind."
+    (_resolve_bind, above) — "bind via the same path as strata_bind." Clears
+    ONLY _STARTUP_ERRORS_BINDING on success — a config-class failure (see
+    _validate_binding's docstring) is left exactly as it was; the caller
+    (_require_bound_or_elicit) never reaches this function while one is
+    present, since a scope pick cannot fix it.
 
     Tolerant of everything: no MCP session available, the client not
-    declaring the elicitation capability, the client declining/cancelling,
-    a validation failure on the picked scope, or any transport error —
-    every one of these returns False so the caller falls back to the plain
-    Change-1 error result. Never raises.
+    declaring the elicitation capability, a validation failure on the picked
+    scope — every one of these returns False so the caller falls back to the
+    plain Change-1 error result, without latching (nothing was actually
+    asked of the client, so there's nothing to "not ask again"). A client
+    that DOES get asked and declines, cancels, or never answers within
+    _ELICIT_TIMEOUT is latched (_ELICIT_DECLINED) so this process doesn't
+    re-prompt (or re-hang on) the same unresponsive client on its very next
+    call. Never raises.
     """
     global _ELICIT_DECLINED
 
@@ -962,14 +1094,22 @@ async def _attempt_elicit_bind(fleet: FleetConfig) -> bool:
             ClientCapabilities(elicitation=ElicitationCapability())
         ):
             return False
+    except Exception:  # noqa: BLE001 - no session / no capability: nothing was asked, no latch
+        return False
 
-        listing = "\n".join(f"- {s.id}: {s.name}" for s in sorted(scopes, key=lambda s: s.id))
-        message = (
-            "Strata is not yet bound to a scope for this session. Pick one to continue:\n" + listing
-        )
+    listing = "\n".join(f"- {s.id}: {s.name}" for s in sorted(scopes, key=lambda s: s.id))
+    message = (
+        "Strata is not yet bound to a scope for this session. Pick one to continue:\n" + listing
+    )
 
-        result = await ctx.elicit(message, _ScopePick)
-    except Exception:  # noqa: BLE001 - any elicitation failure falls back silently
+    try:
+        result = await _send_scope_pick_elicitation(session, message, ctx.request_id)
+    except Exception:
+        # Covers a timeout (McpError, after _ELICIT_TIMEOUT) and any other
+        # transport failure once a request was actually sent to the client
+        # — treated exactly like an explicit decline (spec): latch so this
+        # process doesn't hang on, or re-prompt, the same client again.
+        _ELICIT_DECLINED = True
         return False
 
     if not isinstance(result, AcceptedElicitation):
@@ -983,11 +1123,15 @@ async def _attempt_elicit_bind(fleet: FleetConfig) -> bool:
     if errors:
         return False
 
-    global _AGENT_SCOPE, _AGENT_SKILL, _UNRESOLVED
+    global _AGENT_SCOPE, _AGENT_SKILL, _UNRESOLVED, _STARTUP_ERRORS_BINDING
     with _binding_lock:
         _AGENT_SCOPE = picked_scope_id
         _AGENT_SKILL = resolved_skill
-        _UNRESOLVED = False
+        _STARTUP_ERRORS_BINDING = []
+        _UNRESOLVED = bool(_STARTUP_ERRORS_CONFIG)
+        # A fresh binding clears the latch too — see its docstring (module
+        # top): a client that declined once isn't locked out forever by it.
+        _ELICIT_DECLINED = False
     return True
 
 
@@ -1001,10 +1145,13 @@ async def _require_bound_or_elicit() -> None:
 
     A no-op — zero overhead — once the session is resolved (the common
     case). While unresolved: tries exactly one elicitation attempt (Change
-    2) when the fleet itself loads fine (nothing to offer a pick of
-    otherwise); on any outcome other than a successful bind, raises with
-    the same aggregated startup-failure list plus recovery instructions
-    that used to only reach stderr (Change 1).
+    2) when the fleet itself loads fine AND the only remaining problem is
+    binding-class (nothing to offer a pick of when the fleet won't load; no
+    point offering one when a config-class failure means the session stays
+    gated regardless of what gets picked — see _validate_binding's
+    docstring); on any outcome other than a successful bind, raises with
+    the same aggregated, class-aware startup-failure list plus recovery
+    instructions that used to only reach stderr (Change 1).
     """
     if not _UNRESOLVED:
         return
@@ -1015,7 +1162,7 @@ async def _require_bound_or_elicit() -> None:
     except Exception:  # noqa: BLE001 - a fleet that still won't load has nothing to elicit
         fleet = None
 
-    if fleet is not None and await _attempt_elicit_bind(fleet):
+    if not _STARTUP_ERRORS_CONFIG and fleet is not None and await _attempt_elicit_bind(fleet):
         return
 
     raise RuntimeError(_unresolved_message(fleet))
@@ -1080,6 +1227,18 @@ def strata_bind(scope_id: str, skill: str | None = None) -> dict:
     On failure the binding is left completely unchanged — a rejected
     strata_bind call never leaves you half-bound.
 
+    Clears ONLY the binding-class startup failures (which scope/skill this
+    session acts as) — never a config-class one (a broken/missing
+    ``.strata/config.toml`` or ``fleet.yaml``; see ``_validate_binding``'s
+    docstring for why: those mean the server may be running against the
+    WRONG storage source, and no scope pick fixes that). If a config-class
+    failure remains after an otherwise-successful bind, the result carries a
+    ``config_notice`` explaining that memory tools stay gated regardless —
+    review follow-up: strata_bind used to clear the WHOLE startup-failure
+    list unconditionally, so a "successful" bind after a broken config.toml
+    would silently look fully resolved while still writing to the wrong
+    (env-fallback) store.
+
     Args:
         scope_id: The scope to bind to. Must exist in fleet.yaml and be
             ``active`` (an archived scope cannot be bound).
@@ -1100,7 +1259,7 @@ def strata_bind(scope_id: str, skill: str | None = None) -> dict:
             not permitted — the error lists the valid scopes/skills. The
             binding is left unchanged in every failure case.
     """
-    global _AGENT_SCOPE, _AGENT_SKILL, _UNRESOLVED
+    global _AGENT_SCOPE, _AGENT_SKILL, _UNRESOLVED, _STARTUP_ERRORS_BINDING, _ELICIT_DECLINED
 
     # This is THE recovery path for an unresolved session (Change 1), so it
     # deliberately re-reads fleet.yaml itself (below) rather than trusting
@@ -1136,7 +1295,15 @@ def strata_bind(scope_id: str, skill: str | None = None) -> dict:
     with _binding_lock:
         _AGENT_SCOPE = scope_id
         _AGENT_SKILL = resolved_skill
-        _UNRESOLVED = False
+        # Clears ONLY the binding-class failures — see the docstring above
+        # and _validate_binding's for why a config-class one (if present)
+        # is deliberately left untouched here.
+        _STARTUP_ERRORS_BINDING = []
+        _UNRESOLVED = bool(_STARTUP_ERRORS_CONFIG)
+        # A fresh binding clears the elicitation-decline latch too — see its
+        # docstring (module top): a client that declined once isn't locked
+        # out forever by it.
+        _ELICIT_DECLINED = False
 
     result = {
         "scope_id": _AGENT_SCOPE,
@@ -1148,6 +1315,14 @@ def strata_bind(scope_id: str, skill: str | None = None) -> dict:
             f"Session id unchanged ({_AGENT_SESSION_ID!r})."
         ),
     }
+    if _STARTUP_ERRORS_CONFIG:
+        result["config_notice"] = (
+            "Binding succeeded, but memory tools remain gated: "
+            f"{len(_STARTUP_ERRORS_CONFIG)} unresolved config/storage-source "
+            "failure(s) (the server may be running against the wrong fleet.yaml "
+            "or database). Fix the file(s) and restart the server — strata_bind "
+            "cannot clear these."
+        )
     return _attach_fleet_notice(result)
 
 
@@ -2117,10 +2292,14 @@ def main() -> None:
 
     Startup order (issue #46 — nothing touches storage before validation):
 
-    1. Resolve paths (project config walk-up; env fallback).
+    1. Resolve paths (project config walk-up; env fallback — reusing the ONE
+       load_project_config() call below; see the note above the fallback
+       branch for why a second call was a bug, not redundancy).
     2. Load the fleet config — parse/invariant failures become startup-error
        entries, not tracebacks.
-    3. Validate the agent binding (scope, skill) — all failures aggregated.
+    3. Validate the agent binding (scope, skill) — all failures aggregated
+       and classified (config-class vs binding-class — see
+       _validate_binding's docstring).
     4. Initialise storage (migrations, stores) — a failure here is still
        fatal (a corrupt DB or unwritable directory isn't something
        strata_bind can recover from) and exits 1 with a single actionable
@@ -2128,12 +2307,12 @@ def main() -> None:
     5. Serve — always. Soft-start (dated addendum, ADR 0005 D5): binding
        failures from step 3 (unbound multi-scope, unknown scope,
        impermissible skill, missing/invalid fleet) no longer exit here. The
-       server completes the MCP handshake regardless, stores the aggregated
-       failure list, and every memory tool but strata_bind returns that list
-       as its error result until the session is bound — see
-       _require_bound_or_elicit(). A harness that swallows stderr (Codex,
-       Claude Code) otherwise leaves the human never seeing why nothing
-       works.
+       server completes the MCP handshake regardless, stores the aggregated,
+       classified failure lists, and every memory tool but strata_bind
+       returns the relevant one as its error result until the session is
+       bound — see _require_bound_or_elicit(). A harness that swallows
+       stderr (Codex, Claude Code) otherwise leaves the human never seeing
+       why nothing works.
     """
     # Walk for the project config once at startup so we can show the user
     # exactly which paths we examined when validation fails.
@@ -2145,15 +2324,40 @@ def main() -> None:
     except ProjectConfigError as exc:
         startup_errors.append(
             f".strata/config.toml is invalid: {exc}\n"
-            "  Fix the file (or delete it and re-run `strata register`)."
+            "  Fix the file (or delete it and re-run `strata register`), then restart "
+            "the server — this is read once, at process start."
         )
 
-    paths = resolve_storage_paths(_settings)
+    # Resolve storage paths from the project_config ALREADY loaded above,
+    # never by calling resolve_storage_paths() (which would call
+    # load_project_config() a second time, independently) — review
+    # follow-up: an invalid .strata/config.toml made that second call raise
+    # the SAME ProjectConfigError again, uncaught, crashing main() with a
+    # raw traceback instead of degrading gracefully like every other
+    # config-class failure. Mirrors resolve_storage_paths' own precedence
+    # (project wins; env settings are the fallback) without re-deriving it.
+    if project_config is not None:
+        paths = StoragePaths(
+            db_path=str(project_config.db),
+            summaries_dir=str(project_config.summaries_dir),
+            fleet_yaml_path=str(project_config.fleet_yaml),
+            source="project",
+            project_root=project_config.project_root,
+        )
+    else:
+        paths = StoragePaths(
+            db_path=_settings.db_path,
+            summaries_dir=_settings.summaries_dir,
+            fleet_yaml_path=_settings.fleet_yaml_path,
+            source="env",
+            project_root=None,
+        )
     _set_paths(paths)
 
     # Load fleet only when we have a config; without one there's nothing to
     # validate against, and the loader would just hit env-var fallbacks.
-    # Parse errors and invariant violations become refuse-to-start entries.
+    # Parse errors and invariant violations become config-class startup
+    # errors, not tracebacks.
     fleet = None
     if project_config is not None:
         try:
@@ -2162,19 +2366,24 @@ def main() -> None:
             startup_errors.append(
                 f"fleet config at {paths.fleet_yaml_path} is invalid "
                 f"[{exc.kind}]: {exc.message}\n"
-                "  Fix fleet.yaml, then relaunch."
+                "  Fix fleet.yaml, then restart the server."
             )
         except yaml.YAMLError as exc:
             startup_errors.append(
                 f"fleet config at {paths.fleet_yaml_path} is not valid YAML: {exc}\n"
-                "  Fix fleet.yaml, then relaunch."
+                "  Fix fleet.yaml, then restart the server."
             )
 
     # Rebind the module globals to the resolved (possibly auto-bound) scope
     # and skill — every tool function below reads _AGENT_SCOPE / _AGENT_SKILL
     # directly, so the auto-bind decision must land here before mcp.run().
-    global _AGENT_SCOPE, _AGENT_SKILL, _UNRESOLVED, _STARTUP_ERRORS
-    _AGENT_SCOPE, _AGENT_SKILL, _STARTUP_ERRORS = _validate_binding(
+    global _AGENT_SCOPE, _AGENT_SKILL, _UNRESOLVED, _STARTUP_ERRORS_CONFIG, _STARTUP_ERRORS_BINDING
+    (
+        _AGENT_SCOPE,
+        _AGENT_SKILL,
+        _STARTUP_ERRORS_CONFIG,
+        _STARTUP_ERRORS_BINDING,
+    ) = _validate_binding(
         fleet,
         _AGENT_SCOPE,
         _AGENT_SKILL,
@@ -2182,7 +2391,7 @@ def main() -> None:
         searched_paths=[str(p) for p in searched_paths_out],
         extra_errors=startup_errors,
     )
-    _UNRESOLVED = bool(_STARTUP_ERRORS)
+    _UNRESOLVED = bool(_STARTUP_ERRORS_CONFIG) or bool(_STARTUP_ERRORS_BINDING)
 
     # Storage init after validation — failures here (unwritable directory,
     # corrupt DB) also render as a refuse-to-start message, not a traceback.

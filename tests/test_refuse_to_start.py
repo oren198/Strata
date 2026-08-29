@@ -9,11 +9,20 @@ It enforces four conditions in order:
 4. STRATA_AGENT_SKILL is in the scope's permitted_skills (when set)
 
 Soft-start (dated addendum): a failure no longer exits the process. Each
-condition's failure is instead appended to the returned ``errors`` list —
-the third element of the ``(resolved_scope, resolved_skill, errors)`` tuple
-— which the caller (main()) stores for every memory tool to report until
-the session is bound via strata_bind. Happy path: all four conditions met →
-empty errors list, mcp.run would proceed exactly as before.
+condition's failure is instead appended to one of two classified lists —
+the ``(resolved_scope, resolved_skill, config_errors, binding_errors)``
+tuple's last two elements (review follow-up: strata_bind/elicitation used
+to clear EVERY startup failure unconditionally, including a broken
+.strata/config.toml it can never actually fix; see _validate_binding's
+docstring for the incident):
+
+- config_errors: condition 1 (.strata/config.toml not found) — a config/
+  storage-source problem strata_bind can never clear, since fixing it only
+  takes effect on the next restart.
+- binding_errors: conditions 2-5 (scope/skill selection) — live-fixable via
+  strata_bind or an accepted elicitation.
+
+Happy path: both lists empty, mcp.run would proceed exactly as before.
 
 Vocabulary: scope, stratum, fleet, contribution, scope-manager.
 """
@@ -69,73 +78,78 @@ def _make_two_scope_fleet(tmp_path: Path) -> FleetConfig:
 
 
 # ---------------------------------------------------------------------------
-# Condition 1: project config not found → reported, no exit
+# Condition 1: project config not found → config-class, reported, no exit
 # ---------------------------------------------------------------------------
 
 
 def test_no_project_config_does_not_exit(tmp_path: Path) -> None:
-    """Condition 1 failure: no .strata/config.toml → returned in errors, no exit."""
+    """Condition 1 failure: no .strata/config.toml → config_errors, no exit."""
     fleet = _make_fleet_with_skills(tmp_path)
 
-    _resolved_scope, _resolved_skill, errors = _validate_binding(
+    _resolved_scope, _resolved_skill, config_errors, binding_errors = _validate_binding(
         fleet,
         scope="g_root",
         skill="strata-worker",
         project_config_found=False,
     )
 
-    assert errors  # non-empty: the failure is present
+    assert config_errors  # non-empty: the failure is present
+    assert binding_errors == []
 
 
 def test_no_project_config_message_mentions_register(tmp_path: Path) -> None:
     """Condition 1 failure message should mention strata register."""
     fleet = _make_fleet_with_skills(tmp_path)
 
-    _resolved_scope, _resolved_skill, errors = _validate_binding(
+    _resolved_scope, _resolved_skill, config_errors, _binding_errors = _validate_binding(
         fleet,
         scope="g_root",
         skill="strata-worker",
         project_config_found=False,
     )
 
-    assert any("strata register" in e for e in errors)
+    assert any("strata register" in e for e in config_errors)
 
 
 # ---------------------------------------------------------------------------
 # Condition 2: STRATA_AGENT_SCOPE not set, and no single-scope fleet to
-# auto-bind to → reported. A single-scope fleet is covered separately below
-# (single-scope auto-bind never reports a failure here).
+# auto-bind to → binding-class, reported. A single-scope fleet is covered
+# separately below (single-scope auto-bind never reports a failure here).
 # ---------------------------------------------------------------------------
 
 
 def test_no_scope_reports_failure(tmp_path: Path) -> None:
-    """Condition 2 failure: STRATA_AGENT_SCOPE empty, 2+ scope fleet → error reported."""
+    """Condition 2 failure: STRATA_AGENT_SCOPE empty, 2+ scope fleet → binding_errors."""
     fleet = _make_two_scope_fleet(tmp_path)
 
-    _resolved_scope, _resolved_skill, errors = _validate_binding(
+    _resolved_scope, _resolved_skill, config_errors, binding_errors = _validate_binding(
         fleet,
         scope="",  # not set
         skill="strata-worker",
         project_config_found=True,
     )
 
-    assert errors
+    assert config_errors == []
+    assert binding_errors
 
 
-def test_no_scope_message_mentions_export(tmp_path: Path) -> None:
-    """Condition 2 message must include export STRATA_AGENT_SCOPE instruction."""
+def test_no_scope_message_mentions_strata_bind_and_restart(tmp_path: Path) -> None:
+    """Condition 2 message must name both live-fix paths: strata_bind, or a
+    restart with the env var set (dropped the misleading "export ... and
+    call strata_bind" combo — the env var is read once, at process start)."""
     fleet = _make_two_scope_fleet(tmp_path)
 
-    _resolved_scope, _resolved_skill, errors = _validate_binding(
+    _resolved_scope, _resolved_skill, _config_errors, binding_errors = _validate_binding(
         fleet,
         scope="",
         skill="strata-worker",
         project_config_found=True,
     )
 
-    joined = "\n".join(errors)
+    joined = "\n".join(binding_errors)
     assert "STRATA_AGENT_SCOPE" in joined
-    assert "export" in joined
+    assert "strata_bind" in joined
+    assert "restart" in joined.lower()
 
 
 def test_no_scope_message_lists_available_scopes_for_multi_scope_fleet(tmp_path: Path) -> None:
@@ -143,14 +157,14 @@ def test_no_scope_message_lists_available_scopes_for_multi_scope_fleet(tmp_path:
     the fleet has 2+ of them (no single scope to auto-bind to)."""
     fleet = _make_two_scope_fleet(tmp_path)
 
-    _resolved_scope, _resolved_skill, errors = _validate_binding(
+    _resolved_scope, _resolved_skill, _config_errors, binding_errors = _validate_binding(
         fleet,
         scope="",
         skill="strata-worker",
         project_config_found=True,
     )
 
-    joined = "\n".join(errors)
+    joined = "\n".join(binding_errors)
     assert "g_root" in joined
     assert "g_arch" in joined
 
@@ -160,14 +174,14 @@ def test_empty_string_scope_treated_as_unset_for_multi_scope_fleet(tmp_path: Pat
     env values) — a 2+ scope fleet still reports a failure."""
     fleet = _make_two_scope_fleet(tmp_path)
 
-    _resolved_scope, _resolved_skill, errors = _validate_binding(
+    _resolved_scope, _resolved_skill, _config_errors, binding_errors = _validate_binding(
         fleet,
         scope="",
         skill="strata-worker",
         project_config_found=True,
     )
 
-    assert errors
+    assert binding_errors
 
 
 # ---------------------------------------------------------------------------
@@ -181,7 +195,7 @@ def test_single_scope_fleet_auto_binds_when_scope_unset(tmp_path: Path) -> None:
     """A single-scope fleet auto-binds — no failure reported — and returns the scope id."""
     fleet = _make_fleet_with_skills(tmp_path, permitted_skills=None)
 
-    resolved_scope, _resolved_skill, errors = _validate_binding(
+    resolved_scope, _resolved_skill, config_errors, binding_errors = _validate_binding(
         fleet,
         scope="",
         skill=None,
@@ -189,7 +203,8 @@ def test_single_scope_fleet_auto_binds_when_scope_unset(tmp_path: Path) -> None:
     )
 
     assert resolved_scope == "g_root"
-    assert errors == []
+    assert config_errors == []
+    assert binding_errors == []
 
 
 def test_single_scope_fleet_auto_bind_prints_notice(tmp_path: Path, capsys) -> None:
@@ -230,7 +245,7 @@ def test_single_scope_fleet_auto_binds_skill_to_default(tmp_path: Path) -> None:
     fleet_path.write_text(yaml.dump(data), encoding="utf-8")
     fleet = FleetConfig.load(fleet_path)
 
-    resolved_scope, resolved_skill, errors = _validate_binding(
+    resolved_scope, resolved_skill, config_errors, binding_errors = _validate_binding(
         fleet,
         scope="",
         skill="",
@@ -239,21 +254,22 @@ def test_single_scope_fleet_auto_binds_skill_to_default(tmp_path: Path) -> None:
 
     assert resolved_scope == "g_root"
     assert resolved_skill == "strata-worker"
-    assert errors == []
+    assert config_errors == []
+    assert binding_errors == []
 
 
 def test_multi_scope_fleet_does_not_auto_bind(tmp_path: Path) -> None:
     """A 2+ scope fleet still reports a failure on unset scope — no auto-bind target."""
     fleet = _make_two_scope_fleet(tmp_path)
 
-    _resolved_scope, _resolved_skill, errors = _validate_binding(
+    _resolved_scope, _resolved_skill, _config_errors, binding_errors = _validate_binding(
         fleet,
         scope="",
         skill="strata-worker",
         project_config_found=True,
     )
 
-    assert errors
+    assert binding_errors
 
 
 def test_explicit_scope_unchanged_by_auto_bind_logic(tmp_path: Path) -> None:
@@ -261,7 +277,7 @@ def test_explicit_scope_unchanged_by_auto_bind_logic(tmp_path: Path) -> None:
     logic only ever engages when scope is unset/empty."""
     fleet = _make_two_scope_fleet(tmp_path)
 
-    resolved_scope, resolved_skill, errors = _validate_binding(
+    resolved_scope, resolved_skill, config_errors, binding_errors = _validate_binding(
         fleet,
         scope="g_arch",
         skill="strata-worker",
@@ -270,7 +286,8 @@ def test_explicit_scope_unchanged_by_auto_bind_logic(tmp_path: Path) -> None:
 
     assert resolved_scope == "g_arch"
     assert resolved_skill == "strata-worker"
-    assert errors == []
+    assert config_errors == []
+    assert binding_errors == []
 
 
 def test_explicit_scope_no_auto_bind_notice_printed(tmp_path: Path, capsys) -> None:
@@ -290,36 +307,37 @@ def test_explicit_scope_no_auto_bind_notice_printed(tmp_path: Path, capsys) -> N
 
 
 # ---------------------------------------------------------------------------
-# Condition 3: scope not in fleet → reported
+# Condition 3: scope not in fleet → binding-class, reported
 # ---------------------------------------------------------------------------
 
 
 def test_unknown_scope_reports_failure(tmp_path: Path) -> None:
-    """Condition 3 failure: scope not in fleet config → error reported."""
+    """Condition 3 failure: scope not in fleet config → binding_errors."""
     fleet = _make_fleet_with_skills(tmp_path)
 
-    _resolved_scope, _resolved_skill, errors = _validate_binding(
+    _resolved_scope, _resolved_skill, config_errors, binding_errors = _validate_binding(
         fleet,
         scope="g_nonexistent",
         skill="strata-worker",
         project_config_found=True,
     )
 
-    assert errors
+    assert config_errors == []
+    assert binding_errors
 
 
 def test_unknown_scope_message_lists_available_scopes(tmp_path: Path) -> None:
     """Condition 3 message must list available scope IDs."""
     fleet = _make_fleet_with_skills(tmp_path)
 
-    _resolved_scope, _resolved_skill, errors = _validate_binding(
+    _resolved_scope, _resolved_skill, _config_errors, binding_errors = _validate_binding(
         fleet,
         scope="g_nonexistent",
         skill="strata-worker",
         project_config_found=True,
     )
 
-    assert any("g_root" in e for e in errors)  # the available scope
+    assert any("g_root" in e for e in binding_errors)  # the available scope
 
 
 # ---------------------------------------------------------------------------
@@ -348,33 +366,34 @@ def test_archived_scope_reports_failure(tmp_path: Path) -> None:
     """An archived scope must be refused at startup, exactly like strata_bind refuses it."""
     fleet = _make_fleet_with_archived_scope(tmp_path)
 
-    _resolved_scope, _resolved_skill, errors = _validate_binding(
+    _resolved_scope, _resolved_skill, config_errors, binding_errors = _validate_binding(
         fleet,
         scope="g_root",
         skill=None,
         project_config_found=True,
     )
 
-    assert errors
+    assert config_errors == []
+    assert binding_errors
 
 
 def test_archived_scope_message_names_it_archived_and_lists_active(tmp_path: Path) -> None:
     fleet = _make_fleet_with_archived_scope(tmp_path)
 
-    _resolved_scope, _resolved_skill, errors = _validate_binding(
+    _resolved_scope, _resolved_skill, _config_errors, binding_errors = _validate_binding(
         fleet,
         scope="g_root",
         skill=None,
         project_config_found=True,
     )
 
-    joined = "\n".join(errors)
+    joined = "\n".join(binding_errors)
     assert "archived" in joined
     assert "g_active" in joined
 
 
 # ---------------------------------------------------------------------------
-# Condition 4a: STRATA_AGENT_SKILL not set → reported
+# Condition 4a: STRATA_AGENT_SKILL not set → binding-class, reported
 # ---------------------------------------------------------------------------
 
 
@@ -386,28 +405,32 @@ def test_no_skill_reports_failure(tmp_path: Path) -> None:
     """
     fleet = _make_fleet_with_skills(tmp_path, permitted_skills=["strata-worker"])
 
-    _resolved_scope, _resolved_skill, errors = _validate_binding(
+    _resolved_scope, _resolved_skill, config_errors, binding_errors = _validate_binding(
         fleet,
         scope="g_root",
         skill="",  # not set
         project_config_found=True,
     )
 
-    assert errors
+    assert config_errors == []
+    assert binding_errors
 
 
-def test_no_skill_message_mentions_skill_export(tmp_path: Path) -> None:
-    """Condition 3b failure message must mention STRATA_AGENT_SKILL."""
+def test_no_skill_message_mentions_skill_and_bind(tmp_path: Path) -> None:
+    """Condition 3b failure message must mention STRATA_AGENT_SKILL and the
+    strata_bind recovery path."""
     fleet = _make_fleet_with_skills(tmp_path, permitted_skills=["strata-worker"])
 
-    _resolved_scope, _resolved_skill, errors = _validate_binding(
+    _resolved_scope, _resolved_skill, _config_errors, binding_errors = _validate_binding(
         fleet,
         scope="g_root",
         skill="",
         project_config_found=True,
     )
 
-    assert any("STRATA_AGENT_SKILL" in e for e in errors)
+    joined = "\n".join(binding_errors)
+    assert "STRATA_AGENT_SKILL" in joined
+    assert "strata_bind" in joined
 
 
 def test_no_skill_on_unrestricted_scope_is_accepted(tmp_path: Path) -> None:
@@ -419,47 +442,49 @@ def test_no_skill_on_unrestricted_scope_is_accepted(tmp_path: Path) -> None:
     """
     fleet = _make_fleet_with_skills(tmp_path, permitted_skills=None)
 
-    _resolved_scope, _resolved_skill, errors = _validate_binding(
+    _resolved_scope, _resolved_skill, config_errors, binding_errors = _validate_binding(
         fleet,
         scope="g_root",
         skill=None,
         project_config_found=True,
     )
 
-    assert errors == []
+    assert config_errors == []
+    assert binding_errors == []
 
 
 # ---------------------------------------------------------------------------
-# Condition 4b: skill not in permitted_skills → reported
+# Condition 4b: skill not in permitted_skills → binding-class, reported
 # ---------------------------------------------------------------------------
 
 
 def test_skill_not_in_permitted_reports_failure(tmp_path: Path) -> None:
-    """Condition 4 failure: skill not in permitted_skills → error reported."""
+    """Condition 4 failure: skill not in permitted_skills → binding_errors."""
     fleet = _make_fleet_with_skills(tmp_path, permitted_skills=["strata-worker", "inspector"])
 
-    _resolved_scope, _resolved_skill, errors = _validate_binding(
+    _resolved_scope, _resolved_skill, config_errors, binding_errors = _validate_binding(
         fleet,
         scope="g_root",
         skill="unauthorized-skill",
         project_config_found=True,
     )
 
-    assert errors
+    assert config_errors == []
+    assert binding_errors
 
 
 def test_skill_not_in_permitted_message_lists_permitted_skills(tmp_path: Path) -> None:
     """Condition 4 message must list the permitted skills for the scope."""
     fleet = _make_fleet_with_skills(tmp_path, permitted_skills=["strata-worker", "inspector"])
 
-    _resolved_scope, _resolved_skill, errors = _validate_binding(
+    _resolved_scope, _resolved_skill, _config_errors, binding_errors = _validate_binding(
         fleet,
         scope="g_root",
         skill="unauthorized-skill",
         project_config_found=True,
     )
 
-    joined = "\n".join(errors)
+    joined = "\n".join(binding_errors)
     assert "strata-worker" in joined
     assert "inspector" in joined
 
@@ -473,47 +498,50 @@ def test_empty_permitted_skills_allows_any_skill(tmp_path: Path) -> None:
     """When permitted_skills is empty/None, any skill is accepted (no failure)."""
     fleet = _make_fleet_with_skills(tmp_path, permitted_skills=None)
 
-    _resolved_scope, _resolved_skill, errors = _validate_binding(
+    _resolved_scope, _resolved_skill, config_errors, binding_errors = _validate_binding(
         fleet,
         scope="g_root",
         skill="any-skill-whatsoever",
         project_config_found=True,
     )
 
-    assert errors == []
+    assert config_errors == []
+    assert binding_errors == []
 
 
 # ---------------------------------------------------------------------------
-# Happy path: all conditions met → empty errors
+# Happy path: all conditions met → both lists empty
 # ---------------------------------------------------------------------------
 
 
 def test_happy_path_no_errors(tmp_path: Path) -> None:
-    """When all four conditions pass, _validate_binding returns an empty errors list."""
+    """When all four conditions pass, _validate_binding returns empty error lists."""
     fleet = _make_fleet_with_skills(tmp_path, permitted_skills=["strata-worker"])
 
-    _resolved_scope, _resolved_skill, errors = _validate_binding(
+    _resolved_scope, _resolved_skill, config_errors, binding_errors = _validate_binding(
         fleet,
         scope="g_root",
         skill="strata-worker",
         project_config_found=True,
     )
 
-    assert errors == []
+    assert config_errors == []
+    assert binding_errors == []
 
 
 def test_happy_path_with_empty_permitted_skills_no_errors(tmp_path: Path) -> None:
     """Happy path works when scope has no permitted_skills restriction."""
     fleet = _make_fleet_with_skills(tmp_path, permitted_skills=None)
 
-    _resolved_scope, _resolved_skill, errors = _validate_binding(
+    _resolved_scope, _resolved_skill, config_errors, binding_errors = _validate_binding(
         fleet,
         scope="g_root",
         skill="strata-developer",
         project_config_found=True,
     )
 
-    assert errors == []
+    assert config_errors == []
+    assert binding_errors == []
 
 
 # ---------------------------------------------------------------------------
@@ -533,32 +561,35 @@ def test_multiple_failures_never_raise_systemexit(tmp_path: Path) -> None:
     )
 
 
-def test_all_failures_reported_in_single_list(tmp_path: Path) -> None:
-    """Per ADR 0005 Decision 5: all validation failures are reported in a
-    single aggregated list, not first-failure-wins.
+def test_all_failures_reported_across_both_classified_lists(tmp_path: Path) -> None:
+    """Per ADR 0005 Decision 5: all validation failures are reported (not
+    first-failure-wins), now split across the two classified lists.
 
     A user with three missing pieces (no config, no scope env, no skill env)
-    sees the complete remediation list in one pass.
+    sees the complete remediation picture in one pass: one config-class
+    failure, two binding-class ones.
     """
-    _resolved_scope, _resolved_skill, errors = _validate_binding(
+    _resolved_scope, _resolved_skill, config_errors, binding_errors = _validate_binding(
         None,  # No fleet because no config (mirrors main() behaviour)
         scope="",
         skill="",
         project_config_found=False,
     )
 
-    joined = "\n".join(errors)
-    # All three remediations appear in the same aggregated list.
-    assert "strata register" in joined, "missing config remediation"
-    assert "export STRATA_AGENT_SCOPE" in joined, "missing scope remediation"
-    assert "export STRATA_AGENT_SKILL" in joined, "missing skill remediation"
-    assert len(errors) == 3
+    assert any("strata register" in e for e in config_errors), "missing config remediation"
+    assert len(config_errors) == 1
+
+    joined_binding = "\n".join(binding_errors)
+    assert "STRATA_AGENT_SCOPE" in joined_binding, "missing scope remediation"
+    assert "STRATA_AGENT_SKILL" in joined_binding, "missing skill remediation"
+    assert len(binding_errors) == 2
 
 
 def test_all_failures_also_printed_to_stderr_for_local_dev(tmp_path: Path, capsys) -> None:
-    """The aggregated message is still printed to stderr — useful for a human
-    running the server locally who does read it — even though it is no
-    longer the only place the failure is visible (soft-start addendum)."""
+    """The aggregated message (both classes combined) is still printed to
+    stderr — useful for a human running the server locally who does read it
+    — even though it is no longer the only place the failure is visible
+    (soft-start addendum)."""
     _validate_binding(
         None,
         scope="",

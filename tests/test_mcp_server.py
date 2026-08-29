@@ -3127,7 +3127,7 @@ async def test_unbound_tool_call_returns_error_with_scopes_and_bind_mention(tmp_
         patch.object(mod, "_UNRESOLVED", True),
         patch.object(
             mod,
-            "_STARTUP_ERRORS",
+            "_STARTUP_ERRORS_BINDING",
             ["STRATA_AGENT_SCOPE is not set.\n  Available scope IDs: g_arch, g_backend."],
         ),
         patch.object(mod, "_load_fleet", return_value=fleet),
@@ -3153,7 +3153,7 @@ async def test_unbound_tool_call_raises_for_every_memory_tool_but_bind(tmp_path:
     with (
         patch.object(mod, "_AGENT_SCOPE", ""),
         patch.object(mod, "_UNRESOLVED", True),
-        patch.object(mod, "_STARTUP_ERRORS", ["STRATA_AGENT_SCOPE is not set."]),
+        patch.object(mod, "_STARTUP_ERRORS_BINDING", ["STRATA_AGENT_SCOPE is not set."]),
         patch.object(mod, "_load_fleet", return_value=fleet),
     ):
         with pytest.raises(RuntimeError):
@@ -3178,7 +3178,7 @@ async def test_strata_bind_works_while_unresolved(tmp_path: Path) -> None:
     with (
         patch.object(mod, "_AGENT_SCOPE", ""),
         patch.object(mod, "_UNRESOLVED", True),
-        patch.object(mod, "_STARTUP_ERRORS", ["STRATA_AGENT_SCOPE is not set."]),
+        patch.object(mod, "_STARTUP_ERRORS_BINDING", ["STRATA_AGENT_SCOPE is not set."]),
     ):
         result = mod.strata_bind(scope_id="g_backend")
         assert result["scope_id"] == "g_backend"
@@ -3214,7 +3214,7 @@ async def test_strata_list_scopes_works_unbound_and_carries_notice(tmp_path: Pat
     with (
         patch.object(mod, "_AGENT_SCOPE", ""),
         patch.object(mod, "_UNRESOLVED", True),
-        patch.object(mod, "_STARTUP_ERRORS", ["STRATA_AGENT_SCOPE is not set."]),
+        patch.object(mod, "_STARTUP_ERRORS_BINDING", ["STRATA_AGENT_SCOPE is not set."]),
         patch.object(mod, "_load_fleet", return_value=fleet),
     ):
         # Must NOT raise — pure topology reads work unbound.
@@ -3261,7 +3261,7 @@ async def test_unresolved_message_mentions_strata_list_scopes_works_unbound(
     with (
         patch.object(mod, "_AGENT_SCOPE", ""),
         patch.object(mod, "_UNRESOLVED", True),
-        patch.object(mod, "_STARTUP_ERRORS", ["STRATA_AGENT_SCOPE is not set."]),
+        patch.object(mod, "_STARTUP_ERRORS_BINDING", ["STRATA_AGENT_SCOPE is not set."]),
         patch.object(mod, "_load_fleet", return_value=fleet),
         pytest.raises(RuntimeError) as exc_info,
     ):
@@ -3273,7 +3273,9 @@ async def test_unresolved_message_mentions_strata_list_scopes_works_unbound(
 async def test_fleet_missing_at_startup_then_created_bindable_without_restart(
     tmp_path: Path,
 ) -> None:
-    """The exact incident: fleet.yaml missing at startup (unresolved), created
+    """The exact incident: fleet.yaml missing at startup (a binding-class
+    failure — an unwritten fleet.yaml loads as the empty fleet, no scopes,
+    so STRATA_AGENT_SCOPE can never resolve — unresolved), created
     afterward, and bindable with no server restart — strata_bind re-reads
     fleet.yaml itself via the reloader."""
     db_path = _make_db(tmp_path)
@@ -3285,7 +3287,7 @@ async def test_fleet_missing_at_startup_then_created_bindable_without_restart(
     with (
         patch.object(mod, "_AGENT_SCOPE", ""),
         patch.object(mod, "_UNRESOLVED", True),
-        patch.object(mod, "_STARTUP_ERRORS", [".strata/config.toml not found."]),
+        patch.object(mod, "_STARTUP_ERRORS_BINDING", ["STRATA_AGENT_SCOPE is not set."]),
     ):
         with pytest.raises(RuntimeError):
             await mod.strata_read_perspective()
@@ -3346,7 +3348,7 @@ async def test_unbound_two_scope_start_handshake_completes_and_tools_listable(
     with (
         patch.object(mod, "_AGENT_SCOPE", ""),
         patch.object(mod, "_UNRESOLVED", True),
-        patch.object(mod, "_STARTUP_ERRORS", ["STRATA_AGENT_SCOPE is not set."]),
+        patch.object(mod, "_STARTUP_ERRORS_BINDING", ["STRATA_AGENT_SCOPE is not set."]),
     ):
         async with create_connected_server_and_client_session(mod.mcp) as client:
             tools = await client.list_tools()
@@ -3372,7 +3374,7 @@ async def test_elicitation_accept_binds_and_continues_original_call(tmp_path: Pa
     with (
         patch.object(mod, "_AGENT_SCOPE", ""),
         patch.object(mod, "_UNRESOLVED", True),
-        patch.object(mod, "_STARTUP_ERRORS", ["STRATA_AGENT_SCOPE is not set."]),
+        patch.object(mod, "_STARTUP_ERRORS_BINDING", ["STRATA_AGENT_SCOPE is not set."]),
     ):
         async with create_connected_server_and_client_session(
             mod.mcp, elicitation_callback=_elicit_accept_g_backend
@@ -3409,7 +3411,7 @@ async def test_elicitation_only_attempted_once_then_bound_calls_skip_it(tmp_path
     with (
         patch.object(mod, "_AGENT_SCOPE", ""),
         patch.object(mod, "_UNRESOLVED", True),
-        patch.object(mod, "_STARTUP_ERRORS", ["STRATA_AGENT_SCOPE is not set."]),
+        patch.object(mod, "_STARTUP_ERRORS_BINDING", ["STRATA_AGENT_SCOPE is not set."]),
     ):
         async with create_connected_server_and_client_session(
             mod.mcp, elicitation_callback=_counting_accept
@@ -3444,7 +3446,7 @@ async def test_elicitation_accept_with_invalid_scope_falls_back_binding_unchange
     with (
         patch.object(mod, "_AGENT_SCOPE", ""),
         patch.object(mod, "_UNRESOLVED", True),
-        patch.object(mod, "_STARTUP_ERRORS", ["STRATA_AGENT_SCOPE is not set."]),
+        patch.object(mod, "_STARTUP_ERRORS_BINDING", ["STRATA_AGENT_SCOPE is not set."]),
     ):
         async with create_connected_server_and_client_session(
             mod.mcp, elicitation_callback=_accept_bad_scope
@@ -3473,7 +3475,7 @@ async def test_elicitation_decline_falls_back_to_unresolved_error(tmp_path: Path
     with (
         patch.object(mod, "_AGENT_SCOPE", ""),
         patch.object(mod, "_UNRESOLVED", True),
-        patch.object(mod, "_STARTUP_ERRORS", ["STRATA_AGENT_SCOPE is not set."]),
+        patch.object(mod, "_STARTUP_ERRORS_BINDING", ["STRATA_AGENT_SCOPE is not set."]),
     ):
         async with create_connected_server_and_client_session(
             mod.mcp, elicitation_callback=_elicit_decline
@@ -3504,7 +3506,7 @@ async def test_elicitation_missing_capability_falls_back_to_unresolved_error(
     with (
         patch.object(mod, "_AGENT_SCOPE", ""),
         patch.object(mod, "_UNRESOLVED", True),
-        patch.object(mod, "_STARTUP_ERRORS", ["STRATA_AGENT_SCOPE is not set."]),
+        patch.object(mod, "_STARTUP_ERRORS_BINDING", ["STRATA_AGENT_SCOPE is not set."]),
     ):
         async with create_connected_server_and_client_session(mod.mcp) as client:
             result = await client.call_tool("strata_read_perspective", {})
@@ -3530,7 +3532,7 @@ async def test_elicitation_never_attempted_from_within_strata_bind(tmp_path: Pat
     with (
         patch.object(mod, "_AGENT_SCOPE", ""),
         patch.object(mod, "_UNRESOLVED", True),
-        patch.object(mod, "_STARTUP_ERRORS", ["STRATA_AGENT_SCOPE is not set."]),
+        patch.object(mod, "_STARTUP_ERRORS_BINDING", ["STRATA_AGENT_SCOPE is not set."]),
         patch.object(
             mod,
             "_attempt_elicit_bind",
@@ -3539,3 +3541,209 @@ async def test_elicitation_never_attempted_from_within_strata_bind(tmp_path: Pat
     ):
         result = mod.strata_bind(scope_id="g_backend")
         assert result["scope_id"] == "g_backend"
+
+
+# ---------------------------------------------------------------------------
+# Review follow-up (fix round): elicitation timeout, per-class gate
+# clearing, and the decline-latch reset. See _validate_binding's and
+# _attempt_elicit_bind's docstrings (src/strata/mcp/server.py) for the two
+# incidents these close: (a) a capability-declaring client that never
+# answers used to hang the tool call forever — no timeout was threaded
+# through Context.elicit()/ServerSession.elicit_form(), even though the SDK
+# primitive underneath (BaseSession.send_request) supports one; (b)
+# strata_bind used to clear the WHOLE startup-failure list unconditionally,
+# so a "successful" bind after a broken .strata/config.toml would silently
+# look fully resolved while the server kept writing to the wrong
+# (env-fallback) storage location.
+# ---------------------------------------------------------------------------
+
+
+async def test_elicitation_timeout_falls_back_like_decline_and_latches(tmp_path: Path) -> None:
+    """A capability-declaring client that never answers must not hang the
+    tool call forever — _ELICIT_TIMEOUT bounds the wait via
+    request_read_timeout_seconds threaded into session.send_request
+    (_send_scope_pick_elicitation), and expiry is treated exactly like an
+    explicit decline: silent fallback to the readable error, plus the same
+    latch (no re-prompt/re-hang on the very next call)."""
+    from datetime import timedelta
+
+    import anyio
+    from mcp.shared.memory import create_connected_server_and_client_session
+
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fleet_yaml(tmp_path)
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+
+    async def _never_respond(context, params):
+        # Sleeps well past the (shrunk, below) server-side timeout. The
+        # server's send_request races anyio.fail_after independently of
+        # this client-side task, so this never needs to actually finish —
+        # create_connected_server_and_client_session cancels it on exit.
+        await anyio.sleep(5)
+        from mcp import types as mcp_types
+
+        return mcp_types.ElicitResult(action="decline")  # pragma: no cover
+
+    with (
+        patch.object(mod, "_AGENT_SCOPE", ""),
+        patch.object(mod, "_UNRESOLVED", True),
+        patch.object(mod, "_STARTUP_ERRORS_BINDING", ["STRATA_AGENT_SCOPE is not set."]),
+        patch.object(mod, "_ELICIT_TIMEOUT", timedelta(milliseconds=50)),
+    ):
+        async with create_connected_server_and_client_session(
+            mod.mcp, elicitation_callback=_never_respond
+        ) as client:
+            result = await client.call_tool("strata_read_perspective", {})
+
+            assert result.isError is True
+            text = _result_text(result)
+            assert "strata_bind" in text
+
+            # Latched exactly like a decline: a second unbound call must not
+            # hang out the same unresponsive client again.
+            second = await client.call_tool("strata_read_perspective", {})
+            assert second.isError is True
+
+        assert mod._ELICIT_DECLINED is True
+        assert mod._AGENT_SCOPE == ""
+
+
+async def test_elicit_declined_latch_cleared_by_successful_bind(tmp_path: Path) -> None:
+    """The latch docstring's claim must be TRUE (review follow-up: it used
+    to say 'cleared implicitly by any successful bind' while nothing in the
+    code ever cleared it): a decline latches (no re-ask on the very next
+    call), and a subsequent successful strata_bind clears it — a client
+    that declined once isn't locked out of elicitation forever by that one
+    no."""
+    from mcp.shared.memory import create_connected_server_and_client_session
+
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fleet_yaml(tmp_path)  # g_arch, g_backend
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+
+    with (
+        patch.object(mod, "_AGENT_SCOPE", ""),
+        patch.object(mod, "_UNRESOLVED", True),
+        patch.object(mod, "_STARTUP_ERRORS_BINDING", ["STRATA_AGENT_SCOPE is not set."]),
+    ):
+        async with create_connected_server_and_client_session(
+            mod.mcp, elicitation_callback=_elicit_decline
+        ) as client:
+            result = await client.call_tool("strata_read_perspective", {})
+            assert result.isError is True
+
+        assert mod._ELICIT_DECLINED is True
+
+        # A later successful strata_bind clears the latch.
+        bind_result = mod.strata_bind(scope_id="g_backend")
+        assert bind_result["scope_id"] == "g_backend"
+        assert mod._ELICIT_DECLINED is False
+
+
+async def test_config_class_failure_survives_a_successful_binding_class_bind(
+    tmp_path: Path,
+) -> None:
+    """Review follow-up incident: strata_bind must clear ONLY binding-class
+    startup failures. A broken .strata/config.toml means the server may
+    have opened storage at the wrong (env-fallback) location — no scope
+    pick fixes that, so memory tools must stay gated, naming the config
+    problem, even after strata_bind otherwise succeeds at the scope/skill
+    it was actually asked to fix."""
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fleet_yaml(tmp_path)  # g_arch, g_backend
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+    fleet = FleetConfig.load(fleet_path)
+
+    config_error = (
+        ".strata/config.toml is invalid: TOML parse error.\n"
+        "  Fix the file (or delete it and re-run `strata register`), then restart "
+        "the server — this is read once, at process start."
+    )
+
+    with (
+        patch.object(mod, "_AGENT_SCOPE", ""),
+        patch.object(mod, "_UNRESOLVED", True),
+        patch.object(mod, "_STARTUP_ERRORS_BINDING", ["STRATA_AGENT_SCOPE is not set."]),
+        patch.object(mod, "_STARTUP_ERRORS_CONFIG", [config_error]),
+        patch.object(mod, "_load_fleet", return_value=fleet),
+    ):
+        # The bind itself succeeds — the scope/skill problem strata_bind was
+        # asked to fix is fully valid and gets fixed.
+        result = mod.strata_bind(scope_id="g_backend")
+        assert result["scope_id"] == "g_backend"
+        # Told, in the same result, that memory tools remain gated anyway.
+        assert "config_notice" in result
+
+        # Binding-class cleared...
+        assert mod._STARTUP_ERRORS_BINDING == []
+        # ...but the config-class failure is untouched, so the session
+        # stays gated overall.
+        assert [config_error] == mod._STARTUP_ERRORS_CONFIG
+        assert mod._UNRESOLVED is True
+
+        # A memory tool call must still be refused, naming the config
+        # problem specifically.
+        with pytest.raises(RuntimeError) as exc_info:
+            await mod.strata_read_perspective()
+
+        message = str(exc_info.value)
+        assert "config.toml is invalid" in message
+        assert "restart" in message.lower()
+        # It must NOT re-suggest strata_bind for the scope/skill — that
+        # part is already fixed and re-suggesting it would be misleading.
+        assert "Call strata_bind" not in message
+
+        # Pure fleet topology stays visible regardless (Change 1's ungate
+        # follow-up) — this is not a binding problem.
+        listing = mod.strata_list_scopes()
+        assert {s["id"] for s in listing["scopes"]} == {"g_arch", "g_backend"}
+
+
+async def test_config_class_failure_skips_elicitation_entirely(tmp_path: Path) -> None:
+    """A config-class failure gates a scope pick from ever being offered —
+    there is no point eliciting when an answer would not unblock the
+    session (_require_bound_or_elicit only attempts elicitation when
+    _STARTUP_ERRORS_CONFIG is empty)."""
+    from mcp.shared.memory import create_connected_server_and_client_session
+
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fleet_yaml(tmp_path)
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+
+    calls = 0
+
+    async def _counting_accept(context, params):
+        nonlocal calls
+        calls += 1
+        from mcp import types as mcp_types
+
+        return mcp_types.ElicitResult(action="accept", content={"scope_id": "g_backend"})
+
+    with (
+        patch.object(mod, "_AGENT_SCOPE", ""),
+        patch.object(mod, "_UNRESOLVED", True),
+        patch.object(mod, "_STARTUP_ERRORS_BINDING", ["STRATA_AGENT_SCOPE is not set."]),
+        patch.object(
+            mod,
+            "_STARTUP_ERRORS_CONFIG",
+            [".strata/config.toml is invalid: bad toml.\n  Fix and restart."],
+        ),
+    ):
+        async with create_connected_server_and_client_session(
+            mod.mcp, elicitation_callback=_counting_accept
+        ) as client:
+            result = await client.call_tool("strata_read_perspective", {})
+
+        assert result.isError is True
+        text = _result_text(result)
+        assert "config.toml is invalid" in text
+        assert calls == 0  # never even asked
+        assert mod._AGENT_SCOPE == ""
