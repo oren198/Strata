@@ -2820,7 +2820,7 @@ async def test_invalid_fleet_edit_keeps_serving_last_good_fleet_with_notice(tmp_
 # ---------------------------------------------------------------------------
 
 
-def test_bind_to_scope_added_after_server_init_succeeds(tmp_path: Path) -> None:
+async def test_bind_to_scope_added_after_server_init_succeeds(tmp_path: Path) -> None:
     """The incident: a scope added to fleet.yaml after the server started must be bindable."""
     db_path = _make_db(tmp_path)
     summaries_dir = str(tmp_path / "summaries")
@@ -2830,20 +2830,23 @@ def test_bind_to_scope_added_after_server_init_succeeds(tmp_path: Path) -> None:
     with patch.object(mod, "_AGENT_SCOPE", "g_backend"):
         # g_new does not exist yet — binding to it now must fail.
         with pytest.raises(RuntimeError, match="not found"):
-            mod.strata_bind(scope_id="g_new")
+            await mod.strata_bind(scope_id="g_new")
 
         # Add the scope to fleet.yaml out of band (no server restart).
         raw = yaml.safe_load(fleet_path.read_text(encoding="utf-8"))
         raw["scopes"].append({"id": "g_new", "name": "New Scope", "stratum_id": "L1"})
         fleet_path.write_text(yaml.dump(raw, default_flow_style=False), encoding="utf-8")
 
-        result = mod.strata_bind(scope_id="g_new")
+        # Already bound to g_backend, so this is a switch — the self-bind
+        # guard (a separate feature) requires confirm=True; not what this
+        # test is about, so supply it directly.
+        result = await mod.strata_bind(scope_id="g_new", confirm=True)
 
         assert result["scope_id"] == "g_new"
         assert mod._AGENT_SCOPE == "g_new"
 
 
-def test_bind_to_nonexistent_scope_lists_valid_scopes_and_leaves_binding_intact(
+async def test_bind_to_nonexistent_scope_lists_valid_scopes_and_leaves_binding_intact(
     tmp_path: Path,
 ) -> None:
     db_path = _make_db(tmp_path)
@@ -2853,7 +2856,7 @@ def test_bind_to_nonexistent_scope_lists_valid_scopes_and_leaves_binding_intact(
     mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
     with patch.object(mod, "_AGENT_SCOPE", "g_backend"), patch.object(mod, "_AGENT_SKILL", None):
         with pytest.raises(RuntimeError) as exc_info:
-            mod.strata_bind(scope_id="g_does_not_exist")
+            await mod.strata_bind(scope_id="g_does_not_exist")
 
         message = str(exc_info.value)
         assert "g_arch" in message
@@ -2863,7 +2866,7 @@ def test_bind_to_nonexistent_scope_lists_valid_scopes_and_leaves_binding_intact(
         assert mod._AGENT_SKILL is None
 
 
-def test_bind_enforces_skill_permission(tmp_path: Path) -> None:
+async def test_bind_enforces_skill_permission(tmp_path: Path) -> None:
     db_path = _make_db(tmp_path)
     summaries_dir = str(tmp_path / "summaries")
     fleet = {
@@ -2884,14 +2887,14 @@ def test_bind_enforces_skill_permission(tmp_path: Path) -> None:
     mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
     with patch.object(mod, "_AGENT_SCOPE", ""), patch.object(mod, "_AGENT_SKILL", None):
         with pytest.raises(RuntimeError, match="permitted skills"):
-            mod.strata_bind(scope_id="g_restricted", skill="not-allowed")
+            await mod.strata_bind(scope_id="g_restricted", skill="not-allowed")
 
-        result = mod.strata_bind(scope_id="g_restricted", skill="strata-developer")
+        result = await mod.strata_bind(scope_id="g_restricted", skill="strata-developer")
         assert result["skill"] == "strata-developer"
         assert mod._AGENT_SKILL == "strata-developer"
 
 
-def test_bind_leaves_session_id_unchanged(tmp_path: Path) -> None:
+async def test_bind_leaves_session_id_unchanged(tmp_path: Path) -> None:
     db_path = _make_db(tmp_path)
     summaries_dir = str(tmp_path / "summaries")
     fleet_path = _make_fleet_yaml(tmp_path)
@@ -2901,10 +2904,239 @@ def test_bind_leaves_session_id_unchanged(tmp_path: Path) -> None:
         patch.object(mod, "_AGENT_SCOPE", "g_backend"),
         patch.object(mod, "_AGENT_SESSION_ID", "sess_stable"),
     ):
-        result = mod.strata_bind(scope_id="g_arch")
+        # Already bound to g_backend, so this is a switch — the self-bind
+        # guard (a separate feature) requires confirm=True; not what this
+        # test is about, so supply it directly.
+        result = await mod.strata_bind(scope_id="g_arch", confirm=True)
 
+        assert result["scope_id"] == "g_arch"
         assert result["session_id"] == "sess_stable"
         assert mod._AGENT_SESSION_ID == "sess_stable"
+
+
+# ---------------------------------------------------------------------------
+# Self-bind guard (operator finding from live testing): an agent picked a
+# scope on its own judgment to answer a question, without the user ever
+# weighing in. Two rules: (1) every bind-instructing text must route through
+# the user, never read as permission for the agent to choose; (2) switching
+# an ALREADY-bound session to a different scope requires an explicit,
+# separate confirmation step — either an accepted elicitation, or a second
+# strata_bind call carrying confirm=True. Initial bind (from unbound) and a
+# same-scope re-bind are unaffected — no prior identity to protect.
+# ---------------------------------------------------------------------------
+
+
+async def test_rebind_without_confirm_does_not_switch_and_returns_heads_up(
+    tmp_path: Path,
+) -> None:
+    """A switch attempted without confirmation must not take effect — the
+    binding stays exactly as it was, and the result is a heads-up, not a
+    silent no-op and not an exception."""
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fleet_yaml(tmp_path)  # g_arch, g_backend
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+    with patch.object(mod, "_AGENT_SCOPE", "g_arch"), patch.object(mod, "_AGENT_SKILL", None):
+        result = await mod.strata_bind(scope_id="g_backend")
+
+        # Binding is untouched.
+        assert result["scope_id"] == "g_arch"
+        assert mod._AGENT_SCOPE == "g_arch"
+
+        # A clear, programmatically-detectable heads-up, not silence.
+        assert result["switch_pending"] is True
+        assert result["switch_declined"] is False
+        assert "g_arch" in result["message"]
+        assert "g_backend" in result["message"]
+        assert "confirm" in result["message"].lower()
+
+
+async def test_rebind_with_confirm_switches_and_notes_identity_change(tmp_path: Path) -> None:
+    """confirm=True actually performs the switch, and the result explicitly
+    calls out the identity change — this is not a cosmetic rename."""
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fleet_yaml(tmp_path)
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+    with patch.object(mod, "_AGENT_SCOPE", "g_arch"), patch.object(mod, "_AGENT_SKILL", None):
+        result = await mod.strata_bind(scope_id="g_backend", confirm=True)
+
+        assert result["scope_id"] == "g_backend"
+        assert mod._AGENT_SCOPE == "g_backend"
+        assert "switch_pending" not in result
+        assert "g_arch" in result["message"]
+        assert "g_backend" in result["message"]
+        # Explicitly frames this as a change of whose memory is read/written.
+        assert "memory" in result["message"].lower()
+
+
+async def test_rebind_same_scope_is_a_no_op_success_without_confirm(tmp_path: Path) -> None:
+    """Naming the SAME scope you are already bound to is never a switch —
+    confirm is neither required nor meaningful, and it stays a plain
+    success like today."""
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fleet_yaml(tmp_path)
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+    with patch.object(mod, "_AGENT_SCOPE", "g_arch"), patch.object(mod, "_AGENT_SKILL", None):
+        result = await mod.strata_bind(scope_id="g_arch")
+
+        assert result["scope_id"] == "g_arch"
+        assert "switch_pending" not in result
+        assert mod._AGENT_SCOPE == "g_arch"
+
+
+async def test_initial_bind_from_unbound_needs_no_confirm(tmp_path: Path) -> None:
+    """An initial bind (session currently unbound) is not a switch — no
+    prior identity to protect, so it proceeds immediately, confirm or not."""
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fleet_yaml(tmp_path)
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+    with patch.object(mod, "_AGENT_SCOPE", ""), patch.object(mod, "_AGENT_SKILL", None):
+        result = await mod.strata_bind(scope_id="g_backend")
+
+        assert result["scope_id"] == "g_backend"
+        assert "switch_pending" not in result
+        assert mod._AGENT_SCOPE == "g_backend"
+
+
+async def test_rebind_elicitation_accept_switches(tmp_path: Path) -> None:
+    """Where the client declares the elicitation capability, strata_bind
+    asks the user directly and an accepted confirmation switches — this
+    replaces the confirm= dance when available."""
+    from mcp.shared.memory import create_connected_server_and_client_session
+
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fleet_yaml(tmp_path)
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+
+    async def _confirm_switch(context, params):
+        from mcp import types as mcp_types
+
+        return mcp_types.ElicitResult(action="accept", content={"confirm": True})
+
+    with patch.object(mod, "_AGENT_SCOPE", "g_arch"), patch.object(mod, "_AGENT_SKILL", None):
+        async with create_connected_server_and_client_session(
+            mod.mcp, elicitation_callback=_confirm_switch
+        ) as client:
+            result = await client.call_tool("strata_bind", {"scope_id": "g_backend"})
+
+        assert result.isError is not True
+        assert mod._AGENT_SCOPE == "g_backend"
+
+
+async def test_rebind_elicitation_decline_refuses_without_changes(tmp_path: Path) -> None:
+    """A declined elicitation refuses the switch — binding left completely
+    unchanged, no confirm= param needed to reach that outcome."""
+    from mcp.shared.memory import create_connected_server_and_client_session
+
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fleet_yaml(tmp_path)
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+
+    with patch.object(mod, "_AGENT_SCOPE", "g_arch"), patch.object(mod, "_AGENT_SKILL", None):
+        async with create_connected_server_and_client_session(
+            mod.mcp, elicitation_callback=_elicit_decline
+        ) as client:
+            result = await client.call_tool("strata_bind", {"scope_id": "g_backend"})
+
+        assert result.isError is not True  # a heads-up result, not an error
+        text = _result_text(result)
+        assert "switch_pending" in text or "did not confirm" in text.lower()
+        assert mod._AGENT_SCOPE == "g_arch"
+
+
+async def test_rebind_elicitation_never_latches(tmp_path: Path) -> None:
+    """Unlike the scope-pick elicitation (Change 2), a declined switch
+    confirmation must NOT set _ELICIT_DECLINED — a user might legitimately
+    confirm the very same switch moments later."""
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fleet_yaml(tmp_path)
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+
+    with (
+        patch.object(mod, "_AGENT_SCOPE", "g_arch"),
+        patch.object(mod, "_AGENT_SKILL", None),
+        patch.object(
+            mod,
+            "_attempt_elicit_switch_confirm",
+            return_value=False,
+        ),
+    ):
+        await mod.strata_bind(scope_id="g_backend")
+        assert mod._ELICIT_DECLINED is False
+
+
+def _normalize(text: str) -> str:
+    """Collapse whitespace/newlines to single spaces for robust substring
+    checks against wrapped docstrings/messages — a phrase split across a
+    line-wrap boundary must still be found."""
+    return " ".join(text.lower().split())
+
+
+async def test_reworded_bind_texts_route_through_the_user(tmp_path: Path) -> None:
+    """Grep-style assertions: every bind-instructing text an agent reads
+    must tell it to ask the user, and none may read as permission for the
+    agent to pick a scope on its own."""
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fleet_yaml(tmp_path)  # g_arch, g_backend
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+    fleet = FleetConfig.load(fleet_path)
+
+    # 1. The unbound_notice attached to strata_list_scopes.
+    with (
+        patch.object(mod, "_AGENT_SCOPE", ""),
+        patch.object(mod, "_UNRESOLVED", True),
+        patch.object(mod, "_load_fleet", return_value=fleet),
+    ):
+        listing = mod.strata_list_scopes()
+    assert "ask the user" in _normalize(listing["unbound_notice"])
+
+    # 2. The gated-tool unresolved error text (_unresolved_message).
+    with (
+        patch.object(mod, "_AGENT_SCOPE", ""),
+        patch.object(mod, "_UNRESOLVED", True),
+        patch.object(mod, "_STARTUP_ERRORS_BINDING", ["STRATA_AGENT_SCOPE is not set."]),
+        patch.object(mod, "_load_fleet", return_value=fleet),
+        pytest.raises(RuntimeError) as exc_info,
+    ):
+        await mod.strata_read_perspective()
+    assert "ask the user" in _normalize(str(exc_info.value))
+
+    # 3. strata_bind's own tool docstring (what the client sees as the
+    # tool's description).
+    assert "ask the user" in _normalize(mod.strata_bind.__doc__)
+    assert "must come from the user" in _normalize(mod.strata_bind.__doc__)
+
+    # 4. The switch-pending heads-up message.
+    with patch.object(mod, "_AGENT_SCOPE", "g_arch"), patch.object(mod, "_AGENT_SKILL", None):
+        pending = await mod.strata_bind(scope_id="g_backend")
+    assert "ask the user" in _normalize(pending["message"])
+
+    # No surviving self-bind instruction — the pre-fix text this whole
+    # guard replaces — in any of the texts checked above.
+    for text in (
+        listing["unbound_notice"],
+        str(exc_info.value),
+        mod.strata_bind.__doc__,
+        pending["message"],
+    ):
+        normalized = _normalize(text)
+        assert "bind with strata_bind(scope_id=...)" not in normalized
+        assert "call strata_bind to rebind this session to it" not in normalized
 
 
 async def test_contribution_after_bind_carries_new_scope_in_provenance(tmp_path: Path) -> None:
@@ -2927,7 +3159,10 @@ async def test_contribution_after_bind_carries_new_scope_in_provenance(tmp_path:
         patch("strata.scope_manager.ScopeManager.judge", return_value=fake_judgment),
         patch("anthropic.Anthropic", return_value=MagicMock()),
     ):
-        bind_result = mod.strata_bind(scope_id="g_arch")
+        # Already bound to g_backend, so this is a switch — the self-bind
+        # guard (a separate feature) requires confirm=True; not what this
+        # test is about, so supply it directly.
+        bind_result = await mod.strata_bind(scope_id="g_arch", confirm=True)
         assert bind_result["scope_id"] == "g_arch"
         assert mod._AGENT_SCOPE == "g_arch"
 
@@ -2973,7 +3208,7 @@ async def test_bind_refusal_mentions_active_fleet_reload_warning(tmp_path: Path)
         )
 
         with pytest.raises(RuntimeError) as exc_info:
-            mod.strata_bind(scope_id="g_new")
+            await mod.strata_bind(scope_id="g_new")
 
     message = str(exc_info.value)
     assert "g_new" in message
@@ -2989,7 +3224,7 @@ async def test_bind_refusal_mentions_active_fleet_reload_warning(tmp_path: Path)
 # ---------------------------------------------------------------------------
 
 
-def test_bind_applies_default_skill_when_omitted(tmp_path: Path) -> None:
+async def test_bind_applies_default_skill_when_omitted(tmp_path: Path) -> None:
     db_path = _make_db(tmp_path)
     summaries_dir = str(tmp_path / "summaries")
     fleet = {
@@ -3012,7 +3247,7 @@ def test_bind_applies_default_skill_when_omitted(tmp_path: Path) -> None:
     with patch.object(mod, "_AGENT_SCOPE", ""), patch.object(mod, "_AGENT_SKILL", None):
         # No skill given — must fall back to default_skill rather than
         # refusing with "no skill was given" (misleading when one exists).
-        result = mod.strata_bind(scope_id="g_defaulted")
+        result = await mod.strata_bind(scope_id="g_defaulted")
 
         assert result["skill"] == "strata-developer"
         assert mod._AGENT_SKILL == "strata-developer"
@@ -3024,7 +3259,7 @@ def test_bind_applies_default_skill_when_omitted(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_bind_refuses_archived_scope_via_shared_check(tmp_path: Path) -> None:
+async def test_bind_refuses_archived_scope_via_shared_check(tmp_path: Path) -> None:
     db_path = _make_db(tmp_path)
     summaries_dir = str(tmp_path / "summaries")
     fleet = {
@@ -3037,7 +3272,7 @@ def test_bind_refuses_archived_scope_via_shared_check(tmp_path: Path) -> None:
 
     mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
     with patch.object(mod, "_AGENT_SCOPE", ""), pytest.raises(RuntimeError, match="archived"):
-        mod.strata_bind(scope_id="g_gone")
+        await mod.strata_bind(scope_id="g_gone")
 
 
 # ---------------------------------------------------------------------------
@@ -3226,7 +3461,7 @@ async def test_strata_bind_works_while_unresolved(tmp_path: Path) -> None:
         patch.object(mod, "_UNRESOLVED", True),
         patch.object(mod, "_STARTUP_ERRORS_BINDING", ["STRATA_AGENT_SCOPE is not set."]),
     ):
-        result = mod.strata_bind(scope_id="g_backend")
+        result = await mod.strata_bind(scope_id="g_backend")
         assert result["scope_id"] == "g_backend"
         assert mod._UNRESOLVED is False
 
@@ -3346,7 +3581,7 @@ async def test_fleet_missing_at_startup_then_created_bindable_without_restart(
         }
         fleet_path.write_text(yaml.dump(fleet_data, default_flow_style=False), encoding="utf-8")
 
-        result = mod.strata_bind(scope_id="g_solo")
+        result = await mod.strata_bind(scope_id="g_solo")
         assert result["scope_id"] == "g_solo"
         assert mod._UNRESOLVED is False
 
@@ -3585,7 +3820,7 @@ async def test_elicitation_never_attempted_from_within_strata_bind(tmp_path: Pat
             side_effect=AssertionError("strata_bind must never elicit"),
         ),
     ):
-        result = mod.strata_bind(scope_id="g_backend")
+        result = await mod.strata_bind(scope_id="g_backend")
         assert result["scope_id"] == "g_backend"
 
 
@@ -3685,7 +3920,7 @@ async def test_elicit_declined_latch_cleared_by_successful_bind(tmp_path: Path) 
         assert mod._ELICIT_DECLINED is True
 
         # A later successful strata_bind clears the latch.
-        bind_result = mod.strata_bind(scope_id="g_backend")
+        bind_result = await mod.strata_bind(scope_id="g_backend")
         assert bind_result["scope_id"] == "g_backend"
         assert mod._ELICIT_DECLINED is False
 
@@ -3721,7 +3956,7 @@ async def test_config_class_failure_survives_a_successful_binding_class_bind(
     ):
         # The bind itself succeeds — the scope/skill problem strata_bind was
         # asked to fix is fully valid and gets fixed.
-        result = mod.strata_bind(scope_id="g_backend")
+        result = await mod.strata_bind(scope_id="g_backend")
         assert result["scope_id"] == "g_backend"
         # Told, in the same result, that memory tools remain gated anyway.
         assert "config_notice" in result

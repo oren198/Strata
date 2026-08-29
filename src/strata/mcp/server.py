@@ -55,7 +55,7 @@ from typing import Literal
 
 import yaml
 from mcp.server.elicitation import AcceptedElicitation, CancelledElicitation, DeclinedElicitation
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.session import ServerSession
 from mcp.shared.message import ServerMessageMetadata
 from mcp.types import (
@@ -385,7 +385,12 @@ def _attach_unbound_notice(result: dict) -> dict:
     when there is something to say.
     """
     if _UNRESOLVED:
-        result["unbound_notice"] = "session not bound yet — bind with strata_bind(scope_id=...)"
+        result["unbound_notice"] = (
+            "session not bound yet — ask the user which scope this session should "
+            "act as (see the scopes above for the choices), then call "
+            "strata_bind(scope_id=...) with their answer. Do not pick a scope "
+            "yourself — binding decides whose memory this session reads and writes."
+        )
     return result
 
 
@@ -985,11 +990,14 @@ def _unresolved_message(fleet: FleetConfig | None) -> str:
         sections.append(
             "\n\nTo recover the scope/skill binding without restarting this server:\n"
             f"{scopes_line}"
-            "  Call strata_bind(scope_id=<one of the above>[, skill=<skill>]) to bind "
-            "this session now, or\n"
-            "  fix fleet.yaml (its scopes, its permitted_skills) and call strata_bind "
-            "again — fleet.yaml is re-read as part of that call, so a fix made after "
-            "startup is bindable immediately, or\n"
+            "  Ask the user which scope this session should act as — never pick one "
+            "yourself, binding decides whose memory this session reads and writes — "
+            "then call strata_bind(scope_id=<their answer>[, skill=<skill>]) with "
+            "their choice, or\n"
+            "  if the scope they want isn't listed, fix fleet.yaml (its scopes, its "
+            "permitted_skills) and call strata_bind again once they've confirmed the "
+            "right one — fleet.yaml is re-read as part of that call, so a fix made "
+            "after startup is bindable immediately, or\n"
             "  restart the server with STRATA_AGENT_SCOPE/STRATA_AGENT_SKILL set in its "
             "environment (these are read once, at process start — setting them in your "
             "shell after the server is already running has no effect on this session)."
@@ -1007,38 +1015,54 @@ class _ScopePick(BaseModel):
     scope_id: str = Field(description="The scope_id to bind this session to.")
 
 
-# How long the server waits for a capability-declaring client to answer the
-# scope-pick elicitation before giving up. Context.elicit() / ServerSession.
+class _SwitchConfirm(BaseModel):
+    """Elicitation response schema (self-bind guard): does the user confirm
+    switching this session's already-bound scope to a different one?"""
+
+    confirm: bool = Field(description="True to confirm switching this session's bound scope.")
+
+
+# How long the server waits for a capability-declaring client to answer an
+# elicitation before giving up. Context.elicit() / ServerSession.
 # elicit_form() (mcp/server/fastmcp/server.py, mcp/server/session.py) don't
 # expose a timeout parameter at all, even though the primitive underneath
 # both of them — BaseSession.send_request() (mcp/shared/session.py) — takes
 # one (request_read_timeout_seconds) and races it via anyio.fail_after,
 # raising McpError on expiry. Without threading one through here, a client
 # that declares the capability and then never answers hangs this tool call
-# forever. _send_scope_pick_elicitation, below, calls send_request directly
-# (bypassing the two convenience wrappers) so this timeout actually applies.
+# forever. _send_elicitation, below, calls send_request directly (bypassing
+# the two convenience wrappers) so this timeout actually applies — shared by
+# every elicitation this module sends (the scope pick, and the rebind
+# confirmation).
 _ELICIT_TIMEOUT = timedelta(seconds=120)
 
 
-async def _send_scope_pick_elicitation(
-    session: ServerSession, message: str, related_request_id: RequestId | None
-) -> AcceptedElicitation[_ScopePick] | DeclinedElicitation | CancelledElicitation:
-    """Send the scope-pick elicitation request with _ELICIT_TIMEOUT enforced.
+async def _send_elicitation(
+    session: ServerSession,
+    message: str,
+    schema: type[BaseModel],
+    related_request_id: RequestId | None,
+) -> AcceptedElicitation | DeclinedElicitation | CancelledElicitation:
+    """Send an elicitation request with _ELICIT_TIMEOUT enforced, generic over
+    the response *schema* — shared by the scope-pick elicitation (Change 2,
+    ``_ScopePick``) and the rebind-confirmation elicitation (self-bind guard,
+    ``_SwitchConfirm``), so both go through the one place that actually
+    threads a timeout.
 
     Replicates what mcp.server.elicitation.elicit_with_validation +
     ServerSession.elicit_form do internally (build an ElicitRequest, send it,
     interpret the ElicitResult) but calls session.send_request(...) directly
     so request_read_timeout_seconds can be passed — see _ELICIT_TIMEOUT's
     docstring for why neither of those wrappers allows that. A timeout
-    surfaces as an McpError, same as any other transport failure; the caller
-    (_attempt_elicit_bind) treats that identically to an explicit decline.
+    surfaces as an McpError, same as any other transport failure; every
+    caller treats that identically to an explicit decline.
     """
     result = await session.send_request(
         ServerRequest(
             ElicitRequest(
                 params=ElicitRequestFormParams(
                     message=message,
-                    requestedSchema=_ScopePick.model_json_schema(),
+                    requestedSchema=schema.model_json_schema(),
                 ),
             )
         ),
@@ -1047,11 +1071,37 @@ async def _send_scope_pick_elicitation(
         metadata=ServerMessageMetadata(related_request_id=related_request_id),
     )
     if result.action == "accept" and result.content is not None:
-        return AcceptedElicitation(data=_ScopePick.model_validate(result.content))
+        return AcceptedElicitation(data=schema.model_validate(result.content))
     elif result.action == "decline":
         return DeclinedElicitation()
     else:
         return CancelledElicitation()
+
+
+def _elicitation_session_if_capable() -> tuple[Context, ServerSession] | None:
+    """Return ``(ctx, session)`` when an MCP request is in flight AND the
+    client declares the elicitation capability; ``None`` otherwise (no
+    session, or the client doesn't support it).
+
+    The one "can we even ask?" check, shared by the scope-pick elicitation
+    (Change 2) and the rebind-confirmation elicitation (self-bind guard) —
+    so both entry points agree on what "the client can be asked" means.
+    Never raises: any failure getting the context or session is treated the
+    same as "can't ask."
+    """
+    try:
+        ctx = mcp.get_context()
+        request_context = ctx.request_context
+        if request_context is None:
+            return None
+        session = request_context.session
+        if not session.check_client_capability(
+            ClientCapabilities(elicitation=ElicitationCapability())
+        ):
+            return None
+        return ctx, session
+    except Exception:  # noqa: BLE001 - no session / no capability: nothing was asked
+        return None
 
 
 async def _attempt_elicit_bind(fleet: FleetConfig) -> bool:
@@ -1084,26 +1134,20 @@ async def _attempt_elicit_bind(fleet: FleetConfig) -> bool:
     if not scopes:
         return False
 
-    try:
-        ctx = mcp.get_context()
-        request_context = ctx.request_context
-        if request_context is None:
-            return False
-        session = request_context.session
-        if not session.check_client_capability(
-            ClientCapabilities(elicitation=ElicitationCapability())
-        ):
-            return False
-    except Exception:  # noqa: BLE001 - no session / no capability: nothing was asked, no latch
+    capable = _elicitation_session_if_capable()
+    if capable is None:
         return False
+    ctx, session = capable
 
     listing = "\n".join(f"- {s.id}: {s.name}" for s in sorted(scopes, key=lambda s: s.id))
     message = (
-        "Strata is not yet bound to a scope for this session. Pick one to continue:\n" + listing
+        "This session needs a scope binding to continue — ask the user which "
+        "scope it should act as (binding decides whose memory this session "
+        "reads and writes). Choices:\n" + listing
     )
 
     try:
-        result = await _send_scope_pick_elicitation(session, message, ctx.request_id)
+        result = await _send_elicitation(session, message, _ScopePick, ctx.request_id)
     except Exception:
         # Covers a timeout (McpError, after _ELICIT_TIMEOUT) and any other
         # transport failure once a request was actually sent to the client
@@ -1168,6 +1212,89 @@ async def _require_bound_or_elicit() -> None:
     raise RuntimeError(_unresolved_message(fleet))
 
 
+async def _attempt_elicit_switch_confirm(
+    previous_scope_id: str, requested_scope_id: str
+) -> bool | None:
+    """Try once, via elicitation, to get the user's confirmation for
+    switching this session's bound scope from *previous_scope_id* to
+    *requested_scope_id* — the self-bind guard's Change-3 upgrade: where the
+    client supports it, this REPLACES strata_bind's confirm= parameter
+    dance.
+
+    Returns:
+        ``True`` — confirmed; the caller proceeds with the switch.
+        ``False`` — declined, cancelled, or timed out; the caller refuses
+            the switch without changing anything.
+        ``None`` — no MCP session, or the client doesn't declare the
+            elicitation capability; the caller falls back to the confirm=
+            parameter heads-up instead.
+
+    Deliberately does NOT touch _ELICIT_DECLINED: unlike the scope-pick
+    elicitation (Change 2), this is per-call only — a user who declines a
+    switch right now may legitimately be asked again a moment later (they
+    might reconsider, or the agent might re-confirm after checking
+    something), so nothing here should lock a later attempt out.
+    """
+    capable = _elicitation_session_if_capable()
+    if capable is None:
+        return None
+    ctx, session = capable
+
+    message = (
+        f"This session is currently bound to {previous_scope_id!r}. Switching to "
+        f"{requested_scope_id!r} changes whose memory this session reads and writes "
+        "for the rest of the session. Please confirm: should it switch?"
+    )
+
+    try:
+        result = await _send_elicitation(session, message, _SwitchConfirm, ctx.request_id)
+    except Exception:  # noqa: BLE001 - timeout/transport failure: treat as declined
+        return False
+
+    if not isinstance(result, AcceptedElicitation):
+        return False
+    return bool(result.data.confirm)
+
+
+def _switch_pending_result(
+    previous_scope_id: str, requested_scope_id: str, *, declined: bool
+) -> dict:
+    """Build the heads-up result for an unconfirmed scope switch (self-bind
+    guard) — the binding is left COMPLETELY unchanged in every case this
+    builds a result for.
+
+    *declined* only changes the wording (an elicitation was actually sent
+    and the user said no / it timed out, vs. no confirmation was offered
+    yet); the caller-visible shape — ``switch_pending: True``, the
+    unchanged ``scope_id``/``skill`` — is identical either way, so an agent
+    can branch on the flag alone without parsing the message.
+    """
+    if declined:
+        detail = (
+            "The user was asked and did not confirm. If they change their mind, "
+            f"call strata_bind(scope_id={requested_scope_id!r}, confirm=True) to "
+            "proceed."
+        )
+    else:
+        detail = (
+            "Ask the user to confirm the switch, then call "
+            f"strata_bind(scope_id={requested_scope_id!r}, confirm=True) with "
+            "their answer — do not confirm this yourself."
+        )
+    return {
+        "scope_id": _AGENT_SCOPE,
+        "skill": _AGENT_SKILL,
+        "session_id": _AGENT_SESSION_ID,
+        "switch_pending": True,
+        "switch_declined": declined,
+        "message": (
+            f"This session is bound to {previous_scope_id!r}; switching to "
+            f"{requested_scope_id!r} changes whose memory it reads and writes. "
+            f"{detail}"
+        ),
+    }
+
+
 # ---------------------------------------------------------------------------
 # MCP server
 # ---------------------------------------------------------------------------
@@ -1181,10 +1308,13 @@ mcp = FastMCP(
         "Before finishing, contribute the session's outcomes back with "
         "strata_contribute; if there is genuinely nothing to record, call "
         "strata_session_closeout so an empty session stays distinguishable from a "
-        "forgotten one. If a scope you need was just created (or you were bound to "
-        "the wrong one), call strata_bind to rebind this session to it — fleet.yaml "
-        "is re-read as part of that call, so a scope added moments ago is bindable "
-        "immediately, no restart required."
+        "forgotten one. Binding decides whose memory this session reads and "
+        "writes — never pick or change the bound scope on your own judgment. If "
+        "a scope you need was just created, or this session should act as a "
+        "different scope, ask the user which scope it should be, then call "
+        "strata_bind with their answer — fleet.yaml is re-read as part of that "
+        "call, so a scope added moments ago is bindable immediately, no restart "
+        "required."
     ),
 )
 
@@ -1201,15 +1331,21 @@ mcp = FastMCP(
 
 
 @mcp.tool()
-def strata_bind(scope_id: str, skill: str | None = None) -> dict:
-    """Rebind this session to a different scope (and optionally skill), right now.
+async def strata_bind(scope_id: str, skill: str | None = None, confirm: bool = False) -> dict:
+    """Bind (or rebind) this session to a scope (and optionally skill), right now.
+
+    THE SCOPE MUST COME FROM THE USER. Binding decides whose memory this
+    session reads and writes — never call this with a scope you (the agent)
+    picked on your own judgment, even to "just answer one question." Ask
+    the user which scope this session should act as, then call this tool
+    with their answer.
 
     Startup binds this session to ``STRATA_AGENT_SCOPE``/``STRATA_AGENT_SKILL``
     once. This tool changes that binding mid-session — for the common case
     where a scope was just added to fleet.yaml (by this session, an operator,
     or another process) and isn't visible yet under the stale startup
-    binding, or where this session simply needs to act as a different scope
-    from here on.
+    binding, or where the user wants this session to act as a different
+    scope from here on.
 
     Reloads fleet.yaml first (the same lazy reload-on-read path every other
     tool call uses — Feature A), so a scope added moments ago is bindable
@@ -1224,8 +1360,23 @@ def strata_bind(scope_id: str, skill: str | None = None) -> dict:
     per call, so the record stays truthful regardless of how many times a
     session rebinds.
 
-    On failure the binding is left completely unchanged — a rejected
-    strata_bind call never leaves you half-bound.
+    SWITCHING requires explicit confirmation (self-bind guard). Binding for
+    the FIRST time this session (currently unbound) needs no confirmation —
+    there is no prior identity to lose. But once this session is ALREADY
+    bound to a scope, a call naming a DIFFERENT scope is a SWITCH, and a
+    switch is refused on the first call: the result comes back with
+    ``switch_pending: True`` and NO change is made, so you can hand that to
+    the user and ask them to confirm. Call again with ``confirm=True`` once
+    they have. (A call naming the SAME scope you are already bound to is a
+    no-op success, never a switch — only pass ``confirm`` when you actually
+    mean to change identity.) Where the client supports server-initiated MCP
+    elicitation, this tool asks the user to confirm the switch itself before
+    you ever need the ``confirm`` parameter — a decline there refuses the
+    switch immediately, with the binding left unchanged, exactly like an
+    unconfirmed ``switch_pending`` result.
+
+    On failure — an invalid scope/skill, or a switch pending confirmation —
+    the binding is left completely unchanged.
 
     Clears ONLY the binding-class startup failures (which scope/skill this
     session acts as) — never a config-class one (a broken/missing
@@ -1240,8 +1391,9 @@ def strata_bind(scope_id: str, skill: str | None = None) -> dict:
     (env-fallback) store.
 
     Args:
-        scope_id: The scope to bind to. Must exist in fleet.yaml and be
-            ``active`` (an archived scope cannot be bound).
+        scope_id: The scope to bind to — the user's choice, never your own.
+            Must exist in fleet.yaml and be ``active`` (an archived scope
+            cannot be bound).
         skill: The skill to bind as, or omit it. When omitted and the scope
             declares a ``default_skill``, that default is used (the same
             companion rule startup auto-bind applies) — required only when
@@ -1249,10 +1401,22 @@ def strata_bind(scope_id: str, skill: str | None = None) -> dict:
             ``permitted_skills``) and has no ``default_skill`` to fall back
             on. When given, must be one of the scope's ``permitted_skills``
             (any skill is allowed if that list is empty).
+        confirm: Only meaningful when this session is already bound to a
+            DIFFERENT scope than *scope_id* — pass ``True`` once the user
+            has confirmed the switch. Ignored (no effect either way) for an
+            initial bind or a same-scope re-bind. Never set this to
+            ``True`` on your own judgment; it must reflect the user's
+            actual answer.
 
     Returns:
-        ``scope_id``, ``skill``, ``session_id`` (the new binding — session_id
-        unchanged), and ``message`` (a one-line confirmation).
+        On success: ``scope_id``, ``skill``, ``session_id`` (the new
+        binding — session_id unchanged), and ``message`` (a one-line
+        confirmation, noting the identity change when this was a switch).
+        On an unconfirmed switch: the binding UNCHANGED — same ``scope_id``/
+        ``skill`` as before this call — plus ``switch_pending: True``,
+        ``switch_declined`` (whether an elicitation was actually sent and
+        refused, vs. no confirmation offered yet), and a ``message``
+        explaining what to do next.
 
     Raises:
         RuntimeError: The scope does not exist, is archived, or the skill is
@@ -1264,9 +1428,9 @@ def strata_bind(scope_id: str, skill: str | None = None) -> dict:
     # This is THE recovery path for an unresolved session (Change 1), so it
     # deliberately re-reads fleet.yaml itself (below) rather than trusting
     # any cached startup fleet — a fleet fixed after startup must be
-    # bindable without a restart. It also never calls
-    # _require_bound_or_elicit(): eliciting from inside the tool that IS the
-    # elicitation's own bind target would be circular.
+    # bindable without a restart. It never calls _require_bound_or_elicit():
+    # eliciting from inside the tool that IS the elicitation's own bind
+    # target would be circular.
     fleet = _load_fleet()
 
     # require_active=True is the shared "archived scopes cannot be bound"
@@ -1292,6 +1456,29 @@ def strata_bind(scope_id: str, skill: str | None = None) -> dict:
             + notice_line
         )
 
+    # Self-bind guard (operator finding: an agent picked a scope on its own
+    # judgment, without the user ever weighing in). Binding for the first
+    # time this session needs no confirmation — there is no prior identity
+    # to lose. Naming the SAME scope again is a no-op, never a switch. Only
+    # naming a DIFFERENT scope while already bound is a switch, and a
+    # switch requires the user's explicit say-so — either via an accepted
+    # elicitation (asked right here, right now) or a second call carrying
+    # confirm=True (the fallback for a client that can't be asked).
+    previous_scope_id = _AGENT_SCOPE
+    is_switch = bool(previous_scope_id) and scope_id != previous_scope_id
+
+    if is_switch and not confirm:
+        elicited = await _attempt_elicit_switch_confirm(previous_scope_id, scope_id)
+        if elicited is True:
+            confirm = True
+        elif elicited is False:
+            return _switch_pending_result(previous_scope_id, scope_id, declined=True)
+        # elicited is None: no session, or the client can't be asked — fall
+        # through to the confirm= heads-up below.
+
+    if is_switch and not confirm:
+        return _switch_pending_result(previous_scope_id, scope_id, declined=False)
+
     with _binding_lock:
         _AGENT_SCOPE = scope_id
         _AGENT_SKILL = resolved_skill
@@ -1305,15 +1492,25 @@ def strata_bind(scope_id: str, skill: str | None = None) -> dict:
         # out forever by it.
         _ELICIT_DECLINED = False
 
+    if is_switch:
+        message = (
+            f"Switched from {previous_scope_id!r} to {_AGENT_SCOPE!r}"
+            f"{f' with skill {_AGENT_SKILL!r}' if _AGENT_SKILL else ''}. "
+            f"This session now reads and writes {_AGENT_SCOPE!r}'s memory, not "
+            f"{previous_scope_id!r}'s. Session id unchanged ({_AGENT_SESSION_ID!r})."
+        )
+    else:
+        message = (
+            f"Bound to {_AGENT_SCOPE!r}"
+            f"{f' with skill {_AGENT_SKILL!r}' if _AGENT_SKILL else ''}. "
+            f"Session id unchanged ({_AGENT_SESSION_ID!r})."
+        )
+
     result = {
         "scope_id": _AGENT_SCOPE,
         "skill": _AGENT_SKILL,
         "session_id": _AGENT_SESSION_ID,
-        "message": (
-            f"Bound to {_AGENT_SCOPE!r}"
-            f"{f' with skill {_AGENT_SKILL!r}' if _AGENT_SKILL else ''}. "
-            f"Session id unchanged ({_AGENT_SESSION_ID!r})."
-        ),
+        "message": message,
     }
     if _STARTUP_ERRORS_CONFIG:
         result["config_notice"] = (
