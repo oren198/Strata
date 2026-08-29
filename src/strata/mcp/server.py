@@ -48,7 +48,8 @@ import os
 import sqlite3
 import sys
 import threading
-from dataclasses import asdict
+import time
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Literal
@@ -295,24 +296,47 @@ _STARTUP_ERRORS_BINDING: list[str] = []
 # so a client that declined once isn't locked out forever by that one no.
 _ELICIT_DECLINED: bool = False
 
+
+@dataclass
+class _PendingSwitch:
+    """An announced-but-not-yet-confirmed scope switch (self-bind guard
+    hardening).
+
+    ``requested_at`` is a :func:`time.monotonic` reading, deliberately NOT
+    wall-clock — an NTP jump (backward or forward) must never stretch or
+    shrink the confirmation window; monotonic time only ever moves forward
+    at a steady rate, so the window is exactly ``_PENDING_SWITCH_WINDOW_
+    SECONDS`` of real elapsed time regardless of what the system clock does
+    in between.
+    """
+
+    target_scope_id: str
+    requested_at: float
+
+
 # Pending-switch state (self-bind guard hardening — live-test finding: a
 # bare confirm=True is a PROMISE from whoever is calling, not a GATE. An
 # agent could self-supply confirm=True on the very first strata_bind call
 # for a switch, indistinguishable from a genuinely user-confirmed one. A
 # switch is now honored only when the SAME target scope was announced
 # first, on an earlier call, and confirm=True arrives on a FOLLOW-UP call
-# naming that same target within _PENDING_SWITCH_WINDOW. One outstanding
-# pending switch at a time (this server binds one session at a time) —
-# either None, or {"target_scope_id": str, "requested_at": datetime}.
-# Elicitation-accepted switches bypass this entirely (the user answered
-# directly, right there — no announce-then-confirm dance needed).
-_PENDING_SWITCH: dict[str, object] | None = None
+# naming that same target within _PENDING_SWITCH_WINDOW_SECONDS. One
+# outstanding pending switch at a time (this server binds one session at a
+# time) — either None, or a _PendingSwitch. Elicitation-accepted switches
+# bypass this entirely (the user answered directly, right there — no
+# announce-then-confirm dance needed). Cleared on ANY successful bind
+# (initial, same-scope no-op, or a confirmed/elicited switch) — an
+# announced target shouldn't stay confirmable after unrelated bind
+# activity moved the session on. Read and written only under
+# _binding_lock, for the same reason every other binding-state write is:
+# no torn read of the (target, timestamp) pair.
+_PENDING_SWITCH: _PendingSwitch | None = None
 
 # How long an announced-but-unconfirmed switch stays live. A confirm=True
 # call naming a DIFFERENT target, or arriving after this window, is cold —
 # a fresh announcement (which replaces/restarts the pending record), not a
 # confirmation of the old one.
-_PENDING_SWITCH_WINDOW = timedelta(minutes=5)
+_PENDING_SWITCH_WINDOW_SECONDS = 5 * 60.0
 
 # Guards ONLY the (scope, skill) WRITE in strata_bind (Feature B), so a
 # concurrent strata_bind call can't interleave its two assignments with
@@ -1306,7 +1330,7 @@ def _switch_pending_result(
     if declined:
         detail = "The user declined. The binding stands."
     else:
-        minutes = int(_PENDING_SWITCH_WINDOW.total_seconds() // 60)
+        minutes = int(_PENDING_SWITCH_WINDOW_SECONDS // 60)
         detail = (
             "Ask the user to confirm the switch, then call "
             f"strata_bind(scope_id={requested_scope_id!r}, confirm=True) with "
@@ -1527,6 +1551,19 @@ async def strata_bind(scope_id: str, skill: str | None = None, confirm: bool = F
     if is_switch:
         switched_via_elicitation = False
         if not confirm:
+            # This await deliberately happens OUTSIDE _binding_lock. A
+            # threading.Lock held across an `await` in this single-threaded
+            # asyncio server would risk a same-thread deadlock: a
+            # concurrent, synchronous lock.acquire() from another coroutine
+            # blocks the ONLY thread that could ever run this suspended
+            # coroutine again to release it. So the lock is only ever held
+            # for the synchronous pending-record and binding writes below,
+            # never spanning this call — leaving a narrow interleaving
+            # window, between this elicitation returning and the lock
+            # acquisition below, where a concurrent strata_bind call could
+            # read/write _PENDING_SWITCH first. Accepted as a narrow race on
+            # a server that in practice serves one request at a time; not
+            # solved here.
             elicited = await _attempt_elicit_switch_confirm(previous_scope_id, scope_id)
             if elicited is True:
                 switched_via_elicitation = True
@@ -1545,22 +1582,25 @@ async def strata_bind(scope_id: str, skill: str | None = None, confirm: bool = F
             # window. No matching pending record (never announced, a
             # different target, or the window elapsed) means this IS the
             # announcing call, confirm=True or not — it does not switch.
-            now = datetime.now(UTC)
-            pending = _PENDING_SWITCH
-            pending_confirmed = (
-                confirm
-                and pending is not None
-                and pending["target_scope_id"] == scope_id
-                and now - pending["requested_at"] <= _PENDING_SWITCH_WINDOW
-            )
-            if not pending_confirmed:
-                _PENDING_SWITCH = {"target_scope_id": scope_id, "requested_at": now}
-                return _switch_pending_result(previous_scope_id, scope_id, declined=False)
-
-        # Confirmed — either an accepted elicitation (bypasses pending
-        # entirely) or a matching, unexpired announce-then-confirm pair.
-        # The pending record has served its purpose.
-        _PENDING_SWITCH = None
+            #
+            # Read-then-write of _PENDING_SWITCH under _binding_lock (moved
+            # here for symmetry with every other binding-state write below,
+            # and so the check-and-set is one atomic step, not two).
+            with _binding_lock:
+                now = time.monotonic()
+                pending = _PENDING_SWITCH
+                pending_confirmed = (
+                    confirm
+                    and pending is not None
+                    and pending.target_scope_id == scope_id
+                    and now - pending.requested_at <= _PENDING_SWITCH_WINDOW_SECONDS
+                )
+                if not pending_confirmed:
+                    _PENDING_SWITCH = _PendingSwitch(target_scope_id=scope_id, requested_at=now)
+                    return _switch_pending_result(previous_scope_id, scope_id, declined=False)
+        # Confirmed — either an accepted elicitation or a matching,
+        # unexpired announce-then-confirm pair. The pending record (if any)
+        # is cleared below, along with every other successful-bind path.
 
     with _binding_lock:
         _AGENT_SCOPE = scope_id
@@ -1574,6 +1614,12 @@ async def strata_bind(scope_id: str, skill: str | None = None, confirm: bool = F
         # docstring (module top): a client that declined once isn't locked
         # out forever by it.
         _ELICIT_DECLINED = False
+        # Tidiness (reviewer hardening): clear any pending switch on ANY
+        # successful bind — initial, same-scope no-op, confirmed switch, or
+        # an elicitation-accepted switch. An announced target shouldn't
+        # stay confirmable after unrelated bind activity moved the session
+        # on.
+        _PENDING_SWITCH = None
 
     if is_switch:
         message = (

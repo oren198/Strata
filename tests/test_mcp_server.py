@@ -61,7 +61,7 @@ from __future__ import annotations
 
 import logging
 import sys
-from datetime import UTC, datetime
+import time
 from pathlib import Path
 from unittest.mock import ANY, MagicMock, patch
 
@@ -1534,7 +1534,7 @@ def _seeded_pending_switch(mod, target_scope_id: str):
     return patch.object(
         mod,
         "_PENDING_SWITCH",
-        {"target_scope_id": target_scope_id, "requested_at": datetime.now(UTC)},
+        mod._PendingSwitch(target_scope_id=target_scope_id, requested_at=time.monotonic()),
     )
 
 
@@ -2970,7 +2970,9 @@ async def test_rebind_without_confirm_does_not_switch_and_returns_heads_up(
         assert "g_arch" in result["message"]
         assert "g_backend" in result["message"]
         assert "confirm" in result["message"].lower()
-        assert mod._PENDING_SWITCH == {"target_scope_id": "g_backend", "requested_at": ANY}
+        assert (
+            mod._PendingSwitch(target_scope_id="g_backend", requested_at=ANY) == mod._PENDING_SWITCH
+        )
 
 
 async def test_switch_cold_confirm_true_does_not_bypass_announce(tmp_path: Path) -> None:
@@ -2996,7 +2998,9 @@ async def test_switch_cold_confirm_true_does_not_bypass_announce(tmp_path: Path)
         assert mod._AGENT_SCOPE == "g_arch"
         # This first (cold) call is now the announcement, for a REAL
         # follow-up to confirm — not itself a confirmation.
-        assert mod._PENDING_SWITCH == {"target_scope_id": "g_backend", "requested_at": ANY}
+        assert (
+            mod._PendingSwitch(target_scope_id="g_backend", requested_at=ANY) == mod._PENDING_SWITCH
+        )
 
 
 async def test_switch_announce_then_confirm_within_window_switches(tmp_path: Path) -> None:
@@ -3043,7 +3047,7 @@ async def test_switch_mismatched_target_confirm_returns_new_heads_up(tmp_path: P
     with patch.object(mod, "_AGENT_SCOPE", "g_arch"), patch.object(mod, "_AGENT_SKILL", None):
         # Announce a switch to g_backend.
         await mod.strata_bind(scope_id="g_backend")
-        assert mod._PENDING_SWITCH["target_scope_id"] == "g_backend"
+        assert mod._PENDING_SWITCH.target_scope_id == "g_backend"
 
         # A confirm=True for a DIFFERENT target (g_other) must not switch
         # to g_other, and must not be treated as confirming g_backend either.
@@ -3053,7 +3057,7 @@ async def test_switch_mismatched_target_confirm_returns_new_heads_up(tmp_path: P
         assert result["scope_id"] == "g_arch"
         assert mod._AGENT_SCOPE == "g_arch"
         # Pending now tracks the NEW target, not the old one.
-        assert mod._PENDING_SWITCH["target_scope_id"] == "g_other"
+        assert mod._PENDING_SWITCH.target_scope_id == "g_other"
 
         # And the original g_backend announcement no longer confirms,
         # since it was replaced.
@@ -3064,36 +3068,37 @@ async def test_switch_mismatched_target_confirm_returns_new_heads_up(tmp_path: P
 
 async def test_switch_pending_expires_after_window(tmp_path: Path) -> None:
     """A confirm=True arriving after the pending window elapsed is treated
-    as cold — a fresh announcement, not a confirmation of the stale one."""
-    from datetime import timedelta
+    as cold — a fresh announcement, not a confirmation of the stale one.
 
+    Monkeypatches time.monotonic() directly rather than seeding a stale
+    wall-clock timestamp — expiry is computed from monotonic time
+    specifically so an NTP jump can't stretch or shrink the window, so the
+    test has to move the SAME clock the code reads."""
     db_path = _make_db(tmp_path)
     summaries_dir = str(tmp_path / "summaries")
     fleet_path = _make_fleet_yaml(tmp_path)
 
     mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+    announced_at = 1_000_000.0
+    now = announced_at + mod._PENDING_SWITCH_WINDOW_SECONDS + 1.0
     with (
         patch.object(mod, "_AGENT_SCOPE", "g_arch"),
         patch.object(mod, "_AGENT_SKILL", None),
         patch.object(
             mod,
             "_PENDING_SWITCH",
-            {
-                "target_scope_id": "g_backend",
-                "requested_at": datetime.now(UTC)
-                - mod._PENDING_SWITCH_WINDOW
-                - timedelta(seconds=1),
-            },
+            mod._PendingSwitch(target_scope_id="g_backend", requested_at=announced_at),
         ),
+        patch.object(mod.time, "monotonic", return_value=now),
     ):
         result = await mod.strata_bind(scope_id="g_backend", confirm=True)
 
         # Expired — cold again, not a switch.
         assert result["switch_pending"] is True
         assert mod._AGENT_SCOPE == "g_arch"
-        # Re-announced with a fresh timestamp.
-        assert mod._PENDING_SWITCH["target_scope_id"] == "g_backend"
-        assert mod._PENDING_SWITCH["requested_at"] > datetime.now(UTC) - timedelta(seconds=5)
+        # Re-announced with the (patched) "now" timestamp.
+        assert mod._PENDING_SWITCH.target_scope_id == "g_backend"
+        assert mod._PENDING_SWITCH.requested_at == now
 
 
 def test_switch_declined_message_has_no_override_recipe() -> None:
