@@ -1268,13 +1268,16 @@ def _switch_pending_result(
     yet); the caller-visible shape — ``switch_pending: True``, the
     unchanged ``scope_id``/``skill`` — is identical either way, so an agent
     can branch on the flag alone without parsing the message.
+
+    Reviewer follow-up: the ``declined`` branch used to hand the agent the
+    override recipe (``call strata_bind(..., confirm=True)``) right after
+    the user said no — an immediate, ready-to-use way around a "no" defeats
+    the whole point of asking. On a decline the binding simply stands; the
+    override path is not mentioned at all. A fresh ask starts the flow over
+    from a brand new user request, not from replaying this message.
     """
     if declined:
-        detail = (
-            "The user was asked and did not confirm. If they change their mind, "
-            f"call strata_bind(scope_id={requested_scope_id!r}, confirm=True) to "
-            "proceed."
-        )
+        detail = "The user declined. The binding stands."
     else:
         detail = (
             "Ask the user to confirm the switch, then call "
@@ -1460,12 +1463,21 @@ async def strata_bind(scope_id: str, skill: str | None = None, confirm: bool = F
     # judgment, without the user ever weighing in). Binding for the first
     # time this session needs no confirmation — there is no prior identity
     # to lose. Naming the SAME scope again is a no-op, never a switch. Only
-    # naming a DIFFERENT scope while already bound is a switch, and a
-    # switch requires the user's explicit say-so — either via an accepted
-    # elicitation (asked right here, right now) or a second call carrying
-    # confirm=True (the fallback for a client that can't be asked).
+    # naming a DIFFERENT scope while ALREADY BOUND AND RESOLVED is a switch,
+    # and a switch requires the user's explicit say-so — either via an
+    # accepted elicitation (asked right here, right now) or a second call
+    # carrying confirm=True (the fallback for a client that can't be asked).
+    #
+    # Gated on `not _UNRESOLVED` (reviewer follow-up — recovery friction):
+    # a startup failure can leave _AGENT_SCOPE holding an INVALID id (e.g.
+    # an unknown scope named in STRATA_AGENT_SCOPE) with the session still
+    # gated. That stale, never-actually-bound value is not an "identity to
+    # protect" — there is nothing legitimate to lose by moving off of it —
+    # so a user-directed recovery bind to a valid scope must complete in
+    # ONE call, not be treated as a switch away from a binding that was
+    # never real to begin with.
     previous_scope_id = _AGENT_SCOPE
-    is_switch = bool(previous_scope_id) and scope_id != previous_scope_id
+    is_switch = not _UNRESOLVED and bool(previous_scope_id) and scope_id != previous_scope_id
 
     if is_switch and not confirm:
         elicited = await _attempt_elicit_switch_confirm(previous_scope_id, scope_id)
@@ -1556,7 +1568,7 @@ async def strata_contribute(
 
     Write surface: ``scope_id`` must be this agent's bound scope
     (``STRATA_AGENT_SCOPE``) or one of its inter-stratum ancestors — the same
-    surface shape as the entitled read surface (issue #48). Contribute to
+    surface shape as the entitled read surface. Contribute to
     your own scope, or propose upward to an ancestor scope; that is the
     mechanism of legitimate upward influence. A peer or descendant scope is
     refused before any judging or recording happens — sideways flow reaches
@@ -1683,7 +1695,7 @@ async def strata_contribute(
 async def strata_rejudge(contribution_id: str) -> dict:
     """Re-judge a contribution whose scope-manager judgment previously failed.
 
-    Idempotent (issue #57): if the contribution already has a verdict, this is
+    Idempotent: if the contribution already has a verdict, this is
     a no-op that returns that verdict unchanged. Otherwise it re-reads the
     scope's CURRENT summary, invokes the scope-manager, records the judgment,
     and updates the summary — all under the scope's serialization lock, so a
@@ -2002,7 +2014,7 @@ async def strata_read_scope_summary(scope_id: str | None = None) -> dict:
         If the scope has no summary on disk yet, a synthesized empty summary
         is returned with ``version=0`` and ``exists=False`` — distinguishable
         from a real first write (``version=1``, ``exists=True``); see
-        :class:`strata.summary_store.ScopeSummary` (issue #59).
+        :class:`strata.summary_store.ScopeSummary`.
 
         For a chain-referenced scope: ``{"scope_id": ..., "relation":
         "peer_reference", "publication": {"items": [<item dicts: id, kind,
@@ -2094,12 +2106,12 @@ async def strata_read_perspective(scope_id: str | None = None) -> dict:
     If a chain scope has no summary on disk yet, its layer is still included
     with empty directives and context so that the structure is visible; that
     layer's summary honestly reports ``version=0``/``exists=False`` rather
-    than looking like a real first write (issue #59).
+    than looking like a real first write.
 
     Args:
         scope_id: The scope for which to build the perspective. Defaults to
             this agent's bound scope. An explicit scope_id must be the bound
-            scope or one of its inter-stratum ancestors (issue #48) — this is
+            scope or one of its inter-stratum ancestors — this is
             the perspective *target*, which stays chain-only (ADR 0006 D4):
             you compose a perspective for your own chain, not for a peer's.
 
@@ -2230,7 +2242,7 @@ async def strata_read_scope_record(
     this for debugging, accountability investigation, or understanding the
     history behind the current scope summary.
 
-    BOUNDED BY DEFAULT (issue #130): an unadorned call returns the NEWEST page,
+    BOUNDED BY DEFAULT: an unadorned call returns the NEWEST page,
     not the whole record. The record only ever grows, so a whole-scope read of
     a long-lived scope runs to megabytes and overflows the tool-result limit of
     the very agents this view exists for. Nothing is hidden — walk back through
@@ -2244,7 +2256,7 @@ async def strata_read_scope_record(
       - To CONSUME memory rather than audit it, call strata_read_perspective.
         The record is forensic; the perspective is the working view.
 
-    Migration note (issue #48 supersedes the earlier HTTP-parity note): this
+    Migration note (entitlement supersedes the earlier HTTP-parity note): this
     tool used to skip fleet loading entirely and return an empty record for
     any unknown scope, mirroring the old HTTP ``GET /scopes/{id}/record``
     contract. Entitlement now takes precedence over that parity concern — the
@@ -2263,7 +2275,7 @@ async def strata_read_scope_record(
         scope_id: The scope whose record to read (e.g. ``g_backend``).
             Defaults to this agent's bound scope. An explicit scope_id must
             be the bound scope or one of its inter-stratum ancestors
-            (issue #48) — a peer scope is not readable here even when it is
+            — a peer scope is not readable here even when it is
             referenced by your chain and its summary is otherwise readable
             (ADR 0006 D4).
         limit: Page size. Defaults to the configured record page size.
@@ -2350,7 +2362,7 @@ async def strata_read_contribution(contribution_id: str) -> dict:
 
     Read surface: the contribution's own scope must be within this agent's
     entitled (chain-only) surface, exactly as strata_read_scope_record requires
-    (issue #48) — a by-id lookup never reaches a record the scope read cannot.
+    — a by-id lookup never reaches a record the scope read cannot.
 
     Args:
         contribution_id: The id returned by strata_contribute (``c_``-prefixed).
@@ -2393,7 +2405,7 @@ async def strata_read_contribution(contribution_id: str) -> dict:
 async def strata_session_stats() -> dict:
     """Return this session's mechanical read/contribute asymmetry counters.
 
-    A cheap, mechanical self-query (issue #110): the MCP server tracks, per
+    A cheap, mechanical self-query: the MCP server tracks, per
     session, how many perspective/summary reads, accepted contribution acts, and
     explicit declines this session has performed. These counters never judge what
     is memory-worthy — the model always makes that call. They exist so a later
@@ -2437,7 +2449,7 @@ async def strata_session_closeout(reason: str) -> dict:
     Call this before finishing when the session read from the fleet's memory but
     genuinely has no outcome to record. It is recorded exactly like a read
     receipt: NO scope-manager, NO judge call, NO admission decision, zero
-    judge-token cost, and nothing enters any scope's memory (issue #109). It only
+    judge-token cost, and nothing enters any scope's memory. It only
     increments this session's mechanical ``declines`` counter — the asymmetry's
     release valve — which resets the read/contribute gap and silences the
     read-time nudge for the rest of the session.

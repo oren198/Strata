@@ -2952,6 +2952,27 @@ async def test_rebind_without_confirm_does_not_switch_and_returns_heads_up(
         assert "confirm" in result["message"].lower()
 
 
+def test_switch_declined_message_has_no_override_recipe() -> None:
+    """Reviewer follow-up: handing the agent the override recipe (call again
+    with confirm=true) immediately after the user declined defeats the
+    consent design. A decline just says the user declined and the binding
+    stands — a fresh ask has to come from a NEW user request, not from this
+    message telling the agent how to route around a 'no'."""
+    from strata.mcp.server import _switch_pending_result
+
+    declined = _switch_pending_result("g_arch", "g_backend", declined=True)
+    message = declined["message"].lower()
+    assert "declined" in message
+    assert "confirm=true" not in message
+    assert "call strata_bind" not in message
+
+    # The non-declined (no confirmation offered yet) heads-up is the one
+    # that's SUPPOSED to hand over the recipe — confirm this asymmetry is
+    # deliberate, not both branches accidentally losing it.
+    pending = _switch_pending_result("g_arch", "g_backend", declined=False)
+    assert "confirm=true" in pending["message"].lower()
+
+
 async def test_rebind_with_confirm_switches_and_notes_identity_change(tmp_path: Path) -> None:
     """confirm=True actually performs the switch, and the result explicitly
     calls out the identity change — this is not a cosmetic rename."""
@@ -3005,6 +3026,41 @@ async def test_initial_bind_from_unbound_needs_no_confirm(tmp_path: Path) -> Non
         assert mod._AGENT_SCOPE == "g_backend"
 
 
+async def test_recovery_bind_after_unknown_scope_startup_failure_is_one_call(
+    tmp_path: Path,
+) -> None:
+    """Reviewer follow-up (recovery friction): after an unknown-scope
+    startup failure, _AGENT_SCOPE holds the INVALID id from
+    STRATA_AGENT_SCOPE — that stale, never-actually-bound value is not an
+    identity worth protecting. Recovering to a valid scope while still
+    unresolved must complete in a single strata_bind call, not be treated
+    as a switch requiring confirmation."""
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fleet_yaml(tmp_path)  # g_arch, g_backend
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+    with (
+        # The startup shape: STRATA_AGENT_SCOPE named a scope that doesn't
+        # exist in fleet.yaml, so _AGENT_SCOPE holds that invalid id and the
+        # session is unresolved.
+        patch.object(mod, "_AGENT_SCOPE", "g_does_not_exist"),
+        patch.object(mod, "_AGENT_SKILL", None),
+        patch.object(mod, "_UNRESOLVED", True),
+        patch.object(
+            mod,
+            "_STARTUP_ERRORS_BINDING",
+            ["scope 'g_does_not_exist' not found in fleet config."],
+        ),
+    ):
+        result = await mod.strata_bind(scope_id="g_backend")
+
+        assert result["scope_id"] == "g_backend"
+        assert "switch_pending" not in result
+        assert mod._AGENT_SCOPE == "g_backend"
+        assert mod._UNRESOLVED is False
+
+
 async def test_rebind_elicitation_accept_switches(tmp_path: Path) -> None:
     """Where the client declares the elicitation capability, strata_bind
     asks the user directly and an accepted confirmation switches — this
@@ -3051,7 +3107,11 @@ async def test_rebind_elicitation_decline_refuses_without_changes(tmp_path: Path
 
         assert result.isError is not True  # a heads-up result, not an error
         text = _result_text(result)
-        assert "switch_pending" in text or "did not confirm" in text.lower()
+        assert "switch_pending" in text
+        assert "declined" in text.lower()
+        # Reviewer follow-up: no override recipe handed over right after a
+        # decline — that would defeat the point of asking.
+        assert "confirm=true" not in text.lower()
         assert mod._AGENT_SCOPE == "g_arch"
 
 
@@ -3405,6 +3465,36 @@ async def test_unbound_tool_call_error_carries_no_issue_references(tmp_path: Pat
         await mod.strata_read_perspective()
 
     assert "issue #" not in str(exc_info.value).lower()
+
+
+async def test_tool_descriptions_carry_no_issue_references(tmp_path: Path) -> None:
+    """FastMCP ships each tool's docstring to clients verbatim as its
+    description — an agent reads these before ever calling the tool, so
+    they are exactly as user-facing as any error message or --help text.
+    Reviewer follow-up: 11 tool docstrings (strata_contribute,
+    strata_rejudge, strata_read_scope_summary, strata_read_perspective,
+    strata_read_scope_record, strata_read_contribution,
+    strata_session_stats, strata_session_closeout) still carried internal
+    '(issue #NN)' references.
+
+    Drives the REAL client-visible surface — mod.mcp.list_tools(), the same
+    call an MCP client makes — rather than grepping source text, so this
+    catches a leak regardless of which tool it's in or how the docstring is
+    wrapped.
+    """
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fleet_yaml(tmp_path)
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+
+    tools = await mod.mcp.list_tools()
+    assert tools, "expected at least one registered tool"
+
+    leaked = {
+        t.name: t.description for t in tools if t.description and "issue #" in t.description.lower()
+    }
+    assert not leaked, f"tool description(s) leaked an issue number: {leaked}"
 
 
 def _validate_binding_skill_error(fleet: FleetConfig) -> list[str]:
