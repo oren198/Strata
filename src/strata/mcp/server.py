@@ -295,6 +295,25 @@ _STARTUP_ERRORS_BINDING: list[str] = []
 # so a client that declined once isn't locked out forever by that one no.
 _ELICIT_DECLINED: bool = False
 
+# Pending-switch state (self-bind guard hardening — live-test finding: a
+# bare confirm=True is a PROMISE from whoever is calling, not a GATE. An
+# agent could self-supply confirm=True on the very first strata_bind call
+# for a switch, indistinguishable from a genuinely user-confirmed one. A
+# switch is now honored only when the SAME target scope was announced
+# first, on an earlier call, and confirm=True arrives on a FOLLOW-UP call
+# naming that same target within _PENDING_SWITCH_WINDOW. One outstanding
+# pending switch at a time (this server binds one session at a time) —
+# either None, or {"target_scope_id": str, "requested_at": datetime}.
+# Elicitation-accepted switches bypass this entirely (the user answered
+# directly, right there — no announce-then-confirm dance needed).
+_PENDING_SWITCH: dict[str, object] | None = None
+
+# How long an announced-but-unconfirmed switch stays live. A confirm=True
+# call naming a DIFFERENT target, or arriving after this window, is cold —
+# a fresh announcement (which replaces/restarts the pending record), not a
+# confirmation of the old one.
+_PENDING_SWITCH_WINDOW = timedelta(minutes=5)
+
 # Guards ONLY the (scope, skill) WRITE in strata_bind (Feature B), so a
 # concurrent strata_bind call can't interleave its two assignments with
 # another's (no torn write of the pair). It does NOT guard reads: every
@@ -1275,14 +1294,25 @@ def _switch_pending_result(
     the whole point of asking. On a decline the binding simply stands; the
     override path is not mentioned at all. A fresh ask starts the flow over
     from a brand new user request, not from replaying this message.
+
+    Live-test follow-up (two-step switch enforcement): the non-declined
+    ``detail`` now names the pending window explicitly — a bare
+    ``confirm=True`` is honored only on a FOLLOW-UP call naming this SAME
+    target within that window (see ``_PENDING_SWITCH`` and its docstring),
+    never on the call that first announces the switch. The wording says so,
+    so an agent reads this as "announce, then confirm on a second call,"
+    not as "just add confirm=True."
     """
     if declined:
         detail = "The user declined. The binding stands."
     else:
+        minutes = int(_PENDING_SWITCH_WINDOW.total_seconds() // 60)
         detail = (
             "Ask the user to confirm the switch, then call "
             f"strata_bind(scope_id={requested_scope_id!r}, confirm=True) with "
-            "their answer — do not confirm this yourself."
+            f"their answer within {minutes} minutes — do not confirm this "
+            "yourself, and do not pass confirm=True on this same call; it is "
+            "only honored on a follow-up call naming this same target."
         )
     return {
         "scope_id": _AGENT_SCOPE,
@@ -1363,20 +1393,29 @@ async def strata_bind(scope_id: str, skill: str | None = None, confirm: bool = F
     per call, so the record stays truthful regardless of how many times a
     session rebinds.
 
-    SWITCHING requires explicit confirmation (self-bind guard). Binding for
-    the FIRST time this session (currently unbound) needs no confirmation —
-    there is no prior identity to lose. But once this session is ALREADY
-    bound to a scope, a call naming a DIFFERENT scope is a SWITCH, and a
-    switch is refused on the first call: the result comes back with
-    ``switch_pending: True`` and NO change is made, so you can hand that to
-    the user and ask them to confirm. Call again with ``confirm=True`` once
-    they have. (A call naming the SAME scope you are already bound to is a
-    no-op success, never a switch — only pass ``confirm`` when you actually
-    mean to change identity.) Where the client supports server-initiated MCP
-    elicitation, this tool asks the user to confirm the switch itself before
-    you ever need the ``confirm`` parameter — a decline there refuses the
-    switch immediately, with the binding left unchanged, exactly like an
-    unconfirmed ``switch_pending`` result.
+    SWITCHING requires an explicit ANNOUNCE-THEN-CONFIRM round trip
+    (self-bind guard). Binding for the FIRST time this session (currently
+    unbound) needs no confirmation — there is no prior identity to lose.
+    But once this session is ALREADY bound to a scope, a call naming a
+    DIFFERENT scope is a SWITCH, and a switch is never performed on the
+    call that first names it — not even if that call already carries
+    ``confirm=True``. ``confirm=True`` is a promise from whoever is
+    calling, not proof the user actually answered, so it is honored ONLY on
+    a FOLLOW-UP call that names the SAME target scope again, within a few
+    minutes of the call that first announced it. The first call always
+    returns ``switch_pending: True`` with the binding UNCHANGED, so hand
+    that to the user, get their answer, and call again — with
+    ``confirm=True`` and the SAME ``scope_id`` — once they've confirmed.
+    Naming a different target, or waiting too long, restarts the
+    announcement (another ``switch_pending`` result, not a switch). (A call
+    naming the SAME scope you are already bound to is a no-op success,
+    never a switch — only pass ``confirm`` when you actually mean to change
+    identity.) Where the client supports server-initiated MCP elicitation,
+    this tool asks the user to confirm the switch itself, in the SAME call
+    that first names it — that one round trip replaces the announce-then-
+    confirm dance entirely, since the user is answering directly, right
+    now. A decline there refuses the switch immediately, with the binding
+    left unchanged, exactly like an unconfirmed ``switch_pending`` result.
 
     On failure — an invalid scope/skill, or a switch pending confirmation —
     the binding is left completely unchanged.
@@ -1406,10 +1445,15 @@ async def strata_bind(scope_id: str, skill: str | None = None, confirm: bool = F
             (any skill is allowed if that list is empty).
         confirm: Only meaningful when this session is already bound to a
             DIFFERENT scope than *scope_id* — pass ``True`` once the user
-            has confirmed the switch. Ignored (no effect either way) for an
-            initial bind or a same-scope re-bind. Never set this to
-            ``True`` on your own judgment; it must reflect the user's
-            actual answer.
+            has confirmed the switch, on a FOLLOW-UP call naming the same
+            *scope_id* you already announced. Has NO effect on the call
+            that first names a new target (that call always comes back as
+            ``switch_pending`` regardless of this flag) — it only performs
+            the switch when it matches an announcement from an earlier
+            call, within a few minutes. Ignored entirely for an initial
+            bind or a same-scope re-bind. Never set this to ``True`` on
+            your own judgment; it must reflect the user's actual answer,
+            given after you told them about the switch.
 
     Returns:
         On success: ``scope_id``, ``skill``, ``session_id`` (the new
@@ -1426,7 +1470,8 @@ async def strata_bind(scope_id: str, skill: str | None = None, confirm: bool = F
             not permitted — the error lists the valid scopes/skills. The
             binding is left unchanged in every failure case.
     """
-    global _AGENT_SCOPE, _AGENT_SKILL, _UNRESOLVED, _STARTUP_ERRORS_BINDING, _ELICIT_DECLINED
+    global _AGENT_SCOPE, _AGENT_SKILL, _UNRESOLVED, _STARTUP_ERRORS_BINDING
+    global _ELICIT_DECLINED, _PENDING_SWITCH
 
     # This is THE recovery path for an unresolved session (Change 1), so it
     # deliberately re-reads fleet.yaml itself (below) rather than trusting
@@ -1479,17 +1524,43 @@ async def strata_bind(scope_id: str, skill: str | None = None, confirm: bool = F
     previous_scope_id = _AGENT_SCOPE
     is_switch = not _UNRESOLVED and bool(previous_scope_id) and scope_id != previous_scope_id
 
-    if is_switch and not confirm:
-        elicited = await _attempt_elicit_switch_confirm(previous_scope_id, scope_id)
-        if elicited is True:
-            confirm = True
-        elif elicited is False:
-            return _switch_pending_result(previous_scope_id, scope_id, declined=True)
-        # elicited is None: no session, or the client can't be asked — fall
-        # through to the confirm= heads-up below.
+    if is_switch:
+        switched_via_elicitation = False
+        if not confirm:
+            elicited = await _attempt_elicit_switch_confirm(previous_scope_id, scope_id)
+            if elicited is True:
+                switched_via_elicitation = True
+            elif elicited is False:
+                return _switch_pending_result(previous_scope_id, scope_id, declined=True)
+            # elicited is None: no session, or the client can't be asked —
+            # fall through to the announce-then-confirm dance below.
 
-    if is_switch and not confirm:
-        return _switch_pending_result(previous_scope_id, scope_id, declined=False)
+        if not switched_via_elicitation:
+            # Two-step enforcement (live-test finding): a bare confirm=True
+            # is a PROMISE from whoever is calling, not a GATE — an agent
+            # could self-supply it on the very first call, indistinguishable
+            # from a genuinely user-confirmed one. confirm=True is honored
+            # ONLY when this exact target was already announced, on an
+            # EARLIER call, and this call names it again within the pending
+            # window. No matching pending record (never announced, a
+            # different target, or the window elapsed) means this IS the
+            # announcing call, confirm=True or not — it does not switch.
+            now = datetime.now(UTC)
+            pending = _PENDING_SWITCH
+            pending_confirmed = (
+                confirm
+                and pending is not None
+                and pending["target_scope_id"] == scope_id
+                and now - pending["requested_at"] <= _PENDING_SWITCH_WINDOW
+            )
+            if not pending_confirmed:
+                _PENDING_SWITCH = {"target_scope_id": scope_id, "requested_at": now}
+                return _switch_pending_result(previous_scope_id, scope_id, declined=False)
+
+        # Confirmed — either an accepted elicitation (bypasses pending
+        # entirely) or a matching, unexpired announce-then-confirm pair.
+        # The pending record has served its purpose.
+        _PENDING_SWITCH = None
 
     with _binding_lock:
         _AGENT_SCOPE = scope_id

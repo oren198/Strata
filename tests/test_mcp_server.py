@@ -61,8 +61,9 @@ from __future__ import annotations
 
 import logging
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 import yaml
@@ -1522,6 +1523,21 @@ def _patch_agent_binding(
     )
 
 
+def _seeded_pending_switch(mod, target_scope_id: str):
+    """Patch context manager pre-seeding mod._PENDING_SWITCH as though
+    *target_scope_id* was already announced, just now — so a single
+    strata_bind(scope_id=target_scope_id, confirm=True) call in the test
+    body performs the switch immediately, standing in for the real
+    announce-then-confirm round trip when a test's focus is elsewhere
+    (provenance, fleet hot-reload, session id stability, ...) and not the
+    two-step enforcement itself."""
+    return patch.object(
+        mod,
+        "_PENDING_SWITCH",
+        {"target_scope_id": target_scope_id, "requested_at": datetime.now(UTC)},
+    )
+
+
 @pytest.mark.parametrize(
     "target_scope_id",
     ["g_team", "g_func", "g_exec"],
@@ -2838,9 +2854,11 @@ async def test_bind_to_scope_added_after_server_init_succeeds(tmp_path: Path) ->
         fleet_path.write_text(yaml.dump(raw, default_flow_style=False), encoding="utf-8")
 
         # Already bound to g_backend, so this is a switch — the self-bind
-        # guard (a separate feature) requires confirm=True; not what this
-        # test is about, so supply it directly.
-        result = await mod.strata_bind(scope_id="g_new", confirm=True)
+        # guard (a separate feature) requires an announce-then-confirm round
+        # trip; not what this test is about, so seed the announcement
+        # directly and confirm in one call.
+        with _seeded_pending_switch(mod, "g_new"):
+            result = await mod.strata_bind(scope_id="g_new", confirm=True)
 
         assert result["scope_id"] == "g_new"
         assert mod._AGENT_SCOPE == "g_new"
@@ -2905,9 +2923,11 @@ async def test_bind_leaves_session_id_unchanged(tmp_path: Path) -> None:
         patch.object(mod, "_AGENT_SESSION_ID", "sess_stable"),
     ):
         # Already bound to g_backend, so this is a switch — the self-bind
-        # guard (a separate feature) requires confirm=True; not what this
-        # test is about, so supply it directly.
-        result = await mod.strata_bind(scope_id="g_arch", confirm=True)
+        # guard (a separate feature) requires an announce-then-confirm round
+        # trip; not what this test is about, so seed the announcement
+        # directly and confirm in one call.
+        with _seeded_pending_switch(mod, "g_arch"):
+            result = await mod.strata_bind(scope_id="g_arch", confirm=True)
 
         assert result["scope_id"] == "g_arch"
         assert result["session_id"] == "sess_stable"
@@ -2950,6 +2970,130 @@ async def test_rebind_without_confirm_does_not_switch_and_returns_heads_up(
         assert "g_arch" in result["message"]
         assert "g_backend" in result["message"]
         assert "confirm" in result["message"].lower()
+        assert mod._PENDING_SWITCH == {"target_scope_id": "g_backend", "requested_at": ANY}
+
+
+async def test_switch_cold_confirm_true_does_not_bypass_announce(tmp_path: Path) -> None:
+    """Live-test finding: an agent self-supplying confirm=True on the VERY
+    FIRST call for a switch must not switch — confirm=True is a promise
+    from whoever is calling, not proof the user actually answered. Without
+    a matching prior announcement, this is the exact bypass the two-step
+    enforcement exists to kill."""
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fleet_yaml(tmp_path)  # g_arch, g_backend
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+    with patch.object(mod, "_AGENT_SCOPE", "g_arch"), patch.object(mod, "_AGENT_SKILL", None):
+        # No prior announcement exists — mod._PENDING_SWITCH is None.
+        assert mod._PENDING_SWITCH is None
+
+        result = await mod.strata_bind(scope_id="g_backend", confirm=True)
+
+        # Still a heads-up, NOT a switch — the binding is untouched.
+        assert result["switch_pending"] is True
+        assert result["scope_id"] == "g_arch"
+        assert mod._AGENT_SCOPE == "g_arch"
+        # This first (cold) call is now the announcement, for a REAL
+        # follow-up to confirm — not itself a confirmation.
+        assert mod._PENDING_SWITCH == {"target_scope_id": "g_backend", "requested_at": ANY}
+
+
+async def test_switch_announce_then_confirm_within_window_switches(tmp_path: Path) -> None:
+    """The legitimate two-step: announce (any confirm value), then a
+    follow-up call naming the SAME target with confirm=True actually
+    switches, and clears the pending record."""
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fleet_yaml(tmp_path)
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+    with patch.object(mod, "_AGENT_SCOPE", "g_arch"), patch.object(mod, "_AGENT_SKILL", None):
+        announced = await mod.strata_bind(scope_id="g_backend")
+        assert announced["switch_pending"] is True
+        assert mod._AGENT_SCOPE == "g_arch"
+
+        confirmed = await mod.strata_bind(scope_id="g_backend", confirm=True)
+
+        assert confirmed["scope_id"] == "g_backend"
+        assert "switch_pending" not in confirmed
+        assert mod._AGENT_SCOPE == "g_backend"
+        assert mod._PENDING_SWITCH is None
+
+
+async def test_switch_mismatched_target_confirm_returns_new_heads_up(tmp_path: Path) -> None:
+    """A confirm=True naming a DIFFERENT target than the one currently
+    pending is cold for THAT target — it replaces the pending record with
+    its own fresh announcement rather than switching to anything."""
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet = {
+        "strata": [{"id": "L0", "name": "root", "ordinal": 0}],
+        "scopes": [
+            {"id": "g_arch", "name": "Arch", "stratum_id": "L0"},
+            {"id": "g_backend", "name": "Backend", "stratum_id": "L0"},
+            {"id": "g_other", "name": "Other", "stratum_id": "L0"},
+        ],
+        "edges": [],
+    }
+    fleet_path = tmp_path / "fleet.yaml"
+    fleet_path.write_text(yaml.dump(fleet, default_flow_style=False), encoding="utf-8")
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+    with patch.object(mod, "_AGENT_SCOPE", "g_arch"), patch.object(mod, "_AGENT_SKILL", None):
+        # Announce a switch to g_backend.
+        await mod.strata_bind(scope_id="g_backend")
+        assert mod._PENDING_SWITCH["target_scope_id"] == "g_backend"
+
+        # A confirm=True for a DIFFERENT target (g_other) must not switch
+        # to g_other, and must not be treated as confirming g_backend either.
+        result = await mod.strata_bind(scope_id="g_other", confirm=True)
+
+        assert result["switch_pending"] is True
+        assert result["scope_id"] == "g_arch"
+        assert mod._AGENT_SCOPE == "g_arch"
+        # Pending now tracks the NEW target, not the old one.
+        assert mod._PENDING_SWITCH["target_scope_id"] == "g_other"
+
+        # And the original g_backend announcement no longer confirms,
+        # since it was replaced.
+        stale = await mod.strata_bind(scope_id="g_backend", confirm=True)
+        assert stale["switch_pending"] is True
+        assert mod._AGENT_SCOPE == "g_arch"
+
+
+async def test_switch_pending_expires_after_window(tmp_path: Path) -> None:
+    """A confirm=True arriving after the pending window elapsed is treated
+    as cold — a fresh announcement, not a confirmation of the stale one."""
+    from datetime import timedelta
+
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fleet_yaml(tmp_path)
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+    with (
+        patch.object(mod, "_AGENT_SCOPE", "g_arch"),
+        patch.object(mod, "_AGENT_SKILL", None),
+        patch.object(
+            mod,
+            "_PENDING_SWITCH",
+            {
+                "target_scope_id": "g_backend",
+                "requested_at": datetime.now(UTC)
+                - mod._PENDING_SWITCH_WINDOW
+                - timedelta(seconds=1),
+            },
+        ),
+    ):
+        result = await mod.strata_bind(scope_id="g_backend", confirm=True)
+
+        # Expired — cold again, not a switch.
+        assert result["switch_pending"] is True
+        assert mod._AGENT_SCOPE == "g_arch"
+        # Re-announced with a fresh timestamp.
+        assert mod._PENDING_SWITCH["target_scope_id"] == "g_backend"
+        assert mod._PENDING_SWITCH["requested_at"] > datetime.now(UTC) - timedelta(seconds=5)
 
 
 def test_switch_declined_message_has_no_override_recipe() -> None:
@@ -2974,14 +3118,21 @@ def test_switch_declined_message_has_no_override_recipe() -> None:
 
 
 async def test_rebind_with_confirm_switches_and_notes_identity_change(tmp_path: Path) -> None:
-    """confirm=True actually performs the switch, and the result explicitly
-    calls out the identity change — this is not a cosmetic rename."""
+    """The genuine announce-then-confirm round trip actually performs the
+    switch on the SECOND call, and the result explicitly calls out the
+    identity change — this is not a cosmetic rename."""
     db_path = _make_db(tmp_path)
     summaries_dir = str(tmp_path / "summaries")
     fleet_path = _make_fleet_yaml(tmp_path)
 
     mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
     with patch.object(mod, "_AGENT_SCOPE", "g_arch"), patch.object(mod, "_AGENT_SKILL", None):
+        # First call announces — no switch yet, regardless of confirm.
+        announced = await mod.strata_bind(scope_id="g_backend")
+        assert announced.get("switch_pending") is True
+        assert mod._AGENT_SCOPE == "g_arch"
+
+        # Second call, same target, confirm=True: the switch actually happens.
         result = await mod.strata_bind(scope_id="g_backend", confirm=True)
 
         assert result["scope_id"] == "g_backend"
@@ -3220,9 +3371,11 @@ async def test_contribution_after_bind_carries_new_scope_in_provenance(tmp_path:
         patch("anthropic.Anthropic", return_value=MagicMock()),
     ):
         # Already bound to g_backend, so this is a switch — the self-bind
-        # guard (a separate feature) requires confirm=True; not what this
-        # test is about, so supply it directly.
-        bind_result = await mod.strata_bind(scope_id="g_arch", confirm=True)
+        # guard (a separate feature) requires an announce-then-confirm round
+        # trip; not what this test is about, so seed the announcement
+        # directly and confirm in one call.
+        with _seeded_pending_switch(mod, "g_arch"):
+            bind_result = await mod.strata_bind(scope_id="g_arch", confirm=True)
         assert bind_result["scope_id"] == "g_arch"
         assert mod._AGENT_SCOPE == "g_arch"
 
