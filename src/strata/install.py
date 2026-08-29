@@ -232,18 +232,25 @@ summaries_dir = ".strata/summaries"
 
 _HISTORICAL_ARTIFACT_HASHES: dict[str, dict[str, object]] = {
     "strata": {
-        "current": "81a0a8debdb183603a985459c17b7e4800e65a5f5ff7b9cb7c7f0526d133087c",
+        "current": "1620f11a24ec0d3b1d4e776315e02ff343bcc768b6c6b955a7a4ce865058ba84",
         "historical": frozenset(
-            {"5865b8090923c1dd0d3f747490b006b4f0b3b4d18bceffb99ef7fb2fe9e577ab"}
+            {
+                "5865b8090923c1dd0d3f747490b006b4f0b3b4d18bceffb99ef7fb2fe9e577ab",
+                "81a0a8debdb183603a985459c17b7e4800e65a5f5ff7b9cb7c7f0526d133087c",
+            }
         ),
     },
     "strata-worker": {
-        "current": "2e2cb5d953d6e97377a347134ebbef989f85f53cb7604a50e53f2516153831e0",
-        "historical": frozenset(),
+        "current": "110a29368e69e49a45a567f6a91ed3898fa2ebb779a6cb665cb0dde72f79157b",
+        "historical": frozenset(
+            {"2e2cb5d953d6e97377a347134ebbef989f85f53cb7604a50e53f2516153831e0"}
+        ),
     },
     "strata-inspect": {
-        "current": "707793640183dfd5e503c57c48133c8d56747b74a49268bdd76b8cc77335f2ad",
-        "historical": frozenset(),
+        "current": "848e7e35726620cf54cab6d19657fcb2e43d71c30ed4ca49bc1cbae2ea6f857e",
+        "historical": frozenset(
+            {"707793640183dfd5e503c57c48133c8d56747b74a49268bdd76b8cc77335f2ad"}
+        ),
     },
     "strata-stop-hook": {
         "current": "d950ad8fcf436069b49d247543ab6a4a2c98481d6ef853e5c78a5289e0f5c582",
@@ -268,9 +275,12 @@ _HISTORICAL_ARTIFACT_HASHES: dict[str, dict[str, object]] = {
         "historical": frozenset(),
     },
     "agents-md": {
-        "current": "ceea6568ab9160d54f2d3edd7131bc9b3bf2a694832226e67e7553de7325825f",
+        "current": "d4e9b4da5543ad2faf75bedb17c426a8dab72e858955b1a48e7b718f72092aca",
         "historical": frozenset(
-            {"f6df7e82395ba3199d3a52c1651db8afb93b2fdd139b496974f871d453535b68"}
+            {
+                "f6df7e82395ba3199d3a52c1651db8afb93b2fdd139b496974f871d453535b68",
+                "ceea6568ab9160d54f2d3edd7131bc9b3bf2a694832226e67e7553de7325825f",
+            }
         ),
     },
 }

@@ -3737,6 +3737,10 @@ async def test_startup_validator_error_items_route_through_the_user(tmp_path: Pa
     assert "to bind this session now" not in rendered
     assert "call strata_bind(scope_id=<one of the above>)" not in rendered
     assert "call strata_bind(scope_id=..., skill=" not in rendered
+    # Live incident: an unbound agent shell-read .strata/summaries/g_root.md
+    # directly instead of asking the user — the exact surface an agent
+    # reads at the moment of temptation must warn it off that.
+    assert "never read or write files under .strata/ directly" in rendered
 
 
 async def test_unbound_tool_call_raises_for_every_memory_tool_but_bind(tmp_path: Path) -> None:

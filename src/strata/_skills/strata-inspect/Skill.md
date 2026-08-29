@@ -63,6 +63,12 @@ than guessing at its content.
 - Do not interpret what the user "should" do based on what you read —
   that's their judgement. Surface the facts.
 - Do not start the backend or run any `strata` CLI command yourself.
+- Never read or write files under `.strata/` directly (its database,
+  session files, or summaries) — that bypasses binding and judgment. All
+  memory access goes through the MCP tools above.
+- If shared memory would help and this session isn't bound yet, ask the
+  user which scope to act as before answering — don't work around it by
+  reading `.strata/` files directly.
 
 ## Also: the CLI
 

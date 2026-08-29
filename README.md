@@ -17,6 +17,11 @@ so one agent's mistake never corrupts what the rest of the fleet reads.
 - **Record** — the append-only audit trail of everything ever contributed
   and judged, per scope.
 
+Scoping — which memory an agent binds to and reads/writes — is a
+discipline boundary for well-behaved agents, not a security boundary; a
+harness sandbox's own file-access rules are the enforcement layer against
+an adversarial agent.
+
 For the full theory and vocabulary, see
 [`docs/philosophy.md`](https://github.com/oren198/Strata/blob/main/docs/philosophy.md) (why Strata exists, why naive
 sharing fails) and [`CONTEXT.md`](https://github.com/oren198/Strata/blob/main/CONTEXT.md) (the canonical glossary

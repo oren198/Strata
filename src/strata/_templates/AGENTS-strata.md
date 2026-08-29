@@ -18,6 +18,14 @@ exposed to this session — never run `strata start` or talk to its HTTP
 backend yourself; that process serves the human's Console UI only and is
 not part of your job.
 
+**Two hard rules:**
+- Never read or write files under `.strata/` directly (its database,
+  session files, or summaries) — that bypasses binding and judgment. All
+  memory access goes through the strata tools above.
+- If shared memory would help and this session isn't bound yet, ask the
+  user which scope to act as before answering — don't work around it by
+  reading `.strata/` files directly.
+
 Your scope and role identity are bound through environment variables
 (`STRATA_AGENT_SCOPE`, `STRATA_AGENT_SKILL`, `STRATA_AGENT_SESSION_ID`) set
 before this session starts — do not hardcode them.

@@ -27,12 +27,13 @@ Strata is a **shared memory system for fleets of agents**.
 ## What you do in this skill
 
 1. **Check the MCP tools work**: call `strata_list_scopes`. The tools are
-   embedded — no backend process is involved. If the tool is unavailable,
-   the Strata MCP server refused to start (its startup message names the
-   fix — usually `STRATA_AGENT_SCOPE`/`STRATA_AGENT_SKILL` or a missing
-   `.strata/config.toml`); relay that to the user. Never run `strata start`
-   yourself to fix this — that launches the Console backend for the human's
-   browser UI, not something your session needs.
+   embedded — no backend process is involved, and the server always starts.
+   If a memory tool errors instead, this session isn't bound yet — its
+   error names the fix (usually asking the user which scope/skill to bind
+   as via `strata_bind`, or a missing/broken `.strata/config.toml`); relay
+   that to the user. Never run `strata start` yourself to fix this — that
+   launches the Console backend for the human's browser UI, not something
+   your session needs.
 2. **Show the user the fleet**: report the strata, scopes, and edges from
    `strata_list_scopes`. Explain which scopes the user can act *as*.
 3. **Help the user pick a role**:
@@ -76,3 +77,9 @@ target stay chain-only (issue #48; ADR 0006 D3/D4).
   it and can validate with `strata bootstrap`.
 - Do not assume which scope the user belongs at — ask, or list and let them
   pick.
+- Never read or write files under `.strata/` directly (its database,
+  session files, or summaries) — that bypasses binding and judgment. All
+  memory access goes through the MCP tools above.
+- If shared memory would help and this session isn't bound yet, ask the
+  user which scope to act as before answering — don't work around it by
+  reading `.strata/` files directly.

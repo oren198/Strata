@@ -1053,6 +1053,11 @@ def _unresolved_message(fleet: FleetConfig | None) -> str:
         "\n\n  strata_list_scopes works unbound too (fleet topology is not scoped "
         "memory) if you need the full strata/scope/edge picture before picking."
     )
+    sections.append(
+        "\n\n  Never read or write files under .strata/ directly (its database, "
+        "session files, or summaries) to work around this — that bypasses binding "
+        "and judgment entirely. All memory access goes through the strata tools."
+    )
     return header + body + "".join(sections)
 
 

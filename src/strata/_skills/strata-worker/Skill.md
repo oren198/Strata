@@ -17,8 +17,9 @@ variables — **do not hardcode them**:
 | `STRATA_AGENT_SESSION_ID` | Unique per CC session. Auto-generated when absent. |
 
 The Strata MCP server validates these at startup. If they aren't set correctly,
-the server will have already exited with an actionable error before your session
-begins.
+the server still starts, but every memory tool (except `strata_bind`) raises
+an actionable error until the session is bound — ask the user which scope
+(and skill) to act as, then call `strata_bind` with their answer.
 
 ## Vocabulary (canonical — use these terms verbatim)
 
@@ -107,3 +108,9 @@ perspective — a peer's directives never bind you, only inform you.
   may contribute to that scope or propose upward to one of its ancestors;
   the server refuses any other target (a peer or descendant scope) before
   it is judged, no matter what the user asks.
+- Never read or write files under `.strata/` directly (its database,
+  session files, or summaries) — that bypasses binding and judgment. All
+  memory access goes through the MCP tools above.
+- If shared memory would help and this session isn't bound yet, ask the
+  user which scope to act as before answering — don't work around it by
+  reading `.strata/` files directly.
