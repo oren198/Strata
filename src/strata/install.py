@@ -376,26 +376,37 @@ def is_v1_2_shape_mcp_entry(entry: dict) -> bool:
     return isinstance(env, dict) and "STRATA_BACKEND_URL" in env
 
 
-def is_bootstrap_venv_shape_mcp_entry(entry: dict) -> bool:
-    """Return ``True`` if *entry* is a ``--bootstrap-venv``-written mcpServer entry.
+def is_bootstrap_venv_shape_mcp_entry(entry: dict, project_root: Path) -> bool:
+    """Return ``True`` if *entry* is exactly what ``--bootstrap-venv`` wrote
+    for THIS project.
 
     ``strata register --bootstrap-venv`` points the entry's ``command`` at an
-    absolute, per-project path (``<project>/.strata/.venv/bin/strata-mcp``)
+    absolute, per-project path (``<project_root>/.strata/.venv/bin/strata-mcp``)
     rather than the ``strata-mcp`` name :data:`MCP_ENTRY` resolves on
     ``PATH`` — so it can never byte-match :data:`MCP_ENTRY` or anything in
     :data:`MCP_ENTRY_HISTORICAL`. Still register-written and never
     hand-authored, so a legacy copy of it found in ``.claude/settings.json``
-    is just as migratable as an exact match — the caller carries the
-    ``command`` value verbatim into ``.mcp.json`` rather than overwriting it
-    with the canonical one.
+    is just as migratable/removable as an exact match — the caller carries
+    the ``command`` value verbatim into ``.mcp.json`` rather than
+    overwriting it with the canonical one.
+
+    Deliberately narrow (a live incident found an earlier version of this
+    too loose): the ``command`` must match *this* project's venv path
+    exactly — a path ending in the right suffix but rooted at another
+    project (or hand-typed) is NOT ours — and *entry* must have exactly the
+    two keys register ever writes here (``command``, ``env``); an entry
+    with extra keys (``args``, or anything beyond those two) was never
+    something register wrote and must never be silently deleted/migrated.
+    ``env``'s *contents* stay free — register preserves a user-customised
+    env block across a bootstrap-venv re-run (see the caller in
+    ``__main__.cmd_register``) — only its type is checked here.
     """
+    if set(entry) != {"command", "env"}:
+        return False
     command = entry.get("command")
-    env = entry.get("env", {})
-    return (
-        isinstance(command, str)
-        and command.endswith("/.strata/.venv/bin/strata-mcp")
-        and isinstance(env, dict)
-    )
+    env = entry.get("env")
+    expected_command = str(Path(project_root) / ".strata" / ".venv" / "bin" / "strata-mcp")
+    return command == expected_command and isinstance(env, dict)
 
 
 def mcp_server_present(settings_data: dict, name: str = MCP_SERVER_NAME) -> bool:

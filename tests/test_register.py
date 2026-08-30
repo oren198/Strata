@@ -658,6 +658,192 @@ def test_legacy_bootstrap_venv_shape_entry_rerun_is_idempotent(tmp_path: Path, c
 
 
 # ---------------------------------------------------------------------------
+# HIGH 1 (fix round): the --bootstrap-venv-shape matcher must be narrow —
+# an entry with extra keys, or one pointing at ANOTHER project's venv, is
+# NOT something register wrote and must never be migrated.
+# ---------------------------------------------------------------------------
+
+
+def test_venv_shape_legacy_entry_with_extra_keys_is_not_migrated(tmp_path: Path, capsys) -> None:
+    """A legacy entry that looks venv-shaped but carries extra keys was
+    never written by register's --bootstrap-venv (which writes exactly
+    {command, env}) — must be left in place, not migrated."""
+    _init_project(tmp_path)
+    claude_dir = tmp_path / ".claude"
+    claude_dir.mkdir(parents=True)
+    venv_command = str(tmp_path / ".strata" / ".venv" / "bin" / "strata-mcp")
+    (claude_dir / "settings.json").write_text(
+        json.dumps(
+            {"mcpServers": {"strata": {"command": venv_command, "env": {}, "args": ["--extra"]}}},
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    _run_register(tmp_path)
+    captured = capsys.readouterr()
+
+    assert "moved" not in captured.out.lower()
+    settings_data = json.loads((claude_dir / "settings.json").read_text(encoding="utf-8"))
+    assert settings_data["mcpServers"]["strata"]["command"] == venv_command
+    assert settings_data["mcpServers"]["strata"]["args"] == ["--extra"]
+    # register still adds a working canonical entry to .mcp.json.
+    mcp_data = json.loads((tmp_path / ".mcp.json").read_text(encoding="utf-8"))
+    assert mcp_data["mcpServers"]["strata"]["command"] == "strata-mcp"
+
+
+def test_venv_shape_legacy_entry_for_foreign_project_is_not_migrated(
+    tmp_path: Path, capsys
+) -> None:
+    """A legacy entry pointing at ANOTHER project's venv path must never be
+    treated as THIS project's own register-written entry."""
+    _init_project(tmp_path)
+    claude_dir = tmp_path / ".claude"
+    claude_dir.mkdir(parents=True)
+    foreign_command = "/opt/other-project/.strata/.venv/bin/strata-mcp"
+    (claude_dir / "settings.json").write_text(
+        json.dumps({"mcpServers": {"strata": {"command": foreign_command, "env": {}}}}, indent=2),
+        encoding="utf-8",
+    )
+
+    _run_register(tmp_path)
+    captured = capsys.readouterr()
+
+    assert "moved" not in captured.out.lower()
+    settings_data = json.loads((claude_dir / "settings.json").read_text(encoding="utf-8"))
+    assert settings_data["mcpServers"]["strata"]["command"] == foreign_command
+    mcp_data = json.loads((tmp_path / ".mcp.json").read_text(encoding="utf-8"))
+    assert mcp_data["mcpServers"]["strata"]["command"] == "strata-mcp"
+
+
+# ---------------------------------------------------------------------------
+# HIGH 2 (fix round): valid JSON but not an object must not crash register.
+# ---------------------------------------------------------------------------
+
+
+def test_register_non_dict_mcp_json_does_not_crash(tmp_path: Path, capsys) -> None:
+    """`.mcp.json` containing `[]` (valid JSON, not an object) must fail
+    cleanly with an actionable message, not an AttributeError."""
+    _init_project(tmp_path)
+    (tmp_path / ".mcp.json").write_text("[]", encoding="utf-8")
+
+    rc = _run_register(tmp_path)
+
+    assert rc == 1
+    captured = capsys.readouterr()
+    assert ".mcp.json" in captured.err
+    assert (tmp_path / ".mcp.json").read_text(encoding="utf-8") == "[]", (
+        "register must never overwrite a .mcp.json it could not use"
+    )
+
+
+def test_register_null_mcp_json_does_not_crash(tmp_path: Path, capsys) -> None:
+    """`null` is valid JSON but not an object — must not crash register."""
+    _init_project(tmp_path)
+    (tmp_path / ".mcp.json").write_text("null", encoding="utf-8")
+
+    rc = _run_register(tmp_path)
+
+    assert rc == 1
+    captured = capsys.readouterr()
+    assert ".mcp.json" in captured.err
+
+
+# ---------------------------------------------------------------------------
+# MEDIUM 3 (fix round): --diff mode honesty for the migration/dedup prints.
+# ---------------------------------------------------------------------------
+
+
+def test_diff_mode_stale_duplicate_uses_would_wording(tmp_path: Path, capsys) -> None:
+    """--diff mode's stale-duplicate sweep line must read as a preview
+    ("would remove"), never a past-tense claim of a write that never
+    happened."""
+    _init_project(tmp_path)
+    claude_dir = tmp_path / ".claude"
+    claude_dir.mkdir(parents=True)
+    (claude_dir / "settings.json").write_text(
+        json.dumps({"mcpServers": {"strata": {"command": "strata-mcp", "env": {}}}}, indent=2),
+        encoding="utf-8",
+    )
+    (tmp_path / ".mcp.json").write_text(
+        json.dumps({"mcpServers": {"strata": {"command": "strata-mcp", "env": {}}}}, indent=2),
+        encoding="utf-8",
+    )
+
+    rc = _run_register(tmp_path, diff=True)
+
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert "would remove" in captured.out.lower()
+    assert "removed stale duplicate" not in captured.out.lower()
+    # --diff must not have touched either file.
+    settings_data = json.loads((claude_dir / "settings.json").read_text(encoding="utf-8"))
+    assert "strata" in settings_data["mcpServers"]
+
+
+def test_diff_mode_with_legacy_entry_previews_the_move(tmp_path: Path, capsys) -> None:
+    """--diff on a project with a migratable legacy entry must call out
+    BOTH halves of the move: the .mcp.json side (via the normal
+    [would create/update] line) and that the legacy settings.json entry
+    would be removed."""
+    _init_project(tmp_path)
+    claude_dir = tmp_path / ".claude"
+    claude_dir.mkdir(parents=True)
+    (claude_dir / "settings.json").write_text(
+        json.dumps({"mcpServers": {"strata": {"command": "strata-mcp", "env": {}}}}, indent=2),
+        encoding="utf-8",
+    )
+
+    rc = _run_register(tmp_path, diff=True)
+
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert ".mcp.json" in captured.out
+    assert "would remove" in captured.out.lower()
+    assert "settings.json" in captured.out.lower()
+    # --diff must not have touched either file.
+    assert not (tmp_path / ".mcp.json").exists()
+    settings_data = json.loads((claude_dir / "settings.json").read_text(encoding="utf-8"))
+    assert "strata" in settings_data["mcpServers"]
+
+
+# ---------------------------------------------------------------------------
+# Missing coverage (fix round): register's stale-duplicate sweep branch,
+# exercised directly through cmd_register (not just unregister/doctor).
+# ---------------------------------------------------------------------------
+
+
+def test_register_sweeps_stale_duplicate_when_mcp_json_already_present(
+    tmp_path: Path, capsys
+) -> None:
+    """.mcp.json already has the byte-exact entry AND a byte-exact
+    duplicate sits in .claude/settings.json (e.g. a half-migrated project,
+    or one re-registered with an old release after a post-fix one) —
+    register must sweep the stale duplicate out of settings.json."""
+    _init_project(tmp_path)
+    claude_dir = tmp_path / ".claude"
+    claude_dir.mkdir(parents=True)
+    (claude_dir / "settings.json").write_text(
+        json.dumps({"mcpServers": {"strata": {"command": "strata-mcp", "env": {}}}}, indent=2),
+        encoding="utf-8",
+    )
+    (tmp_path / ".mcp.json").write_text(
+        json.dumps({"mcpServers": {"strata": {"command": "strata-mcp", "env": {}}}}, indent=2),
+        encoding="utf-8",
+    )
+
+    rc = _run_register(tmp_path)
+
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert "removed stale duplicate" in captured.out.lower()
+    settings_data = json.loads((claude_dir / "settings.json").read_text(encoding="utf-8"))
+    assert "mcpServers" not in settings_data
+    mcp_data = json.loads((tmp_path / ".mcp.json").read_text(encoding="utf-8"))
+    assert mcp_data["mcpServers"]["strata"]["command"] == "strata-mcp"
+
+
+# ---------------------------------------------------------------------------
 # Test 6: --diff mode prints what would differ without writing
 # ---------------------------------------------------------------------------
 

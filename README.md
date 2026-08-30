@@ -239,12 +239,6 @@ Then, per resolved harness:
   `.claude/settings.json` (a location Claude Code never reads for MCP
   servers), register migrates it into `.mcp.json` and prints a "moved" line;
   a hand-edited legacy entry is left in place with a note instead.
-
-`.mcp.json` is not gitignored by register: in Claude Code's model it's
-meant to be committable, shared team config, and Strata's own entry carries
-an empty `env` (binding comes from process env / auto-bind, not a value
-baked into the file), so there is nothing project-specific or secret in it —
-it is safe to commit as-is.
 - **codex** — merges Strata into Codex CLI's own `config.toml` and seeds
   `AGENTS.md` with a short memory-moves block — see
   [Using Strata with Codex CLI](#using-strata-with-codex-cli).
@@ -252,6 +246,16 @@ it is safe to commit as-is.
 Run it again at any time — it skips everything that already exists and reports what it kept.
 Every step is additive: your own `mcpServers`, `hooks`, skills, `AGENTS.md` content, and
 `fleet.yaml` are never overwritten.
+
+`.mcp.json` is not gitignored by register: in Claude Code's model it's
+meant to be committable, shared team config, and a plain `strata register`'s
+entry carries an empty `env` (binding comes from process env / auto-bind,
+not a value baked into the file), so there is nothing project-specific or
+secret in it — it is safe to commit as-is. The one exception is
+`--bootstrap-venv`: that flag points `command` at an absolute,
+machine-local `.strata/.venv/bin/strata-mcp` path, which is NOT portable
+across machines/checkouts — if your team uses `--bootstrap-venv`, treat
+`.mcp.json` as machine-local (don't commit that version) rather than shared.
 
 ### After registration
 
@@ -991,8 +995,7 @@ src/strata/              # Python backend package
     strata/              # CC skill (copy used in Strata-repo sessions)
     strata-worker/       # CC skill (copy used in Strata-repo sessions)
     strata-inspect/      # CC skill (copy used in Strata-repo sessions)
-.mcp.json.example        # Example MCP-server registration block (command: strata-mcp) —
-                          #   the shape `strata register` writes to .mcp.json
+.mcp.json.example        # Example .mcp.json (the shape `strata register` writes)
 tests/                   # pytest suite
 src/strata/_templates/   # Bundled starter fleets (dev-team.yaml is the default seed;
                           #   minimal.yaml/research-group.yaml/support-org.yaml also ship)

@@ -227,6 +227,119 @@ def test_edited_legacy_settings_entry_left_in_place_exit_1(tmp_path: Path, capsy
     assert "edited" in captured.err or "differs" in captured.err
 
 
+# ---------------------------------------------------------------------------
+# HIGH 1 (fix round): the --bootstrap-venv-shape matcher must be narrow —
+# a live incident found the old version matched any command ending in
+# ".strata/.venv/bin/strata-mcp" plus an env-is-dict check, which deleted
+# hand-edited entries (extra keys) and entries pointing at ANOTHER
+# project's venv. Tightened to require the exact key set {"command", "env"}
+# AND command == THIS project's own venv path.
+# ---------------------------------------------------------------------------
+
+
+def test_venv_shape_entry_with_extra_keys_survives_unregister(tmp_path: Path, capsys) -> None:
+    """A venv-shaped .mcp.json entry with extra keys (never something
+    register wrote — register's --bootstrap-venv writes exactly {command,
+    env}) is left in place, not silently deleted."""
+    _init_project(tmp_path)
+    cmd_register(_register_args(str(tmp_path)))
+
+    venv_command = str(tmp_path / ".strata" / ".venv" / "bin" / "strata-mcp")
+    mcp_json = tmp_path / ".mcp.json"
+    mcp_data = json.loads(mcp_json.read_text(encoding="utf-8"))
+    mcp_data["mcpServers"]["strata"] = {
+        "command": venv_command,
+        "env": {},
+        "args": ["--extra"],
+    }
+    mcp_json.write_text(json.dumps(mcp_data, indent=2) + "\n", encoding="utf-8")
+
+    rc = cmd_unregister(_unregister_args(str(tmp_path)))
+
+    assert rc == 1
+    on_disk = json.loads(mcp_json.read_text(encoding="utf-8"))
+    assert on_disk["mcpServers"]["strata"]["command"] == venv_command
+    assert on_disk["mcpServers"]["strata"]["args"] == ["--extra"]
+    captured = capsys.readouterr()
+    assert ".mcp.json" in captured.err
+
+
+def test_venv_shape_entry_pointing_at_foreign_project_survives_unregister(
+    tmp_path: Path, capsys
+) -> None:
+    """A venv-shaped entry whose command points at ANOTHER project's venv
+    (same suffix, different root) must never be treated as this project's
+    own register-written entry."""
+    _init_project(tmp_path)
+    cmd_register(_register_args(str(tmp_path)))
+
+    foreign_command = "/opt/other-project/.strata/.venv/bin/strata-mcp"
+    mcp_json = tmp_path / ".mcp.json"
+    mcp_data = json.loads(mcp_json.read_text(encoding="utf-8"))
+    mcp_data["mcpServers"]["strata"] = {"command": foreign_command, "env": {}}
+    mcp_json.write_text(json.dumps(mcp_data, indent=2) + "\n", encoding="utf-8")
+
+    rc = cmd_unregister(_unregister_args(str(tmp_path)))
+
+    assert rc == 1
+    on_disk = json.loads(mcp_json.read_text(encoding="utf-8"))
+    assert on_disk["mcpServers"]["strata"]["command"] == foreign_command
+
+
+# ---------------------------------------------------------------------------
+# HIGH 2 (fix round): valid JSON but not an object (`[]`, `null`, ...) must
+# never crash with a raw AttributeError.
+# ---------------------------------------------------------------------------
+
+
+def test_unregister_non_dict_mcp_json_does_not_crash(tmp_path: Path, capsys) -> None:
+    """`.mcp.json` containing valid JSON that isn't an object (e.g. `[]`)
+    must be reported, not crash with AttributeError."""
+    _init_project(tmp_path)
+    cmd_register(_register_args(str(tmp_path)))
+    (tmp_path / ".mcp.json").write_text("[]", encoding="utf-8")
+
+    rc = cmd_unregister(_unregister_args(str(tmp_path)))
+
+    assert rc == 1
+    captured = capsys.readouterr()
+    assert ".mcp.json" in captured.err
+
+
+def test_unregister_null_mcp_json_does_not_crash(tmp_path: Path, capsys) -> None:
+    """`null` is valid JSON but not an object — must not crash either."""
+    _init_project(tmp_path)
+    cmd_register(_register_args(str(tmp_path)))
+    (tmp_path / ".mcp.json").write_text("null", encoding="utf-8")
+
+    rc = cmd_unregister(_unregister_args(str(tmp_path)))
+
+    assert rc == 1
+    captured = capsys.readouterr()
+    assert ".mcp.json" in captured.err
+
+
+# ---------------------------------------------------------------------------
+# LOW (fix round): --dry-run also previews the .mcp.json deletion.
+# ---------------------------------------------------------------------------
+
+
+def test_dry_run_previews_mcp_json_removal(tmp_path: Path, capsys) -> None:
+    """--dry-run on a clean register must preview that .mcp.json would be
+    removed (empty after removal), not just the entry inside it."""
+    _init_project(tmp_path)
+    cmd_register(_register_args(str(tmp_path)))
+    capsys.readouterr()
+
+    rc = cmd_unregister(_unregister_args(str(tmp_path), dry_run=True))
+
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert "would remove" in captured.out.lower()
+    assert ".mcp.json" in captured.out
+    assert (tmp_path / ".mcp.json").exists(), "--dry-run must not delete anything"
+
+
 def test_edited_gitignore_block_left_in_place_exit_1(tmp_path: Path, capsys) -> None:
     """An edited managed .gitignore block is left in place and exits 1."""
     _init_project(tmp_path)

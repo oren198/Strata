@@ -81,10 +81,19 @@ jobs:
           test -f .mcp.json
           grep -q '"strata"' .mcp.json
           grep -q '"strata-mcp"' .mcp.json
+          # Prefixed with `test -f` so this can't pass vacuously if the file
+          # were ever missing (grep on a nonexistent file also fails, but
+          # spell out the real assertion being made: the file exists AND
+          # has no mcpServers key).
+          test -f .claude/settings.json
           if grep -q "mcpServers" .claude/settings.json; then
             echo ".claude/settings.json must not carry an mcpServers block:"
             cat .claude/settings.json; exit 1
           fi
+          # The freshness Stop hook IS correctly wired into settings.json —
+          # only the mcpServers block moved to .mcp.json.
+          grep -q "hooks" .claude/settings.json
+          grep -q "strata-stop-hook" .claude/settings.json
 
           # --- Phase 1: fresh single-scope fleet, no binding ----------------
           # Single-scope auto-bind (operator directive): the seeded fleet has

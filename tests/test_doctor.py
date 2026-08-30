@@ -327,6 +327,89 @@ def test_doctor_flags_stale_duplicate_when_both_present(
 
 
 # ---------------------------------------------------------------------------
+# MEDIUM 4 (fix round): doctor must never promise a migration `strata
+# register` will not actually perform — a hand-edited legacy entry is not
+# migratable, so the advice must say "left in place / remove by hand"
+# instead of "run register to migrate/clean it up" (a dead end otherwise).
+# ---------------------------------------------------------------------------
+
+
+def test_doctor_legacy_only_hand_edited_entry_does_not_promise_migration(
+    registered_project: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """A hand-edited legacy entry (not something `strata register` would
+    ever move automatically) must not be told "run register to migrate" —
+    that's a promise register will not keep."""
+    mcp_json = registered_project / ".mcp.json"
+    mcp_data = json.loads(mcp_json.read_text(encoding="utf-8"))
+    del mcp_data["mcpServers"]["strata"]
+    mcp_json.write_text(json.dumps(mcp_data), encoding="utf-8")
+
+    settings_json = registered_project / ".claude" / "settings.json"
+    settings_data = json.loads(settings_json.read_text(encoding="utf-8"))
+    settings_data["mcpServers"] = {"strata": {"command": "/hand/edited/strata-mcp", "env": {}}}
+    settings_json.write_text(json.dumps(settings_data), encoding="utf-8")
+
+    rc, output = _run_doctor(capsys)
+
+    assert rc == 1
+    lower = output.lower()
+    assert "mcp" in lower
+    assert "migrate it into .mcp.json" not in lower
+    assert "by hand" in lower
+
+
+def test_doctor_hand_edited_duplicate_when_both_present_does_not_promise_cleanup(
+    registered_project: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """A working .mcp.json entry plus a HAND-EDITED duplicate in
+    settings.json must still pass, but must not tell the user "run register
+    to clean it up" — register will leave a hand-edited entry alone."""
+    settings_json = registered_project / ".claude" / "settings.json"
+    settings_data = json.loads(settings_json.read_text(encoding="utf-8"))
+    settings_data["mcpServers"] = {"strata": {"command": "/hand/edited/strata-mcp", "env": {}}}
+    settings_json.write_text(json.dumps(settings_data), encoding="utf-8")
+
+    rc, output = _run_doctor(capsys)
+
+    assert rc == 0
+    lower = output.lower()
+    assert "mcp.json" in lower
+    assert "clean it up" not in lower
+    assert "by hand" in lower
+
+
+# ---------------------------------------------------------------------------
+# HIGH 2 (fix round): valid JSON but not an object must not crash doctor.
+# ---------------------------------------------------------------------------
+
+
+def test_doctor_non_dict_mcp_json_does_not_crash(
+    registered_project: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """`.mcp.json` containing `[]` (valid JSON, not an object) must be
+    reported as a hard-check failure, not crash with AttributeError."""
+    (registered_project / ".mcp.json").write_text("[]", encoding="utf-8")
+
+    rc, output = _run_doctor(capsys)
+
+    assert rc == 1
+    lower = output.lower()
+    assert "mcp" in lower
+
+
+def test_doctor_null_mcp_json_does_not_crash(
+    registered_project: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """`null` is valid JSON but not an object — must not crash doctor."""
+    (registered_project / ".mcp.json").write_text("null", encoding="utf-8")
+
+    rc, output = _run_doctor(capsys)
+
+    assert rc == 1
+
+
+# ---------------------------------------------------------------------------
 # 5. Stop hook script present and matching shipped.
 # ---------------------------------------------------------------------------
 
