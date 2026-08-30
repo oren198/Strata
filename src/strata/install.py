@@ -3,8 +3,11 @@
 This is the stable, documented import surface for the additive install
 operations Strata performs when it wires itself into a foreign project:
 
-* the additive ``.claude/settings.json`` merge (an ``mcpServers`` entry is
-  added only when absent — user state is never overwritten),
+* the additive ``mcpServers`` merge — into ``.mcp.json`` at the project root
+  for Claude Code (that file, not ``.claude/settings.json``, is what Claude
+  Code actually reads for project-scoped MCP servers; ``.claude/settings.json``
+  has no ``mcpServers`` key in its schema) — an entry is added only when
+  absent, user state is never overwritten,
 * skill copying into ``.claude/skills/`` (each skill is copied only when
   absent), and
 * ``--diff`` line rendering (the read-only "what would change" view).
@@ -45,6 +48,8 @@ if TYPE_CHECKING:
 __all__ = [
     "MCP_SERVER_NAME",
     "MCP_ENTRY",
+    "MCP_ENTRY_HISTORICAL",
+    "is_bootstrap_venv_shape_mcp_entry",
     "SKILL_NAMES",
     "HOOK_SCRIPT_NAME",
     "HOOK_COMMAND",
@@ -102,15 +107,32 @@ __all__ = [
 # Canonical install artifacts
 # ---------------------------------------------------------------------------
 
-#: Key under ``.claude/settings.json``'s ``mcpServers`` block for the engine's
-#: MCP server. This is the import/CLI name (``strata``), unchanged by the
-#: ADR 0009 distribution rename — only ``pip install`` names moved.
+#: Key under the ``mcpServers`` block for the engine's MCP server. This is
+#: the import/CLI name (``strata``), unchanged by the ADR 0009 distribution
+#: rename — only ``pip install`` names moved. For Claude Code, the
+#: ``mcpServers`` block this key lives under is at the PROJECT ROOT's
+#: ``.mcp.json`` — Claude Code's actual project-scoped MCP config file, not
+#: ``.claude/settings.json`` (that file's schema has no ``mcpServers`` key;
+#: ``enabledMcpjsonServers`` there explicitly refers to servers "from
+#: .mcp.json"). ``.claude/settings.json`` still carries the ``hooks.Stop``
+#: entry below — that location IS correct for hooks.
 MCP_SERVER_NAME = "strata"
 
-#: The canonical ``mcpServers.strata`` entry ``strata register`` merges in and
-#: ``strata unregister`` removes (only when the on-disk entry still matches it
-#: byte-for-byte). ``strata-mcp`` is resolved on ``PATH`` (ADR 0005 Decision 1).
+#: The canonical ``mcpServers.strata`` entry ``strata register`` merges into
+#: the project's ``.mcp.json`` and ``strata unregister`` removes (only when
+#: the on-disk entry still matches it byte-for-byte). ``strata-mcp`` is
+#: resolved on ``PATH`` (ADR 0005 Decision 1).
 MCP_ENTRY: dict = {"command": "strata-mcp", "env": {}}
+
+#: No other byte-exact ``mcpServers.strata`` shape has ever shipped besides
+#: :data:`MCP_ENTRY` — kept as an explicit empty tuple, not a special case, so
+#: legacy-entry migration/removal goes through the same current-or-historical
+#: mechanism every other managed artifact does (round-4 unregister fix, bug
+#: B: "wire the mechanism uniformly"). The ``--bootstrap-venv`` shape (an
+#: absolute ``.strata/.venv/bin/strata-mcp`` path) is NOT a byte-exact entry
+#: here — it varies per project — and is matched separately by
+#: :func:`is_bootstrap_venv_shape_mcp_entry`.
+MCP_ENTRY_HISTORICAL: tuple[dict, ...] = ()
 
 #: The canonical Claude Code skills vendored as package data under
 #: ``strata/_skills`` and copied into a project's ``.claude/skills/``.
@@ -354,11 +376,37 @@ def is_v1_2_shape_mcp_entry(entry: dict) -> bool:
     return isinstance(env, dict) and "STRATA_BACKEND_URL" in env
 
 
+def is_bootstrap_venv_shape_mcp_entry(entry: dict) -> bool:
+    """Return ``True`` if *entry* is a ``--bootstrap-venv``-written mcpServer entry.
+
+    ``strata register --bootstrap-venv`` points the entry's ``command`` at an
+    absolute, per-project path (``<project>/.strata/.venv/bin/strata-mcp``)
+    rather than the ``strata-mcp`` name :data:`MCP_ENTRY` resolves on
+    ``PATH`` — so it can never byte-match :data:`MCP_ENTRY` or anything in
+    :data:`MCP_ENTRY_HISTORICAL`. Still register-written and never
+    hand-authored, so a legacy copy of it found in ``.claude/settings.json``
+    is just as migratable as an exact match — the caller carries the
+    ``command`` value verbatim into ``.mcp.json`` rather than overwriting it
+    with the canonical one.
+    """
+    command = entry.get("command")
+    env = entry.get("env", {})
+    return (
+        isinstance(command, str)
+        and command.endswith("/.strata/.venv/bin/strata-mcp")
+        and isinstance(env, dict)
+    )
+
+
 def mcp_server_present(settings_data: dict, name: str = MCP_SERVER_NAME) -> bool:
     """Return whether ``settings_data['mcpServers'][name]`` already exists.
 
+    Generic over which JSON document backs *settings_data* — for Claude Code
+    that's the project's ``.mcp.json`` (the file Claude Code actually reads
+    for MCP servers); this function only cares about the ``mcpServers`` shape.
+
     Args:
-        settings_data: Parsed ``settings.json`` contents.
+        settings_data: Parsed JSON contents (``.mcp.json`` for Claude Code).
         name: The ``mcpServers`` key to check (default :data:`MCP_SERVER_NAME`).
     """
     mcp_servers = settings_data.get("mcpServers", {})

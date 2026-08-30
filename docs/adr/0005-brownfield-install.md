@@ -133,7 +133,14 @@ Concrete actions, in order:
 - Copy canonical skills to `.claude/skills/strata*` **only if absent**
   (Decision 6).
 - Merge the `strata` entry into `.claude/settings.json`'s `mcpServers`
-  block **only if absent** (Decision 6).
+  block **only if absent** (Decision 6). **Corrected 2026-08-30:** Claude
+  Code does not read `mcpServers` from `.claude/settings.json` — its
+  project-scoped MCP config file is `.mcp.json` at the project root. Every
+  prior release's registration was memory-blind for Claude Code. `strata
+  register` now writes/merges the entry into `.mcp.json` instead (migrating
+  a byte-exact legacy entry it finds in `.claude/settings.json`); the
+  `hooks.Stop` entry stays in `.claude/settings.json`, which is the correct
+  location for hooks.
 - Print a clear next-steps message (set `STRATA_AGENT_SCOPE`, edit
   `fleet.yaml`, open `claude`).
 

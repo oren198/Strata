@@ -228,11 +228,23 @@ The common setup runs once regardless of which harnesses are resolved:
 Then, per resolved harness:
 
 - **claude-code** — copies the `strata`, `strata-worker`, and `strata-inspect`
-  skills to `.claude/skills/`; merges a `strata` entry into
-  `.claude/settings.json`'s `mcpServers` block; installs the freshness
-  `Stop`-hook (copies `.claude/hooks/strata-stop-hook` and merges a
-  `hooks.Stop` entry into `.claude/settings.json` — see
-  [Memory-freshness Stop-hook](#memory-freshness-stop-hook)).
+  skills to `.claude/skills/`; merges a `strata` entry into the project
+  root's `.mcp.json` `mcpServers` block — the file Claude Code actually reads
+  for project-scoped MCP servers (`.claude/settings.json` has no
+  `mcpServers` key in its schema); installs the freshness `Stop`-hook
+  (copies `.claude/hooks/strata-stop-hook` and merges a `hooks.Stop` entry
+  into `.claude/settings.json`, which IS the right place for hooks — see
+  [Memory-freshness Stop-hook](#memory-freshness-stop-hook)). If an earlier
+  Strata release had written the `mcpServers.strata` entry into
+  `.claude/settings.json` (a location Claude Code never reads for MCP
+  servers), register migrates it into `.mcp.json` and prints a "moved" line;
+  a hand-edited legacy entry is left in place with a note instead.
+
+`.mcp.json` is not gitignored by register: in Claude Code's model it's
+meant to be committable, shared team config, and Strata's own entry carries
+an empty `env` (binding comes from process env / auto-bind, not a value
+baked into the file), so there is nothing project-specific or secret in it —
+it is safe to commit as-is.
 - **codex** — merges Strata into Codex CLI's own `config.toml` and seeds
   `AGENTS.md` with a short memory-moves block — see
   [Using Strata with Codex CLI](#using-strata-with-codex-cli).
@@ -416,7 +428,7 @@ If `pipx` can't find Python 3.11+ (locked-down corporate environment), use:
 strata register --bootstrap-venv
 ```
 
-This creates `.strata/.venv/` with strata installed, and updates `.claude/settings.json`
+This creates `.strata/.venv/` with strata installed, and updates `.mcp.json`
 to point at the absolute venv path. The `.strata/.venv/` directory is gitignored
 automatically. Note: this downloads ~100MB of Python deps.
 
@@ -434,7 +446,7 @@ you only want the Codex wiring right now.
 
 The Codex wiring does the same per-project setup as plain `strata register`
 (`.strata/`, `fleet.yaml`, `.gitignore`), but instead of (or in addition to,
-when both harnesses are resolved) wiring `.claude/settings.json` it merges
+when both harnesses are resolved) wiring `.mcp.json` it merges
 Strata's config into the **OpenAI Codex CLI**'s own config file —
 `$CODEX_HOME/config.toml`, which defaults to `~/.codex/config.toml`. That is a
 user-level file, not a per-project one, matching how Codex's own `codex mcp
@@ -633,9 +645,11 @@ What it does, step by step:
 
 1. Removes the managed `# Strata` block from `.gitignore`, leaving every other
    line byte-for-byte unchanged. An edited block is reported and left.
-2. Removes the `mcpServers.strata` entry from `.claude/settings.json`,
-   preserving all your other keys. If you customised the entry, it is left in
-   place and reported.
+2. Removes the `mcpServers.strata` entry from `.mcp.json`, preserving all
+   your other keys (deleting the file only if register's entry was its only
+   content). If you customised the entry, it is left in place and reported.
+   A legacy `mcpServers.strata` entry left over in `.claude/settings.json`
+   from a pre-fix `strata register` is cleaned up the same way.
 3. Removes each of the `strata`, `strata-worker`, and `strata-inspect` skills
    **only if byte-identical to the shipped version**. A modified or
    older-version skill is left alone and reported.
@@ -652,7 +666,7 @@ For the Codex harness (resolved by default when Codex is wired, or via
 wiring: the `[mcp_servers.strata]` table and the freshness `hooks.Stop` block
 are removed from `$CODEX_HOME/config.toml` only when each still byte-matches
 what register wrote, and the marker-fenced Strata block is removed from the
-project's `AGENTS.md`, again only when unedited; `.claude/settings.json` is
+project's `AGENTS.md`, again only when unedited; `.mcp.json` is
 untouched. Steps 1 and 5 are unchanged. When both harnesses are resolved
 (the default on a machine with both wired), both sets of steps run, one
 after the other.
@@ -977,7 +991,8 @@ src/strata/              # Python backend package
     strata/              # CC skill (copy used in Strata-repo sessions)
     strata-worker/       # CC skill (copy used in Strata-repo sessions)
     strata-inspect/      # CC skill (copy used in Strata-repo sessions)
-  settings.example.json  # Example MCP-server registration block (command: strata-mcp)
+.mcp.json.example        # Example MCP-server registration block (command: strata-mcp) —
+                          #   the shape `strata register` writes to .mcp.json
 tests/                   # pytest suite
 src/strata/_templates/   # Bundled starter fleets (dev-team.yaml is the default seed;
                           #   minimal.yaml/research-group.yaml/support-org.yaml also ship)
@@ -1031,14 +1046,16 @@ The backend is only required if you want the browser Console UI at
 
 ### 2. Register the MCP server in Claude Code
 
-After running `strata register`, `.claude/settings.json` already contains the
-correct `mcpServers.strata` entry. **This applies to the Strata repo itself
-too**: without a discoverable `.strata/config.toml` the MCP server still
-starts (soft-start, ADR 0005 D5 dated addendum), but every memory tool stays
-gated with an actionable error naming the missing config until one exists
-and the server is restarted — so for developing on Strata run
-`strata register` once from the repo root — it is strictly additive, and the
-created `.strata/` workspace is gitignored. The settings entry it merges is:
+After running `strata register`, `.mcp.json` at the repo root already
+contains the correct `mcpServers.strata` entry — that's the file Claude Code
+actually reads for project-scoped MCP servers, not `.claude/settings.json`.
+**This applies to the Strata repo itself too**: without a discoverable
+`.strata/config.toml` the MCP server still starts (soft-start, ADR 0005 D5
+dated addendum), but every memory tool stays gated with an actionable error
+naming the missing config until one exists and the server is restarted — so
+for developing on Strata run `strata register` once from the repo root — it
+is strictly additive, and the created `.strata/` workspace is gitignored.
+The `.mcp.json` entry it merges is:
 
 ```json
 {

@@ -239,10 +239,10 @@ def test_doctor_flags_invalid_fleet_yaml(
 def test_doctor_flags_missing_mcp_entry(
     registered_project: Path, capsys: pytest.CaptureFixture
 ) -> None:
-    settings_json = registered_project / ".claude" / "settings.json"
-    data = json.loads(settings_json.read_text(encoding="utf-8"))
+    mcp_json = registered_project / ".mcp.json"
+    data = json.loads(mcp_json.read_text(encoding="utf-8"))
     del data["mcpServers"]["strata"]
-    settings_json.write_text(json.dumps(data), encoding="utf-8")
+    mcp_json.write_text(json.dumps(data), encoding="utf-8")
 
     rc, output = _run_doctor(capsys)
 
@@ -250,6 +250,80 @@ def test_doctor_flags_missing_mcp_entry(
     lower = output.lower()
     assert "mcp" in lower
     assert "register" in lower
+
+
+def test_doctor_passes_mcp_entry_in_mcp_json(
+    registered_project: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """The MCP server entry check must read `.mcp.json` — the file Claude
+    Code actually reads for project-scoped MCP servers — not
+    `.claude/settings.json`, which has no `mcpServers` key in its schema."""
+    mcp_json = registered_project / ".mcp.json"
+    assert mcp_json.exists()
+    data = json.loads(mcp_json.read_text(encoding="utf-8"))
+    assert data["mcpServers"]["strata"]["command"] == "strata-mcp"
+
+    settings_json = registered_project / ".claude" / "settings.json"
+    settings_data = json.loads(settings_json.read_text(encoding="utf-8"))
+    assert "mcpServers" not in settings_data
+
+    rc, output = _run_doctor(capsys)
+
+    assert rc == 0
+    assert "mcp.json" in output.lower()
+
+
+def test_doctor_flags_legacy_mcp_entry_with_migrate_hint(
+    registered_project: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """A legacy `mcpServers.strata` entry left in `.claude/settings.json`
+    (what a pre-fix `strata register` wrote, and Claude Code never reads)
+    must fail the check and point at `strata register` to migrate it."""
+    mcp_json = registered_project / ".mcp.json"
+    mcp_data = json.loads(mcp_json.read_text(encoding="utf-8"))
+    legacy_entry = mcp_data["mcpServers"]["strata"]
+    del mcp_data["mcpServers"]["strata"]
+    mcp_json.write_text(json.dumps(mcp_data), encoding="utf-8")
+
+    settings_json = registered_project / ".claude" / "settings.json"
+    settings_data = json.loads(settings_json.read_text(encoding="utf-8"))
+    settings_data["mcpServers"] = {"strata": legacy_entry}
+    settings_json.write_text(json.dumps(settings_data), encoding="utf-8")
+
+    rc, output = _run_doctor(capsys)
+
+    assert rc == 1
+    lower = output.lower()
+    assert "mcp" in lower
+    assert "strata register" in lower
+    assert "migrate" in lower
+
+
+def test_doctor_flags_stale_duplicate_when_both_present(
+    registered_project: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """A stale duplicate mcpServers.strata entry left in
+    .claude/settings.json alongside a working .mcp.json entry (a
+    half-migrated or re-registered-with-an-old-release project) must still
+    pass the check but call out the duplicate — not report a silent clean
+    pass, since register itself sweeps this exact state up as a "stale
+    duplicate"."""
+    mcp_json = registered_project / ".mcp.json"
+    mcp_data = json.loads(mcp_json.read_text(encoding="utf-8"))
+    entry = mcp_data["mcpServers"]["strata"]
+
+    settings_json = registered_project / ".claude" / "settings.json"
+    settings_data = json.loads(settings_json.read_text(encoding="utf-8"))
+    settings_data["mcpServers"] = {"strata": entry}
+    settings_json.write_text(json.dumps(settings_data), encoding="utf-8")
+
+    rc, output = _run_doctor(capsys)
+
+    assert rc == 0
+    lower = output.lower()
+    assert "mcp.json" in lower
+    assert "settings.json" in lower
+    assert "strata register" in lower
 
 
 # ---------------------------------------------------------------------------

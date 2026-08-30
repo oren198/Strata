@@ -459,6 +459,7 @@ def test_register_diff_mode_writes_nothing(tmp_path: Path) -> None:
     assert rc == 0
     assert not (root / ".strata").exists()
     assert not (root / ".claude" / "settings.json").exists()
+    assert not (root / ".mcp.json").exists()
 
 
 def test_register_valid_settings_json_merges_additively(tmp_path: Path) -> None:
@@ -476,4 +477,6 @@ def test_register_valid_settings_json_merges_additively(tmp_path: Path) -> None:
     assert rc == 0
     data = json.loads((claude_dir / "settings.json").read_text(encoding="utf-8"))
     assert data["permissions"] == {"allow": ["Bash"]}
-    assert data["mcpServers"]["strata"]["command"] == "strata-mcp"
+    assert "mcpServers" not in data
+    mcp_data = json.loads((root / ".mcp.json").read_text(encoding="utf-8"))
+    assert mcp_data["mcpServers"]["strata"]["command"] == "strata-mcp"

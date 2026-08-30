@@ -74,6 +74,18 @@ jobs:
           test -f .strata/config.toml
           test -f .strata/fleet.yaml
 
+          # Claude Code reads project-scoped MCP servers from `.mcp.json`,
+          # not `.claude/settings.json` (which has no `mcpServers` key in
+          # its schema) — register must wire the entry into the file
+          # Claude Code actually reads, or every session is memory-blind.
+          test -f .mcp.json
+          grep -q '"strata"' .mcp.json
+          grep -q '"strata-mcp"' .mcp.json
+          if grep -q "mcpServers" .claude/settings.json; then
+            echo ".claude/settings.json must not carry an mcpServers block:"
+            cat .claude/settings.json; exit 1
+          fi
+
           # --- Phase 1: fresh single-scope fleet, no binding ----------------
           # Single-scope auto-bind (operator directive): the seeded fleet has
           # exactly one scope (g_root), so an unset STRATA_AGENT_SCOPE now
