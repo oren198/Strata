@@ -1022,7 +1022,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         try:
             loaded_mcp_json = json.loads(mcp_json.read_text(encoding="utf-8"))
         except json.JSONDecodeError as exc:
-            mcp_json_error = str(exc)
+            mcp_json_error = f"not valid JSON ({exc})"
         else:
             # Valid JSON but not an object (e.g. `[]`, `null`, a bare string)
             # — .get()/mcpServers lookups below assume a dict; route this
@@ -1030,7 +1030,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             if isinstance(loaded_mcp_json, dict):
                 mcp_json_data = loaded_mcp_json
             else:
-                mcp_json_error = f"must be a JSON object, got {type(loaded_mcp_json).__name__}"
+                mcp_json_error = f"not a JSON object (got {type(loaded_mcp_json).__name__})"
 
     legacy_mcp_servers = settings_data.get("mcpServers") if settings_error is None else None
     legacy_mcp_entry = (
@@ -1052,7 +1052,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                 kind="hard",
                 passed=False,
                 message=(
-                    f".mcp.json is not valid JSON ({mcp_json_error}) — fix the file, then "
+                    f".mcp.json is {mcp_json_error} — fix the file, then "
                     "run 'strata register' to add the strata entry."
                 ),
             )
