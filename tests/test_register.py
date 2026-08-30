@@ -361,17 +361,31 @@ def test_fresh_project_creates_skills(tmp_path: Path) -> None:
         assert skill_md.exists(), f"Expected {skill_md} to exist after strata register"
 
 
-def test_fresh_project_creates_settings_json(tmp_path: Path) -> None:
-    """strata register must merge strata mcpServer into .claude/settings.json."""
+def test_fresh_project_creates_mcp_json(tmp_path: Path) -> None:
+    """strata register must merge strata mcpServer into .mcp.json — the file
+    Claude Code actually reads for project-scoped MCP servers."""
+    _init_project(tmp_path)
+    _run_register(tmp_path)
+
+    mcp_json = tmp_path / ".mcp.json"
+    assert mcp_json.exists()
+    data = json.loads(mcp_json.read_text(encoding="utf-8"))
+    assert "mcpServers" in data
+    assert "strata" in data["mcpServers"]
+    assert data["mcpServers"]["strata"]["command"] == "strata-mcp"
+
+
+def test_fresh_project_settings_json_has_no_mcp_servers_key(tmp_path: Path) -> None:
+    """`.claude/settings.json` has no `mcpServers` key in its schema — register
+    must never write one there (it still gets the Stop hook entry)."""
     _init_project(tmp_path)
     _run_register(tmp_path)
 
     settings = tmp_path / ".claude" / "settings.json"
     assert settings.exists()
     data = json.loads(settings.read_text(encoding="utf-8"))
-    assert "mcpServers" in data
-    assert "strata" in data["mcpServers"]
-    assert data["mcpServers"]["strata"]["command"] == "strata-mcp"
+    assert "mcpServers" not in data
+    assert "hooks" in data  # Stop hook entry still lands here.
 
 
 def test_fresh_project_updates_gitignore(tmp_path: Path) -> None:
@@ -468,16 +482,15 @@ def test_existing_skill_skip_reported(tmp_path: Path, capsys) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Test 5: Collision-skip on existing settings.json strata entry
+# Test 5: Collision-skip on existing .mcp.json strata entry
 # ---------------------------------------------------------------------------
 
 
 def test_existing_mcp_entry_not_overwritten(tmp_path: Path) -> None:
-    """strata register must not overwrite an existing mcpServers.strata entry."""
+    """strata register must not overwrite an existing mcpServers.strata entry
+    in .mcp.json."""
     _init_project(tmp_path)
-    claude_dir = tmp_path / ".claude"
-    claude_dir.mkdir(parents=True)
-    custom_settings = {
+    custom_mcp = {
         "mcpServers": {
             "strata": {
                 "command": "/custom/path/strata-mcp",
@@ -485,38 +498,349 @@ def test_existing_mcp_entry_not_overwritten(tmp_path: Path) -> None:
             }
         }
     }
-    (claude_dir / "settings.json").write_text(
-        json.dumps(custom_settings, indent=2), encoding="utf-8"
-    )
+    (tmp_path / ".mcp.json").write_text(json.dumps(custom_mcp, indent=2), encoding="utf-8")
 
     _run_register(tmp_path)
 
-    settings = json.loads((claude_dir / "settings.json").read_text(encoding="utf-8"))
-    assert settings["mcpServers"]["strata"]["command"] == "/custom/path/strata-mcp"
-    assert settings["mcpServers"]["strata"]["env"]["CUSTOM"] == "value"
+    data = json.loads((tmp_path / ".mcp.json").read_text(encoding="utf-8"))
+    assert data["mcpServers"]["strata"]["command"] == "/custom/path/strata-mcp"
+    assert data["mcpServers"]["strata"]["env"]["CUSTOM"] == "value"
 
 
 def test_existing_mcp_preserves_other_keys(tmp_path: Path) -> None:
-    """strata register must preserve all existing settings.json keys."""
+    """strata register must preserve all existing .mcp.json keys."""
+    _init_project(tmp_path)
+    existing_mcp = {
+        "mcpServers": {"other-tool": {"command": "other-tool-bin"}},
+    }
+    (tmp_path / ".mcp.json").write_text(json.dumps(existing_mcp, indent=2), encoding="utf-8")
+
+    _run_register(tmp_path)
+
+    data = json.loads((tmp_path / ".mcp.json").read_text(encoding="utf-8"))
+    assert "other-tool" in data["mcpServers"]
+    assert "strata" in data["mcpServers"]
+
+
+def test_legacy_settings_json_mcp_entry_is_migrated(tmp_path: Path, capsys) -> None:
+    """A byte-exact legacy mcpServers.strata entry in .claude/settings.json
+    (what a pre-fix `strata register` wrote there) is migrated into
+    .mcp.json, removed from settings.json, and a 'moved' line is printed."""
     _init_project(tmp_path)
     claude_dir = tmp_path / ".claude"
     claude_dir.mkdir(parents=True)
-    existing_settings = {
-        "theme": "dark",
-        "mcpServers": {"other-tool": {"command": "other-tool-bin"}},
-        "keybindings": [],
-    }
     (claude_dir / "settings.json").write_text(
-        json.dumps(existing_settings, indent=2), encoding="utf-8"
+        json.dumps({"mcpServers": {"strata": {"command": "strata-mcp", "env": {}}}}, indent=2),
+        encoding="utf-8",
+    )
+
+    _run_register(tmp_path)
+    captured = capsys.readouterr()
+
+    assert "moved" in captured.out.lower()
+    mcp_data = json.loads((tmp_path / ".mcp.json").read_text(encoding="utf-8"))
+    assert mcp_data["mcpServers"]["strata"]["command"] == "strata-mcp"
+    settings_data = json.loads((claude_dir / "settings.json").read_text(encoding="utf-8"))
+    assert "mcpServers" not in settings_data
+
+
+def test_legacy_settings_json_mcp_entry_preserves_other_keys(tmp_path: Path) -> None:
+    """Migration only removes the strata key — a user's other mcpServers
+    entries in the legacy location are preserved byte-for-byte."""
+    _init_project(tmp_path)
+    claude_dir = tmp_path / ".claude"
+    claude_dir.mkdir(parents=True)
+    (claude_dir / "settings.json").write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "strata": {"command": "strata-mcp", "env": {}},
+                    "other-tool": {"command": "other-tool-bin"},
+                }
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
     )
 
     _run_register(tmp_path)
 
-    settings = json.loads((claude_dir / "settings.json").read_text(encoding="utf-8"))
-    assert settings["theme"] == "dark"
-    assert "other-tool" in settings["mcpServers"]
-    assert "strata" in settings["mcpServers"]
-    assert settings["keybindings"] == []
+    settings_data = json.loads((claude_dir / "settings.json").read_text(encoding="utf-8"))
+    assert "strata" not in settings_data["mcpServers"]
+    assert "other-tool" in settings_data["mcpServers"]
+    mcp_data = json.loads((tmp_path / ".mcp.json").read_text(encoding="utf-8"))
+    assert mcp_data["mcpServers"]["strata"]["command"] == "strata-mcp"
+
+
+def test_legacy_settings_json_edited_mcp_entry_left_in_place(tmp_path: Path, capsys) -> None:
+    """A legacy entry that does NOT byte-match the canonical one (user edited
+    it, or it's a custom command) is left untouched in settings.json — never
+    deleted speculatively — while the working entry still lands in
+    .mcp.json."""
+    _init_project(tmp_path)
+    claude_dir = tmp_path / ".claude"
+    claude_dir.mkdir(parents=True)
+    (claude_dir / "settings.json").write_text(
+        json.dumps(
+            {"mcpServers": {"strata": {"command": "/custom/strata-mcp", "env": {}}}},
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    _run_register(tmp_path)
+
+    settings_data = json.loads((claude_dir / "settings.json").read_text(encoding="utf-8"))
+    assert settings_data["mcpServers"]["strata"]["command"] == "/custom/strata-mcp"
+    mcp_data = json.loads((tmp_path / ".mcp.json").read_text(encoding="utf-8"))
+    assert mcp_data["mcpServers"]["strata"]["command"] == "strata-mcp"
+
+
+def test_register_idempotent_with_mcp_json_already_present(tmp_path: Path) -> None:
+    """Re-running register with .mcp.json already carrying the entry is a
+    no-op for that file."""
+    _init_project(tmp_path)
+    _run_register(tmp_path)
+    mcp_json = tmp_path / ".mcp.json"
+    before = mcp_json.read_text(encoding="utf-8")
+
+    _run_register(tmp_path)
+
+    assert mcp_json.read_text(encoding="utf-8") == before
+
+
+def test_legacy_bootstrap_venv_shape_entry_is_migrated(tmp_path: Path, capsys) -> None:
+    """A legacy `--bootstrap-venv`-shaped entry in .claude/settings.json (an
+    absolute `.strata/.venv/bin/strata-mcp` path, register-written but never
+    byte-exact against the plain-register default) is still recognised as
+    register's own and migrated — its project-specific command is carried
+    over verbatim rather than replaced with the canonical `strata-mcp`."""
+    _init_project(tmp_path)
+    claude_dir = tmp_path / ".claude"
+    claude_dir.mkdir(parents=True)
+    venv_command = str(tmp_path / ".strata" / ".venv" / "bin" / "strata-mcp")
+    (claude_dir / "settings.json").write_text(
+        json.dumps({"mcpServers": {"strata": {"command": venv_command, "env": {}}}}, indent=2),
+        encoding="utf-8",
+    )
+
+    _run_register(tmp_path)
+    captured = capsys.readouterr()
+
+    assert "moved" in captured.out.lower()
+    mcp_data = json.loads((tmp_path / ".mcp.json").read_text(encoding="utf-8"))
+    assert mcp_data["mcpServers"]["strata"]["command"] == venv_command
+    settings_data = json.loads((claude_dir / "settings.json").read_text(encoding="utf-8"))
+    assert "mcpServers" not in settings_data
+
+
+def test_legacy_bootstrap_venv_shape_entry_rerun_is_idempotent(tmp_path: Path, capsys) -> None:
+    """Once migrated, re-running register does not re-flag the (now absent)
+    legacy entry, and does not touch .mcp.json again."""
+    _init_project(tmp_path)
+    claude_dir = tmp_path / ".claude"
+    claude_dir.mkdir(parents=True)
+    venv_command = str(tmp_path / ".strata" / ".venv" / "bin" / "strata-mcp")
+    (claude_dir / "settings.json").write_text(
+        json.dumps({"mcpServers": {"strata": {"command": venv_command, "env": {}}}}, indent=2),
+        encoding="utf-8",
+    )
+    _run_register(tmp_path)
+    capsys.readouterr()  # discard first-run output (contains "moved")
+    mcp_json = tmp_path / ".mcp.json"
+    before = mcp_json.read_text(encoding="utf-8")
+
+    _run_register(tmp_path)
+    captured = capsys.readouterr()
+
+    assert "moved" not in captured.out.lower()
+    assert mcp_json.read_text(encoding="utf-8") == before
+
+
+# ---------------------------------------------------------------------------
+# HIGH 1 (fix round): the --bootstrap-venv-shape matcher must be narrow —
+# an entry with extra keys, or one pointing at ANOTHER project's venv, is
+# NOT something register wrote and must never be migrated.
+# ---------------------------------------------------------------------------
+
+
+def test_venv_shape_legacy_entry_with_extra_keys_is_not_migrated(tmp_path: Path, capsys) -> None:
+    """A legacy entry that looks venv-shaped but carries extra keys was
+    never written by register's --bootstrap-venv (which writes exactly
+    {command, env}) — must be left in place, not migrated."""
+    _init_project(tmp_path)
+    claude_dir = tmp_path / ".claude"
+    claude_dir.mkdir(parents=True)
+    venv_command = str(tmp_path / ".strata" / ".venv" / "bin" / "strata-mcp")
+    (claude_dir / "settings.json").write_text(
+        json.dumps(
+            {"mcpServers": {"strata": {"command": venv_command, "env": {}, "args": ["--extra"]}}},
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    _run_register(tmp_path)
+    captured = capsys.readouterr()
+
+    assert "moved" not in captured.out.lower()
+    settings_data = json.loads((claude_dir / "settings.json").read_text(encoding="utf-8"))
+    assert settings_data["mcpServers"]["strata"]["command"] == venv_command
+    assert settings_data["mcpServers"]["strata"]["args"] == ["--extra"]
+    # register still adds a working canonical entry to .mcp.json.
+    mcp_data = json.loads((tmp_path / ".mcp.json").read_text(encoding="utf-8"))
+    assert mcp_data["mcpServers"]["strata"]["command"] == "strata-mcp"
+
+
+def test_venv_shape_legacy_entry_for_foreign_project_is_not_migrated(
+    tmp_path: Path, capsys
+) -> None:
+    """A legacy entry pointing at ANOTHER project's venv path must never be
+    treated as THIS project's own register-written entry."""
+    _init_project(tmp_path)
+    claude_dir = tmp_path / ".claude"
+    claude_dir.mkdir(parents=True)
+    foreign_command = "/opt/other-project/.strata/.venv/bin/strata-mcp"
+    (claude_dir / "settings.json").write_text(
+        json.dumps({"mcpServers": {"strata": {"command": foreign_command, "env": {}}}}, indent=2),
+        encoding="utf-8",
+    )
+
+    _run_register(tmp_path)
+    captured = capsys.readouterr()
+
+    assert "moved" not in captured.out.lower()
+    settings_data = json.loads((claude_dir / "settings.json").read_text(encoding="utf-8"))
+    assert settings_data["mcpServers"]["strata"]["command"] == foreign_command
+    mcp_data = json.loads((tmp_path / ".mcp.json").read_text(encoding="utf-8"))
+    assert mcp_data["mcpServers"]["strata"]["command"] == "strata-mcp"
+
+
+# ---------------------------------------------------------------------------
+# HIGH 2 (fix round): valid JSON but not an object must not crash register.
+# ---------------------------------------------------------------------------
+
+
+def test_register_non_dict_mcp_json_does_not_crash(tmp_path: Path, capsys) -> None:
+    """`.mcp.json` containing `[]` (valid JSON, not an object) must fail
+    cleanly with an actionable message, not an AttributeError."""
+    _init_project(tmp_path)
+    (tmp_path / ".mcp.json").write_text("[]", encoding="utf-8")
+
+    rc = _run_register(tmp_path)
+
+    assert rc == 1
+    captured = capsys.readouterr()
+    assert ".mcp.json" in captured.err
+    assert (tmp_path / ".mcp.json").read_text(encoding="utf-8") == "[]", (
+        "register must never overwrite a .mcp.json it could not use"
+    )
+
+
+def test_register_null_mcp_json_does_not_crash(tmp_path: Path, capsys) -> None:
+    """`null` is valid JSON but not an object — must not crash register."""
+    _init_project(tmp_path)
+    (tmp_path / ".mcp.json").write_text("null", encoding="utf-8")
+
+    rc = _run_register(tmp_path)
+
+    assert rc == 1
+    captured = capsys.readouterr()
+    assert ".mcp.json" in captured.err
+
+
+# ---------------------------------------------------------------------------
+# MEDIUM 3 (fix round): --diff mode honesty for the migration/dedup prints.
+# ---------------------------------------------------------------------------
+
+
+def test_diff_mode_stale_duplicate_uses_would_wording(tmp_path: Path, capsys) -> None:
+    """--diff mode's stale-duplicate sweep line must read as a preview
+    ("would remove"), never a past-tense claim of a write that never
+    happened."""
+    _init_project(tmp_path)
+    claude_dir = tmp_path / ".claude"
+    claude_dir.mkdir(parents=True)
+    (claude_dir / "settings.json").write_text(
+        json.dumps({"mcpServers": {"strata": {"command": "strata-mcp", "env": {}}}}, indent=2),
+        encoding="utf-8",
+    )
+    (tmp_path / ".mcp.json").write_text(
+        json.dumps({"mcpServers": {"strata": {"command": "strata-mcp", "env": {}}}}, indent=2),
+        encoding="utf-8",
+    )
+
+    rc = _run_register(tmp_path, diff=True)
+
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert "would remove" in captured.out.lower()
+    assert "removed stale duplicate" not in captured.out.lower()
+    # --diff must not have touched either file.
+    settings_data = json.loads((claude_dir / "settings.json").read_text(encoding="utf-8"))
+    assert "strata" in settings_data["mcpServers"]
+
+
+def test_diff_mode_with_legacy_entry_previews_the_move(tmp_path: Path, capsys) -> None:
+    """--diff on a project with a migratable legacy entry must call out
+    BOTH halves of the move: the .mcp.json side (via the normal
+    [would create/update] line) and that the legacy settings.json entry
+    would be removed."""
+    _init_project(tmp_path)
+    claude_dir = tmp_path / ".claude"
+    claude_dir.mkdir(parents=True)
+    (claude_dir / "settings.json").write_text(
+        json.dumps({"mcpServers": {"strata": {"command": "strata-mcp", "env": {}}}}, indent=2),
+        encoding="utf-8",
+    )
+
+    rc = _run_register(tmp_path, diff=True)
+
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert ".mcp.json" in captured.out
+    assert "would remove" in captured.out.lower()
+    assert "settings.json" in captured.out.lower()
+    # --diff must not have touched either file.
+    assert not (tmp_path / ".mcp.json").exists()
+    settings_data = json.loads((claude_dir / "settings.json").read_text(encoding="utf-8"))
+    assert "strata" in settings_data["mcpServers"]
+
+
+# ---------------------------------------------------------------------------
+# Missing coverage (fix round): register's stale-duplicate sweep branch,
+# exercised directly through cmd_register (not just unregister/doctor).
+# ---------------------------------------------------------------------------
+
+
+def test_register_sweeps_stale_duplicate_when_mcp_json_already_present(
+    tmp_path: Path, capsys
+) -> None:
+    """.mcp.json already has the byte-exact entry AND a byte-exact
+    duplicate sits in .claude/settings.json (e.g. a half-migrated project,
+    or one re-registered with an old release after a post-fix one) —
+    register must sweep the stale duplicate out of settings.json."""
+    _init_project(tmp_path)
+    claude_dir = tmp_path / ".claude"
+    claude_dir.mkdir(parents=True)
+    (claude_dir / "settings.json").write_text(
+        json.dumps({"mcpServers": {"strata": {"command": "strata-mcp", "env": {}}}}, indent=2),
+        encoding="utf-8",
+    )
+    (tmp_path / ".mcp.json").write_text(
+        json.dumps({"mcpServers": {"strata": {"command": "strata-mcp", "env": {}}}}, indent=2),
+        encoding="utf-8",
+    )
+
+    rc = _run_register(tmp_path)
+
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert "removed stale duplicate" in captured.out.lower()
+    settings_data = json.loads((claude_dir / "settings.json").read_text(encoding="utf-8"))
+    assert "mcpServers" not in settings_data
+    mcp_data = json.loads((tmp_path / ".mcp.json").read_text(encoding="utf-8"))
+    assert mcp_data["mcpServers"]["strata"]["command"] == "strata-mcp"
 
 
 # ---------------------------------------------------------------------------
@@ -620,7 +944,7 @@ def test_pyproject_toml_accepted_as_project_marker(tmp_path: Path) -> None:
 
 @pytest.mark.slow
 def test_bootstrap_venv_creates_venv_and_updates_settings(tmp_path: Path) -> None:
-    """--bootstrap-venv must create .strata/.venv/ and update settings.json.
+    """--bootstrap-venv must create .strata/.venv/ and update .mcp.json.
 
     This test requires network access (pip install strata) and is slow.
     Skip in CI unless STRATA_RUN_BOOTSTRAP_VENV=1.
@@ -639,8 +963,8 @@ def test_bootstrap_venv_creates_venv_and_updates_settings(tmp_path: Path) -> Non
     strata_mcp_bin = venv_dir / "bin" / "strata-mcp"
     assert strata_mcp_bin.exists(), ".strata/.venv/bin/strata-mcp was not installed"
 
-    settings = json.loads((tmp_path / ".claude" / "settings.json").read_text(encoding="utf-8"))
-    assert str(strata_mcp_bin) == settings["mcpServers"]["strata"]["command"]
+    mcp_data = json.loads((tmp_path / ".mcp.json").read_text(encoding="utf-8"))
+    assert str(strata_mcp_bin) == mcp_data["mcpServers"]["strata"]["command"]
 
 
 # ---------------------------------------------------------------------------

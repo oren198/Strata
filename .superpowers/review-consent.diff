@@ -1,0 +1,996 @@
+diff --git a/src/strata/__main__.py b/src/strata/__main__.py
+index af1532d..2a02aaa 100644
+--- a/src/strata/__main__.py
++++ b/src/strata/__main__.py
+@@ -3723,7 +3723,7 @@ def _build_parser() -> argparse.ArgumentParser:
+ 
+     p_status = sub.add_parser(
+         "status",
+-        help="Show per-scope memory-freshness (read-vs-contribute staleness, issue #110).",
++        help="Show per-scope memory-freshness (read-vs-contribute staleness).",
+     )
+     p_status.add_argument(
+         "--window-days",
+@@ -3983,7 +3983,7 @@ def _build_parser() -> argparse.ArgumentParser:
+         help=(
+             "Reverse `strata register` — remove the .gitignore block, the "
+             "mcpServers.strata entry, and the vendored skills (only when "
+-            "unmodified). Leaves .strata/ data unless --purge-data (issue #53)."
++            "unmodified). Leaves .strata/ data unless --purge-data."
+         ),
+         description=(
+             "Reverse the wiring `strata register` added, honouring the "
+diff --git a/src/strata/mcp/server.py b/src/strata/mcp/server.py
+index 9336c47..659a08f 100644
+--- a/src/strata/mcp/server.py
++++ b/src/strata/mcp/server.py
+@@ -55,7 +55,7 @@ from typing import Literal
+ 
+ import yaml
+ from mcp.server.elicitation import AcceptedElicitation, CancelledElicitation, DeclinedElicitation
+-from mcp.server.fastmcp import FastMCP
++from mcp.server.fastmcp import Context, FastMCP
+ from mcp.server.session import ServerSession
+ from mcp.shared.message import ServerMessageMetadata
+ from mcp.types import (
+@@ -385,7 +385,12 @@ def _attach_unbound_notice(result: dict) -> dict:
+     when there is something to say.
+     """
+     if _UNRESOLVED:
+-        result["unbound_notice"] = "session not bound yet — bind with strata_bind(scope_id=...)"
++        result["unbound_notice"] = (
++            "session not bound yet — ask the user which scope this session should "
++            "act as (see the scopes above for the choices), then call "
++            "strata_bind(scope_id=...) with their answer. Do not pick a scope "
++            "yourself — binding decides whose memory this session reads and writes."
++        )
+     return result
+ 
+ 
+@@ -870,7 +875,7 @@ def _validate_binding(
+             "  Call strata_bind(scope_id=..., skill=<skill_name>) to bind this session "
+             "now, or restart the server with STRATA_AGENT_SCOPE/STRATA_AGENT_SKILL set "
+             "in its environment.\n"
+-            "  (Optional only for scopes that declare no skills — issue #121.)\n"
++            "  (A skill is optional when the scope declares none.)\n"
+             "  See README.md § 'Quick Start for an existing project' for the full setup."
+         )
+ 
+@@ -985,11 +990,14 @@ def _unresolved_message(fleet: FleetConfig | None) -> str:
+         sections.append(
+             "\n\nTo recover the scope/skill binding without restarting this server:\n"
+             f"{scopes_line}"
+-            "  Call strata_bind(scope_id=<one of the above>[, skill=<skill>]) to bind "
+-            "this session now, or\n"
+-            "  fix fleet.yaml (its scopes, its permitted_skills) and call strata_bind "
+-            "again — fleet.yaml is re-read as part of that call, so a fix made after "
+-            "startup is bindable immediately, or\n"
++            "  Ask the user which scope this session should act as — never pick one "
++            "yourself, binding decides whose memory this session reads and writes — "
++            "then call strata_bind(scope_id=<their answer>[, skill=<skill>]) with "
++            "their choice, or\n"
++            "  if the scope they want isn't listed, fix fleet.yaml (its scopes, its "
++            "permitted_skills) and call strata_bind again once they've confirmed the "
++            "right one — fleet.yaml is re-read as part of that call, so a fix made "
++            "after startup is bindable immediately, or\n"
+             "  restart the server with STRATA_AGENT_SCOPE/STRATA_AGENT_SKILL set in its "
+             "environment (these are read once, at process start — setting them in your "
+             "shell after the server is already running has no effect on this session)."
+@@ -1007,38 +1015,54 @@ class _ScopePick(BaseModel):
+     scope_id: str = Field(description="The scope_id to bind this session to.")
+ 
+ 
+-# How long the server waits for a capability-declaring client to answer the
+-# scope-pick elicitation before giving up. Context.elicit() / ServerSession.
++class _SwitchConfirm(BaseModel):
++    """Elicitation response schema (self-bind guard): does the user confirm
++    switching this session's already-bound scope to a different one?"""
++
++    confirm: bool = Field(description="True to confirm switching this session's bound scope.")
++
++
++# How long the server waits for a capability-declaring client to answer an
++# elicitation before giving up. Context.elicit() / ServerSession.
+ # elicit_form() (mcp/server/fastmcp/server.py, mcp/server/session.py) don't
+ # expose a timeout parameter at all, even though the primitive underneath
+ # both of them — BaseSession.send_request() (mcp/shared/session.py) — takes
+ # one (request_read_timeout_seconds) and races it via anyio.fail_after,
+ # raising McpError on expiry. Without threading one through here, a client
+ # that declares the capability and then never answers hangs this tool call
+-# forever. _send_scope_pick_elicitation, below, calls send_request directly
+-# (bypassing the two convenience wrappers) so this timeout actually applies.
++# forever. _send_elicitation, below, calls send_request directly (bypassing
++# the two convenience wrappers) so this timeout actually applies — shared by
++# every elicitation this module sends (the scope pick, and the rebind
++# confirmation).
+ _ELICIT_TIMEOUT = timedelta(seconds=120)
+ 
+ 
+-async def _send_scope_pick_elicitation(
+-    session: ServerSession, message: str, related_request_id: RequestId | None
+-) -> AcceptedElicitation[_ScopePick] | DeclinedElicitation | CancelledElicitation:
+-    """Send the scope-pick elicitation request with _ELICIT_TIMEOUT enforced.
++async def _send_elicitation(
++    session: ServerSession,
++    message: str,
++    schema: type[BaseModel],
++    related_request_id: RequestId | None,
++) -> AcceptedElicitation | DeclinedElicitation | CancelledElicitation:
++    """Send an elicitation request with _ELICIT_TIMEOUT enforced, generic over
++    the response *schema* — shared by the scope-pick elicitation (Change 2,
++    ``_ScopePick``) and the rebind-confirmation elicitation (self-bind guard,
++    ``_SwitchConfirm``), so both go through the one place that actually
++    threads a timeout.
+ 
+     Replicates what mcp.server.elicitation.elicit_with_validation +
+     ServerSession.elicit_form do internally (build an ElicitRequest, send it,
+     interpret the ElicitResult) but calls session.send_request(...) directly
+     so request_read_timeout_seconds can be passed — see _ELICIT_TIMEOUT's
+     docstring for why neither of those wrappers allows that. A timeout
+-    surfaces as an McpError, same as any other transport failure; the caller
+-    (_attempt_elicit_bind) treats that identically to an explicit decline.
++    surfaces as an McpError, same as any other transport failure; every
++    caller treats that identically to an explicit decline.
+     """
+     result = await session.send_request(
+         ServerRequest(
+             ElicitRequest(
+                 params=ElicitRequestFormParams(
+                     message=message,
+-                    requestedSchema=_ScopePick.model_json_schema(),
++                    requestedSchema=schema.model_json_schema(),
+                 ),
+             )
+         ),
+@@ -1047,13 +1071,39 @@ async def _send_scope_pick_elicitation(
+         metadata=ServerMessageMetadata(related_request_id=related_request_id),
+     )
+     if result.action == "accept" and result.content is not None:
+-        return AcceptedElicitation(data=_ScopePick.model_validate(result.content))
++        return AcceptedElicitation(data=schema.model_validate(result.content))
+     elif result.action == "decline":
+         return DeclinedElicitation()
+     else:
+         return CancelledElicitation()
+ 
+ 
++def _elicitation_session_if_capable() -> tuple[Context, ServerSession] | None:
++    """Return ``(ctx, session)`` when an MCP request is in flight AND the
++    client declares the elicitation capability; ``None`` otherwise (no
++    session, or the client doesn't support it).
++
++    The one "can we even ask?" check, shared by the scope-pick elicitation
++    (Change 2) and the rebind-confirmation elicitation (self-bind guard) —
++    so both entry points agree on what "the client can be asked" means.
++    Never raises: any failure getting the context or session is treated the
++    same as "can't ask."
++    """
++    try:
++        ctx = mcp.get_context()
++        request_context = ctx.request_context
++        if request_context is None:
++            return None
++        session = request_context.session
++        if not session.check_client_capability(
++            ClientCapabilities(elicitation=ElicitationCapability())
++        ):
++            return None
++        return ctx, session
++    except Exception:  # noqa: BLE001 - no session / no capability: nothing was asked
++        return None
++
++
+ async def _attempt_elicit_bind(fleet: FleetConfig) -> bool:
+     """Try once to resolve the unbound session via server-initiated elicitation.
+ 
+@@ -1084,26 +1134,20 @@ async def _attempt_elicit_bind(fleet: FleetConfig) -> bool:
+     if not scopes:
+         return False
+ 
+-    try:
+-        ctx = mcp.get_context()
+-        request_context = ctx.request_context
+-        if request_context is None:
+-            return False
+-        session = request_context.session
+-        if not session.check_client_capability(
+-            ClientCapabilities(elicitation=ElicitationCapability())
+-        ):
+-            return False
+-    except Exception:  # noqa: BLE001 - no session / no capability: nothing was asked, no latch
++    capable = _elicitation_session_if_capable()
++    if capable is None:
+         return False
++    ctx, session = capable
+ 
+     listing = "\n".join(f"- {s.id}: {s.name}" for s in sorted(scopes, key=lambda s: s.id))
+     message = (
+-        "Strata is not yet bound to a scope for this session. Pick one to continue:\n" + listing
++        "This session needs a scope binding to continue — ask the user which "
++        "scope it should act as (binding decides whose memory this session "
++        "reads and writes). Choices:\n" + listing
+     )
+ 
+     try:
+-        result = await _send_scope_pick_elicitation(session, message, ctx.request_id)
++        result = await _send_elicitation(session, message, _ScopePick, ctx.request_id)
+     except Exception:
+         # Covers a timeout (McpError, after _ELICIT_TIMEOUT) and any other
+         # transport failure once a request was actually sent to the client
+@@ -1168,6 +1212,89 @@ async def _require_bound_or_elicit() -> None:
+     raise RuntimeError(_unresolved_message(fleet))
+ 
+ 
++async def _attempt_elicit_switch_confirm(
++    previous_scope_id: str, requested_scope_id: str
++) -> bool | None:
++    """Try once, via elicitation, to get the user's confirmation for
++    switching this session's bound scope from *previous_scope_id* to
++    *requested_scope_id* — the self-bind guard's Change-3 upgrade: where the
++    client supports it, this REPLACES strata_bind's confirm= parameter
++    dance.
++
++    Returns:
++        ``True`` — confirmed; the caller proceeds with the switch.
++        ``False`` — declined, cancelled, or timed out; the caller refuses
++            the switch without changing anything.
++        ``None`` — no MCP session, or the client doesn't declare the
++            elicitation capability; the caller falls back to the confirm=
++            parameter heads-up instead.
++
++    Deliberately does NOT touch _ELICIT_DECLINED: unlike the scope-pick
++    elicitation (Change 2), this is per-call only — a user who declines a
++    switch right now may legitimately be asked again a moment later (they
++    might reconsider, or the agent might re-confirm after checking
++    something), so nothing here should lock a later attempt out.
++    """
++    capable = _elicitation_session_if_capable()
++    if capable is None:
++        return None
++    ctx, session = capable
++
++    message = (
++        f"This session is currently bound to {previous_scope_id!r}. Switching to "
++        f"{requested_scope_id!r} changes whose memory this session reads and writes "
++        "for the rest of the session. Please confirm: should it switch?"
++    )
++
++    try:
++        result = await _send_elicitation(session, message, _SwitchConfirm, ctx.request_id)
++    except Exception:  # noqa: BLE001 - timeout/transport failure: treat as declined
++        return False
++
++    if not isinstance(result, AcceptedElicitation):
++        return False
++    return bool(result.data.confirm)
++
++
++def _switch_pending_result(
++    previous_scope_id: str, requested_scope_id: str, *, declined: bool
++) -> dict:
++    """Build the heads-up result for an unconfirmed scope switch (self-bind
++    guard) — the binding is left COMPLETELY unchanged in every case this
++    builds a result for.
++
++    *declined* only changes the wording (an elicitation was actually sent
++    and the user said no / it timed out, vs. no confirmation was offered
++    yet); the caller-visible shape — ``switch_pending: True``, the
++    unchanged ``scope_id``/``skill`` — is identical either way, so an agent
++    can branch on the flag alone without parsing the message.
++    """
++    if declined:
++        detail = (
++            "The user was asked and did not confirm. If they change their mind, "
++            f"call strata_bind(scope_id={requested_scope_id!r}, confirm=True) to "
++            "proceed."
++        )
++    else:
++        detail = (
++            "Ask the user to confirm the switch, then call "
++            f"strata_bind(scope_id={requested_scope_id!r}, confirm=True) with "
++            "their answer — do not confirm this yourself."
++        )
++    return {
++        "scope_id": _AGENT_SCOPE,
++        "skill": _AGENT_SKILL,
++        "session_id": _AGENT_SESSION_ID,
++        "switch_pending": True,
++        "switch_declined": declined,
++        "message": (
++            f"This session is bound to {previous_scope_id!r}; switching to "
++            f"{requested_scope_id!r} changes whose memory it reads and writes. "
++            f"{detail}"
++        ),
++    }
++
++
+ # ---------------------------------------------------------------------------
+ # MCP server
+ # ---------------------------------------------------------------------------
+@@ -1181,10 +1308,13 @@ mcp = FastMCP(
+         "Before finishing, contribute the session's outcomes back with "
+         "strata_contribute; if there is genuinely nothing to record, call "
+         "strata_session_closeout so an empty session stays distinguishable from a "
+-        "forgotten one. If a scope you need was just created (or you were bound to "
+-        "the wrong one), call strata_bind to rebind this session to it — fleet.yaml "
+-        "is re-read as part of that call, so a scope added moments ago is bindable "
+-        "immediately, no restart required."
++        "forgotten one. Binding decides whose memory this session reads and "
++        "writes — never pick or change the bound scope on your own judgment. If "
++        "a scope you need was just created, or this session should act as a "
++        "different scope, ask the user which scope it should be, then call "
++        "strata_bind with their answer — fleet.yaml is re-read as part of that "
++        "call, so a scope added moments ago is bindable immediately, no restart "
++        "required."
+     ),
+ )
+ 
+@@ -1201,15 +1331,21 @@ mcp = FastMCP(
+ 
+ 
+ @mcp.tool()
+-def strata_bind(scope_id: str, skill: str | None = None) -> dict:
+-    """Rebind this session to a different scope (and optionally skill), right now.
++async def strata_bind(scope_id: str, skill: str | None = None, confirm: bool = False) -> dict:
++    """Bind (or rebind) this session to a scope (and optionally skill), right now.
++
++    THE SCOPE MUST COME FROM THE USER. Binding decides whose memory this
++    session reads and writes — never call this with a scope you (the agent)
++    picked on your own judgment, even to "just answer one question." Ask
++    the user which scope this session should act as, then call this tool
++    with their answer.
+ 
+     Startup binds this session to ``STRATA_AGENT_SCOPE``/``STRATA_AGENT_SKILL``
+     once. This tool changes that binding mid-session — for the common case
+     where a scope was just added to fleet.yaml (by this session, an operator,
+     or another process) and isn't visible yet under the stale startup
+-    binding, or where this session simply needs to act as a different scope
+-    from here on.
++    binding, or where the user wants this session to act as a different
++    scope from here on.
+ 
+     Reloads fleet.yaml first (the same lazy reload-on-read path every other
+     tool call uses — Feature A), so a scope added moments ago is bindable
+@@ -1224,8 +1360,23 @@ def strata_bind(scope_id: str, skill: str | None = None) -> dict:
+     per call, so the record stays truthful regardless of how many times a
+     session rebinds.
+ 
+-    On failure the binding is left completely unchanged — a rejected
+-    strata_bind call never leaves you half-bound.
++    SWITCHING requires explicit confirmation (self-bind guard). Binding for
++    the FIRST time this session (currently unbound) needs no confirmation —
++    there is no prior identity to lose. But once this session is ALREADY
++    bound to a scope, a call naming a DIFFERENT scope is a SWITCH, and a
++    switch is refused on the first call: the result comes back with
++    ``switch_pending: True`` and NO change is made, so you can hand that to
++    the user and ask them to confirm. Call again with ``confirm=True`` once
++    they have. (A call naming the SAME scope you are already bound to is a
++    no-op success, never a switch — only pass ``confirm`` when you actually
++    mean to change identity.) Where the client supports server-initiated MCP
++    elicitation, this tool asks the user to confirm the switch itself before
++    you ever need the ``confirm`` parameter — a decline there refuses the
++    switch immediately, with the binding left unchanged, exactly like an
++    unconfirmed ``switch_pending`` result.
++
++    On failure — an invalid scope/skill, or a switch pending confirmation —
++    the binding is left completely unchanged.
+ 
+     Clears ONLY the binding-class startup failures (which scope/skill this
+     session acts as) — never a config-class one (a broken/missing
+@@ -1240,8 +1391,9 @@ def strata_bind(scope_id: str, skill: str | None = None) -> dict:
+     (env-fallback) store.
+ 
+     Args:
+-        scope_id: The scope to bind to. Must exist in fleet.yaml and be
+-            ``active`` (an archived scope cannot be bound).
++        scope_id: The scope to bind to — the user's choice, never your own.
++            Must exist in fleet.yaml and be ``active`` (an archived scope
++            cannot be bound).
+         skill: The skill to bind as, or omit it. When omitted and the scope
+             declares a ``default_skill``, that default is used (the same
+             companion rule startup auto-bind applies) — required only when
+@@ -1249,10 +1401,22 @@ def strata_bind(scope_id: str, skill: str | None = None) -> dict:
+             ``permitted_skills``) and has no ``default_skill`` to fall back
+             on. When given, must be one of the scope's ``permitted_skills``
+             (any skill is allowed if that list is empty).
++        confirm: Only meaningful when this session is already bound to a
++            DIFFERENT scope than *scope_id* — pass ``True`` once the user
++            has confirmed the switch. Ignored (no effect either way) for an
++            initial bind or a same-scope re-bind. Never set this to
++            ``True`` on your own judgment; it must reflect the user's
++            actual answer.
+ 
+     Returns:
+-        ``scope_id``, ``skill``, ``session_id`` (the new binding — session_id
+-        unchanged), and ``message`` (a one-line confirmation).
++        On success: ``scope_id``, ``skill``, ``session_id`` (the new
++        binding — session_id unchanged), and ``message`` (a one-line
++        confirmation, noting the identity change when this was a switch).
++        On an unconfirmed switch: the binding UNCHANGED — same ``scope_id``/
++        ``skill`` as before this call — plus ``switch_pending: True``,
++        ``switch_declined`` (whether an elicitation was actually sent and
++        refused, vs. no confirmation offered yet), and a ``message``
++        explaining what to do next.
+ 
+     Raises:
+         RuntimeError: The scope does not exist, is archived, or the skill is
+@@ -1264,9 +1428,9 @@ def strata_bind(scope_id: str, skill: str | None = None) -> dict:
+     # This is THE recovery path for an unresolved session (Change 1), so it
+     # deliberately re-reads fleet.yaml itself (below) rather than trusting
+     # any cached startup fleet — a fleet fixed after startup must be
+-    # bindable without a restart. It also never calls
+-    # _require_bound_or_elicit(): eliciting from inside the tool that IS the
+-    # elicitation's own bind target would be circular.
++    # bindable without a restart. It never calls _require_bound_or_elicit():
++    # eliciting from inside the tool that IS the elicitation's own bind
++    # target would be circular.
+     fleet = _load_fleet()
+ 
+     # require_active=True is the shared "archived scopes cannot be bound"
+@@ -1292,6 +1456,29 @@ def strata_bind(scope_id: str, skill: str | None = None) -> dict:
+             + notice_line
+         )
+ 
++    # Self-bind guard (operator finding: an agent picked a scope on its own
++    # judgment, without the user ever weighing in). Binding for the first
++    # time this session needs no confirmation — there is no prior identity
++    # to lose. Naming the SAME scope again is a no-op, never a switch. Only
++    # naming a DIFFERENT scope while already bound is a switch, and a
++    # switch requires the user's explicit say-so — either via an accepted
++    # elicitation (asked right here, right now) or a second call carrying
++    # confirm=True (the fallback for a client that can't be asked).
++    previous_scope_id = _AGENT_SCOPE
++    is_switch = bool(previous_scope_id) and scope_id != previous_scope_id
++
++    if is_switch and not confirm:
++        elicited = await _attempt_elicit_switch_confirm(previous_scope_id, scope_id)
++        if elicited is True:
++            confirm = True
++        elif elicited is False:
++            return _switch_pending_result(previous_scope_id, scope_id, declined=True)
++        # elicited is None: no session, or the client can't be asked — fall
++        # through to the confirm= heads-up below.
++
++    if is_switch and not confirm:
++        return _switch_pending_result(previous_scope_id, scope_id, declined=False)
++
+     with _binding_lock:
+         _AGENT_SCOPE = scope_id
+         _AGENT_SKILL = resolved_skill
+@@ -1305,15 +1492,25 @@ def strata_bind(scope_id: str, skill: str | None = None) -> dict:
+         # out forever by it.
+         _ELICIT_DECLINED = False
+ 
++    if is_switch:
++        message = (
++            f"Switched from {previous_scope_id!r} to {_AGENT_SCOPE!r}"
++            f"{f' with skill {_AGENT_SKILL!r}' if _AGENT_SKILL else ''}. "
++            f"This session now reads and writes {_AGENT_SCOPE!r}'s memory, not "
++            f"{previous_scope_id!r}'s. Session id unchanged ({_AGENT_SESSION_ID!r})."
++        )
++    else:
++        message = (
++            f"Bound to {_AGENT_SCOPE!r}"
++            f"{f' with skill {_AGENT_SKILL!r}' if _AGENT_SKILL else ''}. "
++            f"Session id unchanged ({_AGENT_SESSION_ID!r})."
++        )
++
+     result = {
+         "scope_id": _AGENT_SCOPE,
+         "skill": _AGENT_SKILL,
+         "session_id": _AGENT_SESSION_ID,
+-        "message": (
+-            f"Bound to {_AGENT_SCOPE!r}"
+-            f"{f' with skill {_AGENT_SKILL!r}' if _AGENT_SKILL else ''}. "
+-            f"Session id unchanged ({_AGENT_SESSION_ID!r})."
+-        ),
++        "message": message,
+     }
+     if _STARTUP_ERRORS_CONFIG:
+         result["config_notice"] = (
+diff --git a/tests/test_cli.py b/tests/test_cli.py
+index f2ea337..e48a935 100644
+--- a/tests/test_cli.py
++++ b/tests/test_cli.py
+@@ -145,6 +145,27 @@ def test_help_flag_survives_deleted_cwd(
+     assert "Strata — shared memory for agent fleets." in captured.out
+ 
+ 
++def test_help_text_carries_no_issue_references(capsys: pytest.CaptureFixture[str]) -> None:
++    """CLI --help output is operator-facing — it must never carry internal
++    issue numbers (same rule test_register.py's next-steps text enforces).
++
++    Covers the top-level help plus every subcommand's, since a subcommand's
++    own help= string only ever renders inside ITS --help, never the
++    top-level listing.
++    """
++    from strata.__main__ import _build_parser
++
++    parser = _build_parser()
++    subparsers_action = next(action for action in parser._actions if action.choices)
++    command_names = list(subparsers_action.choices)
++
++    for argv in [["--help"], *([name, "--help"] for name in command_names)]:
++        with pytest.raises(SystemExit):
++            main(argv)
++        captured = capsys.readouterr()
++        assert "issue #" not in captured.out.lower(), f"{argv} help text leaked an issue number"
++
++
+ def test_migrate_calls_runner(tmp_path, capsys: pytest.CaptureFixture[str]) -> None:
+     """``strata migrate --db <path>`` calls the migrations runner."""
+     db_path = str(tmp_path / "test.db")
+diff --git a/tests/test_mcp_server.py b/tests/test_mcp_server.py
+index 410da22..dce2463 100644
+--- a/tests/test_mcp_server.py
++++ b/tests/test_mcp_server.py
+@@ -2820,7 +2820,7 @@ async def test_invalid_fleet_edit_keeps_serving_last_good_fleet_with_notice(tmp_
+ # ---------------------------------------------------------------------------
+ 
+ 
+-def test_bind_to_scope_added_after_server_init_succeeds(tmp_path: Path) -> None:
++async def test_bind_to_scope_added_after_server_init_succeeds(tmp_path: Path) -> None:
+     """The incident: a scope added to fleet.yaml after the server started must be bindable."""
+     db_path = _make_db(tmp_path)
+     summaries_dir = str(tmp_path / "summaries")
+@@ -2830,20 +2830,23 @@ def test_bind_to_scope_added_after_server_init_succeeds(tmp_path: Path) -> None:
+     with patch.object(mod, "_AGENT_SCOPE", "g_backend"):
+         # g_new does not exist yet — binding to it now must fail.
+         with pytest.raises(RuntimeError, match="not found"):
+-            mod.strata_bind(scope_id="g_new")
++            await mod.strata_bind(scope_id="g_new")
+ 
+         # Add the scope to fleet.yaml out of band (no server restart).
+         raw = yaml.safe_load(fleet_path.read_text(encoding="utf-8"))
+         raw["scopes"].append({"id": "g_new", "name": "New Scope", "stratum_id": "L1"})
+         fleet_path.write_text(yaml.dump(raw, default_flow_style=False), encoding="utf-8")
+ 
+-        result = mod.strata_bind(scope_id="g_new")
++        # Already bound to g_backend, so this is a switch — the self-bind
++        # guard (a separate feature) requires confirm=True; not what this
++        # test is about, so supply it directly.
++        result = await mod.strata_bind(scope_id="g_new", confirm=True)
+ 
+         assert result["scope_id"] == "g_new"
+         assert mod._AGENT_SCOPE == "g_new"
+ 
+ 
+-def test_bind_to_nonexistent_scope_lists_valid_scopes_and_leaves_binding_intact(
++async def test_bind_to_nonexistent_scope_lists_valid_scopes_and_leaves_binding_intact(
+     tmp_path: Path,
+ ) -> None:
+     db_path = _make_db(tmp_path)
+@@ -2853,7 +2856,7 @@ def test_bind_to_nonexistent_scope_lists_valid_scopes_and_leaves_binding_intact(
+     mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+     with patch.object(mod, "_AGENT_SCOPE", "g_backend"), patch.object(mod, "_AGENT_SKILL", None):
+         with pytest.raises(RuntimeError) as exc_info:
+-            mod.strata_bind(scope_id="g_does_not_exist")
++            await mod.strata_bind(scope_id="g_does_not_exist")
+ 
+         message = str(exc_info.value)
+         assert "g_arch" in message
+@@ -2863,7 +2866,7 @@ def test_bind_to_nonexistent_scope_lists_valid_scopes_and_leaves_binding_intact(
+         assert mod._AGENT_SKILL is None
+ 
+ 
+-def test_bind_enforces_skill_permission(tmp_path: Path) -> None:
++async def test_bind_enforces_skill_permission(tmp_path: Path) -> None:
+     db_path = _make_db(tmp_path)
+     summaries_dir = str(tmp_path / "summaries")
+     fleet = {
+@@ -2884,14 +2887,14 @@ def test_bind_enforces_skill_permission(tmp_path: Path) -> None:
+     mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+     with patch.object(mod, "_AGENT_SCOPE", ""), patch.object(mod, "_AGENT_SKILL", None):
+         with pytest.raises(RuntimeError, match="permitted skills"):
+-            mod.strata_bind(scope_id="g_restricted", skill="not-allowed")
++            await mod.strata_bind(scope_id="g_restricted", skill="not-allowed")
+ 
+-        result = mod.strata_bind(scope_id="g_restricted", skill="strata-developer")
++        result = await mod.strata_bind(scope_id="g_restricted", skill="strata-developer")
+         assert result["skill"] == "strata-developer"
+         assert mod._AGENT_SKILL == "strata-developer"
+ 
+ 
+-def test_bind_leaves_session_id_unchanged(tmp_path: Path) -> None:
++async def test_bind_leaves_session_id_unchanged(tmp_path: Path) -> None:
+     db_path = _make_db(tmp_path)
+     summaries_dir = str(tmp_path / "summaries")
+     fleet_path = _make_fleet_yaml(tmp_path)
+@@ -2901,12 +2904,241 @@ def test_bind_leaves_session_id_unchanged(tmp_path: Path) -> None:
+         patch.object(mod, "_AGENT_SCOPE", "g_backend"),
+         patch.object(mod, "_AGENT_SESSION_ID", "sess_stable"),
+     ):
+-        result = mod.strata_bind(scope_id="g_arch")
++        # Already bound to g_backend, so this is a switch — the self-bind
++        # guard (a separate feature) requires confirm=True; not what this
++        # test is about, so supply it directly.
++        result = await mod.strata_bind(scope_id="g_arch", confirm=True)
+ 
++        assert result["scope_id"] == "g_arch"
+         assert result["session_id"] == "sess_stable"
+         assert mod._AGENT_SESSION_ID == "sess_stable"
+ 
+ 
++# ---------------------------------------------------------------------------
++# Self-bind guard (operator finding from live testing): an agent picked a
++# scope on its own judgment to answer a question, without the user ever
++# weighing in. Two rules: (1) every bind-instructing text must route through
++# the user, never read as permission for the agent to choose; (2) switching
++# an ALREADY-bound session to a different scope requires an explicit,
++# separate confirmation step — either an accepted elicitation, or a second
++# strata_bind call carrying confirm=True. Initial bind (from unbound) and a
++# same-scope re-bind are unaffected — no prior identity to protect.
++# ---------------------------------------------------------------------------
++
++
++async def test_rebind_without_confirm_does_not_switch_and_returns_heads_up(
++    tmp_path: Path,
++) -> None:
++    """A switch attempted without confirmation must not take effect — the
++    binding stays exactly as it was, and the result is a heads-up, not a
++    silent no-op and not an exception."""
++    db_path = _make_db(tmp_path)
++    summaries_dir = str(tmp_path / "summaries")
++    fleet_path = _make_fleet_yaml(tmp_path)  # g_arch, g_backend
++
++    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
++    with patch.object(mod, "_AGENT_SCOPE", "g_arch"), patch.object(mod, "_AGENT_SKILL", None):
++        result = await mod.strata_bind(scope_id="g_backend")
++
++        # Binding is untouched.
++        assert result["scope_id"] == "g_arch"
++        assert mod._AGENT_SCOPE == "g_arch"
++
++        # A clear, programmatically-detectable heads-up, not silence.
++        assert result["switch_pending"] is True
++        assert result["switch_declined"] is False
++        assert "g_arch" in result["message"]
++        assert "g_backend" in result["message"]
++        assert "confirm" in result["message"].lower()
++
++
++async def test_rebind_with_confirm_switches_and_notes_identity_change(tmp_path: Path) -> None:
++    """confirm=True actually performs the switch, and the result explicitly
++    calls out the identity change — this is not a cosmetic rename."""
++    db_path = _make_db(tmp_path)
++    summaries_dir = str(tmp_path / "summaries")
++    fleet_path = _make_fleet_yaml(tmp_path)
++
++    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
++    with patch.object(mod, "_AGENT_SCOPE", "g_arch"), patch.object(mod, "_AGENT_SKILL", None):
++        result = await mod.strata_bind(scope_id="g_backend", confirm=True)
++
++        assert result["scope_id"] == "g_backend"
++        assert mod._AGENT_SCOPE == "g_backend"
++        assert "switch_pending" not in result
++        assert "g_arch" in result["message"]
++        assert "g_backend" in result["message"]
++        # Explicitly frames this as a change of whose memory is read/written.
++        assert "memory" in result["message"].lower()
++
++
++async def test_rebind_same_scope_is_a_no_op_success_without_confirm(tmp_path: Path) -> None:
++    """Naming the SAME scope you are already bound to is never a switch —
++    confirm is neither required nor meaningful, and it stays a plain
++    success like today."""
++    db_path = _make_db(tmp_path)
++    summaries_dir = str(tmp_path / "summaries")
++    fleet_path = _make_fleet_yaml(tmp_path)
++
++    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
++    with patch.object(mod, "_AGENT_SCOPE", "g_arch"), patch.object(mod, "_AGENT_SKILL", None):
++        result = await mod.strata_bind(scope_id="g_arch")
++
++        assert result["scope_id"] == "g_arch"
++        assert "switch_pending" not in result
++        assert mod._AGENT_SCOPE == "g_arch"
++
++
++async def test_initial_bind_from_unbound_needs_no_confirm(tmp_path: Path) -> None:
++    """An initial bind (session currently unbound) is not a switch — no
++    prior identity to protect, so it proceeds immediately, confirm or not."""
++    db_path = _make_db(tmp_path)
++    summaries_dir = str(tmp_path / "summaries")
++    fleet_path = _make_fleet_yaml(tmp_path)
++
++    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
++    with patch.object(mod, "_AGENT_SCOPE", ""), patch.object(mod, "_AGENT_SKILL", None):
++        result = await mod.strata_bind(scope_id="g_backend")
++
++        assert result["scope_id"] == "g_backend"
++        assert "switch_pending" not in result
++        assert mod._AGENT_SCOPE == "g_backend"
++
++
++async def test_rebind_elicitation_accept_switches(tmp_path: Path) -> None:
++    """Where the client declares the elicitation capability, strata_bind
++    asks the user directly and an accepted confirmation switches — this
++    replaces the confirm= dance when available."""
++    from mcp.shared.memory import create_connected_server_and_client_session
++
++    db_path = _make_db(tmp_path)
++    summaries_dir = str(tmp_path / "summaries")
++    fleet_path = _make_fleet_yaml(tmp_path)
++
++    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
++
++    async def _confirm_switch(context, params):
++        from mcp import types as mcp_types
++
++        return mcp_types.ElicitResult(action="accept", content={"confirm": True})
++
++    with patch.object(mod, "_AGENT_SCOPE", "g_arch"), patch.object(mod, "_AGENT_SKILL", None):
++        async with create_connected_server_and_client_session(
++            mod.mcp, elicitation_callback=_confirm_switch
++        ) as client:
++            result = await client.call_tool("strata_bind", {"scope_id": "g_backend"})
++
++        assert result.isError is not True
++        assert mod._AGENT_SCOPE == "g_backend"
++
++
++async def test_rebind_elicitation_decline_refuses_without_changes(tmp_path: Path) -> None:
++    """A declined elicitation refuses the switch — binding left completely
++    unchanged, no confirm= param needed to reach that outcome."""
++    from mcp.shared.memory import create_connected_server_and_client_session
++
++    db_path = _make_db(tmp_path)
++    summaries_dir = str(tmp_path / "summaries")
++    fleet_path = _make_fleet_yaml(tmp_path)
++
++    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
++
++    with patch.object(mod, "_AGENT_SCOPE", "g_arch"), patch.object(mod, "_AGENT_SKILL", None):
++        async with create_connected_server_and_client_session(
++            mod.mcp, elicitation_callback=_elicit_decline
++        ) as client:
++            result = await client.call_tool("strata_bind", {"scope_id": "g_backend"})
++
++        assert result.isError is not True  # a heads-up result, not an error
++        text = _result_text(result)
++        assert "switch_pending" in text or "did not confirm" in text.lower()
++        assert mod._AGENT_SCOPE == "g_arch"
++
++
++async def test_rebind_elicitation_never_latches(tmp_path: Path) -> None:
++    """Unlike the scope-pick elicitation (Change 2), a declined switch
++    confirmation must NOT set _ELICIT_DECLINED — a user might legitimately
++    confirm the very same switch moments later."""
++    db_path = _make_db(tmp_path)
++    summaries_dir = str(tmp_path / "summaries")
++    fleet_path = _make_fleet_yaml(tmp_path)
++
++    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
++
++    with (
++        patch.object(mod, "_AGENT_SCOPE", "g_arch"),
++        patch.object(mod, "_AGENT_SKILL", None),
++        patch.object(
++            mod,
++            "_attempt_elicit_switch_confirm",
++            return_value=False,
++        ),
++    ):
++        await mod.strata_bind(scope_id="g_backend")
++        assert mod._ELICIT_DECLINED is False
++
++
++def _normalize(text: str) -> str:
++    """Collapse whitespace/newlines to single spaces for robust substring
++    checks against wrapped docstrings/messages — a phrase split across a
++    line-wrap boundary must still be found."""
++    return " ".join(text.lower().split())
++
++
++async def test_reworded_bind_texts_route_through_the_user(tmp_path: Path) -> None:
++    """Grep-style assertions: every bind-instructing text an agent reads
++    must tell it to ask the user, and none may read as permission for the
++    agent to pick a scope on its own."""
++    db_path = _make_db(tmp_path)
++    summaries_dir = str(tmp_path / "summaries")
++    fleet_path = _make_fleet_yaml(tmp_path)  # g_arch, g_backend
++
++    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
++    fleet = FleetConfig.load(fleet_path)
++
++    # 1. The unbound_notice attached to strata_list_scopes.
++    with (
++        patch.object(mod, "_AGENT_SCOPE", ""),
++        patch.object(mod, "_UNRESOLVED", True),
++        patch.object(mod, "_load_fleet", return_value=fleet),
++    ):
++        listing = mod.strata_list_scopes()
++    assert "ask the user" in _normalize(listing["unbound_notice"])
++
++    # 2. The gated-tool unresolved error text (_unresolved_message).
++    with (
++        patch.object(mod, "_AGENT_SCOPE", ""),
++        patch.object(mod, "_UNRESOLVED", True),
++        patch.object(mod, "_STARTUP_ERRORS_BINDING", ["STRATA_AGENT_SCOPE is not set."]),
++        patch.object(mod, "_load_fleet", return_value=fleet),
++        pytest.raises(RuntimeError) as exc_info,
++    ):
++        await mod.strata_read_perspective()
++    assert "ask the user" in _normalize(str(exc_info.value))
++
++    # 3. strata_bind's own tool docstring (what the client sees as the
++    # tool's description).
++    assert "ask the user" in _normalize(mod.strata_bind.__doc__)
++    assert "must come from the user" in _normalize(mod.strata_bind.__doc__)
++
++    # 4. The switch-pending heads-up message.
++    with patch.object(mod, "_AGENT_SCOPE", "g_arch"), patch.object(mod, "_AGENT_SKILL", None):
++        pending = await mod.strata_bind(scope_id="g_backend")
++    assert "ask the user" in _normalize(pending["message"])
++
++    # No surviving self-bind instruction — the pre-fix text this whole
++    # guard replaces — in any of the texts checked above.
++    for text in (
++        listing["unbound_notice"],
++        str(exc_info.value),
++        mod.strata_bind.__doc__,
++        pending["message"],
++    ):
++        normalized = _normalize(text)
++        assert "bind with strata_bind(scope_id=...)" not in normalized
++        assert "call strata_bind to rebind this session to it" not in normalized
++
++
+ async def test_contribution_after_bind_carries_new_scope_in_provenance(tmp_path: Path) -> None:
+     db_path = _make_db(tmp_path)
+     summaries_dir = str(tmp_path / "summaries")
+@@ -2927,7 +3159,10 @@ async def test_contribution_after_bind_carries_new_scope_in_provenance(tmp_path:
+         patch("strata.scope_manager.ScopeManager.judge", return_value=fake_judgment),
+         patch("anthropic.Anthropic", return_value=MagicMock()),
+     ):
+-        bind_result = mod.strata_bind(scope_id="g_arch")
++        # Already bound to g_backend, so this is a switch — the self-bind
++        # guard (a separate feature) requires confirm=True; not what this
++        # test is about, so supply it directly.
++        bind_result = await mod.strata_bind(scope_id="g_arch", confirm=True)
+         assert bind_result["scope_id"] == "g_arch"
+         assert mod._AGENT_SCOPE == "g_arch"
+ 
+@@ -2973,7 +3208,7 @@ async def test_bind_refusal_mentions_active_fleet_reload_warning(tmp_path: Path)
+         )
+ 
+         with pytest.raises(RuntimeError) as exc_info:
+-            mod.strata_bind(scope_id="g_new")
++            await mod.strata_bind(scope_id="g_new")
+ 
+     message = str(exc_info.value)
+     assert "g_new" in message
+@@ -2989,7 +3224,7 @@ async def test_bind_refusal_mentions_active_fleet_reload_warning(tmp_path: Path)
+ # ---------------------------------------------------------------------------
+ 
+ 
+-def test_bind_applies_default_skill_when_omitted(tmp_path: Path) -> None:
++async def test_bind_applies_default_skill_when_omitted(tmp_path: Path) -> None:
+     db_path = _make_db(tmp_path)
+     summaries_dir = str(tmp_path / "summaries")
+     fleet = {
+@@ -3012,7 +3247,7 @@ def test_bind_applies_default_skill_when_omitted(tmp_path: Path) -> None:
+     with patch.object(mod, "_AGENT_SCOPE", ""), patch.object(mod, "_AGENT_SKILL", None):
+         # No skill given — must fall back to default_skill rather than
+         # refusing with "no skill was given" (misleading when one exists).
+-        result = mod.strata_bind(scope_id="g_defaulted")
++        result = await mod.strata_bind(scope_id="g_defaulted")
+ 
+         assert result["skill"] == "strata-developer"
+         assert mod._AGENT_SKILL == "strata-developer"
+@@ -3024,7 +3259,7 @@ def test_bind_applies_default_skill_when_omitted(tmp_path: Path) -> None:
+ # ---------------------------------------------------------------------------
+ 
+ 
+-def test_bind_refuses_archived_scope_via_shared_check(tmp_path: Path) -> None:
++async def test_bind_refuses_archived_scope_via_shared_check(tmp_path: Path) -> None:
+     db_path = _make_db(tmp_path)
+     summaries_dir = str(tmp_path / "summaries")
+     fleet = {
+@@ -3037,7 +3272,7 @@ def test_bind_refuses_archived_scope_via_shared_check(tmp_path: Path) -> None:
+ 
+     mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+     with patch.object(mod, "_AGENT_SCOPE", ""), pytest.raises(RuntimeError, match="archived"):
+-        mod.strata_bind(scope_id="g_gone")
++        await mod.strata_bind(scope_id="g_gone")
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -3141,6 +3376,52 @@ async def test_unbound_tool_call_returns_error_with_scopes_and_bind_mention(tmp_
+     assert "strata_bind" in message
+ 
+ 
++async def test_unbound_tool_call_error_carries_no_issue_references(tmp_path: Path) -> None:
++    """Operator-facing output must never carry internal issue numbers — the
++    same rule test_register.py's next-steps text enforces, and a QA-round-2
++    finding against a stale binding_errors string that used to say
++    '... issue #121.'"""
++    db_path = _make_db(tmp_path)
++    summaries_dir = str(tmp_path / "summaries")
++    fleet_path = _make_fleet_yaml(tmp_path)  # g_arch, g_backend
++
++    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
++    fleet = FleetConfig.load(fleet_path)
++
++    with (
++        patch.object(mod, "_AGENT_SCOPE", "g_backend"),
++        patch.object(mod, "_AGENT_SKILL", None),
++        patch.object(mod, "_UNRESOLVED", True),
++        # Exercise the real skill-unset message text, not a stand-in — this
++        # is the exact code path the leaked "issue #121" reference lived in.
++        patch.object(
++            mod,
++            "_STARTUP_ERRORS_BINDING",
++            _validate_binding_skill_error(fleet),
++        ),
++        patch.object(mod, "_load_fleet", return_value=fleet),
++        pytest.raises(RuntimeError) as exc_info,
++    ):
++        await mod.strata_read_perspective()
++
++    assert "issue #" not in str(exc_info.value).lower()
++
++
++def _validate_binding_skill_error(fleet: FleetConfig) -> list[str]:
++    """Build the real STRATA_AGENT_SKILL-unset binding_errors list for a
++    2+ scope fleet — used to prove the guard test above exercises the
++    actual message text, not a hand-written stand-in."""
++    from strata.mcp.server import _validate_binding
++
++    _scope, _skill, _config_errors, binding_errors = _validate_binding(
++        fleet,
++        scope="g_backend",
++        skill="",
++        project_config_found=True,
++    )
++    return binding_errors
++
++
+ async def test_unbound_tool_call_raises_for_every_memory_tool_but_bind(tmp_path: Path) -> None:
+     """Every memory tool but strata_bind is gated — not just one of them."""
+     db_path = _make_db(tmp_path)
+@@ -3180,7 +3461,7 @@ async def test_strata_bind_works_while_unresolved(tmp_path: Path) -> None:
+         patch.object(mod, "_UNRESOLVED", True),
+         patch.object(mod, "_STARTUP_ERRORS_BINDING", ["STRATA_AGENT_SCOPE is not set."]),
+     ):
+-        result = mod.strata_bind(scope_id="g_backend")
++        result = await mod.strata_bind(scope_id="g_backend")
+         assert result["scope_id"] == "g_backend"
+         assert mod._UNRESOLVED is False
+ 
+@@ -3300,7 +3581,7 @@ async def test_fleet_missing_at_startup_then_created_bindable_without_restart(
+         }
+         fleet_path.write_text(yaml.dump(fleet_data, default_flow_style=False), encoding="utf-8")
+ 
+-        result = mod.strata_bind(scope_id="g_solo")
++        result = await mod.strata_bind(scope_id="g_solo")
+         assert result["scope_id"] == "g_solo"
+         assert mod._UNRESOLVED is False
+ 
+@@ -3539,7 +3820,7 @@ async def test_elicitation_never_attempted_from_within_strata_bind(tmp_path: Pat
+             side_effect=AssertionError("strata_bind must never elicit"),
+         ),
+     ):
+-        result = mod.strata_bind(scope_id="g_backend")
++        result = await mod.strata_bind(scope_id="g_backend")
+         assert result["scope_id"] == "g_backend"
+ 
+ 
+@@ -3639,7 +3920,7 @@ async def test_elicit_declined_latch_cleared_by_successful_bind(tmp_path: Path)
+         assert mod._ELICIT_DECLINED is True
+ 
+         # A later successful strata_bind clears the latch.
+-        bind_result = mod.strata_bind(scope_id="g_backend")
++        bind_result = await mod.strata_bind(scope_id="g_backend")
+         assert bind_result["scope_id"] == "g_backend"
+         assert mod._ELICIT_DECLINED is False
+ 
+@@ -3675,7 +3956,7 @@ async def test_config_class_failure_survives_a_successful_binding_class_bind(
+     ):
+         # The bind itself succeeds — the scope/skill problem strata_bind was
+         # asked to fix is fully valid and gets fixed.
+-        result = mod.strata_bind(scope_id="g_backend")
++        result = await mod.strata_bind(scope_id="g_backend")
+         assert result["scope_id"] == "g_backend"
+         # Told, in the same result, that memory tools remain gated anyway.
+         assert "config_notice" in result

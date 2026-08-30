@@ -107,6 +107,26 @@ def test_remove_agents_md_round_trips_a_fresh_file() -> None:
     assert new_text == ""
 
 
+def test_shipped_agents_md_block_prohibits_reading_strata_dir_directly() -> None:
+    """Live incident: an unbound agent shell-read .strata/summaries/g_root.md
+    directly instead of asking the user which scope to bind as — bypassing
+    binding, scoping, and judgment entirely. The seeded AGENTS.md block (the
+    REAL shipped content, via merge_agents_md, not a hand-copied string) must
+    say plainly: never touch .strata/ directly.
+
+    Live-replay follow-up: the ask-first rule used to fire on the agent's
+    own judgment ("if shared memory would help") — an agent that never
+    judged memory would help never triggered it. Reworked so the not-bound
+    error ITSELF is the trigger: any strata tool returning it means stop
+    and ask, no judgment call involved.
+    """
+    text, _ = install.merge_agents_md("")
+    normalized = " ".join(text.lower().split())
+    assert "never read or write files under `.strata/` directly" in normalized
+    assert "if any strata tool returns the not-bound error" in normalized
+    assert "stop and ask the user which scope to act as" in normalized
+
+
 def test_remove_agents_md_round_trips_users_preexisting_content() -> None:
     existing = "# My Project\n\nSome hand-written agent instructions here.\n"
     text, _ = install.merge_agents_md(existing)

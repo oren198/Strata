@@ -184,15 +184,38 @@ def test_edited_skill_left_in_place_exit_1(tmp_path: Path, capsys) -> None:
     assert not (tmp_path / ".claude" / "skills" / "strata-inspect").exists()
 
 
-def test_edited_settings_entry_left_in_place_exit_1(tmp_path: Path, capsys) -> None:
-    """An edited mcpServers.strata entry is left in place and exits 1."""
+def test_edited_mcp_json_entry_left_in_place_exit_1(tmp_path: Path, capsys) -> None:
+    """An edited mcpServers.strata entry in .mcp.json is left in place and exits 1."""
     _init_project(tmp_path)
     cmd_register(_register_args(str(tmp_path)))
 
-    settings_json = tmp_path / ".claude" / "settings.json"
-    data = json.loads(settings_json.read_text(encoding="utf-8"))
+    mcp_json = tmp_path / ".mcp.json"
+    data = json.loads(mcp_json.read_text(encoding="utf-8"))
     data["mcpServers"]["strata"]["command"] = "/custom/strata-mcp"
-    settings_json.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    mcp_json.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+
+    rc = cmd_unregister(_unregister_args(str(tmp_path)))
+
+    assert rc == 1
+    on_disk = json.loads(mcp_json.read_text(encoding="utf-8"))
+    assert on_disk["mcpServers"]["strata"]["command"] == "/custom/strata-mcp"
+    captured = capsys.readouterr()
+    assert ".mcp.json" in captured.err
+    assert "edited" in captured.err or "differs" in captured.err
+
+
+def test_edited_legacy_settings_entry_left_in_place_exit_1(tmp_path: Path, capsys) -> None:
+    """An edited legacy mcpServers.strata entry in .claude/settings.json
+    (never migrated because it doesn't byte-match) is left in place and
+    exits 1."""
+    _init_project(tmp_path)
+    cmd_register(_register_args(str(tmp_path)))
+
+    claude_dir = tmp_path / ".claude"
+    settings_json = claude_dir / "settings.json"
+    settings_data = json.loads(settings_json.read_text(encoding="utf-8"))
+    settings_data["mcpServers"] = {"strata": {"command": "/custom/strata-mcp", "env": {}}}
+    settings_json.write_text(json.dumps(settings_data, indent=2) + "\n", encoding="utf-8")
 
     rc = cmd_unregister(_unregister_args(str(tmp_path)))
 
@@ -202,6 +225,119 @@ def test_edited_settings_entry_left_in_place_exit_1(tmp_path: Path, capsys) -> N
     captured = capsys.readouterr()
     assert "settings.json" in captured.err
     assert "edited" in captured.err or "differs" in captured.err
+
+
+# ---------------------------------------------------------------------------
+# HIGH 1 (fix round): the --bootstrap-venv-shape matcher must be narrow —
+# a live incident found the old version matched any command ending in
+# ".strata/.venv/bin/strata-mcp" plus an env-is-dict check, which deleted
+# hand-edited entries (extra keys) and entries pointing at ANOTHER
+# project's venv. Tightened to require the exact key set {"command", "env"}
+# AND command == THIS project's own venv path.
+# ---------------------------------------------------------------------------
+
+
+def test_venv_shape_entry_with_extra_keys_survives_unregister(tmp_path: Path, capsys) -> None:
+    """A venv-shaped .mcp.json entry with extra keys (never something
+    register wrote — register's --bootstrap-venv writes exactly {command,
+    env}) is left in place, not silently deleted."""
+    _init_project(tmp_path)
+    cmd_register(_register_args(str(tmp_path)))
+
+    venv_command = str(tmp_path / ".strata" / ".venv" / "bin" / "strata-mcp")
+    mcp_json = tmp_path / ".mcp.json"
+    mcp_data = json.loads(mcp_json.read_text(encoding="utf-8"))
+    mcp_data["mcpServers"]["strata"] = {
+        "command": venv_command,
+        "env": {},
+        "args": ["--extra"],
+    }
+    mcp_json.write_text(json.dumps(mcp_data, indent=2) + "\n", encoding="utf-8")
+
+    rc = cmd_unregister(_unregister_args(str(tmp_path)))
+
+    assert rc == 1
+    on_disk = json.loads(mcp_json.read_text(encoding="utf-8"))
+    assert on_disk["mcpServers"]["strata"]["command"] == venv_command
+    assert on_disk["mcpServers"]["strata"]["args"] == ["--extra"]
+    captured = capsys.readouterr()
+    assert ".mcp.json" in captured.err
+
+
+def test_venv_shape_entry_pointing_at_foreign_project_survives_unregister(
+    tmp_path: Path, capsys
+) -> None:
+    """A venv-shaped entry whose command points at ANOTHER project's venv
+    (same suffix, different root) must never be treated as this project's
+    own register-written entry."""
+    _init_project(tmp_path)
+    cmd_register(_register_args(str(tmp_path)))
+
+    foreign_command = "/opt/other-project/.strata/.venv/bin/strata-mcp"
+    mcp_json = tmp_path / ".mcp.json"
+    mcp_data = json.loads(mcp_json.read_text(encoding="utf-8"))
+    mcp_data["mcpServers"]["strata"] = {"command": foreign_command, "env": {}}
+    mcp_json.write_text(json.dumps(mcp_data, indent=2) + "\n", encoding="utf-8")
+
+    rc = cmd_unregister(_unregister_args(str(tmp_path)))
+
+    assert rc == 1
+    on_disk = json.loads(mcp_json.read_text(encoding="utf-8"))
+    assert on_disk["mcpServers"]["strata"]["command"] == foreign_command
+
+
+# ---------------------------------------------------------------------------
+# HIGH 2 (fix round): valid JSON but not an object (`[]`, `null`, ...) must
+# never crash with a raw AttributeError.
+# ---------------------------------------------------------------------------
+
+
+def test_unregister_non_dict_mcp_json_does_not_crash(tmp_path: Path, capsys) -> None:
+    """`.mcp.json` containing valid JSON that isn't an object (e.g. `[]`)
+    must be reported, not crash with AttributeError."""
+    _init_project(tmp_path)
+    cmd_register(_register_args(str(tmp_path)))
+    (tmp_path / ".mcp.json").write_text("[]", encoding="utf-8")
+
+    rc = cmd_unregister(_unregister_args(str(tmp_path)))
+
+    assert rc == 1
+    captured = capsys.readouterr()
+    assert ".mcp.json" in captured.err
+
+
+def test_unregister_null_mcp_json_does_not_crash(tmp_path: Path, capsys) -> None:
+    """`null` is valid JSON but not an object — must not crash either."""
+    _init_project(tmp_path)
+    cmd_register(_register_args(str(tmp_path)))
+    (tmp_path / ".mcp.json").write_text("null", encoding="utf-8")
+
+    rc = cmd_unregister(_unregister_args(str(tmp_path)))
+
+    assert rc == 1
+    captured = capsys.readouterr()
+    assert ".mcp.json" in captured.err
+
+
+# ---------------------------------------------------------------------------
+# LOW (fix round): --dry-run also previews the .mcp.json deletion.
+# ---------------------------------------------------------------------------
+
+
+def test_dry_run_previews_mcp_json_removal(tmp_path: Path, capsys) -> None:
+    """--dry-run on a clean register must preview that .mcp.json would be
+    removed (empty after removal), not just the entry inside it."""
+    _init_project(tmp_path)
+    cmd_register(_register_args(str(tmp_path)))
+    capsys.readouterr()
+
+    rc = cmd_unregister(_unregister_args(str(tmp_path), dry_run=True))
+
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert "would remove" in captured.out.lower()
+    assert ".mcp.json" in captured.out
+    assert (tmp_path / ".mcp.json").exists(), "--dry-run must not delete anything"
 
 
 def test_edited_gitignore_block_left_in_place_exit_1(tmp_path: Path, capsys) -> None:
@@ -345,39 +481,46 @@ def test_gitignore_block_removed_byte_exact(tmp_path: Path) -> None:
     assert (tmp_path / ".gitignore").read_text(encoding="utf-8") == original
 
 
-def test_settings_entry_removed_preserving_other_keys(tmp_path: Path) -> None:
-    """Removing mcpServers.strata preserves every other settings key."""
+def test_mcp_json_entry_removed_preserving_other_keys(tmp_path: Path) -> None:
+    """Removing mcpServers.strata from .mcp.json preserves every other key."""
     _init_project(tmp_path)
-    claude_dir = tmp_path / ".claude"
-    claude_dir.mkdir()
-    user_settings = {
-        "theme": "dark",
+    user_mcp = {
         "mcpServers": {"other-tool": {"command": "other-tool-bin"}},
     }
-    (claude_dir / "settings.json").write_text(
-        json.dumps(user_settings, indent=2) + "\n", encoding="utf-8"
-    )
+    (tmp_path / ".mcp.json").write_text(json.dumps(user_mcp, indent=2) + "\n", encoding="utf-8")
 
     cmd_register(_register_args(str(tmp_path)))
     cmd_unregister(_unregister_args(str(tmp_path), purge_data=True))
 
-    data = json.loads((claude_dir / "settings.json").read_text(encoding="utf-8"))
-    assert data["theme"] == "dark"
+    data = json.loads((tmp_path / ".mcp.json").read_text(encoding="utf-8"))
     assert data["mcpServers"] == {"other-tool": {"command": "other-tool-bin"}}
     assert "strata" not in data.get("mcpServers", {})
 
 
-def test_settings_mcpservers_block_dropped_when_only_strata(tmp_path: Path) -> None:
-    """When register created mcpServers solely for strata, the block is dropped."""
+def test_mcp_json_dropped_when_only_strata(tmp_path: Path) -> None:
+    """When register created .mcp.json solely for strata, the file is removed
+    entirely for a clean round-trip."""
     _init_project(tmp_path)
     cmd_register(_register_args(str(tmp_path)))
-    settings_json = tmp_path / ".claude" / "settings.json"
-    assert "mcpServers" in json.loads(settings_json.read_text(encoding="utf-8"))
+    mcp_json = tmp_path / ".mcp.json"
+    assert "mcpServers" in json.loads(mcp_json.read_text(encoding="utf-8"))
 
     cmd_unregister(_unregister_args(str(tmp_path)))
 
-    data = json.loads(settings_json.read_text(encoding="utf-8"))
-    assert "mcpServers" not in data
+    assert not mcp_json.exists()
+
+
+def test_settings_json_never_gets_mcpservers_key(tmp_path: Path) -> None:
+    """register/unregister never introduces an mcpServers key into
+    .claude/settings.json — it has no such key in its schema."""
+    _init_project(tmp_path)
+    cmd_register(_register_args(str(tmp_path)))
+    settings_json = tmp_path / ".claude" / "settings.json"
+    assert "mcpServers" not in json.loads(settings_json.read_text(encoding="utf-8"))
+
+    cmd_unregister(_unregister_args(str(tmp_path)))
+
+    assert "mcpServers" not in json.loads(settings_json.read_text(encoding="utf-8"))
 
 
 def test_unmodified_skills_removed(tmp_path: Path) -> None:

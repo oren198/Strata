@@ -1,0 +1,3173 @@
+diff --git a/docs/adr/0005-brownfield-install.md b/docs/adr/0005-brownfield-install.md
+index 8748ce2..d5bf92d 100644
+--- a/docs/adr/0005-brownfield-install.md
++++ b/docs/adr/0005-brownfield-install.md
+@@ -348,3 +348,64 @@ Three feature branches off `dev`, stacked sequentially:
+ **V1.2.1** = branches 1 + 2 (closes ADR 0004, adds preflight
+ hygiene).
+ **V1.3** = branch 3 (ADR 0005 in full — the brownfield install).
++
++---
++
++## Amendment — soft-start: the refusal travels in tool results, not just stderr (2026-08-29)
++
++**The incident.** Decision 5's refuse-to-start validation worked exactly as
++designed and still failed the user: a fleet with 2+ scopes and an unbound
++session (or an unknown scope, an impermissible skill, or a missing/invalid
++fleet) printed the aggregated, actionable error to stderr and called
++`sys.exit(1)`. Both Codex and Claude Code — the two harnesses this server
++actually runs inside — swallow a failed MCP server's stderr entirely. The
++human never sees "valid scopes are …"; they see only an opaque "MCP
++handshake failed." Decision 5 assumed a human reads stderr. Running inside
++an agent harness, nobody does.
++
++**The fix.** The MCP server always completes the handshake now. Every
++startup validation failure that used to call `sys.exit(1)` — unbound
++multi-scope, unknown scope, impermissible skill, missing/invalid fleet
++config, missing `.strata/config.toml` — is instead aggregated into a
++startup-failure list, exactly as before, and stored on the running server.
++`main()` no longer exits on a binding failure; `_validate_binding` returns
++the list instead of calling `sys.exit`.
++
++Every memory tool except `strata_bind` checks this state first
++(`_require_bound_or_elicit`, `strata/mcp/server.py`): while unresolved, it
++returns that same aggregated list as its error result, appended with the
++recovery instructions that used to only reach stderr — which scopes exist,
++and that `strata_bind(scope_id=...)` (or fixing the underlying env/config
++and calling it again) resolves the session with no restart. An agent
++working inside a harness that hides stderr now reads the refusal exactly
++where it already reads every other tool result.
++
++`strata_bind` — Decision 5's own runtime-rebind companion, added after this
++ADR's initial acceptance — is untouched by this gate and is *the* recovery
++path: it re-reads `fleet.yaml` through the same reloader every other call
++uses, so a fleet fixed (or created) after startup is bindable immediately,
++matching the "no restart required" property `strata_bind` already had.
++
++**What still exits.** Storage initialisation failures (an unwritable
++directory, a corrupt DB) still call `sys.exit(1)`. Decision 5's binding
++checks are all recoverable via `strata_bind` once the server is running;
++a storage layer that cannot be opened is not — there is no tool call that
++fixes a corrupt SQLite file, so refusing to start is still the right
++answer there. Single-scope auto-bind (Decision 5, checked before the
++unset-scope failure) is unchanged: it never produced a failure to begin
++with.
++
++**Companion change (same session): elicitation.** When a tool is called
++unbound and the fleet itself loads fine, the server now attempts one
++server-initiated MCP elicitation first — offering the caller a pick of the
++fleet's scopes — before falling back to the aggregated error above. See
++`_attempt_elicit_bind` in `strata/mcp/server.py`. Tolerant by construction:
++a client that lacks the elicitation capability, declines, cancels, or hits
++a transport error falls back silently to the same error result a harness
++without elicitation support gets. This is genuinely conditional on client
++support — as of this addendum, the two harnesses this server ships for
++(Codex, Claude Code) are not known to implement server-initiated MCP
++elicitation, so in practice this path is dormant there today and the
++aggregated error result (the fix above) is what actually reaches an agent
++in either harness; the elicitation attempt is there for any client that
++does support it, present or future, and costs nothing when it isn't.
+diff --git a/src/strata/mcp/server.py b/src/strata/mcp/server.py
+index b394bf3..b8ab2d5 100644
+--- a/src/strata/mcp/server.py
++++ b/src/strata/mcp/server.py
+@@ -52,7 +52,10 @@ from pathlib import Path
+ from typing import Literal
+ 
+ import yaml
++from mcp.server.elicitation import AcceptedElicitation
+ from mcp.server.fastmcp import FastMCP
++from mcp.types import ClientCapabilities, ElicitationCapability
++from pydantic import BaseModel, Field
+ 
+ from strata.fleet_config import FleetConfig, FleetConfigError, Scope
+ from strata.fleet_reload import FleetReloader
+@@ -244,6 +247,29 @@ _AGENT_SCOPE: str = os.environ.get("STRATA_AGENT_SCOPE", "")
+ _AGENT_SKILL: str | None = os.environ.get("STRATA_AGENT_SKILL") or None
+ _AGENT_SESSION_ID: str = resolve_agent_session_id()
+ 
++# Soft-start state (dated addendum to ADR 0005 Decision 5 — see
++# docs/adr/0005-brownfield-install.md). A harness that swallows stderr (the
++# motivating incident: Codex and Claude Code both do) never shows a human
++# the refuse-to-start message, so the same aggregated failure list that used
++# to go to sys.exit(1) is instead captured here and handed back as the
++# result of every memory tool call until the session is bound — see
++# _require_bound_or_elicit(), below. Set once by main() before mcp.run();
++# left at its default (resolved, no errors) for every test that never calls
++# main(), which is what keeps the rest of this module's existing tests
++# behaving exactly as before.
++_UNRESOLVED: bool = False
++_STARTUP_ERRORS: list[str] = []
++
++# Change 2 (elicitation) latch: a client that declines or cancels once, or
++# whose answer fails to bind, should not be re-prompted on its very next
++# tool call in the same process — "one elicitation attempt per tool call at
++# most" (spec) reads as "don't nag" across a session's worth of calls too.
++# A capability-absent client is never latched here: there is nothing to
++# retry differently next time, so the (silent, free) capability check runs
++# again rather than being remembered as a decline. Cleared implicitly by any
++# successful bind (checked only while _UNRESOLVED is True).
++_ELICIT_DECLINED: bool = False
++
+ # Guards ONLY the (scope, skill) WRITE in strata_bind (Feature B), so a
+ # concurrent strata_bind call can't interleave its two assignments with
+ # another's (no torn write of the pair). It does NOT guard reads: every
+@@ -322,6 +348,22 @@ def _attach_fleet_notice(result: dict) -> dict:
+     return result
+ 
+ 
++def _attach_unbound_notice(result: dict) -> dict:
++    """Attach a one-line ``unbound_notice`` when the session is still
++    unresolved (soft-start, Change 1) — for the pure fleet-topology tools
++    (currently only strata_list_scopes) that are deliberately NOT gated by
++    _require_bound_or_elicit: topology is not scoped memory, so an agent
++    helping the user bind can still see it, but the unbound state should
++    stay visible rather than silently look identical to a normal call.
++
++    Additive, like :func:`_attach_fleet_notice`: the key is present only
++    when there is something to say.
++    """
++    if _UNRESOLVED:
++        result["unbound_notice"] = "session not bound yet — bind with strata_bind(scope_id=...)"
++    return result
++
++
+ def _publication_item_dict(item: PublishedItem) -> dict:
+     """Verbatim item dict for a published item, as returned across MCP tool surfaces."""
+     return {
+@@ -627,7 +669,7 @@ def _check_skill_permitted(scope_obj: Scope, scope_id: str, skill: str) -> str |
+ 
+ 
+ # ---------------------------------------------------------------------------
+-# Refuse-to-start validation (ADR 0005 Decision 5)
++# Startup validation (ADR 0005 Decision 5; soft-start dated addendum)
+ # ---------------------------------------------------------------------------
+ 
+ 
+@@ -639,14 +681,23 @@ def _validate_binding(
+     project_config_found: bool = False,
+     searched_paths: list[str] | None = None,
+     extra_errors: list[str] | None = None,
+-) -> tuple[str, str | None]:
++) -> tuple[str, str | None, list[str]]:
+     """Validate agent binding before starting the MCP server.
+ 
+-    Runs all checks independently, then reports every failure in a single
+-    error message before ``sys.exit(1)`` (per ADR 0005 Decision 5 — "all
+-    failures are reported in a single error message"). A user with multiple
+-    missing pieces sees the complete remediation list in one pass rather than
+-    fix-one-rerun-fix-next.
++    Runs all checks independently and returns every failure in one list (per
++    ADR 0005 Decision 5 — "all failures are reported in a single error
++    message"). A user with multiple missing pieces sees the complete
++    remediation list in one pass rather than fix-one-rerun-fix-next.
++
++    Soft-start (dated addendum, docs/adr/0005-brownfield-install.md): this
++    function no longer exits the process. A harness that swallows stderr
++    (Codex, Claude Code) never surfaces a sys.exit(1) message to the human
++    behind it — the motivating incident this addendum fixes. The caller
++    (main()) now always proceeds to mcp.run(); when the returned error list
++    is non-empty it stores the list and marks the session unresolved, and
++    every memory tool (except strata_bind, the recovery path) returns that
++    same list as its error result until the session is bound — see
++    _require_bound_or_elicit(), below.
+ 
+     Checks (in order, outermost setup gap → innermost binding mismatch):
+ 
+@@ -688,9 +739,10 @@ def _validate_binding(
+                                #46) — reported in the same aggregated message.
+ 
+     Returns:
+-        ``(resolved_scope, resolved_skill)`` — the values the caller should
+-        actually bind to. Identical to ``(scope, skill)`` unless auto-binding
+-        applied. Never returns on failure — exits the process instead.
++        ``(resolved_scope, resolved_skill, errors)`` — the values the caller
++        should bind to (identical to ``(scope, skill)`` unless auto-binding
++        applied), and the list of validation failures (empty on success).
++        Always returns — soft-start never exits the process.
+     """
+     errors: list[str] = list(extra_errors) if extra_errors else []
+ 
+@@ -777,17 +829,196 @@ def _validate_binding(
+             errors.append(skill_error)
+ 
+     if errors:
+-        # Report all failures in a single error message — the user sees the
+-        # complete remediation list in one pass.
++        # Still printed for a human who does read stderr (local dev) — but
++        # soft-start no longer exits on it; the same list also travels back
++        # via _STARTUP_ERRORS for every memory tool to report (see main()
++        # and _require_bound_or_elicit(), below).
+         header = (
+-            "Strata MCP server refuses to start — "
++            "Strata MCP server started but is not yet bound — "
+             f"{len(errors)} validation {'failure' if len(errors) == 1 else 'failures'}:\n"
+         )
+         body = "\n".join(f"\n[{i + 1}] {err}" for i, err in enumerate(errors))
+         print(header + body, file=sys.stderr)
+-        sys.exit(1)
+ 
+-    return resolved_scope, resolved_skill
++    return resolved_scope, resolved_skill, errors
++
++
++def _resolve_bind(
++    fleet: FleetConfig, scope_id: str, skill: str | None
++) -> tuple[str | None, list[str]]:
++    """Validate a candidate (scope_id, skill) binding against *fleet*.
++
++    The one rule for "is this a valid binding to rebind to right now",
++    shared by strata_bind (an explicit agent request) and the elicitation
++    fallback in _attempt_elicit_bind (an accepted scope pick) — so the two
++    entry points can never drift into disagreeing about what a valid
++    rebind is. Deliberately does NOT touch the _AGENT_SCOPE/_AGENT_SKILL
++    globals; callers apply the result themselves after deciding how to
++    react to a failure (raise vs. silently give up).
++
++    Returns:
++        ``(resolved_skill, errors)`` — ``errors`` is empty on success, and
++        ``resolved_skill`` is the skill to bind (including a resolved
++        ``default_skill`` when *skill* was omitted).
++    """
++    errors: list[str] = []
++    scope_obj, exists_error = _check_scope_exists(fleet, scope_id, require_active=True)
++    if exists_error is not None:
++        return None, [exists_error]
++
++    assert scope_obj is not None
++    # Companion default-skill rule (shared with startup auto-bind, same
++    # helper): a scope with a default_skill may be bound without naming
++    # one, so an omitted skill is not automatically "requires a skill."
++    resolved_skill = _resolve_skill_default(scope_obj, skill)
++
++    if resolved_skill:
++        skill_error = _check_skill_permitted(scope_obj, scope_id, resolved_skill)
++        if skill_error is not None:
++            errors.append(skill_error)
++    elif not _scope_waives_skill(scope_obj):
++        errors.append(
++            f"scope {scope_id!r} declares skills (default_skill or "
++            "permitted_skills) but no skill was given.\n"
++            "  Pass skill=<one of its permitted skills>, or omit skill only "
++            "for an unrestricted scope."
++        )
++
++    return resolved_skill, errors
++
++
++def _unresolved_message(fleet: FleetConfig | None) -> str:
++    """Build the error text a memory tool returns while the session is unbound.
++
++    Same content the refuse-to-start message used to print to stderr (now
++    unreadable inside a harness), plus the recovery instructions that are
++    new to soft-start: which scopes exist, and the two ways out —
++    strata_bind, or fixing the underlying env/config and calling
++    strata_bind again (it re-reads fleet.yaml itself).
++    """
++    header = (
++        "Strata MCP server started but this session is not yet bound — "
++        f"{len(_STARTUP_ERRORS)} startup validation "
++        f"{'failure' if len(_STARTUP_ERRORS) == 1 else 'failures'}:\n"
++    )
++    body = "\n".join(f"\n[{i + 1}] {err}" for i, err in enumerate(_STARTUP_ERRORS))
++
++    scope_ids = [s.id for s in fleet.active_scopes()] if fleet is not None else []
++    scopes_line = (
++        f"  Available scope IDs: {', '.join(scope_ids)}\n"
++        if scope_ids
++        else "  (no active scopes found in fleet.yaml)\n"
++    )
++    recovery = (
++        "\n\nTo recover without restarting this server:\n"
++        f"{scopes_line}"
++        "  Call strata_bind(scope_id=<one of the above>[, skill=<skill>]) to bind "
++        "this session now, or\n"
++        "  fix the underlying issue (create/edit fleet.yaml, set "
++        "STRATA_AGENT_SCOPE/STRATA_AGENT_SKILL) and call strata_bind again — "
++        "fleet.yaml is re-read as part of that call, so a fix made after startup "
++        "is bindable immediately.\n"
++        "  strata_list_scopes works unbound too (fleet topology is not scoped "
++        "memory) if you need the full strata/scope/edge picture before picking."
++    )
++    return header + body + recovery
++
++
++class _ScopePick(BaseModel):
++    """Elicitation response schema (Change 2): the scope id the caller picked."""
++
++    scope_id: str = Field(description="The scope_id to bind this session to.")
++
++
++async def _attempt_elicit_bind(fleet: FleetConfig) -> bool:
++    """Try once to resolve the unbound session via server-initiated elicitation.
++
++    Change 2. Offers the caller a pick of the fleet's active scopes; an
++    accepted pick is bound via the exact same rule strata_bind enforces
++    (_resolve_bind, above) — "bind via the same path as strata_bind."
++
++    Tolerant of everything: no MCP session available, the client not
++    declaring the elicitation capability, the client declining/cancelling,
++    a validation failure on the picked scope, or any transport error —
++    every one of these returns False so the caller falls back to the plain
++    Change-1 error result. Never raises.
++    """
++    global _ELICIT_DECLINED
++
++    if _ELICIT_DECLINED:
++        return False
++
++    scopes = fleet.active_scopes()
++    if not scopes:
++        return False
++
++    try:
++        ctx = mcp.get_context()
++        request_context = ctx.request_context
++        if request_context is None:
++            return False
++        session = request_context.session
++        if not session.check_client_capability(
++            ClientCapabilities(elicitation=ElicitationCapability())
++        ):
++            return False
++
++        listing = "\n".join(f"- {s.id}: {s.name}" for s in sorted(scopes, key=lambda s: s.id))
++        message = (
++            "Strata is not yet bound to a scope for this session. Pick one to continue:\n" + listing
++        )
++
++        result = await ctx.elicit(message, _ScopePick)
++    except Exception:  # noqa: BLE001 - any elicitation failure falls back silently
++        return False
++
++    if not isinstance(result, AcceptedElicitation):
++        # DeclinedElicitation, CancelledElicitation, or an unexpected shape —
++        # latch so this process doesn't re-prompt the same client again.
++        _ELICIT_DECLINED = True
++        return False
++
++    picked_scope_id = result.data.scope_id
++    resolved_skill, errors = _resolve_bind(fleet, picked_scope_id, None)
++    if errors:
++        return False
++
++    global _AGENT_SCOPE, _AGENT_SKILL, _UNRESOLVED
++    with _binding_lock:
++        _AGENT_SCOPE = picked_scope_id
++        _AGENT_SKILL = resolved_skill
++        _UNRESOLVED = False
++    return True
++
++
++async def _require_bound_or_elicit() -> None:
++    """Guard called at the top of every tool that touches actual memory —
++    a scope's summary, record, perspective, or session state — except
++    strata_bind. Pure fleet-topology reads (currently only
++    strata_list_scopes) do NOT call this: topology is not scoped memory,
++    so an unbound agent helping the user bind can still see it — see
++    _attach_unbound_notice, its ungated counterpart.
++
++    A no-op — zero overhead — once the session is resolved (the common
++    case). While unresolved: tries exactly one elicitation attempt (Change
++    2) when the fleet itself loads fine (nothing to offer a pick of
++    otherwise); on any outcome other than a successful bind, raises with
++    the same aggregated startup-failure list plus recovery instructions
++    that used to only reach stderr (Change 1).
++    """
++    if not _UNRESOLVED:
++        return
++
++    fleet: FleetConfig | None
++    try:
++        fleet = _load_fleet()
++    except Exception:  # noqa: BLE001 - a fleet that still won't load has nothing to elicit
++        fleet = None
++
++    if fleet is not None and await _attempt_elicit_bind(fleet):
++        return
++
++    raise RuntimeError(_unresolved_message(fleet))
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -869,36 +1100,22 @@ def strata_bind(scope_id: str, skill: str | None = None) -> dict:
+             not permitted — the error lists the valid scopes/skills. The
+             binding is left unchanged in every failure case.
+     """
+-    global _AGENT_SCOPE, _AGENT_SKILL
+-
++    global _AGENT_SCOPE, _AGENT_SKILL, _UNRESOLVED
++
++    # This is THE recovery path for an unresolved session (Change 1), so it
++    # deliberately re-reads fleet.yaml itself (below) rather than trusting
++    # any cached startup fleet — a fleet fixed after startup must be
++    # bindable without a restart. It also never calls
++    # _require_bound_or_elicit(): eliciting from inside the tool that IS the
++    # elicitation's own bind target would be circular.
+     fleet = _load_fleet()
+-    errors: list[str] = []
+ 
+     # require_active=True is the shared "archived scopes cannot be bound"
+     # rule — the same check startup binding runs (_validate_binding, above),
+-    # not a parallel reimplementation of it.
+-    scope_obj, exists_error = _check_scope_exists(fleet, scope_id, require_active=True)
+-    resolved_skill = skill
+-    if exists_error is not None:
+-        errors.append(exists_error)
+-    else:
+-        assert scope_obj is not None
+-        # Companion default-skill rule (shared with startup auto-bind, same
+-        # helper): a scope with a default_skill may be bound without naming
+-        # one, so an omitted skill is not automatically "requires a skill."
+-        resolved_skill = _resolve_skill_default(scope_obj, skill)
+-
+-        if resolved_skill:
+-            skill_error = _check_skill_permitted(scope_obj, scope_id, resolved_skill)
+-            if skill_error is not None:
+-                errors.append(skill_error)
+-        elif not _scope_waives_skill(scope_obj):
+-            errors.append(
+-                f"scope {scope_id!r} declares skills (default_skill or "
+-                "permitted_skills) but no skill was given.\n"
+-                "  Pass skill=<one of its permitted skills>, or omit skill only "
+-                "for an unrestricted scope."
+-            )
++    # not a parallel reimplementation of it. _resolve_bind is the same
++    # "is this a valid rebind" rule the elicitation fallback (Change 2)
++    # applies to an accepted scope pick.
++    resolved_skill, errors = _resolve_bind(fleet, scope_id, skill)
+ 
+     if errors:
+         # Feature A: the exact incident this tool exists to close is a
+@@ -919,6 +1136,7 @@ def strata_bind(scope_id: str, skill: str | None = None) -> dict:
+     with _binding_lock:
+         _AGENT_SCOPE = scope_id
+         _AGENT_SKILL = resolved_skill
++        _UNRESOLVED = False
+ 
+     result = {
+         "scope_id": _AGENT_SCOPE,
+@@ -939,7 +1157,7 @@ def strata_bind(scope_id: str, skill: str | None = None) -> dict:
+ 
+ 
+ @mcp.tool()
+-def strata_contribute(
++async def strata_contribute(
+     scope_id: str,
+     content: str,
+     proposed_classification: Literal["directive", "context"],
+@@ -992,6 +1210,8 @@ def strata_contribute(
+         RuntimeError: If the scope is not found, is archived, or is outside
+             this agent's entitled write surface.
+     """
++    await _require_bound_or_elicit()
++
+     # Snapshot the binding ONCE, into locals, and use these — never the
+     # _AGENT_* globals directly — for both the authorization check below and
+     # the provenance stamp on ContributorRef. Without this, a strata_bind
+@@ -1088,7 +1308,7 @@ def strata_contribute(
+ 
+ 
+ @mcp.tool()
+-def strata_rejudge(contribution_id: str) -> dict:
++async def strata_rejudge(contribution_id: str) -> dict:
+     """Re-judge a contribution whose scope-manager judgment previously failed.
+ 
+     Idempotent (issue #57): if the contribution already has a verdict, this is
+@@ -1124,6 +1344,8 @@ def strata_rejudge(contribution_id: str) -> dict:
+             (the contribution stays pending; a fresh judgment-attempt-failed
+             event is recorded and you may re-judge again later).
+     """
++    await _require_bound_or_elicit()
++
+     fleet = _load_fleet()
+ 
+     contribution = _record_store.get_contribution(contribution_id)
+@@ -1197,7 +1419,7 @@ def strata_rejudge(contribution_id: str) -> dict:
+ 
+ 
+ @mcp.tool()
+-def strata_publish(
++async def strata_publish(
+     content: str,
+     kind: Literal["directive", "context"],
+     anchors: list[str],
+@@ -1244,6 +1466,8 @@ def strata_publish(
+         RuntimeError: The bound scope is unknown, or the anchors fail
+             structural validation.
+     """
++    await _require_bound_or_elicit()
++
+     # Snapshot the binding ONCE — see strata_contribute for why (authorize
+     # and stamp must use the identical value, never two separate global reads).
+     agent_scope, agent_skill, agent_session_id = _AGENT_SCOPE, _AGENT_SKILL, _AGENT_SESSION_ID
+@@ -1298,7 +1522,7 @@ def strata_publish(
+ 
+ 
+ @mcp.tool()
+-def strata_withdraw(item_id: str) -> dict:
++async def strata_withdraw(item_id: str) -> dict:
+     """Propose withdrawing a published item from this agent's bound scope's publication.
+ 
+     Same proposal-not-write shape as ``strata_publish`` — the scope-manager
+@@ -1322,6 +1546,8 @@ def strata_withdraw(item_id: str) -> dict:
+         RuntimeError: The bound scope is unknown, or *item_id* is not in this
+             scope's current publication.
+     """
++    await _require_bound_or_elicit()
++
+     # Snapshot the binding ONCE — see strata_contribute for why.
+     agent_scope, agent_skill, agent_session_id = _AGENT_SCOPE, _AGENT_SKILL, _AGENT_SESSION_ID
+ 
+@@ -1372,7 +1598,7 @@ def strata_withdraw(item_id: str) -> dict:
+ 
+ 
+ @mcp.tool()
+-def strata_read_scope_summary(scope_id: str | None = None) -> dict:
++async def strata_read_scope_summary(scope_id: str | None = None) -> dict:
+     """Return the scope summary for the given scope — or a referenced scope's publication.
+ 
+     For your own bound scope or an inter-stratum ancestor, this returns the
+@@ -1416,6 +1642,8 @@ def strata_read_scope_summary(scope_id: str | None = None) -> dict:
+         RuntimeError: If the scope does not exist, or if scope_id is outside
+             this agent's entitled context surface.
+     """
++    await _require_bound_or_elicit()
++
+     fleet = _load_fleet()
+ 
+     if scope_id is None:
+@@ -1467,7 +1695,7 @@ def strata_read_scope_summary(scope_id: str | None = None) -> dict:
+ 
+ 
+ @mcp.tool()
+-def strata_read_perspective(scope_id: str | None = None) -> dict:
++async def strata_read_perspective(scope_id: str | None = None) -> dict:
+     """Return this agent's perspective on the fleet's long-term memory.
+ 
+     A perspective is a composed, provenance-preserving view of: the scope's
+@@ -1512,6 +1740,8 @@ def strata_read_perspective(scope_id: str | None = None) -> dict:
+         RuntimeError: If the scope is unknown, or if scope_id is outside this
+             agent's entitled (chain-only) surface.
+     """
++    await _require_bound_or_elicit()
++
+     fleet = _load_fleet()
+ 
+     if scope_id is None:
+@@ -1576,11 +1806,20 @@ def strata_list_scopes() -> dict:
+     they are arranged into strata, and which chain and reference edges
+     connect them.
+ 
++    Works even while this session is unbound (soft-start, Change 1): fleet
++    topology is not scoped memory, so an agent helping the user pick a
++    scope to bind to can still see what's available — unlike every other
++    tool here, this one does NOT call _require_bound_or_elicit. While
++    unbound, the response carries an additional ``unbound_notice`` so that
++    state stays visible (_attach_unbound_notice) rather than looking like
++    an ordinary, fully-bound call.
++
+     Returns:
+         Fleet config: ``strata`` (list), ``scopes`` (list), ``edges`` (list).
+         Each edge carries ``kind`` — ``"chain"`` (binding; ``from_scope_id``
+         is always the child) or ``"reference"`` (non-binding; ``from_scope_id``
+-        references ``to_scope_id``).
++        references ``to_scope_id``). ``unbound_notice`` is present only while
++        this session has not yet been bound.
+     """
+     fleet = _load_fleet()
+ 
+@@ -1588,7 +1827,7 @@ def strata_list_scopes() -> dict:
+     active_ids = {s.id for s in active}
+     active_edges = [e for e in fleet.edges if e.from_ in active_ids and e.to in active_ids]
+ 
+-    return _attach_fleet_notice(
++    result = _attach_fleet_notice(
+         {
+             "strata": [s.model_dump() for s in fleet.strata],
+             "scopes": [s.model_dump() for s in active],
+@@ -1598,6 +1837,7 @@ def strata_list_scopes() -> dict:
+             ],
+         }
+     )
++    return _attach_unbound_notice(result)
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -1606,7 +1846,7 @@ def strata_list_scopes() -> dict:
+ 
+ 
+ @mcp.tool()
+-def strata_read_scope_record(
++async def strata_read_scope_record(
+     scope_id: str | None = None,
+     limit: int | None = None,
+     before_id: str | None = None,
+@@ -1673,6 +1913,8 @@ def strata_read_scope_record(
+             (chain-only) surface, or the paging arguments are out of range —
+             including a before_id that is not a contribution in this scope.
+     """
++    await _require_bound_or_elicit()
++
+     fleet = _load_fleet()
+ 
+     if scope_id is None:
+@@ -1718,7 +1960,7 @@ def strata_read_scope_record(
+ 
+ 
+ @mcp.tool()
+-def strata_read_contribution(contribution_id: str) -> dict:
++async def strata_read_contribution(contribution_id: str) -> dict:
+     """Return one contribution with its state, verdict, and judgment attempts.
+ 
+     The cheap answer to "what happened to the contribution I submitted?" — the
+@@ -1749,6 +1991,8 @@ def strata_read_contribution(contribution_id: str) -> dict:
+         RuntimeError: If the contribution is unknown, or its scope is outside
+             this agent's entitled (chain-only) surface.
+     """
++    await _require_bound_or_elicit()
++
+     fleet = _load_fleet()
+ 
+     entry = _record_store.get_record_entry(contribution_id)
+@@ -1774,7 +2018,7 @@ def strata_read_contribution(contribution_id: str) -> dict:
+ 
+ 
+ @mcp.tool()
+-def strata_session_stats() -> dict:
++async def strata_session_stats() -> dict:
+     """Return this session's mechanical read/contribute asymmetry counters.
+ 
+     A cheap, mechanical self-query (issue #110): the MCP server tracks, per
+@@ -1793,6 +2037,8 @@ def strata_session_stats() -> dict:
+         ``reads_by_scope`` (scope_id → ``{count, last_read_at}``). A session that
+         has done nothing yet returns zeroed counters, never an error.
+     """
++    await _require_bound_or_elicit()
++
+     if _session_store is not None:
+         state = _session_store.read(_AGENT_SESSION_ID)
+         if state is not None:
+@@ -1813,7 +2059,7 @@ def strata_session_stats() -> dict:
+ 
+ 
+ @mcp.tool()
+-def strata_session_closeout(reason: str) -> dict:
++async def strata_session_closeout(reason: str) -> dict:
+     """Record that this session has nothing to contribute — a MECHANICAL act.
+ 
+     Call this before finishing when the session read from the fleet's memory but
+@@ -1843,6 +2089,8 @@ def strata_session_closeout(reason: str) -> dict:
+         ``contributions``, ``declines`` (now incremented), ``reads_by_scope``,
+         and ``updated_at`` — the same shape as ``strata_session_stats``.
+     """
++    await _require_bound_or_elicit()
++
+     _logger.info("session %r closeout: %s", _AGENT_SESSION_ID, reason)
+     state = _record_decline()
+     if state is not None:
+@@ -1870,14 +2118,22 @@ def main() -> None:
+     Startup order (issue #46 — nothing touches storage before validation):
+ 
+     1. Resolve paths (project config walk-up; env fallback).
+-    2. Load the fleet config — parse/invariant failures become refuse-to-start
++    2. Load the fleet config — parse/invariant failures become startup-error
+        entries, not tracebacks.
+     3. Validate the agent binding (scope, skill) — all failures aggregated.
+-    4. Initialise storage (migrations, stores) — failures also render as a
+-       refuse-to-start message.
+-    5. Serve.
+-
+-    Any failure exits 1 with a single actionable message (ADR 0005 D5).
++    4. Initialise storage (migrations, stores) — a failure here is still
++       fatal (a corrupt DB or unwritable directory isn't something
++       strata_bind can recover from) and exits 1 with a single actionable
++       message.
++    5. Serve — always. Soft-start (dated addendum, ADR 0005 D5): binding
++       failures from step 3 (unbound multi-scope, unknown scope,
++       impermissible skill, missing/invalid fleet) no longer exit here. The
++       server completes the MCP handshake regardless, stores the aggregated
++       failure list, and every memory tool but strata_bind returns that list
++       as its error result until the session is bound — see
++       _require_bound_or_elicit(). A harness that swallows stderr (Codex,
++       Claude Code) otherwise leaves the human never seeing why nothing
++       works.
+     """
+     # Walk for the project config once at startup so we can show the user
+     # exactly which paths we examined when validation fails.
+@@ -1917,8 +2173,8 @@ def main() -> None:
+     # Rebind the module globals to the resolved (possibly auto-bound) scope
+     # and skill — every tool function below reads _AGENT_SCOPE / _AGENT_SKILL
+     # directly, so the auto-bind decision must land here before mcp.run().
+-    global _AGENT_SCOPE, _AGENT_SKILL
+-    _AGENT_SCOPE, _AGENT_SKILL = _validate_binding(
++    global _AGENT_SCOPE, _AGENT_SKILL, _UNRESOLVED, _STARTUP_ERRORS
++    _AGENT_SCOPE, _AGENT_SKILL, _STARTUP_ERRORS = _validate_binding(
+         fleet,
+         _AGENT_SCOPE,
+         _AGENT_SKILL,
+@@ -1926,6 +2182,7 @@ def main() -> None:
+         searched_paths=[str(p) for p in searched_paths_out],
+         extra_errors=startup_errors,
+     )
++    _UNRESOLVED = bool(_STARTUP_ERRORS)
+ 
+     # Storage init after validation — failures here (unwritable directory,
+     # corrupt DB) also render as a refuse-to-start message, not a traceback.
+diff --git a/tests/test_mcp_server.py b/tests/test_mcp_server.py
+index 66d9677..ce38580 100644
+--- a/tests/test_mcp_server.py
++++ b/tests/test_mcp_server.py
+@@ -379,7 +379,7 @@ def test_agent_session_id_explicit_value_unchanged(tmp_path: Path, monkeypatch)
+ # ---------------------------------------------------------------------------
+ 
+ 
+-def test_contribute_writes_to_record_store_without_http(tmp_path: Path) -> None:
++async def test_contribute_writes_to_record_store_without_http(tmp_path: Path) -> None:
+     """strata_contribute must append a contribution to RecordStore in-process."""
+     db_path = _make_db(tmp_path)
+     summaries_dir = str(tmp_path / "summaries")
+@@ -405,7 +405,7 @@ def test_contribute_writes_to_record_store_without_http(tmp_path: Path) -> None:
+         patch("strata.scope_manager.ScopeManager.judge", return_value=fake_judgment),
+         patch("anthropic.Anthropic", return_value=MagicMock()),
+     ):
+-        result = mod.strata_contribute(
++        result = await mod.strata_contribute(
+             scope_id="g_arch",
+             content="All services should use structured logging.",
+             proposed_classification="context",
+@@ -431,7 +431,7 @@ def test_contribute_writes_to_record_store_without_http(tmp_path: Path) -> None:
+ # ---------------------------------------------------------------------------
+ 
+ 
+-def test_read_scope_summary_reads_from_summary_store(tmp_path: Path) -> None:
++async def test_read_scope_summary_reads_from_summary_store(tmp_path: Path) -> None:
+     """strata_read_scope_summary must read the ScopeSummary from disk directly."""
+     db_path = _make_db(tmp_path)
+     summaries_dir = str(tmp_path / "summaries")
+@@ -451,7 +451,7 @@ def test_read_scope_summary_reads_from_summary_store(tmp_path: Path) -> None:
+         patch.object(mod, "_AGENT_SCOPE", "g_arch"),
+     ):
+         mod._summary_store = ss
+-        result = mod.strata_read_scope_summary("g_arch")
++        result = await mod.strata_read_scope_summary("g_arch")
+ 
+     assert result["scope_id"] == "g_arch"
+     assert result["context"] == "arch context from disk"
+@@ -459,7 +459,7 @@ def test_read_scope_summary_reads_from_summary_store(tmp_path: Path) -> None:
+     assert "updated_at" in result
+ 
+ 
+-def test_read_scope_summary_no_summary_yet_reports_version_zero_and_not_exists(
++async def test_read_scope_summary_no_summary_yet_reports_version_zero_and_not_exists(
+     tmp_path: Path,
+ ) -> None:
+     """Issue #59: a scope with no on-disk summary gets a synthesized empty
+@@ -479,13 +479,13 @@ def test_read_scope_summary_no_summary_yet_reports_version_zero_and_not_exists(
+         patch.object(mod, "_AGENT_SCOPE", "g_arch"),
+     ):
+         mod._summary_store = SummaryStore(summaries_dir)
+-        result = mod.strata_read_scope_summary("g_arch")
++        result = await mod.strata_read_scope_summary("g_arch")
+ 
+     assert result["version"] == 0
+     assert result["exists"] is False
+ 
+ 
+-def test_read_scope_summary_after_first_write_reports_version_one_and_exists(
++async def test_read_scope_summary_after_first_write_reports_version_one_and_exists(
+     tmp_path: Path,
+ ) -> None:
+     """Issue #59: once a scope has a real first write, strata_read_scope_summary
+@@ -508,7 +508,7 @@ def test_read_scope_summary_after_first_write_reports_version_one_and_exists(
+         patch.object(mod, "_AGENT_SCOPE", "g_arch"),
+     ):
+         mod._summary_store = ss
+-        result = mod.strata_read_scope_summary("g_arch")
++        result = await mod.strata_read_scope_summary("g_arch")
+ 
+     assert result["version"] == 1
+     assert result["exists"] is True
+@@ -519,7 +519,7 @@ def test_read_scope_summary_after_first_write_reports_version_one_and_exists(
+ # ---------------------------------------------------------------------------
+ 
+ 
+-def test_read_perspective_returns_layers_root_first(tmp_path: Path) -> None:
++async def test_read_perspective_returns_layers_root_first(tmp_path: Path) -> None:
+     """strata_read_perspective returns a layered perspective (Decision 3).
+ 
+     For g_backend (L1, child of g_arch L0) the perspective must have two
+@@ -542,7 +542,7 @@ def test_read_perspective_returns_layers_root_first(tmp_path: Path) -> None:
+         patch.object(mod, "_AGENT_SCOPE", "g_backend"),
+     ):
+         mod._summary_store = ss
+-        result = mod.strata_read_perspective("g_backend")
++        result = await mod.strata_read_perspective("g_backend")
+ 
+     assert result["scope_id"] == "g_backend"
+     assert result["_layers_count"] == 2
+@@ -556,7 +556,7 @@ def test_read_perspective_returns_layers_root_first(tmp_path: Path) -> None:
+     assert layers[1]["summary"]["context"] == "backend context"
+ 
+ 
+-def test_read_perspective_includes_operator_layers_for_bound_chain(tmp_path: Path) -> None:
++async def test_read_perspective_includes_operator_layers_for_bound_chain(tmp_path: Path) -> None:
+     """ADR 0008 D2: strata_read_perspective composes operator layers for the agent's chain.
+ 
+     Agents are never the operator (ADR 0008 D1 — no agent-facing operator MCP
+@@ -593,7 +593,7 @@ def test_read_perspective_includes_operator_layers_for_bound_chain(tmp_path: Pat
+         patch.object(mod, "_AGENT_SCOPE", "g_backend"),
+     ):
+         mod._summary_store = ss
+-        result = mod.strata_read_perspective("g_backend")
++        result = await mod.strata_read_perspective("g_backend")
+ 
+     layers = result["layers"]
+     # Operator layer for g_arch immediately precedes g_arch's own layer;
+@@ -614,7 +614,7 @@ def test_read_perspective_includes_operator_layers_for_bound_chain(tmp_path: Pat
+ # ---------------------------------------------------------------------------
+ 
+ 
+-def test_list_scopes_re_reads_fleet_yaml_each_call(tmp_path: Path) -> None:
++async def test_list_scopes_re_reads_fleet_yaml_each_call(tmp_path: Path) -> None:
+     """strata_list_scopes must reflect changes to fleet.yaml between calls."""
+     db_path = _make_db(tmp_path)
+     summaries_dir = str(tmp_path / "summaries")
+@@ -646,7 +646,7 @@ def test_list_scopes_re_reads_fleet_yaml_each_call(tmp_path: Path) -> None:
+ # ---------------------------------------------------------------------------
+ 
+ 
+-def test_read_scope_record_reads_from_record_store(tmp_path: Path) -> None:
++async def test_read_scope_record_reads_from_record_store(tmp_path: Path) -> None:
+     """strata_read_scope_record must return contributions and judgments from RecordStore."""
+     db_path = _make_db(tmp_path)
+     summaries_dir = str(tmp_path / "summaries")
+@@ -682,7 +682,7 @@ def test_read_scope_record_reads_from_record_store(tmp_path: Path) -> None:
+         patch.object(mod, "_AGENT_SCOPE", "g_arch"),
+         patch.object(mod, "_load_fleet", return_value=fleet),
+     ):
+-        result = mod.strata_read_scope_record("g_arch")
++        result = await mod.strata_read_scope_record("g_arch")
+ 
+     assert len(result["contributions"]) == 1
+     assert result["contributions"][0]["content"] == "Use WAL mode for SQLite."
+@@ -695,7 +695,7 @@ def test_read_scope_record_reads_from_record_store(tmp_path: Path) -> None:
+ # ---------------------------------------------------------------------------
+ 
+ 
+-def test_contribute_raises_for_unknown_scope(tmp_path: Path) -> None:
++async def test_contribute_raises_for_unknown_scope(tmp_path: Path) -> None:
+     """strata_contribute must raise RuntimeError when the scope is not in fleet config."""
+     db_path = _make_db(tmp_path)
+     summaries_dir = str(tmp_path / "summaries")
+@@ -708,7 +708,7 @@ def test_contribute_raises_for_unknown_scope(tmp_path: Path) -> None:
+         patch.object(mod, "_load_fleet", return_value=fleet),
+         pytest.raises(RuntimeError, match="Scope not found"),
+     ):
+-        mod.strata_contribute(
++        await mod.strata_contribute(
+             scope_id="g_nonexistent",
+             content="This should fail.",
+             proposed_classification="context",
+@@ -740,7 +740,7 @@ def test_wal_mode_enabled_after_record_store_init(tmp_path: Path) -> None:
+ # ---------------------------------------------------------------------------
+ 
+ 
+-def test_perspective_root_scope_returns_one_layer(tmp_path: Path) -> None:
++async def test_perspective_root_scope_returns_one_layer(tmp_path: Path) -> None:
+     """strata_read_perspective on a root (L0) scope returns a single layer."""
+     db_path = _make_db(tmp_path)
+     summaries_dir = str(tmp_path / "summaries")
+@@ -758,7 +758,7 @@ def test_perspective_root_scope_returns_one_layer(tmp_path: Path) -> None:
+         patch.object(mod, "_AGENT_SCOPE", "g_arch"),
+     ):
+         mod._summary_store = ss
+-        result = mod.strata_read_perspective("g_arch")
++        result = await mod.strata_read_perspective("g_arch")
+ 
+     assert result["scope_id"] == "g_arch"
+     assert result["_layers_count"] == 1
+@@ -772,7 +772,7 @@ def test_perspective_root_scope_returns_one_layer(tmp_path: Path) -> None:
+ # ---------------------------------------------------------------------------
+ 
+ 
+-def test_perspective_deep_scope_returns_layers_root_first(tmp_path: Path) -> None:
++async def test_perspective_deep_scope_returns_layers_root_first(tmp_path: Path) -> None:
+     """strata_read_perspective on a 3-level chain returns 3 layers in root-first order."""
+     db_path = _make_db(tmp_path)
+     summaries_dir = str(tmp_path / "summaries")
+@@ -792,7 +792,7 @@ def test_perspective_deep_scope_returns_layers_root_first(tmp_path: Path) -> Non
+         patch.object(mod, "_AGENT_SCOPE", "g_team"),
+     ):
+         mod._summary_store = ss
+-        result = mod.strata_read_perspective("g_team")
++        result = await mod.strata_read_perspective("g_team")
+ 
+     assert result["scope_id"] == "g_team"
+     assert result["_layers_count"] == 3
+@@ -811,7 +811,7 @@ def test_perspective_deep_scope_returns_layers_root_first(tmp_path: Path) -> Non
+ # ---------------------------------------------------------------------------
+ 
+ 
+-def test_perspective_unreferenced_peer_never_appears(tmp_path: Path) -> None:
++async def test_perspective_unreferenced_peer_never_appears(tmp_path: Path) -> None:
+     """A peer scope with no intra-stratum reference edge must not appear in layers.
+ 
+     The deep fleet has g_peer (L1), a same-stratum scope as g_func with no
+@@ -838,7 +838,7 @@ def test_perspective_unreferenced_peer_never_appears(tmp_path: Path) -> None:
+         patch.object(mod, "_AGENT_SCOPE", "g_team"),
+     ):
+         mod._summary_store = ss
+-        result = mod.strata_read_perspective("g_team")
++        result = await mod.strata_read_perspective("g_team")
+ 
+     layer_scope_ids = {layer["scope_id"] for layer in result["layers"]}
+     assert "g_peer" not in layer_scope_ids, (
+@@ -853,7 +853,7 @@ def test_perspective_unreferenced_peer_never_appears(tmp_path: Path) -> None:
+ # ---------------------------------------------------------------------------
+ 
+ 
+-def test_perspective_missing_ancestor_summary_produces_empty_layer(tmp_path: Path) -> None:
++async def test_perspective_missing_ancestor_summary_produces_empty_layer(tmp_path: Path) -> None:
+     """A scope with no on-disk summary still appears as a layer with empty content."""
+     db_path = _make_db(tmp_path)
+     summaries_dir = str(tmp_path / "summaries")
+@@ -872,7 +872,7 @@ def test_perspective_missing_ancestor_summary_produces_empty_layer(tmp_path: Pat
+         patch.object(mod, "_AGENT_SCOPE", "g_backend"),
+     ):
+         mod._summary_store = ss
+-        result = mod.strata_read_perspective("g_backend")
++        result = await mod.strata_read_perspective("g_backend")
+ 
+     assert result["_layers_count"] == 2
+     layers = result["layers"]
+@@ -897,7 +897,7 @@ def test_perspective_missing_ancestor_summary_produces_empty_layer(tmp_path: Pat
+ # ---------------------------------------------------------------------------
+ 
+ 
+-def test_perspective_no_v1_limitation_key(tmp_path: Path) -> None:
++async def test_perspective_no_v1_limitation_key(tmp_path: Path) -> None:
+     """strata_read_perspective must NOT include the _v1_limitation key."""
+     db_path = _make_db(tmp_path)
+     summaries_dir = str(tmp_path / "summaries")
+@@ -912,7 +912,7 @@ def test_perspective_no_v1_limitation_key(tmp_path: Path) -> None:
+         patch.object(mod, "_AGENT_SCOPE", "g_arch"),
+     ):
+         mod._summary_store = SummaryStore(summaries_dir)
+-        result = mod.strata_read_perspective("g_arch")
++        result = await mod.strata_read_perspective("g_arch")
+ 
+     assert "_v1_limitation" not in result, (
+         "_v1_limitation must be removed now that real perspective composition is implemented"
+@@ -933,7 +933,7 @@ def test_perspective_no_v1_limitation_key(tmp_path: Path) -> None:
+ # ---------------------------------------------------------------------------
+ 
+ 
+-def test_perspective_self_and_ancestor_layers_are_binding(tmp_path: Path) -> None:
++async def test_perspective_self_and_ancestor_layers_are_binding(tmp_path: Path) -> None:
+     """Self and ancestor layers carry relation="self"/"ancestor" and binding=True."""
+     db_path = _make_db(tmp_path)
+     summaries_dir = str(tmp_path / "summaries")
+@@ -947,7 +947,7 @@ def test_perspective_self_and_ancestor_layers_are_binding(tmp_path: Path) -> Non
+         patch.object(mod, "_AGENT_SCOPE", "g_team"),
+     ):
+         mod._summary_store = SummaryStore(summaries_dir)
+-        result = mod.strata_read_perspective("g_team")
++        result = await mod.strata_read_perspective("g_team")
+ 
+     chain_layers = {
+         layer["scope_id"]: layer
+@@ -962,7 +962,7 @@ def test_perspective_self_and_ancestor_layers_are_binding(tmp_path: Path) -> Non
+     assert chain_layers["g_team"]["binding"] is True
+ 
+ 
+-def test_perspective_referenced_peer_appears_as_context_layer(tmp_path: Path) -> None:
++async def test_perspective_referenced_peer_appears_as_context_layer(tmp_path: Path) -> None:
+     """A peer referenced by a chain scope appears with relation="peer_reference", binding=False.
+ 
+     ADR 0007 D4: the peer layer carries that peer's PUBLICATION, not its
+@@ -984,7 +984,7 @@ def test_perspective_referenced_peer_appears_as_context_layer(tmp_path: Path) ->
+         patch.object(mod, "_AGENT_SCOPE", "g_team"),
+     ):
+         mod._summary_store = ss
+-        result = mod.strata_read_perspective("g_team")
++        result = await mod.strata_read_perspective("g_team")
+ 
+     peer_layer = next(layer for layer in result["layers"] if layer["scope_id"] == "g_peer_a")
+     assert peer_layer["relation"] == "peer_reference"
+@@ -994,7 +994,7 @@ def test_perspective_referenced_peer_appears_as_context_layer(tmp_path: Path) ->
+     assert peer_layer["publication"] == {"items": []}
+ 
+ 
+-def test_perspective_referenced_peer_publication_composed_verbatim(tmp_path: Path) -> None:
++async def test_perspective_referenced_peer_publication_composed_verbatim(tmp_path: Path) -> None:
+     """A peer's PUBLISHED items compose into the peer layer, verbatim and labelled."""
+     from strata.publication import PublishedItem, _write_publication
+ 
+@@ -1027,7 +1027,7 @@ def test_perspective_referenced_peer_publication_composed_verbatim(tmp_path: Pat
+         patch.object(mod, "_AGENT_SCOPE", "g_team"),
+     ):
+         mod._summary_store = ss
+-        result = mod.strata_read_perspective("g_team")
++        result = await mod.strata_read_perspective("g_team")
+ 
+     peer_layer = next(layer for layer in result["layers"] if layer["scope_id"] == "g_peer_a")
+     assert peer_layer["publication"]["items"] == [
+@@ -1045,7 +1045,7 @@ def test_perspective_referenced_peer_publication_composed_verbatim(tmp_path: Pat
+     assert "must NOT appear" not in rendered
+ 
+ 
+-def test_perspective_ancestor_referenced_peer_appears(tmp_path: Path) -> None:
++async def test_perspective_ancestor_referenced_peer_appears(tmp_path: Path) -> None:
+     """A peer referenced by an ANCESTOR (not the scope itself) still appears."""
+     db_path = _make_db(tmp_path)
+     summaries_dir = str(tmp_path / "summaries")
+@@ -1062,7 +1062,7 @@ def test_perspective_ancestor_referenced_peer_appears(tmp_path: Path) -> None:
+         patch.object(mod, "_AGENT_SCOPE", "g_team"),
+     ):
+         mod._summary_store = ss
+-        result = mod.strata_read_perspective("g_team")
++        result = await mod.strata_read_perspective("g_team")
+ 
+     layer_scope_ids = {layer["scope_id"] for layer in result["layers"]}
+     assert "g_exec_peer" in layer_scope_ids
+@@ -1071,7 +1071,7 @@ def test_perspective_ancestor_referenced_peer_appears(tmp_path: Path) -> None:
+     assert peer_layer["binding"] is False
+ 
+ 
+-def test_perspective_peer_of_peer_not_traversed(tmp_path: Path) -> None:
++async def test_perspective_peer_of_peer_not_traversed(tmp_path: Path) -> None:
+     """Only one hop is followed — a peer's own peer reference is not composed in."""
+     db_path = _make_db(tmp_path)
+     summaries_dir = str(tmp_path / "summaries")
+@@ -1085,13 +1085,13 @@ def test_perspective_peer_of_peer_not_traversed(tmp_path: Path) -> None:
+         patch.object(mod, "_AGENT_SCOPE", "g_team"),
+     ):
+         mod._summary_store = SummaryStore(summaries_dir)
+-        result = mod.strata_read_perspective("g_team")
++        result = await mod.strata_read_perspective("g_team")
+ 
+     layer_scope_ids = {layer["scope_id"] for layer in result["layers"]}
+     assert "g_peer_of_peer" not in layer_scope_ids
+ 
+ 
+-def test_perspective_unreferenced_sibling_absent_alongside_referenced_peers(
++async def test_perspective_unreferenced_sibling_absent_alongside_referenced_peers(
+     tmp_path: Path,
+ ) -> None:
+     """An unreferenced sibling never appears, even in a fleet with referenced peers."""
+@@ -1107,13 +1107,15 @@ def test_perspective_unreferenced_sibling_absent_alongside_referenced_peers(
+         patch.object(mod, "_AGENT_SCOPE", "g_team"),
+     ):
+         mod._summary_store = SummaryStore(summaries_dir)
+-        result = mod.strata_read_perspective("g_team")
++        result = await mod.strata_read_perspective("g_team")
+ 
+     layer_scope_ids = {layer["scope_id"] for layer in result["layers"]}
+     assert "g_sibling" not in layer_scope_ids
+ 
+ 
+-def test_perspective_peer_without_publication_reports_honestly_empty_face(tmp_path: Path) -> None:
++async def test_perspective_peer_without_publication_reports_honestly_empty_face(
++    tmp_path: Path,
++) -> None:
+     """A referenced peer with nothing published gets an honestly empty face (ADR 0007 D4)."""
+     db_path = _make_db(tmp_path)
+     summaries_dir = str(tmp_path / "summaries")
+@@ -1127,14 +1129,14 @@ def test_perspective_peer_without_publication_reports_honestly_empty_face(tmp_pa
+         patch.object(mod, "_AGENT_SCOPE", "g_team"),
+     ):
+         mod._summary_store = SummaryStore(summaries_dir)  # no summaries written anywhere
+-        result = mod.strata_read_perspective("g_team")
++        result = await mod.strata_read_perspective("g_team")
+ 
+     peer_layer = next(layer for layer in result["layers"] if layer["scope_id"] == "g_peer_a")
+     assert "summary" not in peer_layer
+     assert peer_layer["publication"] == {"items": []}
+ 
+ 
+-def test_perspective_peer_layers_sorted_by_scope_id(tmp_path: Path) -> None:
++async def test_perspective_peer_layers_sorted_by_scope_id(tmp_path: Path) -> None:
+     """Peer layers are ordered by scope id for deterministic output, after self/ancestors."""
+     db_path = _make_db(tmp_path)
+     summaries_dir = str(tmp_path / "summaries")
+@@ -1148,7 +1150,7 @@ def test_perspective_peer_layers_sorted_by_scope_id(tmp_path: Path) -> None:
+         patch.object(mod, "_AGENT_SCOPE", "g_team"),
+     ):
+         mod._summary_store = SummaryStore(summaries_dir)
+-        result = mod.strata_read_perspective("g_team")
++        result = await mod.strata_read_perspective("g_team")
+ 
+     layers = result["layers"]
+     # Chain first (root-first: g_exec, g_func, g_team), then peer layers
+@@ -1175,7 +1177,7 @@ def test_perspective_peer_layers_sorted_by_scope_id(tmp_path: Path) -> None:
+ # ---------------------------------------------------------------------------
+ 
+ 
+-def test_summary_read_of_referenced_peer_succeeds(tmp_path: Path) -> None:
++async def test_summary_read_of_referenced_peer_succeeds(tmp_path: Path) -> None:
+     """strata_read_scope_summary succeeds for a peer referenced by the caller's chain.
+ 
+     ADR 0007 D4: the entitled content for a peer is its PUBLICATION, not its
+@@ -1197,7 +1199,7 @@ def test_summary_read_of_referenced_peer_succeeds(tmp_path: Path) -> None:
+         patch.object(mod, "_AGENT_SCOPE", "g_team"),
+     ):
+         mod._summary_store = ss
+-        result = mod.strata_read_scope_summary("g_peer_a")
++        result = await mod.strata_read_scope_summary("g_peer_a")
+ 
+     assert result["scope_id"] == "g_peer_a"
+     assert result["relation"] == "peer_reference"
+@@ -1205,7 +1207,7 @@ def test_summary_read_of_referenced_peer_succeeds(tmp_path: Path) -> None:
+     assert "context" not in result
+ 
+ 
+-def test_summary_read_of_referenced_peer_returns_its_publication(tmp_path: Path) -> None:
++async def test_summary_read_of_referenced_peer_returns_its_publication(tmp_path: Path) -> None:
+     """strata_read_scope_summary on a referenced peer returns its PUBLISHED items, verbatim."""
+     from strata.publication import PublishedItem, _write_publication
+ 
+@@ -1236,7 +1238,7 @@ def test_summary_read_of_referenced_peer_returns_its_publication(tmp_path: Path)
+         patch.object(mod, "_AGENT_SCOPE", "g_team"),
+     ):
+         mod._summary_store = SummaryStore(summaries_dir)
+-        result = mod.strata_read_scope_summary("g_peer_a")
++        result = await mod.strata_read_scope_summary("g_peer_a")
+ 
+     assert result["scope_id"] == "g_peer_a"
+     assert result["relation"] == "peer_reference"
+@@ -1246,7 +1248,7 @@ def test_summary_read_of_referenced_peer_returns_its_publication(tmp_path: Path)
+     )
+ 
+ 
+-def test_summary_read_of_unreferenced_sibling_still_refused(tmp_path: Path) -> None:
++async def test_summary_read_of_unreferenced_sibling_still_refused(tmp_path: Path) -> None:
+     """strata_read_scope_summary still refuses an unreferenced sibling scope."""
+     db_path = _make_db(tmp_path)
+     summaries_dir = str(tmp_path / "summaries")
+@@ -1260,14 +1262,14 @@ def test_summary_read_of_unreferenced_sibling_still_refused(tmp_path: Path) -> N
+         patch.object(mod, "_AGENT_SCOPE", "g_team"),
+         pytest.raises(RuntimeError, match="entitled context surface") as exc_info,
+     ):
+-        mod.strata_read_scope_summary("g_sibling")
++        await mod.strata_read_scope_summary("g_sibling")
+ 
+     message = str(exc_info.value)
+     assert "g_sibling" in message
+     assert "g_team" in message
+ 
+ 
+-def test_record_read_of_referenced_peer_refused_chain_only(tmp_path: Path) -> None:
++async def test_record_read_of_referenced_peer_refused_chain_only(tmp_path: Path) -> None:
+     """strata_read_scope_record refuses a referenced peer — records stay chain-only."""
+     db_path = _make_db(tmp_path)
+     summaries_dir = str(tmp_path / "summaries")
+@@ -1281,14 +1283,14 @@ def test_record_read_of_referenced_peer_refused_chain_only(tmp_path: Path) -> No
+         patch.object(mod, "_AGENT_SCOPE", "g_team"),
+         pytest.raises(RuntimeError, match="entitled surface") as exc_info,
+     ):
+-        mod.strata_read_scope_record("g_peer_a")
++        await mod.strata_read_scope_record("g_peer_a")
+ 
+     message = str(exc_info.value)
+     assert "g_peer_a" in message
+     assert "chain-only" in message
+ 
+ 
+-def test_perspective_target_of_referenced_peer_refused(tmp_path: Path) -> None:
++async def test_perspective_target_of_referenced_peer_refused(tmp_path: Path) -> None:
+     """A referenced peer is still refused as a perspective TARGET (ADR 0006 D4)."""
+     db_path = _make_db(tmp_path)
+     summaries_dir = str(tmp_path / "summaries")
+@@ -1302,7 +1304,7 @@ def test_perspective_target_of_referenced_peer_refused(tmp_path: Path) -> None:
+         patch.object(mod, "_AGENT_SCOPE", "g_team"),
+         pytest.raises(RuntimeError, match="entitled surface") as exc_info,
+     ):
+-        mod.strata_read_perspective("g_peer_a")
++        await mod.strata_read_perspective("g_peer_a")
+ 
+     message = str(exc_info.value)
+     assert "g_peer_a" in message
+@@ -1320,7 +1322,7 @@ def test_perspective_target_of_referenced_peer_refused(tmp_path: Path) -> None:
+ # ---------------------------------------------------------------------------
+ 
+ 
+-def test_entitled_no_argument_returns_bound_scope_data(tmp_path: Path) -> None:
++async def test_entitled_no_argument_returns_bound_scope_data(tmp_path: Path) -> None:
+     """Calling read tools with no scope_id defaults to the agent's bound scope."""
+     db_path = _make_db(tmp_path)
+     summaries_dir = str(tmp_path / "summaries")
+@@ -1340,9 +1342,9 @@ def test_entitled_no_argument_returns_bound_scope_data(tmp_path: Path) -> None:
+         patch.object(mod, "_AGENT_SCOPE", "g_team"),
+     ):
+         mod._summary_store = ss
+-        summary_result = mod.strata_read_scope_summary()
+-        perspective_result = mod.strata_read_perspective()
+-        record_result = mod.strata_read_scope_record()
++        summary_result = await mod.strata_read_scope_summary()
++        perspective_result = await mod.strata_read_perspective()
++        record_result = await mod.strata_read_scope_record()
+ 
+     assert summary_result["scope_id"] == "g_team"
+     assert summary_result["context"] == "team context"
+@@ -1362,7 +1364,7 @@ def test_entitled_no_argument_returns_bound_scope_data(tmp_path: Path) -> None:
+     }
+ 
+ 
+-def test_entitled_ancestor_read_allowed(tmp_path: Path) -> None:
++async def test_entitled_ancestor_read_allowed(tmp_path: Path) -> None:
+     """Reading an inter-stratum ancestor of the bound scope is allowed."""
+     db_path = _make_db(tmp_path)
+     summaries_dir = str(tmp_path / "summaries")
+@@ -1380,13 +1382,13 @@ def test_entitled_ancestor_read_allowed(tmp_path: Path) -> None:
+         patch.object(mod, "_AGENT_SCOPE", "g_team"),
+     ):
+         mod._summary_store = ss
+-        result = mod.strata_read_scope_summary("g_exec")
++        result = await mod.strata_read_scope_summary("g_exec")
+ 
+     assert result["scope_id"] == "g_exec"
+     assert result["context"] == "executive context"
+ 
+ 
+-def test_entitled_peer_read_raises_with_entitlement_message(tmp_path: Path) -> None:
++async def test_entitled_peer_read_raises_with_entitlement_message(tmp_path: Path) -> None:
+     """Reading an unreferenced peer (intra-stratum, non-ancestor) scope raises RuntimeError.
+ 
+     g_peer in the deep fleet has no reference edge to or from g_func — an
+@@ -1411,7 +1413,7 @@ def test_entitled_peer_read_raises_with_entitlement_message(tmp_path: Path) -> N
+     ):
+         mod._summary_store = ss
+         with pytest.raises(RuntimeError, match="entitled context surface") as exc_info:
+-            mod.strata_read_scope_summary("g_peer")
++            await mod.strata_read_scope_summary("g_peer")
+ 
+     message = str(exc_info.value)
+     assert "g_peer" in message
+@@ -1424,12 +1426,12 @@ def test_entitled_peer_read_raises_with_entitlement_message(tmp_path: Path) -> N
+         patch.object(mod, "_AGENT_SCOPE", "g_team"),
+     ):
+         with pytest.raises(RuntimeError, match="entitled surface"):
+-            mod.strata_read_perspective("g_peer")
++            await mod.strata_read_perspective("g_peer")
+         with pytest.raises(RuntimeError, match="entitled surface"):
+-            mod.strata_read_scope_record("g_peer")
++            await mod.strata_read_scope_record("g_peer")
+ 
+ 
+-def test_entitled_own_empty_record_returns_empty_shape(tmp_path: Path) -> None:
++async def test_entitled_own_empty_record_returns_empty_shape(tmp_path: Path) -> None:
+     """Reading the bound scope's own record with no rows yet returns the empty shape."""
+     db_path = _make_db(tmp_path)
+     summaries_dir = str(tmp_path / "summaries")
+@@ -1443,7 +1445,7 @@ def test_entitled_own_empty_record_returns_empty_shape(tmp_path: Path) -> None:
+         patch.object(mod, "_load_fleet", return_value=fleet),
+         patch.object(mod, "_AGENT_SCOPE", "g_team"),
+     ):
+-        result = mod.strata_read_scope_record("g_team")
++        result = await mod.strata_read_scope_record("g_team")
+ 
+     assert result == {
+         "contributions": [],
+@@ -1460,7 +1462,7 @@ def test_entitled_own_empty_record_returns_empty_shape(tmp_path: Path) -> None:
+ # ---------------------------------------------------------------------------
+ 
+ 
+-def test_descendant_read_is_denied(tmp_path: Path) -> None:
++async def test_descendant_read_is_denied(tmp_path: Path) -> None:
+     """The entitled surface is self + ANCESTORS — descendants are not readable.
+ 
+     Scope summary reads go through the wider context surface (ADR 0006 D3/
+@@ -1478,10 +1480,10 @@ def test_descendant_read_is_denied(tmp_path: Path) -> None:
+         patch.object(mod, "_load_fleet", return_value=fleet),
+         pytest.raises(RuntimeError, match="entitled context surface"),
+     ):
+-        mod.strata_read_scope_summary("g_backend")  # its L1 child
++        await mod.strata_read_scope_summary("g_backend")  # its L1 child
+ 
+ 
+-def test_stale_bound_scope_gets_distinct_error(tmp_path: Path) -> None:
++async def test_stale_bound_scope_gets_distinct_error(tmp_path: Path) -> None:
+     """Bound scope removed from fleet.yaml mid-session → rebind error, not a peer error."""
+     db_path = _make_db(tmp_path)
+     summaries_dir = str(tmp_path / "summaries")
+@@ -1494,7 +1496,7 @@ def test_stale_bound_scope_gets_distinct_error(tmp_path: Path) -> None:
+         patch.object(mod, "_load_fleet", return_value=fleet),
+         pytest.raises(RuntimeError, match="no longer exists in the fleet"),
+     ):
+-        mod.strata_read_perspective()
++        await mod.strata_read_perspective()
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -1525,7 +1527,9 @@ def _patch_agent_binding(
+     ["g_team", "g_func", "g_exec"],
+     ids=["own-scope", "parent", "root-grandparent"],
+ )
+-def test_contribute_within_write_surface_allowed(tmp_path: Path, target_scope_id: str) -> None:
++async def test_contribute_within_write_surface_allowed(
++    tmp_path: Path, target_scope_id: str
++) -> None:
+     """Own scope, parent, and root/grandparent are all within the write surface."""
+     db_path = _make_db(tmp_path)
+     summaries_dir = str(tmp_path / "summaries")
+@@ -1549,7 +1553,7 @@ def test_contribute_within_write_surface_allowed(tmp_path: Path, target_scope_id
+         patch("strata.scope_manager.ScopeManager.judge", return_value=fake_judgment),
+         patch("anthropic.Anthropic", return_value=MagicMock()),
+     ):
+-        result = mod.strata_contribute(
++        result = await mod.strata_contribute(
+             scope_id=target_scope_id,
+             content="within the write surface",
+             proposed_classification="context",
+@@ -1562,7 +1566,7 @@ def test_contribute_within_write_surface_allowed(tmp_path: Path, target_scope_id
+     assert contributions[0].content == "within the write surface"
+ 
+ 
+-def test_contribute_to_sibling_refused(tmp_path: Path) -> None:
++async def test_contribute_to_sibling_refused(tmp_path: Path) -> None:
+     """A direct write into a peer (sibling) scope is refused (ADR 0006 D1).
+ 
+     Sideways knowledge flow has exactly two sanctioned routes: ratification
+@@ -1584,7 +1588,7 @@ def test_contribute_to_sibling_refused(tmp_path: Path) -> None:
+         patch.object(mod, "_load_fleet", return_value=fleet),
+         pytest.raises(RuntimeError, match="entitled write surface") as exc_info,
+     ):
+-        mod.strata_contribute(
++        await mod.strata_contribute(
+             scope_id="g_team2",
+             content="sideways contribution",
+             proposed_classification="context",
+@@ -1595,7 +1599,7 @@ def test_contribute_to_sibling_refused(tmp_path: Path) -> None:
+     assert "g_team" in message
+ 
+ 
+-def test_contribute_to_descendant_refused(tmp_path: Path) -> None:
++async def test_contribute_to_descendant_refused(tmp_path: Path) -> None:
+     """A direct write into a descendant scope is refused (ADR 0006 D1).
+ 
+     Authority already flows down structurally: publish at your own scope and
+@@ -1617,7 +1621,7 @@ def test_contribute_to_descendant_refused(tmp_path: Path) -> None:
+         patch.object(mod, "_load_fleet", return_value=fleet),
+         pytest.raises(RuntimeError, match="entitled write surface") as exc_info,
+     ):
+-        mod.strata_contribute(
++        await mod.strata_contribute(
+             scope_id="g_team",
+             content="downward contribution",
+             proposed_classification="context",
+@@ -1628,7 +1632,7 @@ def test_contribute_to_descendant_refused(tmp_path: Path) -> None:
+     assert "g_func" in message
+ 
+ 
+-def test_refused_write_leaves_no_record_row(tmp_path: Path) -> None:
++async def test_refused_write_leaves_no_record_row(tmp_path: Path) -> None:
+     """A structurally-refused write must not append a contribution or judgment row.
+ 
+     ADR 0006 D1: a structural refusal is an error, not a scope-manager
+@@ -1654,7 +1658,7 @@ def test_refused_write_leaves_no_record_row(tmp_path: Path) -> None:
+         patch.object(mod, "_load_fleet", return_value=fleet),
+         pytest.raises(RuntimeError, match="entitled write surface"),
+     ):
+-        mod.strata_contribute(
++        await mod.strata_contribute(
+             scope_id="g_team2",
+             content="sideways contribution",
+             proposed_classification="context",
+@@ -1665,7 +1669,9 @@ def test_refused_write_leaves_no_record_row(tmp_path: Path) -> None:
+         assert rs.list_judgments(scope_id="g_team2") == []
+ 
+ 
+-def test_refused_write_emits_warning_log(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
++async def test_refused_write_emits_warning_log(
++    tmp_path: Path, caplog: pytest.LogCaptureFixture
++) -> None:
+     """A refused write emits one WARNING log line naming contributor and target.
+ 
+     Grill decision (ADR 0006 D1): every refusal is logged (contributor
+@@ -1690,7 +1696,7 @@ def test_refused_write_emits_warning_log(tmp_path: Path, caplog: pytest.LogCaptu
+         caplog.at_level(logging.WARNING, logger="strata.mcp"),
+         pytest.raises(RuntimeError, match="entitled write surface"),
+     ):
+-        mod.strata_contribute(
++        await mod.strata_contribute(
+             scope_id="g_team2",
+             content="sideways contribution",
+             proposed_classification="context",
+@@ -1705,7 +1711,7 @@ def test_refused_write_emits_warning_log(tmp_path: Path, caplog: pytest.LogCaptu
+     assert "g_team2" in message
+ 
+ 
+-def test_contribute_raises_for_unknown_scope_before_entitlement_check(tmp_path: Path) -> None:
++async def test_contribute_raises_for_unknown_scope_before_entitlement_check(tmp_path: Path) -> None:
+     """Scope-not-found errors are unchanged and reported before the entitlement check runs."""
+     db_path = _make_db(tmp_path)
+     summaries_dir = str(tmp_path / "summaries")
+@@ -1722,14 +1728,16 @@ def test_contribute_raises_for_unknown_scope_before_entitlement_check(tmp_path:
+         patch.object(mod, "_load_fleet", return_value=fleet),
+         pytest.raises(RuntimeError, match="Scope not found"),
+     ):
+-        mod.strata_contribute(
++        await mod.strata_contribute(
+             scope_id="g_nonexistent",
+             content="This should fail.",
+             proposed_classification="context",
+         )
+ 
+ 
+-def test_contribute_raises_for_archived_scope_before_entitlement_check(tmp_path: Path) -> None:
++async def test_contribute_raises_for_archived_scope_before_entitlement_check(
++    tmp_path: Path,
++) -> None:
+     """Archived-scope errors are unchanged and reported before the entitlement check runs.
+ 
+     g_archived is a sibling of g_team (not in g_team's write surface), so this
+@@ -1751,7 +1759,7 @@ def test_contribute_raises_for_archived_scope_before_entitlement_check(tmp_path:
+         patch.object(mod, "_load_fleet", return_value=fleet),
+         pytest.raises(RuntimeError, match="archived") as exc_info,
+     ):
+-        mod.strata_contribute(
++        await mod.strata_contribute(
+             scope_id="g_archived",
+             content="This should fail.",
+             proposed_classification="context",
+@@ -1766,7 +1774,7 @@ def test_contribute_raises_for_archived_scope_before_entitlement_check(tmp_path:
+ # ---------------------------------------------------------------------------
+ 
+ 
+-def test_contribute_passes_entitlement_view_to_judge(tmp_path: Path) -> None:
++async def test_contribute_passes_entitlement_view_to_judge(tmp_path: Path) -> None:
+     """strata_contribute must compute and pass a non-None entitlement view to judge."""
+     db_path = _make_db(tmp_path)
+     summaries_dir = str(tmp_path / "summaries")
+@@ -1791,7 +1799,7 @@ def test_contribute_passes_entitlement_view_to_judge(tmp_path: Path) -> None:
+         patch("strata.scope_manager.ScopeManager.judge", judge_spy),
+         patch("anthropic.Anthropic", return_value=MagicMock()),
+     ):
+-        mod.strata_contribute(
++        await mod.strata_contribute(
+             scope_id="g_arch",
+             content="All services should use structured logging.",
+             proposed_classification="context",
+@@ -1821,7 +1829,9 @@ def test_contribute_passes_entitlement_view_to_judge(tmp_path: Path) -> None:
+ # ---------------------------------------------------------------------------
+ 
+ 
+-def test_contribute_judge_failure_records_attempt_and_points_to_rejudge(tmp_path: Path) -> None:
++async def test_contribute_judge_failure_records_attempt_and_points_to_rejudge(
++    tmp_path: Path,
++) -> None:
+     """A scope-manager failure records the contribution + an attempt event, no
+     judgment, and the raised error carries the contribution id + strata_rejudge.
+     """
+@@ -1841,7 +1851,7 @@ def test_contribute_judge_failure_records_attempt_and_points_to_rejudge(tmp_path
+         patch("anthropic.Anthropic", return_value=MagicMock()),
+         pytest.raises(RuntimeError) as exc_info,
+     ):
+-        mod.strata_contribute(
++        await mod.strata_contribute(
+             scope_id="g_backend",
+             content="contribution before the crash",
+             proposed_classification="context",
+@@ -1867,7 +1877,7 @@ def test_contribute_judge_failure_records_attempt_and_points_to_rejudge(tmp_path
+     assert SummaryStore(summaries_dir).read("g_backend") is None
+ 
+ 
+-def test_strata_rejudge_recovers_pending_then_idempotent(tmp_path: Path) -> None:
++async def test_strata_rejudge_recovers_pending_then_idempotent(tmp_path: Path) -> None:
+     """strata_rejudge judges a pending contribution against the current summary
+     and appends exactly one judgment; a second call is a no-op (idempotent).
+     """
+@@ -1890,7 +1900,7 @@ def test_strata_rejudge_recovers_pending_then_idempotent(tmp_path: Path) -> None
+         patch("anthropic.Anthropic", return_value=MagicMock()),
+         pytest.raises(RuntimeError),
+     ):
+-        mod.strata_contribute(
++        await mod.strata_contribute(
+             scope_id="g_backend",
+             content="recover me",
+             proposed_classification="context",
+@@ -1916,7 +1926,7 @@ def test_strata_rejudge_recovers_pending_then_idempotent(tmp_path: Path) -> None
+         patch("strata.scope_manager.ScopeManager.judge", return_value=good_judgment),
+         patch("anthropic.Anthropic", return_value=MagicMock()),
+     ):
+-        result = mod.strata_rejudge(contribution_id)
++        result = await mod.strata_rejudge(contribution_id)
+ 
+     assert result["contribution_id"] == contribution_id
+     assert result["judgment"]["decision"] == "accept_as_context"
+@@ -1939,7 +1949,7 @@ def test_strata_rejudge_recovers_pending_then_idempotent(tmp_path: Path) -> None
+         ),
+         patch("anthropic.Anthropic", return_value=MagicMock()),
+     ):
+-        result2 = mod.strata_rejudge(contribution_id)
++        result2 = await mod.strata_rejudge(contribution_id)
+ 
+     assert result2["judgment"]["decision"] == "accept_as_context"
+     assert result2["judgment"]["summary_updated"] is False
+@@ -1947,7 +1957,7 @@ def test_strata_rejudge_recovers_pending_then_idempotent(tmp_path: Path) -> None
+         assert len(rs.list_judgments(scope_id="g_backend")) == 1
+ 
+ 
+-def test_strata_rejudge_unknown_contribution_raises(tmp_path: Path) -> None:
++async def test_strata_rejudge_unknown_contribution_raises(tmp_path: Path) -> None:
+     """strata_rejudge on an unknown contribution id raises RuntimeError."""
+     db_path = _make_db(tmp_path)
+     summaries_dir = str(tmp_path / "summaries")
+@@ -1964,7 +1974,7 @@ def test_strata_rejudge_unknown_contribution_raises(tmp_path: Path) -> None:
+         patch.object(mod, "_load_fleet", return_value=fleet),
+         pytest.raises(RuntimeError, match="Contribution not found"),
+     ):
+-        mod.strata_rejudge("c_does_not_exist")
++        await mod.strata_rejudge("c_does_not_exist")
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -1998,7 +2008,7 @@ def _seed_summary_with_directive(ss: SummaryStore, scope_id: str, directive_id:
+     )
+ 
+ 
+-def test_strata_publish_acts_on_bound_scope_with_own_provenance(tmp_path: Path) -> None:
++async def test_strata_publish_acts_on_bound_scope_with_own_provenance(tmp_path: Path) -> None:
+     """strata_publish always targets STRATA_AGENT_SCOPE and stamps the agent's own provenance."""
+     from strata.scope_manager import PublicationJudgment
+ 
+@@ -2026,7 +2036,7 @@ def test_strata_publish_acts_on_bound_scope_with_own_provenance(tmp_path: Path)
+         patch("anthropic.Anthropic", return_value=MagicMock()),
+     ):
+         mod._summary_store = ss
+-        result = mod.strata_publish(
++        result = await mod.strata_publish(
+             content="Use protobuf for all RPC.",
+             kind="directive",
+             anchors=["c_dir1"],
+@@ -2061,7 +2071,7 @@ def test_strata_publish_no_scope_id_parameter_exists() -> None:
+     assert "scope_id" not in params
+ 
+ 
+-def test_strata_publish_zero_anchors_raises_runtimeerror(tmp_path: Path) -> None:
++async def test_strata_publish_zero_anchors_raises_runtimeerror(tmp_path: Path) -> None:
+     db_path = _make_db(tmp_path)
+     summaries_dir = str(tmp_path / "summaries")
+     fleet_path = _make_fleet_yaml(tmp_path)
+@@ -2081,13 +2091,13 @@ def test_strata_publish_zero_anchors_raises_runtimeerror(tmp_path: Path) -> None
+         pytest.raises(RuntimeError, match="at least one anchor"),
+     ):
+         mod._summary_store = ss
+-        mod.strata_publish(content="x", kind="context", anchors=[])
++        await mod.strata_publish(content="x", kind="context", anchors=[])
+ 
+     with RecordStore(db_path) as rs:
+         assert rs.list_publication_acts(scope_id="g_backend") == []
+ 
+ 
+-def test_strata_withdraw_acts_on_bound_scope_with_own_provenance(tmp_path: Path) -> None:
++async def test_strata_withdraw_acts_on_bound_scope_with_own_provenance(tmp_path: Path) -> None:
+     """strata_withdraw always targets STRATA_AGENT_SCOPE's own publication."""
+     from strata.publication import PublishedItem, _write_publication, read_publication
+     from strata.scope_manager import PublicationJudgment
+@@ -2145,7 +2155,7 @@ def test_strata_withdraw_acts_on_bound_scope_with_own_provenance(tmp_path: Path)
+         patch("anthropic.Anthropic", return_value=MagicMock()),
+     ):
+         mod._summary_store = SummaryStore(summaries_dir)
+-        result = mod.strata_withdraw(act.id)
++        result = await mod.strata_withdraw(act.id)
+ 
+     assert result["judgment"]["decision"] == "accept"
+     assert result["judgment"]["artifact_updated"] is True
+@@ -2158,7 +2168,7 @@ def test_strata_withdraw_acts_on_bound_scope_with_own_provenance(tmp_path: Path)
+         assert withdraw_act.proposer.session_id == "sess_wd"
+ 
+ 
+-def test_strata_withdraw_unknown_item_raises_runtimeerror(tmp_path: Path) -> None:
++async def test_strata_withdraw_unknown_item_raises_runtimeerror(tmp_path: Path) -> None:
+     db_path = _make_db(tmp_path)
+     summaries_dir = str(tmp_path / "summaries")
+     fleet_path = _make_fleet_yaml(tmp_path)
+@@ -2175,7 +2185,7 @@ def test_strata_withdraw_unknown_item_raises_runtimeerror(tmp_path: Path) -> Non
+         pytest.raises(RuntimeError, match="not found"),
+     ):
+         mod._summary_store = SummaryStore(summaries_dir)
+-        mod.strata_withdraw("pub_does_not_exist")
++        await mod.strata_withdraw("pub_does_not_exist")
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -2183,7 +2193,7 @@ def test_strata_withdraw_unknown_item_raises_runtimeerror(tmp_path: Path) -> Non
+ # ---------------------------------------------------------------------------
+ 
+ 
+-def test_read_scope_summary_increments_session_reads(tmp_path: Path) -> None:
++async def test_read_scope_summary_increments_session_reads(tmp_path: Path) -> None:
+     """A summary read increments the session's reads counter and per-scope receipt."""
+     db_path = _make_db(tmp_path)
+     summaries_dir = str(tmp_path / "summaries")
+@@ -2195,8 +2205,8 @@ def test_read_scope_summary_increments_session_reads(tmp_path: Path) -> None:
+ 
+     scope_p, skill_p, session_p = _patch_agent_binding(mod, scope="g_backend", session_id="sess_r")
+     with scope_p, skill_p, session_p, patch.object(mod, "_load_fleet", return_value=fleet):
+-        mod.strata_read_scope_summary("g_arch")
+-        mod.strata_read_scope_summary("g_arch")
++        await mod.strata_read_scope_summary("g_arch")
++        await mod.strata_read_scope_summary("g_arch")
+ 
+     # The state file exists, is readable, and records both reads of g_arch.
+     state = mod._session_store.read("sess_r")
+@@ -2208,7 +2218,7 @@ def test_read_scope_summary_increments_session_reads(tmp_path: Path) -> None:
+     assert state.reads_by_scope["g_arch"].last_read_at != ""
+ 
+ 
+-def test_read_perspective_records_read_for_target_scope(tmp_path: Path) -> None:
++async def test_read_perspective_records_read_for_target_scope(tmp_path: Path) -> None:
+     """A perspective read is attributed to its target scope only, not its ancestors."""
+     db_path = _make_db(tmp_path)
+     summaries_dir = str(tmp_path / "summaries")
+@@ -2219,7 +2229,7 @@ def test_read_perspective_records_read_for_target_scope(tmp_path: Path) -> None:
+ 
+     scope_p, skill_p, session_p = _patch_agent_binding(mod, scope="g_backend", session_id="sess_p")
+     with scope_p, skill_p, session_p, patch.object(mod, "_load_fleet", return_value=fleet):
+-        mod.strata_read_perspective("g_backend")
++        await mod.strata_read_perspective("g_backend")
+ 
+     state = mod._session_store.read("sess_p")
+     assert state is not None
+@@ -2228,7 +2238,7 @@ def test_read_perspective_records_read_for_target_scope(tmp_path: Path) -> None:
+     assert set(state.reads_by_scope) == {"g_backend"}
+ 
+ 
+-def test_session_stats_tool_returns_counters(tmp_path: Path) -> None:
++async def test_session_stats_tool_returns_counters(tmp_path: Path) -> None:
+     """strata_session_stats returns the live counters; zeroed before any activity."""
+     db_path = _make_db(tmp_path)
+     summaries_dir = str(tmp_path / "summaries")
+@@ -2241,19 +2251,19 @@ def test_session_stats_tool_returns_counters(tmp_path: Path) -> None:
+     scope_p, skill_p, session_p = _patch_agent_binding(mod, scope="g_backend", session_id="sess_s")
+     with scope_p, skill_p, session_p, patch.object(mod, "_load_fleet", return_value=fleet):
+         # Before any read, the self-query returns zeroed counters (never errors).
+-        empty = mod.strata_session_stats()
++        empty = await mod.strata_session_stats()
+         assert empty["reads"] == 0
+         assert empty["session_id"] == "sess_s"
+ 
+-        mod.strata_read_scope_summary("g_arch")
+-        stats = mod.strata_session_stats()
++        await mod.strata_read_scope_summary("g_arch")
++        stats = await mod.strata_session_stats()
+ 
+     assert stats["reads"] == 1
+     assert stats["contributions"] == 0
+     assert stats["reads_by_scope"]["g_arch"]["count"] == 1
+ 
+ 
+-def test_accepted_contribution_increments_session_counter(tmp_path: Path) -> None:
++async def test_accepted_contribution_increments_session_counter(tmp_path: Path) -> None:
+     """An accepted contribution bumps the session's contributions counter (release valve)."""
+     db_path = _make_db(tmp_path)
+     summaries_dir = str(tmp_path / "summaries")
+@@ -2277,7 +2287,7 @@ def test_accepted_contribution_increments_session_counter(tmp_path: Path) -> Non
+         patch("strata.scope_manager.ScopeManager.judge", return_value=fake_judgment),
+         patch("anthropic.Anthropic", return_value=MagicMock()),
+     ):
+-        mod.strata_contribute(
++        await mod.strata_contribute(
+             scope_id="g_arch",
+             content="Use structured logging.",
+             proposed_classification="context",
+@@ -2290,7 +2300,7 @@ def test_accepted_contribution_increments_session_counter(tmp_path: Path) -> Non
+     assert state.contributions == 1
+ 
+ 
+-def test_declined_contribution_does_not_increment_counter(tmp_path: Path) -> None:
++async def test_declined_contribution_does_not_increment_counter(tmp_path: Path) -> None:
+     """A scope-manager decline is not an accepted contribution — no counter bump."""
+     db_path = _make_db(tmp_path)
+     summaries_dir = str(tmp_path / "summaries")
+@@ -2314,7 +2324,7 @@ def test_declined_contribution_does_not_increment_counter(tmp_path: Path) -> Non
+         patch("strata.scope_manager.ScopeManager.judge", return_value=fake_judgment),
+         patch("anthropic.Anthropic", return_value=MagicMock()),
+     ):
+-        mod.strata_contribute(
++        await mod.strata_contribute(
+             scope_id="g_arch",
+             content="trivia",
+             proposed_classification="context",
+@@ -2334,7 +2344,7 @@ def test_declined_contribution_does_not_increment_counter(tmp_path: Path) -> Non
+ # ---------------------------------------------------------------------------
+ 
+ 
+-def _seed_and_read(mod, fleet, *, scope: str, session_id: str, times: int) -> list[dict]:
++async def _seed_and_read(mod, fleet, *, scope: str, session_id: str, times: int) -> list[dict]:
+     """Read g_arch's summary *times* times as *scope*/*session_id*; return the results.
+ 
+     Every read increments the session's reads counter, so this walks the session
+@@ -2344,11 +2354,11 @@ def _seed_and_read(mod, fleet, *, scope: str, session_id: str, times: int) -> li
+     results: list[dict] = []
+     with scope_p, skill_p, session_p, patch.object(mod, "_load_fleet", return_value=fleet):
+         for _ in range(times):
+-            results.append(mod.strata_read_scope_summary("g_arch"))
++            results.append(await mod.strata_read_scope_summary("g_arch"))
+     return results
+ 
+ 
+-def test_closeout_records_decline_without_building_judge(tmp_path: Path) -> None:
++async def test_closeout_records_decline_without_building_judge(tmp_path: Path) -> None:
+     """strata_session_closeout records a decline as a pure session-state write.
+ 
+     The mechanical decline path must never construct the scope-manager or the
+@@ -2375,7 +2385,9 @@ def test_closeout_records_decline_without_building_judge(tmp_path: Path) -> None
+             side_effect=AssertionError("closeout must never construct a judge client"),
+         ),
+     ):
+-        result = mod.strata_session_closeout(reason="read-only investigation, nothing decided")
++        result = await mod.strata_session_closeout(
++            reason="read-only investigation, nothing decided"
++        )
+ 
+     assert result["session_id"] == "sess_co"
+     assert result["declines"] == 1
+@@ -2386,7 +2398,7 @@ def test_closeout_records_decline_without_building_judge(tmp_path: Path) -> None
+     assert state.declines == 1
+ 
+ 
+-def test_no_nudge_below_threshold(tmp_path: Path) -> None:
++async def test_no_nudge_below_threshold(tmp_path: Path) -> None:
+     """Reads below the threshold carry no nudge — the early-read silence (#111)."""
+     db_path = _make_db(tmp_path)
+     summaries_dir = str(tmp_path / "summaries")
+@@ -2396,12 +2408,12 @@ def test_no_nudge_below_threshold(tmp_path: Path) -> None:
+     SummaryStore(summaries_dir).write("g_arch", _make_summary("g_arch", "ctx"))
+     fleet = FleetConfig.load(fleet_path)
+ 
+-    results = _seed_and_read(mod, fleet, scope="g_backend", session_id="sess_nb", times=2)
++    results = await _seed_and_read(mod, fleet, scope="g_backend", session_id="sess_nb", times=2)
+ 
+     assert all("nudge" not in r for r in results)
+ 
+ 
+-def test_nudge_appears_at_threshold_with_current_counts(tmp_path: Path) -> None:
++async def test_nudge_appears_at_threshold_with_current_counts(tmp_path: Path) -> None:
+     """At the threshold the nudge fires and names the CURRENT read count."""
+     db_path = _make_db(tmp_path)
+     summaries_dir = str(tmp_path / "summaries")
+@@ -2411,7 +2423,7 @@ def test_nudge_appears_at_threshold_with_current_counts(tmp_path: Path) -> None:
+     SummaryStore(summaries_dir).write("g_arch", _make_summary("g_arch", "ctx"))
+     fleet = FleetConfig.load(fleet_path)
+ 
+-    results = _seed_and_read(mod, fleet, scope="g_backend", session_id="sess_th", times=3)
++    results = await _seed_and_read(mod, fleet, scope="g_backend", session_id="sess_th", times=3)
+ 
+     # First two reads (below threshold) stay silent; the third fires.
+     assert "nudge" not in results[0]
+@@ -2425,7 +2437,7 @@ def test_nudge_appears_at_threshold_with_current_counts(tmp_path: Path) -> None:
+     assert "stale" not in nudge
+ 
+ 
+-def test_nudge_escalates_at_higher_threshold(tmp_path: Path) -> None:
++async def test_nudge_escalates_at_higher_threshold(tmp_path: Path) -> None:
+     """Once reads reach the escalation threshold the wording sharpens."""
+     db_path = _make_db(tmp_path)
+     summaries_dir = str(tmp_path / "summaries")
+@@ -2435,7 +2447,7 @@ def test_nudge_escalates_at_higher_threshold(tmp_path: Path) -> None:
+     SummaryStore(summaries_dir).write("g_arch", _make_summary("g_arch", "ctx"))
+     fleet = FleetConfig.load(fleet_path)
+ 
+-    results = _seed_and_read(mod, fleet, scope="g_backend", session_id="sess_esc", times=6)
++    results = await _seed_and_read(mod, fleet, scope="g_backend", session_id="sess_esc", times=6)
+ 
+     base_nudge = results[2]["nudge"]  # reads == 3, base tier
+     escalated = results[5]["nudge"]  # reads == 6, escalated tier
+@@ -2445,7 +2457,7 @@ def test_nudge_escalates_at_higher_threshold(tmp_path: Path) -> None:
+     assert escalated != base_nudge
+ 
+ 
+-def test_nudge_silent_after_contribution(tmp_path: Path) -> None:
++async def test_nudge_silent_after_contribution(tmp_path: Path) -> None:
+     """An accepted contribution resets the asymmetry and quiets the nudge."""
+     db_path = _make_db(tmp_path)
+     summaries_dir = str(tmp_path / "summaries")
+@@ -2456,7 +2468,7 @@ def test_nudge_silent_after_contribution(tmp_path: Path) -> None:
+     fleet = FleetConfig.load(fleet_path)
+ 
+     # Read to the threshold: the last read carries a nudge.
+-    pre = _seed_and_read(mod, fleet, scope="g_backend", session_id="sess_ac", times=3)
++    pre = await _seed_and_read(mod, fleet, scope="g_backend", session_id="sess_ac", times=3)
+     assert "nudge" in pre[-1]
+ 
+     fake_judgment = ScopeManagerJudgment(
+@@ -2474,17 +2486,17 @@ def test_nudge_silent_after_contribution(tmp_path: Path) -> None:
+         patch("strata.scope_manager.ScopeManager.judge", return_value=fake_judgment),
+         patch("anthropic.Anthropic", return_value=MagicMock()),
+     ):
+-        mod.strata_contribute(
++        await mod.strata_contribute(
+             scope_id="g_arch",
+             content="Structured logging is the standard.",
+             proposed_classification="context",
+         )
+-        after = mod.strata_read_scope_summary("g_arch")
++        after = await mod.strata_read_scope_summary("g_arch")
+ 
+     assert "nudge" not in after
+ 
+ 
+-def test_nudge_silent_after_closeout(tmp_path: Path) -> None:
++async def test_nudge_silent_after_closeout(tmp_path: Path) -> None:
+     """A mechanical closeout resets the asymmetry and quiets the nudge."""
+     db_path = _make_db(tmp_path)
+     summaries_dir = str(tmp_path / "summaries")
+@@ -2495,19 +2507,19 @@ def test_nudge_silent_after_closeout(tmp_path: Path) -> None:
+     fleet = FleetConfig.load(fleet_path)
+ 
+     # Read to the threshold: the last read carries a nudge.
+-    pre = _seed_and_read(mod, fleet, scope="g_backend", session_id="sess_cn", times=3)
++    pre = await _seed_and_read(mod, fleet, scope="g_backend", session_id="sess_cn", times=3)
+     assert "nudge" in pre[-1]
+ 
+     scope_p, skill_p, session_p = _patch_agent_binding(mod, scope="g_backend", session_id="sess_cn")
+     with scope_p, skill_p, session_p, patch.object(mod, "_load_fleet", return_value=fleet):
+-        closeout = mod.strata_session_closeout(reason="nothing to record")
+-        after = mod.strata_read_scope_summary("g_arch")
++        closeout = await mod.strata_session_closeout(reason="nothing to record")
++        after = await mod.strata_read_scope_summary("g_arch")
+ 
+     assert closeout["declines"] == 1
+     assert "nudge" not in after
+ 
+ 
+-def test_nudge_rides_perspective_and_record_reads(tmp_path: Path) -> None:
++async def test_nudge_rides_perspective_and_record_reads(tmp_path: Path) -> None:
+     """The nudge is not summary-only: it rides perspective reads and record reads.
+ 
+     A perspective read increments the counter like a summary read; a record read
+@@ -2525,8 +2537,8 @@ def test_nudge_rides_perspective_and_record_reads(tmp_path: Path) -> None:
+     scope_p, skill_p, session_p = _patch_agent_binding(mod, scope="g_backend", session_id="sess_pr")
+     with scope_p, skill_p, session_p, patch.object(mod, "_load_fleet", return_value=fleet):
+         # Three perspective reads take the session to the threshold.
+-        persp = [mod.strata_read_perspective("g_backend") for _ in range(3)]
+-        record = mod.strata_read_scope_record("g_backend")
++        persp = [await mod.strata_read_perspective("g_backend") for _ in range(3)]
++        record = await mod.strata_read_scope_record("g_backend")
+ 
+     assert "nudge" not in persp[0]
+     assert "nudge" in persp[2]
+@@ -2582,7 +2594,7 @@ def _record_reader(tmp_path: Path, fleet_path: Path) -> tuple[object, str]:
+     return mod, db_path
+ 
+ 
+-def test_read_scope_record_is_bounded_by_default(tmp_path: Path) -> None:
++async def test_read_scope_record_is_bounded_by_default(tmp_path: Path) -> None:
+     """The breaking change issue #130 asks for: an unadorned call is the newest page.
+ 
+     The unbounded default was the bug — a whole-record read overflows the
+@@ -2598,8 +2610,8 @@ def test_read_scope_record_is_bounded_by_default(tmp_path: Path) -> None:
+         patch.object(mod, "_AGENT_SCOPE", "g_backend"),
+         patch.object(mod, "_load_fleet", return_value=fleet),
+     ):
+-        default_page = mod.strata_read_scope_record("g_backend")
+-        small_page = mod.strata_read_scope_record("g_backend", limit=2)
++        default_page = await mod.strata_read_scope_record("g_backend")
++        small_page = await mod.strata_read_scope_record("g_backend", limit=2)
+ 
+     # The default page size comes from settings, never a literal at the call site.
+     assert default_page["page"]["limit"] == mod._settings.record_page_size
+@@ -2609,7 +2621,7 @@ def test_read_scope_record_is_bounded_by_default(tmp_path: Path) -> None:
+     assert small_page["page"]["next_before_id"] == expected[3]
+ 
+ 
+-def test_read_scope_record_pages_walk_the_whole_record(tmp_path: Path) -> None:
++async def test_read_scope_record_pages_walk_the_whole_record(tmp_path: Path) -> None:
+     """Walking before_id until it is null covers the record exactly once."""
+     fleet_path = _make_fleet_yaml(tmp_path)
+     mod, db_path = _record_reader(tmp_path, fleet_path)
+@@ -2624,7 +2636,7 @@ def test_read_scope_record_pages_walk_the_whole_record(tmp_path: Path) -> None:
+     ):
+         cursor = None
+         while True:
+-            page = mod.strata_read_scope_record("g_backend", limit=2, before_id=cursor)
++            page = await mod.strata_read_scope_record("g_backend", limit=2, before_id=cursor)
+             walked.extend(c["id"] for c in page["contributions"])
+             cursor = page["page"]["next_before_id"]
+             if cursor is None:
+@@ -2633,7 +2645,7 @@ def test_read_scope_record_pages_walk_the_whole_record(tmp_path: Path) -> None:
+     assert walked == list(reversed(expected))
+ 
+ 
+-def test_read_scope_record_rejects_out_of_range_paging(tmp_path: Path) -> None:
++async def test_read_scope_record_rejects_out_of_range_paging(tmp_path: Path) -> None:
+     """A limit below 1 and a stale cursor both fail loudly."""
+     fleet_path = _make_fleet_yaml(tmp_path)
+     mod, db_path = _record_reader(tmp_path, fleet_path)
+@@ -2645,12 +2657,12 @@ def test_read_scope_record_rejects_out_of_range_paging(tmp_path: Path) -> None:
+         patch.object(mod, "_load_fleet", return_value=fleet),
+     ):
+         with pytest.raises(RuntimeError, match="Invalid record page"):
+-            mod.strata_read_scope_record("g_backend", limit=0)
++            await mod.strata_read_scope_record("g_backend", limit=0)
+         with pytest.raises(RuntimeError, match="before_id is not a contribution"):
+-            mod.strata_read_scope_record("g_backend", before_id="c_does_not_exist")
++            await mod.strata_read_scope_record("g_backend", before_id="c_does_not_exist")
+ 
+ 
+-def test_read_contribution_returns_state_and_verdict(tmp_path: Path) -> None:
++async def test_read_contribution_returns_state_and_verdict(tmp_path: Path) -> None:
+     """The by-id hit: one contribution, its state, and the scope-manager's notes."""
+     fleet_path = _make_fleet_yaml(tmp_path)
+     mod, db_path = _record_reader(tmp_path, fleet_path)
+@@ -2669,7 +2681,7 @@ def test_read_contribution_returns_state_and_verdict(tmp_path: Path) -> None:
+         patch.object(mod, "_AGENT_SCOPE", "g_backend"),
+         patch.object(mod, "_load_fleet", return_value=fleet),
+     ):
+-        result = mod.strata_read_contribution(contribution_id)
++        result = await mod.strata_read_contribution(contribution_id)
+ 
+     assert result["contribution"]["id"] == contribution_id
+     assert result["state"]["state"] == "judged"
+@@ -2678,7 +2690,7 @@ def test_read_contribution_returns_state_and_verdict(tmp_path: Path) -> None:
+     assert result["judgment_attempts"] == []
+ 
+ 
+-def test_read_contribution_marks_a_failed_judgment(tmp_path: Path) -> None:
++async def test_read_contribution_marks_a_failed_judgment(tmp_path: Path) -> None:
+     """judge_failed carries no verdict — "the judge errored" never reads as "in flight"."""
+     fleet_path = _make_fleet_yaml(tmp_path)
+     mod, db_path = _record_reader(tmp_path, fleet_path)
+@@ -2697,7 +2709,7 @@ def test_read_contribution_marks_a_failed_judgment(tmp_path: Path) -> None:
+         patch.object(mod, "_AGENT_SCOPE", "g_backend"),
+         patch.object(mod, "_load_fleet", return_value=fleet),
+     ):
+-        result = mod.strata_read_contribution(contribution_id)
++        result = await mod.strata_read_contribution(contribution_id)
+ 
+     assert result["state"]["state"] == "judge_failed"
+     assert result["state"]["error_class"] == "APIError"
+@@ -2705,7 +2717,7 @@ def test_read_contribution_marks_a_failed_judgment(tmp_path: Path) -> None:
+     assert [a["error_class"] for a in result["judgment_attempts"]] == ["APIError"]
+ 
+ 
+-def test_read_contribution_raises_for_an_unknown_id(tmp_path: Path) -> None:
++async def test_read_contribution_raises_for_an_unknown_id(tmp_path: Path) -> None:
+     """The by-id miss raises the record's existing not-found idiom."""
+     fleet_path = _make_fleet_yaml(tmp_path)
+     mod, db_path = _record_reader(tmp_path, fleet_path)
+@@ -2717,10 +2729,10 @@ def test_read_contribution_raises_for_an_unknown_id(tmp_path: Path) -> None:
+         patch.object(mod, "_load_fleet", return_value=fleet),
+         pytest.raises(RuntimeError, match="Contribution not found"),
+     ):
+-        mod.strata_read_contribution("c_does_not_exist")
++        await mod.strata_read_contribution("c_does_not_exist")
+ 
+ 
+-def test_read_contribution_refuses_a_contribution_outside_the_entitled_surface(
++async def test_read_contribution_refuses_a_contribution_outside_the_entitled_surface(
+     tmp_path: Path,
+ ) -> None:
+     """The by-id lookup never reaches a record the scope read cannot (issue #48)."""
+@@ -2735,7 +2747,7 @@ def test_read_contribution_refuses_a_contribution_outside_the_entitled_surface(
+         patch.object(mod, "_load_fleet", return_value=fleet),
+         pytest.raises(RuntimeError, match="outside your entitled surface"),
+     ):
+-        mod.strata_read_contribution(peer_contribution)
++        await mod.strata_read_contribution(peer_contribution)
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -2746,7 +2758,7 @@ def test_read_contribution_refuses_a_contribution_outside_the_entitled_surface(
+ # ---------------------------------------------------------------------------
+ 
+ 
+-def test_list_scopes_no_reparse_when_fleet_yaml_unchanged(
++async def test_list_scopes_no_reparse_when_fleet_yaml_unchanged(
+     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+ ) -> None:
+     """Two calls with no file change between them must reload fleet.yaml only once."""
+@@ -2774,7 +2786,7 @@ def test_list_scopes_no_reparse_when_fleet_yaml_unchanged(
+     assert calls == 0, "unchanged fleet.yaml must not be re-parsed"
+ 
+ 
+-def test_invalid_fleet_edit_keeps_serving_last_good_fleet_with_notice(tmp_path: Path) -> None:
++async def test_invalid_fleet_edit_keeps_serving_last_good_fleet_with_notice(tmp_path: Path) -> None:
+     """An invalid mid-session edit must not break every subsequent tool call."""
+     db_path = _make_db(tmp_path)
+     summaries_dir = str(tmp_path / "summaries")
+@@ -2895,7 +2907,7 @@ def test_bind_leaves_session_id_unchanged(tmp_path: Path) -> None:
+         assert mod._AGENT_SESSION_ID == "sess_stable"
+ 
+ 
+-def test_contribution_after_bind_carries_new_scope_in_provenance(tmp_path: Path) -> None:
++async def test_contribution_after_bind_carries_new_scope_in_provenance(tmp_path: Path) -> None:
+     db_path = _make_db(tmp_path)
+     summaries_dir = str(tmp_path / "summaries")
+     fleet_path = _make_fleet_yaml(tmp_path)
+@@ -2919,7 +2931,7 @@ def test_contribution_after_bind_carries_new_scope_in_provenance(tmp_path: Path)
+         assert bind_result["scope_id"] == "g_arch"
+         assert mod._AGENT_SCOPE == "g_arch"
+ 
+-        mod.strata_contribute(
++        await mod.strata_contribute(
+             scope_id="g_arch",
+             content="Bound to g_arch and contributing.",
+             proposed_classification="context",
+@@ -2940,7 +2952,7 @@ def test_contribution_after_bind_carries_new_scope_in_provenance(tmp_path: Path)
+ # ---------------------------------------------------------------------------
+ 
+ 
+-def test_bind_refusal_mentions_active_fleet_reload_warning(tmp_path: Path) -> None:
++async def test_bind_refusal_mentions_active_fleet_reload_warning(tmp_path: Path) -> None:
+     db_path = _make_db(tmp_path)
+     summaries_dir = str(tmp_path / "summaries")
+     fleet_path = _make_fleet_yaml(tmp_path)
+@@ -3036,7 +3048,7 @@ def test_bind_refuses_archived_scope_via_shared_check(tmp_path: Path) -> None:
+ # ---------------------------------------------------------------------------
+ 
+ 
+-def test_contribute_stamps_provenance_with_the_scope_it_authorized_against(
++async def test_contribute_stamps_provenance_with_the_scope_it_authorized_against(
+     tmp_path: Path,
+ ) -> None:
+     """A binding change that happens mid-call must not split authorize/stamp.
+@@ -3075,7 +3087,7 @@ def test_contribute_stamps_provenance_with_the_scope_it_authorized_against(
+         patch("strata.scope_manager.ScopeManager.judge", return_value=fake_judgment),
+         patch("anthropic.Anthropic", return_value=MagicMock()),
+     ):
+-        mod.strata_contribute(
++        await mod.strata_contribute(
+             scope_id="g_backend",
+             content="Provenance must not split from authorization.",
+             proposed_classification="context",
+@@ -3087,3 +3099,443 @@ def test_contribute_stamps_provenance_with_the_scope_it_authorized_against(
+     # Stamped with the scope strata_contribute snapshotted at the top
+     # (g_backend), NOT the value _AGENT_SCOPE was mutated to mid-call.
+     assert contributions[0].contributor.scope_id == "g_backend"
++
++
++# ---------------------------------------------------------------------------
++# Soft-start (Change 1, dated addendum to ADR 0005 D5): a 2+ scope fleet with
++# no binding resolved at startup no longer exits the process. The server
++# always starts; every memory tool but strata_bind returns the aggregated
++# startup-failure list (plus recovery instructions) as its error result
++# until the session is bound. strata_bind is the recovery path and must work
++# in this unresolved state, including re-reading a fleet fixed after
++# startup.
++# ---------------------------------------------------------------------------
++
++
++async def test_unbound_tool_call_returns_error_with_scopes_and_bind_mention(tmp_path: Path) -> None:
++    """A memory tool call while unresolved returns the startup failures, the
++    fleet's scope ids, and a strata_bind mention — never a bare traceback."""
++    db_path = _make_db(tmp_path)
++    summaries_dir = str(tmp_path / "summaries")
++    fleet_path = _make_fleet_yaml(tmp_path)  # g_arch, g_backend — two scopes
++
++    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
++    fleet = FleetConfig.load(fleet_path)
++
++    with (
++        patch.object(mod, "_AGENT_SCOPE", ""),
++        patch.object(mod, "_UNRESOLVED", True),
++        patch.object(
++            mod,
++            "_STARTUP_ERRORS",
++            ["STRATA_AGENT_SCOPE is not set.\n  Available scope IDs: g_arch, g_backend."],
++        ),
++        patch.object(mod, "_load_fleet", return_value=fleet),
++        pytest.raises(RuntimeError) as exc_info,
++    ):
++        await mod.strata_read_perspective()
++
++    message = str(exc_info.value)
++    assert "g_arch" in message
++    assert "g_backend" in message
++    assert "strata_bind" in message
++
++
++async def test_unbound_tool_call_raises_for_every_memory_tool_but_bind(tmp_path: Path) -> None:
++    """Every memory tool but strata_bind is gated — not just one of them."""
++    db_path = _make_db(tmp_path)
++    summaries_dir = str(tmp_path / "summaries")
++    fleet_path = _make_fleet_yaml(tmp_path)
++
++    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
++    fleet = FleetConfig.load(fleet_path)
++
++    with (
++        patch.object(mod, "_AGENT_SCOPE", ""),
++        patch.object(mod, "_UNRESOLVED", True),
++        patch.object(mod, "_STARTUP_ERRORS", ["STRATA_AGENT_SCOPE is not set."]),
++        patch.object(mod, "_load_fleet", return_value=fleet),
++    ):
++        with pytest.raises(RuntimeError):
++            await mod.strata_read_perspective()
++        with pytest.raises(RuntimeError):
++            await mod.strata_read_scope_summary()
++        with pytest.raises(RuntimeError):
++            await mod.strata_session_stats()
++        with pytest.raises(RuntimeError):
++            await mod.strata_session_closeout(reason="n/a")
++
++
++async def test_strata_bind_works_while_unresolved(tmp_path: Path) -> None:
++    """strata_bind is THE recovery path — it must work while unresolved, and
++    resolve the session so subsequent tool calls stop erroring."""
++    db_path = _make_db(tmp_path)
++    summaries_dir = str(tmp_path / "summaries")
++    fleet_path = _make_fleet_yaml(tmp_path)  # g_arch, g_backend
++
++    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
++
++    with (
++        patch.object(mod, "_AGENT_SCOPE", ""),
++        patch.object(mod, "_UNRESOLVED", True),
++        patch.object(mod, "_STARTUP_ERRORS", ["STRATA_AGENT_SCOPE is not set."]),
++    ):
++        result = mod.strata_bind(scope_id="g_backend")
++        assert result["scope_id"] == "g_backend"
++        assert mod._UNRESOLVED is False
++
++        # Bound now — a subsequent tool call must work, not error.
++        listing = mod.strata_list_scopes()
++        assert {s["id"] for s in listing["scopes"]} == {"g_arch", "g_backend"}
++
++
++# ---------------------------------------------------------------------------
++# Ungate audit follow-up: strata_list_scopes reads only fleet topology — no
++# scope's summary, record, perspective, or session state — so it works
++# unbound (controller ruling: topology is not scoped memory, and an agent
++# helping the user bind should be able to look at the fleet). Every other
++# gated tool stays gated (see test_unbound_tool_call_raises_for_every_
++# memory_tool_but_bind, above, and test_unbound_tool_call_returns_error_
++# with_scopes_and_bind_mention, which now exercises a genuine memory tool).
++# ---------------------------------------------------------------------------
++
++
++async def test_strata_list_scopes_works_unbound_and_carries_notice(tmp_path: Path) -> None:
++    """strata_list_scopes must NOT be gated: it returns the fleet topology
++    while unresolved, with a one-line unbound_notice appended so the state
++    stays visible rather than looking like an ordinary bound call."""
++    db_path = _make_db(tmp_path)
++    summaries_dir = str(tmp_path / "summaries")
++    fleet_path = _make_fleet_yaml(tmp_path)  # g_arch, g_backend
++
++    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
++    fleet = FleetConfig.load(fleet_path)
++
++    with (
++        patch.object(mod, "_AGENT_SCOPE", ""),
++        patch.object(mod, "_UNRESOLVED", True),
++        patch.object(mod, "_STARTUP_ERRORS", ["STRATA_AGENT_SCOPE is not set."]),
++        patch.object(mod, "_load_fleet", return_value=fleet),
++    ):
++        # Must NOT raise — pure topology reads work unbound.
++        result = mod.strata_list_scopes()
++
++    assert {s["id"] for s in result["scopes"]} == {"g_arch", "g_backend"}
++    assert "unbound_notice" in result
++    assert "strata_bind(scope_id=...)" in result["unbound_notice"]
++
++
++async def test_strata_list_scopes_has_no_notice_once_bound(tmp_path: Path) -> None:
++    """Once resolved, strata_list_scopes carries no unbound_notice — an
++    ordinary bound call must not look like it's still waiting on a bind."""
++    db_path = _make_db(tmp_path)
++    summaries_dir = str(tmp_path / "summaries")
++    fleet_path = _make_fleet_yaml(tmp_path)
++
++    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
++    fleet = FleetConfig.load(fleet_path)
++
++    with (
++        patch.object(mod, "_AGENT_SCOPE", "g_backend"),
++        patch.object(mod, "_UNRESOLVED", False),
++        patch.object(mod, "_load_fleet", return_value=fleet),
++    ):
++        result = mod.strata_list_scopes()
++
++    assert "unbound_notice" not in result
++
++
++async def test_unresolved_message_mentions_strata_list_scopes_works_unbound(
++    tmp_path: Path,
++) -> None:
++    """The gated-tool error text must reflect reality: strata_list_scopes no
++    longer needs strata_bind first, so the recovery text should point an
++    agent at it for the full fleet picture while still unbound."""
++    db_path = _make_db(tmp_path)
++    summaries_dir = str(tmp_path / "summaries")
++    fleet_path = _make_fleet_yaml(tmp_path)
++
++    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
++    fleet = FleetConfig.load(fleet_path)
++
++    with (
++        patch.object(mod, "_AGENT_SCOPE", ""),
++        patch.object(mod, "_UNRESOLVED", True),
++        patch.object(mod, "_STARTUP_ERRORS", ["STRATA_AGENT_SCOPE is not set."]),
++        patch.object(mod, "_load_fleet", return_value=fleet),
++        pytest.raises(RuntimeError) as exc_info,
++    ):
++        await mod.strata_read_perspective()
++
++    assert "strata_list_scopes" in str(exc_info.value)
++
++
++async def test_fleet_missing_at_startup_then_created_bindable_without_restart(
++    tmp_path: Path,
++) -> None:
++    """The exact incident: fleet.yaml missing at startup (unresolved), created
++    afterward, and bindable with no server restart — strata_bind re-reads
++    fleet.yaml itself via the reloader."""
++    db_path = _make_db(tmp_path)
++    summaries_dir = str(tmp_path / "summaries")
++    fleet_path = tmp_path / "fleet.yaml"  # deliberately does not exist yet
++
++    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
++
++    with (
++        patch.object(mod, "_AGENT_SCOPE", ""),
++        patch.object(mod, "_UNRESOLVED", True),
++        patch.object(mod, "_STARTUP_ERRORS", [".strata/config.toml not found."]),
++    ):
++        with pytest.raises(RuntimeError):
++            await mod.strata_read_perspective()
++
++        # Fleet created after startup, out of band — no server restart.
++        fleet_data = {
++            "strata": [{"id": "L0", "name": "root", "ordinal": 0}],
++            "scopes": [{"id": "g_solo", "name": "Solo", "stratum_id": "L0"}],
++            "edges": [],
++        }
++        fleet_path.write_text(yaml.dump(fleet_data, default_flow_style=False), encoding="utf-8")
++
++        result = mod.strata_bind(scope_id="g_solo")
++        assert result["scope_id"] == "g_solo"
++        assert mod._UNRESOLVED is False
++
++
++# ---------------------------------------------------------------------------
++# Elicitation (Change 2): a tool call while unbound, with a fleet that loads
++# fine, first attempts a server-initiated MCP elicitation offering a scope
++# pick, through a real (in-memory) MCP session — the SDK test seam
++# mcp.shared.memory.create_connected_server_and_client_session, driven by a
++# fake elicitation_callback (accept / decline) or its absence (no capability
++# declared).
++# ---------------------------------------------------------------------------
++
++
++async def _elicit_accept_g_backend(context, params):
++    from mcp import types as mcp_types
++
++    return mcp_types.ElicitResult(action="accept", content={"scope_id": "g_backend"})
++
++
++async def _elicit_decline(context, params):
++    from mcp import types as mcp_types
++
++    return mcp_types.ElicitResult(action="decline")
++
++
++def _result_text(result) -> str:
++    return "".join(getattr(block, "text", "") for block in result.content)
++
++
++async def test_unbound_two_scope_start_handshake_completes_and_tools_listable(
++    tmp_path: Path,
++) -> None:
++    """Change 1's core claim at the protocol level: an unresolved 2-scope
++    fleet still completes the MCP handshake, and every tool (including
++    strata_bind, the recovery path) is listable."""
++    from mcp.shared.memory import create_connected_server_and_client_session
++
++    db_path = _make_db(tmp_path)
++    summaries_dir = str(tmp_path / "summaries")
++    fleet_path = _make_fleet_yaml(tmp_path)
++
++    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
++
++    with (
++        patch.object(mod, "_AGENT_SCOPE", ""),
++        patch.object(mod, "_UNRESOLVED", True),
++        patch.object(mod, "_STARTUP_ERRORS", ["STRATA_AGENT_SCOPE is not set."]),
++    ):
++        async with create_connected_server_and_client_session(mod.mcp) as client:
++            tools = await client.list_tools()
++
++    names = {t.name for t in tools.tools}
++    assert "strata_bind" in names
++    assert "strata_list_scopes" in names
++    assert "strata_contribute" in names
++
++
++async def test_elicitation_accept_binds_and_continues_original_call(tmp_path: Path) -> None:
++    """A client that accepts the elicitation binds via the strata_bind path
++    AND the original tool call proceeds against the new binding — a single
++    round trip, not a second call."""
++    from mcp.shared.memory import create_connected_server_and_client_session
++
++    db_path = _make_db(tmp_path)
++    summaries_dir = str(tmp_path / "summaries")
++    fleet_path = _make_fleet_yaml(tmp_path)  # g_arch, g_backend
++
++    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
++
++    with (
++        patch.object(mod, "_AGENT_SCOPE", ""),
++        patch.object(mod, "_UNRESOLVED", True),
++        patch.object(mod, "_STARTUP_ERRORS", ["STRATA_AGENT_SCOPE is not set."]),
++    ):
++        async with create_connected_server_and_client_session(
++            mod.mcp, elicitation_callback=_elicit_accept_g_backend
++        ) as client:
++            result = await client.call_tool("strata_read_perspective", {})
++
++        assert result.isError is not True
++        assert mod._AGENT_SCOPE == "g_backend"
++        assert mod._UNRESOLVED is False
++
++
++async def test_elicitation_only_attempted_once_then_bound_calls_skip_it(tmp_path: Path) -> None:
++    """Single-round-trip guard: after an accepted elicitation binds the
++    session, a second tool call must not elicit again — it is already
++    resolved, so _require_bound_or_elicit is a no-op before it ever reaches
++    the elicitation machinery."""
++    from mcp.shared.memory import create_connected_server_and_client_session
++
++    db_path = _make_db(tmp_path)
++    summaries_dir = str(tmp_path / "summaries")
++    fleet_path = _make_fleet_yaml(tmp_path)
++
++    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
++
++    calls = 0
++
++    async def _counting_accept(context, params):
++        nonlocal calls
++        calls += 1
++        from mcp import types as mcp_types
++
++        return mcp_types.ElicitResult(action="accept", content={"scope_id": "g_backend"})
++
++    with (
++        patch.object(mod, "_AGENT_SCOPE", ""),
++        patch.object(mod, "_UNRESOLVED", True),
++        patch.object(mod, "_STARTUP_ERRORS", ["STRATA_AGENT_SCOPE is not set."]),
++    ):
++        async with create_connected_server_and_client_session(
++            mod.mcp, elicitation_callback=_counting_accept
++        ) as client:
++            first = await client.call_tool("strata_read_perspective", {})
++            second = await client.call_tool("strata_read_perspective", {})
++
++        assert first.isError is not True
++        assert second.isError is not True
++        assert calls == 1
++
++
++async def test_elicitation_accept_with_invalid_scope_falls_back_binding_unchanged(
++    tmp_path: Path,
++) -> None:
++    """An accepted pick that fails _resolve_bind (unknown scope_id) falls
++    back to the plain Change-1 error — the binding is left unchanged, same
++    guarantee strata_bind itself gives on a rejected bind."""
++    from mcp.shared.memory import create_connected_server_and_client_session
++
++    db_path = _make_db(tmp_path)
++    summaries_dir = str(tmp_path / "summaries")
++    fleet_path = _make_fleet_yaml(tmp_path)  # g_arch, g_backend — no "g_nope"
++
++    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
++
++    async def _accept_bad_scope(context, params):
++        from mcp import types as mcp_types
++
++        return mcp_types.ElicitResult(action="accept", content={"scope_id": "g_nope"})
++
++    with (
++        patch.object(mod, "_AGENT_SCOPE", ""),
++        patch.object(mod, "_UNRESOLVED", True),
++        patch.object(mod, "_STARTUP_ERRORS", ["STRATA_AGENT_SCOPE is not set."]),
++    ):
++        async with create_connected_server_and_client_session(
++            mod.mcp, elicitation_callback=_accept_bad_scope
++        ) as client:
++            result = await client.call_tool("strata_read_perspective", {})
++
++        assert result.isError is True
++        text = _result_text(result)
++        assert "strata_bind" in text
++        # Binding left unchanged — same as any other failed bind attempt.
++        assert mod._AGENT_SCOPE == ""
++        assert mod._UNRESOLVED is True
++
++
++async def test_elicitation_decline_falls_back_to_unresolved_error(tmp_path: Path) -> None:
++    """A client that declines the elicitation falls back silently to the
++    plain Change-1 error result — never a raw elicitation-protocol error."""
++    from mcp.shared.memory import create_connected_server_and_client_session
++
++    db_path = _make_db(tmp_path)
++    summaries_dir = str(tmp_path / "summaries")
++    fleet_path = _make_fleet_yaml(tmp_path)
++
++    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
++
++    with (
++        patch.object(mod, "_AGENT_SCOPE", ""),
++        patch.object(mod, "_UNRESOLVED", True),
++        patch.object(mod, "_STARTUP_ERRORS", ["STRATA_AGENT_SCOPE is not set."]),
++    ):
++        async with create_connected_server_and_client_session(
++            mod.mcp, elicitation_callback=_elicit_decline
++        ) as client:
++            result = await client.call_tool("strata_read_perspective", {})
++
++        assert result.isError is True
++        text = _result_text(result)
++        assert "strata_bind" in text
++        assert mod._AGENT_SCOPE == ""
++        assert mod._UNRESOLVED is True
++
++
++async def test_elicitation_missing_capability_falls_back_to_unresolved_error(
++    tmp_path: Path,
++) -> None:
++    """A client that never declares the elicitation capability (no callback
++    given — the SDK's own signal for "not supported") gets the plain
++    Change-1 error, with no elicitation round trip attempted."""
++    from mcp.shared.memory import create_connected_server_and_client_session
++
++    db_path = _make_db(tmp_path)
++    summaries_dir = str(tmp_path / "summaries")
++    fleet_path = _make_fleet_yaml(tmp_path)
++
++    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
++
++    with (
++        patch.object(mod, "_AGENT_SCOPE", ""),
++        patch.object(mod, "_UNRESOLVED", True),
++        patch.object(mod, "_STARTUP_ERRORS", ["STRATA_AGENT_SCOPE is not set."]),
++    ):
++        async with create_connected_server_and_client_session(mod.mcp) as client:
++            result = await client.call_tool("strata_read_perspective", {})
++
++        assert result.isError is True
++        text = _result_text(result)
++        assert "strata_bind" in text
++        assert mod._AGENT_SCOPE == ""
++        assert mod._UNRESOLVED is True
++
++
++async def test_elicitation_never_attempted_from_within_strata_bind(tmp_path: Path) -> None:
++    """strata_bind never elicits — it IS the elicitation's own bind target,
++    so eliciting from inside it would be circular. Calling it directly
++    (bypassing the guard entirely, as it always does) must not touch the
++    elicitation machinery at all."""
++    db_path = _make_db(tmp_path)
++    summaries_dir = str(tmp_path / "summaries")
++    fleet_path = _make_fleet_yaml(tmp_path)
++
++    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
++
++    with (
++        patch.object(mod, "_AGENT_SCOPE", ""),
++        patch.object(mod, "_UNRESOLVED", True),
++        patch.object(mod, "_STARTUP_ERRORS", ["STRATA_AGENT_SCOPE is not set."]),
++        patch.object(
++            mod,
++            "_attempt_elicit_bind",
++            side_effect=AssertionError("strata_bind must never elicit"),
++        ),
++    ):
++        result = mod.strata_bind(scope_id="g_backend")
++        assert result["scope_id"] == "g_backend"
+diff --git a/tests/test_perspective.py b/tests/test_perspective.py
+index e061a0a..c997623 100644
+--- a/tests/test_perspective.py
++++ b/tests/test_perspective.py
+@@ -178,7 +178,7 @@ def _load_mcp_module(db_path: str, summaries_dir: str, fleet_yaml_path: str):
+ # ---------------------------------------------------------------------------
+ 
+ 
+-def test_golden_equivalence_mcp_tool_matches_compose_perspective(tmp_path: Path) -> None:
++async def test_golden_equivalence_mcp_tool_matches_compose_perspective(tmp_path: Path) -> None:
+     """strata_read_perspective's dict equals compose_perspective's, pinned literally."""
+     db_path = str(tmp_path / "strata.db")
+     run_migrations(db_path)
+@@ -220,7 +220,7 @@ def test_golden_equivalence_mcp_tool_matches_compose_perspective(tmp_path: Path)
+     ):
+         mock_dt.now.return_value = fixed_now
+         mod._summary_store = store
+-        tool_result = mod.strata_read_perspective("g_team")
++        tool_result = await mod.strata_read_perspective("g_team")
+ 
+     assert tool_result == direct_result
+ 
+diff --git a/tests/test_refuse_to_start.py b/tests/test_refuse_to_start.py
+index 493b544..cc11398 100644
+--- a/tests/test_refuse_to_start.py
++++ b/tests/test_refuse_to_start.py
+@@ -1,4 +1,4 @@
+-"""Tests for 3b refuse-to-start validation (ADR 0005 Decision 5).
++"""Tests for startup binding validation (ADR 0005 Decision 5, soft-start addendum).
+ 
+ The _validate_binding function is called from main() before mcp.run().
+ It enforces four conditions in order:
+@@ -8,8 +8,12 @@ It enforces four conditions in order:
+ 3. Scope exists in fleet config
+ 4. STRATA_AGENT_SKILL is in the scope's permitted_skills (when set)
+ 
+-Each failure → sys.exit(1) with actionable message content.
+-Happy path: all four conditions met → no exit, mcp.run would proceed.
++Soft-start (dated addendum): a failure no longer exits the process. Each
++condition's failure is instead appended to the returned ``errors`` list —
++the third element of the ``(resolved_scope, resolved_skill, errors)`` tuple
++— which the caller (main()) stores for every memory tool to report until
++the session is bound via strata_bind. Happy path: all four conditions met →
++empty errors list, mcp.run would proceed exactly as before.
+ 
+ Vocabulary: scope, stratum, fleet, contribution, scope-manager.
+ """
+@@ -19,7 +23,6 @@ from __future__ import annotations
+ import sys
+ from pathlib import Path
+ 
+-import pytest
+ import yaml
+ 
+ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+@@ -66,114 +69,105 @@ def _make_two_scope_fleet(tmp_path: Path) -> FleetConfig:
+ 
+ 
+ # ---------------------------------------------------------------------------
+-# Condition 1: project config not found → exit(1)
++# Condition 1: project config not found → reported, no exit
+ # ---------------------------------------------------------------------------
+ 
+ 
+-def test_no_project_config_exits_with_message(tmp_path: Path) -> None:
+-    """Condition 1 failure: no .strata/config.toml → sys.exit(1) with path info."""
++def test_no_project_config_does_not_exit(tmp_path: Path) -> None:
++    """Condition 1 failure: no .strata/config.toml → returned in errors, no exit."""
+     fleet = _make_fleet_with_skills(tmp_path)
+ 
+-    with pytest.raises(SystemExit) as exc_info:
+-        _validate_binding(
+-            fleet,
+-            scope="g_root",
+-            skill="strata-worker",
+-            project_config_found=False,
+-        )
++    _resolved_scope, _resolved_skill, errors = _validate_binding(
++        fleet,
++        scope="g_root",
++        skill="strata-worker",
++        project_config_found=False,
++    )
+ 
+-    assert exc_info.value.code == 1
++    assert errors  # non-empty: the failure is present
+ 
+ 
+-def test_no_project_config_message_mentions_register(tmp_path: Path, capsys) -> None:
++def test_no_project_config_message_mentions_register(tmp_path: Path) -> None:
+     """Condition 1 failure message should mention strata register."""
+     fleet = _make_fleet_with_skills(tmp_path)
+ 
+-    with pytest.raises(SystemExit):
+-        _validate_binding(
+-            fleet,
+-            scope="g_root",
+-            skill="strata-worker",
+-            project_config_found=False,
+-        )
++    _resolved_scope, _resolved_skill, errors = _validate_binding(
++        fleet,
++        scope="g_root",
++        skill="strata-worker",
++        project_config_found=False,
++    )
+ 
+-    captured = capsys.readouterr()
+-    assert "strata register" in captured.err
++    assert any("strata register" in e for e in errors)
+ 
+ 
+ # ---------------------------------------------------------------------------
+ # Condition 2: STRATA_AGENT_SCOPE not set, and no single-scope fleet to
+-# auto-bind to → exit(1). A single-scope fleet is covered separately below
+-# (single-scope auto-bind no longer exits here).
++# auto-bind to → reported. A single-scope fleet is covered separately below
++# (single-scope auto-bind never reports a failure here).
+ # ---------------------------------------------------------------------------
+ 
+ 
+-def test_no_scope_exits_with_message(tmp_path: Path) -> None:
+-    """Condition 2 failure: STRATA_AGENT_SCOPE empty, 2+ scope fleet → sys.exit(1)."""
++def test_no_scope_reports_failure(tmp_path: Path) -> None:
++    """Condition 2 failure: STRATA_AGENT_SCOPE empty, 2+ scope fleet → error reported."""
+     fleet = _make_two_scope_fleet(tmp_path)
+ 
+-    with pytest.raises(SystemExit) as exc_info:
+-        _validate_binding(
+-            fleet,
+-            scope="",  # not set
+-            skill="strata-worker",
+-            project_config_found=True,
+-        )
++    _resolved_scope, _resolved_skill, errors = _validate_binding(
++        fleet,
++        scope="",  # not set
++        skill="strata-worker",
++        project_config_found=True,
++    )
+ 
+-    assert exc_info.value.code == 1
++    assert errors
+ 
+ 
+-def test_no_scope_message_mentions_export(tmp_path: Path, capsys) -> None:
++def test_no_scope_message_mentions_export(tmp_path: Path) -> None:
+     """Condition 2 message must include export STRATA_AGENT_SCOPE instruction."""
+     fleet = _make_two_scope_fleet(tmp_path)
+ 
+-    with pytest.raises(SystemExit):
+-        _validate_binding(
+-            fleet,
+-            scope="",
+-            skill="strata-worker",
+-            project_config_found=True,
+-        )
++    _resolved_scope, _resolved_skill, errors = _validate_binding(
++        fleet,
++        scope="",
++        skill="strata-worker",
++        project_config_found=True,
++    )
+ 
+-    captured = capsys.readouterr()
+-    assert "STRATA_AGENT_SCOPE" in captured.err
+-    assert "export" in captured.err
++    joined = "\n".join(errors)
++    assert "STRATA_AGENT_SCOPE" in joined
++    assert "export" in joined
+ 
+ 
+-def test_no_scope_message_lists_available_scopes_for_multi_scope_fleet(
+-    tmp_path: Path, capsys
+-) -> None:
++def test_no_scope_message_lists_available_scopes_for_multi_scope_fleet(tmp_path: Path) -> None:
+     """Task requirement: the unset-scope error names the valid scopes when
+     the fleet has 2+ of them (no single scope to auto-bind to)."""
+     fleet = _make_two_scope_fleet(tmp_path)
+ 
+-    with pytest.raises(SystemExit):
+-        _validate_binding(
+-            fleet,
+-            scope="",
+-            skill="strata-worker",
+-            project_config_found=True,
+-        )
++    _resolved_scope, _resolved_skill, errors = _validate_binding(
++        fleet,
++        scope="",
++        skill="strata-worker",
++        project_config_found=True,
++    )
+ 
+-    captured = capsys.readouterr()
+-    assert "g_root" in captured.err
+-    assert "g_arch" in captured.err
++    joined = "\n".join(errors)
++    assert "g_root" in joined
++    assert "g_arch" in joined
+ 
+ 
+-def test_empty_string_scope_treated_as_unset_for_multi_scope_fleet(tmp_path: Path, capsys) -> None:
++def test_empty_string_scope_treated_as_unset_for_multi_scope_fleet(tmp_path: Path) -> None:
+     """Empty string counts as unset everywhere (Codex writes literal empty
+-    env values) — a 2+ scope fleet still exits."""
++    env values) — a 2+ scope fleet still reports a failure."""
+     fleet = _make_two_scope_fleet(tmp_path)
+ 
+-    with pytest.raises(SystemExit) as exc_info:
+-        _validate_binding(
+-            fleet,
+-            scope="",
+-            skill="strata-worker",
+-            project_config_found=True,
+-        )
++    _resolved_scope, _resolved_skill, errors = _validate_binding(
++        fleet,
++        scope="",
++        skill="strata-worker",
++        project_config_found=True,
++    )
+ 
+-    assert exc_info.value.code == 1
++    assert errors
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -184,10 +178,10 @@ def test_empty_string_scope_treated_as_unset_for_multi_scope_fleet(tmp_path: Pat
+ 
+ 
+ def test_single_scope_fleet_auto_binds_when_scope_unset(tmp_path: Path) -> None:
+-    """A single-scope fleet auto-binds — no exit — and returns the scope id."""
++    """A single-scope fleet auto-binds — no failure reported — and returns the scope id."""
+     fleet = _make_fleet_with_skills(tmp_path, permitted_skills=None)
+ 
+-    resolved_scope, _resolved_skill = _validate_binding(
++    resolved_scope, _resolved_skill, errors = _validate_binding(
+         fleet,
+         scope="",
+         skill=None,
+@@ -195,6 +189,7 @@ def test_single_scope_fleet_auto_binds_when_scope_unset(tmp_path: Path) -> None:
+     )
+ 
+     assert resolved_scope == "g_root"
++    assert errors == []
+ 
+ 
+ def test_single_scope_fleet_auto_bind_prints_notice(tmp_path: Path, capsys) -> None:
+@@ -218,7 +213,7 @@ def test_single_scope_fleet_auto_bind_prints_notice(tmp_path: Path, capsys) -> N
+ def test_single_scope_fleet_auto_binds_skill_to_default(tmp_path: Path) -> None:
+     """When the scope was auto-bound and skill is unset, resolve the scope's
+     default_skill (companion rule — otherwise a fresh install with a
+-    default_skill-declaring seeded scope would still refuse to start)."""
++    default_skill-declaring seeded scope would still report a failure)."""
+     data = {
+         "strata": [{"id": "L0", "name": "root", "ordinal": 0}],
+         "scopes": [
+@@ -235,7 +230,7 @@ def test_single_scope_fleet_auto_binds_skill_to_default(tmp_path: Path) -> None:
+     fleet_path.write_text(yaml.dump(data), encoding="utf-8")
+     fleet = FleetConfig.load(fleet_path)
+ 
+-    resolved_scope, resolved_skill = _validate_binding(
++    resolved_scope, resolved_skill, errors = _validate_binding(
+         fleet,
+         scope="",
+         skill="",
+@@ -244,19 +239,21 @@ def test_single_scope_fleet_auto_binds_skill_to_default(tmp_path: Path) -> None:
+ 
+     assert resolved_scope == "g_root"
+     assert resolved_skill == "strata-worker"
++    assert errors == []
+ 
+ 
+ def test_multi_scope_fleet_does_not_auto_bind(tmp_path: Path) -> None:
+-    """A 2+ scope fleet still exits on unset scope — no auto-bind target."""
++    """A 2+ scope fleet still reports a failure on unset scope — no auto-bind target."""
+     fleet = _make_two_scope_fleet(tmp_path)
+ 
+-    with pytest.raises(SystemExit):
+-        _validate_binding(
+-            fleet,
+-            scope="",
+-            skill="strata-worker",
+-            project_config_found=True,
+-        )
++    _resolved_scope, _resolved_skill, errors = _validate_binding(
++        fleet,
++        scope="",
++        skill="strata-worker",
++        project_config_found=True,
++    )
++
++    assert errors
+ 
+ 
+ def test_explicit_scope_unchanged_by_auto_bind_logic(tmp_path: Path) -> None:
+@@ -264,7 +261,7 @@ def test_explicit_scope_unchanged_by_auto_bind_logic(tmp_path: Path) -> None:
+     logic only ever engages when scope is unset/empty."""
+     fleet = _make_two_scope_fleet(tmp_path)
+ 
+-    resolved_scope, resolved_skill = _validate_binding(
++    resolved_scope, resolved_skill, errors = _validate_binding(
+         fleet,
+         scope="g_arch",
+         skill="strata-worker",
+@@ -273,6 +270,7 @@ def test_explicit_scope_unchanged_by_auto_bind_logic(tmp_path: Path) -> None:
+ 
+     assert resolved_scope == "g_arch"
+     assert resolved_skill == "strata-worker"
++    assert errors == []
+ 
+ 
+ def test_explicit_scope_no_auto_bind_notice_printed(tmp_path: Path, capsys) -> None:
+@@ -292,39 +290,36 @@ def test_explicit_scope_no_auto_bind_notice_printed(tmp_path: Path, capsys) -> N
+ 
+ 
+ # ---------------------------------------------------------------------------
+-# Condition 3: scope not in fleet → exit(1)
++# Condition 3: scope not in fleet → reported
+ # ---------------------------------------------------------------------------
+ 
+ 
+-def test_unknown_scope_exits_with_message(tmp_path: Path) -> None:
+-    """Condition 3 failure: scope not in fleet config → sys.exit(1)."""
++def test_unknown_scope_reports_failure(tmp_path: Path) -> None:
++    """Condition 3 failure: scope not in fleet config → error reported."""
+     fleet = _make_fleet_with_skills(tmp_path)
+ 
+-    with pytest.raises(SystemExit) as exc_info:
+-        _validate_binding(
+-            fleet,
+-            scope="g_nonexistent",
+-            skill="strata-worker",
+-            project_config_found=True,
+-        )
++    _resolved_scope, _resolved_skill, errors = _validate_binding(
++        fleet,
++        scope="g_nonexistent",
++        skill="strata-worker",
++        project_config_found=True,
++    )
+ 
+-    assert exc_info.value.code == 1
++    assert errors
+ 
+ 
+-def test_unknown_scope_message_lists_available_scopes(tmp_path: Path, capsys) -> None:
++def test_unknown_scope_message_lists_available_scopes(tmp_path: Path) -> None:
+     """Condition 3 message must list available scope IDs."""
+     fleet = _make_fleet_with_skills(tmp_path)
+ 
+-    with pytest.raises(SystemExit):
+-        _validate_binding(
+-            fleet,
+-            scope="g_nonexistent",
+-            skill="strata-worker",
+-            project_config_found=True,
+-        )
++    _resolved_scope, _resolved_skill, errors = _validate_binding(
++        fleet,
++        scope="g_nonexistent",
++        skill="strata-worker",
++        project_config_found=True,
++    )
+ 
+-    captured = capsys.readouterr()
+-    assert "g_root" in captured.err  # the available scope
++    assert any("g_root" in e for e in errors)  # the available scope
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -349,130 +344,124 @@ def _make_fleet_with_archived_scope(tmp_path: Path) -> FleetConfig:
+     return FleetConfig.load(fleet_path)
+ 
+ 
+-def test_archived_scope_exits_with_message(tmp_path: Path) -> None:
++def test_archived_scope_reports_failure(tmp_path: Path) -> None:
+     """An archived scope must be refused at startup, exactly like strata_bind refuses it."""
+     fleet = _make_fleet_with_archived_scope(tmp_path)
+ 
+-    with pytest.raises(SystemExit) as exc_info:
+-        _validate_binding(
+-            fleet,
+-            scope="g_root",
+-            skill=None,
+-            project_config_found=True,
+-        )
++    _resolved_scope, _resolved_skill, errors = _validate_binding(
++        fleet,
++        scope="g_root",
++        skill=None,
++        project_config_found=True,
++    )
+ 
+-    assert exc_info.value.code == 1
++    assert errors
+ 
+ 
+-def test_archived_scope_message_names_it_archived_and_lists_active(tmp_path: Path, capsys) -> None:
++def test_archived_scope_message_names_it_archived_and_lists_active(tmp_path: Path) -> None:
+     fleet = _make_fleet_with_archived_scope(tmp_path)
+ 
+-    with pytest.raises(SystemExit):
+-        _validate_binding(
+-            fleet,
+-            scope="g_root",
+-            skill=None,
+-            project_config_found=True,
+-        )
++    _resolved_scope, _resolved_skill, errors = _validate_binding(
++        fleet,
++        scope="g_root",
++        skill=None,
++        project_config_found=True,
++    )
+ 
+-    captured = capsys.readouterr()
+-    assert "archived" in captured.err
+-    assert "g_active" in captured.err
++    joined = "\n".join(errors)
++    assert "archived" in joined
++    assert "g_active" in joined
+ 
+ 
+ # ---------------------------------------------------------------------------
+-# Condition 4a: STRATA_AGENT_SKILL not set → exit(1)
++# Condition 4a: STRATA_AGENT_SKILL not set → reported
+ # ---------------------------------------------------------------------------
+ 
+ 
+-def test_no_skill_exits_with_message(tmp_path: Path) -> None:
+-    """Condition 3b failure: STRATA_AGENT_SKILL empty on a skill-declaring scope → sys.exit(1).
++def test_no_skill_reports_failure(tmp_path: Path) -> None:
++    """Condition 3b failure: STRATA_AGENT_SKILL empty on a skill-declaring scope → reported.
+ 
+     Issue #121: a scope that DECLARES skills keeps today's "skill required"
+     semantics; only an unrestricted scope may bind skill-less.
+     """
+     fleet = _make_fleet_with_skills(tmp_path, permitted_skills=["strata-worker"])
+ 
+-    with pytest.raises(SystemExit) as exc_info:
+-        _validate_binding(
+-            fleet,
+-            scope="g_root",
+-            skill="",  # not set
+-            project_config_found=True,
+-        )
++    _resolved_scope, _resolved_skill, errors = _validate_binding(
++        fleet,
++        scope="g_root",
++        skill="",  # not set
++        project_config_found=True,
++    )
+ 
+-    assert exc_info.value.code == 1
++    assert errors
+ 
+ 
+-def test_no_skill_message_mentions_skill_export(tmp_path: Path, capsys) -> None:
++def test_no_skill_message_mentions_skill_export(tmp_path: Path) -> None:
+     """Condition 3b failure message must mention STRATA_AGENT_SKILL."""
+     fleet = _make_fleet_with_skills(tmp_path, permitted_skills=["strata-worker"])
+ 
+-    with pytest.raises(SystemExit):
+-        _validate_binding(
+-            fleet,
+-            scope="g_root",
+-            skill="",
+-            project_config_found=True,
+-        )
++    _resolved_scope, _resolved_skill, errors = _validate_binding(
++        fleet,
++        scope="g_root",
++        skill="",
++        project_config_found=True,
++    )
+ 
+-    captured = capsys.readouterr()
+-    assert "STRATA_AGENT_SKILL" in captured.err
++    assert any("STRATA_AGENT_SKILL" in e for e in errors)
+ 
+ 
+ def test_no_skill_on_unrestricted_scope_is_accepted(tmp_path: Path) -> None:
+-    """Issue #121: a scope declaring no skills may bind skill-less — no exit.
++    """Issue #121: a scope declaring no skills may bind skill-less — no failure.
+ 
+     The scope is confirmed unrestricted (no default_skill, no
+     permitted_skills), so the missing STRATA_AGENT_SKILL is waived rather
+-    than a refuse-to-start failure.
++    than a validation failure.
+     """
+     fleet = _make_fleet_with_skills(tmp_path, permitted_skills=None)
+ 
+-    # Must NOT raise SystemExit.
+-    _validate_binding(
++    _resolved_scope, _resolved_skill, errors = _validate_binding(
+         fleet,
+         scope="g_root",
+         skill=None,
+         project_config_found=True,
+     )
+ 
++    assert errors == []
++
+ 
+ # ---------------------------------------------------------------------------
+-# Condition 4b: skill not in permitted_skills → exit(1)
++# Condition 4b: skill not in permitted_skills → reported
+ # ---------------------------------------------------------------------------
+ 
+ 
+-def test_skill_not_in_permitted_exits_with_message(tmp_path: Path) -> None:
+-    """Condition 4 failure: skill not in permitted_skills → sys.exit(1)."""
++def test_skill_not_in_permitted_reports_failure(tmp_path: Path) -> None:
++    """Condition 4 failure: skill not in permitted_skills → error reported."""
+     fleet = _make_fleet_with_skills(tmp_path, permitted_skills=["strata-worker", "inspector"])
+ 
+-    with pytest.raises(SystemExit) as exc_info:
+-        _validate_binding(
+-            fleet,
+-            scope="g_root",
+-            skill="unauthorized-skill",
+-            project_config_found=True,
+-        )
++    _resolved_scope, _resolved_skill, errors = _validate_binding(
++        fleet,
++        scope="g_root",
++        skill="unauthorized-skill",
++        project_config_found=True,
++    )
+ 
+-    assert exc_info.value.code == 1
++    assert errors
+ 
+ 
+-def test_skill_not_in_permitted_message_lists_permitted_skills(tmp_path: Path, capsys) -> None:
++def test_skill_not_in_permitted_message_lists_permitted_skills(tmp_path: Path) -> None:
+     """Condition 4 message must list the permitted skills for the scope."""
+     fleet = _make_fleet_with_skills(tmp_path, permitted_skills=["strata-worker", "inspector"])
+ 
+-    with pytest.raises(SystemExit):
+-        _validate_binding(
+-            fleet,
+-            scope="g_root",
+-            skill="unauthorized-skill",
+-            project_config_found=True,
+-        )
++    _resolved_scope, _resolved_skill, errors = _validate_binding(
++        fleet,
++        scope="g_root",
++        skill="unauthorized-skill",
++        project_config_found=True,
++    )
+ 
+-    captured = capsys.readouterr()
+-    assert "strata-worker" in captured.err
+-    assert "inspector" in captured.err
++    joined = "\n".join(errors)
++    assert "strata-worker" in joined
++    assert "inspector" in joined
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -481,73 +470,101 @@ def test_skill_not_in_permitted_message_lists_permitted_skills(tmp_path: Path, c
+ 
+ 
+ def test_empty_permitted_skills_allows_any_skill(tmp_path: Path) -> None:
+-    """When permitted_skills is empty/None, any skill is accepted (no exit)."""
++    """When permitted_skills is empty/None, any skill is accepted (no failure)."""
+     fleet = _make_fleet_with_skills(tmp_path, permitted_skills=None)
+ 
+-    # Must NOT raise SystemExit.
+-    _validate_binding(
++    _resolved_scope, _resolved_skill, errors = _validate_binding(
+         fleet,
+         scope="g_root",
+         skill="any-skill-whatsoever",
+         project_config_found=True,
+     )
+ 
++    assert errors == []
++
+ 
+ # ---------------------------------------------------------------------------
+-# Happy path: all conditions met → no exit
++# Happy path: all conditions met → empty errors
+ # ---------------------------------------------------------------------------
+ 
+ 
+-def test_happy_path_no_exit(tmp_path: Path) -> None:
+-    """When all four conditions pass, _validate_binding returns without calling sys.exit."""
++def test_happy_path_no_errors(tmp_path: Path) -> None:
++    """When all four conditions pass, _validate_binding returns an empty errors list."""
+     fleet = _make_fleet_with_skills(tmp_path, permitted_skills=["strata-worker"])
+ 
+-    # Should NOT raise SystemExit.
+-    _validate_binding(
++    _resolved_scope, _resolved_skill, errors = _validate_binding(
+         fleet,
+         scope="g_root",
+         skill="strata-worker",
+         project_config_found=True,
+     )
+ 
++    assert errors == []
++
+ 
+-def test_happy_path_with_empty_permitted_skills_no_exit(tmp_path: Path) -> None:
++def test_happy_path_with_empty_permitted_skills_no_errors(tmp_path: Path) -> None:
+     """Happy path works when scope has no permitted_skills restriction."""
+     fleet = _make_fleet_with_skills(tmp_path, permitted_skills=None)
+ 
+-    _validate_binding(
++    _resolved_scope, _resolved_skill, errors = _validate_binding(
+         fleet,
+         scope="g_root",
+         skill="strata-developer",
+         project_config_found=True,
+     )
+ 
++    assert errors == []
++
+ 
+ # ---------------------------------------------------------------------------
+-# Ordering: condition 1 checked before condition 2
++# Never exits: soft-start's whole point (dated addendum, ADR 0005 D5)
+ # ---------------------------------------------------------------------------
+ 
+ 
+-def test_all_failures_reported_in_single_error(tmp_path: Path, capsys) -> None:
++def test_multiple_failures_never_raise_systemexit(tmp_path: Path) -> None:
++    """Soft-start: even with every condition failing at once, _validate_binding
++    returns normally — it must never call sys.exit."""
++    # Should not raise SystemExit (or anything else).
++    _validate_binding(
++        None,  # No fleet because no config (mirrors main() behaviour)
++        scope="",
++        skill="",
++        project_config_found=False,
++    )
++
++
++def test_all_failures_reported_in_single_list(tmp_path: Path) -> None:
+     """Per ADR 0005 Decision 5: all validation failures are reported in a
+-    single error message before exit, not first-failure-wins.
++    single aggregated list, not first-failure-wins.
+ 
+     A user with three missing pieces (no config, no scope env, no skill env)
+     sees the complete remediation list in one pass.
+     """
+-    with pytest.raises(SystemExit) as exc_info:
+-        _validate_binding(
+-            None,  # No fleet because no config (mirrors main() behaviour)
+-            scope="",
+-            skill="",
+-            project_config_found=False,
+-        )
+-
+-    assert exc_info.value.code == 1
++    _resolved_scope, _resolved_skill, errors = _validate_binding(
++        None,  # No fleet because no config (mirrors main() behaviour)
++        scope="",
++        skill="",
++        project_config_found=False,
++    )
++
++    joined = "\n".join(errors)
++    # All three remediations appear in the same aggregated list.
++    assert "strata register" in joined, "missing config remediation"
++    assert "export STRATA_AGENT_SCOPE" in joined, "missing scope remediation"
++    assert "export STRATA_AGENT_SKILL" in joined, "missing skill remediation"
++    assert len(errors) == 3
++
++
++def test_all_failures_also_printed_to_stderr_for_local_dev(tmp_path: Path, capsys) -> None:
++    """The aggregated message is still printed to stderr — useful for a human
++    running the server locally who does read it — even though it is no
++    longer the only place the failure is visible (soft-start addendum)."""
++    _validate_binding(
++        None,
++        scope="",
++        skill="",
++        project_config_found=False,
++    )
++
+     captured = capsys.readouterr()
+-    # All three remediations appear in the same message.
+-    assert "strata register" in captured.err, "missing config remediation"
+-    assert "export STRATA_AGENT_SCOPE" in captured.err, "missing scope remediation"
+-    assert "export STRATA_AGENT_SKILL" in captured.err, "missing skill remediation"
+-    # The header announces the failure count.
+     assert "3 validation failures" in captured.err

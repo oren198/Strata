@@ -91,11 +91,14 @@ def test_plain_register_wires_every_detected_harness(
 
     assert _register(tmp_path) == 0
 
+    mcp_json = tmp_path / ".mcp.json"
+    assert mcp_json.exists()
+    assert install.mcp_server_present(
+        __import__("json").loads(mcp_json.read_text(encoding="utf-8"))
+    )
     settings = tmp_path / ".claude" / "settings.json"
     assert settings.exists()
-    assert install.mcp_server_present(
-        __import__("json").loads(settings.read_text(encoding="utf-8"))
-    )
+    assert install.stop_hook_present(__import__("json").loads(settings.read_text(encoding="utf-8")))
 
     codex_config = codex_home / "config.toml"
     assert codex_config.exists()
@@ -134,6 +137,7 @@ def test_explicit_harness_codex_only_leaves_claude_settings_untouched(
     assert _register(tmp_path, harness=["codex"]) == 0
 
     assert not (tmp_path / ".claude" / "settings.json").exists()
+    assert not (tmp_path / ".mcp.json").exists()
     codex_config = codex_home / "config.toml"
     assert install.codex_mcp_present(codex_config.read_text(encoding="utf-8"))
 
@@ -147,6 +151,7 @@ def test_explicit_harness_claude_code_only_leaves_codex_untouched(
     assert _register(tmp_path, harness=["claude-code"]) == 0
 
     assert (tmp_path / ".claude" / "settings.json").exists()
+    assert (tmp_path / ".mcp.json").exists()
     assert not (codex_home / "config.toml").exists()
 
 
@@ -215,6 +220,7 @@ def test_diff_mode_reports_both_harnesses_without_writing(
     assert _register(tmp_path, diff=True) == 0
 
     assert not (tmp_path / ".claude" / "settings.json").exists()
+    assert not (tmp_path / ".mcp.json").exists()
     assert not (codex_home / "config.toml").exists()
 
     out = capsys.readouterr().out
@@ -251,6 +257,9 @@ def test_plain_unregister_reverses_every_wired_harness(
     data = __import__("json").loads(settings.read_text(encoding="utf-8"))
     assert install.mcp_server_present(data) is False
     assert install.stop_hook_present(data) is False
+    # register's `.mcp.json` carried only the strata entry, so unregister
+    # deletes the file outright for a clean round-trip.
+    assert not (tmp_path / ".mcp.json").exists()
 
     codex_config = codex_home / "config.toml"
     assert codex_config.exists()
@@ -308,9 +317,11 @@ def test_explicit_unregister_harness_codex_leaves_claude_wiring_intact(
 
     assert _unregister(tmp_path, harness=["codex"]) == 0
 
+    mcp_json = tmp_path / ".mcp.json"
+    mcp_data = __import__("json").loads(mcp_json.read_text(encoding="utf-8"))
+    assert install.mcp_server_present(mcp_data) is True
     settings = tmp_path / ".claude" / "settings.json"
     data = __import__("json").loads(settings.read_text(encoding="utf-8"))
-    assert install.mcp_server_present(data) is True
     assert install.stop_hook_present(data) is True
 
     codex_config = codex_home / "config.toml"
@@ -350,9 +361,9 @@ def test_unregister_named_but_unwired_harness_skips_with_notice(
     assert "codex" in out.lower()
     assert "not wired" in out.lower() or "nothing to do" in out.lower()
     # claude-code wiring untouched — codex-only unregister was requested.
-    settings = tmp_path / ".claude" / "settings.json"
-    data = __import__("json").loads(settings.read_text(encoding="utf-8"))
-    assert install.mcp_server_present(data) is True
+    mcp_json = tmp_path / ".mcp.json"
+    mcp_data = __import__("json").loads(mcp_json.read_text(encoding="utf-8"))
+    assert install.mcp_server_present(mcp_data) is True
 
 
 def test_unregister_corrupt_settings_json_is_not_downgraded_to_a_skip(

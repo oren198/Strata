@@ -66,7 +66,7 @@ jobs:
           python -m venv /tmp/wheelenv
           /tmp/wheelenv/bin/pip install --quiet dist/*.whl
 
-      - name: strata register + single-scope auto-bind + refuse-to-start smoke (foreign project)
+      - name: strata register + single-scope auto-bind + soft-start smoke (foreign project)
         run: |
           set -eu
           mkdir /tmp/foreign && cd /tmp/foreign && git init -q
@@ -74,7 +74,28 @@ jobs:
           test -f .strata/config.toml
           test -f .strata/fleet.yaml
 
-          # --- Side 1: fresh single-scope fleet, no binding -----------------
+          # Claude Code reads project-scoped MCP servers from `.mcp.json`,
+          # not `.claude/settings.json` (which has no `mcpServers` key in
+          # its schema) — register must wire the entry into the file
+          # Claude Code actually reads, or every session is memory-blind.
+          test -f .mcp.json
+          grep -q '"strata"' .mcp.json
+          grep -q '"strata-mcp"' .mcp.json
+          # Prefixed with `test -f` so this can't pass vacuously if the file
+          # were ever missing (grep on a nonexistent file also fails, but
+          # spell out the real assertion being made: the file exists AND
+          # has no mcpServers key).
+          test -f .claude/settings.json
+          if grep -q "mcpServers" .claude/settings.json; then
+            echo ".claude/settings.json must not carry an mcpServers block:"
+            cat .claude/settings.json; exit 1
+          fi
+          # The freshness Stop hook IS correctly wired into settings.json —
+          # only the mcpServers block moved to .mcp.json.
+          grep -q "hooks" .claude/settings.json
+          grep -q "strata-stop-hook" .claude/settings.json
+
+          # --- Phase 1: fresh single-scope fleet, no binding ----------------
           # Single-scope auto-bind (operator directive): the seeded fleet has
           # exactly one scope (g_root), so an unset STRATA_AGENT_SCOPE now
           # auto-binds to it instead of refusing to start. Must print the
@@ -98,11 +119,16 @@ jobs:
             echo "strata-mcp crashed with a traceback:"; echo "$out"; exit 1
           fi
 
-          # --- Side 2: grow the fleet past one scope, no binding ------------
-          # Preserves the refuse-path coverage the old smoke had: once the
-          # fleet has 2+ scopes, auto-bind no longer applies and an unset
-          # STRATA_AGENT_SCOPE must exit 1 with the aggregated
-          # refuse-to-start message naming every available scope id, NOT a
+          # --- Phase 2: grow the fleet past one scope, no binding -----------
+          # Soft-start (ADR 0005 D5 addendum) abolished refuse-to-start for
+          # an unbound multi-scope fleet: the server always completes
+          # startup and serves, with every memory tool but strata_bind
+          # gated until a binding resolves (via strata_bind or elicitation).
+          # So growing the fleet past one scope with no binding must now
+          # exit 0 (same as phase 1 — soft-start, not a refusal) with
+          # stderr containing the real "started but is not yet bound"
+          # message (_validate_binding's actual printed text) naming every
+          # available scope id, and NEVER "refuses to start" or a
           # traceback. Edited via PyYAML (not a raw text append — the
           # seeded scopes list sits before a trailing `edges: []`, so a
           # naive append lands after it and produces invalid YAML) using
@@ -121,12 +147,47 @@ jobs:
           out=$(/tmp/wheelenv/bin/strata-mcp </dev/null 2>&1)
           rc=$?
           set -e
-          [ "$rc" -eq 1 ]
-          echo "$out" | grep -q "refuses to start"
+          [ "$rc" -eq 0 ]
+          if echo "$out" | grep -q "refuses to start"; then
+            echo "strata-mcp refused to start on an unbound multi-scope fleet (soft-start regression):"
+            echo "$out"; exit 1
+          fi
+          echo "$out" | grep -q "not yet bound"
           echo "$out" | grep -q "g_root"
           echo "$out" | grep -q "g_arch"
           if echo "$out" | grep -q "Traceback"; then
             echo "strata-mcp crashed with a traceback:"; echo "$out"; exit 1
+          fi
+
+          # --- Phase 3: a genuinely-refusing case still refuses -------------
+          # Storage-init failure (main(), after binding validation) is the
+          # one soft-start left as a hard refusal — a corrupt DB or
+          # unwritable directory isn't something strata_bind can recover
+          # from. An unparseable config.toml alone would just become a
+          # config-class startup-error entry and soft-start; to reach the
+          # real storage-init refusal, point the (still valid) config.toml's
+          # `db` at a path through a file, not a directory, so SQLite can
+          # never create it.
+          touch /tmp/foreign/notadir
+          /tmp/wheelenv/bin/python -c "
+          import re
+          path = '.strata/config.toml'
+          with open(path) as f:
+              text = f.read()
+          text = re.sub(r'^db\s*=\s*\".*\"', 'db = \"/tmp/foreign/notadir/strata.db\"', text, flags=re.MULTILINE)
+          with open(path, 'w') as f:
+              f.write(text)
+          "
+          set +e
+          out=$(/tmp/wheelenv/bin/strata-mcp </dev/null 2>&1)
+          rc=$?
+          set -e
+          [ "$rc" -eq 1 ]
+          echo "$out" | grep -q "refuses to start"
+          echo "$out" | grep -q "storage initialisation failed"
+          if echo "$out" | grep -q "Traceback"; then
+            echo "strata-mcp crashed with a traceback instead of the storage refusal message:"
+            echo "$out"; exit 1
           fi
 
       # The Console must serve from the wheel install (issue #65) — a

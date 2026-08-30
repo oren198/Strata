@@ -3,8 +3,11 @@
 This is the stable, documented import surface for the additive install
 operations Strata performs when it wires itself into a foreign project:
 
-* the additive ``.claude/settings.json`` merge (an ``mcpServers`` entry is
-  added only when absent — user state is never overwritten),
+* the additive ``mcpServers`` merge — into ``.mcp.json`` at the project root
+  for Claude Code (that file, not ``.claude/settings.json``, is what Claude
+  Code actually reads for project-scoped MCP servers; ``.claude/settings.json``
+  has no ``mcpServers`` key in its schema) — an entry is added only when
+  absent, user state is never overwritten,
 * skill copying into ``.claude/skills/`` (each skill is copied only when
   absent), and
 * ``--diff`` line rendering (the read-only "what would change" view).
@@ -45,6 +48,8 @@ if TYPE_CHECKING:
 __all__ = [
     "MCP_SERVER_NAME",
     "MCP_ENTRY",
+    "MCP_ENTRY_HISTORICAL",
+    "is_bootstrap_venv_shape_mcp_entry",
     "SKILL_NAMES",
     "HOOK_SCRIPT_NAME",
     "HOOK_COMMAND",
@@ -102,15 +107,32 @@ __all__ = [
 # Canonical install artifacts
 # ---------------------------------------------------------------------------
 
-#: Key under ``.claude/settings.json``'s ``mcpServers`` block for the engine's
-#: MCP server. This is the import/CLI name (``strata``), unchanged by the
-#: ADR 0009 distribution rename — only ``pip install`` names moved.
+#: Key under the ``mcpServers`` block for the engine's MCP server. This is
+#: the import/CLI name (``strata``), unchanged by the ADR 0009 distribution
+#: rename — only ``pip install`` names moved. For Claude Code, the
+#: ``mcpServers`` block this key lives under is at the PROJECT ROOT's
+#: ``.mcp.json`` — Claude Code's actual project-scoped MCP config file, not
+#: ``.claude/settings.json`` (that file's schema has no ``mcpServers`` key;
+#: ``enabledMcpjsonServers`` there explicitly refers to servers "from
+#: .mcp.json"). ``.claude/settings.json`` still carries the ``hooks.Stop``
+#: entry below — that location IS correct for hooks.
 MCP_SERVER_NAME = "strata"
 
-#: The canonical ``mcpServers.strata`` entry ``strata register`` merges in and
-#: ``strata unregister`` removes (only when the on-disk entry still matches it
-#: byte-for-byte). ``strata-mcp`` is resolved on ``PATH`` (ADR 0005 Decision 1).
+#: The canonical ``mcpServers.strata`` entry ``strata register`` merges into
+#: the project's ``.mcp.json`` and ``strata unregister`` removes (only when
+#: the on-disk entry still matches it byte-for-byte). ``strata-mcp`` is
+#: resolved on ``PATH`` (ADR 0005 Decision 1).
 MCP_ENTRY: dict = {"command": "strata-mcp", "env": {}}
+
+#: No other byte-exact ``mcpServers.strata`` shape has ever shipped besides
+#: :data:`MCP_ENTRY` — kept as an explicit empty tuple, not a special case, so
+#: legacy-entry migration/removal goes through the same current-or-historical
+#: mechanism every other managed artifact does (round-4 unregister fix, bug
+#: B: "wire the mechanism uniformly"). The ``--bootstrap-venv`` shape (an
+#: absolute ``.strata/.venv/bin/strata-mcp`` path) is NOT a byte-exact entry
+#: here — it varies per project — and is matched separately by
+#: :func:`is_bootstrap_venv_shape_mcp_entry`.
+MCP_ENTRY_HISTORICAL: tuple[dict, ...] = ()
 
 #: The canonical Claude Code skills vendored as package data under
 #: ``strata/_skills`` and copied into a project's ``.claude/skills/``.
@@ -232,18 +254,32 @@ summaries_dir = ".strata/summaries"
 
 _HISTORICAL_ARTIFACT_HASHES: dict[str, dict[str, object]] = {
     "strata": {
-        "current": "81a0a8debdb183603a985459c17b7e4800e65a5f5ff7b9cb7c7f0526d133087c",
+        "current": "30cb5a5f9beb522a1f1ab47f30aaa9b2545b182a719b81576e163eeb01c434e2",
         "historical": frozenset(
-            {"5865b8090923c1dd0d3f747490b006b4f0b3b4d18bceffb99ef7fb2fe9e577ab"}
+            {
+                "5865b8090923c1dd0d3f747490b006b4f0b3b4d18bceffb99ef7fb2fe9e577ab",
+                "81a0a8debdb183603a985459c17b7e4800e65a5f5ff7b9cb7c7f0526d133087c",
+                "1620f11a24ec0d3b1d4e776315e02ff343bcc768b6c6b955a7a4ce865058ba84",
+            }
         ),
     },
     "strata-worker": {
-        "current": "2e2cb5d953d6e97377a347134ebbef989f85f53cb7604a50e53f2516153831e0",
-        "historical": frozenset(),
+        "current": "60b7e03b4ad34db9f73837cd49c4925f6dd10d68df3251867b2486dbe8bf1f09",
+        "historical": frozenset(
+            {
+                "2e2cb5d953d6e97377a347134ebbef989f85f53cb7604a50e53f2516153831e0",
+                "110a29368e69e49a45a567f6a91ed3898fa2ebb779a6cb665cb0dde72f79157b",
+            }
+        ),
     },
     "strata-inspect": {
-        "current": "707793640183dfd5e503c57c48133c8d56747b74a49268bdd76b8cc77335f2ad",
-        "historical": frozenset(),
+        "current": "c8021ce536a43b4f2156b172ea196268754898130021d24ca64640d2cada4787",
+        "historical": frozenset(
+            {
+                "707793640183dfd5e503c57c48133c8d56747b74a49268bdd76b8cc77335f2ad",
+                "848e7e35726620cf54cab6d19657fcb2e43d71c30ed4ca49bc1cbae2ea6f857e",
+            }
+        ),
     },
     "strata-stop-hook": {
         "current": "d950ad8fcf436069b49d247543ab6a4a2c98481d6ef853e5c78a5289e0f5c582",
@@ -268,9 +304,13 @@ _HISTORICAL_ARTIFACT_HASHES: dict[str, dict[str, object]] = {
         "historical": frozenset(),
     },
     "agents-md": {
-        "current": "ceea6568ab9160d54f2d3edd7131bc9b3bf2a694832226e67e7553de7325825f",
+        "current": "58c0612121bc2f3061f7ba18fa32163a98ed15c88f279b194abe7f0bba5fbbe7",
         "historical": frozenset(
-            {"f6df7e82395ba3199d3a52c1651db8afb93b2fdd139b496974f871d453535b68"}
+            {
+                "f6df7e82395ba3199d3a52c1651db8afb93b2fdd139b496974f871d453535b68",
+                "ceea6568ab9160d54f2d3edd7131bc9b3bf2a694832226e67e7553de7325825f",
+                "d4e9b4da5543ad2faf75bedb17c426a8dab72e858955b1a48e7b718f72092aca",
+            }
         ),
     },
 }
@@ -336,11 +376,48 @@ def is_v1_2_shape_mcp_entry(entry: dict) -> bool:
     return isinstance(env, dict) and "STRATA_BACKEND_URL" in env
 
 
+def is_bootstrap_venv_shape_mcp_entry(entry: dict, project_root: Path) -> bool:
+    """Return ``True`` if *entry* is exactly what ``--bootstrap-venv`` wrote
+    for THIS project.
+
+    ``strata register --bootstrap-venv`` points the entry's ``command`` at an
+    absolute, per-project path (``<project_root>/.strata/.venv/bin/strata-mcp``)
+    rather than the ``strata-mcp`` name :data:`MCP_ENTRY` resolves on
+    ``PATH`` — so it can never byte-match :data:`MCP_ENTRY` or anything in
+    :data:`MCP_ENTRY_HISTORICAL`. Still register-written and never
+    hand-authored, so a legacy copy of it found in ``.claude/settings.json``
+    is just as migratable/removable as an exact match — the caller carries
+    the ``command`` value verbatim into ``.mcp.json`` rather than
+    overwriting it with the canonical one.
+
+    Deliberately narrow (a live incident found an earlier version of this
+    too loose): the ``command`` must match *this* project's venv path
+    exactly — a path ending in the right suffix but rooted at another
+    project (or hand-typed) is NOT ours — and *entry* must have exactly the
+    two keys register ever writes here (``command``, ``env``); an entry
+    with extra keys (``args``, or anything beyond those two) was never
+    something register wrote and must never be silently deleted/migrated.
+    ``env``'s *contents* stay free — register preserves a user-customised
+    env block across a bootstrap-venv re-run (see the caller in
+    ``__main__.cmd_register``) — only its type is checked here.
+    """
+    if set(entry) != {"command", "env"}:
+        return False
+    command = entry.get("command")
+    env = entry.get("env")
+    expected_command = str(Path(project_root) / ".strata" / ".venv" / "bin" / "strata-mcp")
+    return command == expected_command and isinstance(env, dict)
+
+
 def mcp_server_present(settings_data: dict, name: str = MCP_SERVER_NAME) -> bool:
     """Return whether ``settings_data['mcpServers'][name]`` already exists.
 
+    Generic over which JSON document backs *settings_data* — for Claude Code
+    that's the project's ``.mcp.json`` (the file Claude Code actually reads
+    for MCP servers); this function only cares about the ``mcpServers`` shape.
+
     Args:
-        settings_data: Parsed ``settings.json`` contents.
+        settings_data: Parsed JSON contents (``.mcp.json`` for Claude Code).
         name: The ``mcpServers`` key to check (default :data:`MCP_SERVER_NAME`).
     """
     mcp_servers = settings_data.get("mcpServers", {})

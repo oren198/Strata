@@ -116,3 +116,39 @@ def test_skill_md_content_is_substantial(skill_name: str) -> None:
     assert len(content) > 100, (
         f"strata/_skills/{skill_name}/Skill.md appears truncated (< 100 bytes)"
     )
+
+
+# ---------------------------------------------------------------------------
+# Test 7: every seeded skill prohibits reading/writing .strata/ directly
+#
+# Live incident: an unbound agent, correctly told to ask the user before
+# binding, instead shell-read .strata/summaries/g_root.md directly —
+# bypassing binding, scoping, and judgment entirely. Every seeded skill's
+# memory guidance must say plainly not to do that.
+#
+# Live-replay follow-up: the ask-first rule used to fire on the agent's own
+# judgment ("if shared memory would help") — an agent that never judged
+# memory would help never triggered it, and one live replay answered a
+# first question from the repo without ever asking. Reworked so the
+# not-bound error ITSELF is the trigger, no judgment call involved.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("skill_name", _STRATA_SKILLS)
+def test_skill_md_prohibits_reading_strata_dir_directly(skill_name: str) -> None:
+    skill_md = importlib.resources.files("strata") / "_skills" / skill_name / "Skill.md"
+    content = skill_md.read_text(encoding="utf-8")
+    normalized = " ".join(content.lower().split())
+
+    assert "never read or write files under `.strata/` directly" in normalized, (
+        f"strata/_skills/{skill_name}/Skill.md must plainly prohibit reading/writing "
+        ".strata/ directly — all memory access goes through the MCP tools."
+    )
+    assert "if any strata tool returns the not-bound error" in normalized, (
+        f"strata/_skills/{skill_name}/Skill.md must trigger the ask-the-user rule "
+        "off the not-bound error itself, not off the agent's own judgment."
+    )
+    assert "stop and ask the user which scope to act as" in normalized, (
+        f"strata/_skills/{skill_name}/Skill.md must tell the agent to stop and ask "
+        "the user which scope to act as when a strata tool returns the not-bound error."
+    )

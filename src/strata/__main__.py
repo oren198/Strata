@@ -53,6 +53,7 @@ Vocabulary throughout follows ``CONTEXT.md``.
 from __future__ import annotations
 
 import argparse
+import copy
 import getpass
 import json
 import os
@@ -85,6 +86,9 @@ from strata.install import (
     MCP_ENTRY as _MCP_ENTRY,
 )
 from strata.install import (
+    MCP_ENTRY_HISTORICAL as _MCP_ENTRY_HISTORICAL,
+)
+from strata.install import (
     SKILL_NAMES,
     copy_hook,
     copy_skill,
@@ -112,6 +116,9 @@ from strata.install import (
 )
 from strata.install import (
     hook_matches_shipped as _hook_matches_shipped,
+)
+from strata.install import (
+    is_bootstrap_venv_shape_mcp_entry as _is_bootstrap_venv_shape_mcp_entry,
 )
 from strata.install import (
     is_v1_2_shape_mcp_entry as _is_v1_2_shape_mcp_entry,
@@ -765,6 +772,28 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def _mcp_entry_is_migratable(entry: object, project_root: Path) -> bool:
+    """Whether *entry* is something a previous `strata register` would have
+    written into `.claude/settings.json`'s legacy `mcpServers.strata`
+    location — byte-exact against the canonical/historical shape
+    (:data:`_MCP_ENTRY` / :data:`_MCP_ENTRY_HISTORICAL`), or this exact
+    project's `--bootstrap-venv` absolute-path shape
+    (:func:`_is_bootstrap_venv_shape_mcp_entry`). Anything else — a
+    hand-edited entry, or a different tool's — is not.
+
+    Shared by `cmd_register`'s legacy-entry migration and `cmd_doctor`'s
+    advice so the two never give conflicting guidance about the same
+    on-disk entry: register only ever moves what doctor calls migratable,
+    and doctor only ever tells the user to expect an automatic move for
+    entries register will actually move.
+    """
+    if not isinstance(entry, dict):
+        return False
+    if entry in (_MCP_ENTRY, *_MCP_ENTRY_HISTORICAL):
+        return True
+    return _is_bootstrap_venv_shape_mcp_entry(entry, project_root)
+
+
 # ---------------------------------------------------------------------------
 # strata doctor — diagnose a registered project's wiring (Task 2.1,
 # local-launch-bar plan).
@@ -785,7 +814,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     1. Project config (``.strata/config.toml``) resolvable.
     2. DB reachable and migrated.
     3. ``fleet.yaml`` valid.
-    4. MCP server entry present in ``.claude/settings.json``.
+    4. MCP server entry present in ``.mcp.json`` (flags a legacy, unread
+       ``.claude/settings.json`` copy if that's all that's present).
     5. Stop hook script present and matching the shipped version.
     6. ``hooks.Stop`` entry present in ``.claude/settings.json``.
     7. Skills present in ``.claude/skills/``.
@@ -981,27 +1011,98 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             settings_error = str(exc)
 
     # -----------------------------------------------------------------------
-    # 4. MCP server entry present.
+    # 4. MCP server entry present — checked in `.mcp.json`, the file Claude
+    # Code actually reads for project-scoped MCP servers (not
+    # `.claude/settings.json`, which has no `mcpServers` key in its schema).
     # -----------------------------------------------------------------------
-    if settings_error is not None:
+    mcp_json = project_root / ".mcp.json"
+    mcp_json_data: dict = {}
+    mcp_json_error: str | None = None
+    if mcp_json.exists():
+        try:
+            loaded_mcp_json = json.loads(mcp_json.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            mcp_json_error = f"not valid JSON ({exc})"
+        else:
+            # Valid JSON but not an object (e.g. `[]`, `null`, a bare string)
+            # — .get()/mcpServers lookups below assume a dict; route this
+            # through the same "fix the file" message rather than crashing.
+            if isinstance(loaded_mcp_json, dict):
+                mcp_json_data = loaded_mcp_json
+            else:
+                mcp_json_error = f"not a JSON object (got {type(loaded_mcp_json).__name__})"
+
+    legacy_mcp_servers = settings_data.get("mcpServers") if settings_error is None else None
+    legacy_mcp_entry = (
+        legacy_mcp_servers.get("strata") if isinstance(legacy_mcp_servers, dict) else None
+    )
+    legacy_mcp_entry_present = legacy_mcp_entry is not None
+    # Only entries `strata register` would actually move automatically get
+    # told "run register to migrate/clean it up" — a hand-edited legacy
+    # entry is register's business to leave alone (see
+    # `_mcp_entry_is_migratable`'s docstring), so doctor must not promise a
+    # move that will never happen (MEDIUM 4, live incident: doctor's advice
+    # was a dead end for exactly this case).
+    legacy_mcp_entry_migratable = _mcp_entry_is_migratable(legacy_mcp_entry, project_root)
+
+    if mcp_json_error is not None:
         checks.append(
             Check(
                 name="MCP server entry",
                 kind="hard",
                 passed=False,
                 message=(
-                    f".claude/settings.json is not valid JSON ({settings_error}) — fix the "
-                    "file, then run 'strata register' to add the strata entry."
+                    f".mcp.json is {mcp_json_error} — fix the file, then "
+                    "run 'strata register' to add the strata entry."
                 ),
             )
         )
-    elif _mcp_server_present(settings_data):
+    elif _mcp_server_present(mcp_json_data):
+        message = "present in .mcp.json"
+        if legacy_mcp_entry_present:
+            # Both present — a half-migrated or re-registered-with-an-old-
+            # release project (register itself sweeps this up as "stale
+            # duplicate"; doctor surfaces it too rather than reporting a
+            # silent clean pass).
+            if legacy_mcp_entry_migratable:
+                message += (
+                    "; a stale duplicate is also in .claude/settings.json mcpServers — run "
+                    "'strata register' to clean it up"
+                )
+            else:
+                message += (
+                    "; an edited mcpServers.strata entry is also in .claude/settings.json — "
+                    "harmless (Claude Code doesn't read it), but left in place — remove it "
+                    "by hand if you want it gone"
+                )
         checks.append(
             Check(
                 name="MCP server entry",
                 kind="hard",
                 passed=True,
-                message="present in .claude/settings.json",
+                message=message,
+            )
+        )
+    elif legacy_mcp_entry_present:
+        if legacy_mcp_entry_migratable:
+            message = (
+                "found only in .claude/settings.json mcpServers — that file is not read "
+                "by Claude Code for MCP servers; run 'strata register' to migrate it "
+                "into .mcp.json."
+            )
+        else:
+            message = (
+                "found only in .claude/settings.json mcpServers, but it's been edited so "
+                "'strata register' will not move it automatically — left in place; remove "
+                "it by hand, then run 'strata register' to add the working entry to "
+                ".mcp.json."
+            )
+        checks.append(
+            Check(
+                name="MCP server entry",
+                kind="hard",
+                passed=False,
+                message=message,
             )
         )
     else:
@@ -1010,10 +1111,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                 name="MCP server entry",
                 kind="hard",
                 passed=False,
-                message=(
-                    "missing from .claude/settings.json mcpServers — run 'strata register' "
-                    "to add it."
-                ),
+                message="missing from .mcp.json mcpServers — run 'strata register' to add it.",
             )
         )
 
@@ -2445,7 +2543,8 @@ def cmd_register(args: argparse.Namespace) -> int:
     4. Update .gitignore (idempotent block with # Strata marker).
     5. Seed .strata/fleet.yaml from templates/minimal.yaml (skip if exists).
     6. Copy strata skills to .claude/skills/ (skip each if exists).
-    7. Merge strata into .claude/settings.json mcpServers (skip if exists).
+    7. Merge strata into .mcp.json mcpServers (skip if exists; migrates a
+       legacy .claude/settings.json mcpServers.strata entry if found).
     8. Print next-steps or diff report.
 
     All writes are strictly additive (never overwrite existing user state).
@@ -2537,9 +2636,11 @@ def cmd_register(args: argparse.Namespace) -> int:
     # -----------------------------------------------------------------------
     # Helper: print action or diff line.
     # -----------------------------------------------------------------------
+    def _rel(path: str | Path) -> Path:
+        return Path(path).relative_to(project_root) if Path(path).is_absolute() else Path(path)
+
     def _act(action: str, path: str | Path, *, skipped: bool = False) -> None:
-        rel = Path(path).relative_to(project_root) if Path(path).is_absolute() else Path(path)
-        print(render_action_line(action, rel, diff_mode=diff_mode, skipped=skipped))
+        print(render_action_line(action, _rel(path), diff_mode=diff_mode, skipped=skipped))
 
     def _report_self_update(path: str | Path, status: str) -> None:
         """Print the register line for a managed artifact's self-update status.
@@ -2666,9 +2767,10 @@ def cmd_register(args: argparse.Namespace) -> int:
             return True, "g_root"
 
     settings_unreadable = False
+    mcp_json_unreadable = False
 
     def _register_claude_code() -> None:
-        nonlocal settings_unreadable
+        nonlocal settings_unreadable, mcp_json_unreadable
 
         # -------------------------------------------------------------------
         # Step 6: Copy canonical skills to .claude/skills/ (skip each if
@@ -2710,8 +2812,22 @@ def cmd_register(args: argparse.Namespace) -> int:
                 _report_self_update(dest_hook, hook_status)
 
         # -------------------------------------------------------------------
-        # Step 7: Merge strata into .claude/settings.json — the mcpServers block and
-        # the freshness hooks.Stop entry (issue #112), both strictly additive.
+        # Step 7: Merge strata into the project's `.mcp.json` — the file
+        # Claude Code actually reads for project-scoped MCP servers
+        # (`.claude/settings.json` has no `mcpServers` key in its schema;
+        # its `enabledMcpjsonServers` setting explicitly refers to servers
+        # "from .mcp.json"). `.claude/settings.json` still gets the
+        # freshness `hooks.Stop` entry below (issue #112) — that location
+        # IS correct for hooks. Both merges are strictly additive.
+        #
+        # Earlier Strata releases wrote the `mcpServers.strata` entry into
+        # `.claude/settings.json` — a location Claude Code never reads for
+        # MCP servers, shipping a memory-blind session. A legacy entry that
+        # still byte/shape-matches exactly what a previous register wrote
+        # is migrated here: removed from settings.json, written into
+        # `.mcp.json`, with a "moved" line printed. Anything else there
+        # (hand-edited, V1.2-shape, or simply other keys alongside it) is
+        # left untouched with a note — never deleted speculatively.
         # -------------------------------------------------------------------
         settings_json = project_root / ".claude" / "settings.json"
         if settings_json.exists():
@@ -2720,13 +2836,13 @@ def cmd_register(args: argparse.Namespace) -> int:
             except json.JSONDecodeError as exc:
                 # NEVER fall through to a write here: writing with an empty dict
                 # would replace the user's entire settings file with just the
-                # strata entry. Skip the merge outright and fail the run so the
-                # user notices ("never overwrite user state" — ADR 0005 D6).
+                # Stop hook entry. Skip the merge outright and fail the run so
+                # the user notices ("never overwrite user state" — ADR 0005 D6).
                 print(
                     f"  {_glyph('fail')} .claude/settings.json exists but is not valid JSON "
                     f"({exc}).\n"
-                    "    Fix the file, then re-run `strata register` to add the strata "
-                    "mcpServers entry.",
+                    "    Fix the file, then re-run `strata register` to add the freshness "
+                    "Stop hook entry.",
                     file=sys.stderr,
                 )
                 settings_unreadable = True
@@ -2734,48 +2850,133 @@ def cmd_register(args: argparse.Namespace) -> int:
         else:
             settings_data = {}
 
-        settings_changed = False
-        mcp_servers: dict = settings_data.get("mcpServers", {})
-        if settings_unreadable:
-            pass  # merge skipped — reported above; register exits non-zero below
-        elif _mcp_server_present(settings_data):
-            _act("skip", settings_json, skipped=True)
-            # Stale-shape detection (ADR 0005 Decision 6): warn if the existing
-            # strata mcpServer entry is V1.2-shape (broken on V1.3). Keeps the
-            # strict-additive contract — we never overwrite — but surfaces the
-            # upgrade-path issue at register time, when the user is in fix-mind.
-            existing = mcp_servers["strata"]
-            if isinstance(existing, dict) and _is_v1_2_shape_mcp_entry(existing):
+        mcp_json = project_root / ".mcp.json"
+        mcp_json_data: dict = {}
+        if mcp_json.exists():
+            try:
+                loaded_mcp_json = json.loads(mcp_json.read_text(encoding="utf-8"))
+            except json.JSONDecodeError as exc:
                 print(
-                    f"  {_glyph('warn')} WARNING: your existing strata mcpServer entry is "
-                    "V1.2-shape and will silently",
+                    f"  {_glyph('fail')} .mcp.json exists but is not valid JSON ({exc}).\n"
+                    "    Fix the file, then re-run `strata register` to add the strata "
+                    "mcpServers entry.",
                     file=sys.stderr,
                 )
-                print(
-                    "    fail on V1.3 (the `mcp_server` Python module no longer exists; "
-                    "`STRATA_BACKEND_URL` is unused).",
-                    file=sys.stderr,
-                )
-                print(
-                    f"    The canonical V1.3 entry is: {json.dumps(_MCP_ENTRY)}",
-                    file=sys.stderr,
-                )
-                print(
-                    "    Strata never overwrites your settings — run `strata register --diff` "
-                    "to see the canonical,",
-                    file=sys.stderr,
-                )
-                print(
-                    "    then update .claude/settings.json by hand.",
-                    file=sys.stderr,
-                )
-        else:
-            merge_mcp_server(settings_data)
-            settings_changed = True
-            _act("merged strata into", settings_json)
+                mcp_json_unreadable = True
+            else:
+                # Valid JSON but not an object (`[]`, `null`, ...) — never
+                # fall through to a write here either; the merge below
+                # assumes a dict.
+                if isinstance(loaded_mcp_json, dict):
+                    mcp_json_data = loaded_mcp_json
+                else:
+                    print(
+                        f"  {_glyph('fail')} .mcp.json exists but is not a JSON object "
+                        f"(got {type(loaded_mcp_json).__name__}).\n"
+                        "    Fix the file, then re-run `strata register` to add the strata "
+                        "mcpServers entry.",
+                        file=sys.stderr,
+                    )
+                    mcp_json_unreadable = True
 
-        # Step 7b: additively merge the freshness hooks.Stop entry (issue #112).
-        # A user's own Stop hooks — and every other settings key — are preserved;
+        settings_changed = False
+        mcp_json_changed = False
+
+        legacy_mcp_servers = settings_data.get("mcpServers") if not settings_unreadable else None
+        legacy_entry = (
+            legacy_mcp_servers.get("strata") if isinstance(legacy_mcp_servers, dict) else None
+        )
+
+        def _migratable_legacy_entry() -> dict | None:
+            """Return a deep copy of *legacy_entry* if it's something a
+            previous release of `strata register` would have written —
+            see :func:`_mcp_entry_is_migratable`. Anything else —
+            hand-edited or simply a different tool's entry — returns
+            ``None`` and is left untouched.
+            """
+            if _mcp_entry_is_migratable(legacy_entry, project_root):
+                return copy.deepcopy(legacy_entry)
+            return None
+
+        def _drop_legacy_entry() -> None:
+            nonlocal settings_changed
+            del legacy_mcp_servers["strata"]
+            if not legacy_mcp_servers:
+                del settings_data["mcpServers"]
+            settings_changed = True
+
+        migratable_entry = _migratable_legacy_entry()
+
+        if mcp_json_unreadable:
+            pass  # merge skipped — reported above; register exits non-zero below
+        elif _mcp_server_present(mcp_json_data):
+            _act("skip", mcp_json, skipped=True)
+            if migratable_entry is not None:
+                # .mcp.json already has it (e.g. a previous migration run) but
+                # the stale duplicate in settings.json was never cleaned up —
+                # sweep it now so re-running register finishes the migration.
+                # In --diff mode nothing is actually written below (the
+                # settings.json write is gated on `not diff_mode`), so the
+                # wording must stay a preview, not a past-tense claim.
+                _drop_legacy_entry()
+                verb = "would remove" if diff_mode else "removed"
+                print(
+                    f"  {verb} stale duplicate mcpServers.strata entry from "
+                    f".claude/settings.json ({_rel(mcp_json)} already has it)"
+                )
+        elif migratable_entry is not None:
+            # Something a previous register wrote (byte-exact canonical/
+            # historical shape, or the --bootstrap-venv absolute-path shape)
+            # — migrate it rather than leaving Claude Code memory-blind.
+            # The venv shape's project-specific command is carried over
+            # verbatim rather than replaced with the plain-register default.
+            _drop_legacy_entry()
+            mcp_json_data.setdefault("mcpServers", {})["strata"] = migratable_entry
+            mcp_json_changed = True
+            _act("moved strata mcpServers entry from .claude/settings.json into", mcp_json)
+            if diff_mode:
+                # _act's diff-mode wording only names the .mcp.json side
+                # ("[would create/update]  .mcp.json") — call out the other
+                # half of the move explicitly so --diff doesn't undersell
+                # what a real run would do.
+                print("  [would remove]  mcpServers.strata entry from .claude/settings.json")
+        else:
+            if isinstance(legacy_entry, dict):
+                if _is_v1_2_shape_mcp_entry(legacy_entry):
+                    print(
+                        f"  {_glyph('warn')} WARNING: your existing strata mcpServer entry in "
+                        ".claude/settings.json is V1.2-shape\n"
+                        "    and will silently fail on V1.3 (the `mcp_server` Python module "
+                        "no longer exists;\n"
+                        "    `STRATA_BACKEND_URL` is unused). It is also in a location Claude "
+                        "Code never reads for MCP\n"
+                        f"    servers — strata register is adding the working entry to "
+                        f"{_rel(mcp_json)} instead; run\n"
+                        "    `strata register --diff` to see the canonical entry, then remove "
+                        "the stale one from\n"
+                        "    .claude/settings.json by hand.",
+                        file=sys.stderr,
+                    )
+                else:
+                    print(
+                        f"  {_glyph('warn')} NOTE: .claude/settings.json has an "
+                        "mcpServers.strata entry that differs from the canonical\n"
+                        "    one — Claude Code never reads mcpServers from settings.json, so "
+                        "it was never doing\n"
+                        f"    anything; left in place. strata register is adding the working "
+                        f"entry to {_rel(mcp_json)} instead.",
+                        file=sys.stderr,
+                    )
+            merge_mcp_server(mcp_json_data)
+            mcp_json_changed = True
+            _act("merged strata into", mcp_json)
+
+        if mcp_json_changed and not diff_mode:
+            mcp_json.write_text(json.dumps(mcp_json_data, indent=2) + "\n", encoding="utf-8")
+
+        # Step 7b: additively merge the freshness hooks.Stop entry (issue #112)
+        # into .claude/settings.json — that location IS correct for hooks. A
+        # user's own Stop hooks — and every other settings key — are preserved;
         # the Strata group is appended only when absent.
         if not settings_unreadable:
             if _stop_hook_present(settings_data):
@@ -2785,9 +2986,9 @@ def cmd_register(args: argparse.Namespace) -> int:
                 settings_changed = True
                 _act("merged Stop hook into", settings_json)
 
-        # One write for both additive merges — so an existing mcpServers entry that
-        # was skipped still gets the new Stop hook, and bootstrap-venv (step 8) reads
-        # the up-to-date file back.
+        # One write for the settings.json changes (legacy-entry removal and/or
+        # the Stop hook merge) — so bootstrap-venv (step 8) reads the
+        # up-to-date file back.
         if settings_changed and not diff_mode:
             (project_root / ".claude").mkdir(parents=True, exist_ok=True)
             settings_json.write_text(json.dumps(settings_data, indent=2) + "\n", encoding="utf-8")
@@ -2929,13 +3130,12 @@ def cmd_register(args: argparse.Namespace) -> int:
         print(
             "\n  --bootstrap-venv: codex has no venv-wiring equivalent yet — skipping "
             "that step for codex only (not the rest of --bootstrap-venv). It only "
-            "wires .claude/settings.json for\n"
+            "wires .mcp.json for\n"
             "  Claude Code; install strata normally (pipx/pip) so `strata-mcp` and "
             "`strata` are on PATH for\n"
             "  the Codex config register wrote."
         )
     if bootstrap_venv and "claude-code" in resolved_harnesses:
-        settings_json = project_root / ".claude" / "settings.json"
         venv_dir = strata_dir / ".venv"
         venv_strata_mcp = venv_dir / "bin" / "strata-mcp"
         if diff_mode:
@@ -2994,32 +3194,35 @@ def cmd_register(args: argparse.Namespace) -> int:
                 )
                 return 1
 
-            # Update settings.json to point at the venv binary. Runs on every
-            # bootstrap-venv invocation (not only when the venv was just
-            # created) so an earlier interrupted run can be repaired by
-            # re-running. Merge, never replace: a user-customised env block
-            # on the strata entry is preserved.
-            if settings_unreadable:
+            # Update .mcp.json to point at the venv binary — that's the file
+            # Claude Code actually reads for project-scoped MCP servers, same
+            # as the plain-register merge above. Runs on every bootstrap-venv
+            # invocation (not only when the venv was just created) so an
+            # earlier interrupted run can be repaired by re-running. Merge,
+            # never replace: a user-customised env block on the strata entry
+            # is preserved.
+            if mcp_json_unreadable:
                 print(
-                    f"  {_glyph('fail')} skipping settings.json venv update — fix the JSON "
+                    f"  {_glyph('fail')} skipping .mcp.json venv update — fix the JSON "
                     "first (see above).",
                     file=sys.stderr,
                 )
             else:
-                settings_data_venv: dict
-                if settings_json.exists():
+                mcp_json = project_root / ".mcp.json"
+                mcp_json_data_venv: dict
+                if mcp_json.exists():
                     try:
-                        settings_data_venv = json.loads(settings_json.read_text(encoding="utf-8"))
+                        mcp_json_data_venv = json.loads(mcp_json.read_text(encoding="utf-8"))
                     except json.JSONDecodeError as exc:
                         print(
-                            f"  {_glyph('fail')} .claude/settings.json is not valid JSON "
+                            f"  {_glyph('fail')} .mcp.json is not valid JSON "
                             f"({exc}) — fix it, then re-run.",
                             file=sys.stderr,
                         )
                         return 1
                 else:
-                    settings_data_venv = {}
-                mcp_venv = settings_data_venv.get("mcpServers", {})
+                    mcp_json_data_venv = {}
+                mcp_venv = mcp_json_data_venv.get("mcpServers", {})
                 existing_entry = mcp_venv.get("strata")
                 preserved_env = (
                     existing_entry.get("env", {}) if isinstance(existing_entry, dict) else {}
@@ -3028,12 +3231,11 @@ def cmd_register(args: argparse.Namespace) -> int:
                     "command": str(venv_strata_mcp),
                     "env": preserved_env,
                 }
-                settings_data_venv["mcpServers"] = mcp_venv
-                (project_root / ".claude").mkdir(parents=True, exist_ok=True)
-                settings_json.write_text(
-                    json.dumps(settings_data_venv, indent=2) + "\n", encoding="utf-8"
+                mcp_json_data_venv["mcpServers"] = mcp_venv
+                mcp_json.write_text(
+                    json.dumps(mcp_json_data_venv, indent=2) + "\n", encoding="utf-8"
                 )
-                print(f"  updated .claude/settings.json to use {venv_strata_mcp}")
+                print(f"  updated .mcp.json to use {venv_strata_mcp}")
 
     # -----------------------------------------------------------------------
     # Print next steps.
@@ -3083,14 +3285,18 @@ def cmd_register(args: argparse.Namespace) -> int:
     # settings.json merge failure below means this run didn't fully
     # succeed, so neither is "the end of a successful register".
     # -----------------------------------------------------------------------
-    if not diff_mode and not settings_unreadable:
+    if not diff_mode and not settings_unreadable and not mcp_json_unreadable:
         print()
         _offer_judge_key_capture(project_root, skip_prompt=getattr(args, "yes", False))
 
-    if settings_unreadable:
+    if settings_unreadable or mcp_json_unreadable:
+        broken_paths = (
+            (".claude/settings.json", settings_unreadable),
+            (".mcp.json", mcp_json_unreadable),
+        )
+        broken = ", ".join(p for p, bad in broken_paths if bad)
         print(
-            "\nCompleted with 1 problem: .claude/settings.json could not be merged "
-            "(invalid JSON — see above).",
+            f"\nCompleted with 1 problem: {broken} could not be merged (invalid JSON — see above).",
             file=sys.stderr,
         )
         return 1
@@ -3108,7 +3314,10 @@ def cmd_register(args: argparse.Namespace) -> int:
 # run exits 1 so scripts can detect the partial case.
 #
 #   1. `.gitignore` managed block  — removed verbatim, other lines byte-stable.
-#   2. `mcpServers.strata` entry    — removed only if identical to _MCP_ENTRY.
+#   2. `mcpServers.strata` entry    — removed from `.mcp.json` only if
+#                                     identical to _MCP_ENTRY; a legacy
+#                                     `.claude/settings.json` copy is cleaned
+#                                     up the same way if still present.
 #   3. the three vendored skills     — removed only if byte-identical to the
 #                                     currently-shipped src/strata/_skills copy.
 #   4. `.strata/` data               — memory, not wiring: left alone unless
@@ -3138,6 +3347,23 @@ def _wired_harnesses(project_root: Path) -> list[str]:
     import json  # noqa: PLC0415
 
     def _claude_code_wired() -> bool:
+        mcp_json = project_root / ".mcp.json"
+        if mcp_json.exists():
+            try:
+                mcp_data = json.loads(mcp_json.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                # Corrupt JSON is not proof there's nothing wired — treat it as
+                # conservatively "possibly wired".
+                return True
+            if not isinstance(mcp_data, dict):
+                # Valid JSON but not an object (`[]`, `null`, ...) — same
+                # "possibly wired" conservatism as corrupt JSON; the actual
+                # unregister step below reports this properly instead of
+                # crashing.
+                return True
+            if _mcp_server_present(mcp_data):
+                return True
+
         settings_json = project_root / ".claude" / "settings.json"
         if not settings_json.exists():
             return False
@@ -3147,6 +3373,8 @@ def _wired_harnesses(project_root: Path) -> list[str]:
             # Corrupt JSON is not proof there's nothing wired — treat it as
             # conservatively "possibly wired".
             return True
+        # `_mcp_server_present` here also catches a not-yet-migrated legacy
+        # entry (earlier releases wrote mcpServers.strata into settings.json).
         return _mcp_server_present(data) or _stop_hook_present(data)
 
     def _codex_wired() -> bool:
@@ -3289,9 +3517,77 @@ def cmd_unregister(args: argparse.Namespace) -> int:
 
     def _unregister_claude_code() -> None:
         # -----------------------------------------------------------------------
-        # Step 2: `.claude/settings.json` — the `mcpServers.strata` entry and the
-        # freshness `hooks.Stop` entry (issue #112). Both removed only when they
-        # still byte-match what register wrote; one write persists both removals.
+        # Step 2a: `.mcp.json` — the `mcpServers.strata` entry. That file is
+        # what Claude Code actually reads for project-scoped MCP servers, so
+        # this — not `.claude/settings.json` — is where register's live
+        # entry lives now. Removed only when it still byte-matches what
+        # register wrote.
+        # -----------------------------------------------------------------------
+        mcp_json = project_root / ".mcp.json"
+        if not mcp_json.exists():
+            _ok(".mcp.json: nothing to do (no .mcp.json)")
+        else:
+            mcp_json_data: dict | None
+            try:
+                loaded_mcp_json = json.loads(mcp_json.read_text(encoding="utf-8"))
+            except json.JSONDecodeError as exc:
+                _left(f".mcp.json: not valid JSON ({exc}) — left untouched (fix it, then re-run)")
+                mcp_json_data = None
+            else:
+                if isinstance(loaded_mcp_json, dict):
+                    mcp_json_data = loaded_mcp_json
+                else:
+                    _left(
+                        f".mcp.json: must be a JSON object, got "
+                        f"{type(loaded_mcp_json).__name__} — left untouched (fix it, then "
+                        "re-run)"
+                    )
+                    mcp_json_data = None
+
+            if mcp_json_data is not None:
+                mcp_json_changed = False
+                mcp_servers = mcp_json_data.get("mcpServers")
+                entry = mcp_servers.get("strata") if isinstance(mcp_servers, dict) else None
+                removable = isinstance(entry, dict) and (
+                    entry in (_MCP_ENTRY, *_MCP_ENTRY_HISTORICAL)
+                    or _is_bootstrap_venv_shape_mcp_entry(entry, project_root)
+                )
+                if entry is None:
+                    _ok(".mcp.json: nothing to do (no mcpServers.strata entry)")
+                elif removable:
+                    del mcp_servers["strata"]
+                    if not mcp_servers:
+                        del mcp_json_data["mcpServers"]
+                    mcp_json_changed = True
+                    _ok(f".mcp.json: {_would('remove', 'removed')} mcpServers.strata entry")
+                else:
+                    _left(
+                        ".mcp.json: mcpServers.strata entry was edited "
+                        "(differs from the canonical entry) — left in place"
+                    )
+
+                if mcp_json_changed:
+                    if not mcp_json_data:
+                        # register only ever creates `.mcp.json` to carry this
+                        # one entry, so an empty result has no standalone
+                        # reason to exist — delete it for a clean round-trip
+                        # (unlike settings.json/.gitignore, where the file
+                        # predates register far more often and an emptied
+                        # file's authorship isn't detectable).
+                        if not dry_run:
+                            mcp_json.unlink()
+                        _ok(f".mcp.json: {_would('remove', 'removed')} (empty after removal)")
+                    elif not dry_run:
+                        mcp_json.write_text(
+                            json.dumps(mcp_json_data, indent=2) + "\n", encoding="utf-8"
+                        )
+
+        # -----------------------------------------------------------------------
+        # Step 2b: `.claude/settings.json` — a legacy `mcpServers.strata`
+        # entry (what a pre-fix `strata register` wrote there; Claude Code
+        # never reads mcpServers from settings.json) and the freshness
+        # `hooks.Stop` entry (issue #112). Both removed only when they still
+        # byte-match what register wrote; one write persists both removals.
         # -----------------------------------------------------------------------
         settings_json = project_root / ".claude" / "settings.json"
         if not settings_json.exists():
@@ -3309,26 +3605,34 @@ def cmd_unregister(args: argparse.Namespace) -> int:
             if settings_data is not None:
                 settings_changed = False
 
-                # mcpServers.strata entry.
-                mcp_servers = settings_data.get("mcpServers")
-                entry = mcp_servers.get("strata") if isinstance(mcp_servers, dict) else None
-                if entry is None:
-                    _ok(".claude/settings.json: nothing to do (no mcpServers.strata entry)")
-                elif entry == _MCP_ENTRY:
-                    del mcp_servers["strata"]
+                # Legacy mcpServers.strata entry (pre-fix `strata register`).
+                legacy_mcp_servers = settings_data.get("mcpServers")
+                legacy_entry = (
+                    legacy_mcp_servers.get("strata")
+                    if isinstance(legacy_mcp_servers, dict)
+                    else None
+                )
+                legacy_removable = isinstance(legacy_entry, dict) and (
+                    legacy_entry in (_MCP_ENTRY, *_MCP_ENTRY_HISTORICAL)
+                    or _is_bootstrap_venv_shape_mcp_entry(legacy_entry, project_root)
+                )
+                if legacy_entry is None:
+                    _ok(".claude/settings.json: nothing to do (no legacy mcpServers.strata entry)")
+                elif legacy_removable:
+                    del legacy_mcp_servers["strata"]
                     # Register creates the mcpServers block when absent; if strata
                     # was its only key, drop the now-empty block so a project that
                     # had no mcpServers before register round-trips byte-for-byte.
-                    if not mcp_servers:
+                    if not legacy_mcp_servers:
                         del settings_data["mcpServers"]
                     settings_changed = True
                     _ok(
-                        f".claude/settings.json: {_would('remove', 'removed')} "
+                        f".claude/settings.json: {_would('remove', 'removed')} legacy "
                         "mcpServers.strata entry"
                     )
                 else:
                     _left(
-                        ".claude/settings.json: mcpServers.strata entry was edited "
+                        ".claude/settings.json: legacy mcpServers.strata entry was edited "
                         "(differs from the canonical entry) — left in place"
                     )
 
@@ -3723,7 +4027,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_status = sub.add_parser(
         "status",
-        help="Show per-scope memory-freshness (read-vs-contribute staleness, issue #110).",
+        help="Show per-scope memory-freshness (read-vs-contribute staleness).",
     )
     p_status.add_argument(
         "--window-days",
@@ -3944,7 +4248,7 @@ def _build_parser() -> argparse.ArgumentParser:
         dest="bootstrap_venv",
         help=(
             "Create .strata/.venv/ with strata installed and update "
-            ".claude/settings.json to use the absolute venv path. "
+            ".mcp.json to use the absolute venv path. "
             "Use when pipx is not available or strata-mcp is not on PATH."
         ),
     )
@@ -3972,7 +4276,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "claude-code is wired anyway with a one-line notice. 'codex' merges "
             "Strata's [mcp_servers.strata] table and freshness Stop-hook block "
             "into the Codex CLI's own config.toml instead of "
-            ".claude/settings.json; the Stop-hook wiring is schema-verified "
+            ".mcp.json; the Stop-hook wiring is schema-verified "
             "only (see README 'Using Strata with Codex CLI')."
         ),
     )
@@ -3983,7 +4287,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "Reverse `strata register` — remove the .gitignore block, the "
             "mcpServers.strata entry, and the vendored skills (only when "
-            "unmodified). Leaves .strata/ data unless --purge-data (issue #53)."
+            "unmodified). Leaves .strata/ data unless --purge-data."
         ),
         description=(
             "Reverse the wiring `strata register` added, honouring the "
@@ -4035,7 +4339,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "named explicitly but not wired just prints a skip line. 'codex' "
             "removes the [mcp_servers.strata] table and freshness Stop-hook "
             "block from the Codex CLI's config.toml instead of "
-            ".claude/settings.json — only when they still byte-match what "
+            ".mcp.json — only when they still byte-match what "
             "`strata register --harness codex` wrote."
         ),
     )
