@@ -3828,6 +3828,79 @@ async def test_startup_validator_error_items_route_through_the_user(tmp_path: Pa
     assert "never read or write files under .strata/ directly" in rendered
 
 
+async def test_unbound_error_leads_with_stop_imperative_before_failure_details(
+    tmp_path: Path,
+) -> None:
+    """Live-replay finding: an agent hit this exact error on its very first
+    question and answered from the repo anyway, without asking the user
+    anything — it treated the numbered failure details and recovery
+    mechanics as background information rather than a blocking instruction,
+    since nothing at the very top of the message said "stop." The message
+    must now LEAD with an unmissable imperative — before any '[1]'-numbered
+    detail — telling the agent not to answer yet and to ask the user which
+    scope to act as right now."""
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fleet_yaml(tmp_path)  # g_arch, g_backend
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+    fleet = FleetConfig.load(fleet_path)
+    binding_errors = _validate_binding_scope_and_skill_errors(fleet)
+
+    with (
+        patch.object(mod, "_AGENT_SCOPE", ""),
+        patch.object(mod, "_UNRESOLVED", True),
+        patch.object(mod, "_STARTUP_ERRORS_BINDING", binding_errors),
+        patch.object(mod, "_load_fleet", return_value=fleet),
+        pytest.raises(RuntimeError) as exc_info,
+    ):
+        await mod.strata_read_perspective()
+
+    text = str(exc_info.value)
+    lowered = text.lower()
+
+    assert "stop" in lowered
+    assert "do not answer" in lowered
+    assert "ask the user now" in lowered
+
+    # The imperative must come BEFORE the first numbered failure item —
+    # not after it, and not only somewhere further down in the recovery
+    # mechanics.
+    stop_index = lowered.index("stop")
+    first_item_index = text.index("[1]")
+    assert stop_index < first_item_index, (
+        "the STOP imperative must precede the first '[1]' failure item, "
+        f"got stop at {stop_index}, '[1]' at {first_item_index}:\n{text}"
+    )
+
+
+def test_unbound_notice_leads_with_stop_imperative(tmp_path: Path) -> None:
+    """Same finding, the other unbound surface: strata_list_scopes's
+    unbound_notice already told the agent to ask the user, but the ask
+    must LEAD the notice, not be buried after mechanics an agent could
+    read as optional."""
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fleet_yaml(tmp_path)
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+    fleet = FleetConfig.load(fleet_path)
+
+    with (
+        patch.object(mod, "_AGENT_SCOPE", ""),
+        patch.object(mod, "_UNRESOLVED", True),
+        patch.object(mod, "_load_fleet", return_value=fleet),
+    ):
+        result = mod.strata_list_scopes()
+
+    notice = result["unbound_notice"]
+    lowered = notice.lower()
+    assert "stop" in lowered
+    assert "do not answer" in lowered
+    assert "ask the user now" in lowered
+    assert lowered.index("stop") < lowered.index("ask the user now")
+
+
 async def test_unbound_tool_call_raises_for_every_memory_tool_but_bind(tmp_path: Path) -> None:
     """Every memory tool but strata_bind is gated — not just one of them."""
     db_path = _make_db(tmp_path)

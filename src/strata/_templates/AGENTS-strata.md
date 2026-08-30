@@ -22,9 +22,9 @@ not part of your job.
 - Never read or write files under `.strata/` directly (its database,
   session files, or summaries) — that bypasses binding and judgment. All
   memory access goes through the strata tools above.
-- If shared memory would help and this session isn't bound yet, ask the
-  user which scope to act as before answering — don't work around it by
-  reading `.strata/` files directly.
+- If any strata tool returns the not-bound error, stop and ask the user
+  which scope to act as before completing your answer; an answer produced
+  without the project's memory is incomplete.
 
 Your scope and role identity are bound through environment variables
 (`STRATA_AGENT_SCOPE`, `STRATA_AGENT_SKILL`, `STRATA_AGENT_SESSION_ID`) set

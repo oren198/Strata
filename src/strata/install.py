@@ -232,24 +232,31 @@ summaries_dir = ".strata/summaries"
 
 _HISTORICAL_ARTIFACT_HASHES: dict[str, dict[str, object]] = {
     "strata": {
-        "current": "1620f11a24ec0d3b1d4e776315e02ff343bcc768b6c6b955a7a4ce865058ba84",
+        "current": "30cb5a5f9beb522a1f1ab47f30aaa9b2545b182a719b81576e163eeb01c434e2",
         "historical": frozenset(
             {
                 "5865b8090923c1dd0d3f747490b006b4f0b3b4d18bceffb99ef7fb2fe9e577ab",
                 "81a0a8debdb183603a985459c17b7e4800e65a5f5ff7b9cb7c7f0526d133087c",
+                "1620f11a24ec0d3b1d4e776315e02ff343bcc768b6c6b955a7a4ce865058ba84",
             }
         ),
     },
     "strata-worker": {
-        "current": "110a29368e69e49a45a567f6a91ed3898fa2ebb779a6cb665cb0dde72f79157b",
+        "current": "60b7e03b4ad34db9f73837cd49c4925f6dd10d68df3251867b2486dbe8bf1f09",
         "historical": frozenset(
-            {"2e2cb5d953d6e97377a347134ebbef989f85f53cb7604a50e53f2516153831e0"}
+            {
+                "2e2cb5d953d6e97377a347134ebbef989f85f53cb7604a50e53f2516153831e0",
+                "110a29368e69e49a45a567f6a91ed3898fa2ebb779a6cb665cb0dde72f79157b",
+            }
         ),
     },
     "strata-inspect": {
-        "current": "848e7e35726620cf54cab6d19657fcb2e43d71c30ed4ca49bc1cbae2ea6f857e",
+        "current": "c8021ce536a43b4f2156b172ea196268754898130021d24ca64640d2cada4787",
         "historical": frozenset(
-            {"707793640183dfd5e503c57c48133c8d56747b74a49268bdd76b8cc77335f2ad"}
+            {
+                "707793640183dfd5e503c57c48133c8d56747b74a49268bdd76b8cc77335f2ad",
+                "848e7e35726620cf54cab6d19657fcb2e43d71c30ed4ca49bc1cbae2ea6f857e",
+            }
         ),
     },
     "strata-stop-hook": {
@@ -275,11 +282,12 @@ _HISTORICAL_ARTIFACT_HASHES: dict[str, dict[str, object]] = {
         "historical": frozenset(),
     },
     "agents-md": {
-        "current": "d4e9b4da5543ad2faf75bedb17c426a8dab72e858955b1a48e7b718f72092aca",
+        "current": "58c0612121bc2f3061f7ba18fa32163a98ed15c88f279b194abe7f0bba5fbbe7",
         "historical": frozenset(
             {
                 "f6df7e82395ba3199d3a52c1651db8afb93b2fdd139b496974f871d453535b68",
                 "ceea6568ab9160d54f2d3edd7131bc9b3bf2a694832226e67e7553de7325825f",
+                "d4e9b4da5543ad2faf75bedb17c426a8dab72e858955b1a48e7b718f72092aca",
             }
         ),
     },

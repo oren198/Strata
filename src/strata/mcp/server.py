@@ -444,10 +444,12 @@ def _attach_unbound_notice(result: dict) -> dict:
     """
     if _UNRESOLVED:
         result["unbound_notice"] = (
-            "session not bound yet — ask the user which scope this session should "
-            "act as (see the scopes above for the choices), then call "
-            "strata_bind(scope_id=...) with their answer. Do not pick a scope "
-            "yourself — binding decides whose memory this session reads and writes."
+            "STOP — do not answer the user's request yet if shared memory would "
+            "help. This session is not bound. Ask the user now: which scope "
+            "should this session act as (see the scopes above for the choices)? "
+            "Then call strata_bind(scope_id=...) with their answer. Do not pick "
+            "a scope yourself — binding decides whose memory this session reads "
+            "and writes."
         )
     return result
 
@@ -1012,19 +1014,53 @@ def _resolve_bind(
 def _unresolved_message(fleet: FleetConfig | None) -> str:
     """Build the error text a memory tool returns while the session is unbound.
 
-    Same content the refuse-to-start message used to print to stderr (now
-    unreadable inside a harness), plus recovery instructions that are new to
-    soft-start and class-aware (review follow-up): a config-class failure
-    (broken/missing .strata/config.toml, broken fleet.yaml) can only be
-    fixed by editing the file and restarting the process — strata_bind
-    can't touch it, so its section never mentions strata_bind. A
-    binding-class failure (which scope/skill) is strata_bind/elicitation-
-    eligible and says so. Either section is omitted when that class has no
-    failures, so a session left gated ONLY by a config-class problem after a
-    successful strata_bind never sees a stale "call strata_bind" line for a
-    binding that is already resolved.
+    Live-replay finding: an agent hit this exact error on its very first
+    question and answered from the repo anyway, without asking the user
+    anything at all — it read the validation-failure details and recovery
+    mechanics as background information rather than a blocking instruction,
+    since nothing at the top of the message said "stop." Fix: an unmissable
+    imperative line now LEADS the whole message, before any of the
+    ``[1]``/``[2]``-numbered failure details or recovery mechanics — "STOP
+    — do not answer yet... ask the user now... then call strata_bind." Only
+    once that instruction has been read does the message continue into the
+    numbered failures and the class-aware detail below.
+
+    That detail is the same content the refuse-to-start message used to
+    print to stderr (now unreadable inside a harness), plus recovery
+    instructions that are new to soft-start and class-aware (review
+    follow-up): a config-class failure (broken/missing .strata/config.toml,
+    broken fleet.yaml) can only be fixed by editing the file and restarting
+    the process — strata_bind can't touch it, so its section never mentions
+    strata_bind. A binding-class failure (which scope/skill) is
+    strata_bind/elicitation-eligible and says so. Either section is omitted
+    when that class has no failures, so a session left gated ONLY by a
+    config-class problem after a successful strata_bind never sees a stale
+    "call strata_bind" line for a binding that is already resolved.
     """
     all_errors = _STARTUP_ERRORS_CONFIG + _STARTUP_ERRORS_BINDING
+    scope_ids = [s.id for s in fleet.active_scopes()] if fleet is not None else []
+
+    if _STARTUP_ERRORS_BINDING:
+        scopes_paren = f" (Available: {', '.join(scope_ids)}.)" if scope_ids else ""
+        stop_line = (
+            "STOP — do not answer the user's request yet. This project keeps "
+            "shared memory your answer should draw on, but this session is not "
+            "bound. Ask the user now: which scope should this session act as?"
+            f"{scopes_paren} Then call strata_bind with their choice and retry "
+            "this read.\n\n"
+        )
+    else:
+        # Config-class only: no scope choice can fix this, so the
+        # imperative points at telling the user and fixing/restarting
+        # instead of asking a scope question that wouldn't help.
+        stop_line = (
+            "STOP — do not answer the user's request yet. This project keeps "
+            "shared memory your answer should draw on, but this session's "
+            "memory access is broken (see the failure below) — no scope choice "
+            "fixes this. Tell the user, then fix the file(s) named below and "
+            "restart the server.\n\n"
+        )
+
     header = (
         "Strata MCP server started but this session is not yet bound — "
         f"{len(all_errors)} startup validation "
@@ -1043,7 +1079,6 @@ def _unresolved_message(fleet: FleetConfig | None) -> str:
             "place."
         )
     if _STARTUP_ERRORS_BINDING:
-        scope_ids = [s.id for s in fleet.active_scopes()] if fleet is not None else []
         scopes_line = (
             f"  Available scope IDs: {', '.join(scope_ids)}\n"
             if scope_ids
@@ -1073,7 +1108,7 @@ def _unresolved_message(fleet: FleetConfig | None) -> str:
         "session files, or summaries) to work around this — that bypasses binding "
         "and judgment entirely. All memory access goes through the strata tools."
     )
-    return header + body + "".join(sections)
+    return stop_line + header + body + "".join(sections)
 
 
 class _ScopePick(BaseModel):
