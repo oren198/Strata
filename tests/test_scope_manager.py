@@ -2070,6 +2070,104 @@ def test_publication_system_prompt_states_audience_fitness() -> None:
     assert "dead end" in flat
 
 
+def test_publication_system_prompt_declines_contradiction_citing_operator_directive() -> None:
+    """The publication system prompt instructs declining contradictions of a binding directive."""
+    flat = " ".join(_PUBLICATION_SYSTEM_PROMPT.split())
+    assert "OPERATOR MEMORY" in flat
+    assert "CONTRADICTS" in flat
+    assert "DECLINED" in flat
+    assert "citing that operator directive's id" in flat
+
+
+def test_judge_publication_operator_memory_block_present_with_verbatim_items() -> None:
+    """The OPERATOR MEMORY block renders into the publication judge's message, verbatim."""
+    manager, mock_client = _make_publication_manager("accept", "Fits published <= believed.")
+
+    manager.judge_publication(
+        scope=SCOPE,
+        act_kind="publish",
+        content="Use protobuf for all RPC.",
+        kind="directive",
+        subject="rpc-protocol",
+        anchors=["directive:c_old001"],
+        current_summary=CURRENT_SUMMARY,
+        current_publication=[],
+        operator_memory=[("g_exec", [OPERATOR_DIRECTIVE, OPERATOR_CONTEXT])],
+    )
+
+    message = mock_client.messages.create.call_args.kwargs["messages"][0]["content"]
+    assert "OPERATOR MEMORY (binding this scope" in message
+    assert OPERATOR_DIRECTIVE.id in message
+    assert OPERATOR_DIRECTIVE.content in message
+    assert "attached at g_exec" in message
+    assert OPERATOR_CONTEXT.id in message
+    assert OPERATOR_CONTEXT.content in message
+
+
+def test_judge_publication_operator_memory_block_omitted_when_none_or_empty() -> None:
+    """operator_memory=None (default) and operator_memory=[] both omit the block."""
+    manager, mock_client = _make_publication_manager("accept", "Fits published <= believed.")
+
+    manager.judge_publication(
+        scope=SCOPE,
+        act_kind="publish",
+        content="Use protobuf for all RPC.",
+        kind="directive",
+        subject="rpc-protocol",
+        anchors=["directive:c_old001"],
+        current_summary=CURRENT_SUMMARY,
+        current_publication=[],
+    )
+    message_none = mock_client.messages.create.call_args.kwargs["messages"][0]["content"]
+    assert "OPERATOR MEMORY" not in message_none
+
+    manager.judge_publication(
+        scope=SCOPE,
+        act_kind="publish",
+        content="Use protobuf for all RPC.",
+        kind="directive",
+        subject="rpc-protocol",
+        anchors=["directive:c_old001"],
+        current_summary=CURRENT_SUMMARY,
+        current_publication=[],
+        operator_memory=[],
+    )
+    message_empty = mock_client.messages.create.call_args.kwargs["messages"][0]["content"]
+    assert "OPERATOR MEMORY" not in message_empty
+
+
+def test_judge_publication_declines_publish_that_contradicts_operator_directive() -> None:
+    """A publish act contradicting the rendered binding operator directive can be declined.
+
+    The judge is a mocked API call, so this exercises the machinery end to
+    end: the operator memory reaches the rendered message the judge acts on,
+    and a 'decline' verdict citing the operator directive flows back out as
+    the judgment, exactly as a real contradiction would be judged.
+    """
+    manager, mock_client = _make_publication_manager(
+        "decline",
+        f"Contradicts operator directive {OPERATOR_DIRECTIVE.id}, which requires TLS 1.3+.",
+    )
+
+    judgment = manager.judge_publication(
+        scope=SCOPE,
+        act_kind="publish",
+        content="Services may use plain TCP without TLS.",
+        kind="directive",
+        subject="tls",
+        anchors=["directive:c_old001"],
+        current_summary=CURRENT_SUMMARY,
+        current_publication=[],
+        operator_memory=[("g_exec", [OPERATOR_DIRECTIVE])],
+    )
+
+    assert judgment.decision == "decline"
+    assert OPERATOR_DIRECTIVE.id in judgment.reasoning
+    message = mock_client.messages.create.call_args.kwargs["messages"][0]["content"]
+    assert OPERATOR_DIRECTIVE.id in message
+    assert OPERATOR_DIRECTIVE.content in message
+
+
 # ---------------------------------------------------------------------------
 # judge_bootstrap_publication (ADR 0007 D4)
 # ---------------------------------------------------------------------------

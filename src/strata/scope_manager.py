@@ -708,6 +708,17 @@ withdrawal itself looks like it would misrepresent this scope's actual
 current position (e.g. withdrawing something the CURRENT SUMMARY still
 plainly supports, with no stated reason to retract it).
 
+When an OPERATOR MEMORY section is present in the user message: this is
+verbatim operator memory binding this scope — attached here or at any
+inter-stratum ancestor, occupying the implicit stratum above every fleet
+stratum (CONTEXT.md § Operator). A scope's outward face must not be able to
+contradict the operator directive binding the scope it belongs to: a
+proposed act that CONTRADICTS an operator directive listed there must be
+DECLINED, citing that operator directive's id in your reasoning. Refinement
+WITHIN an inherited operator directive remains legitimate — narrowing detail
+is not contradiction, but reversing or countermanding what the operator
+directive establishes is.
+
 You must call the `submit_publication_judgment` tool exactly once and
 provide a one-or-two-sentence reasoning.\
 """
@@ -2879,6 +2890,7 @@ class ScopeManager:
         subject: str | None = None,
         anchors: Sequence[str] | None = None,
         withdraw_item: _PublishedItemLike | None = None,
+        operator_memory: list[tuple[str, list[OperatorItem]]] | None = None,
     ) -> PublicationJudgment:
         """Judge a publish or withdraw proposal against the scope's current state.
 
@@ -2902,6 +2914,12 @@ class ScopeManager:
                 already-tagged anchor strings.
             withdraw_item: Required for ``act_kind='withdraw'`` — the
                 published item being proposed for removal.
+            operator_memory: The operator memory binding *scope* — see
+                :func:`strata.operator.operator_memory_binding`. Rendered via
+                the same :func:`_render_operator_memory` the contribution
+                judge uses (ADR 0008 D3), so a publish or withdraw act that
+                contradicts a binding operator directive can be declined,
+                citing its id, exactly as a contradicting contribution is.
 
         Returns:
             A :class:`PublicationJudgment`.
@@ -2936,6 +2954,7 @@ class ScopeManager:
                 f"- item to withdraw: {_render_published_item(withdraw_item)}\n"
             )
 
+        operator_block = _render_operator_memory(operator_memory)
         publication_block = _render_current_publication(current_publication)
         summary_block = (
             _render_summary(current_summary)
@@ -2945,6 +2964,7 @@ class ScopeManager:
 
         user_message = (
             f"SCOPE: {scope.name} (id={scope.id})\n\n"
+            f"{operator_block}"
             f"{publication_block}"
             "CURRENT SUMMARY\n"
             "---\n"
