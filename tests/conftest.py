@@ -61,3 +61,23 @@ def _isolate_harness_detection_and_codex_home(
 
     monkeypatch.setattr(install, "detect_harnesses", lambda *a, **k: [])
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / "_autouse_codex_home_guard"))
+
+    # (c) Run each test from a private directory (issue #181).
+    #
+    # ``project_config.load_project_config`` walks UP from the current
+    # working directory looking for ``.strata/config.toml``, and
+    # ``resolve_storage_paths`` gives whatever it finds precedence over env
+    # settings. With the suite's cwd inside a checkout that has been
+    # registered against itself — which the README encourages for
+    # dogfooding — every test that resolves storage without an explicit
+    # override finds the developer's real config and reads their live store.
+    # On 2026-08-31 that produced 23 failures in tests/test_app.py alone,
+    # asserting against the developer's own scope ids.
+    #
+    # tmp_path is empty and its ancestors are pytest's own tmp root, so the
+    # walk-up terminates having found nothing — the same state a bare
+    # machine is in. Tests that want a project config still build one and
+    # pass its path explicitly; only the ambient default is pinned.
+    guard_cwd = tmp_path / "_autouse_cwd_guard"
+    guard_cwd.mkdir(exist_ok=True)
+    monkeypatch.chdir(guard_cwd)
