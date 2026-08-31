@@ -240,6 +240,89 @@ def test_artifact_round_trip_byte_identical_multiline_content(summaries_dir: str
     assert _parse_publication(_render_publication("g_team", items)) == items
 
 
+def test_artifact_round_trip_preserves_relay_fields(summaries_dir: str) -> None:
+    """A relayed item's origin/relay pointer survives write -> read -> re-render (ADR 0013 D4)."""
+    items = [
+        PublishedItem(
+            id="pub_relay1",
+            kind="context",
+            content="Deploys happen at 3pm UTC.",
+            subject="deploy-notes",
+            anchors=["subject:deploy-notes"],
+            published_at="2026-08-31T10:00:00+00:00",
+            origin_scope_id="g_exec",
+            relay_scope_id="g_func",
+            relay_item_id="pub_orig1",
+        ),
+    ]
+    _write_publication("g_team", items, summaries_dir=summaries_dir)
+
+    read_back = read_publication("g_team", summaries_dir=summaries_dir)
+    assert read_back == items
+    assert read_back[0].origin_scope_id == "g_exec"
+    assert read_back[0].relay_scope_id == "g_func"
+    assert read_back[0].relay_item_id == "pub_orig1"
+
+    original_text = Path(summaries_dir, "g_team.pub.md").read_text(encoding="utf-8")
+    assert _render_publication("g_team", read_back) == original_text
+
+
+def test_artifact_render_omits_relay_lines_for_non_relay_item(summaries_dir: str) -> None:
+    """A non-relay item's rendered section carries no origin/relay lines at all.
+
+    Load-bearing for ADR 0013 D7 (no migration, no back-filling): an
+    old-format artifact predating relay fields must re-render byte-identical
+    once parsed, which only holds if an absent origin/relay emits nothing.
+    """
+    item = PublishedItem(
+        id="pub_plain1",
+        kind="directive",
+        content="Use protobuf for all RPC.",
+        subject="rpc-protocol",
+        anchors=["directive:c_dir1"],
+        published_at="2026-07-12T10:00:00+00:00",
+    )
+    rendered = _render_publication("g_team", [item])
+    assert "origin" not in rendered
+    assert "relay" not in rendered
+
+    parsed = _parse_publication(rendered)
+    assert parsed == [item]
+    assert parsed[0].origin_scope_id is None
+    assert parsed[0].relay_scope_id is None
+    assert parsed[0].relay_item_id is None
+
+
+def test_old_format_artifact_without_relay_fields_parses_and_rerenders_byte_identical(
+    summaries_dir: str,
+) -> None:
+    """A pre-ADR-0013 artifact on disk (no origin/relay lines) is untouched by the new parser.
+
+    Simulates a store written before this release: existing items keep
+    exactly what they have, nothing is back-filled (ADR 0013 D7).
+    """
+    old_text = (
+        "---\n"
+        "scope_id: g_team\n"
+        "---\n"
+        "\n"
+        "# Publication: g_team\n"
+        "\n"
+        "## [pub_old1] directive\n"
+        "- subject: rpc-protocol\n"
+        '- anchors: ["directive:c_dir1"]\n'
+        "- published_at: 2026-07-01T00:00:00+00:00\n"
+        "\n"
+        "> Use protobuf for all RPC.\n"
+    )
+    parsed = _parse_publication(old_text)
+    assert len(parsed) == 1
+    assert parsed[0].origin_scope_id is None
+    assert parsed[0].relay_scope_id is None
+    assert parsed[0].relay_item_id is None
+    assert _render_publication("g_team", parsed) == old_text
+
+
 def test_read_publication_empty_for_scope_with_no_artifact(summaries_dir: str) -> None:
     """A scope that has published nothing yet returns an empty list — the honestly empty face."""
     assert read_publication("g_never_published", summaries_dir=summaries_dir) == []
@@ -677,6 +760,596 @@ def test_propose_withdraw_judge_failure_records_marked_attempt(
     assert attempts[0].act_id == withdraw_act.id
     assert attempts[0].error_class == "ValueError"
     assert attempts[0].outcome == "judge_failed"
+
+
+# ---------------------------------------------------------------------------
+# 2b. Republication (ADR 0013 D4) — propose_publish relaying material
+#     received in another scope's publication.
+# ---------------------------------------------------------------------------
+
+
+def test_propose_publish_relay_records_origin_and_relay_and_marks_second_hand(
+    fleet, record_store, summary_store, summaries_dir
+) -> None:
+    """Relaying a scope's own original item: origin and relay both name the source scope."""
+    origin_item = _seed_published_item(
+        record_store,
+        summaries_dir,
+        "g_exec",
+        content="Deploys happen at 3pm UTC.",
+        subject="deploy-notes",
+        anchors=["subject:deploy-notes"],
+    )
+    _seed_summary_with_directive(summary_store, "g_func", directive_id="c_dir2")
+    manager = _FakeScopeManager(
+        publication_judgment=PublicationJudgment(decision="accept", reasoning="Worth relaying.")
+    )
+
+    outcome = propose_publish(
+        "g_func",
+        "Deploys happen at 3pm UTC.",
+        "context",
+        "deploy-notes",
+        ["deploy-notes"],
+        _proposer("g_func"),
+        fleet=fleet,
+        record_store=record_store,
+        summary_store=summary_store,
+        scope_manager=manager,
+        relay_source_scope_id="g_exec",
+        relay_source_item_id=origin_item.id,
+    )
+
+    assert outcome.decision == "accept"
+    item = read_publication("g_func", summaries_dir=summaries_dir)[0]
+    assert item.origin_scope_id == "g_exec"
+    assert item.relay_scope_id == "g_exec"
+    assert item.relay_item_id == origin_item.id
+
+    act = record_store.get_publication_act(outcome.act_id)
+    assert act is not None
+    assert act.origin_scope_id == "g_exec"
+    assert act.relay_scope_id == "g_exec"
+    assert act.relay_item_id == origin_item.id
+
+    # The judge was told this is second-hand, with the origin — D4c.
+    assert len(manager.publication_calls) == 1
+    call = manager.publication_calls[0]
+    assert call["relay_origin_scope_id"] == "g_exec"
+    assert call["relay_via_scope_id"] == "g_exec"
+
+
+def test_propose_publish_relay_transitive_origin_across_two_hops(
+    fleet, record_store, summary_store, summaries_dir
+) -> None:
+    """C relaying B's copy of A's item: origin stays A (the ultimate origin), relay is B."""
+    origin_item = _seed_published_item(
+        record_store,
+        summaries_dir,
+        "g_exec",
+        content="Deploys happen at 3pm UTC.",
+        subject="deploy-notes",
+        anchors=["subject:deploy-notes"],
+    )
+    manager = _FakeScopeManager(
+        publication_judgment=PublicationJudgment(decision="accept", reasoning="Worth relaying.")
+    )
+    first_hop = propose_publish(
+        "g_func",
+        "Deploys happen at 3pm UTC.",
+        "context",
+        "deploy-notes",
+        ["deploy-notes"],
+        _proposer("g_func"),
+        fleet=fleet,
+        record_store=record_store,
+        summary_store=summary_store,
+        scope_manager=manager,
+        relay_source_scope_id="g_exec",
+        relay_source_item_id=origin_item.id,
+    )
+    relayed_by_func = read_publication("g_func", summaries_dir=summaries_dir)[0]
+    assert relayed_by_func.id == first_hop.act_id
+
+    second_hop = propose_publish(
+        "g_team",
+        "Deploys happen at 3pm UTC.",
+        "context",
+        "deploy-notes",
+        ["deploy-notes"],
+        _proposer("g_team"),
+        fleet=fleet,
+        record_store=record_store,
+        summary_store=summary_store,
+        scope_manager=manager,
+        relay_source_scope_id="g_func",
+        relay_source_item_id=relayed_by_func.id,
+    )
+
+    item = read_publication("g_team", summaries_dir=summaries_dir)[0]
+    assert second_hop.decision == "accept"
+    assert item.origin_scope_id == "g_exec"  # ultimate origin, not g_func
+    assert item.relay_scope_id == "g_func"  # immediate predecessor
+    assert item.relay_item_id == relayed_by_func.id
+
+
+def test_propose_publish_relay_missing_source_item_raises_no_act_row(
+    fleet, record_store, summary_store, summaries_dir
+) -> None:
+    manager = _FakeScopeManager()
+    with pytest.raises(ValueError):  # noqa: PT011 — structural error, message not asserted
+        propose_publish(
+            "g_func",
+            "Deploys happen at 3pm UTC.",
+            "context",
+            "deploy-notes",
+            ["deploy-notes"],
+            _proposer("g_func"),
+            fleet=fleet,
+            record_store=record_store,
+            summary_store=summary_store,
+            scope_manager=manager,
+            relay_source_scope_id="g_exec",
+            relay_source_item_id="pub_does_not_exist",
+        )
+    assert record_store.list_publication_acts(scope_id="g_func") == []
+    assert manager.publication_calls == []
+
+
+def test_propose_publish_without_relay_source_leaves_relay_fields_none(
+    fleet, record_store, summary_store, summaries_dir
+) -> None:
+    """An ordinary (non-relay) publish gets no relay origin in the judge's inputs."""
+    _seed_summary_with_directive(summary_store, "g_team")
+    manager = _FakeScopeManager(
+        publication_judgment=PublicationJudgment(decision="accept", reasoning="Fit for export.")
+    )
+    propose_publish(
+        "g_team",
+        "Use protobuf for all RPC.",
+        "directive",
+        "rpc-protocol",
+        ["c_dir1"],
+        _proposer(),
+        fleet=fleet,
+        record_store=record_store,
+        summary_store=summary_store,
+        scope_manager=manager,
+    )
+    item = read_publication("g_team", summaries_dir=summaries_dir)[0]
+    assert item.origin_scope_id is None
+    assert item.relay_scope_id is None
+    assert item.relay_item_id is None
+    assert manager.publication_calls[0]["relay_origin_scope_id"] is None
+    assert manager.publication_calls[0]["relay_via_scope_id"] is None
+
+
+# ---------------------------------------------------------------------------
+# 2c. Withdrawal cascade to relayed copies (ADR 0013 D4b) — mechanical, no
+#     LLM in the loop, a fourth choke point of ADR 0007 D3's class.
+# ---------------------------------------------------------------------------
+
+
+def _relay_via_publish(
+    fleet,
+    record_store,
+    summary_store,
+    summaries_dir,
+    *,
+    into_scope: str,
+    from_scope: str,
+    from_item_id: str,
+    content: str = "Deploys happen at 3pm UTC.",
+    subject: str = "deploy-notes",
+) -> PublishedItem:
+    """Relay *from_scope*'s published item into *into_scope*'s publication (accepted)."""
+    manager = _FakeScopeManager(
+        publication_judgment=PublicationJudgment(decision="accept", reasoning="Worth relaying.")
+    )
+    outcome = propose_publish(
+        into_scope,
+        content,
+        "context",
+        subject,
+        [subject],
+        _proposer(into_scope),
+        fleet=fleet,
+        record_store=record_store,
+        summary_store=summary_store,
+        scope_manager=manager,
+        relay_source_scope_id=from_scope,
+        relay_source_item_id=from_item_id,
+    )
+    assert outcome.decision == "accept"
+    published = read_publication(into_scope, summaries_dir=summaries_dir)
+    return next(i for i in published if i.id == outcome.act_id)
+
+
+def test_propose_withdraw_cascades_to_relayed_copy_mechanically_no_judge_call(
+    fleet, record_store, summary_store, summaries_dir
+) -> None:
+    origin_item = _seed_published_item(
+        record_store,
+        summaries_dir,
+        "g_exec",
+        content="Deploys happen at 3pm UTC.",
+        subject="deploy-notes",
+        anchors=["subject:deploy-notes"],
+    )
+    relayed = _relay_via_publish(
+        fleet,
+        record_store,
+        summary_store,
+        summaries_dir,
+        into_scope="g_func",
+        from_scope="g_exec",
+        from_item_id=origin_item.id,
+    )
+    assert read_publication("g_func", summaries_dir=summaries_dir) != []
+
+    withdraw_manager = _FakeScopeManager(
+        publication_judgment=PublicationJudgment(decision="accept", reasoning="Retracted.")
+    )
+    outcome = propose_withdraw(
+        "g_exec",
+        origin_item.id,
+        _proposer("g_exec"),
+        fleet=fleet,
+        record_store=record_store,
+        summary_store=summary_store,
+        scope_manager=withdraw_manager,
+    )
+    assert outcome.decision == "accept"
+
+    # The relayed copy is gone from g_func's publication.
+    assert read_publication("g_func", summaries_dir=summaries_dir) == []
+
+    # The cascade withdrawal is mechanical: no judgment row, a trigger
+    # naming the origin's withdraw act, and NO extra judge_publication call
+    # (the only call the fake manager saw is for the g_exec withdraw itself).
+    assert len(withdraw_manager.publication_calls) == 1
+    func_acts = record_store.list_publication_acts(scope_id="g_func")
+    cascade_withdraw = next(a for a in func_acts if a.act == "withdraw")
+    assert cascade_withdraw.withdraws == relayed.id
+    assert cascade_withdraw.trigger is not None
+    assert record_store.get_publication_judgment(cascade_withdraw.id) is None
+    state = next(
+        s
+        for s in record_store.list_publication_act_states(scope_id="g_func")
+        if s.act_id == cascade_withdraw.id
+    )
+    assert state.state == "mechanical"
+
+
+def test_propose_withdraw_cascade_is_transitive_across_two_hops(
+    fleet, record_store, summary_store, summaries_dir
+) -> None:
+    origin_item = _seed_published_item(
+        record_store,
+        summaries_dir,
+        "g_exec",
+        content="Deploys happen at 3pm UTC.",
+        subject="deploy-notes",
+        anchors=["subject:deploy-notes"],
+    )
+    hop1 = _relay_via_publish(
+        fleet,
+        record_store,
+        summary_store,
+        summaries_dir,
+        into_scope="g_func",
+        from_scope="g_exec",
+        from_item_id=origin_item.id,
+    )
+    _relay_via_publish(
+        fleet,
+        record_store,
+        summary_store,
+        summaries_dir,
+        into_scope="g_team",
+        from_scope="g_func",
+        from_item_id=hop1.id,
+    )
+    assert read_publication("g_team", summaries_dir=summaries_dir) != []
+
+    withdraw_manager = _FakeScopeManager(
+        publication_judgment=PublicationJudgment(decision="accept", reasoning="Retracted.")
+    )
+    propose_withdraw(
+        "g_exec",
+        origin_item.id,
+        _proposer("g_exec"),
+        fleet=fleet,
+        record_store=record_store,
+        summary_store=summary_store,
+        scope_manager=withdraw_manager,
+    )
+
+    assert read_publication("g_func", summaries_dir=summaries_dir) == []
+    assert read_publication("g_team", summaries_dir=summaries_dir) == []
+    # Still only the one judge call — for the origin withdraw. Both cascaded
+    # withdrawals (g_func, then g_team) are mechanical.
+    assert len(withdraw_manager.publication_calls) == 1
+
+
+def test_propose_withdraw_cascade_self_relay_does_not_deadlock(
+    fleet, record_store, summary_store, summaries_dir
+) -> None:
+    """A scope relaying its own former (already-relayed) item back into a new item of
+    its own must not re-lock itself mid-cascade (scope_lock is not reentrant)."""
+    origin_item = _seed_published_item(
+        record_store,
+        summaries_dir,
+        "g_exec",
+        content="Deploys happen at 3pm UTC.",
+        subject="deploy-notes",
+        anchors=["subject:deploy-notes"],
+    )
+    hop1 = _relay_via_publish(
+        fleet,
+        record_store,
+        summary_store,
+        summaries_dir,
+        into_scope="g_func",
+        from_scope="g_exec",
+        from_item_id=origin_item.id,
+    )
+    # g_exec relays g_func's copy into a SECOND item of its own.
+    _relay_via_publish(
+        fleet,
+        record_store,
+        summary_store,
+        summaries_dir,
+        into_scope="g_exec",
+        from_scope="g_func",
+        from_item_id=hop1.id,
+    )
+
+    withdraw_manager = _FakeScopeManager(
+        publication_judgment=PublicationJudgment(decision="accept", reasoning="Retracted.")
+    )
+    outcome = propose_withdraw(
+        "g_func",
+        hop1.id,
+        _proposer("g_func"),
+        fleet=fleet,
+        record_store=record_store,
+        summary_store=summary_store,
+        scope_manager=withdraw_manager,
+    )
+    assert outcome.decision == "accept"
+    # No hang, and g_exec's second item (relayed from g_func's now-withdrawn
+    # copy) is cascaded away too.
+    assert read_publication("g_exec", summaries_dir=summaries_dir) == [origin_item]
+
+
+def test_propose_withdraw_cascade_reaches_a_relayed_copy_in_the_withdrawing_scope_itself(
+    fleet, record_store, summary_store, summaries_dir
+) -> None:
+    """A relayed copy that loops back into the SAME scope being withdrawn from (whose
+    lock the outer call already holds) is still withdrawn — not skipped for lack of a
+    fresh lock to take."""
+    origin_item = _seed_published_item(
+        record_store,
+        summaries_dir,
+        "g_exec",
+        content="Deploys happen at 3pm UTC.",
+        subject="deploy-notes",
+        anchors=["subject:deploy-notes"],
+    )
+    # g_exec relays its OWN item into a second item of its own.
+    _relay_via_publish(
+        fleet,
+        record_store,
+        summary_store,
+        summaries_dir,
+        into_scope="g_exec",
+        from_scope="g_exec",
+        from_item_id=origin_item.id,
+    )
+    assert len(read_publication("g_exec", summaries_dir=summaries_dir)) == 2
+
+    withdraw_manager = _FakeScopeManager(
+        publication_judgment=PublicationJudgment(decision="accept", reasoning="Retracted.")
+    )
+    propose_withdraw(
+        "g_exec",
+        origin_item.id,
+        _proposer("g_exec"),
+        fleet=fleet,
+        record_store=record_store,
+        summary_store=summary_store,
+        scope_manager=withdraw_manager,
+    )
+
+    assert read_publication("g_exec", summaries_dir=summaries_dir) == []
+
+
+def test_propose_withdraw_cascade_reaches_a_scope_revisited_via_a_different_relay_chain(
+    fleet, record_store, summary_store, summaries_dir
+) -> None:
+    """A -> B -> C -> (back into) B: withdrawing A's item must still reach B's SECOND
+    item, even though B was already visited earlier in the same cascade for its FIRST
+    item. Regression guard for an over-coarse per-scope visited-set that would have
+    left the second B item stranded."""
+    origin_item = _seed_published_item(
+        record_store,
+        summaries_dir,
+        "g_exec",
+        content="Deploys happen at 3pm UTC.",
+        subject="deploy-notes",
+        anchors=["subject:deploy-notes"],
+    )
+    hop_b1 = _relay_via_publish(
+        fleet,
+        record_store,
+        summary_store,
+        summaries_dir,
+        into_scope="g_func",
+        from_scope="g_exec",
+        from_item_id=origin_item.id,
+    )
+    hop_c = _relay_via_publish(
+        fleet,
+        record_store,
+        summary_store,
+        summaries_dir,
+        into_scope="g_team",
+        from_scope="g_func",
+        from_item_id=hop_b1.id,
+    )
+    # g_func relays g_team's copy into a SECOND item of its own.
+    _relay_via_publish(
+        fleet,
+        record_store,
+        summary_store,
+        summaries_dir,
+        into_scope="g_func",
+        from_scope="g_team",
+        from_item_id=hop_c.id,
+    )
+    assert len(read_publication("g_func", summaries_dir=summaries_dir)) == 2
+
+    withdraw_manager = _FakeScopeManager(
+        publication_judgment=PublicationJudgment(decision="accept", reasoning="Retracted.")
+    )
+    propose_withdraw(
+        "g_exec",
+        origin_item.id,
+        _proposer("g_exec"),
+        fleet=fleet,
+        record_store=record_store,
+        summary_store=summary_store,
+        scope_manager=withdraw_manager,
+    )
+
+    assert read_publication("g_func", summaries_dir=summaries_dir) == []
+    assert read_publication("g_team", summaries_dir=summaries_dir) == []
+
+
+def test_relay_origin_and_relay_survive_a_summary_rewrite(
+    fleet, record_store, summary_store, summaries_dir
+) -> None:
+    """A relayed item's origin/relay pointer is untouched by an unrelated summary rewrite
+    and mechanical propagation event in the SAME scope (D4: survives a summary rewrite)."""
+    origin_item = _seed_published_item(
+        record_store,
+        summaries_dir,
+        "g_exec",
+        content="Deploys happen at 3pm UTC.",
+        subject="deploy-notes",
+        anchors=["subject:deploy-notes"],
+    )
+    relayed = _relay_via_publish(
+        fleet,
+        record_store,
+        summary_store,
+        summaries_dir,
+        into_scope="g_func",
+        from_scope="g_exec",
+        from_item_id=origin_item.id,
+    )
+
+    # An unrelated directive is seeded and then removed via the scope's
+    # mechanical propagation path — the closest analogue, in this module, to
+    # a scope-manager rewriting g_func's summary and dropping a directive.
+    _seed_summary_with_directive(summary_store, "g_func", directive_id="c_unrelated")
+    unrelated = _seed_published_item(
+        record_store,
+        summaries_dir,
+        "g_func",
+        content="Use protobuf.",
+        anchors=["directive:c_unrelated"],
+    )
+    withdrawn = propagate_directive_removals(
+        "g_func",
+        {"c_unrelated"},
+        "c_trigger_unrelated",
+        surviving_directive_ids=set(),
+        record_store=record_store,
+        summaries_dir=summaries_dir,
+    )
+    assert [i.id for i in withdrawn] == [unrelated.id]
+
+    # The relayed item — untouched by that event — still carries its origin
+    # and relay pointer exactly as it did before the rewrite.
+    survivor = next(
+        i for i in read_publication("g_func", summaries_dir=summaries_dir) if i.id == relayed.id
+    )
+    assert survivor == relayed
+    assert survivor.origin_scope_id == "g_exec"
+    assert survivor.relay_scope_id == "g_exec"
+    assert survivor.relay_item_id == origin_item.id
+
+
+def test_mechanical_directive_removal_cascades_to_relayed_copy(
+    fleet, record_store, summary_store, summaries_dir
+) -> None:
+    origin_item = _seed_published_item(
+        record_store,
+        summaries_dir,
+        "g_exec",
+        content="Use protobuf.",
+        anchors=["directive:c_dir1"],
+    )
+    _relay_via_publish(
+        fleet,
+        record_store,
+        summary_store,
+        summaries_dir,
+        into_scope="g_func",
+        from_scope="g_exec",
+        from_item_id=origin_item.id,
+        content="Use protobuf.",
+        subject="rpc",
+    )
+    assert read_publication("g_func", summaries_dir=summaries_dir) != []
+
+    withdrawn = propagate_directive_removals(
+        "g_exec",
+        {"c_dir1"},
+        "c_trigger1",
+        surviving_directive_ids=set(),
+        record_store=record_store,
+        summaries_dir=summaries_dir,
+    )
+    assert [i.id for i in withdrawn] == [origin_item.id]
+    assert read_publication("g_func", summaries_dir=summaries_dir) == []
+
+
+def test_judged_propagation_withdrawal_cascades_to_relayed_copy(
+    fleet, record_store, summary_store, summaries_dir
+) -> None:
+    origin_item = _seed_published_item(
+        record_store,
+        summaries_dir,
+        "g_exec",
+        content="stale belief",
+        anchors=["subject:x"],
+    )
+    _relay_via_publish(
+        fleet,
+        record_store,
+        summary_store,
+        summaries_dir,
+        into_scope="g_func",
+        from_scope="g_exec",
+        from_item_id=origin_item.id,
+        content="stale belief",
+        subject="x",
+    )
+    assert read_publication("g_func", summaries_dir=summaries_dir) != []
+
+    withdrawn = apply_judged_withdrawals(
+        "g_exec",
+        [origin_item.id],
+        judged_by="scope-manager",
+        reasoning="No longer believed.",
+        record_store=record_store,
+        summaries_dir=summaries_dir,
+    )
+    assert [i.id for i in withdrawn] == [origin_item.id]
+    assert read_publication("g_func", summaries_dir=summaries_dir) == []
 
 
 # ---------------------------------------------------------------------------
