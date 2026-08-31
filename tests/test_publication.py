@@ -360,7 +360,6 @@ def test_propose_publish_threads_operator_memory_binding_into_judge_publication(
     item = operator_publish(
         "g_exec",
         "All services must use TLS 1.3 or later.",
-        "directive",
         "tls",
         record_store=record_store,
         summaries_dir=summaries_dir,
@@ -421,7 +420,6 @@ def test_propose_withdraw_threads_operator_memory_binding_into_judge_publication
     item = operator_publish(
         "g_exec",
         "All services must use TLS 1.3 or later.",
-        "directive",
         "tls",
         record_store=record_store,
         summaries_dir=summaries_dir,

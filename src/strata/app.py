@@ -1606,9 +1606,15 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
 
         total = 0
         for layer in composed["layers"]:
-            payload = (
-                layer.get("summary") or layer.get("publication") or layer.get("operator_memory")
-            )
+            # An ancestor layer's "directives" (ADR 0013 D1) can legitimately
+            # be an empty list — checked by key, not truthiness, so an empty
+            # ancestor layer still estimates against "[]" rather than "null".
+            for key in ("summary", "publication", "operator_memory", "directives"):
+                if key in layer:
+                    payload = layer[key]
+                    break
+            else:
+                payload = None
             estimate = _estimate_tokens(json.dumps(payload, sort_keys=True))
             layer["token_estimate"] = estimate
             total += estimate

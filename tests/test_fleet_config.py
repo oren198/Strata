@@ -1048,6 +1048,77 @@ def test_entitlement_view_root_scope_works(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# references_from (ADR 0013 D3 — publication travels exactly one edge; a
+# perspective composes only the scope's OWN reference edges, never an
+# ancestor's).
+# ---------------------------------------------------------------------------
+
+
+def test_references_from_returns_only_the_scope_s_own_reference(tmp_path: Path) -> None:
+    """g_funcA's own reference (g_funcB) is returned; g_funcB's own reference (g_funcC) is not."""
+    config = FleetConfig.load(_write(tmp_path, _ENTITLEMENT_YAML))
+
+    assert [s.id for s in config.references_from("g_funcA")] == ["g_funcB"]
+
+
+def test_references_from_excludes_ancestor_s_reference(tmp_path: Path) -> None:
+    """g_teamX has no reference edges of its own — g_funcA's reference to g_funcB
+    does not belong to g_teamX just because g_funcA is its ancestor."""
+    config = FleetConfig.load(_write(tmp_path, _ENTITLEMENT_YAML))
+
+    assert config.references_from("g_teamX") == []
+
+
+def test_references_from_excludes_archived_targets(tmp_path: Path) -> None:
+    """A reference to an archived scope is not returned."""
+    config = FleetConfig.load(_write(tmp_path, _ENTITLEMENT_YAML))
+
+    ids = [s.id for s in config.references_from("g_funcA")]
+    assert "g_funcD" not in ids
+
+
+def test_references_from_sorted_and_deterministic(tmp_path: Path) -> None:
+    """Multiple references from the same scope come back sorted by scope id."""
+    yaml_text = """
+    strata:
+      - id: L0
+        name: Executive
+        ordinal: 0
+      - id: L1
+        name: Function
+        ordinal: 1
+
+    scopes:
+      - id: g_exec
+        name: Executive
+        stratum_id: L0
+      - id: g_funcZ
+        name: Function Z
+        stratum_id: L1
+      - id: g_funcA
+        name: Function A
+        stratum_id: L1
+
+    edges:
+      - from: g_exec
+        to: g_funcZ
+        kind: reference
+      - from: g_exec
+        to: g_funcA
+        kind: reference
+    """
+    config = FleetConfig.load(_write(tmp_path, yaml_text))
+
+    assert [s.id for s in config.references_from("g_exec")] == ["g_funcA", "g_funcZ"]
+
+
+def test_references_from_root_scope_with_no_references_is_empty(tmp_path: Path) -> None:
+    config = FleetConfig.load(_write(tmp_path, _ENTITLEMENT_YAML))
+
+    assert config.references_from("g_exec") == []
+
+
+# ---------------------------------------------------------------------------
 # ADR 0008 — reserved "operator" stratum label
 # ---------------------------------------------------------------------------
 

@@ -570,6 +570,45 @@ class FleetConfig(BaseModel):
             others=others,
         )
 
+    def references_from(self, scope_id: str) -> list[Scope]:
+        """Return the active scopes *scope_id* itself references, one hop (ADR 0013 D3).
+
+        Publication travels exactly one edge, uniformly for chain and
+        reference edges: a perspective's referenced-scope layers come from
+        the requested scope's OWN reference edges only, never an ancestor's
+        — an ancestor's own reference is that ancestor's business to relay
+        or not (curation checkpoint), not something a further descendant
+        receives for free. This is deliberately narrower than
+        :meth:`entitlement_view`'s ``referenced_peers`` (ADR 0006 D2 judge
+        entitlement, chain-wide, unchanged by this ADR): a relay's origin
+        must stay a legitimate fleet-internal name for the judge even after
+        this scope stops composing that origin's publication directly.
+
+        Args:
+            scope_id: The scope whose own outgoing reference edges to
+                resolve. Not validated against the fleet — an unknown id
+                simply has no outgoing edges to resolve.
+
+        Returns:
+            Active target scopes, sorted by scope id for deterministic
+            order. An archived target, or a scope with no reference edges of
+            its own, yields an empty list.
+        """
+        scope_map = {s.id: s for s in self.scopes}
+        ids: list[str] = []
+        seen: set[str] = set()
+        for resolution in _resolve_edges(self):
+            if resolution.kind != "reference" or resolution.from_ != scope_id:
+                continue
+            if resolution.to in seen:
+                continue
+            target = scope_map.get(resolution.to)
+            if target is None or target.status != "active":
+                continue
+            seen.add(resolution.to)
+            ids.append(resolution.to)
+        return sorted((scope_map[sid] for sid in ids), key=lambda s: s.id)
+
     # ------------------------------------------------------------------
     # Mutation API
     # ------------------------------------------------------------------

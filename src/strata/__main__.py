@@ -1561,7 +1561,6 @@ def cmd_operator_publish(args: argparse.Namespace) -> int:
         item = operator_publish(
             args.scope_id,
             args.content,
-            args.kind,
             args.subject,
             record_store=stores.record_store,
             summaries_dir=stores.summary_store.summaries_dir,
@@ -1603,7 +1602,7 @@ def cmd_operator_supersede(args: argparse.Namespace) -> int:
                     record_store=stores.record_store,
                     summaries_dir=stores.summary_store.summaries_dir,
                 )
-            except KeyError as exc:
+            except (KeyError, ValueError) as exc:
                 print(str(exc), file=sys.stderr)
                 return 1
             print(
@@ -4430,9 +4429,6 @@ def _build_parser() -> argparse.ArgumentParser:
         "publish", help="Publish a new operator memory item attached at a scope."
     )
     p_op_publish.add_argument("scope_id")
-    p_op_publish.add_argument(
-        "--kind", choices=["directive", "context"], required=True, help="Operator memory kind."
-    )
     p_op_publish.add_argument("--content", required=True, help="Verbatim operator memory text.")
     p_op_publish.add_argument("--subject", default=None, help="Optional short subject line.")
     p_op_publish.set_defaults(func=cmd_operator_publish)

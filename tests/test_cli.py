@@ -556,8 +556,6 @@ def test_operator_publish_and_show(
             "operator",
             "publish",
             "g_ceo",
-            "--kind",
-            "directive",
             "--content",
             "All services must use TLS 1.3.",
             "--subject",
@@ -602,8 +600,6 @@ def test_operator_publish_configures_cross_process_lock_dir(
             "operator",
             "publish",
             "g_ceo",
-            "--kind",
-            "directive",
             "--content",
             "All services must use TLS 1.3.",
             "--subject",
@@ -625,8 +621,6 @@ def test_operator_publish_unknown_scope_returns_1(
             "operator",
             "publish",
             "g_does_not_exist",
-            "--kind",
-            "directive",
             "--content",
             "text",
         ]
@@ -646,8 +640,6 @@ def test_operator_supersede_op_prefixed_item(
             "operator",
             "publish",
             "g_ceo",
-            "--kind",
-            "directive",
             "--content",
             "v1",
         ]
@@ -738,7 +730,7 @@ def test_operator_retire_op_prefixed_item(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     _seed_fleet(tmp_path, monkeypatch)
-    main(["operator", "publish", "g_ceo", "--kind", "context", "--content", "temp"])
+    main(["operator", "publish", "g_ceo", "--content", "temp"])
     publish_out = capsys.readouterr().out
     op_id = publish_out.split("[")[1].split("]")[0]
 
