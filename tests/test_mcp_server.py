@@ -2271,6 +2271,190 @@ async def test_strata_publish_zero_anchors_raises_runtimeerror(tmp_path: Path) -
         assert rs.list_publication_acts(scope_id="g_backend") == []
 
 
+# ---------------------------------------------------------------------------
+# ADR 0013 D4 — strata_publish relay arguments (republication).
+#
+# g_backend (L1) is the sole child of g_arch (L0) in _make_fleet_yaml, so
+# g_arch is g_backend's chain parent — the one scope whose publication
+# g_backend's own perspective composes one hop away, and therefore the one
+# scope g_backend is entitled to relay from without any reference edge.
+# ---------------------------------------------------------------------------
+
+
+async def test_strata_publish_relay_from_parent_threads_through(tmp_path: Path) -> None:
+    """A relay from the bound scope's chain parent is accepted and threaded to propose_publish."""
+    from strata.publication import PublishedItem, _write_publication, read_publication
+    from strata.scope_manager import PublicationJudgment
+
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fleet_yaml(tmp_path)
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+    fleet = FleetConfig.load(fleet_path)
+
+    ss = SummaryStore(summaries_dir)
+    _seed_summary_with_directive(ss, "g_backend", "c_dir1")
+
+    # g_arch has published an item of its own for g_backend to relay.
+    source_item = PublishedItem(
+        id="pub_arch1",
+        kind="context",
+        content="Architecture decided on protobuf fleet-wide.",
+        subject="rpc",
+        anchors=["subject:rpc"],
+        published_at="2026-07-12T00:00:00+00:00",
+    )
+    _write_publication("g_arch", [source_item], summaries_dir=summaries_dir)
+
+    fake_judgment = PublicationJudgment(decision="accept", reasoning="Worth relaying.")
+
+    scope_p, skill_p, session_p = _patch_agent_binding(
+        mod, scope="g_backend", skill="strata-developer", session_id="sess_relay"
+    )
+    with (
+        scope_p,
+        skill_p,
+        session_p,
+        patch.object(mod, "_load_fleet", return_value=fleet),
+        patch("strata.scope_manager.ScopeManager.judge_publication", return_value=fake_judgment),
+        patch("anthropic.Anthropic", return_value=MagicMock()),
+    ):
+        mod._summary_store = ss
+        result = await mod.strata_publish(
+            content="Architecture decided on protobuf fleet-wide.",
+            kind="context",
+            anchors=["subject:rpc"],
+            subject="rpc",
+            relay_source_scope_id="g_arch",
+            relay_source_item_id="pub_arch1",
+        )
+
+    assert result["judgment"]["decision"] == "accept"
+
+    items = read_publication("g_backend", summaries_dir=summaries_dir)
+    assert len(items) == 1
+    assert items[0].origin_scope_id == "g_arch"
+    assert items[0].relay_scope_id == "g_arch"
+    assert items[0].relay_item_id == "pub_arch1"
+
+
+async def test_strata_publish_relay_source_not_entitled_raises(tmp_path: Path) -> None:
+    """A relay_source_scope_id outside the bound scope's one-hop entitled surface is refused."""
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fleet_yaml(tmp_path)
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+    fleet = FleetConfig.load(fleet_path)
+
+    ss = SummaryStore(summaries_dir)
+    _seed_summary_with_directive(ss, "g_backend", "c_dir1")
+
+    scope_p, skill_p, session_p = _patch_agent_binding(mod, scope="g_backend")
+    with (
+        scope_p,
+        skill_p,
+        session_p,
+        patch.object(mod, "_load_fleet", return_value=fleet),
+        pytest.raises(RuntimeError, match="entitled"),
+    ):
+        mod._summary_store = ss
+        await mod.strata_publish(
+            content="x",
+            kind="context",
+            anchors=["subject:x"],
+            relay_source_scope_id="g_unrelated",
+            relay_source_item_id="pub_x1",
+        )
+
+    with RecordStore(db_path) as rs:
+        assert rs.list_publication_acts(scope_id="g_backend") == []
+
+
+async def test_strata_publish_relay_source_malformed_pair_raises(tmp_path: Path) -> None:
+    """Giving only one of relay_source_scope_id/relay_source_item_id is refused cleanly."""
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fleet_yaml(tmp_path)
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+    fleet = FleetConfig.load(fleet_path)
+
+    ss = SummaryStore(summaries_dir)
+    _seed_summary_with_directive(ss, "g_backend", "c_dir1")
+
+    scope_p, skill_p, session_p = _patch_agent_binding(mod, scope="g_backend")
+    with (
+        scope_p,
+        skill_p,
+        session_p,
+        patch.object(mod, "_load_fleet", return_value=fleet),
+        pytest.raises(RuntimeError, match="together"),
+    ):
+        mod._summary_store = ss
+        await mod.strata_publish(
+            content="x",
+            kind="context",
+            anchors=["subject:x"],
+            relay_source_scope_id="g_arch",
+            relay_source_item_id=None,
+        )
+
+    with RecordStore(db_path) as rs:
+        assert rs.list_publication_acts(scope_id="g_backend") == []
+
+
+async def test_strata_publish_relay_source_unknown_item_raises(tmp_path: Path) -> None:
+    """A relay_source_item_id absent from the (entitled) source scope's publication is refused."""
+    from strata.publication import PublishedItem, _write_publication
+
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fleet_yaml(tmp_path)
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+    fleet = FleetConfig.load(fleet_path)
+
+    ss = SummaryStore(summaries_dir)
+    _seed_summary_with_directive(ss, "g_backend", "c_dir1")
+
+    _write_publication(
+        "g_arch",
+        [
+            PublishedItem(
+                id="pub_arch1",
+                kind="context",
+                content="Architecture decided on protobuf fleet-wide.",
+                subject="rpc",
+                anchors=["subject:rpc"],
+                published_at="2026-07-12T00:00:00+00:00",
+            )
+        ],
+        summaries_dir=summaries_dir,
+    )
+
+    scope_p, skill_p, session_p = _patch_agent_binding(mod, scope="g_backend")
+    with (
+        scope_p,
+        skill_p,
+        session_p,
+        patch.object(mod, "_load_fleet", return_value=fleet),
+        pytest.raises(RuntimeError, match="not in scope"),
+    ):
+        mod._summary_store = ss
+        await mod.strata_publish(
+            content="x",
+            kind="context",
+            anchors=["subject:x"],
+            relay_source_scope_id="g_arch",
+            relay_source_item_id="pub_does_not_exist",
+        )
+
+    with RecordStore(db_path) as rs:
+        assert rs.list_publication_acts(scope_id="g_backend") == []
+
+
 async def test_strata_withdraw_acts_on_bound_scope_with_own_provenance(tmp_path: Path) -> None:
     """strata_withdraw always targets STRATA_AGENT_SCOPE's own publication."""
     from strata.publication import PublishedItem, _write_publication, read_publication
