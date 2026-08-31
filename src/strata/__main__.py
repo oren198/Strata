@@ -83,6 +83,9 @@ from strata.install import (
     HOOK_SCRIPT_NAME as _HOOK_SCRIPT_NAME,
 )
 from strata.install import (
+    HOOK_SCRIPT_NAME_SESSION_START as _HOOK_SCRIPT_NAME_SESSION_START,
+)
+from strata.install import (
     MCP_ENTRY as _MCP_ENTRY,
 )
 from strata.install import (
@@ -93,6 +96,7 @@ from strata.install import (
     copy_hook,
     copy_skill,
     merge_mcp_server,
+    merge_session_start_hook,
     merge_stop_hook,
     render_action_line,
 )
@@ -148,6 +152,9 @@ from strata.install import (
     remove_gitignore_block as _remove_gitignore_block,
 )
 from strata.install import (
+    remove_session_start_hook as _remove_session_start_hook,
+)
+from strata.install import (
     remove_stop_hook as _remove_stop_hook,
 )
 from strata.install import (
@@ -158,6 +165,9 @@ from strata.install import (
 )
 from strata.install import (
     self_update_skill as _self_update_skill,
+)
+from strata.install import (
+    session_start_hook_present as _session_start_hook_present,
 )
 from strata.install import (
     skill_matches_shipped as _skill_matches_shipped,
@@ -818,6 +828,10 @@ def cmd_doctor(args: argparse.Namespace) -> int:
        ``.claude/settings.json`` copy if that's all that's present).
     5. Stop hook script present and matching the shipped version.
     6. ``hooks.Stop`` entry present in ``.claude/settings.json``.
+    6b. SessionStart hook script present and matching the shipped version —
+        the READ-side trigger, symmetric with check 5.
+    6c. ``hooks.SessionStart`` entry present in ``.claude/settings.json`` —
+        symmetric with check 6.
     7. Skills present in ``.claude/skills/``.
     8. Binding env vars (``STRATA_AGENT_SCOPE`` / ``_SKILL`` / ``_SESSION_ID``)
        set and valid against the fleet.
@@ -1212,6 +1226,101 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                 message=(
                     "missing from .claude/settings.json hooks.Stop — run 'strata register' "
                     "to add it."
+                ),
+            )
+        )
+
+    # -----------------------------------------------------------------------
+    # 6b. SessionStart hook script present and matching shipped — the
+    # READ-side trigger, symmetric with check 5 above.
+    # -----------------------------------------------------------------------
+    session_start_hook_script = project_root / ".claude" / "hooks" / _HOOK_SCRIPT_NAME_SESSION_START
+    if not session_start_hook_script.exists():
+        checks.append(
+            Check(
+                name="SessionStart hook",
+                kind="hard",
+                passed=False,
+                message="script missing — run 'strata register' to restore it.",
+            )
+        )
+    else:
+        session_start_hook_status = _classify_hook_drift(
+            session_start_hook_script, _HOOK_SCRIPT_NAME_SESSION_START
+        )
+        if session_start_hook_status == "stale":
+            checks.append(
+                Check(
+                    name="SessionStart hook",
+                    kind="hard",
+                    passed=False,
+                    message=(
+                        "script present but does not match the shipped version (an older "
+                        "shipped version) — run 'strata register' to refresh it."
+                    ),
+                )
+            )
+        elif session_start_hook_status == "edited":
+            checks.append(
+                Check(
+                    name="SessionStart hook",
+                    kind="hard",
+                    passed=False,
+                    message=(
+                        "script present but does not match the shipped version — run "
+                        "'strata register' to restore it (or keep it if you edited it "
+                        "intentionally)."
+                    ),
+                )
+            )
+        else:
+            note = (
+                ""
+                if session_start_hook_status == "match"
+                else " (shipped version unavailable to compare)"
+            )
+            checks.append(
+                Check(
+                    name="SessionStart hook",
+                    kind="hard",
+                    passed=True,
+                    message=f"script present{note}",
+                )
+            )
+
+    # -----------------------------------------------------------------------
+    # 6c. hooks.SessionStart entry present — symmetric with check 6 above.
+    # -----------------------------------------------------------------------
+    if settings_error is not None:
+        checks.append(
+            Check(
+                name="SessionStart hook entry",
+                kind="hard",
+                passed=False,
+                message=(
+                    f".claude/settings.json is {settings_error} — fix the "
+                    "file, then run 'strata register' to add the SessionStart hook entry."
+                ),
+            )
+        )
+    elif _session_start_hook_present(settings_data):
+        checks.append(
+            Check(
+                name="SessionStart hook entry",
+                kind="hard",
+                passed=True,
+                message="present in .claude/settings.json hooks.SessionStart",
+            )
+        )
+    else:
+        checks.append(
+            Check(
+                name="SessionStart hook entry",
+                kind="hard",
+                passed=False,
+                message=(
+                    "missing from .claude/settings.json hooks.SessionStart — run "
+                    "'strata register' to add it."
                 ),
             )
         )
@@ -2916,6 +3025,35 @@ def cmd_register(args: argparse.Namespace) -> int:
                 _report_self_update(dest_hook, hook_status)
 
         # -------------------------------------------------------------------
+        # Step 6c: Copy the SessionStart-hook script to .claude/hooks/ — the
+        # READ-side trigger, symmetric with step 6b above. Nothing fires on
+        # its own to make an agent read its perspective at session start;
+        # this closes that gap the same way the Stop hook closed the
+        # WRITE-side one.
+        # -------------------------------------------------------------------
+        dest_session_start_hook = claude_hooks_dir / _HOOK_SCRIPT_NAME_SESSION_START
+        if not dest_session_start_hook.exists():
+            session_start_hook_copied = copy_hook(
+                hooks_root,
+                claude_hooks_dir,
+                script_name=_HOOK_SCRIPT_NAME_SESSION_START,
+                dry_run=diff_mode,
+            )
+            _act(
+                "copied" if session_start_hook_copied else "skip",
+                dest_session_start_hook,
+                skipped=not session_start_hook_copied,
+            )
+        else:
+            session_start_hook_status = _self_update_hook(
+                dest_session_start_hook, _HOOK_SCRIPT_NAME_SESSION_START, dry_run=diff_mode
+            )
+            if session_start_hook_status == "match":
+                _act("skip", dest_session_start_hook, skipped=True)
+            else:
+                _report_self_update(dest_session_start_hook, session_start_hook_status)
+
+        # -------------------------------------------------------------------
         # Step 7: Merge strata into the project's `.mcp.json` — the file
         # Claude Code actually reads for project-scoped MCP servers
         # (`.claude/settings.json` has no `mcpServers` key in its schema;
@@ -3106,9 +3244,21 @@ def cmd_register(args: argparse.Namespace) -> int:
                 settings_changed = True
                 _act("merged Stop hook into", settings_json)
 
+        # Step 7c: additively merge the hooks.SessionStart entry — the
+        # READ-side trigger, symmetric with step 7b above. A user's own
+        # SessionStart hooks — and every other settings key — are preserved;
+        # the Strata group is appended only when absent.
+        if not settings_unreadable:
+            if _session_start_hook_present(settings_data):
+                _act("skip SessionStart hook in", settings_json, skipped=True)
+            else:
+                merge_session_start_hook(settings_data)
+                settings_changed = True
+                _act("merged SessionStart hook into", settings_json)
+
         # One write for the settings.json changes (legacy-entry removal and/or
-        # the Stop hook merge) — so bootstrap-venv (step 8) reads the
-        # up-to-date file back.
+        # the Stop/SessionStart hook merges) — so bootstrap-venv (step 8) reads
+        # the up-to-date file back.
         if settings_changed and not diff_mode:
             (project_root / ".claude").mkdir(parents=True, exist_ok=True)
             settings_json.write_text(json.dumps(settings_data, indent=2) + "\n", encoding="utf-8")
@@ -3505,7 +3655,11 @@ def _wired_harnesses(project_root: Path) -> list[str]:
             return True
         # `_mcp_server_present` here also catches a not-yet-migrated legacy
         # entry (earlier releases wrote mcpServers.strata into settings.json).
-        return _mcp_server_present(data) or _stop_hook_present(data)
+        return (
+            _mcp_server_present(data)
+            or _stop_hook_present(data)
+            or _session_start_hook_present(data)
+        )
 
     def _codex_wired() -> bool:
         # Codex "wiredness" must be project-scoped, not machine-scoped
@@ -3792,6 +3946,20 @@ def cmd_unregister(args: argparse.Namespace) -> int:
                 else:  # absent
                     _ok(".claude/settings.json: nothing to do (no freshness Stop hook)")
 
+                # hooks.SessionStart entry — the READ-side trigger, same
+                # byte-identity rule, symmetric with the Stop hook above.
+                session_start_hook_status = _remove_session_start_hook(settings_data)
+                if session_start_hook_status == "removed":
+                    settings_changed = True
+                    _ok(f".claude/settings.json: {_would('remove', 'removed')} SessionStart hook")
+                elif session_start_hook_status == "edited":
+                    _left(
+                        ".claude/settings.json: SessionStart hook was edited "
+                        "(differs from the canonical entry) — left in place"
+                    )
+                else:  # absent
+                    _ok(".claude/settings.json: nothing to do (no SessionStart hook)")
+
                 if settings_changed and not dry_run:
                     settings_json.write_text(
                         json.dumps(settings_data, indent=2) + "\n", encoding="utf-8"
@@ -3860,6 +4028,35 @@ def cmd_unregister(args: argparse.Namespace) -> int:
                 _left(
                     f"hook {_HOOK_SCRIPT_NAME}: modified or from an older Strata version "
                     "(differs from shipped) — left in place"
+                )
+
+        # -----------------------------------------------------------------------
+        # Step 3c: the vendored SessionStart-hook script — the READ-side
+        # trigger, symmetric with step 3b above.
+        # -----------------------------------------------------------------------
+        session_start_hook_script = claude_hooks_dir / _HOOK_SCRIPT_NAME_SESSION_START
+        if not session_start_hook_script.exists():
+            _ok(f"hook {_HOOK_SCRIPT_NAME_SESSION_START}: nothing to do (not installed)")
+        else:
+            session_start_hook_match = _hook_matches_shipped(
+                session_start_hook_script, _HOOK_SCRIPT_NAME_SESSION_START
+            )
+            if session_start_hook_match is True:
+                if not dry_run:
+                    session_start_hook_script.unlink()
+                _ok(
+                    f"hook {_HOOK_SCRIPT_NAME_SESSION_START}: {_would('remove', 'removed')} "
+                    "(matched shipped version)"
+                )
+            elif session_start_hook_match is None:
+                _left(
+                    f"hook {_HOOK_SCRIPT_NAME_SESSION_START}: could not read the shipped "
+                    "reference to compare — left in place"
+                )
+            else:  # False — differs
+                _left(
+                    f"hook {_HOOK_SCRIPT_NAME_SESSION_START}: modified or from an older "
+                    "Strata version (differs from shipped) — left in place"
                 )
 
         # Tidy up register-created empty parent dirs so a clean unregister restores
@@ -4095,6 +4292,31 @@ def cmd_freshness_evaluator(args: argparse.Namespace) -> int:
     from strata.freshness import run_evaluator  # noqa: PLC0415
 
     run_evaluator(session_id=args.session_id, transcript_path=args.transcript_path)
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# strata session-start-hook — the READ-side trigger, symmetric with
+# freshness-hook above. Hidden subcommand: it is the engine the installed
+# `.claude/hooks/strata-session-start-hook` wrapper invokes, not a command a
+# user runs by hand.
+# ---------------------------------------------------------------------------
+
+
+def cmd_session_start_hook(args: argparse.Namespace) -> int:
+    """Print the SessionStart hook's read-side trigger instruction.
+
+    Reads (and discards) the hook JSON on stdin — mirroring
+    ``cmd_freshness_hook``'s stdin handling, though nothing here is
+    load-bearing for what gets printed, unlike the Stop hook's asymmetry
+    gate. Always exits 0 — a broken hook must never break the session.
+    """
+    if not sys.stdin.isatty():
+        sys.stdin.read()
+
+    from strata.session_start import run_session_start_hook  # noqa: PLC0415
+
+    run_session_start_hook(out=sys.stdout)
     return 0
 
 
@@ -4545,6 +4767,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p_fresh_eval.add_argument("--session-id", dest="session_id", required=True)
     p_fresh_eval.add_argument("--transcript-path", dest="transcript_path", required=True)
     p_fresh_eval.set_defaults(func=cmd_freshness_evaluator)
+
+    p_session_start_hook = sub.add_parser("session-start-hook", help=argparse.SUPPRESS)
+    p_session_start_hook.set_defaults(func=cmd_session_start_hook)
 
     return parser
 

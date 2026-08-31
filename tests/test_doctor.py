@@ -115,6 +115,7 @@ def test_doctor_all_checks_pass(registered_project: Path, capsys: pytest.Capture
     assert "fleet" in lower
     assert "mcp" in lower
     assert "stop hook" in lower
+    assert "sessionstart hook" in lower
     assert "skill" in lower
     assert "binding" in lower
     assert "session id" in lower
@@ -515,6 +516,53 @@ def test_doctor_flags_missing_stop_hook_entry(
     assert rc == 1
     lower = output.lower()
     assert "hooks.stop" in lower or "stop hook entry" in lower
+    assert "register" in lower
+
+
+# ---------------------------------------------------------------------------
+# 6b/6c. SessionStart hook script + hooks.SessionStart entry — symmetric with
+# checks 5/6 above (the READ-side trigger).
+# ---------------------------------------------------------------------------
+
+
+def test_doctor_flags_missing_session_start_hook(
+    registered_project: Path, capsys: pytest.CaptureFixture
+) -> None:
+    (registered_project / ".claude" / "hooks" / "strata-session-start-hook").unlink()
+
+    rc, output = _run_doctor(capsys)
+
+    assert rc == 1
+    lower = output.lower()
+    assert "sessionstart hook" in lower
+    assert "register" in lower
+
+
+def test_doctor_flags_edited_session_start_hook_script(
+    registered_project: Path, capsys: pytest.CaptureFixture
+) -> None:
+    hook_script = registered_project / ".claude" / "hooks" / "strata-session-start-hook"
+    hook_script.write_text("#!/bin/sh\necho tampered\n", encoding="utf-8")
+
+    rc, output = _run_doctor(capsys)
+
+    assert rc == 1
+    assert "sessionstart hook" in output.lower()
+
+
+def test_doctor_flags_missing_session_start_hook_entry(
+    registered_project: Path, capsys: pytest.CaptureFixture
+) -> None:
+    settings_json = registered_project / ".claude" / "settings.json"
+    data = json.loads(settings_json.read_text(encoding="utf-8"))
+    del data["hooks"]["SessionStart"]
+    settings_json.write_text(json.dumps(data), encoding="utf-8")
+
+    rc, output = _run_doctor(capsys)
+
+    assert rc == 1
+    lower = output.lower()
+    assert "hooks.sessionstart" in lower or "sessionstart hook entry" in lower
     assert "register" in lower
 
 
