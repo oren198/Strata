@@ -2829,6 +2829,62 @@ async def test_invalid_fleet_edit_keeps_serving_last_good_fleet_with_notice(tmp_
     assert "fleet.yaml" in served["fleet_notice"]
 
 
+async def test_read_perspective_gates_when_fleet_yaml_vanishes(tmp_path: Path) -> None:
+    """A fleet.yaml that vanishes AFTER a successful bind must gate memory
+    reads with a loud, actionable error — not the success-shaped empty
+    payload the reload-on-read fallback used to produce (with only an
+    easy-to-miss ``fleet_notice`` riding along). That payload is
+    indistinguishable from a legitimately new scope with nothing written
+    yet, so an agent reading it has no reason to stop.
+
+    This must gate the same way an unresolved binding already does — via
+    _require_bound_or_elicit — since a vanished fleet source is a
+    config-class failure strata_bind can never clear (a restart is
+    required once the file is back)."""
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fleet_yaml(tmp_path)
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+
+    with (
+        patch.object(mod, "_AGENT_SCOPE", "g_backend"),
+        patch.object(mod, "_AGENT_SKILL", "strata-developer"),
+    ):
+        # Prime the reloader with a good load — an ordinary, ungated read.
+        good = await mod.strata_read_perspective()
+        assert "fleet_notice" not in good
+
+        fleet_path.unlink()
+
+        with pytest.raises(RuntimeError) as exc_info:
+            await mod.strata_read_perspective()
+
+    message = str(exc_info.value)
+    assert str(fleet_path) in message, "must name the missing file path"
+    assert "restart" in message.lower(), "must say a restart is required once fixed"
+
+
+async def test_list_scopes_stays_ungated_when_fleet_yaml_vanishes(tmp_path: Path) -> None:
+    """strata_list_scopes is deliberately NOT gated by _require_bound_or_elicit
+    (fleet topology is not scoped memory) — an operator diagnosing a vanished
+    fleet.yaml still needs it to work, carrying the fleet_notice as before."""
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fleet_yaml(tmp_path)
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+
+    good = mod.strata_list_scopes()
+    assert "fleet_notice" not in good
+
+    fleet_path.unlink()
+
+    served = mod.strata_list_scopes()
+    assert "fleet_notice" in served
+    assert "fleet.yaml" in served["fleet_notice"]
+
+
 # ---------------------------------------------------------------------------
 # Feature B: strata_bind — rebind this session to a different scope at
 # runtime, sharing Feature A's reload path so a scope added after server
