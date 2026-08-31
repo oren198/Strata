@@ -437,6 +437,19 @@ class PublicationAct:
     withdrawal (ADR 0007 D3) it carries the record id of the internal change
     that caused it (a contribution id or an operator retirement id).
     ``proposer`` mirrors :class:`ContributorRef` — this act's provenance.
+
+    ``origin_scope_id`` / ``relay_scope_id`` / ``relay_item_id`` carry
+    republication provenance (ADR 0013 D4, migration 0009): when this act
+    relays content received in another scope's publication rather than
+    originating here, ``origin_scope_id`` is the ULTIMATE origin scope
+    (however many hops the content has travelled), and ``relay_scope_id`` /
+    ``relay_item_id`` name the IMMEDIATE predecessor — the scope and item id
+    this specific copy was republished from ("according to
+    ``origin_scope_id``, via ``relay_scope_id``"). All three are ``None``
+    together for an item that originated in this act's own ``scope_id``,
+    including every act recorded before this migration (ADR 0013 D7 — no
+    backfill; a pre-existing item reads as "not a relay", never invented
+    history).
     """
 
     id: str
@@ -450,6 +463,9 @@ class PublicationAct:
     trigger: str | None
     proposer: ContributorRef
     created_at: str
+    origin_scope_id: str | None = None
+    relay_scope_id: str | None = None
+    relay_item_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1455,6 +1471,9 @@ class RecordStore:
         withdraws: str | None,
         trigger: str | None,
         proposer: ContributorRef,
+        origin_scope_id: str | None = None,
+        relay_scope_id: str | None = None,
+        relay_item_id: str | None = None,
     ) -> PublicationAct:
         """Append a publish or withdraw act to *scope_id*'s publication record.
 
@@ -1478,6 +1497,16 @@ class RecordStore:
                        D3): the record id of the triggering internal change.
                        ``None`` otherwise.
             proposer:  Provenance — mirrors :class:`ContributorRef`.
+            origin_scope_id: ADR 0013 D4 — the ULTIMATE origin scope when
+                       this act relays content received in another scope's
+                       publication. ``None`` for an item that originates in
+                       *scope_id* itself.
+            relay_scope_id: ADR 0013 D4 — the immediate predecessor scope
+                       this copy was republished from. ``None`` unless
+                       *origin_scope_id* is also set.
+            relay_item_id: ADR 0013 D4 — the ``pub_`` id, in
+                       *relay_scope_id*'s publication, of the item this copy
+                       relays. ``None`` unless *origin_scope_id* is also set.
 
         Returns:
             The newly appended :class:`PublicationAct`.
@@ -1492,8 +1521,9 @@ class RecordStore:
             """
             INSERT INTO publication_acts (
                 id, scope_id, act, kind, content, subject, anchors, withdraws, "trigger",
-                proposer_scope_id, proposer_skill, proposer_session_id, proposer_ts
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                proposer_scope_id, proposer_skill, proposer_session_id, proposer_ts,
+                origin_scope_id, relay_scope_id, relay_item_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 act_id,
@@ -1509,6 +1539,9 @@ class RecordStore:
                 proposer.skill,
                 proposer.session_id,
                 proposer.ts,
+                origin_scope_id,
+                relay_scope_id,
+                relay_item_id,
             ),
         )
         self._conn.commit()
@@ -1520,7 +1553,7 @@ class RecordStore:
             """
             SELECT id, scope_id, act, kind, content, subject, anchors, withdraws,
                    "trigger", proposer_scope_id, proposer_skill, proposer_session_id,
-                   proposer_ts, created_at
+                   proposer_ts, created_at, origin_scope_id, relay_scope_id, relay_item_id
             FROM publication_acts
             WHERE scope_id = ?
             ORDER BY created_at ASC, rowid ASC
@@ -1541,7 +1574,7 @@ class RecordStore:
             """
             SELECT id, scope_id, act, kind, content, subject, anchors, withdraws,
                    "trigger", proposer_scope_id, proposer_skill, proposer_session_id,
-                   proposer_ts, created_at
+                   proposer_ts, created_at, origin_scope_id, relay_scope_id, relay_item_id
             FROM publication_acts WHERE id = ?
             """,
             (act_id,),

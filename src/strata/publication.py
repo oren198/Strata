@@ -113,6 +113,20 @@ class PublishedItem:
     subject: str | None
     anchors: list[str]
     published_at: str
+    origin_scope_id: str | None = None
+    """ADR 0013 D4 — the ULTIMATE origin scope when this item relays content
+    received in another scope's publication (republication). ``None`` when
+    this item originated here — including every item written before this
+    release (ADR 0013 D7: no migration, no back-filling)."""
+    relay_scope_id: str | None = None
+    """ADR 0013 D4 — the immediate predecessor scope this copy was
+    republished from (the "via Y" of "according to X, via Y"). ``None``
+    unless ``origin_scope_id`` is also set."""
+    relay_item_id: str | None = None
+    """ADR 0013 D4 — the id of the published item, in ``relay_scope_id``'s
+    publication, this copy relays. ``None`` unless ``origin_scope_id`` is
+    also set. Together with ``relay_scope_id`` this is the pointer the
+    mechanical withdrawal cascade (D4b) follows."""
 
 
 @dataclass(frozen=True)
@@ -157,6 +171,10 @@ _SUBJECT_LINE_RE = re.compile(r"^-\s+subject:\s*(.*)")
 _ANCHORS_LINE_RE = re.compile(r"^-\s+anchors:\s*(.*)")
 # Matches:  - published_at: value
 _PUBLISHED_AT_LINE_RE = re.compile(r"^-\s+published_at:\s*(.*)")
+# Matches:  - origin: value           (ADR 0013 D4 — omitted for a non-relay item)
+_ORIGIN_LINE_RE = re.compile(r"^-\s+origin:\s*(.*)")
+# Matches:  - relay: scope/item       (ADR 0013 D4 — omitted for a non-relay item)
+_RELAY_LINE_RE = re.compile(r"^-\s+relay:\s*(\S+)/(\S+)\s*$")
 # Matches:  > blockquote body
 _BLOCKQUOTE_RE = re.compile(r"^>\s*(.*)")
 
@@ -187,6 +205,13 @@ def _render_publication(scope_id: str, items: list[PublishedItem]) -> str:
             lines.append(f"- subject: {subject_value}")
             lines.append(f"- anchors: {json.dumps(list(item.anchors))}")
             lines.append(f"- published_at: {item.published_at}")
+            # ADR 0013 D4 — omitted entirely for a non-relay item (origin_scope_id
+            # is None), so an artifact predating relay fields re-renders
+            # byte-identical after a parse -> re-render round trip (D7: no
+            # migration, no back-filling).
+            if item.origin_scope_id is not None:
+                lines.append(f"- origin: {item.origin_scope_id}")
+                lines.append(f"- relay: {item.relay_scope_id}/{item.relay_item_id}")
             lines.append("")
             # Blockquote every line, verbatim, so multi-line content round-trips
             # exactly instead of being flattened or truncated.
@@ -212,11 +237,15 @@ def _parse_publication(text: str) -> list[PublishedItem]:
     cur_subject: str | None = None
     cur_anchors_raw: str | None = None
     cur_published_at: str | None = None
+    cur_origin_scope_id: str | None = None
+    cur_relay_scope_id: str | None = None
+    cur_relay_item_id: str | None = None
     cur_blockquote_lines: list[str] = []
 
     def _flush() -> None:
         nonlocal cur_id, cur_kind, cur_subject, cur_anchors_raw
         nonlocal cur_published_at, cur_blockquote_lines
+        nonlocal cur_origin_scope_id, cur_relay_scope_id, cur_relay_item_id
         if cur_id is None:
             return
         anchors: list[str] = []
@@ -235,6 +264,9 @@ def _parse_publication(text: str) -> list[PublishedItem]:
                 subject=cur_subject if cur_subject else None,
                 anchors=anchors,
                 published_at=cur_published_at or "",
+                origin_scope_id=cur_origin_scope_id,
+                relay_scope_id=cur_relay_scope_id,
+                relay_item_id=cur_relay_item_id,
             )
         )
         cur_id = None
@@ -242,6 +274,9 @@ def _parse_publication(text: str) -> list[PublishedItem]:
         cur_subject = None
         cur_anchors_raw = None
         cur_published_at = None
+        cur_origin_scope_id = None
+        cur_relay_scope_id = None
+        cur_relay_item_id = None
         cur_blockquote_lines = []
 
     for raw_line in body.splitlines():
@@ -272,6 +307,17 @@ def _parse_publication(text: str) -> list[PublishedItem]:
         m_published_at = _PUBLISHED_AT_LINE_RE.match(line)
         if m_published_at:
             cur_published_at = m_published_at.group(1).strip()
+            continue
+
+        m_origin = _ORIGIN_LINE_RE.match(line)
+        if m_origin:
+            cur_origin_scope_id = m_origin.group(1).strip() or None
+            continue
+
+        m_relay = _RELAY_LINE_RE.match(line)
+        if m_relay:
+            cur_relay_scope_id = m_relay.group(1)
+            cur_relay_item_id = m_relay.group(2)
             continue
 
         m_bq = _BLOCKQUOTE_RE.match(line)
@@ -458,6 +504,8 @@ def propose_publish(
     record_store: RecordStore,
     summary_store: SummaryStore,
     scope_manager: ScopeManager,
+    relay_source_scope_id: str | None = None,
+    relay_source_item_id: str | None = None,
 ) -> PublicationOutcome:
     """Propose publishing *content* from *scope_id*'s own memory, judged by its scope-manager.
 
@@ -498,17 +546,66 @@ def propose_publish(
             this scope's summary, or free-form subject text. Tagged
             internally (:func:`_tag_anchor`) before storage and validation.
         proposer: Provenance of the proposing agent.
+        relay_source_scope_id: ADR 0013 D4 (republication) — when this
+            publish RELAYS an item *scope_id* received in another scope's
+            publication, the scope that item currently lives in. Must be
+            given together with *relay_source_item_id*, or not at all. The
+            item's origin is DERIVED from the source item itself, never
+            taken from the caller: if the source item is already a relay
+            (its own ``origin_scope_id`` is set), that ORIGINAL origin
+            carries forward unchanged — a caller cannot assert an origin
+            that the chain of publish acts does not itself establish, which
+            is exactly the provenance-laundering this ADR exists to
+            prevent. This function does not check that *scope_id* is
+            entitled to read *relay_source_scope_id*'s publication (one-hop
+            entitlement is a fleet-topology concern) — same precedent as
+            *scope_id* itself: structural enforcement belongs to the
+            calling surface.
+        relay_source_item_id: The id of the published item, in
+            *relay_source_scope_id*'s CURRENT publication, being relayed.
 
     Returns:
         A :class:`PublicationOutcome`.
 
     Raises:
-        ValueError: *scope_id* is not found in *fleet*, or the anchors fail
-            structural validation (no act row is appended in either case).
+        ValueError: *scope_id* is not found in *fleet*; the anchors fail
+            structural validation; exactly one of *relay_source_scope_id* /
+            *relay_source_item_id* is given; or *relay_source_item_id* is
+            not present in *relay_source_scope_id*'s current publication (no
+            act row is appended in any of these cases).
     """
     scope = fleet.get_scope(scope_id)
     if scope is None:
         raise ValueError(f"Scope not found: {scope_id!r}")
+
+    if (relay_source_scope_id is None) != (relay_source_item_id is None):
+        raise ValueError(
+            "relay_source_scope_id and relay_source_item_id must be given together, or not at all."
+        )
+
+    # ADR 0013 D4 — republication provenance, derived from the source item
+    # itself before anything is recorded (mirrors the anchor structural
+    # check below: a failure here appends no act row). origin_scope_id is
+    # never taken from the caller: it is the source item's OWN origin when
+    # the source item is itself a relay (transitive — the origin never
+    # changes hands, however many relays it passes through), or the source
+    # scope itself when the source item is an original publish.
+    origin_scope_id: str | None = None
+    relay_scope_id: str | None = None
+    relay_item_id: str | None = None
+    if relay_source_scope_id is not None:
+        source_items = read_publication(
+            relay_source_scope_id, summaries_dir=str(summary_store.summaries_dir)
+        )
+        source_item = next((i for i in source_items if i.id == relay_source_item_id), None)
+        if source_item is None:
+            raise ValueError(
+                f"Relay source item {relay_source_item_id!r} is not in scope "
+                f"{relay_source_scope_id!r}'s current publication."
+            )
+        origin_scope_id = source_item.origin_scope_id or relay_source_scope_id
+        relay_scope_id = relay_source_scope_id
+        relay_item_id = source_item.id
 
     with scope_lock(scope_id):
         current_summary = summary_store.read(scope_id)
@@ -525,6 +622,9 @@ def propose_publish(
             withdraws=None,
             trigger=None,
             proposer=proposer,
+            origin_scope_id=origin_scope_id,
+            relay_scope_id=relay_scope_id,
+            relay_item_id=relay_item_id,
         )
 
         current_publication = read_publication(
@@ -556,6 +656,8 @@ def propose_publish(
                 current_summary=current_summary,
                 current_publication=current_publication,
                 operator_memory=operator_memory,
+                relay_origin_scope_id=origin_scope_id,
+                relay_via_scope_id=relay_scope_id,
             )
         except Exception as exc:
             # Record the failure as an event against the act — never as a
@@ -585,6 +687,9 @@ def propose_publish(
                 subject=subject,
                 anchors=tagged_anchors,
                 published_at=act.created_at,
+                origin_scope_id=origin_scope_id,
+                relay_scope_id=relay_scope_id,
+                relay_item_id=relay_item_id,
             )
             current_publication.append(item)
             _write_publication(
@@ -699,6 +804,15 @@ def propose_withdraw(
             remaining = [i for i in current_publication if i.id != item_id]
             _write_publication(scope_id, remaining, summaries_dir=str(summary_store.summaries_dir))
             artifact_updated = True
+            # ADR 0013 D4b — mechanical, no LLM: every downstream copy
+            # relayed from this item goes with it.
+            _cascade_withdraw_relays(
+                scope_id,
+                item_id,
+                record_store=record_store,
+                summaries_dir=str(summary_store.summaries_dir),
+                held_scope_id=scope_id,
+            )
 
         return PublicationOutcome(
             act_id=act.id,
@@ -707,6 +821,116 @@ def propose_withdraw(
             reasoning=judgment.reasoning,
             artifact_updated=artifact_updated,
         )
+
+
+# ---------------------------------------------------------------------------
+# Withdrawal cascade to relayed copies (ADR 0013 D4b) — a fourth mechanical
+# choke point of the class ADR 0007 D3 established: a relay is anchored to
+# its origin exactly as a published item is anchored to the directive it
+# came from, and this is the one-edge-further-out counterpart of
+# propagate_directive_removals. No LLM in the loop, whatever caused the
+# upstream withdrawal (an agent's own propose_withdraw, mechanical
+# propagation, or judged propagation) — a relay believes an item only
+# because its origin does, so every path that removes an item from a
+# publication must sweep its relayed copies the same way.
+# ---------------------------------------------------------------------------
+
+
+def _cascade_withdraw_relays(
+    scope_id: str,
+    item_id: str,
+    *,
+    record_store: RecordStore,
+    summaries_dir: str,
+    held_scope_id: str,
+) -> None:
+    """Mechanically withdraw every published item relayed from ``(scope_id, item_id)``.
+
+    Recurses: a copy withdrawn here may itself have been relayed onward
+    again — including, since reference edges may form cycles (CONTEXT.md §
+    Reference edge), back through a scope this cascade has already visited
+    for a DIFFERENT item — and D4b's cascade can therefore change several
+    strata in one act. Each withdraw act's ``trigger`` names the id of the
+    item ONE hop upstream that caused it (chained, so every hop stays
+    locally traceable from the record alone) and gets NO judgment row —
+    mechanical, exactly like :func:`propagate_directive_removals`'s
+    withdrawals. Termination does not depend on tracking visited scopes:
+    every relay item id is a fresh publish act created strictly after the
+    item it relays, so the chain of ``relay_item_id`` pointers this
+    function follows can never loop back to an id it has already withdrawn.
+
+    *held_scope_id* is the ONE scope whose :func:`strata.locks.scope_lock`
+    is already held by the outermost caller of this cascade (every entry
+    point calls this from inside its own ``with scope_lock(scope_id):``
+    block) — the only scope this function must NOT try to re-lock (the lock
+    is not reentrant). A downstream scope's lock, once taken below, is
+    always released before recursing, so at most one OTHER scope's lock is
+    ever held at a time; *held_scope_id* is therefore the only deadlock risk,
+    and a relayed copy that loops back into it is withdrawn in place, under
+    the lock the caller already holds, rather than skipped.
+    """
+    proposer = _mechanical_proposer(scope_id)
+
+    def _remove_matches(other_scope_id: str) -> list[PublishedItem]:
+        current = read_publication(other_scope_id, summaries_dir=summaries_dir)
+        to_remove = [
+            i for i in current if i.relay_scope_id == scope_id and i.relay_item_id == item_id
+        ]
+        if not to_remove:
+            return []
+        removed_ids = {i.id for i in to_remove}
+        remaining = [i for i in current if i.id not in removed_ids]
+        for item in to_remove:
+            record_store.append_publication_act(
+                scope_id=other_scope_id,
+                act="withdraw",
+                kind=None,
+                content=None,
+                subject=None,
+                anchors=None,
+                withdraws=item.id,
+                trigger=item_id,
+                proposer=proposer,
+            )
+            _logger.info(
+                "cascaded mechanical withdrawal of relayed item %s from scope %s "
+                "(relayed from %s/%s)",
+                item.id,
+                other_scope_id,
+                scope_id,
+                item_id,
+            )
+        _write_publication(other_scope_id, remaining, summaries_dir=summaries_dir)
+        return to_remove
+
+    for other_scope_id in list_scopes_with_publications(summaries_dir):
+        candidates = read_publication(other_scope_id, summaries_dir=summaries_dir)
+        matches = [
+            i for i in candidates if i.relay_scope_id == scope_id and i.relay_item_id == item_id
+        ]
+        if not matches:
+            continue
+
+        if other_scope_id == held_scope_id:
+            # Already locked by the outer caller — mutate in place rather
+            # than re-acquiring (would deadlock) or skipping (would leave a
+            # relayed copy asserting what its origin has retracted).
+            removed = _remove_matches(other_scope_id)
+        else:
+            with scope_lock(other_scope_id):
+                # Re-read under the lock — another writer may have changed
+                # this scope's publication between the unlocked scan above
+                # and here.
+                removed = _remove_matches(other_scope_id)
+
+        for item in removed:
+            _cascade_withdraw_relays(
+                other_scope_id,
+                item.id,
+                record_store=record_store,
+                summaries_dir=summaries_dir,
+                held_scope_id=held_scope_id,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -820,6 +1044,18 @@ def propagate_directive_removals(
     withdrawn_ids = {item.id for item in to_withdraw}
     remaining = [item for item in current_publication if item.id not in withdrawn_ids]
     _write_publication(scope_id, remaining, summaries_dir=summaries_dir)
+
+    # ADR 0013 D4b — mechanical, no LLM: sweep every downstream copy relayed
+    # from each item this call just withdrew.
+    for item in to_withdraw:
+        _cascade_withdraw_relays(
+            scope_id,
+            item.id,
+            record_store=record_store,
+            summaries_dir=summaries_dir,
+            held_scope_id=scope_id,
+        )
+
     return to_withdraw
 
 
@@ -909,6 +1145,20 @@ def apply_judged_withdrawals(
     withdrawn_ids = {item.id for item in withdrawn}
     remaining = [item for item in current_publication if item.id not in withdrawn_ids]
     _write_publication(scope_id, remaining, summaries_dir=summaries_dir)
+
+    # ADR 0013 D4b — mechanical, no LLM: this withdrawal was judged (as part
+    # of the triggering contribution judgment), but the relay cascade it
+    # sets off never is — a relay believes an item only because its origin
+    # does.
+    for item in withdrawn:
+        _cascade_withdraw_relays(
+            scope_id,
+            item.id,
+            record_store=record_store,
+            summaries_dir=summaries_dir,
+            held_scope_id=scope_id,
+        )
+
     return withdrawn
 
 

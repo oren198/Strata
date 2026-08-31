@@ -1,0 +1,42 @@
+-- Strata migration: republication provenance on publication_acts (ADR 0013 D4).
+--
+-- A publication now travels exactly one edge (ADR 0013 D3); the only way an
+-- item reaches beyond a scope's immediate neighbours is republication — a
+-- scope publishing onward an item it received in another scope's
+-- publication. D4 requires a republished item to keep its ORIGIN scope and
+-- record the RELAY it travelled ("according to X, via Y"), surviving
+-- composition and summary rewrites alike, so trust feedback and
+-- non-corroboration checks can be traced to the true origin instead of the
+-- relay wearing the credit.
+--
+-- Three nullable columns, additive, no backfill (ADR 0013 D7 — no
+-- migration; existing items keep what they have):
+--
+--   origin_scope_id   The scope where this item's content was FIRST
+--                      published — the ultimate origin, however many hops
+--                      it has since travelled. NULL means this item is not
+--                      a relay: it originated in THIS act's own scope_id.
+--   relay_scope_id     The scope this copy was republished FROM (the
+--                      immediate predecessor — the "via Y" of "according to
+--                      X, via Y"). NULL for a non-relay item.
+--   relay_item_id      The `pub_` id of the published item, in
+--                      relay_scope_id's publication, this copy relays.
+--                      NULL for a non-relay item. Together with
+--                      relay_scope_id this is the pointer the mechanical
+--                      withdrawal cascade (ADR 0013 D4b) follows: when that
+--                      exact (relay_scope_id, relay_item_id) pair is
+--                      withdrawn, every item naming it is withdrawn too.
+--
+-- All three are set together (a relay) or all NULL together (an original
+-- publish or a mechanically-cascaded withdrawal act, which carries no
+-- content and so carries no relay pointer of its own — see 0005's "trigger"
+-- column for how a withdraw act's provenance is carried instead).
+--
+-- Existing rows get NULL for all three (SQLite's default ALTER TABLE ADD
+-- COLUMN behaviour) — read exactly as "not a relay", which is the correct,
+-- non-invented reading for every publish act that predates this release:
+-- nothing about their provenance changes, per ADR 0013 D7.
+
+ALTER TABLE publication_acts ADD COLUMN origin_scope_id TEXT;
+ALTER TABLE publication_acts ADD COLUMN relay_scope_id TEXT;
+ALTER TABLE publication_acts ADD COLUMN relay_item_id TEXT;

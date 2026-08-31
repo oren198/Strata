@@ -1143,3 +1143,65 @@ class TestPageDeclines:
         self._decline(store, "g_a", "mine", "no")
         with pytest.raises(ValueError):
             store.page_declines(scope_id="g_a", before_id="c_doesnotexist")
+
+
+# ---------------------------------------------------------------------------
+# Republication provenance on publication_acts (ADR 0013 D4 / migration 0009).
+# Three new nullable columns — origin_scope_id, relay_scope_id, relay_item_id
+# — carrying "according to X, via Y" through the record, append-only, no
+# backfill (ADR 0013 D7).
+# ---------------------------------------------------------------------------
+
+
+def test_append_publication_act_without_relay_fields_defaults_to_none(tmp_path: Path) -> None:
+    """An ordinary (non-relay) publish act carries no origin/relay pointer — the default."""
+    with _open_store(str(tmp_path / "strata.db")) as rs:
+        act = _publish(rs)
+        fetched = rs.get_publication_act(act)
+
+    assert fetched is not None
+    assert fetched.origin_scope_id is None
+    assert fetched.relay_scope_id is None
+    assert fetched.relay_item_id is None
+
+
+def test_append_publication_act_round_trips_relay_fields(tmp_path: Path) -> None:
+    """A relay act's origin/relay pointer survives append -> fetch -> list, unmodified."""
+    with _open_store(str(tmp_path / "strata.db")) as rs:
+        origin_act = rs.append_publication_act(
+            scope_id="g_root",
+            act="publish",
+            kind="context",
+            content="root's own material",
+            subject=None,
+            anchors=["subject:x"],
+            withdraws=None,
+            trigger=None,
+            proposer=_CONTRIBUTOR,
+        )
+        relay_act = rs.append_publication_act(
+            scope_id="g_mid",
+            act="publish",
+            kind="context",
+            content="root's own material",
+            subject=None,
+            anchors=["subject:x"],
+            withdraws=None,
+            trigger=None,
+            proposer=_CONTRIBUTOR,
+            origin_scope_id="g_root",
+            relay_scope_id="g_root",
+            relay_item_id=origin_act.id,
+        )
+
+        fetched = rs.get_publication_act(relay_act.id)
+        assert fetched is not None
+        assert fetched.origin_scope_id == "g_root"
+        assert fetched.relay_scope_id == "g_root"
+        assert fetched.relay_item_id == origin_act.id
+
+        listed = rs.list_publication_acts(scope_id="g_mid")
+        assert len(listed) == 1
+        assert listed[0].origin_scope_id == "g_root"
+        assert listed[0].relay_scope_id == "g_root"
+        assert listed[0].relay_item_id == origin_act.id
