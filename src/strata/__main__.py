@@ -1309,12 +1309,11 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
     scope_obj = None
     if fleet_config is not None and scope:
-        scope_obj = fleet_config.get_scope(scope)
-        if scope_obj is None:
-            available = ", ".join(s.id for s in fleet_config.active_scopes())
-            binding_problems.append(
-                f"scope {scope!r} not found in fleet.yaml (available: {available or '(none)'})"
-            )
+        from strata.mcp.server import _check_scope_exists
+
+        scope_obj, exists_error = _check_scope_exists(fleet_config, scope, require_active=True)
+        if exists_error is not None:
+            binding_problems.append(exists_error)
 
     # A scope that declares no skills (no default_skill, no permitted_skills)
     # may bind skill-less — mirrors strata.mcp.server._validate_binding.
