@@ -31,6 +31,13 @@ POST /contribute
 GET /scopes
     Return active scopes and strata from FleetConfig.
 
+GET /fleet
+    Return the raw fleet.yaml text plus a content etag (Console fleet editing).
+
+POST /fleet/validate
+    Dry-run validate submitted fleet.yaml text through the engine's own load
+    path. Never writes.
+
 GET /scopes/{scope_id}/summary
     Return the scope summary.  200 with a synthesized empty summary
     (``version=0``, ``exists=False``) if the scope exists but has no summary
@@ -51,10 +58,13 @@ Vocabulary follows CONTEXT.md verbatim.
 
 from __future__ import annotations
 
+import hashlib
 import importlib.resources
 import json
+import os
 import pathlib
 import sqlite3
+import tempfile
 from collections.abc import AsyncGenerator, Generator, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -62,13 +72,15 @@ from datetime import UTC, datetime, timedelta
 from typing import Literal
 
 import anthropic
+import yaml
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from strata import __version__
-from strata.fleet_config import FleetConfig, Scope, Stratum
+from strata.bootstrap import load_fleet_config
+from strata.fleet_config import FleetConfig, FleetConfigError, Scope, Stratum
 from strata.fleet_reload import FleetReloader
 from strata.locks import BATCH_CAP, QUEUE_WAIT_TIMEOUT_S, QueueTicket, configure_lock_dir
 from strata.locks import scope_append_lock as _scope_append_lock
@@ -215,6 +227,55 @@ def get_fleet_config(request: Request) -> FleetConfig:
     return request.app.state.fleet_reloader.get()
 
 
+class InvalidFleetYaml(Exception):
+    """Raised by :func:`_load_fleet_from_text` when submitted YAML does not load.
+
+    ``detail`` is plain-language and safe to hand straight back to the
+    Console — it never leaks a stack trace or an internal token.
+    """
+
+    def __init__(self, detail: str) -> None:
+        super().__init__(detail)
+        self.detail = detail
+
+
+def _fleet_etag(raw: bytes) -> str:
+    """Return the content etag for *raw* fleet.yaml bytes — sha256 over the
+    exact bytes on disk (never over a decoded/re-encoded string), so a
+    save's conflict check can never be fooled by a newline-translation
+    round trip this repo has been bitten by before.
+    """
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _load_fleet_from_text(text: str) -> FleetConfig:
+    """Validate *text* as a fleet.yaml body through the engine's OWN load path.
+
+    :class:`~strata.fleet_config.FleetConfig` only loads from a path, so this
+    writes *text* to a throwaway temp file and calls the exact same
+    :func:`strata.bootstrap.load_fleet_config` entry point ``strata
+    bootstrap`` uses — never a parallel reimplementation of the invariant
+    checks. The temp file is removed before returning either way; nothing
+    here ever touches the real fleet.yaml.
+    """
+    fd, tmp_name = tempfile.mkstemp(suffix=".yaml")
+    tmp_path = pathlib.Path(tmp_name)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(text.encode("utf-8"))
+        return load_fleet_config(tmp_path)
+    except FleetConfigError as exc:
+        # Same message `strata bootstrap` prints (minus the leading
+        # "Fleet config invalid " — the Console names its own context).
+        raise InvalidFleetYaml(f"[{exc.kind}] {exc.message}") from exc
+    except yaml.YAMLError as exc:
+        raise InvalidFleetYaml(f"This is not valid YAML: {exc}") from exc
+    except ValidationError as exc:
+        raise InvalidFleetYaml(f"This does not match the expected fleet.yaml shape: {exc}") from exc
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
 # ---------------------------------------------------------------------------
 # Request / response models
 # ---------------------------------------------------------------------------
@@ -258,6 +319,12 @@ class ContributeResponse(BaseModel):
 
     contribution_id: str
     judgment: JudgmentResult
+
+
+class FleetYamlBody(BaseModel):
+    """Request body for ``POST /fleet/validate`` — the raw text to check."""
+
+    yaml: str
 
 
 class SupersedeDirectiveRequest(BaseModel):
@@ -1216,6 +1283,58 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
             ],
             "fleet_file_warning": warning,
         }
+
+    # -----------------------------------------------------------------------
+    # GET /fleet, POST /fleet/validate, PUT /fleet — Console fleet editing.
+    #
+    # UI-only surface (constraint G1): no engine flow calls these. The
+    # on-disk file stays the source of truth (ADR 0002) — a save edits it the
+    # exact way a hand edit would, byte-for-byte, and validation always runs
+    # through the engine's own `FleetConfig` load path, never a parallel
+    # reimplementation. See docs/plans/2026-08-26-console-fleet-edit.md.
+    # -----------------------------------------------------------------------
+
+    @application.get("/fleet")
+    def get_fleet(request: Request) -> dict:
+        """Return the raw fleet.yaml text plus a content etag for the save guard.
+
+        Counts come from the currently loaded ``FleetConfig`` (reloaded here
+        if the file changed — same lazy reload-on-read path as every other
+        fleet-reading route), so a fleet.yaml edited out of band with content
+        that fails to load shows its actual (possibly broken) text alongside
+        the last KNOWN-GOOD counts, rather than either silently disagreeing.
+        """
+        reloader: FleetReloader = request.app.state.fleet_reloader
+        fleet_path = reloader.path
+        try:
+            raw = fleet_path.read_bytes()
+        except OSError:
+            raw = b""
+        fleet = reloader.get()
+        return {
+            "yaml": raw.decode("utf-8"),
+            "etag": _fleet_etag(raw),
+            "path": str(fleet_path),
+            "scopes": len(fleet.scopes),
+            "edges": len(fleet.edges),
+        }
+
+    @application.post("/fleet/validate")
+    def validate_fleet(body: FleetYamlBody) -> dict:
+        """Dry-run validate submitted fleet.yaml text. Never writes anything.
+
+        200 on a loadable fleet; 422 ``invalid_fleet`` with a plain-language
+        detail (YAML syntax errors included) when it is not — the exact same
+        load path ``PUT /fleet`` re-runs before it ever touches the file.
+        """
+        try:
+            fleet = _load_fleet_from_text(body.yaml)
+        except InvalidFleetYaml as exc:
+            raise HTTPException(
+                status_code=422,
+                detail={"error": "invalid_fleet", "detail": exc.detail},
+            ) from exc
+        return {"ok": True, "scopes": len(fleet.scopes), "edges": len(fleet.edges)}
 
     # -----------------------------------------------------------------------
     # GET /staleness
