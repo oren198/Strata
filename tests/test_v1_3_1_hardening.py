@@ -397,6 +397,45 @@ def test_resolver_env_fallback(tmp_path: Path) -> None:
     assert paths.project_root is None
 
 
+def test_resolver_accepts_preloaded_project_config(tmp_path: Path) -> None:
+    """A caller that already loaded a ProjectConfig (e.g. the MCP server's
+    main(), which must not call load_project_config() a second time — a
+    second call would re-raise a ProjectConfigError already handled once)
+    can inject it via `project=`, so precedence still resolves in exactly
+    one function without a second filesystem walk."""
+    from strata.project_config import load_project_config
+
+    strata_dir = tmp_path / ".strata"
+    strata_dir.mkdir()
+    (strata_dir / "config.toml").write_text(
+        'db = ".strata/strata.db"\n'
+        'fleet_yaml = ".strata/fleet.yaml"\n'
+        'summaries_dir = ".strata/summaries"\n',
+        encoding="utf-8",
+    )
+    project = load_project_config(tmp_path)
+    assert project is not None
+
+    paths = resolve_storage_paths(project=project)
+    assert paths.source == "project"
+    assert paths.db_path == str(strata_dir / "strata.db")
+    assert paths.project_root == tmp_path.resolve()
+
+
+def test_resolver_accepts_preloaded_none_project_config(tmp_path: Path, monkeypatch) -> None:
+    """Injecting `project=None` (the "config was invalid, already handled"
+    case) falls back to env settings without attempting its own config walk
+    — moving cwd elsewhere must not change the outcome."""
+    monkeypatch.chdir(tmp_path)
+    settings = Settings(
+        db_path="/env/db.sqlite", summaries_dir="/env/sums", fleet_yaml_path="/env/fleet.yaml"
+    )
+    paths = resolve_storage_paths(settings, project=None)
+    assert paths.source == "env"
+    assert paths.db_path == "/env/db.sqlite"
+    assert paths.project_root is None
+
+
 # ---------------------------------------------------------------------------
 # Launch refresh — record trail (the record never lies)
 # ---------------------------------------------------------------------------
