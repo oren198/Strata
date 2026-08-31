@@ -593,7 +593,11 @@ def test_propose_withdraw_unknown_item_raises_keyerror_no_act_row(
 def test_propose_publish_judge_failure_leaves_act_row_unjudged(
     fleet, record_store, summary_store
 ) -> None:
-    """A judge_publication failure propagates AS-IS, after the act row already exists."""
+    """A judge_publication failure propagates AS-IS, after the act row already exists —
+    but, unlike before this fix, the failure is now recorded as a marked attempt
+    event, so the act is visibly stranded rather than indistinguishable from one
+    nobody has gotten around to judging yet.
+    """
     _seed_summary_with_directive(summary_store, "g_team")
 
     class _RaisingManager:
@@ -618,6 +622,63 @@ def test_propose_publish_judge_failure_leaves_act_row_unjudged(
     acts = record_store.list_publication_acts(scope_id="g_team")
     assert len(acts) == 1
     assert record_store.list_publication_judgments(scope_id="g_team") == []
+
+    # The failure is now legible on the record: one attempt, marked terminal,
+    # never a fabricated verdict.
+    attempts = record_store.list_publication_judgment_attempts(scope_id="g_team")
+    assert len(attempts) == 1
+    assert attempts[0].act_id == acts[0].id
+    assert attempts[0].error_class == "RuntimeError"
+    assert attempts[0].message == "scope-manager unavailable"
+    assert attempts[0].outcome == "judge_failed"
+
+    (state,) = record_store.list_publication_act_states(scope_id="g_team")
+    assert state.state == "judge_failed"
+    assert state.error_class == "RuntimeError"
+
+
+def test_propose_withdraw_judge_failure_records_marked_attempt(
+    fleet, record_store, summary_store, summaries_dir
+) -> None:
+    """The same reliability treatment applies to a withdraw act's judge failure."""
+    _seed_summary_with_directive(summary_store, "g_team")
+    published = propose_publish(
+        "g_team",
+        "Use protobuf for all RPC.",
+        "directive",
+        "rpc-protocol",
+        ["c_dir1"],
+        _proposer(),
+        fleet=fleet,
+        record_store=record_store,
+        summary_store=summary_store,
+        scope_manager=_FakeScopeManager(
+            publication_judgment=PublicationJudgment(decision="accept", reasoning="Fit.")
+        ),
+    )
+
+    class _RaisingManager:
+        def judge_publication(self, **_kwargs):
+            raise ValueError("malformed judge output")
+
+    with pytest.raises(ValueError, match="malformed judge output"):
+        propose_withdraw(
+            "g_team",
+            published.act_id,
+            _proposer(),
+            fleet=fleet,
+            record_store=record_store,
+            summary_store=summary_store,
+            scope_manager=_RaisingManager(),
+        )
+
+    acts = record_store.list_publication_acts(scope_id="g_team")
+    withdraw_act = next(a for a in acts if a.act == "withdraw")
+    attempts = record_store.list_publication_judgment_attempts(scope_id="g_team")
+    assert len(attempts) == 1
+    assert attempts[0].act_id == withdraw_act.id
+    assert attempts[0].error_class == "ValueError"
+    assert attempts[0].outcome == "judge_failed"
 
 
 # ---------------------------------------------------------------------------
