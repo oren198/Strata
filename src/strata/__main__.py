@@ -2533,6 +2533,30 @@ def _offer_judge_key_capture(project_root: Path, *, skip_prompt: bool) -> None:
     print(f"judge key: {verb} {env_path.relative_to(project_root)}")
 
 
+def _store_rel(path: Path, project_root: Path) -> str:
+    """Render *path* as the project-relative string ``config.toml`` records."""
+    try:
+        return str(path.resolve().relative_to(project_root.resolve()))
+    except ValueError:
+        return str(path)
+
+
+def _describe_store(candidate, project_root: Path) -> str:
+    """One line naming a store and the evidence that it is one (issue #178).
+
+    The operator picks between candidates on this line, so it carries what
+    distinguishes them: where the fleet is, how many scopes it declares, and
+    how much memory sits beside it.
+    """
+    where = _store_rel(candidate.fleet_yaml, project_root)
+    bits = [f"{candidate.scopes} scope(s)"]
+    if candidate.db_bytes:
+        bits.append(f"{candidate.db_bytes // 1024}KB database")
+    if candidate.summary_count:
+        bits.append(f"{candidate.summary_count} summary file(s)")
+    return f"{where} — {', '.join(bits)}"
+
+
 def cmd_register(args: argparse.Namespace) -> int:
     """Idempotent brownfield installer — per ADR 0005 Decision 4.
 
@@ -2623,8 +2647,22 @@ def cmd_register(args: argparse.Namespace) -> int:
     # prevents register from running against a half-initialised state from
     # an interrupted prior register.
     # -----------------------------------------------------------------------
+    # Exception (issue #178): a `.strata/` that holds a real store — a
+    # loadable fleet with memory beside it — is not a foreign directory or a
+    # half-initialised register. It is a store that predates project config
+    # (or whose config.toml was lost), and Step 1c below adopts it or asks
+    # which store to use. Refusing here would send the operator to "remove or
+    # rename it", i.e. to delete real memory.
     candidate_strata = project_root / ".strata"
-    if candidate_strata.exists() and not (candidate_strata / "config.toml").exists():
+    _strata_is_a_store = any(
+        c.root.resolve() == candidate_strata.resolve()
+        for c in install.find_existing_stores(project_root)
+    )
+    if (
+        candidate_strata.exists()
+        and not (candidate_strata / "config.toml").exists()
+        and not _strata_is_a_store
+    ):
         print(
             f"Existing .strata/ directory at {candidate_strata} does not look like a Strata "
             f"workspace (no config.toml).\n"
@@ -2677,6 +2715,53 @@ def cmd_register(args: argparse.Namespace) -> int:
         print("no harness detected on this machine — wiring claude-code (the default)")
 
     # -----------------------------------------------------------------------
+    # Step 1c: Adopt an existing store rather than shadowing it (issue #178).
+    #
+    # Writing .strata/config.toml flips storage resolution from the env
+    # fallback to the project branch, so seeding beside a store the project
+    # already uses does not add a second store — it makes the first one
+    # unreachable, silently. Detection runs only when this project is not
+    # already registered: an existing config.toml IS the registration marker
+    # (project_config.load_project_config walks up, first match wins), so
+    # there is nothing to decide when one is present.
+    # -----------------------------------------------------------------------
+    adopted_store = None
+    if not (project_root / ".strata" / "config.toml").exists() and not getattr(
+        args, "fresh", False
+    ):
+        candidates = install.find_existing_stores(project_root)
+        adopt_arg = getattr(args, "adopt", None)
+
+        if adopt_arg:
+            wanted = Path(adopt_arg).expanduser().resolve()
+            adopted_store = next((c for c in candidates if c.root.resolve() == wanted), None)
+            if adopted_store is None:
+                print(f"--adopt: no Strata store found at {adopt_arg}")
+                if candidates:
+                    print("stores found in this project:")
+                    for c in candidates:
+                        print(f"  {_describe_store(c, project_root)}")
+                else:
+                    print(
+                        "a store needs a loadable fleet.yaml and memory beside it "
+                        "(a non-empty strata.db or a summaries/ directory with files)."
+                    )
+                return 1
+        elif len(candidates) > 1:
+            print("this project already has more than one Strata store:")
+            for c in candidates:
+                print(f"  {_describe_store(c, project_root)}")
+            print(
+                "\nregister will not choose for you — picking wrong would hide the "
+                "other one.\n"
+                "  strata register --adopt <path>   use that store\n"
+                "  strata register --fresh          seed a new, empty store anyway"
+            )
+            return 1
+        elif len(candidates) == 1:
+            adopted_store = candidates[0]
+
+    # -----------------------------------------------------------------------
     # Step 2: Create .strata/ directory.
     # -----------------------------------------------------------------------
     strata_dir = project_root / ".strata"
@@ -2692,9 +2777,21 @@ def cmd_register(args: argparse.Namespace) -> int:
     if config_toml.exists():
         _act("skip", config_toml, skipped=True)
     else:
+        if adopted_store is not None:
+            body = install.config_toml_for(
+                db=_store_rel(adopted_store.root / "strata.db", project_root),
+                fleet_yaml=_store_rel(adopted_store.fleet_yaml, project_root),
+                summaries_dir=_store_rel(adopted_store.root / "summaries", project_root),
+                adopted=True,
+            )
+        else:
+            body = _CONFIG_TOML
         if not diff_mode:
-            config_toml.write_text(_CONFIG_TOML, encoding="utf-8")
+            config_toml.write_text(body, encoding="utf-8")
         _act("wrote", config_toml)
+        if adopted_store is not None:
+            described = _describe_store(adopted_store, project_root)
+            print(f"    adopted the store already in this project: {described}")
 
     # -----------------------------------------------------------------------
     # Step 4: Update .gitignore.
@@ -2715,7 +2812,7 @@ def cmd_register(args: argparse.Namespace) -> int:
     # -----------------------------------------------------------------------
     # Step 5: Seed .strata/fleet.yaml from templates/minimal.yaml.
     # -----------------------------------------------------------------------
-    fleet_yaml = strata_dir / "fleet.yaml"
+    fleet_yaml = adopted_store.fleet_yaml if adopted_store else strata_dir / "fleet.yaml"
     minimal_template = _TEMPLATES_DIR / "minimal.yaml"
     if fleet_yaml.exists():
         _act("skip", fleet_yaml, skipped=True)
@@ -4215,6 +4312,28 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "Idempotent brownfield installer — create .strata/config.toml, "
             "seed fleet.yaml, copy skills, merge MCP entry (ADR 0005)."
+        ),
+    )
+    p_register.add_argument(
+        "--adopt",
+        dest="adopt",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Use the existing Strata store at PATH instead of creating one. "
+            "Only needed when this project has more than one store and "
+            "register cannot tell which is yours — with a single store it is "
+            "adopted automatically."
+        ),
+    )
+    p_register.add_argument(
+        "--fresh",
+        dest="fresh",
+        action="store_true",
+        help=(
+            "Create a new, empty store even though this project already has "
+            "one. The existing store is left on disk but stops being the one "
+            "this project reads and writes."
         ),
     )
     p_register.add_argument(

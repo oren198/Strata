@@ -39,6 +39,7 @@ import hashlib
 import os
 import re
 import shutil
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -92,6 +93,9 @@ __all__ = [
     "merge_codex_freshness_hook",
     "remove_codex_freshness_hook",
     "KNOWN_HARNESSES",
+    "find_existing_stores",
+    "StoreCandidate",
+    "config_toml_for",
     "detect_harnesses",
     "set_default_harness",
     "read_default_harness_from_text",
@@ -201,6 +205,36 @@ db = ".strata/strata.db"
 fleet_yaml = ".strata/fleet.yaml"
 summaries_dir = ".strata/summaries"
 """
+
+
+def config_toml_for(
+    *,
+    db: str,
+    fleet_yaml: str,
+    summaries_dir: str,
+    adopted: bool = False,
+) -> str:
+    """Render a ``config.toml`` body pointing at the given project-relative paths.
+
+    :data:`CONFIG_TOML` is the seeded-store default; this renders the same
+    file for a store register **adopted** rather than created (issue #178),
+    so the config records the layout that was already there instead of the
+    one register would have made.
+    """
+    note = (
+        "# Adopted an existing store found in this project — these paths were\n"
+        "# already in use, so registering did not create a new one.\n"
+        if adopted
+        else ""
+    )
+    return (
+        "# Strata per-project configuration — managed by `strata register`.\n"
+        "# Paths are relative to this project's root.\n"
+        f"{note}"
+        f'db = "{db}"\n'
+        f'fleet_yaml = "{fleet_yaml}"\n'
+        f'summaries_dir = "{summaries_dir}"\n'
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1379,6 +1413,108 @@ def detect_harnesses(home: Path | None = None, path_env: str | None = None) -> l
     if shutil.which("codex", path=path_env) or (home / ".codex").exists():
         detected.append("codex")
     return detected
+
+
+# ---------------------------------------------------------------------------
+# Existing-store detection (issue #178)
+#
+# `strata register` seeds a starter fleet and an empty database and then
+# writes `.strata/config.toml` pointing at them. Writing that config flips
+# storage resolution from the env fallback to the project branch
+# (`project_config.resolve_storage_paths`), so seeding beside a store the
+# project was already using does not merely add a second store — it makes the
+# first one unreachable, silently, while `strata doctor` reports all-green
+# against the new empty one.
+#
+# Detection is deliberately conservative: adopting the wrong directory is a
+# worse failure than asking the operator. A candidate must carry BOTH a
+# loadable fleet and actual memory beside it, so a stray fleet.yaml is never
+# mistaken for a store, and neither is the empty scaffolding register itself
+# writes.
+# ---------------------------------------------------------------------------
+
+#: Store layouts to probe, relative to the project root, in report order.
+#: The project root itself is the pre-`.strata/` layout (what the env-var
+#: fallback resolves to); `.strata/` is what register writes today.
+_STORE_LAYOUTS: tuple[str, ...] = ("", ".strata")
+
+
+@dataclass(frozen=True)
+class StoreCandidate:
+    """An existing Strata store found on disk, with the evidence for it.
+
+    The evidence fields exist so the operator can tell candidates apart when
+    more than one is found — that choice is theirs, never register's.
+    """
+
+    root: Path
+    fleet_yaml: Path
+    db_path: Path | None
+    summaries_dir: Path | None
+    scopes: int
+    summary_count: int
+    db_bytes: int
+
+
+def find_existing_stores(project_root: Path) -> list[StoreCandidate]:
+    """Return the Strata stores that already exist under *project_root*.
+
+    A directory counts as a store only when it holds a **loadable**
+    ``fleet.yaml`` AND memory beside it — a non-empty ``strata.db`` or a
+    ``summaries/`` directory containing at least one file. Both halves are
+    required on purpose:
+
+    - A lone ``fleet.yaml`` is just a file someone wrote; adopting it would
+      point the project at a store that has never held anything.
+    - Memory with no fleet cannot be served — there is no topology to read it
+      through.
+    - The empty ``strata.db`` and ``summaries/`` register itself creates fail
+      the memory half, so a half-finished registration is never mistaken for
+      a store worth preserving.
+
+    Returns candidates in :data:`_STORE_LAYOUTS` order (project root first,
+    then ``.strata/``), so a caller reporting them lists the outer, older
+    layout before the one register would write.
+    """
+    found: list[StoreCandidate] = []
+    for layout in _STORE_LAYOUTS:
+        root = (project_root / layout) if layout else project_root
+        fleet_yaml = root / "fleet.yaml"
+        if not fleet_yaml.is_file():
+            continue
+
+        try:
+            from strata.fleet_config import FleetConfig
+
+            fleet = FleetConfig.load(fleet_yaml)
+        except Exception:
+            # Unloadable fleet — not a store we can honestly adopt. Register
+            # says what it found; it does not try to repair a broken fleet.
+            continue
+
+        db_path = root / "strata.db"
+        db_bytes = db_path.stat().st_size if db_path.is_file() else 0
+
+        summaries_dir = root / "summaries"
+        summary_count = (
+            sum(1 for p in summaries_dir.iterdir() if p.is_file()) if summaries_dir.is_dir() else 0
+        )
+
+        if db_bytes == 0 and summary_count == 0:
+            continue
+
+        found.append(
+            StoreCandidate(
+                root=root,
+                fleet_yaml=fleet_yaml,
+                db_path=db_path if db_bytes else None,
+                summaries_dir=summaries_dir if summary_count else None,
+                scopes=len(fleet.scopes),
+                summary_count=summary_count,
+                db_bytes=db_bytes,
+            )
+        )
+    return found
 
 
 # ---------------------------------------------------------------------------
