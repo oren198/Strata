@@ -896,6 +896,160 @@ def test_latest_accepted_contribution_breaks_a_same_second_tie_by_rowid(tmp_path
 
 
 # ---------------------------------------------------------------------------
+# Publication judgment attempts + derived act state — the publication-side
+# mirror of judgment_attempts / ContributionState (fix: record attempts and
+# mark terminal judge failure for publish/withdraw acts, not just
+# contributions).
+# ---------------------------------------------------------------------------
+
+
+def _publish(rs: RecordStore, scope_id: str = "g_ceo", *, trigger: str | None = None) -> str:
+    """Append a publish act (or, with *trigger*, a mechanically-triggered withdraw act
+    removing that same publish act — the withdraw FK needs a real target).
+    """
+    published = rs.append_publication_act(
+        scope_id=scope_id,
+        act="publish",
+        kind="context",
+        content="outward wording",
+        subject=None,
+        anchors=["subject:x"],
+        withdraws=None,
+        trigger=None,
+        proposer=_CONTRIBUTOR,
+    ).id
+    if trigger is None:
+        return published
+    return rs.append_publication_act(
+        scope_id=scope_id,
+        act="withdraw",
+        kind=None,
+        content=None,
+        subject=None,
+        anchors=None,
+        withdraws=published,
+        trigger=trigger,
+        proposer=_CONTRIBUTOR,
+    ).id
+
+
+def test_publication_judge_failed_marker_round_trips_and_rejects_other_values(
+    tmp_path: Path,
+) -> None:
+    """The marker persists on a publication attempt; the column admits nothing else."""
+    with _open_store(str(tmp_path / "strata.db")) as rs:
+        act_id = _publish(rs)
+
+        unmarked = rs.record_publication_judgment_attempt(
+            act_id=act_id, error_class="TimeoutError", message="slow"
+        )
+        marked = rs.record_publication_judgment_attempt(
+            act_id=act_id,
+            error_class="ValueError",
+            message="unparseable payload",
+            outcome=JUDGE_FAILED,
+        )
+
+        assert unmarked.outcome is None
+        assert marked.outcome == JUDGE_FAILED
+        assert [a.outcome for a in rs.list_publication_judgment_attempts(scope_id="g_ceo")] == [
+            None,
+            JUDGE_FAILED,
+        ]
+
+        with pytest.raises(sqlite3.IntegrityError):
+            rs.record_publication_judgment_attempt(
+                act_id=act_id,
+                error_class="ValueError",
+                message="boom",
+                outcome="declined_by_judge",  # type: ignore[arg-type]
+            )
+
+
+def test_publication_judgment_attempt_fk_rejects_unknown_act(tmp_path: Path) -> None:
+    with _open_store(str(tmp_path / "strata.db")) as rs, pytest.raises(sqlite3.IntegrityError):
+        rs.record_publication_judgment_attempt(act_id="pub_doesnotexist", error_class="ValueError")
+
+
+def test_publication_act_states_separate_judge_failed_from_pending(tmp_path: Path) -> None:
+    """The three states — judged, judge_failed, pending — on a scope's publication acts."""
+    with _open_store(str(tmp_path / "strata.db")) as rs:
+        judged = _publish(rs)
+        errored = _publish(rs)
+        in_flight = _publish(rs)
+
+        rs.record_publication_judgment(act_id=judged, decision="accept", judged_by="scope-manager")
+        rs.record_publication_judgment_attempt(
+            act_id=errored,
+            error_class="ValueError",
+            message="unparseable payload",
+            outcome=JUDGE_FAILED,
+        )
+
+        states = {s.act_id: s for s in rs.list_publication_act_states(scope_id="g_ceo")}
+
+    assert states[judged].state == "judged"
+    assert states[judged].decision == "accept"
+
+    assert states[errored].state == "judge_failed"
+    assert states[errored].decision is None
+    assert states[errored].error_class == "ValueError"
+    assert states[errored].error_message == "unparseable payload"
+    assert states[errored].failed_at is not None
+
+    assert states[in_flight].state == "pending"
+    assert states[in_flight].failed_attempts == 0
+
+
+def test_publication_act_state_of_a_stranded_act_stays_pending_with_its_count(
+    tmp_path: Path,
+) -> None:
+    """An unmarked attempt (or one predating the marker) is never claimed terminal."""
+    with _open_store(str(tmp_path / "strata.db")) as rs:
+        act_id = _publish(rs)
+        rs.record_publication_judgment_attempt(act_id=act_id, error_class="ValueError")
+        rs.record_publication_judgment_attempt(act_id=act_id, error_class="APIError")
+
+        (state,) = rs.list_publication_act_states(scope_id="g_ceo")
+
+    assert state.state == "pending"
+    assert state.failed_attempts == 2
+    assert state.error_class is None
+
+
+def test_a_successful_publication_judgment_outranks_an_earlier_marker(tmp_path: Path) -> None:
+    """A verdict wins: an act judged after a failure reads as judged, not errored."""
+    with _open_store(str(tmp_path / "strata.db")) as rs:
+        act_id = _publish(rs)
+        rs.record_publication_judgment_attempt(
+            act_id=act_id, error_class="ValueError", outcome=JUDGE_FAILED
+        )
+        rs.record_publication_judgment(act_id=act_id, decision="accept", judged_by="scope-manager")
+
+        (state,) = rs.list_publication_act_states(scope_id="g_ceo")
+
+    assert state.state == "judged"
+    assert state.decision == "accept"
+    assert state.failed_attempts == 1
+
+
+def test_mechanically_propagated_withdrawal_state_is_never_pending(tmp_path: Path) -> None:
+    """A trigger-carrying withdraw act gets no judgment row BY DESIGN (ADR 0007 D3) —
+    it must read as its own distinct state, not as indistinguishable from an act
+    still awaiting judgment (the exact ambiguity this fix exists to kill).
+    """
+    with _open_store(str(tmp_path / "strata.db")) as rs:
+        mechanical_id = _publish(rs, trigger="c_abc123")
+
+        states = {s.act_id: s for s in rs.list_publication_act_states(scope_id="g_ceo")}
+
+    state = states[mechanical_id]
+    assert state.state == "mechanical"
+    assert state.decision is None
+    assert state.failed_attempts == 0
+
+
+# ---------------------------------------------------------------------------
 # Scenario N — page_declines (UI-only proof surface)
 # ---------------------------------------------------------------------------
 

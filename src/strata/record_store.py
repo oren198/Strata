@@ -15,10 +15,14 @@ This module owns all SQLite access.  It is the authoritative source of truth for
     in person (a judgment, lives in that scope's own record). See
     :mod:`strata.operator` for the primitives built on top of these tables.
   - The publication channel's own record (``publication_acts`` +
-    ``publication_judgments``) — ADR 0007. Every publish/withdraw act on a
-    scope's curated outward face, distinct from its contribution record; see
-    :mod:`strata.publication` for the primitives built on top of these
-    tables.
+    ``publication_judgments`` + ``publication_judgment_attempts``) — ADR
+    0007. Every publish/withdraw act on a scope's curated outward face,
+    distinct from its contribution record, plus the failed-judgment events a
+    ``judge_publication()`` call leaves behind (mirroring
+    ``judgment_attempts``' issue #57 / #118 treatment) so a judge crash mid-
+    publication is legible rather than indistinguishable from an act nobody
+    ever judged; see :mod:`strata.publication` for the primitives built on
+    top of these tables.
 
 Fleet configuration (strata, scopes, edges) is no longer stored here.  Under
 ADR 0002 it lives in ``fleet.yaml`` and is held in memory by
@@ -42,6 +46,8 @@ Design decisions
     ``pub_<6hex>`` publication acts (ADR 0007) — a publish act's id doubles
                    as its published item's id
     ``pubj_<6hex>`` publication judgments (ADR 0007)
+    ``pubja_<6hex>`` publication judgment attempts (failed judge_publication()
+                   events, mirroring ``ja_``)
 
 Vocabulary throughout follows CONTEXT.md verbatim.
 """
@@ -95,6 +101,10 @@ def _new_publication_act_id() -> str:
 
 def _new_publication_judgment_id() -> str:
     return f"pubj_{secrets.token_hex(8)}"
+
+
+def _new_publication_judgment_attempt_id() -> str:
+    return f"pubja_{secrets.token_hex(8)}"
 
 
 # ---------------------------------------------------------------------------
@@ -458,6 +468,62 @@ class PublicationJudgment:
     judged_by: str
     reasoning: str | None
     created_at: str
+
+
+@dataclass(frozen=True)
+class PublicationJudgmentAttempt:
+    """A record of the scope-manager's ``judge_publication()`` *failing* on a publish/withdraw act.
+
+    The publication-side mirror of :class:`JudgmentAttempt` (fix: publication
+    judging gets the same reliability treatment contribution judging already
+    had). An event, never a verdict — this table has no decision column and
+    cannot enter ``publication_judgments``, so a failure can never masquerade
+    as an ``accept``/``decline``. Append-only: an act may accumulate several
+    attempts.
+
+    ``outcome`` is :data:`JUDGE_FAILED` when this attempt ended the judge run
+    (mechanical — no judge or LLM decides this), and ``None`` when nothing
+    asserts that it did.
+    """
+
+    id: str
+    act_id: str
+    error_class: str
+    message: str | None
+    attempted_at: str
+    outcome: Literal["judge_failed"] | None = None
+
+
+@dataclass(frozen=True)
+class PublicationActState:
+    """One publish/withdraw act's judgment state, derived for read surfaces.
+
+    The publication-side mirror of :class:`ContributionState`, with one
+    addition mechanical propagation forces: a MECHANICALLY propagated
+    withdrawal (``publication_acts."trigger"`` is not ``None`` — ADR 0007 D3)
+    gets no judgment row and is never attempted BY DESIGN, so a bare mirror
+    of the contribution derivation would render it ``pending`` forever —
+    recreating the exact ambiguity ("awaiting judgment" vs. "will never be
+    judged") this fix exists to kill. Such an act reads as ``mechanical``
+    instead, checked before anything else.
+
+    - ``judged`` — a verdict exists; ``decision`` carries it.
+    - ``mechanical`` — a trigger-carrying act with no verdict: it was never
+      going to be judged, so it is not "pending" one.
+    - ``judge_failed`` — no verdict, no trigger, and an attempt carries the
+      mechanical :data:`JUDGE_FAILED` marker.
+    - ``pending`` — no verdict, no trigger, no marker: judgment is in flight,
+      has never been attempted, or the act predates this fix and its
+      attempts (if any) predate the marker.
+    """
+
+    act_id: str
+    state: Literal["judged", "mechanical", "judge_failed", "pending"]
+    decision: Literal["accept", "decline"] | None
+    failed_attempts: int
+    error_class: str | None
+    error_message: str | None
+    failed_at: str | None
 
 
 # ---------------------------------------------------------------------------
@@ -1563,6 +1629,106 @@ class RecordStore:
             raise KeyError(f"Publication judgment not found: {judgment_id!r}")
         return PublicationJudgment(**dict(row))
 
+    # ------------------------------------------------------------------
+    # Publication judgment attempts (failed judge_publication() events —
+    # the publication-side mirror of judgment_attempts)
+    # ------------------------------------------------------------------
+
+    def record_publication_judgment_attempt(
+        self,
+        *,
+        act_id: str,
+        error_class: str,
+        message: str | None = None,
+        outcome: Literal["judge_failed"] | None = None,
+    ) -> PublicationJudgmentAttempt:
+        """Record a failed ``judge_publication()`` call as an event on the act.
+
+        This is an event, never a verdict — the ``publication_judgment_attempts``
+        table has no decision column, so a failure can never be mistaken for an
+        ``accept``/``decline``. Append-only — an act may accumulate several
+        attempts.
+
+        Args:
+            act_id:       The publication act whose judgment failed.
+            error_class:  The failing exception's class name.
+            message:      Optional free-text detail (the exception message).
+            outcome:      :data:`JUDGE_FAILED` to mark this attempt as the end
+                          of the judge run — mechanical, no judge involved.
+                          ``None`` (the default) records the attempt without
+                          claiming the run ended.
+
+        Returns:
+            The newly recorded :class:`PublicationJudgmentAttempt`.
+
+        Raises:
+            sqlite3.IntegrityError: If *act_id* does not exist (FK), or
+                *outcome* is neither ``None`` nor :data:`JUDGE_FAILED` (CHECK).
+        """
+        attempt_id = _new_publication_judgment_attempt_id()
+        self._conn.execute(
+            """
+            INSERT INTO publication_judgment_attempts (id, act_id, error_class, message, outcome)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (attempt_id, act_id, error_class, message, outcome),
+        )
+        self._conn.commit()
+        row = self._conn.execute(
+            """
+            SELECT id, act_id, error_class, message, attempted_at, outcome
+            FROM publication_judgment_attempts WHERE id = ?
+            """,
+            (attempt_id,),
+        ).fetchone()
+        return PublicationJudgmentAttempt(**dict(row))
+
+    def list_publication_judgment_attempts(
+        self, *, scope_id: str
+    ) -> list[PublicationJudgmentAttempt]:
+        """Return all publication judgment-attempt events for acts in *scope_id*.
+
+        Joins ``publication_judgment_attempts`` against ``publication_acts`` to
+        filter by scope, ordered by ``attempted_at`` ascending.
+        """
+        rows = self._conn.execute(
+            """
+            SELECT a.id, a.act_id, a.error_class, a.message, a.attempted_at, a.outcome
+            FROM publication_judgment_attempts a
+            JOIN publication_acts p ON a.act_id = p.id
+            WHERE p.scope_id = ?
+            ORDER BY a.attempted_at ASC, a.rowid ASC
+            """,
+            (scope_id,),
+        ).fetchall()
+        return [PublicationJudgmentAttempt(**dict(row)) for row in rows]
+
+    def list_publication_act_states(self, *, scope_id: str) -> list[PublicationActState]:
+        """Return each publication act's judgment state for *scope_id*.
+
+        The publication-side mirror of :meth:`list_contribution_states`: hosts
+        rendering a publication record need to tell "the judge errored on
+        this" and "this was never going to be judged" (a mechanically
+        propagated withdrawal) apart from "no verdict yet" — deriving that
+        from three parallel reads is a join every host would otherwise
+        reinvent. Reads only; the record is untouched.
+        """
+        acts = self.list_publication_acts(scope_id=scope_id)
+        judgments = {j.act_id: j for j in self.list_publication_judgments(scope_id=scope_id)}
+        attempts_by_act: dict[str, list[PublicationJudgmentAttempt]] = {}
+        for attempt in self.list_publication_judgment_attempts(scope_id=scope_id):
+            attempts_by_act.setdefault(attempt.act_id, []).append(attempt)
+
+        return [
+            _derive_publication_act_state(
+                act.id,
+                judgments.get(act.id),
+                attempts_by_act.get(act.id, []),
+                trigger=act.trigger,
+            )
+            for act in acts
+        ]
+
 
 # ---------------------------------------------------------------------------
 # Row → model helpers
@@ -1596,6 +1762,44 @@ def _derive_contribution_state(
     )
     return ContributionState(
         contribution_id=contribution_id,
+        state=state,
+        decision=judgment.decision if judgment is not None else None,
+        failed_attempts=len(attempts),
+        error_class=last_failure.error_class if last_failure is not None else None,
+        error_message=last_failure.message if last_failure is not None else None,
+        failed_at=last_failure.attempted_at if last_failure is not None else None,
+    )
+
+
+def _derive_publication_act_state(
+    act_id: str,
+    judgment: PublicationJudgment | None,
+    attempts: list[PublicationJudgmentAttempt],
+    *,
+    trigger: str | None,
+) -> PublicationActState:
+    """Derive one publication act's :class:`PublicationActState`.
+
+    The publication-side mirror of :func:`_derive_contribution_state`, with
+    ``trigger`` checked ahead of everything else: a mechanically propagated
+    withdrawal (ADR 0007 D3) gets no judgment row and is never attempted BY
+    DESIGN, so it must never fall through to ``pending`` — see
+    :class:`PublicationActState`.
+    """
+    if judgment is not None:
+        state: Literal["judged", "mechanical", "judge_failed", "pending"] = "judged"
+    elif trigger is not None:
+        state = "mechanical"
+    elif any(a.outcome == JUDGE_FAILED for a in attempts):
+        state = "judge_failed"
+    else:
+        state = "pending"
+    last_failure = next(
+        (a for a in reversed(attempts) if a.outcome == JUDGE_FAILED),
+        None,
+    )
+    return PublicationActState(
+        act_id=act_id,
         state=state,
         decision=judgment.decision if judgment is not None else None,
         failed_attempts=len(attempts),
