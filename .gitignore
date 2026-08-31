@@ -36,3 +36,15 @@ fleet.yaml
 *.local-backup
 .backup-*/
 .mcp.json
+
+# Strata — managed by `strata register` — do not remove this line
+.strata/.venv/
+.strata/strata.db*
+.strata/summaries/
+.env
+# SQLite sidecars for a project-root store (the .strata/ pattern above only
+# covers a store kept under .strata/).
+/strata.db-shm
+/strata.db-wal
+/sessions/
+# fleet.yaml is intentionally NOT listed above — commit it (it is your team's org chart).

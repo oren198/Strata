@@ -39,6 +39,7 @@ import hashlib
 import os
 import re
 import shutil
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -54,6 +55,12 @@ __all__ = [
     "HOOK_SCRIPT_NAME",
     "HOOK_COMMAND",
     "HOOK_STOP_ENTRY",
+    "HOOK_SCRIPT_NAME_SESSION_START",
+    "HOOK_COMMAND_SESSION_START",
+    "HOOK_SESSION_START_ENTRY",
+    "session_start_hook_present",
+    "merge_session_start_hook",
+    "remove_session_start_hook",
     "GITIGNORE_MARKER",
     "GITIGNORE_BLOCK",
     "GITIGNORE_BLOCK_HISTORICAL",
@@ -92,6 +99,9 @@ __all__ = [
     "merge_codex_freshness_hook",
     "remove_codex_freshness_hook",
     "KNOWN_HARNESSES",
+    "find_existing_stores",
+    "StoreCandidate",
+    "config_toml_for",
     "detect_harnesses",
     "set_default_harness",
     "read_default_harness_from_text",
@@ -161,6 +171,34 @@ _HOOK_COMMAND_MARKER = "strata-stop-hook"
 #: Claude Code ``Stop``-hook shape.
 HOOK_STOP_ENTRY: dict = {"hooks": [{"type": "command", "command": HOOK_COMMAND}]}
 
+#: The vendored ``SessionStart``-hook script (package data under
+#: ``strata/_hooks``), copied into a project's ``.claude/hooks/`` by
+#: ``strata register`` — the READ-side trigger, symmetric with
+#: :data:`HOOK_SCRIPT_NAME`'s WRITE-side trigger. The Stop hook exists
+#: because "contribute before ending" as prose was never enough; the same is
+#: true in reverse — an agent's instructions to read its perspective at
+#: session start compete with everything else in context and don't fire on
+#: their own. A POSIX-``sh`` wrapper that ``exec``s ``strata
+#: session-start-hook`` so the running engine is resolved on ``PATH`` like
+#: ``strata-mcp``.
+HOOK_SCRIPT_NAME_SESSION_START = "strata-session-start-hook"
+
+#: The shell command the merged ``hooks.SessionStart`` entry runs. Mirrors
+#: :data:`HOOK_COMMAND` exactly, one hook event over.
+HOOK_COMMAND_SESSION_START = 'sh "$CLAUDE_PROJECT_DIR/.claude/hooks/strata-session-start-hook"'
+
+#: Marker substring identifying Strata's own ``hooks.SessionStart`` command,
+#: so the additive merge never mistakes a user's unrelated SessionStart hook
+#: for ours. Mirrors :data:`_HOOK_COMMAND_MARKER`.
+_HOOK_COMMAND_MARKER_SESSION_START = "strata-session-start-hook"
+
+#: The canonical ``hooks.SessionStart`` group ``strata register`` merges in
+#: and ``strata unregister`` removes (only when the on-disk group still
+#: matches it byte-for-byte). Mirrors :data:`HOOK_STOP_ENTRY`.
+HOOK_SESSION_START_ENTRY: dict = {
+    "hooks": [{"type": "command", "command": HOOK_COMMAND_SESSION_START}]
+}
+
 #: Marker line identifying register's managed ``.gitignore`` block. Matched as
 #: an exact line, not a loose ``# Strata`` substring — a user comment like
 #: ``# Strata console output`` must not be mistaken for the managed block.
@@ -201,6 +239,36 @@ db = ".strata/strata.db"
 fleet_yaml = ".strata/fleet.yaml"
 summaries_dir = ".strata/summaries"
 """
+
+
+def config_toml_for(
+    *,
+    db: str,
+    fleet_yaml: str,
+    summaries_dir: str,
+    adopted: bool = False,
+) -> str:
+    """Render a ``config.toml`` body pointing at the given project-relative paths.
+
+    :data:`CONFIG_TOML` is the seeded-store default; this renders the same
+    file for a store register **adopted** rather than created (issue #178),
+    so the config records the layout that was already there instead of the
+    one register would have made.
+    """
+    note = (
+        "# Adopted an existing store found in this project — these paths were\n"
+        "# already in use, so registering did not create a new one.\n"
+        if adopted
+        else ""
+    )
+    return (
+        "# Strata per-project configuration — managed by `strata register`.\n"
+        "# Paths are relative to this project's root.\n"
+        f"{note}"
+        f'db = "{db}"\n'
+        f'fleet_yaml = "{fleet_yaml}"\n'
+        f'summaries_dir = "{summaries_dir}"\n'
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -283,6 +351,10 @@ _HISTORICAL_ARTIFACT_HASHES: dict[str, dict[str, object]] = {
     },
     "strata-stop-hook": {
         "current": "d950ad8fcf436069b49d247543ab6a4a2c98481d6ef853e5c78a5289e0f5c582",
+        "historical": frozenset(),
+    },
+    "strata-session-start-hook": {
+        "current": "c21b0282d6cdf7b65e104e243ae3c57daf9c3518c8f32ffa4c7ad208ec14fff6",
         "historical": frozenset(),
     },
     "codex-mcp": {
@@ -585,23 +657,37 @@ def skill_matches_shipped(installed_md: Path, skill_name: str) -> bool | None:
 # ---------------------------------------------------------------------------
 
 
-def _stop_hook_groups(settings_data: dict) -> list:
-    """Return the ``hooks.Stop`` group list, or ``[]`` when absent/malformed."""
+def _hook_event_groups(settings_data: dict, event: str) -> list:
+    """Return the ``hooks.<event>`` group list, or ``[]`` when absent/malformed.
+
+    Generic over the hook event name (``"Stop"`` / ``"SessionStart"``) so the
+    Stop-hook and SessionStart-hook merge machinery share one implementation.
+    """
     hooks = settings_data.get("hooks")
     if not isinstance(hooks, dict):
         return []
-    stop = hooks.get("Stop")
-    return stop if isinstance(stop, list) else []
+    group = hooks.get(event)
+    return group if isinstance(group, list) else []
+
+
+def _group_references_marker(group: object, marker: str) -> bool:
+    """Return whether *group* contains a command hook whose command carries *marker*."""
+    if not isinstance(group, dict):
+        return False
+    for hook in group.get("hooks", []) or []:
+        if isinstance(hook, dict) and marker in str(hook.get("command", "")):
+            return True
+    return False
+
+
+def _stop_hook_groups(settings_data: dict) -> list:
+    """Return the ``hooks.Stop`` group list, or ``[]`` when absent/malformed."""
+    return _hook_event_groups(settings_data, "Stop")
 
 
 def _group_references_hook(group: object) -> bool:
     """Return whether *group* contains a command hook running Strata's Stop hook."""
-    if not isinstance(group, dict):
-        return False
-    for hook in group.get("hooks", []) or []:
-        if isinstance(hook, dict) and _HOOK_COMMAND_MARKER in str(hook.get("command", "")):
-            return True
-    return False
+    return _group_references_marker(group, _HOOK_COMMAND_MARKER)
 
 
 def stop_hook_present(settings_data: dict) -> bool:
@@ -627,19 +713,7 @@ def merge_stop_hook(settings_data: dict, *, entry: dict = HOOK_STOP_ENTRY) -> bo
         ``True`` if the Strata group was appended, ``False`` if one was already
         present and the settings were left as the user had them.
     """
-    if stop_hook_present(settings_data):
-        return False
-    hooks = settings_data.setdefault("hooks", {})
-    if not isinstance(hooks, dict):
-        # A malformed user "hooks" value: never clobber it — report not-added.
-        return False
-    stop = hooks.setdefault("Stop", [])
-    if not isinstance(stop, list):
-        return False
-    # Deep-copy so the caller owns the written group outright (the default is the
-    # shared module-level HOOK_STOP_ENTRY — a later edit must not mutate it).
-    stop.append(copy.deepcopy(entry))
-    return True
+    return _merge_hook_event(settings_data, "Stop", entry, present=stop_hook_present)
 
 
 def remove_stop_hook(settings_data: dict, *, entry: dict = HOOK_STOP_ENTRY) -> str:
@@ -657,19 +731,102 @@ def remove_stop_hook(settings_data: dict, *, entry: dict = HOOK_STOP_ENTRY) -> s
       matches *entry* (the user edited it); *settings_data* is left unchanged.
     - ``"absent"``  — no Strata Stop hook at all; nothing to do.
     """
-    groups = _stop_hook_groups(settings_data)
-    ours = [g for g in groups if _group_references_hook(g)]
+    return _remove_hook_event(settings_data, "Stop", entry, references=_group_references_hook)
+
+
+# ---------------------------------------------------------------------------
+# settings.json — additive hooks.SessionStart merge — the READ-side trigger,
+# symmetric with the hooks.Stop merge above (see HOOK_SCRIPT_NAME_SESSION_START).
+# ---------------------------------------------------------------------------
+
+
+def _group_references_session_start_hook(group: object) -> bool:
+    """Return whether *group* contains a command hook running Strata's SessionStart hook."""
+    return _group_references_marker(group, _HOOK_COMMAND_MARKER_SESSION_START)
+
+
+def session_start_hook_present(settings_data: dict) -> bool:
+    """Return whether a Strata ``SessionStart`` hook is already merged into *settings_data*.
+
+    Mirrors :func:`stop_hook_present` exactly, one hook event over.
+    """
+    return any(
+        _group_references_session_start_hook(g)
+        for g in _hook_event_groups(settings_data, "SessionStart")
+    )
+
+
+def merge_session_start_hook(
+    settings_data: dict, *, entry: dict = HOOK_SESSION_START_ENTRY
+) -> bool:
+    """Additively merge *entry* into ``settings_data['hooks']['SessionStart']``.
+
+    Mirrors :func:`merge_stop_hook` exactly, one hook event over.
+    """
+    return _merge_hook_event(
+        settings_data, "SessionStart", entry, present=session_start_hook_present
+    )
+
+
+def remove_session_start_hook(
+    settings_data: dict, *, entry: dict = HOOK_SESSION_START_ENTRY
+) -> str:
+    """Remove Strata's ``hooks.SessionStart`` group from *settings_data*, in place.
+
+    Mirrors :func:`remove_stop_hook` exactly, one hook event over.
+    """
+    return _remove_hook_event(
+        settings_data,
+        "SessionStart",
+        entry,
+        references=_group_references_session_start_hook,
+    )
+
+
+def _merge_hook_event(
+    settings_data: dict,
+    event: str,
+    entry: dict,
+    *,
+    present: object,
+) -> bool:
+    """Shared implementation behind :func:`merge_stop_hook` / :func:`merge_session_start_hook`."""
+    if present(settings_data):
+        return False
+    hooks = settings_data.setdefault("hooks", {})
+    if not isinstance(hooks, dict):
+        # A malformed user "hooks" value: never clobber it — report not-added.
+        return False
+    group_list = hooks.setdefault(event, [])
+    if not isinstance(group_list, list):
+        return False
+    # Deep-copy so the caller owns the written group outright (the default is a
+    # shared module-level constant — a later edit must not mutate it).
+    group_list.append(copy.deepcopy(entry))
+    return True
+
+
+def _remove_hook_event(
+    settings_data: dict,
+    event: str,
+    entry: dict,
+    *,
+    references: object,
+) -> str:
+    """Shared implementation behind :func:`remove_stop_hook` / :func:`remove_session_start_hook`."""
+    groups = _hook_event_groups(settings_data, event)
+    ours = [g for g in groups if references(g)]
     if not ours:
         return "absent"
     if not all(g == entry for g in ours):
         # A user-edited Strata group — leave everything as-is.
         return "edited"
-    remaining = [g for g in groups if not _group_references_hook(g)]
+    remaining = [g for g in groups if not references(g)]
     hooks = settings_data["hooks"]
     if remaining:
-        hooks["Stop"] = remaining
+        hooks[event] = remaining
     else:
-        del hooks["Stop"]
+        del hooks[event]
         if not hooks:
             del settings_data["hooks"]
     return "removed"
@@ -684,80 +841,91 @@ def copy_hook(
     hooks_root: Traversable | Path,
     dest_hooks_dir: Path,
     *,
+    script_name: str = HOOK_SCRIPT_NAME,
     dry_run: bool = False,
 ) -> bool:
-    """Copy the vendored ``strata-stop-hook`` script into *dest_hooks_dir*.
+    """Copy a vendored hook script into *dest_hooks_dir*.
 
     Strictly additive, like :func:`copy_skill`: an existing
-    ``<dest_hooks_dir>/strata-stop-hook`` is left untouched. The copied script is
+    ``<dest_hooks_dir>/<script_name>`` is left untouched. The copied script is
     marked executable so a harness may invoke it directly, in addition to the
-    merged ``sh``-prefixed :data:`HOOK_COMMAND`.
+    merged ``sh``-prefixed hook command.
 
     Args:
         hooks_root: The vendored hooks root, e.g.
             ``importlib.resources.files("strata") / "_hooks"`` (a Traversable),
             or any directory ``Path`` laid out the same way.
         dest_hooks_dir: The project's ``.claude/hooks`` directory.
+        script_name: Which vendored script to copy — :data:`HOOK_SCRIPT_NAME`
+            (the Stop hook, default) or :data:`HOOK_SCRIPT_NAME_SESSION_START`.
         dry_run: When ``True``, compute the outcome but write nothing.
 
     Returns:
         ``True`` if the script was copied, ``False`` if the destination already
         existed and was left in place.
     """
-    dest = Path(dest_hooks_dir) / HOOK_SCRIPT_NAME
+    dest = Path(dest_hooks_dir) / script_name
     if dest.exists():
         return False
     if not dry_run:
-        src = hooks_root / HOOK_SCRIPT_NAME
+        src = hooks_root / script_name
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
         dest.chmod(0o755)
     return True
 
 
-def _read_shipped_hook_text() -> str | None:
-    """Read the shipped Stop-hook script text, or ``None`` if unreadable."""
+def _read_shipped_hook_text(script_name: str = HOOK_SCRIPT_NAME) -> str | None:
+    """Read the shipped hook script text for *script_name*, or ``None`` if unreadable."""
     import importlib.resources  # noqa: PLC0415
 
     try:
-        shipped = importlib.resources.files("strata") / "_hooks" / HOOK_SCRIPT_NAME
+        shipped = importlib.resources.files("strata") / "_hooks" / script_name
         return shipped.read_text(encoding="utf-8")
     except (OSError, ModuleNotFoundError):
         return None
 
 
-def classify_hook_drift(installed_script: Path) -> str:
+def classify_hook_drift(installed_script: Path, script_name: str = HOOK_SCRIPT_NAME) -> str:
     """Classify an installed hook script against shipped + historical hashes.
 
     Mirrors :func:`classify_skill_drift`; see its docstring for the four
-    ``"match"``/``"stale"``/``"edited"``/``"unknown"`` states.
+    ``"match"``/``"stale"``/``"edited"``/``"unknown"`` states. *script_name*
+    selects both which shipped script to compare against and which
+    :data:`_HISTORICAL_ARTIFACT_HASHES` entry to classify against — it doubles
+    as that table's key, so it must be one of :data:`HOOK_SCRIPT_NAME` or
+    :data:`HOOK_SCRIPT_NAME_SESSION_START`.
     """
-    shipped_text = _read_shipped_hook_text()
+    shipped_text = _read_shipped_hook_text(script_name)
     if shipped_text is None:
         return "unknown"
     try:
         installed_text = installed_script.read_text(encoding="utf-8")
     except OSError:
         return "unknown"
-    return _classify_drift(installed_text, shipped_text, "strata-stop-hook")
+    return _classify_drift(installed_text, shipped_text, script_name)
 
 
-def self_update_hook(installed_script: Path, *, dry_run: bool = False) -> str:
+def self_update_hook(
+    installed_script: Path, script_name: str = HOOK_SCRIPT_NAME, *, dry_run: bool = False
+) -> str:
     """Self-update *installed_script* to the current shipped content when stale.
 
     Mirrors :func:`self_update_skill`. The executable bit is re-applied after
     a write, matching :func:`copy_hook`.
     """
-    status = classify_hook_drift(installed_script)
+    status = classify_hook_drift(installed_script, script_name)
     if status == "stale" and not dry_run:
-        shipped_text = _read_shipped_hook_text()
+        shipped_text = _read_shipped_hook_text(script_name)
         if shipped_text is not None:
             installed_script.write_text(shipped_text, encoding="utf-8")
             installed_script.chmod(0o755)
     return status
 
 
-def hook_matches_shipped(installed_script: Path) -> bool | None:
+def hook_matches_shipped(
+    installed_script: Path, script_name: str = HOOK_SCRIPT_NAME
+) -> bool | None:
     """Return whether an installed hook script matches the shipped copy.
 
     The byte-identity check (mirroring :func:`skill_matches_shipped`) that lets
@@ -773,7 +941,7 @@ def hook_matches_shipped(installed_script: Path) -> bool | None:
           recognized as any shipped version, current or historical.
         - ``None``  — the shipped reference could not be read; treat as "leave it".
     """
-    status = classify_hook_drift(installed_script)
+    status = classify_hook_drift(installed_script, script_name)
     if status == "unknown":
         return None
     return status in ("match", "stale")
@@ -1379,6 +1547,108 @@ def detect_harnesses(home: Path | None = None, path_env: str | None = None) -> l
     if shutil.which("codex", path=path_env) or (home / ".codex").exists():
         detected.append("codex")
     return detected
+
+
+# ---------------------------------------------------------------------------
+# Existing-store detection (issue #178)
+#
+# `strata register` seeds a starter fleet and an empty database and then
+# writes `.strata/config.toml` pointing at them. Writing that config flips
+# storage resolution from the env fallback to the project branch
+# (`project_config.resolve_storage_paths`), so seeding beside a store the
+# project was already using does not merely add a second store — it makes the
+# first one unreachable, silently, while `strata doctor` reports all-green
+# against the new empty one.
+#
+# Detection is deliberately conservative: adopting the wrong directory is a
+# worse failure than asking the operator. A candidate must carry BOTH a
+# loadable fleet and actual memory beside it, so a stray fleet.yaml is never
+# mistaken for a store, and neither is the empty scaffolding register itself
+# writes.
+# ---------------------------------------------------------------------------
+
+#: Store layouts to probe, relative to the project root, in report order.
+#: The project root itself is the pre-`.strata/` layout (what the env-var
+#: fallback resolves to); `.strata/` is what register writes today.
+_STORE_LAYOUTS: tuple[str, ...] = ("", ".strata")
+
+
+@dataclass(frozen=True)
+class StoreCandidate:
+    """An existing Strata store found on disk, with the evidence for it.
+
+    The evidence fields exist so the operator can tell candidates apart when
+    more than one is found — that choice is theirs, never register's.
+    """
+
+    root: Path
+    fleet_yaml: Path
+    db_path: Path | None
+    summaries_dir: Path | None
+    scopes: int
+    summary_count: int
+    db_bytes: int
+
+
+def find_existing_stores(project_root: Path) -> list[StoreCandidate]:
+    """Return the Strata stores that already exist under *project_root*.
+
+    A directory counts as a store only when it holds a **loadable**
+    ``fleet.yaml`` AND memory beside it — a non-empty ``strata.db`` or a
+    ``summaries/`` directory containing at least one file. Both halves are
+    required on purpose:
+
+    - A lone ``fleet.yaml`` is just a file someone wrote; adopting it would
+      point the project at a store that has never held anything.
+    - Memory with no fleet cannot be served — there is no topology to read it
+      through.
+    - The empty ``strata.db`` and ``summaries/`` register itself creates fail
+      the memory half, so a half-finished registration is never mistaken for
+      a store worth preserving.
+
+    Returns candidates in :data:`_STORE_LAYOUTS` order (project root first,
+    then ``.strata/``), so a caller reporting them lists the outer, older
+    layout before the one register would write.
+    """
+    found: list[StoreCandidate] = []
+    for layout in _STORE_LAYOUTS:
+        root = (project_root / layout) if layout else project_root
+        fleet_yaml = root / "fleet.yaml"
+        if not fleet_yaml.is_file():
+            continue
+
+        try:
+            from strata.fleet_config import FleetConfig
+
+            fleet = FleetConfig.load(fleet_yaml)
+        except Exception:
+            # Unloadable fleet — not a store we can honestly adopt. Register
+            # says what it found; it does not try to repair a broken fleet.
+            continue
+
+        db_path = root / "strata.db"
+        db_bytes = db_path.stat().st_size if db_path.is_file() else 0
+
+        summaries_dir = root / "summaries"
+        summary_count = (
+            sum(1 for p in summaries_dir.iterdir() if p.is_file()) if summaries_dir.is_dir() else 0
+        )
+
+        if db_bytes == 0 and summary_count == 0:
+            continue
+
+        found.append(
+            StoreCandidate(
+                root=root,
+                fleet_yaml=fleet_yaml,
+                db_path=db_path if db_bytes else None,
+                summaries_dir=summaries_dir if summary_count else None,
+                scopes=len(fleet.scopes),
+                summary_count=summary_count,
+                db_bytes=db_bytes,
+            )
+        )
+    return found
 
 
 # ---------------------------------------------------------------------------

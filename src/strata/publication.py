@@ -22,12 +22,16 @@ This module is the library home for the publication channel, mirroring
   and :func:`propose_withdraw` append the act to the scope's publication
   record FIRST (the record never lies), then invoke the scope-manager
   (:meth:`strata.scope_manager.ScopeManager.judge_publication`), then record
-  the judgment, then (on accept) rewrite the artifact. Unlike the
-  contribution path (:mod:`strata.app`), a judge() failure here is NOT
-  wrapped in a retry-attempt event — it is deliberately simple (see
-  :func:`propose_publish`'s docstring): the act row already exists, so
-  nothing is lost, but a future re-judge pathway for publication is not
-  built in V1.
+  the judgment, then (on accept) rewrite the artifact. A ``judge_publication()``
+  failure gets the same reliability treatment the contribution path
+  (:mod:`strata.app`) already has: it is recorded as a ``judge_failed``-marked
+  attempt event against the act (mirroring ``judgment_attempts`` — issue #57 /
+  #118), so a stranded act is visibly stranded on the record rather than
+  indistinguishable from one nobody ever judged. The exception itself still
+  propagates AS-IS after being recorded — no new exception type, and no
+  automatic retry: a future re-judge pathway for publication is not built in
+  V1, so a caller cannot yet route a retry the way ``strata_rejudge`` does for
+  contributions.
 - **Staleness propagation** (ADR 0007 D3) — two paths, by anchor type:
   :func:`propagate_directive_removals` is the MECHANICAL path (directive-
   anchored items, called from the three choke points that remove a directive
@@ -79,7 +83,7 @@ from typing import TYPE_CHECKING, Literal
 import yaml
 
 from strata.locks import scope_lock
-from strata.record_store import ContributorRef, RecordStore
+from strata.record_store import JUDGE_FAILED, ContributorRef, RecordStore
 
 if TYPE_CHECKING:
     from strata.fleet_config import FleetConfig
@@ -469,13 +473,15 @@ def propose_publish(
     5. On ``accept``, rewrite the publication artifact to include the new
        item; on ``decline``, the artifact is untouched.
 
-    Judge-failure handling is deliberately simple (unlike the contribution
-    path's judgment-attempt machinery, :class:`strata.app.JudgeUnavailable`):
-    the act row from step 2 already exists when :meth:`judge_publication`
-    is called in step 3, so if it raises, the exception propagates AS-IS —
-    the act sits in the record with no judgment, honestly reflecting that it
-    was never judged. A re-judge pathway for publication acts is a future
-    addition, not built in V1.
+    The act row from step 2 already exists when :meth:`judge_publication` is
+    called in step 3, so a failure there is recorded as a ``judge_failed``-
+    marked attempt event against that act (mirroring the contribution path's
+    judgment-attempt machinery — issue #57 / #118) and the exception then
+    propagates AS-IS — the act sits in the record with no judgment, but the
+    attempt row makes the failure legible instead of indistinguishable from
+    "never judged". No new exception type, and no automatic retry: a
+    re-judge pathway for publication acts is a future addition, not built in
+    V1.
 
     Args:
         scope_id: The publishing scope — always the proposer's own bound
@@ -525,16 +531,43 @@ def propose_publish(
             scope_id, summaries_dir=str(summary_store.summaries_dir)
         )
 
-        judgment = scope_manager.judge_publication(
-            scope=scope,
-            act_kind="publish",
-            content=content,
-            kind=kind,
-            subject=subject,
-            anchors=tagged_anchors,
-            current_summary=current_summary,
-            current_publication=current_publication,
+        # Judge-aware rendering (ADR 0008 D3): the operator memory binding
+        # this scope (attached here or at any inter-stratum ancestor) is
+        # rendered to the publication judge as a binding input — a publish
+        # act must not be able to contradict the operator directive binding
+        # the scope it belongs to, any more than a contribution can (issue
+        # #90's asymmetry between the contribution and publication paths).
+        # Imported lazily: strata.operator imports from this module, so a
+        # module-level import here would be circular.
+        from strata.operator import operator_memory_binding
+
+        operator_memory = operator_memory_binding(
+            scope_id, fleet=fleet, summaries_dir=str(summary_store.summaries_dir)
         )
+
+        try:
+            judgment = scope_manager.judge_publication(
+                scope=scope,
+                act_kind="publish",
+                content=content,
+                kind=kind,
+                subject=subject,
+                anchors=tagged_anchors,
+                current_summary=current_summary,
+                current_publication=current_publication,
+                operator_memory=operator_memory,
+            )
+        except Exception as exc:
+            # Record the failure as an event against the act — never as a
+            # fabricated verdict — mirroring strata.app._judge_and_record.
+            # Mechanical: no judge or LLM call is made to write the marker.
+            record_store.record_publication_judgment_attempt(
+                act_id=act.id,
+                error_class=type(exc).__name__,
+                message=str(exc),
+                outcome=JUDGE_FAILED,
+            )
+            raise
 
         record_store.record_publication_judgment(
             act_id=act.id,
@@ -626,13 +659,33 @@ def propose_withdraw(
             proposer=proposer,
         )
 
-        judgment = scope_manager.judge_publication(
-            scope=scope,
-            act_kind="withdraw",
-            withdraw_item=item,
-            current_summary=current_summary,
-            current_publication=current_publication,
+        # Judge-aware rendering (ADR 0008 D3) — see propose_publish above.
+        from strata.operator import operator_memory_binding
+
+        operator_memory = operator_memory_binding(
+            scope_id, fleet=fleet, summaries_dir=str(summary_store.summaries_dir)
         )
+
+        try:
+            judgment = scope_manager.judge_publication(
+                scope=scope,
+                act_kind="withdraw",
+                withdraw_item=item,
+                current_summary=current_summary,
+                current_publication=current_publication,
+                operator_memory=operator_memory,
+            )
+        except Exception as exc:
+            # Record the failure as an event against the act — never as a
+            # fabricated verdict — mirroring strata.app._judge_and_record.
+            # Mechanical: no judge or LLM call is made to write the marker.
+            record_store.record_publication_judgment_attempt(
+                act_id=act.id,
+                error_class=type(exc).__name__,
+                message=str(exc),
+                outcome=JUDGE_FAILED,
+            )
+            raise
 
         record_store.record_publication_judgment(
             act_id=act.id,

@@ -2829,6 +2829,62 @@ async def test_invalid_fleet_edit_keeps_serving_last_good_fleet_with_notice(tmp_
     assert "fleet.yaml" in served["fleet_notice"]
 
 
+async def test_read_perspective_gates_when_fleet_yaml_vanishes(tmp_path: Path) -> None:
+    """A fleet.yaml that vanishes AFTER a successful bind must gate memory
+    reads with a loud, actionable error — not the success-shaped empty
+    payload the reload-on-read fallback used to produce (with only an
+    easy-to-miss ``fleet_notice`` riding along). That payload is
+    indistinguishable from a legitimately new scope with nothing written
+    yet, so an agent reading it has no reason to stop.
+
+    This must gate the same way an unresolved binding already does — via
+    _require_bound_or_elicit — since a vanished fleet source is a
+    config-class failure strata_bind can never clear (a restart is
+    required once the file is back)."""
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fleet_yaml(tmp_path)
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+
+    with (
+        patch.object(mod, "_AGENT_SCOPE", "g_backend"),
+        patch.object(mod, "_AGENT_SKILL", "strata-developer"),
+    ):
+        # Prime the reloader with a good load — an ordinary, ungated read.
+        good = await mod.strata_read_perspective()
+        assert "fleet_notice" not in good
+
+        fleet_path.unlink()
+
+        with pytest.raises(RuntimeError) as exc_info:
+            await mod.strata_read_perspective()
+
+    message = str(exc_info.value)
+    assert str(fleet_path) in message, "must name the missing file path"
+    assert "restart" in message.lower(), "must say a restart is required once fixed"
+
+
+async def test_list_scopes_stays_ungated_when_fleet_yaml_vanishes(tmp_path: Path) -> None:
+    """strata_list_scopes is deliberately NOT gated by _require_bound_or_elicit
+    (fleet topology is not scoped memory) — an operator diagnosing a vanished
+    fleet.yaml still needs it to work, carrying the fleet_notice as before."""
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fleet_yaml(tmp_path)
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+
+    good = mod.strata_list_scopes()
+    assert "fleet_notice" not in good
+
+    fleet_path.unlink()
+
+    served = mod.strata_list_scopes()
+    assert "fleet_notice" in served
+    assert "fleet.yaml" in served["fleet_notice"]
+
+
 # ---------------------------------------------------------------------------
 # Feature B: strata_bind — rebind this session to a different scope at
 # runtime, sharing Feature A's reload path so a scope added after server
@@ -4474,6 +4530,31 @@ async def test_elicit_unavailable_memo_cleared_by_successful_bind(tmp_path: Path
         bind_result = await mod.strata_bind(scope_id="g_backend")
         assert bind_result["scope_id"] == "g_backend"
         assert mod._ELICIT_UNAVAILABLE is False
+
+
+def test_reset_elicit_state_clears_latch_and_pending_switch_without_a_bind(
+    tmp_path: Path,
+) -> None:
+    """Review follow-up (final fix wave, item 4): _ELICIT_UNAVAILABLE was
+    process-global mutable state with no reset path OTHER than a successful
+    strata_bind — a test (or a future caller) that needs to clear it without
+    also performing a bind had to reach for the sledgehammer of reloading
+    the whole module via sys.modules. _reset_elicit_state() is the single,
+    explicit, testable reset path for both elicit-adjacent globals
+    (_ELICIT_UNAVAILABLE and its sibling _PENDING_SWITCH, which strata_bind's
+    own successful-bind path already clears together — see its comment)."""
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fleet_yaml(tmp_path)
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+
+    mod._ELICIT_UNAVAILABLE = True
+    mod._PENDING_SWITCH = mod._PendingSwitch(target_scope_id="g_backend", requested_at=0.0)
+
+    mod._reset_elicit_state()
+
+    assert mod._ELICIT_UNAVAILABLE is False
+    assert mod._PENDING_SWITCH is None
 
 
 async def test_config_class_failure_survives_a_successful_binding_class_bind(

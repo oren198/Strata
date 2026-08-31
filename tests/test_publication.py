@@ -345,6 +345,120 @@ def test_propose_publish_decline_records_rows_only_artifact_untouched(
     assert read_publication_text("g_team", summaries_dir=summaries_dir) is None
 
 
+def test_propose_publish_threads_operator_memory_binding_into_judge_publication(
+    fleet, record_store, summary_store, summaries_dir
+) -> None:
+    """The operator memory binding g_team reaches judge_publication, per ADR 0008 D3.
+
+    Mirrors the contribution path (strata.app._read_judge_inputs): operator
+    memory attached at an inter-stratum ancestor (g_exec here) binds every
+    descendant scope, publication judging included.
+    """
+    from strata.operator import operator_publish
+
+    _seed_summary_with_directive(summary_store, "g_team")
+    item = operator_publish(
+        "g_exec",
+        "All services must use TLS 1.3 or later.",
+        "directive",
+        "tls",
+        record_store=record_store,
+        summaries_dir=summaries_dir,
+    )
+    manager = _FakeScopeManager(
+        publication_judgment=PublicationJudgment(decision="accept", reasoning="Fit for export.")
+    )
+
+    propose_publish(
+        "g_team",
+        "Use protobuf for all RPC.",
+        "directive",
+        "rpc-protocol",
+        ["c_dir1"],
+        _proposer(),
+        fleet=fleet,
+        record_store=record_store,
+        summary_store=summary_store,
+        scope_manager=manager,
+    )
+
+    assert len(manager.publication_calls) == 1
+    operator_memory = manager.publication_calls[0]["operator_memory"]
+    assert operator_memory == [("g_exec", [item])]
+
+
+def test_propose_publish_operator_memory_empty_when_none_attached(
+    fleet, record_store, summary_store
+) -> None:
+    """No operator memory anywhere on the chain threads through as an empty binding."""
+    _seed_summary_with_directive(summary_store, "g_team")
+    manager = _FakeScopeManager(
+        publication_judgment=PublicationJudgment(decision="accept", reasoning="Fit for export.")
+    )
+
+    propose_publish(
+        "g_team",
+        "Use protobuf for all RPC.",
+        "directive",
+        "rpc-protocol",
+        ["c_dir1"],
+        _proposer(),
+        fleet=fleet,
+        record_store=record_store,
+        summary_store=summary_store,
+        scope_manager=manager,
+    )
+
+    assert manager.publication_calls[0]["operator_memory"] == []
+
+
+def test_propose_withdraw_threads_operator_memory_binding_into_judge_publication(
+    fleet, record_store, summary_store, summaries_dir
+) -> None:
+    from strata.operator import operator_publish
+
+    _seed_summary_with_directive(summary_store, "g_team")
+    item = operator_publish(
+        "g_exec",
+        "All services must use TLS 1.3 or later.",
+        "directive",
+        "tls",
+        record_store=record_store,
+        summaries_dir=summaries_dir,
+    )
+    publish_manager = _FakeScopeManager(
+        publication_judgment=PublicationJudgment(decision="accept", reasoning="Fit for export.")
+    )
+    published = propose_publish(
+        "g_team",
+        "Use protobuf for all RPC.",
+        "directive",
+        "rpc-protocol",
+        ["c_dir1"],
+        _proposer(),
+        fleet=fleet,
+        record_store=record_store,
+        summary_store=summary_store,
+        scope_manager=publish_manager,
+    )
+
+    withdraw_manager = _FakeScopeManager(
+        publication_judgment=PublicationJudgment(decision="accept", reasoning="No longer relevant.")
+    )
+    propose_withdraw(
+        "g_team",
+        published.act_id,
+        _proposer(),
+        fleet=fleet,
+        record_store=record_store,
+        summary_store=summary_store,
+        scope_manager=withdraw_manager,
+    )
+
+    assert len(withdraw_manager.publication_calls) == 1
+    assert withdraw_manager.publication_calls[0]["operator_memory"] == [("g_exec", [item])]
+
+
 def test_propose_publish_zero_anchors_raises_and_appends_no_act_row(
     fleet, record_store, summary_store
 ) -> None:
@@ -479,7 +593,11 @@ def test_propose_withdraw_unknown_item_raises_keyerror_no_act_row(
 def test_propose_publish_judge_failure_leaves_act_row_unjudged(
     fleet, record_store, summary_store
 ) -> None:
-    """A judge_publication failure propagates AS-IS, after the act row already exists."""
+    """A judge_publication failure propagates AS-IS, after the act row already exists —
+    but, unlike before this fix, the failure is now recorded as a marked attempt
+    event, so the act is visibly stranded rather than indistinguishable from one
+    nobody has gotten around to judging yet.
+    """
     _seed_summary_with_directive(summary_store, "g_team")
 
     class _RaisingManager:
@@ -504,6 +622,63 @@ def test_propose_publish_judge_failure_leaves_act_row_unjudged(
     acts = record_store.list_publication_acts(scope_id="g_team")
     assert len(acts) == 1
     assert record_store.list_publication_judgments(scope_id="g_team") == []
+
+    # The failure is now legible on the record: one attempt, marked terminal,
+    # never a fabricated verdict.
+    attempts = record_store.list_publication_judgment_attempts(scope_id="g_team")
+    assert len(attempts) == 1
+    assert attempts[0].act_id == acts[0].id
+    assert attempts[0].error_class == "RuntimeError"
+    assert attempts[0].message == "scope-manager unavailable"
+    assert attempts[0].outcome == "judge_failed"
+
+    (state,) = record_store.list_publication_act_states(scope_id="g_team")
+    assert state.state == "judge_failed"
+    assert state.error_class == "RuntimeError"
+
+
+def test_propose_withdraw_judge_failure_records_marked_attempt(
+    fleet, record_store, summary_store, summaries_dir
+) -> None:
+    """The same reliability treatment applies to a withdraw act's judge failure."""
+    _seed_summary_with_directive(summary_store, "g_team")
+    published = propose_publish(
+        "g_team",
+        "Use protobuf for all RPC.",
+        "directive",
+        "rpc-protocol",
+        ["c_dir1"],
+        _proposer(),
+        fleet=fleet,
+        record_store=record_store,
+        summary_store=summary_store,
+        scope_manager=_FakeScopeManager(
+            publication_judgment=PublicationJudgment(decision="accept", reasoning="Fit.")
+        ),
+    )
+
+    class _RaisingManager:
+        def judge_publication(self, **_kwargs):
+            raise ValueError("malformed judge output")
+
+    with pytest.raises(ValueError, match="malformed judge output"):
+        propose_withdraw(
+            "g_team",
+            published.act_id,
+            _proposer(),
+            fleet=fleet,
+            record_store=record_store,
+            summary_store=summary_store,
+            scope_manager=_RaisingManager(),
+        )
+
+    acts = record_store.list_publication_acts(scope_id="g_team")
+    withdraw_act = next(a for a in acts if a.act == "withdraw")
+    attempts = record_store.list_publication_judgment_attempts(scope_id="g_team")
+    assert len(attempts) == 1
+    assert attempts[0].act_id == withdraw_act.id
+    assert attempts[0].error_class == "ValueError"
+    assert attempts[0].outcome == "judge_failed"
 
 
 # ---------------------------------------------------------------------------

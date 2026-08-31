@@ -80,6 +80,7 @@ from strata.project_config import (
     ProjectConfigError,
     StoragePaths,
     load_project_config,
+    resolve_storage_paths,
 )
 from strata.publication import PublishedItem, propose_publish, propose_withdraw, read_publication
 from strata.record_store import ContributorRef, RecordStore
@@ -312,6 +313,39 @@ _STARTUP_ERRORS_BINDING: list[str] = []
 _ELICIT_UNAVAILABLE: bool = False
 
 
+def _reset_elicit_state() -> None:
+    """Clear the two elicit-adjacent module globals — _ELICIT_UNAVAILABLE
+    and _PENDING_SWITCH — without performing a bind.
+
+    Review follow-up: this server binds one session per process
+    (_AGENT_SESSION_ID is resolved once, at import, and documented as never
+    changing — see its module-level comment), so "per-process" already
+    means "per-session" here; splitting _ELICIT_UNAVAILABLE out to be
+    per-session while every sibling global (_AGENT_SCOPE, _AGENT_SKILL,
+    _UNRESOLVED, both startup-error lists, _PENDING_SWITCH) stays
+    module-global would be inconsistent with the rest of this module's
+    design, not a fix. The actual gap: the only place either global was
+    ever cleared was inside a successful strata_bind (and, for
+    _ELICIT_UNAVAILABLE alone, a successful _attempt_elicit_bind) — a
+    caller (chiefly a test) that needs to reset this state WITHOUT also
+    performing a bind had no way to do it short of reloading the whole
+    module via sys.modules. This function is that explicit reset path.
+
+    Not called from strata_bind's or _attempt_elicit_bind's own
+    successful-bind clearing: both already hold _binding_lock (a plain,
+    non-reentrant threading.Lock) while clearing these alongside the
+    binding fields they update atomically with it — calling this function
+    (which acquires the same lock) from inside that block would deadlock.
+    Those two sites keep their own inline, lock-protected clears; this
+    function is for every OTHER caller that wants the same reset without
+    performing a bind.
+    """
+    global _ELICIT_UNAVAILABLE, _PENDING_SWITCH
+    with _binding_lock:
+        _ELICIT_UNAVAILABLE = False
+        _PENDING_SWITCH = None
+
+
 @dataclass
 class _PendingSwitch:
     """An announced-but-not-yet-confirmed scope switch (self-bind guard
@@ -415,6 +449,55 @@ def _load_fleet() -> FleetConfig:
 def _fleet_notice() -> str | None:
     """Return the fleet reload warning captured by the most recent :func:`_load_fleet` call."""
     return _fleet_last_warning
+
+
+def _fleet_source_missing() -> bool:
+    """True when the fleet source (fleet.yaml) loaded successfully at some
+    point but is now gone from disk, per the reloader's ``source_missing``
+    flag (:class:`~strata.fleet_reload.FleetReloader`). Must only be called
+    after :func:`_load_fleet` has run at least once in this process (the
+    reloader is created lazily there) — every call site in this module
+    calls :func:`_load_fleet` first via ``_require_bound_or_elicit``.
+    """
+    return _fleet_reloader is not None and _fleet_reloader.source_missing
+
+
+def _fleet_missing_message() -> str:
+    """Build the error text a memory tool returns while the configured
+    fleet.yaml is missing from disk (config-class, per _validate_binding's
+    two-class split: nothing strata_bind or elicitation can fix, since the
+    fix — putting the file back, or repointing the project config — only
+    takes effect on the next restart).
+
+    This is the same class of problem exists=False/the honest-empty-
+    publication face exist to prevent, one level up: a stale-but-present
+    fleet.yaml already degrades gracefully via lazy reload-on-read (Feature
+    A) and is deliberately NOT gated here — only the file actually being
+    gone is. Without this gate, a read tool would otherwise return a
+    normal-looking success (a synthesized empty layer, version=0,
+    exists=False) plus an easy-to-miss ``fleet_notice`` — indistinguishable
+    from a legitimately new scope with nothing written yet, giving an agent
+    no reason to stop.
+    """
+    path = _fleet_reloader.path if _fleet_reloader is not None else Path(_fleet_yaml_path)
+    return (
+        "STOP — do not answer the user's request yet. This session's memory "
+        "access is broken: fleet.yaml is missing.\n\n"
+        f"  Expected at: {path}\n\n"
+        "  The server reads this file at process start and only reloads it "
+        "on read while it stays in place — now that it is gone, this "
+        "session cannot be trusted to read or write the right scope's "
+        "memory. No scope choice fixes this, and strata_bind cannot clear "
+        "it. Tell the user, then put fleet.yaml back (or repoint the "
+        "project config at the right one) and restart the server — this is "
+        "read once, at process start, so a strata_bind call in the "
+        "meantime has no effect on this.\n\n"
+        "  strata_list_scopes works even with fleet.yaml missing (fleet "
+        "topology is not scoped memory) if you need to confirm what the "
+        "server currently has cached.\n\n"
+        "  Never read or write files under .strata/ directly to work around "
+        "this — all memory access goes through the strata tools."
+    )
 
 
 def _attach_fleet_notice(result: dict) -> dict:
@@ -1301,24 +1384,41 @@ async def _require_bound_or_elicit() -> None:
     so an unbound agent helping the user bind can still see it — see
     _attach_unbound_notice, its ungated counterpart.
 
-    A no-op — zero overhead — once the session is resolved (the common
-    case). While unresolved: tries exactly one elicitation attempt (Change
-    2) when the fleet itself loads fine AND the only remaining problem is
-    binding-class (nothing to offer a pick of when the fleet won't load; no
-    point offering one when a config-class failure means the session stays
-    gated regardless of what gets picked — see _validate_binding's
-    docstring); on any outcome other than a successful bind, raises with
-    the same aggregated, class-aware startup-failure list plus recovery
-    instructions that used to only reach stderr (Change 1).
-    """
-    if not _UNRESOLVED:
-        return
+    Also gates on a vanished fleet source (dated addendum, live-observed
+    2026-08-31): even for an already-resolved session, a fleet.yaml that
+    loaded fine at some point and has since disappeared (moved, deleted, or
+    the project config repointed) is a config-class failure the same as a
+    broken fleet.yaml at startup — strata_bind cannot clear it, since
+    fixing it only takes effect on the next restart. Without this, the
+    reload-on-read fallback (Feature A) would keep serving a normal-looking
+    success — a synthesized empty layer, an easy-to-miss ``fleet_notice`` —
+    indistinguishable from a legitimately new, empty scope. This check
+    always runs (both here and via the per-tool :func:`_load_fleet` call
+    right after), so it is NOT part of the "zero overhead once resolved"
+    fast path below; a stale-but-present fleet.yaml is unaffected and keeps
+    degrading gracefully via lazy reload-on-read, unchanged.
 
+    Once resolved AND the fleet source is present: a no-op — zero overhead
+    (the common case). While unresolved: tries exactly one elicitation
+    attempt (Change 2) when the fleet itself loads fine AND the only
+    remaining problem is binding-class (nothing to offer a pick of when the
+    fleet won't load; no point offering one when a config-class failure
+    means the session stays gated regardless of what gets picked — see
+    _validate_binding's docstring); on any outcome other than a successful
+    bind, raises with the same aggregated, class-aware startup-failure list
+    plus recovery instructions that used to only reach stderr (Change 1).
+    """
     fleet: FleetConfig | None
     try:
         fleet = _load_fleet()
     except Exception:  # noqa: BLE001 - a fleet that still won't load has nothing to elicit
         fleet = None
+
+    if _fleet_source_missing():
+        raise RuntimeError(_fleet_missing_message())
+
+    if not _UNRESOLVED:
+        return
 
     if not _STARTUP_ERRORS_CONFIG and fleet is not None and await _attempt_elicit_bind(fleet):
         return
@@ -2759,30 +2859,15 @@ def main() -> None:
             "the server — this is read once, at process start."
         )
 
-    # Resolve storage paths from the project_config ALREADY loaded above,
-    # never by calling resolve_storage_paths() (which would call
-    # load_project_config() a second time, independently) — review
-    # follow-up: an invalid .strata/config.toml made that second call raise
-    # the SAME ProjectConfigError again, uncaught, crashing main() with a
-    # raw traceback instead of degrading gracefully like every other
-    # config-class failure. Mirrors resolve_storage_paths' own precedence
-    # (project wins; env settings are the fallback) without re-deriving it.
-    if project_config is not None:
-        paths = StoragePaths(
-            db_path=str(project_config.db),
-            summaries_dir=str(project_config.summaries_dir),
-            fleet_yaml_path=str(project_config.fleet_yaml),
-            source="project",
-            project_root=project_config.project_root,
-        )
-    else:
-        paths = StoragePaths(
-            db_path=_settings.db_path,
-            summaries_dir=_settings.summaries_dir,
-            fleet_yaml_path=_settings.fleet_yaml_path,
-            source="env",
-            project_root=None,
-        )
+    # Resolve storage paths through resolve_storage_paths() — the ONE place
+    # the project-wins/env-fallback precedence is decided — but inject the
+    # project_config ALREADY loaded above via its `project=` parameter,
+    # rather than letting it call load_project_config() a second time,
+    # independently. Review follow-up: an invalid .strata/config.toml made
+    # that second call raise the SAME ProjectConfigError again, uncaught,
+    # crashing main() with a raw traceback instead of degrading gracefully
+    # like every other config-class failure.
+    paths = resolve_storage_paths(_settings, project=project_config)
     _set_paths(paths)
 
     # Load fleet only when we have a config; without one there's nothing to
