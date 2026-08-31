@@ -3135,8 +3135,12 @@ def cmd_register(args: argparse.Namespace) -> int:
         # the absolute path, via the same render_action_line used everywhere
         # else for consistent [would create/update]/kept-user's wording.
         codex_config = _codex_config_path()
+        # read_bytes, not read_text: text-mode I/O strips \r via universal
+        # newline translation before it ever reaches the CRLF-preserving
+        # merge logic — same bug class as AGENTS.md above (final fix wave,
+        # item 3).
         existing_codex_text = (
-            codex_config.read_text(encoding="utf-8") if codex_config.exists() else ""
+            codex_config.read_bytes().decode("utf-8") if codex_config.exists() else ""
         )
 
         def _act_codex(action: str, *, skipped: bool) -> None:
@@ -3162,7 +3166,7 @@ def cmd_register(args: argparse.Namespace) -> int:
 
         if not diff_mode and (mcp_added or hook_added):
             codex_config.parent.mkdir(parents=True, exist_ok=True)
-            codex_config.write_text(merged_text, encoding="utf-8")
+            codex_config.write_bytes(merged_text.encode("utf-8"))
 
         # Codex has no skills mechanism (unlike Claude Code's
         # .claude/skills/) — seed the same memory-move guidance into the
@@ -3878,7 +3882,9 @@ def cmd_unregister(args: argparse.Namespace) -> int:
         if not codex_config.exists():
             _ok(f"{codex_config}: nothing to do (no Codex config.toml)")
         else:
-            codex_text = codex_config.read_text(encoding="utf-8")
+            # read_bytes, not read_text — see the matching comment in
+            # _register_codex (final fix wave, item 3).
+            codex_text = codex_config.read_bytes().decode("utf-8")
             codex_changed = False
 
             new_text, mcp_status = _remove_codex_mcp_server(codex_text)
@@ -3924,7 +3930,7 @@ def cmd_unregister(args: argparse.Namespace) -> int:
                 _ok(f"{codex_config}: nothing to do (no freshness Stop-hook block)")
 
             if codex_changed and not dry_run:
-                codex_config.write_text(codex_text, encoding="utf-8")
+                codex_config.write_bytes(codex_text.encode("utf-8"))
 
         # Reverse of the AGENTS.md seed in `strata register --harness codex`
         # (Task 6, harness parity). AGENTS.md lives at the project root, not
