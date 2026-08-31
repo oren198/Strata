@@ -100,6 +100,9 @@ class _PublishedItemLike(Protocol):
     subject: str | None
     anchors: list[str]
     published_at: str
+    origin_scope_id: str | None
+    relay_scope_id: str | None
+    relay_item_id: str | None
 
 
 #: Reads the current published items for one scope (ADR 0007 D1/D4). Returns
@@ -113,16 +116,15 @@ PublicationReader = Callable[[str], Sequence[_PublishedItemLike]]
 def _publication_item_dict(item: _PublishedItemLike) -> dict:
     """Verbatim item dict for a parent_publication/peer_reference layer's payload.
 
-    Seam for republication provenance (ADR 0013 D4/D4b/D4c, owned by
-    :mod:`strata.publication`/:mod:`strata.record_store`): once a
-    ``PublishedItem`` carries an origin/relay-path field, this dict must
-    include it — a relayed item's "according to X, via Y" attribution has to
-    survive into the composed layer, or a reader can't tell a relay from an
-    original. ``_PublishedItemLike`` above is the structural contract this
-    function reads; widen it alongside ``PublishedItem`` when that field
-    lands.
+    Carries republication provenance (ADR 0013 D4/D4b/D4c): when *item* is a
+    relay (``origin_scope_id`` set), the dict also carries ``origin_scope_id``,
+    ``relay_scope_id``, and ``relay_item_id`` — the "according to X, via Y"
+    attribution a reader needs to tell a relayed claim from the publishing
+    scope's own. A non-relayed item's dict is exactly the original shape, no
+    invented keys — the same discipline :func:`_render_publication` in
+    :mod:`strata.publication` already follows for the on-disk artifact.
     """
-    return {
+    item_dict = {
         "id": item.id,
         "kind": item.kind,
         "content": item.content,
@@ -130,6 +132,11 @@ def _publication_item_dict(item: _PublishedItemLike) -> dict:
         "anchors": list(item.anchors),
         "published_at": item.published_at,
     }
+    if item.origin_scope_id is not None:
+        item_dict["origin_scope_id"] = item.origin_scope_id
+        item_dict["relay_scope_id"] = item.relay_scope_id
+        item_dict["relay_item_id"] = item.relay_item_id
+    return item_dict
 
 
 def _operator_directives(items: Sequence[_OperatorItemLike]) -> list[dict]:
