@@ -47,6 +47,7 @@
 def test_detects_nothing_on_bare_machine(tmp_path):
     assert detect_harnesses(home=tmp_path, path_env=str(tmp_path)) == []
 
+
 def test_detects_claude_by_home_dir(tmp_path):
     (tmp_path / ".claude").mkdir()
     assert detect_harnesses(home=tmp_path, path_env=str(tmp_path)) == ["claude-code"]

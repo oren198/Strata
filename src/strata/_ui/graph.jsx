@@ -542,4 +542,17 @@ function MemoryGraph({ state, tweaks, onOpenScope, onExpandSummary }) {
   );
 }
 
-Object.assign(window, { MemoryGraph });
+// ─────────────────────────────────────────────────────────────────────
+// EditFleetButton — opens the fleet editor (fleet-edit.jsx). Lives in the
+// graph view's header, next to the Graph/List toggle.
+// ─────────────────────────────────────────────────────────────────────
+function EditFleetButton({ onClick }) {
+  return (
+    <button className="at-btn at-btn-secondary at-btn-sm" onClick={onClick}>
+      <Icon name="pencil" size={12} style={{ marginRight: 6, verticalAlign: "-2px" }} />
+      Edit fleet
+    </button>
+  );
+}
+
+Object.assign(window, { MemoryGraph, EditFleetButton });
