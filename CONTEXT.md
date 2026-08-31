@@ -318,10 +318,12 @@ but may not contradict it.
 ## Context
 
 A kind of long-term memory representing observation, working state, or
-non-binding knowledge. Context propagates along both chain edges (downward)
-and reference edges (to the referencing scope). When two pieces of context
-conflict, the one from the scope closest to the reader wins. Context never
-overrides a directive.
+non-binding knowledge. Context is a scope's own internal working memory — it
+never leaves the scope on its own, over a chain edge or a reference edge. It
+feeds the scope's own judgments and its own choice of what to **publish**;
+what reaches another scope is whatever it chose to publish, not its raw
+context. When two pieces of published context conflict, the one from the
+source closest to the reader wins. Context never overrides a directive.
 
 ## Authority
 

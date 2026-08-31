@@ -548,7 +548,6 @@ def test_run_contribution_passes_operator_memory_binding_to_judge(tmp_path: Path
         operator_publish(
             "g_root",
             "Operator-mandated directive.",
-            "directive",
             record_store=rs,
             summaries_dir=summary_store.summaries_dir,
         )
@@ -605,7 +604,6 @@ def test_rejudge_contribution_passes_operator_memory_binding_to_judge(tmp_path: 
         operator_publish(
             "g_root",
             "Operator directive for rejudge.",
-            "directive",
             record_store=rs,
             summaries_dir=summary_store.summaries_dir,
         )
