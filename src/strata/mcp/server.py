@@ -684,6 +684,53 @@ def _check_entitled_context(fleet: FleetConfig, agent_scope: str, scope_id: str)
 
 
 # ---------------------------------------------------------------------------
+# Entitled relay-source surface (ADR 0013 D3/D4 — republication). A scope may
+# only relay an item it could actually have seen in its own composed
+# perspective: the publication of its chain parent (one hop via the chain
+# edge), or the publication of a scope it itself references (one hop via a
+# reference edge) — exactly the set compose_perspective composes as
+# parent_publication/peer_reference layers for this scope, never a wider
+# chain-wide surface (that would let a relay smuggle in a grandparent's or an
+# ancestor-referenced peer's publication this scope never actually receives).
+# strata.publication.propose_publish deliberately leaves this check to its
+# caller (same precedent as own-scope-only publishing) — this is that caller.
+# ---------------------------------------------------------------------------
+
+
+def _relay_source_scope_ids(fleet: FleetConfig, agent_scope: str) -> set[str]:
+    """Return the scope ids *agent_scope* may name as a republication relay source.
+
+    Exactly the scopes whose publication *agent_scope*'s own perspective
+    composes one hop away (``compose_perspective``'s parent_publication and
+    peer_reference layers): its chain parent, if any, and every scope it
+    itself references via a reference edge. Deliberately narrower than
+    ``_context_surface_scope_ids`` (chain-wide referenced peers) — a relay
+    source must be something this scope could actually have read, not merely
+    something entitled somewhere on its chain.
+    """
+    ids: set[str] = set()
+    parent = fleet.inter_stratum_parent(agent_scope)
+    if parent is not None:
+        ids.add(parent.id)
+    ids.update(s.id for s in fleet.references_from(agent_scope))
+    return ids
+
+
+def _check_entitled_relay_source(fleet: FleetConfig, agent_scope: str, scope_id: str) -> None:
+    """Raise RuntimeError if *scope_id* is outside *agent_scope*'s entitled relay-source surface."""
+    if scope_id not in _relay_source_scope_ids(fleet, agent_scope):
+        raise RuntimeError(
+            f"relay source scope {scope_id!r} is outside your entitled relay "
+            f"surface (your scope {agent_scope!r}'s chain parent, and any "
+            "scope it itself references via a reference edge). You may only "
+            "relay an item from a scope whose publication your own "
+            "perspective actually composes — never a grandparent's "
+            "publication or a publication reached only through an "
+            "ancestor's own reference edge."
+        )
+
+
+# ---------------------------------------------------------------------------
 # Entitled write surface (ADR 0006 Decision D1 — agent-facing contributions
 # are target-entitled, mirroring the #48 read surface). `strata_contribute`
 # refuses any target outside the bound scope plus its inter-stratum
@@ -2130,6 +2177,8 @@ async def strata_publish(
     kind: Literal["directive", "context"],
     anchors: list[str],
     subject: str | None = None,
+    relay_source_scope_id: str | None = None,
+    relay_source_item_id: str | None = None,
 ) -> dict:
     """Propose publishing content from this agent's bound scope's own memory.
 
@@ -2163,14 +2212,34 @@ async def strata_publish(
         anchors: At least one anchor — a directive id from this scope's
             current summary, or a subject string.
         subject: Optional short label.
+        relay_source_scope_id: ADR 0013 D4 (republication) — set this
+            together with *relay_source_item_id* when *content* relays an
+            item you received in another scope's publication, rather than
+            something original to your own memory. Must be a scope whose
+            publication your own perspective actually composes: your bound
+            scope's chain parent, or a scope your bound scope itself
+            references. The item's ultimate origin is derived from the
+            source item itself — you cannot assert an origin, only point at
+            what you received. The scope-manager is told the proposal is a
+            relay and shown its origin (CONTEXT.md § Republication):
+            relaying is a different judgment from publishing your own
+            material, and an ancestor having said it is information, not
+            permission to pass it on.
+        relay_source_item_id: The id of the published item, in
+            *relay_source_scope_id*'s CURRENT publication, being relayed.
+            Must be given together with *relay_source_scope_id*, or not at
+            all.
 
     Returns:
         ``act_id`` and ``judgment`` (``decision``: ``"accept"``/``"decline"``,
         ``reasoning``, ``artifact_updated``).
 
     Raises:
-        RuntimeError: The bound scope is unknown, or the anchors fail
-            structural validation.
+        RuntimeError: The bound scope is unknown; the anchors fail
+            structural validation; *relay_source_scope_id* is outside your
+            entitled relay surface; exactly one of *relay_source_scope_id* /
+            *relay_source_item_id* is given; or *relay_source_item_id* is
+            not present in *relay_source_scope_id*'s current publication.
     """
     await _require_bound_or_elicit()
 
@@ -2183,6 +2252,14 @@ async def strata_publish(
     scope = fleet.get_scope(agent_scope)
     if scope is None:
         raise RuntimeError(f"Your bound scope {agent_scope!r} was not found in the fleet config.")
+
+    # ADR 0013 D3/D4 — structural entitlement check for the relay source,
+    # BEFORE anything is recorded (mirrors propose_publish's own anchor
+    # validation: a failure here appends no act row). propose_publish itself
+    # does not check this — same precedent as own-scope-only publishing —
+    # so this calling surface is where it belongs.
+    if relay_source_scope_id is not None:
+        _check_entitled_relay_source(fleet, agent_scope, relay_source_scope_id)
 
     ts = datetime.now(UTC).isoformat()
     proposer = ContributorRef(
@@ -2206,6 +2283,8 @@ async def strata_publish(
             record_store=_record_store,
             summary_store=_summary_store,
             scope_manager=manager,
+            relay_source_scope_id=relay_source_scope_id,
+            relay_source_item_id=relay_source_item_id,
         )
     except ValueError as exc:
         raise RuntimeError(str(exc)) from exc

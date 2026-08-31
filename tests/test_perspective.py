@@ -909,6 +909,76 @@ def test_publication_reader_peer_layers_carry_publication_payload(tmp_path: Path
     }
 
 
+def test_publication_reader_relayed_item_carries_origin_and_relay(tmp_path: Path) -> None:
+    """ADR 0013 D4/D4c — a relayed item's origin/relay path reach the composed layer."""
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fixture_fleet_yaml(tmp_path)
+    store = _seed_summaries(summaries_dir)
+    fleet = FleetConfig.load(fleet_path)
+
+    item = PublishedItem(
+        id="pub_relay1",
+        kind="context",
+        content="Root's decision, relayed by the team peer.",
+        subject="status",
+        anchors=["subject:status"],
+        published_at="2026-07-12T00:00:00+00:00",
+        origin_scope_id="g_exec",
+        relay_scope_id="g_team_peer",
+        relay_item_id="pub_root1",
+    )
+    reader = _make_publication_reader({"g_team_peer": [item]})
+
+    result = compose_perspective(
+        "g_team", fleet=fleet, summary_store=store, publication_reader=reader
+    )
+
+    peer_layer = next(layer for layer in result["layers"] if layer["scope_id"] == "g_team_peer")
+    assert peer_layer["publication"] == {
+        "items": [
+            {
+                "id": "pub_relay1",
+                "kind": "context",
+                "content": "Root's decision, relayed by the team peer.",
+                "subject": "status",
+                "anchors": ["subject:status"],
+                "published_at": "2026-07-12T00:00:00+00:00",
+                "origin_scope_id": "g_exec",
+                "relay_scope_id": "g_team_peer",
+                "relay_item_id": "pub_root1",
+            }
+        ]
+    }
+
+
+def test_publication_reader_non_relayed_item_shape_unchanged(tmp_path: Path) -> None:
+    """A non-relayed item's composed dict carries no origin/relay keys at all."""
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fixture_fleet_yaml(tmp_path)
+    store = _seed_summaries(summaries_dir)
+    fleet = FleetConfig.load(fleet_path)
+
+    item = PublishedItem(
+        id="pub_a1",
+        kind="context",
+        content="Team peer's outward face.",
+        subject="status",
+        anchors=["subject:status"],
+        published_at="2026-07-12T00:00:00+00:00",
+    )
+    reader = _make_publication_reader({"g_team_peer": [item]})
+
+    result = compose_perspective(
+        "g_team", fleet=fleet, summary_store=store, publication_reader=reader
+    )
+
+    peer_layer = next(layer for layer in result["layers"] if layer["scope_id"] == "g_team_peer")
+    item_dict = peer_layer["publication"]["items"][0]
+    assert "origin_scope_id" not in item_dict
+    assert "relay_scope_id" not in item_dict
+    assert "relay_item_id" not in item_dict
+
+
 def test_publication_reader_none_default_composes_no_publication_layers(tmp_path: Path) -> None:
     """No publication_reader means no publication layers at all — never a full-summary fallback."""
     summaries_dir = str(tmp_path / "summaries")
