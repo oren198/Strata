@@ -69,12 +69,24 @@ function makeInitialState() {
 
 function App() {
   const [state, dispatch] = React.useReducer(reducer, undefined, makeInitialState);
-  const [tab, setTab] = React.useState("graph"); // graph | settings
+  const [tab, setTab] = React.useState("graph"); // graph | settings | fleet-edit
   const [view, setView] = React.useState("graph"); // graph | list
   const [openScopeId, setOpenScopeId] = React.useState(null);
   const [expandSummaryId, setExpandSummaryId] = React.useState(null);
   const [toast, setToast] = React.useState(null);
   const [tweaks, setTweak] = useTweaks(TWEAK_DEFAULTS);
+  const [fleetEditDirty, setFleetEditDirty] = React.useState(false);
+
+  // In-app navigation guard for the fleet editor (D1): leaving "fleet-edit"
+  // with an unsaved textarea edit asks first. No beforeunload reliance —
+  // this only guards navigation the app itself controls.
+  function goToTab(nextTab) {
+    if (tab === "fleet-edit" && nextTab !== "fleet-edit" && fleetEditDirty) {
+      const proceed = window.confirm("You have unsaved fleet edits. Leave without saving?");
+      if (!proceed) return;
+    }
+    setTab(nextTab);
+  }
 
   // Expose dispatch for graph.jsx interactions.
   React.useEffect(() => { window.__strataDispatch = dispatch; }, [dispatch]);
@@ -150,7 +162,7 @@ function App() {
     <div className="at" style={{ minHeight: "100vh", display: "flex", flexDirection: "column" }}>
       <TopBar
         tab={tab}
-        onTab={(t) => { setTab(t); setOpenScopeId(null); }}
+        onTab={(t) => { goToTab(t); setOpenScopeId(null); }}
         dark={!!state.options.dark_mode}
         onToggleDark={() => dispatch({ type: "set_option", key: "dark_mode", value: !state.options.dark_mode })}
       />
@@ -183,6 +195,7 @@ function App() {
                   <span><b style={{ color: "var(--at-ink)" }}>{state.edges.length}</b> edges</span>
                 </div>
                 <ViewToggle view={view} onChange={setView} />
+                <EditFleetButton onClick={() => goToTab("fleet-edit")} />
               </div>
             </div>
 
@@ -224,6 +237,24 @@ function App() {
 
         {tab === "settings" && (
           <SettingsScreen state={state} dispatch={dispatch} onFlash={flash} />
+        )}
+
+        {tab === "fleet-edit" && (
+          <FleetEditView
+            onDirtyChange={setFleetEditDirty}
+            onFleetSaved={async () => {
+              // Best-effort refresh of the graph state a save just changed —
+              // the existing 5s poll (see the effect above) will also pick
+              // it up, so a failure here is never fatal to the app.
+              try {
+                const data = await STRATA_STORE.fetchFleet();
+                dispatch({ type: "hydrate", data });
+              } catch (err) {
+                console.warn("Strata: could not refresh fleet state after save.", err);
+              }
+            }}
+            onFlash={flash}
+          />
         )}
       </main>
 

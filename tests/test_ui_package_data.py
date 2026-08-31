@@ -16,6 +16,9 @@ Verifies that:
 from __future__ import annotations
 
 import importlib.resources
+import os
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -33,6 +36,7 @@ _UI_FILES = [
     "scope-detail.jsx",
     "settings.jsx",
     "format.jsx",
+    "fleet-edit.jsx",
     "declines.jsx",
     "freshness.jsx",
     "record-trail.jsx",
@@ -41,6 +45,36 @@ _UI_FILES = [
     "store.js",
     "atlas.css",
 ]
+
+_JSX_FILES = [f for f in _UI_FILES if f.endswith(".jsx")]
+
+
+def _find_babel_node_path() -> str | None:
+    """Return a ``NODE_PATH`` entry with ``@babel/core`` + ``@babel/preset-react``
+    importable from it, or ``None`` if neither ``node`` nor those packages are
+    available in this environment.
+
+    The Console deliberately has no build step (``index.html`` loads
+    ``@babel/standalone`` in the browser, per its no-build JSX contract) — this
+    is only an offline syntax check for the test suite, so it degrades to a
+    skip rather than a failure when the environment doesn't have them; it
+    never becomes a hard dependency of `pip install -e .[dev]`.
+    """
+    if shutil.which("node") is None:
+        return None
+    for candidate in (
+        os.environ.get("STRATA_TEST_BABEL_NODE_PATH"),
+        "/tmp/node_modules",
+    ):
+        if not candidate:
+            continue
+        base = Path(candidate)
+        if (base / "@babel" / "core").is_dir() and (base / "@babel" / "preset-react").is_dir():
+            return candidate
+    return None
+
+
+_BABEL_NODE_PATH = _find_babel_node_path()
 
 
 def test_ui_directory_accessible_via_importlib() -> None:
@@ -72,3 +106,45 @@ def test_static_mount_source_is_package_data() -> None:
         f"_UI_DIR ({_UI_DIR}) resolves outside the strata package ({pkg_dir}); "
         "it will not ship in the wheel"
     )
+
+
+@pytest.mark.skipif(
+    _BABEL_NODE_PATH is None,
+    reason="node + @babel/core + @babel/preset-react not available in this environment",
+)
+@pytest.mark.parametrize("filename", _JSX_FILES)
+def test_jsx_parses_with_babel(filename: str) -> None:
+    """Every Console .jsx file must be syntactically valid to Babel's JSX parser.
+
+    Runs the same transform ``@babel/standalone`` performs in the browser
+    (JSX + ``@babel/preset-react``), offline, through ``@babel/core`` — a
+    real parse, not a regex heuristic. Source is piped over stdin so this
+    works the same whether the package is an editable install or a wheel.
+    """
+    source = (importlib.resources.files("strata") / "_ui" / filename).read_text(encoding="utf-8")
+    script = (
+        "const babel = require('@babel/core');"
+        "let code = '';"
+        "process.stdin.setEncoding('utf8');"
+        "process.stdin.on('data', d => code += d);"
+        "process.stdin.on('end', () => {"
+        "  try {"
+        "    const filename = process.argv[1];"
+        "    babel.transform(code, { presets: ['@babel/preset-react'], filename });"
+        "    console.log('OK');"
+        "  } catch (e) {"
+        "    console.error(e.message);"
+        "    process.exit(1);"
+        "  }"
+        "});"
+    )
+    env = {**os.environ, "NODE_PATH": _BABEL_NODE_PATH}
+    result = subprocess.run(
+        ["node", "-e", script, filename],
+        input=source,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env=env,
+    )
+    assert result.returncode == 0, result.stderr

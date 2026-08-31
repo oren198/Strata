@@ -353,3 +353,12 @@
   flex-direction: column;
   gap: 6px;
 }
+
+.fleet-edit-textarea {
+  outline: none;
+  transition: border-color 120ms, box-shadow 120ms;
+}
+.fleet-edit-textarea:focus {
+  border-color: var(--at-primary);
+  box-shadow: 0 0 0 3px rgba(26, 36, 56, 0.08);
+}
