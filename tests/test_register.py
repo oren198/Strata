@@ -749,6 +749,38 @@ def test_register_null_mcp_json_does_not_crash(tmp_path: Path, capsys) -> None:
     assert ".mcp.json" in captured.err
 
 
+def test_register_non_dict_settings_json_does_not_crash(tmp_path: Path, capsys) -> None:
+    """`.claude/settings.json` containing `[]` (valid JSON, not an object)
+    must fail cleanly with an actionable message, not an AttributeError."""
+    _init_project(tmp_path)
+    claude_dir = tmp_path / ".claude"
+    claude_dir.mkdir(parents=True)
+    (claude_dir / "settings.json").write_text("[]", encoding="utf-8")
+
+    rc = _run_register(tmp_path)
+
+    assert rc == 1
+    captured = capsys.readouterr()
+    assert ".claude/settings.json" in captured.err
+    assert (claude_dir / "settings.json").read_text(encoding="utf-8") == "[]", (
+        "register must never overwrite a settings.json it could not use"
+    )
+
+
+def test_register_null_settings_json_does_not_crash(tmp_path: Path, capsys) -> None:
+    """`null` is valid JSON but not an object — must not crash register."""
+    _init_project(tmp_path)
+    claude_dir = tmp_path / ".claude"
+    claude_dir.mkdir(parents=True)
+    (claude_dir / "settings.json").write_text("null", encoding="utf-8")
+
+    rc = _run_register(tmp_path)
+
+    assert rc == 1
+    captured = capsys.readouterr()
+    assert ".claude/settings.json" in captured.err
+
+
 # ---------------------------------------------------------------------------
 # MEDIUM 3 (fix round): --diff mode honesty for the migration/dedup prints.
 # ---------------------------------------------------------------------------
