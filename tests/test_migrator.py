@@ -90,6 +90,7 @@ def test_full_chain_drops_fleet_tables_and_preserves_record(tmp_path: Path) -> N
         "0006_optional_skill.sql",
         "0007_failed_judgment_marker.sql",
         "0008_publication_judgment_attempts.sql",
+        "0009_publication_relay.sql",
     ]
 
     # Fleet tables gone.
@@ -338,6 +339,7 @@ def test_idempotent_reapply(tmp_path: Path) -> None:
         "0006_optional_skill.sql",
         "0007_failed_judgment_marker.sql",
         "0008_publication_judgment_attempts.sql",
+        "0009_publication_relay.sql",
     ]
 
     second = run_migrations(db_path, migrations_dir=migrations_dir)
@@ -542,6 +544,7 @@ def test_crash_at_tracking_insert_rolls_back_script_too(
         "0006_optional_skill.sql",
         "0007_failed_judgment_marker.sql",
         "0008_publication_judgment_attempts.sql",
+        "0009_publication_relay.sql",
     ]
 
 

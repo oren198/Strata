@@ -125,6 +125,9 @@ class _PublishedItemLike(Protocol):
     subject: str | None
     anchors: list[str]
     published_at: str
+    origin_scope_id: str | None
+    relay_scope_id: str | None
+    relay_item_id: str | None
 
 
 # ---------------------------------------------------------------------------
@@ -718,6 +721,22 @@ DECLINED, citing that operator directive's id in your reasoning. Refinement
 WITHIN an inherited operator directive remains legitimate — narrowing detail
 is not contradiction, but reversing or countermanding what the operator
 directive establishes is.
+
+When a THIS ITEM IS SECOND-HAND section is present in the user message
+(republication, ADR 0013 D4c): the proposed content did not originate in
+this scope — it is being relayed onward from another scope's publication,
+and you are told that item's origin. Judging a relay is a DIFFERENT
+question from judging this scope's own material: not "is this true and mine
+to say" but "do my readers need to hear this from me." The origin having
+published it is INFORMATION, NOT PERMISSION — an ancestor or peer having
+said something is never by itself a reason to pass it on, and treating it
+as one turns this judgment into an automatic pass-through with an API call
+attached. Apply every ordinary rule (published must stay within believed,
+audience fitness) exactly as you would to the scope's own material, and
+also decline a relay that would misrepresent this scope's own position,
+duplicate or contradict something this scope already publishes, or add
+nothing a reader would not get more directly by referencing the origin
+themselves.
 
 You must call the `submit_publication_judgment` tool exactly once and
 provide a one-or-two-sentence reasoning.\
@@ -1688,9 +1707,24 @@ def _render_operator_memory(
 
 
 def _render_published_item(item: _PublishedItemLike) -> str:
+    """Render one published item for a judge prompt, id first.
+
+    Names the item's origin/relay when present (ADR 0013 D4 — republication):
+    an item this scope relayed carries its ULTIMATE origin scope and the
+    scope it was relayed VIA, so a judge can trace "according to <origin>"
+    attributions back through however many hops a claim has travelled —
+    what non-corroboration (D4's transitive extension of ADR 0007 D5)
+    depends on. Omitted entirely for a non-relay item (``origin_scope_id``
+    is ``None``), including every item that predates this release (D7).
+    """
     subject_part = f" subject={item.subject}" if item.subject else ""
     anchors_part = f" anchors={list(item.anchors)}"
-    return f"[{item.id}] {item.kind}{subject_part}{anchors_part}: {item.content}"
+    origin_part = (
+        f" (relayed — origin={item.origin_scope_id}, via={item.relay_scope_id})"
+        if getattr(item, "origin_scope_id", None) is not None
+        else ""
+    )
+    return f"[{item.id}] {item.kind}{subject_part}{anchors_part}{origin_part}: {item.content}"
 
 
 def _render_current_publication(items: Sequence[_PublishedItemLike] | None) -> str:
@@ -1711,6 +1745,34 @@ def _render_current_publication(items: Sequence[_PublishedItemLike] | None) -> s
         for item in items:
             lines.append(_render_published_item(item))
     return "\n".join(lines) + "\n\n"
+
+
+def _render_relay_origin(relay_origin_scope_id: str | None, relay_via_scope_id: str | None) -> str:
+    """Render the RELAY block for ``judge_publication`` (ADR 0013 D4c).
+
+    ``None`` for either argument omits the block entirely — an ordinary
+    publish of the scope's own material renders exactly as it did before
+    this ADR. When both are given, the block states plainly that this
+    proposal is SECOND-HAND (received from another scope's publication, not
+    this scope's own material) and names its origin — information the judge
+    uses to decide whether the item is fit to relay, never a reason by
+    itself to relay it.
+    """
+    if relay_origin_scope_id is None or relay_via_scope_id is None:
+        return ""
+    return (
+        "THIS ITEM IS SECOND-HAND (republication, ADR 0013 D4c)\n"
+        f"- origin scope: {relay_origin_scope_id}\n"
+        f"- relayed via: {relay_via_scope_id}\n"
+        "This content did not originate in THIS scope — it is being relayed onward from "
+        "another scope's publication. The origin having said it is INFORMATION, NOT "
+        "PERMISSION: judge whether YOUR readers need to hear it from you, not whether the "
+        "origin was entitled to say it. Weigh it exactly as you would any other publish "
+        "proposal — audience fitness and published-within-believed both still apply — and "
+        "decline it if relaying it would misrepresent this scope's own position, duplicate "
+        "or contradict what this scope already publishes, or add nothing your readers do "
+        "not already get more directly by referencing the origin themselves.\n\n"
+    )
 
 
 def _render_peer_publications(
@@ -2891,6 +2953,8 @@ class ScopeManager:
         anchors: Sequence[str] | None = None,
         withdraw_item: _PublishedItemLike | None = None,
         operator_memory: list[tuple[str, list[OperatorItem]]] | None = None,
+        relay_origin_scope_id: str | None = None,
+        relay_via_scope_id: str | None = None,
     ) -> PublicationJudgment:
         """Judge a publish or withdraw proposal against the scope's current state.
 
@@ -2920,6 +2984,18 @@ class ScopeManager:
                 judge uses (ADR 0008 D3), so a publish or withdraw act that
                 contradicts a binding operator directive can be declined,
                 citing its id, exactly as a contradicting contribution is.
+            relay_origin_scope_id: ADR 0013 D4c — when this ``publish``
+                RELAYS an item *scope* received in another scope's
+                publication (republication), the item's ULTIMATE origin
+                scope. ``None`` for an ordinary publish of *scope*'s own
+                material. Given together with *relay_via_scope_id*.
+            relay_via_scope_id: The immediate scope this copy was relayed
+                from (the "via Y" of "according to X, via Y"). Rendered
+                alongside *relay_origin_scope_id* so the judge is told the
+                proposed item is second-hand, not *scope*'s own — a
+                different question ("do my readers need to hear this" vs.
+                "is this true and mine to say") that the system prompt
+                spells out is information, never permission, to relay.
 
         Returns:
             A :class:`PublicationJudgment`.
@@ -2956,6 +3032,7 @@ class ScopeManager:
 
         operator_block = _render_operator_memory(operator_memory)
         publication_block = _render_current_publication(current_publication)
+        relay_block = _render_relay_origin(relay_origin_scope_id, relay_via_scope_id)
         summary_block = (
             _render_summary(current_summary)
             if current_summary is not None
@@ -2966,6 +3043,7 @@ class ScopeManager:
             f"SCOPE: {scope.name} (id={scope.id})\n\n"
             f"{operator_block}"
             f"{publication_block}"
+            f"{relay_block}"
             "CURRENT SUMMARY\n"
             "---\n"
             f"{summary_block}\n"

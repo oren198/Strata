@@ -45,6 +45,7 @@ from strata.scope_manager import (
     _build_batch_user_message,
     _build_user_message,
     _render_contributor,
+    _render_published_item,
     _render_recent_contributions,
     _summary_word_count,
 )
@@ -2166,6 +2167,84 @@ def test_judge_publication_declines_publish_that_contradicts_operator_directive(
     message = mock_client.messages.create.call_args.kwargs["messages"][0]["content"]
     assert OPERATOR_DIRECTIVE.id in message
     assert OPERATOR_DIRECTIVE.content in message
+
+
+# ---------------------------------------------------------------------------
+# judge_publication relay-origin input (ADR 0013 D4c) — the judge is told a
+# publish act relays second-hand material, shown its origin, and warned that
+# origin is information, not permission.
+# ---------------------------------------------------------------------------
+
+
+def test_judge_publication_relay_origin_renders_second_hand_and_origin_in_message() -> None:
+    manager, mock_client = _make_publication_manager("accept", "Worth relaying to our readers.")
+
+    manager.judge_publication(
+        scope=SCOPE,
+        act_kind="publish",
+        content="Deploys happen at 3pm UTC.",
+        kind="context",
+        subject="deploy-notes",
+        anchors=["subject:deploy-notes"],
+        current_summary=CURRENT_SUMMARY,
+        current_publication=[],
+        relay_origin_scope_id="g_exec",
+        relay_via_scope_id="g_func",
+    )
+
+    message = mock_client.messages.create.call_args.kwargs["messages"][0]["content"]
+    assert "g_exec" in message
+    assert "g_func" in message
+    assert "second-hand" in message.lower() or "relay" in message.lower()
+
+
+def test_judge_publication_no_relay_origin_omits_relay_block() -> None:
+    manager, mock_client = _make_publication_manager("accept", "Fits published <= believed.")
+
+    manager.judge_publication(
+        scope=SCOPE,
+        act_kind="publish",
+        content="Use protobuf for all RPC.",
+        kind="directive",
+        subject="rpc-protocol",
+        anchors=["directive:c_old001"],
+        current_summary=CURRENT_SUMMARY,
+        current_publication=[],
+    )
+
+    message = mock_client.messages.create.call_args.kwargs["messages"][0]["content"]
+    assert "second-hand" not in message.lower()
+
+
+def test_publication_system_prompt_states_origin_is_information_not_permission() -> None:
+    """D4c's core rule: an ancestor having said it is not by itself a reason to relay it."""
+    flat = " ".join(_PUBLICATION_SYSTEM_PROMPT.split())
+    assert "information" in flat.lower()
+    assert "not permission" in flat.lower() or "not a permission" in flat.lower()
+
+
+def test_render_published_item_shows_origin_and_relay_when_present() -> None:
+    """A relayed item's rendered form names its origin — what lets a judge trace independent
+    origins for non-corroboration (ADR 0013 D4), including across more than one hop."""
+    relayed = PublishedItem(
+        id="pub_relay1",
+        kind="context",
+        content="Deploys happen at 3pm UTC.",
+        subject="deploy-notes",
+        anchors=["subject:deploy-notes"],
+        published_at="2026-08-31T00:00:00+00:00",
+        origin_scope_id="g_exec",
+        relay_scope_id="g_func",
+        relay_item_id="pub_orig1",
+    )
+    rendered = _render_published_item(relayed)
+    assert "g_exec" in rendered
+    assert "g_func" in rendered
+
+
+def test_render_published_item_omits_origin_for_non_relay_item() -> None:
+    rendered = _render_published_item(_PUBLISHED_ITEM)
+    assert "origin" not in rendered.lower()
 
 
 # ---------------------------------------------------------------------------
