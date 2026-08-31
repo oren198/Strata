@@ -313,6 +313,39 @@ _STARTUP_ERRORS_BINDING: list[str] = []
 _ELICIT_UNAVAILABLE: bool = False
 
 
+def _reset_elicit_state() -> None:
+    """Clear the two elicit-adjacent module globals — _ELICIT_UNAVAILABLE
+    and _PENDING_SWITCH — without performing a bind.
+
+    Review follow-up: this server binds one session per process
+    (_AGENT_SESSION_ID is resolved once, at import, and documented as never
+    changing — see its module-level comment), so "per-process" already
+    means "per-session" here; splitting _ELICIT_UNAVAILABLE out to be
+    per-session while every sibling global (_AGENT_SCOPE, _AGENT_SKILL,
+    _UNRESOLVED, both startup-error lists, _PENDING_SWITCH) stays
+    module-global would be inconsistent with the rest of this module's
+    design, not a fix. The actual gap: the only place either global was
+    ever cleared was inside a successful strata_bind (and, for
+    _ELICIT_UNAVAILABLE alone, a successful _attempt_elicit_bind) — a
+    caller (chiefly a test) that needs to reset this state WITHOUT also
+    performing a bind had no way to do it short of reloading the whole
+    module via sys.modules. This function is that explicit reset path.
+
+    Not called from strata_bind's or _attempt_elicit_bind's own
+    successful-bind clearing: both already hold _binding_lock (a plain,
+    non-reentrant threading.Lock) while clearing these alongside the
+    binding fields they update atomically with it — calling this function
+    (which acquires the same lock) from inside that block would deadlock.
+    Those two sites keep their own inline, lock-protected clears; this
+    function is for every OTHER caller that wants the same reset without
+    performing a bind.
+    """
+    global _ELICIT_UNAVAILABLE, _PENDING_SWITCH
+    with _binding_lock:
+        _ELICIT_UNAVAILABLE = False
+        _PENDING_SWITCH = None
+
+
 @dataclass
 class _PendingSwitch:
     """An announced-but-not-yet-confirmed scope switch (self-bind guard
