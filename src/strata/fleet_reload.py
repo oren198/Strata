@@ -65,11 +65,33 @@ class FleetReloader:
         # fresh-install shape) from "this file existed and then vanished"
         # (a reload-time failure, same as a corrupt edit — sets a warning).
         self._ever_existed = False
+        # True only for the "existed, then vanished" case above — distinct
+        # from "existed, then failed to parse" (both set .warning, but only
+        # a vanished SOURCE FILE is a config-class problem the MCP server
+        # gates memory tools on; see strata.mcp.server._require_bound_or_elicit).
+        # Cleared the moment a reload succeeds again.
+        self._source_missing = False
 
     @property
     def path(self) -> Path:
         """The ``fleet.yaml`` path this reloader watches."""
         return self._path
+
+    @property
+    def source_missing(self) -> bool:
+        """Whether ``fleet.yaml`` existed and was successfully loaded at
+        least once, but is now gone from disk — as opposed to merely
+        having changed to something invalid (a typo mid-edit), or never
+        having existed at all (a fresh install with no fleet.yaml yet).
+
+        A vanished source file means the server may not even be reading
+        the fleet its operator intends anymore; a changed-but-invalid file
+        is a normal, correctable mid-edit stumble. Callers that need to
+        gate on the former without gating on the latter (see
+        ``strata.mcp.server._require_bound_or_elicit``) read this rather
+        than pattern-matching :attr:`warning`'s text.
+        """
+        return self._source_missing
 
     @property
     def warning(self) -> str | None:
@@ -124,6 +146,7 @@ class FleetReloader:
                             f"fleet.yaml is missing (expected at {self._path}); "
                             "serving the last known-good fleet."
                         )
+                        self._source_missing = True
                         logger.warning("fleet.yaml missing, serving stale fleet: %s", self._path)
                     return self._config, self._warning
                 # Never existed — an empty fleet is the normal shape here,
@@ -158,6 +181,7 @@ class FleetReloader:
                 self._config = loaded
                 self._stat_key = stat_key
                 self._warning = None
+                self._source_missing = False
                 return self._config, self._warning
 
 
