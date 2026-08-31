@@ -24,6 +24,7 @@ from strata.fleet_config import FleetConfig
 from strata.migrator import run_migrations
 from strata.operator import (
     OperatorItem,
+    _write_operator_layer,
     operator_health,
     operator_memory_binding,
     operator_publish,
@@ -35,6 +36,40 @@ from strata.operator import (
 )
 from strata.record_store import ContributorRef, RecordStore
 from strata.summary_store import Directive, ScopeSummary, SummaryStore
+
+
+def _seed_legacy_context_item(
+    target_scope_id: str,
+    content: str,
+    subject: str | None = None,
+    *,
+    record_store: RecordStore,
+    summaries_dir: str,
+) -> OperatorItem:
+    """Simulate a ``context``-kind operator item written before ADR 0013 D5.
+
+    ADR 0013 retires the operator's ``context`` kind going forward —
+    :func:`strata.operator.operator_publish` no longer accepts one. This
+    helper writes one directly (append the act, splice the working layer)
+    exactly as the pre-ADR-0013 ``operator_publish`` did, so tests can still
+    exercise "a legacy context item is on disk" without resurrecting a
+    write path the product no longer offers.
+    """
+    act = record_store.append_operator_act(
+        act="publish",
+        target_scope_id=target_scope_id,
+        kind="context",
+        content=content,
+        subject=subject,
+    )
+    item = OperatorItem(
+        id=act.id, kind="context", content=content, subject=subject, created_at=act.created_at
+    )
+    items = read_operator_layer(target_scope_id, summaries_dir=summaries_dir)
+    items.append(item)
+    _write_operator_layer(target_scope_id, items, summaries_dir=summaries_dir)
+    return item
+
 
 # ---------------------------------------------------------------------------
 # Fixture fleet — g_exec (L0) <- g_func (L1) <- g_team (L2)
@@ -99,7 +134,6 @@ def test_publish_appends_exactly_one_operator_act_row(record_store, summaries_di
     item = operator_publish(
         "g_team",
         "All services must use TLS 1.3.",
-        "directive",
         "tls",
         record_store=record_store,
         summaries_dir=summaries_dir,
@@ -119,9 +153,7 @@ def test_publish_appends_exactly_one_operator_act_row(record_store, summaries_di
 
 
 def test_supersede_item_appends_supersede_act_with_reference(record_store, summaries_dir) -> None:
-    first = operator_publish(
-        "g_team", "v1", "directive", record_store=record_store, summaries_dir=summaries_dir
-    )
+    first = operator_publish("g_team", "v1", record_store=record_store, summaries_dir=summaries_dir)
     second = operator_supersede_item(
         "g_team", first.id, "v2", record_store=record_store, summaries_dir=summaries_dir
     )
@@ -139,7 +171,7 @@ def test_retire_item_appends_retire_act_with_null_kind_and_content(
     record_store, summaries_dir
 ) -> None:
     item = operator_publish(
-        "g_team", "context item", "context", record_store=record_store, summaries_dir=summaries_dir
+        "g_team", "context item", record_store=record_store, summaries_dir=summaries_dir
     )
     act = operator_retire_item(
         "g_team", item.id, record_store=record_store, summaries_dir=summaries_dir
@@ -151,9 +183,7 @@ def test_retire_item_appends_retire_act_with_null_kind_and_content(
 
 
 def test_operator_acts_are_append_only_across_multiple_ops(record_store, summaries_dir) -> None:
-    a = operator_publish(
-        "g_team", "one", "directive", record_store=record_store, summaries_dir=summaries_dir
-    )
+    a = operator_publish("g_team", "one", record_store=record_store, summaries_dir=summaries_dir)
     b = operator_supersede_item(
         "g_team", a.id, "two", record_store=record_store, summaries_dir=summaries_dir
     )
@@ -172,6 +202,50 @@ def test_supersede_item_unknown_id_raises_keyerror(record_store, summaries_dir) 
         )
 
 
+def test_operator_publish_writes_a_directive_item(record_store, summaries_dir) -> None:
+    """ADR 0013 D5: there is no kind argument any more — every fresh write is a directive."""
+    item = operator_publish(
+        "g_team", "New operator memory.", record_store=record_store, summaries_dir=summaries_dir
+    )
+    assert item.kind == "directive"
+    act = record_store.list_operator_acts()[0]
+    assert act.kind == "directive"
+
+
+def test_supersede_item_rejects_a_legacy_context_item(record_store, summaries_dir) -> None:
+    """ADR 0013 D5/D7: a legacy context item cannot be superseded — only retired.
+
+    Superseding it would mint a fresh, non-binding operator write, which D5
+    forbids going forward; re-attributing it to a directive would silently
+    change what the stored item means rather than replace it.
+    """
+    legacy = _seed_legacy_context_item(
+        "g_team", "Old observation.", record_store=record_store, summaries_dir=summaries_dir
+    )
+    with pytest.raises(ValueError, match=legacy.id):
+        operator_supersede_item(
+            "g_team",
+            legacy.id,
+            "New text.",
+            record_store=record_store,
+            summaries_dir=summaries_dir,
+        )
+    # The legacy item is untouched — the rejected call did not rewrite it.
+    items = read_operator_layer("g_team", summaries_dir=summaries_dir)
+    assert items == [legacy]
+
+
+def test_retire_item_accepts_a_legacy_context_item(record_store, summaries_dir) -> None:
+    """Retire remains the one path off a legacy context item — no new write, just removal."""
+    legacy = _seed_legacy_context_item(
+        "g_team", "Old observation.", record_store=record_store, summaries_dir=summaries_dir
+    )
+    operator_retire_item(
+        "g_team", legacy.id, record_store=record_store, summaries_dir=summaries_dir
+    )
+    assert read_operator_layer("g_team", summaries_dir=summaries_dir) == []
+
+
 def test_retire_item_unknown_id_raises_keyerror(record_store, summaries_dir) -> None:
     with pytest.raises(KeyError):
         operator_retire_item(
@@ -188,7 +262,6 @@ def test_publish_writes_layer_file_readable_back(record_store, summaries_dir) ->
     item = operator_publish(
         "g_team",
         "Content for the layer file.",
-        "directive",
         "subj",
         record_store=record_store,
         summaries_dir=summaries_dir,
@@ -206,7 +279,7 @@ def test_read_operator_layer_empty_for_unattached_scope(summaries_dir) -> None:
 
 def test_supersede_item_replaces_old_item_in_layer(record_store, summaries_dir) -> None:
     first = operator_publish(
-        "g_team", "v1", "directive", "sub", record_store=record_store, summaries_dir=summaries_dir
+        "g_team", "v1", "sub", record_store=record_store, summaries_dir=summaries_dir
     )
     second = operator_supersede_item(
         "g_team", first.id, "v2", record_store=record_store, summaries_dir=summaries_dir
@@ -221,7 +294,7 @@ def test_supersede_item_replaces_old_item_in_layer(record_store, summaries_dir) 
 
 def test_retire_item_removes_from_layer(record_store, summaries_dir) -> None:
     item = operator_publish(
-        "g_team", "gone soon", "context", record_store=record_store, summaries_dir=summaries_dir
+        "g_team", "gone soon", record_store=record_store, summaries_dir=summaries_dir
     )
     operator_retire_item("g_team", item.id, record_store=record_store, summaries_dir=summaries_dir)
     items = read_operator_layer("g_team", summaries_dir=summaries_dir)
@@ -240,7 +313,6 @@ def test_layer_file_content_survives_byte_identical_round_trip(record_store, sum
     item = operator_publish(
         "g_team",
         tricky_content,
-        "directive",
         "tricky",
         record_store=record_store,
         summaries_dir=summaries_dir,
@@ -252,11 +324,10 @@ def test_layer_file_content_survives_byte_identical_round_trip(record_store, sum
 
 
 def test_multiple_items_coexist_in_one_layer_file(record_store, summaries_dir) -> None:
-    a = operator_publish(
-        "g_team", "first", "directive", record_store=record_store, summaries_dir=summaries_dir
-    )
-    b = operator_publish(
-        "g_team", "second", "context", record_store=record_store, summaries_dir=summaries_dir
+    """A fresh directive and a legacy (pre-ADR-0013) context item coexist in one layer file."""
+    a = operator_publish("g_team", "first", record_store=record_store, summaries_dir=summaries_dir)
+    b = _seed_legacy_context_item(
+        "g_team", "second", record_store=record_store, summaries_dir=summaries_dir
     )
     items = read_operator_layer("g_team", summaries_dir=summaries_dir)
     assert {i.id for i in items} == {a.id, b.id}
@@ -265,13 +336,29 @@ def test_multiple_items_coexist_in_one_layer_file(record_store, summaries_dir) -
     assert by_id[b.id].kind == "context"
 
 
+def test_new_directive_write_does_not_stealth_migrate_a_legacy_context_item(
+    record_store, summaries_dir
+) -> None:
+    """ADR 0013 D7: a fresh operator_publish read-modify-writes the layer file — the
+    legacy context item already on disk must survive that write byte-for-byte
+    identical, not be silently dropped or reclassified."""
+    legacy = _seed_legacy_context_item(
+        "g_team", "Old observation.", record_store=record_store, summaries_dir=summaries_dir
+    )
+    fresh = operator_publish(
+        "g_team", "New directive.", record_store=record_store, summaries_dir=summaries_dir
+    )
+
+    items = read_operator_layer("g_team", summaries_dir=summaries_dir)
+    by_id = {item.id: item for item in items}
+    assert by_id[legacy.id] == legacy
+    assert by_id[legacy.id].kind == "context"
+    assert by_id[fresh.id].kind == "directive"
+
+
 def test_layers_for_different_scopes_are_independent_files(record_store, summaries_dir) -> None:
-    operator_publish(
-        "g_team", "team item", "directive", record_store=record_store, summaries_dir=summaries_dir
-    )
-    operator_publish(
-        "g_func", "func item", "context", record_store=record_store, summaries_dir=summaries_dir
-    )
+    operator_publish("g_team", "team item", record_store=record_store, summaries_dir=summaries_dir)
+    operator_publish("g_func", "func item", record_store=record_store, summaries_dir=summaries_dir)
     team_items = read_operator_layer("g_team", summaries_dir=summaries_dir)
     func_items = read_operator_layer("g_func", summaries_dir=summaries_dir)
     assert [i.content for i in team_items] == ["team item"]
@@ -289,14 +376,12 @@ def test_memory_binding_includes_self_and_ancestors_root_first(
     operator_publish(
         "g_exec",
         "exec directive",
-        "directive",
         record_store=record_store,
         summaries_dir=summaries_dir,
     )
     operator_publish(
         "g_team",
         "team directive",
-        "directive",
         record_store=record_store,
         summaries_dir=summaries_dir,
     )
@@ -306,9 +391,7 @@ def test_memory_binding_includes_self_and_ancestors_root_first(
 
 def test_memory_binding_skips_unattached_ancestors(fleet, record_store, summaries_dir) -> None:
     # Only g_team has operator memory; g_exec and g_func do not.
-    operator_publish(
-        "g_team", "team only", "context", record_store=record_store, summaries_dir=summaries_dir
-    )
+    operator_publish("g_team", "team only", record_store=record_store, summaries_dir=summaries_dir)
     binding = operator_memory_binding("g_team", fleet=fleet, summaries_dir=summaries_dir)
     assert [scope_id for scope_id, _ in binding] == ["g_team"]
 
@@ -322,6 +405,39 @@ def test_memory_binding_unknown_scope_raises(fleet, summaries_dir) -> None:
         operator_memory_binding("g_nonexistent", fleet=fleet, summaries_dir=summaries_dir)
 
 
+def test_memory_binding_excludes_legacy_context_items(fleet, record_store, summaries_dir) -> None:
+    """ADR 0013 D5/D7: a legacy context-kind item is inert — it neither binds (not a
+    directive) nor informs (it stopped composing) — so it is absent from the binding
+    judgment renders against, alongside a directive at the same attachment scope."""
+    _seed_legacy_context_item(
+        "g_team", "Old observation.", record_store=record_store, summaries_dir=summaries_dir
+    )
+    operator_publish(
+        "g_team", "Still binds.", record_store=record_store, summaries_dir=summaries_dir
+    )
+
+    binding = operator_memory_binding("g_team", fleet=fleet, summaries_dir=summaries_dir)
+    assert [scope_id for scope_id, _ in binding] == ["g_team"]
+    items = dict(binding)["g_team"]
+    assert [item.kind for item in items] == ["directive"]
+    assert [item.content for item in items] == ["Still binds."]
+
+
+def test_memory_binding_excludes_scope_with_only_legacy_context(
+    fleet, record_store, summaries_dir
+) -> None:
+    """A chain scope whose ONLY operator memory is a legacy context item contributes no entry."""
+    _seed_legacy_context_item(
+        "g_exec", "Old observation.", record_store=record_store, summaries_dir=summaries_dir
+    )
+    operator_publish(
+        "g_team", "Team directive.", record_store=record_store, summaries_dir=summaries_dir
+    )
+
+    binding = operator_memory_binding("g_team", fleet=fleet, summaries_dir=summaries_dir)
+    assert [scope_id for scope_id, _ in binding] == ["g_team"]
+
+
 # ---------------------------------------------------------------------------
 # operator_health — constitutional, not operational (ADR 0008 D6).
 # ---------------------------------------------------------------------------
@@ -331,13 +447,10 @@ def test_health_reports_per_scope_and_total_counts(record_store, summaries_dir) 
     operator_publish(
         "g_team",
         "one two three",
-        "directive",
         record_store=record_store,
         summaries_dir=summaries_dir,
     )
-    operator_publish(
-        "g_func", "four five", "context", record_store=record_store, summaries_dir=summaries_dir
-    )
+    operator_publish("g_func", "four five", record_store=record_store, summaries_dir=summaries_dir)
     health = operator_health(record_store=record_store, summaries_dir=summaries_dir)
     assert health["per_scope"]["g_team"] == {"items": 1, "words": 3}
     assert health["per_scope"]["g_func"] == {"items": 1, "words": 2}
@@ -346,9 +459,7 @@ def test_health_reports_per_scope_and_total_counts(record_store, summaries_dir) 
 
 
 def test_health_reports_act_counts_and_churn(record_store, summaries_dir) -> None:
-    item = operator_publish(
-        "g_team", "one", "directive", record_store=record_store, summaries_dir=summaries_dir
-    )
+    item = operator_publish("g_team", "one", record_store=record_store, summaries_dir=summaries_dir)
     operator_supersede_item(
         "g_team", item.id, "two", record_store=record_store, summaries_dir=summaries_dir
     )
@@ -375,7 +486,6 @@ def test_health_retired_items_do_not_count_toward_size(record_store, summaries_d
     item = operator_publish(
         "g_team",
         "will be retired",
-        "directive",
         record_store=record_store,
         summaries_dir=summaries_dir,
     )
@@ -790,7 +900,6 @@ def test_operator_stratum_acts_never_appear_in_scope_record(
     operator_publish(
         "g_team",
         "operator layer item",
-        "directive",
         record_store=record_store,
         summaries_dir=summaries_dir,
     )

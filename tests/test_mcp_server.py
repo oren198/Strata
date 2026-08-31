@@ -150,17 +150,20 @@ def _make_deep_fleet_yaml(tmp_path: Path) -> Path:
 
 
 def _make_peer_composition_fleet_yaml(tmp_path: Path) -> Path:
-    """Write a fleet.yaml exercising ADR 0006 D3/D4 (peer-reference composition).
+    """Write a fleet.yaml exercising ADR 0013 D2/D3 (one-hop publication composition).
 
     Topology: g_exec (L0) ← g_func (L1) ← g_team (L2).
 
-    Reference edges (intra-stratum, context only):
-      - g_func → g_peer_a   (referenced by a *chain* scope — must appear)
-      - g_func → g_peer_b   (second chain-referenced peer — ordering)
-      - g_exec → g_exec_peer (referenced by an *ancestor* — must also appear)
+    Reference edges (publication only, one hop — ADR 0013 D3):
+      - g_team → g_team_peer   (g_team's OWN reference — must appear)
+      - g_func → g_peer_a      (g_team's PARENT's own reference — must NOT
+        appear in g_team's perspective; it is g_func's edge, not g_team's)
+      - g_func → g_peer_b      (second parent-owned reference — same rule)
+      - g_exec → g_exec_peer   (the ROOT's own reference — must NOT appear
+        either, for the same reason, two hops removed)
       - g_peer_a → g_peer_of_peer (peer-of-peer — one hop only, must NOT
-        appear in g_team's perspective since g_peer_a is not itself on the
-        chain)
+        appear in g_func's perspective either since g_peer_a is not itself
+        on g_func's chain)
 
     g_sibling is an L1 scope with no reference edge at all — an unreferenced
     sibling that must never appear and must never be directly readable.
@@ -176,6 +179,7 @@ def _make_peer_composition_fleet_yaml(tmp_path: Path) -> Path:
             {"id": "g_exec_peer", "name": "Executive Peer", "stratum_id": "L0"},
             {"id": "g_func", "name": "Function", "stratum_id": "L1"},
             {"id": "g_team", "name": "Team", "stratum_id": "L2"},
+            {"id": "g_team_peer", "name": "Team Peer", "stratum_id": "L2"},
             {"id": "g_peer_a", "name": "Peer A", "stratum_id": "L1"},
             {"id": "g_peer_b", "name": "Peer B", "stratum_id": "L1"},
             {"id": "g_peer_of_peer", "name": "Peer Of Peer", "stratum_id": "L1"},
@@ -185,11 +189,12 @@ def _make_peer_composition_fleet_yaml(tmp_path: Path) -> Path:
             # Inter-stratum: child → parent
             {"from": "g_func", "to": "g_exec"},
             {"from": "g_team", "to": "g_func"},
-            # Intra-stratum peer references (context only)
+            # Intra-stratum peer references (publication only, one hop)
             {"from": "g_func", "to": "g_peer_b"},
             {"from": "g_func", "to": "g_peer_a"},
             {"from": "g_exec", "to": "g_exec_peer"},
             {"from": "g_peer_a", "to": "g_peer_of_peer"},
+            {"from": "g_team", "to": "g_team_peer"},
         ],
     }
     fleet_path = tmp_path / "fleet.yaml"
@@ -523,8 +528,10 @@ async def test_read_scope_summary_after_first_write_reports_version_one_and_exis
 async def test_read_perspective_returns_layers_root_first(tmp_path: Path) -> None:
     """strata_read_perspective returns a layered perspective (Decision 3).
 
-    For g_backend (L1, child of g_arch L0) the perspective must have two
-    layers: g_arch first (root), then g_backend (requested scope).
+    For g_backend (L1, child of g_arch L0) the perspective has three layers:
+    g_arch's directives-only ancestor layer, g_backend's own layer, then
+    g_arch's publication layer (ADR 0013 D3 — the chain parent's publication
+    composes as a dedicated layer, always wired by this server).
     """
     db_path = _make_db(tmp_path)
     summaries_dir = str(tmp_path / "summaries")
@@ -546,15 +553,23 @@ async def test_read_perspective_returns_layers_root_first(tmp_path: Path) -> Non
         result = await mod.strata_read_perspective("g_backend")
 
     assert result["scope_id"] == "g_backend"
-    assert result["_layers_count"] == 2
+    assert result["_layers_count"] == 3
     layers = result["layers"]
-    assert len(layers) == 2
-    # Root-first ordering
-    assert layers[0]["scope_id"] == "g_arch"
-    assert layers[1]["scope_id"] == "g_backend"
-    # Summary content is preserved per layer
-    assert layers[0]["summary"]["context"] == "arch context"
+    assert len(layers) == 3
+    # Root-first ordering: ancestor, self, then the parent's publication layer.
+    assert [layer["scope_id"] for layer in layers] == ["g_arch", "g_backend", "g_arch"]
+    assert [layer["relation"] for layer in layers] == [
+        "ancestor",
+        "self",
+        "parent_publication",
+    ]
+    # Ancestor layer: directives only, never a "summary" or "context" key.
+    assert "summary" not in layers[0]
+    assert layers[0]["directives"] == []
+    # Self layer keeps its full summary.
     assert layers[1]["summary"]["context"] == "backend context"
+    # The parent's publication layer is honestly empty — nothing published.
+    assert layers[2]["publication"] == {"items": []}
 
 
 async def test_read_perspective_includes_operator_layers_for_bound_chain(tmp_path: Path) -> None:
@@ -580,7 +595,6 @@ async def test_read_perspective_includes_operator_layers_for_bound_chain(tmp_pat
     operator_publish(
         "g_arch",
         "All services must use TLS 1.3.",
-        "directive",
         "tls",
         record_store=rs,
         summaries_dir=summaries_dir,
@@ -598,8 +612,14 @@ async def test_read_perspective_includes_operator_layers_for_bound_chain(tmp_pat
 
     layers = result["layers"]
     # Operator layer for g_arch immediately precedes g_arch's own layer;
-    # g_backend has no operator memory, so it gets no operator layer.
-    assert [layer["relation"] for layer in layers] == ["operator", "ancestor", "self"]
+    # g_backend has no operator memory, so it gets no operator layer; the
+    # parent's (g_arch's) publication layer composes last (ADR 0013 D3).
+    assert [layer["relation"] for layer in layers] == [
+        "operator",
+        "ancestor",
+        "self",
+        "parent_publication",
+    ]
     operator_layer = layers[0]
     assert operator_layer["scope_id"] == "g_arch"
     assert operator_layer["stratum_id"] == "operator"
@@ -607,7 +627,7 @@ async def test_read_perspective_includes_operator_layers_for_bound_chain(tmp_pat
     assert operator_layer["operator_memory"]["directives"][0]["content"] == (
         "All services must use TLS 1.3."
     )
-    assert operator_layer["operator_memory"]["context"] == []
+    assert "context" not in operator_layer["operator_memory"]
 
 
 # ---------------------------------------------------------------------------
@@ -796,12 +816,21 @@ async def test_perspective_deep_scope_returns_layers_root_first(tmp_path: Path) 
         result = await mod.strata_read_perspective("g_team")
 
     assert result["scope_id"] == "g_team"
-    assert result["_layers_count"] == 3
+    # Ancestors (directives only), self, then the parent's publication layer
+    # (ADR 0013 D3 — always wired by this server).
+    assert result["_layers_count"] == 4
     layers = result["layers"]
-    assert [layer["scope_id"] for layer in layers] == ["g_exec", "g_func", "g_team"]
-    assert layers[0]["summary"]["context"] == "executive context"
-    assert layers[1]["summary"]["context"] == "function context"
+    assert [layer["scope_id"] for layer in layers] == ["g_exec", "g_func", "g_team", "g_func"]
+    assert [layer["relation"] for layer in layers] == [
+        "ancestor",
+        "ancestor",
+        "self",
+        "parent_publication",
+    ]
+    assert "summary" not in layers[0]
+    assert "summary" not in layers[1]
     assert layers[2]["summary"]["context"] == "team context"
+    assert layers[3]["publication"] == {"items": []}
 
 
 # ---------------------------------------------------------------------------
@@ -875,22 +904,27 @@ async def test_perspective_missing_ancestor_summary_produces_empty_layer(tmp_pat
         mod._summary_store = ss
         result = await mod.strata_read_perspective("g_backend")
 
-    assert result["_layers_count"] == 2
+    # Ancestor, self, then the parent's publication layer (ADR 0013 D3).
+    assert result["_layers_count"] == 3
     layers = result["layers"]
     # Root layer (g_arch) must be present even though no summary file exists
-    root_layer = next(layer for layer in layers if layer["scope_id"] == "g_arch")
-    assert root_layer["summary"]["directives"] == []
-    assert root_layer["summary"]["context"] == ""
-    # Issue #59: the synthesized layer is honest about being synthesized —
-    # version=0/exists=False — not a look-alike for a real first write.
-    assert root_layer["summary"]["version"] == 0
-    assert root_layer["summary"]["exists"] is False
+    # — directives only, empty, never a "summary" or "context" key.
+    root_layer = next(layer for layer in layers if layer["relation"] == "ancestor")
+    assert root_layer["scope_id"] == "g_arch"
+    assert root_layer["directives"] == []
+    assert "summary" not in root_layer
+    assert "context" not in root_layer
 
     # The child layer (g_backend) has a real on-disk summary, so it reports
     # a real first write: version=1, exists=True.
     child_layer = next(layer for layer in layers if layer["scope_id"] == "g_backend")
     assert child_layer["summary"]["version"] == 1
     assert child_layer["summary"]["exists"] is True
+
+    # The parent's publication layer is present too, honestly empty.
+    parent_pub_layer = next(layer for layer in layers if layer["relation"] == "parent_publication")
+    assert parent_pub_layer["scope_id"] == "g_arch"
+    assert parent_pub_layer["publication"] == {"items": []}
 
 
 # ---------------------------------------------------------------------------
@@ -921,16 +955,20 @@ async def test_perspective_no_v1_limitation_key(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# ADR 0006 D3 — peer-reference composition
+# ADR 0013 D2/D3 — one-hop publication composition (amends ADR 0006 D3)
 #
-# strata_read_perspective appends one layer per peer referenced (one hop)
-# from any scope on the chain, labelled relation="peer_reference" and
-# binding=False. Self/ancestor layers gain relation="self"/"ancestor" and
-# binding=True. Uses _make_peer_composition_fleet_yaml: g_exec (L0) <-
-# g_func (L1) <- g_team (L2), with g_func referencing g_peer_a and g_peer_b,
-# g_exec referencing g_exec_peer, g_peer_a referencing g_peer_of_peer
-# (two hops from g_team — must not appear), and g_sibling as an unreferenced
-# L1 scope.
+# strata_read_perspective appends exactly one publication layer for the
+# chain parent (relation="parent_publication") and one per scope the
+# REQUESTED SCOPE ITSELF references (relation="peer_reference") — never a
+# grandparent's publication, and never a publication reached only through an
+# ancestor's own reference edge. Self/ancestor layers keep
+# relation="self"/"ancestor" and binding=True; every publication layer is
+# binding=False. Uses _make_peer_composition_fleet_yaml: g_exec (L0) <-
+# g_func (L1) <- g_team (L2), with g_team referencing g_team_peer (its own —
+# composes), g_func referencing g_peer_a/g_peer_b (the PARENT's own — does
+# not compose for g_team), g_exec referencing g_exec_peer (the ROOT's own —
+# does not compose for g_team either), g_peer_a referencing g_peer_of_peer
+# (peer-of-peer, never composes), and g_sibling as an unreferenced L1 scope.
 # ---------------------------------------------------------------------------
 
 
@@ -953,7 +991,7 @@ async def test_perspective_self_and_ancestor_layers_are_binding(tmp_path: Path) 
     chain_layers = {
         layer["scope_id"]: layer
         for layer in result["layers"]
-        if layer["scope_id"] in {"g_exec", "g_func", "g_team"}
+        if layer["relation"] in ("ancestor", "self")
     }
     assert chain_layers["g_exec"]["relation"] == "ancestor"
     assert chain_layers["g_exec"]["binding"] is True
@@ -963,10 +1001,10 @@ async def test_perspective_self_and_ancestor_layers_are_binding(tmp_path: Path) 
     assert chain_layers["g_team"]["binding"] is True
 
 
-async def test_perspective_referenced_peer_appears_as_context_layer(tmp_path: Path) -> None:
-    """A peer referenced by a chain scope appears with relation="peer_reference", binding=False.
+async def test_perspective_own_reference_appears_as_publication_layer(tmp_path: Path) -> None:
+    """A peer referenced by the REQUESTED SCOPE ITSELF appears, relation="peer_reference".
 
-    ADR 0007 D4: the peer layer carries that peer's PUBLICATION, not its
+    ADR 0013 D2/D3: the peer layer carries that peer's PUBLICATION, not its
     internal summary — writing only a summary (no publication artifact)
     leaves the layer with an honestly empty ``publication.items`` list.
     """
@@ -976,7 +1014,7 @@ async def test_perspective_referenced_peer_appears_as_context_layer(tmp_path: Pa
 
     mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
     ss = SummaryStore(summaries_dir)
-    ss.write("g_peer_a", _make_summary("g_peer_a", "peer a context"))
+    ss.write("g_team_peer", _make_summary("g_team_peer", "team peer context"))
 
     fleet = FleetConfig.load(fleet_path)
 
@@ -987,7 +1025,7 @@ async def test_perspective_referenced_peer_appears_as_context_layer(tmp_path: Pa
         mod._summary_store = ss
         result = await mod.strata_read_perspective("g_team")
 
-    peer_layer = next(layer for layer in result["layers"] if layer["scope_id"] == "g_peer_a")
+    peer_layer = next(layer for layer in result["layers"] if layer["scope_id"] == "g_team_peer")
     assert peer_layer["relation"] == "peer_reference"
     assert peer_layer["binding"] is False
     # Never the peer's internal summary — no "summary" key at all.
@@ -995,8 +1033,8 @@ async def test_perspective_referenced_peer_appears_as_context_layer(tmp_path: Pa
     assert peer_layer["publication"] == {"items": []}
 
 
-async def test_perspective_referenced_peer_publication_composed_verbatim(tmp_path: Path) -> None:
-    """A peer's PUBLISHED items compose into the peer layer, verbatim and labelled."""
+async def test_perspective_own_reference_publication_composed_verbatim(tmp_path: Path) -> None:
+    """A referenced peer's PUBLISHED items compose into the peer layer, verbatim and labelled."""
     from strata.publication import PublishedItem, _write_publication
 
     db_path = _make_db(tmp_path)
@@ -1005,14 +1043,16 @@ async def test_perspective_referenced_peer_publication_composed_verbatim(tmp_pat
 
     mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
     ss = SummaryStore(summaries_dir)
-    ss.write("g_peer_a", _make_summary("g_peer_a", "peer a internal context — must NOT appear"))
+    ss.write(
+        "g_team_peer", _make_summary("g_team_peer", "team peer internal context — must NOT appear")
+    )
     _write_publication(
-        "g_peer_a",
+        "g_team_peer",
         [
             PublishedItem(
                 id="pub_a1",
                 kind="context",
-                content="Peer A's outward status update.",
+                content="Team Peer's outward status update.",
                 subject="status",
                 anchors=["subject:status"],
                 published_at="2026-07-12T00:00:00+00:00",
@@ -1030,12 +1070,12 @@ async def test_perspective_referenced_peer_publication_composed_verbatim(tmp_pat
         mod._summary_store = ss
         result = await mod.strata_read_perspective("g_team")
 
-    peer_layer = next(layer for layer in result["layers"] if layer["scope_id"] == "g_peer_a")
+    peer_layer = next(layer for layer in result["layers"] if layer["scope_id"] == "g_team_peer")
     assert peer_layer["publication"]["items"] == [
         {
             "id": "pub_a1",
             "kind": "context",
-            "content": "Peer A's outward status update.",
+            "content": "Team Peer's outward status update.",
             "subject": "status",
             "anchors": ["subject:status"],
             "published_at": "2026-07-12T00:00:00+00:00",
@@ -1046,8 +1086,55 @@ async def test_perspective_referenced_peer_publication_composed_verbatim(tmp_pat
     assert "must NOT appear" not in rendered
 
 
-async def test_perspective_ancestor_referenced_peer_appears(tmp_path: Path) -> None:
-    """A peer referenced by an ANCESTOR (not the scope itself) still appears."""
+async def test_perspective_parent_publication_layer_composed(tmp_path: Path) -> None:
+    """The chain PARENT's publication composes as a dedicated layer (ADR 0013 D3)."""
+    from strata.publication import PublishedItem, _write_publication
+
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_peer_composition_fleet_yaml(tmp_path)
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+    _write_publication(
+        "g_func",
+        [
+            PublishedItem(
+                id="pub_func1",
+                kind="context",
+                content="Function's outward face.",
+                subject=None,
+                anchors=[],
+                published_at="2026-07-12T00:00:00+00:00",
+            )
+        ],
+        summaries_dir=summaries_dir,
+    )
+
+    fleet = FleetConfig.load(fleet_path)
+
+    with (
+        patch.object(mod, "_load_fleet", return_value=fleet),
+        patch.object(mod, "_AGENT_SCOPE", "g_team"),
+    ):
+        mod._summary_store = SummaryStore(summaries_dir)
+        result = await mod.strata_read_perspective("g_team")
+
+    parent_pub_layer = next(
+        layer for layer in result["layers"] if layer["relation"] == "parent_publication"
+    )
+    assert parent_pub_layer["scope_id"] == "g_func"
+    assert parent_pub_layer["binding"] is False
+    assert parent_pub_layer["publication"]["items"][0]["content"] == "Function's outward face."
+
+
+async def test_perspective_ancestor_referenced_peer_does_not_appear(tmp_path: Path) -> None:
+    """A peer referenced by an ANCESTOR (not the requested scope itself) does NOT appear.
+
+    ADR 0013 D3: publication travels exactly one edge. g_exec_peer is
+    referenced by g_exec (the root, two strata up from g_team) — that is
+    g_exec's own reference edge, not g_team's, so it never reaches g_team.
+    Same for g_peer_a/g_peer_b, referenced by g_func (g_team's parent).
+    """
     db_path = _make_db(tmp_path)
     summaries_dir = str(tmp_path / "summaries")
     fleet_path = _make_peer_composition_fleet_yaml(tmp_path)
@@ -1066,10 +1153,21 @@ async def test_perspective_ancestor_referenced_peer_appears(tmp_path: Path) -> N
         result = await mod.strata_read_perspective("g_team")
 
     layer_scope_ids = {layer["scope_id"] for layer in result["layers"]}
-    assert "g_exec_peer" in layer_scope_ids
-    peer_layer = next(layer for layer in result["layers"] if layer["scope_id"] == "g_exec_peer")
-    assert peer_layer["relation"] == "peer_reference"
-    assert peer_layer["binding"] is False
+    assert "g_exec_peer" not in layer_scope_ids
+    assert "g_peer_a" not in layer_scope_ids
+    assert "g_peer_b" not in layer_scope_ids
+
+    # g_func's OWN perspective, though, does receive both — one hop from
+    # g_func itself.
+    with (
+        patch.object(mod, "_load_fleet", return_value=fleet),
+        patch.object(mod, "_AGENT_SCOPE", "g_func"),
+    ):
+        mod._summary_store = ss
+        func_result = await mod.strata_read_perspective("g_func")
+    func_layer_ids = {layer["scope_id"] for layer in func_result["layers"]}
+    assert "g_peer_a" in func_layer_ids
+    assert "g_peer_b" in func_layer_ids
 
 
 async def test_perspective_peer_of_peer_not_traversed(tmp_path: Path) -> None:
@@ -1083,10 +1181,10 @@ async def test_perspective_peer_of_peer_not_traversed(tmp_path: Path) -> None:
 
     with (
         patch.object(mod, "_load_fleet", return_value=fleet),
-        patch.object(mod, "_AGENT_SCOPE", "g_team"),
+        patch.object(mod, "_AGENT_SCOPE", "g_func"),
     ):
         mod._summary_store = SummaryStore(summaries_dir)
-        result = await mod.strata_read_perspective("g_team")
+        result = await mod.strata_read_perspective("g_func")
 
     layer_scope_ids = {layer["scope_id"] for layer in result["layers"]}
     assert "g_peer_of_peer" not in layer_scope_ids
@@ -1132,13 +1230,13 @@ async def test_perspective_peer_without_publication_reports_honestly_empty_face(
         mod._summary_store = SummaryStore(summaries_dir)  # no summaries written anywhere
         result = await mod.strata_read_perspective("g_team")
 
-    peer_layer = next(layer for layer in result["layers"] if layer["scope_id"] == "g_peer_a")
+    peer_layer = next(layer for layer in result["layers"] if layer["scope_id"] == "g_team_peer")
     assert "summary" not in peer_layer
     assert peer_layer["publication"] == {"items": []}
 
 
 async def test_perspective_peer_layers_sorted_by_scope_id(tmp_path: Path) -> None:
-    """Peer layers are ordered by scope id for deterministic output, after self/ancestors."""
+    """Peer layers are ordered by scope id for deterministic output, after self/ancestors/parent."""
     db_path = _make_db(tmp_path)
     summaries_dir = str(tmp_path / "summaries")
     fleet_path = _make_peer_composition_fleet_yaml(tmp_path)
@@ -1148,24 +1246,25 @@ async def test_perspective_peer_layers_sorted_by_scope_id(tmp_path: Path) -> Non
 
     with (
         patch.object(mod, "_load_fleet", return_value=fleet),
-        patch.object(mod, "_AGENT_SCOPE", "g_team"),
+        patch.object(mod, "_AGENT_SCOPE", "g_func"),
     ):
         mod._summary_store = SummaryStore(summaries_dir)
-        result = await mod.strata_read_perspective("g_team")
+        result = await mod.strata_read_perspective("g_func")
 
     layers = result["layers"]
-    # Chain first (root-first: g_exec, g_func, g_team), then peer layers
-    # sorted by scope id: g_exec_peer, g_peer_a, g_peer_b.
+    # Chain first (root-first: g_exec, g_func-self), then g_exec's
+    # parent_publication layer, then g_func's own references sorted by
+    # scope id: g_peer_a, g_peer_b.
     assert [layer["scope_id"] for layer in layers] == [
         "g_exec",
         "g_func",
-        "g_team",
-        "g_exec_peer",
+        "g_exec",
         "g_peer_a",
         "g_peer_b",
     ]
+    assert layers[2]["relation"] == "parent_publication"
     peer_relations = [layer["relation"] for layer in layers[3:]]
-    assert peer_relations == ["peer_reference", "peer_reference", "peer_reference"]
+    assert peer_relations == ["peer_reference", "peer_reference"]
 
 
 # ---------------------------------------------------------------------------
@@ -1351,7 +1450,10 @@ async def test_entitled_no_argument_returns_bound_scope_data(tmp_path: Path) -> 
     assert summary_result["context"] == "team context"
 
     assert perspective_result["scope_id"] == "g_team"
-    assert perspective_result["layers"][-1]["scope_id"] == "g_team"
+    self_layer = next(
+        layer for layer in perspective_result["layers"] if layer["relation"] == "self"
+    )
+    assert self_layer["scope_id"] == "g_team"
 
     assert record_result == {
         "contributions": [],
@@ -1366,7 +1468,12 @@ async def test_entitled_no_argument_returns_bound_scope_data(tmp_path: Path) -> 
 
 
 async def test_entitled_ancestor_read_allowed(tmp_path: Path) -> None:
-    """Reading an inter-stratum ancestor of the bound scope is allowed."""
+    """Reading an inter-stratum ancestor of the bound scope is allowed, directives only.
+
+    A chain edge carries only the ancestor's directives — a direct read of
+    an ancestor scope must not leak its context either, or this tool would
+    reopen exactly the leak perspective composition closes.
+    """
     db_path = _make_db(tmp_path)
     summaries_dir = str(tmp_path / "summaries")
     fleet_path = _make_deep_fleet_yaml(tmp_path)
@@ -1374,7 +1481,10 @@ async def test_entitled_ancestor_read_allowed(tmp_path: Path) -> None:
     mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
 
     ss = SummaryStore(summaries_dir)
-    ss.write("g_exec", _make_summary("g_exec", "executive context"))
+    ss.write(
+        "g_exec",
+        _make_summary("g_exec", "executive context — must never leak through a direct read"),
+    )
 
     fleet = FleetConfig.load(fleet_path)
 
@@ -1386,7 +1496,55 @@ async def test_entitled_ancestor_read_allowed(tmp_path: Path) -> None:
         result = await mod.strata_read_scope_summary("g_exec")
 
     assert result["scope_id"] == "g_exec"
-    assert result["context"] == "executive context"
+    assert result["relation"] == "ancestor"
+    assert result["binding"] is True
+    assert result["directives"] == []
+    assert "context" not in result
+    assert "summary" not in result
+    assert "must never leak" not in str(result)
+
+
+async def test_entitled_ancestor_read_carries_directives(tmp_path: Path) -> None:
+    """An ancestor's directives DO reach a direct read — only its context is withheld."""
+    from strata.summary_store import Directive
+
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_deep_fleet_yaml(tmp_path)
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+
+    ss = SummaryStore(summaries_dir)
+    ss.write(
+        "g_exec",
+        ScopeSummary(
+            scope_id="g_exec",
+            directives=[
+                Directive(
+                    id="c_root1",
+                    content="Root directive — binds everyone.",
+                    subject=None,
+                    source_scope_id="g_exec",
+                    source_skill="architect",
+                    created_at="2026-07-12T00:00:00+00:00",
+                )
+            ],
+            context="executive context",
+            updated_at="2026-07-12T00:00:00+00:00",
+        ),
+    )
+
+    fleet = FleetConfig.load(fleet_path)
+
+    with (
+        patch.object(mod, "_load_fleet", return_value=fleet),
+        patch.object(mod, "_AGENT_SCOPE", "g_team"),
+    ):
+        mod._summary_store = ss
+        result = await mod.strata_read_scope_summary("g_exec")
+
+    assert [d["id"] for d in result["directives"]] == ["c_root1"]
+    assert result["directives"][0]["content"] == "Root directive — binds everyone."
 
 
 async def test_entitled_peer_read_raises_with_entitlement_message(tmp_path: Path) -> None:

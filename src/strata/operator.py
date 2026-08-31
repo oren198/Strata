@@ -268,7 +268,6 @@ def _operator_layer_lock_key(target_scope_id: str) -> str:
 def operator_publish(
     target_scope_id: str,
     content: str,
-    kind: Literal["directive", "context"],
     subject: str | None = None,
     *,
     record_store: RecordStore,
@@ -281,29 +280,37 @@ def operator_publish(
     Not judged (ADR 0008 D1) — the operator's stratum authority is not
     delegated.
 
+    ADR 0013 D5/D7: the operator's ``context`` kind is retired — everything
+    the operator attaches to a scope binds. Every new operator item is a
+    directive; there is no *kind* argument any more, and no way to write a
+    non-binding operator item going forward. A ``context``-kind item written
+    before this ADR stays on disk exactly as it was (D7 — no migration) but
+    stops composing into any perspective (:mod:`strata.perspective`).
+
     Args:
         target_scope_id: The attachment scope — the operator layer's reach
             point (ADR 0008 D2): attached at S, it composes above S and
             binds S's subtree.
         content: Verbatim operator memory text.
-        kind: ``'directive'`` (binds the attachment scope's subtree) or
-            ``'context'`` (informs without binding), exactly like any
-            stratum's memory.
         subject: Optional short subject line.
 
     Returns:
-        The newly published :class:`OperatorItem`.
+        The newly published :class:`OperatorItem` (``kind="directive"``).
     """
     with scope_lock(_operator_layer_lock_key(target_scope_id)):
         act = record_store.append_operator_act(
             act="publish",
             target_scope_id=target_scope_id,
-            kind=kind,
+            kind="directive",
             content=content,
             subject=subject,
         )
         item = OperatorItem(
-            id=act.id, kind=kind, content=content, subject=subject, created_at=act.created_at
+            id=act.id,
+            kind="directive",
+            content=content,
+            subject=subject,
+            created_at=act.created_at,
         )
         items = read_operator_layer(target_scope_id, summaries_dir=summaries_dir)
         items.append(item)
@@ -325,7 +332,15 @@ def operator_supersede_item(
     Appends a ``supersede`` act (``supersedes=item_id``) to the operator's
     own record and rewrites the working layer: the old item is replaced,
     in place, by a new item under a new id. Not judged (ADR 0008 D1). The
-    new item keeps the superseded item's ``kind``.
+    new item is a directive (ADR 0013 D5) — superseding is a fresh operator
+    write, and every fresh operator write binds.
+
+    A ``context``-kind item written before ADR 0013 cannot be superseded:
+    superseding would mint a new, non-binding operator write, which ADR 0013
+    D5/D7 forbids going forward — and re-attributing it to a directive would
+    silently change what it means rather than replace it. Retire it instead
+    (:func:`operator_retire_item`) and publish a fresh directive if the
+    scope still needs the point made.
 
     Args:
         target_scope_id: The attachment scope the item lives at.
@@ -335,10 +350,12 @@ def operator_supersede_item(
             to the superseded item's subject when omitted.
 
     Returns:
-        The new :class:`OperatorItem`.
+        The new :class:`OperatorItem` (``kind="directive"``).
 
     Raises:
         KeyError: *item_id* is not in *target_scope_id*'s current operator layer.
+        ValueError: *item_id* is a legacy ``context``-kind item — retire it
+            instead of superseding it.
     """
     with scope_lock(_operator_layer_lock_key(target_scope_id)):
         items = read_operator_layer(target_scope_id, summaries_dir=summaries_dir)
@@ -349,19 +366,24 @@ def operator_supersede_item(
                 f"{target_scope_id!r}."
             )
         existing = items[index]
+        if existing.kind != "directive":
+            raise ValueError(
+                f"Operator item {item_id!r} is a legacy non-binding item and cannot be "
+                "superseded — retire it and publish a fresh directive instead."
+            )
         effective_subject = subject if subject is not None else existing.subject
 
         act = record_store.append_operator_act(
             act="supersede",
             target_scope_id=target_scope_id,
-            kind=existing.kind,
+            kind="directive",
             content=content,
             subject=effective_subject,
             supersedes=item_id,
         )
         new_item = OperatorItem(
             id=act.id,
-            kind=existing.kind,
+            kind="directive",
             content=content,
             subject=effective_subject,
             created_at=act.created_at,
@@ -431,9 +453,15 @@ def operator_memory_binding(
     "Binding" here means: attached at *scope_id* itself, or at any of its
     inter-stratum ancestors — the same chain :mod:`strata.perspective`
     composes (ADR 0008 D2) and :mod:`strata.scope_manager` renders to the
-    scope-manager (ADR 0008 D3). Only chain scopes that actually HAVE
-    operator memory are included — an unattached ancestor contributes no
-    entry.
+    scope-manager (ADR 0008 D3). Only chain scopes that actually HAVE at
+    least one DIRECTIVE-kind operator item are included — an unattached
+    ancestor contributes no entry, and so does one whose operator memory is
+    entirely legacy ``context``-kind items (ADR 0013 D5/D7): such an item is
+    inert — it does not bind (it is not a directive) and it does not inform
+    (it stopped composing), so rendering it to a judge under a binding
+    header would be exactly the dishonesty D5 ends. The item stays on disk,
+    untouched; this reader just stops surfacing it here, the same boundary
+    :mod:`strata.perspective` filters at.
 
     Args:
         scope_id: The scope whose binding operator memory to resolve.
@@ -441,8 +469,8 @@ def operator_memory_binding(
         summaries_dir: The summaries directory operator layers live under.
 
     Returns:
-        ``[(attachment_scope_id, items), ...]`` root-first, one entry per
-        chain scope that has operator memory.
+        ``[(attachment_scope_id, directive_items), ...]`` root-first, one
+        entry per chain scope with at least one directive-kind item.
 
     Raises:
         ValueError: *scope_id* is not found in *fleet*.
@@ -454,7 +482,11 @@ def operator_memory_binding(
     chain = [*fleet.inter_stratum_ancestors(scope_id), scope]
     binding: list[tuple[str, list[OperatorItem]]] = []
     for s in chain:
-        items = read_operator_layer(s.id, summaries_dir=summaries_dir)
+        items = [
+            item
+            for item in read_operator_layer(s.id, summaries_dir=summaries_dir)
+            if item.kind == "directive"
+        ]
         if items:
             binding.append((s.id, items))
     return binding
