@@ -1006,9 +1006,17 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     settings_error: str | None = None
     if settings_json.exists():
         try:
-            settings_data = json.loads(settings_json.read_text(encoding="utf-8"))
+            loaded_settings_json = json.loads(settings_json.read_text(encoding="utf-8"))
         except json.JSONDecodeError as exc:
-            settings_error = str(exc)
+            settings_error = f"not valid JSON ({exc})"
+        else:
+            # Valid JSON but not an object (e.g. `[]`, `null`, a bare string)
+            # — .get()/settings lookups below assume a dict; route this
+            # through the same "fix the file" message rather than crashing.
+            if isinstance(loaded_settings_json, dict):
+                settings_data = loaded_settings_json
+            else:
+                settings_error = f"not a JSON object (got {type(loaded_settings_json).__name__})"
 
     # -----------------------------------------------------------------------
     # 4. MCP server entry present — checked in `.mcp.json`, the file Claude
@@ -1181,7 +1189,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                 kind="hard",
                 passed=False,
                 message=(
-                    f".claude/settings.json is not valid JSON ({settings_error}) — fix the "
+                    f".claude/settings.json is {settings_error} — fix the "
                     "file, then run 'strata register' to add the Stop hook entry."
                 ),
             )
@@ -2832,12 +2840,12 @@ def cmd_register(args: argparse.Namespace) -> int:
         settings_json = project_root / ".claude" / "settings.json"
         if settings_json.exists():
             try:
-                settings_data: dict = json.loads(settings_json.read_text(encoding="utf-8"))
+                loaded_settings_json = json.loads(settings_json.read_text(encoding="utf-8"))
             except json.JSONDecodeError as exc:
                 # NEVER fall through to a write here: writing with an empty dict
                 # would replace the user's entire settings file with just the
                 # Stop hook entry. Skip the merge outright and fail the run so
-                # the user notices ("never overwrite user state" — ADR 0005 D6).
+                # the user notices ("never overwrite user state").
                 print(
                     f"  {_glyph('fail')} .claude/settings.json exists but is not valid JSON "
                     f"({exc}).\n"
@@ -2846,7 +2854,23 @@ def cmd_register(args: argparse.Namespace) -> int:
                     file=sys.stderr,
                 )
                 settings_unreadable = True
-                settings_data = {}
+                settings_data: dict = {}
+            else:
+                # Valid JSON but not an object (`[]`, `null`, ...) — never
+                # fall through to a write here either; the merge below
+                # assumes a dict.
+                if isinstance(loaded_settings_json, dict):
+                    settings_data = loaded_settings_json
+                else:
+                    print(
+                        f"  {_glyph('fail')} .claude/settings.json exists but is not a JSON "
+                        f"object (got {type(loaded_settings_json).__name__}).\n"
+                        "    Fix the file, then re-run `strata register` to add the freshness "
+                        "Stop hook entry.",
+                        file=sys.stderr,
+                    )
+                    settings_unreadable = True
+                    settings_data = {}
         else:
             settings_data = {}
 
@@ -3373,6 +3397,12 @@ def _wired_harnesses(project_root: Path) -> list[str]:
             # Corrupt JSON is not proof there's nothing wired — treat it as
             # conservatively "possibly wired".
             return True
+        if not isinstance(data, dict):
+            # Valid JSON but not an object (`[]`, `null`, ...) — same
+            # "possibly wired" conservatism as corrupt JSON; the actual
+            # unregister step below reports this properly instead of
+            # crashing.
+            return True
         # `_mcp_server_present` here also catches a not-yet-migrated legacy
         # entry (earlier releases wrote mcpServers.strata into settings.json).
         return _mcp_server_present(data) or _stop_hook_present(data)
@@ -3593,14 +3623,25 @@ def cmd_unregister(args: argparse.Namespace) -> int:
         if not settings_json.exists():
             _ok(".claude/settings.json: nothing to do (no settings.json)")
         else:
+            settings_data: dict | None
             try:
-                settings_data: dict = json.loads(settings_json.read_text(encoding="utf-8"))
+                loaded_settings_json = json.loads(settings_json.read_text(encoding="utf-8"))
             except json.JSONDecodeError as exc:
                 _left(
                     f".claude/settings.json: not valid JSON ({exc}) — left untouched "
                     "(fix it, then re-run)"
                 )
-                settings_data = None  # type: ignore[assignment]
+                settings_data = None
+            else:
+                if isinstance(loaded_settings_json, dict):
+                    settings_data = loaded_settings_json
+                else:
+                    _left(
+                        f".claude/settings.json: must be a JSON object, got "
+                        f"{type(loaded_settings_json).__name__} — left untouched (fix it, "
+                        "then re-run)"
+                    )
+                    settings_data = None
 
             if settings_data is not None:
                 settings_changed = False

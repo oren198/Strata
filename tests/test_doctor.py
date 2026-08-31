@@ -409,6 +409,31 @@ def test_doctor_null_mcp_json_does_not_crash(
     assert rc == 1
 
 
+def test_doctor_non_dict_settings_json_does_not_crash(
+    registered_project: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """`.claude/settings.json` containing `[]` (valid JSON, not an object)
+    must be reported as a hard-check failure, not crash with AttributeError."""
+    (registered_project / ".claude" / "settings.json").write_text("[]", encoding="utf-8")
+
+    rc, output = _run_doctor(capsys)
+
+    assert rc == 1
+    lower = output.lower()
+    assert "settings.json" in lower
+
+
+def test_doctor_null_settings_json_does_not_crash(
+    registered_project: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """`null` is valid JSON but not an object — must not crash doctor."""
+    (registered_project / ".claude" / "settings.json").write_text("null", encoding="utf-8")
+
+    rc, output = _run_doctor(capsys)
+
+    assert rc == 1
+
+
 # ---------------------------------------------------------------------------
 # 5. Stop hook script present and matching shipped.
 # ---------------------------------------------------------------------------
