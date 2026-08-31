@@ -38,6 +38,10 @@ POST /fleet/validate
     Dry-run validate submitted fleet.yaml text through the engine's own load
     path. Never writes.
 
+PUT /fleet
+    Save fleet.yaml: validate, back up, atomic write, hot-swap the in-memory
+    FleetConfig. 409 on a stale etag (D4); UI-only, no engine flow calls it.
+
 GET /scopes/{scope_id}/summary
     Return the scope summary.  200 with a synthesized empty summary
     (``version=0``, ``exists=False``) if the scope exists but has no summary
@@ -325,6 +329,18 @@ class FleetYamlBody(BaseModel):
     """Request body for ``POST /fleet/validate`` — the raw text to check."""
 
     yaml: str
+
+
+class FleetSaveBody(BaseModel):
+    """Request body for ``PUT /fleet``.
+
+    ``etag`` must match the sha256 of the fleet.yaml bytes on disk right
+    now (D4) — carried forward from a prior ``GET /fleet`` — or the save is
+    refused with 409 rather than silently overwriting a concurrent edit.
+    """
+
+    yaml: str
+    etag: str
 
 
 class SupersedeDirectiveRequest(BaseModel):
@@ -1335,6 +1351,64 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
                 detail={"error": "invalid_fleet", "detail": exc.detail},
             ) from exc
         return {"ok": True, "scopes": len(fleet.scopes), "edges": len(fleet.edges)}
+
+    @application.put("/fleet")
+    def save_fleet(body: FleetSaveBody, request: Request) -> dict:
+        """Save fleet.yaml: validate -> etag check -> back up -> atomic write -> hot swap.
+
+        In that order (D2, D4, D5): nothing is written unless the submitted
+        text loads cleanly AND the file on disk still matches the etag the
+        caller last read. Every fleet-reading route reads through
+        ``app.state.fleet_reloader``, which stats fleet.yaml before serving
+        (ADR 0002 addendum) — so the ``os.replace`` below is itself the hot
+        swap: the very next fleet-reading call sees the new mtime/size and
+        reloads, with no extra state to keep in sync by hand.
+        """
+        reloader: FleetReloader = request.app.state.fleet_reloader
+        fleet_path = reloader.path
+
+        try:
+            _load_fleet_from_text(body.yaml)
+        except InvalidFleetYaml as exc:
+            raise HTTPException(
+                status_code=422,
+                detail={"error": "invalid_fleet", "detail": exc.detail},
+            ) from exc
+
+        try:
+            current_bytes = fleet_path.read_bytes()
+        except OSError:
+            current_bytes = b""
+        if body.etag != _fleet_etag(current_bytes):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "fleet_changed",
+                    "detail": (
+                        "the fleet file changed since you loaded it — reload and reapply your edit"
+                    ),
+                },
+            )
+
+        backup_path = fleet_path.with_name(fleet_path.name + ".bak")
+        backup_path.write_bytes(current_bytes)
+
+        tmp_path = fleet_path.with_name(fleet_path.name + ".tmp")
+        tmp_path.write_bytes(body.yaml.encode("utf-8"))
+        os.replace(tmp_path, fleet_path)
+
+        fresh_fleet = reloader.get()
+
+        return {
+            "saved": True,
+            "backup": str(backup_path),
+            "scopes": len(fresh_fleet.scopes),
+            "edges": len(fresh_fleet.edges),
+            "note": (
+                "running agent sessions keep the fleet they started with — "
+                "restart them to pick this up"
+            ),
+        }
 
     # -----------------------------------------------------------------------
     # GET /staleness
