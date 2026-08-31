@@ -1468,7 +1468,12 @@ async def test_entitled_no_argument_returns_bound_scope_data(tmp_path: Path) -> 
 
 
 async def test_entitled_ancestor_read_allowed(tmp_path: Path) -> None:
-    """Reading an inter-stratum ancestor of the bound scope is allowed."""
+    """Reading an inter-stratum ancestor of the bound scope is allowed, directives only.
+
+    A chain edge carries only the ancestor's directives — a direct read of
+    an ancestor scope must not leak its context either, or this tool would
+    reopen exactly the leak perspective composition closes.
+    """
     db_path = _make_db(tmp_path)
     summaries_dir = str(tmp_path / "summaries")
     fleet_path = _make_deep_fleet_yaml(tmp_path)
@@ -1476,7 +1481,10 @@ async def test_entitled_ancestor_read_allowed(tmp_path: Path) -> None:
     mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
 
     ss = SummaryStore(summaries_dir)
-    ss.write("g_exec", _make_summary("g_exec", "executive context"))
+    ss.write(
+        "g_exec",
+        _make_summary("g_exec", "executive context — must never leak through a direct read"),
+    )
 
     fleet = FleetConfig.load(fleet_path)
 
@@ -1488,7 +1496,55 @@ async def test_entitled_ancestor_read_allowed(tmp_path: Path) -> None:
         result = await mod.strata_read_scope_summary("g_exec")
 
     assert result["scope_id"] == "g_exec"
-    assert result["context"] == "executive context"
+    assert result["relation"] == "ancestor"
+    assert result["binding"] is True
+    assert result["directives"] == []
+    assert "context" not in result
+    assert "summary" not in result
+    assert "must never leak" not in str(result)
+
+
+async def test_entitled_ancestor_read_carries_directives(tmp_path: Path) -> None:
+    """An ancestor's directives DO reach a direct read — only its context is withheld."""
+    from strata.summary_store import Directive
+
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_deep_fleet_yaml(tmp_path)
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+
+    ss = SummaryStore(summaries_dir)
+    ss.write(
+        "g_exec",
+        ScopeSummary(
+            scope_id="g_exec",
+            directives=[
+                Directive(
+                    id="c_root1",
+                    content="Root directive — binds everyone.",
+                    subject=None,
+                    source_scope_id="g_exec",
+                    source_skill="architect",
+                    created_at="2026-07-12T00:00:00+00:00",
+                )
+            ],
+            context="executive context",
+            updated_at="2026-07-12T00:00:00+00:00",
+        ),
+    )
+
+    fleet = FleetConfig.load(fleet_path)
+
+    with (
+        patch.object(mod, "_load_fleet", return_value=fleet),
+        patch.object(mod, "_AGENT_SCOPE", "g_team"),
+    ):
+        mod._summary_store = ss
+        result = await mod.strata_read_scope_summary("g_exec")
+
+    assert [d["id"] for d in result["directives"]] == ["c_root1"]
+    assert result["directives"][0]["content"] == "Root directive — binds everyone."
 
 
 async def test_entitled_peer_read_raises_with_entitlement_message(tmp_path: Path) -> None:

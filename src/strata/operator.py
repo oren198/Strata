@@ -453,9 +453,15 @@ def operator_memory_binding(
     "Binding" here means: attached at *scope_id* itself, or at any of its
     inter-stratum ancestors — the same chain :mod:`strata.perspective`
     composes (ADR 0008 D2) and :mod:`strata.scope_manager` renders to the
-    scope-manager (ADR 0008 D3). Only chain scopes that actually HAVE
-    operator memory are included — an unattached ancestor contributes no
-    entry.
+    scope-manager (ADR 0008 D3). Only chain scopes that actually HAVE at
+    least one DIRECTIVE-kind operator item are included — an unattached
+    ancestor contributes no entry, and so does one whose operator memory is
+    entirely legacy ``context``-kind items (ADR 0013 D5/D7): such an item is
+    inert — it does not bind (it is not a directive) and it does not inform
+    (it stopped composing), so rendering it to a judge under a binding
+    header would be exactly the dishonesty D5 ends. The item stays on disk,
+    untouched; this reader just stops surfacing it here, the same boundary
+    :mod:`strata.perspective` filters at.
 
     Args:
         scope_id: The scope whose binding operator memory to resolve.
@@ -463,8 +469,8 @@ def operator_memory_binding(
         summaries_dir: The summaries directory operator layers live under.
 
     Returns:
-        ``[(attachment_scope_id, items), ...]`` root-first, one entry per
-        chain scope that has operator memory.
+        ``[(attachment_scope_id, directive_items), ...]`` root-first, one
+        entry per chain scope with at least one directive-kind item.
 
     Raises:
         ValueError: *scope_id* is not found in *fleet*.
@@ -476,7 +482,11 @@ def operator_memory_binding(
     chain = [*fleet.inter_stratum_ancestors(scope_id), scope]
     binding: list[tuple[str, list[OperatorItem]]] = []
     for s in chain:
-        items = read_operator_layer(s.id, summaries_dir=summaries_dir)
+        items = [
+            item
+            for item in read_operator_layer(s.id, summaries_dir=summaries_dir)
+            if item.kind == "directive"
+        ]
         if items:
             binding.append((s.id, items))
     return binding

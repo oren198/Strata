@@ -336,6 +336,26 @@ def test_multiple_items_coexist_in_one_layer_file(record_store, summaries_dir) -
     assert by_id[b.id].kind == "context"
 
 
+def test_new_directive_write_does_not_stealth_migrate_a_legacy_context_item(
+    record_store, summaries_dir
+) -> None:
+    """ADR 0013 D7: a fresh operator_publish read-modify-writes the layer file — the
+    legacy context item already on disk must survive that write byte-for-byte
+    identical, not be silently dropped or reclassified."""
+    legacy = _seed_legacy_context_item(
+        "g_team", "Old observation.", record_store=record_store, summaries_dir=summaries_dir
+    )
+    fresh = operator_publish(
+        "g_team", "New directive.", record_store=record_store, summaries_dir=summaries_dir
+    )
+
+    items = read_operator_layer("g_team", summaries_dir=summaries_dir)
+    by_id = {item.id: item for item in items}
+    assert by_id[legacy.id] == legacy
+    assert by_id[legacy.id].kind == "context"
+    assert by_id[fresh.id].kind == "directive"
+
+
 def test_layers_for_different_scopes_are_independent_files(record_store, summaries_dir) -> None:
     operator_publish("g_team", "team item", record_store=record_store, summaries_dir=summaries_dir)
     operator_publish("g_func", "func item", record_store=record_store, summaries_dir=summaries_dir)
@@ -383,6 +403,39 @@ def test_memory_binding_empty_when_nothing_attached(fleet, summaries_dir) -> Non
 def test_memory_binding_unknown_scope_raises(fleet, summaries_dir) -> None:
     with pytest.raises(ValueError, match="g_nonexistent"):
         operator_memory_binding("g_nonexistent", fleet=fleet, summaries_dir=summaries_dir)
+
+
+def test_memory_binding_excludes_legacy_context_items(fleet, record_store, summaries_dir) -> None:
+    """ADR 0013 D5/D7: a legacy context-kind item is inert — it neither binds (not a
+    directive) nor informs (it stopped composing) — so it is absent from the binding
+    judgment renders against, alongside a directive at the same attachment scope."""
+    _seed_legacy_context_item(
+        "g_team", "Old observation.", record_store=record_store, summaries_dir=summaries_dir
+    )
+    operator_publish(
+        "g_team", "Still binds.", record_store=record_store, summaries_dir=summaries_dir
+    )
+
+    binding = operator_memory_binding("g_team", fleet=fleet, summaries_dir=summaries_dir)
+    assert [scope_id for scope_id, _ in binding] == ["g_team"]
+    items = dict(binding)["g_team"]
+    assert [item.kind for item in items] == ["directive"]
+    assert [item.content for item in items] == ["Still binds."]
+
+
+def test_memory_binding_excludes_scope_with_only_legacy_context(
+    fleet, record_store, summaries_dir
+) -> None:
+    """A chain scope whose ONLY operator memory is a legacy context item contributes no entry."""
+    _seed_legacy_context_item(
+        "g_exec", "Old observation.", record_store=record_store, summaries_dir=summaries_dir
+    )
+    operator_publish(
+        "g_team", "Team directive.", record_store=record_store, summaries_dir=summaries_dir
+    )
+
+    binding = operator_memory_binding("g_team", fleet=fleet, summaries_dir=summaries_dir)
+    assert [scope_id for scope_id, _ in binding] == ["g_team"]
 
 
 # ---------------------------------------------------------------------------

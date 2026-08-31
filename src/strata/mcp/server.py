@@ -637,8 +637,8 @@ def _check_entitled(fleet: FleetConfig, agent_scope: str, scope_id: str) -> None
             "composed for your own chain, not a peer's. A scope reachable "
             "only through a reference edge informs you via "
             "strata_read_scope_summary and as a non-binding peer_reference "
-            "layer inside your own perspective (ADR 0006 D3/D4) — never as "
-            "its own record or perspective target."
+            "layer inside your own perspective — never as its own record or "
+            "perspective target."
         )
 
 
@@ -2305,38 +2305,48 @@ async def strata_withdraw(item_id: str) -> dict:
 
 @mcp.tool()
 async def strata_read_scope_summary(scope_id: str | None = None) -> dict:
-    """Return the scope summary for the given scope — or a referenced scope's publication.
+    """Return the scope summary for the given scope — or its directives, or its publication.
 
-    For your own bound scope or an inter-stratum ancestor, this returns the
-    scope summary: the curated, condensed working view of a scope, maintained
-    by its scope-manager, with two sections — directives (binding decisions
-    that propagate to all descendant scopes) and context (non-binding
+    For your own bound scope, this returns the full scope summary: the
+    curated, condensed working view of a scope, maintained by its
+    scope-manager, with two sections — directives (binding decisions that
+    propagate to all descendant scopes) and context (non-binding
     observations and knowledge).
 
-    For a chain-REFERENCED scope (ADR 0007 D4: the ADR 0006 D3 amendment),
-    this returns that scope's **publication** instead — its curated, judged
-    outward face — never its internal summary. The entitled content across a
-    reference was always "its outward face" (CONTEXT.md § Reference edge:
-    "what a reference edge delivers is the referenced scope's publication —
-    never its full internal summary"); the face just became a real, judged
-    artifact rather than the whole internal summary.
+    For an inter-stratum ANCESTOR, this returns that scope's **directives
+    only** — a chain edge carries directives, full fidelity, never the
+    ancestor's context, so a direct read of an ancestor scope stays as
+    honest as the composed perspective already is: the ancestor's context is
+    its own working memory, not something a descendant is entitled to.
+
+    For a chain-REFERENCED scope, this returns that scope's **publication**
+    instead — its curated, judged outward face — never its internal
+    summary. The entitled content across a reference was always "its
+    outward face" (CONTEXT.md § Reference edge: "what a reference edge
+    delivers is the referenced scope's publication — never its full
+    internal summary"); the face is a real, judged artifact, never the
+    whole internal summary.
 
     Args:
-        scope_id: The scope whose summary (or publication) to read (e.g.
-            ``g_arch``). Defaults to this agent's bound scope. An explicit
-            scope_id must be within this agent's entitled *context* surface
-            (ADR 0006 D3/D4): the bound scope, one of its inter-stratum
-            ancestors, or a scope referenced by a scope on that chain via a
-            reference edge. Unreferenced scopes and descendants are not
-            directly readable.
+        scope_id: The scope whose summary/directives/publication to read
+            (e.g. ``g_arch``). Defaults to this agent's bound scope. An
+            explicit scope_id must be within this agent's entitled *context*
+            surface: the bound scope, one of its inter-stratum ancestors, or
+            a scope referenced by a scope on that chain via a reference
+            edge. Unreferenced scopes and descendants are not directly
+            readable.
 
     Returns:
-        For own scope / ancestor: parsed scope summary — ``scope_id``,
+        For your own scope: the parsed scope summary — ``scope_id``,
         ``directives``, ``context``, ``updated_at``, ``version``, ``exists``.
         If the scope has no summary on disk yet, a synthesized empty summary
         is returned with ``version=0`` and ``exists=False`` — distinguishable
         from a real first write (``version=1``, ``exists=True``); see
         :class:`strata.summary_store.ScopeSummary`.
+
+        For an inter-stratum ancestor: ``{"scope_id": ..., "stratum_id":
+        ..., "relation": "ancestor", "binding": True, "directives": [...]}``
+        — no ``"context"`` or ``"summary"`` key at all.
 
         For a chain-referenced scope: ``{"scope_id": ..., "relation":
         "peer_reference", "publication": {"items": [<item dicts: id, kind,
@@ -2364,8 +2374,8 @@ async def strata_read_scope_summary(scope_id: str | None = None) -> dict:
     # toward the session asymmetry counters and the per-scope staleness metric.
     _record_read(scope_id)
 
-    # ADR 0007 D4: a chain-referenced scope (not the bound scope, not an
-    # ancestor) is entitled for its OUTWARD FACE, never its internal summary.
+    # A chain-referenced scope (not the bound scope, not an ancestor) is
+    # entitled for its OUTWARD FACE, never its internal summary.
     chain_ids = {s.id for s in fleet.entitlement_view(_AGENT_SCOPE).chain}
     if scope_id not in chain_ids:
         items = read_publication(scope_id, summaries_dir=_summaries_dir)
@@ -2374,6 +2384,23 @@ async def strata_read_scope_summary(scope_id: str | None = None) -> dict:
                 "scope_id": scope_id,
                 "relation": "peer_reference",
                 "publication": {"items": [_publication_item_dict(i) for i in items]},
+            }
+        )
+
+    if scope_id != _AGENT_SCOPE:
+        # A chain edge carries only the ancestor's directives, never its
+        # context — a direct read of an ancestor scope stays honest with
+        # what perspective composition already withholds; the ancestor's
+        # own context is that scope's working memory, not this reader's.
+        ancestor_summary = _summary_store.read(scope_id)
+        directives = ancestor_summary.directives if ancestor_summary is not None else []
+        return _attach_nudge(
+            {
+                "scope_id": scope_id,
+                "stratum_id": scope.stratum_id,
+                "relation": "ancestor",
+                "binding": True,
+                "directives": [d.model_dump() for d in directives],
             }
         )
 
@@ -2405,42 +2432,49 @@ async def strata_read_perspective(scope_id: str | None = None) -> dict:
     """Return this agent's perspective on the fleet's long-term memory.
 
     A perspective is a composed, provenance-preserving view of: the scope's
-    own summary, all inter-stratum ancestor summaries up to the root, and —
-    ADR 0006 D3, delivering the referenced scope's **publication** per the
-    ADR 0007 D4 amendment — the outward face of any scopes referenced (one
-    hop, via a reference edge) by a scope on that chain. Layers are ordered
-    root-first: ancestors first, then the requested scope's own layer, then
-    referenced-scope layers (sorted by scope id for deterministic ordering).
+    own summary; the **directives** of every inter-stratum ancestor up to
+    the root, full walk, root-first — never an ancestor's context, which
+    stays inside that scope; and the **publication** of every scope exactly
+    one edge away — the immediate chain parent, and any scope this scope
+    itself references — never a grandparent's publication, and never one
+    reached only through an ancestor's own reference edge. Layers are
+    ordered root-first: ancestor directive layers, then the requested
+    scope's own layer, then the parent's publication layer (if any), then
+    referenced-scope publication layers (sorted by scope id for
+    deterministic ordering).
 
-    Every layer carries ``relation`` (``"self"``, ``"ancestor"``, or
-    ``"peer_reference"``) and ``binding`` (``True`` for self/ancestor layers,
-    ``False`` for reference layers). Reference layers are **context only** —
-    nothing in them binds the reader, whether the referenced scope sits on
-    your own stratum, above it, or below it (ADR 0010 D2); each is labelled
-    with that scope's own stratum. Self/ancestor layers carry that scope's
-    full ``summary``; reference layers carry the referenced scope's CURRENT
+    Every layer carries ``relation`` (``"self"``, ``"ancestor"``,
+    ``"parent_publication"``, or ``"peer_reference"``) and ``binding``
+    (``True`` for self/ancestor layers, ``False`` for every publication
+    layer, wherever it came from). Publication layers are non-binding at any
+    stratum distance or edge type, each labelled with the source scope's own
+    stratum. Self layers carry that scope's full ``summary``; ancestor
+    layers carry ``directives`` only (a list, never a ``summary`` or
+    ``context`` key); publication layers carry the source scope's CURRENT
     ``publication`` (``{"items": [...]}``, verbatim, never its internal
     summary — a scope that has published nothing gets an empty ``items``
     list, the honestly empty face). References-of-references are not
-    traversed: only edges whose source scope is itself on the chain count
-    (one hop, per ``FleetConfig.entitlement_view``).
+    traversed, and an ancestor's own reference edges are never this scope's
+    to compose — only this scope's own outgoing reference edges count, one
+    hop.
 
     If a chain scope has no summary on disk yet, its layer is still included
-    with empty directives and context so that the structure is visible; that
-    layer's summary honestly reports ``version=0``/``exists=False`` rather
-    than looking like a real first write.
+    with an honestly empty payload so the structure stays visible; a self
+    layer's synthesized summary reports ``version=0``/``exists=False``
+    rather than looking like a real first write.
 
     Args:
         scope_id: The scope for which to build the perspective. Defaults to
             this agent's bound scope. An explicit scope_id must be the bound
-            scope or one of its inter-stratum ancestors — this is
-            the perspective *target*, which stays chain-only (ADR 0006 D4):
-            you compose a perspective for your own chain, not for a peer's.
+            scope or one of its inter-stratum ancestors — this is the
+            perspective *target*, which stays chain-only: you compose a
+            perspective for your own chain, not for a peer's.
 
     Returns:
         ``{layers: [{scope_id, stratum_id, relation, binding, summary |
-        publication}], scope_id: <requested>, _layers_count: N}`` ordered
-        root-first, then self, then sorted peer layers.
+        directives | publication}], scope_id: <requested>, _layers_count:
+        N}`` ordered root-first, then self, then the parent's publication
+        layer, then sorted referenced-scope publication layers.
 
     Raises:
         RuntimeError: If the scope is unknown, or if scope_id is outside this
