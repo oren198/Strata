@@ -80,6 +80,7 @@ from strata.project_config import (
     ProjectConfigError,
     StoragePaths,
     load_project_config,
+    resolve_storage_paths,
 )
 from strata.publication import PublishedItem, propose_publish, propose_withdraw, read_publication
 from strata.record_store import ContributorRef, RecordStore
@@ -310,6 +311,39 @@ _STARTUP_ERRORS_BINDING: list[str] = []
 # that came back non-accept once isn't locked out of elicitation forever by
 # that.
 _ELICIT_UNAVAILABLE: bool = False
+
+
+def _reset_elicit_state() -> None:
+    """Clear the two elicit-adjacent module globals — _ELICIT_UNAVAILABLE
+    and _PENDING_SWITCH — without performing a bind.
+
+    Review follow-up: this server binds one session per process
+    (_AGENT_SESSION_ID is resolved once, at import, and documented as never
+    changing — see its module-level comment), so "per-process" already
+    means "per-session" here; splitting _ELICIT_UNAVAILABLE out to be
+    per-session while every sibling global (_AGENT_SCOPE, _AGENT_SKILL,
+    _UNRESOLVED, both startup-error lists, _PENDING_SWITCH) stays
+    module-global would be inconsistent with the rest of this module's
+    design, not a fix. The actual gap: the only place either global was
+    ever cleared was inside a successful strata_bind (and, for
+    _ELICIT_UNAVAILABLE alone, a successful _attempt_elicit_bind) — a
+    caller (chiefly a test) that needs to reset this state WITHOUT also
+    performing a bind had no way to do it short of reloading the whole
+    module via sys.modules. This function is that explicit reset path.
+
+    Not called from strata_bind's or _attempt_elicit_bind's own
+    successful-bind clearing: both already hold _binding_lock (a plain,
+    non-reentrant threading.Lock) while clearing these alongside the
+    binding fields they update atomically with it — calling this function
+    (which acquires the same lock) from inside that block would deadlock.
+    Those two sites keep their own inline, lock-protected clears; this
+    function is for every OTHER caller that wants the same reset without
+    performing a bind.
+    """
+    global _ELICIT_UNAVAILABLE, _PENDING_SWITCH
+    with _binding_lock:
+        _ELICIT_UNAVAILABLE = False
+        _PENDING_SWITCH = None
 
 
 @dataclass
@@ -2825,30 +2859,15 @@ def main() -> None:
             "the server — this is read once, at process start."
         )
 
-    # Resolve storage paths from the project_config ALREADY loaded above,
-    # never by calling resolve_storage_paths() (which would call
-    # load_project_config() a second time, independently) — review
-    # follow-up: an invalid .strata/config.toml made that second call raise
-    # the SAME ProjectConfigError again, uncaught, crashing main() with a
-    # raw traceback instead of degrading gracefully like every other
-    # config-class failure. Mirrors resolve_storage_paths' own precedence
-    # (project wins; env settings are the fallback) without re-deriving it.
-    if project_config is not None:
-        paths = StoragePaths(
-            db_path=str(project_config.db),
-            summaries_dir=str(project_config.summaries_dir),
-            fleet_yaml_path=str(project_config.fleet_yaml),
-            source="project",
-            project_root=project_config.project_root,
-        )
-    else:
-        paths = StoragePaths(
-            db_path=_settings.db_path,
-            summaries_dir=_settings.summaries_dir,
-            fleet_yaml_path=_settings.fleet_yaml_path,
-            source="env",
-            project_root=None,
-        )
+    # Resolve storage paths through resolve_storage_paths() — the ONE place
+    # the project-wins/env-fallback precedence is decided — but inject the
+    # project_config ALREADY loaded above via its `project=` parameter,
+    # rather than letting it call load_project_config() a second time,
+    # independently. Review follow-up: an invalid .strata/config.toml made
+    # that second call raise the SAME ProjectConfigError again, uncaught,
+    # crashing main() with a raw traceback instead of degrading gracefully
+    # like every other config-class failure.
+    paths = resolve_storage_paths(_settings, project=project_config)
     _set_paths(paths)
 
     # Load fleet only when we have a config; without one there's nothing to

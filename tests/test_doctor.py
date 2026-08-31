@@ -696,6 +696,30 @@ def test_doctor_flags_scope_not_in_fleet(
     assert "g_does_not_exist" in lower
 
 
+def test_doctor_flags_archived_scope(
+    registered_project: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """A binding against an archived scope must fail doctor the same way it
+    fails strata_bind — doctor and the MCP server must agree on what a valid
+    binding is (unified via ``_check_scope_exists(require_active=True)``)."""
+    fleet_yaml = registered_project / ".strata" / "fleet.yaml"
+    fleet_yaml.write_text(
+        "strata:\n  - id: L0\n    name: root\n    ordinal: 0\n"
+        "scopes:\n  - id: g_root\n    name: Root\n    stratum_id: L0\n"
+        "    status: archived\n"
+        "edges: []\n",
+        encoding="utf-8",
+    )
+
+    rc, output = _run_doctor(capsys)
+
+    assert rc == 1
+    lower = output.lower()
+    assert "binding" in lower
+    assert "archived" in lower
+    assert "g_root" in lower
+
+
 def test_doctor_flags_skill_not_permitted(
     registered_project: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
 ) -> None:
