@@ -131,6 +131,12 @@ def _shipped_hook_text() -> str:
     )
 
 
+def _shipped_session_start_hook_text() -> str:
+    return (
+        importlib.resources.files("strata") / "_hooks" / install.HOOK_SCRIPT_NAME_SESSION_START
+    ).read_text(encoding="utf-8")
+
+
 def _shipped_agents_block() -> str:
     return install._shipped_agents_md_block()  # noqa: SLF001
 
@@ -508,6 +514,18 @@ def test_release_discipline_hashes_are_current() -> None:
         "shipped strata-stop-hook content changed but _HISTORICAL_ARTIFACT_HASHES "
         "was not updated — move the old 'current' hash into 'historical' and "
         "record the new 'current'."
+    )
+
+    session_start_hook_hash = hashlib.sha256(
+        _shipped_session_start_hook_text().encode("utf-8")
+    ).hexdigest()
+    recorded_session_start_hook = install._HISTORICAL_ARTIFACT_HASHES[  # noqa: SLF001
+        "strata-session-start-hook"
+    ]["current"]
+    assert session_start_hook_hash == recorded_session_start_hook, (
+        "shipped strata-session-start-hook content changed but "
+        "_HISTORICAL_ARTIFACT_HASHES was not updated — move the old 'current' hash "
+        "into 'historical' and record the new 'current'."
     )
 
     agents_hash = hashlib.sha256(_shipped_agents_block().encode("utf-8")).hexdigest()
