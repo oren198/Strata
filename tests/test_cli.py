@@ -147,7 +147,8 @@ def test_help_flag_survives_deleted_cwd(
 
 def test_help_text_carries_no_issue_references(capsys: pytest.CaptureFixture[str]) -> None:
     """CLI --help output is operator-facing — it must never carry internal
-    issue numbers (same rule test_register.py's next-steps text enforces).
+    issue numbers or design-record references (ADRs) (same rule
+    test_register.py's next-steps text enforces).
 
     Covers the top-level help plus every subcommand's, since a subcommand's
     own help= string only ever renders inside ITS --help, never the
@@ -164,6 +165,7 @@ def test_help_text_carries_no_issue_references(capsys: pytest.CaptureFixture[str
             main(argv)
         captured = capsys.readouterr()
         assert "issue #" not in captured.out.lower(), f"{argv} help text leaked an issue number"
+        assert "adr " not in captured.out.lower(), f"{argv} help text leaked an ADR reference"
 
 
 def test_migrate_calls_runner(tmp_path, capsys: pytest.CaptureFixture[str]) -> None:
