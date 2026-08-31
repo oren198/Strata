@@ -434,8 +434,11 @@ class PublicationAct:
     the list of anchor strings (``directive:<id>`` or ``subject:<text>``,
     ADR 0007 D1) — ``None`` for withdraw. ``trigger`` is ``None`` for an
     agent-proposed or operator-in-person act; for a MECHANICALLY propagated
-    withdrawal (ADR 0007 D3) it carries the record id of the internal change
-    that caused it (a contribution id or an operator retirement id).
+    withdrawal it carries the id of the event that caused it — for ADR 0007
+    D3's directive-removal path, a contribution id or an operator retirement
+    id; for ADR 0013 D4b's relay cascade, the ``pub_`` id of the item ONE
+    hop upstream whose own withdrawal triggered this one (so a cascade many
+    hops deep stays locally traceable from any single act).
     ``proposer`` mirrors :class:`ContributorRef` — this act's provenance.
 
     ``origin_scope_id`` / ``relay_scope_id`` / ``relay_item_id`` carry
@@ -1493,9 +1496,11 @@ class RecordStore:
                        ``None`` for withdraw. Stored as a JSON array.
             withdraws: For ``act == 'withdraw'``: the ``pub_`` id of the
                        published item being removed. ``None`` for publish.
-            trigger:   For a mechanically propagated withdrawal (ADR 0007
-                       D3): the record id of the triggering internal change.
-                       ``None`` otherwise.
+            trigger:   For a mechanically propagated withdrawal: the id of
+                       the triggering event — a contribution or operator
+                       retirement id (ADR 0007 D3's directive-removal path),
+                       or the upstream item id one hop up a relay cascade
+                       (ADR 0013 D4b). ``None`` otherwise.
             proposer:  Provenance — mirrors :class:`ContributorRef`.
             origin_scope_id: ADR 0013 D4 — the ULTIMATE origin scope when
                        this act relays content received in another scope's

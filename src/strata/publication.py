@@ -42,6 +42,20 @@ This module is the library home for the publication channel, mirroring
   operator-initiated migration primitive: a single scope-manager call
   proposes an initial publication distilled from the scope's current summary,
   each accepted item recorded as an ordinary accepted publish act.
+- **Republication** (ADR 0013 D4/D4b/D4c) — a scope may publish onward an
+  item it received in another scope's publication. :func:`propose_publish`'s
+  ``relay_source_scope_id``/``relay_source_item_id`` derive the item's
+  ultimate origin from the source item itself (never taken from the
+  caller), stored on :class:`PublishedItem` and in the record and surviving
+  both composition and summary rewrites, omitted from the artifact entirely
+  for a non-relay item (D7 — no migration, no back-filling of existing
+  items). Withdrawing an item mechanically cascades to every downstream
+  copy relayed from it, transitively, with no LLM in the loop
+  (:func:`_cascade_withdraw_relays`, wired into :func:`propose_withdraw`,
+  :func:`propagate_directive_removals`, and :func:`apply_judged_withdrawals`
+  — a fourth choke point of D3's class). :meth:`ScopeManager.judge_publication`
+  is told when a proposal relays second-hand material and shown its origin,
+  with the prompt explicit that origin is information, not permission.
 
 Every publish act carries **at least one anchor** (ADR 0007 D1) — the
 provenance link obligations 2/3/7 (published ⊆ believed, trust flows home,
