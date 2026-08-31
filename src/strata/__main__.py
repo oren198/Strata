@@ -4095,7 +4095,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "operator",
         help=(
             "Operator stratum: publish/supersede/retire operator memory, or "
-            "correct a scope's native memory in person (ADR 0008)."
+            "correct a scope's native memory in person."
         ),
     )
     _operator_parser = p_operator
@@ -4141,7 +4141,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_op_retire.set_defaults(func=cmd_operator_retire)
 
     p_op_show = operator_sub.add_parser(
-        "show", help="Print operator memory verbatim, plus the health signal (ADR 0008 D6)."
+        "show", help="Print operator memory verbatim, plus the health signal."
     )
     p_op_show.add_argument(
         "scope_id",
@@ -4159,9 +4159,7 @@ def _build_parser() -> argparse.ArgumentParser:
     global _publication_parser
     p_publication = sub.add_parser(
         "publication",
-        help=(
-            "Show a scope's publication artifact, or bootstrap its initial publication (ADR 0007)."
-        ),
+        help=("Show a scope's publication artifact, or bootstrap its initial publication."),
     )
     _publication_parser = p_publication
     p_publication.set_defaults(func=cmd_publication_root)
@@ -4183,14 +4181,14 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_pub_bootstrap = publication_sub.add_parser(
         "bootstrap",
-        help="Bootstrap a scope's initial publication from its current summary (ADR 0007 D4).",
+        help="Bootstrap a scope's initial publication from its current summary.",
     )
     p_pub_bootstrap.add_argument("scope_id")
     p_pub_bootstrap.set_defaults(func=cmd_publication_bootstrap)
 
     p_launch = sub.add_parser(
         "launch",
-        help="Resolve scope/skill binding and exec claude with STRATA_AGENT_* set (ADR 0003).",
+        help="Resolve scope/skill binding and exec claude with STRATA_AGENT_* set.",
     )
     p_launch.add_argument(
         "scope_id",
@@ -4210,7 +4208,7 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         dest="skip_refresh",
         help=(
-            "Skip the pre-session manager-refresh step (ADR 0004 D4). "
+            "Skip the pre-session manager-refresh step. "
             "Use when the API key is unavailable or for debugging."
         ),
     )
@@ -4255,7 +4253,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "register",
         help=(
             "Idempotent brownfield installer — create .strata/config.toml, "
-            "seed fleet.yaml, copy skills, merge MCP entry (ADR 0005)."
+            "seed fleet.yaml, copy skills, merge MCP entry."
         ),
     )
     p_register.add_argument(
