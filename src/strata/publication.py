@@ -525,6 +525,20 @@ def propose_publish(
             scope_id, summaries_dir=str(summary_store.summaries_dir)
         )
 
+        # Judge-aware rendering (ADR 0008 D3): the operator memory binding
+        # this scope (attached here or at any inter-stratum ancestor) is
+        # rendered to the publication judge as a binding input — a publish
+        # act must not be able to contradict the operator directive binding
+        # the scope it belongs to, any more than a contribution can (issue
+        # #90's asymmetry between the contribution and publication paths).
+        # Imported lazily: strata.operator imports from this module, so a
+        # module-level import here would be circular.
+        from strata.operator import operator_memory_binding
+
+        operator_memory = operator_memory_binding(
+            scope_id, fleet=fleet, summaries_dir=str(summary_store.summaries_dir)
+        )
+
         judgment = scope_manager.judge_publication(
             scope=scope,
             act_kind="publish",
@@ -534,6 +548,7 @@ def propose_publish(
             anchors=tagged_anchors,
             current_summary=current_summary,
             current_publication=current_publication,
+            operator_memory=operator_memory,
         )
 
         record_store.record_publication_judgment(
@@ -626,12 +641,20 @@ def propose_withdraw(
             proposer=proposer,
         )
 
+        # Judge-aware rendering (ADR 0008 D3) — see propose_publish above.
+        from strata.operator import operator_memory_binding
+
+        operator_memory = operator_memory_binding(
+            scope_id, fleet=fleet, summaries_dir=str(summary_store.summaries_dir)
+        )
+
         judgment = scope_manager.judge_publication(
             scope=scope,
             act_kind="withdraw",
             withdraw_item=item,
             current_summary=current_summary,
             current_publication=current_publication,
+            operator_memory=operator_memory,
         )
 
         record_store.record_publication_judgment(

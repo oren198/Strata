@@ -345,6 +345,120 @@ def test_propose_publish_decline_records_rows_only_artifact_untouched(
     assert read_publication_text("g_team", summaries_dir=summaries_dir) is None
 
 
+def test_propose_publish_threads_operator_memory_binding_into_judge_publication(
+    fleet, record_store, summary_store, summaries_dir
+) -> None:
+    """The operator memory binding g_team reaches judge_publication, per ADR 0008 D3.
+
+    Mirrors the contribution path (strata.app._read_judge_inputs): operator
+    memory attached at an inter-stratum ancestor (g_exec here) binds every
+    descendant scope, publication judging included.
+    """
+    from strata.operator import operator_publish
+
+    _seed_summary_with_directive(summary_store, "g_team")
+    item = operator_publish(
+        "g_exec",
+        "All services must use TLS 1.3 or later.",
+        "directive",
+        "tls",
+        record_store=record_store,
+        summaries_dir=summaries_dir,
+    )
+    manager = _FakeScopeManager(
+        publication_judgment=PublicationJudgment(decision="accept", reasoning="Fit for export.")
+    )
+
+    propose_publish(
+        "g_team",
+        "Use protobuf for all RPC.",
+        "directive",
+        "rpc-protocol",
+        ["c_dir1"],
+        _proposer(),
+        fleet=fleet,
+        record_store=record_store,
+        summary_store=summary_store,
+        scope_manager=manager,
+    )
+
+    assert len(manager.publication_calls) == 1
+    operator_memory = manager.publication_calls[0]["operator_memory"]
+    assert operator_memory == [("g_exec", [item])]
+
+
+def test_propose_publish_operator_memory_empty_when_none_attached(
+    fleet, record_store, summary_store
+) -> None:
+    """No operator memory anywhere on the chain threads through as an empty binding."""
+    _seed_summary_with_directive(summary_store, "g_team")
+    manager = _FakeScopeManager(
+        publication_judgment=PublicationJudgment(decision="accept", reasoning="Fit for export.")
+    )
+
+    propose_publish(
+        "g_team",
+        "Use protobuf for all RPC.",
+        "directive",
+        "rpc-protocol",
+        ["c_dir1"],
+        _proposer(),
+        fleet=fleet,
+        record_store=record_store,
+        summary_store=summary_store,
+        scope_manager=manager,
+    )
+
+    assert manager.publication_calls[0]["operator_memory"] == []
+
+
+def test_propose_withdraw_threads_operator_memory_binding_into_judge_publication(
+    fleet, record_store, summary_store, summaries_dir
+) -> None:
+    from strata.operator import operator_publish
+
+    _seed_summary_with_directive(summary_store, "g_team")
+    item = operator_publish(
+        "g_exec",
+        "All services must use TLS 1.3 or later.",
+        "directive",
+        "tls",
+        record_store=record_store,
+        summaries_dir=summaries_dir,
+    )
+    publish_manager = _FakeScopeManager(
+        publication_judgment=PublicationJudgment(decision="accept", reasoning="Fit for export.")
+    )
+    published = propose_publish(
+        "g_team",
+        "Use protobuf for all RPC.",
+        "directive",
+        "rpc-protocol",
+        ["c_dir1"],
+        _proposer(),
+        fleet=fleet,
+        record_store=record_store,
+        summary_store=summary_store,
+        scope_manager=publish_manager,
+    )
+
+    withdraw_manager = _FakeScopeManager(
+        publication_judgment=PublicationJudgment(decision="accept", reasoning="No longer relevant.")
+    )
+    propose_withdraw(
+        "g_team",
+        published.act_id,
+        _proposer(),
+        fleet=fleet,
+        record_store=record_store,
+        summary_store=summary_store,
+        scope_manager=withdraw_manager,
+    )
+
+    assert len(withdraw_manager.publication_calls) == 1
+    assert withdraw_manager.publication_calls[0]["operator_memory"] == [("g_exec", [item])]
+
+
 def test_propose_publish_zero_anchors_raises_and_appends_no_act_row(
     fleet, record_store, summary_store
 ) -> None:
