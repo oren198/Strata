@@ -494,6 +494,131 @@ def test_propose_publish_operator_memory_empty_when_none_attached(
     assert manager.publication_calls[0]["operator_memory"] == []
 
 
+def test_propose_publish_over_budget_declines_via_real_scope_manager_no_artifact(
+    fleet, record_store, summary_store, summaries_dir
+) -> None:
+    """End-to-end: a real ScopeManager mechanically declines an over-budget publish.
+
+    No Anthropic call is made and the artifact is left untouched — same
+    outcome shape as an ordinary judged decline (act + judgment recorded,
+    artifact_updated is False), but without ever reaching the judge prompt.
+    """
+    from unittest.mock import MagicMock
+
+    from strata.scope_manager import ScopeManager
+
+    _seed_summary_with_directive(summary_store, "g_team")
+    mock_client = MagicMock()
+    manager = ScopeManager(client=mock_client)
+
+    outcome = propose_publish(
+        "g_team",
+        "one two three four five six seven eight nine ten",
+        "context",
+        None,
+        ["deploy-notes"],
+        _proposer(),
+        fleet=fleet,
+        record_store=record_store,
+        summary_store=summary_store,
+        scope_manager=manager,
+        publication_max_words=3,
+    )
+
+    assert outcome.decision == "decline"
+    assert outcome.artifact_updated is False
+    assert mock_client.messages.create.call_count == 0
+    assert read_publication("g_team", summaries_dir=summaries_dir) == []
+
+
+def test_propose_withdraw_unblocked_even_on_already_over_budget_face(
+    fleet, record_store, summary_store, summaries_dir
+) -> None:
+    """A withdrawal proceeds even when the face it shrinks is already over any budget.
+
+    Existing over-budget faces are never retroactively trimmed (ADR 0013
+    D7 — append-only, stored state is never rewritten); withdrawal must
+    stay the only shrink path and must never itself be blocked by a budget.
+    """
+    _seed_summary_with_directive(summary_store, "g_team")
+    item = _seed_published_item(
+        record_store,
+        summaries_dir,
+        "g_team",
+        content="one two three four five six seven eight nine ten",
+        anchors=["subject:notes"],
+    )
+    manager = _FakeScopeManager(
+        publication_judgment=PublicationJudgment(decision="accept", reasoning="Fine to withdraw.")
+    )
+
+    outcome = propose_withdraw(
+        "g_team",
+        item.id,
+        _proposer(),
+        fleet=fleet,
+        record_store=record_store,
+        summary_store=summary_store,
+        scope_manager=manager,
+    )
+
+    assert outcome.decision == "accept"
+    assert outcome.artifact_updated is True
+    assert read_publication("g_team", summaries_dir=summaries_dir) == []
+
+
+def test_propose_publish_threads_publication_max_words_into_judge_publication(
+    fleet, record_store, summary_store
+) -> None:
+    """propose_publish threads publication_max_words through, default PUBLICATION_MAX_WORDS."""
+    from strata.scope_manager import PUBLICATION_MAX_WORDS
+
+    _seed_summary_with_directive(summary_store, "g_team")
+    manager = _FakeScopeManager(
+        publication_judgment=PublicationJudgment(decision="accept", reasoning="Fit for export.")
+    )
+
+    propose_publish(
+        "g_team",
+        "Use protobuf for all RPC.",
+        "directive",
+        "rpc-protocol",
+        ["c_dir1"],
+        _proposer(),
+        fleet=fleet,
+        record_store=record_store,
+        summary_store=summary_store,
+        scope_manager=manager,
+    )
+
+    assert manager.publication_calls[0]["publication_max_words"] == PUBLICATION_MAX_WORDS
+
+
+def test_propose_publish_threads_explicit_publication_max_words(
+    fleet, record_store, summary_store
+) -> None:
+    _seed_summary_with_directive(summary_store, "g_team")
+    manager = _FakeScopeManager(
+        publication_judgment=PublicationJudgment(decision="accept", reasoning="Fit for export.")
+    )
+
+    propose_publish(
+        "g_team",
+        "Use protobuf for all RPC.",
+        "directive",
+        "rpc-protocol",
+        ["c_dir1"],
+        _proposer(),
+        fleet=fleet,
+        record_store=record_store,
+        summary_store=summary_store,
+        scope_manager=manager,
+        publication_max_words=42,
+    )
+
+    assert manager.publication_calls[0]["publication_max_words"] == 42
+
+
 def test_propose_withdraw_threads_operator_memory_binding_into_judge_publication(
     fleet, record_store, summary_store, summaries_dir
 ) -> None:

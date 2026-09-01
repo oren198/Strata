@@ -520,6 +520,7 @@ def propose_publish(
     scope_manager: ScopeManager,
     relay_source_scope_id: str | None = None,
     relay_source_item_id: str | None = None,
+    publication_max_words: int | None = None,
 ) -> PublicationOutcome:
     """Propose publishing *content* from *scope_id*'s own memory, judged by its scope-manager.
 
@@ -577,6 +578,16 @@ def propose_publish(
             calling surface.
         relay_source_item_id: The id of the published item, in
             *relay_source_scope_id*'s CURRENT publication, being relayed.
+        publication_max_words: ADR 0013 D3 — the word budget for
+            *scope_id*'s published face, forwarded to
+            :meth:`~strata.scope_manager.ScopeManager.judge_publication`,
+            which declines the act mechanically (no API call) when
+            publishing *content* would put the face over budget. ``None``
+            (the default) resolves to
+            :data:`strata.scope_manager.PUBLICATION_MAX_WORDS` — the
+            engine default for library callers that do not thread
+            :attr:`strata.settings.Settings.publication_max_words` through
+            explicitly.
 
     Returns:
         A :class:`PublicationOutcome`.
@@ -591,6 +602,14 @@ def propose_publish(
     scope = fleet.get_scope(scope_id)
     if scope is None:
         raise ValueError(f"Scope not found: {scope_id!r}")
+
+    if publication_max_words is None:
+        # Deferred import: strata.scope_manager imports strata.operator,
+        # which imports this module — a module-level import here would be
+        # circular (same reason the operator import below is deferred).
+        from strata.scope_manager import PUBLICATION_MAX_WORDS
+
+        publication_max_words = PUBLICATION_MAX_WORDS
 
     if (relay_source_scope_id is None) != (relay_source_item_id is None):
         raise ValueError(
@@ -672,6 +691,7 @@ def propose_publish(
                 operator_memory=operator_memory,
                 relay_origin_scope_id=origin_scope_id,
                 relay_via_scope_id=relay_scope_id,
+                publication_max_words=publication_max_words,
             )
         except Exception as exc:
             # Record the failure as an event against the act — never as a
@@ -1190,6 +1210,7 @@ def bootstrap_publication(
     record_store: RecordStore,
     summary_store: SummaryStore,
     scope_manager: ScopeManager,
+    publication_max_words: int | None = None,
 ) -> BootstrapOutcome:
     """Bootstrap *scope_id*'s initial publication from its current summary (ADR 0007 D4).
 
@@ -1210,12 +1231,19 @@ def bootstrap_publication(
 
     Args:
         scope_id: The scope to bootstrap.
+        publication_max_words: ADR 0013 D3 — the word budget for the
+            bootstrapped face, forwarded to
+            :meth:`~strata.scope_manager.ScopeManager.judge_bootstrap_publication`,
+            which trims the candidate set mechanically to fit. ``None``
+            (the default) resolves to
+            :data:`strata.scope_manager.PUBLICATION_MAX_WORDS`.
 
     Returns:
         A :class:`BootstrapOutcome` — ``decision="decline"`` with an empty
         ``items`` list when the scope-manager finds nothing fit to publish
         yet; otherwise the accepted items (which may be fewer than the
-        scope-manager proposed, if any failed anchor validation).
+        scope-manager proposed, if any failed anchor validation or were
+        trimmed to fit the budget).
 
     Raises:
         ValueError: *scope_id* is not found in *fleet*.
@@ -1224,12 +1252,20 @@ def bootstrap_publication(
     if scope is None:
         raise ValueError(f"Scope not found: {scope_id!r}")
 
+    if publication_max_words is None:
+        # Deferred import — see propose_publish above: a module-level
+        # import here would be circular.
+        from strata.scope_manager import PUBLICATION_MAX_WORDS
+
+        publication_max_words = PUBLICATION_MAX_WORDS
+
     with scope_lock(scope_id):
         current_summary = summary_store.read(scope_id)
 
         judgment = scope_manager.judge_bootstrap_publication(
             scope=scope,
             current_summary=current_summary,
+            publication_max_words=publication_max_words,
         )
 
         if judgment.decision == "decline" or not judgment.items:

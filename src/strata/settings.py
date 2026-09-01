@@ -59,6 +59,17 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("STRATA_MANAGER_MODEL", "JUDGE_MODEL"),
     )
     summary_max_words: int = Field(default=500, ge=1)
+    # ADR 0013 D3: the word budget for a scope's PUBLISHED FACE (its own
+    # published items, summed the same way summary_max_words is — see
+    # scope_manager._content_word_count). Publication now travels exactly
+    # one edge, so a face is bounded against its readers, never multiplied
+    # by chain depth. Defaults to summary_max_words' default: a publication
+    # is a SELECTION from the summary it is distilled from, so it cannot
+    # coherently be given more room than the summary itself. Enforced by the
+    # scope-manager at judgment time (mirrors summary_max_words' own
+    # enforcement point) — never retroactively against items already
+    # published.
+    publication_max_words: int = Field(default=500, ge=1)
     # ADR 0011 D2: how many of the newest contributions in the scope-manager's
     # recency window keep their full verbatim text. Everything older renders as
     # a mechanical digest row. Raise it when phrasing-level duplicate detection
