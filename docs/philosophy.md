@@ -81,7 +81,7 @@ The result is the resolution of the central tension. Every agent can influence s
 
 ### Where authority grounds: the operator
 
-One question remains: what gives the *broadest* scope its authority? Nothing inside the fleet can — every scope's authority is derived from the level above it. The chain grounds outside the system, in the **operator**: the human who defined the fleet in the first place. The operator is best understood as an implicit stratum above the broadest scope — not a special mechanism, but the top of the same structure. Like any stratum, the operator's layer carries both **directives** (binding) and **context** (informative), and the ordinary precedence rule is all that is needed: a fleet-wide native directive cannot contradict an operator directive for the same reason a team directive cannot contradict a fleet-wide one — nothing outranks the source of its own authority.
+One question remains: what gives the *broadest* scope its authority? Nothing inside the fleet can — every scope's authority is derived from the level above it. The chain grounds outside the system, in the **operator**: the human who defined the fleet in the first place. The operator is best understood as an implicit stratum above the broadest scope — not a special mechanism, but the top of the same structure. Like any stratum, what the operator's layer sends downward is **directives**, and the ordinary precedence rule is all that is needed: a fleet-wide native directive cannot contradict an operator directive for the same reason a team directive cannot contradict a fleet-wide one — nothing outranks the source of its own authority.
 
 Three things distinguish the operator layer, and all three follow from its position rather than from special rules:
 
@@ -107,7 +107,7 @@ A helpful analogy is variable scope in programming: a local context, an enclosin
 
 ## Core concept 5: Precedence — directives versus context
 
-Once composition keeps multiple reaches side by side, conflicts between them must resolve by rule. The key insight is that the right rule **depends on the kind of memory**, and there are two kinds that obey opposite rules.
+Once composition keeps multiple reaches side by side, what a reader does when memory conflicts must be settled by rule. The key insight is that the right rule **depends on the kind of memory**, and the two kinds behave differently.
 
 - **Directives** are binding decisions — what the fleet (or a part of it) has resolved to do or to treat as true. For directives, **broader authority wins.** A narrower scope inherits a directive and may refine within it, but may not contradict it. A worker's local belief cannot repeal a fleet-wide decision.
 - **Context** is observation and working state — what is happening, what was just learned. Context does not cross scope boundaries by inheritance at all (Concept 2), so it never arrives from a competing scope to be ranked against. Its precedence rule operates *within* a scope: **the most recent observation wins**, and supersedes what it contradicts.
@@ -140,7 +140,7 @@ A useful principle is to separate the **record** from the **working memory**: th
 
 ## Core concept 8: Publication — how memory crosses sideways
 
-The concepts so far give memory two sanctioned directions of travel. Directives cross *downward*: an authority publishes, descendants are bound. Evidence crosses *upward*: contributions are judged, and what proves out is ratified into broader reach. But fleets also need memory to travel *sideways* — between scopes where neither contains the other. One team needs another's interfaces, conventions, findings, status: knowledge that is wider than its home scope but narrower than the common ancestor, and informative rather than binding.
+The concepts so far give memory two sanctioned directions of travel. Directives cross *downward*: an authority decides, descendants are bound. Evidence crosses *upward*: contributions are judged, and what proves out is ratified into broader reach. But fleets also need memory to travel *sideways* — between scopes where neither contains the other. One team needs another's interfaces, conventions, findings, status: knowledge that is wider than its home scope but narrower than the common ancestor, and informative rather than binding.
 
 Neither existing direction serves this. Sharing a scope's entire working face is naive sharing wearing labels: internal memory is written for internal readers — half-formed hypotheses, dead ends, low-trust observations — and exporting it wholesale is exactly the contamination and relevance collapse this design exists to prevent. Ratifying into a common ancestor forces every sideways share to escalate into a claim it doesn't mean: binding force, and relevance to everyone under the ancestor.
 
