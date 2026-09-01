@@ -1862,6 +1862,7 @@ def cmd_publication_bootstrap(args: argparse.Namespace) -> int:
                 record_store=stores.record_store,
                 summary_store=stores.summary_store,
                 scope_manager=manager,
+                publication_max_words=settings.publication_max_words,
             )
         except ValueError as exc:
             print(str(exc), file=sys.stderr)

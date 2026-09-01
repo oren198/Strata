@@ -76,6 +76,15 @@ from strata.summary_store import Directive, ScopeSummary, _render_summary
 #: cost. The engine default behind :attr:`strata.settings.Settings.window_verbatim_tail`.
 WINDOW_VERBATIM_TAIL = 3
 
+#: ADR 0013 D3 — the word budget for a scope's published face (its own
+#: current publication plus whatever a ``publish`` act would add). The
+#: engine default behind :attr:`strata.settings.Settings.publication_max_words`
+#: for library callers that construct a :class:`ScopeManager` directly.
+#: Enforced by :meth:`ScopeManager.judge_publication` at judgment time —
+#: the same choke point that enforces ``summary_max_words`` — never against
+#: items already on disk.
+PUBLICATION_MAX_WORDS = 500
+
 #: Length of a digest row's mechanical content excerpt, in characters.
 WINDOW_CONTENT_PREFIX_CHARS = 200
 
@@ -783,6 +792,18 @@ null.\
 # ---------------------------------------------------------------------------
 
 
+def _content_word_count(text: str) -> int:
+    """Return the canonical "words" count for one piece of prose.
+
+    A whitespace split — the single definition of "words" shared by
+    ``summary_max_words`` (:func:`_summary_word_count`) and
+    ``publication_max_words`` (:func:`_publication_word_count`) alike, so
+    the two budgets stay comparable and there is exactly one place that
+    defines what a "word" is.
+    """
+    return len(text.split())
+
+
 def _summary_word_count(summary: ScopeSummary) -> int:
     """Return the budget-accounting word count for a scope summary.
 
@@ -792,10 +813,22 @@ def _summary_word_count(summary: ScopeSummary) -> int:
     subject, provenance) is not counted — only the prose that consumes the
     reader's attention.
     """
-    count = len(summary.context.split())
+    count = _content_word_count(summary.context)
     for directive in summary.directives:
-        count += len(directive.content.split())
+        count += _content_word_count(directive.content)
     return count
+
+
+def _publication_word_count(items: Sequence[_PublishedItemLike]) -> int:
+    """Return the budget-accounting word count for a scope's published face.
+
+    Sums :func:`_content_word_count` over every item's ``content`` — item
+    metadata (id, subject, anchors, provenance) is not counted, mirroring
+    :func:`_summary_word_count`'s treatment of directive metadata. Used
+    against ``publication_max_words`` (ADR 0013 D3) exactly as
+    :func:`_summary_word_count` is used against ``summary_max_words``.
+    """
+    return sum(_content_word_count(item.content) for item in items)
 
 
 def _coerce_json_object(value: str, error_message: str) -> dict:
@@ -2955,6 +2988,7 @@ class ScopeManager:
         operator_memory: list[tuple[str, list[OperatorItem]]] | None = None,
         relay_origin_scope_id: str | None = None,
         relay_via_scope_id: str | None = None,
+        publication_max_words: int = PUBLICATION_MAX_WORDS,
     ) -> PublicationJudgment:
         """Judge a publish or withdraw proposal against the scope's current state.
 
@@ -2996,6 +3030,19 @@ class ScopeManager:
                 different question ("do my readers need to hear this" vs.
                 "is this true and mine to say") that the system prompt
                 spells out is information, never permission, to relay.
+            publication_max_words: ADR 0013 D3 — the word budget for
+                *scope*'s published face (its current items plus, for a
+                ``publish`` act, the proposed one), the same "words" unit
+                :func:`_summary_word_count` uses. Checked ONLY for
+                ``act_kind='publish'`` — a ``publish`` act that would put
+                the face over budget is declined mechanically, before any
+                API call is made (see the accept/decline shortcut below). A
+                ``withdraw`` act is never checked against it: withdrawal
+                only ever shrinks the face, and a mechanically-propagated
+                withdrawal must never be blocked by a budget. Defaults to
+                :data:`PUBLICATION_MAX_WORDS` for library callers that do
+                not thread :attr:`strata.settings.Settings.publication_max_words`
+                through explicitly.
 
         Returns:
             A :class:`PublicationJudgment`.
@@ -3014,11 +3061,38 @@ class ScopeManager:
                     "judge_publication(act_kind='publish') requires content, kind, and "
                     "at least one anchor."
                 )
+
+            # ADR 0013 D3 — mechanical budget enforcement, the same choke
+            # point (judgment time) as summary_max_words. A publication is a
+            # SELECTION from the scope's summary, so growing it past budget
+            # is declined outright — no API call, no LLM in the loop, mirroring
+            # the structural checks above it (missing fields) rather than the
+            # summary path's corrective re-ask: there is no amendment to
+            # retry here, a publish act is an atomic, unrewritten append
+            # (ADR 0007 D1), so the only correction available is withdrawing
+            # something first — a separate, judged act the proposer makes.
+            current_words = _publication_word_count(current_publication)
+            new_words = _content_word_count(content)
+            prospective_words = current_words + new_words
+            if prospective_words > publication_max_words:
+                return PublicationJudgment(
+                    decision="decline",
+                    reasoning=(
+                        f"Declined without judgment: this item is {new_words} words; "
+                        f"with the {current_words} words already published, the face "
+                        f"would be {prospective_words} words — over its "
+                        f"{publication_max_words}-word budget. Withdraw an existing "
+                        "published item to make room, then retry."
+                    ),
+                )
+
             proposal_block = (
                 "PROPOSED ACT: publish\n"
                 f"- kind: {kind}\n"
                 f"- subject: {subject or '(none)'}\n"
                 f"- anchors: {list(anchors)}\n"
+                f"- word budget: {current_words} published + {new_words} this item = "
+                f"{prospective_words} / {publication_max_words}\n"
                 "- content:\n"
                 f"    {content}\n"
             )
@@ -3086,6 +3160,8 @@ class ScopeManager:
         *,
         scope: Scope,
         current_summary: ScopeSummary | None,
+        publication_max_words: int = PUBLICATION_MAX_WORDS,
+        current_publication: Sequence[_PublishedItemLike] = (),
     ) -> BootstrapJudgment:
         """Distill an initial publication for *scope* from its current summary.
 
@@ -3098,6 +3174,24 @@ class ScopeManager:
         Args:
             scope: The scope to bootstrap.
             current_summary: The scope's current internal summary.
+            publication_max_words: ADR 0013 D3 — the word budget for
+                *scope*'s published face AFTER bootstrapping — the same
+                budget :meth:`judge_publication` enforces for an ordinary
+                ``publish`` act, not a separate allowance for candidates
+                alone. Enforced mechanically, not by an API retry: proposed
+                items are kept in the order the model returned them,
+                accumulating :func:`_content_word_count` on top of
+                *current_publication*'s own word count, skipping (not
+                stopping at) any candidate that would push the running
+                total over budget so a large early candidate cannot starve
+                smaller ones behind it — the rest are dropped, and the drop
+                is noted in the returned ``reasoning``. Defaults to
+                :data:`PUBLICATION_MAX_WORDS`.
+            current_publication: *scope*'s already-published items, if any
+                — bootstrapping a scope that has published before must
+                trim candidates against the REMAINING budget, not the full
+                one, or the combined face can land over budget. Empty by
+                default (the common case: a scope's first publication).
 
         Returns:
             A :class:`BootstrapJudgment`.
@@ -3156,4 +3250,30 @@ class ScopeManager:
             )
             for i in raw_items
         ]
-        return BootstrapJudgment(decision=raw["decision"], reasoning=raw["reasoning"], items=items)
+
+        # ADR 0013 D3 — mechanical trim to fit publication_max_words, against
+        # the REMAINING budget (current_publication may already hold words —
+        # bootstrapping is not always a scope's first publication). Kept in
+        # proposal order, greedily: an item is kept only if it still fits
+        # under the running total, so a large early item cannot starve every
+        # item behind it out of a face that had room for them.
+        reasoning = raw["reasoning"]
+        if items:
+            kept: list[BootstrapPublishedItemInput] = []
+            total_words = _publication_word_count(current_publication)
+            dropped = 0
+            for item in items:
+                words = _content_word_count(item.content)
+                if total_words + words > publication_max_words:
+                    dropped += 1
+                    continue
+                kept.append(item)
+                total_words += words
+            items = kept
+            if dropped:
+                reasoning = (
+                    f"{reasoning} ({dropped} proposed item(s) omitted mechanically to fit "
+                    f"the {publication_max_words}-word publication budget.)"
+                )
+
+        return BootstrapJudgment(decision=raw["decision"], reasoning=reasoning, items=items)

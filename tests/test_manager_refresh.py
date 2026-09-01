@@ -274,6 +274,20 @@ def test_budget_env_var_plumbed_through_settings() -> None:
         get_settings.cache_clear()
 
 
+def test_publication_max_words_default_and_env_var() -> None:
+    """Settings.publication_max_words defaults to 500 and honors STRATA_PUBLICATION_MAX_WORDS."""
+    from strata.settings import Settings, get_settings
+
+    get_settings.cache_clear()
+    try:
+        assert Settings().publication_max_words == 500
+        with patch.dict("os.environ", {"STRATA_PUBLICATION_MAX_WORDS": "120"}, clear=False):
+            settings = Settings()
+            assert settings.publication_max_words == 120
+    finally:
+        get_settings.cache_clear()
+
+
 # ---------------------------------------------------------------------------
 # Test 4 — Multi-inter-stratum-edge invariant (invariant 9)
 # ---------------------------------------------------------------------------
