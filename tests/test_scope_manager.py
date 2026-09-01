@@ -2036,6 +2036,108 @@ def test_judge_publication_withdraw_missing_item_raises() -> None:
         )
 
 
+# ---------------------------------------------------------------------------
+# judge_publication — publication_max_words budget (item-count/word bound on
+# the published face, ADR 0013 D3 — one edge, not a chain product)
+# ---------------------------------------------------------------------------
+
+
+def test_judge_publication_publish_over_budget_declines_without_api_call() -> None:
+    """A publish that would push the face over budget is declined mechanically — no LLM call."""
+    manager, mock_client = _make_publication_manager("accept", "would never be seen")
+
+    judgment = manager.judge_publication(
+        scope=SCOPE,
+        act_kind="publish",
+        content="one two three four five six",
+        kind="context",
+        subject=None,
+        anchors=["subject:x"],
+        current_summary=CURRENT_SUMMARY,
+        current_publication=[_PUBLISHED_ITEM],
+        publication_max_words=5,
+    )
+
+    assert judgment.decision == "decline"
+    assert mock_client.messages.create.call_count == 0
+
+
+def test_judge_publication_publish_over_budget_reasoning_mentions_withdrawal() -> None:
+    manager, _ = _make_publication_manager("accept")
+
+    judgment = manager.judge_publication(
+        scope=SCOPE,
+        act_kind="publish",
+        content="one two three four five six",
+        kind="context",
+        subject=None,
+        anchors=["subject:x"],
+        current_summary=CURRENT_SUMMARY,
+        current_publication=[],
+        publication_max_words=5,
+    )
+
+    assert judgment.decision == "decline"
+    assert "withdraw" in judgment.reasoning.lower()
+    assert "budget" in judgment.reasoning.lower()
+
+
+def test_judge_publication_publish_at_budget_exactly_still_calls_judge() -> None:
+    """Landing exactly ON budget is not over — the ordinary judged path still runs."""
+    manager, mock_client = _make_publication_manager("accept", "Fits.")
+
+    judgment = manager.judge_publication(
+        scope=SCOPE,
+        act_kind="publish",
+        content="one two three four five",
+        kind="context",
+        subject=None,
+        anchors=["subject:x"],
+        current_summary=CURRENT_SUMMARY,
+        current_publication=[],
+        publication_max_words=5,
+    )
+
+    assert judgment.decision == "accept"
+    assert mock_client.messages.create.call_count == 1
+
+
+def test_judge_publication_publish_default_budget_is_500_words() -> None:
+    """Omitting publication_max_words falls back to the module default (PUBLICATION_MAX_WORDS)."""
+    manager, mock_client = _make_publication_manager("accept", "Fits.")
+
+    judgment = manager.judge_publication(
+        scope=SCOPE,
+        act_kind="publish",
+        content="short content",
+        kind="context",
+        subject=None,
+        anchors=["subject:x"],
+        current_summary=CURRENT_SUMMARY,
+        current_publication=[],
+    )
+
+    assert judgment.decision == "accept"
+    assert mock_client.messages.create.call_count == 1
+
+
+def test_judge_publication_withdraw_never_checked_against_budget() -> None:
+    """A withdraw proposal is exempt from the budget check regardless of current face size."""
+    manager, mock_client = _make_publication_manager("accept", "Fine to withdraw.")
+
+    judgment = manager.judge_publication(
+        scope=SCOPE,
+        act_kind="withdraw",
+        withdraw_item=_PUBLISHED_ITEM,
+        current_summary=CURRENT_SUMMARY,
+        current_publication=[_PUBLISHED_ITEM],
+        publication_max_words=1,
+    )
+
+    assert judgment.decision == "accept"
+    assert mock_client.messages.create.call_count == 1
+
+
 def test_judge_publication_missing_api_key_raises_runtimeerror() -> None:
     mock_client = MagicMock()
     mock_client.api_key = None
@@ -2309,6 +2411,79 @@ def test_judge_bootstrap_publication_no_summary_uses_sentinel() -> None:
 
     message = mock_client.messages.create.call_args.kwargs["messages"][0]["content"]
     assert "this scope has no summary yet" in message
+
+
+def test_judge_bootstrap_publication_trims_items_over_budget() -> None:
+    """Bootstrap proposes a whole face at once — over-budget items are dropped mechanically."""
+    manager, _ = _make_bootstrap_manager(
+        "accept",
+        [
+            {"content": "one two three", "kind": "context", "subject": None, "anchors": ["a"]},
+            {
+                "content": "four five six seven",
+                "kind": "context",
+                "subject": None,
+                "anchors": ["b"],
+            },
+        ],
+        "Two items fit for export.",
+    )
+
+    judgment = manager.judge_bootstrap_publication(
+        scope=SCOPE, current_summary=CURRENT_SUMMARY, publication_max_words=3
+    )
+
+    assert judgment.decision == "accept"
+    assert len(judgment.items) == 1
+    assert judgment.items[0].content == "one two three"
+
+
+def test_judge_bootstrap_publication_trims_against_existing_published_face() -> None:
+    """Bootstrap on a scope that already published trims against the REMAINING budget.
+
+    _PUBLISHED_ITEM is 5 words ("Use protobuf for all RPC."). With a
+    10-word budget that leaves 5 words of room — enough for the 3-word
+    candidate but not the 4-word one behind it.
+    """
+    manager, _ = _make_bootstrap_manager(
+        "accept",
+        [
+            {"content": "one two three", "kind": "context", "subject": None, "anchors": ["a"]},
+            {
+                "content": "four five six seven",
+                "kind": "context",
+                "subject": None,
+                "anchors": ["b"],
+            },
+        ],
+        "Two items fit for export.",
+    )
+
+    judgment = manager.judge_bootstrap_publication(
+        scope=SCOPE,
+        current_summary=CURRENT_SUMMARY,
+        publication_max_words=10,
+        current_publication=[_PUBLISHED_ITEM],
+    )
+
+    assert len(judgment.items) == 1
+    assert judgment.items[0].content == "one two three"
+
+
+def test_judge_bootstrap_publication_within_budget_keeps_all_items() -> None:
+    manager, _ = _make_bootstrap_manager(
+        "accept",
+        [
+            {"content": "one two three", "kind": "context", "subject": None, "anchors": ["a"]},
+        ],
+        "Fits.",
+    )
+
+    judgment = manager.judge_bootstrap_publication(
+        scope=SCOPE, current_summary=CURRENT_SUMMARY, publication_max_words=500
+    )
+
+    assert len(judgment.items) == 1
 
 
 def test_bootstrap_system_prompt_states_conservative_default() -> None:

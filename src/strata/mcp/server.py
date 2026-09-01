@@ -2285,6 +2285,7 @@ async def strata_publish(
             scope_manager=manager,
             relay_source_scope_id=relay_source_scope_id,
             relay_source_item_id=relay_source_item_id,
+            publication_max_words=_settings.publication_max_words,
         )
     except ValueError as exc:
         raise RuntimeError(str(exc)) from exc
