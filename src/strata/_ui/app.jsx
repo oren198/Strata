@@ -235,6 +235,10 @@ function App() {
           <ViewAsView state={state} scopeId={openScopeId || state.scopes[0]?.id} onSelectScope={setOpenScopeId} />
         )}
 
+        {tab === "publications" && (
+          <PublicationsView state={state} scopeId={openScopeId || state.scopes[0]?.id} onSelectScope={setOpenScopeId} />
+        )}
+
         {tab === "settings" && (
           <SettingsScreen state={state} dispatch={dispatch} onFlash={flash} />
         )}
@@ -351,6 +355,13 @@ function TopBar({ tab, onTab, dark, onToggleDark }) {
         >
           <Icon name="eye" size={13} style={{ marginRight: 6, verticalAlign: "-2px" }} />
           View as
+        </button>
+        <button
+          className={"at-tab" + (tab === "publications" ? " active" : "")}
+          onClick={() => onTab("publications")}
+        >
+          <Icon name="megaphone" size={13} style={{ marginRight: 6, verticalAlign: "-2px" }} />
+          Publications
         </button>
         <button
           className={"at-tab" + (tab === "settings" ? " active" : "")}

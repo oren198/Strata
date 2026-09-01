@@ -57,6 +57,18 @@ GET /scopes/{scope_id}/record/{contribution_id}
     Return one contribution with its state, verdict, and judgment attempts
     (issue #130) — the cheap "what happened to this contribution?" read.
 
+GET /scopes/{scope_id}/publication
+    Return a scope's CURRENT publication — its curated outward face, verbatim,
+    including republication provenance (origin/relay) for a relayed item
+    (ADR 0013 D4). UI-only; read-only.
+
+GET /scopes/{scope_id}/publication/record
+    Return a scope's publish/withdraw act history: every act, its judgment
+    (if any), its judgment attempts, and its derived state — honestly
+    distinguishing a judged verdict, a mechanically-cascaded withdrawal, a
+    judge failure, and an act still awaiting judgment (ADR 0013 D4b).
+    UI-only; read-only.
+
 Vocabulary follows CONTEXT.md verbatim.
 """
 
@@ -1821,6 +1833,98 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
             "state": asdict(entry.state),
             "judgment": asdict(entry.judgment) if entry.judgment is not None else None,
             "judgment_attempts": [asdict(a) for a in entry.judgment_attempts],
+        }
+
+    # -----------------------------------------------------------------------
+    # GET /scopes/{scope_id}/publication
+    #
+    # UI-only proof surface (constraint G1): what a scope publishes right
+    # now. Delegates straight to `read_publication` — no reimplementation of
+    # publication reading; the Console never writes here (read-only).
+    # -----------------------------------------------------------------------
+
+    @application.get("/scopes/{scope_id}/publication")
+    def get_scope_publication(
+        scope_id: str,
+        request: Request,
+        summary_store: SummaryStore = Depends(get_summary_store),
+    ) -> dict:
+        """Return a scope's current publication — its curated outward face.
+
+        Items are returned verbatim, exactly as the publication artifact
+        holds them (ADR 0007 D1: machine-written, never LLM-rewritten). A
+        relayed item (ADR 0013 D4 — republication) carries its origin scope
+        and the immediate relay it travelled, so a reader can render
+        "according to X, via Y"; a non-relayed item carries `null` for all
+        three provenance fields, never an invented value.
+
+        Returns 404 if the scope is not in the FleetConfig. A scope that has
+        published nothing yet gets 200 with an empty ``items`` list — the
+        honestly empty face, not an error.
+        """
+        from dataclasses import asdict
+
+        fleet: FleetConfig = request.app.state.fleet_reloader.get()
+        scope = fleet.get_scope(scope_id)
+        if scope is None:
+            raise HTTPException(status_code=404, detail=f"Scope not found: {scope_id!r}")
+
+        items = read_publication(scope_id, summaries_dir=str(summary_store.summaries_dir))
+        return {"scope_id": scope_id, "items": [asdict(i) for i in items]}
+
+    # -----------------------------------------------------------------------
+    # GET /scopes/{scope_id}/publication/record
+    #
+    # UI-only proof surface (constraint G1): the scope's publish/withdraw
+    # act history. Delegates straight to RecordStore's publication-act
+    # readers — the same derivation `list_publication_act_states` already
+    # gives every other host, never re-derived here. Unbounded (unlike
+    # GET .../record): RecordStore has no paged reader for publication acts
+    # yet, and this surface must not invent a page size at the call site
+    # (no numeric literal owns that decision) — a publication act history is
+    # expected to stay small relative to a scope's full contribution record,
+    # since publishing is a deliberate curation act, not every accepted
+    # write.
+    # -----------------------------------------------------------------------
+
+    @application.get("/scopes/{scope_id}/publication/record")
+    def get_scope_publication_record(
+        scope_id: str,
+        request: Request,
+        record_store: RecordStore = Depends(get_record_store),
+    ) -> dict:
+        """Return a scope's publish/withdraw act history, oldest first.
+
+        Four parallel lists — ``acts``, ``judgments``, ``judgment_attempts``,
+        ``act_states`` — mirroring ``GET .../record``'s shape, so a client
+        joins them the same way. ``act_states`` is the honest discriminator
+        (``judged`` / ``mechanical`` / ``judge_failed`` / ``pending``,
+        ADR 0013 D4b): a mechanically-cascaded withdrawal carries a
+        ``trigger`` and no judgment row by design, and must never be
+        confused with an act that is merely still awaiting one.
+
+        Returns 404 if the scope is not in the FleetConfig.
+        """
+        from dataclasses import asdict
+
+        fleet: FleetConfig = request.app.state.fleet_reloader.get()
+        scope = fleet.get_scope(scope_id)
+        if scope is None:
+            raise HTTPException(status_code=404, detail=f"Scope not found: {scope_id!r}")
+
+        return {
+            "scope_id": scope_id,
+            "acts": [asdict(a) for a in record_store.list_publication_acts(scope_id=scope_id)],
+            "judgments": [
+                asdict(j) for j in record_store.list_publication_judgments(scope_id=scope_id)
+            ],
+            "judgment_attempts": [
+                asdict(a)
+                for a in record_store.list_publication_judgment_attempts(scope_id=scope_id)
+            ],
+            "act_states": [
+                asdict(s) for s in record_store.list_publication_act_states(scope_id=scope_id)
+            ],
         }
 
     # -----------------------------------------------------------------------
