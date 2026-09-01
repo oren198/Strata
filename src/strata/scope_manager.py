@@ -3161,6 +3161,7 @@ class ScopeManager:
         scope: Scope,
         current_summary: ScopeSummary | None,
         publication_max_words: int = PUBLICATION_MAX_WORDS,
+        current_publication: Sequence[_PublishedItemLike] = (),
     ) -> BootstrapJudgment:
         """Distill an initial publication for *scope* from its current summary.
 
@@ -3173,16 +3174,24 @@ class ScopeManager:
         Args:
             scope: The scope to bootstrap.
             current_summary: The scope's current internal summary.
-            publication_max_words: ADR 0013 D3 — the word budget for the
-                proposed face. Enforced mechanically, not by an API retry:
-                the proposed items are kept in the order the model returned
-                them, accumulating :func:`_content_word_count`, until the
-                next item would push the running total over budget — the
-                rest are dropped, and the drop is noted in the returned
-                ``reasoning``. Unlike the per-item ``publish`` path, a whole
-                candidate set is available at once here, so trimming to fit
-                is a mechanical selection rather than a decline. Defaults to
+            publication_max_words: ADR 0013 D3 — the word budget for
+                *scope*'s published face AFTER bootstrapping — the same
+                budget :meth:`judge_publication` enforces for an ordinary
+                ``publish`` act, not a separate allowance for candidates
+                alone. Enforced mechanically, not by an API retry: proposed
+                items are kept in the order the model returned them,
+                accumulating :func:`_content_word_count` on top of
+                *current_publication*'s own word count, skipping (not
+                stopping at) any candidate that would push the running
+                total over budget so a large early candidate cannot starve
+                smaller ones behind it — the rest are dropped, and the drop
+                is noted in the returned ``reasoning``. Defaults to
                 :data:`PUBLICATION_MAX_WORDS`.
+            current_publication: *scope*'s already-published items, if any
+                — bootstrapping a scope that has published before must
+                trim candidates against the REMAINING budget, not the full
+                one, or the combined face can land over budget. Empty by
+                default (the common case: a scope's first publication).
 
         Returns:
             A :class:`BootstrapJudgment`.
@@ -3242,14 +3251,16 @@ class ScopeManager:
             for i in raw_items
         ]
 
-        # ADR 0013 D3 — mechanical trim to fit publication_max_words. Kept
-        # in proposal order, greedily: an item is kept only if it still fits
+        # ADR 0013 D3 — mechanical trim to fit publication_max_words, against
+        # the REMAINING budget (current_publication may already hold words —
+        # bootstrapping is not always a scope's first publication). Kept in
+        # proposal order, greedily: an item is kept only if it still fits
         # under the running total, so a large early item cannot starve every
         # item behind it out of a face that had room for them.
         reasoning = raw["reasoning"]
         if items:
             kept: list[BootstrapPublishedItemInput] = []
-            total_words = 0
+            total_words = _publication_word_count(current_publication)
             dropped = 0
             for item in items:
                 words = _content_word_count(item.content)

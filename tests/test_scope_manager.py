@@ -2438,6 +2438,38 @@ def test_judge_bootstrap_publication_trims_items_over_budget() -> None:
     assert judgment.items[0].content == "one two three"
 
 
+def test_judge_bootstrap_publication_trims_against_existing_published_face() -> None:
+    """Bootstrap on a scope that already published trims against the REMAINING budget.
+
+    _PUBLISHED_ITEM is 5 words ("Use protobuf for all RPC."). With a
+    10-word budget that leaves 5 words of room — enough for the 3-word
+    candidate but not the 4-word one behind it.
+    """
+    manager, _ = _make_bootstrap_manager(
+        "accept",
+        [
+            {"content": "one two three", "kind": "context", "subject": None, "anchors": ["a"]},
+            {
+                "content": "four five six seven",
+                "kind": "context",
+                "subject": None,
+                "anchors": ["b"],
+            },
+        ],
+        "Two items fit for export.",
+    )
+
+    judgment = manager.judge_bootstrap_publication(
+        scope=SCOPE,
+        current_summary=CURRENT_SUMMARY,
+        publication_max_words=10,
+        current_publication=[_PUBLISHED_ITEM],
+    )
+
+    assert len(judgment.items) == 1
+    assert judgment.items[0].content == "one two three"
+
+
 def test_judge_bootstrap_publication_within_budget_keeps_all_items() -> None:
     manager, _ = _make_bootstrap_manager(
         "accept",

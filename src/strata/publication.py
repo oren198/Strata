@@ -1261,17 +1261,22 @@ def bootstrap_publication(
 
     with scope_lock(scope_id):
         current_summary = summary_store.read(scope_id)
+        # Read BEFORE judging (ADR 0013 D3): bootstrapping is not always a
+        # scope's first publication — the trim inside judge_bootstrap_publication
+        # must see what is already published so the combined face cannot
+        # land over budget.
+        existing = read_publication(scope_id, summaries_dir=str(summary_store.summaries_dir))
 
         judgment = scope_manager.judge_bootstrap_publication(
             scope=scope,
             current_summary=current_summary,
             publication_max_words=publication_max_words,
+            current_publication=existing,
         )
 
         if judgment.decision == "decline" or not judgment.items:
             return BootstrapOutcome(decision="decline", reasoning=judgment.reasoning, items=[])
 
-        existing = read_publication(scope_id, summaries_dir=str(summary_store.summaries_dir))
         proposer = _bootstrap_proposer(scope_id)
         recorded: list[PublishedItem] = []
 
