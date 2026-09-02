@@ -134,6 +134,8 @@ There are several kinds of forgetting, and they are conceptually distinct:
 - **Decay** — memory that is rarely used or poorly trusted fades from relevance over time.
 - **Retirement** — an authority deliberately withdraws a piece of shared memory.
 
+These three do not all tolerate the same latency, and conflating them is a real hazard. **Decay is passive and may be gradual**: a note that stopped mattering costs little while it lingers, and it is right that it simply stops being carried the next time memory is curated. **Correction is active and must not wait**: an item that is false — false when written, and being acted on now — has to be removable on demand, by an act, and the removal must reach the readers it reached. A system that routes correction through curation sets the window in which the fleet acts on a known falsehood by unrelated traffic, and a quiet corner that is never rewritten never corrects at all. This holds regardless of kind: a false observation is as worth correcting as a mistaken decision, and an authority that can retire the one but not the other cannot say "that is wrong" about most of what its memory holds.
+
 A useful principle is to separate the **record** from the **working memory**: the raw history of what was contributed can be kept immutably for accountability and recovery, while the curated memory that agents actually read is allowed to forget. Forgetting then operates on the working view without destroying the system's ability to look back.
 
 ---
