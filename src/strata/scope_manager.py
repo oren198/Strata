@@ -568,14 +568,16 @@ An excerpt is a prefix, not a claim about the whole contribution: where a
 truncated row makes a duplicate call genuinely uncertain, judge the
 contribution on its merits rather than declining on a partial match.
 
-When a PARENT SCOPE SUMMARY is provided in the user message:
+When PARENT SCOPE DIRECTIVES are provided in the user message:
 - Inherited parent directives reach this scope's summary MECHANICALLY: the
   engine copies parent directive rows in byte-exactly, ids and provenance
   preserved (ADR 0011 D4). They are not yours to admit — never `append` or
   `publish` a parent directive, and never name one in a `supersede` or
   `retire` op.
-- Context from the parent may be paraphrased or summarised into
-  `new_context`, but must not contradict or override it.
+- They bind this scope: nothing you admit may contradict or override them.
+- You are shown the parent's directives and nothing else of the parent's.
+  Its own working notes are not yours to see, restate, or write into
+  `new_context`.
 
 When a MANAGER REFRESH block is present in the user message: the parent's
 directives have already been spliced into this scope's summary
@@ -1714,6 +1716,31 @@ def _render_entitlement(entitlement: EntitlementView) -> str:
     )
 
 
+def _render_directives_only(summary: ScopeSummary) -> str:
+    """Render a summary's directives, without its context (ADR 0013 D1, #187).
+
+    Used for an ancestor's summary rendered to a DESCENDANT's judge. A chain
+    edge carries directives — they bind, so the judge must see them, at full
+    fidelity and with provenance intact. It does not carry context: that is
+    the ancestor's own working memory and never leaves the ancestor.
+
+    Deliberately not a flag on :func:`_render_summary`. Every other call site
+    renders a scope's own summary to its own judge, where the context belongs;
+    only this one crosses a scope boundary, and a separate function keeps that
+    boundary visible instead of hiding it behind a default argument.
+    """
+    if not summary.directives:
+        return "(no directives)"
+    lines: list[str] = []
+    for directive in summary.directives:
+        lines.append(f"### [{directive.id}] {directive.content}")
+        if directive.subject:
+            lines.append(f"- subject: {directive.subject}")
+        lines.append(f"- source: scope={directive.source_scope_id} · at={directive.created_at}")
+        lines.append("")
+    return "\n".join(lines).rstrip()
+
+
 def _render_operator_memory(
     operator_memory: list[tuple[str, list[OperatorItem]]] | None,
 ) -> str:
@@ -1883,8 +1910,15 @@ def _build_judge_preamble(
 
     parent_block = ""
     if parent_summary is not None:
-        rendered_parent = _render_summary(parent_summary)
-        parent_block = f"PARENT SCOPE SUMMARY (inherited)\n---\n{rendered_parent}\n---\n\n"
+        # ADR 0013 D1 (issue #187): the parent's DIRECTIVES only. A chain edge
+        # carries what binds; a scope's context is its own internal working
+        # memory and never leaves the scope. Rendering the parent's whole
+        # summary here reintroduced, through judgment, exactly what D1 removed
+        # from composition — and once the judge wrote it into `new_context` it
+        # became the child's own context, indistinguishable on the read side
+        # from something the child observed itself.
+        rendered_parent = _render_directives_only(parent_summary)
+        parent_block = f"PARENT SCOPE DIRECTIVES (inherited)\n---\n{rendered_parent}\n---\n\n"
 
     entitlement_block = ""
     if entitlement is not None:

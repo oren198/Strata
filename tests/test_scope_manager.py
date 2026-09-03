@@ -5,7 +5,7 @@ made.  The optional integration test (marked ``pytest.mark.integration``) is
 skipped unless ``STRATA_RUN_INTEGRATION=1`` is set in the environment.
 
 Decision 2 tests (parent summary in user message):
-- Test 11: parent summary renders under "PARENT SCOPE SUMMARY (inherited)" header.
+- Test 11: parent directives render under "PARENT SCOPE DIRECTIVES (inherited)" header.
 - Test 12: parent_summary=None (L0 root) — header is omitted entirely.
 - Test 13: parent directive text appears in user message when parent provided.
 """
@@ -886,7 +886,7 @@ PARENT_SUMMARY = ScopeSummary(
 
 
 # ---------------------------------------------------------------------------
-# Test 11: parent summary renders under PARENT SCOPE SUMMARY (inherited) header
+# Test 11: parent directives render under PARENT SCOPE DIRECTIVES (inherited) header
 # ---------------------------------------------------------------------------
 
 
@@ -907,7 +907,7 @@ def test_parent_summary_renders_under_inherited_header() -> None:
     messages = call_kwargs.kwargs["messages"]
     user_message_content = messages[0]["content"]
 
-    assert "PARENT SCOPE SUMMARY (inherited)" in user_message_content
+    assert "PARENT SCOPE DIRECTIVES (inherited)" in user_message_content
     assert PARENT_SCOPE.id in user_message_content
 
 
@@ -917,7 +917,7 @@ def test_parent_summary_renders_under_inherited_header() -> None:
 
 
 def test_no_parent_summary_omits_inherited_header() -> None:
-    """When parent_summary=None (root scope), the PARENT SCOPE SUMMARY section must be absent."""
+    """When parent_summary=None (root scope), the PARENT SCOPE DIRECTIVES section must be absent."""
     manager, mock_client = _make_manager(_accept_directive_input())
 
     manager.judge(
@@ -933,7 +933,7 @@ def test_no_parent_summary_omits_inherited_header() -> None:
     messages = call_kwargs.kwargs["messages"]
     user_message_content = messages[0]["content"]
 
-    assert "PARENT SCOPE SUMMARY (inherited)" not in user_message_content
+    assert "PARENT SCOPE DIRECTIVES (inherited)" not in user_message_content
 
 
 # ---------------------------------------------------------------------------
@@ -1689,7 +1689,7 @@ def test_operator_memory_block_omitted_when_none_or_empty() -> None:
 
 
 def test_operator_memory_block_precedes_parent_summary_block() -> None:
-    """OPERATOR MEMORY renders before PARENT SCOPE SUMMARY, per ADR 0008 D3."""
+    """OPERATOR MEMORY renders before PARENT SCOPE DIRECTIVES, per ADR 0008 D3."""
     manager, mock_client = _make_manager(_accept_directive_input())
 
     manager.judge(
@@ -1703,7 +1703,7 @@ def test_operator_memory_block_precedes_parent_summary_block() -> None:
     )
     content = mock_client.messages.create.call_args.kwargs["messages"][0]["content"]
     operator_idx = content.index("OPERATOR MEMORY")
-    parent_idx = content.index("PARENT SCOPE SUMMARY (inherited)")
+    parent_idx = content.index("PARENT SCOPE DIRECTIVES (inherited)")
     assert operator_idx < parent_idx
 
 
@@ -1732,9 +1732,9 @@ def test_system_prompt_requires_per_operator_directive_attribution() -> None:
 
 
 def test_system_prompt_operator_memory_precedes_parent_summary_guidance() -> None:
-    """The OPERATOR MEMORY rule appears before the PARENT SCOPE SUMMARY rule."""
+    """The OPERATOR MEMORY rule appears before the PARENT SCOPE DIRECTIVES rule."""
     operator_idx = _SYSTEM_PROMPT.index("When an OPERATOR MEMORY section is present")
-    parent_idx = _SYSTEM_PROMPT.index("When a PARENT SCOPE SUMMARY is provided")
+    parent_idx = _SYSTEM_PROMPT.index("When PARENT SCOPE DIRECTIVES are provided")
     assert operator_idx < parent_idx
 
 
