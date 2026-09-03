@@ -203,3 +203,67 @@ def test_already_registered_project_is_untouched(tmp_path):
 
     assert rc == 0
     assert _config(tmp_path)["fleet_yaml"] == ".strata/fleet.yaml"
+
+
+def test_already_registered_project_with_fleet_elsewhere_is_not_seeded(tmp_path, capsys):
+    """Live incident 2026-08-31 (#184): config.toml already points somewhere
+    other than ``.strata/fleet.yaml`` — an absolute path outside the project
+    tree, in the reported case. Register must ask the resolver where the
+    fleet actually lives, not assume the default layout, before deciding
+    whether to seed.
+    """
+    (tmp_path / ".git").mkdir()
+    external_root = tmp_path.parent / (tmp_path.name + "_external")
+    external_root.mkdir()
+    external_fleet = external_root / "fleet.yaml"
+    external_fleet.write_text(_FLEET_7, encoding="utf-8")
+
+    strata_dir = tmp_path / ".strata"
+    strata_dir.mkdir()
+    (strata_dir / "config.toml").write_text(
+        f'db = "{external_root / "strata.db"}"\n'
+        f'fleet_yaml = "{external_fleet}"\n'
+        f'summaries_dir = "{external_root / "summaries"}"\n',
+        encoding="utf-8",
+    )
+
+    rc = cmd_register(_args(tmp_path))
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    # The bug: register seeded a starter fleet under .strata/ even though
+    # config.toml pointed elsewhere.
+    assert not (strata_dir / "fleet.yaml").exists()
+    # The external fleet must be untouched.
+    assert external_fleet.read_text(encoding="utf-8") == _FLEET_7
+    # The closing advice must name the fleet the project actually uses, not
+    # the file register would have invented, and must not claim single-scope
+    # auto-bind for a 7-scope fleet.
+    assert str(external_fleet) in out
+    assert ".strata/fleet.yaml" not in out
+    assert "g_root" not in out
+
+
+def test_reseeds_at_the_configured_path_when_its_parent_dir_is_gone(tmp_path):
+    """Recovery path `strata start` promises: "fleet.yaml missing ... Re-run
+    `strata register` ... to re-seed it." That must actually re-seed at the
+    resolved path — including creating the parent directory if it, too, was
+    removed — not crash and not fall back to the default `.strata/fleet.yaml`
+    layout.
+    """
+    (tmp_path / ".git").mkdir()
+    strata_dir = tmp_path / ".strata"
+    strata_dir.mkdir()
+    missing_parent = tmp_path / "custom"  # deliberately not created
+    (strata_dir / "config.toml").write_text(
+        f'db = "{missing_parent / "db.sqlite"}"\n'
+        f'fleet_yaml = "{missing_parent / "fleet.yaml"}"\n'
+        f'summaries_dir = "{missing_parent / "summaries"}"\n',
+        encoding="utf-8",
+    )
+
+    rc = cmd_register(_args(tmp_path))
+
+    assert rc == 0
+    assert (missing_parent / "fleet.yaml").exists()
+    assert not (strata_dir / "fleet.yaml").exists()
