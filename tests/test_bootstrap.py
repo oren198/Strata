@@ -238,6 +238,72 @@ def test_loaded_config_has_path(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Test 9 — a schema-shape error (missing required field) is humanized, not a
+# raw pydantic dump (issue #182: the operator reading this is editing YAML in
+# a browser, not reading pydantic's source).
+# ---------------------------------------------------------------------------
+
+
+def test_missing_required_field_raises_humanized_schema_error(tmp_path: Path) -> None:
+    """A scope missing a required field (e.g. ``name``) names the scope and
+    field in plain language — no pydantic class name, dotted path, type tag,
+    or documentation URL.
+    """
+    bad_yaml = """
+        strata:
+          - id: L0
+            name: Executive
+            ordinal: 0
+
+        scopes:
+          - id: g_boss
+            stratum_id: L0
+
+        edges: []
+    """
+    yaml_path = _write_yaml(tmp_path, bad_yaml)
+    with pytest.raises(FleetConfigError) as exc_info:
+        load_fleet_config(yaml_path)
+
+    message = exc_info.value.message
+    assert "g_boss" in message
+    assert "name" in message
+    # No leaked pydantic internals.
+    assert "FleetConfig" not in message
+    assert "pydantic" not in message.lower()
+    assert "errors.pydantic.dev" not in message
+    assert "type=" not in message
+    assert "input_value" not in message
+    assert "input_type" not in message
+
+
+def test_wrong_type_field_raises_humanized_schema_error(tmp_path: Path) -> None:
+    """A field of the wrong type (e.g. a non-integer ordinal) is named too,
+    without leaking pydantic internals.
+    """
+    bad_yaml = """
+        strata:
+          - id: L0
+            name: Executive
+            ordinal: not-a-number
+
+        scopes: []
+        edges: []
+    """
+    yaml_path = _write_yaml(tmp_path, bad_yaml)
+    with pytest.raises(FleetConfigError) as exc_info:
+        load_fleet_config(yaml_path)
+
+    message = exc_info.value.message
+    assert "ordinal" in message
+    assert "L0" in message
+    assert "FleetConfig" not in message
+    assert "pydantic" not in message.lower()
+    assert "errors.pydantic.dev" not in message
+    assert "type=" not in message
+
+
 def test_active_scopes_excludes_archived(tmp_path: Path) -> None:
     """active_scopes() returns only status=active scopes."""
     yaml = """

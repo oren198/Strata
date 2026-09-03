@@ -92,7 +92,7 @@ import yaml
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field, ValidationError, field_validator
+from pydantic import BaseModel, Field, field_validator
 
 from strata import __version__
 from strata.bootstrap import load_fleet_config
@@ -286,8 +286,6 @@ def _load_fleet_from_text(text: str) -> FleetConfig:
         raise InvalidFleetYaml(f"[{exc.kind}] {exc.message}") from exc
     except yaml.YAMLError as exc:
         raise InvalidFleetYaml(f"This is not valid YAML: {exc}") from exc
-    except ValidationError as exc:
-        raise InvalidFleetYaml(f"This does not match the expected fleet.yaml shape: {exc}") from exc
     finally:
         tmp_path.unlink(missing_ok=True)
 
