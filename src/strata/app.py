@@ -1940,8 +1940,10 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
             raise HTTPException(
                 status_code=422,
                 detail=(
-                    "This action corrects a scope's own directive. Operator-stratum "
-                    "items (ids starting with 'op_') are managed from the command line."
+                    "This action corrects a scope's own directive, whose ids start "
+                    "with 'c_' — this one does not. Operator-stratum items (ids "
+                    "starting with 'op_') are one example: those are managed from "
+                    "the command line."
                 ),
             )
 
