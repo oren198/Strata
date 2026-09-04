@@ -1865,6 +1865,73 @@ def test_bootstrap_drops_candidate_with_invalid_anchors_keeps_the_rest(
     assert len(record_store.list_publication_acts(scope_id="g_team")) == 1
 
 
+def test_bootstrap_outcome_threads_trimmed_flag_from_judgment(
+    fleet, record_store, summary_store, summaries_dir
+) -> None:
+    """Issue #185: a caller of bootstrap_publication must be able to tell a mechanical
+
+    backstop trim happened without parsing the reasoning prose — the judgment's
+    ``trimmed`` flag must reach the outcome the caller actually sees.
+    """
+    _seed_summary_with_directive(summary_store, "g_team")
+    manager = _FakeScopeManager(
+        bootstrap_judgment=BootstrapJudgment(
+            decision="accept",
+            reasoning="One item is fit for export.",
+            items=[
+                BootstrapPublishedItemInput(
+                    content="Use protobuf for all RPC.",
+                    kind="directive",
+                    subject="rpc",
+                    anchors=["c_dir1"],
+                ),
+            ],
+            trimmed=True,
+        )
+    )
+
+    outcome: BootstrapOutcome = bootstrap_publication(
+        "g_team",
+        fleet=fleet,
+        record_store=record_store,
+        summary_store=summary_store,
+        scope_manager=manager,
+    )
+
+    assert outcome.trimmed is True
+
+
+def test_bootstrap_outcome_trimmed_false_when_judgment_not_trimmed(
+    fleet, record_store, summary_store, summaries_dir
+) -> None:
+    _seed_summary_with_directive(summary_store, "g_team")
+    manager = _FakeScopeManager(
+        bootstrap_judgment=BootstrapJudgment(
+            decision="accept",
+            reasoning="One item is fit for export.",
+            items=[
+                BootstrapPublishedItemInput(
+                    content="Use protobuf for all RPC.",
+                    kind="directive",
+                    subject="rpc",
+                    anchors=["c_dir1"],
+                ),
+            ],
+            trimmed=False,
+        )
+    )
+
+    outcome: BootstrapOutcome = bootstrap_publication(
+        "g_team",
+        fleet=fleet,
+        record_store=record_store,
+        summary_store=summary_store,
+        scope_manager=manager,
+    )
+
+    assert outcome.trimmed is False
+
+
 def test_bootstrap_unknown_scope_raises_valueerror(record_store, summary_store) -> None:
     empty_fleet = FleetConfig(strata=[], scopes=[], edges=[])
     manager = _FakeScopeManager()

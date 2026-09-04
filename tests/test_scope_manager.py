@@ -13,6 +13,7 @@ Decision 2 tests (parent summary in user message):
 from __future__ import annotations
 
 import json
+import logging
 import os
 from unittest.mock import MagicMock
 
@@ -2490,6 +2491,136 @@ def test_bootstrap_system_prompt_states_conservative_default() -> None:
     flat = " ".join(_BOOTSTRAP_SYSTEM_PROMPT.split())
     assert "conservative" in flat.lower()
     assert "initial" in flat.lower() or "INITIAL" in flat
+
+
+def test_bootstrap_system_prompt_tells_judge_about_the_word_budget() -> None:
+    """Issue #185: the bootstrap judge must be told its budget exists — it must not
+
+    propose a whole face believing everything it names will publish, only to have
+    a silent Python-side trim drop the tail. The prompt must name the constraint so
+    the judge can propose a face that fits it in the first place.
+    """
+    flat = " ".join(_BOOTSTRAP_SYSTEM_PROMPT.split()).lower()
+    assert "budget" in flat
+    assert "word" in flat
+
+
+def test_judge_bootstrap_publication_user_message_states_the_numeric_budget() -> None:
+    """The concrete number (from publication_max_words) must reach the judge via the
+
+    user message, the same way the ordinary publish path's decline states it —
+    this is the actual "tell the judge" mechanism, since the system prompt text is
+    static and cached.
+    """
+    manager, mock_client = _make_bootstrap_manager("decline", None)
+
+    manager.judge_bootstrap_publication(
+        scope=SCOPE, current_summary=CURRENT_SUMMARY, publication_max_words=42
+    )
+
+    message = mock_client.messages.create.call_args.kwargs["messages"][0]["content"]
+    assert "42" in message
+    assert "budget" in message.lower()
+
+
+def test_judge_bootstrap_publication_user_message_states_remaining_budget_when_scope_already_published() -> (  # noqa: E501
+    None
+):
+    """Bootstrapping a scope that already published must tell the judge the REMAINING
+
+    budget (not the full one) — the same accounting the mechanical backstop trim uses.
+    """
+    manager, mock_client = _make_bootstrap_manager("decline", None)
+
+    manager.judge_bootstrap_publication(
+        scope=SCOPE,
+        current_summary=CURRENT_SUMMARY,
+        publication_max_words=10,
+        current_publication=[_PUBLISHED_ITEM],
+    )
+
+    message = mock_client.messages.create.call_args.kwargs["messages"][0]["content"]
+    # _PUBLISHED_ITEM is 5 words ("Use protobuf for all RPC.") — 5 of the 10-word
+    # budget are already spent, leaving 5.
+    assert "5" in message
+    assert "10" in message
+
+
+def test_judge_bootstrap_publication_trim_sets_trimmed_flag_true() -> None:
+    """The backstop is a BACKSTOP now, not the primary mechanism — but when it does
+
+    fire, a caller must be able to tell without parsing the reasoning prose.
+    """
+    manager, _ = _make_bootstrap_manager(
+        "accept",
+        [
+            {"content": "one two three", "kind": "context", "subject": None, "anchors": ["a"]},
+            {
+                "content": "four five six seven",
+                "kind": "context",
+                "subject": None,
+                "anchors": ["b"],
+            },
+        ],
+        "Two items fit for export.",
+    )
+
+    judgment = manager.judge_bootstrap_publication(
+        scope=SCOPE, current_summary=CURRENT_SUMMARY, publication_max_words=3
+    )
+
+    assert judgment.trimmed is True
+
+
+def test_judge_bootstrap_publication_no_trim_leaves_trimmed_flag_false() -> None:
+    manager, _ = _make_bootstrap_manager(
+        "accept",
+        [
+            {"content": "one two three", "kind": "context", "subject": None, "anchors": ["a"]},
+        ],
+        "Fits.",
+    )
+
+    judgment = manager.judge_bootstrap_publication(
+        scope=SCOPE, current_summary=CURRENT_SUMMARY, publication_max_words=500
+    )
+
+    assert judgment.trimmed is False
+
+
+def test_judge_bootstrap_publication_decline_leaves_trimmed_flag_false() -> None:
+    manager, _ = _make_bootstrap_manager("decline", None, "Nothing fit yet.")
+
+    judgment = manager.judge_bootstrap_publication(scope=SCOPE, current_summary=CURRENT_SUMMARY)
+
+    assert judgment.trimmed is False
+
+
+def test_judge_bootstrap_publication_trim_logs_a_warning(caplog: pytest.LogCaptureFixture) -> None:
+    """Loud, not silent (issue #185): the backstop firing is logged, not just flagged."""
+    manager, _ = _make_bootstrap_manager(
+        "accept",
+        [
+            {"content": "one two three", "kind": "context", "subject": None, "anchors": ["a"]},
+            {
+                "content": "four five six seven",
+                "kind": "context",
+                "subject": None,
+                "anchors": ["b"],
+            },
+        ],
+        "Two items fit for export.",
+    )
+
+    with caplog.at_level(logging.WARNING, logger="strata.scope_manager"):
+        manager.judge_bootstrap_publication(
+            scope=SCOPE, current_summary=CURRENT_SUMMARY, publication_max_words=3
+        )
+
+    assert any(
+        "trim" in record.message.lower() or "budget" in record.message.lower()
+        for record in caplog.records
+    )
 
 
 # ---------------------------------------------------------------------------
