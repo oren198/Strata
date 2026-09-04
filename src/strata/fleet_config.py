@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import Annotated, Literal
 
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 # ---------------------------------------------------------------------------
 # Error
@@ -50,6 +50,96 @@ class FleetConfigError(Exception):
         super().__init__(message)
         self.kind = kind
         self.message = message
+
+
+# ---------------------------------------------------------------------------
+# Schema-error humanizing (issue #182)
+#
+# ``FleetConfig.model_validate`` raises pydantic's own ``ValidationError`` for
+# shape problems (a missing field, a wrong type) — invariant checks in
+# ``_validate`` below never see these, because the model does not even exist
+# yet. Left uncaught, that error's ``str()`` dumps the pydantic class name, a
+# dotted field path, a ``type=`` tag, and a link to pydantic's own error
+# reference — none of it meaningful to someone editing fleet.yaml. This
+# rewrites each underlying error into the same vocabulary the rest of this
+# module speaks (stratum, scope, edge), using only ``ValidationError.errors()``
+# — never the library's rendered ``str()`` — so no internal detail leaks
+# through. Both ``strata bootstrap`` and the Console read the identical
+# message, because both go through :meth:`FleetConfig.load` /
+# :meth:`FleetConfig._commit`.
+# ---------------------------------------------------------------------------
+
+#: Section name in the raw YAML -> singular noun used in messages.
+_SECTION_SINGULAR = {"strata": "stratum", "scopes": "scope", "edges": "edge"}
+
+
+def _item_label(singular: str, index: int, item: object) -> str:
+    """Return e.g. ``"scope #1 (id 'g_boss')"`` or ``"edge #3 ('g_a' -> 'g_b')"``.
+
+    Falls back to a bare ``"{singular} #{n}"`` when the offending item isn't a
+    dict, or carries none of the identifying fields (which happens when the
+    identifying field is itself the one missing).
+    """
+    label = f"{singular} #{index + 1}"
+    if not isinstance(item, dict):
+        return label
+    if singular == "edge":
+        frm = item.get("from", item.get("from_"))
+        to = item.get("to")
+        if frm is not None and to is not None:
+            return f"{label} ({frm!r} -> {to!r})"
+        return label
+    ident = item.get("id")
+    return f"{label} (id {ident!r})" if ident is not None else label
+
+
+def _describe_schema_error(err: dict, raw: object) -> str:
+    """Render one entry of :meth:`ValidationError.errors` in fleet vocabulary.
+
+    *raw* is the parsed YAML document the error came from — used to look up
+    the offending item by section/index, since ``err["input"]`` is the whole
+    item for a *missing*-field error but only the bad value itself for a
+    wrong-type error, and only the former identifies the item.
+    """
+    loc = err["loc"]
+    msg = err["msg"]
+    if not loc:
+        return msg
+    section = loc[0] if isinstance(loc[0], str) else None
+    singular = _SECTION_SINGULAR.get(section)
+    if singular is None or len(loc) < 2 or not isinstance(loc[1], int):
+        # Not a per-item field error (e.g. "scopes" itself absent or not a
+        # list) — name the raw path, still without any pydantic internals.
+        path = ".".join(str(p) for p in loc)
+        return f"{path}: {msg}" if path else msg
+    index = loc[1]
+    item = None
+    if isinstance(raw, dict):
+        section_list = raw.get(section)
+        if isinstance(section_list, list) and 0 <= index < len(section_list):
+            item = section_list[index]
+    label = _item_label(singular, index, item)
+    if len(loc) == 2:
+        # The item itself is malformed (e.g. not a mapping at all).
+        return f"{label}: {msg}"
+    field = loc[2]
+    if err["type"] == "missing":
+        return f"{label} is missing its {field}."
+    return f"{label}: {field} — {msg}."
+
+
+def _schema_error_to_fleet_config_error(exc: ValidationError, raw: object) -> FleetConfigError:
+    """Convert a raw pydantic :class:`ValidationError` into a :class:`FleetConfigError`.
+
+    ``kind`` is the single stable token ``"invalid_schema"`` — unlike the
+    invariant checks below, a schema error is pydantic's own field-shape
+    complaint rather than one of this module's named checks, so there is no
+    finer-grained kind to report. ``message`` lists every underlying error
+    (fleet.yaml can fail this in more than one place at once), each one
+    naming the offending scope/stratum/edge and field.
+    """
+    message = " ".join(_describe_schema_error(e, raw) for e in exc.errors())
+    return FleetConfigError(kind="invalid_schema", message=message)
 
 
 # ---------------------------------------------------------------------------
@@ -380,7 +470,10 @@ class FleetConfig(BaseModel):
                 the check, ``message`` names the offending item.
         """
         raw = yaml.safe_load(path.read_text(encoding="utf-8"))
-        config = cls.model_validate(raw)
+        try:
+            config = cls.model_validate(raw)
+        except ValidationError as exc:
+            raise _schema_error_to_fleet_config_error(exc, raw) from exc
         _validate(config)
         _canonicalize(config)
         object.__setattr__(config, "_path", path)
@@ -623,7 +716,10 @@ class FleetConfig(BaseModel):
         Callers hold ``self._lock``.
         """
         assert self._path is not None
-        candidate = FleetConfig.model_validate(raw)
+        try:
+            candidate = FleetConfig.model_validate(raw)
+        except ValidationError as exc:
+            raise _schema_error_to_fleet_config_error(exc, raw) from exc
         _validate(candidate)
         _canonicalize_raw_edges(candidate, raw["edges"])
         _atomic_write(self._path, raw)
