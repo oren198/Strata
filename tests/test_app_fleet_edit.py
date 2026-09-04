@@ -97,6 +97,21 @@ _FLEET_YAML_DUPLICATE_SCOPE = textwrap.dedent("""
     edges: []
 """).strip()
 
+# A scope missing its required `name` field — a pydantic schema-shape error,
+# not one of the engine's own invariant checks (issue #182).
+_FLEET_YAML_MISSING_FIELD = textwrap.dedent("""
+    strata:
+      - id: L0
+        name: Executive
+        ordinal: 0
+
+    scopes:
+      - id: g_boss
+        stratum_id: L0
+
+    edges: []
+""").strip()
+
 
 def _make_judgment(
     decision: str = "accept_as_directive",
@@ -228,6 +243,29 @@ class TestValidateFleet:
         body = resp.json()
         assert body["detail"]["error"] == "invalid_fleet"
         assert body["detail"]["detail"]
+        assert client.fleet_yaml_path.read_bytes() == before_content
+
+    def test_schema_shape_error_is_plain_language_returns_422(self, client):
+        """A schema-validation failure (missing required field) names the
+        offending scope and field, and never leaks pydantic's class name,
+        dotted field path, type tag, or documentation URL (issue #182) — the
+        same quality bar the YAML-syntax path already meets.
+        """
+        before_content = client.fleet_yaml_path.read_bytes()
+
+        resp = client.post("/fleet/validate", json={"yaml": _FLEET_YAML_MISSING_FIELD})
+
+        assert resp.status_code == 422
+        body = resp.json()
+        assert body["detail"]["error"] == "invalid_fleet"
+        detail = body["detail"]["detail"]
+        assert "g_boss" in detail
+        assert "name" in detail
+        assert "FleetConfig" not in detail
+        assert "pydantic" not in detail.lower()
+        assert "errors.pydantic.dev" not in detail
+        assert "type=" not in detail
+        assert "input_value" not in detail
         assert client.fleet_yaml_path.read_bytes() == before_content
 
     def test_never_writes_the_file(self, client):

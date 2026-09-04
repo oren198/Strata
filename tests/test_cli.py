@@ -387,6 +387,41 @@ def test_status_custom_window_flag(
     assert "7-day window" in capsys.readouterr().out
 
 
+def test_bootstrap_schema_error_is_plain_language(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``strata bootstrap`` on a fleet.yaml with a missing required field
+    (a pydantic schema-shape error, not one of the engine's own invariant
+    checks) prints a plain-language message — the offending scope and field,
+    no pydantic class name/dotted path/type tag/documentation URL (issue
+    #182; this is the CLI half of the same shared-layer fix the Console
+    route gets).
+    """
+    fleet_path = tmp_path / "fleet.yaml"
+    fleet_path.write_text(
+        "strata:\n"
+        "  - id: L0\n"
+        "    name: Executive\n"
+        "    ordinal: 0\n"
+        "scopes:\n"
+        "  - id: g_boss\n"
+        "    stratum_id: L0\n"
+        "edges: []\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("STRATA_FLEET_CONFIG", str(fleet_path))
+    with patch("sys.stderr", new_callable=io.StringIO) as err_buf:
+        rc = main(["bootstrap"])
+    err = err_buf.getvalue()
+    assert rc == 1
+    assert "g_boss" in err
+    assert "name" in err
+    assert "FleetConfig" not in err
+    assert "pydantic" not in err.lower()
+    assert "errors.pydantic.dev" not in err
+    assert "type=" not in err
+
+
 def test_bootstrap_no_config_found(
     monkeypatch: pytest.MonkeyPatch, tmp_path, capsys: pytest.CaptureFixture[str]
 ) -> None:

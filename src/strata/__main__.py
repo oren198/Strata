@@ -2791,7 +2791,16 @@ def cmd_register(args: argparse.Namespace) -> int:
     # Helper: print action or diff line.
     # -----------------------------------------------------------------------
     def _rel(path: str | Path) -> Path:
-        return Path(path).relative_to(project_root) if Path(path).is_absolute() else Path(path)
+        p = Path(path)
+        if not p.is_absolute():
+            return p
+        try:
+            return p.relative_to(project_root)
+        except ValueError:
+            # Outside the project tree (issue #184: a configured fleet_yaml
+            # can point anywhere) — show the absolute path rather than
+            # crashing on relative_to.
+            return p
 
     def _act(action: str, path: str | Path, *, skipped: bool = False) -> None:
         print(render_action_line(action, _rel(path), diff_mode=diff_mode, skipped=skipped))
@@ -2890,7 +2899,8 @@ def cmd_register(args: argparse.Namespace) -> int:
     # Step 3: Write .strata/config.toml.
     # -----------------------------------------------------------------------
     config_toml = strata_dir / "config.toml"
-    if config_toml.exists():
+    config_toml_already_registered = config_toml.exists()
+    if config_toml_already_registered:
         _act("skip", config_toml, skipped=True)
     else:
         if adopted_store is not None:
@@ -2927,13 +2937,47 @@ def cmd_register(args: argparse.Namespace) -> int:
 
     # -----------------------------------------------------------------------
     # Step 5: Seed .strata/fleet.yaml from templates/minimal.yaml.
+    #
+    # A project already carrying a config.toml is already registered — its
+    # config.toml is the source of truth for where the fleet lives, and may
+    # point anywhere (issue #184: seen pointing at an absolute path outside
+    # the project tree). Seeding must ask the resolver, not assume the
+    # default `.strata/fleet.yaml` layout, or it plants a second, misleading
+    # fleet file nothing reads while the project's real one goes untouched.
     # -----------------------------------------------------------------------
-    fleet_yaml = adopted_store.fleet_yaml if adopted_store else strata_dir / "fleet.yaml"
+    if adopted_store is not None:
+        fleet_yaml = adopted_store.fleet_yaml
+    elif config_toml_already_registered:
+        from strata.project_config import (  # noqa: PLC0415
+            ProjectConfigError,
+            load_project_config,
+        )
+
+        try:
+            existing_project_config = load_project_config(project_root)
+        except ProjectConfigError:
+            # Malformed config.toml — not this step's problem to diagnose
+            # (doctor covers that). Fall back to the default layout so
+            # register can still finish the rest of its work.
+            existing_project_config = None
+        fleet_yaml = (
+            existing_project_config.fleet_yaml
+            if existing_project_config is not None
+            else strata_dir / "fleet.yaml"
+        )
+    else:
+        fleet_yaml = strata_dir / "fleet.yaml"
     minimal_template = _TEMPLATES_DIR / "minimal.yaml"
     if fleet_yaml.exists():
         _act("skip", fleet_yaml, skipped=True)
     else:
         if not diff_mode:
+            # The configured fleet path can point anywhere (issue #184),
+            # including a directory that no longer exists — e.g. the
+            # recovery path `strata start` documents ("fleet.yaml missing
+            # ... Re-run `strata register` ... to re-seed it") must actually
+            # work even when the parent directory was removed too.
+            fleet_yaml.parent.mkdir(parents=True, exist_ok=True)
             if minimal_template.exists():
                 shutil.copy(minimal_template, fleet_yaml)
             else:
@@ -3519,7 +3563,7 @@ def cmd_register(args: argparse.Namespace) -> int:
 
         print()
         print("Done. Next steps:")
-        print(f"  1. Edit {fleet_yaml.relative_to(project_root)} for your team's structure")
+        print(f"  1. Edit {_rel(fleet_yaml)} for your team's structure")
         print()
         if single_scope:
             # Single-scope auto-bind (operator directive): a fresh install

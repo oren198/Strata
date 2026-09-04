@@ -161,6 +161,12 @@ class BootstrapOutcome:
     decision: Literal["accept", "decline"]
     reasoning: str
     items: list[PublishedItem]
+    trimmed: bool = False
+    """Threaded from :attr:`~strata.scope_manager.BootstrapJudgment.trimmed`
+    (issue #185): ``True`` when the scope-manager's own mechanical word-budget
+    backstop dropped at least one item the judge proposed. ``False`` for a
+    decline, and ``False`` whenever the judge's proposal already fit its
+    budget — which the judge is told, so this should be the common case."""
 
 
 # ---------------------------------------------------------------------------
@@ -1275,7 +1281,12 @@ def bootstrap_publication(
         )
 
         if judgment.decision == "decline" or not judgment.items:
-            return BootstrapOutcome(decision="decline", reasoning=judgment.reasoning, items=[])
+            return BootstrapOutcome(
+                decision="decline",
+                reasoning=judgment.reasoning,
+                items=[],
+                trimmed=judgment.trimmed,
+            )
 
         proposer = _bootstrap_proposer(scope_id)
         recorded: list[PublishedItem] = []
@@ -1328,4 +1339,9 @@ def bootstrap_publication(
             )
 
         decision: Literal["accept", "decline"] = "accept" if recorded else "decline"
-        return BootstrapOutcome(decision=decision, reasoning=judgment.reasoning, items=recorded)
+        return BootstrapOutcome(
+            decision=decision,
+            reasoning=judgment.reasoning,
+            items=recorded,
+            trimmed=judgment.trimmed,
+        )

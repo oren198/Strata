@@ -54,6 +54,7 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 import re
 from collections.abc import Callable, Collection, Mapping, Sequence
 from datetime import UTC, datetime
@@ -66,6 +67,8 @@ from strata.fleet_config import EntitlementView, Scope, Stratum
 from strata.operator import OperatorItem
 from strata.record_store import Contribution, RecentContribution
 from strata.summary_store import Directive, ScopeSummary, _render_summary
+
+_logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Recency-window constants (ADR 0011 D2)
@@ -783,6 +786,15 @@ more can always be published later through the ordinary publish path. If
 nothing in the CURRENT SUMMARY is fit to publish yet, decline the whole
 bootstrap rather than forcing items into existence — an empty face is
 honest; a padded one is not.
+
+The user message states this scope's WORD BUDGET for the published face you
+are proposing — a hard limit on the combined word count of every item's
+content, counting anything already published plus everything you propose
+here. Propose a set of items that fits entirely within that budget; do not
+rely on being trimmed afterward. If everything genuinely worth publishing
+would not fit, be MORE conservative, not less — cut the weakest items so the
+strongest ones fit, rather than naming a longer list you expect to be
+shortened for you.
 
 You must call the `submit_bootstrap_publication` tool exactly once and
 provide a one-or-two-sentence reasoning. When declining, set `items` to
@@ -1575,6 +1587,14 @@ class BootstrapJudgment(BaseModel):
     decision: Literal["accept", "decline"]
     reasoning: str
     items: list[BootstrapPublishedItemInput] = Field(default_factory=list)
+    trimmed: bool = False
+    """True when the mechanical word-budget backstop (ADR 0013 D3) dropped at
+    least one of the judge's own proposed items. The judge is told its
+    budget (see :data:`_BOOTSTRAP_SYSTEM_PROMPT`) and is expected to propose
+    a face that already fits it — this backstop exists only for a judge that
+    overshoots anyway, so it firing is notable, not routine. A caller must
+    be able to detect that structurally, without parsing ``reasoning``
+    prose: ``False`` unless the backstop actually removed something."""
 
 
 # ---------------------------------------------------------------------------
@@ -3212,15 +3232,21 @@ class ScopeManager:
                 *scope*'s published face AFTER bootstrapping — the same
                 budget :meth:`judge_publication` enforces for an ordinary
                 ``publish`` act, not a separate allowance for candidates
-                alone. Enforced mechanically, not by an API retry: proposed
-                items are kept in the order the model returned them,
-                accumulating :func:`_content_word_count` on top of
-                *current_publication*'s own word count, skipping (not
-                stopping at) any candidate that would push the running
-                total over budget so a large early candidate cannot starve
-                smaller ones behind it — the rest are dropped, and the drop
-                is noted in the returned ``reasoning``. Defaults to
-                :data:`PUBLICATION_MAX_WORDS`.
+                alone. Told to the judge itself, in the user message, so it
+                can propose a face that already fits (issue #185 — a judge
+                unaware of its budget cannot make a real selection). A
+                mechanical trim still runs as a BACKSTOP for a judge that
+                overshoots anyway, not the primary mechanism: proposed items
+                are kept in the order the model returned them, accumulating
+                :func:`_content_word_count` on top of *current_publication*'s
+                own word count, skipping (not stopping at) any candidate
+                that would push the running total over budget so a large
+                early candidate cannot starve smaller ones behind it — the
+                rest are dropped. When the backstop drops anything, it is
+                loud, not silent: the drop is noted in the returned
+                ``reasoning``, the returned :class:`BootstrapJudgment`'s
+                ``trimmed`` flag is set ``True``, and a warning is logged.
+                Defaults to :data:`PUBLICATION_MAX_WORDS`.
             current_publication: *scope*'s already-published items, if any
                 — bootstrapping a scope that has published before must
                 trim candidates against the REMAINING budget, not the full
@@ -3241,8 +3267,17 @@ class ScopeManager:
             if current_summary is not None
             else "(this scope has no summary yet)"
         )
+        already_published_words = _publication_word_count(current_publication)
+        remaining_budget = publication_max_words - already_published_words
+        budget_block = (
+            f"WORD BUDGET: {already_published_words} words already published + up to "
+            f"{remaining_budget} words remaining = {publication_max_words}-word budget for "
+            "this scope's published face. The combined content of every item you propose "
+            "must fit within the remaining budget.\n\n"
+        )
         user_message = (
             f"SCOPE: {scope.name} (id={scope.id})\n\n"
+            f"{budget_block}"
             "CURRENT SUMMARY\n"
             "---\n"
             f"{summary_block}\n"
@@ -3287,11 +3322,22 @@ class ScopeManager:
 
         # ADR 0013 D3 — mechanical trim to fit publication_max_words, against
         # the REMAINING budget (current_publication may already hold words —
-        # bootstrapping is not always a scope's first publication). Kept in
-        # proposal order, greedily: an item is kept only if it still fits
+        # bootstrapping is not always a scope's first publication). The judge
+        # is told this budget above (see budget_block) and is asked to
+        # propose a face that already fits it, so this trim is now a BACKSTOP
+        # for a judge that overshoots anyway, not the primary mechanism. Kept
+        # in proposal order, greedily: an item is kept only if it still fits
         # under the running total, so a large early item cannot starve every
         # item behind it out of a face that had room for them.
+        #
+        # A silent trim here is exactly the trap issue #185 named: the judge
+        # believes everything it named will publish, so a caller must be
+        # able to tell the backstop fired without parsing `reasoning` prose.
+        # It stays loud in two ways: the structured `trimmed` flag on the
+        # returned judgment, and a warning log line here, at the point the
+        # silent drop used to happen.
         reasoning = raw["reasoning"]
+        trimmed = False
         if items:
             kept: list[BootstrapPublishedItemInput] = []
             total_words = _publication_word_count(current_publication)
@@ -3305,9 +3351,20 @@ class ScopeManager:
                 total_words += words
             items = kept
             if dropped:
+                trimmed = True
                 reasoning = (
                     f"{reasoning} ({dropped} proposed item(s) omitted mechanically to fit "
                     f"the {publication_max_words}-word publication budget.)"
                 )
+                _logger.warning(
+                    "judge_bootstrap_publication: budget backstop trimmed %d proposed "
+                    "item(s) for scope %r — the judge overshot the %d-word publication "
+                    "budget despite being told it in the prompt.",
+                    dropped,
+                    scope.id,
+                    publication_max_words,
+                )
 
-        return BootstrapJudgment(decision=raw["decision"], reasoning=reasoning, items=items)
+        return BootstrapJudgment(
+            decision=raw["decision"], reasoning=reasoning, items=items, trimmed=trimmed
+        )
