@@ -280,16 +280,19 @@ refresh it would otherwise trigger.
 
 ## Refresh
 
-The judged cycle a **change event** triggers: the scope's pending change
+The judged cycle a **change event** triggers. First the mechanical half:
+the chain parent's **directives** are spliced into the scope's own summary,
+byte for byte, ids and provenance intact — this needs no judge and runs
+wherever a refresh runs. Then the judged half: the scope's pending change
 events are judged together in one amendment, whose ops may admit a new
 **directive** or **context** as well as retire, supersede, or withdraw a
-publication — because the notice being judged is a real contribution with
-honest provenance, unlike the mechanical splice that carries an ancestor's
-directives into a scope's own summary on `strata launch` and `strata
-refresh`, which admits nothing. Reading or binding a scope through the MCP
-server runs the judged cycle alone, with no splice. A refresh runs before a
-scope is bound or its perspective is read; `strata refresh` also runs it
-directly, for an operator who wants it without touching either.
+publication — the notice being judged is a real contribution with honest
+provenance. A refresh runs inside the MCP server before a scope is bound or
+its perspective is read; a scope with nothing pending and nothing to splice
+costs the read nothing. `strata launch` and `strata refresh` run the same
+cycle from the command line. Without a judge key the splice still lands and
+the reconciliation waits, as a pending change event, for the first keyed
+refresh.
 
 ## Supersession
 
