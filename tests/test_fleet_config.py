@@ -1866,3 +1866,104 @@ def test_add_edge_untyped_onto_a_taken_slot_becomes_a_reference(tmp_path: Path) 
     with pytest.raises(FleetConfigError) as exc_info:
         config.add_edge(from_scope_id="g_teamX", to_scope_id="g_funcB", kind="chain")
     assert exc_info.value.kind == "multiple_inter_stratum_parents"
+
+
+# ---------------------------------------------------------------------------
+# ADR 0014 D3 — topological traversal for the affected set
+#
+# The affected set of an input change is computed from three walks: the
+# source's chain children and chain descendants (a directive binds downward),
+# and the INVERSE of `references_from` — the scopes that read the source's
+# publication.
+# ---------------------------------------------------------------------------
+
+
+def test_chain_children_are_direct_children_only(tmp_path: Path) -> None:
+    """g_exec's chain child is g_funcA; g_teamX is a grandchild, not a child."""
+    config = FleetConfig.load(_write(tmp_path, _ENTITLEMENT_YAML))
+
+    assert [s.id for s in config.chain_children("g_exec")] == ["g_funcA"]
+
+
+def test_chain_children_sorted_and_excludes_archived(tmp_path: Path) -> None:
+    """g_funcA's children come back sorted by id; an archived child is skipped."""
+    config = FleetConfig.load(_write(tmp_path, _ENTITLEMENT_YAML))
+
+    assert [s.id for s in config.chain_children("g_funcA")] == ["g_teamSibling", "g_teamX"]
+
+
+def test_chain_children_of_a_leaf_is_empty(tmp_path: Path) -> None:
+    config = FleetConfig.load(_write(tmp_path, _ENTITLEMENT_YAML))
+
+    assert config.chain_children("g_teamX") == []
+
+
+def test_chain_descendants_reach_every_depth(tmp_path: Path) -> None:
+    """A directive on g_exec binds its whole subtree, not just its children."""
+    config = FleetConfig.load(_write(tmp_path, _ENTITLEMENT_YAML))
+
+    assert [s.id for s in config.chain_descendants("g_exec")] == [
+        "g_funcA",
+        "g_teamSibling",
+        "g_teamX",
+    ]
+
+
+def test_chain_descendants_exclude_the_scope_itself(tmp_path: Path) -> None:
+    config = FleetConfig.load(_write(tmp_path, _ENTITLEMENT_YAML))
+
+    assert "g_exec" not in [s.id for s in config.chain_descendants("g_exec")]
+
+
+def test_chain_descendants_never_follow_reference_edges(tmp_path: Path) -> None:
+    """g_funcA references g_funcB; a reference delivers publication, never ancestry."""
+    config = FleetConfig.load(_write(tmp_path, _ENTITLEMENT_YAML))
+
+    assert "g_funcB" not in [s.id for s in config.chain_descendants("g_funcA")]
+
+
+def test_referenced_by_is_the_inverse_of_references_from(tmp_path: Path) -> None:
+    """g_funcA references g_funcB, so g_funcB's publication is read by g_funcA."""
+    config = FleetConfig.load(_write(tmp_path, _ENTITLEMENT_YAML))
+
+    assert [s.id for s in config.referenced_by("g_funcB")] == ["g_funcA"]
+    assert "g_funcB" in [s.id for s in config.references_from("g_funcA")]
+
+
+def test_referenced_by_a_scope_nobody_references_is_empty(tmp_path: Path) -> None:
+    config = FleetConfig.load(_write(tmp_path, _ENTITLEMENT_YAML))
+
+    assert config.referenced_by("g_exec") == []
+
+
+def test_referenced_by_excludes_archived_readers(tmp_path: Path) -> None:
+    """An archived scope cannot be woken by a change; it reads nothing."""
+    yaml_text = """
+    strata:
+      - id: L1
+        name: Function
+        ordinal: 1
+
+    scopes:
+      - id: g_source
+        name: Source
+        stratum_id: L1
+      - id: g_live
+        name: Live reader
+        stratum_id: L1
+      - id: g_gone
+        name: Archived reader
+        stratum_id: L1
+        status: archived
+
+    edges:
+      - from: g_live
+        to: g_source
+        kind: reference
+      - from: g_gone
+        to: g_source
+        kind: reference
+    """
+    config = FleetConfig.load(_write(tmp_path, textwrap.dedent(yaml_text)))
+
+    assert [s.id for s in config.referenced_by("g_source")] == ["g_live"]

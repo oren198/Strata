@@ -703,6 +703,119 @@ class FleetConfig(BaseModel):
         return sorted((scope_map[sid] for sid in ids), key=lambda s: s.id)
 
     # ------------------------------------------------------------------
+    # Affected-set traversal (ADR 0014 D3)
+    #
+    # The three walks the topological affected set is built from: a
+    # publication change reaches the source's chain children and the scopes
+    # whose reference edge points AT the source; a directive change reaches
+    # the holding scope's chain descendants. One rule for an addition, an
+    # amendment and a withdrawal alike — there is no presented index and no
+    # fallback (ADR 0014 D3's rejected alternative).
+    # ------------------------------------------------------------------
+
+    def chain_children(self, scope_id: str) -> list[Scope]:
+        """Return the active scopes whose chain parent is *scope_id*, one hop.
+
+        The publication half of ADR 0014 D3's rule: a scope's publication
+        composes into its chain children (ADR 0013 D2/D3 — publication
+        travels exactly one edge), so those are the scopes a change to it
+        can invalidate. Grandchildren are NOT children: they receive the
+        source's face only if the child relays it, which is the child's own
+        publication act and mints its own change.
+
+        Args:
+            scope_id: The parent scope. Not validated against the fleet — an
+                unknown id simply has no children.
+
+        Returns:
+            Active child scopes, sorted by scope id. Archived children are
+            excluded: an archived scope has no judge to wake.
+        """
+        scope_map = {s.id: s for s in self.scopes}
+        parents = self._chain_parent_ids()
+        children = [
+            scope_map[child_id]
+            for child_id, parent_id in parents.items()
+            if parent_id == scope_id and child_id in scope_map
+        ]
+        return sorted((c for c in children if c.status == "active"), key=lambda s: s.id)
+
+    def chain_descendants(self, scope_id: str) -> list[Scope]:
+        """Return every active scope below *scope_id* on chain edges, at any depth.
+
+        The directive half of ADR 0014 D3's rule: a directive binds the
+        holding scope's whole subtree, so a directive appended, superseded or
+        retired at *scope_id* changes what every descendant's judge would be
+        shown. Reference edges are never followed — a reference delivers
+        publication, never ancestry (:meth:`inter_stratum_parent`).
+
+        *scope_id* itself is NOT included; a scope's own directive change is
+        its own act, and the callers that DO want the scope included (an
+        operator directive attached at S binds S and its subtree, ADR 0008
+        D2) add it themselves.
+
+        Args:
+            scope_id: The holding scope.
+
+        Returns:
+            Active descendant scopes, sorted by scope id.
+        """
+        # One shared parent map, walked per candidate — the same shape
+        # entitlement_view's descendant scan uses, for the same reason:
+        # re-deriving each candidate's ancestry would re-resolve every edge
+        # once per hop, per scope.
+        parents = self._chain_parent_ids()
+        descendants: list[Scope] = []
+        for candidate in self.scopes:
+            if candidate.id == scope_id or candidate.status != "active":
+                continue
+            # A validated fleet's chain edges cannot loop (a parent sits on a
+            # strictly lower ordinal); the walked set keeps this total on a
+            # config built without validation.
+            walked: set[str] = {candidate.id}
+            cursor = parents.get(candidate.id)
+            while cursor is not None and cursor not in walked:
+                if cursor == scope_id:
+                    descendants.append(candidate)
+                    break
+                walked.add(cursor)
+                cursor = parents.get(cursor)
+        return sorted(descendants, key=lambda s: s.id)
+
+    def referenced_by(self, scope_id: str) -> list[Scope]:
+        """Return the active scopes that reference *scope_id*, one hop — the readers.
+
+        The exact inverse of :meth:`references_from`: that method answers
+        "whose publications do I read", this one answers "who reads mine",
+        which is what ADR 0014 D3 needs to name the scopes a change to
+        *scope_id*'s publication affects. Same one-hop, own-edges-only rule
+        on both sides, so ``B in fleet.references_from(A)`` holds exactly
+        when ``A in fleet.referenced_by(B)``.
+
+        Args:
+            scope_id: The referenced scope whose readers to resolve. Not
+                validated against the fleet.
+
+        Returns:
+            Active reader scopes, sorted by scope id. An archived reader is
+            excluded — it has no judge to wake.
+        """
+        scope_map = {s.id: s for s in self.scopes}
+        ids: list[str] = []
+        seen: set[str] = set()
+        for resolution in _resolve_edges(self):
+            if resolution.kind != "reference" or resolution.to != scope_id:
+                continue
+            if resolution.from_ in seen:
+                continue
+            reader = scope_map.get(resolution.from_)
+            if reader is None or reader.status != "active":
+                continue
+            seen.add(resolution.from_)
+            ids.append(resolution.from_)
+        return sorted((scope_map[sid] for sid in ids), key=lambda s: s.id)
+
+    # ------------------------------------------------------------------
     # Mutation API
     # ------------------------------------------------------------------
 
