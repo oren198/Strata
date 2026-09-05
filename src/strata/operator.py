@@ -60,6 +60,7 @@ from typing import Literal
 
 import yaml
 
+from strata.change_events import emit as emit_change_event
 from strata.fleet_config import FleetConfig
 from strata.locks import scope_lock
 from strata.publication import propagate_directive_removals
@@ -265,6 +266,45 @@ def _operator_layer_lock_key(target_scope_id: str) -> str:
     return f"operator:{target_scope_id}"
 
 
+def _emit_operator_layer_change(
+    fleet: FleetConfig | None,
+    *,
+    record_store: RecordStore,
+    target_scope_id: str,
+    item_id: str,
+    before: str | None,
+    after: str | None,
+) -> None:
+    """Announce a change to the operator layer attached at *target_scope_id*.
+
+    ADR 0014 D1 names an operator directive change as a trigger, and D3 makes
+    its affected set the attachment scope PLUS its descendants — the one kind
+    that includes the source, because the operator writes from outside the
+    fleet and the attachment scope is a reader of the layer, not its author
+    (ADR 0008 D2).
+
+    Publish, supersede and retire all emit the same
+    ``operator_directive_changed`` kind: the operator's stratum is not judged
+    (ADR 0008 D1), so what an affected scope needs to know is that the
+    binding layer above it moved — ``before``/``after`` say which way.
+
+    A *fleet* of ``None`` emits nothing. That is the cost of leaving the
+    parameter optional on primitives with many pre-existing callers; every
+    caller inside the engine passes one.
+    """
+    if fleet is None:
+        return
+    emit_change_event(
+        fleet=fleet,
+        record_store=record_store,
+        item=item_id,
+        kind="operator_directive_changed",
+        source_scope_id=target_scope_id,
+        before=before,
+        after=after,
+    )
+
+
 def operator_publish(
     target_scope_id: str,
     content: str,
@@ -272,6 +312,7 @@ def operator_publish(
     *,
     record_store: RecordStore,
     summaries_dir: str,
+    fleet: FleetConfig | None = None,
 ) -> OperatorItem:
     """Publish a new piece of operator memory attached at *target_scope_id*.
 
@@ -293,6 +334,11 @@ def operator_publish(
             binds S's subtree.
         content: Verbatim operator memory text.
         subject: Optional short subject line.
+        fleet: Read to name the scopes this write affects (ADR 0014 D3 — the
+            attachment scope and its subtree). Optional only because this
+            primitive predates change events and has many callers that have
+            no fleet to hand; a call without one informs nobody, which is a
+            silent gap rather than an error.
 
     Returns:
         The newly published :class:`OperatorItem` (``kind="directive"``).
@@ -315,6 +361,14 @@ def operator_publish(
         items = read_operator_layer(target_scope_id, summaries_dir=summaries_dir)
         items.append(item)
         _write_operator_layer(target_scope_id, items, summaries_dir=summaries_dir)
+        _emit_operator_layer_change(
+            fleet,
+            record_store=record_store,
+            target_scope_id=target_scope_id,
+            item_id=item.id,
+            before=None,
+            after=content,
+        )
         return item
 
 
@@ -326,6 +380,7 @@ def operator_supersede_item(
     *,
     record_store: RecordStore,
     summaries_dir: str,
+    fleet: FleetConfig | None = None,
 ) -> OperatorItem:
     """Supersede an existing operator item attached at *target_scope_id*.
 
@@ -390,6 +445,14 @@ def operator_supersede_item(
         )
         items[index] = new_item
         _write_operator_layer(target_scope_id, items, summaries_dir=summaries_dir)
+        _emit_operator_layer_change(
+            fleet,
+            record_store=record_store,
+            target_scope_id=target_scope_id,
+            item_id=new_item.id,
+            before=existing.content,
+            after=content,
+        )
         return new_item
 
 
@@ -399,6 +462,7 @@ def operator_retire_item(
     *,
     record_store: RecordStore,
     summaries_dir: str,
+    fleet: FleetConfig | None = None,
 ) -> OperatorAct:
     """Retire an operator item attached at *target_scope_id* without replacement.
 
@@ -420,7 +484,8 @@ def operator_retire_item(
     """
     with scope_lock(_operator_layer_lock_key(target_scope_id)):
         items = read_operator_layer(target_scope_id, summaries_dir=summaries_dir)
-        if not any(it.id == item_id for it in items):
+        retired = next((it for it in items if it.id == item_id), None)
+        if retired is None:
             raise KeyError(
                 f"Operator item {item_id!r} not found in the operator layer attached at "
                 f"{target_scope_id!r}."
@@ -434,6 +499,14 @@ def operator_retire_item(
         )
         remaining = [it for it in items if it.id != item_id]
         _write_operator_layer(target_scope_id, remaining, summaries_dir=summaries_dir)
+        _emit_operator_layer_change(
+            fleet,
+            record_store=record_store,
+            target_scope_id=target_scope_id,
+            item_id=item_id,
+            before=retired.content,
+            after=None,
+        )
         return act
 
 
@@ -697,6 +770,20 @@ def operator_supersede(
             record_store=record_store,
             summaries_dir=str(summary_store.summaries_dir),
         )
+
+        # ADR 0014 D1/D3 — the corrected scope's directive set changed, so
+        # every descendant composing it must re-judge. The scope itself is
+        # not told: the correction is already in its summary, exactly as its
+        # own judge's amendment would be.
+        emit_change_event(
+            fleet=fleet,
+            record_store=record_store,
+            item=directive_id,
+            kind="directive_superseded",
+            source_scope_id=scope_id,
+            before=existing.content,
+            after=f"{new_directive.id}: {content}",
+        )
         return new_directive
 
 
@@ -771,5 +858,16 @@ def operator_retire(
             fleet=fleet,
             record_store=record_store,
             summaries_dir=str(summary_store.summaries_dir),
+        )
+
+        # ADR 0014 D1/D3 — see operator_supersede: the descendants composed
+        # this directive and no longer do.
+        emit_change_event(
+            fleet=fleet,
+            record_store=record_store,
+            item=directive_id,
+            kind="directive_retired",
+            source_scope_id=scope_id,
+            before=existing.content,
         )
         return retirement

@@ -933,3 +933,143 @@ def test_operator_item_equality() -> None:
     a = OperatorItem(id="op_1", kind="directive", content="x", subject=None, created_at="t")
     b = OperatorItem(id="op_1", kind="directive", content="x", subject=None, created_at="t")
     assert a == b
+
+
+# ---------------------------------------------------------------------------
+# Change-event emission from the operator's two capacities (ADR 0014 D1)
+#
+# The operator changes a scope's composed inputs from OUTSIDE the fleet:
+# nobody inside authored the change, so nobody inside can see it coming.
+# ---------------------------------------------------------------------------
+
+
+def test_operator_publish_tells_the_attachment_scope_and_its_subtree(
+    fleet, record_store, summaries_dir
+) -> None:
+    """An operator directive attached at S binds S and its descendants (ADR
+    0008 D2), so both are affected — the one kind where the source scope is
+    itself a reader of the change."""
+    item = operator_publish(
+        "g_func",
+        "Ship on Fridays.",
+        fleet=fleet,
+        record_store=record_store,
+        summaries_dir=summaries_dir,
+    )
+
+    for scope_id in ("g_func", "g_team"):
+        (event,) = record_store.list_change_events(scope_id=scope_id)
+        assert event.kind == "operator_directive_changed"
+        assert event.item_id == item.id
+        assert event.source_scope_id == "g_func"
+        assert "Ship on Fridays." in (event.after or "")
+    # Never upward: an operator layer binds downward only.
+    assert record_store.list_change_events(scope_id="g_exec") == []
+
+
+def test_operator_supersede_item_emits_with_both_states(fleet, record_store, summaries_dir) -> None:
+    first = operator_publish(
+        "g_func", "v1", fleet=fleet, record_store=record_store, summaries_dir=summaries_dir
+    )
+    second = operator_supersede_item(
+        "g_func",
+        first.id,
+        "v2",
+        fleet=fleet,
+        record_store=record_store,
+        summaries_dir=summaries_dir,
+    )
+
+    events = record_store.list_change_events(scope_id="g_team")
+    assert [e.kind for e in events] == [
+        "operator_directive_changed",
+        "operator_directive_changed",
+    ]
+    assert events[-1].item_id == second.id
+    assert events[-1].before == "v1"
+    assert events[-1].after == "v2"
+
+
+def test_operator_retire_item_emits_with_nothing_after(fleet, record_store, summaries_dir) -> None:
+    item = operator_publish(
+        "g_func", "v1", fleet=fleet, record_store=record_store, summaries_dir=summaries_dir
+    )
+    operator_retire_item(
+        "g_func", item.id, fleet=fleet, record_store=record_store, summaries_dir=summaries_dir
+    )
+
+    last = record_store.list_change_events(scope_id="g_team")[-1]
+    assert last.item_id == item.id
+    assert last.before == "v1"
+    assert last.after is None
+
+
+def test_operator_layer_writes_without_a_fleet_emit_nothing(
+    fleet, record_store, summaries_dir
+) -> None:
+    """KNOWN SEAM, asserted so it stays visible: *fleet* is optional on these
+    primitives (dozens of existing callers pass none), and a caller that
+    omits it silently informs nobody. Precondition first — the same call WITH
+    a fleet does emit."""
+    operator_publish(
+        "g_func", "with fleet", fleet=fleet, record_store=record_store, summaries_dir=summaries_dir
+    )
+    assert len(record_store.list_change_events(scope_id="g_team")) == 1
+
+    operator_publish("g_func", "no fleet", record_store=record_store, summaries_dir=summaries_dir)
+
+    assert len(record_store.list_change_events(scope_id="g_team")) == 1
+
+
+def test_operator_supersede_correction_tells_the_descendants(
+    fleet, record_store, summary_store, summaries_dir
+) -> None:
+    """An operator correction to a scope's OWN directive (ADR 0008 D4) changes
+    what its descendants compose, exactly as the scope's own judge would."""
+    directive_id = _seed_directive(
+        record_store, summary_store, scope_id="g_func", content="Use protobuf."
+    )
+
+    new_directive = operator_supersede(
+        "g_func",
+        directive_id,
+        "Use gRPC instead.",
+        fleet=fleet,
+        record_store=record_store,
+        summary_store=summary_store,
+    )
+
+    (event,) = record_store.list_change_events(scope_id="g_team")
+    assert event.kind == "directive_superseded"
+    assert event.item_id == directive_id
+    assert event.source_scope_id == "g_func"
+    assert new_directive.id in (event.after or "")
+    # The corrected scope is not told about its own directive set (ADR 0014
+    # D1) — the correction is already in its summary.
+    assert record_store.list_change_events(scope_id="g_func") == []
+
+
+def test_operator_retire_correction_tells_the_descendants(
+    fleet, record_store, summary_store, summaries_dir
+) -> None:
+    directive_id = _seed_directive(
+        record_store, summary_store, scope_id="g_func", content="Use protobuf."
+    )
+
+    retirement = operator_retire(
+        "g_func",
+        directive_id,
+        "No longer true.",
+        fleet=fleet,
+        record_store=record_store,
+        summary_store=summary_store,
+    )
+
+    # Precondition: the correction really happened.
+    assert retirement.directive_id == directive_id
+    assert [d.id for d in summary_store.read("g_func").directives] == []
+
+    (event,) = record_store.list_change_events(scope_id="g_team")
+    assert event.kind == "directive_retired"
+    assert event.item_id == directive_id
+    assert event.after is None
