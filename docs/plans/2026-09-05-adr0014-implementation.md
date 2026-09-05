@@ -49,8 +49,8 @@ after A merges; E last.
    twice.
 10. **Vacuous-pass guard.** Every "engine never edited context" test first
     asserts the refresh's judgment row exists.
-11. No `git stash`, no self-spawned agents, no live store, and the word from
-    [[strata-web-isolation]] never appears anywhere.
+11. No `git stash`, no self-spawned agents, no live store, and no reference
+    to any sibling product in files, commits or comments.
 
 ## Phases
 
