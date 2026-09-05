@@ -131,7 +131,10 @@ calls fanning across the fleet.
 
 The queue for a scope is drained **by the MCP server when that scope is bound or
 its perspective is read**, before composition, under the scope's lock. Nobody
-can read a scope without first bringing it up to date. The system is correct for
+can read a scope without the engine first attempting to bring it up to date;
+if the judge is unavailable or no key is configured, the read still returns,
+with `input_changes` listing what is owed (the refresh is deferred, never the
+notice). The system is correct for
 a user who never runs `strata launch`, `strata start` or any CLI. `strata
 refresh [SCOPE | --all]` exists for the operator; `strata doctor` reports queue
 depth and the oldest pending event.
