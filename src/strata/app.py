@@ -1374,8 +1374,8 @@ def _judge_spliced_summary(
     admitting ops for the INPUT-CHANGE refresh, where the change event is a
     real contribution to mint a directive from).
 
-    The caller MUST NOT hold ``_scope_lock(scope.id)``: this delegates to
-    :func:`_judge_and_record`, whose caller takes it.
+    The caller MUST hold ``_scope_lock(scope.id)``: this delegates to
+    :func:`_judge_and_record`, which requires it.
 
     Raises:
         JudgeUnavailable: the judge call failed. The splice itself has
@@ -1469,7 +1469,7 @@ def drain_scope(
     Idempotent by the no-op-if-judged rule (pin 1): an event whose notice
     already carries a verdict — a crash between the judgment write and the
     marking — is marked processed without a second judge call, and a scope with
-    nothing pending makes no judge call at all.
+    nothing pending and nothing to splice makes no judge call at all.
 
     Runs under ``scope_lock`` (ADR 0012), like every other summary write. The
     caller must NOT already hold it; the MCP read path does not.
