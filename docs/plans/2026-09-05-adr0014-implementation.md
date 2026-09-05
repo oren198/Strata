@@ -52,6 +52,26 @@ after A merges; E last.
 11. No `git stash`, no self-spawned agents, no live store, and no reference
     to any sibling product in files, commits or comments.
 
+## Findings from Phase A (binding on B/C/D)
+
+- **The chain parent's publication is never rendered to any judge.**
+  `_read_judge_inputs` builds peer publications from referenced peers only.
+  ADR 0013 D2 composes the parent's publication into the perspective; the
+  judge must see the same thing or a refresh triggered by a parent
+  publication change has nothing to judge against. **Phase C renders the
+  parent's publication to the judge**, as a `PARENT PUBLICATION` block beside
+  the peer block, non-binding, with the same "according to <scope>" rule.
+- **`change_id` is scalar on the single judgment; a coalesced batch carries
+  several.** Decision: the batch judge and `ScopeManagerBatchJudgment` take
+  `change_ids: list[str]`; a derived change event is written as **one row per
+  (change id, affected scope)**, so the once-per-id check stays a row lookup
+  and a scope refreshes if ANY inherited id is unseen (equivalent to D4's
+  "suppressed when all seen"). Phase C owns the type change.
+- `change_events.kind` has no CHECK; Phase B settles the vocabulary
+  (`published`, `amended`, `withdrawn`, `directive_appended`,
+  `directive_superseded`, `directive_retired`, `operator_directive_changed`)
+  and adds the constraint in its migration.
+
 ## Phases
 
 - **A — storage and plumbing (serial, first).** Migration + `change_events`
