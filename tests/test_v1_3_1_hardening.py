@@ -442,7 +442,12 @@ def test_resolver_accepts_preloaded_none_project_config(tmp_path: Path, monkeypa
 
 
 def test_refresh_scope_writes_record_trail(tmp_path: Path) -> None:
-    """_refresh_scope must append its contribution AND judgment to the record."""
+    """_refresh_scope must leave a judgment against the notice it refreshed for.
+
+    The notice is the ``manager-refresh`` contribution the change event points
+    at (ADR 0014 D5); the refresh's own verdict is recorded against it, so the
+    summary still never moves without a record trail.
+    """
     from strata.__main__ import _refresh_scope
     from strata.fleet_config import FleetConfig
 
@@ -466,6 +471,26 @@ def test_refresh_scope_writes_record_trail(tmp_path: Path) -> None:
 
     with RecordStore(db_path) as rs:
         summary_store = SummaryStore(str(tmp_path / "summaries"))
+        notice = rs.append_contribution(
+            scope_id="g_root",
+            content="[Input change chg_a: item p_1 was withdrawn.]",
+            proposed_classification="context",
+            subject="manager-refresh",
+            supersedes=None,
+            contributor=ContributorRef(
+                scope_id="g_root",
+                skill="scope-manager",
+                session_id="refresh",
+                ts="2026-09-05T00:00:00+00:00",
+            ),
+        )
+        rs.append_change_event(
+            change_id="chg_a",
+            contribution_id=notice.id,
+            scope_id="g_root",
+            item_id="p_1",
+            kind="withdrawn",
+        )
         _refresh_scope(
             "g_root",
             fleet_config=fleet,
@@ -477,7 +502,7 @@ def test_refresh_scope_writes_record_trail(tmp_path: Path) -> None:
         contributions = rs.list_contributions(scope_id="g_root")
         judgments = rs.list_judgments(scope_id="g_root")
 
-    assert len(contributions) == 1, "the refresh event must be appended to the record"
+    assert len(contributions) == 1, "the refresh notice must be in the record"
     assert contributions[0].subject == "manager-refresh"
     assert len(judgments) == 1, "the refresh judgment must be recorded"
     assert judgments[0].contribution_id == contributions[0].id

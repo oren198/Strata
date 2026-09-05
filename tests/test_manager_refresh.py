@@ -159,59 +159,6 @@ def test_parent_version_none_for_root_scope(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Test 2 — Staleness detection
-# ---------------------------------------------------------------------------
-
-
-def test_stale_when_parent_version_older(tmp_path: Path) -> None:
-    """Summary with parent_version=3 is stale when parent has version=4."""
-    from strata.__main__ import _is_stale
-
-    my_summary = _make_summary(parent_version=3)
-    parent_summary = _make_summary(version=4)
-
-    assert _is_stale(my_summary, parent_summary) is True
-
-
-def test_fresh_when_parent_version_equal(tmp_path: Path) -> None:
-    """Summary with parent_version=4 is fresh when parent has version=4."""
-    from strata.__main__ import _is_stale
-
-    my_summary = _make_summary(parent_version=4)
-    parent_summary = _make_summary(version=4)
-
-    assert _is_stale(my_summary, parent_summary) is False
-
-
-def test_stale_when_parent_version_none(tmp_path: Path) -> None:
-    """A summary with no parent_version stamp is treated as stale (legacy support)."""
-    from strata.__main__ import _is_stale
-
-    my_summary = _make_summary(parent_version=None)
-    parent_summary = _make_summary(version=1)
-
-    assert _is_stale(my_summary, parent_summary) is True
-
-
-def test_stale_across_parents_first_write(tmp_path: Path) -> None:
-    """version=0 (issue #59's synthesized-summary sentinel) is always older
-    than a parent's real first write (version=1).
-
-    A child stamped with parent_version=0 — because it was built while the
-    parent had no on-disk summary yet, i.e. against the synthesized
-    ``ScopeSummary(version=0, exists=False)`` — must be detected as stale
-    the moment the parent's real first write lands, without any special
-    casing: 0 < 1 falls straight out of ``parent_version < version``.
-    """
-    from strata.__main__ import _is_stale
-
-    my_summary = _make_summary(parent_version=0)
-    parent_summary = _make_summary(version=1)
-
-    assert _is_stale(my_summary, parent_summary) is True
-
-
-# ---------------------------------------------------------------------------
 # Test 3 — Budget rendering in user message
 # ---------------------------------------------------------------------------
 
@@ -506,18 +453,19 @@ def test_judge_called_with_correct_parent_summary(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_cmd_launch_stale_chain_triggers_refresh(
+def test_cmd_launch_refreshes_a_scope_with_pending_input_changes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Stale ancestor chain → ScopeManager.judge called for each stale scope.
+    """A pending input change is what triggers a launch refresh (ADR 0014 D6).
 
-    Tests the _run_manager_refresh path invoked by cmd_launch:
-    - Fleet: L0 (g_root) → L1 (g_child)
-    - g_child summary has parent_version=1 but g_root has version=2 → stale
-    - Expects manager.judge called at least twice (once for g_root, once for g_child)
+    Version-comparison staleness is gone (implementation pin 6): the child here
+    is NOT version-stale — its ``parent_version`` matches the parent's current
+    version — and it is refreshed anyway, because a change event says an input
+    it rests on moved. One mechanism, and it is the change event.
     """
     from strata.__main__ import _run_manager_refresh
     from strata.migrator import run_migrations
+    from strata.record_store import RecordStore
     from strata.scope_manager import ScopeManagerJudgment
     from strata.settings import Settings, get_settings
     from strata.summary_store import ScopeSummary, SummaryStore
@@ -550,28 +498,52 @@ def test_cmd_launch_stale_chain_triggers_refresh(
     summaries_dir_path = tmp_path / "summaries"
     run_migrations(db_path)
 
-    # Write g_root with version=2
     ss = SummaryStore(str(summaries_dir_path))
-    root_summary = ScopeSummary(
-        scope_id="g_root",
-        directives=[],
-        context="Root context.",
-        updated_at="2026-05-31T10:00:00Z",
-        version=1,
+    ss.write(
+        "g_root",
+        ScopeSummary(
+            scope_id="g_root",
+            directives=[],
+            context="Root context.",
+            updated_at="2026-05-31T10:00:00Z",
+        ),
     )
-    ss.write("g_root", root_summary)
-    ss.write("g_root", root_summary)  # second write → version=2
+    root_version = ss.read("g_root").version
+    ss.write(
+        "g_child",
+        ScopeSummary(
+            scope_id="g_child",
+            directives=[],
+            context="Child context.",
+            updated_at="2026-05-31T10:00:00Z",
+            parent_version=root_version,
+        ),
+    )
 
-    # Write g_child with parent_version=1 (stale — parent is now version=2)
-    child_summary = ScopeSummary(
-        scope_id="g_child",
-        directives=[],
-        context="Child context.",
-        updated_at="2026-05-31T10:00:00Z",
-        version=1,
-        parent_version=1,
-    )
-    ss.write("g_child", child_summary)
+    # The notice and its event row — what a Phase B emitter writes.
+    with RecordStore(db_path) as rs:
+        notice = rs.append_contribution(
+            scope_id="g_child",
+            content="[Input change chg_a: item p_1 was withdrawn.]",
+            proposed_classification="context",
+            subject="manager-refresh",
+            supersedes=None,
+            contributor=ContributorRef(
+                scope_id="g_child",
+                skill="scope-manager",
+                session_id="refresh",
+                ts="2026-09-05T00:00:00+00:00",
+            ),
+        )
+        rs.append_change_event(
+            change_id="chg_a",
+            contribution_id=notice.id,
+            scope_id="g_child",
+            item_id="p_1",
+            kind="withdrawn",
+            before="Ship behind a flag.",
+            after=None,
+        )
 
     settings = Settings(
         db_path=db_path,
@@ -619,9 +591,11 @@ def test_cmd_launch_stale_chain_triggers_refresh(
 
     get_settings.cache_clear()
 
-    # judge should have been called for g_child (stale) — g_root has no parent
-    # so it won't be stale, but g_child should be refreshed
-    assert "g_child" in judge_calls, f"Expected g_child in judge calls: {judge_calls}"
+    # Only the scope that owed a refresh was judged: g_root has nothing
+    # pending and no parent to inherit from, so it costs no judge call.
+    assert judge_calls == ["g_child"]
+    with RecordStore(db_path) as rs:
+        assert rs.list_change_events(scope_id="g_child", unprocessed_only=True) == []
 
 
 # ---------------------------------------------------------------------------
@@ -634,14 +608,12 @@ def test_refresh_does_not_crash_when_parent_summary_deleted(
 ) -> None:
     """Regression for the latent AttributeError at __main__.py:498 (PR #31 review).
 
-    Reachable path: child has a summary on disk with parent_version stamped
-    (non-None), but the parent's summary file has been deleted (manual cleanup,
-    storage reset, etc.).  When ``_refresh_scope`` is called for the child
-    directly (e.g. via the cascade inside another refresh), the previous code
-    would call ``_is_stale(my_summary, parent_summary=None)`` and dereference
-    ``parent_summary.version`` — crashing with AttributeError before the
-    recovery path could even fire. The fix is the ``parent_summary is not
-    None`` short-circuit in the ``already_fresh`` expression.
+    Reachable path: the child has a summary on disk with a ``parent_version``
+    stamp, but the parent's summary file has been deleted (manual cleanup,
+    storage reset). The original defect dereferenced the absent parent summary
+    while comparing versions; that comparison is gone (ADR 0014
+    implementation pin 6), but the input shape is still real and a refresh
+    must still survive it — and still drain what the scope owes.
     """
     from strata.__main__ import _refresh_scope
     from strata.fleet_config import FleetConfig
@@ -712,9 +684,28 @@ def test_refresh_does_not_crash_when_parent_summary_deleted(
     mock_manager.judge.side_effect = fake_judge
 
     with RecordStore(db_path) as record_store:
-        # Must not raise AttributeError (regression). On the buggy code,
-        # `_is_stale(child_summary, parent_summary=None)` crashed before the
-        # recovery path could fire.
+        notice = record_store.append_contribution(
+            scope_id="g_child",
+            content="[Input change chg_a: item p_1 was withdrawn.]",
+            proposed_classification="context",
+            subject="manager-refresh",
+            supersedes=None,
+            contributor=ContributorRef(
+                scope_id="g_child",
+                skill="scope-manager",
+                session_id="refresh",
+                ts="2026-09-05T00:00:00+00:00",
+            ),
+        )
+        record_store.append_change_event(
+            change_id="chg_a",
+            contribution_id=notice.id,
+            scope_id="g_child",
+            item_id="p_1",
+            kind="withdrawn",
+        )
+        # Must not raise: the parent summary the child's stamp refers to is
+        # simply not there.
         _refresh_scope(
             "g_child",
             fleet_config=fleet_config,
@@ -724,10 +715,9 @@ def test_refresh_does_not_crash_when_parent_summary_deleted(
             summary_max_words=500,
         )
 
-    # The recovery path should have refreshed the parent first, then the child.
     judge_scopes = [call.kwargs["scope"].id for call in mock_manager.judge.call_args_list]
-    assert "g_child" in judge_scopes, (
-        f"Expected g_child refresh after the deleted-parent-summary recovery: {judge_scopes}"
+    assert judge_scopes == ["g_child"], (
+        f"Expected the child's own drain to run with the parent summary gone: {judge_scopes}"
     )
 
 
