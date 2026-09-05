@@ -103,7 +103,7 @@ from strata.record_store import JUDGE_FAILED, ContributorRef, RecordStore
 if TYPE_CHECKING:
     from strata.fleet_config import FleetConfig
     from strata.scope_manager import ScopeManager
-    from strata.summary_store import ScopeSummary, SummaryStore
+    from strata.summary_store import SummaryStore
 
 _logger = logging.getLogger("strata.publication")
 
@@ -415,7 +415,38 @@ _DIRECTIVE_ANCHOR_PREFIX = "directive:"
 _SUBJECT_ANCHOR_PREFIX = "subject:"
 
 
-def _tag_anchor(raw: str, *, current_summary: ScopeSummary | None) -> str:
+def _binding_directive_ids(
+    scope_id: str, *, fleet: FleetConfig, summary_store: SummaryStore
+) -> set[str]:
+    """Every directive id that binds *scope_id*: its own, plus its ancestors'.
+
+    ADR 0015 D3 — an inherited directive binds the scope, so a published item
+    may anchor to it. Before ADR 0015 the splice put the ancestor's row in the
+    scope's own summary and this set was accidentally right; with the copy
+    gone (D1) the ancestor half comes from the walk, which is the same walk
+    composition and the judge read (D2).
+
+    One set feeding one validation function, deliberately: anchor
+    classification (:func:`_tag_anchor`) and anchor validation
+    (:func:`_validate_anchors`) must agree about which ids are directives, or
+    a bare ancestor id is silently downgraded to a free-form ``subject:``
+    anchor and then passes validation as the wrong kind — an item nothing
+    would ever sweep.
+    """
+    # Deferred import — strata.perspective is a read-side module and importing
+    # it at module scope here would tangle the publication path with it.
+    from strata.perspective import ancestor_directives
+
+    own = summary_store.read(scope_id)
+    ids = {d.id for d in own.directives} if own is not None else set()
+    for _ancestor_scope_id, directives in ancestor_directives(
+        scope_id, fleet=fleet, summary_store=summary_store
+    ):
+        ids.update(d.id for d in directives)
+    return ids
+
+
+def _tag_anchor(raw: str, *, valid_directive_ids: Collection[str]) -> str:
     """Prefix-tag one raw anchor string as ``directive:<id>`` or ``subject:<text>``.
 
     An anchor already carrying an explicit ``directive:``/``subject:`` prefix
@@ -423,21 +454,21 @@ def _tag_anchor(raw: str, *, current_summary: ScopeSummary | None) -> str:
     this lets a caller assert "this is a directive anchor" and have it
     checked, rather than silently downgraded to a subject anchor because the
     directive was removed). Anything else is auto-classified: an exact match
-    against a directive id currently in *current_summary* becomes a
+    against a directive id that currently binds the scope
+    (*valid_directive_ids*, from :func:`_binding_directive_ids`) becomes a
     ``directive:`` anchor; anything else becomes a ``subject:`` anchor
     (free-form — no verification is possible or required for a subject
     reference).
     """
     if raw.startswith(_DIRECTIVE_ANCHOR_PREFIX) or raw.startswith(_SUBJECT_ANCHOR_PREFIX):
         return raw
-    directive_ids = {d.id for d in (current_summary.directives if current_summary else [])}
-    if raw in directive_ids:
+    if raw in valid_directive_ids:
         return f"{_DIRECTIVE_ANCHOR_PREFIX}{raw}"
     return f"{_SUBJECT_ANCHOR_PREFIX}{raw}"
 
 
 def _validate_anchors(
-    tagged_anchors: Sequence[str], *, current_summary: ScopeSummary | None
+    tagged_anchors: Sequence[str], *, valid_directive_ids: Collection[str]
 ) -> None:
     """Structurally validate *tagged_anchors* — raises :class:`ValueError`, never a decline.
 
@@ -447,29 +478,28 @@ def _validate_anchors(
 
     Raises:
         ValueError: *tagged_anchors* is empty, or a ``directive:`` anchor
-            names an id that is not present in *current_summary*'s
-            directives.
+            names an id that does not currently bind the scope — neither its
+            own nor any ancestor's (ADR 0015 D3).
     """
     if not tagged_anchors:
         _logger.warning("publication anchor validation failed: zero anchors supplied")
         raise ValueError(
             "A publish act requires at least one anchor — either a directive id "
-            "currently present in this scope's summary, or a subject string "
-            "(ADR 0007 D1)."
+            "that currently binds this scope (its own, or an ancestor's), or a "
+            "subject string (ADR 0007 D1, ADR 0015 D3)."
         )
-    directive_ids = {d.id for d in (current_summary.directives if current_summary else [])}
     for anchor in tagged_anchors:
         if anchor.startswith(_DIRECTIVE_ANCHOR_PREFIX):
             directive_id = anchor[len(_DIRECTIVE_ANCHOR_PREFIX) :]
-            if directive_id not in directive_ids:
+            if directive_id not in valid_directive_ids:
                 _logger.warning(
-                    "publication anchor validation failed: directive %r not in current summary",
+                    "publication anchor validation failed: directive %r does not bind this scope",
                     directive_id,
                 )
                 raise ValueError(
-                    f"Anchor references directive {directive_id!r}, which is not in this "
-                    "scope's CURRENT summary — a publish act can only anchor to a directive "
-                    "the scope currently holds (ADR 0007 D1)."
+                    f"Anchor references directive {directive_id!r}, which does not currently "
+                    "bind this scope — a publish act can only anchor to a directive the scope "
+                    "holds itself or inherits from an ancestor (ADR 0007 D1, ADR 0015 D3)."
                 )
 
 
@@ -649,8 +679,10 @@ def propose_publish(
 
     with scope_lock(scope_id):
         current_summary = summary_store.read(scope_id)
-        tagged_anchors = [_tag_anchor(a, current_summary=current_summary) for a in anchors]
-        _validate_anchors(tagged_anchors, current_summary=current_summary)
+        # ADR 0015 D3: an inherited directive binds, so its id anchors too.
+        binding_ids = _binding_directive_ids(scope_id, fleet=fleet, summary_store=summary_store)
+        tagged_anchors = [_tag_anchor(a, valid_directive_ids=binding_ids) for a in anchors]
+        _validate_anchors(tagged_anchors, valid_directive_ids=binding_ids)
 
         act = record_store.append_publication_act(
             scope_id=scope_id,
@@ -1402,12 +1434,13 @@ def bootstrap_publication(
         proposer = _bootstrap_proposer(scope_id)
         recorded: list[PublishedItem] = []
 
+        binding_ids = _binding_directive_ids(scope_id, fleet=fleet, summary_store=summary_store)
         for candidate in judgment.items:
             tagged_anchors = [
-                _tag_anchor(a, current_summary=current_summary) for a in candidate.anchors
+                _tag_anchor(a, valid_directive_ids=binding_ids) for a in candidate.anchors
             ]
             try:
-                _validate_anchors(tagged_anchors, current_summary=current_summary)
+                _validate_anchors(tagged_anchors, valid_directive_ids=binding_ids)
             except ValueError as exc:
                 _logger.warning(
                     "bootstrap candidate for scope %r dropped — invalid anchors: %s",

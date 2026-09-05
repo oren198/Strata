@@ -96,8 +96,8 @@ from pydantic import BaseModel, Field, field_validator
 
 from strata import __version__
 from strata.bootstrap import load_fleet_config
+from strata.change_events import DIRECTIVE_UNSPLICED, new_change_id
 from strata.change_events import emit as emit_change_event
-from strata.change_events import new_change_id
 from strata.fleet_config import FleetConfig, FleetConfigError, Scope, Stratum
 from strata.fleet_reload import FleetReloader
 from strata.locks import BATCH_CAP, QUEUE_WAIT_TIMEOUT_S, QueueTicket, configure_lock_dir
@@ -106,7 +106,7 @@ from strata.locks import scope_lock as _scope_lock
 from strata.locks import scope_queue as _scope_queue
 from strata.migrator import run_migrations
 from strata.operator import operator_memory_binding, read_operator_layer
-from strata.perspective import compose_perspective
+from strata.perspective import ancestor_directives, compose_perspective
 from strata.project_config import StoragePaths, resolve_storage_paths
 from strata.publication import (
     apply_judged_withdrawals,
@@ -136,7 +136,7 @@ from strata.session_state import (
     sessions_dir_for,
 )
 from strata.settings import Settings, get_settings
-from strata.summary_store import ScopeSummary, SummaryStore, splice_parent_directives
+from strata.summary_store import Directive, ScopeSummary, SummaryStore
 
 # Console UI static files bundled as package data (same vendoring pattern as
 # _skills/ / _migrations/ / _templates/), so the static mount works regardless
@@ -437,7 +437,7 @@ class _JudgeInputs:
     """
 
     current_summary: ScopeSummary | None
-    parent_summary: ScopeSummary | None
+    ancestor_directives: list[tuple[str, list[Directive]]]
     recent_contributions: list[RecentContribution]
     entitlement: object
     operator_memory: list
@@ -464,11 +464,15 @@ def _read_judge_inputs(
         scope_id=scope.id, limit=recency_window_size
     )
 
-    # Resolve the inter-stratum parent's summary for manager context (ADR 0004
-    # Decision 2). The caller does the graph traversal; the manager is a pure
-    # judgment primitive that receives the resolved summary.
+    # Resolve what binds this scope from above (ADR 0004 D2, ADR 0015 D2): the
+    # ancestor walk, root-first, the SAME one `compose_perspective` reads. The
+    # caller does the graph traversal; the manager is a pure judgment primitive
+    # that receives the resolved walk. It is the whole chain, not the immediate
+    # parent alone — a grandparent's directive binds this scope just as hard,
+    # and the judge that could not see it was judging against a different
+    # picture from the agent's.
     parent_scope = fleet.inter_stratum_parent(scope.id)
-    parent_summary = summary_store.read(parent_scope.id) if parent_scope is not None else None
+    ancestors = ancestor_directives(scope.id, fleet=fleet, summary_store=summary_store)
 
     # Judge-aware rendering (ADR 0008 D3): the operator memory binding this
     # scope (attached here or at any inter-stratum ancestor) is rendered to
@@ -504,7 +508,7 @@ def _read_judge_inputs(
     )
     return _JudgeInputs(
         current_summary=current_summary,
-        parent_summary=parent_summary,
+        ancestor_directives=ancestors,
         recent_contributions=recent_contributions,
         entitlement=entitlement,
         operator_memory=operator_memory,
@@ -545,13 +549,11 @@ def _judge_and_record(
         summary_store=summary_store,
         recency_window_size=recency_window_size,
     )
-    parent_summary = inputs.parent_summary
-
     try:
         judgment: ScopeManagerJudgment = scope_manager.judge(
             scope=scope,
             stratum=stratum,
-            parent_summary=parent_summary,
+            ancestor_directives=inputs.ancestor_directives,
             current_summary=inputs.current_summary,
             recent_contributions=inputs.recent_contributions,
             new_contribution=contribution,
@@ -608,7 +610,6 @@ def _judge_and_record(
             fleet=fleet,
             record_store=record_store,
             summary_store=summary_store,
-            parent_summary=parent_summary,
             previous_summary=inputs.current_summary,
             retirements=[(d, judgment.reasoning) for d in judgment.retired_directive_ids],
             removals=[(d, contribution.id) for d in judgment.removed_directive_ids],
@@ -631,7 +632,6 @@ def _write_amendment(
     fleet: FleetConfig,
     record_store: RecordStore,
     summary_store: SummaryStore,
-    parent_summary: ScopeSummary | None,
     previous_summary: ScopeSummary | None,
     retirements: Sequence[tuple[str, str]],
     removals: Sequence[tuple[str, str]],
@@ -670,12 +670,7 @@ def _write_amendment(
     # a backstop budget that restarts at zero on each derivation is not a
     # backstop.
     change_ids = judgment.wave_ids or [new_change_id()]
-    # Stamp the parent-summary version the judgment was built from, so
-    # staleness stays detectable without re-running the LLM (ADR 0004 D4).
-    to_write = judgment.new_summary.model_copy(
-        update={"parent_version": parent_summary.version if parent_summary else None}
-    )
-    summary_store.write(scope.id, to_write)
+    summary_store.write(scope.id, judgment.new_summary)
 
     # ADR 0011 D1: a `retire` op removes a directive with no replacement,
     # so no contribution row carries the explanation — the retirement
@@ -889,7 +884,7 @@ def _judge_batch_and_record(
         batch: ScopeManagerBatchJudgment = scope_manager.judge_batch(
             scope=scope,
             stratum=stratum,
-            parent_summary=inputs.parent_summary,
+            ancestor_directives=inputs.ancestor_directives,
             current_summary=inputs.current_summary,
             recent_contributions=inputs.recent_contributions,
             new_contributions=list(contributions),
@@ -942,7 +937,6 @@ def _judge_batch_and_record(
             fleet=fleet,
             record_store=record_store,
             summary_store=summary_store,
-            parent_summary=inputs.parent_summary,
             previous_summary=inputs.current_summary,
             retirements=retirements,
             removals=removals,
@@ -1268,158 +1262,16 @@ class DrainFailed(Exception):
 class DrainOutcome:
     """What one :func:`drain_scope` call did.
 
-    ``judged`` is False when no judge call was made at all — an empty queue
-    with nothing to splice, or a queue whose notices already carry verdicts.
-    A caller reporting "refresh pending: N" reads ``events_processed``; it is
-    never a count of judge outages (pin 4), which are a different thing
-    entirely.
-
-    ``spliced`` says whether the mechanical parent-directive splice (ADR 0011
-    D4) actually moved this scope's summary. It is not a second pending
-    count: it is how a caller can tell a drain that did real work from one
-    that found everything settled, since a splice can be the ONLY thing a
-    drain does (a scope binding for the first time owns no change events —
-    nothing changed after it existed).
+    ``judged`` is False when no judge call was made at all — an empty queue,
+    or a queue whose notices already carry verdicts. A caller reporting
+    "refresh pending: N" reads ``events_processed``; it is never a count of
+    judge outages (pin 4), which are a different thing entirely.
     """
 
     scope_id: str
     events_processed: int
     judged: bool
     outcomes: list[ContributionOutcome]
-    spliced: bool = False
-
-
-def _pending_splice(
-    scope: Scope,
-    *,
-    fleet: FleetConfig,
-    summary_store: SummaryStore,
-) -> ScopeSummary | None:
-    """Return *scope*'s summary with the chain parent's directives spliced in.
-
-    Read-only and lock-free: it says what the splice WOULD write, and
-    ``None`` when it would write nothing. :func:`_splice_parent_directives_in`
-    writes it; :func:`drain_is_noop` asks the same question without writing,
-    which is what lets a read of a current scope skip the lock entirely.
-
-    ADR 0011 D4's mechanical half, and the reason it is MECHANICAL: a judge
-    asked to quote an inherited directive paraphrases it sooner or later,
-    while a copied row carries the parent's id, content and provenance
-    unchanged. The judge that runs after this sees the directives already in
-    place and has nothing to copy.
-
-    Unconditional and idempotent —
-    :func:`~strata.summary_store.splice_parent_directives` returns the same
-    object when there is nothing to splice — so this is not a staleness test
-    and there is no version comparison left anywhere (implementation pin 6).
-    A child with no summary of its own still gets one: that is what makes a
-    scope binding for the first time inherit what already binds it.
-
-    Root-first is NOT required. The parent's own drain happens on the
-    parent's own read, so a chain of stale ancestors settles one read at a
-    time — ADR 0014's documented known gap, deliberately left open rather
-    than worked around by fanning judge calls up the chain from one read.
-
-    Returns:
-        The summary to write, or ``None`` when the splice would change
-        nothing — the caller's signal that there is nothing for the judge to
-        reconcile either (fixpoint damping, pin 7).
-    """
-    parent_scope = fleet.inter_stratum_parent(scope.id)
-    parent_summary = summary_store.read(parent_scope.id) if parent_scope is not None else None
-    if parent_summary is None or not parent_summary.directives:
-        return None
-
-    current = summary_store.read(scope.id)
-    base = current or ScopeSummary(
-        scope_id=scope.id,
-        directives=[],
-        context="",
-        updated_at=datetime.now(tz=UTC).isoformat(),
-    )
-    spliced = splice_parent_directives(base, parent_summary)
-    if spliced is base and current is not None:
-        return None
-
-    # Stamp the parent version this was built from, exactly as an amendment
-    # does (ADR 0004 D4) — the stamp is a record of provenance, not the
-    # staleness test it used to stand in for.
-    return spliced.model_copy(update={"parent_version": parent_summary.version})
-
-
-def _splice_parent_directives_in(
-    scope: Scope,
-    *,
-    fleet: FleetConfig,
-    summary_store: SummaryStore,
-) -> list[str]:
-    """Write the splice :func:`_pending_splice` describes, and say what moved.
-
-    The caller MUST hold ``_scope_lock(scope.id)``.
-
-    Returns:
-        The ids of the directives the splice added or replaced, in summary
-        order — empty when it changed nothing. The ids are what a notice for
-        a deferred reconciliation names, so they are read off the write
-        rather than re-derived from it.
-    """
-    to_write = _pending_splice(scope, fleet=fleet, summary_store=summary_store)
-    if to_write is None:
-        return []
-
-    before = summary_store.read(scope.id)
-    previous = {d.id: d for d in before.directives} if before is not None else {}
-    summary_store.write(scope.id, to_write)
-    return [d.id for d in to_write.directives if previous.get(d.id) != d]
-
-
-def _enqueue_splice_reconciliation(
-    scope: Scope,
-    spliced_directive_ids: Sequence[str],
-    *,
-    fleet: FleetConfig,
-    record_store: RecordStore,
-) -> None:
-    """Leave the splice's reconciliation as a pending change notice (ADR 0014 D5).
-
-    Used when the splice ran but no judge was available to reconcile the
-    context behind it — a keyless MCP server. The notice is the same vehicle
-    every other input change uses: a ``subject="manager-refresh"``
-    contribution plus its ``change_events`` row, unprocessed, so the next
-    drain with a judge coalesces it with whatever else is pending and judges
-    it once (implementation pin 1). Dropping it instead would leave the
-    scope holding directives its context never mentions, with nothing in the
-    record saying so.
-
-    The notice and its row are one transaction (ADR 0014 D5), so a reader
-    finds both or neither — there is no half-notice for the next drain to
-    trip over.
-
-    The caller MUST hold ``_scope_lock(scope.id)``.
-    """
-    parent_scope = fleet.inter_stratum_parent(scope.id)
-    ids = list(spliced_directive_ids)
-    rendered = ", ".join(ids)
-    record_store.append_change_notice(
-        scope_id=scope.id,
-        content=(
-            "[Manager refresh — parent directives were incorporated mechanically "
-            "while no judge was configured; reconcile the context digest with the "
-            f"refreshed state. Directives: {rendered}.]"
-        ),
-        contributor=ContributorRef(
-            scope_id=scope.id,
-            skill="scope-manager",
-            session_id="refresh",
-            ts=datetime.now(tz=UTC).isoformat(),
-        ),
-        change_id=new_change_id(),
-        source_scope_id=parent_scope.id if parent_scope is not None else None,
-        item_id=ids[0],
-        kind="directive_appended",
-        before=None,
-        after=rendered,
-    )
 
 
 def drain_is_noop(
@@ -1433,10 +1285,10 @@ def drain_is_noop(
 
     Lock-free and read-only, and that is the whole point: the drain sits on
     the read path of every bind and perspective read (ADR 0014 D6), so a
-    scope with nothing pending and nothing to splice must be answerable
-    without taking ``scope_lock`` — a quiet read would otherwise wait behind
-    any in-flight judgment for that scope, which is an LLM call — and without
-    constructing a judge client it will not use.
+    scope with nothing pending must be answerable without taking
+    ``scope_lock`` — a quiet read would otherwise wait behind any in-flight
+    judgment for that scope, which is an LLM call — and without constructing
+    a judge client it will not use.
 
     Racy by design, in the harmless direction. A change event landing
     immediately after this returns True is drained by the next read, exactly
@@ -1446,83 +1298,202 @@ def drain_is_noop(
     empty at the instant composition begins.
 
     Returns:
-        ``True`` only when both halves of a drain would be no-ops. A scope
-        the fleet no longer holds returns ``False``, so the caller still
-        reaches :func:`drain_scope` and gets its error rather than silence.
+        ``True`` when there is nothing pending AND no legacy spliced row left
+        to remove. A scope the fleet no longer holds returns ``False``, so the
+        caller still reaches :func:`drain_scope` and gets its error rather
+        than silence.
     """
-    scope = fleet.get_scope(scope_id)
-    if scope is None:
+    if fleet.get_scope(scope_id) is None:
         return False
     if record_store.list_change_events(scope_id=scope_id, unprocessed_only=True):
         return False
-    return _pending_splice(scope, fleet=fleet, summary_store=summary_store) is None
+    # ADR 0015 D5's migration has to be reachable from a READ, or it never
+    # runs where it is needed most: a scope carrying spliced copies with an
+    # empty queue is the settled state of every scope nobody has written to
+    # since the upgrade, and D6's "nothing pending" alone would skip it
+    # lock-free forever. So a pending unsplice is work, and this says so.
+    #
+    # Read-only, no lock, and self-terminating: after the first unsplice the
+    # check finds nothing and the scope goes back to answering reads without
+    # the lock. What it costs until then — one summary read and one record
+    # lookup per directive row — is the price of a migration that runs once
+    # rather than a filter the read path pays for forever (D5, Rejected).
+    summary = summary_store.read(scope_id)
+    if summary is None:
+        return True
+    return not _legacy_copied_directive_ids(summary, scope_id=scope_id, record_store=record_store)
 
 
-def _judge_spliced_summary(
+def _legacy_copied_directive_ids(
+    summary: ScopeSummary,
+    *,
+    scope_id: str,
+    record_store: RecordStore,
+) -> list[str]:
+    """Return the ids in *summary* that a pre-0015 splice copied in (ADR 0015 D5).
+
+    The exact test, in one place, because two callers ask the same question and
+    must not be able to disagree about it: :func:`_unsplice_legacy_copies`,
+    which removes these rows under the scope lock, and :func:`drain_is_noop`,
+    which reports the pending removal as work so a read actually reaches it.
+
+    A directive id IS a contribution id, and a contribution is appended to
+    exactly one scope's record. So a row whose contribution lives in ANOTHER
+    scope's record was copied here mechanically and was never judged into this
+    scope, while a row from this scope's own record — or one the record has
+    never heard of at all — is left alone. Absence of evidence is not evidence
+    of a copy.
+
+    Read-only and lock-free, which is what lets ``drain_is_noop`` ask.
+    """
+    return [
+        directive.id
+        for directive in summary.directives
+        if (contribution := record_store.get_contribution(directive.id)) is not None
+        and contribution.scope_id != scope_id
+    ]
+
+
+def _unsplice_legacy_copies(
     scope: Scope,
     *,
-    stratum: Stratum,
-    fleet: FleetConfig,
     record_store: RecordStore,
     summary_store: SummaryStore,
-    scope_manager: ScopeManager,
-    summary_max_words: int,
-    window_verbatim_tail: int,
-    recency_window_size: int,
-) -> ContributionOutcome | None:
-    """Reconcile the scope's context with directives just spliced in (ADR 0011 D4).
+) -> None:
+    """Drop directive rows a pre-0015 splice copied into *scope*'s summary (ADR 0015 D5).
 
-    The judgment half of the splice, for the case where the splice is the
-    only thing that happened: no change event was pending, so there is no
-    notice to judge and one is appended here. The refresh request is itself a
-    contribution, appended to the record BEFORE judgment and judged after, so
-    the summary never changes without a record trail ("the record is sacred"
-    — ROADMAP principle 4; CONTEXT.md § Contribution).
+    The exact inverse of the splice, and exact for the same reason it was:
+    a directive id IS a contribution id, and a contribution is appended to
+    exactly one scope's record. A row whose contribution lives in ANOTHER
+    scope's record was copied here mechanically and was never judged into this
+    scope, so ADR 0014 D7's "no stored state is rewritten" does not cover it —
+    D7 protected JUDGED state, and the splice was never judgment.
 
-    Judged in ``splice_refresh`` mode: the directives are already in place
-    mechanically, so the amendment carries context and lifecycle ops only
-    (ADR 0011 D4, unamended for this path — ADR 0014 D2 lifts the drop of
-    admitting ops for the INPUT-CHANGE refresh, where the change event is a
-    real contribution to mint a directive from).
+    Two rows are NEVER removed, and both matter more than the cleanup:
 
-    The caller MUST hold ``_scope_lock(scope.id)``: this delegates to
-    :func:`_judge_and_record`, which requires it.
+    - one whose contribution is in this scope's own record — the scope
+      admitted it, and it is the scope's own memory;
+    - one the record has never heard of — an operator-attached row, a
+      hand-migrated one, anything at all. Absence of evidence is not evidence
+      of a copy, and removing on a guess destroys memory.
 
-    Raises:
-        JudgeUnavailable: the judge call failed. The splice itself has
-            already been written — it is mechanical and owes nothing to the
-            judge — so the next drain reconciles the context.
+    ``source_scope_id`` is deliberately not the test (ADR 0015 D5): the HTTP
+    route lets a contributor's scope differ from the target scope, so it says
+    who typed, not where the row was admitted.
+
+    Idempotent by construction: a second call finds nothing to remove and
+    writes nothing — no summary version bump, no second record note. This is a
+    migration that happens once, not a filter the read path pays for forever.
+
+    The caller MUST hold ``_scope_lock(scope.id)``.
     """
-    contribution = record_store.append_contribution(
+    current = summary_store.read(scope.id)
+    if current is None:
+        return
+    removed = _legacy_copied_directive_ids(current, scope_id=scope.id, record_store=record_store)
+    if not removed:
+        return
+
+    kept = [d for d in current.directives if d.id not in set(removed)]
+    summary_store.write(scope.id, current.model_copy(update={"directives": kept}))
+
+    # The record says what moved and why. Stamped processed at birth (ADR 0014
+    # D4's "recorded, never drained" shape): this reports mechanical work
+    # already done, not a refresh anyone still owes — the directives it names
+    # are unchanged in their owners' summaries and still bind this scope
+    # through the ancestor walk (ADR 0015 D2).
+    rendered = ", ".join(removed)
+    record_store.append_change_notice(
         scope_id=scope.id,
         content=(
-            "[Manager refresh — parent directives already incorporated"
-            " mechanically; reconcile the context digest with the refreshed"
-            " state.]"
+            "[Manager refresh — directive rows copied here by the pre-1.11 parent splice "
+            "were removed; they live in their owning scope's summary and reach this scope "
+            f"by composition (ADR 0015 D5). Removed: {rendered}.]"
         ),
-        proposed_classification="context",
-        subject="manager-refresh",
-        supersedes=None,
         contributor=ContributorRef(
             scope_id=scope.id,
             skill="scope-manager",
             session_id="refresh",
             ts=datetime.now(tz=UTC).isoformat(),
         ),
+        change_id=new_change_id(),
+        source_scope_id=None,
+        item_id=removed[0],
+        kind=DIRECTIVE_UNSPLICED,
+        before=rendered,
+        after=None,
+        processed=True,
     )
-    return _judge_and_record(
-        contribution=contribution,
-        scope=scope,
-        stratum=stratum,
-        fleet=fleet,
-        record_store=record_store,
-        summary_store=summary_store,
-        scope_manager=scope_manager,
-        summary_max_words=summary_max_words,
-        window_verbatim_tail=window_verbatim_tail,
-        recency_window_size=recency_window_size,
-        mode="splice_refresh",
-    )
+
+
+def _sweep_ancestor_removals(
+    scope: Scope,
+    events: Sequence[ChangeEvent],
+    *,
+    fleet: FleetConfig,
+    record_store: RecordStore,
+    summary_store: SummaryStore,
+) -> None:
+    """Withdraw items an ancestor's retirement left with no anchor (ADR 0015 D3).
+
+    An inherited directive binds the scope, so a published item may anchor to
+    it (D3). When the ancestor retires or supersedes it, the descendant's
+    items anchored ONLY to that id lose their last anchor, and ADR 0007 D3's
+    rule applies unchanged: an item lives while any anchor lives, and is
+    withdrawn mechanically when none does. Mechanical, because the LOCAL case
+    is — a rule that is mechanical for one's own retirements and judged for an
+    ancestor's would be a second rule, and the descendant's judge would be
+    deciding whether the ancestor's retirement counted.
+
+    Runs at the top of the drain, BEFORE the judge, so the judge is shown the
+    swept publication rather than asked to do the sweeping. It needs no judge,
+    which is why a keyless drain runs it too.
+
+    The removed ids come off the change events themselves: ``before`` minus
+    ``after`` when the event carries both directive-id sets (an ancestor
+    amendment can remove several ids at once and ``item_id`` names only the
+    most consequential one — ADR 0014 D4), falling back to ``item_id`` alone.
+
+    The surviving set is every id that still binds this scope — its own
+    summary plus the CURRENT ancestor walk — so an item anchored to a second,
+    still-standing inherited directive is left alone.
+
+    The caller MUST hold ``_scope_lock(scope.id)``.
+    """
+    removals = [e for e in events if e.kind in ("directive_retired", "directive_superseded")]
+    if not removals:
+        return
+
+    own = summary_store.read(scope.id)
+    surviving = {d.id for d in own.directives} if own is not None else set()
+    for _ancestor_scope_id, directives in ancestor_directives(
+        scope.id, fleet=fleet, summary_store=summary_store
+    ):
+        surviving.update(d.id for d in directives)
+
+    for event in removals:
+        if event.before is not None and event.after is not None:
+            before = {i.strip() for i in event.before.split(",") if i.strip()}
+            after = {i.strip() for i in event.after.split(",") if i.strip()}
+            removed = before - after
+        else:
+            removed = set()
+        # `item_id` always names one removed directive; the set arithmetic
+        # above only ever ADDS the siblings it travelled with.
+        removed.add(event.item_id)
+        propagate_directive_removals(
+            scope.id,
+            removed,
+            event.contribution_id,
+            surviving_directive_ids=surviving,
+            fleet=fleet,
+            record_store=record_store,
+            summaries_dir=str(summary_store.summaries_dir),
+            # ADR 0014 D4: this withdrawal is a consequence of that change,
+            # one hop further out — never an independent change of its own.
+            change_ids=[event.change_id],
+            hop=event.hop + 1,
+        )
 
 
 def drain_scope(
@@ -1536,31 +1507,24 @@ def drain_scope(
     window_verbatim_tail: int = WINDOW_VERBATIM_TAIL,
     recency_window_size: int = RECENCY_WINDOW_SIZE,
 ) -> DrainOutcome:
-    """Bring *scope_id* up to date: splice, then judge what changed (ADR 0014 D6).
+    """Judge what changed for *scope_id* (ADR 0014 D6, ADR 0015 D6).
 
-    Two mechanical-then-judged steps, in one place because there is one
-    refresh mechanism (implementation pin 6) and both entry points — the MCP
-    server's drain-on-read and ``strata launch``/``strata refresh`` — go
-    through it:
+    One job, in one place, because there is one refresh mechanism
+    (implementation pin 6) and both entry points — the MCP server's
+    drain-on-read and ``strata launch``/``strata refresh`` — go through it:
+    every unprocessed change event, judged as one batch.
 
-    1. **The parent-directive splice** (ADR 0011 D4), unconditional and
-       idempotent (:func:`_splice_parent_directives_in`). It lives here
-       rather than in the launch path because an MCP-only user never runs a
-       CLI command (ADR 0014 D6) and would otherwise never inherit a
-       directive at all. When the splice is the only thing that moved — a
-       scope binding for the first time owns no change events, since nothing
-       changed after it existed — it gets its own ``splice_refresh``
-       judgment; when there are events too, the input-change refresh below
-       reconciles both at once, in ONE judge call.
-    2. **The drain proper**: every unprocessed change event, judged as one
-       batch.
+    ADR 0015 D1 deleted the step that used to come first. The parent-directive
+    splice copied an ancestor's rows into this scope's stored summary; a
+    directive now lives in exactly one summary — its owner's — and reaches a
+    descendant by composition on every read (D2), so there is nothing left to
+    copy and no unconditional mechanical work a settled scope has to pay for.
+    An MCP-only user still inherits everything that binds them, because the
+    inheriting happens where they read.
 
-    ``scope_manager=None`` runs step 1 alone — the MECHANICAL half, which
-    needs no judge. A user with no judge key still inherits what binds them
-    (ADR 0011 D4 copies rows; it never asks an LLM to quote them); what is
-    deferred is the reconciliation, and it is deferred as a pending notice
-    rather than dropped, so the first drain with a judge picks it up. Nothing
-    is attempted, so nothing records an attempt row: a judge that was never
+    ``scope_manager=None`` judges nothing: a keyless server has no mechanical
+    work left to do at read time beyond what the sweep below does. Nothing is
+    attempted, so nothing records an attempt row — a judge that was never
     configured is not a judge outage (implementation pin 4).
 
     Coalescing IS batch judgment (implementation pin 1): N pending change
@@ -1588,7 +1552,7 @@ def drain_scope(
     Idempotent by the no-op-if-judged rule (pin 1): an event whose notice
     already carries a verdict — a crash between the judgment write and the
     marking — is marked processed without a second judge call, and a scope with
-    nothing pending and nothing to splice makes no judge call at all.
+    nothing pending makes no judge call at all.
 
     Runs under ``scope_lock`` (ADR 0012), like every other summary write. The
     caller must NOT already hold it; the MCP read path does not.
@@ -1609,60 +1573,36 @@ def drain_scope(
         )
 
     with _scope_lock(scope.id):
-        # Step 1 — the mechanical splice, BEFORE the judge reads anything:
-        # the judge is handed the already-spliced summary and never asked to
-        # copy an inherited directive across (ADR 0011 D4). Written to the
-        # store rather than passed along, so a decline still leaves the
-        # inherited rows standing — they are the engine's mechanical work,
-        # not the judge's amendment.
-        spliced_ids = _splice_parent_directives_in(scope, fleet=fleet, summary_store=summary_store)
-        spliced = bool(spliced_ids)
+        # ADR 0015 D5, first and once: a legacy spliced row still sitting in
+        # this scope's summary would otherwise land in the sweep's surviving
+        # set below and keep an un-anchored item alive after its directive was
+        # retired upstream.
+        _unsplice_legacy_copies(scope, record_store=record_store, summary_store=summary_store)
 
         events = record_store.list_change_events(scope_id=scope.id, unprocessed_only=True)
 
-        if scope_manager is None:
-            # Mechanical only. The splice stands; the reconciliation is
-            # written as a notice the next keyed drain will judge, and any
-            # events already pending stay exactly as they were.
-            if spliced and not events:
-                _enqueue_splice_reconciliation(
-                    scope, spliced_ids, fleet=fleet, record_store=record_store
-                )
+        # Mechanical, and BEFORE the judge (ADR 0015 D3): an ancestor's
+        # retirement withdraws this scope's items that rested on it, by the
+        # same rule a local retirement does. Runs with or without a judge, and
+        # leaves the events unprocessed — the judge still has to reconcile the
+        # context behind them.
+        _sweep_ancestor_removals(
+            scope,
+            events,
+            fleet=fleet,
+            record_store=record_store,
+            summary_store=summary_store,
+        )
+
+        if scope_manager is None or not events:
+            # Nothing to judge: a keyless server, or a scope over settled
+            # state. Either way the drain is done (ADR 0015 D6) — there is no
+            # second, mechanical half left to run unconditionally.
             return DrainOutcome(
                 scope_id=scope.id,
                 events_processed=0,
                 judged=False,
                 outcomes=[],
-                spliced=spliced,
-            )
-        if not events:
-            # Nothing pending. A splice that moved something still needs its
-            # context reconciled; a splice that moved nothing is a drain over
-            # settled state and costs no judge call (pin 7's damping).
-            outcomes: list[ContributionOutcome] = []
-            if spliced:
-                try:
-                    outcome = _judge_spliced_summary(
-                        scope,
-                        stratum=stratum,
-                        fleet=fleet,
-                        record_store=record_store,
-                        summary_store=summary_store,
-                        scope_manager=scope_manager,
-                        summary_max_words=summary_max_words,
-                        window_verbatim_tail=window_verbatim_tail,
-                        recency_window_size=recency_window_size,
-                    )
-                except JudgeUnavailable as exc:
-                    raise DrainFailed(scope.id, exc.error_class, str(exc), 0) from exc
-                if outcome is not None:
-                    outcomes.append(outcome)
-            return DrainOutcome(
-                scope_id=scope.id,
-                events_processed=0,
-                judged=spliced,
-                outcomes=outcomes,
-                spliced=spliced,
             )
 
         # One notice may carry several events (a coalesced emission), and an
@@ -1690,7 +1630,6 @@ def drain_scope(
                 events_processed=len(events),
                 judged=False,
                 outcomes=[],
-                spliced=spliced,
             )
 
         change_ids = list(dict.fromkeys(event.change_id for event in events))
@@ -1733,7 +1672,6 @@ def drain_scope(
             events_processed=len(events),
             judged=True,
             outcomes=[r for r in results if isinstance(r, ContributionOutcome)],
-            spliced=spliced,
         )
 
 

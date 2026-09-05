@@ -89,7 +89,6 @@ def fleet_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):  # noqa: ANN201
                 directives=[],
                 context=f"{scope_id} context.",
                 updated_at="2026-09-05T00:00:00+00:00",
-                parent_version=1,
             ),
         )
 

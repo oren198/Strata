@@ -109,7 +109,7 @@ class _AccumulatingManager:
         *,
         scope,
         stratum,
-        parent_summary,
+        ancestor_directives,
         current_summary,
         recent_contributions,
         new_contribution,
@@ -159,7 +159,7 @@ class _SkillEchoManager:
         *,
         scope,
         stratum,
-        parent_summary,
+        ancestor_directives,
         current_summary,
         recent_contributions,
         new_contribution,
@@ -522,7 +522,7 @@ class _CapturingManager:
         *,
         scope,
         stratum,
-        parent_summary,
+        ancestor_directives,
         current_summary,
         recent_contributions,
         new_contribution,
@@ -1596,17 +1596,14 @@ def test_j10_batch_matches_serial_verdicts_summary_and_costs_one_version(
     assert batch_summary.version == 1
 
 
-def test_batch_stamps_parent_version_from_the_summary_read_at_batch_start(
+def test_batch_writes_the_summary_exactly_once(
     tmp_path: Path,
 ) -> None:
-    """One batch, one stamp — from the parent summary as it stood at batch start."""
+    """One batch, one write — however many members it carried (ADR 0011 D3)."""
     _db_path, summary_store, _contributions, _results = _append_and_judge_as_batch(
         tmp_path, ["one", "two"], manager=_ScriptedBatchManager()
     )
     written = summary_store.read("g_root")
-    # A root scope has no inter-stratum parent, so the stamp is None — and it
-    # is stamped exactly once, on the single write the batch performs.
-    assert written.parent_version is None
     assert written.version == 1
 
 

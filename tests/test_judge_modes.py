@@ -1,16 +1,15 @@
-"""The three judge modes (ADR 0014 D2, implementation pin 6).
+"""The two judge modes (ADR 0014 D2, ADR 0015 D6, implementation pin 6).
 
-``amendment_context_only`` was a bool: refresh or not. ADR 0014 splits
-"refresh" in two, because the two refreshes differ in what the judge is
-allowed to do:
+``amendment_context_only`` was a bool: refresh or not. ADR 0014 split
+"refresh" in two; ADR 0015 D1 deleted the splice, and with it the third mode,
+leaving the pair that genuinely differ in what the judge is allowed to do:
 
-- ``splice_refresh`` — ADR 0011 D4's launch-time parent splice. The parent's
-  directives are already in the summary mechanically, so the amendment is
-  context plus lifecycle ops; ``append``/``publish`` are dropped.
+- ``ordinary`` — a contribution arrived; every op is available.
 - ``input_change_refresh`` — ADR 0014 D2's reactive re-judgement. Admitting
   ops are ALLOWED: the refresh has a real contribution to mint a directive
   from (the change notice, ADR 0014 D5), so a minted directive carries honest
-  provenance — this entered because input X changed.
+  provenance — this entered because input X changed. ``append`` is still
+  dropped: it would copy the notice's own bytes.
 
 Plus ``context_sources`` (ADR 0014 D3): the judge declares which published
 item ids its ``new_context`` rests on. Record, never trigger — but it has to
@@ -89,7 +88,7 @@ def _preamble(**kwargs) -> str:  # noqa: ANN003
     return _build_judge_preamble(
         scope=SCOPE,
         stratum=STRATUM,
-        parent_summary=None,
+        ancestor_directives=None,
         current_summary=_summary(),
         recent_contributions=[],
         judged_contribution_ids=[],
@@ -104,18 +103,18 @@ def _preamble(**kwargs) -> str:  # noqa: ANN003
 
 def test_ordinary_mode_renders_no_refresh_block():
     text = _preamble(mode="ordinary")
-    assert "MANAGER REFRESH" not in text
     assert "INPUT-CHANGE REFRESH" not in text
 
 
-def test_splice_refresh_renders_the_manager_refresh_block():
-    text = _preamble(mode="splice_refresh")
-    assert "MANAGER REFRESH" in text
-    assert "INPUT-CHANGE REFRESH" not in text
+def test_the_manager_refresh_block_is_gone_from_every_mode():
+    """ADR 0015 D1: the splice's instruction went with the splice."""
+    assert "MANAGER REFRESH" not in _preamble(mode="ordinary")
+    assert "MANAGER REFRESH" not in _preamble(
+        mode="input_change_refresh", input_changes=[_change_event()]
+    )
 
 
-def test_input_change_refresh_renders_its_own_block_not_the_splice_one():
-    """The sibling block (pin 6) — a different instruction, not the splice one."""
+def test_input_change_refresh_renders_its_own_block():
     text = _preamble(mode="input_change_refresh", input_changes=[_change_event()])
     assert "INPUT-CHANGE REFRESH" in text
     assert "MANAGER REFRESH:" not in text
@@ -191,12 +190,6 @@ def _parse(mode: str, ops=({"op": "append"},)):  # noqa: ANN001, ANN201
     )
 
 
-def test_splice_refresh_still_drops_admitting_ops():
-    judgment = _parse("splice_refresh")
-    assert judgment.directive_ops == []
-    assert judgment.dropped_ops
-
-
 def test_input_change_refresh_keeps_publish_but_drops_append():
     """ADR 0014 D2: the notice is a real contribution to mint a directive FROM,
     but never one to copy. ``publish`` carries the judge's own words on the
@@ -225,34 +218,57 @@ def test_an_unknown_mode_is_refused():
         _parse("refresh")
 
 
-def test_a_splice_refresh_batch_drops_admitting_ops_too():
-    """The mode governs the batch parser as well as the single one.
+def test_the_splice_refresh_mode_no_longer_exists():
+    """ADR 0015 D6: two modes, and a stale caller must fail loudly, not degrade."""
+    from strata.scope_manager import _DROPPED_ADMITTING_OPS, _JUDGE_MODES
 
-    A coalesced splice refresh is not a shape the engine builds today (the
-    drain is always ``input_change_refresh``), but the two parsers must agree
-    about what a mode MEANS — a mode that quietly changed meaning between them
-    would be the drift the derived schema exists to prevent.
+    assert _JUDGE_MODES == ("ordinary", "input_change_refresh")
+    assert set(_DROPPED_ADMITTING_OPS) == {"ordinary", "input_change_refresh"}
+    with pytest.raises(ValueError, match="mode"):
+        _parse("splice_refresh")
+
+
+def test_the_batch_parser_refuses_an_unknown_mode_too():
+    """The mode table governs the batch parser as well as the single one.
+
+    The two parsers must agree about what a mode MEANS — a mode that quietly
+    changed meaning between them, or silently degraded to ``ordinary`` on one
+    side only, would be the drift the derived schema exists to prevent.
     """
     contribution = _contribution()
+    block = _tool_block(
+        verdicts=[
+            {
+                "contribution_id": contribution.id,
+                "decision": "accept_as_context",
+                "reasoning": "reconciled",
+            }
+        ],
+        directive_ops=[
+            {"op": "append", "contribution_id": contribution.id},
+            {"op": "retire", "id": "c_gone", "contribution_id": contribution.id},
+        ],
+        new_context="Reconciled.",
+    )
+
+    def _batch(*, mode):
+        return ScopeManager._parse_batch_judgment(
+            scope=SCOPE,
+            tool_use_block=block,
+            current_summary=_summary(),
+            contributions={contribution.id: contribution},
+            mode=mode,
+        )
+
+    with pytest.raises(ValueError, match="mode"):
+        _batch(mode="splice_refresh")
+
     judgment = ScopeManager._parse_batch_judgment(
         scope=SCOPE,
-        tool_use_block=_tool_block(
-            verdicts=[
-                {
-                    "contribution_id": contribution.id,
-                    "decision": "accept_as_context",
-                    "reasoning": "reconciled",
-                }
-            ],
-            directive_ops=[
-                {"op": "append", "contribution_id": contribution.id},
-                {"op": "retire", "id": "c_gone", "contribution_id": contribution.id},
-            ],
-            new_context="Reconciled.",
-        ),
+        tool_use_block=block,
         current_summary=_summary(),
         contributions={contribution.id: contribution},
-        mode="splice_refresh",
+        mode="input_change_refresh",
     )
 
     assert [op.op for op in judgment.directive_ops] == ["retire"]

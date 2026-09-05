@@ -5,8 +5,8 @@ made.  The optional integration test (marked ``pytest.mark.integration``) is
 skipped unless ``STRATA_RUN_INTEGRATION=1`` is set in the environment.
 
 Decision 2 tests (parent summary in user message):
-- Test 11: parent directives render under "PARENT SCOPE DIRECTIVES (inherited)" header.
-- Test 12: parent_summary=None (L0 root) — header is omitted entirely.
+- Test 11: ancestor directives render under an "ANCESTOR DIRECTIVES — <scope>" header.
+- Test 12: ancestor_directives=None (L0 root) — header is omitted entirely.
 - Test 13: parent directive text appears in user message when parent provided.
 """
 
@@ -396,7 +396,7 @@ def test_user_message_digest_block_announces_the_verbatim_tail() -> None:
     message = _build_user_message(
         scope=SCOPE,
         stratum=STRATUM,
-        parent_summary=None,
+        ancestor_directives=None,
         current_summary=None,
         recent_contributions=[RECENT_ROW],
         new_contribution=NEW_CONTRIBUTION,
@@ -429,7 +429,7 @@ def test_user_message_renders_the_judged_contribution_as_a_digest_row() -> None:
     message = _build_user_message(
         scope=SCOPE,
         stratum=STRATUM,
-        parent_summary=None,
+        ancestor_directives=None,
         current_summary=None,
         # The window contains the contribution under judgment, as it always
         # does: it is appended to the record before the window is read.
@@ -468,7 +468,7 @@ def test_build_user_message_skilless_contributor_has_no_none() -> None:
     message = _build_user_message(
         scope=SCOPE,
         stratum=STRATUM,
-        parent_summary=None,
+        ancestor_directives=None,
         current_summary=None,
         recent_contributions=[],
         new_contribution=contribution,
@@ -878,27 +878,25 @@ PARENT_DIRECTIVE = Directive(
     created_at="2026-01-01T00:00:00+00:00",
 )
 
-PARENT_SUMMARY = ScopeSummary(
-    scope_id=PARENT_SCOPE.id,
-    directives=[PARENT_DIRECTIVE],
-    context="The executive context sets overall fleet direction.",
-    updated_at="2026-01-01T00:00:00+00:00",
-)
+#: The ancestor walk a one-deep chain produces (ADR 0015 D2) — what the judge
+#: is handed in place of the parent's whole summary. The ancestor's context
+#: has no representation here at all: it never crosses the edge.
+PARENT_WALK = [(PARENT_SCOPE.id, [PARENT_DIRECTIVE])]
 
 
 # ---------------------------------------------------------------------------
-# Test 11: parent directives render under PARENT SCOPE DIRECTIVES (inherited) header
+# Test 11: parent directives render under ANCESTOR DIRECTIVES — g_exec (inherited, binding) header
 # ---------------------------------------------------------------------------
 
 
-def test_parent_summary_renders_under_inherited_header() -> None:
+def test_ancestor_directives_render_under_the_inherited_header() -> None:
     """parent_summary renders into the user message with the correct section label."""
     manager, mock_client = _make_manager(_accept_directive_input())
 
     manager.judge(
         scope=SCOPE,
         stratum=STRATUM,
-        parent_summary=PARENT_SUMMARY,
+        ancestor_directives=PARENT_WALK,
         current_summary=CURRENT_SUMMARY,
         recent_contributions=[],
         new_contribution=NEW_CONTRIBUTION,
@@ -908,23 +906,23 @@ def test_parent_summary_renders_under_inherited_header() -> None:
     messages = call_kwargs.kwargs["messages"]
     user_message_content = messages[0]["content"]
 
-    assert "PARENT SCOPE DIRECTIVES (inherited)" in user_message_content
+    assert "ANCESTOR DIRECTIVES — g_exec (inherited, binding)" in user_message_content
     assert PARENT_SCOPE.id in user_message_content
 
 
 # ---------------------------------------------------------------------------
-# Test 12: parent_summary=None (L0 root) — inherited header is absent
+# Test 12: ancestor_directives=None (L0 root) — inherited header is absent
 # ---------------------------------------------------------------------------
 
 
-def test_no_parent_summary_omits_inherited_header() -> None:
-    """When parent_summary=None (root scope), the PARENT SCOPE DIRECTIVES section must be absent."""
+def test_no_ancestor_walk_omits_inherited_header() -> None:
+    """A root scope has no ancestor walk, so no ANCESTOR DIRECTIVES block renders."""
     manager, mock_client = _make_manager(_accept_directive_input())
 
     manager.judge(
         scope=SCOPE,
         stratum=STRATUM,
-        parent_summary=None,
+        ancestor_directives=None,
         current_summary=CURRENT_SUMMARY,
         recent_contributions=[],
         new_contribution=NEW_CONTRIBUTION,
@@ -934,7 +932,7 @@ def test_no_parent_summary_omits_inherited_header() -> None:
     messages = call_kwargs.kwargs["messages"]
     user_message_content = messages[0]["content"]
 
-    assert "PARENT SCOPE DIRECTIVES (inherited)" not in user_message_content
+    assert "ANCESTOR DIRECTIVES — g_exec (inherited, binding)" not in user_message_content
 
 
 # ---------------------------------------------------------------------------
@@ -949,7 +947,7 @@ def test_parent_directive_content_in_user_message() -> None:
     manager.judge(
         scope=SCOPE,
         stratum=STRATUM,
-        parent_summary=PARENT_SUMMARY,
+        ancestor_directives=PARENT_WALK,
         current_summary=CURRENT_SUMMARY,
         recent_contributions=[],
         new_contribution=NEW_CONTRIBUTION,
@@ -1689,14 +1687,14 @@ def test_operator_memory_block_omitted_when_none_or_empty() -> None:
     assert "OPERATOR MEMORY" not in content_empty
 
 
-def test_operator_memory_block_precedes_parent_summary_block() -> None:
+def test_operator_memory_block_precedes_the_ancestor_directives_block() -> None:
     """OPERATOR MEMORY renders before PARENT SCOPE DIRECTIVES, per ADR 0008 D3."""
     manager, mock_client = _make_manager(_accept_directive_input())
 
     manager.judge(
         scope=SCOPE,
         stratum=STRATUM,
-        parent_summary=PARENT_SUMMARY,
+        ancestor_directives=PARENT_WALK,
         current_summary=CURRENT_SUMMARY,
         recent_contributions=[],
         new_contribution=NEW_CONTRIBUTION,
@@ -1704,7 +1702,7 @@ def test_operator_memory_block_precedes_parent_summary_block() -> None:
     )
     content = mock_client.messages.create.call_args.kwargs["messages"][0]["content"]
     operator_idx = content.index("OPERATOR MEMORY")
-    parent_idx = content.index("PARENT SCOPE DIRECTIVES (inherited)")
+    parent_idx = content.index("ANCESTOR DIRECTIVES — g_exec (inherited, binding)")
     assert operator_idx < parent_idx
 
 
@@ -1732,10 +1730,10 @@ def test_system_prompt_requires_per_operator_directive_attribution() -> None:
     assert "an unattributed echo masquerades as native scope memory" in flat
 
 
-def test_system_prompt_operator_memory_precedes_parent_summary_guidance() -> None:
+def test_system_prompt_operator_memory_precedes_ancestor_directives_guidance() -> None:
     """The OPERATOR MEMORY rule appears before the PARENT SCOPE DIRECTIVES rule."""
     operator_idx = _SYSTEM_PROMPT.index("When an OPERATOR MEMORY section is present")
-    parent_idx = _SYSTEM_PROMPT.index("When PARENT SCOPE DIRECTIVES are provided")
+    parent_idx = _SYSTEM_PROMPT.index("When ANCESTOR DIRECTIVES blocks are provided")
     assert operator_idx < parent_idx
 
 
@@ -3034,6 +3032,47 @@ def test_invalid_id_twice_drops_the_op_and_notes_it_without_losing_the_verdict()
     assert judgment.reasoning in judgment.record_notes
 
 
+def test_an_op_naming_an_ancestor_directive_is_dropped_as_an_invalid_target() -> None:
+    """ADR 0015 D4 — the prompt rule became an engine rule.
+
+    "Never supersede or retire a parent directive" was a prompt obligation,
+    and a prompt obligation is a request. With the splice gone (D1) an
+    ancestor's row is not in this scope's CURRENT SUMMARY at all, so an op
+    naming one is an ordinary invalid-target op: ADR 0011 D1's existing
+    validation offers one corrective and then drops and notes it. No second
+    rule, and nothing a judge can talk its way past.
+    """
+    ancestor_directive_id = PARENT_WALK[0][1][0].id
+    verdict = {
+        "decision": "accept_as_directive",
+        "reasoning": "admitting the new rule and retiring the inherited one",
+        "directive_ops": [{"op": "append"}, {"op": "retire", "id": ancestor_directive_id}],
+        "new_context": "Context after the amendment.",
+    }
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [_fake_response(verdict), _fake_response(verdict)]
+    manager = ScopeManager(client=mock_client)
+
+    judgment = manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        ancestor_directives=PARENT_WALK,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+    )
+
+    assert judgment.new_summary is not None
+    # The ancestor's directive was never this scope's to remove — and it is
+    # not this scope's to hold, either.
+    assert ancestor_directive_id not in [d.id for d in judgment.new_summary.directives]
+    assert judgment.retired_directive_ids == []
+    assert judgment.dropped_ops == [f"retire({ancestor_directive_id})"]
+    assert f"retire({ancestor_directive_id})" in judgment.record_notes
+    # The rest of the amendment still applied.
+    assert NEW_CONTRIBUTION.id in [d.id for d in judgment.new_summary.directives]
+
+
 def test_invalid_id_corrective_failure_still_returns_the_first_verdict() -> None:
     """A bad op never costs the contribution its verdict, even if the retry errors."""
     mock_client = MagicMock()
@@ -3383,36 +3422,35 @@ def test_attribution_corrective_rewrite_is_still_budget_checked() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_refresh_block_rendered_in_splice_refresh_mode() -> None:
+def test_refresh_block_rendered_in_input_change_refresh_mode() -> None:
     message = _build_user_message(
         scope=SCOPE,
         stratum=STRATUM,
-        parent_summary=PARENT_SUMMARY,
+        ancestor_directives=PARENT_WALK,
         current_summary=CURRENT_SUMMARY,
         recent_contributions=[],
         new_contribution=NEW_CONTRIBUTION,
-        mode="splice_refresh",
+        mode="input_change_refresh",
     )
-    assert "MANAGER REFRESH" in message
-    assert "already been incorporated" in message
+    assert "INPUT-CHANGE REFRESH" in message
 
     ordinary = _build_user_message(
         scope=SCOPE,
         stratum=STRATUM,
-        parent_summary=PARENT_SUMMARY,
+        ancestor_directives=PARENT_WALK,
         current_summary=CURRENT_SUMMARY,
         recent_contributions=[],
         new_contribution=NEW_CONTRIBUTION,
     )
-    assert "MANAGER REFRESH" not in ordinary
+    assert "INPUT-CHANGE REFRESH" not in ordinary
 
 
-def test_splice_refresh_amendment_drops_append_and_publish_ops() -> None:
-    """A refresh may amend context and retire, but never admit a directive."""
+def test_input_change_refresh_amendment_drops_append_but_keeps_publish() -> None:
+    """A refresh may publish the judge's own words; it may never copy the notice's."""
     manager, _ = _make_manager(
         {
             "decision": "accept_as_context",
-            "reasoning": "refreshed against the parent",
+            "reasoning": "refreshed against the changed input",
             "directive_ops": [
                 {"op": "append"},
                 {"op": "publish", "content": "Something new."},
@@ -3428,14 +3466,13 @@ def test_splice_refresh_amendment_drops_append_and_publish_ops() -> None:
         current_summary=CURRENT_SUMMARY,
         recent_contributions=[],
         new_contribution=NEW_CONTRIBUTION,
-        mode="splice_refresh",
+        mode="input_change_refresh",
     )
 
     assert judgment.new_summary is not None
-    assert judgment.new_summary.directives == []
     assert judgment.new_summary.context == "Reconciled context."
-    assert [op.op for op in judgment.directive_ops] == ["retire"]
-    assert judgment.dropped_ops == ["append", "publish"]
+    assert [op.op for op in judgment.directive_ops] == ["publish", "retire"]
+    assert judgment.dropped_ops == ["append"]
     assert "append" in judgment.record_notes
 
 
@@ -3482,11 +3519,16 @@ def test_system_prompt_narrows_operator_attribution_to_publish_or_context() -> N
 
 
 def test_system_prompt_no_longer_asks_the_judge_to_quote_parent_directives() -> None:
-    """ADR 0011 D4 deletes the parent-quoting rule — the splice is mechanical."""
+    """The judge never restates an inherited directive — a reader assembles them.
+
+    ADR 0011 D4 deleted the parent-quoting rule because the splice copied the
+    rows mechanically; ADR 0015 D1 deletes the splice and the rule stands for
+    a better reason — the directive lives in its owner's summary and is
+    composed into this scope's view on every read.
+    """
     flat = " ".join(_SYSTEM_PROMPT.split())
     assert "quote any parent directives VERBATIM" not in flat
-    assert "MECHANICALLY" in flat
-    assert "never `append` or `publish` a parent directive" in flat
+    assert "never `append` or `publish` an ancestor directive" in flat
 
 
 def test_system_prompt_budget_rule_names_the_two_levers() -> None:
@@ -3741,7 +3783,7 @@ def test_batch_user_message_lists_the_contributions_in_arrival_order() -> None:
     message = _build_batch_user_message(
         scope=SCOPE,
         stratum=STRATUM,
-        parent_summary=None,
+        ancestor_directives=None,
         current_summary=CURRENT_SUMMARY,
         recent_contributions=[],
         new_contributions=BATCH,
@@ -3764,7 +3806,7 @@ def test_batch_members_never_take_a_verbatim_window_slot() -> None:
     message = _build_batch_user_message(
         scope=SCOPE,
         stratum=STRATUM,
-        parent_summary=None,
+        ancestor_directives=None,
         current_summary=CURRENT_SUMMARY,
         recent_contributions=rows,
         new_contributions=BATCH,

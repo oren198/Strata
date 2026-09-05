@@ -4,7 +4,7 @@ Covers the review findings fixed alongside issues #39/#44/#45/#46/#47/#50:
 
 - record store: recency window semantics, collision-resistant IDs
 - summary store: multi-line directive round-trip, header-lookalike context
-- HTTP contribute: parent_version stamping, bad supersedes → 422
+- HTTP contribute: summary version bump, bad supersedes → 422
 - scope-manager: actionable missing-API-key error
 - register: never destroys an unparseable settings.json; exact gitignore marker
 - storage-path resolver: project config wins, env fallback
@@ -201,7 +201,7 @@ def test_context_quoting_section_header_round_trips(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# HTTP contribute — parent_version stamp + supersedes validation
+# HTTP contribute — summary version bump + supersedes validation
 # ---------------------------------------------------------------------------
 
 
@@ -259,16 +259,18 @@ def _contribute_body(**overrides) -> dict:
     return body
 
 
-def test_http_contribute_stamps_parent_version(parent_child_client) -> None:
-    """The written summary records the parent version it was judged against."""
+def test_http_contribute_bumps_the_summary_version(parent_child_client) -> None:
+    """The written summary records its own write counter.
+
+    ADR 0004 D4's companion ``parent_version`` stamp is gone with ADR 0015 D1:
+    it existed to date a summary against the ancestor rows spliced into it,
+    and no ancestor row is copied into a summary any more.
+    """
     resp = parent_child_client.post("/contribute", json=_contribute_body())
     assert resp.status_code == 200, resp.text
     written = SummaryStore(parent_child_client.summaries_dir).read("g_child")
     assert written is not None
-    assert written.parent_version == 3, (
-        "ADR 0004 D4: contribute-time writes must stamp parent_version; "
-        "None would mark the summary permanently stale"
-    )
+    assert written.version == 1
 
 
 def test_http_contribute_bad_supersedes_is_422(parent_child_client) -> None:
@@ -298,7 +300,7 @@ def test_judge_without_api_key_names_the_env_var(
         manager.judge(
             scope=MagicMock(),
             stratum=MagicMock(),
-            parent_summary=None,
+            ancestor_directives=None,
             current_summary=None,
             recent_contributions=[],
             new_contribution=MagicMock(),
