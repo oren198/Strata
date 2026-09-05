@@ -2106,8 +2106,9 @@ def _refresh_scope(
         operator_memory=operator_memory_binding(
             scope_id, fleet=fleet_config, summaries_dir=summary_store.summaries_dir
         ),
-        # ADR 0011 D4 — the refresh amendment is context + lifecycle ops only.
-        amendment_context_only=True,
+        # ADR 0011 D4 — on the splice path the refresh amendment is context +
+        # lifecycle ops only (implementation pin 6's mode, not a bool).
+        mode="splice_refresh",
     )
 
     record_store.record_judgment(

@@ -3383,7 +3383,7 @@ def test_attribution_corrective_rewrite_is_still_budget_checked() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_refresh_block_rendered_when_amendment_is_context_only() -> None:
+def test_refresh_block_rendered_in_splice_refresh_mode() -> None:
     message = _build_user_message(
         scope=SCOPE,
         stratum=STRATUM,
@@ -3391,7 +3391,7 @@ def test_refresh_block_rendered_when_amendment_is_context_only() -> None:
         current_summary=CURRENT_SUMMARY,
         recent_contributions=[],
         new_contribution=NEW_CONTRIBUTION,
-        amendment_context_only=True,
+        mode="splice_refresh",
     )
     assert "MANAGER REFRESH" in message
     assert "already been incorporated" in message
@@ -3407,7 +3407,7 @@ def test_refresh_block_rendered_when_amendment_is_context_only() -> None:
     assert "MANAGER REFRESH" not in ordinary
 
 
-def test_context_only_amendment_drops_append_and_publish_ops() -> None:
+def test_splice_refresh_amendment_drops_append_and_publish_ops() -> None:
     """A refresh may amend context and retire, but never admit a directive."""
     manager, _ = _make_manager(
         {
@@ -3428,7 +3428,7 @@ def test_context_only_amendment_drops_append_and_publish_ops() -> None:
         current_summary=CURRENT_SUMMARY,
         recent_contributions=[],
         new_contribution=NEW_CONTRIBUTION,
-        amendment_context_only=True,
+        mode="splice_refresh",
     )
 
     assert judgment.new_summary is not None

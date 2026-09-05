@@ -867,7 +867,7 @@ def test_refresh_judge_call_is_context_only(tmp_path: Path) -> None:
 
     _written, judge_kwargs = _refresh_child(tmp_path, child_summary=stale_child)
 
-    assert judge_kwargs["amendment_context_only"] is True
+    assert judge_kwargs["mode"] == "splice_refresh"
 
 
 def test_refresh_splices_into_a_child_with_no_summary_yet(tmp_path: Path) -> None:
