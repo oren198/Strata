@@ -1247,3 +1247,139 @@ def test_demoted_legacy_edge_composes_as_a_reference_layer(tmp_path: Path) -> No
     assert "summary" not in demoted_layer
     assert demoted_layer["publication"]["items"][0]["content"] == "Function B's outward face."
     assert "g_funcB internal context" not in str(result)
+
+
+# ---------------------------------------------------------------------------
+# ADR 0014 D5 — input_changes: a scope's UNPROCESSED change events, the
+# reactive re-judgement notice. Verbatim rows, no prose; a key that is always
+# present (honestly empty, like publications) rather than absent when there
+# is nothing to report.
+# ---------------------------------------------------------------------------
+
+
+def _make_change_event(
+    *,
+    id: str = "chg_1",
+    change_id: str = "wave_1",
+    contribution_id: str = "c_refresh_1",
+    scope_id: str = "g_team",
+    item_id: str = "pub_1",
+    kind: str = "withdrawn",
+    before: str | None = "old content",
+    after: str | None = None,
+    hop: int = 0,
+    processed_at: str | None = None,
+    created_at: str = "2026-09-05T00:00:00+00:00",
+):
+    from strata.record_store import ChangeEvent
+
+    return ChangeEvent(
+        id=id,
+        change_id=change_id,
+        contribution_id=contribution_id,
+        scope_id=scope_id,
+        item_id=item_id,
+        kind=kind,
+        before=before,
+        after=after,
+        hop=hop,
+        processed_at=processed_at,
+        created_at=created_at,
+    )
+
+
+def _make_change_event_reader(events_by_scope: dict[str, list]):
+    """Return a change_event_reader over a fixed scope_id -> [ChangeEvent] map.
+
+    Deliberately does NOT pre-filter processed events — compose_perspective
+    itself must filter (test_processed_change_events_never_appear below), not
+    merely trust a well-behaved reader.
+    """
+
+    def reader(scope_id: str) -> list:
+        return events_by_scope.get(scope_id, [])
+
+    return reader
+
+
+def test_no_change_event_reader_input_changes_is_honestly_empty(tmp_path: Path) -> None:
+    """Absent change_event_reader -> input_changes: [] — key always present."""
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fixture_fleet_yaml(tmp_path)
+    store = _seed_summaries(summaries_dir)
+    fleet = FleetConfig.load(fleet_path)
+
+    result = compose_perspective("g_team", fleet=fleet, summary_store=store)
+
+    assert result["input_changes"] == []
+
+
+def test_unprocessed_change_events_appear_verbatim_oldest_first(tmp_path: Path) -> None:
+    """Unprocessed events compose as input_changes, oldest first, verbatim fields."""
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fixture_fleet_yaml(tmp_path)
+    store = _seed_summaries(summaries_dir)
+    fleet = FleetConfig.load(fleet_path)
+
+    older = _make_change_event(
+        id="chg_older", created_at="2026-09-01T00:00:00+00:00", item_id="pub_a"
+    )
+    newer = _make_change_event(
+        id="chg_newer", created_at="2026-09-04T00:00:00+00:00", item_id="pub_b"
+    )
+    # Reader deliberately returns newest-first — compose_perspective's own
+    # oldest-first ordering guarantee must not depend on the reader's order.
+    reader = _make_change_event_reader({"g_team": [newer, older]})
+
+    result = compose_perspective(
+        "g_team", fleet=fleet, summary_store=store, change_event_reader=reader
+    )
+
+    assert [c["item_id"] for c in result["input_changes"]] == ["pub_a", "pub_b"]
+    entry = result["input_changes"][0]
+    assert entry == {
+        "change_id": older.change_id,
+        "item_id": older.item_id,
+        "kind": older.kind,
+        "before": older.before,
+        "after": older.after,
+        "created_at": older.created_at,
+        "contribution_id": older.contribution_id,
+    }
+
+
+def test_processed_change_events_never_appear(tmp_path: Path) -> None:
+    """A processed event is filtered by compose_perspective itself, not merely by the reader."""
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fixture_fleet_yaml(tmp_path)
+    store = _seed_summaries(summaries_dir)
+    fleet = FleetConfig.load(fleet_path)
+
+    processed = _make_change_event(id="chg_done", processed_at="2026-09-05T01:00:00+00:00")
+    unprocessed = _make_change_event(id="chg_pending", item_id="pub_still_open")
+    reader = _make_change_event_reader({"g_team": [processed, unprocessed]})
+
+    result = compose_perspective(
+        "g_team", fleet=fleet, summary_store=store, change_event_reader=reader
+    )
+
+    item_ids = [c["item_id"] for c in result["input_changes"]]
+    assert item_ids == ["pub_still_open"]
+
+
+def test_change_event_reader_called_with_requested_scope_id(tmp_path: Path) -> None:
+    """The reader is called with the scope actually being composed, not an ancestor."""
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fixture_fleet_yaml(tmp_path)
+    store = _seed_summaries(summaries_dir)
+    fleet = FleetConfig.load(fleet_path)
+
+    calls: list[str] = []
+
+    def reader(scope_id: str) -> list:
+        calls.append(scope_id)
+        return []
+
+    compose_perspective("g_team", fleet=fleet, summary_store=store, change_event_reader=reader)
+
+    assert calls == ["g_team"]

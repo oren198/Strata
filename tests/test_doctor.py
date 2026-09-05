@@ -804,3 +804,84 @@ def test_doctor_failure_lines_are_actionable(
     assert rc == 1
     # The failing line must point at a concrete remedy, not just name the problem.
     assert "strata register" in output
+
+
+# ---------------------------------------------------------------------------
+# 10. Refresh queue (ADR 0014 D6/pin 4) — soft, informational, never flips the
+# exit code: a pending change event is NOT a judge outage, it is an input
+# change waiting for its refresh to run.
+# ---------------------------------------------------------------------------
+
+
+def _append_change_event(registered_project: Path, *, scope_id: str = "g_root") -> None:
+    """Append one manager-refresh contribution and its unprocessed change event
+    directly against the registered project's DB — the same rows the drain
+    (a later phase) would leave behind before it runs."""
+    from strata.record_store import ContributorRef, RecordStore
+
+    rs = RecordStore(str(registered_project / ".strata" / "strata.db"))
+    contribution = rs.append_contribution(
+        scope_id=scope_id,
+        content="an input this scope composes changed",
+        proposed_classification="context",
+        subject="manager-refresh",
+        supersedes=None,
+        contributor=ContributorRef(
+            scope_id=scope_id, skill=None, session_id="sess_test", ts="2026-09-05T00:00:00+00:00"
+        ),
+    )
+    rs.append_change_event(
+        change_id="wave_1",
+        contribution_id=contribution.id,
+        scope_id=scope_id,
+        item_id="pub_1",
+        kind="withdrawn",
+    )
+    rs.close()
+
+
+def test_doctor_reports_empty_refresh_queue(
+    registered_project: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """No pending change events: the check passes, reads '0 pending', and never
+    flips the exit code — a pending judgment is a separate check entirely."""
+    rc, output = _run_doctor(capsys)
+
+    assert rc == 0
+    lower = output.lower()
+    assert "refresh queue" in lower
+    assert "0 pending" in lower
+
+
+def test_doctor_reports_refresh_queue_depth_and_oldest_age(
+    registered_project: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """One pending change event: reported as refresh-pending, not a judge outage —
+    the check still passes (soft, informational), never a hard failure."""
+    _append_change_event(registered_project)
+
+    rc, output = _run_doctor(capsys)
+
+    assert rc == 0
+    lower = output.lower()
+    assert "refresh queue" in lower
+    assert "1 pending" in lower
+    # Names the scope carrying the oldest pending event.
+    assert "g_root" in lower
+
+
+def test_doctor_refresh_queue_never_counted_as_judge_outage(
+    registered_project: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """Pin 10's vacuous-pass guard: first assert the refresh-pending count is
+    >= 1, THEN assert doctor's exit code and other checks are untouched by it."""
+    _append_change_event(registered_project)
+
+    rc, output = _run_doctor(capsys)
+
+    lower = output.lower()
+    assert "1 pending" in lower  # the refresh-pending count is >= 1 (pin 10)
+    assert rc == 0  # a pending refresh alone never fails the run
+    # Every other check still reports its own, unrelated result.
+    assert "binding" in lower
+    assert "database" in lower

@@ -16,6 +16,7 @@ Verifies that:
 from __future__ import annotations
 
 import importlib.resources
+import json
 import os
 import shutil
 import subprocess
@@ -148,3 +149,71 @@ def test_jsx_parses_with_babel(filename: str) -> None:
         env=env,
     )
     assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.skipif(
+    _BABEL_NODE_PATH is None,
+    reason="node + @babel/core + @babel/preset-react not available in this environment",
+)
+def test_record_trail_state_words_reports_refresh_pending_not_outage() -> None:
+    """ADR 0014 pin 4, exercised as real JS: `stateWords` in record-trail.jsx
+    must label a pending `manager-refresh` contribution "Refresh pending",
+    never the plain "Awaiting judgment" a genuine stuck judgment gets — an
+    operator scanning the Console's Record view must not count a pending
+    refresh as a judge outage.
+
+    Transpiles the real file with Babel and runs it under Node (the same
+    transform `@babel/standalone` performs in the browser) rather than
+    re-implementing the label logic in Python, so this test fails the moment
+    the shipped function's behaviour changes, not just its source text.
+    """
+    source = (importlib.resources.files("strata") / "_ui" / "record-trail.jsx").read_text(
+        encoding="utf-8"
+    )
+    script = (
+        "const babel = require('@babel/core');"
+        "let code = '';"
+        "process.stdin.setEncoding('utf8');"
+        "process.stdin.on('data', d => code += d);"
+        "process.stdin.on('end', () => {"
+        "  const filename = process.argv[1];"
+        "  const { code: transformed } = babel.transform(code, {"
+        "    presets: ['@babel/preset-react'], filename"
+        "  });"
+        "  global.window = {};"
+        "  global.React = {};"
+        "  (0, eval)(transformed);"
+        "  const cases = ["
+        "    [undefined, undefined, 'manager-refresh', 'Refresh pending'],"
+        "    [undefined, undefined, undefined, 'Awaiting judgment'],"
+        "    [{ state: 'pending' }, undefined, 'manager-refresh', 'Refresh pending'],"
+        "    [{ state: 'pending' }, undefined, undefined, 'Awaiting judgment'],"
+        "    [{ state: 'judge_failed' }, undefined, 'manager-refresh', 'Judgment failed'],"
+        "    [{ state: 'judged', decision: 'accept_as_context' }, undefined, 'manager-refresh',"
+        "      'Accepted as context'],"
+        "  ];"
+        "  const results = cases.map(([stateEntry, attempts, subject]) =>"
+        "    global.window.stateWords(stateEntry, attempts, subject).label"
+        "  );"
+        "  console.log(JSON.stringify(results));"
+        "});"
+    )
+    env = {**os.environ, "NODE_PATH": _BABEL_NODE_PATH}
+    result = subprocess.run(
+        ["node", "-e", script, "record-trail.jsx"],
+        input=source,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env=env,
+    )
+    assert result.returncode == 0, result.stderr
+    labels = json.loads(result.stdout)
+    assert labels == [
+        "Refresh pending",  # no state row yet, but this IS a manager-refresh notice
+        "Awaiting judgment",  # no state row, ordinary contribution
+        "Refresh pending",  # explicit pending state, manager-refresh subject
+        "Awaiting judgment",  # explicit pending state, ordinary subject
+        "Judgment failed",  # a refresh's judge call can still error like any other
+        "Accepted as context",  # a refresh that WAS judged reads as judged, not pending
+    ]

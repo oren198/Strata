@@ -49,9 +49,15 @@ no operator layer at all: that memory stays on disk but stops composing.
 Peer and extra-context layers never get an operator layer: operator memory
 binds a *chain*, and a peer's chain is not this reader's to compose.
 
+ADR 0014 D5 (reactive re-judgement, #186, Phase D) adds a top-level
+``input_changes`` key: the requested scope's own UNPROCESSED change events —
+verbatim rows, no prose — via an optional ``change_event_reader``. Absent a
+reader the key is still present, honestly empty, matching how an unpublished
+scope's publication layer reads ``{"items": []}`` rather than being left out.
+
 Vocabulary follows CONTEXT.md verbatim: scope, stratum, perspective, scope
 summary, directive, context, chain edge, reference edge, peer reference,
-publication, operator.
+publication, operator, change event.
 """
 
 from __future__ import annotations
@@ -111,6 +117,62 @@ class _PublishedItemLike(Protocol):
 #: the canonical implementation — callers typically pass
 #: ``functools.partial(read_publication, summaries_dir=...)``.
 PublicationReader = Callable[[str], Sequence[_PublishedItemLike]]
+
+
+class _ChangeEventLike(Protocol):
+    """Structural shape ``compose_perspective`` needs from a change event.
+
+    A lightweight protocol rather than importing
+    :class:`strata.record_store.ChangeEvent` directly — same rationale as
+    ``_OperatorItemLike``/``_PublishedItemLike`` above: this module composes
+    from reader callables, not from ``strata.record_store`` machinery.
+    """
+
+    change_id: str
+    item_id: str
+    kind: str
+    before: str | None
+    after: str | None
+    contribution_id: str
+    processed_at: str | None
+    created_at: str
+
+
+#: Reads one scope's change events (ADR 0014 D5) — the reactive
+#: re-judgement notice, oldest first, UNPROCESSED AND PROCESSED alike:
+#: ``compose_perspective`` itself is what filters to unprocessed (never trust
+#: the reader to have done it). Called with the scope id being composed.
+#: See :func:`strata.record_store.RecordStore.list_change_events` for the
+#: canonical implementation — callers typically pass
+#: ``functools.partial(record_store.list_change_events, unprocessed_only=False)``
+#: or the plain bound method; either is safe against this filter.
+ChangeEventReader = Callable[[str], Sequence[_ChangeEventLike]]
+
+
+def _change_event_dict(event: _ChangeEventLike) -> dict:
+    """Verbatim ``input_changes`` entry for one unprocessed change event (ADR 0014 D5).
+
+    No prose, no derived fields — the same event the drain will process,
+    machine-readable. ``scope_id`` is left out: it is always the requested
+    scope (the caller already knows which perspective it asked for).
+
+    Known gap (Phase D, reported rather than worked around): the ADR's
+    illustrative shape also names ``source_scope_id`` — the scope the
+    changed item came FROM, as opposed to ``scope_id`` (the affected scope
+    that must refresh). ``strata.record_store.ChangeEvent`` (Phase A) has no
+    such column yet; nothing here fabricates one by parsing it out of
+    ``item_id`` or the notice's prose. Add it here when the emitting phase
+    adds it to the row.
+    """
+    return {
+        "change_id": event.change_id,
+        "item_id": event.item_id,
+        "kind": event.kind,
+        "before": event.before,
+        "after": event.after,
+        "created_at": event.created_at,
+        "contribution_id": event.contribution_id,
+    }
 
 
 def _publication_item_dict(item: _PublishedItemLike) -> dict:
@@ -211,6 +273,7 @@ def compose_perspective(
     extra_context_scopes: Sequence[str] = (),
     operator_reader: OperatorReader | None = None,
     publication_reader: PublicationReader | None = None,
+    change_event_reader: ChangeEventReader | None = None,
 ) -> dict:
     """Compose *scope_id*'s perspective: own summary, ancestor directives, one-hop publications.
 
@@ -295,19 +358,32 @@ def compose_perspective(
             operator-sanctioned hosting surface (issue #83), never a
             publication-carrying edge. ``None`` (the default) composes zero
             publication layers.
+        change_event_reader: ADR 0014 D5. When given, called once with
+            *scope_id* and expected to return that scope's change events
+            (processed or not — this function itself filters to
+            ``processed_at is None``, oldest first by ``created_at``, never
+            trusting the reader to have filtered). Each becomes a verbatim
+            ``input_changes`` entry (see :func:`_change_event_dict`) — the
+            reactive re-judgement notice, never prose. A processed event
+            never appears, however the reader ordered or filtered its
+            results. ``None`` (the default) makes ``input_changes`` an
+            honestly empty list, present but empty — the same discipline as
+            an unpublished scope's ``{"items": []}``.
 
     Returns:
         ``{scope_id: <requested>, layers: [{scope_id, stratum_id, relation,
         binding, summary | directives | publication | operator_memory}],
-        _layers_count: N}`` ordered root-first: ancestor directive layers,
-        self, the parent's publication layer (if any), sorted
-        referenced-scope publication layers, then sorted extra-context
-        layers. Self/extra-context layers carry ``"summary"``; ancestor
-        layers carry ``"directives"`` (a list of directive dicts) and never
-        ``"summary"`` or ``"context"``; publication layers carry
+        _layers_count: N, input_changes: [...]}`` ordered root-first:
+        ancestor directive layers, self, the parent's publication layer (if
+        any), sorted referenced-scope publication layers, then sorted
+        extra-context layers. Self/extra-context layers carry ``"summary"``;
+        ancestor layers carry ``"directives"`` (a list of directive dicts)
+        and never ``"summary"`` or ``"context"``; publication layers carry
         ``"publication"``. When *operator_reader* is given, an operator
         layer (see above) precedes each chain layer that has at least one
-        directive-kind operator item.
+        directive-kind operator item. ``input_changes`` is a top-level key,
+        not a layer — it is the scope's own unprocessed input-change notices
+        (ADR 0014 D5), oldest first, always present even when empty.
 
     Raises:
         ValueError: If *scope_id*, or any entry of *extra_context_scopes*, is
@@ -410,8 +486,20 @@ def compose_perspective(
             }
         )
 
+    # ADR 0014 D5: input_changes is a top-level key, not a layer — the
+    # scope's own unprocessed change events, oldest first, verbatim. Filtered
+    # and sorted HERE rather than trusted from the reader (pin: "processed
+    # events never appear" must hold even against a reader that forgot to
+    # filter or forgot to order).
+    input_changes: list[dict] = []
+    if change_event_reader is not None:
+        events = [e for e in change_event_reader(scope_id) if e.processed_at is None]
+        events.sort(key=lambda e: e.created_at)
+        input_changes = [_change_event_dict(e) for e in events]
+
     return {
         "scope_id": scope_id,
         "layers": layers,
         "_layers_count": len(layers),
+        "input_changes": input_changes,
     }

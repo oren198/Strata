@@ -23,7 +23,9 @@ from strata.session_state import (
     SessionStateStore,
     _last_accepted_contribution_at,
     _parse_ts,
+    compute_fleet_refresh_pending,
     compute_fleet_staleness,
+    compute_refresh_pending,
     compute_scope_staleness,
     resolve_agent_session_id,
     sessions_dir_for,
@@ -512,4 +514,146 @@ def test_last_accepted_matches_the_whole_record_scan(
     assert got == _legacy_last_accepted_contribution_at("g_x", record_store=rs)
     assert got[0] == expected_raw
     assert got[1] == (None if expected_raw is None else _parse(expected_raw))
+    rs.close()
+
+
+# ---------------------------------------------------------------------------
+# ADR 0014 pin 4 — refresh-pending is NOT a judge outage. compute_refresh_pending
+# / compute_fleet_refresh_pending are the one library helper every surface that
+# needs the distinction (doctor, the Console) calls, rather than each
+# reinventing its own change_events query.
+# ---------------------------------------------------------------------------
+
+
+def _manager_refresh_contribution(rs: RecordStore, scope_id: str) -> str:
+    """Append a subject='manager-refresh' contribution and return its id.
+
+    Mirrors ADR 0014 D5: the change event's notice IS this contribution — a
+    row must exist before append_change_event's contribution_id FK accepts it.
+    """
+    c = rs.append_contribution(
+        scope_id=scope_id,
+        content="input changed",
+        proposed_classification="context",
+        subject="manager-refresh",
+        supersedes=None,
+        contributor=_contributor(),
+    )
+    return c.id
+
+
+def test_refresh_pending_counts_first_unprocessed_change_events_pin4(tmp_path: Path) -> None:
+    """A pin-4 vacuous-pass guard: before asserting anything is NOT an outage,
+    first assert the refresh-pending count this scope shows is >= 1 (pin 10)."""
+    rs = _record_store(tmp_path)
+    contribution_id = _manager_refresh_contribution(rs, "g_x")
+    rs.append_change_event(
+        change_id="wave_1",
+        contribution_id=contribution_id,
+        scope_id="g_x",
+        item_id="pub_1",
+        kind="withdrawn",
+    )
+
+    pending = compute_refresh_pending("g_x", record_store=rs)
+
+    assert pending.depth >= 1
+    assert pending.depth == 1
+    assert pending.oldest_pending_at is not None
+    rs.close()
+
+
+def test_refresh_pending_ignores_other_scopes(tmp_path: Path) -> None:
+    """A change event queued for a different scope never inflates this scope's count."""
+    rs = _record_store(tmp_path)
+    contribution_id = _manager_refresh_contribution(rs, "g_other")
+    rs.append_change_event(
+        change_id="wave_1",
+        contribution_id=contribution_id,
+        scope_id="g_other",
+        item_id="pub_1",
+        kind="withdrawn",
+    )
+
+    pending = compute_refresh_pending("g_x", record_store=rs)
+
+    assert pending.depth == 0
+    assert pending.oldest_pending_at is None
+    rs.close()
+
+
+def test_refresh_pending_excludes_processed_events(tmp_path: Path) -> None:
+    """A processed change event (whatever the refresh's verdict) drops out of the count."""
+    rs = _record_store(tmp_path)
+    contribution_id = _manager_refresh_contribution(rs, "g_x")
+    event = rs.append_change_event(
+        change_id="wave_1",
+        contribution_id=contribution_id,
+        scope_id="g_x",
+        item_id="pub_1",
+        kind="withdrawn",
+    )
+    rs.mark_change_event_processed(event.id)
+
+    pending = compute_refresh_pending("g_x", record_store=rs)
+
+    assert pending.depth == 0
+    assert pending.oldest_pending_at is None
+    rs.close()
+
+
+def test_refresh_pending_oldest_pending_at_is_the_earliest_unprocessed(tmp_path: Path) -> None:
+    """Two unprocessed events for one scope: oldest_pending_at names the earliest."""
+    rs = _record_store(tmp_path)
+    contribution_id = _manager_refresh_contribution(rs, "g_x")
+    first = rs.append_change_event(
+        change_id="wave_1",
+        contribution_id=contribution_id,
+        scope_id="g_x",
+        item_id="pub_1",
+        kind="withdrawn",
+    )
+    rs.append_change_event(
+        change_id="wave_2",
+        contribution_id=contribution_id,
+        scope_id="g_x",
+        item_id="pub_2",
+        kind="published",
+    )
+
+    pending = compute_refresh_pending("g_x", record_store=rs)
+
+    assert pending.depth == 2
+    assert pending.oldest_pending_at == first.created_at
+    rs.close()
+
+
+def test_refresh_pending_no_events_is_honestly_empty(tmp_path: Path) -> None:
+    """A scope with no change events at all: depth 0, oldest_pending_at None."""
+    rs = _record_store(tmp_path)
+
+    pending = compute_refresh_pending("g_x", record_store=rs)
+
+    assert pending.depth == 0
+    assert pending.oldest_pending_at is None
+    rs.close()
+
+
+def test_compute_fleet_refresh_pending_preserves_order(tmp_path: Path) -> None:
+    """compute_fleet_refresh_pending maps compute_refresh_pending over scope_ids in order."""
+    rs = _record_store(tmp_path)
+    contribution_id = _manager_refresh_contribution(rs, "g_a")
+    rs.append_change_event(
+        change_id="wave_1",
+        contribution_id=contribution_id,
+        scope_id="g_a",
+        item_id="pub_1",
+        kind="withdrawn",
+    )
+
+    results = compute_fleet_refresh_pending(["g_a", "g_b"], record_store=rs)
+
+    assert [r.scope_id for r in results] == ["g_a", "g_b"]
+    assert results[0].depth == 1
+    assert results[1].depth == 0
     rs.close()
