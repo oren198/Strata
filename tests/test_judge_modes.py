@@ -89,7 +89,7 @@ def _preamble(**kwargs) -> str:  # noqa: ANN003
     return _build_judge_preamble(
         scope=SCOPE,
         stratum=STRATUM,
-        parent_summary=None,
+        ancestor_directives=None,
         current_summary=_summary(),
         recent_contributions=[],
         judged_contribution_ids=[],

@@ -174,7 +174,7 @@ def test_budget_rendered_in_user_message_default() -> None:
     msg = _build_user_message(
         scope=scope,
         stratum=stratum,
-        parent_summary=None,
+        ancestor_directives=None,
         current_summary=None,
         recent_contributions=[],
         new_contribution=contribution,
@@ -196,7 +196,7 @@ def test_budget_uses_configured_max_words() -> None:
     msg = _build_user_message(
         scope=scope,
         stratum=stratum,
-        parent_summary=None,
+        ancestor_directives=None,
         current_summary=None,
         recent_contributions=[],
         new_contribution=contribution,
@@ -334,12 +334,13 @@ def test_intra_stratum_peer_edges_not_counted(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_judge_called_with_correct_parent_summary(tmp_path: Path) -> None:
-    """ScopeManager.judge is called with the parent scope's current summary content.
+def test_judge_called_with_the_ancestor_walk(tmp_path: Path) -> None:
+    """ScopeManager.judge is called with the scope's inter-stratum ancestor walk.
 
-    This is the wiring assertion test for ADR 0004 Decision 2: the correct
-    parent_summary is resolved from FleetConfig + SummaryStore and passed to
-    judge().  The test exercises the app.py contribute route directly.
+    The wiring assertion for ADR 0004 Decision 2, re-pointed by ADR 0015 D2:
+    what the caller resolves and hands the judge is the root-first ancestor
+    walk — the same one composition reads — not the parent's whole summary.
+    The test exercises the app.py contribute route directly.
     """
     from fastapi.testclient import TestClient
 
@@ -409,10 +410,10 @@ def test_judge_called_with_correct_parent_summary(tmp_path: Path) -> None:
         ),
     )
 
-    captured_parent_summary: list[ScopeSummary | None] = []
+    captured_walk: list[object] = []
 
     def fake_judge(**kwargs: Any) -> ScopeManagerJudgment:
-        captured_parent_summary.append(kwargs.get("parent_summary"))
+        captured_walk.append(kwargs.get("ancestor_directives"))
         return mock_judgment
 
     mock_manager = MagicMock()
@@ -441,11 +442,10 @@ def test_judge_called_with_correct_parent_summary(tmp_path: Path) -> None:
 
     # Assert judge was called with the parent's summary
     assert mock_manager.judge.called
-    parent_arg = captured_parent_summary[0]
-    assert parent_arg is not None, "Expected parent_summary to be passed to judge(), got None"
-    assert parent_arg.scope_id == "g_root"
-    assert parent_arg.context == "Parent context text"
-    assert any(d.id == "d_parent" for d in parent_arg.directives)
+    walk = captured_walk[0]
+    assert walk is not None, "Expected ancestor_directives to be passed to judge(), got None"
+    assert [scope_id for scope_id, _ in walk] == ["g_root"]
+    assert any(d.id == "d_parent" for _, directives in walk for d in directives)
 
 
 # ---------------------------------------------------------------------------

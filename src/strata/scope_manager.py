@@ -639,16 +639,18 @@ An excerpt is a prefix, not a claim about the whole contribution: where a
 truncated row makes a duplicate call genuinely uncertain, judge the
 contribution on its merits rather than declining on a partial match.
 
-When PARENT SCOPE DIRECTIVES are provided in the user message:
-- Inherited parent directives reach this scope's summary MECHANICALLY: the
-  engine copies parent directive rows in byte-exactly, ids and provenance
-  preserved (ADR 0011 D4). They are not yours to admit — never `append` or
-  `publish` a parent directive, and never name one in a `supersede` or
-  `retire` op.
+When ANCESTOR DIRECTIVES blocks are provided in the user message (one per
+ancestor scope, broadest first):
+- An inherited directive lives in its OWNER's summary and is assembled into
+  this scope's view when it is read (ADR 0015 D1/D2). It is never copied
+  here. It is not yours to admit — never `append` or `publish` an ancestor
+  directive, and never name one in a `supersede` or `retire` op; an op that
+  names one is dropped as an invalid target, since it is not in this scope's
+  CURRENT SUMMARY.
 - They bind this scope: nothing you admit may contradict or override them.
-- You are shown the parent's directives and nothing else of the parent's.
-  Its own working notes are not yours to see, restate, or write into
-  `new_context`.
+- You are shown each ancestor's directives and nothing else of that
+  ancestor's. Its own working notes are not yours to see, restate, or write
+  into `new_context`.
 
 When a MANAGER REFRESH block is present in the user message: the parent's
 directives have already been spliced into this scope's summary
@@ -1942,23 +1944,26 @@ def _render_entitlement(entitlement: EntitlementView) -> str:
     )
 
 
-def _render_directives_only(summary: ScopeSummary) -> str:
-    """Render a summary's directives, without its context (ADR 0013 D1, #187).
+def _render_directives_only(directives: Sequence[Directive]) -> str:
+    """Render an ancestor's directives, without its context (ADR 0013 D1, #187).
 
-    Used for an ancestor's summary rendered to a DESCENDANT's judge. A chain
-    edge carries directives — they bind, so the judge must see them, at full
-    fidelity and with provenance intact. It does not carry context: that is
-    the ancestor's own working memory and never leaves the ancestor.
+    Used for one ancestor's directives rendered to a DESCENDANT's judge. A
+    chain edge carries directives — they bind, so the judge must see them, at
+    full fidelity and with provenance intact. It does not carry context: that
+    is the ancestor's own working memory and never leaves the ancestor.
 
     Deliberately not a flag on :func:`_render_summary`. Every other call site
     renders a scope's own summary to its own judge, where the context belongs;
     only this one crosses a scope boundary, and a separate function keeps that
-    boundary visible instead of hiding it behind a default argument.
+    boundary visible instead of hiding it behind a default argument. It takes
+    the directives rather than a whole ``ScopeSummary`` since ADR 0015 D2:
+    the ancestor walk hands over exactly what crosses the edge, so a summary
+    with context in it never reaches this side of the boundary at all.
     """
-    if not summary.directives:
+    if not directives:
         return "(no directives)"
     lines: list[str] = []
-    for directive in summary.directives:
+    for directive in directives:
         lines.append(f"### [{directive.id}] {directive.content}")
         if directive.subject:
             lines.append(f"- subject: {directive.subject}")
@@ -2211,7 +2216,7 @@ def _build_judge_preamble(
     *,
     scope: Scope,
     stratum: Stratum,
-    parent_summary: ScopeSummary | None,
+    ancestor_directives: Sequence[tuple[str, Sequence[Directive]]] | None,
     current_summary: ScopeSummary | None,
     recent_contributions: Sequence[RecentContribution],
     judged_contribution_ids: Collection[str],
@@ -2246,17 +2251,27 @@ def _build_judge_preamble(
 
     operator_block = _render_operator_memory(operator_memory)
 
-    parent_block = ""
-    if parent_summary is not None:
-        # ADR 0013 D1 (issue #187): the parent's DIRECTIVES only. A chain edge
-        # carries what binds; a scope's context is its own internal working
-        # memory and never leaves the scope. Rendering the parent's whole
-        # summary here reintroduced, through judgment, exactly what D1 removed
-        # from composition — and once the judge wrote it into `new_context` it
-        # became the child's own context, indistinguishable on the read side
-        # from something the child observed itself.
-        rendered_parent = _render_directives_only(parent_summary)
-        parent_block = f"PARENT SCOPE DIRECTIVES (inherited)\n---\n{rendered_parent}\n---\n\n"
+    # ADR 0015 D2: one block per ANCESTOR, root-first, off the same walk
+    # composition reads — so what the judge is told binds this scope is,
+    # byte for byte, what the agent is shown. Each block names its owner,
+    # because "inherited" alone does not say from where, and a descendant
+    # judging a conflict between two strata needs to know which is broader.
+    #
+    # Directives only (ADR 0013 D1, issue #187): a chain edge carries what
+    # binds; a scope's context is its own internal working memory and never
+    # leaves the scope. Rendering an ancestor's whole summary here
+    # reintroduced, through judgment, exactly what D1 removed from
+    # composition — and once the judge wrote it into `new_context` it became
+    # the child's own context, indistinguishable on the read side from
+    # something the child observed itself.
+    ancestor_block = "".join(
+        f"ANCESTOR DIRECTIVES — {ancestor_scope_id} (inherited, binding)\n"
+        f"---\n{_render_directives_only(directives)}\n---\n\n"
+        for ancestor_scope_id, directives in (ancestor_directives or ())
+        # An ancestor that has admitted nothing binds nothing: a block saying
+        # so is noise in every descendant's prompt, forever.
+        if directives
+    )
 
     entitlement_block = ""
     if entitlement is not None:
@@ -2307,7 +2322,7 @@ def _build_judge_preamble(
         f"{refresh_block}"
         f"{input_changes_block}"
         f"{operator_block}"
-        f"{parent_block}"
+        f"{ancestor_block}"
         f"{entitlement_block}"
         f"{publication_block}"
         f"{parent_publication_block}"
@@ -2327,7 +2342,7 @@ def _build_user_message(
     *,
     scope: Scope,
     stratum: Stratum,
-    parent_summary: ScopeSummary | None,
+    ancestor_directives: Sequence[tuple[str, Sequence[Directive]]] | None,
     current_summary: ScopeSummary | None,
     recent_contributions: Sequence[RecentContribution],
     new_contribution: Contribution,
@@ -2345,7 +2360,7 @@ def _build_user_message(
     preamble = _build_judge_preamble(
         scope=scope,
         stratum=stratum,
-        parent_summary=parent_summary,
+        ancestor_directives=ancestor_directives,
         current_summary=current_summary,
         recent_contributions=recent_contributions,
         judged_contribution_ids=[new_contribution.id],
@@ -2373,7 +2388,7 @@ def _build_batch_user_message(
     *,
     scope: Scope,
     stratum: Stratum,
-    parent_summary: ScopeSummary | None,
+    ancestor_directives: Sequence[tuple[str, Sequence[Directive]]] | None,
     current_summary: ScopeSummary | None,
     recent_contributions: Sequence[RecentContribution],
     new_contributions: Sequence[Contribution],
@@ -2396,7 +2411,7 @@ def _build_batch_user_message(
     preamble = _build_judge_preamble(
         scope=scope,
         stratum=stratum,
-        parent_summary=parent_summary,
+        ancestor_directives=ancestor_directives,
         current_summary=current_summary,
         recent_contributions=recent_contributions,
         judged_contribution_ids=[c.id for c in new_contributions],
@@ -2461,7 +2476,7 @@ class ScopeManager:
         *,
         scope: Scope,
         stratum: Stratum,
-        parent_summary: ScopeSummary | None = None,
+        ancestor_directives: Sequence[tuple[str, Sequence[Directive]]] | None = None,
         current_summary: ScopeSummary | None,
         recent_contributions: Sequence[RecentContribution],
         new_contribution: Contribution,
@@ -2488,10 +2503,16 @@ class ScopeManager:
         Args:
             scope:                The scope receiving the contribution.
             stratum:              The stratum *scope* belongs to.
-            parent_summary:       The inter-stratum parent scope's current
-                                  summary, or ``None`` for L0 root scopes
-                                  (no parent exists).  Resolved by the caller
-                                  — the manager does not traverse the graph.
+            ancestor_directives:  The inter-stratum ancestor walk, root-first
+                                  — ``(ancestor_scope_id, directives)`` pairs
+                                  from
+                                  :func:`strata.perspective.ancestor_directives`,
+                                  empty for an L0 root scope. Resolved by the
+                                  caller — the manager does not traverse the
+                                  graph — and it is the SAME walk composition
+                                  reads (ADR 0015 D2), so what the judge is
+                                  told binds this scope is what the agent is
+                                  shown.
             current_summary:      The scope's current summary, or ``None``
                                   for a fresh scope with no prior summary.
             recent_contributions: The scope's recency window (ADR 0011 D2) —
@@ -2629,7 +2650,7 @@ class ScopeManager:
         user_message = _build_user_message(
             scope=scope,
             stratum=stratum,
-            parent_summary=parent_summary,
+            ancestor_directives=ancestor_directives,
             current_summary=current_summary,
             recent_contributions=recent_contributions,
             new_contribution=new_contribution,
@@ -2989,7 +3010,7 @@ class ScopeManager:
         *,
         scope: Scope,
         stratum: Stratum,
-        parent_summary: ScopeSummary | None = None,
+        ancestor_directives: Sequence[tuple[str, Sequence[Directive]]] | None = None,
         current_summary: ScopeSummary | None,
         recent_contributions: Sequence[RecentContribution],
         new_contributions: Sequence[Contribution],
@@ -3061,7 +3082,7 @@ class ScopeManager:
             judgment = self.judge(
                 scope=scope,
                 stratum=stratum,
-                parent_summary=parent_summary,
+                ancestor_directives=ancestor_directives,
                 current_summary=current_summary,
                 recent_contributions=recent_contributions,
                 new_contribution=only,
@@ -3113,7 +3134,7 @@ class ScopeManager:
         user_message = _build_batch_user_message(
             scope=scope,
             stratum=stratum,
-            parent_summary=parent_summary,
+            ancestor_directives=ancestor_directives,
             current_summary=current_summary,
             recent_contributions=recent_contributions,
             new_contributions=new_contributions,

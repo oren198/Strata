@@ -298,7 +298,7 @@ def test_judge_without_api_key_names_the_env_var(
         manager.judge(
             scope=MagicMock(),
             stratum=MagicMock(),
-            parent_summary=None,
+            ancestor_directives=None,
             current_summary=None,
             recent_contributions=[],
             new_contribution=MagicMock(),

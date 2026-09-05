@@ -67,7 +67,7 @@ from datetime import UTC, datetime
 from typing import Protocol
 
 from strata.fleet_config import FleetConfig
-from strata.summary_store import ScopeSummary, SummaryStore
+from strata.summary_store import Directive, ScopeSummary, SummaryStore
 
 
 class _OperatorItemLike(Protocol):
@@ -263,6 +263,42 @@ def summary_for_scope(scope_id: str, *, summary_store: SummaryStore) -> dict:
     return empty.model_dump()
 
 
+def ancestor_directives(
+    scope_id: str,
+    *,
+    fleet: FleetConfig,
+    summary_store: SummaryStore,
+) -> list[tuple[str, list[Directive]]]:
+    """Walk *scope_id*'s inter-stratum chain root-first and collect what binds it.
+
+    ADR 0015 D2 — one ancestor walk, two consumers. Composition renders each
+    pair as that ancestor's own labelled layer (ADR 0013 D1); the scope's
+    judge renders the same pairs as its ANCESTOR DIRECTIVES blocks. One
+    function, because the judge's view of what binds the scope IS the agent's
+    view: two walks would drift, and until this ADR they had — the judge saw
+    the immediate parent's summary while composition walked the whole chain,
+    so a grandparent's directive bound the scope on the read side and was
+    invisible on the judgment side.
+
+    Directives only, never an ancestor's context (ADR 0013 D1), and the
+    requested scope's own directives are not in it: a scope's own summary is
+    the other half of what binds it, read directly by both consumers.
+
+    Returns:
+        ``(ancestor_scope_id, directives)`` pairs, root-first. An ancestor
+        with no summary on disk yet contributes an empty list rather than
+        being dropped — the chain's shape is not a function of who has
+        written yet.
+    """
+    return [
+        (
+            ancestor.id,
+            list(summary.directives) if (summary := summary_store.read(ancestor.id)) else [],
+        )
+        for ancestor in fleet.inter_stratum_ancestors(scope_id)
+    ]
+
+
 def compose_perspective(
     scope_id: str,
     *,
@@ -401,6 +437,9 @@ def compose_perspective(
     # Build the ancestor chain (root-first), then append the requested scope.
     ancestors = fleet.inter_stratum_ancestors(scope_id)
     chain = [*ancestors, scope]
+    # ADR 0015 D2: the ONE walk, shared with the judge — composition does not
+    # re-derive what binds a scope.
+    inherited = dict(ancestor_directives(scope_id, fleet=fleet, summary_store=summary_store))
 
     layers = []
     for s in chain:
@@ -428,12 +467,11 @@ def compose_perspective(
         else:
             # Ancestor (ADR 0013 D1): directives only, full fidelity — never
             # this ancestor's context. No "summary" key at all in this shape.
-            ancestor_summary = summary_for_scope(s.id, summary_store=summary_store)
             layers.append(
                 {
                     "scope_id": s.id,
                     "stratum_id": s.stratum_id,
-                    "directives": ancestor_summary["directives"],
+                    "directives": [d.model_dump() for d in inherited.get(s.id, [])],
                     "relation": "ancestor",
                     "binding": True,
                 }

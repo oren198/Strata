@@ -81,7 +81,7 @@ class _MarkerManager:
         *,
         scope,
         stratum,
-        parent_summary,
+        ancestor_directives,
         current_summary,
         recent_contributions,
         new_contribution,

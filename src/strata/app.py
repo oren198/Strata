@@ -106,7 +106,7 @@ from strata.locks import scope_lock as _scope_lock
 from strata.locks import scope_queue as _scope_queue
 from strata.migrator import run_migrations
 from strata.operator import operator_memory_binding, read_operator_layer
-from strata.perspective import compose_perspective
+from strata.perspective import ancestor_directives, compose_perspective
 from strata.project_config import StoragePaths, resolve_storage_paths
 from strata.publication import (
     apply_judged_withdrawals,
@@ -136,7 +136,7 @@ from strata.session_state import (
     sessions_dir_for,
 )
 from strata.settings import Settings, get_settings
-from strata.summary_store import ScopeSummary, SummaryStore, splice_parent_directives
+from strata.summary_store import Directive, ScopeSummary, SummaryStore, splice_parent_directives
 
 # Console UI static files bundled as package data (same vendoring pattern as
 # _skills/ / _migrations/ / _templates/), so the static mount works regardless
@@ -437,6 +437,9 @@ class _JudgeInputs:
     """
 
     current_summary: ScopeSummary | None
+    ancestor_directives: list[tuple[str, list[Directive]]]
+    # Read only for ADR 0004 D4's `parent_version` stamp — never for the
+    # judge, which reads the walk above (ADR 0015 D2).
     parent_summary: ScopeSummary | None
     recent_contributions: list[RecentContribution]
     entitlement: object
@@ -464,10 +467,15 @@ def _read_judge_inputs(
         scope_id=scope.id, limit=recency_window_size
     )
 
-    # Resolve the inter-stratum parent's summary for manager context (ADR 0004
-    # Decision 2). The caller does the graph traversal; the manager is a pure
-    # judgment primitive that receives the resolved summary.
+    # Resolve what binds this scope from above (ADR 0004 D2, ADR 0015 D2): the
+    # ancestor walk, root-first, the SAME one `compose_perspective` reads. The
+    # caller does the graph traversal; the manager is a pure judgment primitive
+    # that receives the resolved walk. It is the whole chain, not the immediate
+    # parent alone — a grandparent's directive binds this scope just as hard,
+    # and the judge that could not see it was judging against a different
+    # picture from the agent's.
     parent_scope = fleet.inter_stratum_parent(scope.id)
+    ancestors = ancestor_directives(scope.id, fleet=fleet, summary_store=summary_store)
     parent_summary = summary_store.read(parent_scope.id) if parent_scope is not None else None
 
     # Judge-aware rendering (ADR 0008 D3): the operator memory binding this
@@ -504,6 +512,7 @@ def _read_judge_inputs(
     )
     return _JudgeInputs(
         current_summary=current_summary,
+        ancestor_directives=ancestors,
         parent_summary=parent_summary,
         recent_contributions=recent_contributions,
         entitlement=entitlement,
@@ -551,7 +560,7 @@ def _judge_and_record(
         judgment: ScopeManagerJudgment = scope_manager.judge(
             scope=scope,
             stratum=stratum,
-            parent_summary=parent_summary,
+            ancestor_directives=inputs.ancestor_directives,
             current_summary=inputs.current_summary,
             recent_contributions=inputs.recent_contributions,
             new_contribution=contribution,
@@ -889,7 +898,7 @@ def _judge_batch_and_record(
         batch: ScopeManagerBatchJudgment = scope_manager.judge_batch(
             scope=scope,
             stratum=stratum,
-            parent_summary=inputs.parent_summary,
+            ancestor_directives=inputs.ancestor_directives,
             current_summary=inputs.current_summary,
             recent_contributions=inputs.recent_contributions,
             new_contributions=list(contributions),
