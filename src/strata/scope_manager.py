@@ -1464,6 +1464,21 @@ class _AmendmentJudgment(BaseModel):
     :attr:`record_notes` either way."""
 
     @property
+    def wave_ids(self) -> list[str]:
+        """Every input change this judgment belongs to (ADR 0014 D4).
+
+        The ONE thing an emitter of derived change events should read: the
+        single judgment carries a scalar ``change_id`` and the batch carries
+        ``change_ids``, and a caller that reads the wrong field of the wrong
+        shape inherits nothing — which would silently break the once-per-id
+        rule that is the whole termination guarantee. A drain always produces
+        a batch shape, so this is not a hypothetical.
+
+        Empty for an ordinary contribution, which belongs to no wave.
+        """
+        return [self.change_id] if self.change_id else []
+
+    @property
     def removed_directive_ids(self) -> list[str]:
         """Directive ids this amendment removes from the summary (ADR 0011 D1).
 
@@ -1662,7 +1677,18 @@ class ScopeManagerBatchJudgment(_AmendmentJudgment):
 
     :attr:`change_id`, inherited from :class:`_AmendmentJudgment`, is always
     ``None`` on a batch: one field is the source of truth, so the two can never
-    disagree about which wave a coalesced refresh belongs to."""
+    disagree about which wave a coalesced refresh belongs to. Read
+    :attr:`wave_ids` rather than either field directly and the shape stops
+    mattering."""
+
+    @property
+    def wave_ids(self) -> list[str]:
+        """Every input change this batch belongs to — :attr:`change_ids`.
+
+        Overrides :meth:`_AmendmentJudgment.wave_ids`, whose scalar is always
+        ``None`` here.
+        """
+        return list(self.change_ids)
 
     dropped_ops_by_contribution: dict[str, list[str]] = Field(default_factory=dict)
     """Dropped ops (rendered) keyed by the contribution whose record notes them."""

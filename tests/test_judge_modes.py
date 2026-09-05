@@ -34,6 +34,8 @@ from strata.scope_manager import (
     JUDGE_BATCH_TOOL,
     JUDGE_TOOL,
     ScopeManager,
+    ScopeManagerBatchJudgment,
+    ScopeManagerJudgment,
     _build_judge_preamble,
 )
 from strata.summary_store import ScopeSummary
@@ -248,3 +250,27 @@ def test_a_splice_refresh_batch_drops_admitting_ops_too():
     assert [op.op for op in judgment.directive_ops] == ["retire"]
     assert judgment.dropped_ops == ["append(contribution=c_refresh)"]
     assert "append" in judgment.record_notes_for(contribution.id)
+
+
+def test_wave_ids_reads_the_same_on_both_judgment_shapes():
+    """One field for an emitter to read, whichever shape it was handed.
+
+    A drain always produces the BATCH shape, whose scalar `change_id` is
+    always None — so an emitter reading `change_id` off a refresh judgment
+    would inherit nothing and ADR 0014 D4's once-per-id rule, the whole
+    termination guarantee, would quietly stop bounding anything.
+    """
+    single = ScopeManagerJudgment(
+        decision="accept_as_context",
+        reasoning="judged",
+        new_summary=None,
+        change_id="chg_a",
+    )
+    batch = ScopeManagerBatchJudgment(new_summary=None, change_ids=["chg_a", "chg_b"])
+    ordinary = ScopeManagerJudgment(
+        decision="accept_as_context", reasoning="judged", new_summary=None
+    )
+
+    assert single.wave_ids == ["chg_a"]
+    assert batch.wave_ids == ["chg_a", "chg_b"]
+    assert ordinary.wave_ids == []
