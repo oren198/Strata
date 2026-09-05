@@ -273,3 +273,63 @@ def test_a_scope_with_no_descendants_emits_nothing(fleet, record_store, summary_
     # Nobody below the leaf: no new events anywhere.
     assert record_store.list_change_events(scope_id="g_ce_parent") == []
     assert len(record_store.list_change_events(scope_id="g_ce_child")) == 1
+
+
+# ---------------------------------------------------------------------------
+# The HTTP surface (implementation pin 3)
+# ---------------------------------------------------------------------------
+
+
+def test_the_contribute_route_emits_because_it_shares_the_choke_point(
+    tmp_path: Path, fleet: FleetConfig
+) -> None:
+    """``POST /contribute`` routes through :func:`run_contribution` — the one
+    choke point every surface shares — so it needs no hook of its own, and
+    one route test proves the whole path.
+    """
+    from fastapi.testclient import TestClient
+
+    from strata.app import create_app, get_scope_manager
+    from strata.settings import Settings
+
+    db_path = str(tmp_path / "route.db")
+    run_migrations(db_path)
+    settings = Settings(
+        db_path=db_path,
+        summaries_dir=str(tmp_path / "summaries"),
+        fleet_yaml_path=str(tmp_path / "fleet.yaml"),
+        manager_model="claude-haiku-4-5",
+        anthropic_api_key="test-key",
+    )
+    application = create_app(settings=settings)
+    application.dependency_overrides[get_scope_manager] = lambda: _ScriptedManager(
+        ScopeManagerJudgment(
+            decision="accept_as_directive",
+            reasoning="Binding.",
+            new_summary=_summary(_directive("c_route")),
+        )
+    )
+
+    with TestClient(application) as tc:
+        response = tc.post(
+            "/contribute",
+            json={
+                "scope_id": "g_ce_parent",
+                "content": "A new rule.",
+                "proposed_classification": "directive",
+                "contributor": {
+                    "scope_id": "g_ce_parent",
+                    "skill": "strata-developer",
+                    "session_id": "sess_test",
+                    "ts": "2026-09-05T00:00:00+00:00",
+                },
+            },
+        )
+
+    # Precondition: the route accepted and the amendment was written.
+    assert response.status_code == 200, response.text
+    assert response.json()["judgment"]["decision"] == "accept_as_directive"
+
+    with RecordStore(db_path) as store:
+        (event,) = store.list_change_events(scope_id="g_ce_child")
+    assert event.kind == "directive_appended"
