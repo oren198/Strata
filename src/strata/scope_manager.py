@@ -1429,6 +1429,18 @@ class _AmendmentJudgment(BaseModel):
     whoever minted it, never looked up from a judgment's surroundings.
     ``None`` for an ordinary contribution, which belongs to no wave."""
 
+    hop: int = 0
+    """How many derived hops this judgment is from the change that started the wave.
+
+    ADR 0014 D4's backstop budget only bounds anything if the count TRAVELS: a
+    refresh-derived emission that restarted at zero would leave the budget
+    covering nothing, and a reference cycle is exactly where hops accumulate.
+    So, like :attr:`change_id`, it is a parameter on the judge call
+    (implementation pin 8) — whoever drained the events knows how far along the
+    wave they were — and an emitter writing derived events reads the next hop
+    off the judgment instead of guessing it. ``0`` for an ordinary
+    contribution, which starts no wave and is at no distance from one."""
+
     context_sources: list[str] = Field(default_factory=list)
     """Published item ids the judge declares its ``new_context`` rests on.
 
@@ -2425,6 +2437,7 @@ class ScopeManager:
         input_changes: Sequence[_ChangeEventLike] | None = None,
         window_verbatim_tail: int = WINDOW_VERBATIM_TAIL,
         change_id: str | None = None,
+        hop: int = 0,
     ) -> ScopeManagerJudgment:
         """Judge a new contribution against the scope's current state.
 
@@ -2608,6 +2621,7 @@ class ScopeManager:
                 new_contribution=new_contribution,
                 mode=mode,
                 change_id=change_id,
+                hop=hop,
                 rendered_item_ids=rendered_item_ids,
             )
 
@@ -2951,6 +2965,7 @@ class ScopeManager:
         input_changes: Sequence[_ChangeEventLike] | None = None,
         window_verbatim_tail: int = WINDOW_VERBATIM_TAIL,
         change_ids: Sequence[str] | None = None,
+        hop: int = 0,
     ) -> ScopeManagerBatchJudgment:
         """Judge several new contributions, in arrival order, in ONE call (ADR 0011 D3).
 
@@ -2979,6 +2994,8 @@ class ScopeManager:
                 several pending events as one batch (implementation pin 1), so
                 the batch belongs to every wave it drained. Deduplicated here,
                 order preserved.
+            hop: How many derived hops this batch is from the change that
+                started the wave (ADR 0014 D4) — see :meth:`judge`.
 
             Every other argument means exactly what it means on :meth:`judge`.
 
@@ -3025,6 +3042,7 @@ class ScopeManager:
                 # to carry, and `change_ids` below is the batch's truth either
                 # way.
                 change_id=wave_ids[0] if len(wave_ids) == 1 else None,
+                hop=hop,
             )
             return ScopeManagerBatchJudgment(
                 verdicts=[
@@ -3046,6 +3064,7 @@ class ScopeManager:
                 # silently lose them (ADR 0014 D3/D4). `change_id` stays None
                 # on a batch shape — `change_ids` is the one source of truth.
                 change_ids=wave_ids,
+                hop=judgment.hop,
                 context_sources=judgment.context_sources,
                 dropped_context_sources=judgment.dropped_context_sources,
             )
@@ -3083,6 +3102,7 @@ class ScopeManager:
                 contributions=contributions,
                 mode=mode,
                 change_ids=wave_ids,
+                hop=hop,
                 rendered_item_ids=rendered_item_ids,
             )
 
@@ -3148,6 +3168,7 @@ class ScopeManager:
         contributions: Mapping[str, Contribution],
         mode: JudgeMode = "ordinary",
         change_ids: Sequence[str] = (),
+        hop: int = 0,
         rendered_item_ids: Sequence[str] = (),
     ) -> ScopeManagerBatchJudgment:
         """Validate a ``submit_batch_judgment`` payload and apply its amendment.
@@ -3200,6 +3221,7 @@ class ScopeManager:
                 new_summary=None,
                 withdraw_published=withdraw_published,
                 change_ids=list(change_ids),
+                hop=hop,
             )
 
         dropped: list[str] = []
@@ -3247,6 +3269,7 @@ class ScopeManager:
             dropped_ops_by_contribution=dropped_by_contribution,
             withdraw_published=withdraw_published,
             change_ids=list(change_ids),
+            hop=hop,
             context_sources=context_sources,
             dropped_context_sources=dropped_sources,
         )
@@ -3351,6 +3374,7 @@ class ScopeManager:
         new_contribution: Contribution,
         mode: JudgeMode = "ordinary",
         change_id: str | None = None,
+        hop: int = 0,
         rendered_item_ids: Sequence[str] = (),
     ) -> ScopeManagerJudgment:
         """Validate a ``submit_judgment`` payload and apply its amendment.
@@ -3404,6 +3428,7 @@ class ScopeManager:
                 new_summary=None,
                 withdraw_published=withdraw_published,
                 change_id=change_id,
+                hop=hop,
             )
 
         context_sources, dropped_sources = _validate_context_sources(
@@ -3439,6 +3464,7 @@ class ScopeManager:
             dropped_ops=dropped,
             withdraw_published=withdraw_published,
             change_id=change_id,
+            hop=hop,
             context_sources=context_sources,
             dropped_context_sources=dropped_sources,
         )

@@ -346,3 +346,43 @@ def test_an_already_judged_notice_is_marked_processed_without_re_judging(
     assert outcome.events_processed == 1
     with RecordStore(db_path) as rs:
         assert rs.list_change_events(scope_id="g_drain", unprocessed_only=True) == []
+
+
+def test_the_drained_judgment_carries_the_next_hop(tmp_path: Path) -> None:
+    """ADR 0014 D4's hop budget only bounds a wave if the hop count travels.
+
+    A refresh-derived emission that restarted at hop 0 would leave the backstop
+    covering nothing — the reference cycle it exists for is exactly where hops
+    accumulate. The judgment carries max(drained hop) + 1, so an emitter
+    writing derived events reads the next hop off the judgment rather than
+    guessing it.
+    """
+    db_path, fleet, summary_store = _setup(tmp_path)
+    with RecordStore(db_path) as rs:
+        first = _emit(rs, change_id="chg_a", item_id="p_1")
+        second = _emit(rs, change_id="chg_b", item_id="p_2")
+        rs.append_change_event(
+            change_id="chg_c",
+            contribution_id=first.id,
+            scope_id="g_drain",
+            item_id="p_3",
+            kind="amended",
+            hop=2,
+        )
+        assert second is not None
+
+    judge = _ScriptedJudge(new_context="Reconciled.")
+    _drain(db_path, fleet, summary_store, judge)
+
+    assert judge.batch_calls[0]["hop"] == 3
+
+
+def test_a_first_hop_wave_leaves_the_judgment_at_hop_one(tmp_path: Path) -> None:
+    db_path, fleet, summary_store = _setup(tmp_path)
+    with RecordStore(db_path) as rs:
+        _emit(rs, change_id="chg_a", item_id="p_1")
+
+    judge = _ScriptedJudge(new_context="Reconciled.")
+    _drain(db_path, fleet, summary_store, judge)
+
+    assert judge.judge_calls[0]["hop"] == 1

@@ -4506,3 +4506,56 @@ def test_batch_context_sources_are_validated_the_same_way() -> None:
     # member's row — the rule an unowned dropped op already follows.
     for verdict in judgment.accepted_verdicts:
         assert "pub_neverseen" in judgment.record_notes_for(verdict.contribution_id)
+
+
+def test_hop_defaults_to_zero_on_both_judgment_shapes() -> None:
+    """An ordinary contribution starts no wave, so it is at no distance from one."""
+    manager, _ = _make_manager(_accept_context_input())
+
+    judgment = manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+    )
+    assert judgment.hop == 0
+
+    mock_client = MagicMock()
+    mock_client.messages.create.return_value = _fake_response(_batch_input())
+    assert _judge_batch(mock_client).hop == 0
+
+
+def test_hop_is_carried_onto_the_judgment() -> None:
+    """ADR 0014 D4's backstop: the hop count travels with the wave, like its id."""
+    manager, _ = _make_manager(_accept_context_input())
+
+    judgment = manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+        change_id="chg_wave1",
+        hop=3,
+    )
+
+    assert judgment.hop == 3
+
+
+def test_batch_hop_reaches_a_batch_of_one() -> None:
+    mock_client = MagicMock()
+    mock_client.messages.create.return_value = _fake_response(_accept_context_input())
+
+    judgment = _judge_batch(
+        mock_client, contributions=[NEW_CONTRIBUTION], change_ids=["chg_a"], hop=2
+    )
+
+    assert judgment.hop == 2
+
+
+def test_batch_hop_reaches_a_real_batch() -> None:
+    mock_client = MagicMock()
+    mock_client.messages.create.return_value = _fake_response(_batch_input())
+
+    assert _judge_batch(mock_client, change_ids=["chg_a"], hop=2).hop == 2

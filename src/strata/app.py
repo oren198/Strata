@@ -527,6 +527,7 @@ def _judge_and_record(
     mode: JudgeMode = "ordinary",
     input_changes: Sequence[ChangeEvent] | None = None,
     change_id: str | None = None,
+    hop: int = 0,
 ) -> ContributionOutcome:
     """Judge *contribution* against the scope's current state and persist the result.
 
@@ -565,6 +566,7 @@ def _judge_and_record(
             mode=mode,
             input_changes=input_changes,
             change_id=change_id,
+            hop=hop,
         )
     except Exception as exc:
         # Record the failure as an event against the contribution — never as a
@@ -723,6 +725,7 @@ def _judge_batch_and_record(
     mode: JudgeMode = "ordinary",
     input_changes: Sequence[ChangeEvent] | None = None,
     change_ids: Sequence[str] | None = None,
+    hop: int = 0,
 ) -> list[ContributionOutcome | JudgeUnavailable]:
     """Judge a batch of contributions in ONE call and persist the results (ADR 0011 D3).
 
@@ -765,6 +768,7 @@ def _judge_batch_and_record(
                     change_id=(
                         list(change_ids)[0] if change_ids and len(change_ids) == 1 else None
                     ),
+                    hop=hop,
                 )
             ]
         except JudgeUnavailable as exc:
@@ -796,6 +800,7 @@ def _judge_batch_and_record(
             mode=mode,
             input_changes=input_changes,
             change_ids=change_ids,
+            hop=hop,
         )
     except Exception as exc:  # noqa: BLE001 — every member needs its own error
         # One failed call strands the whole batch, so each member gets the
@@ -1196,6 +1201,11 @@ def drain_scope(
     a directive minted from it carries honest provenance. The engine still
     never edits the scope's memory — only its judge does.
 
+    The resulting judgment carries ``hop`` = the drained events' highest hop
+    plus one, and every drained change id, so whatever writes the derived
+    change events (ADR 0014 D4's inheritance) reads both off the judgment
+    rather than re-deriving them.
+
     Every event drained is marked processed WHATEVER the verdict (ADR 0014 D5):
     a decline is a refresh that ran and decided nothing needed changing, not a
     refresh still owed. The row itself is kept forever.
@@ -1268,6 +1278,11 @@ def drain_scope(
             mode="input_change_refresh",
             input_changes=events,
             change_ids=change_ids,
+            # ADR 0014 D4's backstop budget: this refresh sits one hop beyond
+            # the furthest-travelled event it drained, and the judgment carries
+            # that so an emitter writing derived events inherits the distance
+            # instead of restarting the wave at zero.
+            hop=max(event.hop for event in events) + 1,
         )
 
         failures = [r for r in results if isinstance(r, JudgeUnavailable)]
