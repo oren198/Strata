@@ -13,13 +13,10 @@ after A merges; E last.
    write, one verdict row per event. A judged row = a processed event; drain
    is idempotent by `rejudge_contribution`'s no-op-if-judged rule. Nobody
    builds a separate coalescing mechanism.
-2. **Additions use topology; removals use the index.** A new publication
-   item or new directive has been shown to nobody, so index rows are zero.
-   Affected set for an addition is structural: chain children and
-   `references_from` readers for a publication item; all chain descendants
-   for a directive (operator directives on S → S and descendants). The
-   presented index, with D7's fallback, applies to withdraw/supersede/retire
-   only.
+2. **One affected-set rule, topological, for every kind of change.**
+   Chain children and `references_from` readers for a publication item; all
+   chain descendants for a directive (operator directives on S → S and
+   descendants). No presented index, no fallback (ADR 0014 D3).
 3. **Every writer of a shared input emits an event.** MCP publish/withdraw;
    HTTP `POST /contribute`; CLI `cmd_operator_publish/supersede/retire`;
    `_cascade_withdraw_relays`; and any judgment's directive ops on a scope
@@ -58,13 +55,12 @@ after A merges; E last.
 ## Phases
 
 - **A — storage and plumbing (serial, first).** Migration + `change_events`
-  table; presented-index writes on the judge path (replace on `new_context`,
-  carry otherwise — ADR 0014 D3); `change_id` threading through
+  table; `change_id` threading through
   `ScopeManagerJudgment`/batch and the judge call signature; `context_sources`
   field on `_AmendmentJudgment` with subset validation (record only). No
   behaviour change; suite stays green.
 - **B — emission and affected set.** Every writer in pin 3 emits, with
-  inheritance and hop; affected-set computation per pin 2 with D7 fallback;
+  inheritance and hop; affected-set computation per pin 2;
   enqueue = append manager-refresh contribution + change_events row.
 - **C — drain and judge modes.** Drain in MCP server on bind/read via batch
   rejudge in input-change mode; three-mode judge; prompt sibling block;

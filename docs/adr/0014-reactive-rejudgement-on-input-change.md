@@ -62,26 +62,28 @@ provenance: this entered because input X changed.
 The engine never edits the scope's memory. Only the scope's judge does,
 exercising the scope's authority.
 
-### D3 — The affected set is mechanical: the presented index
+### D3 — The affected set is topological, one rule for every kind of change
 
-Per judgment, the engine records **which input items it showed the judge** —
-publication items, ancestor and operator directives — as an index
-`item_id -> scope_id` in the database, never in the summary markdown. The
-affected set for a changed item is that index's rows plus, structurally, every
-scope holding the item as a directive.
+The scopes affected by a change to item X are the scopes that compose X: for a
+publication item, the source's chain children and every scope whose reference
+edge points at the source (`FleetConfig.references_from`); for a directive, the
+holding scope's chain descendants (an operator directive on S: S and its
+descendants). The same rule for an addition, an amendment and a withdrawal.
 
-Presented, not declared, is the trigger because it is mechanical and cannot
-miss: a spurious refresh costs one LLM call; a missed one costs correctness.
+Rejected: a "presented index" of which items each judge was actually shown,
+used for removals only. It is a strict subset of the topological set — anyone
+shown X is one hop from X's source by construction — so it buys only precision:
+skipping scopes that never read since X appeared. That precision costs a second
+table, a second rule (additions have no index rows and must use topology
+anyway), a retro-fill fallback, and a place for the two to disagree. A spurious
+refresh costs one judge call, which fixpoint damping (D4) then stops. One
+mechanism.
 
-Update semantics: a judgment that sets `new_context` **replaces** the scope's
-rows with what was presented to that judgment; a judgment that leaves context
-untouched, and every decline, **carries** existing rows.
-
-`_AmendmentJudgment` additionally gains `context_sources: list[str]` — the ids
-the judge declares its `new_context` rests on. It is **record, not trigger**: it
-tells an operator what the judge actually used, shows an agent what is new, and
-lets declared-vs-presented divergence be measured. The engine validates it is a
-subset of the presented set and notes anything else in the record.
+`_AmendmentJudgment` gains `context_sources: list[str]` — the ids the judge
+declares its `new_context` rests on. It is **record, not trigger**: it tells an
+operator what the judge actually used, shows an agent what is new, and lets the
+judge's declaration be audited against what was rendered. The engine validates
+it is a subset of the rendered item ids and notes anything else in the record.
 
 ### D4 — One refresh per scope per change id
 
@@ -137,12 +139,11 @@ depth and the oldest pending event.
 No background worker in this version; one can be added without changing
 anything decided here.
 
-### D7 — No retro-fill; an unindexed scope depends on its whole presented set
+### D7 — No retro-fill
 
-The index starts empty and no stored state is rewritten (ADR 0013 D7). Until a
-scope's first post-release judgment writes rows, it is treated as depending on
-all its current one-hop inputs — so the live fleet's existing absorbed claims
-are covered from day one.
+No stored state is rewritten (ADR 0013 D7). Because D3 is topological, the
+live fleet's existing absorbed claims are covered from the first change event
+with nothing to backfill.
 
 ## Known gap — transitive staleness under read-time drain
 
@@ -176,11 +177,11 @@ across the fleet. Revisit with data on how often the gap bites.
 2. **Addition** — parent adds a publication; child's refresh runs and may admit.
 3. **Non-binding** — engine never edited the absorber's context.
 4. **Termination** — reference cycle, one change, bounded refresh count.
-5. **Source honesty** — declared `context_sources` vs presented set.
+5. **Source honesty** — declared `context_sources` vs the ids rendered to the judge.
 
 Hand-built judgments (bench `_MechanicalJudge`, evals `ScriptedJudge`) default
 `context_sources` empty; that is expected, not a bug — the trigger is D3's
-presented index, which needs no judge cooperation.
+topology, which needs no judge cooperation.
 
 ## Rejected
 
@@ -190,6 +191,8 @@ presented index, which needs no judge cooperation.
 - **TTL alone.** Arbitrary, and permits repeated re-judging inside the budget.
 - **Declared sources as the trigger.** A judge under-declaring is a silent miss.
   Kept as record (D3), never as trigger.
+- **A presented index for removals.** A second mechanism beside topology,
+  buying precision only. See D3.
 - **Mechanical downstream deletion.** Makes publication binding.
 - **Drain at `strata launch`/`strata start`.** Never runs for an MCP-only user.
 - **Synchronous cascade.** A withdrawal would take as long as the deepest
