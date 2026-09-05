@@ -837,6 +837,9 @@ def cmd_doctor(args: argparse.Namespace) -> int:
        set and valid against the fleet.
     9. Judge key (``JUDGE_API_KEY`` / ``ANTHROPIC_API_KEY``) resolvable —
        soft, like check 8's session-id half: never flips the exit code.
+    10. Refresh queue depth and oldest pending event (ADR 0014 D6, pin 4) —
+        soft, purely informational: an unprocessed ``change_events`` row is
+        an input change awaiting its refresh, never a judge outage.
     """
     from strata.bootstrap import load_fleet_config
     from strata.fleet_config import FleetConfigError
@@ -1519,6 +1522,87 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                 ),
             )
         )
+
+    # -----------------------------------------------------------------------
+    # 10. Refresh queue (ADR 0014 D6, pin 4). Soft and purely informational —
+    # never flips the exit code: an unprocessed change_events row is an input
+    # change waiting for its refresh to run, NOT a judge outage, so it is
+    # reported on its own line rather than folded into any pending/failed
+    # judgment count. Read-only sqlite3 URI, exactly like check 2 — this must
+    # never create the table it is reporting on.
+    # -----------------------------------------------------------------------
+    if paths is None:
+        checks.append(
+            Check(
+                name="Refresh queue",
+                kind="soft",
+                passed=True,
+                message="skipped — fix the project config check above first.",
+            )
+        )
+    else:
+        refresh_db_file = Path(paths.db_path)
+        conn: sqlite3.Connection | None = None
+        try:
+            if not refresh_db_file.exists():
+                raise sqlite3.OperationalError("no database file")
+            conn = sqlite3.connect(f"file:{refresh_db_file}?mode=ro", uri=True)
+            row = conn.execute(
+                """
+                SELECT COUNT(*), MIN(created_at)
+                FROM change_events
+                WHERE processed_at IS NULL
+                """
+            ).fetchone()
+            depth, oldest_at = row[0], row[1]
+            oldest_scope = None
+            if depth:
+                oldest_scope = conn.execute(
+                    """
+                    SELECT scope_id FROM change_events
+                    WHERE processed_at IS NULL
+                    ORDER BY created_at ASC, rowid ASC LIMIT 1
+                    """
+                ).fetchone()[0]
+        except sqlite3.Error:
+            # No database yet, unreachable, or change_events doesn't exist
+            # (migration 0010 not applied) — the DB check above already
+            # reports that; this check just has nothing to add rather than
+            # repeating it.
+            checks.append(
+                Check(
+                    name="Refresh queue",
+                    kind="soft",
+                    passed=True,
+                    message="skipped — see the Database check above.",
+                )
+            )
+        else:
+            if depth:
+                checks.append(
+                    Check(
+                        name="Refresh queue",
+                        kind="soft",
+                        passed=True,
+                        message=(
+                            f"{depth} pending — oldest queued at {oldest_at} "
+                            f"({oldest_scope}); a refresh has not yet processed it "
+                            "(ADR 0014 D6 — not a judge outage)."
+                        ),
+                    )
+                )
+            else:
+                checks.append(
+                    Check(
+                        name="Refresh queue",
+                        kind="soft",
+                        passed=True,
+                        message="0 pending — no input change is waiting on a refresh.",
+                    )
+                )
+        finally:
+            if conn is not None:
+                conn.close()
 
     return _run_preflight(checks)
 
