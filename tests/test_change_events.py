@@ -470,3 +470,31 @@ class TestEmit:
         ]
         assert len(orphans) == 1
         assert record_store.list_change_events(scope_id="g_teamX") == []
+
+    def test_a_broken_traversal_is_swallowed_too(
+        self,
+        fleet: FleetConfig,
+        record_store: RecordStore,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Not only a store failure: nothing about computing WHO to tell may
+        fail the act that already succeeded (ADR 0014 D6)."""
+
+        def _boom(_self: FleetConfig, _scope_id: str) -> list:
+            raise RuntimeError("the fleet is unreadable")
+
+        monkeypatch.setattr(FleetConfig, "chain_children", _boom)
+
+        with caplog.at_level("ERROR", logger="strata.change_events"):
+            change_id = emit(
+                fleet=fleet,
+                record_store=record_store,
+                item="pub_1",
+                kind="withdrawn",
+                source_scope_id="g_funcA",
+            )
+
+        assert change_id.startswith("chg_")
+        assert "the fleet is unreadable" in caplog.text
+        assert record_store.list_change_events(scope_id="g_teamX") == []

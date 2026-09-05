@@ -1241,6 +1241,41 @@ class TestChangeEvents:
 
         assert store.list_change_events(scope_id="g_ceo") == [event]
 
+    def test_the_source_scope_round_trips_beside_the_affected_scope(self, store) -> None:
+        """Two different facts on one row: g_ceo must refresh, g_eng is what
+        changed. Neither is derivable from the other — an item id does not
+        name its holder — so both are stored (ADR 0014 D5)."""
+        cid = _contribute(store, "manager-refresh notice")
+
+        event = store.append_change_event(
+            change_id="chg_1",
+            contribution_id=cid,
+            scope_id="g_ceo",
+            source_scope_id="g_eng",
+            item_id="pub_abc",
+            kind="published",
+            after="a new claim",
+        )
+
+        assert event.scope_id == "g_ceo"
+        assert event.source_scope_id == "g_eng"
+        assert store.list_change_events(scope_id="g_ceo")[0].source_scope_id == "g_eng"
+
+    def test_a_source_scope_is_optional_and_stays_absent(self, store) -> None:
+        """Nothing is invented for a caller that has no source scope to give —
+        the same discipline the pre-0011 rows the migration carried across get."""
+        cid = _contribute(store, "manager-refresh notice")
+
+        event = store.append_change_event(
+            change_id="chg_1",
+            contribution_id=cid,
+            scope_id="g_ceo",
+            item_id="pub_abc",
+            kind="published",
+        )
+
+        assert event.source_scope_id is None
+
     def test_events_are_listed_oldest_first_and_scoped(self, store) -> None:
         cid = _contribute(store, "notice")
         first = store.append_change_event(

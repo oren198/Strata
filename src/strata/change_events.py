@@ -274,12 +274,12 @@ def emit(
     change_id = inherit_from if inherit_from is not None else new_change_id()
     try:
         scope_ids = affected_scopes(fleet, item=item, kind=kind, source_scope_id=source_scope_id)
-    except ValueError:
-        # A caller emitting an unknown kind is a bug in the caller, not a
-        # reason to fail its act — log it loudly and deliver nothing rather
-        # than delivering to a guessed set.
+    except Exception:  # noqa: BLE001 — the notice, never the act
+        # An unknown kind is a bug in the caller and a broken traversal a bug
+        # here; neither is a reason to undo an act that already succeeded.
+        # Log it loudly and deliver nothing rather than to a guessed set.
         _logger.exception(
-            "change %s (%s of %s in %s) has no affected-set rule; no notice emitted",
+            "change %s (%s of %s in %s) could not be routed; no notice emitted",
             change_id,
             kind,
             item,
