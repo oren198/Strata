@@ -53,6 +53,13 @@ A scope's own contribution is not a trigger; it already has a path.
 
 ### D2 — The trigger runs the manager-refresh path; `publish` allowed, `append` not
 
+> **Amendment (2026-09-06, ADR 0015 D1/D6):** the parent-splice refresh this
+> decision distinguishes itself from no longer exists. There are two judge
+> modes, `ordinary` and `input_change_refresh`, and a drain is always the
+> latter — so the paragraph below about "the drop of both admitting ops stays
+> for the parent-splice refresh" now describes nothing. Everything this
+> decision says about the input-change refresh itself is unchanged.
+
 The triggered cycle is ADR 0011 D4's refresh, **amended**: on an input-change
 refresh the judge's amendment may carry `publish` ops as well as
 `new_context`, lifecycle ops and `withdraw_published`. `append` stays dropped
@@ -139,6 +146,16 @@ can vanish is not notice.
 
 ### D6 — Refresh runs inside the MCP server, on read; no daemon, no CLI needed
 
+> **Amendment (2026-09-06, ADR 0015 D3/D5/D6):** a drain is three things now,
+> in this order: the one-off unsplice of legacy copied rows (ADR 0015 D5), the
+> mechanical sweep of published items an ancestor's retirement un-anchored
+> (D3), then the judged cycle this decision describes. The first two need no
+> judge, which is what a keyless server still does at read time; the parent
+> splice that used to run alongside them is gone (D1). One consequence for
+> this decision's read-path economics: with nothing unconditional left to do,
+> "nothing pending" is now the whole of `drain_is_noop`, so a quiet read costs
+> what reading a current scope costs.
+
 `strata_withdraw`, `strata_publish`, operator edits and directive changes write
 their change events and enqueue refreshes, then return. They never block on LLM
 calls fanning across the fleet.
@@ -161,6 +178,15 @@ anything decided here.
 No stored state is rewritten (ADR 0013 D7). Because D3 is topological, the
 live fleet's existing absorbed claims are covered from the first change event
 with nothing to backfill.
+
+> **Amendment (2026-09-06, ADR 0015 D5):** one deliberate exception, and the
+> only one. Directive rows that the pre-1.11 splice copied into a descendant's
+> summary are removed on that scope's first drain after the 1.11 release. They
+> are not the state this decision protects: this decision protects **judged**
+> state — memory a scope's own judge admitted — and a spliced row was never
+> judged into the scope that holds it. The removal is mechanical, exact (a
+> directive id is a contribution id, and a contribution belongs to exactly one
+> scope's record), idempotent, and named in the record.
 
 ## Known gap — transitive staleness under read-time drain
 

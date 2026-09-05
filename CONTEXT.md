@@ -177,7 +177,10 @@ forensics.
 A scope summary has two sections:
 
 - **Directives** — listed individually, each retaining its identity so it can
-  be cited, superseded, or retired distinctly.
+  be cited, superseded, or retired distinctly. Only the directives this scope
+  itself admitted: an inherited one lives in its owner's summary and is
+  assembled into this scope's **perspective** on every read, never copied
+  here.
 - **Context** — a condensed digest of relevant non-binding knowledge from
   this scope.
 
@@ -280,19 +283,29 @@ refresh it would otherwise trigger.
 
 ## Refresh
 
-The judged cycle a **change event** triggers. First the mechanical half:
-the chain parent's **directives** are spliced into the scope's own summary,
-byte for byte, ids and provenance intact — this needs no judge and runs
-wherever a refresh runs. Then the judged half: the scope's pending change
-events are judged together in one amendment, whose ops may admit a new
-**directive** or **context** as well as retire, supersede, or withdraw a
-publication — the notice being judged is a real contribution with honest
-provenance. A refresh runs inside the MCP server before a scope is bound or
-its perspective is read; a scope with nothing pending and nothing to splice
-costs the read nothing. `strata launch` and `strata refresh` run the same
-cycle from the command line. Without a judge key the splice still lands and
-the reconciliation waits, as a pending change event, for the first keyed
-refresh.
+The judged cycle a **change event** triggers, with two mechanical steps ahead
+of it.
+
+The mechanical steps need no judge and run wherever a refresh runs. First, any
+**directive** row an older release copied into this summary from an ancestor
+is removed — a one-off correction, recorded, that happens once and finds
+nothing thereafter. Then the sweep: where an ancestor retired or superseded a
+directive, this scope's **published** items that rested on it and on nothing
+else are withdrawn, by the same rule that applies when the scope retires one
+of its own.
+
+Then the judged cycle: the scope's pending change events are judged together
+in one amendment, whose ops may admit a new directive or **context** as well
+as retire, supersede, or withdraw a publication — the notice being judged is a
+real contribution with honest provenance. Nothing is copied and nothing is
+inherited here; inheritance is composition, and it happens when the
+**perspective** is read.
+
+A refresh runs inside the MCP server before a scope is bound or its
+perspective is read; a scope with nothing pending costs the read nothing.
+`strata launch` and `strata refresh` run the same cycle from the command line.
+Without a judge key the mechanical steps still run and the judged cycle waits,
+with its change events still pending, for the first keyed refresh.
 
 ## Supersession
 
@@ -357,6 +370,16 @@ descendant scope. When two directives conflict, the one from the broader
 but may not contradict it. Appending, superseding or retiring a directive is
 a **change event** for the holding scope's chain descendants, each due a
 **refresh** against the new state.
+
+Inheritance is composition, not copying: a directive lives in exactly one
+**scope summary**, the summary of the scope that admitted it, and a descendant
+assembles the chain above it every time its **perspective** is read. So an
+ancestor's retirement is visible on the descendant's next read with no copy to
+chase, a descendant's word budget never pays for a directive it does not own,
+and an inherited directive is never a descendant's to supersede or retire — it
+is not in that scope's summary to remove. It is, though, the descendant's to
+build on: a **published** item may anchor to an inherited directive exactly as
+to one of the scope's own.
 
 ## Context
 

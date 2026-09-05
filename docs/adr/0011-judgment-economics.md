@@ -5,6 +5,10 @@ pending — issues #131, #132, #133)
 **D4 amended by ADR 0014 (2026-09-05):** an input-change refresh's amendment
 may carry `append` and `publish` ops as well as `new_context` and lifecycle
 ops — see the amendment note in D4.
+**D4 superseded by ADR 0015 (2026-09-06):** the mechanical parent-directive
+splice is deleted. A directive lives in exactly one summary — its owner's —
+and reaches a descendant by composition on every read. See the amendment note
+in D4; the rest of this ADR stands.
 **Date:** 2026-08-10, revised 2026-08-12
 **Related:** ADR 0004 D1 (the batched-manager work this ADR's D3 delivers,
 tracked separately there), D2 (whose closing property — "the manager remains
@@ -237,6 +241,23 @@ staleness detection (ADR 0004 D4) needs monotonicity, not one-tick-per-
 contribution, and this ADR states that rather than leaving it inferred.
 
 ### D4. The manager-refresh path is rebuilt on the same ops
+
+> **Superseded (2026-09-06, ADR 0015 D1):** the splice this decision
+> introduced is deleted, not disabled. It was the right answer to the question
+> it was asked — how does an inherited directive reach a child's summary
+> without an LLM paraphrasing it — but ADR 0013 D1 had already answered a
+> better question: the child does not need the row in its summary at all,
+> because composition assembles the ancestor's layer on every read. Two
+> mechanisms delivered the same directive and nobody reconciled them, so a
+> root directive appeared twice in a descendant's perspective. What survives
+> from this decision is its instinct: inheritance is never a judgment, and no
+> LLM is ever asked to quote a directive. What goes is the copy —
+> `splice_parent_directives`, the drain's splice step, the `splice_refresh`
+> mode and its MANAGER REFRESH block, the keyless splice-reconciliation
+> notice, and `ScopeSummary.parent_version`, the stamp that dated the copies.
+> ADR 0015 D5 removes the rows already written. The refresh that remains is
+> the input-change refresh the amendment below describes; it is now the only
+> one.
 
 > **Amendment (2026-09-05, ADR 0014 D2):** this decision's drop of admitting
 > ops was correct for the launch-time parent-splice refresh below, and stays
