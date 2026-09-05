@@ -1324,6 +1324,38 @@ class _AmendmentJudgment(BaseModel):
     :func:`strata.publication.apply_judged_withdrawals`.
     """
 
+    change_id: str | None = None
+    """The input change this judgment belongs to (ADR 0014 D4), or ``None``.
+
+    A wave id, not this judgment's own: every change derived from processing
+    an input change INHERITS the originating id, and a scope refreshes for a
+    given id at most once — which is the whole termination guarantee, so the
+    id is a PARAMETER on the judge call (implementation pin 8), passed down by
+    whoever minted it, never looked up from a judgment's surroundings.
+    ``None`` for an ordinary contribution, which belongs to no wave."""
+
+    context_sources: list[str] = Field(default_factory=list)
+    """Published item ids the judge declares its ``new_context`` rests on.
+
+    RECORD, never trigger (ADR 0014 D3): the affected set for a changed item
+    is topological and needs no judge cooperation, so a judge that
+    under-declares here costs nobody a refresh. What it buys is audit — an
+    operator can see what the judge says it used, and the declaration can be
+    checked against what was rendered.
+
+    Validated as a subset of :func:`_rendered_publication_item_ids`; anything
+    else lands in :attr:`dropped_context_sources` instead. Empty by default,
+    which is what every hand-built and scripted judgment produces — expected,
+    not a bug."""
+
+    dropped_context_sources: list[str] = Field(default_factory=list)
+    """Declared sources the judge was never shown, rendered for the record.
+
+    Kept apart from :attr:`dropped_ops` because they are different failures: a
+    dropped op is amendment the engine did not apply, a dropped source is a
+    provenance claim the engine could not corroborate. Noted in
+    :attr:`record_notes` either way."""
+
     @property
     def removed_directive_ids(self) -> list[str]:
         """Directive ids this amendment removes from the summary (ADR 0011 D1).
@@ -1465,9 +1497,13 @@ class ScopeManagerJudgment(_AmendmentJudgment):
 
         The judge's reasoning, plus a mechanical note naming every op that did
         not apply (see :attr:`dropped_ops`) — the record has to show which
-        part of the amendment the engine dropped.
+        part of the amendment the engine dropped — and another naming every
+        declared source the judge was never shown (ADR 0014 D3).
         """
-        return _with_dropped_note(self.reasoning, self.dropped_ops)
+        return _with_dropped_sources_note(
+            _with_dropped_note(self.reasoning, self.dropped_ops),
+            self.dropped_context_sources,
+        )
 
 
 class BatchVerdict(BaseModel):
@@ -1538,11 +1574,19 @@ class ScopeManagerBatchJudgment(_AmendmentJudgment):
         That contribution's own reasoning, plus the mechanical note for any op
         the engine dropped on its behalf — the same rendering a
         single-contribution judgment writes.
+
+        A dropped ``context_sources`` id is noted on EVERY accepted member's
+        row: the batch declares its sources against its one amendment, so the
+        claim belongs to no single member — the same rule an op with no owning
+        member follows in :meth:`_drop_invalid_batch_ops`.
         """
         verdict = next((v for v in self.verdicts if v.contribution_id == contribution_id), None)
         reasoning = verdict.reasoning if verdict is not None else ""
         dropped = self.dropped_ops_by_contribution.get(contribution_id, [])
-        return _with_dropped_note(reasoning, dropped)
+        notes = _with_dropped_note(reasoning, dropped)
+        if verdict is not None and verdict.decision != "decline":
+            notes = _with_dropped_sources_note(notes, self.dropped_context_sources)
+        return notes
 
 
 class PublicationJudgment(BaseModel):
@@ -1805,6 +1849,59 @@ def _render_published_item(item: _PublishedItemLike) -> str:
         else ""
     )
     return f"[{item.id}] {item.kind}{subject_part}{anchors_part}{origin_part}: {item.content}"
+
+
+def _rendered_publication_item_ids(
+    current_publication: Sequence[_PublishedItemLike] | None,
+    peer_publications: Sequence[tuple[str, Sequence[_PublishedItemLike]]] | None,
+) -> list[str]:
+    """The publication item ids a judge call renders in its user message.
+
+    What a judge's declared ``context_sources`` is audited against (ADR 0014
+    D3): the declaration is record, not trigger, and the only thing it can
+    honestly name is something the judge was actually shown. Both publication
+    blocks count — THIS SCOPE'S PUBLICATION and REFERENCED PEER PUBLICATIONS —
+    because the question is what was rendered, not where it came from.
+
+    Computed from the same arguments the message is built from, never looked
+    up, so the check can never disagree with the prompt about what "rendered"
+    meant for this call.
+    """
+    return [
+        *(item.id for item in (current_publication or [])),
+        *(item.id for _scope_id, items in (peer_publications or []) for item in items),
+    ]
+
+
+def _validate_context_sources(
+    declared: Sequence[str], rendered_item_ids: Sequence[str]
+) -> tuple[list[str], list[str]]:
+    """Split *declared* into (kept, dropped) against what was rendered.
+
+    Order-preserving and duplicate-free: the record should read as the judge's
+    own list, minus what it could not have seen.
+    """
+    rendered = set(rendered_item_ids)
+    kept: list[str] = []
+    dropped: list[str] = []
+    for source in dict.fromkeys(declared):
+        (kept if source in rendered else dropped).append(source)
+    return kept, dropped
+
+
+def _with_dropped_sources_note(reasoning: str, dropped_sources: Sequence[str]) -> str:
+    """Return *reasoning* plus the mechanical note naming dropped sources.
+
+    A sibling of :func:`_with_dropped_note`, deliberately not folded into it:
+    a dropped OP is a piece of the amendment the engine did not apply, while a
+    dropped SOURCE is a claim about provenance the engine could not
+    corroborate. The amendment stands either way, and the record has to say
+    which of the two happened.
+    """
+    if not dropped_sources:
+        return reasoning
+    dropped = ", ".join(dropped_sources)
+    return f"{reasoning} [Declared context_sources not rendered to this judge: {dropped}.]"
 
 
 def _render_current_publication(items: Sequence[_PublishedItemLike] | None) -> str:
@@ -2125,6 +2222,7 @@ class ScopeManager:
         peer_publications: Sequence[tuple[str, Sequence[_PublishedItemLike]]] | None = None,
         amendment_context_only: bool = False,
         window_verbatim_tail: int = WINDOW_VERBATIM_TAIL,
+        change_id: str | None = None,
     ) -> ScopeManagerJudgment:
         """Judge a new contribution against the scope's current state.
 
@@ -2202,6 +2300,15 @@ class ScopeManager:
                                   Defaults to :data:`WINDOW_VERBATIM_TAIL`;
                                   callers holding settings pass
                                   ``settings.window_verbatim_tail``.
+            change_id:            The input change this judgment belongs to
+                                  (ADR 0014 D4), carried onto the returned
+                                  judgment. A parameter, never a lookup
+                                  (implementation pin 8): inheriting the
+                                  originating id is what bounds a refresh
+                                  wave, so only the caller that minted it can
+                                  say what it is. ``None`` — the default, and
+                                  what every ordinary contribution passes —
+                                  means this judgment belongs to no wave.
 
         Returns:
             A :class:`ScopeManagerJudgment` with the verdict, reasoning, the
@@ -2271,6 +2378,11 @@ class ScopeManager:
             window_verbatim_tail=window_verbatim_tail,
         )
 
+        # ADR 0014 D3: what a declared `context_sources` is audited against —
+        # derived from the same arguments the message above was built from, so
+        # the check and the prompt can never disagree.
+        rendered_item_ids = _rendered_publication_item_ids(current_publication, peer_publications)
+
         def _parse(block) -> ScopeManagerJudgment:  # noqa: ANN001 — tool_use block
             return self._parse_judgment(
                 scope=scope,
@@ -2278,6 +2390,8 @@ class ScopeManager:
                 current_summary=current_summary,
                 new_contribution=new_contribution,
                 amendment_context_only=amendment_context_only,
+                change_id=change_id,
+                rendered_item_ids=rendered_item_ids,
             )
 
         def _invalid_ops(judgment: ScopeManagerJudgment) -> list[DirectiveOp]:
@@ -2616,6 +2730,7 @@ class ScopeManager:
         current_publication: Sequence[_PublishedItemLike] | None = None,
         peer_publications: Sequence[tuple[str, Sequence[_PublishedItemLike]]] | None = None,
         window_verbatim_tail: int = WINDOW_VERBATIM_TAIL,
+        change_id: str | None = None,
     ) -> ScopeManagerBatchJudgment:
         """Judge several new contributions, in arrival order, in ONE call (ADR 0011 D3).
 
@@ -2636,8 +2751,13 @@ class ScopeManager:
         Args:
             new_contributions: The contributions to judge, in ARRIVAL order —
                 the order the record appended them, which is the order the
-                judge must process them in. Every other argument means exactly
-                what it means on :meth:`judge`.
+                judge must process them in.
+            change_id: The input change this batch belongs to (ADR 0014 D4),
+                carried onto the returned judgment — see :meth:`judge`. A
+                coalesced refresh judges several pending events as one batch,
+                so this names the wave the batch was drained for.
+
+            Every other argument means exactly what it means on :meth:`judge`.
 
         Returns:
             A :class:`ScopeManagerBatchJudgment`.
@@ -2669,6 +2789,7 @@ class ScopeManager:
                 current_publication=current_publication,
                 peer_publications=peer_publications,
                 window_verbatim_tail=window_verbatim_tail,
+                change_id=change_id,
             )
             return ScopeManagerBatchJudgment(
                 verdicts=[
@@ -2686,6 +2807,11 @@ class ScopeManager:
                     {only.id: list(judgment.dropped_ops)} if judgment.dropped_ops else {}
                 ),
                 withdraw_published=judgment.withdraw_published,
+                # The single path already validated these; rewrapping must not
+                # silently lose them (ADR 0014 D3/D4).
+                change_id=judgment.change_id,
+                context_sources=judgment.context_sources,
+                dropped_context_sources=judgment.dropped_context_sources,
             )
 
         contributions = {c.id: c for c in new_contributions}
@@ -2706,12 +2832,16 @@ class ScopeManager:
             window_verbatim_tail=window_verbatim_tail,
         )
 
+        rendered_item_ids = _rendered_publication_item_ids(current_publication, peer_publications)
+
         def _parse(block) -> ScopeManagerBatchJudgment:  # noqa: ANN001 — tool_use block
             return self._parse_batch_judgment(
                 scope=scope,
                 tool_use_block=block,
                 current_summary=current_summary,
                 contributions=contributions,
+                change_id=change_id,
+                rendered_item_ids=rendered_item_ids,
             )
 
         def _invalid_ops(judgment: ScopeManagerBatchJudgment) -> list[DirectiveOp]:
@@ -2774,6 +2904,8 @@ class ScopeManager:
         tool_use_block,  # noqa: ANN001 — Anthropic content block
         current_summary: ScopeSummary | None,
         contributions: Mapping[str, Contribution],
+        change_id: str | None = None,
+        rendered_item_ids: Sequence[str] = (),
     ) -> ScopeManagerBatchJudgment:
         """Validate a ``submit_batch_judgment`` payload and apply its amendment.
 
@@ -2800,6 +2932,12 @@ class ScopeManager:
         # None, so callers never need a null-check.
         withdraw_published = [str(x) for x in (raw.get("withdraw_published") or []) if x]
 
+        # ADR 0014 D3, exactly as on the single path.
+        declared_sources = [str(x) for x in (raw.get("context_sources") or []) if x]
+        context_sources, dropped_sources = _validate_context_sources(
+            declared_sources, rendered_item_ids
+        )
+
         accepted = {v.contribution_id for v in verdicts if v.decision != "decline"}
         if not accepted:
             # Every contribution declined: the same consistency rule a single
@@ -2811,10 +2949,13 @@ class ScopeManager:
                     "returned an amendment (directive_ops or new_context). Declined "
                     "contributions must not amend the summary."
                 )
+            # No amendment, so nothing for a declared source to rest on —
+            # dropped whole, as on a single decline.
             return ScopeManagerBatchJudgment(
                 verdicts=verdicts,
                 new_summary=None,
                 withdraw_published=withdraw_published,
+                change_id=change_id,
             )
 
         for op in ops:
@@ -2839,6 +2980,9 @@ class ScopeManager:
             directive_ops=ops,
             new_context=new_context,
             withdraw_published=withdraw_published,
+            change_id=change_id,
+            context_sources=context_sources,
+            dropped_context_sources=dropped_sources,
         )
 
     @staticmethod
@@ -2940,6 +3084,8 @@ class ScopeManager:
         current_summary: ScopeSummary | None,
         new_contribution: Contribution,
         amendment_context_only: bool = False,
+        change_id: str | None = None,
+        rendered_item_ids: Sequence[str] = (),
     ) -> ScopeManagerJudgment:
         """Validate a ``submit_judgment`` payload and apply its amendment.
 
@@ -2968,6 +3114,11 @@ class ScopeManager:
         # never need a null-check.
         withdraw_published = [str(x) for x in (raw.get("withdraw_published") or []) if x]
 
+        # ADR 0014 D3: the ids the judge declares its new_context rests on.
+        # Record, never trigger — accepted if returned, but not yet asked for
+        # in the prompt or the tool schema, so almost every call omits it.
+        declared_sources = [str(x) for x in (raw.get("context_sources") or []) if x]
+
         # A decline carries no amendment — the same consistency rule the
         # decline-with-new_summary check enforced before ADR 0011 D1.
         if decision == "decline":
@@ -2977,12 +3128,20 @@ class ScopeManager:
                     "(directive_ops or new_context). A declined contribution must "
                     "not amend the summary."
                 )
+            # A decline amends nothing, so it declares nothing: the sources go
+            # whole and silently, unnoted. Nothing was corroborated or failed
+            # to be — there is no claim about the summary to audit.
             return ScopeManagerJudgment(
                 decision="decline",
                 reasoning=reasoning,
                 new_summary=None,
                 withdraw_published=withdraw_published,
+                change_id=change_id,
             )
+
+        context_sources, dropped_sources = _validate_context_sources(
+            declared_sources, rendered_item_ids
+        )
 
         dropped: list[str] = []
         if amendment_context_only:
@@ -3010,6 +3169,9 @@ class ScopeManager:
             new_context=new_context,
             dropped_ops=dropped,
             withdraw_published=withdraw_published,
+            change_id=change_id,
+            context_sources=context_sources,
+            dropped_context_sources=dropped_sources,
         )
 
     # ------------------------------------------------------------------

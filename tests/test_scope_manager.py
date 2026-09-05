@@ -4262,3 +4262,232 @@ def test_batch_stringified_payload_is_coerced_like_the_single_path() -> None:
         NEW_CONTRIBUTION.id,
         SECOND_CONTRIBUTION.id,
     ]
+
+
+# ---------------------------------------------------------------------------
+# ADR 0014 D4 — the change id a judgment belongs to, threaded as a PARAMETER
+# (implementation pin 8: never a lookup).
+# ---------------------------------------------------------------------------
+
+
+def test_change_id_defaults_to_none_on_both_judgment_shapes() -> None:
+    """An ordinary contribution belongs to no wave, and says so."""
+    manager, _ = _make_manager(_accept_context_input())
+
+    judgment = manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+    )
+    assert judgment.change_id is None
+
+    mock_client = MagicMock()
+    mock_client.messages.create.return_value = _fake_response(_batch_input())
+    assert _judge_batch(mock_client).change_id is None
+
+
+def test_change_id_is_carried_onto_the_judgment() -> None:
+    """The id the caller passes in reaches the judgment.
+
+    ADR 0014 D4's inheritance is what bounds a wave, so the id is given, never
+    re-derived — a fresh id per derived change would bound nothing.
+    """
+    manager, _ = _make_manager(_accept_context_input())
+
+    judgment = manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+        change_id="chg_wave1",
+    )
+
+    assert judgment.change_id == "chg_wave1"
+
+
+def test_change_id_survives_the_invalid_op_drop() -> None:
+    """The drop-and-note fallback rebuilds the judgment; the wave id stays on it."""
+    payload = {
+        "decision": "accept_as_directive",
+        "reasoning": "admitted",
+        "directive_ops": [{"op": "retire", "id": "c_nosuch"}],
+        "new_context": None,
+    }
+    manager, _ = _make_manager(payload)
+
+    judgment = manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+        change_id="chg_wave1",
+    )
+
+    assert judgment.dropped_ops
+    assert judgment.change_id == "chg_wave1"
+
+
+def test_batch_change_id_reaches_a_batch_of_one() -> None:
+    """A batch of one delegates to judge() and rebuilds the batch judgment by
+    hand — the wave id must survive that wrapping."""
+    mock_client = MagicMock()
+    mock_client.messages.create.return_value = _fake_response(_accept_context_input())
+
+    judgment = _judge_batch(mock_client, contributions=[NEW_CONTRIBUTION], change_id="chg_wave1")
+
+    assert judgment.change_id == "chg_wave1"
+
+
+def test_batch_change_id_reaches_a_real_batch() -> None:
+    mock_client = MagicMock()
+    mock_client.messages.create.return_value = _fake_response(_batch_input())
+
+    assert _judge_batch(mock_client, change_id="chg_wave1").change_id == "chg_wave1"
+
+
+# ---------------------------------------------------------------------------
+# ADR 0014 D3 — `context_sources`: the ids the judge declares its new_context
+# rests on. RECORD, never trigger — the affected set is topological and needs
+# no judge cooperation. The engine validates the declaration is a subset of the
+# publication item ids RENDERED to that judge and notes anything else, so the
+# declaration can be audited against what the judge actually saw. Not yet asked
+# for in the prompt or the tool schema — accepted if the judge returns it.
+# ---------------------------------------------------------------------------
+
+
+def _sourced_input(sources: list[str]) -> dict:
+    return {**_accept_context_input(), "context_sources": sources}
+
+
+def test_context_sources_defaults_to_empty_when_the_judge_omits_it() -> None:
+    """Hand-built and scripted judgments declare nothing; that is expected, not
+    a bug — the trigger is D3's topology, which needs no judge cooperation."""
+    manager, _ = _make_manager(_accept_context_input())
+
+    judgment = manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+    )
+
+    assert judgment.context_sources == []
+    assert judgment.dropped_context_sources == []
+
+
+def test_a_rendered_peer_context_source_is_kept() -> None:
+    manager, _ = _make_manager(_sourced_input([_PUBLISHED_ITEM.id]))
+
+    judgment = manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+        peer_publications=[("g_peer_a", [_PUBLISHED_ITEM])],
+    )
+
+    assert judgment.context_sources == [_PUBLISHED_ITEM.id]
+    assert judgment.dropped_context_sources == []
+    assert _PUBLISHED_ITEM.id not in judgment.record_notes
+
+
+def test_a_context_source_from_this_scopes_own_publication_is_kept() -> None:
+    """THIS SCOPE'S PUBLICATION is rendered too, so an id from it was seen.
+
+    The check audits the declaration against what the judge was SHOWN — every
+    publication block in the message counts, not only the peers'.
+    """
+    manager, _ = _make_manager(_sourced_input([_PUBLISHED_ITEM.id]))
+
+    judgment = manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+        current_publication=[_PUBLISHED_ITEM],
+    )
+
+    assert judgment.context_sources == [_PUBLISHED_ITEM.id]
+    assert judgment.dropped_context_sources == []
+
+
+def test_an_unrendered_context_source_is_dropped_and_noted() -> None:
+    """A source nobody showed this judge is not a source — and the record says so."""
+    manager, _ = _make_manager(_sourced_input([_PUBLISHED_ITEM.id, "pub_neverseen"]))
+
+    judgment = manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+        peer_publications=[("g_peer_a", [_PUBLISHED_ITEM])],
+    )
+
+    assert judgment.context_sources == [_PUBLISHED_ITEM.id]
+    assert judgment.dropped_context_sources == ["pub_neverseen"]
+    assert "pub_neverseen" in judgment.record_notes
+
+
+def test_every_context_source_is_dropped_when_nothing_was_rendered() -> None:
+    """No publication block rendered at all → the declaration rests on nothing."""
+    manager, _ = _make_manager(_sourced_input(["pub_abc123"]))
+
+    judgment = manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+    )
+
+    assert judgment.context_sources == []
+    assert judgment.dropped_context_sources == ["pub_abc123"]
+
+
+def test_a_decline_declares_no_context_sources() -> None:
+    """There is no new_context for anything to rest on."""
+    manager, _ = _make_manager(
+        {
+            "decision": "decline",
+            "reasoning": "out of scope",
+            "directive_ops": None,
+            "new_context": None,
+            "context_sources": ["pub_abc123"],
+        }
+    )
+
+    judgment = manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+        peer_publications=[("g_peer_a", [_PUBLISHED_ITEM])],
+    )
+
+    assert judgment.decision == "decline"
+    assert judgment.context_sources == []
+
+
+def test_batch_context_sources_are_validated_the_same_way() -> None:
+    mock_client = MagicMock()
+    mock_client.messages.create.return_value = _fake_response(
+        {**_batch_input(), "context_sources": [_PUBLISHED_ITEM.id, "pub_neverseen"]}
+    )
+
+    judgment = _judge_batch(mock_client, peer_publications=[("g_peer_a", [_PUBLISHED_ITEM])])
+
+    assert judgment.context_sources == [_PUBLISHED_ITEM.id]
+    assert judgment.dropped_context_sources == ["pub_neverseen"]
+    # A drop that belongs to no single member is noted on every accepted
+    # member's row — the rule an unowned dropped op already follows.
+    for verdict in judgment.accepted_verdicts:
+        assert "pub_neverseen" in judgment.record_notes_for(verdict.contribution_id)
