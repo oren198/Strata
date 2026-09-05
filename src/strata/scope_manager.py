@@ -1634,6 +1634,24 @@ class ScopeManagerBatchJudgment(_AmendmentJudgment):
 
     verdicts: list[BatchVerdict] = Field(default_factory=list)
 
+    change_ids: list[str] = Field(default_factory=list)
+    """The input changes this batch belongs to (ADR 0014 D4, Phase A finding 2).
+
+    Plural because coalescing IS batch judgment (implementation pin 1): several
+    pending change events for one scope collapse into ONE refresh, so the batch
+    belongs to every wave it drained, never to a chosen one. Deduplicated and
+    order-preserving.
+
+    What a consumer writes from it (Phase B's derived emission): **one row per
+    (change id, affected scope)** — not one row per affected scope carrying a
+    list. That keeps ADR 0014 D4's once-per-id check a row lookup, and makes a
+    scope refresh if ANY inherited id is unseen, which is what "suppressed only
+    when all of them are seen" means in practice.
+
+    :attr:`change_id`, inherited from :class:`_AmendmentJudgment`, is always
+    ``None`` on a batch: one field is the source of truth, so the two can never
+    disagree about which wave a coalesced refresh belongs to."""
+
     dropped_ops_by_contribution: dict[str, list[str]] = Field(default_factory=dict)
     """Dropped ops (rendered) keyed by the contribution whose record notes them."""
 
@@ -2932,7 +2950,7 @@ class ScopeManager:
         mode: JudgeMode = "ordinary",
         input_changes: Sequence[_ChangeEventLike] | None = None,
         window_verbatim_tail: int = WINDOW_VERBATIM_TAIL,
-        change_id: str | None = None,
+        change_ids: Sequence[str] | None = None,
     ) -> ScopeManagerBatchJudgment:
         """Judge several new contributions, in arrival order, in ONE call (ADR 0011 D3).
 
@@ -2954,10 +2972,13 @@ class ScopeManager:
             new_contributions: The contributions to judge, in ARRIVAL order —
                 the order the record appended them, which is the order the
                 judge must process them in.
-            change_id: The input change this batch belongs to (ADR 0014 D4),
-                carried onto the returned judgment — see :meth:`judge`. A
-                coalesced refresh judges several pending events as one batch,
-                so this names the wave the batch was drained for.
+            change_ids: The input changes this batch belongs to (ADR 0014 D4),
+                carried onto the returned judgment as
+                :attr:`ScopeManagerBatchJudgment.change_ids` — see
+                :meth:`judge`. PLURAL because a coalesced refresh judges
+                several pending events as one batch (implementation pin 1), so
+                the batch belongs to every wave it drained. Deduplicated here,
+                order preserved.
 
             Every other argument means exactly what it means on :meth:`judge`.
 
@@ -2973,6 +2994,10 @@ class ScopeManager:
             RuntimeError: No Anthropic API key is configured.
         """
         self._check_api_key()
+        # Two events of one wave collapse to one id: a derived change row is
+        # written per (change id, affected scope), so a duplicate here would be
+        # a duplicate row saying the same thing twice.
+        wave_ids = list(dict.fromkeys(change_ids or ()))
         if not new_contributions:
             raise ValueError("judge_batch requires at least one contribution to judge.")
 
@@ -2994,7 +3019,12 @@ class ScopeManager:
                 mode=mode,
                 input_changes=input_changes,
                 window_verbatim_tail=window_verbatim_tail,
-                change_id=change_id,
+                # A batch of one still has a plural wave list in principle (one
+                # notice can be written for several coalesced ids); the single
+                # judgment's scalar carries it only when there is exactly one
+                # to carry, and `change_ids` below is the batch's truth either
+                # way.
+                change_id=wave_ids[0] if len(wave_ids) == 1 else None,
             )
             return ScopeManagerBatchJudgment(
                 verdicts=[
@@ -3013,8 +3043,9 @@ class ScopeManager:
                 ),
                 withdraw_published=judgment.withdraw_published,
                 # The single path already validated these; rewrapping must not
-                # silently lose them (ADR 0014 D3/D4).
-                change_id=judgment.change_id,
+                # silently lose them (ADR 0014 D3/D4). `change_id` stays None
+                # on a batch shape — `change_ids` is the one source of truth.
+                change_ids=wave_ids,
                 context_sources=judgment.context_sources,
                 dropped_context_sources=judgment.dropped_context_sources,
             )
@@ -3051,7 +3082,7 @@ class ScopeManager:
                 current_summary=current_summary,
                 contributions=contributions,
                 mode=mode,
-                change_id=change_id,
+                change_ids=wave_ids,
                 rendered_item_ids=rendered_item_ids,
             )
 
@@ -3116,7 +3147,7 @@ class ScopeManager:
         current_summary: ScopeSummary | None,
         contributions: Mapping[str, Contribution],
         mode: JudgeMode = "ordinary",
-        change_id: str | None = None,
+        change_ids: Sequence[str] = (),
         rendered_item_ids: Sequence[str] = (),
     ) -> ScopeManagerBatchJudgment:
         """Validate a ``submit_batch_judgment`` payload and apply its amendment.
@@ -3168,7 +3199,7 @@ class ScopeManager:
                 verdicts=verdicts,
                 new_summary=None,
                 withdraw_published=withdraw_published,
-                change_id=change_id,
+                change_ids=list(change_ids),
             )
 
         dropped: list[str] = []
@@ -3215,7 +3246,7 @@ class ScopeManager:
             dropped_ops=dropped,
             dropped_ops_by_contribution=dropped_by_contribution,
             withdraw_published=withdraw_published,
-            change_id=change_id,
+            change_ids=list(change_ids),
             context_sources=context_sources,
             dropped_context_sources=dropped_sources,
         )

@@ -4285,7 +4285,7 @@ def test_change_id_defaults_to_none_on_both_judgment_shapes() -> None:
 
     mock_client = MagicMock()
     mock_client.messages.create.return_value = _fake_response(_batch_input())
-    assert _judge_batch(mock_client).change_id is None
+    assert _judge_batch(mock_client).change_ids == []
 
 
 def test_change_id_is_carried_onto_the_judgment() -> None:
@@ -4331,22 +4331,37 @@ def test_change_id_survives_the_invalid_op_drop() -> None:
     assert judgment.change_id == "chg_wave1"
 
 
-def test_batch_change_id_reaches_a_batch_of_one() -> None:
+def test_batch_change_ids_reach_a_batch_of_one() -> None:
     """A batch of one delegates to judge() and rebuilds the batch judgment by
-    hand — the wave id must survive that wrapping."""
+    hand — the wave ids must survive that wrapping."""
     mock_client = MagicMock()
     mock_client.messages.create.return_value = _fake_response(_accept_context_input())
 
-    judgment = _judge_batch(mock_client, contributions=[NEW_CONTRIBUTION], change_id="chg_wave1")
+    judgment = _judge_batch(mock_client, contributions=[NEW_CONTRIBUTION], change_ids=["chg_wave1"])
 
-    assert judgment.change_id == "chg_wave1"
+    assert judgment.change_ids == ["chg_wave1"]
 
 
-def test_batch_change_id_reaches_a_real_batch() -> None:
+def test_batch_change_ids_reach_a_real_batch() -> None:
+    """A coalesced refresh carries SEVERAL waves (Phase A finding 2).
+
+    Several pending events for one scope collapse into one batch (ADR 0014 D4),
+    so the batch belongs to every one of their ids, not to a chosen one.
+    """
     mock_client = MagicMock()
     mock_client.messages.create.return_value = _fake_response(_batch_input())
 
-    assert _judge_batch(mock_client, change_id="chg_wave1").change_id == "chg_wave1"
+    judgment = _judge_batch(mock_client, change_ids=["chg_a", "chg_b"])
+
+    assert judgment.change_ids == ["chg_a", "chg_b"]
+
+
+def test_batch_change_ids_are_deduplicated() -> None:
+    """Two events of one wave collapse to one id — a derived row is per (id, scope)."""
+    mock_client = MagicMock()
+    mock_client.messages.create.return_value = _fake_response(_batch_input())
+
+    assert _judge_batch(mock_client, change_ids=["chg_a", "chg_a"]).change_ids == ["chg_a"]
 
 
 # ---------------------------------------------------------------------------
