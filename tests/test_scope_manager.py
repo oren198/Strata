@@ -3032,6 +3032,47 @@ def test_invalid_id_twice_drops_the_op_and_notes_it_without_losing_the_verdict()
     assert judgment.reasoning in judgment.record_notes
 
 
+def test_an_op_naming_an_ancestor_directive_is_dropped_as_an_invalid_target() -> None:
+    """ADR 0015 D4 — the prompt rule became an engine rule.
+
+    "Never supersede or retire a parent directive" was a prompt obligation,
+    and a prompt obligation is a request. With the splice gone (D1) an
+    ancestor's row is not in this scope's CURRENT SUMMARY at all, so an op
+    naming one is an ordinary invalid-target op: ADR 0011 D1's existing
+    validation offers one corrective and then drops and notes it. No second
+    rule, and nothing a judge can talk its way past.
+    """
+    ancestor_directive_id = PARENT_WALK[0][1][0].id
+    verdict = {
+        "decision": "accept_as_directive",
+        "reasoning": "admitting the new rule and retiring the inherited one",
+        "directive_ops": [{"op": "append"}, {"op": "retire", "id": ancestor_directive_id}],
+        "new_context": "Context after the amendment.",
+    }
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [_fake_response(verdict), _fake_response(verdict)]
+    manager = ScopeManager(client=mock_client)
+
+    judgment = manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        ancestor_directives=PARENT_WALK,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+    )
+
+    assert judgment.new_summary is not None
+    # The ancestor's directive was never this scope's to remove — and it is
+    # not this scope's to hold, either.
+    assert ancestor_directive_id not in [d.id for d in judgment.new_summary.directives]
+    assert judgment.retired_directive_ids == []
+    assert judgment.dropped_ops == [f"retire({ancestor_directive_id})"]
+    assert f"retire({ancestor_directive_id})" in judgment.record_notes
+    # The rest of the amendment still applied.
+    assert NEW_CONTRIBUTION.id in [d.id for d in judgment.new_summary.directives]
+
+
 def test_invalid_id_corrective_failure_still_returns_the_first_verdict() -> None:
     """A bad op never costs the contribution its verdict, even if the retry errors."""
     mock_client = MagicMock()
