@@ -213,3 +213,38 @@ def test_ordinary_mode_keeps_admitting_ops():
 def test_an_unknown_mode_is_refused():
     with pytest.raises(ValueError, match="mode"):
         _parse("refresh")
+
+
+def test_a_splice_refresh_batch_drops_admitting_ops_too():
+    """The mode governs the batch parser as well as the single one.
+
+    A coalesced splice refresh is not a shape the engine builds today (the
+    drain is always ``input_change_refresh``), but the two parsers must agree
+    about what a mode MEANS — a mode that quietly changed meaning between them
+    would be the drift the derived schema exists to prevent.
+    """
+    contribution = _contribution()
+    judgment = ScopeManager._parse_batch_judgment(
+        scope=SCOPE,
+        tool_use_block=_tool_block(
+            verdicts=[
+                {
+                    "contribution_id": contribution.id,
+                    "decision": "accept_as_context",
+                    "reasoning": "reconciled",
+                }
+            ],
+            directive_ops=[
+                {"op": "append", "contribution_id": contribution.id},
+                {"op": "retire", "id": "c_gone", "contribution_id": contribution.id},
+            ],
+            new_context="Reconciled.",
+        ),
+        current_summary=_summary(),
+        contributions={contribution.id: contribution},
+        mode="splice_refresh",
+    )
+
+    assert [op.op for op in judgment.directive_ops] == ["retire"]
+    assert judgment.dropped_ops == ["append(contribution=c_refresh)"]
+    assert "append" in judgment.record_notes_for(contribution.id)

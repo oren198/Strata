@@ -3406,8 +3406,9 @@ class ScopeManager:
         withdraw_published = [str(x) for x in (raw.get("withdraw_published") or []) if x]
 
         # ADR 0014 D3: the ids the judge declares its new_context rests on.
-        # Record, never trigger — accepted if returned, but not yet asked for
-        # in the prompt or the tool schema, so almost every call omits it.
+        # Record, never trigger — asked for in the tool schema and the prompt
+        # (ADR 0014 D2/D3), but a hand-built or scripted judgment omits it,
+        # which is expected rather than a bug.
         declared_sources = [str(x) for x in (raw.get("context_sources") or []) if x]
 
         # A decline carries no amendment — the same consistency rule the

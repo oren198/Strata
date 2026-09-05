@@ -212,7 +212,10 @@ def _drain_for_read(fleet, scope_id: str) -> int:
             exc.pending,
         )
         return exc.pending
-    return pending - outcome.events_processed
+    # Floored at zero: an event can land between the count above and the
+    # drain's own read, so the drain may properly process more than this call
+    # saw. A negative "pending" would be a lie in the other direction.
+    return max(0, pending - outcome.events_processed)
 
 
 def _record_read(scope_id: str) -> None:

@@ -4369,8 +4369,8 @@ def test_batch_change_ids_are_deduplicated() -> None:
 # rests on. RECORD, never trigger — the affected set is topological and needs
 # no judge cooperation. The engine validates the declaration is a subset of the
 # publication item ids RENDERED to that judge and notes anything else, so the
-# declaration can be audited against what the judge actually saw. Not yet asked
-# for in the prompt or the tool schema — accepted if the judge returns it.
+# declaration can be audited against what the judge actually saw. Asked for in
+# the tool schema and the prompt; a hand-built judgment omits it, as expected.
 # ---------------------------------------------------------------------------
 
 
