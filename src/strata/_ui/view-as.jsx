@@ -70,7 +70,12 @@ function ViewAsView({ state, scopeId, onSelectScope }) {
         overflowY: "auto",
         minHeight: 0,
       }}>
-        <h1 className="at-h1" style={{ marginBottom: 4 }}>View as</h1>
+        <h1 className="at-h1" style={{ marginBottom: 4, display: "flex", alignItems: "center", gap: 8 }}>
+          View as
+          {!loading && !error && data && data.input_changes && data.input_changes.length > 0 && (
+            <RefreshPendingBadge count={data.input_changes.length} />
+          )}
+        </h1>
         <div className="at-body-sm" style={{ marginBottom: 16 }}>
           Exactly what an agent bound to this scope receives when it reads. Layers arrive
           in this order, top first.
@@ -91,6 +96,8 @@ function ViewAsView({ state, scopeId, onSelectScope }) {
 
         {!loading && !error && data && (
           <>
+            <InputChangesPanel inputChanges={data.input_changes} />
+
             <TokenWeightBar layers={data.layers} total={data.token_estimate_total} />
 
             <div style={{ marginTop: 16 }}>
@@ -106,6 +113,49 @@ function ViewAsView({ state, scopeId, onSelectScope }) {
           </>
         )}
       </div>
+    </div>
+  );
+}
+
+// ADR 0014 D5 — this scope's own unprocessed input-change notices (never a
+// judge outage, pin 4). `inputChanges` is `compose_perspective`'s
+// `input_changes` key: always present, empty when there is nothing pending
+// (an honestly-empty backend renders nothing here, not an error).
+function RefreshPendingBadge({ count }) {
+  return (
+    <span className="at-pill" title={`${count} input change${count === 1 ? "" : "s"} awaiting this scope's refresh`}>
+      {count} refresh-pending
+    </span>
+  );
+}
+
+function InputChangesPanel({ inputChanges }) {
+  const changes = inputChanges || [];
+  if (changes.length === 0) return null;
+  return (
+    <div style={{
+      marginBottom: 16,
+      padding: "10px 12px",
+      border: "1px solid var(--at-rule)",
+      borderRadius: 8,
+      background: "var(--at-surface-2, transparent)",
+    }}>
+      <div className="at-section-eyebrow">
+        Input changes awaiting refresh ({changes.length})
+      </div>
+      <div className="at-caption" style={{ marginBottom: 6 }}>
+        Something this scope composes changed since its last judged refresh. This is not a
+        failed judgment — the judge simply has not seen it yet.
+      </div>
+      {changes.map((c, i) => (
+        <div
+          key={c.contribution_id || i}
+          className="at-caption"
+          style={{ fontFamily: "var(--font-mono)", fontSize: 11, color: "var(--at-muted)" }}
+        >
+          {c.created_at} — {c.kind} — {c.item_id}
+        </div>
+      ))}
     </div>
   );
 }
