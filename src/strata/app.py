@@ -1298,15 +1298,60 @@ def drain_is_noop(
     empty at the instant composition begins.
 
     Returns:
-        ``True`` when nothing is pending — which since ADR 0015 D6 is the
-        whole question: the drain's one job is to judge pending change
-        events, so an empty queue is an empty drain. A scope the fleet no
-        longer holds returns ``False``, so the caller still reaches
-        :func:`drain_scope` and gets its error rather than silence.
+        ``True`` when there is nothing pending AND no legacy spliced row left
+        to remove. A scope the fleet no longer holds returns ``False``, so the
+        caller still reaches :func:`drain_scope` and gets its error rather
+        than silence.
     """
     if fleet.get_scope(scope_id) is None:
         return False
-    return not record_store.list_change_events(scope_id=scope_id, unprocessed_only=True)
+    if record_store.list_change_events(scope_id=scope_id, unprocessed_only=True):
+        return False
+    # ADR 0015 D5's migration has to be reachable from a READ, or it never
+    # runs where it is needed most: a scope carrying spliced copies with an
+    # empty queue is the settled state of every scope nobody has written to
+    # since the upgrade, and D6's "nothing pending" alone would skip it
+    # lock-free forever. So a pending unsplice is work, and this says so.
+    #
+    # Read-only, no lock, and self-terminating: after the first unsplice the
+    # check finds nothing and the scope goes back to answering reads without
+    # the lock. What it costs until then — one summary read and one record
+    # lookup per directive row — is the price of a migration that runs once
+    # rather than a filter the read path pays for forever (D5, Rejected).
+    summary = summary_store.read(scope_id)
+    if summary is None:
+        return True
+    return not _legacy_copied_directive_ids(summary, scope_id=scope_id, record_store=record_store)
+
+
+def _legacy_copied_directive_ids(
+    summary: ScopeSummary,
+    *,
+    scope_id: str,
+    record_store: RecordStore,
+) -> list[str]:
+    """Return the ids in *summary* that a pre-0015 splice copied in (ADR 0015 D5).
+
+    The exact test, in one place, because two callers ask the same question and
+    must not be able to disagree about it: :func:`_unsplice_legacy_copies`,
+    which removes these rows under the scope lock, and :func:`drain_is_noop`,
+    which reports the pending removal as work so a read actually reaches it.
+
+    A directive id IS a contribution id, and a contribution is appended to
+    exactly one scope's record. So a row whose contribution lives in ANOTHER
+    scope's record was copied here mechanically and was never judged into this
+    scope, while a row from this scope's own record — or one the record has
+    never heard of at all — is left alone. Absence of evidence is not evidence
+    of a copy.
+
+    Read-only and lock-free, which is what lets ``drain_is_noop`` ask.
+    """
+    return [
+        directive.id
+        for directive in summary.directives
+        if (contribution := record_store.get_contribution(directive.id)) is not None
+        and contribution.scope_id != scope_id
+    ]
 
 
 def _unsplice_legacy_copies(
@@ -1343,20 +1388,13 @@ def _unsplice_legacy_copies(
     The caller MUST hold ``_scope_lock(scope.id)``.
     """
     current = summary_store.read(scope.id)
-    if current is None or not current.directives:
+    if current is None:
         return
-
-    kept = []
-    removed = []
-    for directive in current.directives:
-        contribution = record_store.get_contribution(directive.id)
-        if contribution is not None and contribution.scope_id != scope.id:
-            removed.append(directive.id)
-        else:
-            kept.append(directive)
+    removed = _legacy_copied_directive_ids(current, scope_id=scope.id, record_store=record_store)
     if not removed:
         return
 
+    kept = [d for d in current.directives if d.id not in set(removed)]
     summary_store.write(scope.id, current.model_copy(update={"directives": kept}))
 
     # The record says what moved and why. Stamped processed at birth (ADR 0014

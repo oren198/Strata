@@ -21,6 +21,7 @@ record, contribution, refresh, change event.
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -232,3 +233,96 @@ def test_a_scope_with_no_summary_yet_is_untouched(env) -> None:
     _drain(fleet, record_store, summary_store)
 
     assert summary_store.read("g_child") is None
+
+
+# ---------------------------------------------------------------------------
+# The read path must actually reach the unsplice (ADR 0015 D5 vs D6)
+# ---------------------------------------------------------------------------
+#
+# D6 reduces `drain_is_noop` to "nothing pending", and the MCP read path skips
+# a no-op drain lock-free. On its own that leaves the scope this migration
+# exists for — a legacy summary carrying copies, with an empty queue, which is
+# the settled state of every scope that has not been written to since the
+# upgrade — never unspliced by a read at all. A migration nothing triggers is
+# not a migration. So a pending unsplice is work, and `drain_is_noop` says so.
+
+
+def test_a_legacy_copy_makes_the_drain_not_a_noop(env) -> None:
+    """Nothing pending, and there is still work: the copies are still here."""
+    from strata.app import drain_is_noop
+
+    fleet, record_store, summary_store = env
+    _seed(record_store, summary_store, rows=[_copied_row(record_store)])
+
+    assert record_store.list_change_events(scope_id="g_child", unprocessed_only=True) == []
+    assert (
+        drain_is_noop(
+            "g_child", fleet=fleet, record_store=record_store, summary_store=summary_store
+        )
+        is False
+    )
+
+
+def test_the_drain_is_a_noop_again_once_the_copies_are_gone(env) -> None:
+    """Once, not every read: after the unsplice the check finds nothing."""
+    from strata.app import drain_is_noop
+
+    fleet, record_store, summary_store = env
+    _seed(record_store, summary_store, rows=[_own_row(record_store), _copied_row(record_store)])
+
+    _drain(fleet, record_store, summary_store)
+
+    assert (
+        drain_is_noop(
+            "g_child", fleet=fleet, record_store=record_store, summary_store=summary_store
+        )
+        is True
+    )
+
+
+def test_a_scope_holding_only_its_own_rows_is_a_noop_from_the_start(env) -> None:
+    """A fleet that never ran the splice never pays for the check's verdict."""
+    from strata.app import drain_is_noop
+
+    fleet, record_store, summary_store = env
+    _seed(record_store, summary_store, rows=[_own_row(record_store)])
+
+    assert (
+        drain_is_noop(
+            "g_child", fleet=fleet, record_store=record_store, summary_store=summary_store
+        )
+        is True
+    )
+
+
+def test_the_mcp_read_path_unsplices_a_quiet_legacy_scope(env, monkeypatch) -> None:
+    """The end the hole was at: a read of a settled legacy scope cleans it up.
+
+    `_drain_for_read` skips a no-op drain without taking the scope lock, so
+    this passes only if `drain_is_noop` reports the pending unsplice as work.
+    """
+    import strata.mcp.server as server
+
+    fleet, record_store, summary_store = env
+    copied = _copied_row(record_store)
+    _seed(record_store, summary_store, rows=[copied])
+
+    monkeypatch.setattr(server, "_record_store", record_store)
+    monkeypatch.setattr(server, "_summary_store", summary_store)
+    # No judge key: the unsplice is mechanical and must run without one.
+    monkeypatch.setattr(
+        server,
+        "_settings",
+        SimpleNamespace(
+            judge_api_key=None,
+            anthropic_api_key=None,
+            summary_max_words=500,
+            window_verbatim_tail=2,
+            recency_window_size=20,
+        ),
+    )
+
+    pending = server._drain_for_read(fleet, "g_child")
+
+    assert pending == 0
+    assert [d.id for d in summary_store.read("g_child").directives] == []
