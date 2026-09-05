@@ -35,6 +35,20 @@
 --                               this is the one kind whose affected set
 --                               includes the attachment scope ITSELF.
 --
+-- The same rewrite adds one column, for the same reason the CHECK lands
+-- here — the writers now exist and know the answer:
+--
+--   source_scope_id  The scope the changed item came FROM, as opposed to
+--                    `scope_id`, which is the AFFECTED scope that must
+--                    refresh. Two different facts: "g_teamX must re-judge"
+--                    and "because g_funcA's face changed". The perspective's
+--                    `input_changes` section (ADR 0014 D5) renders both, and
+--                    deriving one from the other is impossible — an item id
+--                    does not name its holder. Nullable: a row written
+--                    before this migration has no source scope to carry
+--                    across, and nothing invents one (ADR 0013 D7 — no
+--                    backfill).
+--
 -- SQLite cannot add a CHECK to an existing column, so this is the standard
 -- recreate-table rewrite (the same shape 0002 used): new table, copy, drop,
 -- rename, recreate 0010's two indexes. Existing rows are carried across
@@ -48,6 +62,7 @@ CREATE TABLE change_events_new (
     change_id       TEXT NOT NULL,
     contribution_id TEXT NOT NULL REFERENCES contributions(id),
     scope_id        TEXT NOT NULL,
+    source_scope_id TEXT,
     item_id         TEXT NOT NULL,
     kind            TEXT NOT NULL CHECK (kind IN (
                         'published',
@@ -66,9 +81,9 @@ CREATE TABLE change_events_new (
 );
 
 INSERT INTO change_events_new
-    (id, change_id, contribution_id, scope_id, item_id, kind,
+    (id, change_id, contribution_id, scope_id, source_scope_id, item_id, kind,
      before, after, hop, processed_at, created_at)
-SELECT id, change_id, contribution_id, scope_id, item_id, kind,
+SELECT id, change_id, contribution_id, scope_id, NULL, item_id, kind,
        before, after, hop, processed_at, created_at
 FROM change_events;
 

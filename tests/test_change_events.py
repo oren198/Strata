@@ -221,6 +221,10 @@ class TestEmit:
         assert event.change_id == change_id
         assert event.item_id == "pub_1"
         assert event.kind == "withdrawn"
+        # The affected scope and the source scope are different facts and
+        # both are on the row: g_teamX must refresh, g_funcA is what changed.
+        assert event.scope_id == "g_teamX"
+        assert event.source_scope_id == "g_funcA"
         assert event.before == "the old claim"
         assert event.hop == 0
         assert event.processed_at is None
@@ -451,3 +455,18 @@ class TestEmit:
             for scope_id in ("g_funcB", "g_teamX", "g_teamY")
             if scope_id in note.content
         }
+
+        # KNOWN SEAM, asserted so it stays visible: the notice contribution
+        # and its event row are two appends, and this failure lands between
+        # them — so g_teamX keeps a `manager-refresh` contribution with no
+        # event row behind it. Nothing will judge it (the drain finds work
+        # through change_events, not through contributions), so it sits
+        # pending. Making the two atomic means one transaction inside the
+        # record store, which is not this phase's to open.
+        orphans = [
+            c
+            for c in record_store.list_contributions(scope_id="g_teamX")
+            if c.subject == "manager-refresh"
+        ]
+        assert len(orphans) == 1
+        assert record_store.list_change_events(scope_id="g_teamX") == []

@@ -1391,6 +1391,7 @@ def test_relay_origin_and_relay_survive_a_summary_rewrite(
         {"c_unrelated"},
         "c_trigger_unrelated",
         surviving_directive_ids=set(),
+        fleet=fleet,
         record_store=record_store,
         summaries_dir=summaries_dir,
     )
@@ -1435,6 +1436,7 @@ def test_mechanical_directive_removal_cascades_to_relayed_copy(
         {"c_dir1"},
         "c_trigger1",
         surviving_directive_ids=set(),
+        fleet=fleet,
         record_store=record_store,
         summaries_dir=summaries_dir,
     )
@@ -1470,6 +1472,7 @@ def test_judged_propagation_withdrawal_cascades_to_relayed_copy(
         [origin_item.id],
         judged_by="scope-manager",
         reasoning="No longer believed.",
+        fleet=fleet,
         record_store=record_store,
         summaries_dir=summaries_dir,
     )
@@ -1483,7 +1486,7 @@ def test_judged_propagation_withdrawal_cascades_to_relayed_copy(
 
 
 def test_mechanical_propagation_withdraws_directive_only_anchored_item(
-    record_store, summaries_dir
+    fleet, record_store, summaries_dir
 ) -> None:
     item = _seed_published_item(
         record_store,
@@ -1498,6 +1501,7 @@ def test_mechanical_propagation_withdraws_directive_only_anchored_item(
         {"c_dir1"},
         "c_trigger1",
         surviving_directive_ids=set(),
+        fleet=fleet,
         record_store=record_store,
         summaries_dir=summaries_dir,
     )
@@ -1533,6 +1537,7 @@ def test_mechanical_propagation_spares_item_with_surviving_subject_anchor(
         {"c_dir1"},
         "c_trigger1",
         surviving_directive_ids=set(),
+        fleet=fleet,
         record_store=record_store,
         summaries_dir=summaries_dir,
     )
@@ -1560,6 +1565,7 @@ def test_mechanical_propagation_spares_item_anchored_to_a_different_surviving_di
         {"c_dir1"},  # c_dir2 survives
         "c_trigger1",
         surviving_directive_ids={"c_dir2"},
+        fleet=fleet,
         record_store=record_store,
         summaries_dir=summaries_dir,
     )
@@ -1569,7 +1575,7 @@ def test_mechanical_propagation_spares_item_anchored_to_a_different_surviving_di
 
 
 def test_mechanical_propagation_fires_when_the_last_anchor_vanishes_in_a_later_event(
-    record_store, summaries_dir
+    fleet, record_store, summaries_dir
 ) -> None:
     # Review fix (PR #97): anchor vanishing is a property of the summary's
     # CURRENT state, not of one removal batch. A two-anchor item loses
@@ -1589,6 +1595,7 @@ def test_mechanical_propagation_fires_when_the_last_anchor_vanishes_in_a_later_e
         {"c_dir1"},
         "c_trigger1",
         surviving_directive_ids={"c_dir2"},
+        fleet=fleet,
         record_store=record_store,
         summaries_dir=summaries_dir,
     )
@@ -1599,6 +1606,7 @@ def test_mechanical_propagation_fires_when_the_last_anchor_vanishes_in_a_later_e
         {"c_dir2"},
         "c_trigger2",
         surviving_directive_ids=set(),
+        fleet=fleet,
         record_store=record_store,
         summaries_dir=summaries_dir,
     )
@@ -1612,7 +1620,7 @@ def test_mechanical_propagation_fires_when_the_last_anchor_vanishes_in_a_later_e
 
 
 def test_mechanical_propagation_attributes_each_item_to_its_own_trigger(
-    record_store, summaries_dir
+    fleet, record_store, summaries_dir
 ) -> None:
     # Issue #137: ONE amendment can remove directives on behalf of several
     # contributions (a batch — ADR 0011 D3), and it writes ONE summary, so
@@ -1650,6 +1658,7 @@ def test_mechanical_propagation_attributes_each_item_to_its_own_trigger(
         {"c_dirA"},
         "c_memberA",
         surviving_directive_ids=surviving,
+        fleet=fleet,
         record_store=record_store,
         summaries_dir=summaries_dir,
     )
@@ -1658,6 +1667,7 @@ def test_mechanical_propagation_attributes_each_item_to_its_own_trigger(
         {"c_dirB"},
         "c_memberB",
         surviving_directive_ids=surviving,
+        fleet=fleet,
         record_store=record_store,
         summaries_dir=summaries_dir,
     )
@@ -1684,6 +1694,7 @@ def test_mechanical_propagation_noop_for_empty_publication(record_store, summari
             {"c_dir1"},
             "c_trigger1",
             surviving_directive_ids=set(),
+            fleet=fleet,
             record_store=record_store,
             summaries_dir=summaries_dir,
         )
@@ -1697,7 +1708,7 @@ def test_mechanical_propagation_noop_for_empty_publication(record_store, summari
 
 
 def test_judged_propagation_withdraws_named_item_with_judgment_row(
-    record_store, summaries_dir
+    fleet, record_store, summaries_dir
 ) -> None:
     item = _seed_published_item(
         record_store,
@@ -1714,6 +1725,7 @@ def test_judged_propagation_withdraws_named_item_with_judgment_row(
         [item.id],
         judged_by="scope-manager",
         reasoning="Rewrite dropped this belief.",
+        fleet=fleet,
         record_store=record_store,
         summaries_dir=summaries_dir,
     )
@@ -1740,6 +1752,7 @@ def test_judged_propagation_ignores_unknown_item_id(record_store, summaries_dir)
         ["pub_does_not_exist"],
         judged_by="scope-manager",
         reasoning="whatever",
+        fleet=fleet,
         record_store=record_store,
         summaries_dir=summaries_dir,
     )
@@ -1943,3 +1956,321 @@ def test_bootstrap_unknown_scope_raises_valueerror(record_store, summary_store) 
             summary_store=summary_store,
             scope_manager=manager,
         )
+
+
+# ---------------------------------------------------------------------------
+# 6. Change-event emission (ADR 0014 D1/D4/D5)
+#
+# Every writer of a shared input emits: a scope's face changing is exactly
+# the kind of change a downstream scope cannot see for itself.
+# ---------------------------------------------------------------------------
+
+
+def _events_for(record_store: RecordStore, scope_id: str) -> list:
+    return record_store.list_change_events(scope_id=scope_id)
+
+
+def test_accepted_publish_emits_a_published_event_to_readers(
+    fleet, record_store, summary_store, summaries_dir
+) -> None:
+    """g_func publishes; its chain child g_team is told (ADR 0014 D1 — an
+    addition triggers exactly as a removal does)."""
+    manager = _FakeScopeManager(
+        publication_judgment=PublicationJudgment(decision="accept", reasoning="fine")
+    )
+    _seed_summary_with_directive(summary_store, "g_func")
+
+    outcome = propose_publish(
+        "g_func",
+        "Use protobuf for all RPC.",
+        "directive",
+        None,
+        ["directive:c_dir1"],
+        _proposer("g_func"),
+        fleet=fleet,
+        record_store=record_store,
+        summary_store=summary_store,
+        scope_manager=manager,
+    )
+
+    assert outcome.decision == "accept"
+    (event,) = _events_for(record_store, "g_team")
+    assert event.kind == "published"
+    assert event.item_id == outcome.act_id
+    assert event.before is None
+    assert "protobuf" in (event.after or "")
+
+
+def test_declined_publish_emits_nothing(fleet, record_store, summary_store, summaries_dir) -> None:
+    """A decline changed no input — nothing composed differently, nobody is told."""
+    manager = _FakeScopeManager(
+        publication_judgment=PublicationJudgment(decision="decline", reasoning="no")
+    )
+    _seed_summary_with_directive(summary_store, "g_func")
+
+    outcome = propose_publish(
+        "g_func",
+        "Use protobuf for all RPC.",
+        "directive",
+        None,
+        ["directive:c_dir1"],
+        _proposer("g_func"),
+        fleet=fleet,
+        record_store=record_store,
+        summary_store=summary_store,
+        scope_manager=manager,
+    )
+
+    # Precondition: the act really was recorded and judged — the decline is
+    # real, not a call that never happened.
+    assert outcome.decision == "decline"
+    assert record_store.get_publication_judgment(outcome.act_id) is not None
+
+    assert _events_for(record_store, "g_team") == []
+
+
+def test_accepted_withdraw_emits_a_withdrawn_event_carrying_what_was_lost(
+    fleet, record_store, summary_store, summaries_dir
+) -> None:
+    manager = _FakeScopeManager(
+        publication_judgment=PublicationJudgment(decision="accept", reasoning="fine")
+    )
+    item = _seed_published_item(
+        record_store, summaries_dir, "g_func", content="Use protobuf.", subject="rpc"
+    )
+
+    outcome = propose_withdraw(
+        "g_func",
+        item.id,
+        _proposer("g_func"),
+        fleet=fleet,
+        record_store=record_store,
+        summary_store=summary_store,
+        scope_manager=manager,
+    )
+
+    assert outcome.artifact_updated is True
+    (event,) = _events_for(record_store, "g_team")
+    assert event.kind == "withdrawn"
+    assert event.item_id == item.id
+    assert "protobuf" in (event.before or "")
+    assert event.after is None
+
+
+def test_cascaded_relay_withdrawal_emits_a_derived_event_inheriting_the_change_id(
+    fleet, record_store, summary_store, summaries_dir
+) -> None:
+    """ADR 0014 D4 — a relayed withdrawal is DERIVED, so it inherits the id
+    rather than minting a fresh one that would bound nothing."""
+    manager = _FakeScopeManager(
+        publication_judgment=PublicationJudgment(decision="accept", reasoning="fine")
+    )
+    origin_item = _seed_published_item(
+        record_store, summaries_dir, "g_exec", content="Use protobuf.", subject="rpc"
+    )
+    _relay_via_publish(
+        fleet,
+        record_store,
+        summary_store,
+        summaries_dir,
+        into_scope="g_func",
+        from_scope="g_exec",
+        from_item_id=origin_item.id,
+        content="Use protobuf.",
+        subject="rpc",
+    )
+
+    propose_withdraw(
+        "g_exec",
+        origin_item.id,
+        _proposer("g_exec"),
+        fleet=fleet,
+        record_store=record_store,
+        summary_store=summary_store,
+        scope_manager=manager,
+    )
+
+    # Precondition: the cascade really did remove the relayed copy.
+    assert read_publication("g_func", summaries_dir=summaries_dir) == []
+
+    # g_func was told as a reader of g_exec (hop 0); g_team was told because
+    # the copy IT read left g_func (hop 1) — same change id throughout.
+    (origin_event,) = [e for e in _events_for(record_store, "g_func") if e.kind == "withdrawn"]
+    (derived_event,) = [e for e in _events_for(record_store, "g_team") if e.kind == "withdrawn"]
+    assert derived_event.change_id == origin_event.change_id
+    assert derived_event.hop == origin_event.hop + 1
+    assert derived_event.kind == "withdrawn"
+
+
+def test_mechanical_directive_propagation_emits_for_each_withdrawn_item(
+    fleet, record_store, summary_store, summaries_dir
+) -> None:
+    item = _seed_published_item(
+        record_store,
+        summaries_dir,
+        "g_func",
+        content="Use protobuf.",
+        anchors=["directive:c_dir1"],
+    )
+
+    withdrawn = propagate_directive_removals(
+        "g_func",
+        {"c_dir1"},
+        "c_trigger1",
+        surviving_directive_ids=set(),
+        fleet=fleet,
+        record_store=record_store,
+        summaries_dir=summaries_dir,
+    )
+
+    assert [i.id for i in withdrawn] == [item.id]
+    (event,) = _events_for(record_store, "g_team")
+    assert event.kind == "withdrawn"
+    assert event.item_id == item.id
+
+
+def test_mechanical_propagation_inherits_a_change_id_when_given_one(
+    fleet, record_store, summary_store, summaries_dir
+) -> None:
+    _seed_published_item(
+        record_store,
+        summaries_dir,
+        "g_func",
+        content="Use protobuf.",
+        anchors=["directive:c_dir1"],
+    )
+
+    propagate_directive_removals(
+        "g_func",
+        {"c_dir1"},
+        "c_trigger1",
+        surviving_directive_ids=set(),
+        fleet=fleet,
+        record_store=record_store,
+        summaries_dir=summaries_dir,
+        change_id="chg_upstream",
+    )
+
+    (event,) = _events_for(record_store, "g_team")
+    assert event.change_id == "chg_upstream"
+
+
+def test_judged_withdrawal_emits_and_inherits_the_judgment_s_change_id(
+    fleet, record_store, summary_store, summaries_dir
+) -> None:
+    """ADR 0014 D8 — the change id is threaded into withdraw_published, never
+    looked up."""
+    item = _seed_published_item(record_store, summaries_dir, "g_func", content="Use protobuf.")
+
+    withdrawn = apply_judged_withdrawals(
+        "g_func",
+        [item.id],
+        judged_by="scope-manager",
+        reasoning="No longer believed.",
+        fleet=fleet,
+        record_store=record_store,
+        summaries_dir=summaries_dir,
+        change_id="chg_from_judgment",
+    )
+
+    assert [i.id for i in withdrawn] == [item.id]
+    (event,) = _events_for(record_store, "g_team")
+    assert event.change_id == "chg_from_judgment"
+    assert event.kind == "withdrawn"
+
+
+def test_a_withdrawal_that_removes_nothing_emits_nothing(
+    fleet, record_store, summary_store, summaries_dir
+) -> None:
+    """Precondition first: a withdrawal that DOES remove something emits."""
+    item = _seed_published_item(record_store, summaries_dir, "g_func", content="Use protobuf.")
+    apply_judged_withdrawals(
+        "g_func",
+        [item.id],
+        judged_by="scope-manager",
+        reasoning="No longer believed.",
+        fleet=fleet,
+        record_store=record_store,
+        summaries_dir=summaries_dir,
+    )
+    assert len(_events_for(record_store, "g_team")) == 1
+
+    apply_judged_withdrawals(
+        "g_func",
+        ["pub_never_existed"],
+        judged_by="scope-manager",
+        reasoning="Nothing to do.",
+        fleet=fleet,
+        record_store=record_store,
+        summaries_dir=summaries_dir,
+    )
+
+    assert len(_events_for(record_store, "g_team")) == 1
+
+
+def test_bootstrap_emits_one_published_event_per_item(
+    fleet, record_store, summary_store, summaries_dir
+) -> None:
+    """A first face is still an addition to everyone downstream (ADR 0014 D1)."""
+    _seed_summary_with_directive(summary_store, "g_func")
+    manager = _FakeScopeManager(
+        bootstrap_judgment=BootstrapJudgment(
+            decision="accept",
+            reasoning="a reasonable first face",
+            items=[
+                BootstrapPublishedItemInput(
+                    kind="directive",
+                    content="Use protobuf for all RPC.",
+                    subject="rpc",
+                    anchors=["directive:c_dir1"],
+                )
+            ],
+        )
+    )
+
+    outcome = bootstrap_publication(
+        "g_func",
+        fleet=fleet,
+        record_store=record_store,
+        summary_store=summary_store,
+        scope_manager=manager,
+    )
+
+    assert outcome.decision == "accept"
+    events = _events_for(record_store, "g_team")
+    assert [e.kind for e in events] == ["published"]
+
+
+def test_emission_failure_never_fails_the_publish(
+    fleet, record_store, summary_store, summaries_dir, monkeypatch
+) -> None:
+    """ADR 0014 D6: the writer writes its event and returns. A notice that
+    cannot be written must not undo an act that already succeeded."""
+    manager = _FakeScopeManager(
+        publication_judgment=PublicationJudgment(decision="accept", reasoning="fine")
+    )
+    _seed_summary_with_directive(summary_store, "g_func")
+
+    def _boom(**_kwargs: object) -> None:
+        raise RuntimeError("the record is unreachable")
+
+    monkeypatch.setattr(record_store, "append_change_event", _boom)
+
+    outcome = propose_publish(
+        "g_func",
+        "Use protobuf for all RPC.",
+        "directive",
+        None,
+        ["directive:c_dir1"],
+        _proposer("g_func"),
+        fleet=fleet,
+        record_store=record_store,
+        summary_store=summary_store,
+        scope_manager=manager,
+    )
+
+    assert outcome.decision == "accept"
+    assert outcome.artifact_updated is True
+    assert [i.content for i in read_publication("g_func", summaries_dir=summaries_dir)] == [
+        "Use protobuf for all RPC."
+    ]

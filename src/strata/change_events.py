@@ -154,7 +154,8 @@ def affected_scopes(
         # binds S's subtree — so S is affected too. Nobody in the fleet
         # authored this change; the operator did, from outside.
         affected = {s.id for s in fleet.chain_descendants(source_scope_id)}
-        if fleet.get_scope(source_scope_id) is not None:
+        attachment = fleet.get_scope(source_scope_id)
+        if attachment is not None and attachment.status == "active":
             affected.add(source_scope_id)
     else:
         raise ValueError(
@@ -330,6 +331,7 @@ def emit(
                 change_id=change_id,
                 contribution_id=contribution.id,
                 scope_id=scope_id,
+                source_scope_id=source_scope_id,
                 item_id=item,
                 kind=kind,
                 before=before,

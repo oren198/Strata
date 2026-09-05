@@ -581,6 +581,7 @@ class ChangeEvent:
     change_id: str
     contribution_id: str
     scope_id: str
+    source_scope_id: str | None
     item_id: str
     kind: str
     before: str | None
@@ -1825,6 +1826,7 @@ class RecordStore:
         scope_id: str,
         item_id: str,
         kind: str,
+        source_scope_id: str | None = None,
         before: str | None = None,
         after: str | None = None,
         hop: int = 0,
@@ -1845,6 +1847,12 @@ class RecordStore:
             contribution_id: The ``manager-refresh`` contribution carrying
                              this event's payload.
             scope_id:        The affected scope — the one that must refresh.
+            source_scope_id: The scope the changed item came FROM. A
+                             different fact from *scope_id* and not derivable
+                             from it — an item id does not name its holder —
+                             and what the perspective's ``input_changes``
+                             section renders as "because X changed". ``None``
+                             only for a caller that genuinely has no source.
             item_id:         The input item that changed.
             kind:            What happened to it.
             before/after:    The item's previous and current state. Either may
@@ -1864,10 +1872,22 @@ class RecordStore:
         self._conn.execute(
             """
             INSERT INTO change_events
-            (id, change_id, contribution_id, scope_id, item_id, kind, before, after, hop)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (id, change_id, contribution_id, scope_id, source_scope_id, item_id, kind,
+             before, after, hop)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (event_id, change_id, contribution_id, scope_id, item_id, kind, before, after, hop),
+            (
+                event_id,
+                change_id,
+                contribution_id,
+                scope_id,
+                source_scope_id,
+                item_id,
+                kind,
+                before,
+                after,
+                hop,
+            ),
         )
         self._conn.commit()
         return self._fetch_change_event(event_id)
@@ -1887,7 +1907,7 @@ class RecordStore:
                               keeps them forever.
         """
         sql = """
-            SELECT id, change_id, contribution_id, scope_id, item_id, kind,
+            SELECT id, change_id, contribution_id, scope_id, source_scope_id, item_id, kind,
                    before, after, hop, processed_at, created_at
             FROM change_events
             WHERE scope_id = ?
@@ -1919,7 +1939,7 @@ class RecordStore:
     def _fetch_change_event(self, event_id: str) -> ChangeEvent:
         row = self._conn.execute(
             """
-            SELECT id, change_id, contribution_id, scope_id, item_id, kind,
+            SELECT id, change_id, contribution_id, scope_id, source_scope_id, item_id, kind,
                    before, after, hop, processed_at, created_at
             FROM change_events WHERE id = ?
             """,

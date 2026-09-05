@@ -725,12 +725,15 @@ def test_0010_adds_change_events_table(tmp_path: Path) -> None:
     conn = sqlite3.connect(db_path)
     try:
         conn.execute("PRAGMA foreign_keys = ON")
+        # 0010's own columns, plus `source_scope_id`, which 0011 adds when it
+        # rewrites the table for the kind CHECK.
         columns = {r[1] for r in conn.execute("PRAGMA table_info(change_events)").fetchall()}
         assert columns == {
             "id",
             "change_id",
             "contribution_id",
             "scope_id",
+            "source_scope_id",
             "item_id",
             "kind",
             "before",
@@ -804,6 +807,11 @@ def test_0011_constrains_change_event_kinds(tmp_path: Path) -> None:
             ) VALUES ('c_1', 'g_a', 'notice', 'context', 'g_a', 'architect', 's', 't')
             """
         )
+        # 0011 also adds source_scope_id — the scope the changed item came
+        # FROM, distinct from scope_id, which is the affected scope.
+        columns = {r[1] for r in conn.execute("PRAGMA table_info(change_events)").fetchall()}
+        assert "source_scope_id" in columns
+
         # Every settled kind is accepted.
         for index, kind in enumerate(
             [
@@ -905,9 +913,11 @@ def test_0011_preserves_change_events_written_before_it(tmp_path: Path) -> None:
     conn = sqlite3.connect(db_path)
     try:
         row = conn.execute(
-            "SELECT change_id, contribution_id, scope_id, item_id, kind, before, after, hop, "
-            "processed_at FROM change_events WHERE id = 'ce_old'"
+            "SELECT change_id, contribution_id, scope_id, source_scope_id, item_id, kind, "
+            "before, after, hop, processed_at FROM change_events WHERE id = 'ce_old'"
         ).fetchone()
-        assert row == ("chg_old", "c_1", "g_a", "pub_1", "withdrawn", "was", None, 3, None)
+        # A row written before 0011 has no source scope to carry across, and
+        # nothing invents one (ADR 0013 D7 — no backfill).
+        assert row == ("chg_old", "c_1", "g_a", None, "pub_1", "withdrawn", "was", None, 3, None)
     finally:
         conn.close()

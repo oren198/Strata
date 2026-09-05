@@ -96,6 +96,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from strata import __version__
 from strata.bootstrap import load_fleet_config
+from strata.change_events import emit as emit_change_event
 from strata.fleet_config import FleetConfig, FleetConfigError, Scope, Stratum
 from strata.fleet_reload import FleetReloader
 from strata.locks import BATCH_CAP, QUEUE_WAIT_TIMEOUT_S, QueueTicket, configure_lock_dir
@@ -572,9 +573,11 @@ def _judge_and_record(
         _write_amendment(
             judgment,
             scope=scope,
+            fleet=fleet,
             record_store=record_store,
             summary_store=summary_store,
             parent_summary=parent_summary,
+            previous_summary=inputs.current_summary,
             retirements=[(d, judgment.reasoning) for d in judgment.retired_directive_ids],
             removals=[(d, contribution.id) for d in judgment.removed_directive_ids],
             withdraw_reasoning=judgment.reasoning,
@@ -593,9 +596,11 @@ def _write_amendment(
     judgment: ScopeManagerJudgment | ScopeManagerBatchJudgment,
     *,
     scope: Scope,
+    fleet: FleetConfig,
     record_store: RecordStore,
     summary_store: SummaryStore,
     parent_summary: ScopeSummary | None,
+    previous_summary: ScopeSummary | None,
     retirements: Sequence[tuple[str, str]],
     removals: Sequence[tuple[str, str]],
     withdraw_reasoning: str,
@@ -652,8 +657,13 @@ def _write_amendment(
             judgment.withdraw_published,
             judged_by="scope-manager",
             reasoning=withdraw_reasoning,
+            fleet=fleet,
             record_store=record_store,
             summaries_dir=str(summary_store.summaries_dir),
+            # ADR 0014 D4/D8 — a withdrawal made on a refresh is derived from
+            # the change that triggered it and inherits its id, threaded
+            # through as a parameter rather than looked up.
+            change_id=judgment.change_id,
         )
 
     # 2. Mechanical propagation (D3): any published item anchored ONLY to
@@ -674,9 +684,78 @@ def _write_amendment(
             directive_ids,
             trigger_contribution_id,
             surviving_directive_ids=surviving,
+            fleet=fleet,
             record_store=record_store,
             summaries_dir=str(summary_store.summaries_dir),
+            change_id=judgment.change_id,
         )
+
+    # ADR 0014 D1/D3 — a scope's own contribution is not a trigger for the
+    # scope, but it IS one for every descendant this amendment's directive
+    # ops now bind differently. One event per affected scope per amendment,
+    # not per op: ADR 0014 D4's once-per-scope-per-change-id rule is a row
+    # lookup, so several rows sharing an id would collapse to the first
+    # anyway — the payload carries the whole directive-id diff instead.
+    _emit_directive_set_change(
+        judgment,
+        scope=scope,
+        fleet=fleet,
+        record_store=record_store,
+        previous_summary=previous_summary,
+    )
+
+
+def _emit_directive_set_change(
+    judgment: ScopeManagerJudgment | ScopeManagerBatchJudgment,
+    *,
+    scope: Scope,
+    fleet: FleetConfig,
+    record_store: RecordStore,
+    previous_summary: ScopeSummary | None,
+) -> None:
+    """Tell this scope's descendants that its directive set changed (ADR 0014 D1).
+
+    Damping is structural (implementation pin 7): the comparison is between
+    the directive ID SETS before and after the amendment, so a context-only
+    rewrite — however extensive — emits nothing and a rewording can never
+    restart a wave. When the set did change, one event goes to each
+    descendant carrying the whole diff.
+
+    ``item_id`` names one changed directive (the most consequential kind
+    present, ids sorted so the pick is deterministic) while ``before`` and
+    ``after`` carry the full sets, so nothing about what moved is lost even
+    though a single id heads the row.
+    """
+    assert judgment.new_summary is not None  # noqa: S101 — caller-checked invariant
+    previous_ids = {d.id for d in previous_summary.directives} if previous_summary else set()
+    current_ids = {d.id for d in judgment.new_summary.directives}
+    removed = sorted(previous_ids - current_ids)
+    added = sorted(current_ids - previous_ids)
+    if not removed and not added:
+        return
+
+    if removed and added:
+        # Something left and something arrived in one amendment: from a
+        # descendant's side that is a replacement, whichever ops produced it.
+        kind, item = "directive_superseded", removed[0]
+    elif removed:
+        kind, item = "directive_retired", removed[0]
+    else:
+        kind, item = "directive_appended", added[0]
+
+    emit_change_event(
+        fleet=fleet,
+        record_store=record_store,
+        item=item,
+        kind=kind,
+        source_scope_id=scope.id,
+        before=", ".join(sorted(previous_ids)) or None,
+        after=", ".join(sorted(current_ids)) or None,
+        # ADR 0014 D4 — a directive admitted on a refresh is DERIVED from the
+        # change that triggered that refresh; an ordinary contribution
+        # belongs to no wave and mints a fresh id.
+        inherit_from=judgment.change_id,
+    )
 
 
 def _judge_batch_and_record(
@@ -787,9 +866,11 @@ def _judge_batch_and_record(
         _write_amendment(
             batch,
             scope=scope,
+            fleet=fleet,
             record_store=record_store,
             summary_store=summary_store,
             parent_summary=inputs.parent_summary,
+            previous_summary=inputs.current_summary,
             retirements=retirements,
             removals=removals,
             # A withdraw_published verdict is submitted against the amendment
