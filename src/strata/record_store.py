@@ -48,6 +48,9 @@ Design decisions
     ``pubj_<6hex>`` publication judgments (ADR 0007)
     ``pubja_<6hex>`` publication judgment attempts (failed judge_publication()
                    events, mirroring ``ja_``)
+    ``ce_<6hex>``  change events (ADR 0014 D5) — the structured half of an
+                   input-change notice. Distinct from the CHANGE ID a row
+                   carries, which the writer of the change mints.
 
 Vocabulary throughout follows CONTEXT.md verbatim.
 """
@@ -105,6 +108,14 @@ def _new_publication_judgment_id() -> str:
 
 def _new_publication_judgment_attempt_id() -> str:
     return f"pubja_{secrets.token_hex(8)}"
+
+
+def _new_change_event_id() -> str:
+    # ADR 0014 D5: the structured half of a `manager-refresh` contribution.
+    # Distinct from the CHANGE ID it carries, which is minted by the writer of
+    # the input change and shared by every event and derived change belonging
+    # to that one wave (ADR 0014 D4).
+    return f"ce_{secrets.token_hex(8)}"
 
 
 # ---------------------------------------------------------------------------
@@ -543,6 +554,40 @@ class PublicationActState:
     error_class: str | None
     error_message: str | None
     failed_at: str | None
+
+
+@dataclass(frozen=True)
+class ChangeEvent:
+    """One scope's notice that a composed input of its memory changed (ADR 0014 D5).
+
+    The structured half of the ``subject="manager-refresh"`` contribution the
+    engine appends to the affected scope's record: same event, machine-
+    readable, so the drain and the perspective's ``input_changes`` section can
+    find what is still unprocessed without parsing the notice's prose.
+
+    A pending event is NOT a judge outage (implementation pin 4) — a
+    :class:`JudgmentAttempt` records a judge that ran and failed, this records
+    an input that changed and a refresh that has not run yet. Every surface
+    that counts one reports the two separately.
+
+    ``change_id`` is the wave this event belongs to, not this event's own id:
+    every change derived from processing it inherits the same id, which is
+    what bounds a wave to one refresh per scope per change (ADR 0014 D4).
+    ``processed_at`` is ``None`` until a refresh has processed the event,
+    whatever its verdict; the row itself is never deleted.
+    """
+
+    id: str
+    change_id: str
+    contribution_id: str
+    scope_id: str
+    item_id: str
+    kind: str
+    before: str | None
+    after: str | None
+    hop: int
+    processed_at: str | None
+    created_at: str
 
 
 # ---------------------------------------------------------------------------
@@ -1766,6 +1811,123 @@ class RecordStore:
             )
             for act in acts
         ]
+
+    # ------------------------------------------------------------------
+    # Change events (ADR 0014 D5) — the reactive re-judgement notice: what
+    # changed under a scope's memory, and whether a refresh has processed it.
+    # ------------------------------------------------------------------
+
+    def append_change_event(
+        self,
+        *,
+        change_id: str,
+        contribution_id: str,
+        scope_id: str,
+        item_id: str,
+        kind: str,
+        before: str | None = None,
+        after: str | None = None,
+        hop: int = 0,
+    ) -> ChangeEvent:
+        """Append the structured half of an input-change notice (ADR 0014 D5).
+
+        The notice itself is *contribution_id* — a ``subject="manager-refresh"``
+        contribution already appended to *scope_id*'s record, which is what
+        makes the notice permanent, auditable and readable by the judge. This
+        row is the same event in machine-readable form.
+
+        Args:
+            change_id:       The independent input change this event belongs
+                             to. Every change derived from processing it
+                             inherits this id (ADR 0014 D4) — it is what
+                             bounds a wave, so it is passed in by the writer
+                             that minted it, never generated here.
+            contribution_id: The ``manager-refresh`` contribution carrying
+                             this event's payload.
+            scope_id:        The affected scope — the one that must refresh.
+            item_id:         The input item that changed.
+            kind:            What happened to it.
+            before/after:    The item's previous and current state. Either may
+                             be ``None``: an addition has no before, a
+                             withdrawal no after.
+            hop:             Derived hops from the originating change, for ADR
+                             0014 D4's backstop budget.
+
+        Returns:
+            The newly appended :class:`ChangeEvent`, unprocessed.
+
+        Raises:
+            sqlite3.IntegrityError: If *contribution_id* does not exist (FK) —
+                an event whose notice nobody can read is not a notice.
+        """
+        event_id = _new_change_event_id()
+        self._conn.execute(
+            """
+            INSERT INTO change_events
+            (id, change_id, contribution_id, scope_id, item_id, kind, before, after, hop)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (event_id, change_id, contribution_id, scope_id, item_id, kind, before, after, hop),
+        )
+        self._conn.commit()
+        return self._fetch_change_event(event_id)
+
+    def list_change_events(
+        self, *, scope_id: str, unprocessed_only: bool = False
+    ) -> list[ChangeEvent]:
+        """Return *scope_id*'s change events, oldest first.
+
+        Args:
+            scope_id:         The affected scope whose events to read.
+            unprocessed_only: When True, return only events no refresh has
+                              processed yet — what the drain consumes and what
+                              the perspective's ``input_changes`` section
+                              carries (ADR 0014 D5/D6). The default returns
+                              every event, processed ones included: the record
+                              keeps them forever.
+        """
+        sql = """
+            SELECT id, change_id, contribution_id, scope_id, item_id, kind,
+                   before, after, hop, processed_at, created_at
+            FROM change_events
+            WHERE scope_id = ?
+        """
+        if unprocessed_only:
+            sql += " AND processed_at IS NULL"
+        sql += " ORDER BY created_at ASC, rowid ASC"
+        rows = self._conn.execute(sql, (scope_id,)).fetchall()
+        return [ChangeEvent(**dict(row)) for row in rows]
+
+    def mark_change_event_processed(self, event_id: str) -> None:
+        """Mark *event_id* consumed by a refresh, whatever the verdict (ADR 0014 D5).
+
+        Idempotent: an event already carrying a ``processed_at`` keeps the
+        stamp it has, so a re-drained queue never rewrites when a scope was
+        actually brought up to date. Unknown ids are a no-op — the drain owns
+        the ids it marks, and a missing row is nothing to correct.
+        """
+        self._conn.execute(
+            """
+            UPDATE change_events
+            SET processed_at = datetime('now')
+            WHERE id = ? AND processed_at IS NULL
+            """,
+            (event_id,),
+        )
+        self._conn.commit()
+
+    def _fetch_change_event(self, event_id: str) -> ChangeEvent:
+        row = self._conn.execute(
+            """
+            SELECT id, change_id, contribution_id, scope_id, item_id, kind,
+                   before, after, hop, processed_at, created_at
+            FROM change_events WHERE id = ?
+            """,
+            (event_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"Change event not found: {event_id!r}")
+        return ChangeEvent(**dict(row))
 
 
 # ---------------------------------------------------------------------------

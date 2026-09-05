@@ -1205,3 +1205,125 @@ def test_append_publication_act_round_trips_relay_fields(tmp_path: Path) -> None
         assert listed[0].origin_scope_id == "g_root"
         assert listed[0].relay_scope_id == "g_root"
         assert listed[0].relay_item_id == origin_act.id
+
+
+# ---------------------------------------------------------------------------
+# Scenario N — change events (ADR 0014 D5), the input-change notice rows
+# ---------------------------------------------------------------------------
+
+
+class TestChangeEvents:
+    """RecordStore change-event primitives — ADR 0014 D5's notice rows."""
+
+    def test_append_and_list_round_trips_the_payload(self, store) -> None:
+        cid = _contribute(store, "manager-refresh notice")
+
+        event = store.append_change_event(
+            change_id="chg_1",
+            contribution_id=cid,
+            scope_id="g_ceo",
+            item_id="pub_abc",
+            kind="withdraw",
+            before="the claim as it stood",
+            after=None,
+            hop=2,
+        )
+
+        assert event.change_id == "chg_1"
+        assert event.contribution_id == cid
+        assert event.item_id == "pub_abc"
+        assert event.kind == "withdraw"
+        assert event.before == "the claim as it stood"
+        assert event.after is None
+        assert event.hop == 2
+        # Unprocessed until a refresh consumes it, whatever its verdict.
+        assert event.processed_at is None
+
+        assert store.list_change_events(scope_id="g_ceo") == [event]
+
+    def test_events_are_listed_oldest_first_and_scoped(self, store) -> None:
+        cid = _contribute(store, "notice")
+        first = store.append_change_event(
+            change_id="chg_1",
+            contribution_id=cid,
+            scope_id="g_ceo",
+            item_id="pub_1",
+            kind="publish",
+        )
+        second = store.append_change_event(
+            change_id="chg_2",
+            contribution_id=cid,
+            scope_id="g_ceo",
+            item_id="pub_2",
+            kind="publish",
+        )
+        store.append_change_event(
+            change_id="chg_3",
+            contribution_id=cid,
+            scope_id="g_other",
+            item_id="pub_3",
+            kind="publish",
+        )
+
+        assert [e.id for e in store.list_change_events(scope_id="g_ceo")] == [
+            first.id,
+            second.id,
+        ]
+        assert [e.item_id for e in store.list_change_events(scope_id="g_other")] == ["pub_3"]
+
+    def test_unprocessed_only_excludes_what_a_refresh_consumed(self, store) -> None:
+        cid = _contribute(store, "notice")
+        done = store.append_change_event(
+            change_id="chg_1",
+            contribution_id=cid,
+            scope_id="g_ceo",
+            item_id="pub_1",
+            kind="withdraw",
+        )
+        pending = store.append_change_event(
+            change_id="chg_2",
+            contribution_id=cid,
+            scope_id="g_ceo",
+            item_id="pub_2",
+            kind="withdraw",
+        )
+
+        store.mark_change_event_processed(done.id)
+
+        # The record keeps the processed event forever (ADR 0014 D5) — only
+        # the perspective's `input_changes` view narrows to unprocessed.
+        assert [e.id for e in store.list_change_events(scope_id="g_ceo")] == [
+            done.id,
+            pending.id,
+        ]
+        unprocessed = store.list_change_events(scope_id="g_ceo", unprocessed_only=True)
+        assert [e.id for e in unprocessed] == [pending.id]
+        assert store.list_change_events(scope_id="g_ceo")[0].processed_at is not None
+
+    def test_marking_an_already_processed_event_is_a_no_op(self, store) -> None:
+        """The drain is idempotent — re-marking never rewrites the timestamp."""
+        cid = _contribute(store, "notice")
+        event = store.append_change_event(
+            change_id="chg_1",
+            contribution_id=cid,
+            scope_id="g_ceo",
+            item_id="pub_1",
+            kind="withdraw",
+        )
+
+        store.mark_change_event_processed(event.id)
+        first_stamp = store.list_change_events(scope_id="g_ceo")[0].processed_at
+        store.mark_change_event_processed(event.id)
+
+        assert store.list_change_events(scope_id="g_ceo")[0].processed_at == first_stamp
+
+    def test_an_event_naming_no_contribution_is_rejected(self, store) -> None:
+        """The notice IS the contribution row (ADR 0014 D5) — no orphan events."""
+        with pytest.raises(sqlite3.IntegrityError):
+            store.append_change_event(
+                change_id="chg_1",
+                contribution_id="c_nope",
+                scope_id="g_ceo",
+                item_id="pub_1",
+                kind="withdraw",
+            )
