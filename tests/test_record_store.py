@@ -1223,7 +1223,7 @@ class TestChangeEvents:
             contribution_id=cid,
             scope_id="g_ceo",
             item_id="pub_abc",
-            kind="withdraw",
+            kind="withdrawn",
             before="the claim as it stood",
             after=None,
             hop=2,
@@ -1232,7 +1232,7 @@ class TestChangeEvents:
         assert event.change_id == "chg_1"
         assert event.contribution_id == cid
         assert event.item_id == "pub_abc"
-        assert event.kind == "withdraw"
+        assert event.kind == "withdrawn"
         assert event.before == "the claim as it stood"
         assert event.after is None
         assert event.hop == 2
@@ -1248,21 +1248,21 @@ class TestChangeEvents:
             contribution_id=cid,
             scope_id="g_ceo",
             item_id="pub_1",
-            kind="publish",
+            kind="published",
         )
         second = store.append_change_event(
             change_id="chg_2",
             contribution_id=cid,
             scope_id="g_ceo",
             item_id="pub_2",
-            kind="publish",
+            kind="published",
         )
         store.append_change_event(
             change_id="chg_3",
             contribution_id=cid,
             scope_id="g_other",
             item_id="pub_3",
-            kind="publish",
+            kind="published",
         )
 
         assert [e.id for e in store.list_change_events(scope_id="g_ceo")] == [
@@ -1278,14 +1278,14 @@ class TestChangeEvents:
             contribution_id=cid,
             scope_id="g_ceo",
             item_id="pub_1",
-            kind="withdraw",
+            kind="withdrawn",
         )
         pending = store.append_change_event(
             change_id="chg_2",
             contribution_id=cid,
             scope_id="g_ceo",
             item_id="pub_2",
-            kind="withdraw",
+            kind="withdrawn",
         )
 
         store.mark_change_event_processed(done.id)
@@ -1308,7 +1308,7 @@ class TestChangeEvents:
             contribution_id=cid,
             scope_id="g_ceo",
             item_id="pub_1",
-            kind="withdraw",
+            kind="withdrawn",
         )
 
         store.mark_change_event_processed(event.id)
@@ -1325,5 +1325,5 @@ class TestChangeEvents:
                 contribution_id="c_nope",
                 scope_id="g_ceo",
                 item_id="pub_1",
-                kind="withdraw",
+                kind="withdrawn",
             )
