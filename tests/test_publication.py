@@ -695,7 +695,7 @@ def test_propose_publish_unknown_directive_anchor_raises_and_appends_no_act_row(
     _seed_summary_with_directive(summary_store, "g_team", directive_id="c_dir1")
     manager = _FakeScopeManager()
 
-    with pytest.raises(ValueError, match="not in this"):
+    with pytest.raises(ValueError, match="does not currently bind"):
         propose_publish(
             "g_team",
             "content",

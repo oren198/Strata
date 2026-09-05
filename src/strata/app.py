@@ -1309,6 +1309,76 @@ def drain_is_noop(
     return not record_store.list_change_events(scope_id=scope_id, unprocessed_only=True)
 
 
+def _sweep_ancestor_removals(
+    scope: Scope,
+    events: Sequence[ChangeEvent],
+    *,
+    fleet: FleetConfig,
+    record_store: RecordStore,
+    summary_store: SummaryStore,
+) -> None:
+    """Withdraw items an ancestor's retirement left with no anchor (ADR 0015 D3).
+
+    An inherited directive binds the scope, so a published item may anchor to
+    it (D3). When the ancestor retires or supersedes it, the descendant's
+    items anchored ONLY to that id lose their last anchor, and ADR 0007 D3's
+    rule applies unchanged: an item lives while any anchor lives, and is
+    withdrawn mechanically when none does. Mechanical, because the LOCAL case
+    is — a rule that is mechanical for one's own retirements and judged for an
+    ancestor's would be a second rule, and the descendant's judge would be
+    deciding whether the ancestor's retirement counted.
+
+    Runs at the top of the drain, BEFORE the judge, so the judge is shown the
+    swept publication rather than asked to do the sweeping. It needs no judge,
+    which is why a keyless drain runs it too.
+
+    The removed ids come off the change events themselves: ``before`` minus
+    ``after`` when the event carries both directive-id sets (an ancestor
+    amendment can remove several ids at once and ``item_id`` names only the
+    most consequential one — ADR 0014 D4), falling back to ``item_id`` alone.
+
+    The surviving set is every id that still binds this scope — its own
+    summary plus the CURRENT ancestor walk — so an item anchored to a second,
+    still-standing inherited directive is left alone.
+
+    The caller MUST hold ``_scope_lock(scope.id)``.
+    """
+    removals = [e for e in events if e.kind in ("directive_retired", "directive_superseded")]
+    if not removals:
+        return
+
+    own = summary_store.read(scope.id)
+    surviving = {d.id for d in own.directives} if own is not None else set()
+    for _ancestor_scope_id, directives in ancestor_directives(
+        scope.id, fleet=fleet, summary_store=summary_store
+    ):
+        surviving.update(d.id for d in directives)
+
+    for event in removals:
+        if event.before is not None and event.after is not None:
+            before = {i.strip() for i in event.before.split(",") if i.strip()}
+            after = {i.strip() for i in event.after.split(",") if i.strip()}
+            removed = before - after
+        else:
+            removed = set()
+        # `item_id` always names one removed directive; the set arithmetic
+        # above only ever ADDS the siblings it travelled with.
+        removed.add(event.item_id)
+        propagate_directive_removals(
+            scope.id,
+            removed,
+            event.contribution_id,
+            surviving_directive_ids=surviving,
+            fleet=fleet,
+            record_store=record_store,
+            summaries_dir=str(summary_store.summaries_dir),
+            # ADR 0014 D4: this withdrawal is a consequence of that change,
+            # one hop further out — never an independent change of its own.
+            change_ids=[event.change_id],
+            hop=event.hop + 1,
+        )
+
+
 def drain_scope(
     scope_id: str,
     *,
@@ -1387,6 +1457,19 @@ def drain_scope(
 
     with _scope_lock(scope.id):
         events = record_store.list_change_events(scope_id=scope.id, unprocessed_only=True)
+
+        # Mechanical, and BEFORE the judge (ADR 0015 D3): an ancestor's
+        # retirement withdraws this scope's items that rested on it, by the
+        # same rule a local retirement does. Runs with or without a judge, and
+        # leaves the events unprocessed — the judge still has to reconcile the
+        # context behind them.
+        _sweep_ancestor_removals(
+            scope,
+            events,
+            fleet=fleet,
+            record_store=record_store,
+            summary_store=summary_store,
+        )
 
         if scope_manager is None or not events:
             # Nothing to judge: a keyless server, or a scope over settled
