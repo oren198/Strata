@@ -93,6 +93,7 @@ def test_full_chain_drops_fleet_tables_and_preserves_record(tmp_path: Path) -> N
         "0009_publication_relay.sql",
         "0010_change_events.sql",
         "0011_change_event_kinds.sql",
+        "0012_directive_unspliced_kind.sql",
     ]
 
     # Fleet tables gone.
@@ -344,6 +345,7 @@ def test_idempotent_reapply(tmp_path: Path) -> None:
         "0009_publication_relay.sql",
         "0010_change_events.sql",
         "0011_change_event_kinds.sql",
+        "0012_directive_unspliced_kind.sql",
     ]
 
     second = run_migrations(db_path, migrations_dir=migrations_dir)
@@ -551,6 +553,7 @@ def test_crash_at_tracking_insert_rolls_back_script_too(
         "0009_publication_relay.sql",
         "0010_change_events.sql",
         "0011_change_event_kinds.sql",
+        "0012_directive_unspliced_kind.sql",
     ]
 
 
@@ -908,7 +911,10 @@ def test_0011_preserves_change_events_written_before_it(tmp_path: Path) -> None:
     finally:
         conn.close()
 
-    assert run_migrations(db_path, migrations_dir=migrations_dir) == ["0011_change_event_kinds.sql"]
+    assert run_migrations(db_path, migrations_dir=migrations_dir) == [
+        "0011_change_event_kinds.sql",
+        "0012_directive_unspliced_kind.sql",
+    ]
 
     conn = sqlite3.connect(db_path)
     try:

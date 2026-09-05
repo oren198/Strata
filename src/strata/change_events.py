@@ -67,6 +67,14 @@ PUBLICATION_KINDS = frozenset({"published", "amended", "withdrawn"})
 """Changes to a scope's outward face — one-hop readers are affected."""
 
 DIRECTIVE_KINDS = frozenset({"directive_appended", "directive_superseded", "directive_retired"})
+
+#: The one-off unsplice of a legacy spliced row (ADR 0015 D5). NOT in
+#: :data:`DIRECTIVE_KINDS`: those three say a scope's directive set moved and
+#: are due every descendant a refresh. This one says the opposite — a row that
+#: was never this scope's has stopped pretending to be, and the directive it
+#: copied is unchanged in its owner's summary — so it is recorded and stamped
+#: processed at birth, never drained, and never emitted to a descendant.
+DIRECTIVE_UNSPLICED = "directive_unspliced"
 """Changes to a scope's own binding directives — its subtree is affected."""
 
 OPERATOR_DIRECTIVE_CHANGED = "operator_directive_changed"

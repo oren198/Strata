@@ -96,8 +96,8 @@ from pydantic import BaseModel, Field, field_validator
 
 from strata import __version__
 from strata.bootstrap import load_fleet_config
+from strata.change_events import DIRECTIVE_UNSPLICED, new_change_id
 from strata.change_events import emit as emit_change_event
-from strata.change_events import new_change_id
 from strata.fleet_config import FleetConfig, FleetConfigError, Scope, Stratum
 from strata.fleet_reload import FleetReloader
 from strata.locks import BATCH_CAP, QUEUE_WAIT_TIMEOUT_S, QueueTicket, configure_lock_dir
@@ -1309,6 +1309,85 @@ def drain_is_noop(
     return not record_store.list_change_events(scope_id=scope_id, unprocessed_only=True)
 
 
+def _unsplice_legacy_copies(
+    scope: Scope,
+    *,
+    record_store: RecordStore,
+    summary_store: SummaryStore,
+) -> None:
+    """Drop directive rows a pre-0015 splice copied into *scope*'s summary (ADR 0015 D5).
+
+    The exact inverse of the splice, and exact for the same reason it was:
+    a directive id IS a contribution id, and a contribution is appended to
+    exactly one scope's record. A row whose contribution lives in ANOTHER
+    scope's record was copied here mechanically and was never judged into this
+    scope, so ADR 0014 D7's "no stored state is rewritten" does not cover it —
+    D7 protected JUDGED state, and the splice was never judgment.
+
+    Two rows are NEVER removed, and both matter more than the cleanup:
+
+    - one whose contribution is in this scope's own record — the scope
+      admitted it, and it is the scope's own memory;
+    - one the record has never heard of — an operator-attached row, a
+      hand-migrated one, anything at all. Absence of evidence is not evidence
+      of a copy, and removing on a guess destroys memory.
+
+    ``source_scope_id`` is deliberately not the test (ADR 0015 D5): the HTTP
+    route lets a contributor's scope differ from the target scope, so it says
+    who typed, not where the row was admitted.
+
+    Idempotent by construction: a second call finds nothing to remove and
+    writes nothing — no summary version bump, no second record note. This is a
+    migration that happens once, not a filter the read path pays for forever.
+
+    The caller MUST hold ``_scope_lock(scope.id)``.
+    """
+    current = summary_store.read(scope.id)
+    if current is None or not current.directives:
+        return
+
+    kept = []
+    removed = []
+    for directive in current.directives:
+        contribution = record_store.get_contribution(directive.id)
+        if contribution is not None and contribution.scope_id != scope.id:
+            removed.append(directive.id)
+        else:
+            kept.append(directive)
+    if not removed:
+        return
+
+    summary_store.write(scope.id, current.model_copy(update={"directives": kept}))
+
+    # The record says what moved and why. Stamped processed at birth (ADR 0014
+    # D4's "recorded, never drained" shape): this reports mechanical work
+    # already done, not a refresh anyone still owes — the directives it names
+    # are unchanged in their owners' summaries and still bind this scope
+    # through the ancestor walk (ADR 0015 D2).
+    rendered = ", ".join(removed)
+    record_store.append_change_notice(
+        scope_id=scope.id,
+        content=(
+            "[Manager refresh — directive rows copied here by the pre-1.11 parent splice "
+            "were removed; they live in their owning scope's summary and reach this scope "
+            f"by composition (ADR 0015 D5). Removed: {rendered}.]"
+        ),
+        contributor=ContributorRef(
+            scope_id=scope.id,
+            skill="scope-manager",
+            session_id="refresh",
+            ts=datetime.now(tz=UTC).isoformat(),
+        ),
+        change_id=new_change_id(),
+        source_scope_id=None,
+        item_id=removed[0],
+        kind=DIRECTIVE_UNSPLICED,
+        before=rendered,
+        after=None,
+        processed=True,
+    )
+
+
 def _sweep_ancestor_removals(
     scope: Scope,
     events: Sequence[ChangeEvent],
@@ -1456,6 +1535,12 @@ def drain_scope(
         )
 
     with _scope_lock(scope.id):
+        # ADR 0015 D5, first and once: a legacy spliced row still sitting in
+        # this scope's summary would otherwise land in the sweep's surviving
+        # set below and keep an un-anchored item alive after its directive was
+        # retired upstream.
+        _unsplice_legacy_copies(scope, record_store=record_store, summary_store=summary_store)
+
         events = record_store.list_change_events(scope_id=scope.id, unprocessed_only=True)
 
         # Mechanical, and BEFORE the judge (ADR 0015 D3): an ancestor's
