@@ -168,7 +168,9 @@ across the fleet. Revisit with data on how often the gap bites.
   The release's eval gate covers it; any bridge run before this lands is stale.
 - Perspective gains `input_changes`; touches composition, MCP surface, Console.
 - ADR 0011 D4 is amended as in D2. CONTEXT.md needs § Change event, § Refresh,
-  and an amended § Perspective.
+  and an amended § Perspective — done, this release (§ Publication, §
+  Directive and § Operator amended too, each noting it is a source of change
+  events).
 
 ## Evals this implies (for the operator's decision, not changed here)
 

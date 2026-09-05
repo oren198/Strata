@@ -132,7 +132,9 @@ labelled layer — never rewritten by any scope-manager. It is **judge-aware**:
 scope-managers see the operator memory binding their scope when judging, and
 decline contributions that contradict it. It is exempt from outcome-based
 **trust** weighting; outcomes that contradict it are surfaced to the
-operator instead.
+operator instead. A change to the operator layer attached at a scope is a
+**change event** for that scope and its descendants alike — the attachment
+scope is as much a reader of the correction as anything beneath it.
 
 The operator reads the entire store — every scope summary and record — for
 verification and steering, and may directly correct any scope's memory
@@ -239,6 +241,9 @@ Properties of published memory:
 - **Never self-corroborating** — a publication does not count as independent
   corroboration for ratifying its own source, however many times it has been
   republished: an item cannot corroborate any origin of itself.
+- **Change-triggering** — publishing, amending or withdrawing an item is a
+  **change event** for the scopes one hop away: the source's chain children
+  and the scopes that reference it, each due a **refresh** against it.
 
 ## Republication
 
@@ -254,6 +259,37 @@ rewrites alike; the judging scope is told an item is second-hand, and that
 its origin is information, not permission. When the origin **withdraws** an
 item, every republished copy of it is withdrawn too — mechanically, with no
 judgment — so no face keeps asserting what its source has retracted.
+
+## Change event
+
+The permanent notice that one input a scope's memory rests on has changed
+with no agent contributing: an ancestor's **directive** appended, superseded
+or retired; a one-hop **publication** published, amended or withdrawn; an
+operator directive attached to a scope. Recorded mechanically, with no
+judgment, as a `manager-refresh` contribution in the **record** of every
+scope that composes the changed item — a publication's chain children and
+the scopes that reference it; a directive's chain descendants; an operator
+directive's attachment scope and its descendants alike.
+
+Every independent change mints a change id; a change derived from processing
+one — a **refresh**'s admitted directive, a relayed withdrawal — inherits
+it, carrying forward how many hops removed it is from the change that
+started it. A scope refreshes for a given change id at most once, however
+many of its notices arrive; the notice itself is never suppressed, only the
+refresh it would otherwise trigger.
+
+## Refresh
+
+The judged cycle a **change event** triggers: the scope's pending change
+events are judged together in one amendment, whose ops may admit a new
+**directive** or **context** as well as retire, supersede, or withdraw a
+publication — because the notice being judged is a real contribution with
+honest provenance, unlike the mechanical splice that carries an ancestor's
+directives into a scope's own summary on `strata launch` and `strata
+refresh`, which admits nothing. Reading or binding a scope through the MCP
+server runs the judged cycle alone, with no splice. A refresh runs before a
+scope is bound or its perspective is read; `strata refresh` also runs it
+directly, for an operator who wants it without touching either.
 
 ## Supersession
 
@@ -299,7 +335,9 @@ assembles:
 - The **directives** of every inter-stratum ancestor up to the root — never
   their context,
 - The **publications** of the scopes one edge away: the agent's parent, and
-  any scope its own scope references.
+  any scope its own scope references,
+- The scope's own unprocessed **change events** — notices of input changes
+  it has not yet been **refresh**ed against.
 
 Each piece in the perspective is labelled with the scope it came from —
 composition is **provenance-preserving**, not flattened. Directives compose
@@ -313,7 +351,9 @@ fleet (or a sub-region of it) has resolved to do or to treat as true.
 Directives propagate down through chain edges and bind every
 descendant scope. When two directives conflict, the one from the broader
 (higher) stratum wins; a descendant may refine within an inherited directive
-but may not contradict it.
+but may not contradict it. Appending, superseding or retiring a directive is
+a **change event** for the holding scope's chain descendants, each due a
+**refresh** against the new state.
 
 ## Context
 
