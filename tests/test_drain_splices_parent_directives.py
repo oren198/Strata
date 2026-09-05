@@ -352,3 +352,118 @@ async def test_the_launch_path_and_the_read_path_produce_the_same_summary(
     assert from_launch.directives == from_read.directives
     assert PARENT_DIRECTIVE in from_read.directives
     assert from_launch.context == from_read.context
+
+
+# ---------------------------------------------------------------------------
+# A quiet read stays cheap, and a keyless one still splices
+# ---------------------------------------------------------------------------
+
+
+def _mcp_module(root: Path, *, child_summary: ScopeSummary | None, keyless: bool = False):  # noqa: ANN202
+    """An MCP server module wired to a fresh store under *root*."""
+    from test_mcp_server import _load_mcp_module
+
+    root.mkdir(exist_ok=True)
+    fleet = _fleet(root)
+    db_path, store = _seed(root, child_summary=child_summary)
+    mod = _load_mcp_module(db_path, str(store.summaries_dir), str(root / "fleet.yaml"))
+    mod._settings = mod._settings.model_copy(
+        update={
+            "judge_api_key": None if keyless else "test-key",
+            "anthropic_api_key": None if keyless else mod._settings.anthropic_api_key,
+        }
+    )
+    return mod, db_path, store, fleet
+
+
+async def test_a_read_of_a_current_scope_takes_no_lock_and_builds_no_judge(
+    tmp_path: Path,
+) -> None:
+    """Nothing pending and nothing to splice is answered WITHOUT the lock.
+
+    The drain sits on the read path of every bind and every perspective read
+    (ADR 0014 D6), so what it costs when there is nothing to do is what
+    reading a current scope costs. Taking ``scope_lock`` would make a quiet
+    read wait behind any in-flight judgment for that scope — an LLM call —
+    and building a judge client would cost a construction per read. Both
+    questions are answerable from two summaries and a queue count, and a
+    change arriving a microsecond after the check is drained by the next read
+    either way.
+    """
+    import strata.app
+
+    current_child = ScopeSummary(
+        scope_id="g_team",
+        directives=[PARENT_DIRECTIVE],
+        context="Already reconciled.",
+        updated_at="2026-09-05T10:00:00+00:00",
+    )
+    mod, db_path, _store, fleet = _mcp_module(tmp_path / "quiet", child_summary=current_child)
+
+    real_lock = strata.app._scope_lock
+    locked: list[str] = []
+
+    def _spy(scope_id: str):  # noqa: ANN202
+        locked.append(scope_id)
+        return real_lock(scope_id)
+
+    with (
+        patch.object(mod, "_AGENT_SCOPE", "g_team"),
+        patch.object(mod, "_AGENT_SKILL", None),
+        patch.object(mod, "_AGENT_SESSION_ID", "sess_test"),
+        patch.object(mod, "_load_fleet", return_value=fleet),
+        patch.object(mod, "_build_scope_manager", side_effect=AssertionError("built a judge")),
+        patch.object(strata.app, "_scope_lock", _spy),
+    ):
+        result = await mod.strata_read_perspective()
+
+    assert result.get("refresh_pending", 0) == 0
+    assert locked == []
+    # Precondition: the scope really was current — nothing owed, nothing judged.
+    with RecordStore(db_path) as record_store:
+        assert record_store.list_change_events(scope_id="g_team", unprocessed_only=True) == []
+        assert record_store.list_judgments(scope_id="g_team") == []
+
+
+async def test_a_keyless_server_splices_and_leaves_the_reconciliation_pending(
+    tmp_path: Path,
+) -> None:
+    """The splice is mechanical; only the reconciliation needs a judge.
+
+    A user with no judge key still inherits what binds them — the rows are
+    copied, never written by an LLM (ADR 0011 D4). What is deferred is the
+    context reconciliation, and it is deferred as a PENDING notice rather
+    than dropped, so the first keyed drain picks it up. The notice was never
+    tried, so it carries no attempt row: a judge outage and a judge that was
+    never configured are different states (implementation pin 4).
+    """
+    mod, db_path, store, fleet = _mcp_module(
+        tmp_path / "keyless", child_summary=_stale_child(), keyless=True
+    )
+
+    with (
+        patch.object(mod, "_AGENT_SCOPE", None),
+        patch.object(mod, "_AGENT_SKILL", None),
+        patch.object(mod, "_AGENT_SESSION_ID", "sess_test"),
+        patch.object(mod, "_load_fleet", return_value=fleet),
+    ):
+        result = await mod.strata_bind(scope_id="g_team")
+
+    assert result["scope_id"] == "g_team"
+
+    written = store.read("g_team")
+    assert written is not None
+    # Byte for byte, ids and provenance included.
+    assert PARENT_DIRECTIVE in written.directives
+    assert any(d.id == "c_local" for d in written.directives)
+
+    with RecordStore(db_path) as record_store:
+        # The reconciliation is owed, not lost.
+        pending = record_store.list_change_events(scope_id="g_team", unprocessed_only=True)
+        assert len(pending) == 1
+        notice = record_store.get_contribution(pending[0].contribution_id)
+        assert notice is not None
+        assert notice.subject == "manager-refresh"
+        # Never tried: no verdict, and no attempt row to mistake for an outage.
+        assert record_store.get_judgment(notice.id) is None
+        assert record_store.list_judgment_attempts(scope_id="g_team") == []

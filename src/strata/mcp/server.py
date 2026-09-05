@@ -163,8 +163,14 @@ def _drain_for_read(fleet, scope_id: str) -> int:
     a user who never runs a CLI command at all.
 
     The drain also performs ADR 0011 D4's mechanical parent-directive
-    splice, so this runs even with an empty queue: it is the one refresh
-    mechanism (implementation pin 6), not a queue worker.
+    splice, so an empty queue is not a reason to skip: this is the one
+    refresh mechanism (implementation pin 6), not a queue worker. What IS
+    skipped, lock-free, is a scope with nothing pending and nothing to
+    splice — a quiet read costs what reading a current scope costs.
+
+    Without a judge configured only the mechanical half runs: the splice
+    lands and its reconciliation is left pending for the first drain that
+    has a judge.
 
     Returns the number of change events still unprocessed AFTER the attempt:
     ``0`` when the drain brought the scope up to date, and the outstanding
@@ -182,25 +188,46 @@ def _drain_for_read(fleet, scope_id: str) -> int:
     WAIT on an in-flight judgment for the same scope, never deadlock against
     one.
     """
-    from strata.app import DrainFailed, drain_scope  # noqa: PLC0415
+    from strata.app import DrainFailed, drain_is_noop, drain_scope  # noqa: PLC0415
 
     if _record_store is None or _summary_store is None:
         return 0
 
-    pending = len(_record_store.list_change_events(scope_id=scope_id, unprocessed_only=True))
-
     # An empty queue is NOT a reason to skip: the drain also splices the
     # chain parent's directives in mechanically (ADR 0011 D4), and a scope
     # binding for the first time owns no change events — nothing changed
-    # after it existed. Skipping here is what left an MCP-only user never
-    # inheriting a directive at all. The drain costs no judge call when
-    # there is nothing pending and nothing to splice.
+    # after it existed. Skipping on an empty queue is what left an MCP-only
+    # user never inheriting a directive at all.
+    #
+    # Nothing pending AND nothing to splice is a different matter, and
+    # `drain_is_noop` answers it lock-free: a quiet read must cost what
+    # reading a current scope costs, not a wait behind whatever judgment is
+    # in flight for that scope plus a judge client it never uses.
+    if drain_is_noop(
+        scope_id, fleet=fleet, record_store=_record_store, summary_store=_summary_store
+    ):
+        return 0
 
-    # No judge configured: skip rather than fail every read with an attempt row
-    # per pending event — the same soft skip `strata launch`'s refresh makes.
-    # The events stay, so the refresh is still owed and still visible.
+    pending = len(_record_store.list_change_events(scope_id=scope_id, unprocessed_only=True))
+
+    # No judge configured: run the MECHANICAL half only. The splice needs no
+    # judge (ADR 0011 D4 copies rows, it never asks an LLM to quote them), so
+    # a keyless user still inherits what binds them; the reconciliation is
+    # left as a pending notice for the first drain that has a judge. Nothing
+    # is attempted, so no attempt row is written — a judge that was never
+    # configured is not a judge outage (implementation pin 4).
     if not (_settings.judge_api_key or _settings.anthropic_api_key):
-        return pending
+        drain_scope(
+            scope_id,
+            fleet=fleet,
+            record_store=_record_store,
+            summary_store=_summary_store,
+            scope_manager=None,
+            summary_max_words=_settings.summary_max_words,
+            window_verbatim_tail=_settings.window_verbatim_tail,
+            recency_window_size=_settings.recency_window_size,
+        )
+        return len(_record_store.list_change_events(scope_id=scope_id, unprocessed_only=True))
 
     try:
         outcome = drain_scope(
