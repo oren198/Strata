@@ -162,15 +162,16 @@ def _drain_for_read(fleet, scope_id: str) -> int:
     scope without first bringing it up to date — and the system is correct for
     a user who never runs a CLI command at all.
 
-    The drain also performs ADR 0011 D4's mechanical parent-directive
-    splice, so an empty queue is not a reason to skip: this is the one
-    refresh mechanism (implementation pin 6), not a queue worker. What IS
-    skipped, lock-free, is a scope with nothing pending and nothing to
-    splice — a quiet read costs what reading a current scope costs.
+    An empty queue IS a reason to skip, and skipped lock-free: since ADR 0015
+    D6 the drain has one job — judge pending change events — so a quiet read
+    costs what reading a current scope costs. Inheritance is no longer
+    something a read has to make happen before composing; composition IS how
+    a descendant inherits (ADR 0015 D2).
 
-    Without a judge configured only the mechanical half runs: the splice
-    lands and its reconciliation is left pending for the first drain that
-    has a judge.
+    Without a judge configured only the mechanical work runs — the sweep of
+    items an ancestor's retirement un-anchored (ADR 0015 D3) and the unsplice
+    of legacy copies (D5), neither of which needs a judge. The judged
+    reconciliation is left pending for the first drain that has one.
 
     Returns the number of change events still unprocessed AFTER the attempt:
     ``0`` when the drain brought the scope up to date, and the outstanding
@@ -193,16 +194,10 @@ def _drain_for_read(fleet, scope_id: str) -> int:
     if _record_store is None or _summary_store is None:
         return 0
 
-    # An empty queue is NOT a reason to skip: the drain also splices the
-    # chain parent's directives in mechanically (ADR 0011 D4), and a scope
-    # binding for the first time owns no change events — nothing changed
-    # after it existed. Skipping on an empty queue is what left an MCP-only
-    # user never inheriting a directive at all.
-    #
-    # Nothing pending AND nothing to splice is a different matter, and
-    # `drain_is_noop` answers it lock-free: a quiet read must cost what
-    # reading a current scope costs, not a wait behind whatever judgment is
-    # in flight for that scope plus a judge client it never uses.
+    # Nothing pending is nothing to do (ADR 0015 D6), and `drain_is_noop`
+    # answers it lock-free: a quiet read must cost what reading a current
+    # scope costs, not a wait behind whatever judgment is in flight for that
+    # scope plus a judge client it never uses.
     if drain_is_noop(
         scope_id, fleet=fleet, record_store=_record_store, summary_store=_summary_store
     ):
@@ -210,12 +205,12 @@ def _drain_for_read(fleet, scope_id: str) -> int:
 
     pending = len(_record_store.list_change_events(scope_id=scope_id, unprocessed_only=True))
 
-    # No judge configured: run the MECHANICAL half only. The splice needs no
-    # judge (ADR 0011 D4 copies rows, it never asks an LLM to quote them), so
-    # a keyless user still inherits what binds them; the reconciliation is
-    # left as a pending notice for the first drain that has a judge. Nothing
-    # is attempted, so no attempt row is written — a judge that was never
-    # configured is not a judge outage (implementation pin 4).
+    # No judge configured: run the MECHANICAL work only — the ancestor-
+    # retirement sweep (ADR 0015 D3) and the legacy unsplice (D5). Neither
+    # needs a judge; the judged reconciliation stays pending for the first
+    # drain that has one. Nothing is attempted, so no attempt row is written
+    # — a judge that was never configured is not a judge outage
+    # (implementation pin 4).
     if not (_settings.judge_api_key or _settings.anthropic_api_key):
         drain_scope(
             scope_id,

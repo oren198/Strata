@@ -2032,15 +2032,13 @@ def _refresh_scope(
 ) -> None:
     """Refresh one scope by draining it — the same call the MCP read makes.
 
-    ONE mechanism (ADR 0014 implementation pin 6). Both halves of a refresh
-    live in :func:`strata.app.drain_scope` now: the mechanical parent-directive
-    splice (ADR 0011 D4) and the input-change drain (ADR 0014 D6). They were
-    split across the two entry points, which meant the splice ran only for
-    someone who typed a CLI command — an MCP-only user never inherited a
-    directive at all — and left two answers to one question. The
-    version-comparison staleness detection this function used to carry is gone
-    with them: a summary's ``parent_version`` stamp said only "the parent
-    moved", a proxy for what the change events now say outright.
+    ONE mechanism (ADR 0014 implementation pin 6): the refresh is
+    :func:`strata.app.drain_scope`, and it is the input-change drain (ADR 0014
+    D6). The mechanical parent-directive splice that used to run alongside it
+    is gone with ADR 0015 D1 — a directive lives in its owner's summary and a
+    descendant assembles it on read — and so is the version-comparison
+    staleness detection this function once carried, which said only "the
+    parent moved", a proxy for what the change events now say outright.
 
     What is left here is the CLI's share: resolving the scope, and reporting.
 
@@ -2212,9 +2210,8 @@ def _run_manager_refresh(scope_id: str, *, skip: bool = False) -> None:
 
     Walks the inter-stratum ancestor chain root-first and refreshes each scope,
     then *scope_id* itself — with no staleness test anywhere (implementation
-    pin 6): :func:`_refresh_scope` splices what the splice would change and
-    drains what is actually pending, so a scope with nothing to do costs
-    nothing.
+    pin 6): :func:`_refresh_scope` drains what is actually pending, so a scope
+    with nothing to do costs nothing.
 
     Skipped when:
 
@@ -2226,8 +2223,7 @@ def _run_manager_refresh(scope_id: str, *, skip: bool = False) -> None:
     refresh that could not run, and the pending events survive for the next
     attempt (ADR 0014 D6).
 
-    ADR 0004 Decision 4 — last-write-wins for the splice; the drain itself
-    takes the scope lock (ADR 0012).
+    The drain takes the scope lock (ADR 0012).
     """
     from strata.app import DrainFailed
     from strata.fleet_config import FleetConfig

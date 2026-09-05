@@ -3381,7 +3381,7 @@ def test_attribution_corrective_rewrite_is_still_budget_checked() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_refresh_block_rendered_in_splice_refresh_mode() -> None:
+def test_refresh_block_rendered_in_input_change_refresh_mode() -> None:
     message = _build_user_message(
         scope=SCOPE,
         stratum=STRATUM,
@@ -3389,10 +3389,9 @@ def test_refresh_block_rendered_in_splice_refresh_mode() -> None:
         current_summary=CURRENT_SUMMARY,
         recent_contributions=[],
         new_contribution=NEW_CONTRIBUTION,
-        mode="splice_refresh",
+        mode="input_change_refresh",
     )
-    assert "MANAGER REFRESH" in message
-    assert "already been incorporated" in message
+    assert "INPUT-CHANGE REFRESH" in message
 
     ordinary = _build_user_message(
         scope=SCOPE,
@@ -3402,15 +3401,15 @@ def test_refresh_block_rendered_in_splice_refresh_mode() -> None:
         recent_contributions=[],
         new_contribution=NEW_CONTRIBUTION,
     )
-    assert "MANAGER REFRESH" not in ordinary
+    assert "INPUT-CHANGE REFRESH" not in ordinary
 
 
-def test_splice_refresh_amendment_drops_append_and_publish_ops() -> None:
-    """A refresh may amend context and retire, but never admit a directive."""
+def test_input_change_refresh_amendment_drops_append_but_keeps_publish() -> None:
+    """A refresh may publish the judge's own words; it may never copy the notice's."""
     manager, _ = _make_manager(
         {
             "decision": "accept_as_context",
-            "reasoning": "refreshed against the parent",
+            "reasoning": "refreshed against the changed input",
             "directive_ops": [
                 {"op": "append"},
                 {"op": "publish", "content": "Something new."},
@@ -3426,14 +3425,13 @@ def test_splice_refresh_amendment_drops_append_and_publish_ops() -> None:
         current_summary=CURRENT_SUMMARY,
         recent_contributions=[],
         new_contribution=NEW_CONTRIBUTION,
-        mode="splice_refresh",
+        mode="input_change_refresh",
     )
 
     assert judgment.new_summary is not None
-    assert judgment.new_summary.directives == []
     assert judgment.new_summary.context == "Reconciled context."
-    assert [op.op for op in judgment.directive_ops] == ["retire"]
-    assert judgment.dropped_ops == ["append", "publish"]
+    assert [op.op for op in judgment.directive_ops] == ["publish", "retire"]
+    assert judgment.dropped_ops == ["append"]
     assert "append" in judgment.record_notes
 
 

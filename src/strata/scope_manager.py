@@ -121,41 +121,38 @@ def _batch_max_tokens(batch_size: int) -> int:
     return JUDGE_MAX_TOKENS + JUDGE_BATCH_MAX_TOKENS_PER_EXTRA * max(0, batch_size - 1)
 
 
-#: Which of the three judgment paths a judge call is on (ADR 0014 D2,
-#: implementation pin 6). It was a bool — refresh or not — until ADR 0014
-#: split "refresh" in two, because the two differ in what the judge may do:
+#: Which of the two judgment paths a judge call is on (ADR 0014 D2, ADR 0015
+#: D6, implementation pin 6). It was a bool — refresh or not — then briefly a
+#: third value for ADR 0011 D4's parent splice; the splice is gone (ADR 0015
+#: D1) and what remains is the pair that genuinely differ in what the judge
+#: may do:
 #:
 #: - ``ordinary``: a contribution arrived; every op is available.
-#: - ``splice_refresh``: ADR 0011 D4's launch-time parent splice. The parent's
-#:   directives are already in the summary mechanically, so the amendment is
-#:   context plus lifecycle ops and admitting ops are dropped.
 #: - ``input_change_refresh``: ADR 0014 D2's reactive re-judgement. ``publish``
 #:   is ALLOWED — the change notice is a real contribution to mint a directive
-#:   FROM (its id, its provenance: this entered because input X changed), which
-#:   is exactly what ADR 0011 D4 lacked. ``append`` is still dropped: it would
-#:   copy the notice's bytes — a mechanical change payload under the subject
-#:   ``manager-refresh`` — verbatim into a directive.
-JudgeMode = Literal["ordinary", "splice_refresh", "input_change_refresh"]
+#:   FROM (its id, its provenance: this entered because input X changed).
+#:   ``append`` is dropped: it would copy the notice's bytes — a mechanical
+#:   change payload under the subject ``manager-refresh`` — verbatim into a
+#:   directive.
+JudgeMode = Literal["ordinary", "input_change_refresh"]
 
-#: The admitting ops each mode drops (ADR 0011 D4, ADR 0014 D2). One table,
-#: read by both parsers, so the single and batch shapes cannot drift on what a
-#: mode means.
+#: The admitting ops each mode drops (ADR 0014 D2). One table, read by both
+#: parsers, so the single and batch shapes cannot drift on what a mode means.
 _DROPPED_ADMITTING_OPS: dict[str, tuple[str, ...]] = {
     "ordinary": (),
-    "splice_refresh": ("append", "publish"),
     "input_change_refresh": ("append",),
 }
 
-_JUDGE_MODES: tuple[str, ...] = ("ordinary", "splice_refresh", "input_change_refresh")
+_JUDGE_MODES: tuple[str, ...] = ("ordinary", "input_change_refresh")
 
 
 def _check_mode(mode: str) -> None:
     """Refuse a mode this module does not know.
 
     A misspelled mode must never quietly degrade to ``ordinary``: on the
-    splice path that would let admitting ops through (ADR 0011 D4), and on the
-    input-change path it would drop the INPUT CHANGES block the judge is meant
-    to be judging against (ADR 0014 D2).
+    input-change path that would drop the INPUT CHANGES block the judge is
+    meant to be judging against, and let through the ``append`` op ADR 0014 D2
+    drops there.
     """
     if mode not in _JUDGE_MODES:
         raise ValueError(f"Unknown judge mode {mode!r} — one of {', '.join(_JUDGE_MODES)}.")
@@ -651,13 +648,6 @@ ancestor scope, broadest first):
 - You are shown each ancestor's directives and nothing else of that
   ancestor's. Its own working notes are not yours to see, restate, or write
   into `new_context`.
-
-When a MANAGER REFRESH block is present in the user message: the parent's
-directives have already been spliced into this scope's summary
-mechanically, so there is nothing for you to copy. Your amendment may carry
-only `new_context` and lifecycle ops (`supersede`, `retire`) — reconciling
-the context digest with the refreshed parent state is the only part of a
-refresh that is judgment. `append` and `publish` ops are dropped.
 
 When an INPUT-CHANGE REFRESH block is present in the user message (ADR 0014
 D2): nobody contributed anything. Something this scope's memory RESTS ON
@@ -1316,8 +1306,8 @@ def _apply_amendment(
     nothing. A ``new_context`` of ``None`` leaves the existing context
     untouched — an omitted section is not an emptied one.
 
-    ``version``/``parent_version`` are not set here: the caller stamps
-    ``parent_version`` and :meth:`~strata.summary_store.SummaryStore.write`
+    ``version`` is not set here:
+    :meth:`~strata.summary_store.SummaryStore.write`
     bumps ``version``, exactly as before.
     """
     directives = list(current_summary.directives) if current_summary is not None else []
@@ -2286,22 +2276,11 @@ def _build_judge_preamble(
         f"{summary_max_words} words (context plus every directive's content).\n\n"
     )
 
-    # The two refresh paths get two different instructions (ADR 0014 D2,
-    # implementation pin 6) — siblings, never the same block with a footnote:
-    # what the judge may DO differs between them, so telling it the splice
-    # rule on an input-change refresh would suppress exactly the admitting op
-    # ADR 0014 exists to allow.
+    # There is one refresh instruction now (ADR 0015 D6): the splice's
+    # MANAGER REFRESH block went with the splice, and a drain is always an
+    # input-change refresh.
     refresh_block = ""
-    if mode == "splice_refresh":
-        # ADR 0011 D4: the parent's directives are already spliced in
-        # mechanically, so the amendment is context + lifecycle ops only.
-        refresh_block = (
-            "MANAGER REFRESH: the parent's directives have already been incorporated "
-            "into the CURRENT SUMMARY below mechanically. Amend the context digest to "
-            "reconcile it with that state; `append` and `publish` ops are dropped on "
-            "this path.\n\n"
-        )
-    elif mode == "input_change_refresh":
+    if mode == "input_change_refresh":
         refresh_block = (
             "INPUT-CHANGE REFRESH: nobody contributed anything — an input this "
             "scope's memory rests on changed, and the INPUT CHANGES block below says "
@@ -2562,13 +2541,8 @@ class ScopeManager:
                                   ``None`` (or empty) omits the block
                                   entirely (backward compatible call shape).
             mode:                 Which judgment path this call is on (see
-                                  :data:`JudgeMode`). ``"splice_refresh"``
-                                  renders the MANAGER REFRESH block and drops
-                                  any ``append``/``publish`` op (ADR 0011 D4 —
-                                  the parent's directives are already spliced
-                                  into *current_summary* mechanically, so the
-                                  refresh can only amend context and retire or
-                                  supersede). ``"input_change_refresh"``
+                                  :data:`JudgeMode`).
+                                  ``"input_change_refresh"``
                                   renders the INPUT-CHANGE REFRESH block and
                                   keeps every op (ADR 0014 D2 — the change
                                   notice is a real contribution to mint a
@@ -3287,8 +3261,7 @@ class ScopeManager:
         dropped_by_contribution: dict[str, list[str]] = {}
         to_drop = _DROPPED_ADMITTING_OPS[mode]
         if to_drop:
-            # Exactly as on the single path — a splice refresh amends context
-            # and lifecycle only (ADR 0011 D4), an input-change refresh keeps
+            # Exactly as on the single path — an input-change refresh keeps
             # `publish` and drops `append` (ADR 0014 D2) — however many notices
             # the batch coalesced.
             admitting = [op for op in ops if op.op in to_drop]
@@ -3499,12 +3472,9 @@ class ScopeManager:
         dropped: list[str] = []
         to_drop = _DROPPED_ADMITTING_OPS[mode]
         if to_drop:
-            # ADR 0011 D4: on the SPLICE refresh path parent directives are
-            # spliced in mechanically, so the amendment carries context and
-            # lifecycle ops only. ADR 0014 D2: an input-change refresh has a
-            # real contribution to mint FROM, so `publish` stands — but never
-            # to copy, so `append` (which takes the notice's bytes verbatim)
-            # is dropped.
+            # ADR 0014 D2: an input-change refresh has a real contribution
+            # to mint FROM, so `publish` stands — but never to copy, so
+            # `append` (which takes the notice's bytes verbatim) is dropped.
             admitting = [op for op in ops if op.op in to_drop]
             if admitting:
                 ops = [op for op in ops if op.op not in to_drop]
