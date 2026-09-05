@@ -223,7 +223,7 @@ class TestEmit:
         self, fleet: FleetConfig, record_store: RecordStore
     ) -> None:
         """The notice IS the trigger row's other half (ADR 0014 D5)."""
-        change_id = emit(
+        (change_id,) = emit(
             fleet=fleet,
             record_store=record_store,
             item="pub_1",
@@ -232,6 +232,7 @@ class TestEmit:
             before="the old claim",
         )
 
+        # An independent input change mints exactly ONE id.
         assert change_id.startswith("chg_")
         events = record_store.list_change_events(scope_id="g_teamX")
         assert len(events) == 1
@@ -278,7 +279,7 @@ class TestEmit:
         self, fleet: FleetConfig, record_store: RecordStore
     ) -> None:
         """Inheritance is the whole termination guarantee (ADR 0014 D4)."""
-        original = emit(
+        (original,) = emit(
             fleet=fleet,
             record_store=record_store,
             item="pub_1",
@@ -294,11 +295,11 @@ class TestEmit:
             item="pub_2",
             kind="withdrawn",
             source_scope_id="g_funcA",
-            inherit_from=original,
+            wave_ids=[original],
             hop=1,
         )
 
-        assert derived == original
+        assert derived == [original]
         # Precondition: the derived change really did reach somebody.
         events = record_store.list_change_events(scope_id="g_teamX")
         assert [e.change_id for e in events] == [original]
@@ -314,7 +315,7 @@ class TestEmit:
         record keeps both notices, because a notice that vanishes is not
         notice.
         """
-        change_id = emit(
+        (change_id,) = emit(
             fleet=fleet,
             record_store=record_store,
             item="pub_1",
@@ -330,7 +331,7 @@ class TestEmit:
             item="pub_2",
             kind="withdrawn",
             source_scope_id="g_funcA",
-            inherit_from=change_id,
+            wave_ids=[change_id],
             hop=1,
         )
 
@@ -347,7 +348,7 @@ class TestEmit:
         again for it (ADR 0014 D4) — but it is still told what happened: the
         row is written, stamped processed at birth, and its notice says why
         no refresh follows."""
-        change_id = emit(
+        (change_id,) = emit(
             fleet=fleet,
             record_store=record_store,
             item="pub_1",
@@ -365,7 +366,7 @@ class TestEmit:
             item="pub_2",
             kind="withdrawn",
             source_scope_id="g_funcA",
-            inherit_from=change_id,
+            wave_ids=[change_id],
             hop=1,
         )
 
@@ -383,7 +384,7 @@ class TestEmit:
         """Dedup is per (change id, scope, item): a cascade that revisits the
         SAME item under the same wave adds nothing, while a different item
         under that wave is a genuinely new notice (the test above)."""
-        change_id = emit(
+        (change_id,) = emit(
             fleet=fleet,
             record_store=record_store,
             item="pub_1",
@@ -398,7 +399,7 @@ class TestEmit:
             item="pub_1",
             kind="withdrawn",
             source_scope_id="g_funcA",
-            inherit_from=change_id,
+            wave_ids=[change_id],
             hop=1,
         )
 
@@ -436,7 +437,7 @@ class TestEmit:
             item="pub_1",
             kind="withdrawn",
             source_scope_id="g_funcA",
-            inherit_from="chg_deep",
+            wave_ids=["chg_deep"],
             hop=HOP_BUDGET + 1,
         )
 
@@ -491,7 +492,7 @@ class TestEmit:
         monkeypatch.setattr(record_store, "append_change_notice", _boom)
 
         with caplog.at_level("ERROR", logger="strata.change_events"):
-            change_id = emit(
+            (change_id,) = emit(
                 fleet=fleet,
                 record_store=record_store,
                 item="pub_1",
@@ -544,7 +545,7 @@ class TestEmit:
         monkeypatch.setattr(FleetConfig, "chain_children", _boom)
 
         with caplog.at_level("ERROR", logger="strata.change_events"):
-            change_id = emit(
+            (change_id,) = emit(
                 fleet=fleet,
                 record_store=record_store,
                 item="pub_1",

@@ -864,7 +864,7 @@ def propose_withdraw(
             # this is where its change id is minted; the cascade below is
             # DERIVED from it and inherits it, which is what stops a
             # reference cycle from running forever (D4).
-            change_id = emit_change_event(
+            change_ids = emit_change_event(
                 fleet=fleet,
                 record_store=record_store,
                 item=item_id,
@@ -881,7 +881,7 @@ def propose_withdraw(
                 record_store=record_store,
                 summaries_dir=str(summary_store.summaries_dir),
                 held_scope_id=scope_id,
-                change_id=change_id,
+                change_ids=change_ids,
             )
 
         return PublicationOutcome(
@@ -914,7 +914,7 @@ def _cascade_withdraw_relays(
     record_store: RecordStore,
     summaries_dir: str,
     held_scope_id: str,
-    change_id: str,
+    change_ids: Sequence[str],
     hop: int = 0,
 ) -> None:
     """Mechanically withdraw every published item relayed from ``(scope_id, item_id)``.
@@ -932,12 +932,13 @@ def _cascade_withdraw_relays(
     item it relays, so the chain of ``relay_item_id`` pointers this
     function follows can never loop back to an id it has already withdrawn.
 
-    *change_id* is the id of the input change this cascade is a consequence
-    of, minted by whichever entry point started it. Every relayed withdrawal
-    emitted here INHERITS it (ADR 0014 D4) rather than minting a fresh one:
-    with fresh ids the visited set would bound nothing and a reference cycle
-    would run forever. *hop* counts derived hops for D4's backstop budget and
-    grows by one per recursion.
+    *change_ids* are the input changes this cascade is a consequence of,
+    minted or inherited by whichever entry point started it — plural because
+    a coalesced refresh belongs to every wave it drained (ADR 0014 D4, Phase
+    A finding 2). Every relayed withdrawal emitted here INHERITS them all
+    rather than minting a fresh id: with fresh ids the visited set would
+    bound nothing and a reference cycle would run forever. *hop* counts
+    derived hops for D4's backstop budget and grows by one per recursion.
 
     *held_scope_id* is the ONE scope whose :func:`strata.locks.scope_lock`
     is already held by the outermost caller of this cascade (every entry
@@ -1005,8 +1006,8 @@ def _cascade_withdraw_relays(
 
         for item in removed:
             # ADR 0014 D4 — one derived event per relayed withdrawal, from
-            # the scope that lost the copy, carrying the wave's id so a scope
-            # already refreshed for it is not woken twice.
+            # the scope that lost the copy, carrying every wave id so a
+            # scope already refreshed for all of them is not woken twice.
             emit_change_event(
                 fleet=fleet,
                 record_store=record_store,
@@ -1014,7 +1015,7 @@ def _cascade_withdraw_relays(
                 kind="withdrawn",
                 source_scope_id=other_scope_id,
                 before=item.content,
-                inherit_from=change_id,
+                wave_ids=change_ids,
                 hop=hop + 1,
             )
             _cascade_withdraw_relays(
@@ -1024,7 +1025,7 @@ def _cascade_withdraw_relays(
                 record_store=record_store,
                 summaries_dir=summaries_dir,
                 held_scope_id=held_scope_id,
-                change_id=change_id,
+                change_ids=change_ids,
                 hop=hop + 1,
             )
 
@@ -1043,7 +1044,8 @@ def propagate_directive_removals(
     fleet: FleetConfig,
     record_store: RecordStore,
     summaries_dir: str,
-    change_id: str | None = None,
+    change_ids: Sequence[str] = (),
+    hop: int = 0,
 ) -> list[PublishedItem]:
     """Mechanically withdraw published items none of whose anchors still stand.
 
@@ -1099,10 +1101,14 @@ def propagate_directive_removals(
             makes (ADR 0014 D3). Required rather than optional: a withdrawal
             nobody downstream is told about is exactly the evidence-blindness
             ADR 0014 exists to end.
-        change_id: The input change this propagation is a consequence of,
-            when it has one (ADR 0014 D4 — a judgment's own change id on a
-            refresh). ``None`` makes each emitted event an independent
-            change, which is right for an ordinary contribution's ops.
+        change_ids: The input changes this propagation is a consequence of,
+            when it has any (ADR 0014 D4 — a judgment's own ``wave_ids`` on
+            a refresh, plural because a refresh coalesces). Empty makes each
+            emitted event an independent change, which is right for an
+            ordinary contribution's ops.
+        hop: How far along the wave the judgment that ordered this sat, so
+            D4's backstop budget keeps counting across the refresh instead
+            of restarting at zero.
 
     Returns:
         The published items that were withdrawn (empty if none qualified).
@@ -1156,14 +1162,15 @@ def propagate_directive_removals(
     # also a change to this scope's face, so each is announced to its readers
     # and the cascade below inherits that announcement's id.
     for item in to_withdraw:
-        item_change_id = emit_change_event(
+        item_change_ids = emit_change_event(
             fleet=fleet,
             record_store=record_store,
             item=item.id,
             kind="withdrawn",
             source_scope_id=scope_id,
             before=item.content,
-            inherit_from=change_id,
+            wave_ids=change_ids,
+            hop=hop,
         )
         _cascade_withdraw_relays(
             scope_id,
@@ -1172,7 +1179,8 @@ def propagate_directive_removals(
             record_store=record_store,
             summaries_dir=summaries_dir,
             held_scope_id=scope_id,
-            change_id=item_change_id,
+            change_ids=item_change_ids,
+            hop=hop,
         )
 
     return to_withdraw
@@ -1187,7 +1195,8 @@ def apply_judged_withdrawals(
     fleet: FleetConfig,
     record_store: RecordStore,
     summaries_dir: str,
-    change_id: str | None = None,
+    change_ids: Sequence[str] = (),
+    hop: int = 0,
 ) -> list[PublishedItem]:
     """Withdraw published items named by a contribution judgment's ``withdraw_published``.
 
@@ -1217,11 +1226,13 @@ def apply_judged_withdrawals(
         reasoning: The originating contribution judgment's reasoning,
             carried onto each derived withdraw act's judgment row.
         fleet: Read to compute each withdrawal's affected set (ADR 0014 D3).
-        change_id: The judgment's own change id, when it has one — a
-            withdrawal made on a refresh is DERIVED from the change that
-            triggered that refresh and inherits its id (ADR 0014 D4/D8: the
-            id is threaded in as a parameter, never looked up). ``None``
-            makes each withdrawal an independent change.
+        change_ids: The judgment's own ``wave_ids``, when it has any — a
+            withdrawal made on a refresh is DERIVED from the changes that
+            triggered that refresh and inherits every one of their ids (ADR
+            0014 D4/D8: the ids are threaded in as a parameter, never looked
+            up). Empty makes each withdrawal an independent change.
+        hop: How far along the wave the judgment that ordered this sat (see
+            :func:`propagate_directive_removals`).
 
     Returns:
         The published items actually withdrawn.
@@ -1278,14 +1289,15 @@ def apply_judged_withdrawals(
     # sets off never is — a relay believes an item only because its origin
     # does.
     for item in withdrawn:
-        item_change_id = emit_change_event(
+        item_change_ids = emit_change_event(
             fleet=fleet,
             record_store=record_store,
             item=item.id,
             kind="withdrawn",
             source_scope_id=scope_id,
             before=item.content,
-            inherit_from=change_id,
+            wave_ids=change_ids,
+            hop=hop,
         )
         _cascade_withdraw_relays(
             scope_id,
@@ -1294,7 +1306,8 @@ def apply_judged_withdrawals(
             record_store=record_store,
             summaries_dir=summaries_dir,
             held_scope_id=scope_id,
-            change_id=item_change_id,
+            change_ids=item_change_ids,
+            hop=hop,
         )
 
     return withdrawn

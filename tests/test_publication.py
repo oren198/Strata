@@ -2129,7 +2129,7 @@ def test_mechanical_directive_propagation_emits_for_each_withdrawn_item(
     assert event.item_id == item.id
 
 
-def test_mechanical_propagation_inherits_a_change_id_when_given_one(
+def test_mechanical_propagation_inherits_every_change_id_it_is_given(
     fleet, record_store, summary_store, summaries_dir
 ) -> None:
     _seed_published_item(
@@ -2148,18 +2148,20 @@ def test_mechanical_propagation_inherits_a_change_id_when_given_one(
         fleet=fleet,
         record_store=record_store,
         summaries_dir=summaries_dir,
-        change_id="chg_upstream",
+        change_ids=["chg_upstream", "chg_also_upstream"],
     )
 
-    (event,) = _events_for(record_store, "g_team")
-    assert event.change_id == "chg_upstream"
+    # One row per wave the refresh drained (ADR 0014 D4, Phase A finding 2):
+    # the reader refreshes if EITHER id is still unseen.
+    events = _events_for(record_store, "g_team")
+    assert {e.change_id for e in events} == {"chg_upstream", "chg_also_upstream"}
 
 
-def test_judged_withdrawal_emits_and_inherits_the_judgment_s_change_id(
+def test_judged_withdrawal_emits_and_inherits_the_judgment_s_change_ids(
     fleet, record_store, summary_store, summaries_dir
 ) -> None:
-    """ADR 0014 D8 — the change id is threaded into withdraw_published, never
-    looked up."""
+    """ADR 0014 D8 — the change ids are threaded into withdraw_published,
+    never looked up."""
     item = _seed_published_item(record_store, summaries_dir, "g_func", content="Use protobuf.")
 
     withdrawn = apply_judged_withdrawals(
@@ -2170,7 +2172,7 @@ def test_judged_withdrawal_emits_and_inherits_the_judgment_s_change_id(
         fleet=fleet,
         record_store=record_store,
         summaries_dir=summaries_dir,
-        change_id="chg_from_judgment",
+        change_ids=["chg_from_judgment"],
     )
 
     assert [i.id for i in withdrawn] == [item.id]

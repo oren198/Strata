@@ -656,12 +656,20 @@ def _write_amendment(
     assert judgment.new_summary is not None  # noqa: S101 — caller-checked invariant
     # ADR 0014 D4 — ONE originating act, one change id. An amendment that
     # withdraws published items AND moves the directive set is a single
-    # input change however many consequences it has, so the id is minted
+    # input change however many consequences it has, so the ids are minted
     # once here and threaded into all three emitters below; on a refresh the
-    # judgment already carries the id of the change that triggered it, and
-    # everything derived inherits that instead (implementation pin 8 — the
-    # id is a parameter, never a lookup).
-    change_id = judgment.change_id if judgment.change_id is not None else new_change_id()
+    # judgment already carries the ids of the changes that triggered it, and
+    # everything derived inherits those instead (implementation pin 8 — the
+    # ids are a parameter, never a lookup).
+    #
+    # `wave_ids` rather than either field behind it: a drain always produces
+    # the BATCH shape, whose scalar `change_id` is always None, so reading
+    # the scalar here would mint a fresh id for every refresh-derived change
+    # and the once-per-id rule would bound nothing (ADR 0014 D4, Rejected:
+    # "fresh ids for derived changes"). `hop` travels for the same reason —
+    # a backstop budget that restarts at zero on each derivation is not a
+    # backstop.
+    change_ids = judgment.wave_ids or [new_change_id()]
     # Stamp the parent-summary version the judgment was built from, so
     # staleness stays detectable without re-running the LLM (ADR 0004 D4).
     to_write = judgment.new_summary.model_copy(
@@ -700,7 +708,8 @@ def _write_amendment(
             fleet=fleet,
             record_store=record_store,
             summaries_dir=str(summary_store.summaries_dir),
-            change_id=change_id,
+            change_ids=change_ids,
+            hop=judgment.hop,
         )
 
     # 2. Mechanical propagation (D3): any published item anchored ONLY to
@@ -724,7 +733,8 @@ def _write_amendment(
             fleet=fleet,
             record_store=record_store,
             summaries_dir=str(summary_store.summaries_dir),
-            change_id=change_id,
+            change_ids=change_ids,
+            hop=judgment.hop,
         )
 
     # ADR 0014 D1/D3 — a scope's own contribution is not a trigger for the
@@ -739,7 +749,8 @@ def _write_amendment(
         fleet=fleet,
         record_store=record_store,
         previous_summary=previous_summary,
-        change_id=change_id,
+        change_ids=change_ids,
+        hop=judgment.hop,
     )
 
 
@@ -750,7 +761,8 @@ def _emit_directive_set_change(
     fleet: FleetConfig,
     record_store: RecordStore,
     previous_summary: ScopeSummary | None,
-    change_id: str,
+    change_ids: Sequence[str],
+    hop: int = 0,
 ) -> None:
     """Tell this scope's descendants that its directive set changed (ADR 0014 D1).
 
@@ -790,9 +802,11 @@ def _emit_directive_set_change(
         source_scope_id=scope.id,
         before=", ".join(sorted(previous_ids)) or None,
         after=", ".join(sorted(current_ids)) or None,
-        # The amendment's own change id, minted or inherited by
-        # _write_amendment: one act, one change (ADR 0014 D4).
-        inherit_from=change_id,
+        # The amendment's own change ids, minted or inherited by
+        # _write_amendment: one act, one change per wave it belongs to
+        # (ADR 0014 D4).
+        wave_ids=change_ids,
+        hop=hop,
     )
 
 
@@ -832,7 +846,15 @@ def _judge_batch_and_record(
 
     The caller MUST hold ``_scope_lock(scope.id)``.
     """
-    if len(contributions) == 1:
+    wave_ids = list(dict.fromkeys(change_ids or ()))
+    # A batch of ONE takes the single-contribution path verbatim (ADR 0011
+    # D3) — unless it belongs to several waves. The single judgment shape
+    # carries a SCALAR change id, so routing a multi-wave refresh through it
+    # would drop every id but one, and whatever the amendment derives would
+    # mint a fresh one: precisely the hole ADR 0014 D4 closes. One notice can
+    # be left holding several waves' events when a crash lands between a
+    # refresh's judgment and its marking, so this is reachable.
+    if len(contributions) == 1 and len(wave_ids) <= 1:
         try:
             return [
                 _judge_and_record(
@@ -848,12 +870,7 @@ def _judge_batch_and_record(
                     recency_window_size=recency_window_size,
                     mode=mode,
                     input_changes=input_changes,
-                    # A batch of one belongs to at most one wave; more than
-                    # that has no scalar to carry it, and the batch path below
-                    # is where a coalesced drain lands anyway.
-                    change_id=(
-                        list(change_ids)[0] if change_ids and len(change_ids) == 1 else None
-                    ),
+                    change_id=wave_ids[0] if wave_ids else None,
                     hop=hop,
                 )
             ]
@@ -885,7 +902,7 @@ def _judge_batch_and_record(
             window_verbatim_tail=window_verbatim_tail,
             mode=mode,
             input_changes=input_changes,
-            change_ids=change_ids,
+            change_ids=wave_ids,
             hop=hop,
         )
     except Exception as exc:  # noqa: BLE001 — every member needs its own error

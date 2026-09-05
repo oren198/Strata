@@ -24,11 +24,15 @@ import yaml
 # Make strata importable when running from the repo root.
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from strata.app import run_contribution  # noqa: E402
+from strata.app import drain_scope, run_contribution  # noqa: E402
 from strata.fleet_config import FleetConfig  # noqa: E402
 from strata.migrator import run_migrations  # noqa: E402
 from strata.record_store import ContributorRef, RecordStore  # noqa: E402
-from strata.scope_manager import ScopeManagerJudgment  # noqa: E402
+from strata.scope_manager import (  # noqa: E402
+    BatchVerdict,
+    ScopeManagerBatchJudgment,
+    ScopeManagerJudgment,
+)
 from strata.summary_store import Directive, ScopeSummary, SummaryStore  # noqa: E402
 
 # ---------------------------------------------------------------------------
@@ -385,3 +389,163 @@ def test_one_amendment_is_one_input_change(fleet, record_store, summary_store) -
     events = record_store.list_change_events(scope_id="g_ce_child")
     assert {e.kind for e in events} == {"withdrawn", "directive_appended"}
     assert len({e.change_id for e in events}) == 1
+
+
+# ---------------------------------------------------------------------------
+# What a REFRESH derives (ADR 0014 D4, Phase A finding 2)
+# ---------------------------------------------------------------------------
+
+
+class _ScriptedBatchManager:
+    """Returns a prepared batch judgment, recording the call it was given."""
+
+    def __init__(self, new_summary: ScopeSummary) -> None:
+        self.new_summary = new_summary
+        self.calls: list[dict] = []
+
+    def judge_batch(self, **kwargs):  # noqa: ANN003, ANN201
+        self.calls.append(kwargs)
+        return ScopeManagerBatchJudgment(
+            verdicts=[
+                BatchVerdict(
+                    contribution_id=c.id,
+                    decision="accept_as_directive",
+                    reasoning="Admitted on the refresh.",
+                )
+                for c in kwargs["new_contributions"]
+            ],
+            new_summary=self.new_summary,
+            change_ids=list(kwargs.get("change_ids") or []),
+            hop=kwargs.get("hop", 0),
+        )
+
+    def judge(self, **_kwargs):  # noqa: ANN003, ANN201
+        raise AssertionError("this drain has several notices, so it judges as a batch")
+
+
+def _notice(record_store, *, change_id: str, item_id: str, hop: int = 0) -> None:  # noqa: ANN001
+    """Write what an emitter writes: the notice and its change-event row."""
+    record_store.append_change_notice(
+        scope_id="g_ce_parent",
+        content=f"[Input change {change_id}: {item_id} was withdrawn.]",
+        contributor=ContributorRef(
+            scope_id="g_ce_parent",
+            skill="scope-manager",
+            session_id="change-event",
+            ts="2026-09-05T00:00:00+00:00",
+        ),
+        change_id=change_id,
+        source_scope_id="g_ce_parent",
+        item_id=item_id,
+        kind="withdrawn",
+        hop=hop,
+    )
+
+
+def test_a_refresh_derived_change_carries_every_drained_id_and_the_next_hop(
+    fleet, record_store, summary_store
+) -> None:
+    """ADR 0014 D4 — inheritance is the whole termination guarantee, and a
+    drain is where it is hardest: the judgment it produces is the BATCH
+    shape, whose scalar ``change_id`` is always ``None``. An emitter reading
+    that scalar would mint a fresh id per refresh and bound nothing, and one
+    reading no hop at all would leave the backstop budget covering nothing.
+    """
+    _notice(record_store, change_id="chg_first", item_id="pub_1", hop=1)
+    _notice(record_store, change_id="chg_second", item_id="pub_2", hop=3)
+    # Precondition: two waves really are pending for one scope.
+    pending = record_store.list_change_events(scope_id="g_ce_parent", unprocessed_only=True)
+    assert len(pending) == 2
+
+    manager = _ScriptedBatchManager(_summary(_directive("c_admitted")))
+    outcome = drain_scope(
+        "g_ce_parent",
+        fleet=fleet,
+        record_store=record_store,
+        summary_store=summary_store,
+        scope_manager=manager,
+        summary_max_words=500,
+    )
+
+    # Precondition: the refresh ran and moved the directive set, so there IS
+    # a derived change to inherit anything (pin 7's damping).
+    assert outcome.judged is True
+    assert outcome.events_processed == 2
+
+    derived = record_store.list_change_events(scope_id="g_ce_child")
+    assert [e.kind for e in derived] == ["directive_appended", "directive_appended"]
+    # One row per (wave id, affected scope): the child refreshes if EITHER
+    # id is unseen, which is what D4's union semantics mean in practice.
+    assert {e.change_id for e in derived} == {"chg_first", "chg_second"}
+    # The hop travels: one beyond the furthest-travelled event drained.
+    assert {e.hop for e in derived} == {4}
+
+
+def test_a_coalesced_refresh_that_withdraws_carries_both_ids_onward(
+    fleet, record_store, summary_store
+) -> None:
+    """The same union, on the publication half of an amendment: a refresh
+    that withdraws from this scope's face announces the withdrawal to its
+    readers once per wave it drained (ADR 0014 D4/D5).
+    """
+    from strata.publication import PublishedItem, _write_publication, read_publication
+
+    summaries_dir = str(summary_store.summaries_dir)
+    act = record_store.append_publication_act(
+        scope_id="g_ce_parent",
+        act="publish",
+        kind="context",
+        content="Deploys are at 3pm.",
+        subject="deploys",
+        anchors=["subject:deploys"],
+        withdraws=None,
+        trigger=None,
+        proposer=_contributor(),
+    )
+    _write_publication(
+        "g_ce_parent",
+        [
+            PublishedItem(
+                id=act.id,
+                kind="context",
+                content="Deploys are at 3pm.",
+                subject="deploys",
+                anchors=["subject:deploys"],
+                published_at=act.created_at,
+            )
+        ],
+        summaries_dir=summaries_dir,
+    )
+    _notice(record_store, change_id="chg_one", item_id="pub_1")
+    _notice(record_store, change_id="chg_two", item_id="pub_2")
+
+    class _WithdrawingManager(_ScriptedBatchManager):
+        def judge_batch(self, **kwargs):  # noqa: ANN003, ANN201
+            judgment = super().judge_batch(**kwargs)
+            return judgment.model_copy(update={"withdraw_published": [act.id]})
+
+    manager = _WithdrawingManager(
+        ScopeSummary(
+            scope_id="g_ce_parent",
+            directives=[],
+            context="Reconciled with both changes.",
+            updated_at="2026-09-05T01:00:00+00:00",
+        )
+    )
+    drain_scope(
+        "g_ce_parent",
+        fleet=fleet,
+        record_store=record_store,
+        summary_store=summary_store,
+        scope_manager=manager,
+        summary_max_words=500,
+    )
+
+    # Precondition: the face really did lose the item.
+    assert read_publication("g_ce_parent", summaries_dir=summaries_dir) == []
+
+    derived = [
+        e for e in record_store.list_change_events(scope_id="g_ce_child") if e.kind == "withdrawn"
+    ]
+    assert {e.change_id for e in derived} == {"chg_one", "chg_two"}
+    assert {e.item_id for e in derived} == {act.id}
