@@ -90,6 +90,7 @@ class _MarkerManager:
         operator_memory=None,
         current_publication=None,
         peer_publications=None,
+        parent_publication=None,
         window_verbatim_tail=None,
     ):  # noqa: ANN001, ANN201, E501
         existing = list(current_summary.directives) if current_summary is not None else []

@@ -97,3 +97,38 @@ def test_prompt_does_not_invite_the_judge_to_absorb_parent_context():
 
     lowered = SYSTEM_PROMPT.lower()
     assert "context from the parent" not in lowered
+
+
+def test_parent_publication_reaches_the_judge_but_its_context_still_does_not():
+    """ADR 0014 (Phase A finding 1) added the parent's FACE, not its notes.
+
+    The parent's publication is curated for outside readers — that is what
+    makes it shareable, and what a context digest is not. Adding one must not
+    reopen the other route into the child's `new_context` that #187 closed.
+    """
+    from strata.publication import PublishedItem
+
+    text = _build_judge_preamble(
+        scope=Scope(id="g_child", name="Child", stratum_id="L1"),
+        stratum=Stratum(id="L1", name="Team", ordinal=1),
+        parent_summary=_parent_summary(),
+        current_summary=None,
+        recent_contributions=[],
+        judged_contribution_ids=[],
+        parent_publication=(
+            "g_parent",
+            [
+                PublishedItem(
+                    id="p_1",
+                    kind="directive",
+                    content="PARENT-PUBLISHED rollbacks are mandatory",
+                    subject="deploys",
+                    anchors=["c_parent_1"],
+                    published_at="2026-09-01T10:00:00+00:00",
+                )
+            ],
+        ),
+    )
+
+    assert "PARENT-PUBLISHED rollbacks are mandatory" in text
+    assert PARENT_CONTEXT not in text

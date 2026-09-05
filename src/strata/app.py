@@ -439,6 +439,7 @@ class _JudgeInputs:
     operator_memory: list
     current_publication: list
     peer_publications: list
+    parent_publication: tuple[str, list] | None
 
 
 def _read_judge_inputs(
@@ -482,6 +483,21 @@ def _read_judge_inputs(
         (peer.id, read_publication(peer.id, summaries_dir=str(summary_store.summaries_dir)))
         for peer in sorted(entitlement.referenced_peers, key=lambda s: s.id)
     ]
+    # ADR 0014 (Phase A finding 1): the chain parent's publication, which ADR
+    # 0013 D2 composes into this scope's perspective. Until now no judge had
+    # ever seen it — the one composed input missing from the judge's view, and
+    # the one an input-change refresh triggered by a parent publish/withdraw
+    # has to judge against. Read as its own pair, not folded into
+    # peer_publications: a chain edge is not a reference edge, and the judge is
+    # told which is which.
+    parent_publication = (
+        (
+            parent_scope.id,
+            read_publication(parent_scope.id, summaries_dir=str(summary_store.summaries_dir)),
+        )
+        if parent_scope is not None
+        else None
+    )
     return _JudgeInputs(
         current_summary=current_summary,
         parent_summary=parent_summary,
@@ -490,6 +506,7 @@ def _read_judge_inputs(
         operator_memory=operator_memory,
         current_publication=current_publication,
         peer_publications=peer_publications,
+        parent_publication=parent_publication,
     )
 
 
@@ -535,6 +552,7 @@ def _judge_and_record(
             operator_memory=inputs.operator_memory,
             current_publication=inputs.current_publication,
             peer_publications=inputs.peer_publications,
+            parent_publication=inputs.parent_publication,
             window_verbatim_tail=window_verbatim_tail,
         )
     except Exception as exc:
@@ -751,6 +769,7 @@ def _judge_batch_and_record(
             operator_memory=inputs.operator_memory,
             current_publication=inputs.current_publication,
             peer_publications=inputs.peer_publications,
+            parent_publication=inputs.parent_publication,
             window_verbatim_tail=window_verbatim_tail,
         )
     except Exception as exc:  # noqa: BLE001 — every member needs its own error
