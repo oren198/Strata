@@ -129,6 +129,7 @@ class _ChangeEventLike(Protocol):
     """
 
     change_id: str
+    source_scope_id: str | None
     item_id: str
     kind: str
     before: str | None
@@ -156,16 +157,13 @@ def _change_event_dict(event: _ChangeEventLike) -> dict:
     machine-readable. ``scope_id`` is left out: it is always the requested
     scope (the caller already knows which perspective it asked for).
 
-    Known gap (Phase D, reported rather than worked around): the ADR's
-    illustrative shape also names ``source_scope_id`` — the scope the
-    changed item came FROM, as opposed to ``scope_id`` (the affected scope
-    that must refresh). ``strata.record_store.ChangeEvent`` (Phase A) has no
-    such column yet; nothing here fabricates one by parsing it out of
-    ``item_id`` or the notice's prose. Add it here when the emitting phase
-    adds it to the row.
+    ``source_scope_id`` is the scope the changed item came FROM — the
+    provenance the reader needs to weigh the change (ADR 0013 D4c: origin is
+    information, not permission).
     """
     return {
         "change_id": event.change_id,
+        "source_scope_id": event.source_scope_id,
         "item_id": event.item_id,
         "kind": event.kind,
         "before": event.before,

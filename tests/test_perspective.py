@@ -1263,6 +1263,7 @@ def _make_change_event(
     change_id: str = "wave_1",
     contribution_id: str = "c_refresh_1",
     scope_id: str = "g_team",
+    source_scope_id: str | None = "g_parent",
     item_id: str = "pub_1",
     kind: str = "withdrawn",
     before: str | None = "old content",
@@ -1278,6 +1279,7 @@ def _make_change_event(
         change_id=change_id,
         contribution_id=contribution_id,
         scope_id=scope_id,
+        source_scope_id=source_scope_id,
         item_id=item_id,
         kind=kind,
         before=before,
@@ -1339,6 +1341,7 @@ def test_unprocessed_change_events_appear_verbatim_oldest_first(tmp_path: Path) 
     entry = result["input_changes"][0]
     assert entry == {
         "change_id": older.change_id,
+        "source_scope_id": older.source_scope_id,
         "item_id": older.item_id,
         "kind": older.kind,
         "before": older.before,
