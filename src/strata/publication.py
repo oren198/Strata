@@ -96,6 +96,7 @@ from typing import TYPE_CHECKING, Literal
 
 import yaml
 
+from strata.change_events import emit as emit_change_event
 from strata.locks import scope_lock
 from strata.record_store import JUDGE_FAILED, ContributorRef, RecordStore
 
@@ -736,6 +737,21 @@ def propose_publish(
                 scope_id, current_publication, summaries_dir=str(summary_store.summaries_dir)
             )
             artifact_updated = True
+            # ADR 0014 D1 — this scope's face just gained an item, which is
+            # a change to what every reader composes. An addition triggers
+            # exactly as a removal does: a child that never re-judges after
+            # its parent added something is as wrong as one that never
+            # re-judges after a withdrawal. A relayed publish is no
+            # exception — the relay is THIS scope's own act, so it mints a
+            # fresh change id rather than inheriting the origin's.
+            emit_change_event(
+                fleet=fleet,
+                record_store=record_store,
+                item=item.id,
+                kind="published",
+                source_scope_id=scope_id,
+                after=content,
+            )
 
         return PublicationOutcome(
             act_id=act.id,
@@ -844,14 +860,28 @@ def propose_withdraw(
             remaining = [i for i in current_publication if i.id != item_id]
             _write_publication(scope_id, remaining, summaries_dir=str(summary_store.summaries_dir))
             artifact_updated = True
+            # ADR 0014 D1/D4 — the independent input change starts here, so
+            # this is where its change id is minted; the cascade below is
+            # DERIVED from it and inherits it, which is what stops a
+            # reference cycle from running forever (D4).
+            change_id = emit_change_event(
+                fleet=fleet,
+                record_store=record_store,
+                item=item_id,
+                kind="withdrawn",
+                source_scope_id=scope_id,
+                before=item.content,
+            )
             # ADR 0013 D4b — mechanical, no LLM: every downstream copy
             # relayed from this item goes with it.
             _cascade_withdraw_relays(
                 scope_id,
                 item_id,
+                fleet=fleet,
                 record_store=record_store,
                 summaries_dir=str(summary_store.summaries_dir),
                 held_scope_id=scope_id,
+                change_id=change_id,
             )
 
         return PublicationOutcome(
@@ -880,9 +910,12 @@ def _cascade_withdraw_relays(
     scope_id: str,
     item_id: str,
     *,
+    fleet: FleetConfig,
     record_store: RecordStore,
     summaries_dir: str,
     held_scope_id: str,
+    change_id: str,
+    hop: int = 0,
 ) -> None:
     """Mechanically withdraw every published item relayed from ``(scope_id, item_id)``.
 
@@ -898,6 +931,13 @@ def _cascade_withdraw_relays(
     every relay item id is a fresh publish act created strictly after the
     item it relays, so the chain of ``relay_item_id`` pointers this
     function follows can never loop back to an id it has already withdrawn.
+
+    *change_id* is the id of the input change this cascade is a consequence
+    of, minted by whichever entry point started it. Every relayed withdrawal
+    emitted here INHERITS it (ADR 0014 D4) rather than minting a fresh one:
+    with fresh ids the visited set would bound nothing and a reference cycle
+    would run forever. *hop* counts derived hops for D4's backstop budget and
+    grows by one per recursion.
 
     *held_scope_id* is the ONE scope whose :func:`strata.locks.scope_lock`
     is already held by the outermost caller of this cascade (every entry
@@ -964,12 +1004,28 @@ def _cascade_withdraw_relays(
                 removed = _remove_matches(other_scope_id)
 
         for item in removed:
+            # ADR 0014 D4 — one derived event per relayed withdrawal, from
+            # the scope that lost the copy, carrying the wave's id so a scope
+            # already refreshed for it is not woken twice.
+            emit_change_event(
+                fleet=fleet,
+                record_store=record_store,
+                item=item.id,
+                kind="withdrawn",
+                source_scope_id=other_scope_id,
+                before=item.content,
+                inherit_from=change_id,
+                hop=hop + 1,
+            )
             _cascade_withdraw_relays(
                 other_scope_id,
                 item.id,
+                fleet=fleet,
                 record_store=record_store,
                 summaries_dir=summaries_dir,
                 held_scope_id=held_scope_id,
+                change_id=change_id,
+                hop=hop + 1,
             )
 
 
@@ -984,8 +1040,10 @@ def propagate_directive_removals(
     trigger_id: str,
     *,
     surviving_directive_ids: Collection[str],
+    fleet: FleetConfig,
     record_store: RecordStore,
     summaries_dir: str,
+    change_id: str | None = None,
 ) -> list[PublishedItem]:
     """Mechanically withdraw published items none of whose anchors still stand.
 
@@ -1037,6 +1095,14 @@ def propagate_directive_removals(
         surviving_directive_ids: Directive ids present in the scope's summary
             after this event's write — the set anchor survival is checked
             against.
+        fleet: Read to compute the affected set of each withdrawal this call
+            makes (ADR 0014 D3). Required rather than optional: a withdrawal
+            nobody downstream is told about is exactly the evidence-blindness
+            ADR 0014 exists to end.
+        change_id: The input change this propagation is a consequence of,
+            when it has one (ADR 0014 D4 — a judgment's own change id on a
+            refresh). ``None`` makes each emitted event an independent
+            change, which is right for an ordinary contribution's ops.
 
     Returns:
         The published items that were withdrawn (empty if none qualified).
@@ -1086,14 +1152,27 @@ def propagate_directive_removals(
     _write_publication(scope_id, remaining, summaries_dir=summaries_dir)
 
     # ADR 0013 D4b — mechanical, no LLM: sweep every downstream copy relayed
-    # from each item this call just withdrew.
+    # from each item this call just withdrew. ADR 0014: each withdrawal is
+    # also a change to this scope's face, so each is announced to its readers
+    # and the cascade below inherits that announcement's id.
     for item in to_withdraw:
+        item_change_id = emit_change_event(
+            fleet=fleet,
+            record_store=record_store,
+            item=item.id,
+            kind="withdrawn",
+            source_scope_id=scope_id,
+            before=item.content,
+            inherit_from=change_id,
+        )
         _cascade_withdraw_relays(
             scope_id,
             item.id,
+            fleet=fleet,
             record_store=record_store,
             summaries_dir=summaries_dir,
             held_scope_id=scope_id,
+            change_id=item_change_id,
         )
 
     return to_withdraw
@@ -1105,8 +1184,10 @@ def apply_judged_withdrawals(
     *,
     judged_by: str,
     reasoning: str | None,
+    fleet: FleetConfig,
     record_store: RecordStore,
     summaries_dir: str,
+    change_id: str | None = None,
 ) -> list[PublishedItem]:
     """Withdraw published items named by a contribution judgment's ``withdraw_published``.
 
@@ -1135,6 +1216,12 @@ def apply_judged_withdrawals(
             ``"scope-manager"``).
         reasoning: The originating contribution judgment's reasoning,
             carried onto each derived withdraw act's judgment row.
+        fleet: Read to compute each withdrawal's affected set (ADR 0014 D3).
+        change_id: The judgment's own change id, when it has one — a
+            withdrawal made on a refresh is DERIVED from the change that
+            triggered that refresh and inherits its id (ADR 0014 D4/D8: the
+            id is threaded in as a parameter, never looked up). ``None``
+            makes each withdrawal an independent change.
 
     Returns:
         The published items actually withdrawn.
@@ -1191,12 +1278,23 @@ def apply_judged_withdrawals(
     # sets off never is — a relay believes an item only because its origin
     # does.
     for item in withdrawn:
+        item_change_id = emit_change_event(
+            fleet=fleet,
+            record_store=record_store,
+            item=item.id,
+            kind="withdrawn",
+            source_scope_id=scope_id,
+            before=item.content,
+            inherit_from=change_id,
+        )
         _cascade_withdraw_relays(
             scope_id,
             item.id,
+            fleet=fleet,
             record_store=record_store,
             summaries_dir=summaries_dir,
             held_scope_id=scope_id,
+            change_id=item_change_id,
         )
 
     return withdrawn
@@ -1337,6 +1435,19 @@ def bootstrap_publication(
             _write_publication(
                 scope_id, existing + recorded, summaries_dir=str(summary_store.summaries_dir)
             )
+            # ADR 0014 D1 — a first face is still an addition to everyone
+            # downstream: they have been composing nothing from this scope
+            # and now have something. One independent change per item, since
+            # a reader may believe one and not another.
+            for item in recorded:
+                emit_change_event(
+                    fleet=fleet,
+                    record_store=record_store,
+                    item=item.id,
+                    kind="published",
+                    source_scope_id=scope_id,
+                    after=item.content,
+                )
 
         decision: Literal["accept", "decline"] = "accept" if recorded else "decline"
         return BootstrapOutcome(

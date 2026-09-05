@@ -581,6 +581,7 @@ class ChangeEvent:
     change_id: str
     contribution_id: str
     scope_id: str
+    source_scope_id: str | None
     item_id: str
     kind: str
     before: str | None
@@ -684,6 +685,34 @@ class RecordStore:
             sqlite3.IntegrityError: If *supersedes* references a non-existent
                 contribution.
         """
+        contribution_id = self._insert_contribution(
+            scope_id=scope_id,
+            content=content,
+            proposed_classification=proposed_classification,
+            subject=subject,
+            supersedes=supersedes,
+            contributor=contributor,
+        )
+        self._conn.commit()
+        return self._fetch_contribution(contribution_id)
+
+    def _insert_contribution(
+        self,
+        *,
+        scope_id: str,
+        content: str,
+        proposed_classification: Literal["directive", "context"],
+        subject: str | None,
+        supersedes: str | None,
+        contributor: ContributorRef,
+    ) -> str:
+        """INSERT one contribution row and return its id. Does NOT commit.
+
+        Split out of :meth:`append_contribution` so a caller that must write
+        this row together with another one — :meth:`append_change_notice`,
+        where the notice and its event row are two halves of one event (ADR
+        0014 D5) — can put both inside a single transaction.
+        """
         contribution_id = _new_contribution_id()
         self._conn.execute(
             """
@@ -707,8 +736,7 @@ class RecordStore:
                 contributor.ts,
             ),
         )
-        self._conn.commit()
-        return self._fetch_contribution(contribution_id)
+        return contribution_id
 
     def list_contributions(
         self,
@@ -1825,6 +1853,7 @@ class RecordStore:
         scope_id: str,
         item_id: str,
         kind: str,
+        source_scope_id: str | None = None,
         before: str | None = None,
         after: str | None = None,
         hop: int = 0,
@@ -1845,6 +1874,12 @@ class RecordStore:
             contribution_id: The ``manager-refresh`` contribution carrying
                              this event's payload.
             scope_id:        The affected scope — the one that must refresh.
+            source_scope_id: The scope the changed item came FROM. A
+                             different fact from *scope_id* and not derivable
+                             from it — an item id does not name its holder —
+                             and what the perspective's ``input_changes``
+                             section renders as "because X changed". ``None``
+                             only for a caller that genuinely has no source.
             item_id:         The input item that changed.
             kind:            What happened to it.
             before/after:    The item's previous and current state. Either may
@@ -1860,17 +1895,140 @@ class RecordStore:
             sqlite3.IntegrityError: If *contribution_id* does not exist (FK) —
                 an event whose notice nobody can read is not a notice.
         """
+        event_id = self._insert_change_event(
+            change_id=change_id,
+            contribution_id=contribution_id,
+            scope_id=scope_id,
+            source_scope_id=source_scope_id,
+            item_id=item_id,
+            kind=kind,
+            before=before,
+            after=after,
+            hop=hop,
+        )
+        self._conn.commit()
+        return self._fetch_change_event(event_id)
+
+    def _insert_change_event(
+        self,
+        *,
+        change_id: str,
+        contribution_id: str,
+        scope_id: str,
+        source_scope_id: str | None,
+        item_id: str,
+        kind: str,
+        before: str | None,
+        after: str | None,
+        hop: int,
+        processed: bool = False,
+    ) -> str:
+        """INSERT one change-event row and return its id. Does NOT commit.
+
+        *processed* stamps ``processed_at`` at birth, for an event that must
+        be recorded but must never be drained (ADR 0014 D4: the scope has
+        already refreshed for this change id, or the hop budget is spent).
+        """
         event_id = _new_change_event_id()
         self._conn.execute(
             """
             INSERT INTO change_events
-            (id, change_id, contribution_id, scope_id, item_id, kind, before, after, hop)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (id, change_id, contribution_id, scope_id, source_scope_id, item_id, kind,
+             before, after, hop, processed_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    CASE WHEN ? THEN datetime('now') ELSE NULL END)
             """,
-            (event_id, change_id, contribution_id, scope_id, item_id, kind, before, after, hop),
+            (
+                event_id,
+                change_id,
+                contribution_id,
+                scope_id,
+                source_scope_id,
+                item_id,
+                kind,
+                before,
+                after,
+                hop,
+                # Same stamp shape mark_change_event_processed writes, so a
+                # born-processed event is indistinguishable from a drained one.
+                processed,
+            ),
         )
-        self._conn.commit()
-        return self._fetch_change_event(event_id)
+        return event_id
+
+    def append_change_notice(
+        self,
+        *,
+        scope_id: str,
+        content: str,
+        contributor: ContributorRef,
+        change_id: str,
+        source_scope_id: str | None,
+        item_id: str,
+        kind: str,
+        before: str | None = None,
+        after: str | None = None,
+        hop: int = 0,
+        processed: bool = False,
+    ) -> tuple[Contribution, ChangeEvent]:
+        """Append a change notice — both halves of one event — atomically.
+
+        ADR 0014 D5 makes the notice of an input change ONE thing with two
+        shapes: a ``subject="manager-refresh"`` contribution in the affected
+        scope's record (permanent, auditable, and the judge's input on the
+        refresh) and the :class:`ChangeEvent` row that is the same event
+        machine-readable. Writing them as two separate appends allowed a
+        half-written notice: a contribution nothing would ever judge, because
+        the drain finds work through ``change_events``, or an event whose
+        notice nobody can read. Both INSERTs go in one transaction here, so a
+        reader finds both or neither.
+
+        Args:
+            scope_id:        The affected scope — the notice lands in ITS
+                             record and the event names it as needing the
+                             refresh.
+            content:         The rendered change payload (mechanical — no LLM
+                             writes it, matching ADR 0013 D4b).
+            contributor:     Provenance for the notice contribution.
+            change_id:       The wave this event belongs to (ADR 0014 D4).
+            source_scope_id: The scope the changed item came FROM.
+            item_id:         The input item that changed.
+            kind:            What happened to it (the vocabulary migration
+                             0011 constrains).
+            before/after:    The item's previous and current state.
+            hop:             Derived hops from the originating change.
+            processed:       Stamp the event processed at birth — recorded,
+                             never drained (ADR 0014 D4).
+
+        Returns:
+            ``(contribution, event)``, the two halves of the notice written.
+
+        Raises:
+            sqlite3.Error: Nothing is written — the transaction rolls back,
+                so the notice never survives without its event.
+        """
+        with self._conn:  # one transaction: both rows, or neither
+            contribution_id = self._insert_contribution(
+                scope_id=scope_id,
+                content=content,
+                proposed_classification="context",
+                subject="manager-refresh",
+                supersedes=None,
+                contributor=contributor,
+            )
+            event_id = self._insert_change_event(
+                change_id=change_id,
+                contribution_id=contribution_id,
+                scope_id=scope_id,
+                source_scope_id=source_scope_id,
+                item_id=item_id,
+                kind=kind,
+                before=before,
+                after=after,
+                hop=hop,
+                processed=processed,
+            )
+        return self._fetch_contribution(contribution_id), self._fetch_change_event(event_id)
 
     def list_change_events(
         self, *, scope_id: str, unprocessed_only: bool = False
@@ -1887,7 +2045,7 @@ class RecordStore:
                               keeps them forever.
         """
         sql = """
-            SELECT id, change_id, contribution_id, scope_id, item_id, kind,
+            SELECT id, change_id, contribution_id, scope_id, source_scope_id, item_id, kind,
                    before, after, hop, processed_at, created_at
             FROM change_events
             WHERE scope_id = ?
@@ -1919,7 +2077,7 @@ class RecordStore:
     def _fetch_change_event(self, event_id: str) -> ChangeEvent:
         row = self._conn.execute(
             """
-            SELECT id, change_id, contribution_id, scope_id, item_id, kind,
+            SELECT id, change_id, contribution_id, scope_id, source_scope_id, item_id, kind,
                    before, after, hop, processed_at, created_at
             FROM change_events WHERE id = ?
             """,

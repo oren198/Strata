@@ -1646,6 +1646,7 @@ def cmd_operator_publish(args: argparse.Namespace) -> int:
             args.scope_id,
             args.content,
             args.subject,
+            fleet=stores.fleet_config,
             record_store=stores.record_store,
             summaries_dir=stores.summary_store.summaries_dir,
         )
@@ -1683,6 +1684,7 @@ def cmd_operator_supersede(args: argparse.Namespace) -> int:
                     item_id,
                     args.content,
                     args.subject,
+                    fleet=stores.fleet_config,
                     record_store=stores.record_store,
                     summaries_dir=stores.summary_store.summaries_dir,
                 )
@@ -1749,6 +1751,7 @@ def cmd_operator_retire(args: argparse.Namespace) -> int:
                 act = operator_retire_item(
                     args.scope_id,
                     item_id,
+                    fleet=stores.fleet_config,
                     record_store=stores.record_store,
                     summaries_dir=stores.summary_store.summaries_dir,
                 )
