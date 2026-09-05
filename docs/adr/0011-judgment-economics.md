@@ -2,6 +2,9 @@
 
 **Status:** Accepted (adversarially reviewed 2026-08-11; implementation
 pending — issues #131, #132, #133)
+**D4 amended by ADR 0014 (2026-09-05):** an input-change refresh's amendment
+may carry `append` and `publish` ops as well as `new_context` and lifecycle
+ops — see the amendment note in D4.
 **Date:** 2026-08-10, revised 2026-08-12
 **Related:** ADR 0004 D1 (the batched-manager work this ADR's D3 delivers,
 tracked separately there), D2 (whose closing property — "the manager remains
@@ -234,6 +237,18 @@ staleness detection (ADR 0004 D4) needs monotonicity, not one-tick-per-
 contribution, and this ADR states that rather than leaving it inferred.
 
 ### D4. The manager-refresh path is rebuilt on the same ops
+
+> **Amendment (2026-09-05, ADR 0014 D2):** this decision's drop of admitting
+> ops was correct for the launch-time parent-splice refresh below, and stays
+> for it. It does not hold for the reactive refresh ADR 0014 adds on an input
+> change other than a parent splice: that refresh's synthetic contribution is
+> a real record row reporting a real event (an input changed), so a directive
+> minted from it carries honest provenance — the thing this D4 said a refresh
+> never had. On that path the amendment may carry `append` and `publish` ops
+> as well as `new_context` and lifecycle ops. The splice-only refresh below is
+> unchanged: the parent's directives are already spliced in mechanically, so
+> admitting anything more from that judgment would still have nothing to mint
+> it from.
 
 `strata launch`'s refresh (ADR 0004 D4) currently judges a synthetic
 contribution whose entire purpose is to make the judge re-emit the summary
