@@ -154,6 +154,67 @@ def _init_stores() -> None:
     _session_store = SessionStateStore(_sessions_dir)
 
 
+def _drain_for_read(fleet, scope_id: str) -> int:
+    """Bring *scope_id* up to date before it is read, and say what is still owed.
+
+    ADR 0014 D6: the refresh queue is drained by the MCP server when a scope is
+    bound or its perspective is read, BEFORE composition, so nobody can read a
+    scope without first bringing it up to date — and the system is correct for
+    a user who never runs a CLI command at all.
+
+    Returns the number of change events still unprocessed AFTER the attempt:
+    ``0`` when the drain brought the scope up to date, and the outstanding
+    count when it could not. That count is a refresh queue depth, never a judge
+    outage (implementation pin 4) — the two are reported separately everywhere.
+
+    Never raises. A read must not fail because a refresh could not run (pin 5):
+    a judge outage leaves the events unprocessed, records its attempt rows
+    exactly as the contribute path does, and the caller returns the perspective
+    anyway with the events still listed. Only :class:`DrainFailed` is swallowed
+    — a bug is still a bug.
+
+    Deadlock: :func:`strata.app.drain_scope` takes ``scope_lock`` (ADR 0012)
+    and the read path holds no scope lock of its own, so this can only ever
+    WAIT on an in-flight judgment for the same scope, never deadlock against
+    one.
+    """
+    from strata.app import DrainFailed, drain_scope  # noqa: PLC0415
+
+    if _record_store is None or _summary_store is None:
+        return 0
+
+    pending = len(_record_store.list_change_events(scope_id=scope_id, unprocessed_only=True))
+    if pending == 0:
+        return 0
+
+    # No judge configured: skip rather than fail every read with an attempt row
+    # per pending event — the same soft skip `strata launch`'s refresh makes.
+    # The events stay, so the refresh is still owed and still visible.
+    if not (_settings.judge_api_key or _settings.anthropic_api_key):
+        return pending
+
+    try:
+        outcome = drain_scope(
+            scope_id,
+            fleet=fleet,
+            record_store=_record_store,
+            summary_store=_summary_store,
+            scope_manager=_build_scope_manager(),
+            summary_max_words=_settings.summary_max_words,
+            window_verbatim_tail=_settings.window_verbatim_tail,
+            recency_window_size=_settings.recency_window_size,
+        )
+    except DrainFailed as exc:
+        _logger.warning(
+            "refresh drain for scope %r failed (%s); %d change event(s) still pending",
+            scope_id,
+            exc.error_class,
+            exc.pending,
+        )
+        return exc.pending
+    return pending - outcome.events_processed
+
+
 def _record_read(scope_id: str) -> None:
     """Record one perspective/summary read for this session (best-effort, #110).
 
@@ -1722,10 +1783,17 @@ async def strata_bind(scope_id: str, skill: str | None = None, confirm: bool = F
             your own judgment; it must reflect the user's actual answer,
             given after you told them about the switch.
 
+    On a binding that actually happens, the newly bound scope's pending
+    input changes are drained first (ADR 0014 D6), so the session's first
+    read is already up to date. An unconfirmed switch drains nothing — it
+    bound nothing.
+
     Returns:
         On success: ``scope_id``, ``skill``, ``session_id`` (the new
-        binding — session_id unchanged), and ``message`` (a one-line
-        confirmation, noting the identity change when this was a switch).
+        binding — session_id unchanged), ``message`` (a one-line
+        confirmation, noting the identity change when this was a switch),
+        and ``refresh_pending`` when the drain left input changes still
+        unprocessed (absent when nothing is owed).
         On an unconfirmed switch: the binding UNCHANGED — same ``scope_id``/
         ``skill`` as before this call — plus ``switch_pending: True`` and a
         ``message`` explaining what to do next (ask the user, then call
@@ -1887,12 +1955,23 @@ async def strata_bind(scope_id: str, skill: str | None = None, confirm: bool = F
             f"Session id unchanged ({_AGENT_SESSION_ID!r})."
         )
 
+    # ADR 0014 D6: the scope this session just bound to is drained here, so
+    # the first read after a bind is already up to date. Only on a binding that
+    # actually happened — an unconfirmed switch returned above, and refreshing
+    # a scope the session did not bind to would be a judge call nobody asked
+    # for.
+    refresh_pending = _drain_for_read(fleet, _AGENT_SCOPE)
+
     result = {
         "scope_id": _AGENT_SCOPE,
         "skill": _AGENT_SKILL,
         "session_id": _AGENT_SESSION_ID,
         "message": message,
     }
+    if refresh_pending:
+        # Present only when the drain left something owed — see
+        # strata_read_perspective for why an absent key means "nothing owed".
+        result["refresh_pending"] = refresh_pending
     if _STARTUP_ERRORS_CONFIG:
         result["config_notice"] = (
             "Binding succeeded, but memory tools remain gated: "
@@ -2550,11 +2629,23 @@ async def strata_read_perspective(scope_id: str | None = None) -> dict:
             perspective *target*, which stays chain-only: you compose a
             perspective for your own chain, not for a peer's.
 
+    Before composing, this brings the scope up to date: any pending input
+    change — an upstream publication withdrawn, amended or added to, an
+    ancestor or operator directive changed — is judged by this scope's own
+    scope-manager first (ADR 0014 D6), so nobody reads a scope whose memory
+    has not been re-judged against its current inputs. The read never fails
+    on that account: if the refresh cannot run, the perspective comes back
+    anyway carrying ``refresh_pending``.
+
     Returns:
         ``{layers: [{scope_id, stratum_id, relation, binding, summary |
         directives | publication}], scope_id: <requested>, _layers_count:
         N}`` ordered root-first, then self, then the parent's publication
         layer, then sorted referenced-scope publication layers.
+        ``refresh_pending`` appears only when input changes are still
+        unprocessed — the refresh could not run (no judge configured, or the
+        scope-manager was unavailable) — so an absent key means nothing is
+        owed. It counts pending refreshes, never judge outages.
 
     Raises:
         RuntimeError: If the scope is unknown, or if scope_id is outside this
@@ -2571,6 +2662,10 @@ async def strata_read_perspective(scope_id: str | None = None) -> dict:
     scope = fleet.get_scope(scope_id)
     if scope is None:
         raise RuntimeError(f"Scope not found: {scope_id!r}")
+
+    # ADR 0014 D6: drain BEFORE composing — the perspective an agent reads is
+    # the one its refreshed memory produces, not the pre-refresh one.
+    refresh_pending = _drain_for_read(fleet, scope_id)
 
     # Read receipt (#110): a perspective read is attributed to its TARGET scope
     # (the scope whose perspective was requested), not fanned out to every
@@ -2597,15 +2692,21 @@ async def strata_read_perspective(scope_id: str | None = None) -> dict:
     def _publication_reader(peer_scope_id: str) -> list:
         return read_publication(peer_scope_id, summaries_dir=_summaries_dir)
 
-    return _attach_nudge(
-        compose_perspective(
-            scope_id,
-            fleet=fleet,
-            summary_store=_summary_store,
-            operator_reader=_operator_reader,
-            publication_reader=_publication_reader,
-        )
+    perspective = compose_perspective(
+        scope_id,
+        fleet=fleet,
+        summary_store=_summary_store,
+        operator_reader=_operator_reader,
+        publication_reader=_publication_reader,
     )
+    # What the drain could NOT bring up to date (ADR 0014 D6). Present only
+    # when non-zero — the same discipline `fleet_notice` and `unbound_notice`
+    # follow: a key that appears exactly when there is something to say, so an
+    # ordinary up-to-date read is byte-identical to compose_perspective's own
+    # dict, and a stale one announces itself.
+    if refresh_pending:
+        perspective["refresh_pending"] = refresh_pending
+    return _attach_nudge(perspective)
 
 
 # ---------------------------------------------------------------------------
