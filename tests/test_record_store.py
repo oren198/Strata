@@ -1276,6 +1276,82 @@ class TestChangeEvents:
 
         assert event.source_scope_id is None
 
+    def test_append_change_notice_writes_both_halves_atomically(self, store) -> None:
+        """The notice and its row are one event (ADR 0014 D5), so they are one
+        write: a reader can never find a `manager-refresh` contribution with
+        no event behind it, or an event whose notice nobody can read."""
+        contribution, event = store.append_change_notice(
+            scope_id="g_ceo",
+            content="[Input change chg_1 ...]",
+            contributor=ContributorRef(
+                scope_id="g_ceo", skill="scope-manager", session_id="change-event", ts="t"
+            ),
+            change_id="chg_1",
+            source_scope_id="g_eng",
+            item_id="pub_abc",
+            kind="withdrawn",
+            before="the claim as it stood",
+        )
+
+        assert contribution.subject == "manager-refresh"
+        assert event.contribution_id == contribution.id
+        assert store.list_change_events(scope_id="g_ceo") == [event]
+        assert [c.id for c in store.list_contributions(scope_id="g_ceo")] == [contribution.id]
+
+    def test_a_failed_event_write_leaves_no_orphan_notice(self, store) -> None:
+        """Precondition: a good notice DOES land. Then a bad one lands nothing
+        — no contribution nothing will ever judge."""
+        store.append_change_notice(
+            scope_id="g_ceo",
+            content="good",
+            contributor=ContributorRef(
+                scope_id="g_ceo", skill="scope-manager", session_id="change-event", ts="t"
+            ),
+            change_id="chg_1",
+            source_scope_id="g_eng",
+            item_id="pub_abc",
+            kind="withdrawn",
+        )
+        assert len(store.list_contributions(scope_id="g_ceo")) == 1
+
+        with pytest.raises(sqlite3.IntegrityError):
+            store.append_change_notice(
+                scope_id="g_ceo",
+                content="orphan candidate",
+                contributor=ContributorRef(
+                    scope_id="g_ceo", skill="scope-manager", session_id="change-event", ts="t"
+                ),
+                change_id="chg_2",
+                source_scope_id="g_eng",
+                item_id="pub_abc",
+                # Outside the settled vocabulary: the CHECK in migration 0011
+                # refuses it, and the notice must go back with it.
+                kind="not-a-kind",
+            )
+
+        assert len(store.list_contributions(scope_id="g_ceo")) == 1
+        assert len(store.list_change_events(scope_id="g_ceo")) == 1
+
+    def test_a_change_notice_can_be_marked_processed_at_birth(self, store) -> None:
+        """A notice the drain must never run (ADR 0014 D4: already refreshed
+        for this change id, or past the hop budget) is still WRITTEN — the
+        record never loses a notice — just never pending."""
+        _, event = store.append_change_notice(
+            scope_id="g_ceo",
+            content="already refreshed",
+            contributor=ContributorRef(
+                scope_id="g_ceo", skill="scope-manager", session_id="change-event", ts="t"
+            ),
+            change_id="chg_1",
+            source_scope_id="g_eng",
+            item_id="pub_abc",
+            kind="withdrawn",
+            processed=True,
+        )
+
+        assert event.processed_at is not None
+        assert store.list_change_events(scope_id="g_ceo", unprocessed_only=True) == []
+
     def test_events_are_listed_oldest_first_and_scoped(self, store) -> None:
         cid = _contribute(store, "notice")
         first = store.append_change_event(

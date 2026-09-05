@@ -26,7 +26,8 @@ This module is the trigger half of the fix:
 
 What bounds a wave is the **change id** (ADR 0014 D4). Every independent
 input change mints one; every change derived from processing it inherits it
-(``inherit_from``); a scope takes a given change id **at most once**. Chain
+(``inherit_from``); a scope **refreshes** for a given change id at most
+once, however many notices of it reach the scope. Chain
 edges form a tree and would need none of this — reference edges may form
 cycles and need all of it. :data:`HOP_BUDGET` is the backstop for bugs, not
 the mechanism.
@@ -99,6 +100,7 @@ def affected_scopes(
     item: str,
     kind: str,
     source_scope_id: str,
+    by_operator: bool = False,
 ) -> list[str]:
     """Return the ids of the scopes that compose *item*, in a deterministic order.
 
@@ -123,12 +125,19 @@ def affected_scopes(
             descendants, so the answer is empty rather than an error — a
             scope can be removed from ``fleet.yaml`` between an act and its
             emission.
+        by_operator: The change was authored by the OPERATOR, from outside
+            the fleet (ADR 0008 D4's in-person correction). A directive
+            change then reaches the holding scope itself as well as its
+            descendants — implementation pin 2's "an operator directive
+            change on S affects S and its descendants". The scope is a
+            reader of what the operator did to it, not its author. Ignored
+            for a publication change, which never reaches its own source.
 
     Returns:
-        Affected scope ids, sorted, each at most once, never including
-        *source_scope_id* — except for
-        :data:`OPERATOR_DIRECTIVE_CHANGED`, whose layer binds the attachment
-        scope itself.
+        Affected scope ids, sorted, each at most once. *source_scope_id* is
+        included only when the change came from outside the scope's own
+        authority: :data:`OPERATOR_DIRECTIVE_CHANGED`, whose layer binds the
+        attachment scope, and any directive change with *by_operator*.
 
     Raises:
         ValueError: *kind* is outside the settled vocabulary. Guessing a rule
@@ -145,18 +154,20 @@ def affected_scopes(
         affected |= {s.id for s in fleet.referenced_by(source_scope_id)}
     elif kind in DIRECTIVE_KINDS:
         # A directive binds the holding scope's whole subtree. The scope
-        # itself is excluded: its own directive set changing is its own act,
-        # and ADR 0014 D1 makes a scope's own contribution not a trigger for
-        # the scope.
+        # itself is excluded when the change is its OWN — ADR 0014 D1: a
+        # scope's contribution is not a trigger for the scope, because it
+        # already has a path. An OPERATOR correction is not the scope's own
+        # act: it comes from outside, and the scope is as blind to it as any
+        # descendant (implementation pin 2).
         affected = {s.id for s in fleet.chain_descendants(source_scope_id)}
+        if by_operator:
+            _add_source_if_active(affected, fleet, source_scope_id)
     elif kind == OPERATOR_DIRECTIVE_CHANGED:
         # ADR 0008 D2: attached at S, the operator layer composes above S and
         # binds S's subtree — so S is affected too. Nobody in the fleet
         # authored this change; the operator did, from outside.
         affected = {s.id for s in fleet.chain_descendants(source_scope_id)}
-        attachment = fleet.get_scope(source_scope_id)
-        if attachment is not None and attachment.status == "active":
-            affected.add(source_scope_id)
+        _add_source_if_active(affected, fleet, source_scope_id)
     else:
         raise ValueError(
             f"Unknown change-event kind {kind!r} for item {item!r} in scope "
@@ -164,6 +175,17 @@ def affected_scopes(
             f"{sorted(PUBLICATION_KINDS | DIRECTIVE_KINDS | {OPERATOR_DIRECTIVE_CHANGED})}."
         )
     return sorted(affected)
+
+
+def _add_source_if_active(affected: set[str], fleet: FleetConfig, source_scope_id: str) -> None:
+    """Include the source scope in *affected*, if the fleet still has it active.
+
+    An archived scope has no judge to wake, and a scope removed from
+    ``fleet.yaml`` between an act and its emission is not addressable.
+    """
+    scope = fleet.get_scope(source_scope_id)
+    if scope is not None and scope.status == "active":
+        affected.add(source_scope_id)
 
 
 # ---------------------------------------------------------------------------
@@ -228,24 +250,35 @@ def emit(
     after: str | None = None,
     inherit_from: str | None = None,
     hop: int = 0,
+    by_operator: bool = False,
 ) -> str:
     """Notify every scope affected by a change to *item*, and return the change id.
 
     For each scope :func:`affected_scopes` names, appends a
     ``subject="manager-refresh"`` contribution carrying the rendered payload
-    and a :class:`~strata.record_store.ChangeEvent` row linked to it — one
-    event, two halves (ADR 0014 D5). Nothing is judged here and no LLM is
-    called: the writer of an input change writes its events and returns (D6).
+    and the :class:`~strata.record_store.ChangeEvent` row linked to it — one
+    event, two halves, written in one transaction (ADR 0014 D5). Nothing is
+    judged here and no LLM is called: the writer of an input change writes
+    its events and returns (D6).
 
-    Two rules bound what this can set off:
+    **The notice is never suppressed; only the refresh is.** ADR 0014 D4
+    bounds a wave at one refresh per scope per change id, and that is a
+    statement about judging, not about telling. Every affected scope is told
+    what changed, and the record keeps every notice — a notice that can
+    vanish is not notice (D5). What varies is whether the notice is
+    ENQUEUED:
 
-    - **Once per scope per change id** (D4). A scope that already holds a row
-      for this change id is skipped, *processed or not* — a processed row
-      means the refresh already ran, which is exactly the case a cycle would
-      otherwise re-arm.
-    - **The hop budget** (D4). Past :data:`HOP_BUDGET` the event is still
-      written — hitting the backstop is recorded, never silent — with a note
-      saying so, and immediately marked processed so no drain will run it.
+    - The scope has this change **pending**: the new notice is pending too.
+      The drain batches everything pending for a scope into ONE refresh
+      (implementation pin 1), so it still refreshes exactly once.
+    - The scope has **already refreshed** for this change id: the notice is
+      written stamped processed at birth, carrying a note saying why no
+      refresh follows.
+    - Past the **hop budget** (:data:`HOP_BUDGET`): the same, with a note
+      naming the backstop — hitting it is recorded, never silent.
+
+    The one thing not written twice is the same ITEM under the same change
+    id: a cascade that revisits it has nothing to add.
 
     This function never raises. Emission is not the originating act: a
     publish that succeeded must not be undone because its notice could not be
@@ -265,6 +298,9 @@ def emit(
             correct only for an independent input change.
         hop: How many derived hops from the originating change this is. A
             caller that inherits an id passes its own hop + 1.
+        by_operator: The operator authored this change from outside the
+            fleet, which widens a directive change's affected set to include
+            the holding scope (see :func:`affected_scopes`).
 
     Returns:
         The change id — minted or inherited — so the caller can thread it
@@ -273,7 +309,13 @@ def emit(
     """
     change_id = inherit_from if inherit_from is not None else new_change_id()
     try:
-        scope_ids = affected_scopes(fleet, item=item, kind=kind, source_scope_id=source_scope_id)
+        scope_ids = affected_scopes(
+            fleet,
+            item=item,
+            kind=kind,
+            source_scope_id=source_scope_id,
+            by_operator=by_operator,
+        )
     except Exception:  # noqa: BLE001 — the notice, never the act
         # An unknown kind is a bug in the caller and a broken traversal a bug
         # here; neither is a reason to undo an act that already succeeded.
@@ -301,17 +343,30 @@ def emit(
 
     for scope_id in scope_ids:
         try:
-            if _already_seen(record_store, scope_id=scope_id, change_id=change_id):
-                # ADR 0014 D4: at most one refresh per scope per change id.
-                # This is what makes a reference cycle terminate.
-                continue
-            note = (
-                f"hop budget of {HOP_BUDGET} exceeded at hop {hop}; recorded, not "
-                "enqueued for a refresh (ADR 0014 D4)"
-                if over_budget
-                else None
+            already_announced, already_refreshed = _prior_notices(
+                record_store, scope_id=scope_id, change_id=change_id, item=item
             )
-            contribution = record_store.append_contribution(
+            if already_announced:
+                # This exact item, under this exact wave, has already been
+                # announced to this scope — a cascade revisiting it has
+                # nothing to add.
+                continue
+
+            # ADR 0014 D4 bounds the REFRESH, never the NOTICE. A scope that
+            # has already refreshed for this change id is still TOLD what
+            # happened — the row is written, stamped processed at birth, so
+            # no second refresh follows for one change. A scope with the
+            # change still PENDING takes this notice pending too: the drain
+            # batches everything pending into one refresh (implementation
+            # pin 1), so it still refreshes exactly once.
+            processed = over_budget or already_refreshed
+            note = _suppression_note(
+                change_id=change_id,
+                hop=hop,
+                over_budget=over_budget,
+                already_refreshed=already_refreshed,
+            )
+            record_store.append_change_notice(
                 scope_id=scope_id,
                 content=_render_notice(
                     change_id=change_id,
@@ -322,24 +377,16 @@ def emit(
                     after=after,
                     note=note,
                 ),
-                proposed_classification="context",
-                subject="manager-refresh",
-                supersedes=None,
                 contributor=_notice_contributor(scope_id),
-            )
-            event = record_store.append_change_event(
                 change_id=change_id,
-                contribution_id=contribution.id,
-                scope_id=scope_id,
                 source_scope_id=source_scope_id,
                 item_id=item,
                 kind=kind,
                 before=before,
                 after=after,
                 hop=hop,
+                processed=processed,
             )
-            if over_budget:
-                record_store.mark_change_event_processed(event.id)
         except Exception:  # noqa: BLE001 — one scope's notice, not the act
             _logger.exception(
                 "failed to enqueue change %s (%s of %s in %s) for scope %s",
@@ -361,15 +408,51 @@ def emit(
     return change_id
 
 
-def _already_seen(record_store: RecordStore, *, scope_id: str, change_id: str) -> bool:
-    """Has *scope_id* already been told about *change_id*? (ADR 0014 D4.)
+def _prior_notices(
+    record_store: RecordStore, *, scope_id: str, change_id: str, item: str
+) -> tuple[bool, bool]:
+    """What *scope_id* already holds for *change_id* — ``(announced, refreshed)``.
 
-    Reads every event of the scope, processed included: "at most once" counts
-    a refresh that already ran, not only a pending one.
+    ``announced`` is True when this exact item has already been announced to
+    this scope under this change id: re-announcing it would add nothing, and
+    a cascade can revisit the same item.
+
+    ``refreshed`` is True when ANY row for this change id has been processed
+    — the scope's one refresh for this wave has already run (ADR 0014 D4), so
+    a further notice is recorded but never enqueued.
     """
-    return any(
-        event.change_id == change_id for event in record_store.list_change_events(scope_id=scope_id)
-    )
+    announced = False
+    refreshed = False
+    for event in record_store.list_change_events(scope_id=scope_id):
+        if event.change_id != change_id:
+            continue
+        if event.item_id == item:
+            announced = True
+        if event.processed_at is not None:
+            refreshed = True
+    return announced, refreshed
+
+
+def _suppression_note(
+    *, change_id: str, hop: int, over_budget: bool, already_refreshed: bool
+) -> str | None:
+    """Why this notice will not be drained, in the notice itself, or ``None``.
+
+    A notice recorded but never enqueued has to say so where the notice
+    lives; leaving it to a log line would make the record misleading about
+    what happens next.
+    """
+    if over_budget:
+        return (
+            f"hop budget of {HOP_BUDGET} exceeded at hop {hop}; recorded, not "
+            "enqueued for a refresh (ADR 0014 D4)"
+        )
+    if already_refreshed:
+        return (
+            f"already refreshed for {change_id}; recorded, not enqueued — a scope "
+            "refreshes at most once per change id (ADR 0014 D4)"
+        )
+    return None
 
 
 def _record_emission_failure(

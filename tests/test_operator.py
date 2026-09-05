@@ -564,8 +564,15 @@ def test_operator_supersede_leaves_contribution_and_judgment_rows(
         summary_store=summary_store,
     )
 
-    contributions = record_store.list_contributions(scope_id="g_team")
-    assert len(contributions) == 2  # the original + the operator's correction
+    # The original + the operator's correction. The input-change notice the
+    # correction also appends (ADR 0014 D5) carries no memory of its own and
+    # is not one of the scope's memory contributions.
+    contributions = [
+        c
+        for c in record_store.list_contributions(scope_id="g_team")
+        if c.subject != "manager-refresh"
+    ]
+    assert len(contributions) == 2
     new_contribution = next(c for c in contributions if c.id == new_directive.id)
     assert new_contribution.supersedes == directive_id
     assert new_contribution.contributor.scope_id == "operator"
@@ -709,8 +716,13 @@ def test_operator_retire_leaves_retirements_row_no_contribution(
     )
 
     after_contributions = record_store.list_contributions(scope_id="g_team")
-    # No contribution row fabricated by the retire.
-    assert len(after_contributions) == len(before_contributions)
+    # No contribution row fabricated by the retire: no new memory entered
+    # (ADR 0008 D4). The one row added is the mechanical input-change NOTICE
+    # (ADR 0014 D5, subject="manager-refresh") — it carries no memory of its
+    # own, it says an input moved, and the scope's judge decides what that
+    # means. Retirement stays the thing that explains the retirement.
+    added = [c for c in after_contributions if c not in before_contributions]
+    assert [c.subject for c in added] == ["manager-refresh"]
 
     retirements = record_store.list_retirements(scope_id="g_team")
     assert len(retirements) == 1
@@ -879,9 +891,16 @@ def test_corrections_are_explainable_by_the_record(fleet, record_store, summary_
     summary = summary_store.read("g_team")
     assert summary.directives == []
 
-    # Every step is reconstructable from the record: two contributions
-    # (original seed + operator's supersede), one retirement event.
-    contributions = record_store.list_contributions(scope_id="g_team")
+    # Every step is reconstructable from the record: two MEMORY contributions
+    # (original seed + operator's supersede), one retirement event. The
+    # input-change notices each correction also appends (ADR 0014 D5) carry
+    # no memory — they say an input moved — so they are excluded here rather
+    # than counted as steps in the summary's derivation.
+    contributions = [
+        c
+        for c in record_store.list_contributions(scope_id="g_team")
+        if c.subject != "manager-refresh"
+    ]
     assert len(contributions) == 2
     retirements = record_store.list_retirements(scope_id="g_team")
     assert len(retirements) == 1
@@ -1044,9 +1063,14 @@ def test_operator_supersede_correction_tells_the_descendants(
     assert event.item_id == directive_id
     assert event.source_scope_id == "g_func"
     assert new_directive.id in (event.after or "")
-    # The corrected scope is not told about its own directive set (ADR 0014
-    # D1) — the correction is already in its summary.
-    assert record_store.list_change_events(scope_id="g_func") == []
+    # The corrected scope IS told: implementation pin 2 — an operator
+    # directive change on S affects S and its descendants. "A scope's own
+    # contribution is not a trigger" is about the scope's own agents
+    # contributing through the ordinary path, not about the operator editing
+    # what binds it from outside.
+    (own,) = record_store.list_change_events(scope_id="g_func")
+    assert own.kind == "directive_superseded"
+    assert own.item_id == directive_id
 
 
 def test_operator_retire_correction_tells_the_descendants(
@@ -1069,7 +1093,8 @@ def test_operator_retire_correction_tells_the_descendants(
     assert retirement.directive_id == directive_id
     assert [d.id for d in summary_store.read("g_func").directives] == []
 
-    (event,) = record_store.list_change_events(scope_id="g_team")
-    assert event.kind == "directive_retired"
-    assert event.item_id == directive_id
-    assert event.after is None
+    for scope_id in ("g_func", "g_team"):
+        (event,) = record_store.list_change_events(scope_id=scope_id)
+        assert event.kind == "directive_retired"
+        assert event.item_id == directive_id
+        assert event.after is None

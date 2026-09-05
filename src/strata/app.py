@@ -97,6 +97,7 @@ from pydantic import BaseModel, Field, field_validator
 from strata import __version__
 from strata.bootstrap import load_fleet_config
 from strata.change_events import emit as emit_change_event
+from strata.change_events import new_change_id
 from strata.fleet_config import FleetConfig, FleetConfigError, Scope, Stratum
 from strata.fleet_reload import FleetReloader
 from strata.locks import BATCH_CAP, QUEUE_WAIT_TIMEOUT_S, QueueTicket, configure_lock_dir
@@ -622,6 +623,14 @@ def _write_amendment(
     provenance.
     """
     assert judgment.new_summary is not None  # noqa: S101 — caller-checked invariant
+    # ADR 0014 D4 — ONE originating act, one change id. An amendment that
+    # withdraws published items AND moves the directive set is a single
+    # input change however many consequences it has, so the id is minted
+    # once here and threaded into all three emitters below; on a refresh the
+    # judgment already carries the id of the change that triggered it, and
+    # everything derived inherits that instead (implementation pin 8 — the
+    # id is a parameter, never a lookup).
+    change_id = judgment.change_id if judgment.change_id is not None else new_change_id()
     # Stamp the parent-summary version the judgment was built from, so
     # staleness stays detectable without re-running the LLM (ADR 0004 D4).
     to_write = judgment.new_summary.model_copy(
@@ -660,10 +669,7 @@ def _write_amendment(
             fleet=fleet,
             record_store=record_store,
             summaries_dir=str(summary_store.summaries_dir),
-            # ADR 0014 D4/D8 — a withdrawal made on a refresh is derived from
-            # the change that triggered it and inherits its id, threaded
-            # through as a parameter rather than looked up.
-            change_id=judgment.change_id,
+            change_id=change_id,
         )
 
     # 2. Mechanical propagation (D3): any published item anchored ONLY to
@@ -687,7 +693,7 @@ def _write_amendment(
             fleet=fleet,
             record_store=record_store,
             summaries_dir=str(summary_store.summaries_dir),
-            change_id=judgment.change_id,
+            change_id=change_id,
         )
 
     # ADR 0014 D1/D3 — a scope's own contribution is not a trigger for the
@@ -702,6 +708,7 @@ def _write_amendment(
         fleet=fleet,
         record_store=record_store,
         previous_summary=previous_summary,
+        change_id=change_id,
     )
 
 
@@ -712,6 +719,7 @@ def _emit_directive_set_change(
     fleet: FleetConfig,
     record_store: RecordStore,
     previous_summary: ScopeSummary | None,
+    change_id: str,
 ) -> None:
     """Tell this scope's descendants that its directive set changed (ADR 0014 D1).
 
@@ -751,10 +759,9 @@ def _emit_directive_set_change(
         source_scope_id=scope.id,
         before=", ".join(sorted(previous_ids)) or None,
         after=", ".join(sorted(current_ids)) or None,
-        # ADR 0014 D4 — a directive admitted on a refresh is DERIVED from the
-        # change that triggered that refresh; an ordinary contribution
-        # belongs to no wave and mints a fresh id.
-        inherit_from=judgment.change_id,
+        # The amendment's own change id, minted or inherited by
+        # _write_amendment: one act, one change (ADR 0014 D4).
+        inherit_from=change_id,
     )
 
 

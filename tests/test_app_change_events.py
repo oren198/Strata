@@ -333,3 +333,55 @@ def test_the_contribute_route_emits_because_it_shares_the_choke_point(
     with RecordStore(db_path) as store:
         (event,) = store.list_change_events(scope_id="g_ce_child")
     assert event.kind == "directive_appended"
+
+
+def test_one_amendment_is_one_input_change(fleet, record_store, summary_store) -> None:
+    """An amendment that withdraws a published item AND moves the directive
+    set is ONE input change (ADR 0014 D4), so every notice it produces —
+    across both emitters — carries the same change id.
+    """
+    from strata.publication import PublishedItem, _write_publication, read_publication
+
+    summaries_dir = str(summary_store.summaries_dir)
+    act = record_store.append_publication_act(
+        scope_id="g_ce_parent",
+        act="publish",
+        kind="context",
+        content="Deploys are at 3pm.",
+        subject="deploys",
+        anchors=["subject:deploys"],
+        withdraws=None,
+        trigger=None,
+        proposer=_contributor(),
+    )
+    _write_publication(
+        "g_ce_parent",
+        [
+            PublishedItem(
+                id=act.id,
+                kind="context",
+                content="Deploys are at 3pm.",
+                subject="deploys",
+                anchors=["subject:deploys"],
+                published_at=act.created_at,
+            )
+        ],
+        summaries_dir=summaries_dir,
+    )
+
+    judgment = ScopeManagerJudgment(
+        decision="accept_as_directive",
+        reasoning="No longer believed; new rule binds.",
+        new_summary=_summary(_directive("c_new")),
+        withdraw_published=[act.id],
+    )
+
+    outcome = _run(fleet, record_store, summary_store, judgment)
+
+    # Preconditions: the amendment really did both things.
+    assert outcome.summary_updated is True
+    assert read_publication("g_ce_parent", summaries_dir=summaries_dir) == []
+
+    events = record_store.list_change_events(scope_id="g_ce_child")
+    assert {e.kind for e in events} == {"withdrawn", "directive_appended"}
+    assert len({e.change_id for e in events}) == 1

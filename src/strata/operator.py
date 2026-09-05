@@ -771,10 +771,11 @@ def operator_supersede(
             summaries_dir=str(summary_store.summaries_dir),
         )
 
-        # ADR 0014 D1/D3 — the corrected scope's directive set changed, so
-        # every descendant composing it must re-judge. The scope itself is
-        # not told: the correction is already in its summary, exactly as its
-        # own judge's amendment would be.
+        # ADR 0014 D1/D3 — the corrected scope's directive set changed, so it
+        # and every descendant composing it must re-judge. `by_operator`
+        # widens the set to include the scope itself (implementation pin 2):
+        # this correction came from OUTSIDE the scope's own authority, so the
+        # scope is as blind to it as any descendant.
         emit_change_event(
             fleet=fleet,
             record_store=record_store,
@@ -783,6 +784,7 @@ def operator_supersede(
             source_scope_id=scope_id,
             before=existing.content,
             after=f"{new_directive.id}: {content}",
+            by_operator=True,
         )
         return new_directive
 
@@ -860,8 +862,8 @@ def operator_retire(
             summaries_dir=str(summary_store.summaries_dir),
         )
 
-        # ADR 0014 D1/D3 — see operator_supersede: the descendants composed
-        # this directive and no longer do.
+        # ADR 0014 D1/D3 — see operator_supersede: the scope and its
+        # descendants composed this directive and no longer do.
         emit_change_event(
             fleet=fleet,
             record_store=record_store,
@@ -869,5 +871,6 @@ def operator_retire(
             kind="directive_retired",
             source_scope_id=scope_id,
             before=existing.content,
+            by_operator=True,
         )
         return retirement

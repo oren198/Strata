@@ -175,6 +175,24 @@ class TestAffectedScopes:
             source_scope_id="g_funcA",
         ) == ["g_funcA", "g_teamX", "g_teamY"]
 
+    def test_an_operator_authored_directive_change_includes_the_scope(
+        self, fleet: FleetConfig
+    ) -> None:
+        """Implementation pin 2 — the operator correcting S's own directive is
+        an operator directive change on S: S and its descendants. Precondition
+        first: the same kind, authored by the scope, excludes S."""
+        assert "g_funcA" not in affected_scopes(
+            fleet, item="c_1", kind="directive_superseded", source_scope_id="g_funcA"
+        )
+
+        assert affected_scopes(
+            fleet,
+            item="c_1",
+            kind="directive_superseded",
+            source_scope_id="g_funcA",
+            by_operator=True,
+        ) == ["g_funcA", "g_teamX", "g_teamY"]
+
     def test_a_reference_cycle_does_not_loop(self, fleet: FleetConfig) -> None:
         """g_funcA and g_funcB reference each other; the walk is one hop, so it
         terminates by construction and each scope appears at most once."""
@@ -285,11 +303,17 @@ class TestEmit:
         events = record_store.list_change_events(scope_id="g_teamX")
         assert [e.change_id for e in events] == [original]
 
-    def test_a_scope_already_holding_the_change_id_is_skipped(
+    def test_a_second_notice_for_a_pending_change_id_is_still_written_pending(
         self, fleet: FleetConfig, record_store: RecordStore
     ) -> None:
-        """One refresh per scope per change id (ADR 0014 D4) — an unprocessed
-        row for that id already stands, so a second is not written."""
+        """Once-per-id bounds the REFRESH, never the NOTICE (ADR 0014 D4/D5).
+
+        A scope with a pending row for this change id takes the second notice
+        pending too: the drain batches what is pending into ONE refresh
+        (implementation pin 1), so the scope still refreshes once — and the
+        record keeps both notices, because a notice that vanishes is not
+        notice.
+        """
         change_id = emit(
             fleet=fleet,
             record_store=record_store,
@@ -297,8 +321,8 @@ class TestEmit:
             kind="withdrawn",
             source_scope_id="g_funcA",
         )
-        # Precondition: the first emission landed.
-        assert len(record_store.list_change_events(scope_id="g_funcB")) == 1
+        # Precondition: the first emission landed, unprocessed.
+        assert len(record_store.list_change_events(scope_id="g_funcB", unprocessed_only=True)) == 1
 
         emit(
             fleet=fleet,
@@ -310,13 +334,19 @@ class TestEmit:
             hop=1,
         )
 
-        assert len(record_store.list_change_events(scope_id="g_funcB")) == 1
+        events = record_store.list_change_events(scope_id="g_funcB")
+        assert [e.item_id for e in events] == ["pub_1", "pub_2"]
+        assert all(e.change_id == change_id for e in events)
+        # Both pending: one batched refresh will consume them together.
+        assert len(record_store.list_change_events(scope_id="g_funcB", unprocessed_only=True)) == 2
 
-    def test_a_processed_event_still_suppresses_a_second(
+    def test_a_notice_for_an_already_processed_change_id_lands_processed(
         self, fleet: FleetConfig, record_store: RecordStore
     ) -> None:
-        """ "At most once" counts a refresh that already RAN, not only a pending
-        one — otherwise a cycle would re-arm every scope it came back to."""
+        """A scope that already REFRESHED for this change id never refreshes
+        again for it (ADR 0014 D4) — but it is still told what happened: the
+        row is written, stamped processed at birth, and its notice says why
+        no refresh follows."""
         change_id = emit(
             fleet=fleet,
             record_store=record_store,
@@ -326,13 +356,46 @@ class TestEmit:
         )
         (event,) = record_store.list_change_events(scope_id="g_teamX")
         record_store.mark_change_event_processed(event.id)
-        # Precondition: it really is processed now.
+        # Precondition: the refresh really did run for this id.
         assert record_store.list_change_events(scope_id="g_teamX", unprocessed_only=True) == []
 
         emit(
             fleet=fleet,
             record_store=record_store,
             item="pub_2",
+            kind="withdrawn",
+            source_scope_id="g_funcA",
+            inherit_from=change_id,
+            hop=1,
+        )
+
+        events = record_store.list_change_events(scope_id="g_teamX")
+        assert [e.item_id for e in events] == ["pub_1", "pub_2"]
+        # Recorded, never enqueued: no second refresh for one change id.
+        assert record_store.list_change_events(scope_id="g_teamX", unprocessed_only=True) == []
+        notice = record_store.get_contribution(events[-1].contribution_id)
+        assert notice is not None
+        assert f"already refreshed for {change_id}" in notice.content
+
+    def test_the_same_item_is_not_announced_twice_for_one_change_id(
+        self, fleet: FleetConfig, record_store: RecordStore
+    ) -> None:
+        """Dedup is per (change id, scope, item): a cascade that revisits the
+        SAME item under the same wave adds nothing, while a different item
+        under that wave is a genuinely new notice (the test above)."""
+        change_id = emit(
+            fleet=fleet,
+            record_store=record_store,
+            item="pub_1",
+            kind="withdrawn",
+            source_scope_id="g_funcA",
+        )
+        assert len(record_store.list_change_events(scope_id="g_teamX")) == 1
+
+        emit(
+            fleet=fleet,
+            record_store=record_store,
+            item="pub_1",
             kind="withdrawn",
             source_scope_id="g_funcA",
             inherit_from=change_id,
@@ -425,7 +488,7 @@ class TestEmit:
         def _boom(**_kwargs: object) -> None:
             raise sqlite3.OperationalError("database is locked")
 
-        monkeypatch.setattr(record_store, "append_change_event", _boom)
+        monkeypatch.setattr(record_store, "append_change_notice", _boom)
 
         with caplog.at_level("ERROR", logger="strata.change_events"):
             change_id = emit(
@@ -456,20 +519,14 @@ class TestEmit:
             if scope_id in note.content
         }
 
-        # KNOWN SEAM, asserted so it stays visible: the notice contribution
-        # and its event row are two appends, and this failure lands between
-        # them — so g_teamX keeps a `manager-refresh` contribution with no
-        # event row behind it. Nothing will judge it (the drain finds work
-        # through change_events, not through contributions), so it sits
-        # pending. Making the two atomic means one transaction inside the
-        # record store, which is not this phase's to open.
-        orphans = [
+        # The notice and its row are ONE write, so a failure leaves neither
+        # half: no `manager-refresh` contribution nothing will ever judge.
+        assert record_store.list_change_events(scope_id="g_teamX") == []
+        assert [
             c
             for c in record_store.list_contributions(scope_id="g_teamX")
             if c.subject == "manager-refresh"
-        ]
-        assert len(orphans) == 1
-        assert record_store.list_change_events(scope_id="g_teamX") == []
+        ] == []
 
     def test_a_broken_traversal_is_swallowed_too(
         self,
