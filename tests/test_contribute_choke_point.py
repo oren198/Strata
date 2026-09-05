@@ -118,6 +118,11 @@ class _AccumulatingManager:
         operator_memory=None,
         current_publication=None,
         peer_publications=None,
+        parent_publication=None,
+        mode="ordinary",
+        input_changes=None,
+        change_id=None,
+        hop=0,
         window_verbatim_tail=None,
     ):  # noqa: ANN001, ANN201, E501
         existing = list(current_summary.directives) if current_summary is not None else []
@@ -163,6 +168,11 @@ class _SkillEchoManager:
         operator_memory=None,
         current_publication=None,
         peer_publications=None,
+        parent_publication=None,
+        mode="ordinary",
+        input_changes=None,
+        change_id=None,
+        hop=0,
         window_verbatim_tail=None,
     ):  # noqa: ANN001, ANN201, E501
         directive = Directive(
@@ -521,6 +531,11 @@ class _CapturingManager:
         operator_memory=None,
         current_publication=None,
         peer_publications=None,
+        parent_publication=None,
+        mode="ordinary",
+        input_changes=None,
+        change_id=None,
+        hop=0,
         window_verbatim_tail=None,
     ):  # noqa: ANN001, ANN201, E501
         self.received_operator_memory = operator_memory

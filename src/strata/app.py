@@ -114,6 +114,7 @@ from strata.publication import (
 from strata.record_store import (
     JUDGE_FAILED,
     RECENCY_WINDOW_SIZE,
+    ChangeEvent,
     Contribution,
     ContributorRef,
     RecentContribution,
@@ -121,6 +122,7 @@ from strata.record_store import (
 )
 from strata.scope_manager import (
     WINDOW_VERBATIM_TAIL,
+    JudgeMode,
     ScopeManager,
     ScopeManagerBatchJudgment,
     ScopeManagerJudgment,
@@ -439,6 +441,7 @@ class _JudgeInputs:
     operator_memory: list
     current_publication: list
     peer_publications: list
+    parent_publication: tuple[str, list] | None
 
 
 def _read_judge_inputs(
@@ -482,6 +485,21 @@ def _read_judge_inputs(
         (peer.id, read_publication(peer.id, summaries_dir=str(summary_store.summaries_dir)))
         for peer in sorted(entitlement.referenced_peers, key=lambda s: s.id)
     ]
+    # ADR 0014 (Phase A finding 1): the chain parent's publication, which ADR
+    # 0013 D2 composes into this scope's perspective. Until now no judge had
+    # ever seen it — the one composed input missing from the judge's view, and
+    # the one an input-change refresh triggered by a parent publish/withdraw
+    # has to judge against. Read as its own pair, not folded into
+    # peer_publications: a chain edge is not a reference edge, and the judge is
+    # told which is which.
+    parent_publication = (
+        (
+            parent_scope.id,
+            read_publication(parent_scope.id, summaries_dir=str(summary_store.summaries_dir)),
+        )
+        if parent_scope is not None
+        else None
+    )
     return _JudgeInputs(
         current_summary=current_summary,
         parent_summary=parent_summary,
@@ -490,6 +508,7 @@ def _read_judge_inputs(
         operator_memory=operator_memory,
         current_publication=current_publication,
         peer_publications=peer_publications,
+        parent_publication=parent_publication,
     )
 
 
@@ -505,6 +524,10 @@ def _judge_and_record(
     summary_max_words: int,
     window_verbatim_tail: int = WINDOW_VERBATIM_TAIL,
     recency_window_size: int = RECENCY_WINDOW_SIZE,
+    mode: JudgeMode = "ordinary",
+    input_changes: Sequence[ChangeEvent] | None = None,
+    change_id: str | None = None,
+    hop: int = 0,
 ) -> ContributionOutcome:
     """Judge *contribution* against the scope's current state and persist the result.
 
@@ -535,7 +558,15 @@ def _judge_and_record(
             operator_memory=inputs.operator_memory,
             current_publication=inputs.current_publication,
             peer_publications=inputs.peer_publications,
+            parent_publication=inputs.parent_publication,
             window_verbatim_tail=window_verbatim_tail,
+            # ADR 0014 D2: which judgment path this is. Everything but a drain
+            # passes the default, so an ordinary contribution's call shape is
+            # untouched.
+            mode=mode,
+            input_changes=input_changes,
+            change_id=change_id,
+            hop=hop,
         )
     except Exception as exc:
         # Record the failure as an event against the contribution — never as a
@@ -691,6 +722,10 @@ def _judge_batch_and_record(
     summary_max_words: int,
     window_verbatim_tail: int = WINDOW_VERBATIM_TAIL,
     recency_window_size: int = RECENCY_WINDOW_SIZE,
+    mode: JudgeMode = "ordinary",
+    input_changes: Sequence[ChangeEvent] | None = None,
+    change_ids: Sequence[str] | None = None,
+    hop: int = 0,
 ) -> list[ContributionOutcome | JudgeUnavailable]:
     """Judge a batch of contributions in ONE call and persist the results (ADR 0011 D3).
 
@@ -725,6 +760,15 @@ def _judge_batch_and_record(
                     summary_max_words=summary_max_words,
                     window_verbatim_tail=window_verbatim_tail,
                     recency_window_size=recency_window_size,
+                    mode=mode,
+                    input_changes=input_changes,
+                    # A batch of one belongs to at most one wave; more than
+                    # that has no scalar to carry it, and the batch path below
+                    # is where a coalesced drain lands anyway.
+                    change_id=(
+                        list(change_ids)[0] if change_ids and len(change_ids) == 1 else None
+                    ),
+                    hop=hop,
                 )
             ]
         except JudgeUnavailable as exc:
@@ -751,7 +795,12 @@ def _judge_batch_and_record(
             operator_memory=inputs.operator_memory,
             current_publication=inputs.current_publication,
             peer_publications=inputs.peer_publications,
+            parent_publication=inputs.parent_publication,
             window_verbatim_tail=window_verbatim_tail,
+            mode=mode,
+            input_changes=input_changes,
+            change_ids=change_ids,
+            hop=hop,
         )
     except Exception as exc:  # noqa: BLE001 — every member needs its own error
         # One failed call strands the whole batch, so each member gets the
@@ -1083,6 +1132,176 @@ def rejudge_contribution(
             summary_max_words=summary_max_words,
             window_verbatim_tail=window_verbatim_tail,
             recency_window_size=recency_window_size,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Drain (ADR 0014 D6) — bring a scope up to date with the inputs its memory
+# rests on, before anyone reads it.
+# ---------------------------------------------------------------------------
+
+
+class DrainFailed(Exception):
+    """Raised when a drain's judge call failed (ADR 0014 D6, pin 5).
+
+    Distinct from :class:`JudgeUnavailable`, which names ONE contribution a
+    caller should re-judge: a drain's caller owes nothing to any particular
+    notice — the change events simply stay unprocessed, so the next read
+    drains them again. Typed so a read surface can swallow exactly this and
+    still fail loudly on anything else: a read must never fail because a
+    refresh could not run (pin 5), but it must not swallow a bug either.
+    """
+
+    def __init__(self, scope_id: str, error_class: str, message: str, pending: int) -> None:
+        self.scope_id = scope_id
+        self.error_class = error_class
+        self.pending = pending
+        super().__init__(message)
+
+
+@dataclass
+class DrainOutcome:
+    """What one :func:`drain_scope` call did.
+
+    ``judged`` is False when no judge call was made at all — an empty queue,
+    or a queue whose notices already carry verdicts. A caller reporting
+    "refresh pending: N" reads ``events_processed``; it is never a count of
+    judge outages (pin 4), which are a different thing entirely.
+    """
+
+    scope_id: str
+    events_processed: int
+    judged: bool
+    outcomes: list[ContributionOutcome]
+
+
+def drain_scope(
+    scope_id: str,
+    *,
+    fleet: FleetConfig,
+    record_store: RecordStore,
+    summary_store: SummaryStore,
+    scope_manager: ScopeManager,
+    summary_max_words: int,
+    window_verbatim_tail: int = WINDOW_VERBATIM_TAIL,
+    recency_window_size: int = RECENCY_WINDOW_SIZE,
+) -> DrainOutcome:
+    """Judge every unprocessed input change for *scope_id* (ADR 0014 D6).
+
+    Coalescing IS batch judgment (implementation pin 1): N pending change
+    events for one scope become ONE
+    :class:`~strata.scope_manager.ScopeManagerBatchJudgment` — one amendment,
+    one summary write, one verdict row per event — carrying every one of their
+    change ids (ADR 0014 D4) and rendering the events themselves as the judge's
+    INPUT CHANGES block (D5). There is no separate coalescing mechanism to get
+    out of step with the batch path.
+
+    Judged in ``input_change_refresh`` mode, so the amendment may ADMIT as well
+    as retire (ADR 0014 D2): the notice being judged is a real contribution, so
+    a directive minted from it carries honest provenance. The engine still
+    never edits the scope's memory — only its judge does.
+
+    The resulting judgment carries ``hop`` = the drained events' highest hop
+    plus one, and every drained change id, so whatever writes the derived
+    change events (ADR 0014 D4's inheritance) reads both off the judgment
+    rather than re-deriving them.
+
+    Every event drained is marked processed WHATEVER the verdict (ADR 0014 D5):
+    a decline is a refresh that ran and decided nothing needed changing, not a
+    refresh still owed. The row itself is kept forever.
+
+    Idempotent by the no-op-if-judged rule (pin 1): an event whose notice
+    already carries a verdict — a crash between the judgment write and the
+    marking — is marked processed without a second judge call, and a scope with
+    nothing pending makes no judge call at all.
+
+    Runs under ``scope_lock`` (ADR 0012), like every other summary write. The
+    caller must NOT already hold it; the MCP read path does not.
+
+    Raises:
+        RuntimeError: *scope_id* or its stratum no longer resolves in the fleet.
+        DrainFailed: the judge call failed. A judgment-attempt-failed event is
+            recorded against each notice exactly as on the contribute path, the
+            events stay unprocessed, and the next drain retries them.
+    """
+    scope = fleet.get_scope(scope_id)
+    if scope is None:
+        raise RuntimeError(f"Scope {scope_id!r} does not exist in the fleet config.")
+    stratum = next((s for s in fleet.strata if s.id == scope.stratum_id), None)
+    if stratum is None:
+        raise RuntimeError(
+            f"Stratum {scope.stratum_id!r} for scope {scope.id!r} not found in fleet config."
+        )
+
+    with _scope_lock(scope.id):
+        events = record_store.list_change_events(scope_id=scope.id, unprocessed_only=True)
+        if not events:
+            return DrainOutcome(scope_id=scope.id, events_processed=0, judged=False, outcomes=[])
+
+        # One notice may carry several events (a coalesced emission), and an
+        # event's notice may already have been judged. Both collapse here, in
+        # event order, so the batch judges each notice exactly once.
+        to_judge: list[Contribution] = []
+        seen: set[str] = set()
+        for event in events:
+            if event.contribution_id in seen:
+                continue
+            seen.add(event.contribution_id)
+            notice = record_store.get_contribution(event.contribution_id)
+            if notice is None or record_store.get_judgment(event.contribution_id) is not None:
+                continue
+            to_judge.append(notice)
+
+        if not to_judge:
+            # Every notice already has a verdict: the refresh ran, only the
+            # marking did not land. Consume the events rather than judging a
+            # second time — a verdict is never re-taken (issue #57).
+            for event in events:
+                record_store.mark_change_event_processed(event.id)
+            return DrainOutcome(
+                scope_id=scope.id, events_processed=len(events), judged=False, outcomes=[]
+            )
+
+        change_ids = list(dict.fromkeys(event.change_id for event in events))
+
+        results = _judge_batch_and_record(
+            contributions=to_judge,
+            scope=scope,
+            stratum=stratum,
+            fleet=fleet,
+            record_store=record_store,
+            summary_store=summary_store,
+            scope_manager=scope_manager,
+            summary_max_words=summary_max_words,
+            window_verbatim_tail=window_verbatim_tail,
+            recency_window_size=recency_window_size,
+            mode="input_change_refresh",
+            input_changes=events,
+            change_ids=change_ids,
+            # ADR 0014 D4's backstop budget: this refresh sits one hop beyond
+            # the furthest-travelled event it drained, and the judgment carries
+            # that so an emitter writing derived events inherits the distance
+            # instead of restarting the wave at zero.
+            hop=max(event.hop for event in events) + 1,
+        )
+
+        failures = [r for r in results if isinstance(r, JudgeUnavailable)]
+        if failures:
+            # The attempt rows are already written (issues #57/#118). Leaving
+            # the events unprocessed is what makes the refresh still owed: the
+            # next read drains them again, and until then the perspective's
+            # `input_changes` still lists them (pin 5).
+            first = failures[0]
+            raise DrainFailed(scope.id, first.error_class, str(first), len(events))
+
+        for event in events:
+            record_store.mark_change_event_processed(event.id)
+
+        return DrainOutcome(
+            scope_id=scope.id,
+            events_processed=len(events),
+            judged=True,
+            outcomes=[r for r in results if isinstance(r, ContributionOutcome)],
         )
 
 
@@ -1572,6 +1791,7 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
         scope_id: str,
         request: Request,
         summary_store: SummaryStore = Depends(get_summary_store),
+        record_store: RecordStore = Depends(get_record_store),
     ) -> dict:
         """Return the composed perspective *scope_id* would receive, with token weights.
 
@@ -1603,6 +1823,13 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
         def _publication_reader(peer_scope_id: str) -> list:
             return read_publication(peer_scope_id, summaries_dir=str(summary_store.summaries_dir))
 
+        # change_event_reader (ADR 0014 D5): the same `input_changes` section
+        # the MCP surface composes, so an operator asking "what does this agent
+        # actually see" sees the pending notices too. compose_perspective
+        # filters to unprocessed itself.
+        def _change_event_reader(target_scope_id: str) -> list:
+            return record_store.list_change_events(scope_id=target_scope_id)
+
         try:
             composed = compose_perspective(
                 scope_id,
@@ -1610,6 +1837,7 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
                 summary_store=summary_store,
                 operator_reader=_operator_reader,
                 publication_reader=_publication_reader,
+                change_event_reader=_change_event_reader,
             )
         except ValueError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc

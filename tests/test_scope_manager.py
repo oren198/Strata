@@ -3383,7 +3383,7 @@ def test_attribution_corrective_rewrite_is_still_budget_checked() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_refresh_block_rendered_when_amendment_is_context_only() -> None:
+def test_refresh_block_rendered_in_splice_refresh_mode() -> None:
     message = _build_user_message(
         scope=SCOPE,
         stratum=STRATUM,
@@ -3391,7 +3391,7 @@ def test_refresh_block_rendered_when_amendment_is_context_only() -> None:
         current_summary=CURRENT_SUMMARY,
         recent_contributions=[],
         new_contribution=NEW_CONTRIBUTION,
-        amendment_context_only=True,
+        mode="splice_refresh",
     )
     assert "MANAGER REFRESH" in message
     assert "already been incorporated" in message
@@ -3407,7 +3407,7 @@ def test_refresh_block_rendered_when_amendment_is_context_only() -> None:
     assert "MANAGER REFRESH" not in ordinary
 
 
-def test_context_only_amendment_drops_append_and_publish_ops() -> None:
+def test_splice_refresh_amendment_drops_append_and_publish_ops() -> None:
     """A refresh may amend context and retire, but never admit a directive."""
     manager, _ = _make_manager(
         {
@@ -3428,7 +3428,7 @@ def test_context_only_amendment_drops_append_and_publish_ops() -> None:
         current_summary=CURRENT_SUMMARY,
         recent_contributions=[],
         new_contribution=NEW_CONTRIBUTION,
-        amendment_context_only=True,
+        mode="splice_refresh",
     )
 
     assert judgment.new_summary is not None
@@ -4285,7 +4285,7 @@ def test_change_id_defaults_to_none_on_both_judgment_shapes() -> None:
 
     mock_client = MagicMock()
     mock_client.messages.create.return_value = _fake_response(_batch_input())
-    assert _judge_batch(mock_client).change_id is None
+    assert _judge_batch(mock_client).change_ids == []
 
 
 def test_change_id_is_carried_onto_the_judgment() -> None:
@@ -4331,22 +4331,37 @@ def test_change_id_survives_the_invalid_op_drop() -> None:
     assert judgment.change_id == "chg_wave1"
 
 
-def test_batch_change_id_reaches_a_batch_of_one() -> None:
+def test_batch_change_ids_reach_a_batch_of_one() -> None:
     """A batch of one delegates to judge() and rebuilds the batch judgment by
-    hand — the wave id must survive that wrapping."""
+    hand — the wave ids must survive that wrapping."""
     mock_client = MagicMock()
     mock_client.messages.create.return_value = _fake_response(_accept_context_input())
 
-    judgment = _judge_batch(mock_client, contributions=[NEW_CONTRIBUTION], change_id="chg_wave1")
+    judgment = _judge_batch(mock_client, contributions=[NEW_CONTRIBUTION], change_ids=["chg_wave1"])
 
-    assert judgment.change_id == "chg_wave1"
+    assert judgment.change_ids == ["chg_wave1"]
 
 
-def test_batch_change_id_reaches_a_real_batch() -> None:
+def test_batch_change_ids_reach_a_real_batch() -> None:
+    """A coalesced refresh carries SEVERAL waves (Phase A finding 2).
+
+    Several pending events for one scope collapse into one batch (ADR 0014 D4),
+    so the batch belongs to every one of their ids, not to a chosen one.
+    """
     mock_client = MagicMock()
     mock_client.messages.create.return_value = _fake_response(_batch_input())
 
-    assert _judge_batch(mock_client, change_id="chg_wave1").change_id == "chg_wave1"
+    judgment = _judge_batch(mock_client, change_ids=["chg_a", "chg_b"])
+
+    assert judgment.change_ids == ["chg_a", "chg_b"]
+
+
+def test_batch_change_ids_are_deduplicated() -> None:
+    """Two events of one wave collapse to one id — a derived row is per (id, scope)."""
+    mock_client = MagicMock()
+    mock_client.messages.create.return_value = _fake_response(_batch_input())
+
+    assert _judge_batch(mock_client, change_ids=["chg_a", "chg_a"]).change_ids == ["chg_a"]
 
 
 # ---------------------------------------------------------------------------
@@ -4354,8 +4369,8 @@ def test_batch_change_id_reaches_a_real_batch() -> None:
 # rests on. RECORD, never trigger — the affected set is topological and needs
 # no judge cooperation. The engine validates the declaration is a subset of the
 # publication item ids RENDERED to that judge and notes anything else, so the
-# declaration can be audited against what the judge actually saw. Not yet asked
-# for in the prompt or the tool schema — accepted if the judge returns it.
+# declaration can be audited against what the judge actually saw. Asked for in
+# the tool schema and the prompt; a hand-built judgment omits it, as expected.
 # ---------------------------------------------------------------------------
 
 
@@ -4491,3 +4506,56 @@ def test_batch_context_sources_are_validated_the_same_way() -> None:
     # member's row — the rule an unowned dropped op already follows.
     for verdict in judgment.accepted_verdicts:
         assert "pub_neverseen" in judgment.record_notes_for(verdict.contribution_id)
+
+
+def test_hop_defaults_to_zero_on_both_judgment_shapes() -> None:
+    """An ordinary contribution starts no wave, so it is at no distance from one."""
+    manager, _ = _make_manager(_accept_context_input())
+
+    judgment = manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+    )
+    assert judgment.hop == 0
+
+    mock_client = MagicMock()
+    mock_client.messages.create.return_value = _fake_response(_batch_input())
+    assert _judge_batch(mock_client).hop == 0
+
+
+def test_hop_is_carried_onto_the_judgment() -> None:
+    """ADR 0014 D4's backstop: the hop count travels with the wave, like its id."""
+    manager, _ = _make_manager(_accept_context_input())
+
+    judgment = manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+        change_id="chg_wave1",
+        hop=3,
+    )
+
+    assert judgment.hop == 3
+
+
+def test_batch_hop_reaches_a_batch_of_one() -> None:
+    mock_client = MagicMock()
+    mock_client.messages.create.return_value = _fake_response(_accept_context_input())
+
+    judgment = _judge_batch(
+        mock_client, contributions=[NEW_CONTRIBUTION], change_ids=["chg_a"], hop=2
+    )
+
+    assert judgment.hop == 2
+
+
+def test_batch_hop_reaches_a_real_batch() -> None:
+    mock_client = MagicMock()
+    mock_client.messages.create.return_value = _fake_response(_batch_input())
+
+    assert _judge_batch(mock_client, change_ids=["chg_a"], hop=2).hop == 2
