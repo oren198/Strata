@@ -136,7 +136,7 @@ from strata.session_state import (
     sessions_dir_for,
 )
 from strata.settings import Settings, get_settings
-from strata.summary_store import ScopeSummary, SummaryStore
+from strata.summary_store import ScopeSummary, SummaryStore, splice_parent_directives
 
 # Console UI static files bundled as package data (same vendoring pattern as
 # _skills/ / _migrations/ / _templates/), so the static mount works regardless
@@ -1268,16 +1268,150 @@ class DrainFailed(Exception):
 class DrainOutcome:
     """What one :func:`drain_scope` call did.
 
-    ``judged`` is False when no judge call was made at all — an empty queue,
-    or a queue whose notices already carry verdicts. A caller reporting
-    "refresh pending: N" reads ``events_processed``; it is never a count of
-    judge outages (pin 4), which are a different thing entirely.
+    ``judged`` is False when no judge call was made at all — an empty queue
+    with nothing to splice, or a queue whose notices already carry verdicts.
+    A caller reporting "refresh pending: N" reads ``events_processed``; it is
+    never a count of judge outages (pin 4), which are a different thing
+    entirely.
+
+    ``spliced`` says whether the mechanical parent-directive splice (ADR 0011
+    D4) actually moved this scope's summary. It is not a second pending
+    count: it is how a caller can tell a drain that did real work from one
+    that found everything settled, since a splice can be the ONLY thing a
+    drain does (a scope binding for the first time owns no change events —
+    nothing changed after it existed).
     """
 
     scope_id: str
     events_processed: int
     judged: bool
     outcomes: list[ContributionOutcome]
+    spliced: bool = False
+
+
+def _splice_parent_directives_in(
+    scope: Scope,
+    *,
+    fleet: FleetConfig,
+    summary_store: SummaryStore,
+) -> bool:
+    """Copy the chain parent's directives into *scope*'s summary, byte-exactly.
+
+    ADR 0011 D4's mechanical half, and the reason it is MECHANICAL: a judge
+    asked to quote an inherited directive paraphrases it sooner or later,
+    while a copied row carries the parent's id, content and provenance
+    unchanged. The judge that runs after this sees the directives already in
+    place and has nothing to copy.
+
+    Unconditional and idempotent —
+    :func:`~strata.summary_store.splice_parent_directives` returns the same
+    object when there is nothing to splice — so this is not a staleness test
+    and there is no version comparison left anywhere (implementation pin 6).
+    A child with no summary of its own still gets one: that is what makes a
+    scope binding for the first time inherit what already binds it.
+
+    Root-first is NOT required. The parent's own drain happens on the
+    parent's own read, so a chain of stale ancestors settles one read at a
+    time — ADR 0014's documented known gap, deliberately left open rather
+    than worked around by fanning judge calls up the chain from one read.
+
+    The caller MUST hold ``_scope_lock(scope.id)``.
+
+    Returns:
+        Whether the splice changed the summary — the caller's signal that
+        there is something for the judge to reconcile (fixpoint damping,
+        pin 7).
+    """
+    parent_scope = fleet.inter_stratum_parent(scope.id)
+    parent_summary = summary_store.read(parent_scope.id) if parent_scope is not None else None
+    if parent_summary is None or not parent_summary.directives:
+        return False
+
+    current = summary_store.read(scope.id)
+    base = current or ScopeSummary(
+        scope_id=scope.id,
+        directives=[],
+        context="",
+        updated_at=datetime.now(tz=UTC).isoformat(),
+    )
+    spliced = splice_parent_directives(base, parent_summary)
+    if spliced is base and current is not None:
+        return False
+
+    # Stamp the parent version this was built from, exactly as an amendment
+    # does (ADR 0004 D4) — the stamp is a record of provenance, not the
+    # staleness test it used to stand in for.
+    summary_store.write(
+        scope.id, spliced.model_copy(update={"parent_version": parent_summary.version})
+    )
+    return True
+
+
+def _judge_spliced_summary(
+    scope: Scope,
+    *,
+    stratum: Stratum,
+    fleet: FleetConfig,
+    record_store: RecordStore,
+    summary_store: SummaryStore,
+    scope_manager: ScopeManager,
+    summary_max_words: int,
+    window_verbatim_tail: int,
+    recency_window_size: int,
+) -> ContributionOutcome | None:
+    """Reconcile the scope's context with directives just spliced in (ADR 0011 D4).
+
+    The judgment half of the splice, for the case where the splice is the
+    only thing that happened: no change event was pending, so there is no
+    notice to judge and one is appended here. The refresh request is itself a
+    contribution, appended to the record BEFORE judgment and judged after, so
+    the summary never changes without a record trail ("the record is sacred"
+    — ROADMAP principle 4; CONTEXT.md § Contribution).
+
+    Judged in ``splice_refresh`` mode: the directives are already in place
+    mechanically, so the amendment carries context and lifecycle ops only
+    (ADR 0011 D4, unamended for this path — ADR 0014 D2 lifts the drop of
+    admitting ops for the INPUT-CHANGE refresh, where the change event is a
+    real contribution to mint a directive from).
+
+    The caller MUST NOT hold ``_scope_lock(scope.id)``: this delegates to
+    :func:`_judge_and_record`, whose caller takes it.
+
+    Raises:
+        JudgeUnavailable: the judge call failed. The splice itself has
+            already been written — it is mechanical and owes nothing to the
+            judge — so the next drain reconciles the context.
+    """
+    contribution = record_store.append_contribution(
+        scope_id=scope.id,
+        content=(
+            "[Manager refresh — parent directives already incorporated"
+            " mechanically; reconcile the context digest with the refreshed"
+            " state.]"
+        ),
+        proposed_classification="context",
+        subject="manager-refresh",
+        supersedes=None,
+        contributor=ContributorRef(
+            scope_id=scope.id,
+            skill="scope-manager",
+            session_id="refresh",
+            ts=datetime.now(tz=UTC).isoformat(),
+        ),
+    )
+    return _judge_and_record(
+        contribution=contribution,
+        scope=scope,
+        stratum=stratum,
+        fleet=fleet,
+        record_store=record_store,
+        summary_store=summary_store,
+        scope_manager=scope_manager,
+        summary_max_words=summary_max_words,
+        window_verbatim_tail=window_verbatim_tail,
+        recency_window_size=recency_window_size,
+        mode="splice_refresh",
+    )
 
 
 def drain_scope(
@@ -1291,7 +1425,24 @@ def drain_scope(
     window_verbatim_tail: int = WINDOW_VERBATIM_TAIL,
     recency_window_size: int = RECENCY_WINDOW_SIZE,
 ) -> DrainOutcome:
-    """Judge every unprocessed input change for *scope_id* (ADR 0014 D6).
+    """Bring *scope_id* up to date: splice, then judge what changed (ADR 0014 D6).
+
+    Two mechanical-then-judged steps, in one place because there is one
+    refresh mechanism (implementation pin 6) and both entry points — the MCP
+    server's drain-on-read and ``strata launch``/``strata refresh`` — go
+    through it:
+
+    1. **The parent-directive splice** (ADR 0011 D4), unconditional and
+       idempotent (:func:`_splice_parent_directives_in`). It lives here
+       rather than in the launch path because an MCP-only user never runs a
+       CLI command (ADR 0014 D6) and would otherwise never inherit a
+       directive at all. When the splice is the only thing that moved — a
+       scope binding for the first time owns no change events, since nothing
+       changed after it existed — it gets its own ``splice_refresh``
+       judgment; when there are events too, the input-change refresh below
+       reconciles both at once, in ONE judge call.
+    2. **The drain proper**: every unprocessed change event, judged as one
+       batch.
 
     Coalescing IS batch judgment (implementation pin 1): N pending change
     events for one scope become ONE
@@ -1339,9 +1490,44 @@ def drain_scope(
         )
 
     with _scope_lock(scope.id):
+        # Step 1 — the mechanical splice, BEFORE the judge reads anything:
+        # the judge is handed the already-spliced summary and never asked to
+        # copy an inherited directive across (ADR 0011 D4). Written to the
+        # store rather than passed along, so a decline still leaves the
+        # inherited rows standing — they are the engine's mechanical work,
+        # not the judge's amendment.
+        spliced = _splice_parent_directives_in(scope, fleet=fleet, summary_store=summary_store)
+
         events = record_store.list_change_events(scope_id=scope.id, unprocessed_only=True)
         if not events:
-            return DrainOutcome(scope_id=scope.id, events_processed=0, judged=False, outcomes=[])
+            # Nothing pending. A splice that moved something still needs its
+            # context reconciled; a splice that moved nothing is a drain over
+            # settled state and costs no judge call (pin 7's damping).
+            outcomes: list[ContributionOutcome] = []
+            if spliced:
+                try:
+                    outcome = _judge_spliced_summary(
+                        scope,
+                        stratum=stratum,
+                        fleet=fleet,
+                        record_store=record_store,
+                        summary_store=summary_store,
+                        scope_manager=scope_manager,
+                        summary_max_words=summary_max_words,
+                        window_verbatim_tail=window_verbatim_tail,
+                        recency_window_size=recency_window_size,
+                    )
+                except JudgeUnavailable as exc:
+                    raise DrainFailed(scope.id, exc.error_class, str(exc), 0) from exc
+                if outcome is not None:
+                    outcomes.append(outcome)
+            return DrainOutcome(
+                scope_id=scope.id,
+                events_processed=0,
+                judged=spliced,
+                outcomes=outcomes,
+                spliced=spliced,
+            )
 
         # One notice may carry several events (a coalesced emission), and an
         # event's notice may already have been judged. Both collapse here, in
@@ -1364,7 +1550,11 @@ def drain_scope(
             for event in events:
                 record_store.mark_change_event_processed(event.id)
             return DrainOutcome(
-                scope_id=scope.id, events_processed=len(events), judged=False, outcomes=[]
+                scope_id=scope.id,
+                events_processed=len(events),
+                judged=False,
+                outcomes=[],
+                spliced=spliced,
             )
 
         change_ids = list(dict.fromkeys(event.change_id for event in events))
@@ -1407,6 +1597,7 @@ def drain_scope(
             events_processed=len(events),
             judged=True,
             outcomes=[r for r in results if isinstance(r, ContributionOutcome)],
+            spliced=spliced,
         )
 
 

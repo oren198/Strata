@@ -162,6 +162,10 @@ def _drain_for_read(fleet, scope_id: str) -> int:
     scope without first bringing it up to date — and the system is correct for
     a user who never runs a CLI command at all.
 
+    The drain also performs ADR 0011 D4's mechanical parent-directive
+    splice, so this runs even with an empty queue: it is the one refresh
+    mechanism (implementation pin 6), not a queue worker.
+
     Returns the number of change events still unprocessed AFTER the attempt:
     ``0`` when the drain brought the scope up to date, and the outstanding
     count when it could not. That count is a refresh queue depth, never a judge
@@ -184,8 +188,13 @@ def _drain_for_read(fleet, scope_id: str) -> int:
         return 0
 
     pending = len(_record_store.list_change_events(scope_id=scope_id, unprocessed_only=True))
-    if pending == 0:
-        return 0
+
+    # An empty queue is NOT a reason to skip: the drain also splices the
+    # chain parent's directives in mechanically (ADR 0011 D4), and a scope
+    # binding for the first time owns no change events — nothing changed
+    # after it existed. Skipping here is what left an MCP-only user never
+    # inheriting a directive at all. The drain costs no judge call when
+    # there is nothing pending and nothing to splice.
 
     # No judge configured: skip rather than fail every read with an attempt row
     # per pending event — the same soft skip `strata launch`'s refresh makes.
