@@ -1776,6 +1776,7 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
         scope_id: str,
         request: Request,
         summary_store: SummaryStore = Depends(get_summary_store),
+        record_store: RecordStore = Depends(get_record_store),
     ) -> dict:
         """Return the composed perspective *scope_id* would receive, with token weights.
 
@@ -1807,6 +1808,13 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
         def _publication_reader(peer_scope_id: str) -> list:
             return read_publication(peer_scope_id, summaries_dir=str(summary_store.summaries_dir))
 
+        # change_event_reader (ADR 0014 D5): the same `input_changes` section
+        # the MCP surface composes, so an operator asking "what does this agent
+        # actually see" sees the pending notices too. compose_perspective
+        # filters to unprocessed itself.
+        def _change_event_reader(target_scope_id: str) -> list:
+            return record_store.list_change_events(scope_id=target_scope_id)
+
         try:
             composed = compose_perspective(
                 scope_id,
@@ -1814,6 +1822,7 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
                 summary_store=summary_store,
                 operator_reader=_operator_reader,
                 publication_reader=_publication_reader,
+                change_event_reader=_change_event_reader,
             )
         except ValueError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc

@@ -2692,12 +2692,21 @@ async def strata_read_perspective(scope_id: str | None = None) -> dict:
     def _publication_reader(peer_scope_id: str) -> list:
         return read_publication(peer_scope_id, summaries_dir=_summaries_dir)
 
+    # change_event_reader (ADR 0014 D5): the scope's own unprocessed input
+    # changes, composed as `input_changes`. Whatever the drain above could not
+    # process is still here — notice that survives in the payload rather than
+    # a read that looks current. compose_perspective filters to unprocessed
+    # itself, so the bound method is handed over unfiltered.
+    def _change_event_reader(target_scope_id: str) -> list:
+        return _record_store.list_change_events(scope_id=target_scope_id)
+
     perspective = compose_perspective(
         scope_id,
         fleet=fleet,
         summary_store=_summary_store,
         operator_reader=_operator_reader,
         publication_reader=_publication_reader,
+        change_event_reader=_change_event_reader,
     )
     # What the drain could NOT bring up to date (ADR 0014 D6). Present only
     # when non-zero — the same discipline `fleet_notice` and `unbound_notice`

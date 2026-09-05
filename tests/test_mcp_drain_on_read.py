@@ -286,3 +286,49 @@ async def test_a_keyless_server_skips_the_drain_and_still_reports_what_is_owed(
     assert result["refresh_pending"] == 1
     with RecordStore(db_path) as rs:
         assert rs.list_judgment_attempts(scope_id="g_team") == []
+
+
+async def test_the_perspective_carries_the_events_the_drain_could_not_process(
+    tmp_path: Path,
+) -> None:
+    """ADR 0014 D5, end to end: what is still owed is IN the payload, not implied.
+
+    The keyless path, so the drain is skipped and the events survive to be
+    composed — after a successful drain there is nothing left to show.
+    """
+    mod, db_path, fleet = _setup(tmp_path)
+    mod._settings = mod._settings.model_copy(
+        update={"judge_api_key": None, "anthropic_api_key": None}
+    )
+    with RecordStore(db_path) as rs:
+        _emit(rs, change_id="chg_a", item_id="p_1", scope_id="g_team")
+
+    with (
+        patch.object(mod, "_AGENT_SCOPE", "g_team"),
+        patch.object(mod, "_AGENT_SKILL", None),
+        patch.object(mod, "_AGENT_SESSION_ID", "sess_test"),
+        patch.object(mod, "_load_fleet", return_value=fleet),
+    ):
+        result = await mod.strata_read_perspective()
+
+    assert [e["item_id"] for e in result["input_changes"]] == ["p_1"]
+    assert result["input_changes"][0]["change_id"] == "chg_a"
+
+
+async def test_a_drained_scope_composes_no_input_changes(tmp_path: Path) -> None:
+    """Composition runs AFTER the drain, so a refreshed scope shows an empty list."""
+    mod, db_path, fleet = _setup(tmp_path)
+    with RecordStore(db_path) as rs:
+        _emit(rs, change_id="chg_a", item_id="p_1", scope_id="g_team")
+
+    with (
+        patch.object(mod, "_AGENT_SCOPE", "g_team"),
+        patch.object(mod, "_AGENT_SKILL", None),
+        patch.object(mod, "_AGENT_SESSION_ID", "sess_test"),
+        patch.object(mod, "_load_fleet", return_value=fleet),
+        patch("strata.scope_manager.ScopeManager.judge", return_value=_accepting_judgment()),
+        patch("anthropic.Anthropic", return_value=MagicMock()),
+    ):
+        result = await mod.strata_read_perspective()
+
+    assert result["input_changes"] == []
