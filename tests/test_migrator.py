@@ -91,6 +91,7 @@ def test_full_chain_drops_fleet_tables_and_preserves_record(tmp_path: Path) -> N
         "0007_failed_judgment_marker.sql",
         "0008_publication_judgment_attempts.sql",
         "0009_publication_relay.sql",
+        "0010_change_events.sql",
     ]
 
     # Fleet tables gone.
@@ -340,6 +341,7 @@ def test_idempotent_reapply(tmp_path: Path) -> None:
         "0007_failed_judgment_marker.sql",
         "0008_publication_judgment_attempts.sql",
         "0009_publication_relay.sql",
+        "0010_change_events.sql",
     ]
 
     second = run_migrations(db_path, migrations_dir=migrations_dir)
@@ -545,6 +547,7 @@ def test_crash_at_tracking_insert_rolls_back_script_too(
         "0007_failed_judgment_marker.sql",
         "0008_publication_judgment_attempts.sql",
         "0009_publication_relay.sql",
+        "0010_change_events.sql",
     ]
 
 
@@ -700,3 +703,73 @@ def test_split_statements_matches_pre_76_line_based_splitter_for_shipped_migrati
     """
     sql = migration_file.read_text(encoding="utf-8")
     assert _split_statements(sql) == _old_split_statements(sql)
+
+
+def test_0010_adds_change_events_table(tmp_path: Path) -> None:
+    """0010 creates ``change_events`` on a fresh db, and re-running adds nothing.
+
+    The change-event row is what ADR 0014 D5 makes the permanent, auditable
+    notice of an input change: one row per affected scope per change, linked
+    to the ``manager-refresh`` contribution that carries it, and unprocessed
+    until a refresh consumes it.
+    """
+    db_path = str(tmp_path / "change_events.db")
+    migrations_dir = Path(__file__).resolve().parent.parent / "src" / "strata" / "_migrations"
+
+    run_migrations(db_path, migrations_dir=migrations_dir)
+    assert "change_events" in _table_names(db_path)
+
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("PRAGMA foreign_keys = ON")
+        columns = {r[1] for r in conn.execute("PRAGMA table_info(change_events)").fetchall()}
+        assert columns == {
+            "id",
+            "change_id",
+            "contribution_id",
+            "scope_id",
+            "item_id",
+            "kind",
+            "before",
+            "after",
+            "hop",
+            "processed_at",
+            "created_at",
+        }
+
+        conn.execute(
+            """
+            INSERT INTO contributions (
+                id, scope_id, content, proposed_classification,
+                contributor_scope_id, contributor_skill,
+                contributor_session_id, contributor_ts
+            ) VALUES ('c_1', 'g_a', 'notice', 'context', 'g_a', 'architect', 's', 't')
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO change_events
+            (id, change_id, contribution_id, scope_id, item_id, kind, before, after, hop)
+            VALUES ('ce_1', 'chg_1', 'c_1', 'g_a', 'pub_1', 'withdraw', 'was', NULL, 0)
+            """
+        )
+        conn.commit()
+
+        # processed_at starts NULL: the event is unprocessed until a refresh
+        # consumes it (ADR 0014 D5), whatever the refresh's verdict.
+        assert conn.execute("SELECT processed_at FROM change_events").fetchall() == [(None,)]
+
+        # The link to the notice contribution is enforced — an event naming no
+        # real contribution row would be a notice nobody can read.
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                """
+                INSERT INTO change_events
+                (id, change_id, contribution_id, scope_id, item_id, kind, hop)
+                VALUES ('ce_2', 'chg_1', 'c_nope', 'g_a', 'pub_1', 'withdraw', 0)
+                """
+            )
+    finally:
+        conn.close()
+
+    assert run_migrations(db_path, migrations_dir=migrations_dir) == []
