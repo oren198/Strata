@@ -1343,7 +1343,7 @@ class _AmendmentJudgment(BaseModel):
     operator can see what the judge says it used, and the declaration can be
     checked against what was rendered.
 
-    Validated as a subset of :func:`rendered_publication_item_ids`; anything
+    Validated as a subset of :func:`_rendered_publication_item_ids`; anything
     else lands in :attr:`dropped_context_sources` instead. Empty by default,
     which is what every hand-built and scripted judgment produces — expected,
     not a bug."""
@@ -1851,7 +1851,7 @@ def _render_published_item(item: _PublishedItemLike) -> str:
     return f"[{item.id}] {item.kind}{subject_part}{anchors_part}{origin_part}: {item.content}"
 
 
-def rendered_publication_item_ids(
+def _rendered_publication_item_ids(
     current_publication: Sequence[_PublishedItemLike] | None,
     peer_publications: Sequence[tuple[str, Sequence[_PublishedItemLike]]] | None,
 ) -> list[str]:
@@ -2381,7 +2381,7 @@ class ScopeManager:
         # ADR 0014 D3: what a declared `context_sources` is audited against —
         # derived from the same arguments the message above was built from, so
         # the check and the prompt can never disagree.
-        rendered_item_ids = rendered_publication_item_ids(current_publication, peer_publications)
+        rendered_item_ids = _rendered_publication_item_ids(current_publication, peer_publications)
 
         def _parse(block) -> ScopeManagerJudgment:  # noqa: ANN001 — tool_use block
             return self._parse_judgment(
@@ -2832,7 +2832,7 @@ class ScopeManager:
             window_verbatim_tail=window_verbatim_tail,
         )
 
-        rendered_item_ids = rendered_publication_item_ids(current_publication, peer_publications)
+        rendered_item_ids = _rendered_publication_item_ids(current_publication, peer_publications)
 
         def _parse(block) -> ScopeManagerBatchJudgment:  # noqa: ANN001 — tool_use block
             return self._parse_batch_judgment(
@@ -3128,9 +3128,9 @@ class ScopeManager:
                     "(directive_ops or new_context). A declined contribution must "
                     "not amend the summary."
                 )
-            # A decline has no new_context, so there is nothing for a declared
-            # source to rest on: the declaration is dropped whole, silently —
-            # it makes no claim about a summary this verdict never touched.
+            # A decline amends nothing, so it declares nothing: the sources go
+            # whole and silently, unnoted. Nothing was corroborated or failed
+            # to be — there is no claim about the summary to audit.
             return ScopeManagerJudgment(
                 decision="decline",
                 reasoning=reasoning,
