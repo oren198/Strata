@@ -23,8 +23,13 @@ Facts read out of the code, not assumed:
 
 - **A refresh path exists** (ADR 0011 D4): parent directives are spliced in
   mechanically, then the judge reconciles context; `append`/`publish` ops are
-  dropped (`scope_manager.py:2988`). It runs from `strata launch`, root-first
-  up the bound scope's chain. It never runs for an MCP-only user.
+  dropped (`scope_manager.py:2988`). At the time of writing it ran only from
+  `strata launch`, root-first up the bound scope's chain, and never for an
+  MCP-only user. *(Corrected in implementation: the splice now lives inside
+  the drain — D6's one refresh mechanism — so it runs wherever the drain
+  runs, which includes every MCP bind and read. Root-first is not preserved;
+  a parent's own drain happens on the parent's own read, which is the known
+  gap below.)*
 - **Directives carry per-item ids; context is one string.**
 - **A refresh can retract from the scope's published face**
   (`withdraw_published` is not stripped) **but can never add to it** —
@@ -51,8 +56,11 @@ A scope's own contribution is not a trigger; it already has a path.
 The triggered cycle is ADR 0011 D4's refresh, **amended**: on an input-change
 refresh the judge's amendment may carry `append` and `publish` ops as well as
 `new_context`, lifecycle ops and `withdraw_published`. The drop of admitting ops
-stays only for the launch-time parent-splice refresh, where the splice already
-did the work.
+stays for the parent-splice refresh, where the splice already did the work —
+that is a distinction between the two judge MODES, not between two entry
+points: the splice runs inside every drain, wherever the drain runs, and a
+drain that both splices and has change events pending judges once, in
+input-change mode.
 
 Why the amendment is now safe: ADR 0011 dropped admitting ops because a refresh
 had no real contribution to mint a directive from. It now does — the change
@@ -155,8 +163,8 @@ refreshes C against B's *current* face, but B's face is stale until B itself is
 bound or read. C sees A's change only after B does an operation.
 
 Candidate fix, not decided: drain a scope's one-hop sources before the scope
-itself, recursively with a visited set — the way the launch-time refresh already
-goes root-first up the chain. It makes reading C run B's judge, which is B's
+itself, recursively with a visited set — the way `strata launch` already walks
+the fleet root-first before draining each scope. It makes reading C run B's judge, which is B's
 authority exercised on B's memory, but it also makes one read fan LLM calls
 across the fleet. Revisit with data on how often the gap bites.
 

@@ -25,9 +25,11 @@ This module is the trigger half of the fix:
   than prose a word budget can condense away.
 
 What bounds a wave is the **change id** (ADR 0014 D4). Every independent
-input change mints one; every change derived from processing it inherits it
-(``inherit_from``); a scope **refreshes** for a given change id at most
-once, however many notices of it reach the scope. Chain
+input change mints one; every change derived from processing it inherits
+them all (``wave_ids`` — a refresh coalesces several pending changes into
+one judgment, so what it derives belongs to every wave it drained); a scope
+**refreshes** for a given change id at most once, however many notices of
+it reach the scope. Chain
 edges form a tree and would need none of this — reference edges may form
 cycles and need all of it. :data:`HOP_BUDGET` is the backstop for bugs, not
 the mechanism.
@@ -44,6 +46,7 @@ from __future__ import annotations
 
 import logging
 import secrets
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
@@ -248,11 +251,11 @@ def emit(
     source_scope_id: str,
     before: str | None = None,
     after: str | None = None,
-    inherit_from: str | None = None,
+    wave_ids: Sequence[str] = (),
     hop: int = 0,
     by_operator: bool = False,
-) -> str:
-    """Notify every scope affected by a change to *item*, and return the change id.
+) -> list[str]:
+    """Notify every scope affected by a change to *item*, and return its change ids.
 
     For each scope :func:`affected_scopes` names, appends a
     ``subject="manager-refresh"`` contribution carrying the rendered payload
@@ -280,6 +283,14 @@ def emit(
     The one thing not written twice is the same ITEM under the same change
     id: a cascade that revisits it has nothing to add.
 
+    **One row per (change id, affected scope).** A change derived from a
+    COALESCED refresh belongs to every wave that refresh drained (ADR 0014
+    D4, Phase A finding 2), and each of those waves gets its own notice
+    rather than one notice carrying a list. That keeps the once-per-id check
+    a row lookup, and gives D4's union semantics for free: an affected scope
+    refreshes if ANY of the inherited ids is unseen, and is told without
+    refreshing only when it has already refreshed for every one of them.
+
     This function never raises. Emission is not the originating act: a
     publish that succeeded must not be undone because its notice could not be
     written, so a store failure is logged and recorded as a note in the
@@ -292,22 +303,24 @@ def emit(
         before/after: The item's previous and current state, rendered for the
             judge. ``None`` reads as "there was none": an addition has no
             before, a withdrawal no after.
-        inherit_from: The change id to inherit (ADR 0014 D4) when this change
-            is DERIVED from processing another — a relayed withdrawal, a
-            refresh's admitted directive. ``None`` mints a fresh id, which is
+        wave_ids: The change ids to inherit (ADR 0014 D4) when this change
+            is DERIVED from processing others — a relayed withdrawal, a
+            refresh's admitted directive. Plural because a refresh coalesces
+            (pin 1): read them off the judgment's ``wave_ids``, never off one
+            of the two fields behind it. Empty mints ONE fresh id, which is
             correct only for an independent input change.
         hop: How many derived hops from the originating change this is. A
-            caller that inherits an id passes its own hop + 1.
+            caller that inherits ids passes its own hop + 1.
         by_operator: The operator authored this change from outside the
             fleet, which widens a directive change's affected set to include
             the holding scope (see :func:`affected_scopes`).
 
     Returns:
-        The change id — minted or inherited — so the caller can thread it
-        into anything it derives (ADR 0014 D8: the change id is a parameter,
-        never a lookup).
+        The change ids — minted or inherited, deduplicated and
+        order-preserving — so the caller can thread them into anything it
+        derives (ADR 0014 D8: the change id is a parameter, never a lookup).
     """
-    change_id = inherit_from if inherit_from is not None else new_change_id()
+    change_ids = list(dict.fromkeys(wave_ids)) or [new_change_id()]
     try:
         scope_ids = affected_scopes(
             fleet,
@@ -321,27 +334,27 @@ def emit(
         # here; neither is a reason to undo an act that already succeeded.
         # Log it loudly and deliver nothing rather than to a guessed set.
         _logger.exception(
-            "change %s (%s of %s in %s) could not be routed; no notice emitted",
-            change_id,
+            "change(s) %s (%s of %s in %s) could not be routed; no notice emitted",
+            ", ".join(change_ids),
             kind,
             item,
             source_scope_id,
         )
-        return change_id
+        return change_ids
 
     over_budget = hop > HOP_BUDGET
     if over_budget:
         _logger.error(
-            "change %s exceeded the hop budget (%s) at %s of %s in %s — recording the "
+            "change(s) %s exceeded the hop budget (%s) at %s of %s in %s — recording the "
             "event without enqueueing a refresh (ADR 0014 D4)",
-            change_id,
+            ", ".join(change_ids),
             HOP_BUDGET,
             kind,
             item,
             source_scope_id,
         )
 
-    for scope_id in scope_ids:
+    for scope_id, change_id in ((s, c) for s in scope_ids for c in change_ids):
         try:
             already_announced, already_refreshed = _prior_notices(
                 record_store, scope_id=scope_id, change_id=change_id, item=item
@@ -405,7 +418,7 @@ def emit(
                 affected_scope_id=scope_id,
             )
 
-    return change_id
+    return change_ids
 
 
 def _prior_notices(

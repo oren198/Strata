@@ -64,10 +64,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from strata.fleet_config import FleetConfig, Scope, Stratum
+    from strata.fleet_config import FleetConfig
     from strata.record_store import RecordStore
     from strata.scope_manager import ScopeManager
-    from strata.summary_store import ScopeSummary, SummaryStore
+    from strata.summary_store import SummaryStore
 
 from strata import DISTRIBUTION_NAME, __version__, install
 from strata.install import (
@@ -2030,45 +2030,32 @@ def _refresh_scope(
     window_verbatim_tail: int | None = None,
     recency_window_size: int | None = None,
 ) -> None:
-    """Refresh one scope: mechanical parent splice, then drain its input changes.
+    """Refresh one scope by draining it — the same call the MCP read makes.
 
-    ONE mechanism (ADR 0014 implementation pin 6). The version-comparison
-    staleness detection this function used to carry is gone: a summary's
-    ``parent_version`` stamp said only "the parent moved", a proxy for the
-    thing the change events now say outright. Two mechanisms for one question
-    is what pin 6 removes.
+    ONE mechanism (ADR 0014 implementation pin 6). Both halves of a refresh
+    live in :func:`strata.app.drain_scope` now: the mechanical parent-directive
+    splice (ADR 0011 D4) and the input-change drain (ADR 0014 D6). They were
+    split across the two entry points, which meant the splice ran only for
+    someone who typed a CLI command — an MCP-only user never inherited a
+    directive at all — and left two answers to one question. The
+    version-comparison staleness detection this function used to carry is gone
+    with them: a summary's ``parent_version`` stamp said only "the parent
+    moved", a proxy for what the change events now say outright.
 
-    What is left is two mechanical steps, neither of them a staleness test:
-
-    1. **The parent-directive splice** (ADR 0011 D4). Inherited directives
-       reach a child's summary mechanically — byte-exact, ids and provenance
-       preserved — and :func:`~strata.summary_store.splice_parent_directives`
-       is idempotent, returning the summary unchanged (by identity) when there
-       is nothing to splice. So the splice runs unconditionally and the judge
-       follows only when it actually changed something: fixpoint damping
-       (pin 7), not a second staleness detector. This step stays because the
-       drain does NOT splice — an input-change refresh has no splice, and the
-       judge is forbidden from admitting a parent's directive itself, so
-       without it an inherited directive would have no path into an existing
-       child's summary at all.
-    2. **The drain** (ADR 0014 D6): every unprocessed change event for this
-       scope, judged as one batch by :func:`strata.app.drain_scope`.
+    What is left here is the CLI's share: resolving the scope, and reporting.
 
     Ancestors are NOT walked here — :func:`_run_manager_refresh` and
     :func:`cmd_refresh` do the root-first walk, so this refreshes exactly the
     scope it was given.
 
     Raises:
-        DrainFailed: the drain's judge call failed. Reported here, re-raised
+        DrainFailed: the refresh's judge call failed. Reported here, re-raised
             for the caller to decide: a launch swallows it, the operator's
             ``strata refresh`` reports a non-zero exit.
     """
-    from datetime import UTC, datetime
-
     from strata.app import DrainFailed, drain_scope
     from strata.record_store import RECENCY_WINDOW_SIZE
     from strata.scope_manager import WINDOW_VERBATIM_TAIL
-    from strata.summary_store import ScopeSummary, splice_parent_directives
 
     # The engine defaults when the caller has no settings in hand (ADR 0011 D2).
     # Resolved here rather than in the signature: scope_manager owns the
@@ -2079,55 +2066,15 @@ def _refresh_scope(
     if recency_window_size is None:
         recency_window_size = RECENCY_WINDOW_SIZE
 
-    scope = fleet_config.get_scope(scope_id)
-    if scope is None:
+    if fleet_config.get_scope(scope_id) is None:
         print(
             f"  [refresh] scope {scope_id!r} not found in fleet config — skipping",
             file=sys.stderr,
         )
         return
 
-    stratum_map = {s.id: s for s in fleet_config.strata}
-    stratum = stratum_map.get(scope.stratum_id)
-    if stratum is None:
-        return
-
-    parent_scope = fleet_config.inter_stratum_parent(scope_id)
-    parent_summary = summary_store.read(parent_scope.id) if parent_scope is not None else None
-
-    current_summary = summary_store.read(scope_id)
-    ts = datetime.now(tz=UTC).isoformat()
-
-    # Step 1 — the mechanical splice (ADR 0011 D4). A child with no summary of
-    # its own still gets it: that is what makes a fresh child inherit on its
-    # first launch.
-    if parent_summary is not None and parent_summary.directives:
-        base_summary = (
-            current_summary
-            if current_summary is not None
-            else ScopeSummary(scope_id=scope_id, directives=[], context="", updated_at=ts)
-        )
-        spliced = splice_parent_directives(base_summary, parent_summary)
-        if spliced is not base_summary or current_summary is None:
-            _judge_spliced_summary(
-                spliced,
-                scope=scope,
-                stratum=stratum,
-                fleet_config=fleet_config,
-                parent_summary=parent_summary,
-                record_store=record_store,
-                summary_store=summary_store,
-                manager=manager,
-                summary_max_words=summary_max_words,
-                window_verbatim_tail=window_verbatim_tail,
-                recency_window_size=recency_window_size,
-                ts=ts,
-            )
-
-    # Step 2 — the drain (ADR 0014 D6). A no-op when nothing is pending, so a
-    # launch against a quiet fleet costs no judge call at all.
     try:
-        drain_scope(
+        outcome = drain_scope(
             scope_id,
             fleet=fleet_config,
             record_store=record_store,
@@ -2144,98 +2091,18 @@ def _refresh_scope(
             file=sys.stderr,
         )
         raise
+    except RuntimeError as exc:
+        # The scope resolves but its stratum does not — a fleet config a
+        # launch should report rather than die on.
+        print(f"  [refresh] scope {scope_id!r}: {exc}", file=sys.stderr)
+        return
 
-
-def _judge_spliced_summary(
-    spliced: ScopeSummary,
-    *,
-    scope: Scope,
-    stratum: Stratum,
-    fleet_config: FleetConfig,
-    parent_summary: ScopeSummary,
-    record_store: RecordStore,
-    summary_store: SummaryStore,
-    manager: ScopeManager,
-    summary_max_words: int,
-    window_verbatim_tail: int,
-    recency_window_size: int,
-    ts: str,
-) -> None:
-    """Reconcile a scope's context with directives just spliced in (ADR 0011 D4).
-
-    The judgment half of the splice: the directives are already in *spliced*
-    mechanically, so the amendment carries context and lifecycle ops only —
-    ``splice_refresh`` mode drops anything admitting. The refresh request is
-    itself a contribution, appended to the record BEFORE judgment and judged
-    after, so the summary never changes without a record trail ("the record is
-    sacred" — ROADMAP principle 4; CONTEXT.md § Contribution).
-    """
-    from strata.operator import operator_memory_binding
-    from strata.record_store import ContributorRef
-
-    recent_contributions = record_store.list_recent_contributions(
-        scope_id=scope.id, limit=recency_window_size
-    )
-
-    refresh_contribution = record_store.append_contribution(
-        scope_id=scope.id,
-        content=(
-            "[Manager refresh triggered by strata launch"
-            " — parent directives already incorporated mechanically;"
-            " reconcile the context digest with the refreshed state.]"
-        ),
-        proposed_classification="context",
-        subject="manager-refresh",
-        supersedes=None,
-        contributor=ContributorRef(
-            scope_id=scope.id,
-            skill="scope-manager",
-            session_id="refresh",
-            ts=ts,
-        ),
-    )
-
-    print(f"  [refresh] refreshing scope {scope.id!r}...", file=sys.stderr)
-    judgment = manager.judge(
-        scope=scope,
-        stratum=stratum,
-        parent_summary=parent_summary,
-        current_summary=spliced,
-        recent_contributions=recent_contributions,
-        new_contribution=refresh_contribution,
-        summary_max_words=summary_max_words,
-        window_verbatim_tail=window_verbatim_tail,
-        entitlement=fleet_config.entitlement_view(scope.id),
-        operator_memory=operator_memory_binding(
-            scope.id, fleet=fleet_config, summaries_dir=summary_store.summaries_dir
-        ),
-        # ADR 0011 D4 — on the splice path the refresh amendment is context +
-        # lifecycle ops only (implementation pin 6's mode, not a bool).
-        mode="splice_refresh",
-    )
-
-    record_store.record_judgment(
-        contribution_id=refresh_contribution.id,
-        decision=judgment.decision,
-        judged_by="scope-manager",
-        notes=judgment.record_notes,
-    )
-
-    if judgment.new_summary is not None:
-        to_write = judgment.new_summary.model_copy(
-            update={"parent_version": parent_summary.version}
+    if outcome.judged:
+        print(
+            f"  [refresh] scope {scope_id!r} refreshed "
+            f"({outcome.events_processed} input change(s))",
+            file=sys.stderr,
         )
-        summary_store.write(scope.id, to_write)
-        # A retire op removes a directive with no replacement, so the record
-        # carries a retirement event for it (ADR 0011 D1).
-        for directive_id in judgment.retired_directive_ids:
-            record_store.append_retirement(
-                scope_id=scope.id,
-                directive_id=directive_id,
-                retired_by="scope-manager",
-                reason=judgment.reasoning,
-            )
-        print(f"  [refresh] scope {scope.id!r} summary updated", file=sys.stderr)
 
 
 def _refresh_order(fleet_config: FleetConfig) -> list[str]:
