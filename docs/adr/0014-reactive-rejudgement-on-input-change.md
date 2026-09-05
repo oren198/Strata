@@ -51,12 +51,18 @@ withdrawal. Termination is solved in D4, not by narrowing the trigger.
 
 A scope's own contribution is not a trigger; it already has a path.
 
-### D2 — The trigger runs the manager-refresh path, with admitting ops allowed
+### D2 — The trigger runs the manager-refresh path; `publish` allowed, `append` not
 
 The triggered cycle is ADR 0011 D4's refresh, **amended**: on an input-change
-refresh the judge's amendment may carry `append` and `publish` ops as well as
-`new_context`, lifecycle ops and `withdraw_published`. The drop of admitting ops
-stays for the parent-splice refresh, where the splice already did the work —
+refresh the judge's amendment may carry `publish` ops as well as
+`new_context`, lifecycle ops and `withdraw_published`. `append` stays dropped
+on this path too: in a refresh the only contribution in the batch is the
+change notice, and `append` copies the triggering contribution's content and
+subject verbatim (ADR 0011 D1) — it would mint a directive whose text is the
+mechanical change payload under the subject `manager-refresh`. `publish`
+carries the judge's own words on the notice's id and provenance, which is all
+the rationale below needs. The drop of both admitting ops stays for the
+parent-splice refresh, where the splice already did the work —
 that is a distinction between the two judge MODES, not between two entry
 points: the splice runs inside every drain, wherever the drain runs, and a
 drain that both splices and has change events pending judges once, in
@@ -64,7 +70,7 @@ input-change mode.
 
 Why the amendment is now safe: ADR 0011 dropped admitting ops because a refresh
 had no real contribution to mint a directive from. It now does — the change
-event is a record row (D5), so a directive minted from it carries honest
+event is a record row (D5), so a directive published from it carries honest
 provenance: this entered because input X changed.
 
 The engine never edits the scope's memory. Only the scope's judge does,

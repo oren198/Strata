@@ -175,13 +175,13 @@ def _tool_block(**payload) -> SimpleNamespace:  # noqa: ANN003
     return SimpleNamespace(input=payload)
 
 
-def _parse(mode: str):  # noqa: ANN201
+def _parse(mode: str, ops=({"op": "append"},)):  # noqa: ANN001, ANN201
     return ScopeManager._parse_judgment(
         scope=SCOPE,
         tool_use_block=_tool_block(
             decision="accept_as_directive",
             reasoning="The withdrawn input no longer supports this claim.",
-            directive_ops=[{"op": "append"}],
+            directive_ops=list(ops),
             new_context="Reconciled.",
             withdraw_published=["p_1"],
         ),
@@ -197,11 +197,19 @@ def test_splice_refresh_still_drops_admitting_ops():
     assert judgment.dropped_ops
 
 
-def test_input_change_refresh_keeps_admitting_ops():
-    """ADR 0014 D2: the change notice is a real contribution to mint from."""
-    judgment = _parse("input_change_refresh")
-    assert [op.op for op in judgment.directive_ops] == ["append"]
-    assert judgment.dropped_ops == []
+def test_input_change_refresh_keeps_publish_but_drops_append():
+    """ADR 0014 D2: the notice is a real contribution to mint a directive FROM,
+    but never one to copy. ``publish`` carries the judge's own words on the
+    notice's id and provenance; ``append`` would copy the notice's mechanical
+    payload verbatim into a directive whose subject is ``manager-refresh``.
+    """
+    judgment = _parse(
+        "input_change_refresh",
+        ops=[{"op": "append"}, {"op": "publish", "content": "Judge's own words.", "subject": "x"}],
+    )
+    assert [op.op for op in judgment.directive_ops] == ["publish"]
+    assert judgment.dropped_ops == ["append"]
+    assert "append" in judgment.record_notes
 
 
 def test_input_change_refresh_keeps_withdraw_published():
@@ -250,6 +258,38 @@ def test_a_splice_refresh_batch_drops_admitting_ops_too():
     assert [op.op for op in judgment.directive_ops] == ["retire"]
     assert judgment.dropped_ops == ["append(contribution=c_refresh)"]
     assert "append" in judgment.record_notes_for(contribution.id)
+
+
+def test_an_input_change_refresh_batch_drops_append_and_keeps_publish():
+    contribution = _contribution()
+    judgment = ScopeManager._parse_batch_judgment(
+        scope=SCOPE,
+        tool_use_block=_tool_block(
+            verdicts=[
+                {
+                    "contribution_id": contribution.id,
+                    "decision": "accept_as_directive",
+                    "reasoning": "reconciled",
+                }
+            ],
+            directive_ops=[
+                {"op": "append", "contribution_id": contribution.id},
+                {
+                    "op": "publish",
+                    "content": "Judge's own words.",
+                    "subject": "x",
+                    "contribution_id": contribution.id,
+                },
+            ],
+            new_context="Reconciled.",
+        ),
+        current_summary=_summary(),
+        contributions={contribution.id: contribution},
+        mode="input_change_refresh",
+    )
+
+    assert [op.op for op in judgment.directive_ops] == ["publish"]
+    assert judgment.dropped_ops == ["append(contribution=c_refresh)"]
 
 
 def test_wave_ids_reads_the_same_on_both_judgment_shapes():
