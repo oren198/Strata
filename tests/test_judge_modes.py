@@ -120,10 +120,15 @@ def test_input_change_refresh_renders_its_own_block():
     assert "MANAGER REFRESH:" not in text
 
 
-def test_input_change_refresh_block_states_the_admitting_ops_are_allowed():
+def test_input_change_refresh_block_states_no_admitting_op_and_no_restatement():
+    """#198: a refresh reconciles the scope's OWN memory. It admits nothing —
+    the changed input is already composed for every reader — and it never
+    writes the changed input into ``new_context``."""
     text = _preamble(mode="input_change_refresh", input_changes=[_change_event()])
-    for op in ("append", "publish", "retire", "supersede", "withdraw_published"):
+    for op in ("retire", "supersede", "withdraw_published"):
         assert op in text
+    assert "`append` and `publish` are dropped" in text
+    assert "restate" in text.lower()
 
 
 def test_input_change_refresh_never_restates_a_parents_context():
@@ -190,19 +195,30 @@ def _parse(mode: str, ops=({"op": "append"},)):  # noqa: ANN001, ANN201
     )
 
 
-def test_input_change_refresh_keeps_publish_but_drops_append():
-    """ADR 0014 D2: the notice is a real contribution to mint a directive FROM,
-    but never one to copy. ``publish`` carries the judge's own words on the
-    notice's id and provenance; ``append`` would copy the notice's mechanical
-    payload verbatim into a directive whose subject is ``manager-refresh``.
-    """
+def test_input_change_refresh_drops_every_admitting_op():
+    """#198: on a refresh the only contribution in the batch is the change
+    notice, and the material it names is already composed for the reader
+    (ADR 0013/0015). Admitting it again — as the notice's bytes (``append``)
+    or as the judge's own words (``publish``) — manufactures a second copy
+    under the hearer's name, escalates a note into a rule, and outlives a
+    withdrawal at the source. Both are dropped; lifecycle ops stand."""
     judgment = _parse(
         "input_change_refresh",
-        ops=[{"op": "append"}, {"op": "publish", "content": "Judge's own words.", "subject": "x"}],
+        ops=[
+            {"op": "append"},
+            {"op": "publish", "content": "Judge's own words.", "subject": "x"},
+            {"op": "retire", "id": "c_gone"},
+        ],
     )
-    assert [op.op for op in judgment.directive_ops] == ["publish"]
-    assert judgment.dropped_ops == ["append"]
-    assert "append" in judgment.record_notes
+    assert [op.op for op in judgment.directive_ops] == ["retire"]
+    assert judgment.dropped_ops == [
+        "append",
+        "publish(content='Judge's own words.', subject='x')",
+    ] or (
+        len(judgment.dropped_ops) == 2
+        and all(k in " ".join(judgment.dropped_ops) for k in ("append", "publish"))
+    )
+    assert "publish" in judgment.record_notes
 
 
 def test_input_change_refresh_keeps_withdraw_published():
@@ -276,7 +292,7 @@ def test_the_batch_parser_refuses_an_unknown_mode_too():
     assert "append" in judgment.record_notes_for(contribution.id)
 
 
-def test_an_input_change_refresh_batch_drops_append_and_keeps_publish():
+def test_an_input_change_refresh_batch_drops_every_admitting_op():
     contribution = _contribution()
     judgment = ScopeManager._parse_batch_judgment(
         scope=SCOPE,
@@ -304,8 +320,9 @@ def test_an_input_change_refresh_batch_drops_append_and_keeps_publish():
         mode="input_change_refresh",
     )
 
-    assert [op.op for op in judgment.directive_ops] == ["publish"]
-    assert judgment.dropped_ops == ["append(contribution=c_refresh)"]
+    assert judgment.directive_ops == []
+    assert len(judgment.dropped_ops) == 2
+    assert any("publish" in d for d in judgment.dropped_ops)
 
 
 def test_wave_ids_reads_the_same_on_both_judgment_shapes():

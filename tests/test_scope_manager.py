@@ -3445,8 +3445,10 @@ def test_refresh_block_rendered_in_input_change_refresh_mode() -> None:
     assert "INPUT-CHANGE REFRESH" not in ordinary
 
 
-def test_input_change_refresh_amendment_drops_append_but_keeps_publish() -> None:
-    """A refresh may publish the judge's own words; it may never copy the notice's."""
+def test_input_change_refresh_amendment_drops_admitting_ops_keeps_lifecycle() -> None:
+    """#198: a refresh admits nothing — not the notice's bytes, not the judge's
+    own words about it. It may retire, supersede, withdraw, and rewrite its
+    own context."""
     manager, _ = _make_manager(
         {
             "decision": "accept_as_context",
@@ -3471,9 +3473,9 @@ def test_input_change_refresh_amendment_drops_append_but_keeps_publish() -> None
 
     assert judgment.new_summary is not None
     assert judgment.new_summary.context == "Reconciled context."
-    assert [op.op for op in judgment.directive_ops] == ["publish", "retire"]
-    assert judgment.dropped_ops == ["append"]
-    assert "append" in judgment.record_notes
+    assert [op.op for op in judgment.directive_ops] == ["retire"]
+    assert len(judgment.dropped_ops) == 2
+    assert "publish" in judgment.record_notes and "append" in judgment.record_notes
 
 
 # ---------------------------------------------------------------------------
