@@ -749,6 +749,38 @@ def test_register_null_mcp_json_does_not_crash(tmp_path: Path, capsys) -> None:
     assert ".mcp.json" in captured.err
 
 
+def test_register_non_dict_settings_json_does_not_crash(tmp_path: Path, capsys) -> None:
+    """`.claude/settings.json` containing `[]` (valid JSON, not an object)
+    must fail cleanly with an actionable message, not an AttributeError."""
+    _init_project(tmp_path)
+    claude_dir = tmp_path / ".claude"
+    claude_dir.mkdir(parents=True)
+    (claude_dir / "settings.json").write_text("[]", encoding="utf-8")
+
+    rc = _run_register(tmp_path)
+
+    assert rc == 1
+    captured = capsys.readouterr()
+    assert ".claude/settings.json" in captured.err
+    assert (claude_dir / "settings.json").read_text(encoding="utf-8") == "[]", (
+        "register must never overwrite a settings.json it could not use"
+    )
+
+
+def test_register_null_settings_json_does_not_crash(tmp_path: Path, capsys) -> None:
+    """`null` is valid JSON but not an object — must not crash register."""
+    _init_project(tmp_path)
+    claude_dir = tmp_path / ".claude"
+    claude_dir.mkdir(parents=True)
+    (claude_dir / "settings.json").write_text("null", encoding="utf-8")
+
+    rc = _run_register(tmp_path)
+
+    assert rc == 1
+    captured = capsys.readouterr()
+    assert ".claude/settings.json" in captured.err
+
+
 # ---------------------------------------------------------------------------
 # MEDIUM 3 (fix round): --diff mode honesty for the migration/dedup prints.
 # ---------------------------------------------------------------------------
@@ -886,15 +918,24 @@ def test_diff_mode_on_existing_project_shows_unchanged(tmp_path: Path, capsys) -
 
 
 def test_existing_config_toml_not_overwritten(tmp_path: Path) -> None:
-    """strata register must not overwrite an existing .strata/config.toml."""
+    """strata register must not overwrite an existing .strata/config.toml.
+
+    The custom paths live outside `.strata/` (issue #184: a configured
+    fleet_yaml can point anywhere, including outside the project tree
+    entirely) in a directory that actually exists on disk, so this also
+    exercises the resolver picking up the configured fleet path rather than
+    assuming the default `.strata/fleet.yaml` layout.
+    """
     _init_project(tmp_path)
     strata_dir = tmp_path / ".strata"
     strata_dir.mkdir()
+    custom_dir = tmp_path / "custom"
+    custom_dir.mkdir()
     custom_config = (
         "# custom config\n"
-        'db = "/custom/db.sqlite"\n'
-        'fleet_yaml = "/custom/fleet.yaml"\n'
-        'summaries_dir = "/custom/summaries"\n'
+        f'db = "{custom_dir / "db.sqlite"}"\n'
+        f'fleet_yaml = "{custom_dir / "fleet.yaml"}"\n'
+        f'summaries_dir = "{custom_dir / "summaries"}"\n'
     )
     config = strata_dir / "config.toml"
     config.write_text(custom_config, encoding="utf-8")
@@ -902,6 +943,10 @@ def test_existing_config_toml_not_overwritten(tmp_path: Path) -> None:
     _run_register(tmp_path)
 
     assert config.read_text(encoding="utf-8") == custom_config
+    # The fleet seeded by this run must land at the resolved custom path,
+    # never at the default .strata/fleet.yaml (which nothing here reads).
+    assert (custom_dir / "fleet.yaml").exists()
+    assert not (strata_dir / "fleet.yaml").exists()
 
 
 # ---------------------------------------------------------------------------

@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import Annotated, Literal
 
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 # ---------------------------------------------------------------------------
 # Error
@@ -50,6 +50,96 @@ class FleetConfigError(Exception):
         super().__init__(message)
         self.kind = kind
         self.message = message
+
+
+# ---------------------------------------------------------------------------
+# Schema-error humanizing (issue #182)
+#
+# ``FleetConfig.model_validate`` raises pydantic's own ``ValidationError`` for
+# shape problems (a missing field, a wrong type) — invariant checks in
+# ``_validate`` below never see these, because the model does not even exist
+# yet. Left uncaught, that error's ``str()`` dumps the pydantic class name, a
+# dotted field path, a ``type=`` tag, and a link to pydantic's own error
+# reference — none of it meaningful to someone editing fleet.yaml. This
+# rewrites each underlying error into the same vocabulary the rest of this
+# module speaks (stratum, scope, edge), using only ``ValidationError.errors()``
+# — never the library's rendered ``str()`` — so no internal detail leaks
+# through. Both ``strata bootstrap`` and the Console read the identical
+# message, because both go through :meth:`FleetConfig.load` /
+# :meth:`FleetConfig._commit`.
+# ---------------------------------------------------------------------------
+
+#: Section name in the raw YAML -> singular noun used in messages.
+_SECTION_SINGULAR = {"strata": "stratum", "scopes": "scope", "edges": "edge"}
+
+
+def _item_label(singular: str, index: int, item: object) -> str:
+    """Return e.g. ``"scope #1 (id 'g_boss')"`` or ``"edge #3 ('g_a' -> 'g_b')"``.
+
+    Falls back to a bare ``"{singular} #{n}"`` when the offending item isn't a
+    dict, or carries none of the identifying fields (which happens when the
+    identifying field is itself the one missing).
+    """
+    label = f"{singular} #{index + 1}"
+    if not isinstance(item, dict):
+        return label
+    if singular == "edge":
+        frm = item.get("from", item.get("from_"))
+        to = item.get("to")
+        if frm is not None and to is not None:
+            return f"{label} ({frm!r} -> {to!r})"
+        return label
+    ident = item.get("id")
+    return f"{label} (id {ident!r})" if ident is not None else label
+
+
+def _describe_schema_error(err: dict, raw: object) -> str:
+    """Render one entry of :meth:`ValidationError.errors` in fleet vocabulary.
+
+    *raw* is the parsed YAML document the error came from — used to look up
+    the offending item by section/index, since ``err["input"]`` is the whole
+    item for a *missing*-field error but only the bad value itself for a
+    wrong-type error, and only the former identifies the item.
+    """
+    loc = err["loc"]
+    msg = err["msg"]
+    if not loc:
+        return msg
+    section = loc[0] if isinstance(loc[0], str) else None
+    singular = _SECTION_SINGULAR.get(section)
+    if singular is None or len(loc) < 2 or not isinstance(loc[1], int):
+        # Not a per-item field error (e.g. "scopes" itself absent or not a
+        # list) — name the raw path, still without any pydantic internals.
+        path = ".".join(str(p) for p in loc)
+        return f"{path}: {msg}" if path else msg
+    index = loc[1]
+    item = None
+    if isinstance(raw, dict):
+        section_list = raw.get(section)
+        if isinstance(section_list, list) and 0 <= index < len(section_list):
+            item = section_list[index]
+    label = _item_label(singular, index, item)
+    if len(loc) == 2:
+        # The item itself is malformed (e.g. not a mapping at all).
+        return f"{label}: {msg}"
+    field = loc[2]
+    if err["type"] == "missing":
+        return f"{label} is missing its {field}."
+    return f"{label}: {field} — {msg}."
+
+
+def _schema_error_to_fleet_config_error(exc: ValidationError, raw: object) -> FleetConfigError:
+    """Convert a raw pydantic :class:`ValidationError` into a :class:`FleetConfigError`.
+
+    ``kind`` is the single stable token ``"invalid_schema"`` — unlike the
+    invariant checks below, a schema error is pydantic's own field-shape
+    complaint rather than one of this module's named checks, so there is no
+    finer-grained kind to report. ``message`` lists every underlying error
+    (fleet.yaml can fail this in more than one place at once), each one
+    naming the offending scope/stratum/edge and field.
+    """
+    message = " ".join(_describe_schema_error(e, raw) for e in exc.errors())
+    return FleetConfigError(kind="invalid_schema", message=message)
 
 
 # ---------------------------------------------------------------------------
@@ -380,7 +470,10 @@ class FleetConfig(BaseModel):
                 the check, ``message`` names the offending item.
         """
         raw = yaml.safe_load(path.read_text(encoding="utf-8"))
-        config = cls.model_validate(raw)
+        try:
+            config = cls.model_validate(raw)
+        except ValidationError as exc:
+            raise _schema_error_to_fleet_config_error(exc, raw) from exc
         _validate(config)
         _canonicalize(config)
         object.__setattr__(config, "_path", path)
@@ -570,6 +663,158 @@ class FleetConfig(BaseModel):
             others=others,
         )
 
+    def references_from(self, scope_id: str) -> list[Scope]:
+        """Return the active scopes *scope_id* itself references, one hop (ADR 0013 D3).
+
+        Publication travels exactly one edge, uniformly for chain and
+        reference edges: a perspective's referenced-scope layers come from
+        the requested scope's OWN reference edges only, never an ancestor's
+        — an ancestor's own reference is that ancestor's business to relay
+        or not (curation checkpoint), not something a further descendant
+        receives for free. This is deliberately narrower than
+        :meth:`entitlement_view`'s ``referenced_peers`` (ADR 0006 D2 judge
+        entitlement, chain-wide, unchanged by this ADR): a relay's origin
+        must stay a legitimate fleet-internal name for the judge even after
+        this scope stops composing that origin's publication directly.
+
+        Args:
+            scope_id: The scope whose own outgoing reference edges to
+                resolve. Not validated against the fleet — an unknown id
+                simply has no outgoing edges to resolve.
+
+        Returns:
+            Active target scopes, sorted by scope id for deterministic
+            order. An archived target, or a scope with no reference edges of
+            its own, yields an empty list.
+        """
+        scope_map = {s.id: s for s in self.scopes}
+        ids: list[str] = []
+        seen: set[str] = set()
+        for resolution in _resolve_edges(self):
+            if resolution.kind != "reference" or resolution.from_ != scope_id:
+                continue
+            if resolution.to in seen:
+                continue
+            target = scope_map.get(resolution.to)
+            if target is None or target.status != "active":
+                continue
+            seen.add(resolution.to)
+            ids.append(resolution.to)
+        return sorted((scope_map[sid] for sid in ids), key=lambda s: s.id)
+
+    # ------------------------------------------------------------------
+    # Affected-set traversal (ADR 0014 D3)
+    #
+    # The three walks the topological affected set is built from: a
+    # publication change reaches the source's chain children and the scopes
+    # whose reference edge points AT the source; a directive change reaches
+    # the holding scope's chain descendants. One rule for an addition, an
+    # amendment and a withdrawal alike — there is no presented index and no
+    # fallback (ADR 0014 D3's rejected alternative).
+    # ------------------------------------------------------------------
+
+    def chain_children(self, scope_id: str) -> list[Scope]:
+        """Return the active scopes whose chain parent is *scope_id*, one hop.
+
+        The publication half of ADR 0014 D3's rule: a scope's publication
+        composes into its chain children (ADR 0013 D2/D3 — publication
+        travels exactly one edge), so those are the scopes a change to it
+        can invalidate. Grandchildren are NOT children: they receive the
+        source's face only if the child relays it, which is the child's own
+        publication act and mints its own change.
+
+        Args:
+            scope_id: The parent scope. Not validated against the fleet — an
+                unknown id simply has no children.
+
+        Returns:
+            Active child scopes, sorted by scope id. Archived children are
+            excluded: an archived scope has no judge to wake.
+        """
+        scope_map = {s.id: s for s in self.scopes}
+        parents = self._chain_parent_ids()
+        children = [
+            scope_map[child_id]
+            for child_id, parent_id in parents.items()
+            if parent_id == scope_id and child_id in scope_map
+        ]
+        return sorted((c for c in children if c.status == "active"), key=lambda s: s.id)
+
+    def chain_descendants(self, scope_id: str) -> list[Scope]:
+        """Return every active scope below *scope_id* on chain edges, at any depth.
+
+        The directive half of ADR 0014 D3's rule: a directive binds the
+        holding scope's whole subtree, so a directive appended, superseded or
+        retired at *scope_id* changes what every descendant's judge would be
+        shown. Reference edges are never followed — a reference delivers
+        publication, never ancestry (:meth:`inter_stratum_parent`).
+
+        *scope_id* itself is NOT included; a scope's own directive change is
+        its own act, and the callers that DO want the scope included (an
+        operator directive attached at S binds S and its subtree, ADR 0008
+        D2) add it themselves.
+
+        Args:
+            scope_id: The holding scope.
+
+        Returns:
+            Active descendant scopes, sorted by scope id.
+        """
+        # One shared parent map, walked per candidate — the same shape
+        # entitlement_view's descendant scan uses, for the same reason:
+        # re-deriving each candidate's ancestry would re-resolve every edge
+        # once per hop, per scope.
+        parents = self._chain_parent_ids()
+        descendants: list[Scope] = []
+        for candidate in self.scopes:
+            if candidate.id == scope_id or candidate.status != "active":
+                continue
+            # A validated fleet's chain edges cannot loop (a parent sits on a
+            # strictly lower ordinal); the walked set keeps this total on a
+            # config built without validation.
+            walked: set[str] = {candidate.id}
+            cursor = parents.get(candidate.id)
+            while cursor is not None and cursor not in walked:
+                if cursor == scope_id:
+                    descendants.append(candidate)
+                    break
+                walked.add(cursor)
+                cursor = parents.get(cursor)
+        return sorted(descendants, key=lambda s: s.id)
+
+    def referenced_by(self, scope_id: str) -> list[Scope]:
+        """Return the active scopes that reference *scope_id*, one hop — the readers.
+
+        The exact inverse of :meth:`references_from`: that method answers
+        "whose publications do I read", this one answers "who reads mine",
+        which is what ADR 0014 D3 needs to name the scopes a change to
+        *scope_id*'s publication affects. Same one-hop, own-edges-only rule
+        on both sides, so ``B in fleet.references_from(A)`` holds exactly
+        when ``A in fleet.referenced_by(B)``.
+
+        Args:
+            scope_id: The referenced scope whose readers to resolve. Not
+                validated against the fleet.
+
+        Returns:
+            Active reader scopes, sorted by scope id. An archived reader is
+            excluded — it has no judge to wake.
+        """
+        scope_map = {s.id: s for s in self.scopes}
+        ids: list[str] = []
+        seen: set[str] = set()
+        for resolution in _resolve_edges(self):
+            if resolution.kind != "reference" or resolution.to != scope_id:
+                continue
+            if resolution.from_ in seen:
+                continue
+            reader = scope_map.get(resolution.from_)
+            if reader is None or reader.status != "active":
+                continue
+            seen.add(resolution.from_)
+            ids.append(resolution.from_)
+        return sorted((scope_map[sid] for sid in ids), key=lambda s: s.id)
+
     # ------------------------------------------------------------------
     # Mutation API
     # ------------------------------------------------------------------
@@ -584,7 +829,10 @@ class FleetConfig(BaseModel):
         Callers hold ``self._lock``.
         """
         assert self._path is not None
-        candidate = FleetConfig.model_validate(raw)
+        try:
+            candidate = FleetConfig.model_validate(raw)
+        except ValidationError as exc:
+            raise _schema_error_to_fleet_config_error(exc, raw) from exc
         _validate(candidate)
         _canonicalize_raw_edges(candidate, raw["edges"])
         _atomic_write(self._path, raw)

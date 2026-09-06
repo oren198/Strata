@@ -159,6 +159,14 @@ primitives, defined by Strata's contract:
   record; this gives explicit retirement its first record shape, which a
   future scope-manager explicit-retire can reuse.)
 
+> **Note (2026-09-05, ADR 0014 D5):** the `manager-refresh` row a change
+> event writes is not the fabricated contribution this decision refuses to
+> invent. It differs from a hand-rolled operator write in the way that
+> matters: it reports an event that actually happened — an input this scope
+> composes changed — and receives a real verdict from the scope's own judge,
+> under the scope's own authority. A mechanical record row carrying no memory
+> of its own is not a proposal dressed up to look like one.
+
 Both leave the summary explainable by the record (the #38 invariant), run
 under the per-scope serialization lock, and are exactly the operations a
 consumer would otherwise hand-roll and must delete in favour of these

@@ -706,3 +706,51 @@ def test_register_bootstrap_venv_both_harnesses_notice_matches_behavior(
     # --bootstrap-venv step was skipped" — which the venv creation above
     # disproves.
     assert "skipping that step for codex only" in out
+
+
+# ---------------------------------------------------------------------------
+# CRLF round-trip through the real CLI (final fix wave, item 3).
+#
+# codex_config.read_text/write_text() (register's merge, unregister's
+# remove) do universal-newline translation, stripping \r before it ever
+# reaches the merge/remove logic — the same bug class already fixed for
+# AGENTS.md (see tests/test_agents_md.py, "CRLF round-trip through the real
+# CLI"). The three in-scope I/O sites must read/write raw bytes instead.
+# ---------------------------------------------------------------------------
+
+
+def test_register_preserves_on_disk_crlf_codex_config(tmp_path: Path, codex_home: Path) -> None:
+    _init_project(tmp_path)
+    codex_home.mkdir(parents=True)
+    crlf_text = (
+        '[model]\r\nname = "gpt-5"\r\n\r\n[mcp_servers.other-tool]\r\ncommand = "other-bin"\r\n'
+    )
+    (codex_home / "config.toml").write_bytes(crlf_text.encode("utf-8"))
+
+    assert _register(tmp_path, harness="codex") == 0
+
+    raw = (codex_home / "config.toml").read_bytes()
+    # The user's own pre-existing CRLF-terminated lines must survive
+    # byte-for-byte.
+    assert (
+        b'[model]\r\nname = "gpt-5"\r\n\r\n[mcp_servers.other-tool]\r\ncommand = "other-bin"\r\n'
+        in raw
+    )
+    assert install.codex_mcp_present(raw.decode("utf-8"))
+
+
+def test_unregister_preserves_on_disk_crlf_codex_config(tmp_path: Path, codex_home: Path) -> None:
+    _init_project(tmp_path)
+    codex_home.mkdir(parents=True)
+    user_crlf = '[model]\r\nname = "gpt-5"\r\n'
+    (codex_home / "config.toml").write_bytes(user_crlf.encode("utf-8"))
+
+    assert _register(tmp_path, harness="codex") == 0
+    assert _unregister(tmp_path, harness="codex") == 0
+
+    raw = (codex_home / "config.toml").read_bytes()
+    assert not install.codex_mcp_present(raw.decode("utf-8"))
+    # The user's own CRLF-terminated lines — present before register ever
+    # touched the file — must survive byte-for-byte through both the merge
+    # (register) and the remove (unregister).
+    assert b'[model]\r\nname = "gpt-5"\r\n' in raw

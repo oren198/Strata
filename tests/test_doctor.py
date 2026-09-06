@@ -115,6 +115,7 @@ def test_doctor_all_checks_pass(registered_project: Path, capsys: pytest.Capture
     assert "fleet" in lower
     assert "mcp" in lower
     assert "stop hook" in lower
+    assert "sessionstart hook" in lower
     assert "skill" in lower
     assert "binding" in lower
     assert "session id" in lower
@@ -409,6 +410,31 @@ def test_doctor_null_mcp_json_does_not_crash(
     assert rc == 1
 
 
+def test_doctor_non_dict_settings_json_does_not_crash(
+    registered_project: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """`.claude/settings.json` containing `[]` (valid JSON, not an object)
+    must be reported as a hard-check failure, not crash with AttributeError."""
+    (registered_project / ".claude" / "settings.json").write_text("[]", encoding="utf-8")
+
+    rc, output = _run_doctor(capsys)
+
+    assert rc == 1
+    lower = output.lower()
+    assert "settings.json" in lower
+
+
+def test_doctor_null_settings_json_does_not_crash(
+    registered_project: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """`null` is valid JSON but not an object — must not crash doctor."""
+    (registered_project / ".claude" / "settings.json").write_text("null", encoding="utf-8")
+
+    rc, output = _run_doctor(capsys)
+
+    assert rc == 1
+
+
 # ---------------------------------------------------------------------------
 # 5. Stop hook script present and matching shipped.
 # ---------------------------------------------------------------------------
@@ -490,6 +516,53 @@ def test_doctor_flags_missing_stop_hook_entry(
     assert rc == 1
     lower = output.lower()
     assert "hooks.stop" in lower or "stop hook entry" in lower
+    assert "register" in lower
+
+
+# ---------------------------------------------------------------------------
+# 6b/6c. SessionStart hook script + hooks.SessionStart entry — symmetric with
+# checks 5/6 above (the READ-side trigger).
+# ---------------------------------------------------------------------------
+
+
+def test_doctor_flags_missing_session_start_hook(
+    registered_project: Path, capsys: pytest.CaptureFixture
+) -> None:
+    (registered_project / ".claude" / "hooks" / "strata-session-start-hook").unlink()
+
+    rc, output = _run_doctor(capsys)
+
+    assert rc == 1
+    lower = output.lower()
+    assert "sessionstart hook" in lower
+    assert "register" in lower
+
+
+def test_doctor_flags_edited_session_start_hook_script(
+    registered_project: Path, capsys: pytest.CaptureFixture
+) -> None:
+    hook_script = registered_project / ".claude" / "hooks" / "strata-session-start-hook"
+    hook_script.write_text("#!/bin/sh\necho tampered\n", encoding="utf-8")
+
+    rc, output = _run_doctor(capsys)
+
+    assert rc == 1
+    assert "sessionstart hook" in output.lower()
+
+
+def test_doctor_flags_missing_session_start_hook_entry(
+    registered_project: Path, capsys: pytest.CaptureFixture
+) -> None:
+    settings_json = registered_project / ".claude" / "settings.json"
+    data = json.loads(settings_json.read_text(encoding="utf-8"))
+    del data["hooks"]["SessionStart"]
+    settings_json.write_text(json.dumps(data), encoding="utf-8")
+
+    rc, output = _run_doctor(capsys)
+
+    assert rc == 1
+    lower = output.lower()
+    assert "hooks.sessionstart" in lower or "sessionstart hook entry" in lower
     assert "register" in lower
 
 
@@ -671,6 +744,30 @@ def test_doctor_flags_scope_not_in_fleet(
     assert "g_does_not_exist" in lower
 
 
+def test_doctor_flags_archived_scope(
+    registered_project: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """A binding against an archived scope must fail doctor the same way it
+    fails strata_bind — doctor and the MCP server must agree on what a valid
+    binding is (unified via ``_check_scope_exists(require_active=True)``)."""
+    fleet_yaml = registered_project / ".strata" / "fleet.yaml"
+    fleet_yaml.write_text(
+        "strata:\n  - id: L0\n    name: root\n    ordinal: 0\n"
+        "scopes:\n  - id: g_root\n    name: Root\n    stratum_id: L0\n"
+        "    status: archived\n"
+        "edges: []\n",
+        encoding="utf-8",
+    )
+
+    rc, output = _run_doctor(capsys)
+
+    assert rc == 1
+    lower = output.lower()
+    assert "binding" in lower
+    assert "archived" in lower
+    assert "g_root" in lower
+
+
 def test_doctor_flags_skill_not_permitted(
     registered_project: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
 ) -> None:
@@ -707,3 +804,84 @@ def test_doctor_failure_lines_are_actionable(
     assert rc == 1
     # The failing line must point at a concrete remedy, not just name the problem.
     assert "strata register" in output
+
+
+# ---------------------------------------------------------------------------
+# 10. Refresh queue (ADR 0014 D6/pin 4) — soft, informational, never flips the
+# exit code: a pending change event is NOT a judge outage, it is an input
+# change waiting for its refresh to run.
+# ---------------------------------------------------------------------------
+
+
+def _append_change_event(registered_project: Path, *, scope_id: str = "g_root") -> None:
+    """Append one manager-refresh contribution and its unprocessed change event
+    directly against the registered project's DB — the same rows the drain
+    (a later phase) would leave behind before it runs."""
+    from strata.record_store import ContributorRef, RecordStore
+
+    rs = RecordStore(str(registered_project / ".strata" / "strata.db"))
+    contribution = rs.append_contribution(
+        scope_id=scope_id,
+        content="an input this scope composes changed",
+        proposed_classification="context",
+        subject="manager-refresh",
+        supersedes=None,
+        contributor=ContributorRef(
+            scope_id=scope_id, skill=None, session_id="sess_test", ts="2026-09-05T00:00:00+00:00"
+        ),
+    )
+    rs.append_change_event(
+        change_id="wave_1",
+        contribution_id=contribution.id,
+        scope_id=scope_id,
+        item_id="pub_1",
+        kind="withdrawn",
+    )
+    rs.close()
+
+
+def test_doctor_reports_empty_refresh_queue(
+    registered_project: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """No pending change events: the check passes, reads '0 pending', and never
+    flips the exit code — a pending judgment is a separate check entirely."""
+    rc, output = _run_doctor(capsys)
+
+    assert rc == 0
+    lower = output.lower()
+    assert "refresh queue" in lower
+    assert "0 pending" in lower
+
+
+def test_doctor_reports_refresh_queue_depth_and_oldest_age(
+    registered_project: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """One pending change event: reported as refresh-pending, not a judge outage —
+    the check still passes (soft, informational), never a hard failure."""
+    _append_change_event(registered_project)
+
+    rc, output = _run_doctor(capsys)
+
+    assert rc == 0
+    lower = output.lower()
+    assert "refresh queue" in lower
+    assert "1 pending" in lower
+    # Names the scope carrying the oldest pending event.
+    assert "g_root" in lower
+
+
+def test_doctor_refresh_queue_never_counted_as_judge_outage(
+    registered_project: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """Pin 10's vacuous-pass guard: first assert the refresh-pending count is
+    >= 1, THEN assert doctor's exit code and other checks are untouched by it."""
+    _append_change_event(registered_project)
+
+    rc, output = _run_doctor(capsys)
+
+    lower = output.lower()
+    assert "1 pending" in lower  # the refresh-pending count is >= 1 (pin 10)
+    assert rc == 0  # a pending refresh alone never fails the run
+    # Every other check still reports its own, unrelated result.
+    assert "binding" in lower
+    assert "database" in lower

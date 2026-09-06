@@ -159,6 +159,24 @@
     return resp.json();
   }
 
+  // Fetch a scope's current publication — its curated outward face.
+  async function fetchScopePublication(scope_id) {
+    const base = getApiBase();
+    const resp = await fetch(`${base}/scopes/${encodeURIComponent(scope_id)}/publication`);
+    if (!resp.ok) throw new Error(`GET /scopes/${scope_id}/publication returned ${resp.status}`);
+    return resp.json();
+  }
+
+  // Fetch a scope's publish/withdraw act history.
+  async function fetchScopePublicationRecord(scope_id) {
+    const base = getApiBase();
+    const resp = await fetch(`${base}/scopes/${encodeURIComponent(scope_id)}/publication/record`);
+    if (!resp.ok) {
+      throw new Error(`GET /scopes/${scope_id}/publication/record returned ${resp.status}`);
+    }
+    return resp.json();
+  }
+
   async function _post(url, payload) {
     const resp = await fetch(url, {
       method: "POST",
@@ -215,6 +233,8 @@
     fetchScopeRecord,
     fetchRecordEntry,
     fetchPerspective,
+    fetchScopePublication,
+    fetchScopePublicationRecord,
     supersedeDirective,
     retireDirective,
     stratumIndex,

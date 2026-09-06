@@ -14,7 +14,6 @@ from strata.summary_store import (
     Directive,
     ScopeSummary,
     SummaryStore,
-    splice_parent_directives,
 )
 
 # ---------------------------------------------------------------------------
@@ -424,91 +423,3 @@ def test_write_forces_exists_true_even_if_caller_passed_false(tmp_path: Path) ->
     result = store.read("g_new")
     assert result is not None
     assert result.exists is True
-
-
-# ---------------------------------------------------------------------------
-# ADR 0011 D4 — the mechanical parent-directive splice
-# ---------------------------------------------------------------------------
-
-
-def _summary(scope_id: str, directives: list[Directive], context: str = "ctx") -> ScopeSummary:
-    return ScopeSummary(
-        scope_id=scope_id,
-        directives=directives,
-        context=context,
-        updated_at="2026-08-12T00:00:00Z",
-    )
-
-
-def test_splice_copies_a_new_parent_directive_byte_exactly() -> None:
-    """The parent's row lands in the child unchanged — id, bytes, provenance."""
-    parent_directive = _make_directive(
-        id="c_parent",
-        content="Line one.\nLine two.",
-        subject="policy",
-        source_scope_id="g_parent",
-        source_skill="scope-manager",
-        created_at="2026-01-01T00:00:00Z",
-    )
-    child = _summary("g_child", [_make_directive(id="c_local")])
-
-    spliced = splice_parent_directives(child, _summary("g_parent", [parent_directive]))
-
-    assert [d.id for d in spliced.directives] == ["c_local", "c_parent"]
-    assert spliced.directives[1] == parent_directive
-    # The child's own rows and context are untouched.
-    assert spliced.directives[0] == child.directives[0]
-    assert spliced.context == child.context
-
-
-def test_splice_replaces_a_changed_parent_directive_in_place() -> None:
-    """A parent directive whose text moved is refreshed, keeping its position."""
-    stale = _make_directive(id="c_parent", content="Old wording.", source_scope_id="g_parent")
-    current = _make_directive(id="c_parent", content="New wording.", source_scope_id="g_parent")
-    child = _summary("g_child", [stale, _make_directive(id="c_local")])
-
-    spliced = splice_parent_directives(child, _summary("g_parent", [current]))
-
-    assert [d.id for d in spliced.directives] == ["c_parent", "c_local"]
-    assert spliced.directives[0].content == "New wording."
-
-
-def test_splice_is_a_no_op_when_the_child_already_matches() -> None:
-    """Nothing to splice returns the same summary object — a refresh with no change."""
-    shared = _make_directive(id="c_parent", source_scope_id="g_parent")
-    child = _summary("g_child", [shared])
-
-    assert splice_parent_directives(child, _summary("g_parent", [shared])) is child
-    assert splice_parent_directives(child, _summary("g_parent", [])) is child
-
-
-def test_splice_never_removes_a_directive_the_parent_dropped() -> None:
-    """Removing a directive is a retirement — a judged, recorded act, not a splice."""
-    inherited = _make_directive(id="c_parent", source_scope_id="g_parent")
-    child = _summary("g_child", [inherited])
-
-    replacement = _make_directive(id="c_parent_new", source_scope_id="g_parent")
-    spliced = splice_parent_directives(child, _summary("g_parent", [replacement]))
-
-    assert [d.id for d in spliced.directives] == ["c_parent", "c_parent_new"]
-
-
-def test_spliced_directive_round_trips_through_the_store(tmp_path: Path) -> None:
-    """The spliced row survives the markdown write/read unchanged."""
-    parent_directive = _make_directive(
-        id="c_parent",
-        content="Multi-line rule.\nSecond line.",
-        subject=None,
-        source_scope_id="g_parent",
-        source_skill=None,
-        created_at="2026-01-01T00:00:00Z",
-    )
-    store = SummaryStore(str(tmp_path))
-    spliced = splice_parent_directives(
-        _summary("g_child", []), _summary("g_parent", [parent_directive])
-    )
-    store.write("g_child", spliced)
-
-    read_back = store.read("g_child")
-    assert read_back is not None
-    assert read_back.directives == [parent_directive]

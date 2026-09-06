@@ -506,6 +506,59 @@ def compute_fleet_staleness(
 
 
 # ---------------------------------------------------------------------------
+# Refresh-pending (ADR 0014 pin 4) — NOT a judge outage. A `change_events` row
+# that has not yet been drained is an input change waiting for its refresh to
+# run, not a judge that ran and failed; every surface that would otherwise
+# count an unjudged `manager-refresh` contribution as an outage (`doctor`, the
+# Console) calls this one helper instead of re-deriving its own query, so the
+# distinction is made once, here, and cannot drift between surfaces.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class RefreshPending:
+    """One scope's refresh queue depth (ADR 0014 D5/D6, pin 4).
+
+    ``depth`` is the count of that scope's UNPROCESSED ``change_events`` rows
+    — the drain has not yet run a refresh for them, whatever the eventual
+    verdict. ``oldest_pending_at`` is the earliest such row's ``created_at``,
+    or ``None`` for an empty queue — what ``strata doctor`` reports as the
+    oldest pending event's age.
+    """
+
+    scope_id: str
+    depth: int
+    oldest_pending_at: str | None
+
+
+def compute_refresh_pending(scope_id: str, *, record_store: RecordStore) -> RefreshPending:
+    """Compute *scope_id*'s refresh-pending queue depth, mechanically.
+
+    :meth:`~strata.record_store.RecordStore.list_change_events` already
+    returns unprocessed events oldest-first (its own ``ORDER BY created_at``),
+    so the first entry — if any — names the oldest pending event without a
+    second sort here.
+    """
+    events = record_store.list_change_events(scope_id=scope_id, unprocessed_only=True)
+    return RefreshPending(
+        scope_id=scope_id,
+        depth=len(events),
+        oldest_pending_at=events[0].created_at if events else None,
+    )
+
+
+def compute_fleet_refresh_pending(
+    scope_ids: list[str], *, record_store: RecordStore
+) -> list[RefreshPending]:
+    """Compute :func:`compute_refresh_pending` for each scope, preserving order.
+
+    Mirrors :func:`compute_fleet_staleness` — the library entry point hosts
+    render from, without reaching into ``change_events`` themselves.
+    """
+    return [compute_refresh_pending(scope_id, record_store=record_store) for scope_id in scope_ids]
+
+
+# ---------------------------------------------------------------------------
 # Read-time nudge policy (issue #111 — engine-owned thresholds + wording)
 # ---------------------------------------------------------------------------
 
