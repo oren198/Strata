@@ -387,6 +387,41 @@ def test_status_custom_window_flag(
     assert "7-day window" in capsys.readouterr().out
 
 
+def test_bootstrap_schema_error_is_plain_language(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``strata bootstrap`` on a fleet.yaml with a missing required field
+    (a pydantic schema-shape error, not one of the engine's own invariant
+    checks) prints a plain-language message — the offending scope and field,
+    no pydantic class name/dotted path/type tag/documentation URL (issue
+    #182; this is the CLI half of the same shared-layer fix the Console
+    route gets).
+    """
+    fleet_path = tmp_path / "fleet.yaml"
+    fleet_path.write_text(
+        "strata:\n"
+        "  - id: L0\n"
+        "    name: Executive\n"
+        "    ordinal: 0\n"
+        "scopes:\n"
+        "  - id: g_boss\n"
+        "    stratum_id: L0\n"
+        "edges: []\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("STRATA_FLEET_CONFIG", str(fleet_path))
+    with patch("sys.stderr", new_callable=io.StringIO) as err_buf:
+        rc = main(["bootstrap"])
+    err = err_buf.getvalue()
+    assert rc == 1
+    assert "g_boss" in err
+    assert "name" in err
+    assert "FleetConfig" not in err
+    assert "pydantic" not in err.lower()
+    assert "errors.pydantic.dev" not in err
+    assert "type=" not in err
+
+
 def test_bootstrap_no_config_found(
     monkeypatch: pytest.MonkeyPatch, tmp_path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -556,8 +591,6 @@ def test_operator_publish_and_show(
             "operator",
             "publish",
             "g_ceo",
-            "--kind",
-            "directive",
             "--content",
             "All services must use TLS 1.3.",
             "--subject",
@@ -602,8 +635,6 @@ def test_operator_publish_configures_cross_process_lock_dir(
             "operator",
             "publish",
             "g_ceo",
-            "--kind",
-            "directive",
             "--content",
             "All services must use TLS 1.3.",
             "--subject",
@@ -625,8 +656,6 @@ def test_operator_publish_unknown_scope_returns_1(
             "operator",
             "publish",
             "g_does_not_exist",
-            "--kind",
-            "directive",
             "--content",
             "text",
         ]
@@ -646,8 +675,6 @@ def test_operator_supersede_op_prefixed_item(
             "operator",
             "publish",
             "g_ceo",
-            "--kind",
-            "directive",
             "--content",
             "v1",
         ]
@@ -738,7 +765,7 @@ def test_operator_retire_op_prefixed_item(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     _seed_fleet(tmp_path, monkeypatch)
-    main(["operator", "publish", "g_ceo", "--kind", "context", "--content", "temp"])
+    main(["operator", "publish", "g_ceo", "--content", "temp"])
     publish_out = capsys.readouterr().out
     op_id = publish_out.split("[")[1].split("]")[0]
 

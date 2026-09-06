@@ -1,6 +1,7 @@
 # ADR 0013 — Publication Is the Only Sharing Channel; Directives Are the Only Inheritance
 
-**Status:** Proposed (grilled 2026-08-31; all decision branches resolved)
+**Status:** Accepted (2026-08-31 — grilled to completion with the operator;
+all decision branches resolved, no open questions)
 **Date:** 2026-08-31
 **Related:** ADR 0006 (entitlement — **amends D3**, peer-reference
 composition), ADR 0007 (publication mechanism — **amends D4**, what a

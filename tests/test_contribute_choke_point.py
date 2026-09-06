@@ -109,7 +109,7 @@ class _AccumulatingManager:
         *,
         scope,
         stratum,
-        parent_summary,
+        ancestor_directives,
         current_summary,
         recent_contributions,
         new_contribution,
@@ -118,6 +118,11 @@ class _AccumulatingManager:
         operator_memory=None,
         current_publication=None,
         peer_publications=None,
+        parent_publication=None,
+        mode="ordinary",
+        input_changes=None,
+        change_id=None,
+        hop=0,
         window_verbatim_tail=None,
     ):  # noqa: ANN001, ANN201, E501
         existing = list(current_summary.directives) if current_summary is not None else []
@@ -154,7 +159,7 @@ class _SkillEchoManager:
         *,
         scope,
         stratum,
-        parent_summary,
+        ancestor_directives,
         current_summary,
         recent_contributions,
         new_contribution,
@@ -163,6 +168,11 @@ class _SkillEchoManager:
         operator_memory=None,
         current_publication=None,
         peer_publications=None,
+        parent_publication=None,
+        mode="ordinary",
+        input_changes=None,
+        change_id=None,
+        hop=0,
         window_verbatim_tail=None,
     ):  # noqa: ANN001, ANN201, E501
         directive = Directive(
@@ -512,7 +522,7 @@ class _CapturingManager:
         *,
         scope,
         stratum,
-        parent_summary,
+        ancestor_directives,
         current_summary,
         recent_contributions,
         new_contribution,
@@ -521,6 +531,11 @@ class _CapturingManager:
         operator_memory=None,
         current_publication=None,
         peer_publications=None,
+        parent_publication=None,
+        mode="ordinary",
+        input_changes=None,
+        change_id=None,
+        hop=0,
         window_verbatim_tail=None,
     ):  # noqa: ANN001, ANN201, E501
         self.received_operator_memory = operator_memory
@@ -548,7 +563,6 @@ def test_run_contribution_passes_operator_memory_binding_to_judge(tmp_path: Path
         operator_publish(
             "g_root",
             "Operator-mandated directive.",
-            "directive",
             record_store=rs,
             summaries_dir=summary_store.summaries_dir,
         )
@@ -605,7 +619,6 @@ def test_rejudge_contribution_passes_operator_memory_binding_to_judge(tmp_path: 
         operator_publish(
             "g_root",
             "Operator directive for rejudge.",
-            "directive",
             record_store=rs,
             summaries_dir=summary_store.summaries_dir,
         )
@@ -1583,17 +1596,14 @@ def test_j10_batch_matches_serial_verdicts_summary_and_costs_one_version(
     assert batch_summary.version == 1
 
 
-def test_batch_stamps_parent_version_from_the_summary_read_at_batch_start(
+def test_batch_writes_the_summary_exactly_once(
     tmp_path: Path,
 ) -> None:
-    """One batch, one stamp — from the parent summary as it stood at batch start."""
+    """One batch, one write — however many members it carried (ADR 0011 D3)."""
     _db_path, summary_store, _contributions, _results = _append_and_judge_as_batch(
         tmp_path, ["one", "two"], manager=_ScriptedBatchManager()
     )
     written = summary_store.read("g_root")
-    # A root scope has no inter-stratum parent, so the stamp is None — and it
-    # is stamped exactly once, on the single write the batch performs.
-    assert written.parent_version is None
     assert written.version == 1
 
 

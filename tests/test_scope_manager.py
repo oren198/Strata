@@ -5,14 +5,15 @@ made.  The optional integration test (marked ``pytest.mark.integration``) is
 skipped unless ``STRATA_RUN_INTEGRATION=1`` is set in the environment.
 
 Decision 2 tests (parent summary in user message):
-- Test 11: parent summary renders under "PARENT SCOPE SUMMARY (inherited)" header.
-- Test 12: parent_summary=None (L0 root) — header is omitted entirely.
+- Test 11: ancestor directives render under an "ANCESTOR DIRECTIVES — <scope>" header.
+- Test 12: ancestor_directives=None (L0 root) — header is omitted entirely.
 - Test 13: parent directive text appears in user message when parent provided.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import os
 from unittest.mock import MagicMock
 
@@ -45,6 +46,7 @@ from strata.scope_manager import (
     _build_batch_user_message,
     _build_user_message,
     _render_contributor,
+    _render_published_item,
     _render_recent_contributions,
     _summary_word_count,
 )
@@ -394,7 +396,7 @@ def test_user_message_digest_block_announces_the_verbatim_tail() -> None:
     message = _build_user_message(
         scope=SCOPE,
         stratum=STRATUM,
-        parent_summary=None,
+        ancestor_directives=None,
         current_summary=None,
         recent_contributions=[RECENT_ROW],
         new_contribution=NEW_CONTRIBUTION,
@@ -427,7 +429,7 @@ def test_user_message_renders_the_judged_contribution_as_a_digest_row() -> None:
     message = _build_user_message(
         scope=SCOPE,
         stratum=STRATUM,
-        parent_summary=None,
+        ancestor_directives=None,
         current_summary=None,
         # The window contains the contribution under judgment, as it always
         # does: it is appended to the record before the window is read.
@@ -466,7 +468,7 @@ def test_build_user_message_skilless_contributor_has_no_none() -> None:
     message = _build_user_message(
         scope=SCOPE,
         stratum=STRATUM,
-        parent_summary=None,
+        ancestor_directives=None,
         current_summary=None,
         recent_contributions=[],
         new_contribution=contribution,
@@ -876,27 +878,25 @@ PARENT_DIRECTIVE = Directive(
     created_at="2026-01-01T00:00:00+00:00",
 )
 
-PARENT_SUMMARY = ScopeSummary(
-    scope_id=PARENT_SCOPE.id,
-    directives=[PARENT_DIRECTIVE],
-    context="The executive context sets overall fleet direction.",
-    updated_at="2026-01-01T00:00:00+00:00",
-)
+#: The ancestor walk a one-deep chain produces (ADR 0015 D2) — what the judge
+#: is handed in place of the parent's whole summary. The ancestor's context
+#: has no representation here at all: it never crosses the edge.
+PARENT_WALK = [(PARENT_SCOPE.id, [PARENT_DIRECTIVE])]
 
 
 # ---------------------------------------------------------------------------
-# Test 11: parent summary renders under PARENT SCOPE SUMMARY (inherited) header
+# Test 11: parent directives render under ANCESTOR DIRECTIVES — g_exec (inherited, binding) header
 # ---------------------------------------------------------------------------
 
 
-def test_parent_summary_renders_under_inherited_header() -> None:
+def test_ancestor_directives_render_under_the_inherited_header() -> None:
     """parent_summary renders into the user message with the correct section label."""
     manager, mock_client = _make_manager(_accept_directive_input())
 
     manager.judge(
         scope=SCOPE,
         stratum=STRATUM,
-        parent_summary=PARENT_SUMMARY,
+        ancestor_directives=PARENT_WALK,
         current_summary=CURRENT_SUMMARY,
         recent_contributions=[],
         new_contribution=NEW_CONTRIBUTION,
@@ -906,23 +906,23 @@ def test_parent_summary_renders_under_inherited_header() -> None:
     messages = call_kwargs.kwargs["messages"]
     user_message_content = messages[0]["content"]
 
-    assert "PARENT SCOPE SUMMARY (inherited)" in user_message_content
+    assert "ANCESTOR DIRECTIVES — g_exec (inherited, binding)" in user_message_content
     assert PARENT_SCOPE.id in user_message_content
 
 
 # ---------------------------------------------------------------------------
-# Test 12: parent_summary=None (L0 root) — inherited header is absent
+# Test 12: ancestor_directives=None (L0 root) — inherited header is absent
 # ---------------------------------------------------------------------------
 
 
-def test_no_parent_summary_omits_inherited_header() -> None:
-    """When parent_summary=None (root scope), the PARENT SCOPE SUMMARY section must be absent."""
+def test_no_ancestor_walk_omits_inherited_header() -> None:
+    """A root scope has no ancestor walk, so no ANCESTOR DIRECTIVES block renders."""
     manager, mock_client = _make_manager(_accept_directive_input())
 
     manager.judge(
         scope=SCOPE,
         stratum=STRATUM,
-        parent_summary=None,
+        ancestor_directives=None,
         current_summary=CURRENT_SUMMARY,
         recent_contributions=[],
         new_contribution=NEW_CONTRIBUTION,
@@ -932,7 +932,7 @@ def test_no_parent_summary_omits_inherited_header() -> None:
     messages = call_kwargs.kwargs["messages"]
     user_message_content = messages[0]["content"]
 
-    assert "PARENT SCOPE SUMMARY (inherited)" not in user_message_content
+    assert "ANCESTOR DIRECTIVES — g_exec (inherited, binding)" not in user_message_content
 
 
 # ---------------------------------------------------------------------------
@@ -947,7 +947,7 @@ def test_parent_directive_content_in_user_message() -> None:
     manager.judge(
         scope=SCOPE,
         stratum=STRATUM,
-        parent_summary=PARENT_SUMMARY,
+        ancestor_directives=PARENT_WALK,
         current_summary=CURRENT_SUMMARY,
         recent_contributions=[],
         new_contribution=NEW_CONTRIBUTION,
@@ -1687,14 +1687,14 @@ def test_operator_memory_block_omitted_when_none_or_empty() -> None:
     assert "OPERATOR MEMORY" not in content_empty
 
 
-def test_operator_memory_block_precedes_parent_summary_block() -> None:
-    """OPERATOR MEMORY renders before PARENT SCOPE SUMMARY, per ADR 0008 D3."""
+def test_operator_memory_block_precedes_the_ancestor_directives_block() -> None:
+    """OPERATOR MEMORY renders before PARENT SCOPE DIRECTIVES, per ADR 0008 D3."""
     manager, mock_client = _make_manager(_accept_directive_input())
 
     manager.judge(
         scope=SCOPE,
         stratum=STRATUM,
-        parent_summary=PARENT_SUMMARY,
+        ancestor_directives=PARENT_WALK,
         current_summary=CURRENT_SUMMARY,
         recent_contributions=[],
         new_contribution=NEW_CONTRIBUTION,
@@ -1702,7 +1702,7 @@ def test_operator_memory_block_precedes_parent_summary_block() -> None:
     )
     content = mock_client.messages.create.call_args.kwargs["messages"][0]["content"]
     operator_idx = content.index("OPERATOR MEMORY")
-    parent_idx = content.index("PARENT SCOPE SUMMARY (inherited)")
+    parent_idx = content.index("ANCESTOR DIRECTIVES — g_exec (inherited, binding)")
     assert operator_idx < parent_idx
 
 
@@ -1730,10 +1730,10 @@ def test_system_prompt_requires_per_operator_directive_attribution() -> None:
     assert "an unattributed echo masquerades as native scope memory" in flat
 
 
-def test_system_prompt_operator_memory_precedes_parent_summary_guidance() -> None:
-    """The OPERATOR MEMORY rule appears before the PARENT SCOPE SUMMARY rule."""
+def test_system_prompt_operator_memory_precedes_ancestor_directives_guidance() -> None:
+    """The OPERATOR MEMORY rule appears before the PARENT SCOPE DIRECTIVES rule."""
     operator_idx = _SYSTEM_PROMPT.index("When an OPERATOR MEMORY section is present")
-    parent_idx = _SYSTEM_PROMPT.index("When a PARENT SCOPE SUMMARY is provided")
+    parent_idx = _SYSTEM_PROMPT.index("When ANCESTOR DIRECTIVES blocks are provided")
     assert operator_idx < parent_idx
 
 
@@ -2035,6 +2035,108 @@ def test_judge_publication_withdraw_missing_item_raises() -> None:
         )
 
 
+# ---------------------------------------------------------------------------
+# judge_publication — publication_max_words budget (item-count/word bound on
+# the published face, ADR 0013 D3 — one edge, not a chain product)
+# ---------------------------------------------------------------------------
+
+
+def test_judge_publication_publish_over_budget_declines_without_api_call() -> None:
+    """A publish that would push the face over budget is declined mechanically — no LLM call."""
+    manager, mock_client = _make_publication_manager("accept", "would never be seen")
+
+    judgment = manager.judge_publication(
+        scope=SCOPE,
+        act_kind="publish",
+        content="one two three four five six",
+        kind="context",
+        subject=None,
+        anchors=["subject:x"],
+        current_summary=CURRENT_SUMMARY,
+        current_publication=[_PUBLISHED_ITEM],
+        publication_max_words=5,
+    )
+
+    assert judgment.decision == "decline"
+    assert mock_client.messages.create.call_count == 0
+
+
+def test_judge_publication_publish_over_budget_reasoning_mentions_withdrawal() -> None:
+    manager, _ = _make_publication_manager("accept")
+
+    judgment = manager.judge_publication(
+        scope=SCOPE,
+        act_kind="publish",
+        content="one two three four five six",
+        kind="context",
+        subject=None,
+        anchors=["subject:x"],
+        current_summary=CURRENT_SUMMARY,
+        current_publication=[],
+        publication_max_words=5,
+    )
+
+    assert judgment.decision == "decline"
+    assert "withdraw" in judgment.reasoning.lower()
+    assert "budget" in judgment.reasoning.lower()
+
+
+def test_judge_publication_publish_at_budget_exactly_still_calls_judge() -> None:
+    """Landing exactly ON budget is not over — the ordinary judged path still runs."""
+    manager, mock_client = _make_publication_manager("accept", "Fits.")
+
+    judgment = manager.judge_publication(
+        scope=SCOPE,
+        act_kind="publish",
+        content="one two three four five",
+        kind="context",
+        subject=None,
+        anchors=["subject:x"],
+        current_summary=CURRENT_SUMMARY,
+        current_publication=[],
+        publication_max_words=5,
+    )
+
+    assert judgment.decision == "accept"
+    assert mock_client.messages.create.call_count == 1
+
+
+def test_judge_publication_publish_default_budget_is_500_words() -> None:
+    """Omitting publication_max_words falls back to the module default (PUBLICATION_MAX_WORDS)."""
+    manager, mock_client = _make_publication_manager("accept", "Fits.")
+
+    judgment = manager.judge_publication(
+        scope=SCOPE,
+        act_kind="publish",
+        content="short content",
+        kind="context",
+        subject=None,
+        anchors=["subject:x"],
+        current_summary=CURRENT_SUMMARY,
+        current_publication=[],
+    )
+
+    assert judgment.decision == "accept"
+    assert mock_client.messages.create.call_count == 1
+
+
+def test_judge_publication_withdraw_never_checked_against_budget() -> None:
+    """A withdraw proposal is exempt from the budget check regardless of current face size."""
+    manager, mock_client = _make_publication_manager("accept", "Fine to withdraw.")
+
+    judgment = manager.judge_publication(
+        scope=SCOPE,
+        act_kind="withdraw",
+        withdraw_item=_PUBLISHED_ITEM,
+        current_summary=CURRENT_SUMMARY,
+        current_publication=[_PUBLISHED_ITEM],
+        publication_max_words=1,
+    )
+
+    assert judgment.decision == "accept"
+    assert mock_client.messages.create.call_count == 1
+
+
 def test_judge_publication_missing_api_key_raises_runtimeerror() -> None:
     mock_client = MagicMock()
     mock_client.api_key = None
@@ -2169,6 +2271,84 @@ def test_judge_publication_declines_publish_that_contradicts_operator_directive(
 
 
 # ---------------------------------------------------------------------------
+# judge_publication relay-origin input (ADR 0013 D4c) — the judge is told a
+# publish act relays second-hand material, shown its origin, and warned that
+# origin is information, not permission.
+# ---------------------------------------------------------------------------
+
+
+def test_judge_publication_relay_origin_renders_second_hand_and_origin_in_message() -> None:
+    manager, mock_client = _make_publication_manager("accept", "Worth relaying to our readers.")
+
+    manager.judge_publication(
+        scope=SCOPE,
+        act_kind="publish",
+        content="Deploys happen at 3pm UTC.",
+        kind="context",
+        subject="deploy-notes",
+        anchors=["subject:deploy-notes"],
+        current_summary=CURRENT_SUMMARY,
+        current_publication=[],
+        relay_origin_scope_id="g_exec",
+        relay_via_scope_id="g_func",
+    )
+
+    message = mock_client.messages.create.call_args.kwargs["messages"][0]["content"]
+    assert "g_exec" in message
+    assert "g_func" in message
+    assert "second-hand" in message.lower() or "relay" in message.lower()
+
+
+def test_judge_publication_no_relay_origin_omits_relay_block() -> None:
+    manager, mock_client = _make_publication_manager("accept", "Fits published <= believed.")
+
+    manager.judge_publication(
+        scope=SCOPE,
+        act_kind="publish",
+        content="Use protobuf for all RPC.",
+        kind="directive",
+        subject="rpc-protocol",
+        anchors=["directive:c_old001"],
+        current_summary=CURRENT_SUMMARY,
+        current_publication=[],
+    )
+
+    message = mock_client.messages.create.call_args.kwargs["messages"][0]["content"]
+    assert "second-hand" not in message.lower()
+
+
+def test_publication_system_prompt_states_origin_is_information_not_permission() -> None:
+    """D4c's core rule: an ancestor having said it is not by itself a reason to relay it."""
+    flat = " ".join(_PUBLICATION_SYSTEM_PROMPT.split())
+    assert "information" in flat.lower()
+    assert "not permission" in flat.lower() or "not a permission" in flat.lower()
+
+
+def test_render_published_item_shows_origin_and_relay_when_present() -> None:
+    """A relayed item's rendered form names its origin — what lets a judge trace independent
+    origins for non-corroboration (ADR 0013 D4), including across more than one hop."""
+    relayed = PublishedItem(
+        id="pub_relay1",
+        kind="context",
+        content="Deploys happen at 3pm UTC.",
+        subject="deploy-notes",
+        anchors=["subject:deploy-notes"],
+        published_at="2026-08-31T00:00:00+00:00",
+        origin_scope_id="g_exec",
+        relay_scope_id="g_func",
+        relay_item_id="pub_orig1",
+    )
+    rendered = _render_published_item(relayed)
+    assert "g_exec" in rendered
+    assert "g_func" in rendered
+
+
+def test_render_published_item_omits_origin_for_non_relay_item() -> None:
+    rendered = _render_published_item(_PUBLISHED_ITEM)
+    assert "origin" not in rendered.lower()
+
+
+# ---------------------------------------------------------------------------
 # judge_bootstrap_publication (ADR 0007 D4)
 # ---------------------------------------------------------------------------
 
@@ -2232,10 +2412,213 @@ def test_judge_bootstrap_publication_no_summary_uses_sentinel() -> None:
     assert "this scope has no summary yet" in message
 
 
+def test_judge_bootstrap_publication_trims_items_over_budget() -> None:
+    """Bootstrap proposes a whole face at once — over-budget items are dropped mechanically."""
+    manager, _ = _make_bootstrap_manager(
+        "accept",
+        [
+            {"content": "one two three", "kind": "context", "subject": None, "anchors": ["a"]},
+            {
+                "content": "four five six seven",
+                "kind": "context",
+                "subject": None,
+                "anchors": ["b"],
+            },
+        ],
+        "Two items fit for export.",
+    )
+
+    judgment = manager.judge_bootstrap_publication(
+        scope=SCOPE, current_summary=CURRENT_SUMMARY, publication_max_words=3
+    )
+
+    assert judgment.decision == "accept"
+    assert len(judgment.items) == 1
+    assert judgment.items[0].content == "one two three"
+
+
+def test_judge_bootstrap_publication_trims_against_existing_published_face() -> None:
+    """Bootstrap on a scope that already published trims against the REMAINING budget.
+
+    _PUBLISHED_ITEM is 5 words ("Use protobuf for all RPC."). With a
+    10-word budget that leaves 5 words of room — enough for the 3-word
+    candidate but not the 4-word one behind it.
+    """
+    manager, _ = _make_bootstrap_manager(
+        "accept",
+        [
+            {"content": "one two three", "kind": "context", "subject": None, "anchors": ["a"]},
+            {
+                "content": "four five six seven",
+                "kind": "context",
+                "subject": None,
+                "anchors": ["b"],
+            },
+        ],
+        "Two items fit for export.",
+    )
+
+    judgment = manager.judge_bootstrap_publication(
+        scope=SCOPE,
+        current_summary=CURRENT_SUMMARY,
+        publication_max_words=10,
+        current_publication=[_PUBLISHED_ITEM],
+    )
+
+    assert len(judgment.items) == 1
+    assert judgment.items[0].content == "one two three"
+
+
+def test_judge_bootstrap_publication_within_budget_keeps_all_items() -> None:
+    manager, _ = _make_bootstrap_manager(
+        "accept",
+        [
+            {"content": "one two three", "kind": "context", "subject": None, "anchors": ["a"]},
+        ],
+        "Fits.",
+    )
+
+    judgment = manager.judge_bootstrap_publication(
+        scope=SCOPE, current_summary=CURRENT_SUMMARY, publication_max_words=500
+    )
+
+    assert len(judgment.items) == 1
+
+
 def test_bootstrap_system_prompt_states_conservative_default() -> None:
     flat = " ".join(_BOOTSTRAP_SYSTEM_PROMPT.split())
     assert "conservative" in flat.lower()
     assert "initial" in flat.lower() or "INITIAL" in flat
+
+
+def test_bootstrap_system_prompt_tells_judge_about_the_word_budget() -> None:
+    """Issue #185: the bootstrap judge must be told its budget exists — it must not
+
+    propose a whole face believing everything it names will publish, only to have
+    a silent Python-side trim drop the tail. The prompt must name the constraint so
+    the judge can propose a face that fits it in the first place.
+    """
+    flat = " ".join(_BOOTSTRAP_SYSTEM_PROMPT.split()).lower()
+    assert "budget" in flat
+    assert "word" in flat
+
+
+def test_judge_bootstrap_publication_user_message_states_the_numeric_budget() -> None:
+    """The concrete number (from publication_max_words) must reach the judge via the
+
+    user message, the same way the ordinary publish path's decline states it —
+    this is the actual "tell the judge" mechanism, since the system prompt text is
+    static and cached.
+    """
+    manager, mock_client = _make_bootstrap_manager("decline", None)
+
+    manager.judge_bootstrap_publication(
+        scope=SCOPE, current_summary=CURRENT_SUMMARY, publication_max_words=42
+    )
+
+    message = mock_client.messages.create.call_args.kwargs["messages"][0]["content"]
+    assert "42" in message
+    assert "budget" in message.lower()
+
+
+def test_judge_bootstrap_publication_user_message_states_remaining_budget_when_scope_already_published() -> (  # noqa: E501
+    None
+):
+    """Bootstrapping a scope that already published must tell the judge the REMAINING
+
+    budget (not the full one) — the same accounting the mechanical backstop trim uses.
+    """
+    manager, mock_client = _make_bootstrap_manager("decline", None)
+
+    manager.judge_bootstrap_publication(
+        scope=SCOPE,
+        current_summary=CURRENT_SUMMARY,
+        publication_max_words=10,
+        current_publication=[_PUBLISHED_ITEM],
+    )
+
+    message = mock_client.messages.create.call_args.kwargs["messages"][0]["content"]
+    # _PUBLISHED_ITEM is 5 words ("Use protobuf for all RPC.") — 5 of the 10-word
+    # budget are already spent, leaving 5.
+    assert "5" in message
+    assert "10" in message
+
+
+def test_judge_bootstrap_publication_trim_sets_trimmed_flag_true() -> None:
+    """The backstop is a BACKSTOP now, not the primary mechanism — but when it does
+
+    fire, a caller must be able to tell without parsing the reasoning prose.
+    """
+    manager, _ = _make_bootstrap_manager(
+        "accept",
+        [
+            {"content": "one two three", "kind": "context", "subject": None, "anchors": ["a"]},
+            {
+                "content": "four five six seven",
+                "kind": "context",
+                "subject": None,
+                "anchors": ["b"],
+            },
+        ],
+        "Two items fit for export.",
+    )
+
+    judgment = manager.judge_bootstrap_publication(
+        scope=SCOPE, current_summary=CURRENT_SUMMARY, publication_max_words=3
+    )
+
+    assert judgment.trimmed is True
+
+
+def test_judge_bootstrap_publication_no_trim_leaves_trimmed_flag_false() -> None:
+    manager, _ = _make_bootstrap_manager(
+        "accept",
+        [
+            {"content": "one two three", "kind": "context", "subject": None, "anchors": ["a"]},
+        ],
+        "Fits.",
+    )
+
+    judgment = manager.judge_bootstrap_publication(
+        scope=SCOPE, current_summary=CURRENT_SUMMARY, publication_max_words=500
+    )
+
+    assert judgment.trimmed is False
+
+
+def test_judge_bootstrap_publication_decline_leaves_trimmed_flag_false() -> None:
+    manager, _ = _make_bootstrap_manager("decline", None, "Nothing fit yet.")
+
+    judgment = manager.judge_bootstrap_publication(scope=SCOPE, current_summary=CURRENT_SUMMARY)
+
+    assert judgment.trimmed is False
+
+
+def test_judge_bootstrap_publication_trim_logs_a_warning(caplog: pytest.LogCaptureFixture) -> None:
+    """Loud, not silent (issue #185): the backstop firing is logged, not just flagged."""
+    manager, _ = _make_bootstrap_manager(
+        "accept",
+        [
+            {"content": "one two three", "kind": "context", "subject": None, "anchors": ["a"]},
+            {
+                "content": "four five six seven",
+                "kind": "context",
+                "subject": None,
+                "anchors": ["b"],
+            },
+        ],
+        "Two items fit for export.",
+    )
+
+    with caplog.at_level(logging.WARNING, logger="strata.scope_manager"):
+        manager.judge_bootstrap_publication(
+            scope=SCOPE, current_summary=CURRENT_SUMMARY, publication_max_words=3
+        )
+
+    assert any(
+        "trim" in record.message.lower() or "budget" in record.message.lower()
+        for record in caplog.records
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2649,6 +3032,47 @@ def test_invalid_id_twice_drops_the_op_and_notes_it_without_losing_the_verdict()
     assert judgment.reasoning in judgment.record_notes
 
 
+def test_an_op_naming_an_ancestor_directive_is_dropped_as_an_invalid_target() -> None:
+    """ADR 0015 D4 — the prompt rule became an engine rule.
+
+    "Never supersede or retire a parent directive" was a prompt obligation,
+    and a prompt obligation is a request. With the splice gone (D1) an
+    ancestor's row is not in this scope's CURRENT SUMMARY at all, so an op
+    naming one is an ordinary invalid-target op: ADR 0011 D1's existing
+    validation offers one corrective and then drops and notes it. No second
+    rule, and nothing a judge can talk its way past.
+    """
+    ancestor_directive_id = PARENT_WALK[0][1][0].id
+    verdict = {
+        "decision": "accept_as_directive",
+        "reasoning": "admitting the new rule and retiring the inherited one",
+        "directive_ops": [{"op": "append"}, {"op": "retire", "id": ancestor_directive_id}],
+        "new_context": "Context after the amendment.",
+    }
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [_fake_response(verdict), _fake_response(verdict)]
+    manager = ScopeManager(client=mock_client)
+
+    judgment = manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        ancestor_directives=PARENT_WALK,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+    )
+
+    assert judgment.new_summary is not None
+    # The ancestor's directive was never this scope's to remove — and it is
+    # not this scope's to hold, either.
+    assert ancestor_directive_id not in [d.id for d in judgment.new_summary.directives]
+    assert judgment.retired_directive_ids == []
+    assert judgment.dropped_ops == [f"retire({ancestor_directive_id})"]
+    assert f"retire({ancestor_directive_id})" in judgment.record_notes
+    # The rest of the amendment still applied.
+    assert NEW_CONTRIBUTION.id in [d.id for d in judgment.new_summary.directives]
+
+
 def test_invalid_id_corrective_failure_still_returns_the_first_verdict() -> None:
     """A bad op never costs the contribution its verdict, even if the retry errors."""
     mock_client = MagicMock()
@@ -2998,36 +3422,35 @@ def test_attribution_corrective_rewrite_is_still_budget_checked() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_refresh_block_rendered_when_amendment_is_context_only() -> None:
+def test_refresh_block_rendered_in_input_change_refresh_mode() -> None:
     message = _build_user_message(
         scope=SCOPE,
         stratum=STRATUM,
-        parent_summary=PARENT_SUMMARY,
+        ancestor_directives=PARENT_WALK,
         current_summary=CURRENT_SUMMARY,
         recent_contributions=[],
         new_contribution=NEW_CONTRIBUTION,
-        amendment_context_only=True,
+        mode="input_change_refresh",
     )
-    assert "MANAGER REFRESH" in message
-    assert "already been incorporated" in message
+    assert "INPUT-CHANGE REFRESH" in message
 
     ordinary = _build_user_message(
         scope=SCOPE,
         stratum=STRATUM,
-        parent_summary=PARENT_SUMMARY,
+        ancestor_directives=PARENT_WALK,
         current_summary=CURRENT_SUMMARY,
         recent_contributions=[],
         new_contribution=NEW_CONTRIBUTION,
     )
-    assert "MANAGER REFRESH" not in ordinary
+    assert "INPUT-CHANGE REFRESH" not in ordinary
 
 
-def test_context_only_amendment_drops_append_and_publish_ops() -> None:
-    """A refresh may amend context and retire, but never admit a directive."""
+def test_input_change_refresh_amendment_drops_append_but_keeps_publish() -> None:
+    """A refresh may publish the judge's own words; it may never copy the notice's."""
     manager, _ = _make_manager(
         {
             "decision": "accept_as_context",
-            "reasoning": "refreshed against the parent",
+            "reasoning": "refreshed against the changed input",
             "directive_ops": [
                 {"op": "append"},
                 {"op": "publish", "content": "Something new."},
@@ -3043,14 +3466,13 @@ def test_context_only_amendment_drops_append_and_publish_ops() -> None:
         current_summary=CURRENT_SUMMARY,
         recent_contributions=[],
         new_contribution=NEW_CONTRIBUTION,
-        amendment_context_only=True,
+        mode="input_change_refresh",
     )
 
     assert judgment.new_summary is not None
-    assert judgment.new_summary.directives == []
     assert judgment.new_summary.context == "Reconciled context."
-    assert [op.op for op in judgment.directive_ops] == ["retire"]
-    assert judgment.dropped_ops == ["append", "publish"]
+    assert [op.op for op in judgment.directive_ops] == ["publish", "retire"]
+    assert judgment.dropped_ops == ["append"]
     assert "append" in judgment.record_notes
 
 
@@ -3097,11 +3519,16 @@ def test_system_prompt_narrows_operator_attribution_to_publish_or_context() -> N
 
 
 def test_system_prompt_no_longer_asks_the_judge_to_quote_parent_directives() -> None:
-    """ADR 0011 D4 deletes the parent-quoting rule — the splice is mechanical."""
+    """The judge never restates an inherited directive — a reader assembles them.
+
+    ADR 0011 D4 deleted the parent-quoting rule because the splice copied the
+    rows mechanically; ADR 0015 D1 deletes the splice and the rule stands for
+    a better reason — the directive lives in its owner's summary and is
+    composed into this scope's view on every read.
+    """
     flat = " ".join(_SYSTEM_PROMPT.split())
     assert "quote any parent directives VERBATIM" not in flat
-    assert "MECHANICALLY" in flat
-    assert "never `append` or `publish` a parent directive" in flat
+    assert "never `append` or `publish` an ancestor directive" in flat
 
 
 def test_system_prompt_budget_rule_names_the_two_levers() -> None:
@@ -3356,7 +3783,7 @@ def test_batch_user_message_lists_the_contributions_in_arrival_order() -> None:
     message = _build_batch_user_message(
         scope=SCOPE,
         stratum=STRATUM,
-        parent_summary=None,
+        ancestor_directives=None,
         current_summary=CURRENT_SUMMARY,
         recent_contributions=[],
         new_contributions=BATCH,
@@ -3379,7 +3806,7 @@ def test_batch_members_never_take_a_verbatim_window_slot() -> None:
     message = _build_batch_user_message(
         scope=SCOPE,
         stratum=STRATUM,
-        parent_summary=None,
+        ancestor_directives=None,
         current_summary=CURRENT_SUMMARY,
         recent_contributions=rows,
         new_contributions=BATCH,
@@ -3877,3 +4304,300 @@ def test_batch_stringified_payload_is_coerced_like_the_single_path() -> None:
         NEW_CONTRIBUTION.id,
         SECOND_CONTRIBUTION.id,
     ]
+
+
+# ---------------------------------------------------------------------------
+# ADR 0014 D4 — the change id a judgment belongs to, threaded as a PARAMETER
+# (implementation pin 8: never a lookup).
+# ---------------------------------------------------------------------------
+
+
+def test_change_id_defaults_to_none_on_both_judgment_shapes() -> None:
+    """An ordinary contribution belongs to no wave, and says so."""
+    manager, _ = _make_manager(_accept_context_input())
+
+    judgment = manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+    )
+    assert judgment.change_id is None
+
+    mock_client = MagicMock()
+    mock_client.messages.create.return_value = _fake_response(_batch_input())
+    assert _judge_batch(mock_client).change_ids == []
+
+
+def test_change_id_is_carried_onto_the_judgment() -> None:
+    """The id the caller passes in reaches the judgment.
+
+    ADR 0014 D4's inheritance is what bounds a wave, so the id is given, never
+    re-derived — a fresh id per derived change would bound nothing.
+    """
+    manager, _ = _make_manager(_accept_context_input())
+
+    judgment = manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+        change_id="chg_wave1",
+    )
+
+    assert judgment.change_id == "chg_wave1"
+
+
+def test_change_id_survives_the_invalid_op_drop() -> None:
+    """The drop-and-note fallback rebuilds the judgment; the wave id stays on it."""
+    payload = {
+        "decision": "accept_as_directive",
+        "reasoning": "admitted",
+        "directive_ops": [{"op": "retire", "id": "c_nosuch"}],
+        "new_context": None,
+    }
+    manager, _ = _make_manager(payload)
+
+    judgment = manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+        change_id="chg_wave1",
+    )
+
+    assert judgment.dropped_ops
+    assert judgment.change_id == "chg_wave1"
+
+
+def test_batch_change_ids_reach_a_batch_of_one() -> None:
+    """A batch of one delegates to judge() and rebuilds the batch judgment by
+    hand — the wave ids must survive that wrapping."""
+    mock_client = MagicMock()
+    mock_client.messages.create.return_value = _fake_response(_accept_context_input())
+
+    judgment = _judge_batch(mock_client, contributions=[NEW_CONTRIBUTION], change_ids=["chg_wave1"])
+
+    assert judgment.change_ids == ["chg_wave1"]
+
+
+def test_batch_change_ids_reach_a_real_batch() -> None:
+    """A coalesced refresh carries SEVERAL waves (Phase A finding 2).
+
+    Several pending events for one scope collapse into one batch (ADR 0014 D4),
+    so the batch belongs to every one of their ids, not to a chosen one.
+    """
+    mock_client = MagicMock()
+    mock_client.messages.create.return_value = _fake_response(_batch_input())
+
+    judgment = _judge_batch(mock_client, change_ids=["chg_a", "chg_b"])
+
+    assert judgment.change_ids == ["chg_a", "chg_b"]
+
+
+def test_batch_change_ids_are_deduplicated() -> None:
+    """Two events of one wave collapse to one id — a derived row is per (id, scope)."""
+    mock_client = MagicMock()
+    mock_client.messages.create.return_value = _fake_response(_batch_input())
+
+    assert _judge_batch(mock_client, change_ids=["chg_a", "chg_a"]).change_ids == ["chg_a"]
+
+
+# ---------------------------------------------------------------------------
+# ADR 0014 D3 — `context_sources`: the ids the judge declares its new_context
+# rests on. RECORD, never trigger — the affected set is topological and needs
+# no judge cooperation. The engine validates the declaration is a subset of the
+# publication item ids RENDERED to that judge and notes anything else, so the
+# declaration can be audited against what the judge actually saw. Asked for in
+# the tool schema and the prompt; a hand-built judgment omits it, as expected.
+# ---------------------------------------------------------------------------
+
+
+def _sourced_input(sources: list[str]) -> dict:
+    return {**_accept_context_input(), "context_sources": sources}
+
+
+def test_context_sources_defaults_to_empty_when_the_judge_omits_it() -> None:
+    """Hand-built and scripted judgments declare nothing; that is expected, not
+    a bug — the trigger is D3's topology, which needs no judge cooperation."""
+    manager, _ = _make_manager(_accept_context_input())
+
+    judgment = manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+    )
+
+    assert judgment.context_sources == []
+    assert judgment.dropped_context_sources == []
+
+
+def test_a_rendered_peer_context_source_is_kept() -> None:
+    manager, _ = _make_manager(_sourced_input([_PUBLISHED_ITEM.id]))
+
+    judgment = manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+        peer_publications=[("g_peer_a", [_PUBLISHED_ITEM])],
+    )
+
+    assert judgment.context_sources == [_PUBLISHED_ITEM.id]
+    assert judgment.dropped_context_sources == []
+    assert _PUBLISHED_ITEM.id not in judgment.record_notes
+
+
+def test_a_context_source_from_this_scopes_own_publication_is_kept() -> None:
+    """THIS SCOPE'S PUBLICATION is rendered too, so an id from it was seen.
+
+    The check audits the declaration against what the judge was SHOWN — every
+    publication block in the message counts, not only the peers'.
+    """
+    manager, _ = _make_manager(_sourced_input([_PUBLISHED_ITEM.id]))
+
+    judgment = manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+        current_publication=[_PUBLISHED_ITEM],
+    )
+
+    assert judgment.context_sources == [_PUBLISHED_ITEM.id]
+    assert judgment.dropped_context_sources == []
+
+
+def test_an_unrendered_context_source_is_dropped_and_noted() -> None:
+    """A source nobody showed this judge is not a source — and the record says so."""
+    manager, _ = _make_manager(_sourced_input([_PUBLISHED_ITEM.id, "pub_neverseen"]))
+
+    judgment = manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+        peer_publications=[("g_peer_a", [_PUBLISHED_ITEM])],
+    )
+
+    assert judgment.context_sources == [_PUBLISHED_ITEM.id]
+    assert judgment.dropped_context_sources == ["pub_neverseen"]
+    assert "pub_neverseen" in judgment.record_notes
+
+
+def test_every_context_source_is_dropped_when_nothing_was_rendered() -> None:
+    """No publication block rendered at all → the declaration rests on nothing."""
+    manager, _ = _make_manager(_sourced_input(["pub_abc123"]))
+
+    judgment = manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+    )
+
+    assert judgment.context_sources == []
+    assert judgment.dropped_context_sources == ["pub_abc123"]
+
+
+def test_a_decline_declares_no_context_sources() -> None:
+    """There is no new_context for anything to rest on."""
+    manager, _ = _make_manager(
+        {
+            "decision": "decline",
+            "reasoning": "out of scope",
+            "directive_ops": None,
+            "new_context": None,
+            "context_sources": ["pub_abc123"],
+        }
+    )
+
+    judgment = manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+        peer_publications=[("g_peer_a", [_PUBLISHED_ITEM])],
+    )
+
+    assert judgment.decision == "decline"
+    assert judgment.context_sources == []
+
+
+def test_batch_context_sources_are_validated_the_same_way() -> None:
+    mock_client = MagicMock()
+    mock_client.messages.create.return_value = _fake_response(
+        {**_batch_input(), "context_sources": [_PUBLISHED_ITEM.id, "pub_neverseen"]}
+    )
+
+    judgment = _judge_batch(mock_client, peer_publications=[("g_peer_a", [_PUBLISHED_ITEM])])
+
+    assert judgment.context_sources == [_PUBLISHED_ITEM.id]
+    assert judgment.dropped_context_sources == ["pub_neverseen"]
+    # A drop that belongs to no single member is noted on every accepted
+    # member's row — the rule an unowned dropped op already follows.
+    for verdict in judgment.accepted_verdicts:
+        assert "pub_neverseen" in judgment.record_notes_for(verdict.contribution_id)
+
+
+def test_hop_defaults_to_zero_on_both_judgment_shapes() -> None:
+    """An ordinary contribution starts no wave, so it is at no distance from one."""
+    manager, _ = _make_manager(_accept_context_input())
+
+    judgment = manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+    )
+    assert judgment.hop == 0
+
+    mock_client = MagicMock()
+    mock_client.messages.create.return_value = _fake_response(_batch_input())
+    assert _judge_batch(mock_client).hop == 0
+
+
+def test_hop_is_carried_onto_the_judgment() -> None:
+    """ADR 0014 D4's backstop: the hop count travels with the wave, like its id."""
+    manager, _ = _make_manager(_accept_context_input())
+
+    judgment = manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+        change_id="chg_wave1",
+        hop=3,
+    )
+
+    assert judgment.hop == 3
+
+
+def test_batch_hop_reaches_a_batch_of_one() -> None:
+    mock_client = MagicMock()
+    mock_client.messages.create.return_value = _fake_response(_accept_context_input())
+
+    judgment = _judge_batch(
+        mock_client, contributions=[NEW_CONTRIBUTION], change_ids=["chg_a"], hop=2
+    )
+
+    assert judgment.hop == 2
+
+
+def test_batch_hop_reaches_a_real_batch() -> None:
+    mock_client = MagicMock()
+    mock_client.messages.create.return_value = _fake_response(_batch_input())
+
+    assert _judge_batch(mock_client, change_ids=["chg_a"], hop=2).hop == 2

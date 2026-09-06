@@ -1143,3 +1143,298 @@ class TestPageDeclines:
         self._decline(store, "g_a", "mine", "no")
         with pytest.raises(ValueError):
             store.page_declines(scope_id="g_a", before_id="c_doesnotexist")
+
+
+# ---------------------------------------------------------------------------
+# Republication provenance on publication_acts (ADR 0013 D4 / migration 0009).
+# Three new nullable columns — origin_scope_id, relay_scope_id, relay_item_id
+# — carrying "according to X, via Y" through the record, append-only, no
+# backfill (ADR 0013 D7).
+# ---------------------------------------------------------------------------
+
+
+def test_append_publication_act_without_relay_fields_defaults_to_none(tmp_path: Path) -> None:
+    """An ordinary (non-relay) publish act carries no origin/relay pointer — the default."""
+    with _open_store(str(tmp_path / "strata.db")) as rs:
+        act = _publish(rs)
+        fetched = rs.get_publication_act(act)
+
+    assert fetched is not None
+    assert fetched.origin_scope_id is None
+    assert fetched.relay_scope_id is None
+    assert fetched.relay_item_id is None
+
+
+def test_append_publication_act_round_trips_relay_fields(tmp_path: Path) -> None:
+    """A relay act's origin/relay pointer survives append -> fetch -> list, unmodified."""
+    with _open_store(str(tmp_path / "strata.db")) as rs:
+        origin_act = rs.append_publication_act(
+            scope_id="g_root",
+            act="publish",
+            kind="context",
+            content="root's own material",
+            subject=None,
+            anchors=["subject:x"],
+            withdraws=None,
+            trigger=None,
+            proposer=_CONTRIBUTOR,
+        )
+        relay_act = rs.append_publication_act(
+            scope_id="g_mid",
+            act="publish",
+            kind="context",
+            content="root's own material",
+            subject=None,
+            anchors=["subject:x"],
+            withdraws=None,
+            trigger=None,
+            proposer=_CONTRIBUTOR,
+            origin_scope_id="g_root",
+            relay_scope_id="g_root",
+            relay_item_id=origin_act.id,
+        )
+
+        fetched = rs.get_publication_act(relay_act.id)
+        assert fetched is not None
+        assert fetched.origin_scope_id == "g_root"
+        assert fetched.relay_scope_id == "g_root"
+        assert fetched.relay_item_id == origin_act.id
+
+        listed = rs.list_publication_acts(scope_id="g_mid")
+        assert len(listed) == 1
+        assert listed[0].origin_scope_id == "g_root"
+        assert listed[0].relay_scope_id == "g_root"
+        assert listed[0].relay_item_id == origin_act.id
+
+
+# ---------------------------------------------------------------------------
+# Scenario N — change events (ADR 0014 D5), the input-change notice rows
+# ---------------------------------------------------------------------------
+
+
+class TestChangeEvents:
+    """RecordStore change-event primitives — ADR 0014 D5's notice rows."""
+
+    def test_append_and_list_round_trips_the_payload(self, store) -> None:
+        cid = _contribute(store, "manager-refresh notice")
+
+        event = store.append_change_event(
+            change_id="chg_1",
+            contribution_id=cid,
+            scope_id="g_ceo",
+            item_id="pub_abc",
+            kind="withdrawn",
+            before="the claim as it stood",
+            after=None,
+            hop=2,
+        )
+
+        assert event.change_id == "chg_1"
+        assert event.contribution_id == cid
+        assert event.item_id == "pub_abc"
+        assert event.kind == "withdrawn"
+        assert event.before == "the claim as it stood"
+        assert event.after is None
+        assert event.hop == 2
+        # Unprocessed until a refresh consumes it, whatever its verdict.
+        assert event.processed_at is None
+
+        assert store.list_change_events(scope_id="g_ceo") == [event]
+
+    def test_the_source_scope_round_trips_beside_the_affected_scope(self, store) -> None:
+        """Two different facts on one row: g_ceo must refresh, g_eng is what
+        changed. Neither is derivable from the other — an item id does not
+        name its holder — so both are stored (ADR 0014 D5)."""
+        cid = _contribute(store, "manager-refresh notice")
+
+        event = store.append_change_event(
+            change_id="chg_1",
+            contribution_id=cid,
+            scope_id="g_ceo",
+            source_scope_id="g_eng",
+            item_id="pub_abc",
+            kind="published",
+            after="a new claim",
+        )
+
+        assert event.scope_id == "g_ceo"
+        assert event.source_scope_id == "g_eng"
+        assert store.list_change_events(scope_id="g_ceo")[0].source_scope_id == "g_eng"
+
+    def test_a_source_scope_is_optional_and_stays_absent(self, store) -> None:
+        """Nothing is invented for a caller that has no source scope to give —
+        the same discipline the pre-0011 rows the migration carried across get."""
+        cid = _contribute(store, "manager-refresh notice")
+
+        event = store.append_change_event(
+            change_id="chg_1",
+            contribution_id=cid,
+            scope_id="g_ceo",
+            item_id="pub_abc",
+            kind="published",
+        )
+
+        assert event.source_scope_id is None
+
+    def test_append_change_notice_writes_both_halves_atomically(self, store) -> None:
+        """The notice and its row are one event (ADR 0014 D5), so they are one
+        write: a reader can never find a `manager-refresh` contribution with
+        no event behind it, or an event whose notice nobody can read."""
+        contribution, event = store.append_change_notice(
+            scope_id="g_ceo",
+            content="[Input change chg_1 ...]",
+            contributor=ContributorRef(
+                scope_id="g_ceo", skill="scope-manager", session_id="change-event", ts="t"
+            ),
+            change_id="chg_1",
+            source_scope_id="g_eng",
+            item_id="pub_abc",
+            kind="withdrawn",
+            before="the claim as it stood",
+        )
+
+        assert contribution.subject == "manager-refresh"
+        assert event.contribution_id == contribution.id
+        assert store.list_change_events(scope_id="g_ceo") == [event]
+        assert [c.id for c in store.list_contributions(scope_id="g_ceo")] == [contribution.id]
+
+    def test_a_failed_event_write_leaves_no_orphan_notice(self, store) -> None:
+        """Precondition: a good notice DOES land. Then a bad one lands nothing
+        — no contribution nothing will ever judge."""
+        store.append_change_notice(
+            scope_id="g_ceo",
+            content="good",
+            contributor=ContributorRef(
+                scope_id="g_ceo", skill="scope-manager", session_id="change-event", ts="t"
+            ),
+            change_id="chg_1",
+            source_scope_id="g_eng",
+            item_id="pub_abc",
+            kind="withdrawn",
+        )
+        assert len(store.list_contributions(scope_id="g_ceo")) == 1
+
+        with pytest.raises(sqlite3.IntegrityError):
+            store.append_change_notice(
+                scope_id="g_ceo",
+                content="orphan candidate",
+                contributor=ContributorRef(
+                    scope_id="g_ceo", skill="scope-manager", session_id="change-event", ts="t"
+                ),
+                change_id="chg_2",
+                source_scope_id="g_eng",
+                item_id="pub_abc",
+                # Outside the settled vocabulary: the CHECK in migration 0011
+                # refuses it, and the notice must go back with it.
+                kind="not-a-kind",
+            )
+
+        assert len(store.list_contributions(scope_id="g_ceo")) == 1
+        assert len(store.list_change_events(scope_id="g_ceo")) == 1
+
+    def test_a_change_notice_can_be_marked_processed_at_birth(self, store) -> None:
+        """A notice the drain must never run (ADR 0014 D4: already refreshed
+        for this change id, or past the hop budget) is still WRITTEN — the
+        record never loses a notice — just never pending."""
+        _, event = store.append_change_notice(
+            scope_id="g_ceo",
+            content="already refreshed",
+            contributor=ContributorRef(
+                scope_id="g_ceo", skill="scope-manager", session_id="change-event", ts="t"
+            ),
+            change_id="chg_1",
+            source_scope_id="g_eng",
+            item_id="pub_abc",
+            kind="withdrawn",
+            processed=True,
+        )
+
+        assert event.processed_at is not None
+        assert store.list_change_events(scope_id="g_ceo", unprocessed_only=True) == []
+
+    def test_events_are_listed_oldest_first_and_scoped(self, store) -> None:
+        cid = _contribute(store, "notice")
+        first = store.append_change_event(
+            change_id="chg_1",
+            contribution_id=cid,
+            scope_id="g_ceo",
+            item_id="pub_1",
+            kind="published",
+        )
+        second = store.append_change_event(
+            change_id="chg_2",
+            contribution_id=cid,
+            scope_id="g_ceo",
+            item_id="pub_2",
+            kind="published",
+        )
+        store.append_change_event(
+            change_id="chg_3",
+            contribution_id=cid,
+            scope_id="g_other",
+            item_id="pub_3",
+            kind="published",
+        )
+
+        assert [e.id for e in store.list_change_events(scope_id="g_ceo")] == [
+            first.id,
+            second.id,
+        ]
+        assert [e.item_id for e in store.list_change_events(scope_id="g_other")] == ["pub_3"]
+
+    def test_unprocessed_only_excludes_what_a_refresh_consumed(self, store) -> None:
+        cid = _contribute(store, "notice")
+        done = store.append_change_event(
+            change_id="chg_1",
+            contribution_id=cid,
+            scope_id="g_ceo",
+            item_id="pub_1",
+            kind="withdrawn",
+        )
+        pending = store.append_change_event(
+            change_id="chg_2",
+            contribution_id=cid,
+            scope_id="g_ceo",
+            item_id="pub_2",
+            kind="withdrawn",
+        )
+
+        store.mark_change_event_processed(done.id)
+
+        # The record keeps the processed event forever (ADR 0014 D5) — only
+        # the perspective's `input_changes` view narrows to unprocessed.
+        assert [e.id for e in store.list_change_events(scope_id="g_ceo")] == [
+            done.id,
+            pending.id,
+        ]
+        unprocessed = store.list_change_events(scope_id="g_ceo", unprocessed_only=True)
+        assert [e.id for e in unprocessed] == [pending.id]
+        assert store.list_change_events(scope_id="g_ceo")[0].processed_at is not None
+
+    def test_marking_an_already_processed_event_is_a_no_op(self, store) -> None:
+        """The drain is idempotent — re-marking never rewrites the timestamp."""
+        cid = _contribute(store, "notice")
+        event = store.append_change_event(
+            change_id="chg_1",
+            contribution_id=cid,
+            scope_id="g_ceo",
+            item_id="pub_1",
+            kind="withdrawn",
+        )
+
+        store.mark_change_event_processed(event.id)
+        first_stamp = store.list_change_events(scope_id="g_ceo")[0].processed_at
+        store.mark_change_event_processed(event.id)
+
+        assert store.list_change_events(scope_id="g_ceo")[0].processed_at == first_stamp
+
+    def test_an_event_naming_no_contribution_is_rejected(self, store) -> None:
+        """The notice IS the contribution row (ADR 0014 D5) — no orphan events."""
+        with pytest.raises(sqlite3.IntegrityError):
+            store.append_change_event(
+                change_id="chg_1",
+                contribution_id="c_nope",
+                scope_id="g_ceo",
+                item_id="pub_1",
+                kind="withdrawn",
+            )

@@ -154,6 +154,101 @@ def _init_stores() -> None:
     _session_store = SessionStateStore(_sessions_dir)
 
 
+def _drain_for_read(fleet, scope_id: str) -> int:
+    """Bring *scope_id* up to date before it is read, and say what is still owed.
+
+    ADR 0014 D6: the refresh queue is drained by the MCP server when a scope is
+    bound or its perspective is read, BEFORE composition, so nobody can read a
+    scope without first bringing it up to date — and the system is correct for
+    a user who never runs a CLI command at all.
+
+    An empty queue IS a reason to skip, and skipped lock-free: since ADR 0015
+    D6 the drain has one job — judge pending change events — so a quiet read
+    costs what reading a current scope costs. Inheritance is no longer
+    something a read has to make happen before composing; composition IS how
+    a descendant inherits (ADR 0015 D2).
+
+    Without a judge configured only the mechanical work runs — the sweep of
+    items an ancestor's retirement un-anchored (ADR 0015 D3) and the unsplice
+    of legacy copies (D5), neither of which needs a judge. The judged
+    reconciliation is left pending for the first drain that has one.
+
+    Returns the number of change events still unprocessed AFTER the attempt:
+    ``0`` when the drain brought the scope up to date, and the outstanding
+    count when it could not. That count is a refresh queue depth, never a judge
+    outage (implementation pin 4) — the two are reported separately everywhere.
+
+    Never raises. A read must not fail because a refresh could not run (pin 5):
+    a judge outage leaves the events unprocessed, records its attempt rows
+    exactly as the contribute path does, and the caller returns the perspective
+    anyway with the events still listed. Only :class:`DrainFailed` is swallowed
+    — a bug is still a bug.
+
+    Deadlock: :func:`strata.app.drain_scope` takes ``scope_lock`` (ADR 0012)
+    and the read path holds no scope lock of its own, so this can only ever
+    WAIT on an in-flight judgment for the same scope, never deadlock against
+    one.
+    """
+    from strata.app import DrainFailed, drain_is_noop, drain_scope  # noqa: PLC0415
+
+    if _record_store is None or _summary_store is None:
+        return 0
+
+    # Nothing pending is nothing to do (ADR 0015 D6), and `drain_is_noop`
+    # answers it lock-free: a quiet read must cost what reading a current
+    # scope costs, not a wait behind whatever judgment is in flight for that
+    # scope plus a judge client it never uses.
+    if drain_is_noop(
+        scope_id, fleet=fleet, record_store=_record_store, summary_store=_summary_store
+    ):
+        return 0
+
+    pending = len(_record_store.list_change_events(scope_id=scope_id, unprocessed_only=True))
+
+    # No judge configured: run the MECHANICAL work only — the ancestor-
+    # retirement sweep (ADR 0015 D3) and the legacy unsplice (D5). Neither
+    # needs a judge; the judged reconciliation stays pending for the first
+    # drain that has one. Nothing is attempted, so no attempt row is written
+    # — a judge that was never configured is not a judge outage
+    # (implementation pin 4).
+    if not (_settings.judge_api_key or _settings.anthropic_api_key):
+        drain_scope(
+            scope_id,
+            fleet=fleet,
+            record_store=_record_store,
+            summary_store=_summary_store,
+            scope_manager=None,
+            summary_max_words=_settings.summary_max_words,
+            window_verbatim_tail=_settings.window_verbatim_tail,
+            recency_window_size=_settings.recency_window_size,
+        )
+        return len(_record_store.list_change_events(scope_id=scope_id, unprocessed_only=True))
+
+    try:
+        outcome = drain_scope(
+            scope_id,
+            fleet=fleet,
+            record_store=_record_store,
+            summary_store=_summary_store,
+            scope_manager=_build_scope_manager(),
+            summary_max_words=_settings.summary_max_words,
+            window_verbatim_tail=_settings.window_verbatim_tail,
+            recency_window_size=_settings.recency_window_size,
+        )
+    except DrainFailed as exc:
+        _logger.warning(
+            "refresh drain for scope %r failed (%s); %d change event(s) still pending",
+            scope_id,
+            exc.error_class,
+            exc.pending,
+        )
+        return exc.pending
+    # Floored at zero: an event can land between the count above and the
+    # drain's own read, so the drain may properly process more than this call
+    # saw. A negative "pending" would be a lie in the other direction.
+    return max(0, pending - outcome.events_processed)
+
+
 def _record_read(scope_id: str) -> None:
     """Record one perspective/summary read for this session (best-effort, #110).
 
@@ -637,8 +732,8 @@ def _check_entitled(fleet: FleetConfig, agent_scope: str, scope_id: str) -> None
             "composed for your own chain, not a peer's. A scope reachable "
             "only through a reference edge informs you via "
             "strata_read_scope_summary and as a non-binding peer_reference "
-            "layer inside your own perspective (ADR 0006 D3/D4) — never as "
-            "its own record or perspective target."
+            "layer inside your own perspective — never as its own record or "
+            "perspective target."
         )
 
 
@@ -680,6 +775,53 @@ def _check_entitled_context(fleet: FleetConfig, agent_scope: str, scope_id: str)
             "edge). Unreferenced scopes and descendants are not directly "
             "readable — legitimizing a knowledge flow between scopes is a "
             "reviewed reference edge in fleet.yaml, not a workaround here."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Entitled relay-source surface (ADR 0013 D3/D4 — republication). A scope may
+# only relay an item it could actually have seen in its own composed
+# perspective: the publication of its chain parent (one hop via the chain
+# edge), or the publication of a scope it itself references (one hop via a
+# reference edge) — exactly the set compose_perspective composes as
+# parent_publication/peer_reference layers for this scope, never a wider
+# chain-wide surface (that would let a relay smuggle in a grandparent's or an
+# ancestor-referenced peer's publication this scope never actually receives).
+# strata.publication.propose_publish deliberately leaves this check to its
+# caller (same precedent as own-scope-only publishing) — this is that caller.
+# ---------------------------------------------------------------------------
+
+
+def _relay_source_scope_ids(fleet: FleetConfig, agent_scope: str) -> set[str]:
+    """Return the scope ids *agent_scope* may name as a republication relay source.
+
+    Exactly the scopes whose publication *agent_scope*'s own perspective
+    composes one hop away (``compose_perspective``'s parent_publication and
+    peer_reference layers): its chain parent, if any, and every scope it
+    itself references via a reference edge. Deliberately narrower than
+    ``_context_surface_scope_ids`` (chain-wide referenced peers) — a relay
+    source must be something this scope could actually have read, not merely
+    something entitled somewhere on its chain.
+    """
+    ids: set[str] = set()
+    parent = fleet.inter_stratum_parent(agent_scope)
+    if parent is not None:
+        ids.add(parent.id)
+    ids.update(s.id for s in fleet.references_from(agent_scope))
+    return ids
+
+
+def _check_entitled_relay_source(fleet: FleetConfig, agent_scope: str, scope_id: str) -> None:
+    """Raise RuntimeError if *scope_id* is outside *agent_scope*'s entitled relay-source surface."""
+    if scope_id not in _relay_source_scope_ids(fleet, agent_scope):
+        raise RuntimeError(
+            f"relay source scope {scope_id!r} is outside your entitled relay "
+            f"surface (your scope {agent_scope!r}'s chain parent, and any "
+            "scope it itself references via a reference edge). You may only "
+            "relay an item from a scope whose publication your own "
+            "perspective actually composes — never a grandparent's "
+            "publication or a publication reached only through an "
+            "ancestor's own reference edge."
         )
 
 
@@ -1675,10 +1817,17 @@ async def strata_bind(scope_id: str, skill: str | None = None, confirm: bool = F
             your own judgment; it must reflect the user's actual answer,
             given after you told them about the switch.
 
+    On a binding that actually happens, the newly bound scope's pending
+    input changes are drained first (ADR 0014 D6), so the session's first
+    read is already up to date. An unconfirmed switch drains nothing — it
+    bound nothing.
+
     Returns:
         On success: ``scope_id``, ``skill``, ``session_id`` (the new
-        binding — session_id unchanged), and ``message`` (a one-line
-        confirmation, noting the identity change when this was a switch).
+        binding — session_id unchanged), ``message`` (a one-line
+        confirmation, noting the identity change when this was a switch),
+        and ``refresh_pending`` when the drain left input changes still
+        unprocessed (absent when nothing is owed).
         On an unconfirmed switch: the binding UNCHANGED — same ``scope_id``/
         ``skill`` as before this call — plus ``switch_pending: True`` and a
         ``message`` explaining what to do next (ask the user, then call
@@ -1840,12 +1989,23 @@ async def strata_bind(scope_id: str, skill: str | None = None, confirm: bool = F
             f"Session id unchanged ({_AGENT_SESSION_ID!r})."
         )
 
+    # ADR 0014 D6: the scope this session just bound to is drained here, so
+    # the first read after a bind is already up to date. Only on a binding that
+    # actually happened — an unconfirmed switch returned above, and refreshing
+    # a scope the session did not bind to would be a judge call nobody asked
+    # for.
+    refresh_pending = _drain_for_read(fleet, _AGENT_SCOPE)
+
     result = {
         "scope_id": _AGENT_SCOPE,
         "skill": _AGENT_SKILL,
         "session_id": _AGENT_SESSION_ID,
         "message": message,
     }
+    if refresh_pending:
+        # Present only when the drain left something owed — see
+        # strata_read_perspective for why an absent key means "nothing owed".
+        result["refresh_pending"] = refresh_pending
     if _STARTUP_ERRORS_CONFIG:
         result["config_notice"] = (
             "Binding succeeded, but memory tools remain gated: "
@@ -2130,6 +2290,8 @@ async def strata_publish(
     kind: Literal["directive", "context"],
     anchors: list[str],
     subject: str | None = None,
+    relay_source_scope_id: str | None = None,
+    relay_source_item_id: str | None = None,
 ) -> dict:
     """Propose publishing content from this agent's bound scope's own memory.
 
@@ -2163,14 +2325,34 @@ async def strata_publish(
         anchors: At least one anchor — a directive id from this scope's
             current summary, or a subject string.
         subject: Optional short label.
+        relay_source_scope_id: ADR 0013 D4 (republication) — set this
+            together with *relay_source_item_id* when *content* relays an
+            item you received in another scope's publication, rather than
+            something original to your own memory. Must be a scope whose
+            publication your own perspective actually composes: your bound
+            scope's chain parent, or a scope your bound scope itself
+            references. The item's ultimate origin is derived from the
+            source item itself — you cannot assert an origin, only point at
+            what you received. The scope-manager is told the proposal is a
+            relay and shown its origin (CONTEXT.md § Republication):
+            relaying is a different judgment from publishing your own
+            material, and an ancestor having said it is information, not
+            permission to pass it on.
+        relay_source_item_id: The id of the published item, in
+            *relay_source_scope_id*'s CURRENT publication, being relayed.
+            Must be given together with *relay_source_scope_id*, or not at
+            all.
 
     Returns:
         ``act_id`` and ``judgment`` (``decision``: ``"accept"``/``"decline"``,
         ``reasoning``, ``artifact_updated``).
 
     Raises:
-        RuntimeError: The bound scope is unknown, or the anchors fail
-            structural validation.
+        RuntimeError: The bound scope is unknown; the anchors fail
+            structural validation; *relay_source_scope_id* is outside your
+            entitled relay surface; exactly one of *relay_source_scope_id* /
+            *relay_source_item_id* is given; or *relay_source_item_id* is
+            not present in *relay_source_scope_id*'s current publication.
     """
     await _require_bound_or_elicit()
 
@@ -2183,6 +2365,14 @@ async def strata_publish(
     scope = fleet.get_scope(agent_scope)
     if scope is None:
         raise RuntimeError(f"Your bound scope {agent_scope!r} was not found in the fleet config.")
+
+    # ADR 0013 D3/D4 — structural entitlement check for the relay source,
+    # BEFORE anything is recorded (mirrors propose_publish's own anchor
+    # validation: a failure here appends no act row). propose_publish itself
+    # does not check this — same precedent as own-scope-only publishing —
+    # so this calling surface is where it belongs.
+    if relay_source_scope_id is not None:
+        _check_entitled_relay_source(fleet, agent_scope, relay_source_scope_id)
 
     ts = datetime.now(UTC).isoformat()
     proposer = ContributorRef(
@@ -2206,6 +2396,9 @@ async def strata_publish(
             record_store=_record_store,
             summary_store=_summary_store,
             scope_manager=manager,
+            relay_source_scope_id=relay_source_scope_id,
+            relay_source_item_id=relay_source_item_id,
+            publication_max_words=_settings.publication_max_words,
         )
     except ValueError as exc:
         raise RuntimeError(str(exc)) from exc
@@ -2305,38 +2498,48 @@ async def strata_withdraw(item_id: str) -> dict:
 
 @mcp.tool()
 async def strata_read_scope_summary(scope_id: str | None = None) -> dict:
-    """Return the scope summary for the given scope — or a referenced scope's publication.
+    """Return the scope summary for the given scope — or its directives, or its publication.
 
-    For your own bound scope or an inter-stratum ancestor, this returns the
-    scope summary: the curated, condensed working view of a scope, maintained
-    by its scope-manager, with two sections — directives (binding decisions
-    that propagate to all descendant scopes) and context (non-binding
+    For your own bound scope, this returns the full scope summary: the
+    curated, condensed working view of a scope, maintained by its
+    scope-manager, with two sections — directives (binding decisions that
+    propagate to all descendant scopes) and context (non-binding
     observations and knowledge).
 
-    For a chain-REFERENCED scope (ADR 0007 D4: the ADR 0006 D3 amendment),
-    this returns that scope's **publication** instead — its curated, judged
-    outward face — never its internal summary. The entitled content across a
-    reference was always "its outward face" (CONTEXT.md § Reference edge:
-    "what a reference edge delivers is the referenced scope's publication —
-    never its full internal summary"); the face just became a real, judged
-    artifact rather than the whole internal summary.
+    For an inter-stratum ANCESTOR, this returns that scope's **directives
+    only** — a chain edge carries directives, full fidelity, never the
+    ancestor's context, so a direct read of an ancestor scope stays as
+    honest as the composed perspective already is: the ancestor's context is
+    its own working memory, not something a descendant is entitled to.
+
+    For a chain-REFERENCED scope, this returns that scope's **publication**
+    instead — its curated, judged outward face — never its internal
+    summary. The entitled content across a reference was always "its
+    outward face" (CONTEXT.md § Reference edge: "what a reference edge
+    delivers is the referenced scope's publication — never its full
+    internal summary"); the face is a real, judged artifact, never the
+    whole internal summary.
 
     Args:
-        scope_id: The scope whose summary (or publication) to read (e.g.
-            ``g_arch``). Defaults to this agent's bound scope. An explicit
-            scope_id must be within this agent's entitled *context* surface
-            (ADR 0006 D3/D4): the bound scope, one of its inter-stratum
-            ancestors, or a scope referenced by a scope on that chain via a
-            reference edge. Unreferenced scopes and descendants are not
-            directly readable.
+        scope_id: The scope whose summary/directives/publication to read
+            (e.g. ``g_arch``). Defaults to this agent's bound scope. An
+            explicit scope_id must be within this agent's entitled *context*
+            surface: the bound scope, one of its inter-stratum ancestors, or
+            a scope referenced by a scope on that chain via a reference
+            edge. Unreferenced scopes and descendants are not directly
+            readable.
 
     Returns:
-        For own scope / ancestor: parsed scope summary — ``scope_id``,
+        For your own scope: the parsed scope summary — ``scope_id``,
         ``directives``, ``context``, ``updated_at``, ``version``, ``exists``.
         If the scope has no summary on disk yet, a synthesized empty summary
         is returned with ``version=0`` and ``exists=False`` — distinguishable
         from a real first write (``version=1``, ``exists=True``); see
         :class:`strata.summary_store.ScopeSummary`.
+
+        For an inter-stratum ancestor: ``{"scope_id": ..., "stratum_id":
+        ..., "relation": "ancestor", "binding": True, "directives": [...]}``
+        — no ``"context"`` or ``"summary"`` key at all.
 
         For a chain-referenced scope: ``{"scope_id": ..., "relation":
         "peer_reference", "publication": {"items": [<item dicts: id, kind,
@@ -2364,8 +2567,8 @@ async def strata_read_scope_summary(scope_id: str | None = None) -> dict:
     # toward the session asymmetry counters and the per-scope staleness metric.
     _record_read(scope_id)
 
-    # ADR 0007 D4: a chain-referenced scope (not the bound scope, not an
-    # ancestor) is entitled for its OUTWARD FACE, never its internal summary.
+    # A chain-referenced scope (not the bound scope, not an ancestor) is
+    # entitled for its OUTWARD FACE, never its internal summary.
     chain_ids = {s.id for s in fleet.entitlement_view(_AGENT_SCOPE).chain}
     if scope_id not in chain_ids:
         items = read_publication(scope_id, summaries_dir=_summaries_dir)
@@ -2374,6 +2577,23 @@ async def strata_read_scope_summary(scope_id: str | None = None) -> dict:
                 "scope_id": scope_id,
                 "relation": "peer_reference",
                 "publication": {"items": [_publication_item_dict(i) for i in items]},
+            }
+        )
+
+    if scope_id != _AGENT_SCOPE:
+        # A chain edge carries only the ancestor's directives, never its
+        # context — a direct read of an ancestor scope stays honest with
+        # what perspective composition already withholds; the ancestor's
+        # own context is that scope's working memory, not this reader's.
+        ancestor_summary = _summary_store.read(scope_id)
+        directives = ancestor_summary.directives if ancestor_summary is not None else []
+        return _attach_nudge(
+            {
+                "scope_id": scope_id,
+                "stratum_id": scope.stratum_id,
+                "relation": "ancestor",
+                "binding": True,
+                "directives": [d.model_dump() for d in directives],
             }
         )
 
@@ -2405,42 +2625,61 @@ async def strata_read_perspective(scope_id: str | None = None) -> dict:
     """Return this agent's perspective on the fleet's long-term memory.
 
     A perspective is a composed, provenance-preserving view of: the scope's
-    own summary, all inter-stratum ancestor summaries up to the root, and —
-    ADR 0006 D3, delivering the referenced scope's **publication** per the
-    ADR 0007 D4 amendment — the outward face of any scopes referenced (one
-    hop, via a reference edge) by a scope on that chain. Layers are ordered
-    root-first: ancestors first, then the requested scope's own layer, then
-    referenced-scope layers (sorted by scope id for deterministic ordering).
+    own summary; the **directives** of every inter-stratum ancestor up to
+    the root, full walk, root-first — never an ancestor's context, which
+    stays inside that scope; and the **publication** of every scope exactly
+    one edge away — the immediate chain parent, and any scope this scope
+    itself references — never a grandparent's publication, and never one
+    reached only through an ancestor's own reference edge. Layers are
+    ordered root-first: ancestor directive layers, then the requested
+    scope's own layer, then the parent's publication layer (if any), then
+    referenced-scope publication layers (sorted by scope id for
+    deterministic ordering).
 
-    Every layer carries ``relation`` (``"self"``, ``"ancestor"``, or
-    ``"peer_reference"``) and ``binding`` (``True`` for self/ancestor layers,
-    ``False`` for reference layers). Reference layers are **context only** —
-    nothing in them binds the reader, whether the referenced scope sits on
-    your own stratum, above it, or below it (ADR 0010 D2); each is labelled
-    with that scope's own stratum. Self/ancestor layers carry that scope's
-    full ``summary``; reference layers carry the referenced scope's CURRENT
+    Every layer carries ``relation`` (``"self"``, ``"ancestor"``,
+    ``"parent_publication"``, or ``"peer_reference"``) and ``binding``
+    (``True`` for self/ancestor layers, ``False`` for every publication
+    layer, wherever it came from). Publication layers are non-binding at any
+    stratum distance or edge type, each labelled with the source scope's own
+    stratum. Self layers carry that scope's full ``summary``; ancestor
+    layers carry ``directives`` only (a list, never a ``summary`` or
+    ``context`` key); publication layers carry the source scope's CURRENT
     ``publication`` (``{"items": [...]}``, verbatim, never its internal
     summary — a scope that has published nothing gets an empty ``items``
     list, the honestly empty face). References-of-references are not
-    traversed: only edges whose source scope is itself on the chain count
-    (one hop, per ``FleetConfig.entitlement_view``).
+    traversed, and an ancestor's own reference edges are never this scope's
+    to compose — only this scope's own outgoing reference edges count, one
+    hop.
 
     If a chain scope has no summary on disk yet, its layer is still included
-    with empty directives and context so that the structure is visible; that
-    layer's summary honestly reports ``version=0``/``exists=False`` rather
-    than looking like a real first write.
+    with an honestly empty payload so the structure stays visible; a self
+    layer's synthesized summary reports ``version=0``/``exists=False``
+    rather than looking like a real first write.
 
     Args:
         scope_id: The scope for which to build the perspective. Defaults to
             this agent's bound scope. An explicit scope_id must be the bound
-            scope or one of its inter-stratum ancestors — this is
-            the perspective *target*, which stays chain-only (ADR 0006 D4):
-            you compose a perspective for your own chain, not for a peer's.
+            scope or one of its inter-stratum ancestors — this is the
+            perspective *target*, which stays chain-only: you compose a
+            perspective for your own chain, not for a peer's.
+
+    Before composing, this brings the scope up to date: any pending input
+    change — an upstream publication withdrawn, amended or added to, an
+    ancestor or operator directive changed — is judged by this scope's own
+    scope-manager first (ADR 0014 D6), so nobody reads a scope whose memory
+    has not been re-judged against its current inputs. The read never fails
+    on that account: if the refresh cannot run, the perspective comes back
+    anyway carrying ``refresh_pending``.
 
     Returns:
         ``{layers: [{scope_id, stratum_id, relation, binding, summary |
-        publication}], scope_id: <requested>, _layers_count: N}`` ordered
-        root-first, then self, then sorted peer layers.
+        directives | publication}], scope_id: <requested>, _layers_count:
+        N}`` ordered root-first, then self, then the parent's publication
+        layer, then sorted referenced-scope publication layers.
+        ``refresh_pending`` appears only when input changes are still
+        unprocessed — the refresh could not run (no judge configured, or the
+        scope-manager was unavailable) — so an absent key means nothing is
+        owed. It counts pending refreshes, never judge outages.
 
     Raises:
         RuntimeError: If the scope is unknown, or if scope_id is outside this
@@ -2457,6 +2696,10 @@ async def strata_read_perspective(scope_id: str | None = None) -> dict:
     scope = fleet.get_scope(scope_id)
     if scope is None:
         raise RuntimeError(f"Scope not found: {scope_id!r}")
+
+    # ADR 0014 D6: drain BEFORE composing — the perspective an agent reads is
+    # the one its refreshed memory produces, not the pre-refresh one.
+    refresh_pending = _drain_for_read(fleet, scope_id)
 
     # Read receipt (#110): a perspective read is attributed to its TARGET scope
     # (the scope whose perspective was requested), not fanned out to every
@@ -2483,15 +2726,30 @@ async def strata_read_perspective(scope_id: str | None = None) -> dict:
     def _publication_reader(peer_scope_id: str) -> list:
         return read_publication(peer_scope_id, summaries_dir=_summaries_dir)
 
-    return _attach_nudge(
-        compose_perspective(
-            scope_id,
-            fleet=fleet,
-            summary_store=_summary_store,
-            operator_reader=_operator_reader,
-            publication_reader=_publication_reader,
-        )
+    # change_event_reader (ADR 0014 D5): the scope's own unprocessed input
+    # changes, composed as `input_changes`. Whatever the drain above could not
+    # process is still here — notice that survives in the payload rather than
+    # a read that looks current. compose_perspective filters to unprocessed
+    # itself, so the bound method is handed over unfiltered.
+    def _change_event_reader(target_scope_id: str) -> list:
+        return _record_store.list_change_events(scope_id=target_scope_id)
+
+    perspective = compose_perspective(
+        scope_id,
+        fleet=fleet,
+        summary_store=_summary_store,
+        operator_reader=_operator_reader,
+        publication_reader=_publication_reader,
+        change_event_reader=_change_event_reader,
     )
+    # What the drain could NOT bring up to date (ADR 0014 D6). Present only
+    # when non-zero — the same discipline `fleet_notice` and `unbound_notice`
+    # follow: a key that appears exactly when there is something to say, so an
+    # ordinary up-to-date read is byte-identical to compose_perspective's own
+    # dict, and a stale one announces itself.
+    if refresh_pending:
+        perspective["refresh_pending"] = refresh_pending
+    return _attach_nudge(perspective)
 
 
 # ---------------------------------------------------------------------------

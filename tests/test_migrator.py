@@ -90,6 +90,11 @@ def test_full_chain_drops_fleet_tables_and_preserves_record(tmp_path: Path) -> N
         "0006_optional_skill.sql",
         "0007_failed_judgment_marker.sql",
         "0008_publication_judgment_attempts.sql",
+        "0009_publication_relay.sql",
+        "0010_change_events.sql",
+        "0011_change_event_kinds.sql",
+        "0012_directive_unspliced_kind.sql",
+        "0013_judgment_summary_version.sql",
     ]
 
     # Fleet tables gone.
@@ -338,6 +343,11 @@ def test_idempotent_reapply(tmp_path: Path) -> None:
         "0006_optional_skill.sql",
         "0007_failed_judgment_marker.sql",
         "0008_publication_judgment_attempts.sql",
+        "0009_publication_relay.sql",
+        "0010_change_events.sql",
+        "0011_change_event_kinds.sql",
+        "0012_directive_unspliced_kind.sql",
+        "0013_judgment_summary_version.sql",
     ]
 
     second = run_migrations(db_path, migrations_dir=migrations_dir)
@@ -542,6 +552,11 @@ def test_crash_at_tracking_insert_rolls_back_script_too(
         "0006_optional_skill.sql",
         "0007_failed_judgment_marker.sql",
         "0008_publication_judgment_attempts.sql",
+        "0009_publication_relay.sql",
+        "0010_change_events.sql",
+        "0011_change_event_kinds.sql",
+        "0012_directive_unspliced_kind.sql",
+        "0013_judgment_summary_version.sql",
     ]
 
 
@@ -697,3 +712,222 @@ def test_split_statements_matches_pre_76_line_based_splitter_for_shipped_migrati
     """
     sql = migration_file.read_text(encoding="utf-8")
     assert _split_statements(sql) == _old_split_statements(sql)
+
+
+def test_0010_adds_change_events_table(tmp_path: Path) -> None:
+    """0010 creates ``change_events`` on a fresh db, and re-running adds nothing.
+
+    The change-event row is what ADR 0014 D5 makes the permanent, auditable
+    notice of an input change: one row per affected scope per change, linked
+    to the ``manager-refresh`` contribution that carries it, and unprocessed
+    until a refresh consumes it.
+    """
+    db_path = str(tmp_path / "change_events.db")
+    migrations_dir = Path(__file__).resolve().parent.parent / "src" / "strata" / "_migrations"
+
+    run_migrations(db_path, migrations_dir=migrations_dir)
+    assert "change_events" in _table_names(db_path)
+
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("PRAGMA foreign_keys = ON")
+        # 0010's own columns, plus `source_scope_id`, which 0011 adds when it
+        # rewrites the table for the kind CHECK.
+        columns = {r[1] for r in conn.execute("PRAGMA table_info(change_events)").fetchall()}
+        assert columns == {
+            "id",
+            "change_id",
+            "contribution_id",
+            "scope_id",
+            "source_scope_id",
+            "item_id",
+            "kind",
+            "before",
+            "after",
+            "hop",
+            "processed_at",
+            "created_at",
+        }
+
+        conn.execute(
+            """
+            INSERT INTO contributions (
+                id, scope_id, content, proposed_classification,
+                contributor_scope_id, contributor_skill,
+                contributor_session_id, contributor_ts
+            ) VALUES ('c_1', 'g_a', 'notice', 'context', 'g_a', 'architect', 's', 't')
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO change_events
+            (id, change_id, contribution_id, scope_id, item_id, kind, before, after, hop)
+            VALUES ('ce_1', 'chg_1', 'c_1', 'g_a', 'pub_1', 'withdrawn', 'was', NULL, 0)
+            """
+        )
+        conn.commit()
+
+        # processed_at starts NULL: the event is unprocessed until a refresh
+        # consumes it (ADR 0014 D5), whatever the refresh's verdict.
+        assert conn.execute("SELECT processed_at FROM change_events").fetchall() == [(None,)]
+
+        # The link to the notice contribution is enforced — an event naming no
+        # real contribution row would be a notice nobody can read.
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                """
+                INSERT INTO change_events
+                (id, change_id, contribution_id, scope_id, item_id, kind, hop)
+                VALUES ('ce_2', 'chg_1', 'c_nope', 'g_a', 'pub_1', 'withdrawn', 0)
+                """
+            )
+    finally:
+        conn.close()
+
+    assert run_migrations(db_path, migrations_dir=migrations_dir) == []
+
+
+def test_0011_constrains_change_event_kinds(tmp_path: Path) -> None:
+    """0011 settles the change-event vocabulary as a CHECK constraint.
+
+    0010 deliberately left ``kind`` unconstrained — the emission vocabulary
+    belongs to the writers (ADR 0014 D1), and a guessed list would have been
+    a wrong constraint on a table nothing could yet write. The writers exist
+    now, so the seven kinds they emit become the constraint: a mistyped kind
+    is a wrong notice, and a wrong notice is worse than a loud failure.
+    """
+    db_path = str(tmp_path / "change_event_kinds.db")
+    migrations_dir = Path(__file__).resolve().parent.parent / "src" / "strata" / "_migrations"
+
+    run_migrations(db_path, migrations_dir=migrations_dir)
+
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute(
+            """
+            INSERT INTO contributions (
+                id, scope_id, content, proposed_classification,
+                contributor_scope_id, contributor_skill,
+                contributor_session_id, contributor_ts
+            ) VALUES ('c_1', 'g_a', 'notice', 'context', 'g_a', 'architect', 's', 't')
+            """
+        )
+        # 0011 also adds source_scope_id — the scope the changed item came
+        # FROM, distinct from scope_id, which is the affected scope.
+        columns = {r[1] for r in conn.execute("PRAGMA table_info(change_events)").fetchall()}
+        assert "source_scope_id" in columns
+
+        # Every settled kind is accepted.
+        for index, kind in enumerate(
+            [
+                "published",
+                "amended",
+                "withdrawn",
+                "directive_appended",
+                "directive_superseded",
+                "directive_retired",
+                "operator_directive_changed",
+            ]
+        ):
+            conn.execute(
+                """
+                INSERT INTO change_events
+                (id, change_id, contribution_id, scope_id, item_id, kind, hop)
+                VALUES (?, 'chg_1', 'c_1', 'g_a', 'pub_1', ?, 0)
+                """,
+                (f"ce_{index}", kind),
+            )
+        conn.commit()
+
+        # Anything outside the vocabulary is refused.
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                """
+                INSERT INTO change_events
+                (id, change_id, contribution_id, scope_id, item_id, kind, hop)
+                VALUES ('ce_bad', 'chg_1', 'c_1', 'g_a', 'pub_1', 'withdraw', 0)
+                """
+            )
+        conn.rollback()
+
+        # The recreate-table rewrite keeps the FK to the notice contribution...
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                """
+                INSERT INTO change_events
+                (id, change_id, contribution_id, scope_id, item_id, kind, hop)
+                VALUES ('ce_fk', 'chg_1', 'c_nope', 'g_a', 'pub_1', 'published', 0)
+                """
+            )
+        conn.rollback()
+
+        # ...and both of 0010's indexes, which the drain and the
+        # once-per-change-id check read through.
+        index_names = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'change_events'"
+            ).fetchall()
+        }
+        assert "idx_change_events_scope_pending" in index_names
+        assert "idx_change_events_change" in index_names
+    finally:
+        conn.close()
+
+    assert run_migrations(db_path, migrations_dir=migrations_dir) == []
+
+
+def test_0011_preserves_change_events_written_before_it(tmp_path: Path) -> None:
+    """The recreate-table rewrite carries an existing event across intact."""
+    db_path = str(tmp_path / "change_event_kinds_existing.db")
+    migrations_dir = Path(__file__).resolve().parent.parent / "src" / "strata" / "_migrations"
+
+    # Everything up to (not including) 0011, then seed an event.
+    through_0010 = tmp_path / "migrations_through_0010"
+    through_0010.mkdir()
+    for path in sorted(migrations_dir.glob("*.sql")):
+        if path.name >= "0011":
+            continue
+        (through_0010 / path.name).write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
+    run_migrations(db_path, migrations_dir=through_0010)
+
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            """
+            INSERT INTO contributions (
+                id, scope_id, content, proposed_classification,
+                contributor_scope_id, contributor_skill,
+                contributor_session_id, contributor_ts
+            ) VALUES ('c_1', 'g_a', 'notice', 'context', 'g_a', 'architect', 's', 't')
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO change_events
+            (id, change_id, contribution_id, scope_id, item_id, kind, before, after, hop)
+            VALUES ('ce_old', 'chg_old', 'c_1', 'g_a', 'pub_1', 'withdrawn', 'was', NULL, 3)
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    assert run_migrations(db_path, migrations_dir=migrations_dir) == [
+        "0011_change_event_kinds.sql",
+        "0012_directive_unspliced_kind.sql",
+        "0013_judgment_summary_version.sql",
+    ]
+
+    conn = sqlite3.connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT change_id, contribution_id, scope_id, source_scope_id, item_id, kind, "
+            "before, after, hop, processed_at FROM change_events WHERE id = 'ce_old'"
+        ).fetchone()
+        # A row written before 0011 has no source scope to carry across, and
+        # nothing invents one (ADR 0013 D7 — no backfill).
+        assert row == ("chg_old", "c_1", "g_a", None, "pub_1", "withdrawn", "was", None, 3, None)
+    finally:
+        conn.close()

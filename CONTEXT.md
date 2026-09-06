@@ -33,8 +33,13 @@ carries. No other relation between scopes exists.
 
 The edge from a scope to its single parent scope in the stratum immediately
 above. Every scope has **at most one** chain edge to a parent — a scope
-without one is a root of its own chain. Carries both directives and context
-downward, **binding** the scope and all its descendants.
+without one is a root of its own chain.
+
+Carries the parent's **directives** downward — full fidelity, every ancestor
+to the root — **binding** the scope and all its descendants. It does not
+carry the parent's context: raw internal memory never leaves its scope. What
+a child knows of its parent beyond what binds it is what the parent chose to
+**publish**, delivered one edge at a time like any publication.
 
 A chain edge's parent is its lower-ordinal endpoint; the direction it is
 written in carries no meaning and none is inferred from it. Legal only
@@ -51,7 +56,9 @@ written *from* references the scope it is written *to*.
 Carries **context only** — directives published in the referenced scope do
 not bind the reader, at any stratum distance. What a reference edge delivers
 is the referenced scope's **publication** — its curated outward face — never
-its full internal summary and never its operator memory. To make a
+its full internal summary and never its operator memory. A publication
+travels exactly **one edge**, here as on a chain edge: what a scope receives
+it may pass on only by republishing it as its own judged act. To make a
 referenced scope's standard binding, it must be ratified into a common
 ancestor scope (i.e. published as a directive at a stratum above both).
 
@@ -112,10 +119,12 @@ also exercise any scope's authority directly (see Operator).
 
 The human authority that defines the fleet — its strata, scopes, and edges —
 and from which all scope authority is delegated. The operator occupies the
-implicit stratum above the broadest scope: operator **directives** bind
-every scope below their attachment point by ordinary broader-stratum
-precedence, and operator **context** informs without binding, like any
-stratum's.
+implicit stratum above the broadest scope: everything the operator attaches
+to a scope is a **directive**, binding every scope below its attachment
+point by ordinary broader-stratum precedence. The operator has no context
+channel — its memory is unjudged, unbounded and composed verbatim into every
+descendant, so a non-binding operator layer would behave in every observable
+way like a binding one.
 
 Operator memory is stored in Strata with external provenance, appended to a
 record like all memory, and composed into perspectives verbatim as its own
@@ -123,7 +132,9 @@ labelled layer — never rewritten by any scope-manager. It is **judge-aware**:
 scope-managers see the operator memory binding their scope when judging, and
 decline contributions that contradict it. It is exempt from outcome-based
 **trust** weighting; outcomes that contradict it are surfaced to the
-operator instead.
+operator instead. A change to the operator layer attached at a scope is a
+**change event** for that scope and its descendants alike — the attachment
+scope is as much a reader of the correction as anything beneath it.
 
 The operator reads the entire store — every scope summary and record — for
 verification and steering, and may directly correct any scope's memory
@@ -166,7 +177,10 @@ forensics.
 A scope summary has two sections:
 
 - **Directives** — listed individually, each retaining its identity so it can
-  be cited, superseded, or retired distinctly.
+  be cited, superseded, or retired distinctly. Only the directives this scope
+  itself admitted: an inherited one lives in its owner's summary and is
+  assembled into this scope's **perspective** on every read, never copied
+  here.
 - **Context** — a condensed digest of relevant non-binding knowledge from
   this scope.
 
@@ -228,7 +242,70 @@ Properties of published memory:
   (summary rewrites) alike, and outcome-based **trust** feedback on it flows
   back to the source memory.
 - **Never self-corroborating** — a publication does not count as independent
-  corroboration for ratifying its own source.
+  corroboration for ratifying its own source, however many times it has been
+  republished: an item cannot corroborate any origin of itself.
+- **Change-triggering** — publishing, amending or withdrawing an item is a
+  **change event** for the scopes one hop away: the source's chain children
+  and the scopes that reference it, each due a **refresh** against it.
+
+## Republication
+
+The act by a scope of publishing onward an item it received in another
+scope's **publication**. Because a publication travels only one edge,
+republication is the sole path by which knowledge reaches beyond a scope's
+immediate neighbours — and every hop is a fresh judged act, so each stratum
+decides for itself what its own readers need.
+
+A republished item keeps its **origin** scope and records the relay it
+travelled ("according to X, via Y"), through composition and summary
+rewrites alike; the judging scope is told an item is second-hand, and that
+its origin is information, not permission. When the origin **withdraws** an
+item, every republished copy of it is withdrawn too — mechanically, with no
+judgment — so no face keeps asserting what its source has retracted.
+
+## Change event
+
+The permanent notice that one input a scope's memory rests on has changed
+with no agent contributing: an ancestor's **directive** appended, superseded
+or retired; a one-hop **publication** published, amended or withdrawn; an
+operator directive attached to a scope. Recorded mechanically, with no
+judgment, as a `manager-refresh` contribution in the **record** of every
+scope that composes the changed item — a publication's chain children and
+the scopes that reference it; a directive's chain descendants; an operator
+directive's attachment scope and its descendants alike.
+
+Every independent change mints a change id; a change derived from processing
+one — a **refresh**'s admitted directive, a relayed withdrawal — inherits
+it, carrying forward how many hops removed it is from the change that
+started it. A scope refreshes for a given change id at most once, however
+many of its notices arrive; the notice itself is never suppressed, only the
+refresh it would otherwise trigger.
+
+## Refresh
+
+The judged cycle a **change event** triggers, with two mechanical steps ahead
+of it.
+
+The mechanical steps need no judge and run wherever a refresh runs. First, any
+**directive** row an older release copied into this summary from an ancestor
+is removed — a one-off correction, recorded, that happens once and finds
+nothing thereafter. Then the sweep: where an ancestor retired or superseded a
+directive, this scope's **published** items that rested on it and on nothing
+else are withdrawn, by the same rule that applies when the scope retires one
+of its own.
+
+Then the judged cycle: the scope's pending change events are judged together
+in one amendment, whose ops may admit a new directive or **context** as well
+as retire, supersede, or withdraw a publication — the notice being judged is a
+real contribution with honest provenance. Nothing is copied and nothing is
+inherited here; inheritance is composition, and it happens when the
+**perspective** is read.
+
+A refresh runs inside the MCP server before a scope is bound or its
+perspective is read; a scope with nothing pending costs the read nothing.
+`strata launch` and `strata refresh` run the same cycle from the command line.
+Without a judge key the mechanical steps still run and the judged cycle waits,
+with its change events still pending, for the first keyed refresh.
 
 ## Supersession
 
@@ -271,8 +348,12 @@ An agent's composed view of long-term memory at read time. A perspective
 assembles:
 
 - The agent's own **scope summary**,
-- The summaries of every inter-stratum ancestor up to the root,
-- The **publications** of any scopes referenced by scopes on that chain.
+- The **directives** of every inter-stratum ancestor up to the root — never
+  their context,
+- The **publications** of the scopes one edge away: the agent's parent, and
+  any scope its own scope references,
+- The scope's own unprocessed **change events** — notices of input changes
+  it has not yet been **refresh**ed against.
 
 Each piece in the perspective is labelled with the scope it came from —
 composition is **provenance-preserving**, not flattened. Directives compose
@@ -286,15 +367,29 @@ fleet (or a sub-region of it) has resolved to do or to treat as true.
 Directives propagate down through chain edges and bind every
 descendant scope. When two directives conflict, the one from the broader
 (higher) stratum wins; a descendant may refine within an inherited directive
-but may not contradict it.
+but may not contradict it. Appending, superseding or retiring a directive is
+a **change event** for the holding scope's chain descendants, each due a
+**refresh** against the new state.
+
+Inheritance is composition, not copying: a directive lives in exactly one
+**scope summary**, the summary of the scope that admitted it, and a descendant
+assembles the chain above it every time its **perspective** is read. So an
+ancestor's retirement is visible on the descendant's next read with no copy to
+chase, a descendant's word budget never pays for a directive it does not own,
+and an inherited directive is never a descendant's to supersede or retire — it
+is not in that scope's summary to remove. It is, though, the descendant's to
+build on: a **published** item may anchor to an inherited directive exactly as
+to one of the scope's own.
 
 ## Context
 
 A kind of long-term memory representing observation, working state, or
-non-binding knowledge. Context propagates along both chain edges (downward)
-and reference edges (to the referencing scope). When two pieces of context
-conflict, the one from the scope closest to the reader wins. Context never
-overrides a directive.
+non-binding knowledge. Context is a scope's own internal working memory — it
+never leaves the scope on its own, over a chain edge or a reference edge. It
+feeds the scope's own judgments and its own choice of what to **publish**;
+what reaches another scope is whatever it chose to publish, not its raw
+context. When two pieces of published context conflict, the one from the
+source closest to the reader wins. Context never overrides a directive.
 
 ## Authority
 

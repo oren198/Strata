@@ -4,7 +4,7 @@ Covers the review findings fixed alongside issues #39/#44/#45/#46/#47/#50:
 
 - record store: recency window semantics, collision-resistant IDs
 - summary store: multi-line directive round-trip, header-lookalike context
-- HTTP contribute: parent_version stamping, bad supersedes → 422
+- HTTP contribute: summary version bump, bad supersedes → 422
 - scope-manager: actionable missing-API-key error
 - register: never destroys an unparseable settings.json; exact gitignore marker
 - storage-path resolver: project config wins, env fallback
@@ -201,7 +201,7 @@ def test_context_quoting_section_header_round_trips(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# HTTP contribute — parent_version stamp + supersedes validation
+# HTTP contribute — summary version bump + supersedes validation
 # ---------------------------------------------------------------------------
 
 
@@ -259,16 +259,18 @@ def _contribute_body(**overrides) -> dict:
     return body
 
 
-def test_http_contribute_stamps_parent_version(parent_child_client) -> None:
-    """The written summary records the parent version it was judged against."""
+def test_http_contribute_bumps_the_summary_version(parent_child_client) -> None:
+    """The written summary records its own write counter.
+
+    ADR 0004 D4's companion ``parent_version`` stamp is gone with ADR 0015 D1:
+    it existed to date a summary against the ancestor rows spliced into it,
+    and no ancestor row is copied into a summary any more.
+    """
     resp = parent_child_client.post("/contribute", json=_contribute_body())
     assert resp.status_code == 200, resp.text
     written = SummaryStore(parent_child_client.summaries_dir).read("g_child")
     assert written is not None
-    assert written.parent_version == 3, (
-        "ADR 0004 D4: contribute-time writes must stamp parent_version; "
-        "None would mark the summary permanently stale"
-    )
+    assert written.version == 1
 
 
 def test_http_contribute_bad_supersedes_is_422(parent_child_client) -> None:
@@ -298,7 +300,7 @@ def test_judge_without_api_key_names_the_env_var(
         manager.judge(
             scope=MagicMock(),
             stratum=MagicMock(),
-            parent_summary=None,
+            ancestor_directives=None,
             current_summary=None,
             recent_contributions=[],
             new_contribution=MagicMock(),
@@ -442,7 +444,12 @@ def test_resolver_accepts_preloaded_none_project_config(tmp_path: Path, monkeypa
 
 
 def test_refresh_scope_writes_record_trail(tmp_path: Path) -> None:
-    """_refresh_scope must append its contribution AND judgment to the record."""
+    """_refresh_scope must leave a judgment against the notice it refreshed for.
+
+    The notice is the ``manager-refresh`` contribution the change event points
+    at (ADR 0014 D5); the refresh's own verdict is recorded against it, so the
+    summary still never moves without a record trail.
+    """
     from strata.__main__ import _refresh_scope
     from strata.fleet_config import FleetConfig
 
@@ -466,6 +473,26 @@ def test_refresh_scope_writes_record_trail(tmp_path: Path) -> None:
 
     with RecordStore(db_path) as rs:
         summary_store = SummaryStore(str(tmp_path / "summaries"))
+        notice = rs.append_contribution(
+            scope_id="g_root",
+            content="[Input change chg_a: item p_1 was withdrawn.]",
+            proposed_classification="context",
+            subject="manager-refresh",
+            supersedes=None,
+            contributor=ContributorRef(
+                scope_id="g_root",
+                skill="scope-manager",
+                session_id="refresh",
+                ts="2026-09-05T00:00:00+00:00",
+            ),
+        )
+        rs.append_change_event(
+            change_id="chg_a",
+            contribution_id=notice.id,
+            scope_id="g_root",
+            item_id="p_1",
+            kind="withdrawn",
+        )
         _refresh_scope(
             "g_root",
             fleet_config=fleet,
@@ -477,7 +504,7 @@ def test_refresh_scope_writes_record_trail(tmp_path: Path) -> None:
         contributions = rs.list_contributions(scope_id="g_root")
         judgments = rs.list_judgments(scope_id="g_root")
 
-    assert len(contributions) == 1, "the refresh event must be appended to the record"
+    assert len(contributions) == 1, "the refresh notice must be in the record"
     assert contributions[0].subject == "manager-refresh"
     assert len(judgments) == 1, "the refresh judgment must be recorded"
     assert judgments[0].contribution_id == contributions[0].id

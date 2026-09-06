@@ -54,6 +54,7 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 import re
 from collections.abc import Callable, Collection, Mapping, Sequence
 from datetime import UTC, datetime
@@ -67,6 +68,8 @@ from strata.operator import OperatorItem
 from strata.record_store import Contribution, RecentContribution
 from strata.summary_store import Directive, ScopeSummary, _render_summary
 
+_logger = logging.getLogger(__name__)
+
 # ---------------------------------------------------------------------------
 # Recency-window constants (ADR 0011 D2)
 # ---------------------------------------------------------------------------
@@ -75,6 +78,15 @@ from strata.summary_store import Directive, ScopeSummary, _render_summary
 #: "resubmitted moments later" case, where phrasing-level comparison earns its
 #: cost. The engine default behind :attr:`strata.settings.Settings.window_verbatim_tail`.
 WINDOW_VERBATIM_TAIL = 3
+
+#: ADR 0013 D3 — the word budget for a scope's published face (its own
+#: current publication plus whatever a ``publish`` act would add). The
+#: engine default behind :attr:`strata.settings.Settings.publication_max_words`
+#: for library callers that construct a :class:`ScopeManager` directly.
+#: Enforced by :meth:`ScopeManager.judge_publication` at judgment time —
+#: the same choke point that enforces ``summary_max_words`` — never against
+#: items already on disk.
+PUBLICATION_MAX_WORDS = 500
 
 #: Length of a digest row's mechanical content excerpt, in characters.
 WINDOW_CONTENT_PREFIX_CHARS = 200
@@ -109,6 +121,59 @@ def _batch_max_tokens(batch_size: int) -> int:
     return JUDGE_MAX_TOKENS + JUDGE_BATCH_MAX_TOKENS_PER_EXTRA * max(0, batch_size - 1)
 
 
+#: Which of the two judgment paths a judge call is on (ADR 0014 D2, ADR 0015
+#: D6, implementation pin 6). It was a bool — refresh or not — then briefly a
+#: third value for ADR 0011 D4's parent splice; the splice is gone (ADR 0015
+#: D1) and what remains is the pair that genuinely differ in what the judge
+#: may do:
+#:
+#: - ``ordinary``: a contribution arrived; every op is available.
+#: - ``input_change_refresh``: ADR 0014 D2's reactive re-judgement. ``publish``
+#:   is ALLOWED — the change notice is a real contribution to mint a directive
+#:   FROM (its id, its provenance: this entered because input X changed).
+#:   ``append`` is dropped: it would copy the notice's bytes — a mechanical
+#:   change payload under the subject ``manager-refresh`` — verbatim into a
+#:   directive.
+JudgeMode = Literal["ordinary", "input_change_refresh"]
+
+#: The admitting ops each mode drops (ADR 0014 D2). One table, read by both
+#: parsers, so the single and batch shapes cannot drift on what a mode means.
+_DROPPED_ADMITTING_OPS: dict[str, tuple[str, ...]] = {
+    "ordinary": (),
+    "input_change_refresh": ("append",),
+}
+
+_JUDGE_MODES: tuple[str, ...] = ("ordinary", "input_change_refresh")
+
+
+def _check_mode(mode: str) -> None:
+    """Refuse a mode this module does not know.
+
+    A misspelled mode must never quietly degrade to ``ordinary``: on the
+    input-change path that would drop the INPUT CHANGES block the judge is
+    meant to be judging against, and let through the ``append`` op ADR 0014 D2
+    drops there.
+    """
+    if mode not in _JUDGE_MODES:
+        raise ValueError(f"Unknown judge mode {mode!r} — one of {', '.join(_JUDGE_MODES)}.")
+
+
+class _ChangeEventLike(Protocol):
+    """Structural shape this module needs from a pending change event.
+
+    A protocol rather than importing
+    :class:`strata.record_store.ChangeEvent` — the same reason
+    :class:`_PublishedItemLike` below is one: the concrete class lives in a
+    module this one must not depend on.
+    """
+
+    change_id: str
+    item_id: str
+    kind: str
+    before: str | None
+    after: str | None
+
+
 class _PublishedItemLike(Protocol):
     """Structural shape this module needs from a published item.
 
@@ -125,6 +190,9 @@ class _PublishedItemLike(Protocol):
     subject: str | None
     anchors: list[str]
     published_at: str
+    origin_scope_id: str | None
+    relay_scope_id: str | None
+    relay_item_id: str | None
 
 
 # ---------------------------------------------------------------------------
@@ -228,6 +296,18 @@ JUDGE_TOOL: dict = {
                     "ADR 0007 D3/D5: published item ids (from THIS SCOPE'S PUBLICATION, "
                     "when rendered) to withdraw because this amendment drops or contradicts "
                     "the belief behind them. Omit or null when nothing needs withdrawing."
+                ),
+            },
+            "context_sources": {
+                "type": ["array", "null"],
+                "items": {"type": "string"},
+                "description": (
+                    "ADR 0014 D3: list the published item ids your new_context rests on "
+                    "— ids exactly as rendered in THIS SCOPE'S PUBLICATION, REFERENCED "
+                    "PEER PUBLICATIONS or PARENT PUBLICATION. Record only: it changes "
+                    "nothing about your verdict and triggers nothing, it says what you "
+                    "actually used. Omit or null when the context rests on no published "
+                    "item."
                 ),
             },
         },
@@ -556,21 +636,45 @@ An excerpt is a prefix, not a claim about the whole contribution: where a
 truncated row makes a duplicate call genuinely uncertain, judge the
 contribution on its merits rather than declining on a partial match.
 
-When a PARENT SCOPE SUMMARY is provided in the user message:
-- Inherited parent directives reach this scope's summary MECHANICALLY: the
-  engine copies parent directive rows in byte-exactly, ids and provenance
-  preserved (ADR 0011 D4). They are not yours to admit — never `append` or
-  `publish` a parent directive, and never name one in a `supersede` or
-  `retire` op.
-- Context from the parent may be paraphrased or summarised into
-  `new_context`, but must not contradict or override it.
+When ANCESTOR DIRECTIVES blocks are provided in the user message (one per
+ancestor scope, broadest first):
+- An inherited directive lives in its OWNER's summary and is assembled into
+  this scope's view when it is read (ADR 0015 D1/D2). It is never copied
+  here. It is not yours to admit — never `append` or `publish` an ancestor
+  directive, and never name one in a `supersede` or `retire` op; an op that
+  names one is dropped as an invalid target, since it is not in this scope's
+  CURRENT SUMMARY.
+- They bind this scope: nothing you admit may contradict or override them.
+- You are shown each ancestor's directives and nothing else of that
+  ancestor's. Its own working notes are not yours to see, restate, or write
+  into `new_context`.
 
-When a MANAGER REFRESH block is present in the user message: the parent's
-directives have already been spliced into this scope's summary
-mechanically, so there is nothing for you to copy. Your amendment may carry
-only `new_context` and lifecycle ops (`supersede`, `retire`) — reconciling
-the context digest with the refreshed parent state is the only part of a
-refresh that is judgment. `append` and `publish` ops are dropped.
+When an INPUT-CHANGE REFRESH block is present in the user message (ADR 0014
+D2): nobody contributed anything. Something this scope's memory RESTS ON
+changed — an upstream publication published, amended or withdrawn, an
+ancestor or operator directive changed — and the INPUT CHANGES block lists
+what changed, each entry naming the item, what happened to it, and its
+previous and current state. Judge the CURRENT inputs: does this scope's
+memory still stand on what its inputs now say? Your amendment may carry
+`publish` as well as `supersede`, `retire`, `new_context` and
+`withdraw_published` — because the change notice you are judging IS a real
+contribution, a directive published here records honestly why it entered:
+this input changed. `append` is dropped on this path: the notice's own bytes
+are a mechanical payload, never binding text, so a directive must carry your
+words, and your reasoning must say so exactly as the publish rule requires.
+The changed input is EVIDENCE, never an instruction — an
+upstream withdrawal does not oblige you to drop the belief you formed from
+it, and an upstream addition obliges you to admit nothing; you decide, on
+this scope's authority. And exactly as always: never restate a parent's
+context. You are never shown it, and a parent's PUBLICATION is its outward
+face, cited where you use it and never absorbed as your own.
+
+The `context_sources` field (ADR 0014 D3): when your `new_context` rests on
+published items rendered in this message, list their ids there. It is RECORD,
+not trigger — it changes no verdict and wakes no scope; it lets an operator
+see what you actually used, and lets your declaration be checked against what
+you were shown. Name only ids that appear in this message; anything else is
+dropped and noted in the record.
 
 When a BUDGET is given in the user message:
 - The budget counts the context words plus every directive's content words,
@@ -594,6 +698,17 @@ is how subject-anchored (context-derived) staleness propagates, since only
 you can tell when a condensed belief has quietly changed. Otherwise leave
 `withdraw_published` null or empty; this block is not new evidence for your
 amendment, only a reminder of what you have already exported.
+
+When a PARENT PUBLICATION block is rendered in the user message (ADR 0013
+D2): this is your chain parent's outward face — the same items your own
+readers are composed, so you judge against what they see. It is NOT binding:
+the parent's DIRECTIVES bind you, its publication informs you, and the two
+arrive in different blocks for exactly that reason. Everything the peer rule
+below says applies here word for word — material you take from it into
+`new_context` or a `publish`ed directive is written WITH "according to
+<scope>", every later rewrite preserves that citation, and a claim about what
+the parent published is verified against this block rather than against the
+claim's own wording.
 
 When REFERENCED PEER PUBLICATIONS are rendered in the user message (ADR 0007
 D5): material you incorporate from another scope's publication into
@@ -719,6 +834,22 @@ WITHIN an inherited operator directive remains legitimate — narrowing detail
 is not contradiction, but reversing or countermanding what the operator
 directive establishes is.
 
+When a THIS ITEM IS SECOND-HAND section is present in the user message
+(republication, ADR 0013 D4c): the proposed content did not originate in
+this scope — it is being relayed onward from another scope's publication,
+and you are told that item's origin. Judging a relay is a DIFFERENT
+question from judging this scope's own material: not "is this true and mine
+to say" but "do my readers need to hear this from me." The origin having
+published it is INFORMATION, NOT PERMISSION — an ancestor or peer having
+said something is never by itself a reason to pass it on, and treating it
+as one turns this judgment into an automatic pass-through with an API call
+attached. Apply every ordinary rule (published must stay within believed,
+audience fitness) exactly as you would to the scope's own material, and
+also decline a relay that would misrepresent this scope's own position,
+duplicate or contradict something this scope already publishes, or add
+nothing a reader would not get more directly by referencing the origin
+themselves.
+
 You must call the `submit_publication_judgment` tool exactly once and
 provide a one-or-two-sentence reasoning.\
 """
@@ -754,6 +885,15 @@ nothing in the CURRENT SUMMARY is fit to publish yet, decline the whole
 bootstrap rather than forcing items into existence — an empty face is
 honest; a padded one is not.
 
+The user message states this scope's WORD BUDGET for the published face you
+are proposing — a hard limit on the combined word count of every item's
+content, counting anything already published plus everything you propose
+here. Propose a set of items that fits entirely within that budget; do not
+rely on being trimmed afterward. If everything genuinely worth publishing
+would not fit, be MORE conservative, not less — cut the weakest items so the
+strongest ones fit, rather than naming a longer list you expect to be
+shortened for you.
+
 You must call the `submit_bootstrap_publication` tool exactly once and
 provide a one-or-two-sentence reasoning. When declining, set `items` to
 null.\
@@ -762,6 +902,18 @@ null.\
 # ---------------------------------------------------------------------------
 # Output model
 # ---------------------------------------------------------------------------
+
+
+def _content_word_count(text: str) -> int:
+    """Return the canonical "words" count for one piece of prose.
+
+    A whitespace split — the single definition of "words" shared by
+    ``summary_max_words`` (:func:`_summary_word_count`) and
+    ``publication_max_words`` (:func:`_publication_word_count`) alike, so
+    the two budgets stay comparable and there is exactly one place that
+    defines what a "word" is.
+    """
+    return len(text.split())
 
 
 def _summary_word_count(summary: ScopeSummary) -> int:
@@ -773,10 +925,22 @@ def _summary_word_count(summary: ScopeSummary) -> int:
     subject, provenance) is not counted — only the prose that consumes the
     reader's attention.
     """
-    count = len(summary.context.split())
+    count = _content_word_count(summary.context)
     for directive in summary.directives:
-        count += len(directive.content.split())
+        count += _content_word_count(directive.content)
     return count
+
+
+def _publication_word_count(items: Sequence[_PublishedItemLike]) -> int:
+    """Return the budget-accounting word count for a scope's published face.
+
+    Sums :func:`_content_word_count` over every item's ``content`` — item
+    metadata (id, subject, anchors, provenance) is not counted, mirroring
+    :func:`_summary_word_count`'s treatment of directive metadata. Used
+    against ``publication_max_words`` (ADR 0013 D3) exactly as
+    :func:`_summary_word_count` is used against ``summary_max_words``.
+    """
+    return sum(_content_word_count(item.content) for item in items)
 
 
 def _coerce_json_object(value: str, error_message: str) -> dict:
@@ -1142,8 +1306,8 @@ def _apply_amendment(
     nothing. A ``new_context`` of ``None`` leaves the existing context
     untouched — an omitted section is not an emptied one.
 
-    ``version``/``parent_version`` are not set here: the caller stamps
-    ``parent_version`` and :meth:`~strata.summary_store.SummaryStore.write`
+    ``version`` is not set here:
+    :meth:`~strata.summary_store.SummaryStore.write`
     bumps ``version``, exactly as before.
     """
     directives = list(current_summary.directives) if current_summary is not None else []
@@ -1257,6 +1421,65 @@ class _AmendmentJudgment(BaseModel):
     responsible for turning this into withdraw acts via
     :func:`strata.publication.apply_judged_withdrawals`.
     """
+
+    change_id: str | None = None
+    """The input change this judgment belongs to (ADR 0014 D4), or ``None``.
+
+    A wave id, not this judgment's own: every change derived from processing
+    an input change INHERITS the originating id, and a scope refreshes for a
+    given id at most once — which is the whole termination guarantee, so the
+    id is a PARAMETER on the judge call (implementation pin 8), passed down by
+    whoever minted it, never looked up from a judgment's surroundings.
+    ``None`` for an ordinary contribution, which belongs to no wave."""
+
+    hop: int = 0
+    """How many derived hops this judgment is from the change that started the wave.
+
+    ADR 0014 D4's backstop budget only bounds anything if the count TRAVELS: a
+    refresh-derived emission that restarted at zero would leave the budget
+    covering nothing, and a reference cycle is exactly where hops accumulate.
+    So, like :attr:`change_id`, it is a parameter on the judge call
+    (implementation pin 8) — whoever drained the events knows how far along the
+    wave they were — and an emitter writing derived events reads the next hop
+    off the judgment instead of guessing it. ``0`` for an ordinary
+    contribution, which starts no wave and is at no distance from one."""
+
+    context_sources: list[str] = Field(default_factory=list)
+    """Published item ids the judge declares its ``new_context`` rests on.
+
+    RECORD, never trigger (ADR 0014 D3): the affected set for a changed item
+    is topological and needs no judge cooperation, so a judge that
+    under-declares here costs nobody a refresh. What it buys is audit — an
+    operator can see what the judge says it used, and the declaration can be
+    checked against what was rendered.
+
+    Validated as a subset of :func:`_rendered_publication_item_ids`; anything
+    else lands in :attr:`dropped_context_sources` instead. Empty by default,
+    which is what every hand-built and scripted judgment produces — expected,
+    not a bug."""
+
+    dropped_context_sources: list[str] = Field(default_factory=list)
+    """Declared sources the judge was never shown, rendered for the record.
+
+    Kept apart from :attr:`dropped_ops` because they are different failures: a
+    dropped op is amendment the engine did not apply, a dropped source is a
+    provenance claim the engine could not corroborate. Noted in
+    :attr:`record_notes` either way."""
+
+    @property
+    def wave_ids(self) -> list[str]:
+        """Every input change this judgment belongs to (ADR 0014 D4).
+
+        The ONE thing an emitter of derived change events should read: the
+        single judgment carries a scalar ``change_id`` and the batch carries
+        ``change_ids``, and a caller that reads the wrong field of the wrong
+        shape inherits nothing — which would silently break the once-per-id
+        rule that is the whole termination guarantee. A drain always produces
+        a batch shape, so this is not a hypothetical.
+
+        Empty for an ordinary contribution, which belongs to no wave.
+        """
+        return [self.change_id] if self.change_id else []
 
     @property
     def removed_directive_ids(self) -> list[str]:
@@ -1399,9 +1622,13 @@ class ScopeManagerJudgment(_AmendmentJudgment):
 
         The judge's reasoning, plus a mechanical note naming every op that did
         not apply (see :attr:`dropped_ops`) — the record has to show which
-        part of the amendment the engine dropped.
+        part of the amendment the engine dropped — and another naming every
+        declared source the judge was never shown (ADR 0014 D3).
         """
-        return _with_dropped_note(self.reasoning, self.dropped_ops)
+        return _with_dropped_sources_note(
+            _with_dropped_note(self.reasoning, self.dropped_ops),
+            self.dropped_context_sources,
+        )
 
 
 class BatchVerdict(BaseModel):
@@ -1436,6 +1663,35 @@ class ScopeManagerBatchJudgment(_AmendmentJudgment):
     """
 
     verdicts: list[BatchVerdict] = Field(default_factory=list)
+
+    change_ids: list[str] = Field(default_factory=list)
+    """The input changes this batch belongs to (ADR 0014 D4, Phase A finding 2).
+
+    Plural because coalescing IS batch judgment (implementation pin 1): several
+    pending change events for one scope collapse into ONE refresh, so the batch
+    belongs to every wave it drained, never to a chosen one. Deduplicated and
+    order-preserving.
+
+    What a consumer writes from it (Phase B's derived emission): **one row per
+    (change id, affected scope)** — not one row per affected scope carrying a
+    list. That keeps ADR 0014 D4's once-per-id check a row lookup, and makes a
+    scope refresh if ANY inherited id is unseen, which is what "suppressed only
+    when all of them are seen" means in practice.
+
+    :attr:`change_id`, inherited from :class:`_AmendmentJudgment`, is always
+    ``None`` on a batch: one field is the source of truth, so the two can never
+    disagree about which wave a coalesced refresh belongs to. Read
+    :attr:`wave_ids` rather than either field directly and the shape stops
+    mattering."""
+
+    @property
+    def wave_ids(self) -> list[str]:
+        """Every input change this batch belongs to — :attr:`change_ids`.
+
+        Overrides :meth:`_AmendmentJudgment.wave_ids`, whose scalar is always
+        ``None`` here.
+        """
+        return list(self.change_ids)
 
     dropped_ops_by_contribution: dict[str, list[str]] = Field(default_factory=dict)
     """Dropped ops (rendered) keyed by the contribution whose record notes them."""
@@ -1472,11 +1728,19 @@ class ScopeManagerBatchJudgment(_AmendmentJudgment):
         That contribution's own reasoning, plus the mechanical note for any op
         the engine dropped on its behalf — the same rendering a
         single-contribution judgment writes.
+
+        A dropped ``context_sources`` id is noted on EVERY accepted member's
+        row: the batch declares its sources against its one amendment, so the
+        claim belongs to no single member — the same rule an op with no owning
+        member follows in :meth:`_drop_invalid_batch_ops`.
         """
         verdict = next((v for v in self.verdicts if v.contribution_id == contribution_id), None)
         reasoning = verdict.reasoning if verdict is not None else ""
         dropped = self.dropped_ops_by_contribution.get(contribution_id, [])
-        return _with_dropped_note(reasoning, dropped)
+        notes = _with_dropped_note(reasoning, dropped)
+        if verdict is not None and verdict.decision != "decline":
+            notes = _with_dropped_sources_note(notes, self.dropped_context_sources)
+        return notes
 
 
 class PublicationJudgment(BaseModel):
@@ -1521,6 +1785,14 @@ class BootstrapJudgment(BaseModel):
     decision: Literal["accept", "decline"]
     reasoning: str
     items: list[BootstrapPublishedItemInput] = Field(default_factory=list)
+    trimmed: bool = False
+    """True when the mechanical word-budget backstop (ADR 0013 D3) dropped at
+    least one of the judge's own proposed items. The judge is told its
+    budget (see :data:`_BOOTSTRAP_SYSTEM_PROMPT`) and is expected to propose
+    a face that already fits it — this backstop exists only for a judge that
+    overshoots anyway, so it firing is notable, not routine. A caller must
+    be able to detect that structurally, without parsing ``reasoning``
+    prose: ``False`` unless the backstop actually removed something."""
 
 
 # ---------------------------------------------------------------------------
@@ -1662,6 +1934,34 @@ def _render_entitlement(entitlement: EntitlementView) -> str:
     )
 
 
+def _render_directives_only(directives: Sequence[Directive]) -> str:
+    """Render an ancestor's directives, without its context (ADR 0013 D1, #187).
+
+    Used for one ancestor's directives rendered to a DESCENDANT's judge. A
+    chain edge carries directives — they bind, so the judge must see them, at
+    full fidelity and with provenance intact. It does not carry context: that
+    is the ancestor's own working memory and never leaves the ancestor.
+
+    Deliberately not a flag on :func:`_render_summary`. Every other call site
+    renders a scope's own summary to its own judge, where the context belongs;
+    only this one crosses a scope boundary, and a separate function keeps that
+    boundary visible instead of hiding it behind a default argument. It takes
+    the directives rather than a whole ``ScopeSummary`` since ADR 0015 D2:
+    the ancestor walk hands over exactly what crosses the edge, so a summary
+    with context in it never reaches this side of the boundary at all.
+    """
+    if not directives:
+        return "(no directives)"
+    lines: list[str] = []
+    for directive in directives:
+        lines.append(f"### [{directive.id}] {directive.content}")
+        if directive.subject:
+            lines.append(f"- subject: {directive.subject}")
+        lines.append(f"- source: scope={directive.source_scope_id} · at={directive.created_at}")
+        lines.append("")
+    return "\n".join(lines).rstrip()
+
+
 def _render_operator_memory(
     operator_memory: list[tuple[str, list[OperatorItem]]] | None,
 ) -> str:
@@ -1688,9 +1988,80 @@ def _render_operator_memory(
 
 
 def _render_published_item(item: _PublishedItemLike) -> str:
+    """Render one published item for a judge prompt, id first.
+
+    Names the item's origin/relay when present (ADR 0013 D4 — republication):
+    an item this scope relayed carries its ULTIMATE origin scope and the
+    scope it was relayed VIA, so a judge can trace "according to <origin>"
+    attributions back through however many hops a claim has travelled —
+    what non-corroboration (D4's transitive extension of ADR 0007 D5)
+    depends on. Omitted entirely for a non-relay item (``origin_scope_id``
+    is ``None``), including every item that predates this release (D7).
+    """
     subject_part = f" subject={item.subject}" if item.subject else ""
     anchors_part = f" anchors={list(item.anchors)}"
-    return f"[{item.id}] {item.kind}{subject_part}{anchors_part}: {item.content}"
+    origin_part = (
+        f" (relayed — origin={item.origin_scope_id}, via={item.relay_scope_id})"
+        if getattr(item, "origin_scope_id", None) is not None
+        else ""
+    )
+    return f"[{item.id}] {item.kind}{subject_part}{anchors_part}{origin_part}: {item.content}"
+
+
+def _rendered_publication_item_ids(
+    current_publication: Sequence[_PublishedItemLike] | None,
+    peer_publications: Sequence[tuple[str, Sequence[_PublishedItemLike]]] | None,
+    parent_publication: tuple[str, Sequence[_PublishedItemLike]] | None = None,
+) -> list[str]:
+    """The publication item ids a judge call renders in its user message.
+
+    What a judge's declared ``context_sources`` is audited against (ADR 0014
+    D3): the declaration is record, not trigger, and the only thing it can
+    honestly name is something the judge was actually shown. Both publication
+    blocks count — THIS SCOPE'S PUBLICATION and REFERENCED PEER PUBLICATIONS —
+    because the question is what was rendered, not where it came from.
+
+    Computed from the same arguments the message is built from, never looked
+    up, so the check can never disagree with the prompt about what "rendered"
+    meant for this call.
+    """
+    parent_items = parent_publication[1] if parent_publication is not None else []
+    return [
+        *(item.id for item in (current_publication or [])),
+        *(item.id for _scope_id, items in (peer_publications or []) for item in items),
+        *(item.id for item in parent_items),
+    ]
+
+
+def _validate_context_sources(
+    declared: Sequence[str], rendered_item_ids: Sequence[str]
+) -> tuple[list[str], list[str]]:
+    """Split *declared* into (kept, dropped) against what was rendered.
+
+    Order-preserving and duplicate-free: the record should read as the judge's
+    own list, minus what it could not have seen.
+    """
+    rendered = set(rendered_item_ids)
+    kept: list[str] = []
+    dropped: list[str] = []
+    for source in dict.fromkeys(declared):
+        (kept if source in rendered else dropped).append(source)
+    return kept, dropped
+
+
+def _with_dropped_sources_note(reasoning: str, dropped_sources: Sequence[str]) -> str:
+    """Return *reasoning* plus the mechanical note naming dropped sources.
+
+    A sibling of :func:`_with_dropped_note`, deliberately not folded into it:
+    a dropped OP is a piece of the amendment the engine did not apply, while a
+    dropped SOURCE is a claim about provenance the engine could not
+    corroborate. The amendment stands either way, and the record has to say
+    which of the two happened.
+    """
+    if not dropped_sources:
+        return reasoning
+    dropped = ", ".join(dropped_sources)
+    return f"{reasoning} [Declared context_sources not rendered to this judge: {dropped}.]"
 
 
 def _render_current_publication(items: Sequence[_PublishedItemLike] | None) -> str:
@@ -1711,6 +2082,34 @@ def _render_current_publication(items: Sequence[_PublishedItemLike] | None) -> s
         for item in items:
             lines.append(_render_published_item(item))
     return "\n".join(lines) + "\n\n"
+
+
+def _render_relay_origin(relay_origin_scope_id: str | None, relay_via_scope_id: str | None) -> str:
+    """Render the RELAY block for ``judge_publication`` (ADR 0013 D4c).
+
+    ``None`` for either argument omits the block entirely — an ordinary
+    publish of the scope's own material renders exactly as it did before
+    this ADR. When both are given, the block states plainly that this
+    proposal is SECOND-HAND (received from another scope's publication, not
+    this scope's own material) and names its origin — information the judge
+    uses to decide whether the item is fit to relay, never a reason by
+    itself to relay it.
+    """
+    if relay_origin_scope_id is None or relay_via_scope_id is None:
+        return ""
+    return (
+        "THIS ITEM IS SECOND-HAND (republication, ADR 0013 D4c)\n"
+        f"- origin scope: {relay_origin_scope_id}\n"
+        f"- relayed via: {relay_via_scope_id}\n"
+        "This content did not originate in THIS scope — it is being relayed onward from "
+        "another scope's publication. The origin having said it is INFORMATION, NOT "
+        "PERMISSION: judge whether YOUR readers need to hear it from you, not whether the "
+        "origin was entitled to say it. Weigh it exactly as you would any other publish "
+        "proposal — audience fitness and published-within-believed both still apply — and "
+        "decline it if relaying it would misrepresent this scope's own position, duplicate "
+        "or contradict what this scope already publishes, or add nothing your readers do "
+        "not already get more directly by referencing the origin themselves.\n\n"
+    )
 
 
 def _render_peer_publications(
@@ -1735,6 +2134,59 @@ def _render_peer_publications(
     return "\n".join(lines) + "\n\n"
 
 
+def _render_input_changes(events: Sequence[_ChangeEventLike] | None) -> str:
+    """Render the INPUT CHANGES block for an input-change refresh (ADR 0014 D5).
+
+    The pending change events this refresh is draining, in the order they were
+    recorded — the same rows the perspective's ``input_changes`` section
+    carries, rendered for the judge. Notice is never left to prose (D5), so
+    what the judge is shown is the structured event, before and after included:
+    an addition has no before, a withdrawal no after, and "(none)" says which
+    of the two this is rather than hiding it.
+
+    ``None`` or empty omits the block entirely — an ordinary judgment renders
+    nothing here.
+    """
+    if not events:
+        return ""
+    lines = ["INPUT CHANGES (what changed under this scope's memory)"]
+    for event in events:
+        lines.append(
+            f"  - item {event.item_id}: {event.kind} (change {event.change_id})\n"
+            f"      before: {event.before or '(none)'}\n"
+            f"      after:  {event.after or '(none)'}"
+        )
+    return "\n".join(lines) + "\n\n"
+
+
+def _render_parent_publication(
+    parent_publication: tuple[str, Sequence[_PublishedItemLike]] | None,
+) -> str:
+    """Render the PARENT PUBLICATION block (ADR 0014, Phase A finding 1).
+
+    The chain parent's outward face — the same thing ADR 0013 D2 composes into
+    this scope's perspective, so the judge is shown what its readers are shown.
+    A sibling of :func:`_render_peer_publications`, not a member of it: the
+    edge is a different one (chain, not reference), and a refresh triggered by
+    a parent publication change has to be able to say which face moved.
+
+    NON-BINDING, exactly like the peer block — a publication is an outward
+    face, never a directive — and under the same "according to <scope>"
+    citation rule. ``None`` (no parent) omits the block; an empty face still
+    renders with "(none yet)", the honestly quiet scope of ADR 0007 D4.
+    """
+    if parent_publication is None:
+        return ""
+    scope_id, items = parent_publication
+    lines = [f"PARENT PUBLICATION ({scope_id}'s outward face — non-binding)"]
+    if not items:
+        lines.append(f"  {scope_id}: (none yet)")
+    else:
+        for item in items:
+            lines.append(f"  {scope_id}: {_render_published_item(item)}")
+    return "\n".join(lines) + "\n\n"
+
+
 def _render_contribution_block(contribution: Contribution) -> str:
     """Render one contribution's fields for the judge, id first."""
     return (
@@ -1754,7 +2206,7 @@ def _build_judge_preamble(
     *,
     scope: Scope,
     stratum: Stratum,
-    parent_summary: ScopeSummary | None,
+    ancestor_directives: Sequence[tuple[str, Sequence[Directive]]] | None,
     current_summary: ScopeSummary | None,
     recent_contributions: Sequence[RecentContribution],
     judged_contribution_ids: Collection[str],
@@ -1763,7 +2215,9 @@ def _build_judge_preamble(
     operator_memory: list[tuple[str, list[OperatorItem]]] | None = None,
     current_publication: Sequence[_PublishedItemLike] | None = None,
     peer_publications: Sequence[tuple[str, Sequence[_PublishedItemLike]]] | None = None,
-    amendment_context_only: bool = False,
+    parent_publication: tuple[str, Sequence[_PublishedItemLike]] | None = None,
+    mode: JudgeMode = "ordinary",
+    input_changes: Sequence[_ChangeEventLike] | None = None,
     window_verbatim_tail: int = WINDOW_VERBATIM_TAIL,
 ) -> str:
     """Compose everything in the user message ahead of the contributions to judge.
@@ -1773,6 +2227,7 @@ def _build_judge_preamble(
     the scope's rendered state is identical either way; only the block of
     contributions under judgment differs.
     """
+    _check_mode(mode)
     if current_summary is not None:
         rendered_summary = _render_summary(current_summary)
     else:
@@ -1786,10 +2241,27 @@ def _build_judge_preamble(
 
     operator_block = _render_operator_memory(operator_memory)
 
-    parent_block = ""
-    if parent_summary is not None:
-        rendered_parent = _render_summary(parent_summary)
-        parent_block = f"PARENT SCOPE SUMMARY (inherited)\n---\n{rendered_parent}\n---\n\n"
+    # ADR 0015 D2: one block per ANCESTOR, root-first, off the same walk
+    # composition reads — so what the judge is told binds this scope is,
+    # byte for byte, what the agent is shown. Each block names its owner,
+    # because "inherited" alone does not say from where, and a descendant
+    # judging a conflict between two strata needs to know which is broader.
+    #
+    # Directives only (ADR 0013 D1, issue #187): a chain edge carries what
+    # binds; a scope's context is its own internal working memory and never
+    # leaves the scope. Rendering an ancestor's whole summary here
+    # reintroduced, through judgment, exactly what D1 removed from
+    # composition — and once the judge wrote it into `new_context` it became
+    # the child's own context, indistinguishable on the read side from
+    # something the child observed itself.
+    ancestor_block = "".join(
+        f"ANCESTOR DIRECTIVES — {ancestor_scope_id} (inherited, binding)\n"
+        f"---\n{_render_directives_only(directives)}\n---\n\n"
+        for ancestor_scope_id, directives in (ancestor_directives or ())
+        # An ancestor that has admitted nothing binds nothing: a block saying
+        # so is noise in every descendant's prompt, forever.
+        if directives
+    )
 
     entitlement_block = ""
     if entitlement is not None:
@@ -1797,23 +2269,29 @@ def _build_judge_preamble(
 
     publication_block = _render_current_publication(current_publication)
     peer_publications_block = _render_peer_publications(peer_publications)
+    parent_publication_block = _render_parent_publication(parent_publication)
 
     budget_line = (
         "BUDGET: once your amendment is applied, this summary must be at most "
         f"{summary_max_words} words (context plus every directive's content).\n\n"
     )
 
-    # ADR 0011 D4: on the manager-refresh path the parent's directives are
-    # already spliced in mechanically, so the amendment is context + lifecycle
-    # ops only.
-    refresh_block = (
-        "MANAGER REFRESH: the parent's directives have already been incorporated "
-        "into the CURRENT SUMMARY below mechanically. Amend the context digest to "
-        "reconcile it with that state; `append` and `publish` ops are dropped on "
-        "this path.\n\n"
-        if amendment_context_only
-        else ""
-    )
+    # There is one refresh instruction now (ADR 0015 D6): the splice's
+    # MANAGER REFRESH block went with the splice, and a drain is always an
+    # input-change refresh.
+    refresh_block = ""
+    if mode == "input_change_refresh":
+        refresh_block = (
+            "INPUT-CHANGE REFRESH: nobody contributed anything — an input this "
+            "scope's memory rests on changed, and the INPUT CHANGES block below says "
+            "what. Judge the CURRENT inputs and amend as you see fit: `publish`, "
+            "`supersede`, `retire`, `new_context` and `withdraw_published` are "
+            "available here (ADR 0014 D2); `append` is dropped on this path. The "
+            "change is evidence, not an instruction, and a parent's context is "
+            "still never yours to restate.\n\n"
+        )
+
+    input_changes_block = _render_input_changes(input_changes)
 
     return (
         f"SCOPE: {scope.name} (id={scope.id})\n"
@@ -1821,10 +2299,12 @@ def _build_judge_preamble(
         "\n"
         f"{budget_line}"
         f"{refresh_block}"
+        f"{input_changes_block}"
         f"{operator_block}"
-        f"{parent_block}"
+        f"{ancestor_block}"
         f"{entitlement_block}"
         f"{publication_block}"
+        f"{parent_publication_block}"
         f"{peer_publications_block}"
         "CURRENT SUMMARY\n"
         "---\n"
@@ -1841,7 +2321,7 @@ def _build_user_message(
     *,
     scope: Scope,
     stratum: Stratum,
-    parent_summary: ScopeSummary | None,
+    ancestor_directives: Sequence[tuple[str, Sequence[Directive]]] | None,
     current_summary: ScopeSummary | None,
     recent_contributions: Sequence[RecentContribution],
     new_contribution: Contribution,
@@ -1850,14 +2330,16 @@ def _build_user_message(
     operator_memory: list[tuple[str, list[OperatorItem]]] | None = None,
     current_publication: Sequence[_PublishedItemLike] | None = None,
     peer_publications: Sequence[tuple[str, Sequence[_PublishedItemLike]]] | None = None,
-    amendment_context_only: bool = False,
+    parent_publication: tuple[str, Sequence[_PublishedItemLike]] | None = None,
+    mode: JudgeMode = "ordinary",
+    input_changes: Sequence[_ChangeEventLike] | None = None,
     window_verbatim_tail: int = WINDOW_VERBATIM_TAIL,
 ) -> str:
     """Compose the (non-cached) per-call user message for a single contribution."""
     preamble = _build_judge_preamble(
         scope=scope,
         stratum=stratum,
-        parent_summary=parent_summary,
+        ancestor_directives=ancestor_directives,
         current_summary=current_summary,
         recent_contributions=recent_contributions,
         judged_contribution_ids=[new_contribution.id],
@@ -1866,7 +2348,9 @@ def _build_user_message(
         operator_memory=operator_memory,
         current_publication=current_publication,
         peer_publications=peer_publications,
-        amendment_context_only=amendment_context_only,
+        parent_publication=parent_publication,
+        mode=mode,
+        input_changes=input_changes,
         window_verbatim_tail=window_verbatim_tail,
     )
     return (
@@ -1883,7 +2367,7 @@ def _build_batch_user_message(
     *,
     scope: Scope,
     stratum: Stratum,
-    parent_summary: ScopeSummary | None,
+    ancestor_directives: Sequence[tuple[str, Sequence[Directive]]] | None,
     current_summary: ScopeSummary | None,
     recent_contributions: Sequence[RecentContribution],
     new_contributions: Sequence[Contribution],
@@ -1892,6 +2376,9 @@ def _build_batch_user_message(
     operator_memory: list[tuple[str, list[OperatorItem]]] | None = None,
     current_publication: Sequence[_PublishedItemLike] | None = None,
     peer_publications: Sequence[tuple[str, Sequence[_PublishedItemLike]]] | None = None,
+    parent_publication: tuple[str, Sequence[_PublishedItemLike]] | None = None,
+    mode: JudgeMode = "ordinary",
+    input_changes: Sequence[_ChangeEventLike] | None = None,
     window_verbatim_tail: int = WINDOW_VERBATIM_TAIL,
 ) -> str:
     """Compose the per-call user message for a BATCH of contributions (ADR 0011 D3).
@@ -1903,7 +2390,7 @@ def _build_batch_user_message(
     preamble = _build_judge_preamble(
         scope=scope,
         stratum=stratum,
-        parent_summary=parent_summary,
+        ancestor_directives=ancestor_directives,
         current_summary=current_summary,
         recent_contributions=recent_contributions,
         judged_contribution_ids=[c.id for c in new_contributions],
@@ -1912,6 +2399,9 @@ def _build_batch_user_message(
         operator_memory=operator_memory,
         current_publication=current_publication,
         peer_publications=peer_publications,
+        parent_publication=parent_publication,
+        mode=mode,
+        input_changes=input_changes,
         window_verbatim_tail=window_verbatim_tail,
     )
     blocks = "\n".join(
@@ -1965,7 +2455,7 @@ class ScopeManager:
         *,
         scope: Scope,
         stratum: Stratum,
-        parent_summary: ScopeSummary | None = None,
+        ancestor_directives: Sequence[tuple[str, Sequence[Directive]]] | None = None,
         current_summary: ScopeSummary | None,
         recent_contributions: Sequence[RecentContribution],
         new_contribution: Contribution,
@@ -1974,8 +2464,12 @@ class ScopeManager:
         operator_memory: list[tuple[str, list[OperatorItem]]] | None = None,
         current_publication: Sequence[_PublishedItemLike] | None = None,
         peer_publications: Sequence[tuple[str, Sequence[_PublishedItemLike]]] | None = None,
-        amendment_context_only: bool = False,
+        parent_publication: tuple[str, Sequence[_PublishedItemLike]] | None = None,
+        mode: JudgeMode = "ordinary",
+        input_changes: Sequence[_ChangeEventLike] | None = None,
         window_verbatim_tail: int = WINDOW_VERBATIM_TAIL,
+        change_id: str | None = None,
+        hop: int = 0,
     ) -> ScopeManagerJudgment:
         """Judge a new contribution against the scope's current state.
 
@@ -1988,10 +2482,16 @@ class ScopeManager:
         Args:
             scope:                The scope receiving the contribution.
             stratum:              The stratum *scope* belongs to.
-            parent_summary:       The inter-stratum parent scope's current
-                                  summary, or ``None`` for L0 root scopes
-                                  (no parent exists).  Resolved by the caller
-                                  — the manager does not traverse the graph.
+            ancestor_directives:  The inter-stratum ancestor walk, root-first
+                                  — ``(ancestor_scope_id, directives)`` pairs
+                                  from
+                                  :func:`strata.perspective.ancestor_directives`,
+                                  empty for an L0 root scope. Resolved by the
+                                  caller — the manager does not traverse the
+                                  graph — and it is the SAME walk composition
+                                  reads (ADR 0015 D2), so what the judge is
+                                  told binds this scope is what the agent is
+                                  shown.
             current_summary:      The scope's current summary, or ``None``
                                   for a fresh scope with no prior summary.
             recent_contributions: The scope's recency window (ADR 0011 D2) —
@@ -2040,19 +2540,34 @@ class ScopeManager:
                                   attribution through condensation cites.
                                   ``None`` (or empty) omits the block
                                   entirely (backward compatible call shape).
-            amendment_context_only: The manager-refresh path (ADR 0011 D4),
-                                  where the parent's directives are already
-                                  spliced into *current_summary*
-                                  mechanically. Renders the MANAGER REFRESH
-                                  block and drops any ``append``/``publish``
-                                  op from the amendment, so a refresh can
-                                  only amend context and retire or supersede.
+            mode:                 Which judgment path this call is on (see
+                                  :data:`JudgeMode`).
+                                  ``"input_change_refresh"``
+                                  renders the INPUT-CHANGE REFRESH block and
+                                  keeps every op (ADR 0014 D2 — the change
+                                  notice is a real contribution to mint a
+                                  directive from). ``"ordinary"``, the
+                                  default, renders neither.
+            input_changes:        The pending change events this refresh is
+                                  draining (ADR 0014 D5), rendered as the
+                                  INPUT CHANGES block. Meaningful only on
+                                  ``"input_change_refresh"``; ``None`` (or
+                                  empty) omits the block entirely.
             window_verbatim_tail: How many of the newest window rows keep
                                   their full verbatim text (ADR 0011 D2);
                                   everything older renders as a digest row.
                                   Defaults to :data:`WINDOW_VERBATIM_TAIL`;
                                   callers holding settings pass
                                   ``settings.window_verbatim_tail``.
+            change_id:            The input change this judgment belongs to
+                                  (ADR 0014 D4), carried onto the returned
+                                  judgment. A parameter, never a lookup
+                                  (implementation pin 8): inheriting the
+                                  originating id is what bounds a refresh
+                                  wave, so only the caller that minted it can
+                                  say what it is. ``None`` — the default, and
+                                  what every ordinary contribution passes —
+                                  means this judgment belongs to no wave.
 
         Returns:
             A :class:`ScopeManagerJudgment` with the verdict, reasoning, the
@@ -2109,7 +2624,7 @@ class ScopeManager:
         user_message = _build_user_message(
             scope=scope,
             stratum=stratum,
-            parent_summary=parent_summary,
+            ancestor_directives=ancestor_directives,
             current_summary=current_summary,
             recent_contributions=recent_contributions,
             new_contribution=new_contribution,
@@ -2117,9 +2632,18 @@ class ScopeManager:
             entitlement=entitlement,
             current_publication=current_publication,
             peer_publications=peer_publications,
+            parent_publication=parent_publication,
             operator_memory=operator_memory,
-            amendment_context_only=amendment_context_only,
+            mode=mode,
+            input_changes=input_changes,
             window_verbatim_tail=window_verbatim_tail,
+        )
+
+        # ADR 0014 D3: what a declared `context_sources` is audited against —
+        # derived from the same arguments the message above was built from, so
+        # the check and the prompt can never disagree.
+        rendered_item_ids = _rendered_publication_item_ids(
+            current_publication, peer_publications, parent_publication
         )
 
         def _parse(block) -> ScopeManagerJudgment:  # noqa: ANN001 — tool_use block
@@ -2128,7 +2652,10 @@ class ScopeManager:
                 tool_use_block=block,
                 current_summary=current_summary,
                 new_contribution=new_contribution,
-                amendment_context_only=amendment_context_only,
+                mode=mode,
+                change_id=change_id,
+                hop=hop,
+                rendered_item_ids=rendered_item_ids,
             )
 
         def _invalid_ops(judgment: ScopeManagerJudgment) -> list[DirectiveOp]:
@@ -2457,7 +2984,7 @@ class ScopeManager:
         *,
         scope: Scope,
         stratum: Stratum,
-        parent_summary: ScopeSummary | None = None,
+        ancestor_directives: Sequence[tuple[str, Sequence[Directive]]] | None = None,
         current_summary: ScopeSummary | None,
         recent_contributions: Sequence[RecentContribution],
         new_contributions: Sequence[Contribution],
@@ -2466,7 +2993,12 @@ class ScopeManager:
         operator_memory: list[tuple[str, list[OperatorItem]]] | None = None,
         current_publication: Sequence[_PublishedItemLike] | None = None,
         peer_publications: Sequence[tuple[str, Sequence[_PublishedItemLike]]] | None = None,
+        parent_publication: tuple[str, Sequence[_PublishedItemLike]] | None = None,
+        mode: JudgeMode = "ordinary",
+        input_changes: Sequence[_ChangeEventLike] | None = None,
         window_verbatim_tail: int = WINDOW_VERBATIM_TAIL,
+        change_ids: Sequence[str] | None = None,
+        hop: int = 0,
     ) -> ScopeManagerBatchJudgment:
         """Judge several new contributions, in arrival order, in ONE call (ADR 0011 D3).
 
@@ -2487,8 +3019,18 @@ class ScopeManager:
         Args:
             new_contributions: The contributions to judge, in ARRIVAL order —
                 the order the record appended them, which is the order the
-                judge must process them in. Every other argument means exactly
-                what it means on :meth:`judge`.
+                judge must process them in.
+            change_ids: The input changes this batch belongs to (ADR 0014 D4),
+                carried onto the returned judgment as
+                :attr:`ScopeManagerBatchJudgment.change_ids` — see
+                :meth:`judge`. PLURAL because a coalesced refresh judges
+                several pending events as one batch (implementation pin 1), so
+                the batch belongs to every wave it drained. Deduplicated here,
+                order preserved.
+            hop: How many derived hops this batch is from the change that
+                started the wave (ADR 0014 D4) — see :meth:`judge`.
+
+            Every other argument means exactly what it means on :meth:`judge`.
 
         Returns:
             A :class:`ScopeManagerBatchJudgment`.
@@ -2502,6 +3044,10 @@ class ScopeManager:
             RuntimeError: No Anthropic API key is configured.
         """
         self._check_api_key()
+        # Two events of one wave collapse to one id: a derived change row is
+        # written per (change id, affected scope), so a duplicate here would be
+        # a duplicate row saying the same thing twice.
+        wave_ids = list(dict.fromkeys(change_ids or ()))
         if not new_contributions:
             raise ValueError("judge_batch requires at least one contribution to judge.")
 
@@ -2510,7 +3056,7 @@ class ScopeManager:
             judgment = self.judge(
                 scope=scope,
                 stratum=stratum,
-                parent_summary=parent_summary,
+                ancestor_directives=ancestor_directives,
                 current_summary=current_summary,
                 recent_contributions=recent_contributions,
                 new_contribution=only,
@@ -2519,7 +3065,17 @@ class ScopeManager:
                 operator_memory=operator_memory,
                 current_publication=current_publication,
                 peer_publications=peer_publications,
+                parent_publication=parent_publication,
+                mode=mode,
+                input_changes=input_changes,
                 window_verbatim_tail=window_verbatim_tail,
+                # A batch of one still has a plural wave list in principle (one
+                # notice can be written for several coalesced ids); the single
+                # judgment's scalar carries it only when there is exactly one
+                # to carry, and `change_ids` below is the batch's truth either
+                # way.
+                change_id=wave_ids[0] if len(wave_ids) == 1 else None,
+                hop=hop,
             )
             return ScopeManagerBatchJudgment(
                 verdicts=[
@@ -2537,6 +3093,13 @@ class ScopeManager:
                     {only.id: list(judgment.dropped_ops)} if judgment.dropped_ops else {}
                 ),
                 withdraw_published=judgment.withdraw_published,
+                # The single path already validated these; rewrapping must not
+                # silently lose them (ADR 0014 D3/D4). `change_id` stays None
+                # on a batch shape — `change_ids` is the one source of truth.
+                change_ids=wave_ids,
+                hop=judgment.hop,
+                context_sources=judgment.context_sources,
+                dropped_context_sources=judgment.dropped_context_sources,
             )
 
         contributions = {c.id: c for c in new_contributions}
@@ -2545,7 +3108,7 @@ class ScopeManager:
         user_message = _build_batch_user_message(
             scope=scope,
             stratum=stratum,
-            parent_summary=parent_summary,
+            ancestor_directives=ancestor_directives,
             current_summary=current_summary,
             recent_contributions=recent_contributions,
             new_contributions=new_contributions,
@@ -2553,8 +3116,15 @@ class ScopeManager:
             entitlement=entitlement,
             current_publication=current_publication,
             peer_publications=peer_publications,
+            parent_publication=parent_publication,
             operator_memory=operator_memory,
+            mode=mode,
+            input_changes=input_changes,
             window_verbatim_tail=window_verbatim_tail,
+        )
+
+        rendered_item_ids = _rendered_publication_item_ids(
+            current_publication, peer_publications, parent_publication
         )
 
         def _parse(block) -> ScopeManagerBatchJudgment:  # noqa: ANN001 — tool_use block
@@ -2563,6 +3133,10 @@ class ScopeManager:
                 tool_use_block=block,
                 current_summary=current_summary,
                 contributions=contributions,
+                mode=mode,
+                change_ids=wave_ids,
+                hop=hop,
+                rendered_item_ids=rendered_item_ids,
             )
 
         def _invalid_ops(judgment: ScopeManagerBatchJudgment) -> list[DirectiveOp]:
@@ -2625,6 +3199,10 @@ class ScopeManager:
         tool_use_block,  # noqa: ANN001 — Anthropic content block
         current_summary: ScopeSummary | None,
         contributions: Mapping[str, Contribution],
+        mode: JudgeMode = "ordinary",
+        change_ids: Sequence[str] = (),
+        hop: int = 0,
+        rendered_item_ids: Sequence[str] = (),
     ) -> ScopeManagerBatchJudgment:
         """Validate a ``submit_batch_judgment`` payload and apply its amendment.
 
@@ -2640,6 +3218,7 @@ class ScopeManager:
                 admitting a contribution this batch declined; or an amendment
                 on a batch that declined everything.
         """
+        _check_mode(mode)
         raw: dict = tool_use_block.input
         batch_ids = list(contributions)
 
@@ -2650,6 +3229,12 @@ class ScopeManager:
         # ADR 0007 D3/D5, exactly as on the single path: always a list, never
         # None, so callers never need a null-check.
         withdraw_published = [str(x) for x in (raw.get("withdraw_published") or []) if x]
+
+        # ADR 0014 D3, exactly as on the single path.
+        declared_sources = [str(x) for x in (raw.get("context_sources") or []) if x]
+        context_sources, dropped_sources = _validate_context_sources(
+            declared_sources, rendered_item_ids
+        )
 
         accepted = {v.contribution_id for v in verdicts if v.decision != "decline"}
         if not accepted:
@@ -2662,11 +3247,35 @@ class ScopeManager:
                     "returned an amendment (directive_ops or new_context). Declined "
                     "contributions must not amend the summary."
                 )
+            # No amendment, so nothing for a declared source to rest on —
+            # dropped whole, as on a single decline.
             return ScopeManagerBatchJudgment(
                 verdicts=verdicts,
                 new_summary=None,
                 withdraw_published=withdraw_published,
+                change_ids=list(change_ids),
+                hop=hop,
             )
+
+        dropped: list[str] = []
+        dropped_by_contribution: dict[str, list[str]] = {}
+        to_drop = _DROPPED_ADMITTING_OPS[mode]
+        if to_drop:
+            # Exactly as on the single path — an input-change refresh keeps
+            # `publish` and drops `append` (ADR 0014 D2) — however many notices
+            # the batch coalesced.
+            admitting = [op for op in ops if op.op in to_drop]
+            if admitting:
+                ops = [op for op in ops if op.op not in to_drop]
+                dropped = [op.describe() for op in admitting]
+                for op in admitting:
+                    targets = (
+                        [op.contribution_id]
+                        if op.contribution_id in contributions
+                        else [cid for cid in accepted]
+                    )
+                    for target in targets:
+                        dropped_by_contribution.setdefault(target, []).append(op.describe())
 
         for op in ops:
             if op.contribution_id in contributions and op.contribution_id not in accepted:
@@ -2689,7 +3298,13 @@ class ScopeManager:
             new_summary=new_summary,
             directive_ops=ops,
             new_context=new_context,
+            dropped_ops=dropped,
+            dropped_ops_by_contribution=dropped_by_contribution,
             withdraw_published=withdraw_published,
+            change_ids=list(change_ids),
+            hop=hop,
+            context_sources=context_sources,
+            dropped_context_sources=dropped_sources,
         )
 
     @staticmethod
@@ -2790,7 +3405,10 @@ class ScopeManager:
         tool_use_block,  # noqa: ANN001 — Anthropic content block
         current_summary: ScopeSummary | None,
         new_contribution: Contribution,
-        amendment_context_only: bool = False,
+        mode: JudgeMode = "ordinary",
+        change_id: str | None = None,
+        hop: int = 0,
+        rendered_item_ids: Sequence[str] = (),
     ) -> ScopeManagerJudgment:
         """Validate a ``submit_judgment`` payload and apply its amendment.
 
@@ -2806,6 +3424,7 @@ class ScopeManager:
                 the field its kind requires, an unpaired ``supersede``, or a
                 ``decline`` carrying an amendment.
         """
+        _check_mode(mode)
         raw: dict = tool_use_block.input
         decision: str = raw["decision"]
         reasoning: str = raw["reasoning"]
@@ -2819,6 +3438,12 @@ class ScopeManager:
         # never need a null-check.
         withdraw_published = [str(x) for x in (raw.get("withdraw_published") or []) if x]
 
+        # ADR 0014 D3: the ids the judge declares its new_context rests on.
+        # Record, never trigger — asked for in the tool schema and the prompt
+        # (ADR 0014 D2/D3), but a hand-built or scripted judgment omits it,
+        # which is expected rather than a bug.
+        declared_sources = [str(x) for x in (raw.get("context_sources") or []) if x]
+
         # A decline carries no amendment — the same consistency rule the
         # decline-with-new_summary check enforced before ADR 0011 D1.
         if decision == "decline":
@@ -2828,21 +3453,31 @@ class ScopeManager:
                     "(directive_ops or new_context). A declined contribution must "
                     "not amend the summary."
                 )
+            # A decline amends nothing, so it declares nothing: the sources go
+            # whole and silently, unnoted. Nothing was corroborated or failed
+            # to be — there is no claim about the summary to audit.
             return ScopeManagerJudgment(
                 decision="decline",
                 reasoning=reasoning,
                 new_summary=None,
                 withdraw_published=withdraw_published,
+                change_id=change_id,
+                hop=hop,
             )
 
+        context_sources, dropped_sources = _validate_context_sources(
+            declared_sources, rendered_item_ids
+        )
+
         dropped: list[str] = []
-        if amendment_context_only:
-            # ADR 0011 D4: on the refresh path parent directives are spliced in
-            # mechanically, so a refresh amendment carries context and
-            # lifecycle ops only.
-            admitting = [op for op in ops if op.op in ("append", "publish")]
+        to_drop = _DROPPED_ADMITTING_OPS[mode]
+        if to_drop:
+            # ADR 0014 D2: an input-change refresh has a real contribution
+            # to mint FROM, so `publish` stands — but never to copy, so
+            # `append` (which takes the notice's bytes verbatim) is dropped.
+            admitting = [op for op in ops if op.op in to_drop]
             if admitting:
-                ops = [op for op in ops if op.op not in ("append", "publish")]
+                ops = [op for op in ops if op.op not in to_drop]
                 dropped = [op.describe() for op in admitting]
 
         new_summary = _apply_amendment(
@@ -2861,6 +3496,10 @@ class ScopeManager:
             new_context=new_context,
             dropped_ops=dropped,
             withdraw_published=withdraw_published,
+            change_id=change_id,
+            hop=hop,
+            context_sources=context_sources,
+            dropped_context_sources=dropped_sources,
         )
 
     # ------------------------------------------------------------------
@@ -2891,6 +3530,9 @@ class ScopeManager:
         anchors: Sequence[str] | None = None,
         withdraw_item: _PublishedItemLike | None = None,
         operator_memory: list[tuple[str, list[OperatorItem]]] | None = None,
+        relay_origin_scope_id: str | None = None,
+        relay_via_scope_id: str | None = None,
+        publication_max_words: int = PUBLICATION_MAX_WORDS,
     ) -> PublicationJudgment:
         """Judge a publish or withdraw proposal against the scope's current state.
 
@@ -2920,6 +3562,31 @@ class ScopeManager:
                 judge uses (ADR 0008 D3), so a publish or withdraw act that
                 contradicts a binding operator directive can be declined,
                 citing its id, exactly as a contradicting contribution is.
+            relay_origin_scope_id: ADR 0013 D4c — when this ``publish``
+                RELAYS an item *scope* received in another scope's
+                publication (republication), the item's ULTIMATE origin
+                scope. ``None`` for an ordinary publish of *scope*'s own
+                material. Given together with *relay_via_scope_id*.
+            relay_via_scope_id: The immediate scope this copy was relayed
+                from (the "via Y" of "according to X, via Y"). Rendered
+                alongside *relay_origin_scope_id* so the judge is told the
+                proposed item is second-hand, not *scope*'s own — a
+                different question ("do my readers need to hear this" vs.
+                "is this true and mine to say") that the system prompt
+                spells out is information, never permission, to relay.
+            publication_max_words: ADR 0013 D3 — the word budget for
+                *scope*'s published face (its current items plus, for a
+                ``publish`` act, the proposed one), the same "words" unit
+                :func:`_summary_word_count` uses. Checked ONLY for
+                ``act_kind='publish'`` — a ``publish`` act that would put
+                the face over budget is declined mechanically, before any
+                API call is made (see the accept/decline shortcut below). A
+                ``withdraw`` act is never checked against it: withdrawal
+                only ever shrinks the face, and a mechanically-propagated
+                withdrawal must never be blocked by a budget. Defaults to
+                :data:`PUBLICATION_MAX_WORDS` for library callers that do
+                not thread :attr:`strata.settings.Settings.publication_max_words`
+                through explicitly.
 
         Returns:
             A :class:`PublicationJudgment`.
@@ -2938,11 +3605,38 @@ class ScopeManager:
                     "judge_publication(act_kind='publish') requires content, kind, and "
                     "at least one anchor."
                 )
+
+            # ADR 0013 D3 — mechanical budget enforcement, the same choke
+            # point (judgment time) as summary_max_words. A publication is a
+            # SELECTION from the scope's summary, so growing it past budget
+            # is declined outright — no API call, no LLM in the loop, mirroring
+            # the structural checks above it (missing fields) rather than the
+            # summary path's corrective re-ask: there is no amendment to
+            # retry here, a publish act is an atomic, unrewritten append
+            # (ADR 0007 D1), so the only correction available is withdrawing
+            # something first — a separate, judged act the proposer makes.
+            current_words = _publication_word_count(current_publication)
+            new_words = _content_word_count(content)
+            prospective_words = current_words + new_words
+            if prospective_words > publication_max_words:
+                return PublicationJudgment(
+                    decision="decline",
+                    reasoning=(
+                        f"Declined without judgment: this item is {new_words} words; "
+                        f"with the {current_words} words already published, the face "
+                        f"would be {prospective_words} words — over its "
+                        f"{publication_max_words}-word budget. Withdraw an existing "
+                        "published item to make room, then retry."
+                    ),
+                )
+
             proposal_block = (
                 "PROPOSED ACT: publish\n"
                 f"- kind: {kind}\n"
                 f"- subject: {subject or '(none)'}\n"
                 f"- anchors: {list(anchors)}\n"
+                f"- word budget: {current_words} published + {new_words} this item = "
+                f"{prospective_words} / {publication_max_words}\n"
                 "- content:\n"
                 f"    {content}\n"
             )
@@ -2956,6 +3650,7 @@ class ScopeManager:
 
         operator_block = _render_operator_memory(operator_memory)
         publication_block = _render_current_publication(current_publication)
+        relay_block = _render_relay_origin(relay_origin_scope_id, relay_via_scope_id)
         summary_block = (
             _render_summary(current_summary)
             if current_summary is not None
@@ -2966,6 +3661,7 @@ class ScopeManager:
             f"SCOPE: {scope.name} (id={scope.id})\n\n"
             f"{operator_block}"
             f"{publication_block}"
+            f"{relay_block}"
             "CURRENT SUMMARY\n"
             "---\n"
             f"{summary_block}\n"
@@ -3008,6 +3704,8 @@ class ScopeManager:
         *,
         scope: Scope,
         current_summary: ScopeSummary | None,
+        publication_max_words: int = PUBLICATION_MAX_WORDS,
+        current_publication: Sequence[_PublishedItemLike] = (),
     ) -> BootstrapJudgment:
         """Distill an initial publication for *scope* from its current summary.
 
@@ -3020,6 +3718,30 @@ class ScopeManager:
         Args:
             scope: The scope to bootstrap.
             current_summary: The scope's current internal summary.
+            publication_max_words: ADR 0013 D3 — the word budget for
+                *scope*'s published face AFTER bootstrapping — the same
+                budget :meth:`judge_publication` enforces for an ordinary
+                ``publish`` act, not a separate allowance for candidates
+                alone. Told to the judge itself, in the user message, so it
+                can propose a face that already fits (issue #185 — a judge
+                unaware of its budget cannot make a real selection). A
+                mechanical trim still runs as a BACKSTOP for a judge that
+                overshoots anyway, not the primary mechanism: proposed items
+                are kept in the order the model returned them, accumulating
+                :func:`_content_word_count` on top of *current_publication*'s
+                own word count, skipping (not stopping at) any candidate
+                that would push the running total over budget so a large
+                early candidate cannot starve smaller ones behind it — the
+                rest are dropped. When the backstop drops anything, it is
+                loud, not silent: the drop is noted in the returned
+                ``reasoning``, the returned :class:`BootstrapJudgment`'s
+                ``trimmed`` flag is set ``True``, and a warning is logged.
+                Defaults to :data:`PUBLICATION_MAX_WORDS`.
+            current_publication: *scope*'s already-published items, if any
+                — bootstrapping a scope that has published before must
+                trim candidates against the REMAINING budget, not the full
+                one, or the combined face can land over budget. Empty by
+                default (the common case: a scope's first publication).
 
         Returns:
             A :class:`BootstrapJudgment`.
@@ -3035,8 +3757,17 @@ class ScopeManager:
             if current_summary is not None
             else "(this scope has no summary yet)"
         )
+        already_published_words = _publication_word_count(current_publication)
+        remaining_budget = publication_max_words - already_published_words
+        budget_block = (
+            f"WORD BUDGET: {already_published_words} words already published + up to "
+            f"{remaining_budget} words remaining = {publication_max_words}-word budget for "
+            "this scope's published face. The combined content of every item you propose "
+            "must fit within the remaining budget.\n\n"
+        )
         user_message = (
             f"SCOPE: {scope.name} (id={scope.id})\n\n"
+            f"{budget_block}"
             "CURRENT SUMMARY\n"
             "---\n"
             f"{summary_block}\n"
@@ -3078,4 +3809,52 @@ class ScopeManager:
             )
             for i in raw_items
         ]
-        return BootstrapJudgment(decision=raw["decision"], reasoning=raw["reasoning"], items=items)
+
+        # ADR 0013 D3 — mechanical trim to fit publication_max_words, against
+        # the REMAINING budget (current_publication may already hold words —
+        # bootstrapping is not always a scope's first publication). The judge
+        # is told this budget above (see budget_block) and is asked to
+        # propose a face that already fits it, so this trim is now a BACKSTOP
+        # for a judge that overshoots anyway, not the primary mechanism. Kept
+        # in proposal order, greedily: an item is kept only if it still fits
+        # under the running total, so a large early item cannot starve every
+        # item behind it out of a face that had room for them.
+        #
+        # A silent trim here is exactly the trap issue #185 named: the judge
+        # believes everything it named will publish, so a caller must be
+        # able to tell the backstop fired without parsing `reasoning` prose.
+        # It stays loud in two ways: the structured `trimmed` flag on the
+        # returned judgment, and a warning log line here, at the point the
+        # silent drop used to happen.
+        reasoning = raw["reasoning"]
+        trimmed = False
+        if items:
+            kept: list[BootstrapPublishedItemInput] = []
+            total_words = _publication_word_count(current_publication)
+            dropped = 0
+            for item in items:
+                words = _content_word_count(item.content)
+                if total_words + words > publication_max_words:
+                    dropped += 1
+                    continue
+                kept.append(item)
+                total_words += words
+            items = kept
+            if dropped:
+                trimmed = True
+                reasoning = (
+                    f"{reasoning} ({dropped} proposed item(s) omitted mechanically to fit "
+                    f"the {publication_max_words}-word publication budget.)"
+                )
+                _logger.warning(
+                    "judge_bootstrap_publication: budget backstop trimmed %d proposed "
+                    "item(s) for scope %r — the judge overshot the %d-word publication "
+                    "budget despite being told it in the prompt.",
+                    dropped,
+                    scope.id,
+                    publication_max_words,
+                )
+
+        return BootstrapJudgment(
+            decision=raw["decision"], reasoning=reasoning, items=items, trimmed=trimmed
+        )

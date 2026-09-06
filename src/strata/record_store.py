@@ -48,6 +48,9 @@ Design decisions
     ``pubj_<6hex>`` publication judgments (ADR 0007)
     ``pubja_<6hex>`` publication judgment attempts (failed judge_publication()
                    events, mirroring ``ja_``)
+    ``ce_<6hex>``  change events (ADR 0014 D5) — the structured half of an
+                   input-change notice. Distinct from the CHANGE ID a row
+                   carries, which the writer of the change mints.
 
 Vocabulary throughout follows CONTEXT.md verbatim.
 """
@@ -57,6 +60,7 @@ from __future__ import annotations
 import json
 import secrets
 import sqlite3
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -105,6 +109,14 @@ def _new_publication_judgment_id() -> str:
 
 def _new_publication_judgment_attempt_id() -> str:
     return f"pubja_{secrets.token_hex(8)}"
+
+
+def _new_change_event_id() -> str:
+    # ADR 0014 D5: the structured half of a `manager-refresh` contribution.
+    # Distinct from the CHANGE ID it carries, which is minted by the writer of
+    # the input change and shared by every event and derived change belonging
+    # to that one wave (ADR 0014 D4).
+    return f"ce_{secrets.token_hex(8)}"
 
 
 # ---------------------------------------------------------------------------
@@ -164,6 +176,11 @@ class Judgment:
     judged_by: str
     notes: str | None
     created_at: str
+    summary_version: int | None = None
+    """The summary ``version`` this judgment's amendment wrote (migration 0013).
+
+    Shared by every accepted row of one batch (ADR 0011 D3: one write);
+    ``None`` for a decline and for rows judged before the column existed."""
 
 
 #: The mechanical failed-judgment marker (issue #118).  Written on a
@@ -434,9 +451,25 @@ class PublicationAct:
     the list of anchor strings (``directive:<id>`` or ``subject:<text>``,
     ADR 0007 D1) — ``None`` for withdraw. ``trigger`` is ``None`` for an
     agent-proposed or operator-in-person act; for a MECHANICALLY propagated
-    withdrawal (ADR 0007 D3) it carries the record id of the internal change
-    that caused it (a contribution id or an operator retirement id).
+    withdrawal it carries the id of the event that caused it — for ADR 0007
+    D3's directive-removal path, a contribution id or an operator retirement
+    id; for ADR 0013 D4b's relay cascade, the ``pub_`` id of the item ONE
+    hop upstream whose own withdrawal triggered this one (so a cascade many
+    hops deep stays locally traceable from any single act).
     ``proposer`` mirrors :class:`ContributorRef` — this act's provenance.
+
+    ``origin_scope_id`` / ``relay_scope_id`` / ``relay_item_id`` carry
+    republication provenance (ADR 0013 D4, migration 0009): when this act
+    relays content received in another scope's publication rather than
+    originating here, ``origin_scope_id`` is the ULTIMATE origin scope
+    (however many hops the content has travelled), and ``relay_scope_id`` /
+    ``relay_item_id`` name the IMMEDIATE predecessor — the scope and item id
+    this specific copy was republished from ("according to
+    ``origin_scope_id``, via ``relay_scope_id``"). All three are ``None``
+    together for an item that originated in this act's own ``scope_id``,
+    including every act recorded before this migration (ADR 0013 D7 — no
+    backfill; a pre-existing item reads as "not a relay", never invented
+    history).
     """
 
     id: str
@@ -450,6 +483,9 @@ class PublicationAct:
     trigger: str | None
     proposer: ContributorRef
     created_at: str
+    origin_scope_id: str | None = None
+    relay_scope_id: str | None = None
+    relay_item_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -524,6 +560,41 @@ class PublicationActState:
     error_class: str | None
     error_message: str | None
     failed_at: str | None
+
+
+@dataclass(frozen=True)
+class ChangeEvent:
+    """One scope's notice that a composed input of its memory changed (ADR 0014 D5).
+
+    The structured half of the ``subject="manager-refresh"`` contribution the
+    engine appends to the affected scope's record: same event, machine-
+    readable, so the drain and the perspective's ``input_changes`` section can
+    find what is still unprocessed without parsing the notice's prose.
+
+    A pending event is NOT a judge outage (implementation pin 4) — a
+    :class:`JudgmentAttempt` records a judge that ran and failed, this records
+    an input that changed and a refresh that has not run yet. Every surface
+    that counts one reports the two separately.
+
+    ``change_id`` is the wave this event belongs to, not this event's own id:
+    every change derived from processing it inherits the same id, which is
+    what bounds a wave to one refresh per scope per change (ADR 0014 D4).
+    ``processed_at`` is ``None`` until a refresh has processed the event,
+    whatever its verdict; the row itself is never deleted.
+    """
+
+    id: str
+    change_id: str
+    contribution_id: str
+    scope_id: str
+    source_scope_id: str | None
+    item_id: str
+    kind: str
+    before: str | None
+    after: str | None
+    hop: int
+    processed_at: str | None
+    created_at: str
 
 
 # ---------------------------------------------------------------------------
@@ -620,6 +691,34 @@ class RecordStore:
             sqlite3.IntegrityError: If *supersedes* references a non-existent
                 contribution.
         """
+        contribution_id = self._insert_contribution(
+            scope_id=scope_id,
+            content=content,
+            proposed_classification=proposed_classification,
+            subject=subject,
+            supersedes=supersedes,
+            contributor=contributor,
+        )
+        self._conn.commit()
+        return self._fetch_contribution(contribution_id)
+
+    def _insert_contribution(
+        self,
+        *,
+        scope_id: str,
+        content: str,
+        proposed_classification: Literal["directive", "context"],
+        subject: str | None,
+        supersedes: str | None,
+        contributor: ContributorRef,
+    ) -> str:
+        """INSERT one contribution row and return its id. Does NOT commit.
+
+        Split out of :meth:`append_contribution` so a caller that must write
+        this row together with another one — :meth:`append_change_notice`,
+        where the notice and its event row are two halves of one event (ADR
+        0014 D5) — can put both inside a single transaction.
+        """
         contribution_id = _new_contribution_id()
         self._conn.execute(
             """
@@ -643,8 +742,7 @@ class RecordStore:
                 contributor.ts,
             ),
         )
-        self._conn.commit()
-        return self._fetch_contribution(contribution_id)
+        return contribution_id
 
     def list_contributions(
         self,
@@ -759,6 +857,23 @@ class RecordStore:
         self._conn.commit()
         return self._fetch_judgment(judgment_id)
 
+    def stamp_summary_version(self, contribution_ids: Sequence[str], *, version: int) -> None:
+        """Record on each judgment row the summary version its amendment wrote.
+
+        Called once per amendment, after the summary write, with every
+        contribution the amendment accepted — one id on the single path, the
+        batch's accepted members on the batch path (ADR 0011 D3), so a batch's
+        rows share one value. Declines are never stamped: they wrote nothing.
+        """
+        if not contribution_ids:
+            return
+        placeholders = ", ".join("?" for _ in contribution_ids)
+        self._conn.execute(
+            f"UPDATE judgments SET summary_version = ? WHERE contribution_id IN ({placeholders})",
+            (version, *contribution_ids),
+        )
+        self._conn.commit()
+
     def list_judgments(self, *, scope_id: str) -> list[Judgment]:
         """Return all judgments for contributions belonging to *scope_id*.
 
@@ -773,7 +888,8 @@ class RecordStore:
         """
         rows = self._conn.execute(
             """
-            SELECT j.id, j.contribution_id, j.decision, j.judged_by, j.notes, j.created_at
+            SELECT j.id, j.contribution_id, j.decision, j.judged_by, j.notes, j.created_at,
+                   j.summary_version
             FROM judgments j
             JOIN contributions c ON j.contribution_id = c.id
             WHERE c.scope_id = ?
@@ -792,7 +908,7 @@ class RecordStore:
         """
         row = self._conn.execute(
             """
-            SELECT id, contribution_id, decision, judged_by, notes, created_at
+            SELECT id, contribution_id, decision, judged_by, notes, created_at, summary_version
             FROM judgments WHERE contribution_id = ?
             """,
             (contribution_id,),
@@ -804,7 +920,7 @@ class RecordStore:
     def _fetch_judgment(self, judgment_id: str) -> Judgment:
         row = self._conn.execute(
             """
-            SELECT id, contribution_id, decision, judged_by, notes, created_at
+            SELECT id, contribution_id, decision, judged_by, notes, created_at, summary_version
             FROM judgments WHERE id = ?
             """,
             (judgment_id,),
@@ -1149,7 +1265,7 @@ class RecordStore:
         placeholders = ", ".join("?" for _ in contribution_ids)
         rows = self._conn.execute(
             f"""
-            SELECT id, contribution_id, decision, judged_by, notes, created_at
+            SELECT id, contribution_id, decision, judged_by, notes, created_at, summary_version
             FROM judgments
             WHERE contribution_id IN ({placeholders})
             ORDER BY created_at ASC, rowid ASC
@@ -1455,6 +1571,9 @@ class RecordStore:
         withdraws: str | None,
         trigger: str | None,
         proposer: ContributorRef,
+        origin_scope_id: str | None = None,
+        relay_scope_id: str | None = None,
+        relay_item_id: str | None = None,
     ) -> PublicationAct:
         """Append a publish or withdraw act to *scope_id*'s publication record.
 
@@ -1474,10 +1593,22 @@ class RecordStore:
                        ``None`` for withdraw. Stored as a JSON array.
             withdraws: For ``act == 'withdraw'``: the ``pub_`` id of the
                        published item being removed. ``None`` for publish.
-            trigger:   For a mechanically propagated withdrawal (ADR 0007
-                       D3): the record id of the triggering internal change.
-                       ``None`` otherwise.
+            trigger:   For a mechanically propagated withdrawal: the id of
+                       the triggering event — a contribution or operator
+                       retirement id (ADR 0007 D3's directive-removal path),
+                       or the upstream item id one hop up a relay cascade
+                       (ADR 0013 D4b). ``None`` otherwise.
             proposer:  Provenance — mirrors :class:`ContributorRef`.
+            origin_scope_id: ADR 0013 D4 — the ULTIMATE origin scope when
+                       this act relays content received in another scope's
+                       publication. ``None`` for an item that originates in
+                       *scope_id* itself.
+            relay_scope_id: ADR 0013 D4 — the immediate predecessor scope
+                       this copy was republished from. ``None`` unless
+                       *origin_scope_id* is also set.
+            relay_item_id: ADR 0013 D4 — the ``pub_`` id, in
+                       *relay_scope_id*'s publication, of the item this copy
+                       relays. ``None`` unless *origin_scope_id* is also set.
 
         Returns:
             The newly appended :class:`PublicationAct`.
@@ -1492,8 +1623,9 @@ class RecordStore:
             """
             INSERT INTO publication_acts (
                 id, scope_id, act, kind, content, subject, anchors, withdraws, "trigger",
-                proposer_scope_id, proposer_skill, proposer_session_id, proposer_ts
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                proposer_scope_id, proposer_skill, proposer_session_id, proposer_ts,
+                origin_scope_id, relay_scope_id, relay_item_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 act_id,
@@ -1509,6 +1641,9 @@ class RecordStore:
                 proposer.skill,
                 proposer.session_id,
                 proposer.ts,
+                origin_scope_id,
+                relay_scope_id,
+                relay_item_id,
             ),
         )
         self._conn.commit()
@@ -1520,7 +1655,7 @@ class RecordStore:
             """
             SELECT id, scope_id, act, kind, content, subject, anchors, withdraws,
                    "trigger", proposer_scope_id, proposer_skill, proposer_session_id,
-                   proposer_ts, created_at
+                   proposer_ts, created_at, origin_scope_id, relay_scope_id, relay_item_id
             FROM publication_acts
             WHERE scope_id = ?
             ORDER BY created_at ASC, rowid ASC
@@ -1541,7 +1676,7 @@ class RecordStore:
             """
             SELECT id, scope_id, act, kind, content, subject, anchors, withdraws,
                    "trigger", proposer_scope_id, proposer_skill, proposer_session_id,
-                   proposer_ts, created_at
+                   proposer_ts, created_at, origin_scope_id, relay_scope_id, relay_item_id
             FROM publication_acts WHERE id = ?
             """,
             (act_id,),
@@ -1728,6 +1863,253 @@ class RecordStore:
             )
             for act in acts
         ]
+
+    # ------------------------------------------------------------------
+    # Change events (ADR 0014 D5) — the reactive re-judgement notice: what
+    # changed under a scope's memory, and whether a refresh has processed it.
+    # ------------------------------------------------------------------
+
+    def append_change_event(
+        self,
+        *,
+        change_id: str,
+        contribution_id: str,
+        scope_id: str,
+        item_id: str,
+        kind: str,
+        source_scope_id: str | None = None,
+        before: str | None = None,
+        after: str | None = None,
+        hop: int = 0,
+    ) -> ChangeEvent:
+        """Append the structured half of an input-change notice (ADR 0014 D5).
+
+        The notice itself is *contribution_id* — a ``subject="manager-refresh"``
+        contribution already appended to *scope_id*'s record, which is what
+        makes the notice permanent, auditable and readable by the judge. This
+        row is the same event in machine-readable form.
+
+        Args:
+            change_id:       The independent input change this event belongs
+                             to. Every change derived from processing it
+                             inherits this id (ADR 0014 D4) — it is what
+                             bounds a wave, so it is passed in by the writer
+                             that minted it, never generated here.
+            contribution_id: The ``manager-refresh`` contribution carrying
+                             this event's payload.
+            scope_id:        The affected scope — the one that must refresh.
+            source_scope_id: The scope the changed item came FROM. A
+                             different fact from *scope_id* and not derivable
+                             from it — an item id does not name its holder —
+                             and what the perspective's ``input_changes``
+                             section renders as "because X changed". ``None``
+                             only for a caller that genuinely has no source.
+            item_id:         The input item that changed.
+            kind:            What happened to it.
+            before/after:    The item's previous and current state. Either may
+                             be ``None``: an addition has no before, a
+                             withdrawal no after.
+            hop:             Derived hops from the originating change, for ADR
+                             0014 D4's backstop budget.
+
+        Returns:
+            The newly appended :class:`ChangeEvent`, unprocessed.
+
+        Raises:
+            sqlite3.IntegrityError: If *contribution_id* does not exist (FK) —
+                an event whose notice nobody can read is not a notice.
+        """
+        event_id = self._insert_change_event(
+            change_id=change_id,
+            contribution_id=contribution_id,
+            scope_id=scope_id,
+            source_scope_id=source_scope_id,
+            item_id=item_id,
+            kind=kind,
+            before=before,
+            after=after,
+            hop=hop,
+        )
+        self._conn.commit()
+        return self._fetch_change_event(event_id)
+
+    def _insert_change_event(
+        self,
+        *,
+        change_id: str,
+        contribution_id: str,
+        scope_id: str,
+        source_scope_id: str | None,
+        item_id: str,
+        kind: str,
+        before: str | None,
+        after: str | None,
+        hop: int,
+        processed: bool = False,
+    ) -> str:
+        """INSERT one change-event row and return its id. Does NOT commit.
+
+        *processed* stamps ``processed_at`` at birth, for an event that must
+        be recorded but must never be drained (ADR 0014 D4: the scope has
+        already refreshed for this change id, or the hop budget is spent).
+        """
+        event_id = _new_change_event_id()
+        self._conn.execute(
+            """
+            INSERT INTO change_events
+            (id, change_id, contribution_id, scope_id, source_scope_id, item_id, kind,
+             before, after, hop, processed_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    CASE WHEN ? THEN datetime('now') ELSE NULL END)
+            """,
+            (
+                event_id,
+                change_id,
+                contribution_id,
+                scope_id,
+                source_scope_id,
+                item_id,
+                kind,
+                before,
+                after,
+                hop,
+                # Same stamp shape mark_change_event_processed writes, so a
+                # born-processed event is indistinguishable from a drained one.
+                processed,
+            ),
+        )
+        return event_id
+
+    def append_change_notice(
+        self,
+        *,
+        scope_id: str,
+        content: str,
+        contributor: ContributorRef,
+        change_id: str,
+        source_scope_id: str | None,
+        item_id: str,
+        kind: str,
+        before: str | None = None,
+        after: str | None = None,
+        hop: int = 0,
+        processed: bool = False,
+    ) -> tuple[Contribution, ChangeEvent]:
+        """Append a change notice — both halves of one event — atomically.
+
+        ADR 0014 D5 makes the notice of an input change ONE thing with two
+        shapes: a ``subject="manager-refresh"`` contribution in the affected
+        scope's record (permanent, auditable, and the judge's input on the
+        refresh) and the :class:`ChangeEvent` row that is the same event
+        machine-readable. Writing them as two separate appends allowed a
+        half-written notice: a contribution nothing would ever judge, because
+        the drain finds work through ``change_events``, or an event whose
+        notice nobody can read. Both INSERTs go in one transaction here, so a
+        reader finds both or neither.
+
+        Args:
+            scope_id:        The affected scope — the notice lands in ITS
+                             record and the event names it as needing the
+                             refresh.
+            content:         The rendered change payload (mechanical — no LLM
+                             writes it, matching ADR 0013 D4b).
+            contributor:     Provenance for the notice contribution.
+            change_id:       The wave this event belongs to (ADR 0014 D4).
+            source_scope_id: The scope the changed item came FROM.
+            item_id:         The input item that changed.
+            kind:            What happened to it (the vocabulary migration
+                             0011 constrains).
+            before/after:    The item's previous and current state.
+            hop:             Derived hops from the originating change.
+            processed:       Stamp the event processed at birth — recorded,
+                             never drained (ADR 0014 D4).
+
+        Returns:
+            ``(contribution, event)``, the two halves of the notice written.
+
+        Raises:
+            sqlite3.Error: Nothing is written — the transaction rolls back,
+                so the notice never survives without its event.
+        """
+        with self._conn:  # one transaction: both rows, or neither
+            contribution_id = self._insert_contribution(
+                scope_id=scope_id,
+                content=content,
+                proposed_classification="context",
+                subject="manager-refresh",
+                supersedes=None,
+                contributor=contributor,
+            )
+            event_id = self._insert_change_event(
+                change_id=change_id,
+                contribution_id=contribution_id,
+                scope_id=scope_id,
+                source_scope_id=source_scope_id,
+                item_id=item_id,
+                kind=kind,
+                before=before,
+                after=after,
+                hop=hop,
+                processed=processed,
+            )
+        return self._fetch_contribution(contribution_id), self._fetch_change_event(event_id)
+
+    def list_change_events(
+        self, *, scope_id: str, unprocessed_only: bool = False
+    ) -> list[ChangeEvent]:
+        """Return *scope_id*'s change events, oldest first.
+
+        Args:
+            scope_id:         The affected scope whose events to read.
+            unprocessed_only: When True, return only events no refresh has
+                              processed yet — what the drain consumes and what
+                              the perspective's ``input_changes`` section
+                              carries (ADR 0014 D5/D6). The default returns
+                              every event, processed ones included: the record
+                              keeps them forever.
+        """
+        sql = """
+            SELECT id, change_id, contribution_id, scope_id, source_scope_id, item_id, kind,
+                   before, after, hop, processed_at, created_at
+            FROM change_events
+            WHERE scope_id = ?
+        """
+        if unprocessed_only:
+            sql += " AND processed_at IS NULL"
+        sql += " ORDER BY created_at ASC, rowid ASC"
+        rows = self._conn.execute(sql, (scope_id,)).fetchall()
+        return [ChangeEvent(**dict(row)) for row in rows]
+
+    def mark_change_event_processed(self, event_id: str) -> None:
+        """Mark *event_id* consumed by a refresh, whatever the verdict (ADR 0014 D5).
+
+        Idempotent: an event already carrying a ``processed_at`` keeps the
+        stamp it has, so a re-drained queue never rewrites when a scope was
+        actually brought up to date. Unknown ids are a no-op — the drain owns
+        the ids it marks, and a missing row is nothing to correct.
+        """
+        self._conn.execute(
+            """
+            UPDATE change_events
+            SET processed_at = datetime('now')
+            WHERE id = ? AND processed_at IS NULL
+            """,
+            (event_id,),
+        )
+        self._conn.commit()
+
+    def _fetch_change_event(self, event_id: str) -> ChangeEvent:
+        row = self._conn.execute(
+            """
+            SELECT id, change_id, contribution_id, scope_id, source_scope_id, item_id, kind,
+                   before, after, hop, processed_at, created_at
+            FROM change_events WHERE id = ?
+            """,
+            (event_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"Change event not found: {event_id!r}")
+        return ChangeEvent(**dict(row))
 
 
 # ---------------------------------------------------------------------------
