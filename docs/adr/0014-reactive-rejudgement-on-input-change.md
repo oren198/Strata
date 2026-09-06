@@ -83,6 +83,21 @@ provenance: this entered because input X changed.
 The engine never edits the scope's memory. Only the scope's judge does,
 exercising the scope's authority.
 
+> **Amended at the 1.11.0 gate (#198).** `publish` is dropped on an
+> input-change refresh as well as `append`. The memory-governance-bench run
+> showed the judge re-admitting every notice as the hearer's own material — a
+> peer's *note* republished as the hearer's binding *rule*, an ancestor's or
+> operator's directive republished "per inherited directive" — with the hearer
+> as origin, so a withdrawal at the source never reached the copy (D4b cascades
+> relays only). The changed input is already composed for every reader
+> (ADR 0013/0015); the refresh has nothing of its own to admit from it. The
+> amendment on this path is `new_context` (never restating the changed input),
+> `supersede`/`retire` of the scope's own directives, and `withdraw_published`
+> of its own face — ADR 0011 D4's shape with `withdraw_published` kept. The
+> rationale above ("a directive published from the notice carries honest
+> provenance") was true and beside the point: provenance was honest, authority
+> was manufactured.
+
 ### D3 — The affected set is topological, one rule for every kind of change
 
 The scopes affected by a change to item X are the scopes that compose X: for a
