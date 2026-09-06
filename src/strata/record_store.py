@@ -60,6 +60,7 @@ from __future__ import annotations
 import json
 import secrets
 import sqlite3
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -175,6 +176,11 @@ class Judgment:
     judged_by: str
     notes: str | None
     created_at: str
+    summary_version: int | None = None
+    """The summary ``version`` this judgment's amendment wrote (migration 0013).
+
+    Shared by every accepted row of one batch (ADR 0011 D3: one write);
+    ``None`` for a decline and for rows judged before the column existed."""
 
 
 #: The mechanical failed-judgment marker (issue #118).  Written on a
@@ -851,6 +857,23 @@ class RecordStore:
         self._conn.commit()
         return self._fetch_judgment(judgment_id)
 
+    def stamp_summary_version(self, contribution_ids: Sequence[str], *, version: int) -> None:
+        """Record on each judgment row the summary version its amendment wrote.
+
+        Called once per amendment, after the summary write, with every
+        contribution the amendment accepted — one id on the single path, the
+        batch's accepted members on the batch path (ADR 0011 D3), so a batch's
+        rows share one value. Declines are never stamped: they wrote nothing.
+        """
+        if not contribution_ids:
+            return
+        placeholders = ", ".join("?" for _ in contribution_ids)
+        self._conn.execute(
+            f"UPDATE judgments SET summary_version = ? WHERE contribution_id IN ({placeholders})",
+            (version, *contribution_ids),
+        )
+        self._conn.commit()
+
     def list_judgments(self, *, scope_id: str) -> list[Judgment]:
         """Return all judgments for contributions belonging to *scope_id*.
 
@@ -865,7 +888,8 @@ class RecordStore:
         """
         rows = self._conn.execute(
             """
-            SELECT j.id, j.contribution_id, j.decision, j.judged_by, j.notes, j.created_at
+            SELECT j.id, j.contribution_id, j.decision, j.judged_by, j.notes, j.created_at,
+                   j.summary_version
             FROM judgments j
             JOIN contributions c ON j.contribution_id = c.id
             WHERE c.scope_id = ?
@@ -884,7 +908,7 @@ class RecordStore:
         """
         row = self._conn.execute(
             """
-            SELECT id, contribution_id, decision, judged_by, notes, created_at
+            SELECT id, contribution_id, decision, judged_by, notes, created_at, summary_version
             FROM judgments WHERE contribution_id = ?
             """,
             (contribution_id,),
@@ -896,7 +920,7 @@ class RecordStore:
     def _fetch_judgment(self, judgment_id: str) -> Judgment:
         row = self._conn.execute(
             """
-            SELECT id, contribution_id, decision, judged_by, notes, created_at
+            SELECT id, contribution_id, decision, judged_by, notes, created_at, summary_version
             FROM judgments WHERE id = ?
             """,
             (judgment_id,),
@@ -1241,7 +1265,7 @@ class RecordStore:
         placeholders = ", ".join("?" for _ in contribution_ids)
         rows = self._conn.execute(
             f"""
-            SELECT id, contribution_id, decision, judged_by, notes, created_at
+            SELECT id, contribution_id, decision, judged_by, notes, created_at, summary_version
             FROM judgments
             WHERE contribution_id IN ({placeholders})
             ORDER BY created_at ASC, rowid ASC

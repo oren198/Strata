@@ -614,6 +614,7 @@ def _judge_and_record(
             retirements=[(d, judgment.reasoning) for d in judgment.retired_directive_ids],
             removals=[(d, contribution.id) for d in judgment.removed_directive_ids],
             withdraw_reasoning=judgment.reasoning,
+            judged_contribution_ids=[contribution.id],
         )
         summary_updated = True
 
@@ -636,6 +637,7 @@ def _write_amendment(
     retirements: Sequence[tuple[str, str]],
     removals: Sequence[tuple[str, str]],
     withdraw_reasoning: str,
+    judged_contribution_ids: Sequence[str],
 ) -> None:
     """Write an accepted amendment's summary and everything that follows from it.
 
@@ -670,7 +672,11 @@ def _write_amendment(
     # a backstop budget that restarts at zero on each derivation is not a
     # backstop.
     change_ids = judgment.wave_ids or [new_change_id()]
-    summary_store.write(scope.id, judgment.new_summary)
+    written = summary_store.write(scope.id, judgment.new_summary)
+    # Migration 0013: the record says which version this amendment wrote —
+    # one value on every accepted row, so a batch's N verdicts tie to their
+    # one write without anyone counting rows against `version`.
+    record_store.stamp_summary_version(judged_contribution_ids, version=written.version)
 
     # ADR 0011 D1: a `retire` op removes a directive with no replacement,
     # so no contribution row carries the explanation — the retirement
@@ -944,6 +950,7 @@ def _judge_batch_and_record(
             # as a whole, so it carries every accepted member's reasoning
             # rather than a guess at which one meant it.
             withdraw_reasoning=batch.batch_reasoning,
+            judged_contribution_ids=[v.contribution_id for v in batch.accepted_verdicts],
         )
         summary_updated = True
 

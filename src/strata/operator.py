@@ -756,7 +756,8 @@ def operator_supersede(
         to_write = current_summary.model_copy(
             update={"directives": new_directives, "updated_at": ts}
         )
-        summary_store.write(scope_id, to_write)
+        written = summary_store.write(scope_id, to_write)
+        record_store.stamp_summary_version([contribution.id], version=written.version)
 
         # ADR 0007 D3 mechanical propagation: the superseded directive's id
         # just vanished from the summary — withdraw any published item
