@@ -51,6 +51,20 @@ withdrawal. Termination is solved in D4, not by narrowing the trigger.
 
 A scope's own contribution is not a trigger; it already has a path.
 
+> **Amended at the 1.11.0 gate (#197).** A scope's own contribution is never a
+> *refresh* trigger for itself — its judge authored it, so there is nothing
+> left to reconcile — but a **retraction** IS notice to the scope's own
+> readers. When an amendment retires or supersedes one of the scope's own
+> directives, or withdraws one of its own published items, a change event is
+> written to the scope itself (`source_scope_id` = the scope), *born
+> processed*: no refresh is queued and `drain_is_noop` stays true. The reason
+> is the fleet premise itself — a scope is a mix of agents, not one mind, and
+> another agent in it may have read the item and acted on it. Silent removal
+> is how decay behaves; a retraction is a correction, and a correction owes
+> notice. Additions are outside this: nothing a reader already holds stops
+> being true when a directive is appended, and the reader's own next read
+> composes it.
+
 ### D2 — The trigger runs the manager-refresh path; `publish` allowed, `append` not
 
 > **Amendment (2026-09-06, ADR 0015 D1/D6):** the parent-splice refresh this
@@ -183,6 +197,23 @@ permanent auditable notice, the judge's input on the refresh, and mechanical
 it, whatever the verdict; the record keeps it forever. Notice is never left to
 the judge's prose — prose condenses away under a word budget, and notice that
 can vanish is not notice.
+
+> **Amended at the 1.11.0 gate (#203, #197).** "Notice is immediate; only
+> absorption is deferred" needs two things this decision left implicit,
+> because a read DRAINS before it composes (D6) and composition filtered to
+> unprocessed events — so a successful drain handed the agent a reconciled
+> summary and no notice at all, the reader who paid for the refresh being the
+> one reader never told.
+>
+> 1. **The read that drains shows what it drained.** `drain_scope` returns the
+>    events it processed; the read surface composes them into `input_changes`
+>    on that read, and they are gone on the next. A bind drains too, and hands
+>    them back on its own result in the same verbatim shape.
+> 2. **A notice with no refresh behind it is consumed by being shown, not by
+>    being drained.** The own-retraction notice of D1's amendment is born
+>    processed, so the drain will never consume it; it carries `shown_at`
+>    instead, and is composed until one read of the scope delivers it. One new
+>    column, no second queue.
 
 ### D6 — Refresh runs inside the MCP server, on read; no daemon, no CLI needed
 
