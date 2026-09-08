@@ -173,7 +173,14 @@ summary.
 > the removal the ops perform. The check is deliberately verbatim-only.
 > **Paraphrase is a prompt-only obligation** — no string check can reach
 > it, and a backstop that guessed would drop contexts the judge wrote
-> correctly, which costs the scope real memory.
+> correctly, which costs the scope real memory. One carve-out, for that
+> same reason: an EXTENSION supersession, where the new claim CONTAINS the
+> old one ("Use snake_case." → "Use snake_case. Also type hints."). The
+> replaced sentence is then in `new_context` because the LIVE claim says
+> it, and no rewrite could satisfy the check without mangling what the
+> scope now believes — so a target whose content is contained in the
+> contribution's own content is skipped. A transition narrative over a
+> target the contribution does not contain still fires.
 >
 > **#200 — "not a decision" is never a reason to decline context.** A judge
 > declined an observation it had just called "proper scope-appropriate

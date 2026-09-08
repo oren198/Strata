@@ -1812,12 +1812,21 @@ def _resurrected_superseded_claims(
     :data:`_SYSTEM_PROMPT`. A backstop that guessed at paraphrase would drop
     contexts the judge wrote correctly, and dropping a correct rewrite costs
     the scope real memory.
+
+    One carve-out, for the same reason: an EXTENSION supersession, where the
+    new claim CONTAINS the old one ("Use snake_case." → "Use snake_case. Also
+    type hints."). The replaced sentence is then in `new_context` because the
+    LIVE claim says it, not because the dead one was kept — nothing was
+    resurrected, and there is no rewrite that could satisfy the check without
+    mangling what the scope now believes. So a target whose content is
+    contained in the contribution's own content is skipped.
     """
     if judgment.new_summary is None or judgment.new_context is None:
         return []
     haystack = _collapse_whitespace(judgment.new_context)
     if not haystack:
         return []
+    admitted = _collapse_whitespace(contribution.content)
     return [
         target
         for target, content in _superseded_claim_contents(
@@ -1826,7 +1835,7 @@ def _resurrected_superseded_claims(
             current_summary=current_summary,
             recent_contributions=recent_contributions,
         ).items()
-        if _collapse_whitespace(content) in haystack
+        if (collapsed := _collapse_whitespace(content)) in haystack and collapsed not in admitted
     ]
 
 

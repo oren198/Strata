@@ -5323,3 +5323,71 @@ def test_budget_rewrite_may_not_resurrect_the_superseded_claim() -> None:
     assert judgment.new_context is None
     assert judgment.new_summary is not None
     assert judgment.new_summary.context == CURRENT_SUMMARY.context
+
+
+# -- extension supersession: the old text is present because the NEW claim
+#    contains it, not because the dead claim was kept (#199 carve-out) ------
+
+
+_EXTENSION_CONTRIBUTION = _contribution(
+    "c_ext01",
+    f"{EXISTING_DIRECTIVE.content} Also annotate every public function.",
+    subject="naming",
+)
+"""A supersession that EXTENDS its target: the old sentence is inside the new one."""
+
+_EXTENSION_OPS = [{"op": "supersede", "id": EXISTING_DIRECTIVE.id}, {"op": "append"}]
+
+
+def test_extension_supersession_is_not_treated_as_a_resurrection() -> None:
+    """The replaced text is in `new_context` because the NEW claim says it — one call, no drop."""
+    manager, mock_client = _make_manager(
+        {
+            "decision": "accept_as_directive",
+            "reasoning": "Extends the naming rule with annotations.",
+            "directive_ops": _EXTENSION_OPS,
+            "new_context": f"Style now covers: {_EXTENSION_CONTRIBUTION.content}",
+        }
+    )
+
+    judgment = manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=_EXTENSION_CONTRIBUTION,
+    )
+
+    assert mock_client.messages.create.call_count == 1
+    assert judgment.dropped_superseded_context is False
+    assert judgment.new_summary is not None
+    assert _EXTENSION_CONTRIBUTION.content in judgment.new_summary.context
+
+
+def test_extension_carve_out_does_not_excuse_a_transition_narrative() -> None:
+    """The contrast: a target the new contribution does NOT contain still fires."""
+    narrating = {
+        "decision": "accept_as_directive",
+        "reasoning": "Replaces the naming rule.",
+        "directive_ops": _EXTENSION_OPS,
+        "new_context": f"Previously: {EXISTING_DIRECTIVE.content} Now type hints are required.",
+    }
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [
+        _fake_response(narrating),
+        _fake_response({**narrating, "new_context": _CLEAN_CONTEXT}),
+    ]
+
+    # NEW_CONTRIBUTION is about type annotations and does not contain the
+    # superseded sentence, so nothing excuses the narration.
+    judgment = ScopeManager(client=mock_client).judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+    )
+
+    assert mock_client.messages.create.call_count == 2
+    assert judgment.new_summary is not None
+    assert judgment.new_summary.context == _CLEAN_CONTEXT
