@@ -95,6 +95,7 @@ def test_full_chain_drops_fleet_tables_and_preserves_record(tmp_path: Path) -> N
         "0011_change_event_kinds.sql",
         "0012_directive_unspliced_kind.sql",
         "0013_judgment_summary_version.sql",
+        "0014_change_event_shown_at.sql",
     ]
 
     # Fleet tables gone.
@@ -348,6 +349,7 @@ def test_idempotent_reapply(tmp_path: Path) -> None:
         "0011_change_event_kinds.sql",
         "0012_directive_unspliced_kind.sql",
         "0013_judgment_summary_version.sql",
+        "0014_change_event_shown_at.sql",
     ]
 
     second = run_migrations(db_path, migrations_dir=migrations_dir)
@@ -557,6 +559,7 @@ def test_crash_at_tracking_insert_rolls_back_script_too(
         "0011_change_event_kinds.sql",
         "0012_directive_unspliced_kind.sql",
         "0013_judgment_summary_version.sql",
+        "0014_change_event_shown_at.sql",
     ]
 
 
@@ -732,7 +735,8 @@ def test_0010_adds_change_events_table(tmp_path: Path) -> None:
     try:
         conn.execute("PRAGMA foreign_keys = ON")
         # 0010's own columns, plus `source_scope_id`, which 0011 adds when it
-        # rewrites the table for the kind CHECK.
+        # rewrites the table for the kind CHECK, and `shown_at`, which 0014
+        # adds for the one notice that owes a reader rather than a refresh.
         columns = {r[1] for r in conn.execute("PRAGMA table_info(change_events)").fetchall()}
         assert columns == {
             "id",
@@ -747,6 +751,7 @@ def test_0010_adds_change_events_table(tmp_path: Path) -> None:
             "hop",
             "processed_at",
             "created_at",
+            "shown_at",
         }
 
         conn.execute(
@@ -918,6 +923,7 @@ def test_0011_preserves_change_events_written_before_it(tmp_path: Path) -> None:
         "0011_change_event_kinds.sql",
         "0012_directive_unspliced_kind.sql",
         "0013_judgment_summary_version.sql",
+        "0014_change_event_shown_at.sql",
     ]
 
     conn = sqlite3.connect(db_path)

@@ -83,7 +83,7 @@ import sqlite3
 import tempfile
 from collections.abc import AsyncGenerator, Generator, Sequence
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Literal
 
@@ -1273,12 +1273,19 @@ class DrainOutcome:
     or a queue whose notices already carry verdicts. A caller reporting
     "refresh pending: N" reads ``events_processed``; it is never a count of
     judge outages (pin 4), which are a different thing entirely.
+
+    ``processed_events`` are those same events, in full. A read surface hands
+    them to :func:`~strata.perspective.compose_perspective` as
+    ``just_processed`` so the reader that paid for the refresh is TOLD what
+    changed on that read (ADR 0014 D5, issue #203) — composition filters to
+    unprocessed events, and the drain has just made these processed.
     """
 
     scope_id: str
     events_processed: int
     judged: bool
     outcomes: list[ContributionOutcome]
+    processed_events: list[ChangeEvent] = field(default_factory=list)
 
 
 def drain_is_noop(
@@ -1637,6 +1644,7 @@ def drain_scope(
                 events_processed=len(events),
                 judged=False,
                 outcomes=[],
+                processed_events=list(events),
             )
 
         change_ids = list(dict.fromkeys(event.change_id for event in events))
@@ -1679,6 +1687,9 @@ def drain_scope(
             events_processed=len(events),
             judged=True,
             outcomes=[r for r in results if isinstance(r, ContributionOutcome)],
+            # The events as they were BEFORE the marking above: what a read
+            # surface shows its reader on this very read (ADR 0014 D5, #203).
+            processed_events=list(events),
         )
 
 

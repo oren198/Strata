@@ -75,7 +75,7 @@ from strata.fleet_reload import FleetReloader
 from strata.locks import configure_lock_dir
 from strata.migrator import run_migrations
 from strata.operator import read_operator_layer
-from strata.perspective import compose_perspective
+from strata.perspective import change_event_dict, compose_perspective
 from strata.project_config import (
     ProjectConfigError,
     StoragePaths,
@@ -154,8 +154,8 @@ def _init_stores() -> None:
     _session_store = SessionStateStore(_sessions_dir)
 
 
-def _drain_for_read(fleet, scope_id: str) -> int:
-    """Bring *scope_id* up to date before it is read, and say what is still owed.
+def _drain_for_read(fleet, scope_id: str) -> tuple[int, list]:
+    """Bring *scope_id* up to date before it is read, and say what it did.
 
     ADR 0014 D6: the refresh queue is drained by the MCP server when a scope is
     bound or its perspective is read, BEFORE composition, so nobody can read a
@@ -173,10 +173,20 @@ def _drain_for_read(fleet, scope_id: str) -> int:
     of legacy copies (D5), neither of which needs a judge. The judged
     reconciliation is left pending for the first drain that has one.
 
-    Returns the number of change events still unprocessed AFTER the attempt:
-    ``0`` when the drain brought the scope up to date, and the outstanding
-    count when it could not. That count is a refresh queue depth, never a judge
-    outage (implementation pin 4) — the two are reported separately everywhere.
+    Returns ``(pending, processed_events)``.
+
+    *pending* is the number of change events still unprocessed AFTER the
+    attempt: ``0`` when the drain brought the scope up to date, and the
+    outstanding count when it could not. That count is a refresh queue depth,
+    never a judge outage (implementation pin 4) — the two are reported
+    separately everywhere.
+
+    *processed_events* are the events this drain consumed, and the caller owes
+    them to its reader on THIS call (ADR 0014 D5, issue #203): composition
+    filters to unprocessed events, so without them a successful drain would
+    hand the agent a reconciled summary and no notice at all — the one reader
+    who paid for the refresh being the one reader never told. Empty whenever
+    the drain processed nothing, including every path that returns early.
 
     Never raises. A read must not fail because a refresh could not run (pin 5):
     a judge outage leaves the events unprocessed, records its attempt rows
@@ -192,7 +202,7 @@ def _drain_for_read(fleet, scope_id: str) -> int:
     from strata.app import DrainFailed, drain_is_noop, drain_scope  # noqa: PLC0415
 
     if _record_store is None or _summary_store is None:
-        return 0
+        return 0, []
 
     # Nothing pending is nothing to do (ADR 0015 D6), and `drain_is_noop`
     # answers it lock-free: a quiet read must cost what reading a current
@@ -201,7 +211,7 @@ def _drain_for_read(fleet, scope_id: str) -> int:
     if drain_is_noop(
         scope_id, fleet=fleet, record_store=_record_store, summary_store=_summary_store
     ):
-        return 0
+        return 0, []
 
     pending = len(_record_store.list_change_events(scope_id=scope_id, unprocessed_only=True))
 
@@ -212,7 +222,7 @@ def _drain_for_read(fleet, scope_id: str) -> int:
     # — a judge that was never configured is not a judge outage
     # (implementation pin 4).
     if not (_settings.judge_api_key or _settings.anthropic_api_key):
-        drain_scope(
+        outcome = drain_scope(
             scope_id,
             fleet=fleet,
             record_store=_record_store,
@@ -222,7 +232,10 @@ def _drain_for_read(fleet, scope_id: str) -> int:
             window_verbatim_tail=_settings.window_verbatim_tail,
             recency_window_size=_settings.recency_window_size,
         )
-        return len(_record_store.list_change_events(scope_id=scope_id, unprocessed_only=True))
+        return (
+            len(_record_store.list_change_events(scope_id=scope_id, unprocessed_only=True)),
+            outcome.processed_events,
+        )
 
     try:
         outcome = drain_scope(
@@ -242,11 +255,14 @@ def _drain_for_read(fleet, scope_id: str) -> int:
             exc.error_class,
             exc.pending,
         )
-        return exc.pending
+        # Nothing was processed, so nothing is owed to this read as
+        # just-drained notice: the events stay unprocessed and compose as
+        # `input_changes` the ordinary way (pin 5).
+        return exc.pending, []
     # Floored at zero: an event can land between the count above and the
     # drain's own read, so the drain may properly process more than this call
     # saw. A negative "pending" would be a lie in the other direction.
-    return max(0, pending - outcome.events_processed)
+    return max(0, pending - outcome.events_processed), outcome.processed_events
 
 
 def _record_read(scope_id: str) -> None:
@@ -1994,7 +2010,7 @@ async def strata_bind(scope_id: str, skill: str | None = None, confirm: bool = F
     # actually happened — an unconfirmed switch returned above, and refreshing
     # a scope the session did not bind to would be a judge call nobody asked
     # for.
-    refresh_pending = _drain_for_read(fleet, _AGENT_SCOPE)
+    refresh_pending, drained = _drain_for_read(fleet, _AGENT_SCOPE)
 
     result = {
         "scope_id": _AGENT_SCOPE,
@@ -2002,6 +2018,13 @@ async def strata_bind(scope_id: str, skill: str | None = None, confirm: bool = F
         "session_id": _AGENT_SESSION_ID,
         "message": message,
     }
+    if drained:
+        # ADR 0014 D5, issue #203: a bind that drains is the surface that sees
+        # what the drain consumed, and the events are processed by the time the
+        # session's first read composes. Handing them back here is what keeps
+        # notice immediate across a bind — the same rows
+        # `strata_read_perspective` composes, in the same verbatim shape.
+        result["input_changes"] = [change_event_dict(e) for e in drained]
     if refresh_pending:
         # Present only when the drain left something owed — see
         # strata_read_perspective for why an absent key means "nothing owed".
@@ -2699,7 +2722,7 @@ async def strata_read_perspective(scope_id: str | None = None) -> dict:
 
     # ADR 0014 D6: drain BEFORE composing — the perspective an agent reads is
     # the one its refreshed memory produces, not the pre-refresh one.
-    refresh_pending = _drain_for_read(fleet, scope_id)
+    refresh_pending, drained = _drain_for_read(fleet, scope_id)
 
     # Read receipt (#110): a perspective read is attributed to its TARGET scope
     # (the scope whose perspective was requested), not fanned out to every
@@ -2741,7 +2764,23 @@ async def strata_read_perspective(scope_id: str | None = None) -> dict:
         operator_reader=_operator_reader,
         publication_reader=_publication_reader,
         change_event_reader=_change_event_reader,
+        # ADR 0014 D5, issue #203: what the drain above just consumed. Notice
+        # is immediate, only absorption is deferred — without this the reader
+        # whose read paid for the refresh is the one reader never told what
+        # changed, because composition filters to unprocessed events and the
+        # drain has just made these processed.
+        just_processed=drained,
     )
+    # Issue #197: a self-notice — the scope's own retraction — is composed
+    # until a read delivers it, and this read just did. Only the notices
+    # actually composed are stamped, and only when the READER is the scope
+    # itself: an entitled ancestor looking in is not the audience #197 names,
+    # and must not discharge a notice on the scope's behalf.
+    if scope_id == _AGENT_SCOPE:
+        _record_store.mark_self_notices_shown(
+            scope_id=scope_id,
+            contribution_ids=[e["contribution_id"] for e in perspective["input_changes"]],
+        )
     # What the drain could NOT bring up to date (ADR 0014 D6). Present only
     # when non-zero — the same discipline `fleet_notice` and `unbound_notice`
     # follow: a key that appears exactly when there is something to say, so an

@@ -50,8 +50,11 @@ Peer and extra-context layers never get an operator layer: operator memory
 binds a *chain*, and a peer's chain is not this reader's to compose.
 
 ADR 0014 D5 (reactive re-judgement, #186, Phase D) adds a top-level
-``input_changes`` key: the requested scope's own UNPROCESSED change events —
-verbatim rows, no prose — via an optional ``change_event_reader``. Absent a
+``input_changes`` key: the requested scope's own change events still owed to
+a reader — verbatim rows, no prose — via an optional ``change_event_reader``:
+the unprocessed ones, the ones this read's own drain just consumed
+(``just_processed``, issue #203) and the scope's own undelivered retraction
+notices (issue #197). Absent a
 reader the key is still present, honestly empty, matching how an unpublished
 scope's publication layer reads ``{"items": []}`` rather than being left out.
 
@@ -128,6 +131,7 @@ class _ChangeEventLike(Protocol):
     from reader callables, not from ``strata.record_store`` machinery.
     """
 
+    id: str
     change_id: str
     source_scope_id: str | None
     item_id: str
@@ -137,6 +141,7 @@ class _ChangeEventLike(Protocol):
     contribution_id: str
     processed_at: str | None
     created_at: str
+    shown_at: str | None
 
 
 #: Reads one scope's change events (ADR 0014 D5) — the reactive
@@ -150,8 +155,13 @@ class _ChangeEventLike(Protocol):
 ChangeEventReader = Callable[[str], Sequence[_ChangeEventLike]]
 
 
-def _change_event_dict(event: _ChangeEventLike) -> dict:
-    """Verbatim ``input_changes`` entry for one unprocessed change event (ADR 0014 D5).
+def change_event_dict(event: _ChangeEventLike) -> dict:
+    """Verbatim ``input_changes`` entry for one change event (ADR 0014 D5).
+
+    Public because ``strata_bind`` renders the events ITS drain consumed in
+    exactly this shape (issue #203) without composing a perspective: one
+    renderer, so the two surfaces cannot drift into two shapes of the same
+    notice.
 
     No prose, no derived fields — the same event the drain will process,
     machine-readable. ``scope_id`` is left out: it is always the requested
@@ -171,6 +181,20 @@ def _change_event_dict(event: _ChangeEventLike) -> dict:
         "created_at": event.created_at,
         "contribution_id": event.contribution_id,
     }
+
+
+def _composes_as_input_change(event: _ChangeEventLike, *, scope_id: str) -> bool:
+    """Is *event* still owed to this scope's readers (ADR 0014 D5)?
+
+    Unprocessed means a refresh is still owed and the notice with it. The one
+    processed event that still composes is a SELF-notice — the scope's own
+    retraction (issue #197), which owes no refresh at all (its own judge wrote
+    it) and so is born processed, but owes its readers one delivery: it carries
+    ``shown_at is None`` until a read hands it over.
+    """
+    if event.processed_at is None:
+        return True
+    return event.source_scope_id == scope_id and event.shown_at is None
 
 
 def _publication_item_dict(item: _PublishedItemLike) -> dict:
@@ -308,6 +332,7 @@ def compose_perspective(
     operator_reader: OperatorReader | None = None,
     publication_reader: PublicationReader | None = None,
     change_event_reader: ChangeEventReader | None = None,
+    just_processed: Sequence[_ChangeEventLike] = (),
 ) -> dict:
     """Compose *scope_id*'s perspective: own summary, ancestor directives, one-hop publications.
 
@@ -397,12 +422,26 @@ def compose_perspective(
             (processed or not — this function itself filters to
             ``processed_at is None``, oldest first by ``created_at``, never
             trusting the reader to have filtered). Each becomes a verbatim
-            ``input_changes`` entry (see :func:`_change_event_dict`) — the
+            ``input_changes`` entry (see :func:`change_event_dict`) — the
             reactive re-judgement notice, never prose. A processed event
             never appears, however the reader ordered or filtered its
-            results. ``None`` (the default) makes ``input_changes`` an
+            results — with ONE exception, and it is exception by construction
+            rather than by trust: a SELF-notice (``source_scope_id ==
+            scope_id``) whose ``shown_at`` is still ``None``. That is the
+            scope's own retraction (ADR 0014 D1 as amended, issue #197) —
+            born processed because its own judge wrote it and no refresh is
+            owed, composed until one read delivers it to the scope's readers.
+            Stamping it delivered is the CALLER's job; composing writes
+            nothing. ``None`` (the default) makes ``input_changes`` an
             honestly empty list, present but empty — the same discipline as
             an unpublished scope's ``{"items": []}``.
+        just_processed: ADR 0014 D5, issue #203. The change events the
+            caller's drain processed on THIS read, composed alongside the
+            unprocessed ones and deduplicated by event id. Without them the
+            reader whose read paid for the refresh is the one reader never
+            told what changed: the drain marks the events processed and the
+            filter above then hides exactly those. Notice is immediate; only
+            absorption is deferred.
 
     Returns:
         ``{scope_id: <requested>, layers: [{scope_id, stratum_id, relation,
@@ -528,10 +567,19 @@ def compose_perspective(
     # events never appear" must hold even against a reader that forgot to
     # filter or forgot to order).
     input_changes: list[dict] = []
-    if change_event_reader is not None:
-        events = [e for e in change_event_reader(scope_id) if e.processed_at is None]
+    if change_event_reader is not None or just_processed:
+        events = [
+            e
+            for e in (change_event_reader(scope_id) if change_event_reader is not None else [])
+            if _composes_as_input_change(e, scope_id=scope_id)
+        ]
+        # The events this read's own drain consumed (issue #203). Deduplicated
+        # by event id, since a caller may hand over both an unfiltered reader
+        # and the drain's own list.
+        seen = {e.id for e in events}
+        events.extend(e for e in just_processed if e.id not in seen)
         events.sort(key=lambda e: e.created_at)
-        input_changes = [_change_event_dict(e) for e in events]
+        input_changes = [change_event_dict(e) for e in events]
 
     return {
         "scope_id": scope_id,

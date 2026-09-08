@@ -290,12 +290,23 @@ def test_one_withdrawal_on_a_reference_cycle_refreshes_each_scope_once(
 
         # D4 bounds the REFRESH, never the NOTICE: B was told a second time
         # and the row was stamped processed at birth (ADR 0014 D5).
-        b_events = record_store.list_change_events(scope_id="g_cycB")
+        b_events = [
+            e
+            for e in record_store.list_change_events(scope_id="g_cycB")
+            # B's own retraction notices to its own readers (issue #197) are
+            # not part of THIS guarantee: they are notice rather than trigger,
+            # and they never reach the drain.
+            if e.source_scope_id != "g_cycB"
+        ]
         assert len(b_events) == 3
         assert all(e.processed_at is not None for e in b_events)
 
         # The hop count travels with the wave, so D4's backstop budget
         # covers the cycle instead of restarting at zero on every derivation.
         assert [e.hop for e in b_events] == [0, 2, 2]
-        a_events = record_store.list_change_events(scope_id="g_cycA")
+        a_events = [
+            e
+            for e in record_store.list_change_events(scope_id="g_cycA")
+            if e.source_scope_id != "g_cycA"  # A's own notices to its readers (#197)
+        ]
         assert [e.hop for e in a_events] == [1, 1]

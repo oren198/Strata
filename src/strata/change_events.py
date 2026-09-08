@@ -66,6 +66,20 @@ _logger = logging.getLogger("strata.change_events")
 PUBLICATION_KINDS = frozenset({"published", "amended", "withdrawn"})
 """Changes to a scope's outward face — one-hop readers are affected."""
 
+RETRACTION_KINDS = frozenset({"withdrawn", "directive_retired", "directive_superseded"})
+"""The kinds that take something AWAY from what a reader already holds.
+
+ADR 0014 D1 says a scope's own contribution is never a REFRESH trigger for
+itself — it already has a path. It is still notice to the scope's own READERS
+when it retracts (issue #197): a scope is a mix of agents, not one mind, and
+another agent in it may have read the item and acted on it. Silent removal is
+how decay behaves; a retraction is a correction, and a correction owes notice.
+
+Additions are deliberately outside this set. Nothing a reader holds stops being
+true when a directive is appended, and its own next read composes the addition
+anyway.
+"""
+
 DIRECTIVE_KINDS = frozenset({"directive_appended", "directive_superseded", "directive_retired"})
 
 #: The one-off unsplice of a legacy spliced row (ADR 0015 D5). NOT in
@@ -426,7 +440,102 @@ def emit(
                 affected_scope_id=scope_id,
             )
 
+    if kind in RETRACTION_KINDS and source_scope_id not in scope_ids:
+        # ADR 0014 D1 as amended (issue #197): the retracting scope's OWN
+        # readers are inside the audience of the retraction. Skipped when the
+        # source is already in the affected set — an operator correction
+        # (`by_operator`, OPERATOR_DIRECTIVE_CHANGED) reaches the scope as an
+        # ordinary refresh trigger, and a second row would be the same notice
+        # twice.
+        _emit_self_notice(
+            record_store,
+            change_ids=change_ids,
+            item=item,
+            kind=kind,
+            source_scope_id=source_scope_id,
+            before=before,
+            after=after,
+            hop=hop,
+        )
+
     return change_ids
+
+
+def _emit_self_notice(
+    record_store: RecordStore,
+    *,
+    change_ids: Sequence[str],
+    item: str,
+    kind: str,
+    source_scope_id: str,
+    before: str | None,
+    after: str | None,
+    hop: int,
+) -> None:
+    """Tell the retracting scope's own readers what it just took away (issue #197).
+
+    Born processed, and that is the whole distinction ADR 0014 D1 now draws:
+    the scope's own judge authored this retraction, so nothing is owed a
+    refresh — ``drain_is_noop`` stays True and no judge is ever woken by it —
+    while the row is still composed into the scope's ``input_changes`` until a
+    read delivers it (``awaiting_show``). A notice for readers, not for a
+    refresh.
+
+    Written on the SOURCE's own row rather than through
+    :func:`affected_scopes`, which answers a different question (who composes
+    this item) and would have to grow a special case to answer this one.
+
+    A relayed withdrawal self-notices its relaying scope too: the relay is that
+    scope's own published face, and its readers relied on it exactly as they
+    would on an original.
+
+    Never raises, for :func:`emit`'s reason: the retraction already happened.
+    """
+    for change_id in change_ids:
+        try:
+            if any(
+                _is_self_notice(event) and event.change_id == change_id and event.item_id == item
+                for event in record_store.list_change_events(scope_id=source_scope_id)
+            ):
+                # This item, under this wave, has already been announced to the
+                # scope's own readers — a cascade revisiting it adds nothing.
+                # Its own check rather than `_prior_notices`, which deliberately
+                # cannot see a self-notice.
+                continue
+            record_store.append_change_notice(
+                scope_id=source_scope_id,
+                content=_render_notice(
+                    change_id=change_id,
+                    item=item,
+                    kind=kind,
+                    source_scope_id=source_scope_id,
+                    before=before,
+                    after=after,
+                    note=(
+                        "this scope's own retraction — recorded for its readers, not "
+                        "enqueued for a refresh: the scope's judge authored it "
+                        "(ADR 0014 D1, as amended by issue #197)"
+                    ),
+                ),
+                contributor=_notice_contributor(source_scope_id),
+                change_id=change_id,
+                source_scope_id=source_scope_id,
+                item_id=item,
+                kind=kind,
+                before=before,
+                after=after,
+                hop=hop,
+                processed=True,
+                awaiting_show=True,
+            )
+        except Exception:  # noqa: BLE001 — one scope's notice, not the act
+            _logger.exception(
+                "failed to record the own-scope notice for change %s (%s of %s in %s)",
+                change_id,
+                kind,
+                item,
+                source_scope_id,
+            )
 
 
 def _prior_notices(
@@ -441,17 +550,36 @@ def _prior_notices(
     ``refreshed`` is True when ANY row for this change id has been processed
     — the scope's one refresh for this wave has already run (ADR 0014 D4), so
     a further notice is recorded but never enqueued.
+
+    A SELF-notice (:func:`_is_self_notice`) counts for neither. It was never a
+    refresh trigger — the scope's own judge wrote the retraction it announces —
+    so reading it as "this scope has already refreshed for this wave" would
+    silence a real notice arriving later in the same wave: exactly what happens
+    on a reference cycle, where a scope's own withdrawal comes back to it as a
+    peer's reaction under the same change id.
     """
     announced = False
     refreshed = False
     for event in record_store.list_change_events(scope_id=scope_id):
-        if event.change_id != change_id:
+        if event.change_id != change_id or _is_self_notice(event):
             continue
         if event.item_id == item:
             announced = True
         if event.processed_at is not None:
             refreshed = True
     return announced, refreshed
+
+
+def _is_self_notice(event) -> bool:  # noqa: ANN001 — a ChangeEvent, without the import cycle
+    """Is *event* a scope's notice of its OWN retraction (issue #197)?
+
+    Two facts, and no new column: the changed item came from the scope the
+    event belongs to, and the row was processed at birth. An ordinary event
+    fails the first test; the one other kind that reaches its own source — an
+    operator correction, which the scope is a READER of rather than the author
+    of — fails the second, because it is enqueued for a real refresh.
+    """
+    return event.source_scope_id == event.scope_id and event.processed_at is not None
 
 
 def _suppression_note(
