@@ -12,6 +12,7 @@ Decision 2 tests (parent summary in user message):
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import os
@@ -4603,3 +4604,278 @@ def test_batch_hop_reaches_a_real_batch() -> None:
     mock_client.messages.create.return_value = _fake_response(_batch_input())
 
     assert _judge_batch(mock_client, change_ids=["chg_a"], hop=2).hop == 2
+
+
+# ---------------------------------------------------------------------------
+# Issue #201 — judge protocol slips: a missing op id defaulted from the
+# contribution, and one corrective re-ask for the remaining slip shapes.
+# Both are protocol robustness (ADR 0011 D1's one-retry discipline), never a
+# judging change.
+# ---------------------------------------------------------------------------
+
+
+def _contribution_superseding(target_id: str) -> Contribution:
+    """A contribution whose record names the directive it replaces."""
+    return dataclasses.replace(NEW_CONTRIBUTION, supersedes=target_id)
+
+
+def _fake_prose_response(text: str = "Here is my judgment in prose.") -> MagicMock:
+    """A response carrying no tool_use block at all — slip shape (a)."""
+    block = MagicMock()
+    block.type = "text"
+    block.text = text
+
+    response = MagicMock()
+    response.content = [block]
+    return response
+
+
+def test_supersede_op_with_no_id_takes_it_from_the_contribution() -> None:
+    """#201: the record already names the target, so the op is repaired, not rejected."""
+    contribution = _contribution_superseding(EXISTING_DIRECTIVE.id)
+    manager, mock_client = _make_manager(
+        {
+            "decision": "accept_as_directive",
+            "reasoning": "replaces the old rule",
+            "directive_ops": [{"op": "supersede"}, {"op": "append"}],
+            "new_context": None,
+        }
+    )
+
+    judgment = manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=contribution,
+    )
+
+    # Exactly one call: the default is mechanical, never a re-ask.
+    assert mock_client.messages.create.call_count == 1
+    supersede = next(op for op in judgment.directive_ops if op.op == "supersede")
+    assert supersede.id == EXISTING_DIRECTIVE.id
+    assert judgment.removed_directive_ids == [EXISTING_DIRECTIVE.id]
+    assert EXISTING_DIRECTIVE.id in judgment.record_notes
+    assert "supersedes" in judgment.record_notes
+
+
+def test_retire_op_with_no_id_and_no_supersedes_still_fails() -> None:
+    """No target in the record leaves the op invalid exactly as before."""
+    bad = {
+        "decision": "accept_as_directive",
+        "reasoning": "dropping the old rule",
+        "directive_ops": [{"op": "retire"}],
+        "new_context": None,
+    }
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [_fake_response(bad), _fake_response(bad)]
+    manager = ScopeManager(client=mock_client)
+
+    with pytest.raises(ValueError, match="retire op with no id"):
+        manager.judge(
+            scope=SCOPE,
+            stratum=STRATUM,
+            current_summary=CURRENT_SUMMARY,
+            recent_contributions=[],
+            new_contribution=NEW_CONTRIBUTION,
+        )
+
+
+def test_batch_supersede_op_with_no_id_takes_it_from_its_member() -> None:
+    """#201, batch path: the op's own member names the target (ADR 0011 D3)."""
+    superseding = _contribution_superseding(EXISTING_DIRECTIVE.id)
+    batch = [superseding, SECOND_CONTRIBUTION, THIRD_CONTRIBUTION]
+    mock_client = MagicMock()
+    mock_client.messages.create.return_value = _fake_response(
+        _batch_input(
+            directive_ops=[
+                {"op": "supersede", "contribution_id": superseding.id},
+                {"op": "append", "contribution_id": superseding.id},
+                {"op": "append", "contribution_id": SECOND_CONTRIBUTION.id},
+            ]
+        )
+    )
+
+    judgment = _judge_batch(mock_client, contributions=batch)
+
+    assert mock_client.messages.create.call_count == 1
+    supersede = next(op for op in judgment.directive_ops if op.op == "supersede")
+    assert supersede.id == EXISTING_DIRECTIVE.id
+    notes = judgment.record_notes_for(superseding.id)
+    assert EXISTING_DIRECTIVE.id in notes
+    assert "supersedes" in notes
+
+
+def test_batch_supersede_op_with_no_id_and_no_supersedes_still_fails() -> None:
+    """A member naming no target leaves the op invalid, as today."""
+    payload = _batch_input(
+        directive_ops=[
+            {"op": "supersede", "contribution_id": NEW_CONTRIBUTION.id},
+            {"op": "append", "contribution_id": NEW_CONTRIBUTION.id},
+        ]
+    )
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [
+        _fake_response(payload),
+        _fake_response(payload),
+    ]
+
+    with pytest.raises(ValueError, match="supersede op with no id"):
+        _judge_batch(mock_client)
+
+
+def test_no_tool_use_block_gets_one_corrective_reask() -> None:
+    """Slip (a): prose instead of a tool call earns one correction, then parses."""
+    prose = _fake_prose_response()
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [
+        prose,
+        _fake_response(_accept_directive_input()),
+    ]
+    manager = ScopeManager(client=mock_client)
+
+    judgment = manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+    )
+
+    assert mock_client.messages.create.call_count == 2
+    assert judgment.decision == "accept_as_directive"
+
+    second_messages = mock_client.messages.create.call_args_list[1].kwargs["messages"]
+    assert second_messages[1] == {"role": "assistant", "content": prose.content}
+    followup = second_messages[2]
+    assert followup["role"] == "user"
+    # No tool_use block means there is no tool_use id to answer with a result.
+    assert all(b["type"] == "text" for b in followup["content"])
+    assert "Respond only by calling" in followup["content"][0]["text"]
+    assert "submit_judgment" in followup["content"][0]["text"]
+    # The re-ask is on the record, exactly as a dropped op would be.
+    assert "re-ask" in judgment.record_notes
+
+
+def test_no_tool_use_block_twice_still_raises() -> None:
+    """One retry, never a loop: the second slip fails exactly as today."""
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [
+        _fake_prose_response(),
+        _fake_prose_response(),
+    ]
+    manager = ScopeManager(client=mock_client)
+
+    with pytest.raises(ValueError, match="tool_use"):
+        manager.judge(
+            scope=SCOPE,
+            stratum=STRATUM,
+            current_summary=CURRENT_SUMMARY,
+            recent_contributions=[],
+            new_contribution=NEW_CONTRIBUTION,
+        )
+
+    assert mock_client.messages.create.call_count == 2
+
+
+def test_decline_with_amendment_corrective_asks_for_a_clean_decline() -> None:
+    """Slip (c): the correction names the two ways out, and the retry recovers."""
+    slip = {
+        "decision": "decline",
+        "reasoning": "outside this scope's entitlement",
+        "directive_ops": [{"op": "append"}],
+        "new_context": "something",
+    }
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [
+        _fake_response(slip),
+        _fake_response(
+            {
+                "decision": "decline",
+                "reasoning": "outside this scope's entitlement",
+                "directive_ops": [],
+                "new_context": None,
+            }
+        ),
+    ]
+    manager = ScopeManager(client=mock_client)
+
+    judgment = manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+    )
+
+    assert mock_client.messages.create.call_count == 2
+    assert judgment.decision == "decline"
+    assert "re-ask" in judgment.record_notes
+
+    followup = mock_client.messages.create.call_args_list[1].kwargs["messages"][2]
+    text = next(b["text"] for b in followup["content"] if b["type"] == "text")
+    assert "empty amendment" in text
+    assert "accept" in text
+
+
+def test_unparseable_ops_corrective_echoes_the_op_schema() -> None:
+    """Slip (b): the correction echoes what an op is, and the retry recovers."""
+    garbage = {
+        "decision": "accept_as_directive",
+        "reasoning": "a clear standard",
+        "directive_ops": "not a list at all",
+        "new_context": None,
+    }
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [
+        _fake_response(garbage),
+        _fake_response(_accept_directive_input()),
+    ]
+    manager = ScopeManager(client=mock_client)
+
+    judgment = manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+    )
+
+    assert mock_client.messages.create.call_count == 2
+    followup = mock_client.messages.create.call_args_list[1].kwargs["messages"][2]
+    text = next(b["text"] for b in followup["content"] if b["type"] == "text")
+    assert "`op` field" in text
+    assert "re-ask" in judgment.record_notes
+
+
+def test_a_clean_first_answer_makes_exactly_one_call_and_notes_nothing() -> None:
+    """Vacuous-pass guard: no slip, no extra call, no protocol note."""
+    manager, mock_client = _make_manager(_accept_directive_input())
+
+    judgment = manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+    )
+
+    assert mock_client.messages.create.call_count == 1
+    assert "re-ask" not in judgment.record_notes
+    assert judgment.record_notes == judgment.reasoning
+
+
+def test_batch_no_tool_use_block_gets_one_corrective_reask() -> None:
+    """The same one-retry protocol correction on the batch path (ADR 0011 D3)."""
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [
+        _fake_prose_response(),
+        _fake_response(_batch_input()),
+    ]
+
+    judgment = _judge_batch(mock_client)
+
+    assert mock_client.messages.create.call_count == 2
+    followup = mock_client.messages.create.call_args_list[1].kwargs["messages"][2]
+    assert "submit_batch_judgment" in followup["content"][0]["text"]
+    assert "re-ask" in judgment.record_notes_for(NEW_CONTRIBUTION.id)
