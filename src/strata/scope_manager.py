@@ -1096,7 +1096,11 @@ _OP_KINDS = (*_ADMITTING_OPS, *_ID_ADDRESSED_OPS)
 _BATCH_DECISIONS = ("accept_as_directive", "accept_as_context", "decline")
 
 
-def _parse_directive_ops(raw_ops) -> list[DirectiveOp]:  # noqa: ANN001 — raw tool-call field
+def _parse_directive_ops(  # noqa: ANN001 — raw tool-call field
+    raw_ops,
+    *,
+    supersedes_for: Callable[[DirectiveOp], str | None] = lambda _op: None,
+) -> tuple[list[DirectiveOp], list[str]]:
     """Parse the ``directive_ops`` field of a ``submit_judgment`` payload.
 
     Coerces the issue #113 stringification failure modes (the whole list, or
@@ -1106,16 +1110,31 @@ def _parse_directive_ops(raw_ops) -> list[DirectiveOp]:  # noqa: ANN001 — raw 
     without an ``append`` or a ``publish`` in the same amendment is a
     retirement wearing the wrong name (ADR 0011 D1).
 
+    Missing-id default (issue #201): a ``supersede`` or ``retire`` op that
+    names no ``id`` takes it from the contribution the op belongs to, when
+    that contribution's record carries ``supersedes``. The judge said which
+    operation; the record already said what it replaces, unambiguously — so
+    the op is repaired rather than costing the contribution its verdict.
+    *supersedes_for* resolves an op to that contribution's ``supersedes``:
+    the contribution under judgment on the single path, the member the op's
+    ``contribution_id`` names in a batch (ADR 0011 D3). A contribution naming
+    no target leaves the op invalid exactly as before.
+
+    Returns:
+        The parsed ops, and the mechanical notes for any id defaulted this
+        way — rendered into the judgment's record notes beside a dropped op's.
+
     Raises:
         ValueError: with a message the parse re-ask can echo back.
     """
+    notes: list[str] = []
     if isinstance(raw_ops, str):
         raw_ops = _coerce_json_list(
             raw_ops,
             "submit_judgment returned directive_ops as an unparseable string.",
         )
     if raw_ops is None:
-        return []
+        return [], notes
     if not isinstance(raw_ops, list):
         raise ValueError("submit_judgment returned directive_ops as neither a list nor null.")
 
@@ -1150,10 +1169,22 @@ def _parse_directive_ops(raw_ops) -> list[DirectiveOp]:  # noqa: ANN001 — raw 
                 "carries the directive text in the judge's own words."
             )
         if op.op in _ID_ADDRESSED_OPS and not (op.id or "").strip():
-            raise ValueError(
-                f"submit_judgment returned a {op.op} op with no id; {op.op} names the "
-                "directive it removes."
-            )
+            # Issue #201: the record names the target — take it, and note it.
+            defaulted = (supersedes_for(op) or "").strip()
+            if defaulted:
+                op = op.model_copy(update={"id": defaulted})
+                # In a batch the note names the member it was read from, so a
+                # call-level note stays legible on every row (ADR 0011 D3).
+                owner = f" ({op.contribution_id})" if op.contribution_id else ""
+                notes.append(
+                    f"{op.op} op took its id from the contribution's"
+                    f"{owner} supersedes: {defaulted}"
+                )
+            else:
+                raise ValueError(
+                    f"submit_judgment returned a {op.op} op with no id; {op.op} names the "
+                    "directive it removes."
+                )
         ops.append(op)
 
     if any(op.op == "supersede" for op in ops) and not any(op.op in _ADMITTING_OPS for op in ops):
@@ -1162,7 +1193,7 @@ def _parse_directive_ops(raw_ops) -> list[DirectiveOp]:  # noqa: ANN001 — raw 
             "same amendment. Supersession replaces: an unpaired supersede is a "
             "retirement — use a retire op instead."
         )
-    return ops
+    return ops, notes
 
 
 def _parse_batch_verdicts(raw_verdicts, *, batch_ids: Sequence[str]) -> list[BatchVerdict]:  # noqa: ANN001 — raw tool-call field
@@ -1455,6 +1486,17 @@ class _AmendmentJudgment(BaseModel):
     the amendment may carry context and lifecycle ops only (ADR 0011 D4).
     Either way the drop is noted in :attr:`record_notes`."""
 
+    protocol_notes: list[str] = Field(default_factory=list)
+    """What the engine repaired about the judge's PROTOCOL, not its judgment.
+
+    Issue #201: an id defaulted from the contribution's ``supersedes``, and
+    the one corrective re-ask a protocol slip earns (a response with no
+    ``tool_use`` block, unparseable ``directive_ops``, a ``decline`` carrying
+    an amendment). Kept apart from :attr:`dropped_ops` for the reason its
+    siblings are: a dropped op is amendment the engine did not apply, while
+    these are the judgment the engine had to work to obtain. Noted in
+    :attr:`record_notes` either way."""
+
     dropped_new_context: bool = False
     """Did the engine drop a ``new_context`` the judge sent (ADR 0014 D2)?
 
@@ -1643,6 +1685,16 @@ def _unattributed_operator_echoes(
     ]
 
 
+def _with_protocol_notes(reasoning: str, protocol_notes: Sequence[str]) -> str:
+    """Return *reasoning* plus a mechanical note per protocol repair (#201).
+
+    The fourth sibling of :func:`_with_dropped_note` and the two beside it,
+    kept apart for the same reason they are: what the engine repaired about
+    the judge's protocol is a different fact from what it declined to apply.
+    """
+    return "".join([reasoning, *(f" [{note}]" for note in protocol_notes)])
+
+
 def _with_dropped_note(reasoning: str, dropped_ops: Sequence[str]) -> str:
     """Return *reasoning* plus the mechanical note naming the dropped ops.
 
@@ -1677,15 +1729,19 @@ class ScopeManagerJudgment(_AmendmentJudgment):
         The judge's reasoning, plus a mechanical note naming every op that did
         not apply (see :attr:`dropped_ops`) — the record has to show which
         part of the amendment the engine dropped — another naming every
-        declared source the judge was never shown (ADR 0014 D3), and one more
-        when the refresh locked the context (ADR 0014 D2).
+        declared source the judge was never shown (ADR 0014 D3), one more
+        when the refresh locked the context (ADR 0014 D2), and one per
+        protocol repair (issue #201).
         """
-        return _with_dropped_context_note(
-            _with_dropped_sources_note(
-                _with_dropped_note(self.reasoning, self.dropped_ops),
-                self.dropped_context_sources,
+        return _with_protocol_notes(
+            _with_dropped_context_note(
+                _with_dropped_sources_note(
+                    _with_dropped_note(self.reasoning, self.dropped_ops),
+                    self.dropped_context_sources,
+                ),
+                self.dropped_new_context,
             ),
-            self.dropped_new_context,
+            self.protocol_notes,
         )
 
 
@@ -1801,7 +1857,10 @@ class ScopeManagerBatchJudgment(_AmendmentJudgment):
             # Same rule, same reason: the amendment is the batch's one
             # amendment, so a locked context is news on every accepted row.
             notes = _with_dropped_context_note(notes, self.dropped_new_context)
-        return notes
+        # Issue #201: a protocol repair is a fact about the CALL — one re-ask
+        # obtained the whole payload, one op read its id off one member — so
+        # it is noted on every row, declines included, like a dropped source.
+        return _with_protocol_notes(notes, self.protocol_notes)
 
 
 class PublicationJudgment(BaseModel):
@@ -3203,6 +3262,7 @@ class ScopeManager:
                 hop=judgment.hop,
                 context_sources=judgment.context_sources,
                 dropped_context_sources=judgment.dropped_context_sources,
+                protocol_notes=judgment.protocol_notes,
             )
 
         contributions = {c.id: c for c in new_contributions}
@@ -3332,7 +3392,15 @@ class ScopeManager:
         batch_ids = list(contributions)
 
         verdicts = _parse_batch_verdicts(raw.get("verdicts"), batch_ids=batch_ids)
-        ops = _parse_directive_ops(raw.get("directive_ops"))
+        # Issue #201: an id-addressed op with no id reads it off the member it
+        # names — an op whose contribution_id is missing or unknown resolves to
+        # nothing and stays invalid, as before.
+        ops, protocol_notes = _parse_directive_ops(
+            raw.get("directive_ops"),
+            supersedes_for=lambda op: getattr(
+                contributions.get(op.contribution_id or ""), "supersedes", None
+            ),
+        )
         new_context = _parse_new_context(raw.get("new_context"))
 
         # ADR 0007 D3/D5, exactly as on the single path: always a list, never
@@ -3364,6 +3432,7 @@ class ScopeManager:
                 withdraw_published=withdraw_published,
                 change_ids=list(change_ids),
                 hop=hop,
+                protocol_notes=protocol_notes,
             )
 
         dropped: list[str] = []
@@ -3421,6 +3490,7 @@ class ScopeManager:
             hop=hop,
             context_sources=context_sources,
             dropped_context_sources=dropped_sources,
+            protocol_notes=protocol_notes,
         )
 
     @staticmethod
@@ -3546,7 +3616,12 @@ class ScopeManager:
         decision: str = raw["decision"]
         reasoning: str = raw["reasoning"]
 
-        ops = _parse_directive_ops(raw.get("directive_ops"))
+        # Issue #201: an id-addressed op with no id reads it off the
+        # contribution under judgment, whose record names what it replaces.
+        ops, protocol_notes = _parse_directive_ops(
+            raw.get("directive_ops"),
+            supersedes_for=lambda _op: new_contribution.supersedes,
+        )
         new_context = _parse_new_context(raw.get("new_context"))
 
         # ADR 0007 D3/D5: published item ids this amendment invalidates. Parsed
@@ -3580,6 +3655,7 @@ class ScopeManager:
                 withdraw_published=withdraw_published,
                 change_id=change_id,
                 hop=hop,
+                protocol_notes=protocol_notes,
             )
 
         context_sources, dropped_sources = _validate_context_sources(
@@ -3627,6 +3703,7 @@ class ScopeManager:
             hop=hop,
             context_sources=context_sources,
             dropped_context_sources=dropped_sources,
+            protocol_notes=protocol_notes,
         )
 
     # ------------------------------------------------------------------
