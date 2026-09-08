@@ -1096,6 +1096,24 @@ _OP_KINDS = (*_ADMITTING_OPS, *_ID_ADDRESSED_OPS)
 _BATCH_DECISIONS = ("accept_as_directive", "accept_as_context", "decline")
 
 
+class _NoToolUseBlock(ValueError):
+    """The judge answered in prose instead of calling its tool (issue #201).
+
+    A ``ValueError`` subclass, not a new exception kind: callers and the app
+    path (:class:`strata.app.JudgeUnavailable`) still see exactly what they
+    saw before. The type exists only so the one corrective re-ask can name
+    the slip it is correcting instead of matching on message text.
+    """
+
+
+class _DeclineWithAmendment(ValueError):
+    """A ``decline`` verdict that nonetheless carried an amendment (issue #201).
+
+    Sibling of :class:`_NoToolUseBlock`, for the same reason and with the same
+    ``ValueError`` visibility.
+    """
+
+
 def _parse_directive_ops(  # noqa: ANN001 — raw tool-call field
     raw_ops,
     *,
@@ -1177,8 +1195,7 @@ def _parse_directive_ops(  # noqa: ANN001 — raw tool-call field
                 # call-level note stays legible on every row (ADR 0011 D3).
                 owner = f" ({op.contribution_id})" if op.contribution_id else ""
                 notes.append(
-                    f"{op.op} op took its id from the contribution's"
-                    f"{owner} supersedes: {defaulted}"
+                    f"{op.op} op took its id from the contribution's{owner} supersedes: {defaulted}"
                 )
             else:
                 raise ValueError(
@@ -2735,11 +2752,19 @@ class ScopeManager:
         ``new_context``.  The second response is used regardless of whether
         it now fits — there is only ever one retry, never a loop.
 
-        Parse re-ask (issue #113): if the first response's ``submit_judgment``
-        payload fails to parse — a stringified ``directive_ops``, an unpaired
-        ``supersede`` op — the manager makes exactly ONE corrective follow-up
-        call echoing the parse error and parses the second response.  A second
-        parse failure propagates — there is only ever one retry, never a loop.
+        Protocol re-ask (issue #113, extended by #201): if the first response
+        is not a usable ``submit_judgment`` payload — no ``tool_use`` block at
+        all, a stringified ``directive_ops``, an unpaired ``supersede`` op, a
+        ``decline`` carrying an amendment — the manager makes exactly ONE
+        corrective follow-up call naming the slip and parses the second
+        response.  A second slip propagates — there is only ever one retry,
+        never a loop — and the re-ask is noted in
+        :attr:`ScopeManagerJudgment.record_notes`.
+
+        Missing-id default (issue #201, ADR 0011 D1): a ``supersede`` or
+        ``retire`` op with no ``id`` takes it from *new_contribution*'s
+        ``supersedes`` before any of that — the record already names the
+        target — and the default is noted in the same place.
 
         Invalid-id corrective (ADR 0011 D1): if an op names a directive id
         that is not in *current_summary* (unknown, or already retired), the
@@ -2761,10 +2786,10 @@ class ScopeManager:
         still budget-checked.
 
         Raises:
-            ValueError: If the model response is missing the ``tool_use``
-                block, or if the verdict is internally inconsistent (e.g.
-                ``decline`` carrying an amendment, or an unpaired
-                ``supersede`` op).
+            ValueError: If the model response is STILL missing the
+                ``tool_use`` block after its one corrective re-ask, or the
+                verdict is still internally inconsistent (e.g. ``decline``
+                carrying an amendment, or an unpaired ``supersede`` op).
         """
         # Fail with an actionable message when no API key is available — the
         # SDK's own error never names the env var the user needs.
@@ -2920,7 +2945,10 @@ class ScopeManager:
         """Run one judgment call and its correctives, one retry each.
 
         The orchestration both judgment modes share (ADR 0011 D1/D3): the
-        forced tool call, the parse re-ask (#113), the invalid-id corrective
+        forced tool call, the protocol re-ask (#113, extended to every slip
+        shape by #201 — a response with no ``tool_use`` block, unparseable
+        ``directive_ops``, a ``decline`` carrying an amendment — sharing that
+        one budget), the invalid-id corrective
         with its drop-and-note fallback, the unattributed-echo corrective
         (ADR 0008 D3) when the caller wires the detection in, and the overflow
         re-ask (#63). What differs between a single contribution and a batch is
@@ -2993,14 +3021,56 @@ class ScopeManager:
                 },
             ]
 
+        def _protocol_corrective(error: ValueError) -> str:
+            """The correction text for one protocol slip (issue #201).
+
+            Three shapes, one budget: the wording names the slip so the judge
+            has something to act on, and nothing here touches a judging rule.
+            """
+            if isinstance(error, _NoToolUseBlock):
+                return (
+                    "Your response contained no tool_use block. Respond only by "
+                    f"calling `{tool_name}`; no prose."
+                )
+            if isinstance(error, _DeclineWithAmendment):
+                return (
+                    f"Your {tool_name} call declined but carried an amendment: {error} "
+                    f"Call {tool_name} again with EITHER the same decline and an empty "
+                    "amendment (no `directive_ops`, `new_context` null), OR an accept "
+                    "that earns the amendment you sent. Do not send both."
+                )
+            return (
+                f"Your {tool_name} call could not be parsed: {error} "
+                f"Call {tool_name} again with the SAME {verdict_noun}, returning the "
+                f"amendment as the structures the tool schema defines — {schema_reminder}"
+            )
+
+        def _protocol_note(error: ValueError) -> str:
+            """What the record says about the re-ask (issue #201)."""
+            if isinstance(error, _NoToolUseBlock):
+                slip = "the first response carried no tool_use block"
+            elif isinstance(error, _DeclineWithAmendment):
+                slip = "the first response declined while carrying an amendment"
+            else:
+                slip = "the first response did not parse"
+            return f"Corrective re-ask: {slip}."
+
+        # Protocol repairs to note on whatever judgment survives the
+        # correctives below (issue #201). Collected here rather than attached
+        # as we go: the invalid-id, attribution and overflow retries each
+        # replace `judgment` with a freshly parsed one, which would drop it.
+        protocol_notes: list[str] = []
+
         first_messages = [{"role": "user", "content": user_message}]
         response = _call(first_messages)
-        tool_use_block = self._extract_tool_use_block(response)
         try:
+            tool_use_block = self._extract_tool_use_block(response)
             judgment = parse(tool_use_block)
         except ValueError as parse_error:
-            # Parse re-ask (issue #113): the first payload did not parse —
-            # a stringified directive_ops (or op entry) instead of the
+            # Protocol re-ask (issue #113, extended by #201): the first
+            # response was not a usable payload — no tool_use block at all
+            # (the judge answered in prose), a stringified directive_ops (or
+            # op entry) instead of the
             # structures the tool schema defines, or an amendment that is
             # internally inconsistent (an unpaired supersede, a decline
             # carrying an amendment). Give it exactly one corrective
@@ -3008,18 +3078,21 @@ class ScopeManager:
             # the same one-retry discipline as the overflow re-ask (#63)
             # below. A second parse failure is NOT caught here: it propagates
             # as the ValueError, so there is never more than one retry.
-            corrective_text = (
-                f"Your {tool_name} call could not be parsed: {parse_error} "
-                f"Call {tool_name} again with the SAME {verdict_noun}, returning the "
-                f"amendment as the structures the tool schema defines — {schema_reminder}"
-            )
-            retry_messages = [
-                *first_messages,
-                *_corrective_turn(response, tool_use_block, corrective_text),
-            ]
+            corrective_text = _protocol_corrective(parse_error)
+            if isinstance(parse_error, _NoToolUseBlock):
+                # No tool_use block means no tool_use id to answer with a
+                # tool_result — the correction is a bare text turn (#201).
+                correction = [
+                    {"role": "assistant", "content": response.content},
+                    {"role": "user", "content": [{"type": "text", "text": corrective_text}]},
+                ]
+            else:
+                correction = _corrective_turn(response, tool_use_block, corrective_text)
+            retry_messages = [*first_messages, *correction]
             response = _call(retry_messages)
             tool_use_block = self._extract_tool_use_block(response)
             judgment = parse(tool_use_block)
+            protocol_notes.append(_protocol_note(parse_error))
             # Chain the correctives below onto this turn: their follow-ups
             # must build on the retry's conversation, not the discarded first
             # turn.
@@ -3137,6 +3210,14 @@ class ScopeManager:
                     second_judgment = None
                 if second_judgment is not None and second_judgment.new_summary is not None:
                     judgment = second_judgment
+
+        if protocol_notes:
+            # Issue #201: whichever judgment survived the correctives above
+            # carries the record's note about the protocol re-ask that
+            # obtained it — beside whatever its own parse already noted.
+            judgment = judgment.model_copy(
+                update={"protocol_notes": [*judgment.protocol_notes, *protocol_notes]}
+            )
 
         return judgment
 
@@ -3419,7 +3500,7 @@ class ScopeManager:
             # decline obeys — a declined contribution amends nothing, and a
             # batch of declines amends nothing either.
             if ops or new_context is not None:
-                raise ValueError(
+                raise _DeclineWithAmendment(
                     "submit_batch_judgment declined every contribution in the batch but "
                     "returned an amendment (directive_ops or new_context). Declined "
                     "contributions must not amend the summary."
@@ -3579,7 +3660,7 @@ class ScopeManager:
         for block in response.content:
             if block.type == "tool_use":
                 return block
-        raise ValueError(
+        raise _NoToolUseBlock(
             "Scope-manager response contained no tool_use block; "
             "expected exactly one `submit_judgment` call."
         )
@@ -3640,7 +3721,7 @@ class ScopeManager:
         # decline-with-new_summary check enforced before ADR 0011 D1.
         if decision == "decline":
             if ops or new_context is not None:
-                raise ValueError(
+                raise _DeclineWithAmendment(
                     "Scope-manager returned decision='decline' with an amendment "
                     "(directive_ops or new_context). A declined contribution must "
                     "not amend the summary."
