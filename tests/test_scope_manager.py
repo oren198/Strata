@@ -734,7 +734,8 @@ def test_accept_with_empty_amendment_still_produces_a_summary() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Test 6: response with no tool_use block → ValueError
+# Test 6: response with no tool_use block → ValueError, after one corrective
+# re-ask (issue #201 — the same `return_value` answers both calls)
 # ---------------------------------------------------------------------------
 
 
@@ -758,6 +759,8 @@ def test_missing_tool_use_block_raises() -> None:
             recent_contributions=[],
             new_contribution=NEW_CONTRIBUTION,
         )
+
+    assert mock_client.messages.create.call_count == 2
 
 
 # ---------------------------------------------------------------------------
