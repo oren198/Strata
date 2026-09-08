@@ -146,6 +146,56 @@ parse-failure path) would convert a hallucinated id into a stranded,
 unjudged contribution, a strictly worse failure than today's merely-wrong
 summary.
 
+> **Note (2026-09-08, issues #199 and #200):** two prompt rules and one
+> corrective added under this decision, both from live-judge runs on
+> 1.11.0.
+>
+> **#199 — a superseded or retracted claim leaves the context.** The
+> engine enforces removal structurally for directives (the `supersede` and
+> `retire` ops above), but `new_context` is generated, and a judge that
+> understood a supersession kept the replaced claim as history —
+> *"206 items were initially left unprocessed (per report CNRYOLD1), but …
+> 0 after the fix (per report CNRYNEW2)"*. A narration that cites the
+> superseded claim by token has not removed it from circulation; it has
+> given the dead claim a new home with a footnote, which makes it look
+> *better* sourced. The prompt rule now says the replaced claim leaves
+> `new_context` entirely — no restatement, no citation, no transition
+> narrative, for a `supersedes` reference, a `supersede` op and a `retire`
+> op alike. The mechanical backstop is the fifth corrective on this
+> decision's one-retry discipline: an accepted amendment whose
+> `new_context` still carries the replaced item's content **verbatim**
+> (whitespace- and case-insensitive, looked up in the current summary and
+> the D2 recency window) earns exactly ONE re-ask naming the rule; if the
+> second answer still carries it, `new_context` is **dropped**, the ops
+> stand, and the drop is noted in the judgment record — the same
+> drop-and-note shape as the invalid-id fallback, and for the same reason:
+> a bad rewrite must never cost the contribution its verdict, nor cost it
+> the removal the ops perform. The check is deliberately verbatim-only.
+> **Paraphrase is a prompt-only obligation** — no string check can reach
+> it, and a backstop that guessed would drop contexts the judge wrote
+> correctly, which costs the scope real memory. One carve-out, for that
+> same reason: an EXTENSION supersession, where the new claim CONTAINS the
+> old one ("Use snake_case." → "Use snake_case. Also type hints."). The
+> replaced sentence is then in `new_context` because the LIVE claim says
+> it, and no rewrite could satisfy the check without mangling what the
+> scope now believes — so a target whose content is contained in the
+> contribution's own content is skipped. A transition narrative over a
+> target the contribution does not contain still fires.
+>
+> **#200 — "not a decision" is never a reason to decline context.** A judge
+> declined an observation it had just called "proper scope-appropriate
+> content" because it had "no directive weight of its own". That is the
+> note/rule distinction collapsing at admission: CONTEXT.md § Context and
+> § Directive make both memory, and a judge that admits only decisions has
+> not been strict, it has stopped being a memory. The admission section now
+> names the closed list of decline grounds (contradiction, duplication,
+> outside entitlement, unshown authority) and says that lacking directive
+> weight, being an observation rather than a decision, or being "transient"
+> is never among them. **No mechanical backstop is added, and none is
+> possible:** nothing in the engine can distinguish a well-reasoned decline
+> from this one. The judgment notes are the record and the only eval hook —
+> which is what the test for it asserts.
+
 **The word budget keeps its combined definition** (ADR 0004 D5:
 `_summary_word_count` sums context words and directive content words), so
 the budget continues to exert retirement pressure on the whole summary. What
