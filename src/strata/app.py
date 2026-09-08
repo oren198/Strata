@@ -136,7 +136,7 @@ from strata.session_state import (
     sessions_dir_for,
 )
 from strata.settings import Settings, get_settings
-from strata.summary_store import Directive, ScopeSummary, SummaryStore
+from strata.summary_store import Directive, ScopeSummary, SummaryStore, derive_condensed
 
 # Console UI static files bundled as package data (same vendoring pattern as
 # _skills/ / _migrations/ / _templates/), so the static mount works regardless
@@ -672,7 +672,19 @@ def _write_amendment(
     # a backstop budget that restarts at zero on each derivation is not a
     # backstop.
     change_ids = judgment.wave_ids or [new_change_id()]
-    written = summary_store.write(scope.id, judgment.new_summary)
+    # Issue #202: the condensation signal is stamped HERE, at the one site
+    # that holds both halves of the comparison — the context this amendment
+    # replaced and the context it writes. `SummaryStore.write` cannot derive
+    # it (it sees only the new summary), and a reader who is never told the
+    # context was shortened cannot tell "condensed away" from "never
+    # admitted". Derived and over-approximate; see `derive_condensed`.
+    condensed = derive_condensed(
+        previous_summary.context if previous_summary is not None else None,
+        judgment.new_summary.context,
+    )
+    written = summary_store.write(
+        scope.id, judgment.new_summary.model_copy(update={"condensed": condensed})
+    )
     # Migration 0013: the record says which version this amendment wrote —
     # one value on every accepted row, so a batch's N verdicts tie to their
     # one write without anyone counting rows against `version`.

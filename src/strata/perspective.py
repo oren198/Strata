@@ -49,6 +49,14 @@ no operator layer at all: that memory stays on disk but stops composing.
 Peer and extra-context layers never get an operator layer: operator memory
 binds a *chain*, and a peer's chain is not this reader's to compose.
 
+Issue #202 adds a condensation signal to the self layer: ``condensation``
+carries the summary's own mechanical ``condensed`` flag plus, when a
+``contribution_reader`` is given, the count of accepted-as-context
+contributions whose text no longer appears in the composed context. A reader
+cannot otherwise distinguish "condensed away" from "never admitted", and both
+owe the same disclosure; the signal is derived from the record and the
+summary alone — no judge is consulted.
+
 ADR 0014 D5 (reactive re-judgement, #186, Phase D) adds a top-level
 ``input_changes`` key: the requested scope's own UNPROCESSED change events —
 verbatim rows, no prose — via an optional ``change_event_reader``. Absent a
@@ -148,6 +156,60 @@ class _ChangeEventLike(Protocol):
 #: ``functools.partial(record_store.list_change_events, unprocessed_only=False)``
 #: or the plain bound method; either is safe against this filter.
 ChangeEventReader = Callable[[str], Sequence[_ChangeEventLike]]
+
+
+class _ContributionLike(Protocol):
+    """Structural shape ``compose_perspective`` needs from a contribution.
+
+    Only the admitted text — the condensation count compares it against the
+    composed context and nothing else. A lightweight protocol for the same
+    reason as the readers above: this module never imports
+    :mod:`strata.record_store`.
+    """
+
+    content: str
+
+
+#: Reads the contributions one scope had accepted INTO its context (issue
+#: #202) — judgment decision ``accept_as_context``, in any order. See
+#: :meth:`strata.record_store.RecordStore.list_accepted_context_contributions`
+#: for the canonical implementation; callers typically pass a small closure
+#: over the bound method's keyword-only ``scope_id``.
+ContributionReader = Callable[[str], Sequence[_ContributionLike]]
+
+
+def _normalised(text: str) -> str:
+    """Collapse *text*'s whitespace runs to single spaces, for the verbatim test.
+
+    "Verbatim" is judged after this normalisation so that a context which
+    merely re-wrapped an admitted paragraph is not reported as having dropped
+    it. Nothing else is normalised — case, punctuation and wording must still
+    match exactly.
+    """
+    return " ".join(text.split())
+
+
+def _context_contributions_absent(context: str, contributions: Sequence[_ContributionLike]) -> int:
+    """Count *contributions* whose text no longer appears verbatim in *context* (issue #202).
+
+    Mechanical and deliberately over-approximate: a contribution the
+    scope-manager admitted and then PARAPHRASED into the context counts as
+    absent, because a substring test cannot tell a paraphrase from a
+    deletion. Over-counting is the safe direction — the reader is told that
+    at most this much may have been condensed away, never that nothing was.
+    It also counts material that left for some other reason (a later
+    amendment superseding it); the count discloses that the context is not
+    the whole of what was accepted, it does not audit why.
+
+    Contributions with empty text are skipped: they assert nothing whose
+    absence could be observed.
+    """
+    haystack = _normalised(context)
+    return sum(
+        1
+        for contribution in contributions
+        if (needle := _normalised(contribution.content)) and needle not in haystack
+    )
 
 
 def _change_event_dict(event: _ChangeEventLike) -> dict:
@@ -308,6 +370,7 @@ def compose_perspective(
     operator_reader: OperatorReader | None = None,
     publication_reader: PublicationReader | None = None,
     change_event_reader: ChangeEventReader | None = None,
+    contribution_reader: ContributionReader | None = None,
 ) -> dict:
     """Compose *scope_id*'s perspective: own summary, ancestor directives, one-hop publications.
 
@@ -403,6 +466,16 @@ def compose_perspective(
             results. ``None`` (the default) makes ``input_changes`` an
             honestly empty list, present but empty — the same discipline as
             an unpublished scope's ``{"items": []}``.
+        contribution_reader: Issue #202. When given, called once with
+            *scope_id* and expected to return the contributions that scope
+            judged ``accept_as_context``; the self layer's
+            ``condensation.context_contributions_absent`` is then how many of
+            them no longer appear verbatim in the composed context (see
+            :func:`_context_contributions_absent` — paraphrase over-counts).
+            ``None`` (the default) leaves that count ``None`` — honestly "not
+            computed", never a misleading ``0`` — while
+            ``condensation.condensed`` is present either way, since it comes
+            from the summary itself.
 
     Returns:
         ``{scope_id: <requested>, layers: [{scope_id, stratum_id, relation,
@@ -410,7 +483,11 @@ def compose_perspective(
         _layers_count: N, input_changes: [...]}`` ordered root-first:
         ancestor directive layers, self, the parent's publication layer (if
         any), sorted referenced-scope publication layers, then sorted
-        extra-context layers. Self/extra-context layers carry ``"summary"``;
+        extra-context layers. The self layer additionally carries
+        ``"condensation": {"condensed": bool, "context_contributions_absent":
+        int | None}`` — the issue #202 disclosure that material may have been
+        condensed away rather than never admitted; both halves are mechanical
+        and over-approximate. Self/extra-context layers carry ``"summary"``;
         ancestor layers carry ``"directives"`` (a list of directive dicts)
         and never ``"summary"`` or ``"context"``; publication layers carry
         ``"publication"``. When *operator_reader* is given, an operator
@@ -455,13 +532,27 @@ def compose_perspective(
         if s.id == scope_id:
             # Self: unaffected by ADR 0013 — full summary, directives and
             # context alike, still feeds this scope's own judgments.
+            self_summary = summary_for_scope(s.id, summary_store=summary_store)
             layers.append(
                 {
                     "scope_id": s.id,
                     "stratum_id": s.stratum_id,
-                    "summary": summary_for_scope(s.id, summary_store=summary_store),
+                    "summary": self_summary,
                     "relation": "self",
                     "binding": True,
+                    # Issue #202: the condensation signal rides the self layer
+                    # only — it describes THIS scope's own context, the one
+                    # payload composition still carries in full.
+                    "condensation": {
+                        "condensed": self_summary["condensed"],
+                        "context_contributions_absent": (
+                            None
+                            if contribution_reader is None
+                            else _context_contributions_absent(
+                                self_summary["context"], contribution_reader(s.id)
+                            )
+                        ),
+                    },
                 }
             )
         else:

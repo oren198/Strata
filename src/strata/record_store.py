@@ -785,6 +785,39 @@ class RecordStore:
             rows = self._conn.execute(sql, params).fetchall()
         return [_contribution_from_row(row) for row in rows]
 
+    def list_accepted_context_contributions(self, *, scope_id: str) -> list[Contribution]:
+        """Return *scope_id*'s contributions judged ``accept_as_context``, oldest first.
+
+        The record half of the condensation signal (issue #202): these are
+        exactly the contributions the scope-manager admitted INTO the context,
+        so any one of them whose text no longer appears there was condensed
+        away rather than never accepted. Composition does that comparison —
+        this read only says which contributions to compare (see
+        :func:`strata.perspective.compose_perspective`).
+
+        ``accept_as_directive`` rows are excluded: a directive keeps its own
+        identity in the summary and is never digested into the context prose,
+        so its absence would mean retirement, not condensation. Declines are
+        excluded because nothing was ever admitted.
+
+        Reads only; the record is untouched.
+        """
+        rows = self._conn.execute(
+            """
+            SELECT c.id, c.scope_id, c.content, c.proposed_classification,
+                   c.subject, c.supersedes,
+                   c.contributor_scope_id, c.contributor_skill,
+                   c.contributor_session_id, c.contributor_ts,
+                   c.created_at
+            FROM contributions c
+            JOIN judgments j ON j.contribution_id = c.id
+            WHERE c.scope_id = ? AND j.decision = 'accept_as_context'
+            ORDER BY c.created_at ASC, c.rowid ASC
+            """,
+            (scope_id,),
+        ).fetchall()
+        return [_contribution_from_row(row) for row in rows]
+
     def get_contribution(self, contribution_id: str) -> Contribution | None:
         """Return the contribution with *contribution_id*, or ``None`` if absent.
 
