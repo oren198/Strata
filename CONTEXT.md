@@ -353,7 +353,11 @@ assembles:
 - The **publications** of the scopes one edge away: the agent's parent, and
   any scope its own scope references,
 - The scope's own unprocessed **change events** — notices of input changes
-  it has not yet been **refresh**ed against.
+  it has not yet been **refresh**ed against,
+- A **condensation** signal on its own layer — whether the last amendment
+  shortened the context, and how many accepted-as-context **contribution**s
+  no longer appear in it — both derived mechanically and over-approximate, so
+  that a reader can tell condensed-away material from material never admitted.
 
 Each piece in the perspective is labelled with the scope it came from —
 composition is **provenance-preserving**, not flattened. Directives compose
