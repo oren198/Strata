@@ -532,6 +532,21 @@ contribution that deliberately OBSCURES its origin ("a team I won't name",
 treat unattributable internal material as originating outside this scope's
 entitlement unless the rendered message shows otherwise.
 
+"NOT A DECISION" IS NEVER A REASON TO DECLINE CONTEXT. An observation an
+entitled agent recorded is admitted as context unless one of the named
+decline grounds applies: it contradicts a directive or operator memory
+binding this scope, it duplicates or restates what this scope's memory
+already holds, its substantive origin is outside this scope's entitlement,
+or it asserts authority or ratification the rendered message does not show.
+Lacking directive weight, being an observation rather than a decision,
+being "transient", "a single data point", or "not actionable", or not yet
+naming the action it supports, is NEVER grounds to decline: context informs
+and directives bind, and BOTH are memory (CONTEXT.md § Context, § Directive).
+Declining a well-formed observation because it binds nothing is not
+strictness — it is the fleet failing to carry what one agent learned to the
+agent who needs it. If it is proper scope-appropriate content and no named
+ground applies, accept it as context.
+
 STEP 2 — CLASSIFICATION. Concepts you must know (from CONTEXT.md):
 - A scope is a bounded region of the fleet.
 - A scope's summary has two sections: directives (binding decisions, listed
@@ -592,6 +607,20 @@ STEP 2 — CLASSIFICATION. Concepts you must know (from CONTEXT.md):
     scope's record; no tombstone stays in the summary.
   Name only directive ids that appear in the CURRENT SUMMARY rendered
   below, each at most once.
+- A SUPERSEDED OR RETRACTED CLAIM LEAVES THE CONTEXT. When the contribution
+  you admit supersedes or retracts an earlier one — it carries a
+  `supersedes` reference, your amendment carries a `supersede` or a `retire`
+  op, or its own content withdraws what an earlier one said — the replaced
+  claim leaves `new_context` ENTIRELY: do not restate it, do not cite it,
+  and do not narrate the transition ("previously X, now Y", "initially X,
+  after the fix Y"). A correction that leaves the original in circulation
+  has corrected nothing, and citing the withdrawn claim by its id does not
+  remove it — it gives the dead claim a new home with a footnote, which
+  makes it look better sourced than before. The record keeps the history;
+  `new_context` carries only what this scope now believes. This binds
+  paraphrase exactly as it binds a verbatim copy: the test is whether a
+  reader of the new context could still come away holding the withdrawn
+  claim.
 - `new_context` is the whole context section, rewritten: incorporate the new
   contribution's observations and drop stale ones. Null leaves the context
   exactly as it stands. Source citations already present in the context —
@@ -1524,6 +1553,20 @@ class _AmendmentJudgment(BaseModel):
     summary's context is untouched; this flag is what keeps the drop visible
     in the record instead of silent."""
 
+    dropped_superseded_context: bool = False
+    """Did the engine drop a ``new_context`` that resurrected a dead claim (#199)?
+
+    True only when the amendment supersedes or retracts an earlier item and
+    the judge's ``new_context`` STILL carried that item's content verbatim
+    after its one corrective re-ask. A superseded or retracted claim leaves
+    the context entirely — a narration that cites it by id has not removed it
+    from circulation, it has given it a new home with a footnote — so the
+    rewrite is dropped, the ops stand, and :attr:`new_context` is ``None``.
+    Kept apart from :attr:`dropped_new_context` for the reason its siblings
+    are kept apart: that one is a context ADR 0014 D2 does not allow on a
+    refresh at all, this one is a context the engine could not let through
+    because of what it still said."""
+
     withdraw_published: list[str] = Field(default_factory=list)
     """Published item ids to withdraw (ADR 0007 D3/D5 judged propagation).
 
@@ -1702,6 +1745,109 @@ def _unattributed_operator_echoes(
     ]
 
 
+def _collapse_whitespace(text: str) -> str:
+    """*text* with every run of whitespace collapsed to one space, casefolded.
+
+    The normalisation the resurrection check compares on (#199): a judge that
+    re-wraps or re-cases a sentence while pasting it into ``new_context`` has
+    still put the same claim back into circulation, and neither line breaks
+    nor capitalisation should let that through.
+    """
+    return " ".join(text.split()).casefold()
+
+
+def _superseded_claim_contents(
+    judgment: _AmendmentJudgment,
+    *,
+    contribution: Contribution,
+    current_summary: ScopeSummary | None,
+    recent_contributions: Sequence[RecentContribution],
+) -> dict[str, str]:
+    """``{id: content}`` for every claim this amendment takes out of circulation.
+
+    Two ways an amendment retires a claim (#199): the contribution's own
+    ``supersedes`` reference — which is how a CONTEXT contribution replaces an
+    earlier one, carrying no ops at all — and the ``supersede``/``retire`` ops
+    on the directives list. Directive ids ARE contribution ids
+    (:func:`_mint_directive` mints from the contribution), so one lookup over
+    the current summary and the recency window covers both.
+
+    Best-effort by construction: a target older than the recency window and no
+    longer in the summary has no content here, so nothing is checked against
+    it. That is the same bound the judge itself was shown.
+    """
+    lookup: dict[str, str] = {}
+    if current_summary is not None:
+        lookup.update({d.id: d.content for d in current_summary.directives})
+    lookup.update({row.contribution.id: row.contribution.content for row in recent_contributions})
+
+    targets = [*judgment.removed_directive_ids]
+    if contribution.supersedes:
+        targets.append(contribution.supersedes)
+
+    return {
+        target: content
+        for target in dict.fromkeys(targets)
+        # An empty (or whitespace-only) claim is a substring of every context;
+        # checking it would fire the backstop on every supersession.
+        if (content := lookup.get(target)) and _collapse_whitespace(content)
+    }
+
+
+def _resurrected_superseded_claims(
+    judgment: _AmendmentJudgment,
+    *,
+    contribution: Contribution,
+    current_summary: ScopeSummary | None,
+    recent_contributions: Sequence[RecentContribution],
+) -> list[str]:
+    """Ids whose superseded content the judge's ``new_context`` still carries (#199).
+
+    The mechanical half of "a superseded or retracted claim leaves the
+    context". Deliberately narrow: it catches a VERBATIM restatement, modulo
+    whitespace and case. Paraphrase — "206 items were initially left
+    unprocessed (per report CNRYOLD1), but 0 after the fix" against an
+    original that said it in other words — is out of reach of any string
+    check and is a PROMPT-ONLY obligation, carried by the rule in
+    :data:`_SYSTEM_PROMPT`. A backstop that guessed at paraphrase would drop
+    contexts the judge wrote correctly, and dropping a correct rewrite costs
+    the scope real memory.
+    """
+    if judgment.new_summary is None or judgment.new_context is None:
+        return []
+    haystack = _collapse_whitespace(judgment.new_context)
+    if not haystack:
+        return []
+    return [
+        target
+        for target, content in _superseded_claim_contents(
+            judgment,
+            contribution=contribution,
+            current_summary=current_summary,
+            recent_contributions=recent_contributions,
+        ).items()
+        if _collapse_whitespace(content) in haystack
+    ]
+
+
+def _with_superseded_context_note(reasoning: str, dropped: bool) -> str:
+    """Return *reasoning* plus the note for a context that resurrected a dead claim.
+
+    The fifth sibling of :func:`_with_dropped_note` and the three beside it,
+    kept apart for the same reason they are: this is neither an op the engine
+    could not apply, nor a provenance claim it could not corroborate, nor a
+    rewrite the refresh path forbids outright — it is a rewrite that put back
+    what the amendment had just removed (#199).
+    """
+    if not dropped:
+        return reasoning
+    return (
+        f"{reasoning} [Dropped new_context: it still carried a superseded or "
+        "retracted claim after one corrective re-ask — a replaced claim leaves "
+        "the context entirely (#199).]"
+    )
+
+
 def _with_protocol_notes(reasoning: str, protocol_notes: Sequence[str]) -> str:
     """Return *reasoning* plus a mechanical note per protocol repair (#201).
 
@@ -1747,16 +1893,20 @@ class ScopeManagerJudgment(_AmendmentJudgment):
         not apply (see :attr:`dropped_ops`) — the record has to show which
         part of the amendment the engine dropped — another naming every
         declared source the judge was never shown (ADR 0014 D3), one more
-        when the refresh locked the context (ADR 0014 D2), and one per
-        protocol repair (issue #201).
+        when the refresh locked the context (ADR 0014 D2), one more when the
+        rewrite still carried a superseded claim (#199), and one per protocol
+        repair (issue #201).
         """
         return _with_protocol_notes(
-            _with_dropped_context_note(
-                _with_dropped_sources_note(
-                    _with_dropped_note(self.reasoning, self.dropped_ops),
-                    self.dropped_context_sources,
+            _with_superseded_context_note(
+                _with_dropped_context_note(
+                    _with_dropped_sources_note(
+                        _with_dropped_note(self.reasoning, self.dropped_ops),
+                        self.dropped_context_sources,
+                    ),
+                    self.dropped_new_context,
                 ),
-                self.dropped_new_context,
+                self.dropped_superseded_context,
             ),
             self.protocol_notes,
         )
@@ -2785,6 +2935,20 @@ class ScopeManager:
         verdict. It runs before the overflow re-ask, so a corrective rewrite is
         still budget-checked.
 
+        Superseded-claim backstop (issue #199): if an accepted amendment
+        supersedes or retracts an earlier item — the contribution's
+        ``supersedes`` reference, or a ``supersede``/``retire`` op — and the
+        judged ``new_context`` still carries that item's content verbatim
+        (whitespace- and case-insensitive), the manager makes exactly ONE
+        corrective follow-up naming the rule. If the second answer still
+        carries it, the amendment's ``new_context`` is DROPPED, the ops stand,
+        and the drop is noted in
+        :attr:`ScopeManagerJudgment.record_notes` — a narration that cites the
+        superseded claim by id has not removed it from circulation, it has
+        given it a new home with a footnote. Text-only, like the attribution
+        re-ask: a retry that changes the decision is discarded. PARAPHRASE is
+        out of reach of any string check and stays a prompt-only obligation.
+
         Raises:
             ValueError: If the model response is STILL missing the
                 ``tool_use`` block after its one corrective re-ask, or the
@@ -2904,6 +3068,41 @@ class ScopeManager:
                 "amendment unchanged."
             )
 
+        # Superseded-claim backstop (#199): the mechanical half of "a
+        # superseded or retracted claim leaves the context". Everything it
+        # needs is already in this call's arguments — the summary and the
+        # recency window are where the replaced item's own bytes live.
+        def _stale_claims(judgment: ScopeManagerJudgment) -> list[str]:
+            return _resurrected_superseded_claims(
+                judgment,
+                contribution=new_contribution,
+                current_summary=current_summary,
+                recent_contributions=recent_contributions,
+            )
+
+        def _stale_claim_corrective(stale_ids: Sequence[str]) -> str:
+            return (
+                "Your amendment supersedes or retracts "
+                f"{', '.join(stale_ids)}, but your `new_context` still carries "
+                "that item's own words. A SUPERSEDED OR RETRACTED CLAIM LEAVES "
+                "THE CONTEXT ENTIRELY: do not restate it, do not cite it, and "
+                "do not narrate the transition — a correction that leaves the "
+                "original in circulation has corrected nothing, and citing the "
+                "withdrawn claim by its id only gives the dead claim a new home "
+                "with a footnote. The record keeps the history. Call "
+                "submit_judgment again with the SAME decision and the SAME ops, "
+                "returning a `new_context` that carries only what this scope now "
+                "believes."
+            )
+
+        def _drop_stale_context(judgment: ScopeManagerJudgment) -> ScopeManagerJudgment:
+            return self._drop_superseded_context(
+                judgment,
+                scope=scope,
+                current_summary=current_summary,
+                new_contribution=new_contribution,
+            )
+
         return self._call_with_correctives(
             user_message=user_message,
             system_prompt=_SYSTEM_PROMPT,
@@ -2922,6 +3121,9 @@ class ScopeManager:
             ),
             attribution_gaps=_attribution_gaps,
             attribution_corrective=_attribution_corrective,
+            stale_claims=_stale_claims,
+            stale_claim_corrective=_stale_claim_corrective,
+            drop_stale_context=_drop_stale_context,
         )
 
     def _call_with_correctives(
@@ -2941,6 +3143,9 @@ class ScopeManager:
         schema_reminder: str,
         attribution_gaps: Callable[[_JudgmentT], list[str]] | None = None,
         attribution_corrective: Callable[[Sequence[str]], str] | None = None,
+        stale_claims: Callable[[_JudgmentT], list[str]] | None = None,
+        stale_claim_corrective: Callable[[Sequence[str]], str] | None = None,
+        drop_stale_context: Callable[[_JudgmentT], _JudgmentT] | None = None,
     ) -> _JudgmentT:
         """Run one judgment call and its correctives, one retry each.
 
@@ -2958,7 +3163,11 @@ class ScopeManager:
 
         *attribution_gaps* and *attribution_corrective* are supplied together
         or not at all; leaving both ``None`` skips the echo check entirely,
-        which is what the batch path does.
+        which is what the batch path does. The three *stale_claim* callables
+        (#199) work the same way and are wired in by the same single path: a
+        batch's several contributions each carry their own ``supersedes``,
+        which the cumulative amendment's one ``new_context`` does not resolve
+        to one target, so that path leaves them ``None``.
         """
         system: list[dict] = [
             {
@@ -3168,6 +3377,49 @@ class ScopeManager:
                     response = retry_response
                     tool_use_block = retry_block
                     first_messages = retry_messages
+
+        # Superseded-claim backstop (#199): the amendment removes an item and
+        # the rewritten context puts its own words straight back — the dead
+        # claim did not leave circulation, it acquired a footnote. Exactly ONE
+        # re-ask naming the rule, and it runs BEFORE the budget check below so
+        # a corrective rewrite is still measured against the BUDGET. VERBATIM
+        # only: paraphrase is a prompt-only obligation (see
+        # :func:`_resurrected_superseded_claims`).
+        if stale_claims is not None and stale_claim_corrective is not None:
+            stale = stale_claims(judgment)
+            if stale:
+                retry_messages = [
+                    *first_messages,
+                    *_corrective_turn(response, tool_use_block, stale_claim_corrective(stale)),
+                ]
+                # Best-effort, exactly as the retries around it.
+                try:
+                    retry_response = _call(retry_messages)
+                    retry_block = self._extract_tool_use_block(retry_response)
+                    retry_judgment = parse(retry_block)
+                except Exception:  # noqa: BLE001 — deliberate: retry is best-effort
+                    retry_judgment = None
+                # Like the attribution re-ask, this corrects TEXT and never a
+                # verdict: a retry that comes back with a different decision
+                # (or no summary) is discarded whole.
+                if (
+                    retry_judgment is not None
+                    and retry_judgment.new_summary is not None
+                    and getattr(retry_judgment, "decision", None)
+                    == getattr(judgment, "decision", None)
+                ):
+                    if invalid_ops(retry_judgment):
+                        retry_judgment = drop_invalid(retry_judgment)
+                    judgment = retry_judgment
+                    response = retry_response
+                    tool_use_block = retry_block
+                    first_messages = retry_messages
+                # Still there after the one re-ask — or no usable retry to be
+                # had, which leaves the first judgment still carrying it. The
+                # context goes; the ops, which are what actually remove the
+                # replaced item, stay.
+                if drop_stale_context is not None and stale_claims(judgment):
+                    judgment = drop_stale_context(judgment)
 
         # Overflow re-ask (issue #63): the LLM was told the BUDGET but nothing
         # enforced it.  Give it exactly one corrective follow-up call if the
@@ -3650,6 +3902,43 @@ class ScopeManager:
                     contribution=new_contribution,
                     ops=applicable,
                     new_context=judgment.new_context,
+                ),
+            }
+        )
+
+    @staticmethod
+    def _drop_superseded_context(
+        judgment: ScopeManagerJudgment,
+        *,
+        scope: Scope,
+        current_summary: ScopeSummary | None,
+        new_contribution: Contribution,
+    ) -> ScopeManagerJudgment:
+        """Return *judgment* with its ``new_context`` dropped and the ops kept (#199).
+
+        The fallback after the single corrective re-ask, shaped exactly like
+        ADR 0011 D1's invalid-id fallback: the part the engine cannot let
+        through goes, the rest of the amendment applies, and the drop is noted
+        in the judgment record. The OPS are what actually remove the replaced
+        item, so they stand — dropping them too would leave the dead claim in
+        the summary, which is the failure this backstop exists to prevent.
+        The previous context is left exactly as it stood: an omitted section is
+        not an emptied one (:func:`_apply_amendment`).
+
+        ``context_sources`` is left alone, as it is when ADR 0014 D2 locks a
+        context: the judge's declaration of what it read is a claim about the
+        record either way, and the record should still show it was made.
+        """
+        return judgment.model_copy(
+            update={
+                "new_context": None,
+                "dropped_superseded_context": True,
+                "new_summary": _apply_amendment(
+                    scope=scope,
+                    current_summary=current_summary,
+                    contribution=new_contribution,
+                    ops=judgment.directive_ops,
+                    new_context=None,
                 ),
             }
         )

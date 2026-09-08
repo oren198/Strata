@@ -326,7 +326,13 @@ no tombstone is left in the summary.
 
 Retirement exists only for **directives**. Context "forgetting" requires no
 ceremony — the scope-manager simply omits stale context from the next
-summary it rewrites.
+summary it rewrites. No ceremony is not the same as no obligation: when a
+contribution supersedes or retracts an earlier one, the replaced claim
+**leaves the context entirely** — not restated, not cited, not narrated as
+"previously X, now Y". A correction that leaves the original in circulation
+has corrected nothing, and citing a withdrawn claim by its id does not
+remove it, it gives the dead claim a new home with a footnote. The history
+lives in the **record**.
 
 ## Fleet
 
