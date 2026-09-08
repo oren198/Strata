@@ -766,6 +766,61 @@ def _write_amendment(
         hop=judgment.hop,
     )
 
+    # Issue #197, the context half: a contribution that supersedes an earlier
+    # one whose claim lived in CONTEXT moves no directive, so the diff above is
+    # silent about it — yet the scope's own readers relied on that claim and
+    # are owed the same `withdrawn` notice a published item's readers get.
+    # Directive supersessions are already covered by the directive-set diff.
+    _emit_context_supersession_self_notices(
+        judged_contribution_ids,
+        scope=scope,
+        record_store=record_store,
+        removed_directive_ids=set(judgment.removed_directive_ids),
+        change_ids=change_ids,
+        hop=judgment.hop,
+    )
+
+
+def _emit_context_supersession_self_notices(
+    judged_contribution_ids: Sequence[str],
+    *,
+    scope: Scope,
+    record_store: RecordStore,
+    removed_directive_ids: set[str],
+    change_ids: Sequence[str],
+    hop: int,
+) -> None:
+    """Self-notice the scope's readers of every context claim this amendment
+    superseded (issue #197). Born-processed, like every self-notice: the
+    scope's judge authored the retraction, so no refresh is owed."""
+    from strata.change_events import (
+        _emit_self_notice,  # noqa: PLC0415 — one caller outside the module
+    )
+
+    for contribution_id in judged_contribution_ids:
+        contribution = record_store.get_contribution(contribution_id)
+        target_id = contribution.supersedes if contribution is not None else None
+        if not target_id or target_id in removed_directive_ids:
+            continue
+        target = record_store.get_contribution(target_id)
+        if target is None or target.scope_id != scope.id:
+            continue
+        # A superseded DIRECTIVE is announced by the directive-set diff; only
+        # a claim that lived in context has nothing else speaking for it.
+        target_judgment = record_store.get_judgment(target_id)
+        if target_judgment is not None and target_judgment.decision == "accept_as_directive":
+            continue
+        _emit_self_notice(
+            record_store,
+            change_ids=change_ids,
+            item=target_id,
+            kind="withdrawn",
+            source_scope_id=scope.id,
+            before=target.content,
+            after=None,
+            hop=hop,
+        )
+
 
 def _emit_directive_set_change(
     judgment: ScopeManagerJudgment | ScopeManagerBatchJudgment,

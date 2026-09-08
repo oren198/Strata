@@ -742,3 +742,71 @@ def test_a_drained_operator_change_still_counts_as_this_scopes_refresh(
     ]
     assert [e.item_id for e in later] == ["c_second"]
     assert later[0].processed_at is not None  # told, not enqueued a second time
+
+
+def test_a_context_supersession_notices_the_scopes_own_readers(
+    fleet, record_store, summary_store
+) -> None:
+    """Issue #197, the context half: retracting a NOTE is an ordinary contribution
+    that supersedes the earlier one. No directive moves, so nothing in the
+    directive-set diff says anything — yet the scope's own readers relied on
+    the note and are owed the same `withdrawn` notice a published item's
+    readers get. Born-processed: no refresh is owed (the scope's judge just
+    acted)."""
+    from strata.app import drain_is_noop
+    from strata.scope_manager import _apply_amendment
+
+    scope = fleet.get_scope("g_ce_parent")
+    old = record_store.append_contribution(
+        scope_id=scope.id,
+        content="The refund API times out under load.",
+        proposed_classification="context",
+        subject="refunds",
+        supersedes=None,
+        contributor=_contributor(),
+    )
+    record_store.record_judgment(
+        contribution_id=old.id, decision="accept_as_context", judged_by="t"
+    )
+    summary_store.write(scope.id, _summary(context="The refund API times out under load."))
+
+    class _Retracting:
+        def judge(self, *, new_contribution, current_summary, **_kw):  # noqa: ANN001, ANN003, ANN201
+            new_summary = _apply_amendment(
+                scope=scope,
+                current_summary=current_summary,
+                contribution=new_contribution,
+                ops=[],
+                new_context="",
+            )
+            return ScopeManagerJudgment(
+                decision="accept_as_context",
+                reasoning="retracted",
+                new_summary=new_summary,
+                new_context="",
+            )
+
+    outcome = run_contribution(
+        scope=scope,
+        stratum=next(s for s in fleet.strata if s.id == "L0"),
+        content=f"Retract note {old.id} on refunds: it no longer holds; remove it.",
+        proposed_classification="context",
+        subject="refunds",
+        supersedes=old.id,
+        contributor=_contributor(),
+        fleet=fleet,
+        record_store=record_store,
+        summary_store=summary_store,
+        scope_manager=_Retracting(),
+        summary_max_words=500,
+    )
+    assert outcome.decision == "accept_as_context"  # precondition: the retraction was judged
+
+    rows = record_store.list_change_events(scope_id=scope.id, unprocessed_only=False)
+    notices = [r for r in rows if r.item_id == old.id and r.kind == "withdrawn"]
+    assert len(notices) == 1
+    assert notices[0].self_notice and notices[0].processed_at is not None
+    assert notices[0].before == "The refund API times out under load."
+    assert drain_is_noop(
+        scope.id, fleet=fleet, record_store=record_store, summary_store=summary_store
+    )
