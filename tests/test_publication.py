@@ -2095,7 +2095,21 @@ def test_cascaded_relay_withdrawal_emits_a_derived_event_inheriting_the_change_i
 
     # g_func was told as a reader of g_exec (hop 0); g_team was told because
     # the copy IT read left g_func (hop 1) — same change id throughout.
-    (origin_event,) = [e for e in _events_for(record_store, "g_func") if e.kind == "withdrawn"]
+    # Selected by SOURCE: g_func now also carries its own self-notice for the
+    # relayed copy it lost (issue #197) — its readers relied on that relay
+    # exactly as they would on an original, so its removal is announced to
+    # them too.
+    (origin_event,) = [
+        e
+        for e in _events_for(record_store, "g_func")
+        if e.kind == "withdrawn" and e.source_scope_id == "g_exec"
+    ]
+    (self_notice,) = [
+        e
+        for e in _events_for(record_store, "g_func")
+        if e.kind == "withdrawn" and e.source_scope_id == "g_func"
+    ]
+    assert self_notice.processed_at is not None  # notice to readers, no refresh owed
     (derived_event,) = [e for e in _events_for(record_store, "g_team") if e.kind == "withdrawn"]
     assert derived_event.change_id == origin_event.change_id
     assert derived_event.hop == origin_event.hop + 1

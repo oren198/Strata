@@ -279,7 +279,11 @@ one — a **refresh**'s admitted directive, a relayed withdrawal — inherits
 it, carrying forward how many hops removed it is from the change that
 started it. A scope refreshes for a given change id at most once, however
 many of its notices arrive; the notice itself is never suppressed, only the
-refresh it would otherwise trigger.
+refresh it would otherwise trigger. A scope that **retracts** — retires or
+supersedes one of its own directives, withdraws one of its own published
+items — is also told, in its own record: no refresh is owed, since its own
+judge acted, but another agent reading the scope may have acted on what is
+now gone, and that notice stands until one read of the scope carries it.
 
 ## Refresh
 

@@ -581,6 +581,18 @@ class ChangeEvent:
     what bounds a wave to one refresh per scope per change (ADR 0014 D4).
     ``processed_at`` is ``None`` until a refresh has processed the event,
     whatever its verdict; the row itself is never deleted.
+
+    ``self_notice`` says what the row IS — a scope's notice of its own
+    retraction — and is settled at birth rather than inferred, because an
+    operator correction to a scope carries the same ``scope_id ==
+    source_scope_id`` and becomes processed the moment its refresh drains.
+
+    ``shown_at`` is the other lifecycle, and only a SELF-notice has one (ADR
+    0014 D1 as amended, issue #197): a scope's own retraction owes its own
+    readers notice but owes its judge no refresh, so the row is born processed
+    and stays composed into ``input_changes`` until a read delivers it. For
+    every other event delivery and processing are the same moment, so the
+    column is stamped at birth and decides nothing.
     """
 
     id: str
@@ -595,6 +607,8 @@ class ChangeEvent:
     hop: int
     processed_at: str | None
     created_at: str
+    self_notice: int = 0
+    shown_at: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -1979,21 +1993,31 @@ class RecordStore:
         after: str | None,
         hop: int,
         processed: bool = False,
+        awaiting_show: bool = False,
     ) -> str:
         """INSERT one change-event row and return its id. Does NOT commit.
 
         *processed* stamps ``processed_at`` at birth, for an event that must
         be recorded but must never be drained (ADR 0014 D4: the scope has
         already refreshed for this change id, or the hop budget is spent).
+
+        *awaiting_show* marks the row a self-notice and leaves ``shown_at``
+        NULL — the one event that is a notice to READERS rather than a refresh
+        trigger — a scope's own
+        retraction (ADR 0014 D1 as amended, issue #197). Every other row is
+        stamped shown at birth: its delivery is the read that drains it, so a
+        second lifecycle would only be state nothing consults.
         """
         event_id = _new_change_event_id()
         self._conn.execute(
             """
             INSERT INTO change_events
             (id, change_id, contribution_id, scope_id, source_scope_id, item_id, kind,
-             before, after, hop, processed_at)
+             before, after, hop, processed_at, self_notice, shown_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                    CASE WHEN ? THEN datetime('now') ELSE NULL END)
+                    CASE WHEN ? THEN datetime('now') ELSE NULL END,
+                    ?,
+                    CASE WHEN ? THEN NULL ELSE datetime('now') END)
             """,
             (
                 event_id,
@@ -2007,8 +2031,12 @@ class RecordStore:
                 after,
                 hop,
                 # Same stamp shape mark_change_event_processed writes, so a
-                # born-processed event is indistinguishable from a drained one.
+                # born-processed event is indistinguishable from a drained one
+                # — except for `shown_at`, which is what tells the two apart:
+                # a self-notice still owes its readers a delivery (#197).
                 processed,
+                awaiting_show,
+                awaiting_show,
             ),
         )
         return event_id
@@ -2027,6 +2055,7 @@ class RecordStore:
         after: str | None = None,
         hop: int = 0,
         processed: bool = False,
+        awaiting_show: bool = False,
     ) -> tuple[Contribution, ChangeEvent]:
         """Append a change notice — both halves of one event — atomically.
 
@@ -2056,6 +2085,10 @@ class RecordStore:
             hop:             Derived hops from the originating change.
             processed:       Stamp the event processed at birth — recorded,
                              never drained (ADR 0014 D4).
+            awaiting_show:   Mark the row a self-notice, ``shown_at`` NULL — a
+                             notice to the scope's
+                             own readers, composed until a read delivers it
+                             (ADR 0014 D1 as amended, issue #197).
 
         Returns:
             ``(contribution, event)``, the two halves of the notice written.
@@ -2084,6 +2117,7 @@ class RecordStore:
                 after=after,
                 hop=hop,
                 processed=processed,
+                awaiting_show=awaiting_show,
             )
         return self._fetch_contribution(contribution_id), self._fetch_change_event(event_id)
 
@@ -2103,7 +2137,7 @@ class RecordStore:
         """
         sql = """
             SELECT id, change_id, contribution_id, scope_id, source_scope_id, item_id, kind,
-                   before, after, hop, processed_at, created_at
+                   before, after, hop, processed_at, created_at, self_notice, shown_at
             FROM change_events
             WHERE scope_id = ?
         """
@@ -2131,11 +2165,43 @@ class RecordStore:
         )
         self._conn.commit()
 
+    def mark_self_notices_shown(self, *, scope_id: str, contribution_ids: Sequence[str]) -> None:
+        """Discharge *scope_id*'s own-retraction notices that a read just delivered.
+
+        The consumption rule for an event that owes a reader rather than a
+        refresh (ADR 0014 D1 as amended, issue #197): it is composed into
+        ``input_changes`` while ``shown_at`` is NULL, and the read that carried
+        it stamps it. One read, one showing — the notice is discharged by being
+        delivered, not by being repeated.
+
+        Scoped to the notices actually composed (*contribution_ids*, off the
+        perspective the caller is about to return) rather than "everything
+        unshown for this scope", so an event written between the composition
+        and this call is not marked delivered by a read that never carried it.
+
+        Only a SELF-notice is touched — ``self_notice = 1``, the fact settled
+        at the row's birth, never inferred from its other columns. Unknown ids
+        are a no-op. Idempotent.
+        """
+        if not contribution_ids:
+            return
+        placeholders = ", ".join("?" for _ in contribution_ids)
+        self._conn.execute(
+            f"""
+            UPDATE change_events
+            SET shown_at = datetime('now')
+            WHERE scope_id = ? AND self_notice = 1 AND shown_at IS NULL
+              AND contribution_id IN ({placeholders})
+            """,  # noqa: S608 — placeholders only, never interpolated values
+            (scope_id, *contribution_ids),
+        )
+        self._conn.commit()
+
     def _fetch_change_event(self, event_id: str) -> ChangeEvent:
         row = self._conn.execute(
             """
             SELECT id, change_id, contribution_id, scope_id, source_scope_id, item_id, kind,
-                   before, after, hop, processed_at, created_at
+                   before, after, hop, processed_at, created_at, self_notice, shown_at
             FROM change_events WHERE id = ?
             """,
             (event_id,),

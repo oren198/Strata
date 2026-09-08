@@ -83,7 +83,7 @@ import sqlite3
 import tempfile
 from collections.abc import AsyncGenerator, Generator, Sequence
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Literal
 
@@ -1285,12 +1285,19 @@ class DrainOutcome:
     or a queue whose notices already carry verdicts. A caller reporting
     "refresh pending: N" reads ``events_processed``; it is never a count of
     judge outages (pin 4), which are a different thing entirely.
+
+    ``processed_events`` are those same events, in full. A read surface hands
+    them to :func:`~strata.perspective.compose_perspective` as
+    ``just_processed`` so the reader that paid for the refresh is TOLD what
+    changed on that read (ADR 0014 D5, issue #203) — composition filters to
+    unprocessed events, and the drain has just made these processed.
     """
 
     scope_id: str
     events_processed: int
     judged: bool
     outcomes: list[ContributionOutcome]
+    processed_events: list[ChangeEvent] = field(default_factory=list)
 
 
 def drain_is_noop(
@@ -1649,6 +1656,7 @@ def drain_scope(
                 events_processed=len(events),
                 judged=False,
                 outcomes=[],
+                processed_events=list(events),
             )
 
         change_ids = list(dict.fromkeys(event.change_id for event in events))
@@ -1691,6 +1699,9 @@ def drain_scope(
             events_processed=len(events),
             judged=True,
             outcomes=[r for r in results if isinstance(r, ContributionOutcome)],
+            # The events as they were BEFORE the marking above: what a read
+            # surface shows its reader on this very read (ADR 0014 D5, #203).
+            processed_events=list(events),
         )
 
 
@@ -2216,6 +2227,11 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
         # the MCP surface composes, so an operator asking "what does this agent
         # actually see" sees the pending notices too. compose_perspective
         # filters to unprocessed itself.
+        #
+        # This route does NOT drain and does NOT stamp what it shows: an
+        # operator looking in is a viewer, not the audience issue #197 names,
+        # so a scope's own undelivered retraction notice stays composed here
+        # until one of the scope's OWN reads carries it away.
         def _change_event_reader(target_scope_id: str) -> list:
             return record_store.list_change_events(scope_id=target_scope_id)
 

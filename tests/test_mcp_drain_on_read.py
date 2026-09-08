@@ -315,8 +315,15 @@ async def test_the_perspective_carries_the_events_the_drain_could_not_process(
     assert result["input_changes"][0]["change_id"] == "chg_a"
 
 
-async def test_a_drained_scope_composes_no_input_changes(tmp_path: Path) -> None:
-    """Composition runs AFTER the drain, so a refreshed scope shows an empty list."""
+async def test_the_read_that_drains_shows_what_it_drained_exactly_once(tmp_path: Path) -> None:
+    """ADR 0014 D5 — notice is immediate; only ABSORPTION is deferred (issue #203).
+
+    Composition runs after the drain and filters to unprocessed events, so
+    without the drain handing its processed events to `compose_perspective` the
+    reader that paid for the refresh is the one reader never told what changed.
+    They are shown on THAT read and gone on the next: the notice is discharged
+    by being delivered, not by being repeated.
+    """
     mod, db_path, fleet = _setup(tmp_path)
     with RecordStore(db_path) as rs:
         _emit(rs, change_id="chg_a", item_id="p_1", scope_id="g_team")
@@ -329,6 +336,150 @@ async def test_a_drained_scope_composes_no_input_changes(tmp_path: Path) -> None
         patch("strata.scope_manager.ScopeManager.judge", return_value=_accepting_judgment()),
         patch("anthropic.Anthropic", return_value=MagicMock()),
     ):
+        first = await mod.strata_read_perspective()
+        second = await mod.strata_read_perspective()
+
+    # Precondition for the "not shown" half below: the drain really ran.
+    with RecordStore(db_path) as rs:
+        assert rs.list_change_events(scope_id="g_team", unprocessed_only=True) == []
+    assert [e["item_id"] for e in first["input_changes"]] == ["p_1"]
+    assert first["input_changes"][0]["change_id"] == "chg_a"
+    assert second["input_changes"] == []
+
+
+async def test_a_bind_hands_back_the_events_its_own_drain_consumed(tmp_path: Path) -> None:
+    """A bind drains too (ADR 0014 D6), and it is the surface that sees the result.
+
+    Without this the notice would be lost between the two calls: the bind
+    processes the events and the first read after it composes only unprocessed
+    ones (issue #203, the same defect one call earlier).
+    """
+    mod, db_path, fleet = _setup(tmp_path)
+    with RecordStore(db_path) as rs:
+        _emit(rs, change_id="chg_a", item_id="p_1", scope_id="g_team")
+
+    with (
+        patch.object(mod, "_AGENT_SCOPE", None),
+        patch.object(mod, "_AGENT_SKILL", None),
+        patch.object(mod, "_AGENT_SESSION_ID", "sess_test"),
+        patch.object(mod, "_load_fleet", return_value=fleet),
+        patch("strata.scope_manager.ScopeManager.judge", return_value=_accepting_judgment()),
+        patch("anthropic.Anthropic", return_value=MagicMock()),
+    ):
+        result = await mod.strata_bind(scope_id="g_team")
+
+    assert result["scope_id"] == "g_team"
+    assert [e["item_id"] for e in result["input_changes"]] == ["p_1"]
+
+
+async def test_a_judge_outage_still_lists_the_events_it_could_not_drain(
+    tmp_path: Path,
+) -> None:
+    """The unprocessed path is untouched by the just-drained one (pin 5)."""
+    mod, db_path, fleet = _setup(tmp_path)
+    with RecordStore(db_path) as rs:
+        _emit(rs, change_id="chg_a", item_id="p_1", scope_id="g_team")
+
+    with (
+        patch.object(mod, "_AGENT_SCOPE", "g_team"),
+        patch.object(mod, "_AGENT_SKILL", None),
+        patch.object(mod, "_AGENT_SESSION_ID", "sess_test"),
+        patch.object(mod, "_load_fleet", return_value=fleet),
+        patch(
+            "strata.scope_manager.ScopeManager.judge",
+            side_effect=RuntimeError("scope-manager is down"),
+        ),
+        patch("anthropic.Anthropic", return_value=MagicMock()),
+    ):
         result = await mod.strata_read_perspective()
 
-    assert result["input_changes"] == []
+    assert result["refresh_pending"] == 1
+    assert [e["item_id"] for e in result["input_changes"]] == ["p_1"]
+
+
+# ---------------------------------------------------------------------------
+# Issue #197 — the scope's own retraction, delivered by a read
+# ---------------------------------------------------------------------------
+
+
+def _self_notice(record_store: RecordStore, *, scope_id: str, item_id: str) -> None:
+    """Write what an own-scope retraction emits: born processed, awaiting a reader."""
+    record_store.append_change_notice(
+        scope_id=scope_id,
+        content=f"[Input change: this scope retired {item_id}.]",
+        contributor=ContributorRef(
+            scope_id=scope_id,
+            skill="scope-manager",
+            session_id="change-event",
+            ts="2026-09-05T00:00:00+00:00",
+        ),
+        change_id="chg_self",
+        source_scope_id=scope_id,
+        item_id=item_id,
+        kind="directive_retired",
+        before=item_id,
+        after=None,
+        processed=True,
+        awaiting_show=True,
+    )
+
+
+async def test_a_read_delivers_the_scopes_own_retraction_notice_once(tmp_path: Path) -> None:
+    """The consumption rule, through the surface that owns it (issue #197).
+
+    The notice owes no refresh — its own judge wrote the retraction — so no
+    drain will ever consume it and `refresh_pending` stays absent. It is the
+    READ that discharges it, and only once.
+    """
+    mod, db_path, fleet = _setup(tmp_path)
+    with RecordStore(db_path) as rs:
+        _self_notice(rs, scope_id="g_team", item_id="c_retired")
+
+    judge = MagicMock()
+    with (
+        patch.object(mod, "_AGENT_SCOPE", "g_team"),
+        patch.object(mod, "_AGENT_SKILL", None),
+        patch.object(mod, "_AGENT_SESSION_ID", "sess_test"),
+        patch.object(mod, "_load_fleet", return_value=fleet),
+        patch("strata.scope_manager.ScopeManager.judge", judge),
+        patch("anthropic.Anthropic", return_value=MagicMock()),
+    ):
+        first = await mod.strata_read_perspective()
+        second = await mod.strata_read_perspective()
+
+    (entry,) = first["input_changes"]
+    assert entry["kind"] == "directive_retired"
+    assert entry["source_scope_id"] == "g_team"
+    assert entry["item_id"] == "c_retired"
+    # No refresh is owed and none was attempted: notice, not trigger.
+    assert "refresh_pending" not in first
+    assert judge.call_count == 0
+    assert second["input_changes"] == []
+
+
+# ---------------------------------------------------------------------------
+# Issue #202 — the condensation disclosure over MCP
+# ---------------------------------------------------------------------------
+
+
+async def test_an_mcp_read_counts_the_contributions_absent_from_its_context(
+    tmp_path: Path,
+) -> None:
+    """`context_contributions_absent` is a live count over MCP, never `None`.
+
+    `None` is composition's honest "not computed", which it returns when no
+    contribution reader is wired — an agent reading its own scope would learn
+    nothing about what was condensed away from it.
+    """
+    mod, _db_path, fleet = _setup(tmp_path)
+
+    with (
+        patch.object(mod, "_AGENT_SCOPE", "g_team"),
+        patch.object(mod, "_AGENT_SKILL", None),
+        patch.object(mod, "_AGENT_SESSION_ID", "sess_test"),
+        patch.object(mod, "_load_fleet", return_value=fleet),
+    ):
+        result = await mod.strata_read_perspective()
+
+    (self_layer,) = [layer for layer in result["layers"] if layer["relation"] == "self"]
+    assert isinstance(self_layer["condensation"]["context_contributions_absent"], int)

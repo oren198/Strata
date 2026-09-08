@@ -1,7 +1,10 @@
 """Change-event emission from the contribution choke point (ADR 0014 D1/D4).
 
-A scope's own contribution is not a trigger for the scope itself — it
-already has a path (ADR 0014 D1). It IS a trigger for its descendants, when
+A scope's own contribution is not a *refresh* trigger for the scope itself —
+it already has a path (ADR 0014 D1). Since issue #197 a RETRACTION is still
+notice to that scope's own readers, born processed: told, never enqueued.
+
+It IS a trigger for its descendants, when
 the judgment's directive ops change what those descendants compose: an
 appended directive binds them, a retired one stops binding them, and neither
 is something they can see for themselves.
@@ -549,3 +552,193 @@ def test_a_coalesced_refresh_that_withdraws_carries_both_ids_onward(
     ]
     assert {e.change_id for e in derived} == {"chg_one", "chg_two"}
     assert {e.item_id for e in derived} == {act.id}
+
+
+# ---------------------------------------------------------------------------
+# ADR 0014 D1, amended — a scope's own contribution is never a REFRESH trigger
+# for itself, but a RETRACTION is notice owed to the scope's own readers
+# (issue #197). A group is a mix of agents, not one mind: another agent in the
+# scope may have read the retired directive and acted on it, and quiet removal
+# gives it nothing to revise.
+# ---------------------------------------------------------------------------
+
+
+def test_retiring_an_own_directive_notices_the_scopes_own_readers(
+    fleet, record_store, summary_store
+) -> None:
+    """The retraction is announced to the retracting scope itself, born-processed.
+
+    Born-processed because the scope's own judge already acted: there is
+    nothing left to reconcile, so no refresh is owed and `drain_is_noop` stays
+    True. The row exists for the scope's READERS, not for its judge.
+    """
+    from strata.app import drain_is_noop
+
+    summary_store.write("g_ce_parent", _summary(_directive("c_old")))
+    judgment = ScopeManagerJudgment(
+        decision="accept_as_context",
+        reasoning="No longer binding.",
+        new_summary=_summary(context="Noted."),
+    )
+
+    outcome = _run(fleet, record_store, summary_store, judgment)
+
+    # Precondition: the amendment really was written before anything is claimed
+    # about what it announced.
+    assert outcome.summary_updated is True
+
+    (self_notice,) = record_store.list_change_events(scope_id="g_ce_parent")
+    assert self_notice.kind == "directive_retired"
+    assert self_notice.source_scope_id == "g_ce_parent"
+    assert self_notice.item_id == "c_old"
+    assert self_notice.processed_at is not None  # born-processed: no refresh owed
+    assert self_notice.shown_at is None  # not yet delivered to a reader
+    assert (
+        drain_is_noop(
+            "g_ce_parent", fleet=fleet, record_store=record_store, summary_store=summary_store
+        )
+        is True
+    )
+
+
+def test_an_own_withdrawal_notices_the_scopes_own_readers(
+    fleet, record_store, summary_store
+) -> None:
+    """A withdrawn published item is a retraction like any other (issue #197)."""
+    from strata.change_events import emit as emit_change_event
+
+    emit_change_event(
+        fleet=fleet,
+        record_store=record_store,
+        item="pub_1",
+        kind="withdrawn",
+        source_scope_id="g_ce_parent",
+        before="Deploys are at 3pm.",
+        after=None,
+    )
+
+    # Precondition: the ordinary one-hop notice went out too — the self-notice
+    # is additive, never a replacement for the reader scopes' own events.
+    (child_event,) = record_store.list_change_events(scope_id="g_ce_child")
+    assert child_event.kind == "withdrawn"
+
+    (self_notice,) = record_store.list_change_events(scope_id="g_ce_parent")
+    assert self_notice.kind == "withdrawn"
+    assert self_notice.source_scope_id == "g_ce_parent"
+    assert self_notice.processed_at is not None
+    assert self_notice.change_id == child_event.change_id
+
+
+def test_an_own_addition_still_notices_nobody_in_the_scope_itself(
+    fleet, record_store, summary_store
+) -> None:
+    """ADR 0014 D1 is amended for RETRACTIONS only.
+
+    An appended directive is the scope's own act with nothing withdrawn under
+    anyone: its own readers compose it on their next read and have nothing to
+    revise. Only a retraction leaves a reader holding something that is gone.
+    """
+    from strata.change_events import emit as emit_change_event
+
+    emit_change_event(
+        fleet=fleet,
+        record_store=record_store,
+        item="c_new",
+        kind="directive_appended",
+        source_scope_id="g_ce_parent",
+        before=None,
+        after="c_new",
+    )
+
+    # Precondition: the emission happened at all.
+    assert len(record_store.list_change_events(scope_id="g_ce_child")) == 1
+    assert record_store.list_change_events(scope_id="g_ce_parent") == []
+
+
+def test_a_self_notice_is_shown_until_a_reader_has_had_it(
+    fleet, record_store, summary_store
+) -> None:
+    """The consumption rule: shown on every read until one read delivers it.
+
+    `shown_at` is the whole of the new state — a born-processed self-notice is
+    composed while it is NULL, and the read that composed it stamps it.
+    """
+    from strata.perspective import compose_perspective
+
+    summary_store.write("g_ce_parent", _summary(_directive("c_old")))
+    _run(
+        fleet,
+        record_store,
+        summary_store,
+        ScopeManagerJudgment(
+            decision="accept_as_context",
+            reasoning="No longer binding.",
+            new_summary=_summary(context="Noted."),
+        ),
+    )
+
+    def reader(scope_id: str) -> list:
+        return record_store.list_change_events(scope_id=scope_id)
+
+    before = compose_perspective(
+        "g_ce_parent", fleet=fleet, summary_store=summary_store, change_event_reader=reader
+    )
+    # Precondition for the "gone" half: it really was there to begin with.
+    assert [e["item_id"] for e in before["input_changes"]] == ["c_old"]
+
+    record_store.mark_self_notices_shown(
+        scope_id="g_ce_parent",
+        contribution_ids=[e["contribution_id"] for e in before["input_changes"]],
+    )
+
+    after = compose_perspective(
+        "g_ce_parent", fleet=fleet, summary_store=summary_store, change_event_reader=reader
+    )
+    assert after["input_changes"] == []
+
+
+def test_a_drained_operator_change_still_counts_as_this_scopes_refresh(
+    fleet, record_store, summary_store
+) -> None:
+    """ADR 0014 D4 — one refresh per scope per change id, operator waves included.
+
+    An operator correction is the one ordinary event whose affected set holds
+    its own source: the scope is a READER of what the operator did to it. Once
+    drained it looks, field for field, like the born-processed self-notice of
+    issue #197 — same scope, same source, processed — and a later notice in the
+    same wave must still see that this scope has refreshed.
+    """
+    from strata.change_events import emit as emit_change_event
+
+    emit_change_event(
+        fleet=fleet,
+        record_store=record_store,
+        item="c_operator",
+        kind="directive_retired",
+        source_scope_id="g_ce_parent",
+        before="c_operator",
+        after=None,
+        wave_ids=["chg_operator_wave"],
+        by_operator=True,
+    )
+    (queued,) = record_store.list_change_events(scope_id="g_ce_parent")
+    # Precondition: the operator's change really was enqueued for a refresh.
+    assert queued.processed_at is None
+    record_store.mark_change_event_processed(queued.id)  # the drain runs
+
+    emit_change_event(
+        fleet=fleet,
+        record_store=record_store,
+        item="c_second",
+        kind="directive_appended",
+        source_scope_id="g_ce_parent",
+        after="c_second",
+        wave_ids=["chg_operator_wave"],
+        by_operator=True,
+    )
+
+    later = [
+        e for e in record_store.list_change_events(scope_id="g_ce_parent") if e.id != queued.id
+    ]
+    assert [e.item_id for e in later] == ["c_second"]
+    assert later[0].processed_at is not None  # told, not enqueued a second time
