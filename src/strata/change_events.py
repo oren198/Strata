@@ -23,6 +23,10 @@ This module is the trigger half of the fix:
   that is the same event machine-readable. Mechanical, no LLM (matching ADR
   0013 D4b), which is what makes the notice permanent and auditable rather
   than prose a word budget can condense away.
+- :func:`_emit_self_notice` — the same notice turned inward when a scope
+  RETRACTS (ADR 0014 D1 as amended, issue #197): the retracting scope's own
+  readers are inside the audience, so the row is written to the scope itself,
+  born processed, owing a reader a delivery rather than a judge a refresh.
 
 What bounds a wave is the **change id** (ADR 0014 D4). Every independent
 input change mints one; every change derived from processing it inherits
@@ -573,13 +577,13 @@ def _prior_notices(
 def _is_self_notice(event) -> bool:  # noqa: ANN001 — a ChangeEvent, without the import cycle
     """Is *event* a scope's notice of its OWN retraction (issue #197)?
 
-    Two facts, and no new column: the changed item came from the scope the
-    event belongs to, and the row was processed at birth. An ordinary event
-    fails the first test; the one other kind that reaches its own source — an
-    operator correction, which the scope is a READER of rather than the author
-    of — fails the second, because it is enqueued for a real refresh.
+    The row says so itself (``self_notice``, migration 0014), and deliberately
+    not "same scope, and processed": an operator correction to a scope is also
+    ``source_scope_id == scope_id``, and the moment its refresh drains it is
+    processed too — so that test would read a wave the scope HAS refreshed for
+    as one it has not, and hand it a second refresh (ADR 0014 D4).
     """
-    return event.source_scope_id == event.scope_id and event.processed_at is not None
+    return bool(event.self_notice)
 
 
 def _suppression_note(

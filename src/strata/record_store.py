@@ -582,6 +582,11 @@ class ChangeEvent:
     ``processed_at`` is ``None`` until a refresh has processed the event,
     whatever its verdict; the row itself is never deleted.
 
+    ``self_notice`` says what the row IS — a scope's notice of its own
+    retraction — and is settled at birth rather than inferred, because an
+    operator correction to a scope carries the same ``scope_id ==
+    source_scope_id`` and becomes processed the moment its refresh drains.
+
     ``shown_at`` is the other lifecycle, and only a SELF-notice has one (ADR
     0014 D1 as amended, issue #197): a scope's own retraction owes its own
     readers notice but owes its judge no refresh, so the row is born processed
@@ -602,6 +607,7 @@ class ChangeEvent:
     hop: int
     processed_at: str | None
     created_at: str
+    self_notice: int = 0
     shown_at: str | None = None
 
 
@@ -1995,8 +2001,9 @@ class RecordStore:
         be recorded but must never be drained (ADR 0014 D4: the scope has
         already refreshed for this change id, or the hop budget is spent).
 
-        *awaiting_show* leaves ``shown_at`` NULL, for the one event that is a
-        notice to READERS rather than a refresh trigger — a scope's own
+        *awaiting_show* marks the row a self-notice and leaves ``shown_at``
+        NULL — the one event that is a notice to READERS rather than a refresh
+        trigger — a scope's own
         retraction (ADR 0014 D1 as amended, issue #197). Every other row is
         stamped shown at birth: its delivery is the read that drains it, so a
         second lifecycle would only be state nothing consults.
@@ -2006,9 +2013,10 @@ class RecordStore:
             """
             INSERT INTO change_events
             (id, change_id, contribution_id, scope_id, source_scope_id, item_id, kind,
-             before, after, hop, processed_at, shown_at)
+             before, after, hop, processed_at, self_notice, shown_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                     CASE WHEN ? THEN datetime('now') ELSE NULL END,
+                    ?,
                     CASE WHEN ? THEN NULL ELSE datetime('now') END)
             """,
             (
@@ -2027,6 +2035,7 @@ class RecordStore:
                 # — except for `shown_at`, which is what tells the two apart:
                 # a self-notice still owes its readers a delivery (#197).
                 processed,
+                awaiting_show,
                 awaiting_show,
             ),
         )
@@ -2076,7 +2085,8 @@ class RecordStore:
             hop:             Derived hops from the originating change.
             processed:       Stamp the event processed at birth — recorded,
                              never drained (ADR 0014 D4).
-            awaiting_show:   Leave ``shown_at`` NULL — a notice to the scope's
+            awaiting_show:   Mark the row a self-notice, ``shown_at`` NULL — a
+                             notice to the scope's
                              own readers, composed until a read delivers it
                              (ADR 0014 D1 as amended, issue #197).
 
@@ -2127,7 +2137,7 @@ class RecordStore:
         """
         sql = """
             SELECT id, change_id, contribution_id, scope_id, source_scope_id, item_id, kind,
-                   before, after, hop, processed_at, created_at, shown_at
+                   before, after, hop, processed_at, created_at, self_notice, shown_at
             FROM change_events
             WHERE scope_id = ?
         """
@@ -2169,9 +2179,9 @@ class RecordStore:
         unshown for this scope", so an event written between the composition
         and this call is not marked delivered by a read that never carried it.
 
-        Only a SELF-notice is touched: an ordinary event's ``shown_at`` is
-        stamped at birth, so the ``IS NULL`` clause is the whole guard, and
-        unknown ids are a no-op. Idempotent.
+        Only a SELF-notice is touched — ``self_notice = 1``, the fact settled
+        at the row's birth, never inferred from its other columns. Unknown ids
+        are a no-op. Idempotent.
         """
         if not contribution_ids:
             return
@@ -2180,7 +2190,7 @@ class RecordStore:
             f"""
             UPDATE change_events
             SET shown_at = datetime('now')
-            WHERE scope_id = ? AND shown_at IS NULL
+            WHERE scope_id = ? AND self_notice = 1 AND shown_at IS NULL
               AND contribution_id IN ({placeholders})
             """,  # noqa: S608 — placeholders only, never interpolated values
             (scope_id, *contribution_ids),
@@ -2191,7 +2201,7 @@ class RecordStore:
         row = self._conn.execute(
             """
             SELECT id, change_id, contribution_id, scope_id, source_scope_id, item_id, kind,
-                   before, after, hop, processed_at, created_at, shown_at
+                   before, after, hop, processed_at, created_at, self_notice, shown_at
             FROM change_events WHERE id = ?
             """,
             (event_id,),

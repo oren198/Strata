@@ -2227,6 +2227,11 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
         # the MCP surface composes, so an operator asking "what does this agent
         # actually see" sees the pending notices too. compose_perspective
         # filters to unprocessed itself.
+        #
+        # This route does NOT drain and does NOT stamp what it shows: an
+        # operator looking in is a viewer, not the audience issue #197 names,
+        # so a scope's own undelivered retraction notice stays composed here
+        # until one of the scope's OWN reads carries it away.
         def _change_event_reader(target_scope_id: str) -> list:
             return record_store.list_change_events(scope_id=target_scope_id)
 

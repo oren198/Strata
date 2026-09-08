@@ -398,6 +398,66 @@ async def test_a_judge_outage_still_lists_the_events_it_could_not_drain(
 
 
 # ---------------------------------------------------------------------------
+# Issue #197 — the scope's own retraction, delivered by a read
+# ---------------------------------------------------------------------------
+
+
+def _self_notice(record_store: RecordStore, *, scope_id: str, item_id: str) -> None:
+    """Write what an own-scope retraction emits: born processed, awaiting a reader."""
+    record_store.append_change_notice(
+        scope_id=scope_id,
+        content=f"[Input change: this scope retired {item_id}.]",
+        contributor=ContributorRef(
+            scope_id=scope_id,
+            skill="scope-manager",
+            session_id="change-event",
+            ts="2026-09-05T00:00:00+00:00",
+        ),
+        change_id="chg_self",
+        source_scope_id=scope_id,
+        item_id=item_id,
+        kind="directive_retired",
+        before=item_id,
+        after=None,
+        processed=True,
+        awaiting_show=True,
+    )
+
+
+async def test_a_read_delivers_the_scopes_own_retraction_notice_once(tmp_path: Path) -> None:
+    """The consumption rule, through the surface that owns it (issue #197).
+
+    The notice owes no refresh — its own judge wrote the retraction — so no
+    drain will ever consume it and `refresh_pending` stays absent. It is the
+    READ that discharges it, and only once.
+    """
+    mod, db_path, fleet = _setup(tmp_path)
+    with RecordStore(db_path) as rs:
+        _self_notice(rs, scope_id="g_team", item_id="c_retired")
+
+    judge = MagicMock()
+    with (
+        patch.object(mod, "_AGENT_SCOPE", "g_team"),
+        patch.object(mod, "_AGENT_SKILL", None),
+        patch.object(mod, "_AGENT_SESSION_ID", "sess_test"),
+        patch.object(mod, "_load_fleet", return_value=fleet),
+        patch("strata.scope_manager.ScopeManager.judge", judge),
+        patch("anthropic.Anthropic", return_value=MagicMock()),
+    ):
+        first = await mod.strata_read_perspective()
+        second = await mod.strata_read_perspective()
+
+    (entry,) = first["input_changes"]
+    assert entry["kind"] == "directive_retired"
+    assert entry["source_scope_id"] == "g_team"
+    assert entry["item_id"] == "c_retired"
+    # No refresh is owed and none was attempted: notice, not trigger.
+    assert "refresh_pending" not in first
+    assert judge.call_count == 0
+    assert second["input_changes"] == []
+
+
+# ---------------------------------------------------------------------------
 # Issue #202 — the condensation disclosure over MCP
 # ---------------------------------------------------------------------------
 

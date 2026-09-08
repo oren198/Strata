@@ -1,7 +1,10 @@
 """Change-event emission from the contribution choke point (ADR 0014 D1/D4).
 
-A scope's own contribution is not a trigger for the scope itself — it
-already has a path (ADR 0014 D1). It IS a trigger for its descendants, when
+A scope's own contribution is not a *refresh* trigger for the scope itself —
+it already has a path (ADR 0014 D1). Since issue #197 a RETRACTION is still
+notice to that scope's own readers, born processed: told, never enqueued.
+
+It IS a trigger for its descendants, when
 the judgment's directive ops change what those descendants compose: an
 appended directive binds them, a retired one stops binding them, and neither
 is something they can see for themselves.
@@ -692,3 +695,50 @@ def test_a_self_notice_is_shown_until_a_reader_has_had_it(
         "g_ce_parent", fleet=fleet, summary_store=summary_store, change_event_reader=reader
     )
     assert after["input_changes"] == []
+
+
+def test_a_drained_operator_change_still_counts_as_this_scopes_refresh(
+    fleet, record_store, summary_store
+) -> None:
+    """ADR 0014 D4 — one refresh per scope per change id, operator waves included.
+
+    An operator correction is the one ordinary event whose affected set holds
+    its own source: the scope is a READER of what the operator did to it. Once
+    drained it looks, field for field, like the born-processed self-notice of
+    issue #197 — same scope, same source, processed — and a later notice in the
+    same wave must still see that this scope has refreshed.
+    """
+    from strata.change_events import emit as emit_change_event
+
+    emit_change_event(
+        fleet=fleet,
+        record_store=record_store,
+        item="c_operator",
+        kind="directive_retired",
+        source_scope_id="g_ce_parent",
+        before="c_operator",
+        after=None,
+        wave_ids=["chg_operator_wave"],
+        by_operator=True,
+    )
+    (queued,) = record_store.list_change_events(scope_id="g_ce_parent")
+    # Precondition: the operator's change really was enqueued for a refresh.
+    assert queued.processed_at is None
+    record_store.mark_change_event_processed(queued.id)  # the drain runs
+
+    emit_change_event(
+        fleet=fleet,
+        record_store=record_store,
+        item="c_second",
+        kind="directive_appended",
+        source_scope_id="g_ce_parent",
+        after="c_second",
+        wave_ids=["chg_operator_wave"],
+        by_operator=True,
+    )
+
+    later = [
+        e for e in record_store.list_change_events(scope_id="g_ce_parent") if e.id != queued.id
+    ]
+    assert [e.item_id for e in later] == ["c_second"]
+    assert later[0].processed_at is not None  # told, not enqueued a second time

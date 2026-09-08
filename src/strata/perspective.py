@@ -149,6 +149,7 @@ class _ChangeEventLike(Protocol):
     contribution_id: str
     processed_at: str | None
     created_at: str
+    self_notice: int
     shown_at: str | None
 
 
@@ -251,12 +252,13 @@ def _composes_as_input_change(event: _ChangeEventLike, *, scope_id: str) -> bool
     Unprocessed means a refresh is still owed and the notice with it. The one
     processed event that still composes is a SELF-notice — the scope's own
     retraction (issue #197), which owes no refresh at all (its own judge wrote
-    it) and so is born processed, but owes its readers one delivery: it carries
-    ``shown_at is None`` until a read hands it over.
+    it) and so is born processed, but owes its readers one delivery: the row
+    says it is one, and carries ``shown_at is None`` until a read hands it
+    over.
     """
     if event.processed_at is None:
         return True
-    return event.source_scope_id == scope_id and event.shown_at is None
+    return bool(event.self_notice) and event.shown_at is None
 
 
 def _publication_item_dict(item: _PublishedItemLike) -> dict:
@@ -489,8 +491,8 @@ def compose_perspective(
             reactive re-judgement notice, never prose. A processed event
             never appears, however the reader ordered or filtered its
             results — with ONE exception, and it is exception by construction
-            rather than by trust: a SELF-notice (``source_scope_id ==
-            scope_id``) whose ``shown_at`` is still ``None``. That is the
+            rather than by trust: a row the store marks a SELF-notice whose
+            ``shown_at`` is still ``None``. That is the
             scope's own retraction (ADR 0014 D1 as amended, issue #197) —
             born processed because its own judge wrote it and no refresh is
             owed, composed until one read delivers it to the scope's readers.

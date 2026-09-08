@@ -8,6 +8,13 @@
 -- have read the item that has just gone and owe a revision. That notice is
 -- born processed and needs its own consumption rule.
 --
+--   self_notice  1 when the row is a scope's notice of its OWN retraction. Not
+--             derivable from the columns already here: an operator correction
+--             to S is also `scope_id = source_scope_id`, and once its refresh
+--             has drained it is also processed, so any test made of those two
+--             would read a refreshed wave as never refreshed and hand the
+--             scope a second refresh (ADR 0014 D4). What the row IS is a fact
+--             about its birth, so it is written at birth.
 --   shown_at  When this notice was delivered to a reader in the perspective's
 --             `input_changes`. NULL means "still owed to a reader". For every
 --             event that is a refresh trigger, the drain-and-read IS the
@@ -16,8 +23,10 @@
 --             with NULL, and `compose_perspective` composes it until the read
 --             that carries it stamps it.
 --
--- Backfilled to `created_at` for every existing row: history is not re-notified
+-- `shown_at` is backfilled to `created_at` for every existing row: history is not re-notified
 -- (ADR 0013 D7 — no reinterpretation of what is already written).
+
+ALTER TABLE change_events ADD COLUMN self_notice INTEGER NOT NULL DEFAULT 0;
 
 ALTER TABLE change_events ADD COLUMN shown_at TEXT;
 
