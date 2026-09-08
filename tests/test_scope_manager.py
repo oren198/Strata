@@ -5280,3 +5280,46 @@ def test_declining_an_observation_leaves_its_reasoning_as_the_only_record() -> N
     assert judgment.decision == "decline"
     assert judgment.new_summary is None
     assert judgment.record_notes == reasoning
+
+
+def test_budget_rewrite_may_not_resurrect_the_superseded_claim() -> None:
+    """Ordering: the overflow re-ask runs last, so its rewrite gets the drop re-applied (#199).
+
+    The stale-claim re-ask has already been spent by then, so a shorter
+    `new_context` that puts the replaced claim back is dropped rather than
+    re-asked — otherwise a budget correction would silently undo the drop.
+    """
+    stale = _context_supersession_input(f"Back again: {_SUPERSEDED_CONTEXT_CONTENT}")
+    over_budget = _context_supersession_input(
+        _CLEAN_CONTEXT + " " + " ".join(f"word{i}" for i in range(40))
+    )
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [
+        _fake_response(stale),
+        _fake_response(over_budget),
+        _fake_response(stale),
+    ]
+
+    # EXISTING_DIRECTIVE is 5 words: the clean rewrite fits, the padded one
+    # does not, so the overflow re-ask fires after the stale-claim one.
+    judgment = ScopeManager(client=mock_client).judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[RECENT_ROW],
+        new_contribution=_contribution_superseding(RECENT_CONTRIBUTION.id),
+        summary_max_words=20,
+    )
+
+    assert mock_client.messages.create.call_count == 3
+    overflow_text = [
+        b
+        for b in mock_client.messages.create.call_args_list[2].kwargs["messages"][-1]["content"]
+        if b["type"] == "text"
+    ][0]["text"]
+    assert "BUDGET" in overflow_text
+
+    assert judgment.dropped_superseded_context is True
+    assert judgment.new_context is None
+    assert judgment.new_summary is not None
+    assert judgment.new_summary.context == CURRENT_SUMMARY.context

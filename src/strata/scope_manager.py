@@ -3458,6 +3458,17 @@ class ScopeManager:
                     # second corrective, never a lost verdict.
                     if invalid_ops(second_judgment):
                         second_judgment = drop_invalid(second_judgment)
+                    # And a shorter rewrite that puts the superseded claim
+                    # back is still a resurrection (#199). The stale-claim
+                    # re-ask has already been spent, so this is the same
+                    # drop-and-note fallback, re-applied — otherwise a budget
+                    # correction would silently undo the drop above.
+                    if (
+                        drop_stale_context is not None
+                        and stale_claims is not None
+                        and stale_claims(second_judgment)
+                    ):
+                        second_judgment = drop_stale_context(second_judgment)
                 except Exception:  # noqa: BLE001 — deliberate: retry is best-effort
                     second_judgment = None
                 if second_judgment is not None and second_judgment.new_summary is not None:
