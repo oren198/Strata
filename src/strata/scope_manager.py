@@ -1826,7 +1826,18 @@ def _resurrected_superseded_claims(
     haystack = _collapse_whitespace(judgment.new_context)
     if not haystack:
         return []
-    admitted = _collapse_whitespace(contribution.content)
+    # The contribution's own bytes, and every admitting op's text: an
+    # extension supersession may have been admitted via `publish` (the judge's
+    # wording) rather than `append`, and the old sentence is then present in
+    # `new_context` because the LIVE claim says it, exactly as for `append`.
+    admitted = " ".join(
+        _collapse_whitespace(text)
+        for text in (
+            contribution.content,
+            *(op.content or "" for op in judgment.directive_ops if op.op in _ADMITTING_OPS),
+        )
+        if text
+    )
     return [
         target
         for target, content in _superseded_claim_contents(
@@ -3300,8 +3311,14 @@ class ScopeManager:
             if isinstance(parse_error, _NoToolUseBlock):
                 # No tool_use block means no tool_use id to answer with a
                 # tool_result — the correction is a bare text turn (#201).
+                # A truncated response can carry no blocks at all; echoing an
+                # empty assistant turn is rejected by the API, so then the
+                # correction goes out as a fresh user turn on its own.
+                echo = (
+                    [{"role": "assistant", "content": response.content}] if response.content else []
+                )
                 correction = [
-                    {"role": "assistant", "content": response.content},
+                    *echo,
                     {"role": "user", "content": [{"type": "text", "text": corrective_text}]},
                 ]
             else:

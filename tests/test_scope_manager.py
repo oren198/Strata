@@ -5391,3 +5391,70 @@ def test_extension_carve_out_does_not_excuse_a_transition_narrative() -> None:
     assert mock_client.messages.create.call_count == 2
     assert judgment.new_summary is not None
     assert judgment.new_summary.context == _CLEAN_CONTEXT
+
+
+def test_extension_supersession_via_publish_is_not_treated_as_a_resurrection() -> None:
+    """The carve-out covers an extension admitted in the judge's own words.
+
+    A `publish` op carries the combined text instead of the contribution's
+    bytes; the old sentence is in `new_context` because the LIVE claim says
+    it, exactly as with `append`. One call, no drop.
+    """
+    combined = f"{EXISTING_DIRECTIVE.content} Also annotate every public function."
+    terse = _contribution("c_ext02", "Add type hints to the naming rule.", subject="naming")
+    manager, mock_client = _make_manager(
+        {
+            "decision": "accept_as_directive",
+            "reasoning": "Extends the naming rule with annotations, in my own words.",
+            "directive_ops": [
+                {"op": "supersede", "id": EXISTING_DIRECTIVE.id},
+                {"op": "publish", "content": combined, "subject": "naming"},
+            ],
+            "new_context": f"Style now covers: {combined}",
+        }
+    )
+
+    judgment = manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=terse,
+    )
+
+    assert mock_client.messages.create.call_count == 1
+    assert judgment.dropped_superseded_context is False
+    assert judgment.new_summary is not None
+    assert combined in judgment.new_summary.context
+
+
+def test_an_empty_response_is_re_asked_without_echoing_an_empty_assistant_turn() -> None:
+    """Slip (a), truncated to nothing: no blocks at all.
+
+    Echoing `{"role": "assistant", "content": []}` is rejected by the API, so
+    the correction goes out as a fresh user turn on its own — and the judgment
+    still recovers on the second call.
+    """
+    empty = MagicMock()
+    empty.content = []
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [
+        empty,
+        _fake_response(_accept_directive_input()),
+    ]
+    manager = ScopeManager(client=mock_client)
+
+    judgment = manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+    )
+
+    assert mock_client.messages.create.call_count == 2
+    assert judgment.decision == "accept_as_directive"
+    second_messages = mock_client.messages.create.call_args_list[1].kwargs["messages"]
+    assert all(m["role"] != "assistant" or m["content"] for m in second_messages)
+    assert second_messages[-1]["role"] == "user"
+    assert "submit_judgment" in second_messages[-1]["content"][0]["text"]
