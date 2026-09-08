@@ -1386,3 +1386,108 @@ def test_change_event_reader_called_with_requested_scope_id(tmp_path: Path) -> N
     compose_perspective("g_team", fleet=fleet, summary_store=store, change_event_reader=reader)
 
     assert calls == ["g_team"]
+
+
+# ---------------------------------------------------------------------------
+# Test 7: the condensation signal on the self layer (issue #202)
+#
+# A reader cannot distinguish "condensed away" from "never admitted", so the
+# self layer discloses both halves mechanically: the summary's own `condensed`
+# stamp, and how many accepted-as-context contributions no longer appear in
+# the context.
+# ---------------------------------------------------------------------------
+
+
+def _seed_accepted_context(db_path: str, *, scope_id: str, contents: list[str]) -> RecordStore:
+    """Append *contents* to *scope_id*'s record and judge each accept_as_context."""
+    from strata.record_store import ContributorRef
+
+    run_migrations(db_path)
+    record_store = RecordStore(db_path)
+    for content in contents:
+        contribution = record_store.append_contribution(
+            scope_id=scope_id,
+            content=content,
+            proposed_classification="context",
+            subject=None,
+            supersedes=None,
+            contributor=ContributorRef(
+                scope_id=scope_id,
+                skill="code-writer",
+                session_id="sess_202",
+                ts="2026-09-08T00:00:00+00:00",
+            ),
+        )
+        record_store.record_judgment(
+            contribution_id=contribution.id,
+            decision="accept_as_context",
+            judged_by="scope-manager",
+        )
+    return record_store
+
+
+def test_self_layer_counts_accepted_context_contributions_absent(tmp_path: Path) -> None:
+    """Two accepted-as-context contributions, one absent from the context → count 1."""
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fixture_fleet_yaml(tmp_path)
+    _seed_summaries(summaries_dir)
+    store = SummaryStore(summaries_dir)
+    fleet = FleetConfig.load(fleet_path)
+
+    store.write(
+        "g_team",
+        ScopeSummary(
+            scope_id="g_team",
+            directives=[],
+            context="The build is pinned to Python 3.12.",
+            updated_at="2026-09-08T00:00:00+00:00",
+            condensed=True,
+        ),
+    )
+    record_store = _seed_accepted_context(
+        str(tmp_path / "strata.db"),
+        scope_id="g_team",
+        contents=[
+            "The build is pinned to Python 3.12.",  # still there, verbatim
+            "The staging cluster reboots on Sundays.",  # condensed away
+        ],
+    )
+
+    def _contribution_reader(scope_id: str) -> list:
+        return record_store.list_accepted_context_contributions(scope_id=scope_id)
+
+    result = compose_perspective(
+        "g_team",
+        fleet=fleet,
+        summary_store=store,
+        contribution_reader=_contribution_reader,
+    )
+
+    self_layer = next(layer for layer in result["layers"] if layer["relation"] == "self")
+    assert self_layer["condensation"] == {
+        "condensed": True,
+        "context_contributions_absent": 1,
+    }
+    # The signal rides the self layer alone — it describes THIS scope's own
+    # context, the one payload composition still carries in full.
+    assert all(
+        "condensation" not in layer for layer in result["layers"] if layer["relation"] != "self"
+    )
+
+
+def test_self_layer_count_is_none_without_a_contribution_reader(tmp_path: Path) -> None:
+    """No reader → the count is honestly ``None``, never a misleading zero."""
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fixture_fleet_yaml(tmp_path)
+    store = _seed_summaries(summaries_dir)
+    fleet = FleetConfig.load(fleet_path)
+
+    result = compose_perspective("g_team", fleet=fleet, summary_store=store)
+
+    self_layer = next(layer for layer in result["layers"] if layer["relation"] == "self")
+    # `condensed` still comes through: it is the summary's own stamp, needing
+    # no reader at all.
+    assert self_layer["condensation"] == {
+        "condensed": False,
+        "context_contributions_absent": None,
+    }
