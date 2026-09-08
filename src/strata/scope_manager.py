@@ -128,12 +128,13 @@ def _batch_max_tokens(batch_size: int) -> int:
 #: may do:
 #:
 #: - ``ordinary``: a contribution arrived; every op is available.
-#: - ``input_change_refresh``: ADR 0014 D2's reactive re-judgement. ``publish``
-#:   is ALLOWED — the change notice is a real contribution to mint a directive
-#:   FROM (its id, its provenance: this entered because input X changed).
-#:   ``append`` is dropped: it would copy the notice's bytes — a mechanical
-#:   change payload under the subject ``manager-refresh`` — verbatim into a
-#:   directive.
+#: - ``input_change_refresh``: ADR 0014 D2's reactive re-judgement. It admits
+#:   nothing — both ``append`` and ``publish`` are dropped (amended at the
+#:   1.11.0 gate, #198): the changed input is already composed for every reader
+#:   (ADR 0013/0015), so re-admitting it would manufacture a second copy under
+#:   the hearer's name. And when every pending event is an ADDITION the
+#:   amendment's ``new_context`` is dropped too (amended 2026-09-08, #198 third
+#:   form) — see :func:`_refresh_events_are_all_additions`.
 JudgeMode = Literal["ordinary", "input_change_refresh"]
 
 #: The admitting ops each mode drops (ADR 0014 D2). One table, read by both
@@ -144,6 +145,24 @@ _DROPPED_ADMITTING_OPS: dict[str, tuple[str, ...]] = {
 }
 
 _JUDGE_MODES: tuple[str, ...] = ("ordinary", "input_change_refresh")
+
+#: The change-event kinds that ADD an input (ADR 0014 D2, amended 2026-09-08,
+#: #198 third form). Nothing of the scope's OWN moved: the added item is
+#: already composed for every reader (ADR 0013/0015), so the only thing a
+#: `new_context` can say about it is a restatement.
+_REFRESH_ADDITION_KINDS: frozenset[str] = frozenset({"published", "amended", "directive_appended"})
+
+#: The kinds that REMOVE or REPLACE an input. Here the scope's own context may
+#: genuinely no longer stand — it may be asserting something its inputs no
+#: longer support — so `new_context` stays available.
+_REFRESH_REMOVAL_KINDS: frozenset[str] = frozenset(
+    {"withdrawn", "directive_retired", "directive_superseded", "operator_directive_changed"}
+)
+
+#: ADR 0015 D5's unsplice, spelled here rather than imported: this module does
+#: not depend on :mod:`strata.change_events` (see :class:`_ChangeEventLike`).
+#: It is in neither set above — an addition it is not, and a removal it is not.
+_REFRESH_NEUTRAL_KIND = "directive_unspliced"
 
 
 def _check_mode(mode: str) -> None:
@@ -172,6 +191,18 @@ class _ChangeEventLike(Protocol):
     kind: str
     before: str | None
     after: str | None
+
+
+def _refresh_events_are_all_additions(events: Sequence[_ChangeEventLike] | None) -> bool:
+    """Is every pending event on this refresh an ADDITION (ADR 0014 D2)?
+
+    The test is a POSITIVE classification, never "no removal present": a kind
+    this module has never heard of, and :data:`_REFRESH_NEUTRAL_KIND`, fall
+    through to the old behaviour rather than silently locking the context. No
+    events at all (a splice-only or odd drain) is likewise not a lock.
+    """
+    kinds = [event.kind for event in (events or ()) if event.kind != _REFRESH_NEUTRAL_KIND]
+    return bool(kinds) and all(kind in _REFRESH_ADDITION_KINDS for kind in kinds)
 
 
 class _PublishedItemLike(Protocol):
@@ -663,7 +694,15 @@ writing it into this scope's memory under this scope's name would manufacture
 a second copy: a note would become a rule, the hearer would become its origin,
 and a withdrawal at the source would leave the copy standing. So `new_context`
 never restates the changed input — not the directive, not the publication, not
-a line saying that it now applies. What the refresh is FOR: `supersede` or
+a line saying that it now applies. This is enforced, not merely asked: when
+every pending change is an ADDITION (published, amended, a directive
+appended), `new_context` is dropped from your amendment and the drop is noted
+in the record — nothing of this scope's own moved, so there is nothing of its
+own to reconcile. When a pending change REMOVES or replaces an input
+(withdrawn, retired, superseded, an operator correction), `new_context`
+stands: this scope may be asserting something its inputs no longer support,
+and dropping that belief is exactly the refresh's work. What the refresh is
+FOR: `supersede` or
 `retire` this scope's own directives that the change undercuts,
 `withdraw_published` this scope's own items whose belief it drops, and rewrite
 this scope's own context where its own beliefs no longer stand.
@@ -1416,6 +1455,16 @@ class _AmendmentJudgment(BaseModel):
     the amendment may carry context and lifecycle ops only (ADR 0011 D4).
     Either way the drop is noted in :attr:`record_notes`."""
 
+    dropped_new_context: bool = False
+    """Did the engine drop a ``new_context`` the judge sent (ADR 0014 D2)?
+
+    True only on an input-change refresh whose pending events are all
+    additions, where the context is locked: nothing of this scope's own moved,
+    so the only thing a rewrite could carry is a restatement of the changed
+    input (#198 third form). :attr:`new_context` is then ``None`` and the
+    summary's context is untouched; this flag is what keeps the drop visible
+    in the record instead of silent."""
+
     withdraw_published: list[str] = Field(default_factory=list)
     """Published item ids to withdraw (ADR 0007 D3/D5 judged propagation).
 
@@ -1627,12 +1676,16 @@ class ScopeManagerJudgment(_AmendmentJudgment):
 
         The judge's reasoning, plus a mechanical note naming every op that did
         not apply (see :attr:`dropped_ops`) — the record has to show which
-        part of the amendment the engine dropped — and another naming every
-        declared source the judge was never shown (ADR 0014 D3).
+        part of the amendment the engine dropped — another naming every
+        declared source the judge was never shown (ADR 0014 D3), and one more
+        when the refresh locked the context (ADR 0014 D2).
         """
-        return _with_dropped_sources_note(
-            _with_dropped_note(self.reasoning, self.dropped_ops),
-            self.dropped_context_sources,
+        return _with_dropped_context_note(
+            _with_dropped_sources_note(
+                _with_dropped_note(self.reasoning, self.dropped_ops),
+                self.dropped_context_sources,
+            ),
+            self.dropped_new_context,
         )
 
 
@@ -1745,6 +1798,9 @@ class ScopeManagerBatchJudgment(_AmendmentJudgment):
         notes = _with_dropped_note(reasoning, dropped)
         if verdict is not None and verdict.decision != "decline":
             notes = _with_dropped_sources_note(notes, self.dropped_context_sources)
+            # Same rule, same reason: the amendment is the batch's one
+            # amendment, so a locked context is news on every accepted row.
+            notes = _with_dropped_context_note(notes, self.dropped_new_context)
         return notes
 
 
@@ -2069,6 +2125,23 @@ def _with_dropped_sources_note(reasoning: str, dropped_sources: Sequence[str]) -
     return f"{reasoning} [Declared context_sources not rendered to this judge: {dropped}.]"
 
 
+def _with_dropped_context_note(reasoning: str, dropped_new_context: bool) -> str:
+    """Return *reasoning* plus the note for a context locked by the refresh.
+
+    The third sibling of :func:`_with_dropped_note` and
+    :func:`_with_dropped_sources_note`, kept apart for the same reason they
+    are: this is neither an op the engine could not apply nor a provenance
+    claim it could not corroborate, but a rewrite of the scope's own context
+    that ADR 0014 D2 does not allow on this refresh at all.
+    """
+    if not dropped_new_context:
+        return reasoning
+    return (
+        f"{reasoning} [Dropped new_context: a refresh on additions reconciles "
+        "nothing of its own — ADR 0014 D2.]"
+    )
+
+
 def _render_current_publication(items: Sequence[_PublishedItemLike] | None) -> str:
     """Render the THIS SCOPE'S PUBLICATION block (ADR 0007 D3/D5).
 
@@ -2286,12 +2359,26 @@ def _build_judge_preamble(
     # input-change refresh.
     refresh_block = ""
     if mode == "input_change_refresh":
+        # ADR 0014 D2 (amended 2026-09-08, #198 third form): say which of the
+        # two cases is pending, because the engine will enforce it either way —
+        # a judge told "lifecycle ops only" on a refresh that may still rewrite
+        # its context would be told something false, and the reverse leaves the
+        # drop unexplained.
+        available = (
+            "These changes are all additions: `new_context` is dropped on this "
+            "refresh — nothing of your own moved, so there is nothing of your own "
+            "to reconcile; use `supersede`, `retire` and `withdraw_published` only. "
+            if _refresh_events_are_all_additions(input_changes)
+            else "These changes include a removal, so your own beliefs may no longer "
+            "stand: `supersede`, `retire`, `new_context` and `withdraw_published` "
+            "are available here. "
+        )
         refresh_block = (
             "INPUT-CHANGE REFRESH: nobody contributed anything — an input this "
             "scope's memory rests on changed, and the INPUT CHANGES block below says "
-            "what. Reconcile THIS SCOPE'S OWN memory with the current inputs: "
-            "`supersede`, `retire`, `new_context` and `withdraw_published` are "
-            "available here; `append` and `publish` are dropped on this path — the "
+            "what. Reconcile THIS SCOPE'S OWN memory with the current inputs. "
+            f"{available}"
+            "`append` and `publish` are dropped on this path — the "
             "changed input is already composed for every reader, so there is "
             "nothing of your own to admit from it. Never restate the changed input "
             "in `new_context`: not the directive, not the publication, not a note "
@@ -2661,6 +2748,13 @@ class ScopeManager:
                 current_summary=current_summary,
                 new_contribution=new_contribution,
                 mode=mode,
+                # ADR 0014 D2: computed from the same events the INPUT-CHANGE
+                # REFRESH block was rendered from, so what the judge is told
+                # and what the engine enforces cannot disagree.
+                context_locked=(
+                    mode == "input_change_refresh"
+                    and _refresh_events_are_all_additions(input_changes)
+                ),
                 change_id=change_id,
                 hop=hop,
                 rendered_item_ids=rendered_item_ids,
@@ -3097,6 +3191,7 @@ class ScopeManager:
                 directive_ops=judgment.directive_ops,
                 new_context=judgment.new_context,
                 dropped_ops=judgment.dropped_ops,
+                dropped_new_context=judgment.dropped_new_context,
                 dropped_ops_by_contribution=(
                     {only.id: list(judgment.dropped_ops)} if judgment.dropped_ops else {}
                 ),
@@ -3142,6 +3237,11 @@ class ScopeManager:
                 current_summary=current_summary,
                 contributions=contributions,
                 mode=mode,
+                # The same one source of truth as on the single path.
+                context_locked=(
+                    mode == "input_change_refresh"
+                    and _refresh_events_are_all_additions(input_changes)
+                ),
                 change_ids=wave_ids,
                 hop=hop,
                 rendered_item_ids=rendered_item_ids,
@@ -3208,6 +3308,7 @@ class ScopeManager:
         current_summary: ScopeSummary | None,
         contributions: Mapping[str, Contribution],
         mode: JudgeMode = "ordinary",
+        context_locked: bool = False,
         change_ids: Sequence[str] = (),
         hop: int = 0,
         rendered_item_ids: Sequence[str] = (),
@@ -3269,9 +3370,8 @@ class ScopeManager:
         dropped_by_contribution: dict[str, list[str]] = {}
         to_drop = _DROPPED_ADMITTING_OPS[mode]
         if to_drop:
-            # Exactly as on the single path — an input-change refresh keeps
-            # `publish` and drops `append` (ADR 0014 D2) — however many notices
-            # the batch coalesced.
+            # Exactly as on the single path — an input-change refresh admits
+            # nothing (ADR 0014 D2) — however many notices the batch coalesced.
             admitting = [op for op in ops if op.op in to_drop]
             if admitting:
                 ops = [op for op in ops if op.op not in to_drop]
@@ -3293,6 +3393,13 @@ class ScopeManager:
                     "declined contribution amends nothing, so no op belongs to it."
                 )
 
+        # ADR 0014 D2 (amended 2026-09-08, #198 third form), exactly as on the
+        # single path: a refresh on additions alone has nothing of this
+        # scope's own to reconcile, so its context is locked.
+        dropped_new_context = context_locked and new_context is not None
+        if dropped_new_context:
+            new_context = None
+
         new_summary = _apply_batch_amendment(
             scope=scope,
             current_summary=current_summary,
@@ -3307,6 +3414,7 @@ class ScopeManager:
             directive_ops=ops,
             new_context=new_context,
             dropped_ops=dropped,
+            dropped_new_context=dropped_new_context,
             dropped_ops_by_contribution=dropped_by_contribution,
             withdraw_published=withdraw_published,
             change_ids=list(change_ids),
@@ -3414,6 +3522,7 @@ class ScopeManager:
         current_summary: ScopeSummary | None,
         new_contribution: Contribution,
         mode: JudgeMode = "ordinary",
+        context_locked: bool = False,
         change_id: str | None = None,
         hop: int = 0,
         rendered_item_ids: Sequence[str] = (),
@@ -3480,13 +3589,22 @@ class ScopeManager:
         dropped: list[str] = []
         to_drop = _DROPPED_ADMITTING_OPS[mode]
         if to_drop:
-            # ADR 0014 D2: an input-change refresh has a real contribution
-            # to mint FROM, so `publish` stands — but never to copy, so
-            # `append` (which takes the notice's bytes verbatim) is dropped.
+            # ADR 0014 D2 as amended at the 1.11.0 gate (#198): the changed
+            # input is already composed for every reader, so an input-change
+            # refresh admits nothing — neither the notice's bytes (`append`)
+            # nor the judge's own words about it (`publish`).
             admitting = [op for op in ops if op.op in to_drop]
             if admitting:
                 ops = [op for op in ops if op.op not in to_drop]
                 dropped = [op.describe() for op in admitting]
+
+        # ADR 0014 D2 (amended 2026-09-08, #198 third form): on a refresh whose
+        # events are all additions the context is locked. A prompt obligation
+        # was not enough — a judge told never to restate the changed input
+        # restated it with attribution and called that acknowledging.
+        dropped_new_context = context_locked and new_context is not None
+        if dropped_new_context:
+            new_context = None
 
         new_summary = _apply_amendment(
             scope=scope,
@@ -3503,6 +3621,7 @@ class ScopeManager:
             directive_ops=ops,
             new_context=new_context,
             dropped_ops=dropped,
+            dropped_new_context=dropped_new_context,
             withdraw_published=withdraw_published,
             change_id=change_id,
             hop=hop,
