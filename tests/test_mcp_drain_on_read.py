@@ -395,3 +395,31 @@ async def test_a_judge_outage_still_lists_the_events_it_could_not_drain(
 
     assert result["refresh_pending"] == 1
     assert [e["item_id"] for e in result["input_changes"]] == ["p_1"]
+
+
+# ---------------------------------------------------------------------------
+# Issue #202 — the condensation disclosure over MCP
+# ---------------------------------------------------------------------------
+
+
+async def test_an_mcp_read_counts_the_contributions_absent_from_its_context(
+    tmp_path: Path,
+) -> None:
+    """`context_contributions_absent` is a live count over MCP, never `None`.
+
+    `None` is composition's honest "not computed", which it returns when no
+    contribution reader is wired — an agent reading its own scope would learn
+    nothing about what was condensed away from it.
+    """
+    mod, _db_path, fleet = _setup(tmp_path)
+
+    with (
+        patch.object(mod, "_AGENT_SCOPE", "g_team"),
+        patch.object(mod, "_AGENT_SKILL", None),
+        patch.object(mod, "_AGENT_SESSION_ID", "sess_test"),
+        patch.object(mod, "_load_fleet", return_value=fleet),
+    ):
+        result = await mod.strata_read_perspective()
+
+    (self_layer,) = [layer for layer in result["layers"] if layer["relation"] == "self"]
+    assert isinstance(self_layer["condensation"]["context_contributions_absent"], int)

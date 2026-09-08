@@ -2757,6 +2757,14 @@ async def strata_read_perspective(scope_id: str | None = None) -> dict:
     def _change_event_reader(target_scope_id: str) -> list:
         return _record_store.list_change_events(scope_id=target_scope_id)
 
+    # contribution_reader (issue #202): what this scope ACCEPTED into its
+    # context, against which composition counts what no longer appears there.
+    # Wired here so the disclosure is live over MCP — absent the reader the
+    # count is an honest `None`, which reads as "not computed" and tells an
+    # agent nothing about its own condensed memory.
+    def _contribution_reader(target_scope_id: str) -> list:
+        return _record_store.list_accepted_context_contributions(scope_id=target_scope_id)
+
     perspective = compose_perspective(
         scope_id,
         fleet=fleet,
@@ -2764,6 +2772,7 @@ async def strata_read_perspective(scope_id: str | None = None) -> dict:
         operator_reader=_operator_reader,
         publication_reader=_publication_reader,
         change_event_reader=_change_event_reader,
+        contribution_reader=_contribution_reader,
         # ADR 0014 D5, issue #203: what the drain above just consumed. Notice
         # is immediate, only absorption is deferred — without this the reader
         # whose read paid for the refresh is the one reader never told what

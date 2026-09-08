@@ -253,8 +253,20 @@ async def test_golden_equivalence_mcp_tool_matches_compose_perspective(tmp_path:
     # g_peer_b has no summary file, so its layer's publication is honestly
     # empty regardless of timestamps — no synthesis/freezing needed for it
     # any more (ADR 0013: a reference layer never carries a summary).
+    # The same contribution reader the MCP tool wires (issue #202): without it
+    # the direct call reports `context_contributions_absent: None` ("not
+    # computed") where the tool reports a live count, and the two dicts are
+    # equal for the wrong reason.
+    def _contribution_reader(scope_id: str) -> list:
+        with RecordStore(db_path) as rs:
+            return rs.list_accepted_context_contributions(scope_id=scope_id)
+
     direct_result = compose_perspective(
-        "g_team", fleet=fleet, summary_store=store, publication_reader=_publication_reader
+        "g_team",
+        fleet=fleet,
+        summary_store=store,
+        publication_reader=_publication_reader,
+        contribution_reader=_contribution_reader,
     )
 
     # Through the MCP tool (entitlement checks + delegation).
