@@ -347,3 +347,129 @@ def test_wave_ids_reads_the_same_on_both_judgment_shapes():
     assert single.wave_ids == ["chg_a"]
     assert batch.wave_ids == ["chg_a", "chg_b"]
     assert ordinary.wave_ids == []
+
+
+# ---------------------------------------------------------------------------
+# A refresh on additions alone reconciles nothing of its own (#198, third
+# form; ADR 0014 D2 as amended 2026-09-08)
+# ---------------------------------------------------------------------------
+
+
+def _locked(events) -> bool:  # noqa: ANN001
+    from strata.scope_manager import _refresh_events_are_all_additions
+
+    return _refresh_events_are_all_additions(events)
+
+
+def test_addition_only_events_lock_the_context():
+    """`published`, `amended` and `directive_appended` add an input; there is
+    nothing of the scope's OWN for a refresh to reconcile against them."""
+    assert _locked([_change_event(kind="published")])
+    assert _locked([_change_event(kind="amended")])
+    assert _locked([_change_event(kind="directive_appended")])
+    assert _locked([_change_event(kind="published"), _change_event(kind="directive_appended")])
+
+
+def test_one_removal_among_additions_unlocks_the_context():
+    """A removal may leave the scope asserting what its inputs no longer
+    support, so its own context must stay writable."""
+    for kind in (
+        "withdrawn",
+        "directive_retired",
+        "directive_superseded",
+        "operator_directive_changed",
+    ):
+        assert not _locked([_change_event(kind=kind)])
+        assert not _locked([_change_event(kind="published"), _change_event(kind=kind)])
+
+
+def test_an_unspliced_event_counts_as_neither():
+    """ADR 0015 D5's unsplice says a row stopped pretending; it is not an
+    addition, and on its own it leaves the old behaviour in place."""
+    assert not _locked([_change_event(kind="directive_unspliced")])
+    assert _locked([_change_event(kind="published"), _change_event(kind="directive_unspliced")])
+
+
+def test_no_events_and_an_unknown_kind_keep_the_old_behaviour():
+    """The rule locks on a positive classification, never on the absence of a
+    removal — a splice-only drain and a kind this module has never heard of
+    both fall through unlocked."""
+    assert not _locked([])
+    assert not _locked(None)
+    assert not _locked([_change_event(kind="something_new")])
+
+
+def test_a_locked_refresh_drops_new_context_and_notes_it():
+    judgment = ScopeManager._parse_judgment(
+        scope=SCOPE,
+        tool_use_block=_tool_block(
+            decision="accept_as_context",
+            reasoning="The publication from billing must be acknowledged here.",
+            new_context="The invoice run must not start before ledger close — per billing.",
+        ),
+        current_summary=_summary(),
+        new_contribution=_contribution(),
+        mode="input_change_refresh",
+        context_locked=True,
+    )
+
+    assert judgment.new_context is None
+    assert judgment.new_summary is not None
+    assert judgment.new_summary.context == _summary().context
+    assert "Dropped new_context" in judgment.record_notes
+
+
+def test_an_unlocked_refresh_keeps_new_context():
+    judgment = _parse("input_change_refresh", ops=[])
+    assert judgment.new_context == "Reconciled."
+    assert "Dropped new_context" not in judgment.record_notes
+
+
+def test_ordinary_mode_is_never_context_locked():
+    judgment = _parse("ordinary", ops=[])
+    assert judgment.new_context == "Reconciled."
+
+
+def test_a_locked_refresh_batch_drops_new_context_and_notes_it():
+    contribution = _contribution()
+    judgment = ScopeManager._parse_batch_judgment(
+        scope=SCOPE,
+        tool_use_block=_tool_block(
+            verdicts=[
+                {
+                    "contribution_id": contribution.id,
+                    "decision": "accept_as_context",
+                    "reasoning": "acknowledging the new publication",
+                }
+            ],
+            directive_ops=[{"op": "retire", "id": "c_gone", "contribution_id": contribution.id}],
+            new_context="Inherited directive c_1 now applies: write incidents up in a day.",
+        ),
+        current_summary=_summary(),
+        contributions={contribution.id: contribution},
+        mode="input_change_refresh",
+        context_locked=True,
+    )
+
+    assert judgment.new_context is None
+    assert [op.op for op in judgment.directive_ops] == ["retire"]
+    assert judgment.new_summary is not None
+    assert judgment.new_summary.context == _summary().context
+    assert "Dropped new_context" in judgment.record_notes_for(contribution.id)
+
+
+def test_the_refresh_block_says_which_case_applies():
+    """The prompt states the rule the engine will enforce, conditioned on what
+    is actually pending — a judge told "use lifecycle ops only" on a refresh
+    that still admits context would be told something false."""
+    additions = _preamble(
+        mode="input_change_refresh", input_changes=[_change_event(kind="published")]
+    )
+    assert "all additions" in additions
+    assert "`new_context` is dropped" in additions
+
+    removal = _preamble(
+        mode="input_change_refresh", input_changes=[_change_event(kind="withdrawn")]
+    )
+    assert "`new_context` is dropped on this refresh" not in removal
+    assert "restate" in removal.lower()

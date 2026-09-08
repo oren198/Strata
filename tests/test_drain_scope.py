@@ -386,3 +386,73 @@ def test_a_first_hop_wave_leaves_the_judgment_at_hop_one(tmp_path: Path) -> None
     _drain(db_path, fleet, summary_store, judge)
 
     assert judge.judge_calls[0]["hop"] == 1
+
+
+# ---------------------------------------------------------------------------
+# A refresh on an addition never writes the changed input into this scope's
+# own context (#198 third form, ADR 0014 D2 as amended 2026-09-08)
+# ---------------------------------------------------------------------------
+
+
+def _real_manager(tool_input: dict):  # noqa: ANN201
+    """A real ScopeManager over a stubbed client — the parser has to run.
+
+    ``_ScriptedJudge`` above stands in for the whole scope-manager, so it
+    never exercises what the parser drops; this defect lives in the parser.
+    """
+    from unittest.mock import MagicMock
+
+    from strata.scope_manager import ScopeManager
+
+    block = MagicMock()
+    block.type = "tool_use"
+    block.input = tool_input
+    response = MagicMock()
+    response.content = [block]
+    client = MagicMock()
+    client.messages.create.return_value = response
+    return ScopeManager(client=client)
+
+
+def test_a_drain_on_an_addition_leaves_the_scopes_own_context_untouched(tmp_path: Path) -> None:
+    """The judge restates the announcement with attribution and calls it
+    acknowledging; the engine drops it, and the record says so."""
+    db_path, fleet, summary_store = _setup(tmp_path)
+    with RecordStore(db_path) as rs:
+        _emit(rs, change_id="chg_add", item_id="p_new", kind="published")
+
+    manager = _real_manager(
+        {
+            "decision": "accept_as_context",
+            "reasoning": "The new publication from billing must be acknowledged here.",
+            "new_context": "restated",
+        }
+    )
+    outcome = _drain(db_path, fleet, summary_store, manager)
+
+    assert outcome.events_processed == 1
+    assert summary_store.read("g_drain").context == EXISTING_CONTEXT
+
+    with RecordStore(db_path) as rs:
+        judgments = rs.list_judgments(scope_id="g_drain")
+    assert len(judgments) == 1
+    assert "Dropped new_context" in judgments[0].notes
+
+
+def test_a_drain_on_a_withdrawal_still_rewrites_the_scopes_own_context(tmp_path: Path) -> None:
+    """The other half of the rule: a removal may undercut what this scope
+    itself believes, so its own context stays writable."""
+    db_path, fleet, summary_store = _setup(tmp_path)
+    with RecordStore(db_path) as rs:
+        _emit(rs, change_id="chg_gone", item_id="p_old", kind="withdrawn")
+
+    manager = _real_manager(
+        {
+            "decision": "accept_as_context",
+            "reasoning": "The belief this rested on is gone.",
+            "new_context": "No longer holds.",
+        }
+    )
+    _drain(db_path, fleet, summary_store, manager)
+
+    assert summary_store.read("g_drain").context == "No longer holds."

@@ -98,6 +98,31 @@ exercising the scope's authority.
 > provenance") was true and beside the point: provenance was honest, authority
 > was manufactured.
 
+> **Amended again (2026-09-08, #198 third form).** The refresh's `new_context`
+> is now mechanically dropped when every pending event on the refresh is an
+> **addition** — `published`, `amended`, `directive_appended`. The amendment
+> may then carry lifecycle ops (`supersede`, `retire`) and `withdraw_published`
+> only; the drop is noted in the judgment record. When at least one pending
+> event is a **removal** — `withdrawn`, `directive_retired`,
+> `directive_superseded`, `operator_directive_changed` — `new_context` stays,
+> because the scope may be asserting something its inputs no longer support and
+> dropping that belief is the refresh's whole purpose. `directive_unspliced`
+> (ADR 0015 D5) is neither, and an unrecognised kind is neither: the rule locks
+> on a positive classification, never on the absence of a removal, so anything
+> unclassified keeps the old behaviour. `append`/`publish` stay dropped on
+> every refresh; an ordinary contribution is untouched.
+>
+> Why mechanical, when the prompt already said it: the paragraph above forbids
+> restating the changed input, and a 235B judge restated a peer's publication
+> into the listener's own context *with attribution* — "…— according to
+> billing" — and called that acknowledging. The reader was then shown the same
+> claim twice, once in the publication layer with billing as origin and a
+> receipt, once in its own context with no receipt. A prompt obligation is a
+> request; the reader's guarantee has to be a property of the engine. On an
+> addition there is nothing of the scope's own to reconcile, so the only thing
+> a rewrite can carry IS the restatement — which is what makes the drop safe
+> rather than lossy.
+
 ### D3 — The affected set is topological, one rule for every kind of change
 
 The scopes affected by a change to item X are the scopes that compose X: for a
