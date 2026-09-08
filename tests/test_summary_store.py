@@ -14,6 +14,7 @@ from strata.summary_store import (
     Directive,
     ScopeSummary,
     SummaryStore,
+    derive_condensed,
 )
 
 # ---------------------------------------------------------------------------
@@ -423,3 +424,87 @@ def test_write_forces_exists_true_even_if_caller_passed_false(tmp_path: Path) ->
     result = store.read("g_new")
     assert result is not None
     assert result.exists is True
+
+
+# ---------------------------------------------------------------------------
+# Test 14 — derive_condensed: the mechanical shortening rule (issue #202)
+# ---------------------------------------------------------------------------
+
+
+def test_derive_condensed_true_only_for_a_shorter_non_empty_rewrite() -> None:
+    """A shorter non-empty context is the only shape that reads as condensation.
+
+    Word count, nothing else — no judge, no paraphrase detection (issue #202).
+    """
+    assert derive_condensed("one two three four", "one two") is True
+    # Growing, unchanged, or same-length rewrites assert no condensation: the
+    # signal describes THIS write, not the scope's whole history.
+    assert derive_condensed("one two", "one two three four") is False
+    assert derive_condensed("one two", "one two") is False
+    assert derive_condensed("one two", "three four") is False
+
+
+def test_derive_condensed_false_when_either_side_is_empty() -> None:
+    """A first write admits, it does not condense; an emptied context is not one either."""
+    # No summary on disk yet — there is no previous context to have shortened.
+    assert derive_condensed(None, "one two") is False
+    assert derive_condensed("", "one two") is False
+    # Nothing survived at all, so "the context you are reading is a
+    # condensation" would be a claim about text that does not exist.
+    assert derive_condensed("one two three", "") is False
+    assert derive_condensed("one two three", "   ") is False
+
+
+# ---------------------------------------------------------------------------
+# Test 15 — condensed round-trips through the summary file (issue #202)
+# ---------------------------------------------------------------------------
+
+
+def test_condensed_round_trips_through_the_file(tmp_path: Path) -> None:
+    """``condensed`` is persisted in the frontmatter like ``version`` and reads back.
+
+    Issue #202: a reader holding only the markdown file must be able to see
+    that its context is a condensation.
+    """
+    store = SummaryStore(str(tmp_path))
+    store.write("g_arch", _make_summary().model_copy(update={"condensed": True}))
+
+    raw = store.path_for("g_arch").read_text(encoding="utf-8")
+    assert "condensed: true" in raw
+
+    read_back = store.read("g_arch")
+    assert read_back is not None
+    assert read_back.condensed is True
+
+
+def test_summary_file_without_condensed_key_parses_as_not_condensed(tmp_path: Path) -> None:
+    """A file written before issue #202 has no ``condensed`` key and still parses.
+
+    The absent key asserts nothing; it reads as ``False`` rather than making
+    the parse fail on every summary already on disk.
+    """
+    store = SummaryStore(str(tmp_path))
+    store.write("g_legacy", _make_summary(scope_id="g_legacy"))
+    path = store.path_for("g_legacy")
+    path.write_text(
+        path.read_text(encoding="utf-8").replace("condensed: false\n", ""),
+        encoding="utf-8",
+    )
+    assert "condensed:" not in path.read_text(encoding="utf-8")
+
+    read_back = store.read("g_legacy")
+    assert read_back is not None
+    assert read_back.condensed is False
+
+
+def test_write_preserves_the_caller_s_condensed_flag(tmp_path: Path) -> None:
+    """``write`` overrides ``version``/``exists`` only — ``condensed`` is the caller's.
+
+    The amendment site (``strata.app._write_amendment``) is what derives the
+    flag, so the store must carry it through untouched.
+    """
+    store = SummaryStore(str(tmp_path))
+    written = store.write("g_arch", _make_summary().model_copy(update={"condensed": True}))
+    assert written.condensed is True
+    assert written.version == 1
+    assert written.exists is True

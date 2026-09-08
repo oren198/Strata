@@ -281,6 +281,15 @@ across the fleet. Revisit with data on how often the gap bites.
 - Judge schema and prompt change (`context_sources`, admitting ops on refresh).
   The release's eval gate covers it; any bridge run before this lands is stale.
 - Perspective gains `input_changes`; touches composition, MCP surface, Console.
+- 2026-09-08 (#202): the self layer also gains `condensation` —
+  `{condensed, context_contributions_absent}`. A refresh that reflows context
+  is exactly the shortening D5's notices set in motion, and until now nothing
+  told the reader it had happened: a reader cannot distinguish "condensed
+  away" from "never admitted", so both owe the same disclosure. Both halves
+  are derived from the summary and the record with no judge in the loop, and
+  both over-approximate (word count cannot see a same-length rewrite;
+  a substring test counts a paraphrase as absent) — deliberately, since
+  over-disclosure is the safe direction for a signal about what is missing.
 - ADR 0011 D4 is amended as in D2. CONTEXT.md needs § Change event, § Refresh,
   and an amended § Perspective — done, this release (§ Publication, §
   Directive and § Operator amended too, each noting it is a source of change

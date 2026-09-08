@@ -329,6 +329,82 @@ class TestScopeSummary:
         assert data["exists"] is True
 
 
+class TestCondensationSignal:
+    """The mechanical ``condensed`` stamp on an accepted amendment (issue #202)."""
+
+    @staticmethod
+    def _context_summary(context: str) -> ScopeSummary:
+        return ScopeSummary(
+            scope_id="g_active",
+            directives=[],
+            context=context,
+            updated_at="2026-09-08T12:00:00+00:00",
+        )
+
+    def _contribute(self, client, content: str) -> None:
+        resp = client.post(
+            "/contribute",
+            json={
+                "scope_id": "g_active",
+                "content": content,
+                "proposed_classification": "context",
+                "subject": None,
+                "supersedes": None,
+                "contributor": _CONTRIBUTOR_BODY,
+            },
+        )
+        assert resp.status_code == 200
+
+    def test_shortening_amendment_stamps_condensed(self, client):
+        """An amendment that replaces context with fewer words stamps condensed=True.
+
+        Issue #202: a reader cannot tell "condensed away" from "never
+        admitted", so the write that shortened the context has to say so.
+        """
+        client.mock_manager.judge.return_value = _make_judgment(
+            decision="accept_as_context",
+            summary=self._context_summary("alpha beta gamma delta epsilon"),
+        )
+        self._contribute(client, "alpha beta gamma delta epsilon")
+
+        client.mock_manager.judge.return_value = _make_judgment(
+            decision="accept_as_context",
+            summary=self._context_summary("alpha beta"),
+        )
+        self._contribute(client, "zeta")
+
+        data = client.get("/scopes/g_active/summary").json()
+        assert data["condensed"] is True
+        assert data["context"] == "alpha beta"
+        assert data["version"] == 2
+
+    def test_growing_amendment_does_not_stamp_condensed(self, client):
+        """An amendment that grows the context stamps condensed=False.
+
+        The flag describes THIS write, not the scope's history. The version
+        and context assertions are the vacuous-pass guard: without them a
+        judge whose amendment never reached disk would also report False.
+        """
+        client.mock_manager.judge.return_value = _make_judgment(
+            decision="accept_as_context",
+            summary=self._context_summary("alpha beta"),
+        )
+        self._contribute(client, "alpha beta")
+
+        client.mock_manager.judge.return_value = _make_judgment(
+            decision="accept_as_context",
+            summary=self._context_summary("alpha beta gamma delta"),
+        )
+        self._contribute(client, "gamma delta")
+
+        data = client.get("/scopes/g_active/summary").json()
+        assert data["condensed"] is False
+        # The amendment really was written — version bumped twice and the
+        # grown context is on disk.
+        assert data["version"] == 2
+        assert data["context"] == "alpha beta gamma delta"
+
+
 class TestContribute:
     """POST /contribute"""
 
