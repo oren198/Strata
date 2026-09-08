@@ -185,7 +185,8 @@ def test_a_batch_of_n_events_is_one_judge_call_and_n_processed_rows(tmp_path: Pa
 
 
 def test_the_drain_judges_in_input_change_refresh_mode(tmp_path: Path) -> None:
-    """ADR 0014 D2: admitting ops are allowed on this path, so the mode says so."""
+    """ADR 0014 D2: this path admits nothing and, on additions alone, rewrites
+    no context — the mode and the pending events are what say so."""
     db_path, fleet, summary_store = _setup(tmp_path)
     with RecordStore(db_path) as rs:
         _emit(rs, change_id="chg_a", item_id="p_1")

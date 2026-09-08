@@ -5,11 +5,12 @@
 leaving the pair that genuinely differ in what the judge is allowed to do:
 
 - ``ordinary`` — a contribution arrived; every op is available.
-- ``input_change_refresh`` — ADR 0014 D2's reactive re-judgement. Admitting
-  ops are ALLOWED: the refresh has a real contribution to mint a directive
-  from (the change notice, ADR 0014 D5), so a minted directive carries honest
-  provenance — this entered because input X changed. ``append`` is still
-  dropped: it would copy the notice's own bytes.
+- ``input_change_refresh`` — ADR 0014 D2's reactive re-judgement. It admits
+  nothing (amended at the 1.11.0 gate, #198): the changed input is already
+  composed for every reader, so neither the notice's bytes (``append``) nor
+  the judge's own words about it (``publish``) may enter under this scope's
+  name. On a refresh whose events are all additions the amendment's
+  ``new_context`` is dropped too (#198 third form).
 
 Plus ``context_sources`` (ADR 0014 D3): the judge declares which published
 item ids its ``new_context`` rests on. Record, never trigger — but it has to
@@ -397,6 +398,30 @@ def test_no_events_and_an_unknown_kind_keep_the_old_behaviour():
     assert not _locked([])
     assert not _locked(None)
     assert not _locked([_change_event(kind="something_new")])
+
+
+def test_the_two_kind_sets_partition_the_settled_vocabulary():
+    """ADR 0014 D1's vocabulary is spelled in three places now — the CHECK in
+    migration 0011, :mod:`strata.change_events`, and the refresh's two sets.
+    A kind added upstream and classified nowhere would fall through unlocked
+    and silently; here it fails loudly instead."""
+    from strata.change_events import (
+        DIRECTIVE_KINDS,
+        DIRECTIVE_UNSPLICED,
+        OPERATOR_DIRECTIVE_CHANGED,
+        PUBLICATION_KINDS,
+    )
+    from strata.scope_manager import (
+        _REFRESH_ADDITION_KINDS,
+        _REFRESH_NEUTRAL_KIND,
+        _REFRESH_REMOVAL_KINDS,
+    )
+
+    assert not _REFRESH_ADDITION_KINDS & _REFRESH_REMOVAL_KINDS
+    assert _REFRESH_NEUTRAL_KIND == DIRECTIVE_UNSPLICED
+    assert _REFRESH_ADDITION_KINDS | _REFRESH_REMOVAL_KINDS | {_REFRESH_NEUTRAL_KIND} == (
+        PUBLICATION_KINDS | DIRECTIVE_KINDS | {OPERATOR_DIRECTIVE_CHANGED, DIRECTIVE_UNSPLICED}
+    )
 
 
 def test_a_locked_refresh_drops_new_context_and_notes_it():

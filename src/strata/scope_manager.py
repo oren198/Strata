@@ -128,12 +128,13 @@ def _batch_max_tokens(batch_size: int) -> int:
 #: may do:
 #:
 #: - ``ordinary``: a contribution arrived; every op is available.
-#: - ``input_change_refresh``: ADR 0014 D2's reactive re-judgement. ``publish``
-#:   is ALLOWED — the change notice is a real contribution to mint a directive
-#:   FROM (its id, its provenance: this entered because input X changed).
-#:   ``append`` is dropped: it would copy the notice's bytes — a mechanical
-#:   change payload under the subject ``manager-refresh`` — verbatim into a
-#:   directive.
+#: - ``input_change_refresh``: ADR 0014 D2's reactive re-judgement. It admits
+#:   nothing — both ``append`` and ``publish`` are dropped (amended at the
+#:   1.11.0 gate, #198): the changed input is already composed for every reader
+#:   (ADR 0013/0015), so re-admitting it would manufacture a second copy under
+#:   the hearer's name. And when every pending event is an ADDITION the
+#:   amendment's ``new_context`` is dropped too (amended 2026-09-08, #198 third
+#:   form) — see :func:`_refresh_events_are_all_additions`.
 JudgeMode = Literal["ordinary", "input_change_refresh"]
 
 #: The admitting ops each mode drops (ADR 0014 D2). One table, read by both
