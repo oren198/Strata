@@ -871,8 +871,9 @@ def cmd_stats_writeback(args: argparse.Namespace) -> int:
         )
     print()
     print(
-        "strict = the Stop hook blocked a silent session once (enforcement on); "
-        "'strict off' includes sessions that never recorded a setting."
+        "strict = sessions that ran with strict Stop-hook enforcement on (a silent session "
+        "is blocked once at its end); 'strict off' includes sessions that never recorded "
+        "a setting."
     )
     print("publish/withdraw are sharing acts and don't count as write-back.")
     print(

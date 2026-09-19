@@ -1057,6 +1057,7 @@ def test_report_splits_by_the_strict_flag(tmp_path: Path) -> None:
     report = compute_writeback_report(store, now=T0 + timedelta(minutes=2))
 
     assert (report.strict_on.n, report.strict_on.contributed) == (1, 1)
+    assert (report.strict_on.strict_on, report.strict_off.strict_on) == (1, 0)
     assert (report.strict_off.n, report.strict_off.contributed) == (2, 0)
     codex = next(r for r in report.rows if r.harness == "codex")
     assert (codex.strict_on, codex.n) == (1, 2)

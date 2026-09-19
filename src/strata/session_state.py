@@ -1026,8 +1026,8 @@ def compute_writeback_report(
             if state.contributions > 0:
                 target.accepted += 1
         if state.strict:
-            row.strict_on += 1
-            overall.strict_on += 1
+            for target in (row, overall, split):
+                target.strict_on += 1
 
     parsed_times = sorted(t for t in times if _parse_ts(t) is not None)
     return WritebackReport(
