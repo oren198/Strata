@@ -1060,3 +1060,17 @@ def test_report_splits_by_the_strict_flag(tmp_path: Path) -> None:
     assert (report.strict_off.n, report.strict_off.contributed) == (2, 0)
     codex = next(r for r in report.rows if r.harness == "codex")
     assert (codex.strict_on, codex.n) == (1, 2)
+
+
+def test_nudge_is_silent_once_a_contribute_call_was_made_whatever_the_verdict(
+    tmp_path: Path,
+) -> None:
+    from strata.session_state import compute_nudge
+
+    store = SessionStateStore(tmp_path / "sessions")
+    store.record_read("s1", "g")
+    assert compute_nudge(store.read("s1")) is not None
+
+    store.record_submission("s1")  # declined by the judge: still written back
+
+    assert compute_nudge(store.read("s1")) is None

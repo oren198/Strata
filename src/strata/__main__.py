@@ -3106,6 +3106,25 @@ def cmd_register(args: argparse.Namespace) -> int:
             described = _describe_store(adopted_store, project_root)
             print(f"    adopted the store already in this project: {described}")
 
+    # Strict Stop-hook enforcement (M3): on by default, recorded in config.toml so
+    # every harness's hook reads the same per-project answer. A plain re-register
+    # adds the setting when absent but never undoes an existing opt-out;
+    # `--no-strict` turns it off.
+    current_config = (
+        body if not config_toml_already_registered else config_toml.read_bytes().decode("utf-8")
+    )
+    current_strict = install.read_freshness_strict_from_text(current_config)
+    if getattr(args, "no_strict", False):
+        desired_strict = False
+    else:
+        desired_strict = True if current_strict is None else current_strict
+    if desired_strict != current_strict:
+        if not diff_mode:
+            config_toml.write_bytes(
+                install.set_freshness_strict(current_config, desired_strict).encode("utf-8")
+            )
+        _act(f"set freshness strict = {str(desired_strict).lower()} in", config_toml)
+
     # -----------------------------------------------------------------------
     # Step 4: Update .gitignore.
     # -----------------------------------------------------------------------
@@ -4863,6 +4882,16 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "Idempotent brownfield installer — create .strata/config.toml, "
             "seed fleet.yaml, copy skills, merge MCP entry."
+        ),
+    )
+    p_register.add_argument(
+        "--no-strict",
+        dest="no_strict",
+        action="store_true",
+        help=(
+            "Turn off strict Stop-hook enforcement (on by default): a silent "
+            "session is no longer blocked once at its end; a background "
+            "evaluator drafts a contribution instead."
         ),
     )
     p_register.add_argument(

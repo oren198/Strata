@@ -13,11 +13,12 @@ counters and #111's mechanical decline. Two cooperating pieces live here:
    noise) when there is no ``.strata`` project, no session state, no API key, or
    on any error — a broken hook must never break the user's session.
 
-   **Strict mode** (opt-in, off by default): when ``STRATA_FRESHNESS_STRICT=1``
-   the hook instead BLOCKS the stop once with the contribute-or-decline
+   **Strict mode** (the default since M3; see :func:`strict_enabled`): the hook
+   instead BLOCKS the stop once per session with the contribute-or-closeout
    instruction (``{"decision": "block", "reason": ...}``), respecting
-   ``stop_hook_active`` so it never loops. No evaluator is spawned in strict
-   mode.
+   ``stop_hook_active`` and the session's ``strict_blocked_at`` so it never
+   loops. No evaluator is spawned in strict mode. ``strata register --no-strict``
+   (or ``STRATA_FRESHNESS_STRICT=0``) restores the background evaluator.
 
 2. **The background evaluator** (:func:`run_evaluator`). A headless model run
    that reads the session transcript tail (the hook passes ``transcript_path``
@@ -79,8 +80,9 @@ _logger = logging.getLogger("strata.freshness")
 #: only *drafts*; the judge that admits or declines the draft is unchanged.
 DEFAULT_EVALUATOR_MODEL = "claude-haiku-4-5-20251001"
 
-#: Env var that opts a project into strict (blocking) mode. Any value other than
-#: exactly ``"1"`` leaves the default (non-blocking, background-evaluator) mode.
+#: Env var that overrides the project's strict (blocking) setting: ``1`` forces it
+#: on, ``0`` forces the non-blocking background-evaluator mode. Unset defers to the
+#: project's ``[freshness] strict`` and then to the default (on).
 STRICT_MODE_ENV = "STRATA_FRESHNESS_STRICT"
 
 #: Env var that overrides :data:`DEFAULT_EVALUATOR_MODEL`.
@@ -103,12 +105,32 @@ TRANSCRIPT_TAIL_BYTES = 16_000
 #: read-time nudge's contribute-or-decline framing (issue #111) so the agent
 #: sees one consistent ask.
 STRICT_BLOCK_REASON = (
-    "This session has read fleet memory but recorded nothing back to it. Before "
-    "finishing, contribute the session's outcomes with strata_contribute so the "
-    "fleet's memory reflects what happened — or, if there is genuinely nothing "
-    "to record, call strata_session_closeout so an empty session stays "
-    "distinguishable from a forgotten one."
+    "This session has read fleet memory but written nothing back to it. Before "
+    "finishing, use strata_contribute to write back what you learned, or call "
+    "strata_session_closeout(reason) if nothing is worth keeping — so the fleet's "
+    "memory reflects what happened, and an empty session stays distinguishable "
+    "from a forgotten one."
 )
+
+
+def strict_enabled(env: dict[str, str], project_root: Path | None) -> bool:
+    """Whether strict (blocking) Stop-hook enforcement is on for this session.
+
+    Strict is the default. Precedence: ``STRATA_FRESHNESS_STRICT`` set to ``1`` or
+    ``0`` wins; otherwise the project's ``[freshness] strict`` setting in
+    ``.strata/config.toml`` (``strata register --no-strict`` writes ``false``);
+    otherwise ON for a registered project. With no project (the env-var dev flow)
+    there is no hook to enforce, so it is off.
+    """
+    override = env.get(STRICT_MODE_ENV)
+    if override in ("0", "1"):
+        return override == "1"
+    if project_root is None:
+        return False
+    from strata.project_config import read_freshness_strict  # noqa: PLC0415
+
+    configured = read_freshness_strict(project_root)
+    return True if configured is None else configured
 
 
 # ---------------------------------------------------------------------------
@@ -162,8 +184,8 @@ def gate_open(state: SessionState | None) -> bool:
 
     Open — the session has consumed memory without giving anything back — iff
     the session has read at least :data:`~strata.session_state.NUDGE_MIN_READS`
-    times with zero contributions and zero declines. A contribution or a
-    mechanical decline (the asymmetry's release valve, issue #109) closes it.
+    times with no write-back: no ``strata_contribute`` call (any verdict) and no
+    closeout. Any of those (the asymmetry's release valve, issue #109) closes it.
 
     Identical in shape to the read-time nudge's fire condition
     (:func:`strata.session_state.compute_nudge`), reusing the same threshold
@@ -172,7 +194,7 @@ def gate_open(state: SessionState | None) -> bool:
     """
     if state is None:
         return False
-    if state.contributions > 0 or state.declines > 0:
+    if state.contributions > 0 or state.submitted > 0 or state.declines > 0:
         return False
     return state.reads >= NUDGE_MIN_READS
 
@@ -180,6 +202,17 @@ def gate_open(state: SessionState | None) -> bool:
 # ---------------------------------------------------------------------------
 # Session-context resolution
 # ---------------------------------------------------------------------------
+
+
+def resolve_project_root() -> Path | None:
+    """The registered project root the hook runs in, or ``None`` (best effort)."""
+    try:
+        from strata.project_config import resolve_storage_paths  # noqa: PLC0415
+
+        paths = resolve_storage_paths()
+        return paths.project_root if paths.source == "project" else None
+    except Exception:  # noqa: BLE001 — hook must never raise
+        return None
 
 
 def resolve_session_store(env: dict[str, str]) -> SessionStateStore | None:
@@ -374,16 +407,22 @@ def run_stop_hook(
     # hook silently no-op'd for the entire zero-export launch path).
     session_id = _strata_session_id(env)  # type: ignore[arg-type]
 
+    strict = strict_enabled(env, resolve_project_root())  # type: ignore[arg-type]
     state = store.read(session_id)
+    if state is not None and state.strict != strict:
+        # The session record says which enforcement it ran under, so the
+        # write-back rate can state it.
+        store.record_strict(session_id, strict)
     if not gate_open(state):
         return 0
 
-    strict = env.get(STRICT_MODE_ENV) == "1"  # type: ignore[union-attr]
     if strict:
-        # Strict mode blocks once. If the stop was already blocked by this hook
-        # (stop_hook_active), never block again — that would loop forever.
-        if hook_input.stop_hook_active:
+        # Strict mode blocks EXACTLY once per session. stop_hook_active only
+        # covers the immediate continuation (a later user turn starts with it
+        # False again), so the session record is what enforces "once".
+        if hook_input.stop_hook_active or (state is not None and state.strict_blocked_at):
             return 0
+        store.record_strict_block(session_id)
         out.write(json.dumps({"decision": "block", "reason": STRICT_BLOCK_REASON}))
         return 0
 

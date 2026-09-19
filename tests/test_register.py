@@ -942,7 +942,9 @@ def test_existing_config_toml_not_overwritten(tmp_path: Path) -> None:
 
     _run_register(tmp_path)
 
-    assert config.read_text(encoding="utf-8") == custom_config
+    # Not overwritten: every line the user wrote survives; register only appends
+    # the strict-enforcement setting (M3) below it.
+    assert config.read_text(encoding="utf-8") == custom_config + "\n[freshness]\nstrict = true\n"
     # The fleet seeded by this run must land at the resolved custom path,
     # never at the default .strata/fleet.yaml (which nothing here reads).
     assert (custom_dir / "fleet.yaml").exists()

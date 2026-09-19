@@ -39,12 +39,14 @@ def _project(root: Path) -> None:
     ``.strata/`` directory with config.toml, fleet.yaml and a migrated db."""
     strata_dir = root / ".strata"
     strata_dir.mkdir(parents=True, exist_ok=True)
-    (strata_dir / "config.toml").write_text(
-        'db = ".strata/strata.db"\n'
-        'fleet_yaml = ".strata/fleet.yaml"\n'
-        'summaries_dir = ".strata/summaries"\n',
-        encoding="utf-8",
-    )
+    config = strata_dir / "config.toml"
+    if not config.exists():  # a test may have added settings (e.g. [freshness])
+        config.write_text(
+            'db = ".strata/strata.db"\n'
+            'fleet_yaml = ".strata/fleet.yaml"\n'
+            'summaries_dir = ".strata/summaries"\n',
+            encoding="utf-8",
+        )
     (strata_dir / "fleet.yaml").write_text(
         yaml.dump(
             {
@@ -289,3 +291,26 @@ def test_two_sequential_servers_with_the_same_explicit_id_are_two_sessions(tmp_p
     assert report.overall.n == 2
     assert report.open_excluded == 0
     assert len(list((tmp_path / ".strata" / "sessions").glob("shared-id*.json"))) == 2
+
+
+def test_the_session_record_carries_the_projects_strict_setting(tmp_path: Path) -> None:
+    """strict is recorded at connect from the project's config (default on), so the
+    write-back rate can say which enforcement it ran under."""
+    default_project = tmp_path / "default"
+    off_project = tmp_path / "off"
+    for project in (default_project, off_project):
+        project.mkdir()
+        _server_params(project, "")  # lays out the .strata project
+    config = off_project / ".strata" / "config.toml"
+    config.write_text(config.read_text(encoding="utf-8") + "\n[freshness]\nstrict = false\n")
+
+    flags = {}
+    for name, project in (("default", default_project), ("off", off_project)):
+        proc = _spawn_server(project, "")
+        assert proc.stdin is not None
+        proc.stdin.close()
+        proc.wait(timeout=15)
+        (state,) = _states(project)
+        flags[name] = state["strict"]
+
+    assert flags == {"default": True, "off": False}

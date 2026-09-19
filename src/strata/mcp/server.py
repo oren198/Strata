@@ -124,11 +124,13 @@ _sessions_dir: str = ""
 _record_store: RecordStore | None = None
 _summary_store: SummaryStore | None = None
 _session_store: SessionStateStore | None = None
+_project_root: Path | None = None
 
 
 def _set_paths(paths: StoragePaths) -> None:
     """Publish resolved storage paths to the module globals (no I/O)."""
-    global _db_path, _summaries_dir, _fleet_yaml_path, _sessions_dir
+    global _db_path, _summaries_dir, _fleet_yaml_path, _sessions_dir, _project_root
+    _project_root = paths.project_root
     _db_path = paths.db_path
     _summaries_dir = paths.summaries_dir
     _fleet_yaml_path = paths.fleet_yaml_path
@@ -287,6 +289,14 @@ def _client_harness() -> str | None:
     return _HARNESS
 
 
+def _strict_now() -> bool:
+    """Whether strict Stop-hook enforcement is on for this project (see
+    :func:`strata.freshness.strict_enabled`), for the session record."""
+    from strata.freshness import strict_enabled  # noqa: PLC0415
+
+    return strict_enabled(dict(os.environ), _project_root)
+
+
 def _record_connect(session: object) -> None:
     """Record this session's connect — the write-back denominator (M2).
 
@@ -305,7 +315,9 @@ def _record_connect(session: object) -> None:
     if _session_store is None or not _sessions_dir:
         return
     try:
-        _session_store.record_connect(_AGENT_SESSION_ID, harness=_HARNESS, pid=os.getpid())
+        _session_store.record_connect(
+            _AGENT_SESSION_ID, harness=_HARNESS, pid=os.getpid(), strict=_strict_now()
+        )
     except OSError as exc:  # pragma: no cover - defensive; disk failure only
         _logger.warning("failed to record connect for session %r: %s", _AGENT_SESSION_ID, exc)
 
@@ -2156,7 +2168,7 @@ async def strata_bind(scope_id: str, skill: str | None = None, confirm: bool = F
             "or database). Fix the file(s) and restart the server — strata_bind "
             "cannot clear these."
         )
-    return _attach_fleet_notice(result)
+    return _attach_nudge(result)
 
 
 # ---------------------------------------------------------------------------
@@ -3176,7 +3188,11 @@ async def strata_session_stats() -> dict:
     if _session_store is not None:
         state = _session_store.read(_AGENT_SESSION_ID)
         if state is not None:
-            return state.model_dump()
+            stats = state.model_dump()
+            nudge = compute_nudge(state)
+            if nudge is not None:
+                stats["nudge"] = nudge
+            return stats
     return {
         "session_id": _AGENT_SESSION_ID,
         "reads": 0,

@@ -770,14 +770,12 @@ def compute_fleet_refresh_pending(
 # Read-time nudge policy (issue #111 — engine-owned thresholds + wording)
 # ---------------------------------------------------------------------------
 
-# Reads with zero contributions and zero declines before the nudge fires at all.
-# Below this, ``compute_nudge`` returns ``None`` and the read tools append
-# nothing (issue #109 direction 2: "append nothing on early reads"). Reads
-# happen at session start while contributions belong at the end, so nudging
-# from the very first read would be noise; three reads with nothing recorded is
-# the point where "this session is consuming memory and giving nothing back" is
-# a fair thing to say.
-NUDGE_MIN_READS = 3
+# Reads with zero write-back before the nudge fires at all. One: the write-back
+# rate counts every session, so a session that has read fleet memory and written
+# nothing back is worth a soft word from its FIRST read (M3; it was 3 before, when
+# early reads were treated as noise). The Stop-hook gate reuses this constant, so
+# the read-time nudge and the turn-boundary block can never disagree.
+NUDGE_MIN_READS = 1
 
 # At/above this read count (still zero contributions and zero declines) the
 # wording escalates in urgency. A single static line becomes wallpaper (#109),
@@ -786,46 +784,54 @@ NUDGE_MIN_READS = 3
 NUDGE_ESCALATE_READS = 6
 
 
+#: What the nudge and the strict block both say, so an agent sees one ask: name
+#: both exits — write back what was learned, or close out with a reason.
+NUDGE_BOTH_EXITS = (
+    "contribute what you learned, or call strata_session_closeout(reason) "
+    "if nothing is worth keeping"
+)
+
+
 def compute_nudge(state: SessionState | None) -> str | None:
     """Return the read-time nudge line for a session's counters, or ``None``.
 
     The stateful read-time nudge (issue #111): the MCP server appends this to
-    ordinary ``strata_*`` read responses once a session has read enough
-    perspectives without recording anything. It is engine-owned policy, computed
-    purely from the #110 counters — no judge, no write, no memory.
+    ordinary ``strata_*`` read responses (and to ``strata_session_stats`` and
+    ``strata_bind`` results) once a session has read fleet memory without writing
+    anything back. It is engine-owned policy, computed purely from the #110
+    counters — no judge, no write, no memory.
 
     Silent (``None``) when:
 
     - there is no session state yet, or reads are below
       :data:`NUDGE_MIN_READS`; or
-    - the session has recorded *any* contribution or decline — the asymmetry's
-      release valve (#109): an accepted contribution or a mechanical
-      ``strata_session_closeout`` both quiet the nudge for the rest of the
-      session.
+    - the session has written back: any ``strata_contribute`` call (whatever the
+      verdict — a declined one is still a write-back), an accepted contribution,
+      or a ``strata_session_closeout``.
 
-    When it fires, the line always names the *current* read count (never a
-    static string, which would become wallpaper) and escalates in tone once the
-    count reaches :data:`NUDGE_ESCALATE_READS`.
+    When it fires, the line names the *current* read count (never a static
+    string, which would become wallpaper) and both exits
+    (:data:`NUDGE_BOTH_EXITS`), and escalates in tone once the count reaches
+    :data:`NUDGE_ESCALATE_READS`.
     """
     if state is None:
         return None
-    # Release valve: a contribution or a mechanical decline silences the nudge.
-    if state.contributions > 0 or state.declines > 0:
+    # Release valve: any write-back silences the nudge.
+    if state.contributions > 0 or state.submitted > 0 or state.declines > 0:
         return None
     reads = state.reads
     if reads < NUDGE_MIN_READS:
         return None
+    times = "1 time" if reads == 1 else f"{reads} times"
     if reads >= NUDGE_ESCALATE_READS:
         return (
-            f"this session has read fleet memory {reads} times and still contributed "
-            "nothing — your scope's memory is going stale while you rely on it. "
-            "Contribute your outcomes now with strata_contribute, or call "
-            "strata_session_closeout if there is genuinely nothing to record."
+            f"this session has read fleet memory {times} and still written nothing "
+            "back — your scope's memory is going stale while you rely on it. Before "
+            f"you finish: {NUDGE_BOTH_EXITS}."
         )
     return (
-        f"this session has read fleet memory {reads} times and contributed nothing "
-        "yet; contribute your outcomes with strata_contribute, or call "
-        "strata_session_closeout if there is nothing to record."
+        f"this session has read fleet memory {times} and written nothing back yet; "
+        f"{NUDGE_BOTH_EXITS}."
     )
 
 
