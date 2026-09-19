@@ -237,8 +237,19 @@ class SessionState(BaseModel):
     connect and by the hook); ``None`` when never recorded."""
 
     strict_blocked_at: str = ""
-    """When the strict Stop hook blocked this session's stop — it blocks at most
-    once per session, however many turns follow."""
+    """When the strict Stop hook last blocked this session's stop."""
+
+    strict_blocks: int = 0
+    """How many times the strict Stop hook blocked this session (hard cap 2: the
+    first reminder, then one last reminder only if the agent made no strata call in
+    between). A pre-cap-2 file has only ``strict_blocked_at``; it counts as one."""
+
+    tool_calls: int = 0
+    """Strata tool calls this session has made (every ``tools/call`` the server
+    handled), so the hook can tell whether the agent reacted to a block."""
+
+    tool_calls_at_last_block: int = 0
+    """The ``tool_calls`` value when the last block was issued."""
 
     submitted: int = 0
     """``strata_contribute`` calls this session made, whatever the verdict (a
@@ -258,6 +269,12 @@ class SessionState(BaseModel):
 
     updated_at: str = ""
     """ISO 8601 timestamp of the last mutation."""
+
+
+def strict_blocks_so_far(state: SessionState) -> int:
+    """How many strict blocks *state* has had (a pre-cap-2 file with only
+    ``strict_blocked_at`` counts as one)."""
+    return max(state.strict_blocks, 1 if state.strict_blocked_at else 0)
 
 
 # ---------------------------------------------------------------------------
@@ -502,12 +519,26 @@ class SessionStateStore:
         return state
 
     def record_strict_block(self, session_id: str, *, now: datetime | None = None) -> SessionState:
-        """Record that the strict Stop hook blocked *session_id*'s stop (once only)."""
+        """Record that the strict Stop hook blocked *session_id*'s stop.
+
+        Counts the block and snapshots ``tool_calls`` so a later stop can tell
+        whether the agent made any strata call since.
+        """
         ts = (now or datetime.now(UTC)).isoformat()
         with self._locked(session_id):
             state = self.read(session_id) or SessionState(session_id=session_id)
             state.strict = True
+            state.strict_blocks = strict_blocks_so_far(state) + 1
             state.strict_blocked_at = ts
+            state.tool_calls_at_last_block = state.tool_calls
+            self._write(state)
+        return state
+
+    def record_tool_call(self, session_id: str) -> SessionState:
+        """Count one strata tool call by *session_id* (any tool, any outcome)."""
+        with self._locked(session_id):
+            state = self.read(session_id) or SessionState(session_id=session_id)
+            state.tool_calls += 1
             self._write(state)
         return state
 
@@ -880,6 +911,22 @@ class WritebackRow(BaseModel):
     def rate_text(self) -> str:
         """The rate as text: ``"no sessions"`` for an empty row, never a percentage."""
         return "no sessions" if self.rate is None else f"{self.rate:.0%}"
+
+    @property
+    def accounted(self) -> int:
+        """Sessions accounted for: contributed plus closed out (report only; the
+        launch bar stays the write-back rate, ``contributed / n``)."""
+        return self.contributed + self.closed_out
+
+    @property
+    def accounted_rate(self) -> float | None:
+        """``accounted / n``, or ``None`` when there are no sessions."""
+        return self.accounted / self.n if self.n else None
+
+    @property
+    def accounted_rate_text(self) -> str:
+        """The accounted-for rate as text (``"no sessions"`` for an empty row)."""
+        return "no sessions" if self.accounted_rate is None else f"{self.accounted_rate:.0%}"
 
 
 class WritebackReport(BaseModel):

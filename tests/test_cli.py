@@ -417,9 +417,45 @@ def test_stats_writeback_prints_counts_beside_each_rate(
     assert "1 open session(s) left out" in out
     assert "accepted" in out and "contributed" in out
     assert "strict on" in out and "strict off" in out
+    assert "accounted for" in out
     codex = next(line for line in out.splitlines() if line.strip().startswith("codex"))
     assert "50%" in codex and "1/2" in codex
     assert "3" in next(line for line in out.splitlines() if line.strip().startswith("overall"))
+
+
+def test_stats_writeback_shows_accounted_for_beside_the_rate_and_explains_both(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _seed_fleet(tmp_path, monkeypatch)
+    _seed_writeback_sessions(tmp_path)  # codex: cx1 contributed (declined), cx2 silent
+
+    rc = main(["stats", "writeback"])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    codex = next(line for line in out.splitlines() if line.strip().startswith("codex"))
+    assert "50% (1/2)" in codex  # write-back rate, then accounted for, both with counts
+    assert codex.count("50% (1/2)") == 2
+    assert "write-back rate =" in out
+    assert "accounted for =" in out
+
+
+def test_stats_writeback_json_carries_accounted_for(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import json
+
+    _seed_fleet(tmp_path, monkeypatch)
+    _seed_writeback_sessions(tmp_path)
+
+    assert main(["stats", "writeback", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    codex = next(r for r in payload["rows"] if r["harness"] == "codex")
+    assert codex["accounted"] == 1
+    assert codex["accounted_rate"] == 0.5
+    assert codex["accounted_rate_text"] == "50%"
+    assert payload["overall"]["accounted"] == 2
 
 
 def test_stats_writeback_include_open_restores_the_all_sessions_view(

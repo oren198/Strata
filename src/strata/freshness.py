@@ -15,9 +15,9 @@ counters and #111's mechanical decline. Two cooperating pieces live here:
 
    **Strict mode** (the default since M3; see :func:`strict_enabled`): the hook
    instead BLOCKS the stop once per session with the contribute-or-closeout
-   instruction (``{"decision": "block", "reason": ...}``), respecting
-   ``stop_hook_active`` and the session's ``strict_blocked_at`` so it never
-   loops. No evaluator is spawned in strict mode. ``strata register --no-strict``
+   instruction (``{"decision": "block", "reason": ...}``). At most twice: a
+   second, blunter block only when no strata call followed the first; never a
+   third, so it cannot loop. No evaluator is spawned in strict mode. ``strata register --no-strict``
    (or ``STRATA_FRESHNESS_STRICT=0``) restores the background evaluator.
 
 2. **The background evaluator** (:func:`run_evaluator`). A headless model run
@@ -63,6 +63,7 @@ from strata.session_state import (
     SessionStateStore,
     resolve_agent_session_id,
     sessions_dir_for,
+    strict_blocks_so_far,
 )
 
 if TYPE_CHECKING:
@@ -111,6 +112,17 @@ STRICT_BLOCK_REASON = (
     "strata_session_closeout(reason) if nothing is worth keeping — so the fleet's "
     "memory reflects what happened, and an empty session stays distinguishable "
     "from a forgotten one."
+)
+
+
+#: The second (and last) strict block: blunter, and only issued when the first
+#: reminder was followed by no strata tool call at all.
+STRICT_LAST_REMINDER_REASON = (
+    "This is the last reminder: this session has read fleet memory and still "
+    "written nothing back, and you have not called any strata tool since the last "
+    "reminder. Do one of these now, before you finish: use strata_contribute to "
+    "write back what you learned, or call strata_session_closeout(reason) if "
+    "nothing is worth keeping. You will not be asked again."
 )
 
 
@@ -463,13 +475,25 @@ def run_stop_hook(
         return 0
 
     if strict:
-        # Strict mode blocks EXACTLY once per session. stop_hook_active only
-        # covers the immediate continuation (a later user turn starts with it
-        # False again), so the session record is what enforces "once".
-        if hook_input.stop_hook_active or (state is not None and state.strict_blocked_at):
+        # Strict mode blocks at most TWICE per session, never a third time. The
+        # session record enforces the cap (stop_hook_active only covers the
+        # immediate continuation, and a later turn starts with it False again):
+        # a first reminder, then one "last reminder" only if the agent made no
+        # strata tool call at all since the first block.
+        blocks = strict_blocks_so_far(state) if state is not None else 0
+        if blocks == 0:
+            # A stop another hook already blocked is not ours to pile onto.
+            if hook_input.stop_hook_active:
+                return 0
+            reason = STRICT_BLOCK_REASON
+        elif (
+            blocks == 1 and state is not None and state.tool_calls == state.tool_calls_at_last_block
+        ):
+            reason = STRICT_LAST_REMINDER_REASON
+        else:
             return 0
         store.record_strict_block(session_id)
-        out.write(json.dumps({"decision": "block", "reason": STRICT_BLOCK_REASON}))
+        out.write(json.dumps({"decision": "block", "reason": reason}))
         return 0
 
     # Default mode: never block. Spawn the detached evaluator behind the gate and

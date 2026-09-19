@@ -145,3 +145,94 @@ def test_the_hook_does_not_attach_to_an_unrelated_session(tmp_path: Path) -> Non
 
     assert proc.stdout == ""
     assert store.read("sess_auto_999999999").strict_blocked_at == ""  # type: ignore[union-attr]
+
+
+# ---------------------------------------------------------------------------
+# Cap-2: the hook blocks at most twice per session, and a second time only when no
+# strata call followed the first. Real processes again: one stand-in harness runs
+# the real hook once per "stop", in sequence, so every stop resolves the session
+# through the same ancestor walk.
+# ---------------------------------------------------------------------------
+
+_STOPS_HARNESS = """
+import json, pathlib, subprocess, sys, time
+sync = pathlib.Path(sys.argv[1])
+payloads = json.loads(sys.argv[2])
+pause_after_first = sys.argv[3] == "pause"
+while not (sync / "start").exists():
+    time.sleep(0.02)
+outs = []
+for i, payload in enumerate(payloads):
+    if i == 1 and pause_after_first:
+        (sync / "paused").write_text("x")
+        while not (sync / "go").exists():
+            time.sleep(0.02)
+    r = subprocess.run(
+        [sys.executable, "-m", "strata", "freshness-hook"],
+        input=json.dumps(payload), capture_output=True, text=True,
+    )
+    outs.append(r.stdout)
+print(json.dumps(outs))
+"""
+
+
+def _stops(root: Path, active_flags: list[bool], *, strata_call_between: bool) -> list[str]:
+    """Run one stop per flag under a single harness pid; optionally have the agent
+    make a strata tool call between the first and second stop. Returns each stop's
+    hook stdout (``""`` when it did not block)."""
+    import time
+
+    store = SessionStateStore(root / ".strata" / "sessions")
+    sync = root / "sync"
+    sync.mkdir()
+    payloads = [
+        {"session_id": "x", "transcript_path": "/tmp/t", "stop_hook_active": flag}
+        for flag in active_flags
+    ]
+    proc = subprocess.Popen(  # noqa: S603
+        [
+            sys.executable,
+            "-c",
+            _STOPS_HARNESS,
+            str(sync),
+            json.dumps(payloads),
+            "pause" if strata_call_between else "run",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=_env(root),
+        cwd=str(root),
+        text=True,
+    )
+    session_id = f"sess_auto_{proc.pid}"
+    store.record_connect(session_id, harness="codex", pid=proc.pid)
+    for _ in range(NUDGE_MIN_READS):
+        store.record_read(session_id, "g_root")
+    (sync / "start").write_text("x")
+    if strata_call_between:
+        deadline = time.monotonic() + 60
+        while not (sync / "paused").exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        store.record_tool_call(session_id)  # the agent reacted to the first block
+        (sync / "go").write_text("x")
+    out, err = proc.communicate(timeout=120)
+    assert proc.returncode == 0, err
+    return json.loads(out)
+
+
+def test_repeated_stops_block_twice_and_never_a_third_time(tmp_path: Path) -> None:
+    _project(tmp_path)
+
+    outs = _stops(tmp_path, [False, True, True, False, True], strata_call_between=False)
+
+    decisions = [json.loads(o)["decision"] if o else None for o in outs]
+    assert decisions == ["block", "block", None, None, None]
+    assert "last reminder" in json.loads(outs[1])["reason"]
+
+
+def test_a_strata_call_between_the_stops_prevents_the_second_block(tmp_path: Path) -> None:
+    _project(tmp_path)
+
+    outs = _stops(tmp_path, [False, True, False], strata_call_between=True)
+
+    assert [bool(o) for o in outs] == [True, False, False]

@@ -314,3 +314,13 @@ def test_the_session_record_carries_the_projects_strict_setting(tmp_path: Path) 
         flags[name] = state["strict"]
 
     assert flags == {"default": True, "off": False}
+
+
+def test_the_server_counts_every_strata_tool_call(tmp_path: Path) -> None:
+    """The strict hook's second block asks whether the agent made ANY strata call
+    after the first block, so the server counts every tools/call for the session."""
+    asyncio.run(_drive(_server_params(tmp_path, ""), "codex-mcp-client", reads=2))
+
+    (state,) = _states(tmp_path)
+    # 2 x (read + session_stats) + the final session_stats = 5 tool calls.
+    assert state["tool_calls"] == 5
