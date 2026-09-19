@@ -83,8 +83,6 @@ exists for one reason, the **Console** (step 7); agents never depend on it.
 pipx install strata-mem      # strata + strata-mcp on PATH, in an isolated env
 ```
 
-Strata 1.12.0 ships with this release; the latest on PyPI is 1.10.5 until then.
-
 `pipx` is the supported install. `pip install strata-mem` inside a Python 3.11+
 virtualenv also gives you working `strata` and `strata-mcp` commands (checked with
 `python3.11 -m venv` + `pip install`); then run `strata` from that environment, or
