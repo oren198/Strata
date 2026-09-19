@@ -376,9 +376,12 @@ _HISTORICAL_ARTIFACT_HASHES: dict[str, dict[str, object]] = {
         "historical": frozenset(),
     },
     "agents-md": {
-        "current": "58c0612121bc2f3061f7ba18fa32163a98ed15c88f279b194abe7f0bba5fbbe7",
+        "current": "4fdc5a5d4fc4a300487e49c0dd1c8449bc0518a32e4ae196990fcec334846c30",
         "historical": frozenset(
             {
+                # Shipped through M2 (before the never-end-silent line and the
+                # identity guidance fix).
+                "58c0612121bc2f3061f7ba18fa32163a98ed15c88f279b194abe7f0bba5fbbe7",
                 "f6df7e82395ba3199d3a52c1651db8afb93b2fdd139b496974f871d453535b68",
                 "ceea6568ab9160d54f2d3edd7131bc9b3bf2a694832226e67e7553de7325825f",
                 "d4e9b4da5543ad2faf75bedb17c426a8dab72e858955b1a48e7b718f72092aca",
@@ -1768,6 +1771,60 @@ def read_default_harness_from_text(config_text: str) -> str | None:
         return None
     value = launch.get("default_harness")
     return value if isinstance(value, str) else None
+
+
+_FRESHNESS_HEADER_RE = re.compile(r"(?m)^\[freshness\][ \t]*\r?$")
+_STRICT_KEY_RE = re.compile(r"(?m)^strict[ \t]*=[^\r\n]*")
+
+
+def set_freshness_strict(config_text: str, strict: bool) -> str:
+    """Set ``strict = true|false`` under a ``[freshness]`` table in *config_text*.
+
+    Textual read-modify-write, like :func:`set_default_harness`: everything else
+    in the file (other tables, comments, line-ending style) survives byte for
+    byte, and a re-run replaces the value in place instead of duplicating the
+    table or the key.
+    """
+    new_line = f"strict = {'true' if strict else 'false'}"
+    nl = _detect_newline(config_text)
+
+    header = _FRESHNESS_HEADER_RE.search(config_text)
+    if header is None:
+        prefix = config_text
+        if prefix and not prefix.endswith("\n"):
+            prefix += nl
+        if prefix:
+            prefix += nl
+        return prefix + f"[freshness]{nl}{new_line}{nl}"
+
+    body_start = header.end()
+    next_header = _TOP_LEVEL_HEADER_RE.search(config_text, body_start + 1)
+    body_end = next_header.start() if next_header else len(config_text)
+    body = config_text[body_start:body_end]
+    key = _STRICT_KEY_RE.search(body)
+    if key is not None:
+        new_body = body[: key.start()] + new_line + body[key.end() :]
+    else:
+        new_body = body
+        if new_body and not new_body.endswith("\n"):
+            new_body += nl
+        new_body += new_line + nl
+    return config_text[:body_start] + new_body + config_text[body_end:]
+
+
+def read_freshness_strict_from_text(config_text: str) -> bool | None:
+    """Return ``[freshness].strict`` from *config_text*, or ``None`` if unset/invalid."""
+    import tomllib  # noqa: PLC0415
+
+    try:
+        data = tomllib.loads(config_text) if config_text.strip() else {}
+    except tomllib.TOMLDecodeError:
+        return None
+    table = data.get("freshness")
+    if not isinstance(table, dict):
+        return None
+    value = table.get("strict")
+    return value if isinstance(value, bool) else None
 
 
 # ---------------------------------------------------------------------------

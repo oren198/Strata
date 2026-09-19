@@ -1508,6 +1508,9 @@ async def test_entitled_no_argument_returns_bound_scope_data(tmp_path: Path) -> 
     )
     assert self_layer["scope_id"] == "g_team"
 
+    # The two reads above wrote nothing back, so the record read carries the
+    # nudge (since M3 it fires from the first read); it is asserted elsewhere.
+    record_result.pop("nudge", None)
     assert record_result == {
         "contributions": [],
         "judgments": [],
@@ -2841,8 +2844,15 @@ async def test_closeout_records_decline_without_building_judge(tmp_path: Path) -
     assert state.declines == 1
 
 
-async def test_no_nudge_below_threshold(tmp_path: Path) -> None:
-    """Reads below the threshold carry no nudge — the early-read silence (#111)."""
+_NUDGE_BOTH_EXITS = (
+    "contribute what you learned, or call strata_session_closeout(reason) "
+    "if nothing is worth keeping"
+)
+
+
+async def test_the_nudge_fires_from_the_first_read_with_soft_wording(tmp_path: Path) -> None:
+    """Zero write-back and one read is enough: the very first read carries a soft nudge
+    that names both exits (contribute, or a closeout with a reason)."""
     db_path = _make_db(tmp_path)
     summaries_dir = str(tmp_path / "summaries")
     fleet_path = _make_fleet_yaml(tmp_path)
@@ -2851,13 +2861,15 @@ async def test_no_nudge_below_threshold(tmp_path: Path) -> None:
     SummaryStore(summaries_dir).write("g_arch", _make_summary("g_arch", "ctx"))
     fleet = FleetConfig.load(fleet_path)
 
-    results = await _seed_and_read(mod, fleet, scope="g_backend", session_id="sess_nb", times=2)
+    results = await _seed_and_read(mod, fleet, scope="g_backend", session_id="sess_first", times=1)
 
-    assert all("nudge" not in r for r in results)
+    nudge = results[0]["nudge"]
+    assert "1 time" in nudge
+    assert _NUDGE_BOTH_EXITS in nudge
+    assert "stale" not in nudge  # the soft tier
 
 
-async def test_nudge_appears_at_threshold_with_current_counts(tmp_path: Path) -> None:
-    """At the threshold the nudge fires and names the CURRENT read count."""
+async def test_nudge_names_the_current_count_and_both_exits_at_each_read(tmp_path: Path) -> None:
     db_path = _make_db(tmp_path)
     summaries_dir = str(tmp_path / "summaries")
     fleet_path = _make_fleet_yaml(tmp_path)
@@ -2868,16 +2880,10 @@ async def test_nudge_appears_at_threshold_with_current_counts(tmp_path: Path) ->
 
     results = await _seed_and_read(mod, fleet, scope="g_backend", session_id="sess_th", times=3)
 
-    # First two reads (below threshold) stay silent; the third fires.
-    assert "nudge" not in results[0]
-    assert "nudge" not in results[1]
-    nudge = results[2]["nudge"]
-    # Names the current count and points at the two release valves. Base tier
-    # (not yet escalated) — the escalation marker is absent.
-    assert "3" in nudge
-    assert "strata_session_closeout" in nudge
-    assert "strata_contribute" in nudge
-    assert "stale" not in nudge
+    assert "1 time" in results[0]["nudge"]
+    assert "3 times" in results[2]["nudge"]
+    assert all(_NUDGE_BOTH_EXITS in r["nudge"] for r in results)
+    assert all("stale" not in r["nudge"] for r in results)
 
 
 async def test_nudge_escalates_at_higher_threshold(tmp_path: Path) -> None:
@@ -2897,7 +2903,50 @@ async def test_nudge_escalates_at_higher_threshold(tmp_path: Path) -> None:
 
     assert "6" in escalated
     assert "stale" in escalated  # escalation marker, absent from the base tier
+    assert _NUDGE_BOTH_EXITS in escalated
     assert escalated != base_nudge
+
+
+async def test_nudge_rides_strata_session_stats(tmp_path: Path) -> None:
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fleet_yaml(tmp_path)
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+    SummaryStore(summaries_dir).write("g_arch", _make_summary("g_arch", "ctx"))
+    fleet = FleetConfig.load(fleet_path)
+
+    scope_p, skill_p, session_p = _patch_agent_binding(mod, scope="g_backend", session_id="sess_st")
+    with scope_p, skill_p, session_p, patch.object(mod, "_load_fleet", return_value=fleet):
+        before_any_read = await mod.strata_session_stats()
+        await mod.strata_read_scope_summary("g_arch")
+        stats = await mod.strata_session_stats()
+
+    assert "nudge" not in before_any_read  # nothing read yet: nothing to say
+    assert _NUDGE_BOTH_EXITS in stats["nudge"]
+
+
+async def test_nudge_rides_the_strata_bind_result(tmp_path: Path) -> None:
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fleet_yaml(tmp_path)
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+    fleet = FleetConfig.load(fleet_path)
+    mod._session_store.record_read("sess_bind", "g_arch")  # one read, zero write-back
+
+    scope_p, skill_p, session_p = _patch_agent_binding(
+        mod, scope="g_backend", session_id="sess_bind"
+    )
+    with (
+        scope_p,
+        skill_p,
+        session_p,
+        patch.object(mod, "_load_fleet", return_value=fleet),
+    ):
+        result = await mod.strata_bind(scope_id="g_backend", confirm=True)
+
+    assert _NUDGE_BOTH_EXITS in result["nudge"]
 
 
 async def test_nudge_silent_after_contribution(tmp_path: Path) -> None:
@@ -2983,9 +3032,8 @@ async def test_nudge_rides_perspective_and_record_reads(tmp_path: Path) -> None:
         persp = [await mod.strata_read_perspective("g_backend") for _ in range(3)]
         record = await mod.strata_read_scope_record("g_backend")
 
-    assert "nudge" not in persp[0]
-    assert "nudge" in persp[2]
-    assert "3" in persp[2]["nudge"]
+    assert "1 time" in persp[0]["nudge"]  # fires from the first read
+    assert "3 times" in persp[2]["nudge"]
 
     # The record read carries the nudge but did not itself bump the counter.
     assert "nudge" in record

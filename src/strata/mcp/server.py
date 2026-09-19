@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import logging
 import os
+import signal
 import sqlite3
 import sys
 import threading
@@ -123,11 +124,13 @@ _sessions_dir: str = ""
 _record_store: RecordStore | None = None
 _summary_store: SummaryStore | None = None
 _session_store: SessionStateStore | None = None
+_project_root: Path | None = None
 
 
 def _set_paths(paths: StoragePaths) -> None:
     """Publish resolved storage paths to the module globals (no I/O)."""
-    global _db_path, _summaries_dir, _fleet_yaml_path, _sessions_dir
+    global _db_path, _summaries_dir, _fleet_yaml_path, _sessions_dir, _project_root
+    _project_root = paths.project_root
     _db_path = paths.db_path
     _summaries_dir = paths.summaries_dir
     _fleet_yaml_path = paths.fleet_yaml_path
@@ -286,6 +289,14 @@ def _client_harness() -> str | None:
     return _HARNESS
 
 
+def _strict_now() -> bool:
+    """Whether strict Stop-hook enforcement is on for this project (see
+    :func:`strata.freshness.strict_enabled`), for the session record."""
+    from strata.freshness import strict_enabled  # noqa: PLC0415
+
+    return strict_enabled(dict(os.environ), _project_root)
+
+
 def _record_connect(session: object) -> None:
     """Record this session's connect — the write-back denominator (M2).
 
@@ -304,9 +315,41 @@ def _record_connect(session: object) -> None:
     if _session_store is None or not _sessions_dir:
         return
     try:
-        _session_store.record_connect(_AGENT_SESSION_ID, harness=_HARNESS)
+        _session_store.record_connect(
+            _AGENT_SESSION_ID, harness=_HARNESS, pid=os.getpid(), strict=_strict_now()
+        )
     except OSError as exc:  # pragma: no cover - defensive; disk failure only
         _logger.warning("failed to record connect for session %r: %s", _AGENT_SESSION_ID, exc)
+
+
+def _record_end() -> None:
+    """Stamp this session's ``ended_at`` — best effort, at connection end (M3).
+
+    Runs when the MCP connection closes (stdin EOF / transport close) or the
+    server is terminated by SIGTERM. A no-op unless this process owns the session
+    record, so an old server exiting after a newer connection reused its id cannot
+    end the newer session. A killed (SIGKILL) server never gets here; the
+    write-back report treats such a session as ended once it has been idle longer
+    than the idle window.
+    """
+    if _session_store is None or not _sessions_dir:
+        return
+    try:
+        _session_store.record_end(_AGENT_SESSION_ID, pid=os.getpid())
+    except Exception as exc:  # noqa: BLE001 - shutdown path: never raise
+        _logger.warning("failed to record end for session %r: %s", _AGENT_SESSION_ID, exc)
+
+
+def _terminate_cleanly(signum: int, frame: object) -> None:
+    """SIGTERM handler: stamp the session's end, then exit.
+
+    Raising ``SystemExit`` here would not exit: the stdio transport reads stdin on
+    a non-daemon worker thread that is still blocked, and the interpreter waits
+    for it. The end stamp is a single small file write, and the server holds no
+    other state that needs flushing, so it exits directly once that is done.
+    """
+    _record_end()
+    os._exit(0)
 
 
 def _install_connect_hook(server: FastMCP) -> None:
@@ -2125,7 +2168,7 @@ async def strata_bind(scope_id: str, skill: str | None = None, confirm: bool = F
             "or database). Fix the file(s) and restart the server — strata_bind "
             "cannot clear these."
         )
-    return _attach_fleet_notice(result)
+    return _attach_nudge(result)
 
 
 # ---------------------------------------------------------------------------
@@ -3145,7 +3188,11 @@ async def strata_session_stats() -> dict:
     if _session_store is not None:
         state = _session_store.read(_AGENT_SESSION_ID)
         if state is not None:
-            return state.model_dump()
+            stats = state.model_dump()
+            nudge = compute_nudge(state)
+            if nudge is not None:
+                stats["nudge"] = nudge
+            return stats
     return {
         "session_id": _AGENT_SESSION_ID,
         "reads": 0,
@@ -3323,7 +3370,11 @@ def main() -> None:
         )
         sys.exit(1)
 
-    mcp.run(transport="stdio")
+    signal.signal(signal.SIGTERM, _terminate_cleanly)
+    try:
+        mcp.run(transport="stdio")
+    finally:
+        _record_end()
 
 
 if __name__ == "__main__":

@@ -81,6 +81,13 @@ except ImportError:  # pragma: no cover — Windows has no fcntl
 # as perpetually stale.
 DEFAULT_STALENESS_WINDOW_DAYS = 30
 
+# How long (seconds) a session with no recorded end may sit idle before the
+# write-back rate treats it as ended. A killed (SIGKILL) server never stamps
+# ``ended_at``; without this window it would count as "open" forever. Overridable
+# per run (``strata stats writeback --idle-window``) and via
+# ``Settings.session_idle_window_seconds``.
+DEFAULT_SESSION_IDLE_WINDOW_SECONDS = 24 * 60 * 60
+
 
 # ---------------------------------------------------------------------------
 # Runtime-area resolution
@@ -122,25 +129,15 @@ def resolve_agent_session_id(env: dict[str, str] | None = None) -> str:
     absent var.
 
     The fallback — ``sess_auto_<parent pid>`` — is deterministic, not
-    random: the MCP server (``strata-mcp``) and the freshness Stop hook
-    (``strata freshness-hook``, invoked via ``exec`` from the shipped
-    ``strata-stop-hook`` shell wrapper — see ``src/strata/_hooks/``, no
-    intervening shell process survives) are both spawned directly by the
-    same harness process, so ``os.getppid()`` resolves to that harness
-    process's pid in both. Reading it independently in each process (no env
-    var, no file, no IPC) is how the two land on the identical session id
-    for the identical turn without coordinating.
-
-    This pairing relies on the harness spawning both the MCP server and the
-    hook as its own direct children — true for Claude Code today, and verified
-    for Codex (codex-cli 0.153.4, ``codex exec`` and the TUI, two concurrent
-    sessions): one ``strata-mcp`` per Codex session, parented by that session's
-    ``codex`` process, with the Stop hook parented by the same process. A harness
-    that instead routes hook invocations through a non-exec'ing intermediate
-    shell (a fresh subshell per hook call, rather than exec'ing into the
-    hook command) would see a different, and possibly a different-every-turn,
-    parent pid there, breaking the pairing; set ``STRATA_AGENT_SESSION_ID``
-    explicitly to sidestep that.
+    random: the MCP server (``strata-mcp``) is spawned by the harness process,
+    so ``os.getppid()`` is that process's pid. The freshness Stop hook must land
+    on the same id without IPC: when the harness runs the hook as a direct child
+    (Codex, verified on codex-cli 0.153.4 for ``codex exec`` and the TUI) its
+    ``os.getppid()`` is the same pid. Claude Code does not: it runs the hook as
+    ``/bin/sh -c 'sh <script>'`` and the outer shell survives, so the hook's
+    parent is that shell. :func:`strata.freshness._strata_session_id` therefore
+    walks up the hook's ancestors to the nearest one that has a session record;
+    this function is the server side and stays the plain parent pid.
 
     A caveat shared with any pid-derived id: pids are reused by the OS over
     time, so a stale session-state file from a past process that happened to
@@ -224,6 +221,24 @@ class SessionState(BaseModel):
 
     reads_by_scope: dict[str, ScopeReadReceipt] = Field(default_factory=dict)
     """scope_id → the session's read receipt for that scope."""
+
+    ended_at: str = ""
+    """ISO 8601 time this session ended (MCP connection closed, server terminated,
+    or rolled over by a newer connection with the same id); ``""`` while open or
+    for a killed session (see :data:`DEFAULT_SESSION_IDLE_WINDOW_SECONDS`)."""
+
+    server_pid: int = 0
+    """Pid of the MCP server that owns this record; ``0`` for a file written
+    before M3. Lets a later connection tell it is a NEW connection reusing the
+    id (rollover), and stops an old server's exit from ending a newer session."""
+
+    strict: bool | None = None
+    """Whether strict Stop-hook enforcement was on for this session (recorded at
+    connect and by the hook); ``None`` when never recorded."""
+
+    strict_blocked_at: str = ""
+    """When the strict Stop hook blocked this session's stop — it blocks at most
+    once per session, however many turns follow."""
 
     submitted: int = 0
     """``strata_contribute`` calls this session made, whatever the verdict (a
@@ -409,21 +424,90 @@ class SessionStateStore:
         return state
 
     def record_connect(
-        self, session_id: str, *, harness: str | None = None, now: datetime | None = None
+        self,
+        session_id: str,
+        *,
+        harness: str | None = None,
+        now: datetime | None = None,
+        pid: int | None = None,
+        strict: bool | None = None,
     ) -> SessionState:
         """Record that *session_id* connected — the write-back denominator.
 
         Creates the state file with zero counters if absent, and stamps
-        ``connected_at`` (first connect wins) and the harness. Idempotent: never
-        resets counters or moves ``connected_at`` for an existing session.
+        ``connected_at`` (first connect wins), the owning server *pid* and the
+        harness. Idempotent for the same server: never resets counters.
+
+        Rollover: if a record already exists from an EARLIER connection (a
+        different server pid) the id is being reused — a deliberate explicit id,
+        or a recycled pid. The earlier record is archived as
+        ``<id>.rolled-<n>.json`` with ``ended_at`` set to now (it still counts in
+        the write-back report as its own session) and a fresh record starts.
         """
+        ts = (now or datetime.now(UTC)).isoformat()
+        pid = os.getpid() if pid is None else pid
+        with self._locked(session_id):
+            state = self.read(session_id)
+            if state is not None and state.connected_at and state.server_pid != pid:
+                if not state.ended_at:
+                    state.ended_at = ts
+                self._write_to(state, self._next_archive_path(session_id))
+                state = None
+            if state is None:
+                state = SessionState(session_id=session_id)
+            if not state.connected_at:
+                state.connected_at = ts
+            if not state.server_pid:
+                state.server_pid = pid
+            self._stamp_harness(state, harness)
+            if strict is not None:
+                state.strict = strict
+            state.updated_at = state.updated_at or ts
+            self._write(state)
+        return state
+
+    def _next_archive_path(self, session_id: str) -> Path:
+        """First unused ``<id>.rolled-<n>.json`` path (matched by the ``*.json`` scan)."""
+        n = 1
+        while (path := self._dir / f"{session_id}.rolled-{n}.json").exists():
+            n += 1
+        return path
+
+    def record_end(
+        self, session_id: str, *, pid: int | None = None, now: datetime | None = None
+    ) -> SessionState | None:
+        """Stamp ``ended_at`` on *session_id*'s record — only for the owning server.
+
+        A no-op when there is no record, it already ended, or it belongs to a
+        different server pid (an old server exiting after a newer connection
+        took over the id must not end the newer session).
+        """
+        ts = (now or datetime.now(UTC)).isoformat()
+        pid = os.getpid() if pid is None else pid
+        with self._locked(session_id):
+            state = self.read(session_id)
+            if state is None or state.ended_at or state.server_pid != pid:
+                return state
+            state.ended_at = ts
+            state.updated_at = ts
+            self._write(state)
+        return state
+
+    def record_strict(self, session_id: str, strict: bool) -> SessionState:
+        """Record whether strict Stop-hook enforcement is on for *session_id*."""
+        with self._locked(session_id):
+            state = self.read(session_id) or SessionState(session_id=session_id)
+            state.strict = strict
+            self._write(state)
+        return state
+
+    def record_strict_block(self, session_id: str, *, now: datetime | None = None) -> SessionState:
+        """Record that the strict Stop hook blocked *session_id*'s stop (once only)."""
         ts = (now or datetime.now(UTC)).isoformat()
         with self._locked(session_id):
             state = self.read(session_id) or SessionState(session_id=session_id)
-            if not state.connected_at:
-                state.connected_at = ts
-            self._stamp_harness(state, harness)
-            state.updated_at = state.updated_at or ts
+            state.strict = True
+            state.strict_blocked_at = ts
             self._write(state)
         return state
 
@@ -480,7 +564,10 @@ class SessionStateStore:
         that degraded path to its documented cost — a lost increment — instead of
         an exception out of an ordinary read.
         """
-        final = self.path_for(state.session_id)
+        self._write_to(state, self.path_for(state.session_id))
+
+    def _write_to(self, state: SessionState, final: Path) -> None:
+        """Atomically persist *state* at *final* (tmp sibling + :func:`os.replace`)."""
         final.parent.mkdir(parents=True, exist_ok=True)
         tmp = final.with_suffix(f".json.{os.getpid()}.tmp")
         tmp.write_text(json.dumps(state.model_dump(), indent=2), encoding="utf-8")
@@ -673,14 +760,12 @@ def compute_fleet_refresh_pending(
 # Read-time nudge policy (issue #111 — engine-owned thresholds + wording)
 # ---------------------------------------------------------------------------
 
-# Reads with zero contributions and zero declines before the nudge fires at all.
-# Below this, ``compute_nudge`` returns ``None`` and the read tools append
-# nothing (issue #109 direction 2: "append nothing on early reads"). Reads
-# happen at session start while contributions belong at the end, so nudging
-# from the very first read would be noise; three reads with nothing recorded is
-# the point where "this session is consuming memory and giving nothing back" is
-# a fair thing to say.
-NUDGE_MIN_READS = 3
+# Reads with zero write-back before the nudge fires at all. One: the write-back
+# rate counts every session, so a session that has read fleet memory and written
+# nothing back is worth a soft word from its FIRST read (M3; it was 3 before, when
+# early reads were treated as noise). The Stop-hook gate reuses this constant, so
+# the read-time nudge and the turn-boundary block can never disagree.
+NUDGE_MIN_READS = 1
 
 # At/above this read count (still zero contributions and zero declines) the
 # wording escalates in urgency. A single static line becomes wallpaper (#109),
@@ -689,46 +774,54 @@ NUDGE_MIN_READS = 3
 NUDGE_ESCALATE_READS = 6
 
 
+#: What the nudge and the strict block both say, so an agent sees one ask: name
+#: both exits — write back what was learned, or close out with a reason.
+NUDGE_BOTH_EXITS = (
+    "contribute what you learned, or call strata_session_closeout(reason) "
+    "if nothing is worth keeping"
+)
+
+
 def compute_nudge(state: SessionState | None) -> str | None:
     """Return the read-time nudge line for a session's counters, or ``None``.
 
     The stateful read-time nudge (issue #111): the MCP server appends this to
-    ordinary ``strata_*`` read responses once a session has read enough
-    perspectives without recording anything. It is engine-owned policy, computed
-    purely from the #110 counters — no judge, no write, no memory.
+    ordinary ``strata_*`` read responses (and to ``strata_session_stats`` and
+    ``strata_bind`` results) once a session has read fleet memory without writing
+    anything back. It is engine-owned policy, computed purely from the #110
+    counters — no judge, no write, no memory.
 
     Silent (``None``) when:
 
     - there is no session state yet, or reads are below
       :data:`NUDGE_MIN_READS`; or
-    - the session has recorded *any* contribution or decline — the asymmetry's
-      release valve (#109): an accepted contribution or a mechanical
-      ``strata_session_closeout`` both quiet the nudge for the rest of the
-      session.
+    - the session has written back: any ``strata_contribute`` call (whatever the
+      verdict — a declined one is still a write-back), an accepted contribution,
+      or a ``strata_session_closeout``.
 
-    When it fires, the line always names the *current* read count (never a
-    static string, which would become wallpaper) and escalates in tone once the
-    count reaches :data:`NUDGE_ESCALATE_READS`.
+    When it fires, the line names the *current* read count (never a static
+    string, which would become wallpaper) and both exits
+    (:data:`NUDGE_BOTH_EXITS`), and escalates in tone once the count reaches
+    :data:`NUDGE_ESCALATE_READS`.
     """
     if state is None:
         return None
-    # Release valve: a contribution or a mechanical decline silences the nudge.
-    if state.contributions > 0 or state.declines > 0:
+    # Release valve: any write-back silences the nudge.
+    if state.contributions > 0 or state.submitted > 0 or state.declines > 0:
         return None
     reads = state.reads
     if reads < NUDGE_MIN_READS:
         return None
+    times = "1 time" if reads == 1 else f"{reads} times"
     if reads >= NUDGE_ESCALATE_READS:
         return (
-            f"this session has read fleet memory {reads} times and still contributed "
-            "nothing — your scope's memory is going stale while you rely on it. "
-            "Contribute your outcomes now with strata_contribute, or call "
-            "strata_session_closeout if there is genuinely nothing to record."
+            f"this session has read fleet memory {times} and still written nothing "
+            "back — your scope's memory is going stale while you rely on it. Before "
+            f"you finish: {NUDGE_BOTH_EXITS}."
         )
     return (
-        f"this session has read fleet memory {reads} times and contributed nothing "
-        "yet; contribute your outcomes with strata_contribute, or call "
-        "strata_session_closeout if there is nothing to record."
+        f"this session has read fleet memory {times} and written nothing back yet; "
+        f"{NUDGE_BOTH_EXITS}."
     )
 
 
@@ -775,6 +868,8 @@ class WritebackRow(BaseModel):
     """Sessions with at least one ACCEPTED contribution."""
     closed_out: int = 0
     silent: int = 0
+    strict_on: int = 0
+    """Sessions that ran with strict Stop-hook enforcement on (unrecorded counts as off)."""
 
     @property
     def rate(self) -> float | None:
@@ -792,14 +887,22 @@ class WritebackReport(BaseModel):
 
     rows: list[WritebackRow]
     overall: WritebackRow
+    strict_on: WritebackRow
+    """The same counts over only the sessions that ran with strict enforcement on."""
+    strict_off: WritebackRow
+    """The same counts over sessions with strict off or never recorded."""
     since: str | None = None
     """The ``--since`` bound applied, if any."""
     first_session_at: str | None = None
     last_session_at: str | None = None
     unreadable_files: int = 0
     """Session files that could not be parsed and are NOT in the counts."""
-    includes_open_sessions: bool = True
-    """Sessions still running are counted (M3 adds ended_at and restricts this)."""
+    include_open: bool = False
+    """Whether sessions still open are counted (default: ended sessions only)."""
+    open_excluded: int = 0
+    """Open sessions left out of the counts (0 when ``include_open``)."""
+    idle_window_seconds: int = DEFAULT_SESSION_IDLE_WINDOW_SECONDS
+    """A session with no recorded end counts as ended once idle longer than this."""
 
 
 def _session_time(state: SessionState) -> str:
@@ -824,38 +927,95 @@ def _in_window(state: SessionState, bound: datetime | None) -> bool:
     return parsed is not None and parsed >= bound
 
 
+def session_is_ended(state: SessionState, *, now: datetime, idle_window: timedelta) -> bool:
+    """Whether *state* counts as an ended session.
+
+    Ended when ``ended_at`` is set, or — for a session that never recorded an end
+    (killed, or a pre-M3 file) — when its last activity is older than
+    *idle_window*. A file with no parseable timestamp cannot be open, so it counts
+    as ended.
+    """
+    if state.ended_at:
+        return True
+    stamps = [t for t in (_parse_ts(state.updated_at), _parse_ts(state.connected_at)) if t]
+    if not stamps:
+        return True
+    return now - max(stamps) > idle_window
+
+
+def _select_sessions(
+    store: SessionStateStore,
+    *,
+    since: str | datetime | None,
+    include_open: bool,
+    idle_window: timedelta | None,
+    now: datetime | None,
+) -> tuple[list[SessionState], int, int, timedelta]:
+    """The sessions a report covers: ``(states, open_excluded, unreadable, idle_window)``."""
+    idle = (
+        idle_window
+        if idle_window is not None
+        else timedelta(seconds=DEFAULT_SESSION_IDLE_WINDOW_SECONDS)
+    )
+    clock = now or datetime.now(UTC)
+    bound = _since_bound(since)
+    states, unreadable = store.scan()
+    chosen: list[SessionState] = []
+    open_excluded = 0
+    for state in states:
+        if not _in_window(state, bound):
+            continue
+        if not include_open and not session_is_ended(state, now=clock, idle_window=idle):
+            open_excluded += 1
+            continue
+        chosen.append(state)
+    return chosen, open_excluded, unreadable, idle
+
+
 def compute_writeback_report(
-    store: SessionStateStore, *, since: str | datetime | None = None
+    store: SessionStateStore,
+    *,
+    since: str | datetime | None = None,
+    include_open: bool = False,
+    idle_window: timedelta | None = None,
+    now: datetime | None = None,
 ) -> WritebackReport:
     """Aggregate every session's outcome by harness — the one write-back function.
 
     The CLI and the export both call this (or :func:`writeback_export_rows`);
     nothing re-derives the rate. Rows: claude-code, codex, unknown (always), an
     ``unrecorded`` row for pre-harness files (only when present), and
-    ``overall``. *since* keeps sessions whose connect time (``updated_at`` for
-    pre-M2 files) is at or after it.
+    ``overall``; ``strict_on``/``strict_off`` repeat the overall counts split by
+    the enforcement each session ran under. *since* keeps sessions whose connect
+    time (``updated_at`` for pre-M2 files) is at or after it.
+
+    By default only ENDED sessions are counted (see :func:`session_is_ended`);
+    ``include_open=True`` restores the all-sessions view, and ``open_excluded``
+    says how many open sessions were left out.
 
     Retention: nothing in Strata deletes session files on a timer — they stay
     until ``strata unregister --purge-data`` or a manual delete — so the window is
     exactly the sessions on disk. The report states its first/last session time
     and the count of unreadable files it could not include.
     """
-    states, unreadable = store.scan()
-    bound = _since_bound(since)
+    chosen, open_excluded, unreadable, idle = _select_sessions(
+        store, since=since, include_open=include_open, idle_window=idle_window, now=now
+    )
 
     rows: dict[str, WritebackRow] = {h: WritebackRow(harness=h) for h in _REPORT_HARNESSES}
     overall = WritebackRow(harness="overall")
+    strict_on = WritebackRow(harness="strict on")
+    strict_off = WritebackRow(harness="strict off")
     times: list[str] = []
-    for state in states:
-        if not _in_window(state, bound):
-            continue
+    for state in chosen:
         stamp = _session_time(state)
         if stamp:
             times.append(stamp)
         label = state.harness or HARNESS_UNRECORDED
         row = rows.setdefault(label, WritebackRow(harness=label))
         outcome = session_outcome(state)
-        for target in (row, overall):
+        split = strict_on if state.strict else strict_off
+        for target in (row, overall, split):
             target.n += 1
             if outcome == OUTCOME_CONTRIBUTED:
                 target.contributed += 1
@@ -865,35 +1025,46 @@ def compute_writeback_report(
                 target.silent += 1
             if state.contributions > 0:
                 target.accepted += 1
+        if state.strict:
+            for target in (row, overall, split):
+                target.strict_on += 1
 
     parsed_times = sorted(t for t in times if _parse_ts(t) is not None)
     return WritebackReport(
         rows=list(rows.values()),
         overall=overall,
+        strict_on=strict_on,
+        strict_off=strict_off,
         since=since if isinstance(since, str) else (since.isoformat() if since else None),
         first_session_at=parsed_times[0] if parsed_times else None,
         last_session_at=parsed_times[-1] if parsed_times else None,
         unreadable_files=unreadable,
+        include_open=include_open,
+        open_excluded=open_excluded,
+        idle_window_seconds=int(idle.total_seconds()),
     )
 
 
 def writeback_export_rows(
-    store: SessionStateStore, *, since: str | datetime | None = None
+    store: SessionStateStore,
+    *,
+    since: str | datetime | None = None,
+    include_open: bool = False,
+    idle_window: timedelta | None = None,
+    now: datetime | None = None,
 ) -> list[dict[str, object]]:
     """One row per session for the strata-evals loader:
-    ``{session_id, harness, outcome, accepted_count}`` (same *since* filter)."""
-    states, _ = store.scan()
-    bound = _since_bound(since)
-    rows: list[dict[str, object]] = []
-    for state in states:
-        if not _in_window(state, bound):
-            continue
-        rows.append(
-            {
-                "session_id": state.session_id,
-                "harness": state.harness or HARNESS_UNRECORDED,
-                "outcome": session_outcome(state),
-                "accepted_count": state.contributions,
-            }
-        )
-    return rows
+    ``{session_id, harness, outcome, accepted_count}`` (same selection as
+    :func:`compute_writeback_report`)."""
+    chosen, _, _, _ = _select_sessions(
+        store, since=since, include_open=include_open, idle_window=idle_window, now=now
+    )
+    return [
+        {
+            "session_id": state.session_id,
+            "harness": state.harness or HARNESS_UNRECORDED,
+            "outcome": session_outcome(state),
+            "accepted_count": state.contributions,
+        }
+        for state in chosen
+    ]

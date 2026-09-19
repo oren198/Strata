@@ -84,6 +84,8 @@ See [What `strata register` does](#what-strata-register-does) for the full
 list of what this creates: a `.strata/` workspace, a starter `fleet.yaml`,
 the harness skills/config, and a freshness `Stop`-hook.
 
+Strict mode is on by default — a session that read fleet memory and wrote nothing back is blocked once at its end and asked to contribute or close out — and `strata register --no-strict` turns it off.
+
 ### 3. Set your judge API key
 
 Either export it in your shell:
@@ -340,47 +342,56 @@ the skills) and strictly additive — your own `Stop` hooks are left untouched.
 **How it works.** At every turn end the hook reads the session's mechanical
 read/contribute counters (the `.strata/sessions/` state files — no judge, no
 memory write). When a session has read fleet memory a few times and recorded
-nothing back, the *gate* opens. What happens then depends on the mode:
+nothing back — no `strata_contribute` call (any verdict) and no
+`strata_session_closeout` — the *gate* opens, from the session's first read. What
+happens then depends on the mode:
 
-- **Default (background) mode.** The hook does **not** block your prompt. It
-  spawns a detached, headless *evaluator* and returns immediately. The evaluator
-  reads the session transcript tail and decides whether the session produced a
-  memory-worthy outcome: if so it drafts a contribution and submits it through
-  the **normal judged path** — the scope-manager gates admission exactly as it
-  does for a contribution you write yourself; if not, it records a mechanical
-  decline. Either outcome resets the session's counters, so you are nudged at
-  most once per stale stretch, never per turn. The evaluator is best-effort:
-  no `.strata` project, no session state, no API key, or any error all degrade
-  to a silent no-op. It never writes memory without judgment — only the decline
-  is mechanical.
+- **Strict (blocking) mode — the default.** The hook blocks the stop **once per
+  session** with an instruction naming both exits — contribute what you learned,
+  or call `strata_session_closeout(reason)` if nothing is worth keeping — then
+  lets the agent proceed. It never loops: it respects the harness's
+  `stop_hook_active` flag, and the session's state records that it already
+  blocked (a later turn would otherwise start with the flag cleared and block
+  again). No evaluator is spawned. The setting is per project, `[freshness]
+  strict` in `.strata/config.toml`, so every harness's hook reads the same
+  answer (Codex's own `config.toml` is global to the machine, so it cannot hold a
+  per-project switch). `strata register` writes `strict = true`; `strata
+  register --no-strict` writes `false`, and a plain re-register never undoes that.
+  `STRATA_FRESHNESS_STRICT=1`/`0` overrides the file. Each session's state records
+  whether it ran strict, and `strata stats writeback` reports the write-back rate
+  split by that, so any percentage states the enforcement behind it.
 
-- **Strict (blocking) mode** — opt in with `STRATA_FRESHNESS_STRICT=1`. Instead
-  of spawning an evaluator, the hook blocks the stop **once** with a
-  contribute-or-decline instruction fed back to the agent, then lets it proceed
-  (it respects Claude Code's `stop_hook_active` flag, so it never loops). This
-  is more insistent but interrupts interactive use, so it is off by default.
+- **Background mode** — `strata register --no-strict`. The hook does **not**
+  block your prompt. It spawns a detached, headless *evaluator* and returns
+  immediately. The evaluator reads the session transcript tail and decides
+  whether the session produced a memory-worthy outcome: if so it drafts a
+  contribution and submits it through the **normal judged path** — the
+  scope-manager gates admission exactly as it does for a contribution you write
+  yourself; if not, it records a mechanical decline. Either outcome resets the
+  session's counters, so you are nudged at most once per stale stretch, never
+  per turn. The evaluator is best-effort: no `.strata` project, no session
+  state, no API key, or any error all degrade to a silent no-op. It never writes
+  memory without judgment — only the decline is mechanical.
 
 At most one evaluator runs per session at a time (a lockfile beside the session
 state, with a stale-lock TTL), and the gate is always checked before spawning.
 
 **Session identity without any export.** Session state is keyed by
 `STRATA_AGENT_SESSION_ID`. On the zero-export single-scope quickstart above,
-nothing sets it — so both the MCP server and this hook resolve the *same*
-deterministic fallback, `sess_auto_<parent pid>`, independently and with no
-IPC between them: Claude Code spawns `strata-mcp` and (via the shipped
-`strata-stop-hook` wrapper, which `exec`s straight into `strata
-freshness-hook` with no intervening shell) the hook process as its own
-direct children, so `os.getppid()` resolves to the same harness process's
-pid in both. Empty string counts as unset here too (Codex's registered
-config ships a literal empty `STRATA_AGENT_SESSION_ID`). This pairing
-assumes the harness spawns both processes directly — true for Claude Code
-today. A harness that instead routes hook invocations through a
-non-exec'ing intermediate shell (a fresh subshell per hook call rather than
-one that execs straight into the hook command) would see a different parent
-pid per invocation there, breaking the pairing — set
-`STRATA_AGENT_SESSION_ID` explicitly to sidestep that. (Reused pids are a
-theoretical edge case here, same as any pid-derived id; the session-state
-staleness handling already tolerates it.)
+nothing sets it — so the MCP server keys the session by the deterministic
+fallback `sess_auto_<parent pid>` (its parent is the harness process), and the
+hook finds the same session with no IPC: it tries its own parent pid and then
+walks up its ancestors to the nearest one that has a session record. The walk is
+needed because Claude Code runs the hook as `/bin/sh -c 'sh <script>'` and that
+outer shell survives, so the hook's direct parent is the shell, not the `claude`
+process the server hangs off (found live in M3; before it, the strict hook never
+found a Claude Code session on this path). Codex runs the hook as a direct child
+of the same `codex` process as its server, so the first step already matches
+there. Empty string counts as unset here too (Codex's registered config ships a
+literal empty `STRATA_AGENT_SESSION_ID`). An explicit `STRATA_AGENT_SESSION_ID`
+skips all of this and is used as-is. (Reused pids are an edge case for any
+pid-derived id; a new connection that finds a record from an earlier server pid
+archives it and starts fresh.)
 
 **Windows: session-state counters are not cross-process locked.** The MCP server
 and the detached evaluator both read-modify-write the same `.strata/sessions/`
@@ -400,7 +411,7 @@ case is one nudge firing a turn early or a turn late.
 
 | Variable | Effect |
 |---|---|
-| `STRATA_FRESHNESS_STRICT` | `1` switches the hook to strict (blocking) mode. Unset/anything else = default background mode. |
+| `STRATA_FRESHNESS_STRICT` | `1` forces strict (blocking) mode, `0` forces background mode. Unset defers to the project's `[freshness] strict` (default on). |
 | `STRATA_EVALUATOR_MODEL` | Overrides the evaluator's drafting model (default `claude-haiku-4-5-20251001`). The scope-manager that *judges* the draft is unaffected. |
 
 **Non-Claude-Code harnesses.** The hook is a documented contract, not magic —
@@ -416,8 +427,8 @@ turn end can reproduce it:
    on this harness spawning the hook the same direct-child way Claude Code does
    (see "Session identity without any export" above); set it explicitly if that
    assumption doesn't hold for your harness.
-3. In default mode the command exits `0` and (when the gate is open) spawns the
-   detached evaluator itself. In strict mode it prints a
+3. In background mode the command exits `0` and (when the gate is open) spawns the
+   detached evaluator itself. In strict mode (the default) it prints a
    `{"decision":"block","reason":"…"}` JSON object on stdout that your harness
    must feed back to the agent and honour as a one-time block.
 
@@ -908,6 +919,13 @@ The MCP server walks up from its current directory to find this file. When
 present, it takes precedence over the env vars below — no shell exports needed
 for storage paths.
 
+`strata register` also records the freshness `Stop`-hook's enforcement here:
+
+```toml
+[freshness]
+strict = true   # `strata register --no-strict` writes false
+```
+
 ### Environment variables
 
 Most settings are env-var driven, prefixed `STRATA_` (the judge configuration
@@ -927,7 +945,7 @@ server (project config wins):
 | `JUDGE_BASE_URL` | (unset) | Optional. Points the judge at a router/proxy/self-hosted gateway instead of the direct Anthropic API — the endpoint must speak the Anthropic Messages API. `STRATA_JUDGE_BASE_URL` also works. |
 | `JUDGE_MODEL` | `claude-haiku-4-5` | Model used by the judge. `STRATA_MANAGER_MODEL` is the original name and still works (wins if both are set). |
 | `ANTHROPIC_API_KEY` / `STRATA_ANTHROPIC_API_KEY` | (unset) | **Deprecated**, kept as a working fallback: used only when `JUDGE_API_KEY` is unset. |
-| `STRATA_FRESHNESS_STRICT` | (unset) | `1` switches the freshness `Stop`-hook to strict (blocking) mode ([details](#memory-freshness-stop-hook)) |
+| `STRATA_FRESHNESS_STRICT` | (unset) | `1`/`0` forces the freshness `Stop`-hook strict (blocking) or background; unset defers to the project's `[freshness] strict`, default on ([details](#memory-freshness-stop-hook)) |
 | `STRATA_EVALUATOR_MODEL` | `claude-haiku-4-5-20251001` | Model the freshness evaluator drafts with (the judge is unaffected) |
 
 A local `.env` file is loaded automatically for every name above.
