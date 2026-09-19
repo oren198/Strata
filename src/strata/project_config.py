@@ -254,6 +254,37 @@ def read_default_harness(project_root: Path) -> str | None:
     return _read_default_harness_toml(text)
 
 
+def read_freshness_strict(project_root: Path) -> bool | None:
+    """Return ``[freshness].strict`` from *project_root*'s config, or ``None``.
+
+    ``None`` means the project never set it (an unset project is strict by
+    default — see :func:`strata.freshness.strict_enabled`), the project is not
+    registered, or the file cannot be read or parsed.
+    """
+    from strata.install import read_freshness_strict_from_text  # noqa: PLC0415
+
+    config_path = Path(project_root) / ".strata" / "config.toml"
+    try:
+        text = config_path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    return read_freshness_strict_from_text(text)
+
+
+def read_install_record(project_root: Path) -> tuple[str, str] | None:
+    """Return the ``(executable, version)`` of the ``strata`` install that registered
+    *project_root*, from ``[install]`` in its config, or ``None`` when absent
+    (registered before the record existed) or unreadable."""
+    from strata.install import read_install_record_from_text  # noqa: PLC0415
+
+    config_path = Path(project_root) / ".strata" / "config.toml"
+    try:
+        text = config_path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    return read_install_record_from_text(text)
+
+
 def resolve_storage_paths(
     settings: Settings | None = None,
     *,

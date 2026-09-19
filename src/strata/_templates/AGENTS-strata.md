@@ -11,6 +11,8 @@ across sessions.
 - **Expect the judge's verdict.** Every contribution is reviewed by that
   scope's manager before it counts as memory — propose freely, but the
   scope-manager decides what sticks.
+- **Never end silent.**
+  Before you finish, either contribute what you learned or call `strata_session_closeout` with a reason — never end silent.
 
 Memory access is only through the strata MCP tools `strata_read_perspective`,
 `strata_contribute`, and `strata_rejudge` (and their read-only siblings)
@@ -26,7 +28,10 @@ not part of your job.
   which scope to act as before completing your answer; an answer produced
   without the project's memory is incomplete.
 
-Your scope and role identity are bound through environment variables
-(`STRATA_AGENT_SCOPE`, `STRATA_AGENT_SKILL`, `STRATA_AGENT_SESSION_ID`) set
-before this session starts — do not hardcode them.
+Your scope and skill are bound when the session starts — from
+`STRATA_AGENT_SCOPE` and `STRATA_AGENT_SKILL` where they are set, or
+automatically when the fleet has a single scope — so do not hardcode them.
+The session id is derived per session by the server, so
+leave `STRATA_AGENT_SESSION_ID` blank (an id exported in your shell would reach
+the Stop hook but not the server, and split one session in two).
 <!-- strata:end -->

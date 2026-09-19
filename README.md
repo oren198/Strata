@@ -37,162 +37,266 @@ cd your-project
 strata register               # wires memory into this project
 ```
 
-Then bind your agent's session to a scope and start your coding harness (e.g.
-Claude Code, Codex CLI) — see [Quick start](#quick-start) below for the full
-first run, five minutes end to end.
-
 `strata` is a local-first Python service: SQLite + markdown storage, an
 embedded MCP mode that needs no backend running, file-canonical
-`fleet.yaml`, and an optional read-only browser Console. Everything deeper —
-architecture decisions, the Console UI, upgrade notes — lives under `docs/`
-and is linked from the relevant section below.
+`fleet.yaml`, and an optional read-only browser Console. The
+[Quick start](#quick-start-two-agents-one-memory) below is the one supported
+first run; everything deeper — architecture decisions, the Console UI, upgrade
+notes — lives under `docs/` and is linked from the relevant section.
 
 ---
 
-## Quick start
+## Quick start: two agents, one memory
 
-A first-time, copy-paste-able run against a brand-new project. ~5 minutes.
-The engine is embedded — the MCP server applies migrations and opens
-storage itself on first use, so nothing needs to be running in the
-background. `strata start` exists for one reason: the **Console**, a local
-web view of memory (see [Console](#console) below) — agents never depend on
-it.
+The first run this release is built around: **two terminals on one machine, a
+Claude Code session and a Codex session bound to the same scope.** One session
+learns something and writes it back; the judge admits or declines it, with a
+reason you can read; the other session acts on it next time. You can see what
+the fleet believes, where each belief came from, and what was kept out.
+
+The engine is embedded — the MCP server applies migrations and opens storage
+itself on first use, so nothing needs to run in the background. `strata start`
+exists for one reason, the **Console** (step 7); agents never depend on it.
 
 ### 1. Prerequisites
 
-- **Python 3.11 or newer**, only so `pipx` has an interpreter to build its isolated env from. Check: `python3 --version`. No Python? See [No Python 3.11+ globally?](#no-python-311-globally-use---bootstrap-venv).
-- **A judge API key.** The judge is an LLM you point at any endpoint that speaks the Anthropic Messages API — get an Anthropic key at <https://console.anthropic.com/>, or use a router/proxy/self-hosted gateway that speaks that API (see [Environment variables](#environment-variables)).
+- **Python 3.11 or newer** (`strata-mem` declares `requires-python >=3.11`).
+  Check: `python3 --version`. On an older interpreter the install refuses rather
+  than half-installing — checked on Python 3.10.12: `pip install` stops with
+  `ERROR: Package 'strata-mem' requires a different Python: 3.10.12 not in
+  '>=3.11'`, and `pipx install --python <3.10 interpreter>` stops with "The Python
+  you named does not satisfy '>=3.11'". pipx builds the isolated env from the
+  interpreter pipx itself runs on, so that is the one that must be 3.11+. No
+  Python 3.11+? See
+  [No Python 3.11+ globally?](#no-python-311-globally-use---bootstrap-venv).
+- **Claude Code and Codex CLI**, both installed and logged in (`claude` and
+  `codex` on your `PATH`). The register step below wires whichever it finds; this
+  quickstart wires both.
+- **A judge API key.** The judge is an LLM you point at any endpoint that speaks
+  the Anthropic Messages API — get an Anthropic key at
+  <https://console.anthropic.com/>, or use a router/proxy/self-hosted gateway
+  that speaks that API (see [Environment variables](#environment-variables)).
 
-### 2. Install and register
+### 2. Install
 
 ```bash
 pipx install strata-mem      # strata + strata-mcp on PATH, in an isolated env
-mkdir strata-quickstart && cd strata-quickstart
-git init                       # a project root needs a marker — see below
-strata register                # idempotent: creates .strata/, seeds fleet.yaml, wires every harness it finds
 ```
 
-`strata register` requires a project root — a directory with `.git`,
-`pyproject.toml`, `package.json`, `Cargo.toml`, or `go.mod` in it. That's
-what `git init` above is for in a brand-new, empty directory; skip it if
-you're registering an existing project that already has one of those.
-Run it from a markerless directory in an interactive terminal and it asks
-before proceeding instead of refusing outright; pass `--yes` to skip that
-question (needed in scripts/CI, where there's no terminal to ask).
+Strata 1.12.0 ships with this release; the latest on PyPI is 1.10.5 until then.
 
-See [What `strata register` does](#what-strata-register-does) for the full
-list of what this creates: a `.strata/` workspace, a starter `fleet.yaml`,
-the harness skills/config, and a freshness `Stop`-hook.
+`pipx` is the supported install. `pip install strata-mem` inside a Python 3.11+
+virtualenv also gives you working `strata` and `strata-mcp` commands (checked with
+`python3.11 -m venv` + `pip install`); then run `strata` from that environment, or
+put its `bin/` on `PATH`, because the registered hooks call bare `strata`. `uv` was
+not checked, so nothing is claimed for it. If another `strata` is already on your
+`PATH` (an older pipx install, say), see [Troubleshooting](#troubleshooting).
 
-### 3. Set your judge API key
-
-Either export it in your shell:
+### 3. Register — wiring both harnesses
 
 ```bash
-export JUDGE_API_KEY=sk-...
+mkdir strata-demo && cd strata-demo
+git init                       # a project root needs a marker (.git, pyproject.toml, ...)
+strata register --harness claude-code --harness codex
 ```
 
-…or create a `.env` file in the project (auto-loaded by every entry point —
-the MCP server, the CLI, and the optional Console backend all resolve
-settings the same way):
+`strata register` is idempotent and strictly additive. With those flags it wires
+both harnesses whether or not it can detect them (without flags it wires every
+harness it finds). It creates `.strata/` (config, a one-scope `fleet.yaml`, the
+database directory), appends a `# Strata` block to `.gitignore`, and then:
+
+- **Claude Code:** copies the Strata skills into `.claude/skills/`, adds the
+  `strata` server to `.mcp.json`, and installs the freshness `Stop` hook under
+  `.claude/`.
+- **Codex:** merges the `strata` MCP server and the same `Stop` hook into Codex's
+  own config, `$CODEX_HOME/config.toml` (default `~/.codex/config.toml` — a
+  machine-level file, not a per-project one), and seeds this project's
+  `AGENTS.md` with a short memory-moves block.
+
+Strict mode is on by default — a session that read fleet memory and wrote nothing back is reminded at its end to contribute or close out (at most twice) — and `strata register --no-strict` turns it off.
+
+See [What `strata register` does](#what-strata-register-does) for the full list.
+
+### 4. Set your judge API key
+
+Put it in a `.env` file at the project root. `strata register` already adds `.env`
+to `.gitignore`, and every entry point (the MCP server, the CLI and the Console
+backend) loads it:
 
 ```
 JUDGE_API_KEY=sk-...
 ```
 
-(The older `ANTHROPIC_API_KEY` / `STRATA_ANTHROPIC_API_KEY` names still work
-as a deprecated fallback — see [Environment variables](#environment-variables).)
+**With Codex, use the `.env` file, not an export.** Codex starts its MCP server with
+only the `[mcp_servers.strata.env]` table from its own config, not your shell's
+environment, so an exported key never reaches it and Codex's contributions go
+unjudged. The project `.env` is how the key reaches Codex's server. For Claude Code
+alone, `export JUDGE_API_KEY=sk-...` in the shell you launch it from also works.
 
-### 4. Edit your fleet
+(The older `ANTHROPIC_API_KEY` / `STRATA_ANTHROPIC_API_KEY` names still work as a
+deprecated fallback — see [Environment variables](#environment-variables).)
 
-```bash
-$EDITOR .strata/fleet.yaml
-```
+Without a key, reads work, but a contribution is recorded with **no verdict**: the
+tool returns an error saying the scope-manager cannot judge without a key, and the
+contribution shows in `strata record` as "judge errored". Once a key is set (restart
+the harness so the server sees it), `strata_rejudge` gives it its verdict.
 
-The seeded file has one scope, `g_root` — for the quickstart, keep it as
-is and bind to it in the next step; one scope is a complete, working
-setup. Grow the fleet later, when real roles emerge: add scopes, strata,
-and edges to match your team (larger starter examples ship in
-`src/strata/_templates/`). Either hand-edit and validate with `strata
-bootstrap`, or edit it in the Console (`strata start`, graph tab → Edit
-fleet) — both paths write the same `fleet.yaml`. A running Console picks
-up either kind of edit on its next read, no restart; an already-running
-agent session keeps the fleet it started with until you restart it.
+### 5. The fleet: keep the one scope
 
-### 5. Bind and work
+`.strata/fleet.yaml` is seeded with one scope, `g_root`. Keep it: one scope is a
+complete, working setup, and it is what both terminals bind to. With exactly one
+scope, an unset `STRATA_AGENT_SCOPE` auto-binds to it, so **you export nothing**
+for either harness. Grow the fleet later, when real roles emerge (edit
+`.strata/fleet.yaml` and validate with `strata bootstrap`, or edit it in the
+Console); binding becomes an explicit choice once there are two or more scopes —
+see [Binding past one scope](#binding-past-one-scope).
 
-Binding means every harness knowing the same three identity values —
-`STRATA_AGENT_SCOPE`, `STRATA_AGENT_SKILL` (optional), and
-`STRATA_AGENT_SESSION_ID` (auto-generated if omitted). For the quickstart's
-seeded fleet (one scope, `g_root`) you don't need to set any of them: with
-exactly one scope in the fleet, an unset `STRATA_AGENT_SCOPE` auto-binds to
-it (and its `default_skill`, when it has one) — you'll see a one-line notice
-naming the scope it bound to.
+### 6. Two terminals, same project
 
-That skill auto-fill only covers a scope with a `default_skill`. A scope
-that lists `permitted_skills` but no `default_skill` still needs an explicit
-`STRATA_AGENT_SKILL` even when it auto-binds — auto-bind picks the *scope*
-for you, not a skill choice among several permitted ones. (The seeded
-`g_root` template ships with a `default_skill`, so the quickstart itself
-never hits this.)
+**Terminal 1 — Claude Code**
 
 ```bash
+cd strata-demo
 claude
 ```
 
-That's it — nothing to export for a fresh, single-scope install. Once your
-fleet grows past one scope, binding becomes an explicit choice, delivered
-differently per harness: Claude Code inherits it from your shell's
-environment, so you export it before running `claude`; Codex CLI doesn't
-inherit your shell, so it reads it as a config value instead (see
-[Using Strata with Codex CLI](#using-strata-with-codex-cli)). Either way
-it's the same identity, only the delivery mechanism differs:
+What to expect the first time in Claude Code (verified on Claude Code 2.1.278):
+
+- It asks whether you **trust this folder** — choose *Yes, I trust this folder*
+  (the highlighted default is *No, exit*).
+- It then reports **"New MCP server found in this project: strata"**. **The
+  highlighted default is *Continue without using this MCP server*. Pick *Use this
+  MCP server* (or *Use this and all future MCP servers in this project*) instead:
+  accepting the default gives you a memory-blind session with no Strata tools.**
+
+**Terminal 2 — Codex**
+
+```bash
+cd strata-demo
+codex
+```
+
+What to expect the first time in Codex (all verified on codex-cli 0.153.4):
+
+- Codex asks whether to **trust the directory** — continue.
+- It then shows **"Hooks need review"** for the Strata `Stop` hook. Choose
+  **Trust all and continue**. Codex does not run a hook until it is trusted; until
+  then (and always under `codex exec`) the turn-end reminder never fires. The
+  trust is remembered.
+- **Leave `STRATA_AGENT_SESSION_ID` blank** in Codex's config (register ships it
+  blank). Each Codex session gets its own id automatically, and the hook lands on
+  the same id as the MCP server; exporting a value would reach the hook but not the
+  server and split one session in two.
+- **Set `default_tools_approval_mode = "approve"` under `[mcp_servers.strata]` in
+  `~/.codex/config.toml` (or answer every per-tool prompt with *Allow*). Under
+  `codex exec` an MCP call that is not approved is refused, so without this
+  `codex exec` gets no Strata tools; in the interactive `codex`, cancelling the
+  prompts does the same. Either way that is a memory-blind session.** The
+  interactive prompts are *Allow*, *Allow for this session*, *Always allow* or
+  *Cancel*; "Always allow" is remembered per tool, so each Strata tool asks once,
+  and the config key covers all of them at once.
+
+Codex's `workspace-write` sandbox mounts `.git/refs` read-only, so a Codex session
+cannot create git tags or refs itself (observed on codex-cli 0.153.4 under `codex exec
+-s workspace-write`: `git tag` failed inside the sandbox). Have another session, or
+you, do the tagging.
+
+In Claude Code the session-start hook tells the agent to read its perspective
+first; in Codex the seeded `AGENTS.md` does. In both, the agent has these tools:
+`strata_read_perspective`, `strata_contribute`, `strata_session_closeout`, and
+their read-only siblings.
+
+A way to run the demo: in terminal 1, ask Claude Code to read the perspective,
+then state one decision or lesson worth keeping and contribute it. Watch the
+judge's verdict come back. Then, in terminal 2, start a Codex session and ask it
+about that topic — it reads the same scope.
+
+### 7. See what the fleet believes
+
+From the project directory:
+
+```bash
+strata stats writeback     # write-back rate by harness: who contributed, who closed out, who stayed silent
+strata summary g_root      # what the scope currently holds
+strata record g_root       # every contribution and its judgment, with reasons
+strata start               # serve the Console at http://127.0.0.1:8000/ui/index.html
+```
+
+`strata stats writeback` counts ended sessions by default (`--include-open`
+adds the rest); its output says what write-back rate and *accounted for* mean.
+
+In the Console (`strata start`; see [Console](#console)), three read-only views
+show the demo's claims: **View as** (exactly what an agent bound to the scope
+receives — the perspective), **Record** (the full contribution record with each
+judgment and its reasoning) and **Turned down** (everything the judge declined,
+with the reason). Stop it with `Ctrl+C` — nothing else depends on it.
+
+### Binding past one scope
+
+With two or more scopes, binding is explicit and delivered differently per
+harness. Claude Code inherits it from your shell, so export it before `claude`:
 
 ```bash
 export STRATA_AGENT_SCOPE=g_root         # scope ID from your fleet.yaml
 export STRATA_AGENT_SKILL=strata-worker  # optional — a skill is not required
-
 claude
 ```
 
-Or skip the manual exports and run `strata launch` — it validates the scope,
-resolves the skill, generates a session ID, and starts your harness already
-bound (with a single-scope fleet it picks that scope without asking; see
-[`strata launch`](#strata-launch--frictionless-cc-session-binding-adr-0003)
-below).
-
-The MCP server validates the binding at startup and applies pending
-migrations on its first tool call — there's no separate setup command to
-run first. In the Claude Code session, invoke `/strata-worker` (or your own
-skill) to read the perspective and contribute back; see
-[Invoke a skill](#3-invoke-a-skill) below for what each shipped skill does.
-
-Inspect what landed from a terminal at any time — this reads storage
-directly, so it works with or without the Console running:
-
-```bash
-strata scopes                # list the fleet's strata, scopes, edges
-strata summary g_root        # curated summary for a scope
-strata record g_root         # full contribution + judgment log
-```
+Codex does not inherit your shell for its MCP server; it reads
+`STRATA_AGENT_SCOPE` / `STRATA_AGENT_SKILL` from the literal `env` table under
+`[mcp_servers.strata.env]` in its `config.toml`. Either way it is the same
+identity. Or run `strata launch` for Claude Code — it validates the scope,
+resolves the skill, generates a session ID and starts the harness already bound
+([`strata launch`](#strata-launch--frictionless-cc-session-binding-adr-0003)).
+`strata launch` does not launch Codex.
 
 ### Troubleshooting
 
 | Symptom | Fix |
 |---|---|
 | Anything looks broken and you're not sure why | Run `strata doctor` first — it checks config, DB, `fleet.yaml`, harness wiring, and agent binding in one pass and names the fix for each failure. |
+| Hooks or skills behave like an older Strata | An older `strata` is first on your `PATH` (say a pipx 1.10.5) and the registered hooks call bare `strata`. Check `which -a strata` and `strata --version`. Run `strata doctor` *from the install you registered with* — its **strata on PATH** check compares the `strata` on `PATH` with the install recorded by `strata register` (path and version) and fails loudly on a mismatch. (An older `strata doctor` has no such check, so it will not warn you: if the output has no `strata on PATH` line, the `strata` you ran is older than the check.) |
 | `strata: command not found` | `pipx install strata-mem` didn't complete, or your shell hasn't picked up the new PATH entry — open a new shell, or run `pipx ensurepath`. |
-| `claude` exits immediately with a binding error | With one scope in the fleet, an unset `STRATA_AGENT_SCOPE` auto-binds — this only fires once the fleet has 2+ scopes: `STRATA_AGENT_SCOPE` is unset (and ambiguous — the error lists the valid scope IDs) or not in `.strata/fleet.yaml`, or `STRATA_AGENT_SKILL` isn't in that scope's `permitted_skills`. The error names which. |
-| A contribution comes back with `scope_manager_failure` | Your judge API key is missing or invalid. Check step 3. |
+| The agent never mentions Strata / has no Strata tools | The harness didn't load the wiring: in Claude Code run `/mcp` and look for `strata`; in Codex run `codex mcp list`. Re-run `strata register` from the project root and restart the harness. |
+| Codex: the turn-end reminder never appears | The hook is not trusted yet — start `codex` (not `codex exec`) and choose **Trust all and continue** at "Hooks need review". |
+| `claude` exits immediately with a binding error | With one scope in the fleet an unset `STRATA_AGENT_SCOPE` auto-binds; this only fires once the fleet has 2+ scopes and none is chosen, or the scope/skill isn't in `.strata/fleet.yaml`. The error names which. |
+| A contribution comes back with `scope_manager_failure` / unjudged | Your judge API key is missing or invalid. Check step 4. |
 | Want to start over with a fresh DB | `rm -f .strata/strata.db && rm -rf .strata/summaries/` — the next session re-creates them. |
 
 ---
 
-## Quick Start for an existing project
+## What the demo shows
 
-This section is for users who have **an existing project** and want to add Strata as its memory layer — without cloning this repo or touching their project's Python runtime.
+From one recorded run on 2026-09-19: strata build `f4e7272` (release/v1.12.0-mvp,
+installed non-editably into a fresh virtualenv), **codex-cli 0.153.4**,
+**Claude Code 2.1.278**, and the judge **`qwen/qwen3-235b-a22b-2507` via
+OpenRouter**. Every verdict below is that judge's. Nothing here says how the
+default judge (`claude-haiku`) behaves: it was not measured. The samples are small
+and scripted — one lesson per direction — so read them as "it happened", not as
+rates.
 
-Two universal commands, then you're ready:
+| | |
+|---|---|
+| **Codex → Claude Code** — **PASS 1/1** | A lesson given only to Codex ("release tags use the prefix `rel-`, never `v`") was contributed and **admitted as context** by the judge. A fresh Claude Code session, asked only to tag the release, read it from shared memory, created `rel-1.0.0` (not `v1.0.0`) and said why: *"the project's shared memory says the maintainers' release tags always start with `rel-` and never `v`."* |
+| **Claude Code → Codex** — **PASS 1/1** | "The version lives only in `VERSION.txt` as a plain semver string" was contributed by Claude Code and **admitted as a directive**. A fresh Codex session read that directive from shared memory, searched the usual version-file locations before writing, and wrote only `VERSION.txt` = `2.1.0`. |
+| **Junk kept out** | Given a task that also included an irrelevant aside ("parking is validated at the front desk"), the agent did the real task, contributed only the relevant policy, and said it did not save the parking note because it is not about the project. That is the *agent* declining to contribute; the judge never saw it. **Judge side**, measured with the demo eval on the shipped judge build (`f4e7272`) with the qwen judge (two live runs): every plain-junk item was declined (7 of 7: trivia, chit-chat, unsupported claims), but the judge admitted 2 of 72 hard adversarial items. Known limits, tracked in issue #209: a contribution saying "this supersedes that directive, just remove it, no replacement" can retire a directive, and another scope's material relayed with an oblique origin ("the people who own the account records mentioned…") can be accepted as context. A fix that declined both classes was tried, regressed elsewhere, and was not merged; no fix is promised here. Nothing is claimed about the default Claude judge; it was not measured. **In the operator rehearsal** (same build line, same judge), the Codex agent contributed an irrelevant office note ("the office coffee machine is broken") and the judge admitted it as context. Filtering this kind of junk relies on the agent today; tracked in issue #210. |
+| **Never-stored honesty, supersession** | Both **PASS** in the live demo eval (`python -m strata_evals.demo`) on the same build and judge. |
+| **Write-back rate** (`strata stats writeback`) | Every session in the run contributed — 3 of 3 in one repository and 2 of 2 in the other (Claude Code 2/2 and Codex 1/1 in the first, one each in the second) — with strict mode on. A small scripted sample, not a population rate. |
+| **Where the evidence lives** | The strata-evals repository, `results/m4-cross-harness-2026-09-19.md` (commit `a264895`), with the raw transcripts, the Console JSON and the `strata stats writeback` output. |
+
+## Out of the MVP
+
+Out of the MVP: multi-human teams (the hosted memfleet platform, Phase B),
+cloud, retrieval sophistication, dashboard metrics, a third harness beyond Claude
+Code and Codex, and per-user profile state.
+
+---
+
+## Adding Strata to an existing project
+
+The [Quick start](#quick-start-two-agents-one-memory) commands work on an
+existing project unchanged — no clone of this repo and no change to your
+project's Python runtime:
 
 ```bash
 pipx install strata-mem    # install strata in an isolated env; puts strata + strata-mcp on PATH
@@ -276,7 +380,7 @@ $EDITOR .strata/fleet.yaml
 strata bootstrap
 
 # Bind: same identity for every harness, delivered differently — see
-# "Bind and work" in the Quick start above. For Claude Code, that's exports
+# "Binding past one scope" in the Quick start above. For Claude Code, that's exports
 # in the shell that opens it:
 export STRATA_AGENT_SCOPE=g_root         # scope ID from your fleet.yaml
 export STRATA_AGENT_SKILL=strata-worker  # optional — a skill is not required
@@ -297,8 +401,9 @@ your harness? Run `strata start` — see [Console](#console). It's optional and
 nothing else depends on it.
 
 Something not working? Run `strata doctor` — it checks your project config,
-DB, `fleet.yaml`, harness wiring (MCP entry, Stop hook, skills/config), and
-agent binding env vars in one pass, entirely offline (no backend needs to be
+DB, `fleet.yaml`, harness wiring (MCP entry, Stop hook, skills/config), agent
+binding env vars, and that the `strata` on your `PATH` is the install that
+registered the project, in one pass, entirely offline (no backend needs to be
 running), and tells you exactly what to fix.
 
 ### `.strata/config.toml` vs `.strata-role`
@@ -339,48 +444,59 @@ the skills) and strictly additive — your own `Stop` hooks are left untouched.
 
 **How it works.** At every turn end the hook reads the session's mechanical
 read/contribute counters (the `.strata/sessions/` state files — no judge, no
-memory write). When a session has read fleet memory a few times and recorded
-nothing back, the *gate* opens. What happens then depends on the mode:
+memory write). When a session has read fleet memory (from its first read) and recorded
+nothing back — no `strata_contribute` call (any verdict) and no
+`strata_session_closeout` — the *gate* opens, from the session's first read. What
+happens then depends on the mode:
 
-- **Default (background) mode.** The hook does **not** block your prompt. It
-  spawns a detached, headless *evaluator* and returns immediately. The evaluator
-  reads the session transcript tail and decides whether the session produced a
-  memory-worthy outcome: if so it drafts a contribution and submits it through
-  the **normal judged path** — the scope-manager gates admission exactly as it
-  does for a contribution you write yourself; if not, it records a mechanical
-  decline. Either outcome resets the session's counters, so you are nudged at
-  most once per stale stretch, never per turn. The evaluator is best-effort:
-  no `.strata` project, no session state, no API key, or any error all degrade
-  to a silent no-op. It never writes memory without judgment — only the decline
-  is mechanical.
+- **Strict (blocking) mode — the default.** The hook blocks the stop with an
+  instruction naming both exits — contribute what you learned, or call
+  `strata_session_closeout(reason)` if nothing is worth keeping — then lets the
+  agent proceed. It blocks **at most twice per session**: a first reminder, and a
+  blunter "last reminder" only if the agent made no strata tool call at all
+  after the first. It never blocks a third time, so it cannot loop (that cap —
+  kept in the session's state — is what guarantees it, not the harness's
+  `stop_hook_active` flag, which a later turn resets). No evaluator is spawned.
+  The setting is per project, `[freshness]
+  strict` in `.strata/config.toml`, so every harness's hook reads the same
+  answer (Codex's own `config.toml` is global to the machine, so it cannot hold a
+  per-project switch). `strata register` writes `strict = true`; `strata
+  register --no-strict` writes `false`, and a plain re-register never undoes that.
+  `STRATA_FRESHNESS_STRICT=1`/`0` overrides the file. Each session's state records
+  whether it ran strict, and `strata stats writeback` reports the write-back rate
+  split by that, so any percentage states the enforcement behind it.
 
-- **Strict (blocking) mode** — opt in with `STRATA_FRESHNESS_STRICT=1`. Instead
-  of spawning an evaluator, the hook blocks the stop **once** with a
-  contribute-or-decline instruction fed back to the agent, then lets it proceed
-  (it respects Claude Code's `stop_hook_active` flag, so it never loops). This
-  is more insistent but interrupts interactive use, so it is off by default.
+- **Background mode** — `strata register --no-strict`. The hook does **not**
+  block your prompt. It spawns a detached, headless *evaluator* and returns
+  immediately. The evaluator reads the session transcript tail and decides
+  whether the session produced a memory-worthy outcome: if so it drafts a
+  contribution and submits it through the **normal judged path** — the
+  scope-manager gates admission exactly as it does for a contribution you write
+  yourself; if not, it records a mechanical decline. Either outcome resets the
+  session's counters, so you are nudged at most once per stale stretch, never
+  per turn. The evaluator is best-effort: no `.strata` project, no session
+  state, no API key, or any error all degrade to a silent no-op. It never writes
+  memory without judgment — only the decline is mechanical.
 
 At most one evaluator runs per session at a time (a lockfile beside the session
 state, with a stale-lock TTL), and the gate is always checked before spawning.
 
 **Session identity without any export.** Session state is keyed by
 `STRATA_AGENT_SESSION_ID`. On the zero-export single-scope quickstart above,
-nothing sets it — so both the MCP server and this hook resolve the *same*
-deterministic fallback, `sess_auto_<parent pid>`, independently and with no
-IPC between them: Claude Code spawns `strata-mcp` and (via the shipped
-`strata-stop-hook` wrapper, which `exec`s straight into `strata
-freshness-hook` with no intervening shell) the hook process as its own
-direct children, so `os.getppid()` resolves to the same harness process's
-pid in both. Empty string counts as unset here too (Codex's registered
-config ships a literal empty `STRATA_AGENT_SESSION_ID`). This pairing
-assumes the harness spawns both processes directly — true for Claude Code
-today. A harness that instead routes hook invocations through a
-non-exec'ing intermediate shell (a fresh subshell per hook call rather than
-one that execs straight into the hook command) would see a different parent
-pid per invocation there, breaking the pairing — set
-`STRATA_AGENT_SESSION_ID` explicitly to sidestep that. (Reused pids are a
-theoretical edge case here, same as any pid-derived id; the session-state
-staleness handling already tolerates it.)
+nothing sets it — so the MCP server keys the session by the deterministic
+fallback `sess_auto_<parent pid>` (its parent is the harness process), and the
+hook finds the same session with no IPC: it tries its own parent pid and then
+walks up its ancestors to the nearest one that has a session record. The walk is
+needed because Claude Code runs the hook as `/bin/sh -c 'sh <script>'` and that
+outer shell survives, so the hook's direct parent is the shell, not the `claude`
+process the server hangs off (found live in M3; before it, the strict hook never
+found a Claude Code session on this path). Codex runs the hook as a direct child
+of the same `codex` process as its server, so the first step already matches
+there. Empty string counts as unset here too (Codex's registered config ships a
+literal empty `STRATA_AGENT_SESSION_ID`). An explicit `STRATA_AGENT_SESSION_ID`
+skips all of this and is used as-is. (Reused pids are an edge case for any
+pid-derived id; a new connection that finds a record from an earlier server pid
+archives it and starts fresh.)
 
 **Windows: session-state counters are not cross-process locked.** The MCP server
 and the detached evaluator both read-modify-write the same `.strata/sessions/`
@@ -400,7 +516,8 @@ case is one nudge firing a turn early or a turn late.
 
 | Variable | Effect |
 |---|---|
-| `STRATA_FRESHNESS_STRICT` | `1` switches the hook to strict (blocking) mode. Unset/anything else = default background mode. |
+| `STRATA_FRESHNESS_STRICT` | `1` forces strict (blocking) mode, `0` forces background mode. Unset defers to the project's `[freshness] strict` (default on). |
+| `STRATA_SESSION_IDLE_WINDOW_SECONDS` | `86400` | How long a session with no recorded end may sit idle before `strata stats writeback` counts it as ended (a killed server never stamps its own end); `--idle-window` overrides it per run |
 | `STRATA_EVALUATOR_MODEL` | Overrides the evaluator's drafting model (default `claude-haiku-4-5-20251001`). The scope-manager that *judges* the draft is unaffected. |
 
 **Non-Claude-Code harnesses.** The hook is a documented contract, not magic —
@@ -416,8 +533,8 @@ turn end can reproduce it:
    on this harness spawning the hook the same direct-child way Claude Code does
    (see "Session identity without any export" above); set it explicitly if that
    assumption doesn't hold for your harness.
-3. In default mode the command exits `0` and (when the gate is open) spawns the
-   detached evaluator itself. In strict mode it prints a
+3. In background mode the command exits `0` and (when the gate is open) spawns the
+   detached evaluator itself. In strict mode (the default) it prints a
    `{"decision":"block","reason":"…"}` JSON object on stdout that your harness
    must feed back to the agent and honour as a one-time block.
 
@@ -473,17 +590,14 @@ genuine edits inside the block itself, are reported and left in place.
 
 **What this gives you, and how confident to be in each part:**
 
-- **MCP config — verified; the live read → contribute → judged-verdict flow
-  is not yet run.** Codex CLI's support for `[mcp_servers.<name>]` in
-  `config.toml` is verified hands-on against codex-cli 0.149.0: `codex mcp
-  add` round-trips through `config.toml` and back out through `codex mcp
-  list` / `codex mcp get` byte-for-byte, and `strata register --harness
-  codex` writes exactly that shape — confirmed against a real codex-cli
-  0.149.0 binary, not just the docs. What that proves is that Codex's MCP
-  client will find and launch `strata-mcp` with the configured env. It does
-  **not** prove the full memory flow works, because no session with real
-  OpenAI credentials has driven `strata-mcp`'s tools from inside Codex — that
-  is item 1 in the live-verification checklist below.
+- **MCP config — verified, including a live read from inside Codex; the
+  contribute → judged-verdict half is not yet run there.** Codex CLI's
+  support for `[mcp_servers.<name>]` in `config.toml` is verified hands-on
+  against codex-cli 0.149.0 (`codex mcp add` round-trips byte-for-byte, and
+  `strata register --harness codex` writes exactly that shape) and again on
+  0.153.4, where a real Codex session launched `strata-mcp` and called
+  `strata_read_perspective` (checklist item 1 below). A contribution with a
+  judge verdict from inside Codex needs a judge key and was not run.
 
   Two things to know before you rely on this:
 
@@ -510,32 +624,35 @@ genuine edits inside the block itself, are reported and left in place.
   Strata projects with Codex you'll want to keep them current, or maintain a
   `<repo>/.codex/config.toml` override — Codex's docs list that as a read
   location for trusted projects, though `strata register --harness codex`
-  itself only writes the global file today). **`STRATA_AGENT_SESSION_ID` is
-  the sharpest edge here**: session state is keyed by it, so a fixed literal
-  value would merge every Codex session's freshness counters into one — there
-  is currently no verified mechanism for Codex to hand a fresh, per-session
-  value into a literal `config.toml` string. Leave it blank (or accept that
-  merged-counter behavior) until this is resolved. It is also unverified
-  whether Codex's MCP subprocess additionally inherits the *launching*
-  process's environment on top of these literal `env` values, or replaces it
-  — if it inherits, a literal empty string here could shadow a real value you
-  exported before running `codex`. Both are live-verification checklist
-  items (2 and 4 below).
+  itself only writes the global file today). **Leave
+  `STRATA_AGENT_SESSION_ID` blank.** Verified against codex-cli 0.153.4:
+  Codex starts one `strata-mcp` per Codex session, as a direct child of that
+  session's `codex` process, so two Codex terminals never share a parent pid.
+  With the id blank, `strata-mcp` and the freshness hook each derive
+  `sess_auto_<parent pid>` and land on the same id (see the checklist below),
+  one id per session. Do not export a value for it: Codex hands `strata-mcp`
+  only the literal `env` table from `config.toml` (it does not inherit your
+  shell — item 2 below), but hands the Stop hook your shell's environment, so
+  an exported id would reach the hook and not the server and split one
+  session into two. The server also records which harness a session ran in
+  (`harness` in its session state: `codex`, `claude-code`, or `unknown`),
+  read from the MCP client's own handshake (`clientInfo.name`), so
+  write-back can be counted per harness.
 
-- **Turn-boundary freshness hook — pending live verification.** Register also
-  merges a `[[hooks.Stop]]` block that runs `strata freshness-hook` at the end
-  of each turn, following the same contract documented above under
-  "Non-Claude-Code harnesses" (stdin JSON with `transcript_path` and
-  `stop_hook_active`; the identity env vars set the same way the MCP server
-  sees them). This is schema-verified only: `codex exec --strict-config`
-  accepts the block without rejecting it, confirming codex-cli 0.149.0
-  understands the shape — but no session with real OpenAI credentials has
-  ever actually triggered it, so whether the hook process fires at all, and
-  whether it inherits `STRATA_AGENT_*` from the Codex process it's spawned
-  from, is **not confirmed**. Until an operator with real OpenAI credentials
-  verifies this (checklist items 3 and 4 below), treat the turn-boundary
-  nudge as absent for Codex — the MCP config above is independently useful
-  without it.
+- **Turn-boundary freshness hook — verified to fire in the interactive
+  `codex` TUI once you trust it; `codex exec` skips it.** Register merges a
+  `[[hooks.Stop]]` block that runs `strata freshness-hook` at the end of each
+  turn, following the contract documented above under "Non-Claude-Code
+  harnesses". Codex will not run a hook until it is trusted: on first launch
+  after register the TUI shows "Hooks need review" — choose **Trust all and
+  continue** (or review them first). Until then, and always under `codex
+  exec` (no prompt to answer; `--dangerously-bypass-hook-trust` exists but
+  skips the review), the hook does not run and the turn-boundary nudge is
+  absent. Once trusted, verified on codex-cli 0.153.4: the hook fires at the
+  end of a turn with stdin JSON carrying `session_id`, `transcript_path`,
+  `stop_hook_active`, `last_assistant_message` and `cwd`, it is a direct
+  child of the same `codex` process as that session's `strata-mcp`, and it
+  inherits the shell that launched `codex`.
 
   `strata unregister --harness codex` reverses this wiring the same way
   `strata unregister` reverses the Claude Code wiring — only when the
@@ -563,58 +680,45 @@ command = "strata freshness-hook"
 timeout = 30
 ```
 
-**Live-verification checklist.** Everything above the line is either
-verified against a real codex-cli 0.149.0 binary or clearly labelled as
-schema-only. The gaps only real OpenAI credentials can close — run these, in
-order, in a scratch project, if you're the first to turn this on for real:
+**Live-verification checklist.** Run on codex-cli 0.153.4 (2026-09-19) in a
+scratch project with a temporary `CODEX_HOME`, two concurrent sessions, with
+probe wrappers around `strata-mcp` and the hook logging pid, parent pid and
+environment. Results:
 
-1. **MCP end-to-end (read → contribute → judged verdict).** Run
-   `strata register` then `strata register --harness codex` in a git repo,
-   fill in `STRATA_AGENT_SCOPE` / `STRATA_AGENT_SKILL` in
-   `~/.codex/config.toml` (leave `STRATA_AGENT_SESSION_ID` blank for now —
-   see item 4), then start `codex` in that directory and ask it to read
-   Strata's fleet memory and then contribute something back. **Go:** the read
-   returns real scope memory and the contribution gets an admitted/declined
-   verdict from the scope-manager (check `.strata/strata.db` or the
-   contribution log, not just "the tool call didn't error"). **No-go:** the
-   MCP tools don't appear, or errors on connect — check `codex mcp get
-   strata` first for a config problem before assuming the memory flow itself
-   is broken.
-2. **Env overlay vs. replace.** Before running `codex`, `export
-   STRATA_AGENT_SCOPE=canary-value` in your shell, but leave the
-   `config.toml` entry as register's empty string. From inside Codex, have
-   it call a tool that reveals what `strata-mcp` actually received for that
-   var (temporarily log the server's received env on startup). **If empty:**
-   the literal `env` table replaces the inherited environment — filling in
-   literal values in `config.toml` is correct and sufficient, no further
-   action needed. **If `canary-value`:** Codex overlays config `env` onto an
-   inherited environment, so an empty-string literal *shadows* a real
-   exported value — remove the placeholder keys from `config.toml` instead
-   of leaving them blank, and rely on exporting the vars before launching
-   `codex`.
-3. **Stop hook fires at all.** Temporarily swap `command = "strata
-   freshness-hook"` for a debug script that dumps its stdin and
-   `os.environ` to a file, complete one real Codex turn end-to-end (a prompt
-   that gets a real response and stops), then check the file. **Go:** the
-   file exists, and its JSON contains `transcript_path` (pointing at a real,
-   readable `.jsonl` rollout file matching the session id in the Codex
-   banner) and `stop_hook_active`. **No-go:** no file at all — the hook
-   never fired; treat the turn-boundary path as non-functional and keep it
-   documented as schema-verified-only.
-4. **Env inheritance in the hook subprocess.** Using the same debug capture
-   from item 3, check whether `STRATA_AGENT_SCOPE` / `STRATA_AGENT_SKILL` /
-   `STRATA_AGENT_SESSION_ID` (exported in the shell that launched `codex`)
-   show up in the hook process's environment. **Go:** they're all present —
-   export a real per-session `STRATA_AGENT_SESSION_ID` before each `codex`
-   session and the freshness hook keys session state correctly. **No-go:**
-   they're missing — there is no way to key session state correctly for this
-   path yet; leave the merged Stop-hook block installed-but-inert (or remove
-   it with `strata unregister --harness codex`) until a delivery mechanism
-   exists.
-5. **Write down the answer.** Whatever items 1–4 find, update this section
-   (and `docs/marketing/CODEX-surface-2026-08.md` in the marketing repo, if
-   you have access to it) so the "pending live verification" labels reflect
-   reality instead of staying permanently hedged.
+1. **MCP end-to-end (read).** Verified: `strata_read_perspective` returned
+   real scope memory from inside Codex. In `codex exec` (approval policy
+   `never`) an MCP tool call is refused with "MCP tool call requires
+   approval" unless the server table sets `default_tools_approval_mode =
+   "approve"`; the interactive TUI asks instead. The contribute → judged
+   verdict half needs a judge key and was not run here.
+2. **Env overlay vs. replace.** Verified: replace. With `CANARY=canary-value`
+   exported in the launching shell, `strata-mcp` saw the config's literal
+   `STRATA_AGENT_SESSION_ID=""` and no `CANARY` — Codex passes the MCP server
+   only its `env` table (plus what Codex itself adds). Literal values in
+   `config.toml` are therefore correct and sufficient; an exported variable
+   never reaches `strata-mcp`.
+3. **Stop hook fires — and Codex honors its block.** Verified in the TUI after
+   trusting the hook (see above); not fired under `codex exec` without trust.
+   It fired on consecutive stops within one session, and Codex showed "Blocked
+   by hook" for both strict reminders (the hook blocks at most twice per session
+   — see [Memory-freshness Stop-hook](#memory-freshness-stop-hook)). Whether the
+   model then acts on a reminder varies: in the runs made, most sessions closed
+   out after the first, one ignored both.
+4. **Env inheritance in the hook.** Verified: the hook inherits the shell
+   that launched `codex` (`CANARY` present) and does **not** get the
+   `config.toml` `env` table (`STRATA_AGENT_SESSION_ID` absent). So an
+   exported `STRATA_AGENT_SESSION_ID` reaches the hook but not the server.
+5. **One session id per session, shared by server and hook.** Verified, in
+   both `codex exec` and the TUI, two sessions running concurrently: each
+   session has its own `codex` process; its `strata-mcp` and its hook have
+   that process as parent pid; the two sessions differ. Every session state
+   is keyed `sess_auto_<codex pid>` and carries `harness: codex`. One
+   `strata-mcp` per session, alive for the session and gone when it ends.
+
+Not verified: a second Codex session sharing a `codex` process (Codex also
+has a shared local app-server daemon behind `codex agents` — sessions started
+through it were not exercised); pid reuse across long gaps (the existing
+caveat on `sess_auto_<pid>` ids).
 
 ### Undoing it: `strata unregister`
 
@@ -692,6 +796,7 @@ detect the partial case.
 strata scopes              # list the fleet's strata, scopes, edges
 strata summary <scope_id>  # curated summary (directives + context)
 strata record  <scope_id>  # every contribution + judgment in the scope's record
+strata stats writeback     # write-back rate by harness (sessions that contributed, closed out, or stayed silent)
 ```
 
 ### Advanced subcommands
@@ -742,15 +847,18 @@ so, the same single-scope auto-bind rule the MCP server applies.
    alone), that one.
 4. Otherwise, `claude-code` — today's behavior, unchanged.
 
-`claude-code` continues through the flow described above. `codex` is
-schema-verified but not live-verified (see
-[Using Strata with Codex CLI](#using-strata-with-codex-cli)), so
-`strata launch --harness codex` — or a project whose default/only-wired
-harness resolves to codex — exits `1` with:
+`claude-code` continues through the flow described above. `strata launch` does
+not launch `codex`: Codex hands its MCP server only the `[mcp_servers.strata.env]`
+table from its own config, never your shell's environment (see
+[Using Strata with Codex CLI](#using-strata-with-codex-cli)), so there is nothing
+for launch to export. `strata launch --harness codex` — or a project whose
+default/only-wired harness resolves to codex — exits `1` with:
 
-> Codex launch is not wired yet: Codex's MCP env delivery is still being
-> verified live (see README, 'Using Strata with Codex CLI'). Start codex
-> manually after filling in the `[mcp_servers.strata.env]` values.
+> Codex launch is not wired yet: Codex hands its MCP server only the
+> `[mcp_servers.strata.env]` table from its own config, not your shell's
+> environment, so there is nothing for `strata launch` to export (see README,
+> 'Using Strata with Codex CLI'). Start codex directly; its identity comes from
+> that table.
 
 #### `strata set-default-harness` — record which harness launch starts
 
@@ -923,6 +1031,18 @@ The MCP server walks up from its current directory to find this file. When
 present, it takes precedence over the env vars below — no shell exports needed
 for storage paths.
 
+`strata register` also records the freshness `Stop`-hook's enforcement here, and
+which `strata` install ran it:
+
+```toml
+[freshness]
+strict = true   # `strata register --no-strict` writes false
+
+[install]       # written by `strata register`; `strata doctor` compares it with `strata` on PATH
+strata = "/home/you/.local/pipx/venvs/strata-mem/bin/strata"
+version = "1.12.0"
+```
+
 ### Environment variables
 
 Most settings are env-var driven, prefixed `STRATA_` (the judge configuration
@@ -942,7 +1062,7 @@ server (project config wins):
 | `JUDGE_BASE_URL` | (unset) | Optional. Points the judge at a router/proxy/self-hosted gateway instead of the direct Anthropic API — the endpoint must speak the Anthropic Messages API. `STRATA_JUDGE_BASE_URL` also works. |
 | `JUDGE_MODEL` | `claude-haiku-4-5` | Model used by the judge. `STRATA_MANAGER_MODEL` is the original name and still works (wins if both are set). |
 | `ANTHROPIC_API_KEY` / `STRATA_ANTHROPIC_API_KEY` | (unset) | **Deprecated**, kept as a working fallback: used only when `JUDGE_API_KEY` is unset. |
-| `STRATA_FRESHNESS_STRICT` | (unset) | `1` switches the freshness `Stop`-hook to strict (blocking) mode ([details](#memory-freshness-stop-hook)) |
+| `STRATA_FRESHNESS_STRICT` | (unset) | `1`/`0` forces the freshness `Stop`-hook strict (blocking) or background; unset defers to the project's `[freshness] strict`, default on ([details](#memory-freshness-stop-hook)) |
 | `STRATA_EVALUATOR_MODEL` | `claude-haiku-4-5-20251001` | Model the freshness evaluator drafts with (the judge is unaffected) |
 
 A local `.env` file is loaded automatically for every name above.
@@ -1037,7 +1157,7 @@ the backend is up or down.
 > entitled surface raises instead of silently returning an empty record.
 
 **For a foreign project**: use `strata register` (see
-[Quick Start for an existing project](#quick-start-for-an-existing-project)
+[Adding Strata to an existing project](#adding-strata-to-an-existing-project)
 above). The steps below are for developing on Strata itself.
 
 ### 1. Start the backend (optional — Console UI only)
@@ -1074,7 +1194,7 @@ The `.mcp.json` entry it merges is:
 ```
 
 The seeded fleet has one scope, so an unset `STRATA_AGENT_SCOPE` auto-binds
-to it (see [Bind and work](#5-bind-and-work) above) — nothing to export
+to it (see [Binding past one scope](#binding-past-one-scope)) — nothing to export
 before launching `claude`. Once you add scopes, set `STRATA_AGENT_SCOPE` and
 `STRATA_AGENT_SKILL` in the shell before launching. Storage paths are read
 from `.strata/config.toml`.

@@ -23,12 +23,16 @@ from strata.session_state import (
     SessionStateStore,
     _last_accepted_contribution_at,
     _parse_ts,
+    classify_harness,
     compute_fleet_refresh_pending,
     compute_fleet_staleness,
     compute_refresh_pending,
     compute_scope_staleness,
+    compute_writeback_report,
     resolve_agent_session_id,
+    session_outcome,
     sessions_dir_for,
+    writeback_export_rows,
 )
 
 if TYPE_CHECKING:
@@ -164,6 +168,67 @@ def test_record_contribution_and_decline(tmp_path: Path) -> None:
     assert state.contributions == 1
     assert state.declines == 2
     assert state.reads == 0
+
+
+# ---------------------------------------------------------------------------
+# Harness recording — M1: the session state says which harness the session ran
+# in (claude-code / codex / unknown), derived from the MCP client's own
+# initialize handshake, so the write-back rate can be split by harness.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("client_name", "expected"),
+    [
+        ("codex-mcp-client", "codex"),  # verified: codex-cli 0.153.4 clientInfo.name
+        ("claude-code", "claude-code"),
+        ("Claude Code", "claude-code"),
+        ("some-other-client", "unknown"),
+        ("", "unknown"),
+        (None, "unknown"),
+    ],
+)
+def test_classify_harness(client_name: str | None, expected: str) -> None:
+    assert classify_harness(client_name) == expected
+
+
+def test_harness_is_recorded_on_first_write_and_survives_later_writes(tmp_path: Path) -> None:
+    store = SessionStateStore(tmp_path / "sessions")
+    store.record_read("s1", "g_arch", harness="codex")
+    store.record_contribution("s1", harness="codex")
+    store.record_decline("s1")  # no harness given: must not erase it
+
+    state = store.read("s1")
+    assert state is not None
+    assert state.harness == "codex"
+
+
+def test_harness_unknown_is_upgraded_but_a_known_harness_is_never_overwritten(
+    tmp_path: Path,
+) -> None:
+    store = SessionStateStore(tmp_path / "sessions")
+    store.record_read("s1", "g_arch", harness="unknown")
+    store.record_read("s1", "g_arch", harness="codex")
+    store.record_read("s1", "g_arch", harness="claude-code")
+
+    state = store.read("s1")
+    assert state is not None
+    assert state.harness == "codex"
+
+
+def test_session_state_written_before_harness_existed_loads_with_empty_harness(
+    tmp_path: Path,
+) -> None:
+    sessions = tmp_path / "sessions"
+    sessions.mkdir()
+    (sessions / "old.json").write_text(
+        '{"session_id": "old", "reads": 2, "contributions": 1, "declines": 0,'
+        ' "reads_by_scope": {}, "updated_at": "2026-09-01T00:00:00+00:00"}',
+        encoding="utf-8",
+    )
+    state = SessionStateStore(sessions).read("old")
+    assert state is not None
+    assert state.harness == ""
 
 
 def test_write_is_atomic_no_tmp_left_behind(tmp_path: Path) -> None:
@@ -657,3 +722,396 @@ def test_compute_fleet_refresh_pending_preserves_order(tmp_path: Path) -> None:
     assert results[0].depth == 1
     assert results[1].depth == 0
     rs.close()
+
+
+# ---------------------------------------------------------------------------
+# M2 — the write-back rate: connect records the denominator, every
+# strata_contribute call is a submission (any verdict), one outcome per session,
+# one aggregation function, an export the evals loader reads.
+# ---------------------------------------------------------------------------
+
+
+def test_record_connect_creates_a_zero_counter_state_with_harness(tmp_path: Path) -> None:
+    store = SessionStateStore(tmp_path / "sessions")
+    store.record_connect("s1", harness="codex", now=datetime(2026, 9, 19, 12, 0, tzinfo=UTC))
+
+    state = store.read("s1")
+    assert state is not None
+    assert state.harness == "codex"
+    assert state.connected_at == "2026-09-19T12:00:00+00:00"
+    assert (state.reads, state.contributions, state.submitted, state.declines) == (0, 0, 0, 0)
+
+
+def test_record_connect_is_idempotent_and_never_resets_counters(tmp_path: Path) -> None:
+    store = SessionStateStore(tmp_path / "sessions")
+    store.record_connect("s1", harness="codex", now=datetime(2026, 9, 19, 12, 0, tzinfo=UTC))
+    store.record_submission("s1")
+    store.record_connect("s1", harness="codex", now=datetime(2026, 9, 19, 13, 0, tzinfo=UTC))
+
+    state = store.read("s1")
+    assert state is not None
+    assert state.connected_at == "2026-09-19T12:00:00+00:00"
+    assert state.submitted == 1
+
+
+def test_a_submission_is_counted_apart_from_an_accepted_contribution(tmp_path: Path) -> None:
+    store = SessionStateStore(tmp_path / "sessions")
+    store.record_submission("s1")  # declined: submitted, not accepted
+    store.record_submission("s1")
+    store.record_contribution("s1")  # one of them was accepted
+
+    state = store.read("s1")
+    assert state is not None
+    assert (state.submitted, state.contributions) == (2, 1)
+
+
+def _outcome_of(tmp_path: Path, *acts: str) -> str:
+    store = SessionStateStore(tmp_path / "sessions")
+    store.record_connect("s", harness="codex")
+    for act in acts:
+        {
+            "submit": store.record_submission,
+            "accept": store.record_contribution,
+            "closeout": store.record_decline,
+        }[act]("s")
+    state = store.read("s")
+    assert state is not None
+    return session_outcome(state)
+
+
+def test_outcome_silent_when_neither_contributed_nor_closed_out(tmp_path: Path) -> None:
+    assert _outcome_of(tmp_path) == "silent"
+
+
+def test_outcome_closed_out_when_closeout_without_contribute(tmp_path: Path) -> None:
+    assert _outcome_of(tmp_path, "closeout") == "closed_out"
+
+
+def test_outcome_contributed_when_a_contribute_call_was_declined(tmp_path: Path) -> None:
+    assert _outcome_of(tmp_path, "submit") == "contributed"
+
+
+def test_outcome_contribute_then_closeout_is_contributed(tmp_path: Path) -> None:
+    assert _outcome_of(tmp_path, "submit", "accept", "closeout") == "contributed"
+
+
+def test_outcome_of_a_pre_m2_file_with_an_accepted_count_is_contributed() -> None:
+    from strata.session_state import SessionState
+
+    legacy = SessionState(session_id="old", contributions=2)  # no `submitted` field
+    assert session_outcome(legacy) == "contributed"
+
+
+def _report_store(tmp_path: Path) -> SessionStateStore:
+    return SessionStateStore(tmp_path / "sessions")
+
+
+def test_report_with_no_sessions_says_so_and_never_a_percentage(tmp_path: Path) -> None:
+    report = compute_writeback_report(_report_store(tmp_path), include_open=True)
+
+    assert report.overall.n == 0
+    assert report.overall.rate is None
+    assert report.overall.rate_text == "no sessions"
+    assert [r.harness for r in report.rows] == ["claude-code", "codex", "unknown"]
+    assert all(r.rate is None and r.rate_text == "no sessions" for r in report.rows)
+    assert report.include_open is True
+
+
+def test_report_with_one_contributing_session(tmp_path: Path) -> None:
+    store = _report_store(tmp_path)
+    store.record_connect("s1", harness="codex")
+    store.record_submission("s1")
+    store.record_contribution("s1")
+
+    report = compute_writeback_report(store, include_open=True)
+    codex = next(r for r in report.rows if r.harness == "codex")
+
+    assert (codex.n, codex.contributed, codex.accepted, codex.closed_out, codex.silent) == (
+        1,
+        1,
+        1,
+        0,
+        0,
+    )
+    assert codex.rate == 1.0
+    assert (report.overall.n, report.overall.contributed) == (1, 1)
+    assert next(r for r in report.rows if r.harness == "claude-code").n == 0
+
+
+def test_report_splits_by_harness_and_counts_every_outcome(tmp_path: Path) -> None:
+    store = _report_store(tmp_path)
+    for sid, harness in [("a", "claude-code"), ("b", "claude-code"), ("c", "codex")]:
+        store.record_connect(sid, harness=harness)
+    store.record_submission("a")  # declined: contributed but not accepted
+    store.record_decline("b")  # closed out
+    # c stays silent
+
+    report = compute_writeback_report(store, include_open=True)
+    cc = next(r for r in report.rows if r.harness == "claude-code")
+    cx = next(r for r in report.rows if r.harness == "codex")
+
+    assert (cc.n, cc.contributed, cc.accepted, cc.closed_out, cc.silent) == (2, 1, 0, 1, 0)
+    assert cc.rate == 0.5
+    assert (cx.n, cx.contributed, cx.silent) == (1, 0, 1)
+    assert cx.rate == 0.0
+    assert (report.overall.n, report.overall.contributed, report.overall.closed_out) == (3, 1, 1)
+
+
+def test_pre_m1_files_get_their_own_unrecorded_row(tmp_path: Path) -> None:
+    sessions = tmp_path / "sessions"
+    sessions.mkdir()
+    (sessions / "old.json").write_text(
+        '{"session_id": "old", "reads": 2, "contributions": 1, "declines": 0,'
+        ' "reads_by_scope": {}, "updated_at": "2026-09-01T00:00:00+00:00"}',
+        encoding="utf-8",
+    )
+    report = compute_writeback_report(SessionStateStore(sessions), include_open=True)
+
+    unrecorded = next(r for r in report.rows if r.harness == "unrecorded")
+    assert (unrecorded.n, unrecorded.contributed) == (1, 1)
+    assert next(r for r in report.rows if r.harness == "unknown").n == 0
+    assert report.overall.n == 1
+
+
+def test_report_since_filters_by_connect_time_and_states_the_window(tmp_path: Path) -> None:
+    store = _report_store(tmp_path)
+    store.record_connect("old", harness="codex", now=datetime(2026, 9, 1, tzinfo=UTC))
+    store.record_connect("new", harness="codex", now=datetime(2026, 9, 18, tzinfo=UTC))
+
+    report = compute_writeback_report(store, since="2026-09-10", include_open=True)
+
+    assert report.overall.n == 1
+    assert report.since == "2026-09-10"
+    assert report.first_session_at == "2026-09-18T00:00:00+00:00"
+
+
+def test_report_counts_unreadable_session_files_rather_than_hiding_them(tmp_path: Path) -> None:
+    store = _report_store(tmp_path)
+    store.record_connect("ok", harness="codex")
+    (store.sessions_dir / "broken.json").write_text("{not json", encoding="utf-8")
+
+    report = compute_writeback_report(store, include_open=True)
+
+    assert report.overall.n == 1
+    assert report.unreadable_files == 1
+
+
+def test_export_rows_carry_session_harness_outcome_and_accepted_count(tmp_path: Path) -> None:
+    store = _report_store(tmp_path)
+    store.record_connect("a", harness="codex")
+    store.record_submission("a")
+    store.record_contribution("a")
+    store.record_connect("b", harness="claude-code")
+
+    rows = {r["session_id"]: r for r in writeback_export_rows(store, include_open=True)}
+
+    assert rows["a"] == {
+        "session_id": "a",
+        "harness": "codex",
+        "outcome": "contributed",
+        "accepted_count": 1,
+    }
+    assert rows["b"]["outcome"] == "silent"
+    assert rows["b"]["accepted_count"] == 0
+
+
+# ---------------------------------------------------------------------------
+# M3 — ended sessions, rollover, strict flag
+# ---------------------------------------------------------------------------
+
+T0 = datetime(2026, 9, 19, 12, 0, tzinfo=UTC)
+
+
+def test_record_end_stamps_ended_at_for_the_owning_server(tmp_path: Path) -> None:
+    store = SessionStateStore(tmp_path / "sessions")
+    store.record_connect("s1", harness="codex", pid=100, now=T0)
+
+    store.record_end("s1", pid=100, now=T0 + timedelta(minutes=5))
+
+    state = store.read("s1")
+    assert state is not None
+    assert state.ended_at == (T0 + timedelta(minutes=5)).isoformat()
+
+
+def test_record_end_from_a_different_server_does_not_touch_the_live_session(
+    tmp_path: Path,
+) -> None:
+    """An old server exiting after a newer one took over the same id must not end
+    the newer session."""
+    store = SessionStateStore(tmp_path / "sessions")
+    store.record_connect("s1", harness="codex", pid=200, now=T0)
+
+    store.record_end("s1", pid=100, now=T0 + timedelta(minutes=5))
+
+    state = store.read("s1")
+    assert state is not None
+    assert state.ended_at == ""
+
+
+def test_record_end_is_idempotent(tmp_path: Path) -> None:
+    store = SessionStateStore(tmp_path / "sessions")
+    store.record_connect("s1", harness="codex", pid=100, now=T0)
+    store.record_end("s1", pid=100, now=T0 + timedelta(minutes=1))
+    store.record_end("s1", pid=100, now=T0 + timedelta(minutes=9))
+
+    state = store.read("s1")
+    assert state is not None
+    assert state.ended_at == (T0 + timedelta(minutes=1)).isoformat()
+
+
+def test_a_second_connection_with_the_same_id_archives_the_first_at_rollover(
+    tmp_path: Path,
+) -> None:
+    store = SessionStateStore(tmp_path / "sessions")
+    store.record_connect("s1", harness="codex", pid=100, now=T0)
+    store.record_submission("s1")
+
+    rollover = T0 + timedelta(hours=1)
+    store.record_connect("s1", harness="codex", pid=200, now=rollover)
+
+    fresh = store.read("s1")
+    assert fresh is not None
+    assert (fresh.submitted, fresh.server_pid, fresh.ended_at) == (0, 200, "")
+    archived = [s for s in store.scan()[0] if s.ended_at]
+    assert len(archived) == 1
+    assert archived[0].ended_at == rollover.isoformat()  # ended AT the rollover moment
+    assert archived[0].submitted == 1
+    assert archived[0].session_id == "s1"
+
+
+def test_a_repeat_connect_from_the_same_server_is_not_a_rollover(tmp_path: Path) -> None:
+    store = SessionStateStore(tmp_path / "sessions")
+    store.record_connect("s1", harness="codex", pid=100, now=T0)
+    store.record_connect("s1", harness="codex", pid=100, now=T0 + timedelta(minutes=1))
+
+    assert len(store.scan()[0]) == 1
+
+
+def test_two_rollovers_keep_two_archives(tmp_path: Path) -> None:
+    store = SessionStateStore(tmp_path / "sessions")
+    for pid in (100, 200, 300):
+        store.record_connect("s1", harness="codex", pid=pid, now=T0 + timedelta(minutes=pid))
+
+    assert len(store.scan()[0]) == 3
+
+
+def test_report_covers_ended_sessions_by_default_and_counts_the_open_ones_left_out(
+    tmp_path: Path,
+) -> None:
+    store = SessionStateStore(tmp_path / "sessions")
+    store.record_connect("done", harness="codex", pid=1, now=T0)
+    store.record_end("done", pid=1, now=T0 + timedelta(minutes=1))
+    store.record_connect("open", harness="codex", pid=2, now=T0)
+
+    now = T0 + timedelta(minutes=2)
+    default = compute_writeback_report(store, now=now)
+    everything = compute_writeback_report(store, include_open=True, now=now)
+
+    assert (default.overall.n, default.open_excluded, default.include_open) == (1, 1, False)
+    assert (everything.overall.n, everything.open_excluded, everything.include_open) == (
+        2,
+        0,
+        True,
+    )
+
+
+def test_a_session_idle_past_the_window_counts_as_ended(tmp_path: Path) -> None:
+    """A killed (SIGKILL) session never stamps ended_at: it counts as ended once its
+    last activity is older than the idle window."""
+    store = SessionStateStore(tmp_path / "sessions")
+    store.record_connect("killed", harness="codex", pid=1, now=T0)
+
+    inside = compute_writeback_report(
+        store, idle_window=timedelta(minutes=10), now=T0 + timedelta(minutes=5)
+    )
+    outside = compute_writeback_report(
+        store, idle_window=timedelta(minutes=10), now=T0 + timedelta(minutes=11)
+    )
+
+    assert (inside.overall.n, inside.open_excluded) == (0, 1)
+    assert (outside.overall.n, outside.open_excluded) == (1, 0)
+    assert outside.idle_window_seconds == 600
+
+
+def test_the_idle_window_is_measured_from_last_activity_not_connect(tmp_path: Path) -> None:
+    store = SessionStateStore(tmp_path / "sessions")
+    store.record_connect("busy", harness="codex", pid=1, now=T0)
+    store.record_read("busy", "g", now=T0 + timedelta(minutes=9))
+
+    report = compute_writeback_report(
+        store, idle_window=timedelta(minutes=10), now=T0 + timedelta(minutes=12)
+    )
+
+    assert (report.overall.n, report.open_excluded) == (0, 1)
+
+
+def test_report_splits_by_the_strict_flag(tmp_path: Path) -> None:
+    store = SessionStateStore(tmp_path / "sessions")
+    store.record_connect("a", harness="codex", pid=1, strict=True, now=T0)
+    store.record_submission("a")
+    store.record_connect("b", harness="codex", pid=2, strict=False, now=T0)
+    store.record_connect("c", harness="claude-code", pid=3, now=T0)  # strict unrecorded
+    for sid in "abc":
+        store.record_end(sid, pid={"a": 1, "b": 2, "c": 3}[sid], now=T0 + timedelta(minutes=1))
+
+    report = compute_writeback_report(store, now=T0 + timedelta(minutes=2))
+
+    assert (report.strict_on.n, report.strict_on.contributed) == (1, 1)
+    assert (report.strict_on.strict_on, report.strict_off.strict_on) == (1, 0)
+    assert (report.strict_off.n, report.strict_off.contributed) == (2, 0)
+    codex = next(r for r in report.rows if r.harness == "codex")
+    assert (codex.strict_on, codex.n) == (1, 2)
+
+
+def test_nudge_is_silent_once_a_contribute_call_was_made_whatever_the_verdict(
+    tmp_path: Path,
+) -> None:
+    from strata.session_state import compute_nudge
+
+    store = SessionStateStore(tmp_path / "sessions")
+    store.record_read("s1", "g")
+    assert compute_nudge(store.read("s1")) is not None
+
+    store.record_submission("s1")  # declined by the judge: still written back
+
+    assert compute_nudge(store.read("s1")) is None
+
+
+def test_tool_calls_are_counted_and_a_block_snapshots_the_count(tmp_path: Path) -> None:
+    store = SessionStateStore(tmp_path / "sessions")
+    store.record_tool_call("s1")
+    store.record_tool_call("s1")
+    store.record_strict_block("s1")
+    store.record_tool_call("s1")
+
+    state = store.read("s1")
+    assert state is not None
+    assert (state.tool_calls, state.strict_blocks, state.tool_calls_at_last_block) == (3, 1, 2)
+
+
+def _accounted_store(tmp_path: Path) -> SessionStateStore:
+    store = SessionStateStore(tmp_path / "sessions")
+    for sid in ("contrib", "closed", "silent", "silent2"):
+        store.record_connect(sid, harness="codex", pid=1)
+    store.record_submission("contrib")
+    store.record_decline("closed")
+    return store
+
+
+def test_accounted_for_is_contributed_plus_closed_out(tmp_path: Path) -> None:
+    report = compute_writeback_report(_accounted_store(tmp_path), include_open=True)
+    codex = next(r for r in report.rows if r.harness == "codex")
+
+    assert (codex.n, codex.contributed, codex.closed_out, codex.silent) == (4, 1, 1, 2)
+    assert codex.accounted == 2
+    assert codex.accounted_rate == 0.5
+    assert codex.accounted_rate_text == "50%"
+    assert codex.rate == 0.25  # the launch bar is still contributed / n
+    assert report.overall.accounted == 2
+
+
+def test_accounted_for_says_no_sessions_for_an_empty_row(tmp_path: Path) -> None:
+    report = compute_writeback_report(SessionStateStore(tmp_path / "sessions"))
+
+    assert report.overall.accounted_rate is None
+    assert report.overall.accounted_rate_text == "no sessions"

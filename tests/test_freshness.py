@@ -143,8 +143,9 @@ def _env(paths: dict[str, str], *, api_key: bool = True, strict: bool = False) -
     }
     if api_key:
         env["ANTHROPIC_API_KEY"] = "sk-test"
-    if strict:
-        env["STRATA_FRESHNESS_STRICT"] = "1"
+    # Strict is now the default, so the non-strict (background-evaluator) tests
+    # opt out explicitly, exactly as `--no-strict` does for a registered project.
+    env["STRATA_FRESHNESS_STRICT"] = "1" if strict else "0"
     return env
 
 
@@ -230,6 +231,60 @@ def test_at_threshold_spawns_with_unset_session_id_via_deterministic_fallback(
     assert rc == 0
     assert len(spawns.calls) == 1
     assert spawns.calls[0][0] == fallback_id
+
+
+def test_the_hook_finds_its_session_through_an_intermediate_shell(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Claude Code runs the hook as `/bin/sh -c 'sh <script>'` and that outer shell
+    survives, so the hook's parent is the shell (2000), not the claude process
+    (1000) that is the MCP server's parent. Found live in M3: the hook derived
+    sess_auto_2000, never found the session sess_auto_1000, and never blocked.
+    It now walks up its ancestors to the nearest one that has a session record."""
+    paths = _make_project(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("os.getppid", lambda: 2000)  # the intermediate shell
+    monkeypatch.setattr(freshness, "_parent_pid", {2000: 1000, 1000: 1}.get)
+    _seed_reads(_session_store(paths), NUDGE_MIN_READS, session_id="sess_auto_1000")
+    env = _env(paths)
+    del env["STRATA_AGENT_SESSION_ID"]
+
+    spawns = _Spawns()
+    freshness.run_stop_hook(_hook_stdin(), env=env, spawn_fn=spawns)
+
+    assert [c[0] for c in spawns.calls] == ["sess_auto_1000"]
+
+
+def test_the_nearest_ancestor_with_a_session_record_wins(tmp_path: Path, monkeypatch) -> None:
+    paths = _make_project(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("os.getppid", lambda: 3000)
+    monkeypatch.setattr(freshness, "_parent_pid", {3000: 2000, 2000: 1000, 1000: 1}.get)
+    store = _session_store(paths)
+    _seed_reads(store, NUDGE_MIN_READS, session_id="sess_auto_2000")
+    _seed_reads(store, NUDGE_MIN_READS, session_id="sess_auto_1000")
+    env = _env(paths)
+    del env["STRATA_AGENT_SESSION_ID"]
+
+    spawns = _Spawns()
+    freshness.run_stop_hook(_hook_stdin(), env=env, spawn_fn=spawns)
+
+    assert [c[0] for c in spawns.calls] == ["sess_auto_2000"]
+
+
+def test_an_explicit_session_id_is_never_replaced_by_an_ancestor_lookup(
+    tmp_path: Path, monkeypatch
+) -> None:
+    paths = _make_project(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("os.getppid", lambda: 2000)
+    monkeypatch.setattr(freshness, "_parent_pid", {2000: 1000, 1000: 1}.get)
+    _seed_reads(_session_store(paths), NUDGE_MIN_READS, session_id="sess_auto_1000")
+
+    spawns = _Spawns()  # env carries the explicit _SESSION_ID, which has no record
+    freshness.run_stop_hook(_hook_stdin(), env=_env(paths), spawn_fn=spawns)
+
+    assert spawns.calls == []
 
 
 def test_at_threshold_spawns_with_empty_string_session_id(tmp_path: Path, monkeypatch) -> None:
@@ -371,6 +426,188 @@ def test_strict_mode_respects_stop_hook_active(tmp_path: Path, monkeypatch) -> N
 
     assert rc == 0
     assert out.getvalue() == ""  # never blocks twice — no loop
+
+
+def _default_env(paths: dict[str, str]) -> dict[str, str]:
+    """The env a hook gets with nothing strict-related set at all."""
+    env = _env(paths, strict=False)
+    del env["STRATA_FRESHNESS_STRICT"]
+    return env
+
+
+def _run_hook(paths: dict[str, str], env: dict[str, str], *, active: bool = False) -> str:
+    out = io.StringIO()
+    freshness.run_stop_hook(_hook_stdin(stop_hook_active=active), env=env, out=out)
+    return out.getvalue()
+
+
+def test_strict_is_the_default_for_a_project_that_says_nothing(tmp_path: Path, monkeypatch) -> None:
+    paths = _make_project(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    _seed_reads(_session_store(paths), NUDGE_MIN_READS)
+
+    payload = json.loads(_run_hook(paths, _default_env(paths)))
+
+    assert payload["decision"] == "block"
+
+
+def test_a_project_can_opt_out_of_strict_in_its_config(tmp_path: Path, monkeypatch) -> None:
+    paths = _make_project(tmp_path)
+    (tmp_path / ".strata" / "config.toml").write_text(
+        'db = ".strata/strata.db"\n'
+        'fleet_yaml = ".strata/fleet.yaml"\n'
+        'summaries_dir = ".strata/summaries"\n'
+        "\n[freshness]\nstrict = false\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    _seed_reads(_session_store(paths), NUDGE_MIN_READS)
+
+    assert _run_hook(paths, _default_env(paths)) == ""
+
+
+def test_the_env_var_overrides_the_project_setting(tmp_path: Path, monkeypatch) -> None:
+    paths = _make_project(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    _seed_reads(_session_store(paths), NUDGE_MIN_READS)
+
+    assert _run_hook(paths, _env(paths, strict=False)) == ""  # STRATA_FRESHNESS_STRICT=0
+
+
+def test_a_second_block_fires_only_when_the_first_was_followed_by_no_strata_call(
+    tmp_path: Path, monkeypatch
+) -> None:
+    paths = _make_project(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    _seed_reads(_session_store(paths), NUDGE_MIN_READS)
+    env = _default_env(paths)
+
+    first = json.loads(_run_hook(paths, env))
+    second = json.loads(_run_hook(paths, env, active=True))  # the immediate continuation
+
+    assert first["decision"] == second["decision"] == "block"
+    assert "last reminder" in second["reason"]
+    assert "last reminder" not in first["reason"]
+    state = _session_store(paths).read(_SESSION_ID)
+    assert state is not None
+    assert state.strict_blocks == 2
+
+
+def test_no_second_block_when_a_strata_call_followed_the_first(tmp_path: Path, monkeypatch) -> None:
+    paths = _make_project(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    store = _session_store(paths)
+    _seed_reads(store, NUDGE_MIN_READS)
+    env = _default_env(paths)
+
+    assert json.loads(_run_hook(paths, env))["decision"] == "block"
+    store.record_tool_call(_SESSION_ID)  # the agent did react: it called a strata tool
+
+    assert _run_hook(paths, env, active=True) == ""
+    assert _run_hook(paths, env, active=False) == ""
+    state = store.read(_SESSION_ID)
+    assert state is not None
+    assert state.strict_blocks == 1
+
+
+def test_a_strata_call_before_the_first_block_does_not_count_as_a_reaction(
+    tmp_path: Path, monkeypatch
+) -> None:
+    paths = _make_project(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    store = _session_store(paths)
+    _seed_reads(store, NUDGE_MIN_READS)
+    store.record_tool_call(_SESSION_ID)  # e.g. the read itself
+    env = _default_env(paths)
+
+    first = _run_hook(paths, env)
+    second = _run_hook(paths, env, active=True)
+
+    assert json.loads(first)["decision"] == json.loads(second)["decision"] == "block"
+
+
+def test_a_third_stop_never_blocks_whatever_stop_hook_active_says(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The no-loop guarantee is the hard cap of two, not stop_hook_active."""
+    paths = _make_project(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    _seed_reads(_session_store(paths), NUDGE_MIN_READS)
+    env = _default_env(paths)
+
+    outputs = [_run_hook(paths, env, active=False) for _ in range(2)]
+    later = [_run_hook(paths, env, active=flag) for flag in (True, False, True, False, False)]
+
+    assert all(json.loads(o)["decision"] == "block" for o in outputs)
+    assert later == [""] * 5
+    state = _session_store(paths).read(_SESSION_ID)
+    assert state is not None
+    assert state.strict_blocks == 2
+
+
+def test_the_first_block_still_ignores_a_stop_that_another_hook_already_blocked(
+    tmp_path: Path, monkeypatch
+) -> None:
+    paths = _make_project(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    _seed_reads(_session_store(paths), NUDGE_MIN_READS)
+
+    assert _run_hook(paths, _default_env(paths), active=True) == ""
+
+
+def test_a_pre_cap_two_record_with_one_block_counts_as_one_block(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Records written by M3 carry strict_blocked_at but no strict_blocks counter."""
+    paths = _make_project(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    store = _session_store(paths)
+    _seed_reads(store, NUDGE_MIN_READS)
+    store.record_strict_block(_SESSION_ID)
+    state = store.read(_SESSION_ID)
+    assert state is not None
+    state.strict_blocks = 0  # what an M3-era file deserializes to
+    store._write(state)  # noqa: SLF001
+
+    second = json.loads(_run_hook(paths, _default_env(paths), active=True))
+    third = _run_hook(paths, _default_env(paths), active=True)
+
+    assert "last reminder" in second["reason"]
+    assert third == ""
+
+
+def test_the_block_message_names_both_exits() -> None:
+    reason = freshness.STRICT_BLOCK_REASON
+
+    assert "strata_contribute" in reason
+    assert "strata_session_closeout(reason)" in reason
+    assert "nothing is worth keeping" in reason
+
+
+def test_the_hook_records_the_strict_flag_on_the_session(tmp_path: Path, monkeypatch) -> None:
+    paths = _make_project(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    _seed_reads(_session_store(paths), NUDGE_MIN_READS)
+
+    _run_hook(paths, _env(paths, strict=False))  # strict off: hook still records it
+
+    state = _session_store(paths).read(_SESSION_ID)
+    assert state is not None
+    assert state.strict is False
+
+
+def test_a_contribution_that_was_declined_still_closes_the_gate(tmp_path: Path) -> None:
+    store = _session_store(_make_project(tmp_path))
+    _seed_reads(store, NUDGE_MIN_READS)
+    assert freshness.gate_open(store.read(_SESSION_ID)) is True
+
+    store.record_submission(_SESSION_ID)  # a contribute call the judge declined
+
+    assert freshness.gate_open(store.read(_SESSION_ID)) is False
+
+
+def test_the_gate_opens_at_the_first_read() -> None:
+    assert NUDGE_MIN_READS == 1
 
 
 # ---------------------------------------------------------------------------
@@ -713,3 +950,12 @@ def test_read_transcript_tail_missing_file_is_empty() -> None:
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
+
+
+def test_the_last_reminder_is_blunter_and_still_names_both_exits() -> None:
+    reason = freshness.STRICT_LAST_REMINDER_REASON
+
+    assert "last reminder" in reason
+    assert "strata_contribute" in reason
+    assert "strata_session_closeout(reason)" in reason
+    assert reason != freshness.STRICT_BLOCK_REASON

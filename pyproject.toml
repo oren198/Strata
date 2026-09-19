@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "strata-mem"
-version = "1.11.0"
+version = "1.12.0"
 description = "Shared memory for agent fleets."
 requires-python = ">=3.11"
 dependencies = [
@@ -14,7 +14,10 @@ dependencies = [
     "pydantic",
     "pydantic-settings",
     "pyyaml",
-    "mcp >=1.28,<2",
+    # Upper bound = the minors the MCP server's private-SDK seam (the lowlevel
+    # server's _handle_message: session connect, tool-call counting) is verified
+    # on. Raise it only after re-verifying that seam on the newer minor — see #206.
+    "mcp >=1.28,<1.30",
 ]
 readme = "README.md"
 
