@@ -225,6 +225,16 @@ class SessionState(BaseModel):
     reads_by_scope: dict[str, ScopeReadReceipt] = Field(default_factory=dict)
     """scope_id → the session's read receipt for that scope."""
 
+    submitted: int = 0
+    """``strata_contribute`` calls this session made, whatever the verdict (a
+    decline counts): the write-back numerator. ``contributions`` above stays the
+    accepted count. A file written before this field existed has ``0`` here."""
+
+    connected_at: str = ""
+    """ISO 8601 time of this session's first MCP connect (written before any tool
+    call, so a session that never does anything is still counted). ``""`` for a
+    file written before M2."""
+
     harness: str = ""
     """Which harness this session ran in (``claude-code`` / ``codex`` /
     ``unknown``), from the MCP client's ``initialize`` handshake. ``""`` for a
@@ -325,6 +335,23 @@ class SessionStateStore:
         except (json.JSONDecodeError, ValueError, OSError):
             return None
 
+    def scan(self) -> tuple[list[SessionState], int]:
+        """Return every readable session state and the count of unreadable files.
+
+        Like :meth:`all_states`, but says how many ``*.json`` files could not be
+        parsed instead of dropping them silently, so a rate computed over the
+        result can report what it left out.
+        """
+        states: list[SessionState] = []
+        unreadable = 0
+        for entry in sorted(self._dir.glob("*.json")):
+            try:
+                data = json.loads(entry.read_text(encoding="utf-8"))
+                states.append(SessionState.model_validate(data))
+            except (json.JSONDecodeError, ValueError, OSError):
+                unreadable += 1
+        return states, unreadable
+
     def all_states(self) -> list[SessionState]:
         """Return every readable session state in the directory.
 
@@ -377,6 +404,38 @@ class SessionStateStore:
             else:
                 receipt.count += 1
                 receipt.last_read_at = ts
+            state.updated_at = ts
+            self._write(state)
+        return state
+
+    def record_connect(
+        self, session_id: str, *, harness: str | None = None, now: datetime | None = None
+    ) -> SessionState:
+        """Record that *session_id* connected — the write-back denominator.
+
+        Creates the state file with zero counters if absent, and stamps
+        ``connected_at`` (first connect wins) and the harness. Idempotent: never
+        resets counters or moves ``connected_at`` for an existing session.
+        """
+        ts = (now or datetime.now(UTC)).isoformat()
+        with self._locked(session_id):
+            state = self.read(session_id) or SessionState(session_id=session_id)
+            if not state.connected_at:
+                state.connected_at = ts
+            self._stamp_harness(state, harness)
+            state.updated_at = state.updated_at or ts
+            self._write(state)
+        return state
+
+    def record_submission(
+        self, session_id: str, *, now: datetime | None = None, harness: str | None = None
+    ) -> SessionState:
+        """Record one ``strata_contribute`` call by *session_id*, whatever its verdict."""
+        ts = (now or datetime.now(UTC)).isoformat()
+        with self._locked(session_id):
+            state = self.read(session_id) or SessionState(session_id=session_id)
+            self._stamp_harness(state, harness)
+            state.submitted += 1
             state.updated_at = ts
             self._write(state)
         return state
@@ -671,3 +730,170 @@ def compute_nudge(state: SessionState | None) -> str | None:
         "yet; contribute your outcomes with strata_contribute, or call "
         "strata_session_closeout if there is nothing to record."
     )
+
+
+# ---------------------------------------------------------------------------
+# The write-back rate (M2) — one outcome per session, one aggregation.
+# ---------------------------------------------------------------------------
+
+OUTCOME_CONTRIBUTED = "contributed"
+OUTCOME_CLOSED_OUT = "closed_out"
+OUTCOME_SILENT = "silent"
+
+#: The row label for session files written before harness recording (harness "").
+HARNESS_UNRECORDED = "unrecorded"
+
+#: Harness rows every report carries, in display order.
+_REPORT_HARNESSES = (HARNESS_CLAUDE_CODE, HARNESS_CODEX, HARNESS_UNKNOWN)
+
+
+def session_outcome(state: SessionState) -> str:
+    """Return the one outcome of a session: contributed, closed_out or silent.
+
+    ``contributed``: at least one ``strata_contribute`` call, whatever the
+    verdict (a declined contribution is still a write-back attempt). A pre-M2
+    file has no ``submitted`` counter, so an accepted count also counts.
+    ``closed_out``: an explicit closeout and no contribute. ``silent``: neither.
+    A session that contributed and then closed out is ``contributed``.
+    """
+    if state.submitted > 0 or state.contributions > 0:
+        return OUTCOME_CONTRIBUTED
+    if state.declines > 0:
+        return OUTCOME_CLOSED_OUT
+    return OUTCOME_SILENT
+
+
+class WritebackRow(BaseModel):
+    """One row of the write-back table: raw counts, never just a percentage."""
+
+    harness: str
+    n: int = 0
+    """Sessions in the row."""
+    contributed: int = 0
+    """Sessions with at least one contribute call, any verdict (the numerator)."""
+    accepted: int = 0
+    """Sessions with at least one ACCEPTED contribution."""
+    closed_out: int = 0
+    silent: int = 0
+
+    @property
+    def rate(self) -> float | None:
+        """``contributed / n``, or ``None`` when there are no sessions."""
+        return self.contributed / self.n if self.n else None
+
+    @property
+    def rate_text(self) -> str:
+        """The rate as text: ``"no sessions"`` for an empty row, never a percentage."""
+        return "no sessions" if self.rate is None else f"{self.rate:.0%}"
+
+
+class WritebackReport(BaseModel):
+    """The write-back rate over the session-state files, with its window."""
+
+    rows: list[WritebackRow]
+    overall: WritebackRow
+    since: str | None = None
+    """The ``--since`` bound applied, if any."""
+    first_session_at: str | None = None
+    last_session_at: str | None = None
+    unreadable_files: int = 0
+    """Session files that could not be parsed and are NOT in the counts."""
+    includes_open_sessions: bool = True
+    """Sessions still running are counted (M3 adds ended_at and restricts this)."""
+
+
+def _session_time(state: SessionState) -> str:
+    return state.connected_at or state.updated_at
+
+
+def _since_bound(since: str | datetime | None) -> datetime | None:
+    """Parse a ``since`` bound (ISO 8601 string or datetime); reject a bad string."""
+    if since is None or isinstance(since, datetime):
+        return since
+    bound = _parse_ts(since)
+    if bound is None:
+        raise ValueError(f"invalid --since value {since!r}: expected an ISO 8601 date or time")
+    return bound
+
+
+def _in_window(state: SessionState, bound: datetime | None) -> bool:
+    """Whether *state*'s session time is at or after *bound* (no bound: always)."""
+    if bound is None:
+        return True
+    parsed = _parse_ts(_session_time(state))
+    return parsed is not None and parsed >= bound
+
+
+def compute_writeback_report(
+    store: SessionStateStore, *, since: str | datetime | None = None
+) -> WritebackReport:
+    """Aggregate every session's outcome by harness — the one write-back function.
+
+    The CLI and the export both call this (or :func:`writeback_export_rows`);
+    nothing re-derives the rate. Rows: claude-code, codex, unknown (always), an
+    ``unrecorded`` row for pre-harness files (only when present), and
+    ``overall``. *since* keeps sessions whose connect time (``updated_at`` for
+    pre-M2 files) is at or after it.
+
+    Retention: nothing in Strata deletes session files on a timer — they stay
+    until ``strata unregister --purge-data`` or a manual delete — so the window is
+    exactly the sessions on disk. The report states its first/last session time
+    and the count of unreadable files it could not include.
+    """
+    states, unreadable = store.scan()
+    bound = _since_bound(since)
+
+    rows: dict[str, WritebackRow] = {h: WritebackRow(harness=h) for h in _REPORT_HARNESSES}
+    overall = WritebackRow(harness="overall")
+    times: list[str] = []
+    for state in states:
+        if not _in_window(state, bound):
+            continue
+        stamp = _session_time(state)
+        if stamp:
+            times.append(stamp)
+        label = state.harness or HARNESS_UNRECORDED
+        row = rows.setdefault(label, WritebackRow(harness=label))
+        outcome = session_outcome(state)
+        for target in (row, overall):
+            target.n += 1
+            if outcome == OUTCOME_CONTRIBUTED:
+                target.contributed += 1
+            elif outcome == OUTCOME_CLOSED_OUT:
+                target.closed_out += 1
+            else:
+                target.silent += 1
+            if state.contributions > 0:
+                target.accepted += 1
+
+    parsed_times = sorted(t for t in times if _parse_ts(t) is not None)
+    return WritebackReport(
+        rows=list(rows.values()),
+        overall=overall,
+        since=since if isinstance(since, str) else (since.isoformat() if since else None),
+        first_session_at=parsed_times[0] if parsed_times else None,
+        last_session_at=parsed_times[-1] if parsed_times else None,
+        unreadable_files=unreadable,
+    )
+
+
+def writeback_export_rows(
+    store: SessionStateStore, *, since: str | datetime | None = None
+) -> list[dict[str, object]]:
+    """One row per session for the strata-evals loader:
+    ``{session_id, harness, outcome, accepted_count}`` (same *since* filter)."""
+    states, _ = store.scan()
+    bound = _since_bound(since)
+    rows: list[dict[str, object]] = []
+    for state in states:
+        if not _in_window(state, bound):
+            continue
+        rows.append(
+            {
+                "session_id": state.session_id,
+                "harness": state.harness or HARNESS_UNRECORDED,
+                "outcome": session_outcome(state),
+                "accepted_count": state.contributions,
+            }
+        )
+    return rows

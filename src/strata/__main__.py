@@ -730,6 +730,109 @@ def cmd_record(args: argparse.Namespace) -> int:
     return 0
 
 
+_stats_parser: argparse.ArgumentParser | None = None
+
+
+def cmd_stats_root(args: argparse.Namespace) -> int:
+    """``strata stats`` with no subcommand — print the group's help."""
+    if _stats_parser is not None:
+        _stats_parser.print_help()
+    return 0
+
+
+def _writeback_report_dict(report) -> dict:  # noqa: ANN001
+    """The report as plain JSON-able data, each row carrying its rate and rate text."""
+
+    def row(r) -> dict:  # noqa: ANN001
+        return {**r.model_dump(), "rate": r.rate, "rate_text": r.rate_text}
+
+    payload = report.model_dump()
+    payload["rows"] = [row(r) for r in report.rows]
+    payload["overall"] = row(report.overall)
+    return payload
+
+
+def cmd_stats_writeback(args: argparse.Namespace) -> int:
+    """``strata stats writeback`` — the write-back rate, split by harness.
+
+    Of the sessions that connected, how many made at least one
+    ``strata_contribute`` call (any verdict). Raw counts sit beside every
+    percentage; an empty row says "no sessions", never a rate. Includes sessions
+    still open. All aggregation lives in
+    :func:`strata.session_state.compute_writeback_report`.
+    """
+    import json
+
+    from strata.session_state import (
+        SessionStateStore,
+        compute_writeback_report,
+        sessions_dir_for,
+        writeback_export_rows,
+    )
+    from strata.stores import EmbeddedStoreError, open_embedded_stores
+
+    try:
+        stores = open_embedded_stores()
+    except EmbeddedStoreError as exc:
+        print(exc.message, file=sys.stderr)
+        return 1
+
+    with stores:
+        store = SessionStateStore(sessions_dir_for(str(stores.summary_store.summaries_dir)))
+        try:
+            report = compute_writeback_report(store, since=args.since)
+            export_rows = writeback_export_rows(store, since=args.since) if args.export else None
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+
+    note_out = sys.stderr if args.json else sys.stdout
+    if export_rows is not None:
+        with open(args.export, "w", encoding="utf-8") as fh:
+            for row in export_rows:
+                fh.write(json.dumps(row) + "\n")
+        print(f"Exported {len(export_rows)} session outcome(s) to {args.export}", file=note_out)
+
+    if args.json:
+        print(json.dumps(_writeback_report_dict(report), indent=2))
+        return 0
+
+    window = (
+        f"{report.first_session_at} to {report.last_session_at}"
+        if report.first_session_at
+        else "no sessions"
+    )
+    since = f"since {report.since}" if report.since else "no --since bound"
+    print("Write-back rate: sessions that made at least one strata_contribute call")
+    print("(any verdict — a declined contribution counts).")
+    print()
+    print(f"Window: {window} ({since})")
+    print("Note: this includes sessions still open — a session that has not ended yet")
+    print("counts as silent until it contributes or closes out.")
+    print()
+    labels = [r.harness for r in [*report.rows, report.overall]]
+    width = max(len(label) for label in labels)
+    print(
+        f"  {'harness':{width}}  sessions  contributed  accepted  closed out  silent  "
+        "write-back rate"
+    )
+    for r in [*report.rows, report.overall]:
+        rate = "no sessions" if r.rate is None else f"{r.rate_text} ({r.contributed}/{r.n})"
+        print(
+            f"  {r.harness:{width}}  {r.n:<8}  {r.contributed:<11}  {r.accepted:<8}  "
+            f"{r.closed_out:<10}  {r.silent:<6}  {rate}"
+        )
+    print()
+    print(
+        "Retention: session files are never deleted automatically (only by "
+        "`strata unregister --purge-data` or by hand), so the window above is every "
+        "session on disk."
+    )
+    if report.unreadable_files:
+        print(f"Not counted: {report.unreadable_files} unreadable session file(s).")
+    return 0
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     """Show the per-scope memory-freshness (staleness) metric — embedded read.
 
@@ -4478,6 +4581,30 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Recency window in days for the staleness metric (default: 30).",
     )
     p_status.set_defaults(func=cmd_status)
+
+    global _stats_parser
+    p_stats = sub.add_parser("stats", help="Engine metrics computed from session state.")
+    _stats_parser = p_stats
+    p_stats.set_defaults(func=cmd_stats_root)
+    stats_sub = p_stats.add_subparsers(dest="stats_command", metavar="<stats-command>")
+    p_stats_wb = stats_sub.add_parser(
+        "writeback",
+        help="Write-back rate: sessions with at least one contribution, by harness.",
+    )
+    p_stats_wb.add_argument(
+        "--since",
+        default=None,
+        metavar="ISO",
+        help="Only sessions that connected at or after this ISO 8601 date/time.",
+    )
+    p_stats_wb.add_argument("--json", action="store_true", help="Print the report as JSON.")
+    p_stats_wb.add_argument(
+        "--export",
+        default=None,
+        metavar="PATH",
+        help="Write one JSON line per session ({session_id, harness, outcome, accepted_count}).",
+    )
+    p_stats_wb.set_defaults(func=cmd_stats_writeback)
 
     p_doctor = sub.add_parser(
         "doctor",

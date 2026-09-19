@@ -140,3 +140,32 @@ def test_explicit_session_id_still_wins(tmp_path: Path) -> None:
 
     assert result["stats"]["session_id"] == "my-explicit-id"
     assert (tmp_path / ".strata" / "sessions" / "my-explicit-id.json").exists()
+
+
+def test_connect_alone_records_the_session_before_any_tool_call(tmp_path: Path) -> None:
+    """The write-back denominator: a server that gets initialize and exits with
+    no tool call still leaves a state file — harness set, counters zero."""
+
+    async def connect_only() -> None:
+        params = _server_params(tmp_path, "")
+        async with (
+            stdio_client(params) as (read, write),
+            ClientSession(
+                read, write, client_info=types.Implementation(name="codex-mcp-client", version="0")
+            ) as session,
+        ):
+            await session.initialize()
+
+    asyncio.run(connect_only())
+
+    files = list((tmp_path / ".strata" / "sessions").glob("*.json"))
+    assert len(files) == 1
+    state = json.loads(files[0].read_text(encoding="utf-8"))
+    assert state["harness"] == "codex"
+    assert state["connected_at"] != ""
+    assert (state["reads"], state["contributions"], state["submitted"], state["declines"]) == (
+        0,
+        0,
+        0,
+        0,
+    )
