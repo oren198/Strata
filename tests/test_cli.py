@@ -440,6 +440,30 @@ def test_stats_writeback_shows_accounted_for_beside_the_rate_and_explains_both(
     assert "accounted for =" in out
 
 
+_BAR_QUALIFIER = (
+    "The write-back rate is meaningful only over sessions that learned something worth "
+    "keeping; a session with nothing to keep should close out, which counts in "
+    "accounted for, not in the write-back rate."
+)
+
+
+def test_stats_writeback_qualifies_the_bar_in_text_and_json(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import json
+    import re
+
+    _seed_fleet(tmp_path, monkeypatch)
+    _seed_writeback_sessions(tmp_path)
+
+    assert main(["stats", "writeback"]) == 0
+    text = re.sub(r"\s+", " ", capsys.readouterr().out)
+    assert _BAR_QUALIFIER in text
+
+    assert main(["stats", "writeback", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["bar_qualifier"] == _BAR_QUALIFIER
+
+
 def test_stats_writeback_json_carries_accounted_for(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

@@ -179,3 +179,23 @@ def test_mcp_is_a_core_dependency() -> None:
         meta = tomllib.load(fh)
     core_deps = [dep.split("[")[0].split(" ")[0] for dep in meta["project"]["dependencies"]]
     assert "mcp" in core_deps, "the mcp SDK must be a core dependency (strata-mcp imports it)"
+
+
+def test_mcp_sdk_is_pinned_to_the_minors_the_private_seam_was_verified_on() -> None:
+    """The MCP server hooks the SDK's private ``_handle_message`` (session connect,
+    tool-call counting); that seam is only verified on mcp 1.28-1.29 (issue #206),
+    so the range must stay ``>=1.28,<1.30`` until it is re-verified on a newer minor."""
+    import tomllib
+
+    from packaging.specifiers import SpecifierSet
+
+    pyproject = Path(__file__).parent.parent / "pyproject.toml"
+    with pyproject.open("rb") as fh:
+        deps = tomllib.load(fh)["project"]["dependencies"]
+    (spec,) = [d for d in deps if d.split("[")[0].split(" ")[0].split(">")[0] == "mcp"]
+    specifier = SpecifierSet(spec.replace("mcp", "", 1).strip())
+
+    assert specifier.contains("1.28.0")
+    assert specifier.contains("1.29.1")
+    assert not specifier.contains("1.30.0")
+    assert not specifier.contains("2.0.0")
