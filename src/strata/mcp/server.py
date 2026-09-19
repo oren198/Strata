@@ -1298,7 +1298,8 @@ def _validate_binding(
             "decides whose memory this session reads and writes. (Alternatively "
             "the server can be restarted with STRATA_AGENT_SCOPE/STRATA_AGENT_SKILL "
             "set in its environment — read once, at process start.)\n"
-            "  See README.md § 'Quick Start for an existing project' for the full setup."
+            "  See README.md § 'Quick start: two agents, one memory' "
+            "(Binding past one scope) for the full setup."
         )
 
     # 3. Scope must exist in fleet config and be active (skip when fleet not
@@ -1337,7 +1338,8 @@ def _validate_binding(
             "with STRATA_AGENT_SCOPE/STRATA_AGENT_SKILL set in its environment — "
             "read once, at process start.)\n"
             "  (A skill is optional when the scope declares none.)\n"
-            "  See README.md § 'Quick Start for an existing project' for the full setup."
+            "  See README.md § 'Quick start: two agents, one memory' "
+            "(Binding past one scope) for the full setup."
         )
 
     # 5. STRATA_AGENT_SKILL must be in permitted_skills (skip when scope or
