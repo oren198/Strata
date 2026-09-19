@@ -349,6 +349,59 @@ def test_agent_session_id_falls_back_deterministically_when_unset(
     assert resolve_agent_session_id({}) == mod._AGENT_SESSION_ID
 
 
+class _FakeClientInfo:
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+
+class _FakeSession:
+    def __init__(self, client_name: str | None) -> None:
+        self.client_params = (
+            None
+            if client_name is None
+            else type("P", (), {"clientInfo": _FakeClientInfo(client_name)})()
+        )
+
+
+def _fake_context(client_name: str | None):
+    request_context = type("RC", (), {"session": _FakeSession(client_name)})()
+    return type("Ctx", (), {"request_context": request_context})()
+
+
+def test_reads_record_the_harness_named_by_the_mcp_client(tmp_path: Path, monkeypatch) -> None:
+    """The MCP client's own initialize handshake says which harness this
+    session runs in (Codex sends clientInfo.name 'codex-mcp-client'); the
+    server stamps it into the session state so M2 can split write-back by
+    harness."""
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fleet_yaml(tmp_path)
+    monkeypatch.delenv("STRATA_AGENT_SESSION_ID", raising=False)
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+    monkeypatch.setattr(mod.mcp, "get_context", lambda: _fake_context("codex-mcp-client"))
+
+    mod._record_read("g_root")
+
+    state = mod._session_store.read(mod._AGENT_SESSION_ID)
+    assert state is not None
+    assert state.harness == "codex"
+
+
+def test_harness_is_unknown_when_no_client_info_is_available(tmp_path: Path, monkeypatch) -> None:
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fleet_yaml(tmp_path)
+    monkeypatch.delenv("STRATA_AGENT_SESSION_ID", raising=False)
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+    monkeypatch.setattr(mod.mcp, "get_context", lambda: _fake_context(None))
+
+    mod._record_read("g_root")
+
+    state = mod._session_store.read(mod._AGENT_SESSION_ID)
+    assert state is not None
+    assert state.harness == "unknown"
+
+
 def test_agent_session_id_treats_empty_string_as_unset(tmp_path: Path, monkeypatch) -> None:
     """Empty string counts as unset — Codex ships literal empty env values —
     so _AGENT_SESSION_ID falls back the same way an absent var does, never

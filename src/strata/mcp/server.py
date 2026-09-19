@@ -87,6 +87,7 @@ from strata.record_store import ContributorRef, RecordStore
 from strata.session_state import (
     SessionState,
     SessionStateStore,
+    classify_harness,
     compute_nudge,
     resolve_agent_session_id,
     sessions_dir_for,
@@ -265,6 +266,26 @@ def _drain_for_read(fleet, scope_id: str) -> tuple[int, list]:
     return max(0, pending - outcome.events_processed), outcome.processed_events
 
 
+def _client_harness() -> str | None:
+    """Return the harness the connected MCP client belongs to, or ``None``.
+
+    Read from the client's own ``initialize`` handshake (``clientInfo.name``)
+    via the request in flight, then held for the process's lifetime: one MCP
+    server serves exactly one client connection. ``None`` only when no request
+    context exists yet; a context with no client info is ``unknown``.
+    """
+    global _HARNESS  # noqa: PLW0603
+    if _HARNESS is not None:
+        return _HARNESS
+    try:
+        params = mcp.get_context().request_context.session.client_params
+        name = params.clientInfo.name if params is not None else None
+    except Exception:  # noqa: BLE001 - no request in flight: nothing to read
+        return None
+    _HARNESS = classify_harness(name)
+    return _HARNESS
+
+
 def _record_read(scope_id: str) -> None:
     """Record one perspective/summary read for this session (best-effort, #110).
 
@@ -276,7 +297,7 @@ def _record_read(scope_id: str) -> None:
     if _session_store is None:
         return
     try:
-        _session_store.record_read(_AGENT_SESSION_ID, scope_id)
+        _session_store.record_read(_AGENT_SESSION_ID, scope_id, harness=_client_harness())
     except OSError as exc:  # pragma: no cover - defensive; disk failure only
         _logger.warning("failed to record read receipt for session %r: %s", _AGENT_SESSION_ID, exc)
 
@@ -291,7 +312,7 @@ def _record_accepted_contribution(decision: str) -> None:
     if _session_store is None or decision not in ("accept_as_directive", "accept_as_context"):
         return
     try:
-        _session_store.record_contribution(_AGENT_SESSION_ID)
+        _session_store.record_contribution(_AGENT_SESSION_ID, harness=_client_harness())
     except OSError as exc:  # pragma: no cover - defensive; disk failure only
         _logger.warning(
             "failed to record contribution counter for session %r: %s", _AGENT_SESSION_ID, exc
@@ -312,7 +333,7 @@ def _record_decline() -> SessionState | None:
     if _session_store is None:
         return None
     try:
-        return _session_store.record_decline(_AGENT_SESSION_ID)
+        return _session_store.record_decline(_AGENT_SESSION_ID, harness=_client_harness())
     except OSError as exc:  # pragma: no cover - defensive; disk failure only
         _logger.warning("failed to record decline for session %r: %s", _AGENT_SESSION_ID, exc)
         return None
@@ -370,6 +391,10 @@ def _build_scope_manager():
 _AGENT_SCOPE: str = os.environ.get("STRATA_AGENT_SCOPE", "")
 _AGENT_SKILL: str | None = os.environ.get("STRATA_AGENT_SKILL") or None
 _AGENT_SESSION_ID: str = resolve_agent_session_id()
+# The harness the connected client belongs to, from its initialize handshake;
+# resolved lazily on the first request (no client is connected at import) by
+# _client_harness() and held for the process's lifetime.
+_HARNESS: str | None = None
 
 # Soft-start state (dated addendum to ADR 0005 Decision 5 — see
 # docs/adr/0005-brownfield-install.md). A harness that swallows stderr (the
@@ -3061,6 +3086,7 @@ async def strata_session_stats() -> dict:
         "contributions": 0,
         "declines": 0,
         "reads_by_scope": {},
+        "harness": "",
         "updated_at": "",
     }
 
@@ -3115,6 +3141,7 @@ async def strata_session_closeout(reason: str) -> dict:
         "contributions": 0,
         "declines": 0,
         "reads_by_scope": {},
+        "harness": "",
         "updated_at": "",
     }
 

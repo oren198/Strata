@@ -132,7 +132,10 @@ def resolve_agent_session_id(env: dict[str, str] | None = None) -> str:
     for the identical turn without coordinating.
 
     This pairing relies on the harness spawning both the MCP server and the
-    hook as its own direct children — true for Claude Code today. A harness
+    hook as its own direct children — true for Claude Code today, and verified
+    for Codex (codex-cli 0.153.4, ``codex exec`` and the TUI, two concurrent
+    sessions): one ``strata-mcp`` per Codex session, parented by that session's
+    ``codex`` process, with the Stop hook parented by the same process. A harness
     that instead routes hook invocations through a non-exec'ing intermediate
     shell (a fresh subshell per hook call, rather than exec'ing into the
     hook command) would see a different, and possibly a different-every-turn,
@@ -152,6 +155,30 @@ def resolve_agent_session_id(env: dict[str, str] | None = None) -> str:
     if explicit:
         return explicit
     return f"sess_auto_{os.getppid()}"
+
+
+#: The harnesses a session's state can name. ``unknown`` is a client that
+#: identified itself as something else (or not at all); ``""`` on a
+#: :class:`SessionState` means the file predates harness recording.
+HARNESS_CLAUDE_CODE = "claude-code"
+HARNESS_CODEX = "codex"
+HARNESS_UNKNOWN = "unknown"
+
+
+def classify_harness(client_name: str | None) -> str:
+    """Map an MCP client's ``clientInfo.name`` to the harness it belongs to.
+
+    The name comes from the client's own ``initialize`` handshake, so it is
+    per-connection evidence rather than configuration: Codex (codex-cli 0.153.4,
+    verified live) sends ``codex-mcp-client``; Claude Code sends ``claude-code``.
+    Anything else — or no client info — is ``unknown``, never a guess.
+    """
+    name = (client_name or "").lower()
+    if "codex" in name:
+        return HARNESS_CODEX
+    if "claude" in name:
+        return HARNESS_CLAUDE_CODE
+    return HARNESS_UNKNOWN
 
 
 # ---------------------------------------------------------------------------
@@ -197,6 +224,12 @@ class SessionState(BaseModel):
 
     reads_by_scope: dict[str, ScopeReadReceipt] = Field(default_factory=dict)
     """scope_id → the session's read receipt for that scope."""
+
+    harness: str = ""
+    """Which harness this session ran in (``claude-code`` / ``codex`` /
+    ``unknown``), from the MCP client's ``initialize`` handshake. ``""`` for a
+    file written before harness recording. Set once by the MCP server; a known
+    harness is never overwritten (see :func:`_stamp_harness`)."""
 
     updated_at: str = ""
     """ISO 8601 timestamp of the last mutation."""
@@ -314,8 +347,20 @@ class SessionStateStore:
     # Mutations (read-modify-write, atomic)
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _stamp_harness(state: SessionState, harness: str | None) -> None:
+        """Record *harness* on *state*: fills an empty or ``unknown`` value, and
+        never overwrites a known harness (a session runs in one harness)."""
+        if harness and state.harness in ("", HARNESS_UNKNOWN):
+            state.harness = harness
+
     def record_read(
-        self, session_id: str, scope_id: str, *, now: datetime | None = None
+        self,
+        session_id: str,
+        scope_id: str,
+        *,
+        now: datetime | None = None,
+        harness: str | None = None,
     ) -> SessionState:
         """Record one perspective/summary read of *scope_id* by *session_id*.
 
@@ -324,6 +369,7 @@ class SessionStateStore:
         ts = (now or datetime.now(UTC)).isoformat()
         with self._locked(session_id):
             state = self.read(session_id) or SessionState(session_id=session_id)
+            self._stamp_harness(state, harness)
             state.reads += 1
             receipt = state.reads_by_scope.get(scope_id)
             if receipt is None:
@@ -335,17 +381,22 @@ class SessionStateStore:
             self._write(state)
         return state
 
-    def record_contribution(self, session_id: str, *, now: datetime | None = None) -> SessionState:
+    def record_contribution(
+        self, session_id: str, *, now: datetime | None = None, harness: str | None = None
+    ) -> SessionState:
         """Record one accepted contribution act by *session_id* (the release valve)."""
         ts = (now or datetime.now(UTC)).isoformat()
         with self._locked(session_id):
             state = self.read(session_id) or SessionState(session_id=session_id)
+            self._stamp_harness(state, harness)
             state.contributions += 1
             state.updated_at = ts
             self._write(state)
         return state
 
-    def record_decline(self, session_id: str, *, now: datetime | None = None) -> SessionState:
+    def record_decline(
+        self, session_id: str, *, now: datetime | None = None, harness: str | None = None
+    ) -> SessionState:
         """Record one explicit "nothing to record" decline by *session_id*.
 
         Unused in WP1 (no closeout tool exists yet); present so the store's
@@ -354,6 +405,7 @@ class SessionStateStore:
         ts = (now or datetime.now(UTC)).isoformat()
         with self._locked(session_id):
             state = self.read(session_id) or SessionState(session_id=session_id)
+            self._stamp_harness(state, harness)
             state.declines += 1
             state.updated_at = ts
             self._write(state)
