@@ -28,8 +28,11 @@ from strata.session_state import (
     compute_fleet_staleness,
     compute_refresh_pending,
     compute_scope_staleness,
+    compute_writeback_report,
     resolve_agent_session_id,
+    session_outcome,
     sessions_dir_for,
+    writeback_export_rows,
 )
 
 if TYPE_CHECKING:
@@ -719,3 +722,194 @@ def test_compute_fleet_refresh_pending_preserves_order(tmp_path: Path) -> None:
     assert results[0].depth == 1
     assert results[1].depth == 0
     rs.close()
+
+
+# ---------------------------------------------------------------------------
+# M2 — the write-back rate: connect records the denominator, every
+# strata_contribute call is a submission (any verdict), one outcome per session,
+# one aggregation function, an export the evals loader reads.
+# ---------------------------------------------------------------------------
+
+
+def test_record_connect_creates_a_zero_counter_state_with_harness(tmp_path: Path) -> None:
+    store = SessionStateStore(tmp_path / "sessions")
+    store.record_connect("s1", harness="codex", now=datetime(2026, 9, 19, 12, 0, tzinfo=UTC))
+
+    state = store.read("s1")
+    assert state is not None
+    assert state.harness == "codex"
+    assert state.connected_at == "2026-09-19T12:00:00+00:00"
+    assert (state.reads, state.contributions, state.submitted, state.declines) == (0, 0, 0, 0)
+
+
+def test_record_connect_is_idempotent_and_never_resets_counters(tmp_path: Path) -> None:
+    store = SessionStateStore(tmp_path / "sessions")
+    store.record_connect("s1", harness="codex", now=datetime(2026, 9, 19, 12, 0, tzinfo=UTC))
+    store.record_submission("s1")
+    store.record_connect("s1", harness="codex", now=datetime(2026, 9, 19, 13, 0, tzinfo=UTC))
+
+    state = store.read("s1")
+    assert state is not None
+    assert state.connected_at == "2026-09-19T12:00:00+00:00"
+    assert state.submitted == 1
+
+
+def test_a_submission_is_counted_apart_from_an_accepted_contribution(tmp_path: Path) -> None:
+    store = SessionStateStore(tmp_path / "sessions")
+    store.record_submission("s1")  # declined: submitted, not accepted
+    store.record_submission("s1")
+    store.record_contribution("s1")  # one of them was accepted
+
+    state = store.read("s1")
+    assert state is not None
+    assert (state.submitted, state.contributions) == (2, 1)
+
+
+def _outcome_of(tmp_path: Path, *acts: str) -> str:
+    store = SessionStateStore(tmp_path / "sessions")
+    store.record_connect("s", harness="codex")
+    for act in acts:
+        {
+            "submit": store.record_submission,
+            "accept": store.record_contribution,
+            "closeout": store.record_decline,
+        }[act]("s")
+    state = store.read("s")
+    assert state is not None
+    return session_outcome(state)
+
+
+def test_outcome_silent_when_neither_contributed_nor_closed_out(tmp_path: Path) -> None:
+    assert _outcome_of(tmp_path) == "silent"
+
+
+def test_outcome_closed_out_when_closeout_without_contribute(tmp_path: Path) -> None:
+    assert _outcome_of(tmp_path, "closeout") == "closed_out"
+
+
+def test_outcome_contributed_when_a_contribute_call_was_declined(tmp_path: Path) -> None:
+    assert _outcome_of(tmp_path, "submit") == "contributed"
+
+
+def test_outcome_contribute_then_closeout_is_contributed(tmp_path: Path) -> None:
+    assert _outcome_of(tmp_path, "submit", "accept", "closeout") == "contributed"
+
+
+def test_outcome_of_a_pre_m2_file_with_an_accepted_count_is_contributed() -> None:
+    from strata.session_state import SessionState
+
+    legacy = SessionState(session_id="old", contributions=2)  # no `submitted` field
+    assert session_outcome(legacy) == "contributed"
+
+
+def _report_store(tmp_path: Path) -> SessionStateStore:
+    return SessionStateStore(tmp_path / "sessions")
+
+
+def test_report_with_no_sessions_says_so_and_never_a_percentage(tmp_path: Path) -> None:
+    report = compute_writeback_report(_report_store(tmp_path))
+
+    assert report.overall.n == 0
+    assert report.overall.rate is None
+    assert report.overall.rate_text == "no sessions"
+    assert [r.harness for r in report.rows] == ["claude-code", "codex", "unknown"]
+    assert all(r.rate is None and r.rate_text == "no sessions" for r in report.rows)
+    assert report.includes_open_sessions is True
+
+
+def test_report_with_one_contributing_session(tmp_path: Path) -> None:
+    store = _report_store(tmp_path)
+    store.record_connect("s1", harness="codex")
+    store.record_submission("s1")
+    store.record_contribution("s1")
+
+    report = compute_writeback_report(store)
+    codex = next(r for r in report.rows if r.harness == "codex")
+
+    assert (codex.n, codex.contributed, codex.accepted, codex.closed_out, codex.silent) == (
+        1,
+        1,
+        1,
+        0,
+        0,
+    )
+    assert codex.rate == 1.0
+    assert (report.overall.n, report.overall.contributed) == (1, 1)
+    assert next(r for r in report.rows if r.harness == "claude-code").n == 0
+
+
+def test_report_splits_by_harness_and_counts_every_outcome(tmp_path: Path) -> None:
+    store = _report_store(tmp_path)
+    for sid, harness in [("a", "claude-code"), ("b", "claude-code"), ("c", "codex")]:
+        store.record_connect(sid, harness=harness)
+    store.record_submission("a")  # declined: contributed but not accepted
+    store.record_decline("b")  # closed out
+    # c stays silent
+
+    report = compute_writeback_report(store)
+    cc = next(r for r in report.rows if r.harness == "claude-code")
+    cx = next(r for r in report.rows if r.harness == "codex")
+
+    assert (cc.n, cc.contributed, cc.accepted, cc.closed_out, cc.silent) == (2, 1, 0, 1, 0)
+    assert cc.rate == 0.5
+    assert (cx.n, cx.contributed, cx.silent) == (1, 0, 1)
+    assert cx.rate == 0.0
+    assert (report.overall.n, report.overall.contributed, report.overall.closed_out) == (3, 1, 1)
+
+
+def test_pre_m1_files_get_their_own_unrecorded_row(tmp_path: Path) -> None:
+    sessions = tmp_path / "sessions"
+    sessions.mkdir()
+    (sessions / "old.json").write_text(
+        '{"session_id": "old", "reads": 2, "contributions": 1, "declines": 0,'
+        ' "reads_by_scope": {}, "updated_at": "2026-09-01T00:00:00+00:00"}',
+        encoding="utf-8",
+    )
+    report = compute_writeback_report(SessionStateStore(sessions))
+
+    unrecorded = next(r for r in report.rows if r.harness == "unrecorded")
+    assert (unrecorded.n, unrecorded.contributed) == (1, 1)
+    assert next(r for r in report.rows if r.harness == "unknown").n == 0
+    assert report.overall.n == 1
+
+
+def test_report_since_filters_by_connect_time_and_states_the_window(tmp_path: Path) -> None:
+    store = _report_store(tmp_path)
+    store.record_connect("old", harness="codex", now=datetime(2026, 9, 1, tzinfo=UTC))
+    store.record_connect("new", harness="codex", now=datetime(2026, 9, 18, tzinfo=UTC))
+
+    report = compute_writeback_report(store, since="2026-09-10")
+
+    assert report.overall.n == 1
+    assert report.since == "2026-09-10"
+    assert report.first_session_at == "2026-09-18T00:00:00+00:00"
+
+
+def test_report_counts_unreadable_session_files_rather_than_hiding_them(tmp_path: Path) -> None:
+    store = _report_store(tmp_path)
+    store.record_connect("ok", harness="codex")
+    (store.sessions_dir / "broken.json").write_text("{not json", encoding="utf-8")
+
+    report = compute_writeback_report(store)
+
+    assert report.overall.n == 1
+    assert report.unreadable_files == 1
+
+
+def test_export_rows_carry_session_harness_outcome_and_accepted_count(tmp_path: Path) -> None:
+    store = _report_store(tmp_path)
+    store.record_connect("a", harness="codex")
+    store.record_submission("a")
+    store.record_contribution("a")
+    store.record_connect("b", harness="claude-code")
+
+    rows = {r["session_id"]: r for r in writeback_export_rows(store)}
+
+    assert rows["a"] == {
+        "session_id": "a",
+        "harness": "codex",
+        "outcome": "contributed",
+        "accepted_count": 1,
+    }
+    assert rows["b"]["outcome"] == "silent"
+    assert rows["b"]["accepted_count"] == 0

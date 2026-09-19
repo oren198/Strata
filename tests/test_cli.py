@@ -387,6 +387,98 @@ def test_status_custom_window_flag(
     assert "7-day window" in capsys.readouterr().out
 
 
+def _seed_writeback_sessions(tmp_path: Path) -> None:
+    from strata.session_state import SessionStateStore, sessions_dir_for
+
+    store = SessionStateStore(sessions_dir_for(str(tmp_path / "summaries")))
+    store.record_connect("cc1", harness="claude-code")
+    store.record_submission("cc1")
+    store.record_contribution("cc1")
+    store.record_connect("cx1", harness="codex")
+    store.record_submission("cx1")  # declined
+    store.record_connect("cx2", harness="codex")  # silent
+
+
+def test_stats_writeback_prints_counts_beside_each_rate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _seed_fleet(tmp_path, monkeypatch)
+    _seed_writeback_sessions(tmp_path)
+
+    rc = main(["stats", "writeback"])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "includes sessions still open" in out
+    assert "accepted" in out and "contributed" in out
+    codex = next(line for line in out.splitlines() if line.strip().startswith("codex"))
+    assert "50%" in codex and "1/2" in codex
+    assert "3" in next(line for line in out.splitlines() if line.strip().startswith("overall"))
+
+
+def test_stats_writeback_with_no_sessions_prints_no_sessions_not_a_percentage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _seed_fleet(tmp_path, monkeypatch)
+
+    rc = main(["stats", "writeback"])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "no sessions" in out
+    assert "%" not in out
+
+
+def test_stats_writeback_json_and_export(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import json
+
+    _seed_fleet(tmp_path, monkeypatch)
+    _seed_writeback_sessions(tmp_path)
+    export = tmp_path / "outcomes.jsonl"
+
+    rc = main(["stats", "writeback", "--json", "--export", str(export)])
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["overall"]["n"] == 3
+    assert payload["includes_open_sessions"] is True
+    assert {r["harness"] for r in payload["rows"]} >= {"claude-code", "codex", "unknown"}
+    rows = [json.loads(line) for line in export.read_text(encoding="utf-8").splitlines()]
+    assert {r["session_id"]: r["outcome"] for r in rows} == {
+        "cc1": "contributed",
+        "cx1": "contributed",
+        "cx2": "silent",
+    }
+    assert {r["session_id"]: r["accepted_count"] for r in rows}["cc1"] == 1
+
+
+def test_stats_writeback_export_matches_the_evals_loader_schema(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pinned schema: strata-evals' ``strata_evals.demo.claims.load_session_outcomes``
+    reads JSONL objects with ``session_id``, ``harness`` and an ``outcome`` in
+    {contributed, closed_out, silent}. strata_evals is a separate repo that is not
+    installed here, so importing it would make this test depend on it; the contract
+    is pinned instead (read from /home/oren/dev/strata-evals/src/strata_evals/demo/
+    claims.py). Verified against the real loader in the M2 live run."""
+    import json
+
+    _seed_fleet(tmp_path, monkeypatch)
+    _seed_writeback_sessions(tmp_path)
+    export = tmp_path / "outcomes.jsonl"
+
+    assert main(["stats", "writeback", "--export", str(export)]) == 0
+
+    valid_outcomes = {"contributed", "closed_out", "silent"}
+    for line in export.read_text(encoding="utf-8").splitlines():
+        raw = json.loads(line)
+        assert isinstance(raw["session_id"], str) and raw["session_id"]
+        assert isinstance(raw["harness"], str) and raw["harness"]
+        assert raw["outcome"] in valid_outcomes
+
+
 def test_bootstrap_schema_error_is_plain_language(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

@@ -286,6 +286,52 @@ def _client_harness() -> str | None:
     return _HARNESS
 
 
+def _record_connect(session: object) -> None:
+    """Record this session's connect — the write-back denominator (M2).
+
+    Called once, when the client's ``initialized`` notification arrives, before
+    any tool call, so a session that then does nothing is still counted. Reads
+    the harness from the session's own ``initialize`` params. Best-effort like
+    every session-state write: never fails the connection.
+    """
+    global _HARNESS  # noqa: PLW0603
+    try:
+        params = session.client_params  # type: ignore[attr-defined]
+        name = params.clientInfo.name if params is not None else None
+    except Exception:  # noqa: BLE001 - no client info: unknown, never a guess
+        name = None
+    _HARNESS = classify_harness(name)
+    if _session_store is None or not _sessions_dir:
+        return
+    try:
+        _session_store.record_connect(_AGENT_SESSION_ID, harness=_HARNESS)
+    except OSError as exc:  # pragma: no cover - defensive; disk failure only
+        _logger.warning("failed to record connect for session %r: %s", _AGENT_SESSION_ID, exc)
+
+
+def _install_connect_hook(server: FastMCP) -> None:
+    """Have *server* call :func:`_record_connect` on the first message after the
+    handshake (the client's ``initialized`` notification).
+
+    The MCP SDK completes ``initialize`` inside the session and forwards only
+    later messages to the server, so the first forwarded message is the earliest
+    seam that has both the session and its client info. Wraps this FastMCP's own
+    lowlevel server instance, so it never touches the SDK class.
+    """
+    lowlevel = server._mcp_server  # noqa: SLF001 - the SDK exposes no public seam
+    original = lowlevel._handle_message  # noqa: SLF001
+    connected = False
+
+    async def handle_message(message, session, *args, **kwargs):  # noqa: ANN001, ANN202
+        nonlocal connected
+        if not connected:
+            connected = True
+            _record_connect(session)
+        return await original(message, session, *args, **kwargs)
+
+    lowlevel._handle_message = handle_message  # noqa: SLF001
+
+
 def _record_read(scope_id: str) -> None:
     """Record one perspective/summary read for this session (best-effort, #110).
 
@@ -317,6 +363,20 @@ def _record_accepted_contribution(decision: str) -> None:
         _logger.warning(
             "failed to record contribution counter for session %r: %s", _AGENT_SESSION_ID, exc
         )
+
+
+def _record_submitted_contribution() -> None:
+    """Record one ``strata_contribute`` call for this session, whatever its verdict.
+
+    The write-back numerator (M2): a declined or unjudged contribution is still
+    the session writing back. Best-effort like the other counters.
+    """
+    if _session_store is None:
+        return
+    try:
+        _session_store.record_submission(_AGENT_SESSION_ID, harness=_client_harness())
+    except OSError as exc:  # pragma: no cover - defensive; disk failure only
+        _logger.warning("failed to record submission for session %r: %s", _AGENT_SESSION_ID, exc)
 
 
 def _record_decline() -> SessionState | None:
@@ -1750,6 +1810,9 @@ mcp = FastMCP(
 )
 
 
+_install_connect_hook(mcp)
+
+
 # ---------------------------------------------------------------------------
 # Tool: strata_bind
 #
@@ -2191,7 +2254,9 @@ async def strata_contribute(
         # The contribution and a judgment-attempt-failed event are already in
         # the record (issue #57); a verdict is never fabricated. Surface the
         # contribution id and route the retry to strata_rejudge — calling
-        # strata_contribute again would duplicate the contribution.
+        # strata_contribute again would duplicate the contribution. It was still
+        # submitted: the session did write back.
+        _record_submitted_contribution()
         raise RuntimeError(
             f"Scope-manager judgment failed ({exc.error_class}): {exc}. "
             f"The contribution is recorded as {exc.contribution_id} with a "
@@ -2200,8 +2265,9 @@ async def strata_contribute(
             "call strata_contribute again, which would duplicate it."
         ) from exc
 
-    # Asymmetry release valve (#110): an accepted contribution resets the
-    # read/contribute gap for this session; a decline does not.
+    # Write-back (M2): any verdict is a submission. Asymmetry release valve
+    # (#110): only an accepted contribution resets the read/contribute gap.
+    _record_submitted_contribution()
     _record_accepted_contribution(outcome.decision)
 
     return _attach_fleet_notice(

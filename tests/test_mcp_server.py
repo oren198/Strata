@@ -2711,6 +2711,38 @@ async def test_accepted_contribution_increments_session_counter(tmp_path: Path) 
     assert state.contributions == 1
 
 
+async def test_a_declined_contribution_is_still_a_submission(tmp_path: Path) -> None:
+    """Write-back counts any strata_contribute call, whatever the verdict: the
+    submitted counter moves on a decline while the accepted counter does not."""
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fleet_yaml(tmp_path)
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+    fleet = FleetConfig.load(fleet_path)
+    declined = ScopeManagerJudgment(decision="decline", reasoning="no", new_summary=None)
+
+    scope_p, skill_p, session_p = _patch_agent_binding(mod, scope="g_backend", session_id="sess_d")
+    with (
+        scope_p,
+        skill_p,
+        session_p,
+        patch.object(mod, "_load_fleet", return_value=fleet),
+        patch("strata.scope_manager.ScopeManager.judge", return_value=declined),
+        patch("anthropic.Anthropic", return_value=MagicMock()),
+    ):
+        await mod.strata_contribute(
+            scope_id="g_arch",
+            content="lunch is at noon",
+            proposed_classification="context",
+            subject=None,
+            supersedes=None,
+        )
+
+    state = mod._session_store.read("sess_d")
+    assert state is not None
+    assert (state.submitted, state.contributions) == (1, 0)
+
+
 async def test_declined_contribution_does_not_increment_counter(tmp_path: Path) -> None:
     """A scope-manager decline is not an accepted contribution — no counter bump."""
     db_path = _make_db(tmp_path)
