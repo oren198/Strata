@@ -23,6 +23,7 @@ from strata.session_state import (
     SessionStateStore,
     _last_accepted_contribution_at,
     _parse_ts,
+    classify_harness,
     compute_fleet_refresh_pending,
     compute_fleet_staleness,
     compute_refresh_pending,
@@ -164,6 +165,67 @@ def test_record_contribution_and_decline(tmp_path: Path) -> None:
     assert state.contributions == 1
     assert state.declines == 2
     assert state.reads == 0
+
+
+# ---------------------------------------------------------------------------
+# Harness recording — M1: the session state says which harness the session ran
+# in (claude-code / codex / unknown), derived from the MCP client's own
+# initialize handshake, so the write-back rate can be split by harness.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("client_name", "expected"),
+    [
+        ("codex-mcp-client", "codex"),  # verified: codex-cli 0.153.4 clientInfo.name
+        ("claude-code", "claude-code"),
+        ("Claude Code", "claude-code"),
+        ("some-other-client", "unknown"),
+        ("", "unknown"),
+        (None, "unknown"),
+    ],
+)
+def test_classify_harness(client_name: str | None, expected: str) -> None:
+    assert classify_harness(client_name) == expected
+
+
+def test_harness_is_recorded_on_first_write_and_survives_later_writes(tmp_path: Path) -> None:
+    store = SessionStateStore(tmp_path / "sessions")
+    store.record_read("s1", "g_arch", harness="codex")
+    store.record_contribution("s1", harness="codex")
+    store.record_decline("s1")  # no harness given: must not erase it
+
+    state = store.read("s1")
+    assert state is not None
+    assert state.harness == "codex"
+
+
+def test_harness_unknown_is_upgraded_but_a_known_harness_is_never_overwritten(
+    tmp_path: Path,
+) -> None:
+    store = SessionStateStore(tmp_path / "sessions")
+    store.record_read("s1", "g_arch", harness="unknown")
+    store.record_read("s1", "g_arch", harness="codex")
+    store.record_read("s1", "g_arch", harness="claude-code")
+
+    state = store.read("s1")
+    assert state is not None
+    assert state.harness == "codex"
+
+
+def test_session_state_written_before_harness_existed_loads_with_empty_harness(
+    tmp_path: Path,
+) -> None:
+    sessions = tmp_path / "sessions"
+    sessions.mkdir()
+    (sessions / "old.json").write_text(
+        '{"session_id": "old", "reads": 2, "contributions": 1, "declines": 0,'
+        ' "reads_by_scope": {}, "updated_at": "2026-09-01T00:00:00+00:00"}',
+        encoding="utf-8",
+    )
+    state = SessionStateStore(sessions).read("old")
+    assert state is not None
+    assert state.harness == ""
 
 
 def test_write_is_atomic_no_tmp_left_behind(tmp_path: Path) -> None:

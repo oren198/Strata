@@ -1036,10 +1036,11 @@ CODEX_MCP_MARKER = "# Strata — managed by `strata register --harness codex`"
 #: [verified] TOML shape — reproduced byte-for-byte by `codex mcp add` against
 #: codex-cli 0.149.0 (CODEX-surface-2026-08.md #1). MCP `env` values are
 #: literal TOML strings (no `${VAR}` interpolation is documented anywhere in
-#: the MCP config reference) so the identity vars ship as empty placeholders:
-#: fill them in by hand, or export them before launching `codex` and rely on
-#: the *unverified* assumption that Codex's MCP subprocess inherits the
-#: launching process's environment on top of these literal values.
+#: the MCP config reference) so the identity vars ship as empty placeholders.
+#: [verified, codex-cli 0.153.4] Codex hands `strata-mcp` ONLY this env table,
+#: not the launching shell's environment — so an empty
+#: STRATA_AGENT_SESSION_ID falls through to `sess_auto_<parent pid>`, which is
+#: distinct per Codex session (one `codex` process each) and matches the hook's.
 CODEX_MCP_BLOCK = f"""\
 {CODEX_MCP_MARKER}
 [mcp_servers.strata]
@@ -1054,12 +1055,12 @@ STRATA_AGENT_SESSION_ID = ""
 #: Marker comment identifying Strata's managed `hooks.Stop` block.
 CODEX_HOOK_MARKER = "# Strata freshness hook — managed by `strata register --harness codex`"
 
-#: [schema-verified, live firing NOT verified] — `codex exec --strict-config`
-#: accepted this exact `[[hooks.Stop]]` / `[[hooks.Stop.hooks]]` shape on
-#: codex-cli 0.149.0 without rejecting it (CODEX-surface-2026-08.md #2), which
-#: confirms the binary understands the schema. It does NOT confirm the hook
-#: process actually runs at `Stop`, nor that it inherits STRATA_AGENT_* env —
-#: the findings sandbox had no OpenAI credentials, so no turn ever completed.
+#: [schema-verified on 0.149.0; live-verified on codex-cli 0.153.4] The hook
+#: fires at the end of a turn in the interactive TUI once the user trusts it
+#: (Codex shows "Hooks need review" on first launch; `codex exec` skips an
+#: untrusted hook). It is a direct child of the same `codex` process as that
+#: session's `strata-mcp`, so both resolve the same `sess_auto_<parent pid>`;
+#: it inherits the launching shell's env, NOT the config's MCP `env` table.
 #: `[features] hooks = true` is deliberately omitted: codex-cli 0.149.0 ships
 #: hooks on by default, and re-declaring a plain `[features]` table here would
 #: conflict with (TOML forbids redefining) a user's own `[features]` table if
