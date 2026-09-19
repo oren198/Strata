@@ -1001,6 +1001,75 @@ def _mcp_entry_is_migratable(entry: object, project_root: Path) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def _check_strata_on_path(project_root: Path) -> Check:
+    """`strata doctor` check: the ``strata`` on PATH is the install that registered."""
+    import subprocess  # noqa: PLC0415
+
+    from strata.project_config import read_install_record
+
+    name = "strata on PATH"
+    on_path = shutil.which("strata")
+    if on_path is None:
+        return Check(
+            name=name,
+            kind="hard",
+            passed=False,
+            message=(
+                "no `strata` on PATH — the registered hooks call bare `strata`, so they "
+                "will fail. Put the install that registered this project on PATH "
+                "(pipx ensurepath), or re-run `strata register`."
+            ),
+        )
+    resolved = os.path.realpath(on_path)
+    try:
+        out = subprocess.run(  # noqa: S603
+            [resolved, "--version"], capture_output=True, text=True, timeout=10, check=False
+        ).stdout.strip()
+        found_version = out.split()[-1] if out else "unknown"
+    except (OSError, subprocess.SubprocessError):
+        found_version = "unknown"
+
+    recorded = read_install_record(project_root)
+    if recorded is None:
+        return Check(
+            name=name,
+            kind="soft",
+            passed=False,
+            message=(
+                f"{resolved} (version {found_version}); this project was registered before "
+                "the registering install was recorded, so it cannot be compared — re-run "
+                "`strata register` to record it."
+            ),
+        )
+    recorded_path, recorded_version = recorded
+    if resolved != os.path.realpath(recorded_path):
+        return Check(
+            name=name,
+            kind="hard",
+            passed=False,
+            message=(
+                f"`strata` on PATH is {resolved} (version {found_version}), but this project "
+                f"was registered by {recorded_path} (version {recorded_version}). The registered "
+                "hooks call bare `strata`, so they run the PATH one. Put the registering "
+                "install first on PATH (or uninstall the other one), or re-run "
+                "`strata register` with the install you want."
+            ),
+        )
+    note = ""
+    if found_version not in ("unknown", recorded_version):
+        note = (
+            f" (upgraded from {recorded_version} since register; re-run `strata register` "
+            "to refresh the project's skills and hooks)"
+        )
+    return Check(
+        name=name,
+        kind="hard",
+        passed=True,
+        message=f"{resolved} (version {found_version}), the install that registered this "
+        f"project{note}",
+    )
+
+
 def cmd_doctor(args: argparse.Namespace) -> int:
     """Diagnose a project's Strata wiring: config, DB, fleet, install, binding.
 
@@ -1685,6 +1754,15 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     # contribution just sits unjudged until one is set). Never flips the
     # exit code.
     # -----------------------------------------------------------------------
+    # -----------------------------------------------------------------------
+    # 8b. The `strata` on PATH is the install that registered this project.
+    # Every registered hook calls bare `strata` (issue #207): if an older install
+    # is first on PATH the hooks silently run old code. Hard failure when the
+    # resolved executable is not the registering one; soft when register predates
+    # the record (nothing to compare).
+    # -----------------------------------------------------------------------
+    checks.append(_check_strata_on_path(project_root))
+
     if _judge_key_visible(project_root):
         checks.append(
             Check(
@@ -2467,13 +2545,15 @@ def _run_manager_refresh(scope_id: str, *, skip: bool = False) -> None:
                 continue
 
 
-#: Codex launch is schema-verified but not live-verified (README, "Using
-#: Strata with Codex CLI") — `strata launch` refuses honestly rather than
-#: handing off to a binding that has never been confirmed to actually work.
+#: `strata launch` does not launch Codex: its MCP server is handed only the config's
+#: env table, not the launching shell (verified, README "Using Strata with Codex CLI"),
+#: so there is nothing to bind by exporting. It refuses and says so.
 _CODEX_LAUNCH_NOT_WIRED_MESSAGE = (
-    "Codex launch is not wired yet: Codex's MCP env delivery is still being "
-    "verified live (see README, 'Using Strata with Codex CLI'). Start codex "
-    "manually after filling in the [mcp_servers.strata.env] values."
+    "Codex launch is not wired yet: Codex hands its MCP server only the "
+    "[mcp_servers.strata.env] table from its own config, not your shell's "
+    "environment, so there is nothing for `strata launch` to export (see README, "
+    "'Using Strata with Codex CLI'). Start codex directly; its identity comes "
+    "from that table."
 )
 
 
@@ -3155,6 +3235,20 @@ def cmd_register(args: argparse.Namespace) -> int:
             )
         _act(f"set freshness strict = {str(desired_strict).lower()} in", config_toml)
 
+    # Record which strata install registered this project: the hooks call bare
+    # `strata`, so `strata doctor` compares this with what resolves on PATH later.
+    registering = install.registering_install()
+    if registering is not None:
+        current_config = (
+            config_toml.read_bytes().decode("utf-8") if config_toml.exists() else current_config
+        )
+        if install.read_install_record_from_text(current_config) != registering:
+            if not diff_mode:
+                config_toml.write_bytes(
+                    install.set_install_record(current_config, *registering).encode("utf-8")
+                )
+            _act(f"recorded the registering install ({registering[1]}) in", config_toml)
+
     # -----------------------------------------------------------------------
     # Step 4: Update .gitignore.
     # -----------------------------------------------------------------------
@@ -3551,12 +3645,10 @@ def cmd_register(args: argparse.Namespace) -> int:
         # broken .claude/settings.json in the same repo must not block a
         # codex-only registration — see test_register_codex.py).
         #
-        # Only claims what docs/marketing/CODEX-surface-2026-08.md marks
-        # [verified]: the MCP table shape and location are verified
-        # hands-on against codex-cli 0.149.0; the Stop-hook block is
-        # schema-verified only (accepted by `codex exec --strict-config`)
-        # — live firing and STRATA_AGENT_* env inheritance are pending
-        # live verification, and the merged block says so on its face.
+        # Claims only what was verified live (README "Using Strata with Codex
+        # CLI"): the MCP table shape and location (codex-cli 0.149.0), and on
+        # 0.153.4 the Stop hook firing once trusted, its env inheritance and
+        # its parent process. The merged block tells the reader to trust it.
         # ---------------------------------------------------------------
         # codex_config lives under $CODEX_HOME (default ~/.codex), NOT under
         # project_root — unlike every other artifact register touches, so it
@@ -3637,10 +3729,11 @@ def cmd_register(args: argparse.Namespace) -> int:
                 f"{codex_config}\n"
                 f"  can stay empty — the fleet has one scope ({first_scope!r}) and the "
                 "engine auto-binds to\n"
-                "  it. Fill them in only once the fleet grows past one scope. The "
-                "Stop-hook block is schema-\n"
-                '  verified only; see README "Using Strata with Codex CLI" for exactly '
-                "what is and isn't proven to work."
+                "  it. Fill them in only once the fleet grows past one scope. Leave "
+                "STRATA_AGENT_SESSION_ID blank.\n"
+                '  Codex asks you to trust the Stop hook once ("Hooks need review" — '
+                'choose "Trust all and continue");\n'
+                '  see README "Using Strata with Codex CLI".'
             )
         else:
             print(
@@ -3648,10 +3741,11 @@ def cmd_register(args: argparse.Namespace) -> int:
                 "STRATA_AGENT_SESSION_ID under\n"
                 f"  [mcp_servers.strata.env] in {codex_config} before running `codex` "
                 "(MCP env values are literal\n"
-                "  TOML strings — Codex does not interpolate them). The Stop-hook block "
-                "is schema-verified only;\n"
-                '  see README "Using Strata with Codex CLI" for exactly what is and '
-                "isn't proven to work."
+                "  TOML strings — Codex does not interpolate them). Leave "
+                "STRATA_AGENT_SESSION_ID blank. Codex asks you\n"
+                '  to trust the Stop hook once ("Hooks need review" — choose "Trust '
+                'all and continue");\n'
+                '  see README "Using Strata with Codex CLI".'
             )
 
     # -----------------------------------------------------------------------
@@ -4866,8 +4960,8 @@ def _build_parser() -> argparse.ArgumentParser:
             "Harness to start. Default: the project's recorded default "
             "(`strata set-default-harness`); else the single harness wired in "
             "this project, if exactly one is; else claude-code. 'codex' "
-            "currently exits 1 — Codex launch is schema-verified but not "
-            "live-verified (see README 'Using Strata with Codex CLI')."
+            "currently exits 1 — `strata launch` cannot bind Codex, whose MCP server "
+            "does not inherit your shell (see README 'Using Strata with Codex CLI')."
         ),
     )
     p_launch.set_defaults(func=cmd_launch)

@@ -33,6 +33,9 @@ none today) can opt out with ``@pytest.mark.real_machine``.
 
 from __future__ import annotations
 
+import os
+import sys
+
 import pytest
 
 from strata import install
@@ -61,6 +64,15 @@ def _isolate_harness_detection_and_codex_home(
 
     monkeypatch.setattr(install, "detect_harnesses", lambda *a, **k: [])
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / "_autouse_codex_home_guard"))
+
+    # (d) The `strata` on PATH is the install running the suite. `strata doctor`
+    # fails when the `strata` that PATH resolves to is not the one that registered
+    # the project (issue #207), and register records the install beside the running
+    # interpreter; on a machine with another strata first on PATH (a pipx install)
+    # that comparison would depend on whoever runs the suite. Tests of the check
+    # itself set their own PATH.
+    bin_dir = os.path.dirname(sys.executable)
+    monkeypatch.setenv("PATH", bin_dir + os.pathsep + os.environ.get("PATH", ""))
 
     # (c) Run each test from a private directory (issue #181).
     #

@@ -36,9 +36,11 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import json
 import os
 import re
 import shutil
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -372,8 +374,13 @@ _HISTORICAL_ARTIFACT_HASHES: dict[str, dict[str, object]] = {
     "codex-hook": {
         # See "codex-mcp" above — same guardrail, for CODEX_HOOK_BLOCK /
         # CODEX_HOOK_BLOCK_HISTORICAL.
-        "current": "df9f579f636015b4060cdabf01ee598698506c7011baba616e7b9ca1620768bf",
-        "historical": frozenset(),
+        "current": "1af4838309108ba673f7782536a7657c20ef873dc2354f0eb37bf000b446f483",
+        "historical": frozenset(
+            {
+                # Shipped through M3.
+                "df9f579f636015b4060cdabf01ee598698506c7011baba616e7b9ca1620768bf",
+            }
+        ),
     },
     "agents-md": {
         "current": "4fdc5a5d4fc4a300487e49c0dd1c8449bc0518a32e4ae196990fcec334846c30",
@@ -1070,9 +1077,9 @@ CODEX_HOOK_MARKER = "# Strata freshness hook — managed by `strata register --h
 #: one already exists in their config.
 CODEX_HOOK_BLOCK = f"""\
 {CODEX_HOOK_MARKER}
-# Schema accepted by `codex exec --strict-config` (codex-cli 0.149.0). Live
-# Stop-hook firing and STRATA_AGENT_* env inheritance are NOT verified — see
-# README "Using Strata with Codex CLI" before relying on this in production.
+# Runs at the end of each turn. Codex asks you to trust it once ("Hooks need
+# review" — choose "Trust all and continue"); it does not run until then. See
+# README "Using Strata with Codex CLI".
 [[hooks.Stop]]
 [[hooks.Stop.hooks]]
 type = "command"
@@ -1219,7 +1226,10 @@ CODEX_MCP_BLOCK_HISTORICAL: tuple[str, ...] = ()
 
 #: See :data:`CODEX_MCP_BLOCK_HISTORICAL` — same story for the freshness
 #: Stop-hook block.
-CODEX_HOOK_BLOCK_HISTORICAL: tuple[str, ...] = ()
+CODEX_HOOK_BLOCK_HISTORICAL: tuple[str, ...] = (
+    # Shipped through M3 (its comment said live firing was not verified).
+    '# Strata freshness hook — managed by `strata register --harness codex`\n# Schema accepted by `codex exec --strict-config` (codex-cli 0.149.0). Live\n# Stop-hook firing and STRATA_AGENT_* env inheritance are NOT verified — see\n# README "Using Strata with Codex CLI" before relying on this in production.\n[[hooks.Stop]]\n[[hooks.Stop.hooks]]\ntype = "command"\ncommand = "strata freshness-hook"\ntimeout = 30\n',  # noqa: E501
+)
 
 
 def remove_codex_mcp_server(config_text: str) -> tuple[str, str]:
@@ -1825,6 +1835,67 @@ def read_freshness_strict_from_text(config_text: str) -> bool | None:
         return None
     value = table.get("strict")
     return value if isinstance(value, bool) else None
+
+
+_INSTALL_HEADER_RE = re.compile(r"(?m)^\[install\][ \t]*\r?$")
+
+
+def set_install_record(config_text: str, executable: str, version: str) -> str:
+    """Record which ``strata`` install registered this project, under ``[install]``.
+
+    Every registered hook calls bare ``strata``, so which install that resolves to
+    matters (issue #207); ``strata doctor`` compares this record with what resolves
+    now. The table is register-owned, so an existing one is replaced wholesale;
+    everything else in *config_text* survives byte for byte.
+    """
+    nl = _detect_newline(config_text)
+    body = f"strata = {json.dumps(executable)}{nl}version = {json.dumps(version)}{nl}"
+    header = _INSTALL_HEADER_RE.search(config_text)
+    if header is None:
+        prefix = config_text
+        if prefix and not prefix.endswith("\n"):
+            prefix += nl
+        if prefix:
+            prefix += nl
+        return prefix + f"[install]{nl}{body}"
+    body_start = header.end()
+    next_header = _TOP_LEVEL_HEADER_RE.search(config_text, body_start + 1)
+    body_end = next_header.start() if next_header else len(config_text)
+    keep_gap = nl if next_header else ""
+    return config_text[:body_start] + nl + body + keep_gap + config_text[body_end:]
+
+
+def read_install_record_from_text(config_text: str) -> tuple[str, str] | None:
+    """Return ``(executable, version)`` from ``[install]``, or ``None`` if unset/invalid."""
+    import tomllib  # noqa: PLC0415
+
+    try:
+        data = tomllib.loads(config_text) if config_text.strip() else {}
+    except tomllib.TOMLDecodeError:
+        return None
+    table = data.get("install")
+    if not isinstance(table, dict):
+        return None
+    executable, version = table.get("strata"), table.get("version")
+    if isinstance(executable, str) and isinstance(version, str):
+        return executable, version
+    return None
+
+
+def registering_install() -> tuple[str, str] | None:
+    """The ``strata`` install running this process: ``(executable, version)``.
+
+    The executable is the ``strata`` script beside the running interpreter (a
+    pipx or virtualenv install), resolved through symlinks; when there is none,
+    whatever ``strata`` resolves to on PATH. ``None`` when neither exists.
+    """
+    from strata import __version__  # noqa: PLC0415
+
+    beside = Path(sys.executable).parent / "strata"
+    found = beside if beside.exists() else shutil.which("strata")
+    if not found:
+        return None
+    return os.path.realpath(found), __version__
 
 
 # ---------------------------------------------------------------------------
