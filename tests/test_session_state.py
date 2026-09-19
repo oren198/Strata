@@ -807,14 +807,14 @@ def _report_store(tmp_path: Path) -> SessionStateStore:
 
 
 def test_report_with_no_sessions_says_so_and_never_a_percentage(tmp_path: Path) -> None:
-    report = compute_writeback_report(_report_store(tmp_path))
+    report = compute_writeback_report(_report_store(tmp_path), include_open=True)
 
     assert report.overall.n == 0
     assert report.overall.rate is None
     assert report.overall.rate_text == "no sessions"
     assert [r.harness for r in report.rows] == ["claude-code", "codex", "unknown"]
     assert all(r.rate is None and r.rate_text == "no sessions" for r in report.rows)
-    assert report.includes_open_sessions is True
+    assert report.include_open is True
 
 
 def test_report_with_one_contributing_session(tmp_path: Path) -> None:
@@ -823,7 +823,7 @@ def test_report_with_one_contributing_session(tmp_path: Path) -> None:
     store.record_submission("s1")
     store.record_contribution("s1")
 
-    report = compute_writeback_report(store)
+    report = compute_writeback_report(store, include_open=True)
     codex = next(r for r in report.rows if r.harness == "codex")
 
     assert (codex.n, codex.contributed, codex.accepted, codex.closed_out, codex.silent) == (
@@ -846,7 +846,7 @@ def test_report_splits_by_harness_and_counts_every_outcome(tmp_path: Path) -> No
     store.record_decline("b")  # closed out
     # c stays silent
 
-    report = compute_writeback_report(store)
+    report = compute_writeback_report(store, include_open=True)
     cc = next(r for r in report.rows if r.harness == "claude-code")
     cx = next(r for r in report.rows if r.harness == "codex")
 
@@ -865,7 +865,7 @@ def test_pre_m1_files_get_their_own_unrecorded_row(tmp_path: Path) -> None:
         ' "reads_by_scope": {}, "updated_at": "2026-09-01T00:00:00+00:00"}',
         encoding="utf-8",
     )
-    report = compute_writeback_report(SessionStateStore(sessions))
+    report = compute_writeback_report(SessionStateStore(sessions), include_open=True)
 
     unrecorded = next(r for r in report.rows if r.harness == "unrecorded")
     assert (unrecorded.n, unrecorded.contributed) == (1, 1)
@@ -878,7 +878,7 @@ def test_report_since_filters_by_connect_time_and_states_the_window(tmp_path: Pa
     store.record_connect("old", harness="codex", now=datetime(2026, 9, 1, tzinfo=UTC))
     store.record_connect("new", harness="codex", now=datetime(2026, 9, 18, tzinfo=UTC))
 
-    report = compute_writeback_report(store, since="2026-09-10")
+    report = compute_writeback_report(store, since="2026-09-10", include_open=True)
 
     assert report.overall.n == 1
     assert report.since == "2026-09-10"
@@ -890,7 +890,7 @@ def test_report_counts_unreadable_session_files_rather_than_hiding_them(tmp_path
     store.record_connect("ok", harness="codex")
     (store.sessions_dir / "broken.json").write_text("{not json", encoding="utf-8")
 
-    report = compute_writeback_report(store)
+    report = compute_writeback_report(store, include_open=True)
 
     assert report.overall.n == 1
     assert report.unreadable_files == 1
@@ -903,7 +903,7 @@ def test_export_rows_carry_session_harness_outcome_and_accepted_count(tmp_path: 
     store.record_contribution("a")
     store.record_connect("b", harness="claude-code")
 
-    rows = {r["session_id"]: r for r in writeback_export_rows(store)}
+    rows = {r["session_id"]: r for r in writeback_export_rows(store, include_open=True)}
 
     assert rows["a"] == {
         "session_id": "a",
@@ -913,3 +913,150 @@ def test_export_rows_carry_session_harness_outcome_and_accepted_count(tmp_path: 
     }
     assert rows["b"]["outcome"] == "silent"
     assert rows["b"]["accepted_count"] == 0
+
+
+# ---------------------------------------------------------------------------
+# M3 — ended sessions, rollover, strict flag
+# ---------------------------------------------------------------------------
+
+T0 = datetime(2026, 9, 19, 12, 0, tzinfo=UTC)
+
+
+def test_record_end_stamps_ended_at_for_the_owning_server(tmp_path: Path) -> None:
+    store = SessionStateStore(tmp_path / "sessions")
+    store.record_connect("s1", harness="codex", pid=100, now=T0)
+
+    store.record_end("s1", pid=100, now=T0 + timedelta(minutes=5))
+
+    state = store.read("s1")
+    assert state is not None
+    assert state.ended_at == (T0 + timedelta(minutes=5)).isoformat()
+
+
+def test_record_end_from_a_different_server_does_not_touch_the_live_session(
+    tmp_path: Path,
+) -> None:
+    """An old server exiting after a newer one took over the same id must not end
+    the newer session."""
+    store = SessionStateStore(tmp_path / "sessions")
+    store.record_connect("s1", harness="codex", pid=200, now=T0)
+
+    store.record_end("s1", pid=100, now=T0 + timedelta(minutes=5))
+
+    state = store.read("s1")
+    assert state is not None
+    assert state.ended_at == ""
+
+
+def test_record_end_is_idempotent(tmp_path: Path) -> None:
+    store = SessionStateStore(tmp_path / "sessions")
+    store.record_connect("s1", harness="codex", pid=100, now=T0)
+    store.record_end("s1", pid=100, now=T0 + timedelta(minutes=1))
+    store.record_end("s1", pid=100, now=T0 + timedelta(minutes=9))
+
+    state = store.read("s1")
+    assert state is not None
+    assert state.ended_at == (T0 + timedelta(minutes=1)).isoformat()
+
+
+def test_a_second_connection_with_the_same_id_archives_the_first_at_rollover(
+    tmp_path: Path,
+) -> None:
+    store = SessionStateStore(tmp_path / "sessions")
+    store.record_connect("s1", harness="codex", pid=100, now=T0)
+    store.record_submission("s1")
+
+    rollover = T0 + timedelta(hours=1)
+    store.record_connect("s1", harness="codex", pid=200, now=rollover)
+
+    fresh = store.read("s1")
+    assert fresh is not None
+    assert (fresh.submitted, fresh.server_pid, fresh.ended_at) == (0, 200, "")
+    archived = [s for s in store.scan()[0] if s.ended_at]
+    assert len(archived) == 1
+    assert archived[0].ended_at == rollover.isoformat()  # ended AT the rollover moment
+    assert archived[0].submitted == 1
+    assert archived[0].session_id == "s1"
+
+
+def test_a_repeat_connect_from_the_same_server_is_not_a_rollover(tmp_path: Path) -> None:
+    store = SessionStateStore(tmp_path / "sessions")
+    store.record_connect("s1", harness="codex", pid=100, now=T0)
+    store.record_connect("s1", harness="codex", pid=100, now=T0 + timedelta(minutes=1))
+
+    assert len(store.scan()[0]) == 1
+
+
+def test_two_rollovers_keep_two_archives(tmp_path: Path) -> None:
+    store = SessionStateStore(tmp_path / "sessions")
+    for pid in (100, 200, 300):
+        store.record_connect("s1", harness="codex", pid=pid, now=T0 + timedelta(minutes=pid))
+
+    assert len(store.scan()[0]) == 3
+
+
+def test_report_covers_ended_sessions_by_default_and_counts_the_open_ones_left_out(
+    tmp_path: Path,
+) -> None:
+    store = SessionStateStore(tmp_path / "sessions")
+    store.record_connect("done", harness="codex", pid=1, now=T0)
+    store.record_end("done", pid=1, now=T0 + timedelta(minutes=1))
+    store.record_connect("open", harness="codex", pid=2, now=T0)
+
+    now = T0 + timedelta(minutes=2)
+    default = compute_writeback_report(store, now=now)
+    everything = compute_writeback_report(store, include_open=True, now=now)
+
+    assert (default.overall.n, default.open_excluded, default.include_open) == (1, 1, False)
+    assert (everything.overall.n, everything.open_excluded, everything.include_open) == (
+        2,
+        0,
+        True,
+    )
+
+
+def test_a_session_idle_past_the_window_counts_as_ended(tmp_path: Path) -> None:
+    """A killed (SIGKILL) session never stamps ended_at: it counts as ended once its
+    last activity is older than the idle window."""
+    store = SessionStateStore(tmp_path / "sessions")
+    store.record_connect("killed", harness="codex", pid=1, now=T0)
+
+    inside = compute_writeback_report(
+        store, idle_window=timedelta(minutes=10), now=T0 + timedelta(minutes=5)
+    )
+    outside = compute_writeback_report(
+        store, idle_window=timedelta(minutes=10), now=T0 + timedelta(minutes=11)
+    )
+
+    assert (inside.overall.n, inside.open_excluded) == (0, 1)
+    assert (outside.overall.n, outside.open_excluded) == (1, 0)
+    assert outside.idle_window_seconds == 600
+
+
+def test_the_idle_window_is_measured_from_last_activity_not_connect(tmp_path: Path) -> None:
+    store = SessionStateStore(tmp_path / "sessions")
+    store.record_connect("busy", harness="codex", pid=1, now=T0)
+    store.record_read("busy", "g", now=T0 + timedelta(minutes=9))
+
+    report = compute_writeback_report(
+        store, idle_window=timedelta(minutes=10), now=T0 + timedelta(minutes=12)
+    )
+
+    assert (report.overall.n, report.open_excluded) == (0, 1)
+
+
+def test_report_splits_by_the_strict_flag(tmp_path: Path) -> None:
+    store = SessionStateStore(tmp_path / "sessions")
+    store.record_connect("a", harness="codex", pid=1, strict=True, now=T0)
+    store.record_submission("a")
+    store.record_connect("b", harness="codex", pid=2, strict=False, now=T0)
+    store.record_connect("c", harness="claude-code", pid=3, now=T0)  # strict unrecorded
+    for sid in "abc":
+        store.record_end(sid, pid={"a": 1, "b": 2, "c": 3}[sid], now=T0 + timedelta(minutes=1))
+
+    report = compute_writeback_report(store, now=T0 + timedelta(minutes=2))
+
+    assert (report.strict_on.n, report.strict_on.contributed) == (1, 1)
+    assert (report.strict_off.n, report.strict_off.contributed) == (2, 0)
+    codex = next(r for r in report.rows if r.harness == "codex")
+    assert (codex.strict_on, codex.n) == (1, 2)

@@ -13,7 +13,11 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import signal
+import subprocess
 import sys
+import time
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import yaml
@@ -169,3 +173,119 @@ def test_connect_alone_records_the_session_before_any_tool_call(tmp_path: Path) 
         0,
         0,
     )
+
+
+# ---------------------------------------------------------------------------
+# M3 — session end and rollover, driven against a bare server process (no
+# launcher in between, so the test owns the pid and can close stdin or signal it).
+# ---------------------------------------------------------------------------
+
+_INITIALIZE = json.dumps(
+    {
+        "jsonrpc": "2.0",
+        "id": 0,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": {"name": "codex-mcp-client", "version": "0"},
+        },
+    }
+)
+_INITIALIZED = json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"})
+
+
+def _spawn_server(project: Path, session_id: str) -> subprocess.Popen:
+    """Start ``strata.mcp.server`` directly, complete the handshake, and return it
+    once its session-state file exists."""
+    params = _server_params(project, session_id)
+    proc = subprocess.Popen(  # noqa: S603
+        [sys.executable, "-m", "strata.mcp.server"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        env=params.env,
+        cwd=str(project),
+        text=True,
+    )
+    assert proc.stdin is not None
+    proc.stdin.write(_INITIALIZE + "\n" + _INITIALIZED + "\n")
+    proc.stdin.flush()
+    sessions = project / ".strata" / "sessions"
+    _wait_for(lambda: any(sessions.glob("*.json")))
+    return proc
+
+
+def _wait_for(predicate, timeout: float = 15.0) -> None:  # noqa: ANN001
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        time.sleep(0.05)
+    raise AssertionError("condition not met in time")
+
+
+def _states(project: Path) -> list[dict]:
+    return [
+        json.loads(f.read_text(encoding="utf-8"))
+        for f in sorted((project / ".strata" / "sessions").glob("*.json"))
+    ]
+
+
+def test_closing_stdin_stamps_ended_at(tmp_path: Path) -> None:
+    proc = _spawn_server(tmp_path, "")
+    assert proc.stdin is not None
+    proc.stdin.close()
+    proc.wait(timeout=15)
+
+    (state,) = _states(tmp_path)
+    assert state["ended_at"] != ""
+    assert state["server_pid"] == proc.pid
+
+
+def test_sigterm_stamps_ended_at(tmp_path: Path) -> None:
+    proc = _spawn_server(tmp_path, "")
+    proc.send_signal(signal.SIGTERM)
+    proc.wait(timeout=15)
+
+    (state,) = _states(tmp_path)
+    assert state["ended_at"] != ""
+
+
+def test_a_killed_server_counts_as_ended_only_after_the_idle_window(tmp_path: Path) -> None:
+    from strata.session_state import SessionStateStore, compute_writeback_report
+
+    proc = _spawn_server(tmp_path, "")
+    proc.kill()
+    proc.wait(timeout=15)
+
+    (state,) = _states(tmp_path)
+    assert state["ended_at"] == ""  # SIGKILL: nothing ran to stamp it
+    store = SessionStateStore(tmp_path / ".strata" / "sessions")
+    idle = timedelta(seconds=30)
+    connected = datetime.fromisoformat(state["connected_at"])
+
+    inside = compute_writeback_report(store, idle_window=idle, now=connected + timedelta(seconds=5))
+    outside = compute_writeback_report(
+        store, idle_window=idle, now=connected + timedelta(seconds=60)
+    )
+
+    assert (inside.overall.n, inside.open_excluded) == (0, 1)
+    assert (outside.overall.n, outside.open_excluded) == (1, 0)
+
+
+def test_two_sequential_servers_with_the_same_explicit_id_are_two_sessions(tmp_path: Path) -> None:
+    from strata.session_state import SessionStateStore, compute_writeback_report
+
+    for _ in range(2):
+        proc = _spawn_server(tmp_path, "shared-id")
+        assert proc.stdin is not None
+        proc.stdin.close()
+        proc.wait(timeout=15)
+
+    store = SessionStateStore(tmp_path / ".strata" / "sessions")
+    report = compute_writeback_report(store)
+
+    assert report.overall.n == 2
+    assert report.open_excluded == 0
+    assert len(list((tmp_path / ".strata" / "sessions").glob("shared-id*.json"))) == 2

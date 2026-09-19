@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import logging
 import os
+import signal
 import sqlite3
 import sys
 import threading
@@ -304,9 +305,39 @@ def _record_connect(session: object) -> None:
     if _session_store is None or not _sessions_dir:
         return
     try:
-        _session_store.record_connect(_AGENT_SESSION_ID, harness=_HARNESS)
+        _session_store.record_connect(_AGENT_SESSION_ID, harness=_HARNESS, pid=os.getpid())
     except OSError as exc:  # pragma: no cover - defensive; disk failure only
         _logger.warning("failed to record connect for session %r: %s", _AGENT_SESSION_ID, exc)
+
+
+def _record_end() -> None:
+    """Stamp this session's ``ended_at`` — best effort, at connection end (M3).
+
+    Runs when the MCP connection closes (stdin EOF / transport close) or the
+    server is terminated by SIGTERM. A no-op unless this process owns the session
+    record, so an old server exiting after a newer connection reused its id cannot
+    end the newer session. A killed (SIGKILL) server never gets here; the
+    write-back report treats such a session as ended once it has been idle longer
+    than the idle window.
+    """
+    if _session_store is None or not _sessions_dir:
+        return
+    try:
+        _session_store.record_end(_AGENT_SESSION_ID, pid=os.getpid())
+    except Exception as exc:  # noqa: BLE001 - shutdown path: never raise
+        _logger.warning("failed to record end for session %r: %s", _AGENT_SESSION_ID, exc)
+
+
+def _terminate_cleanly(signum: int, frame: object) -> None:
+    """SIGTERM handler: stamp the session's end, then exit.
+
+    Raising ``SystemExit`` here would not exit: the stdio transport reads stdin on
+    a non-daemon worker thread that is still blocked, and the interpreter waits
+    for it. The end stamp is a single small file write, and the server holds no
+    other state that needs flushing, so it exits directly once that is done.
+    """
+    _record_end()
+    os._exit(0)
 
 
 def _install_connect_hook(server: FastMCP) -> None:
@@ -3323,7 +3354,11 @@ def main() -> None:
         )
         sys.exit(1)
 
-    mcp.run(transport="stdio")
+    signal.signal(signal.SIGTERM, _terminate_cleanly)
+    try:
+        mcp.run(transport="stdio")
+    finally:
+        _record_end()
 
 
 if __name__ == "__main__":

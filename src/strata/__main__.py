@@ -57,9 +57,11 @@ import copy
 import getpass
 import json
 import os
+import re
 import shutil
 import sqlite3
 import sys
+from datetime import timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -752,13 +754,33 @@ def _writeback_report_dict(report) -> dict:  # noqa: ANN001
     return payload
 
 
+_DURATION_RE = re.compile(r"^(\d+)([smhd]?)$")
+_DURATION_UNITS = {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}
+
+
+def _parse_duration(text: str) -> timedelta | None:
+    """Parse ``30m`` / ``24h`` / ``2d`` / ``90s`` (a bare number is seconds), or ``None``."""
+    match = _DURATION_RE.match(text.strip())
+    if match is None or int(match.group(1)) == 0:
+        return None
+    return timedelta(seconds=int(match.group(1)) * _DURATION_UNITS[match.group(2)])
+
+
+def _format_duration(seconds: int) -> str:
+    """Render a whole number of seconds as the largest exact h/m/s unit (86400 -> 24h)."""
+    for unit, size in (("h", 3600), ("m", 60)):
+        if seconds % size == 0:
+            return f"{seconds // size}{unit}"
+    return f"{seconds}s"
+
+
 def cmd_stats_writeback(args: argparse.Namespace) -> int:
     """``strata stats writeback`` — the write-back rate, split by harness.
 
     Of the sessions that connected, how many made at least one
-    ``strata_contribute`` call (any verdict). Raw counts sit beside every
-    percentage; an empty row says "no sessions", never a rate. Includes sessions
-    still open. All aggregation lives in
+    ``strata_contribute`` call (any verdict). Counts ENDED sessions by default
+    (``--include-open`` adds the rest). Raw counts sit beside every percentage;
+    an empty row says "no sessions", never a rate. All aggregation lives in
     :func:`strata.session_state.compute_writeback_report`.
     """
     import json
@@ -769,7 +791,19 @@ def cmd_stats_writeback(args: argparse.Namespace) -> int:
         sessions_dir_for,
         writeback_export_rows,
     )
+    from strata.settings import get_settings
     from strata.stores import EmbeddedStoreError, open_embedded_stores
+
+    if args.idle_window is not None:
+        idle_window = _parse_duration(args.idle_window)
+        if idle_window is None:
+            print(
+                f"--idle-window {args.idle_window!r} must look like 30m, 24h, 2d or 90s.",
+                file=sys.stderr,
+            )
+            return 1
+    else:
+        idle_window = timedelta(seconds=get_settings().session_idle_window_seconds)
 
     try:
         stores = open_embedded_stores()
@@ -777,11 +811,16 @@ def cmd_stats_writeback(args: argparse.Namespace) -> int:
         print(exc.message, file=sys.stderr)
         return 1
 
+    selection = {
+        "since": args.since,
+        "include_open": args.include_open,
+        "idle_window": idle_window,
+    }
     with stores:
         store = SessionStateStore(sessions_dir_for(str(stores.summary_store.summaries_dir)))
         try:
-            report = compute_writeback_report(store, since=args.since)
-            export_rows = writeback_export_rows(store, since=args.since) if args.export else None
+            report = compute_writeback_report(store, **selection)
+            export_rows = writeback_export_rows(store, **selection) if args.export else None
         except ValueError as exc:
             print(str(exc), file=sys.stderr)
             return 1
@@ -803,26 +842,39 @@ def cmd_stats_writeback(args: argparse.Namespace) -> int:
         else "no sessions"
     )
     since = f"since {report.since}" if report.since else "no --since bound"
+    idle = _format_duration(report.idle_window_seconds)
     print("Write-back rate: sessions that made at least one strata_contribute call")
     print("(any verdict — a declined contribution counts).")
     print()
     print(f"Window: {window} ({since})")
-    print("Note: this includes sessions still open — a session that has not ended yet")
-    print("counts as silent until it contributes or closes out.")
+    if report.include_open:
+        print("Note: this includes sessions still open — a session that has not ended yet")
+        print("counts as silent until it contributes or closes out.")
+    else:
+        print(
+            f"Counts ended sessions only (idle window {idle}: a session with no recorded "
+            "end counts as ended after that long)."
+        )
+        print(f"{report.open_excluded} open session(s) left out; add --include-open to count them.")
     print()
-    labels = [r.harness for r in [*report.rows, report.overall]]
-    width = max(len(label) for label in labels)
+    table_rows = [*report.rows, report.overall, report.strict_on, report.strict_off]
+    width = max(len(r.harness) for r in table_rows)
     print(
         f"  {'harness':{width}}  sessions  contributed  accepted  closed out  silent  "
-        "write-back rate"
+        "strict  write-back rate"
     )
-    for r in [*report.rows, report.overall]:
+    for r in table_rows:
         rate = "no sessions" if r.rate is None else f"{r.rate_text} ({r.contributed}/{r.n})"
         print(
             f"  {r.harness:{width}}  {r.n:<8}  {r.contributed:<11}  {r.accepted:<8}  "
-            f"{r.closed_out:<10}  {r.silent:<6}  {rate}"
+            f"{r.closed_out:<10}  {r.silent:<6}  {r.strict_on}/{r.n:<4}  {rate}"
         )
     print()
+    print(
+        "strict = the Stop hook blocked a silent session once (enforcement on); "
+        "'strict off' includes sessions that never recorded a setting."
+    )
+    print("publish/withdraw are sharing acts and don't count as write-back.")
     print(
         "Retention: session files are never deleted automatically (only by "
         "`strata unregister --purge-data` or by hand), so the window above is every "
@@ -4596,6 +4648,20 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="ISO",
         help="Only sessions that connected at or after this ISO 8601 date/time.",
+    )
+    p_stats_wb.add_argument(
+        "--include-open",
+        action="store_true",
+        help="Also count sessions that have not ended (default: ended sessions only).",
+    )
+    p_stats_wb.add_argument(
+        "--idle-window",
+        default=None,
+        metavar="DURATION",
+        help=(
+            "A session with no recorded end counts as ended once idle this long "
+            "(e.g. 30m, 24h, 2d, 90s; default 24h, or STRATA_SESSION_IDLE_WINDOW_SECONDS)."
+        ),
     )
     p_stats_wb.add_argument("--json", action="store_true", help="Print the report as JSON.")
     p_stats_wb.add_argument(

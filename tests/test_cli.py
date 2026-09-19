@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import patch
@@ -391,12 +392,15 @@ def _seed_writeback_sessions(tmp_path: Path) -> None:
     from strata.session_state import SessionStateStore, sessions_dir_for
 
     store = SessionStateStore(sessions_dir_for(str(tmp_path / "summaries")))
-    store.record_connect("cc1", harness="claude-code")
+    store.record_connect("cc1", harness="claude-code", pid=1, strict=True)
     store.record_submission("cc1")
     store.record_contribution("cc1")
-    store.record_connect("cx1", harness="codex")
+    store.record_connect("cx1", harness="codex", pid=2, strict=True)
     store.record_submission("cx1")  # declined
-    store.record_connect("cx2", harness="codex")  # silent
+    store.record_connect("cx2", harness="codex", pid=3, strict=False)  # silent
+    for sid, pid in (("cc1", 1), ("cx1", 2), ("cx2", 3)):
+        store.record_end(sid, pid=pid)  # all three ended
+    store.record_connect("still-open", harness="codex", pid=4)  # never ended
 
 
 def test_stats_writeback_prints_counts_beside_each_rate(
@@ -409,11 +413,54 @@ def test_stats_writeback_prints_counts_beside_each_rate(
 
     assert rc == 0
     out = capsys.readouterr().out
-    assert "includes sessions still open" in out
+    assert "includes sessions still open" not in out  # only shown with --include-open
+    assert "1 open session(s) left out" in out
     assert "accepted" in out and "contributed" in out
+    assert "strict on" in out and "strict off" in out
     codex = next(line for line in out.splitlines() if line.strip().startswith("codex"))
     assert "50%" in codex and "1/2" in codex
     assert "3" in next(line for line in out.splitlines() if line.strip().startswith("overall"))
+
+
+def test_stats_writeback_include_open_restores_the_all_sessions_view(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _seed_fleet(tmp_path, monkeypatch)
+    _seed_writeback_sessions(tmp_path)
+
+    rc = main(["stats", "writeback", "--include-open"])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "includes sessions still open" in out
+    assert "left out" not in out
+    assert "4" in next(line for line in out.splitlines() if line.strip().startswith("overall"))
+
+
+def test_stats_writeback_shows_the_idle_window_and_takes_an_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _seed_fleet(tmp_path, monkeypatch)
+    _seed_writeback_sessions(tmp_path)
+
+    assert main(["stats", "writeback"]) == 0
+    assert "idle window 24h" in capsys.readouterr().out
+
+    # A 1s window: once a second has passed the never-ended session counts as ended.
+    time.sleep(1.2)
+    assert main(["stats", "writeback", "--idle-window", "1s"]) == 0
+    out = capsys.readouterr().out
+    assert "idle window 1s" in out
+    assert "0 open session(s) left out" in out
+
+
+def test_stats_writeback_rejects_a_bad_idle_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _seed_fleet(tmp_path, monkeypatch)
+
+    assert main(["stats", "writeback", "--idle-window", "soon"]) == 1
+    assert "--idle-window" in capsys.readouterr().err
 
 
 def test_stats_writeback_with_no_sessions_prints_no_sessions_not_a_percentage(
@@ -443,7 +490,8 @@ def test_stats_writeback_json_and_export(
     assert rc == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["overall"]["n"] == 3
-    assert payload["includes_open_sessions"] is True
+    assert payload["include_open"] is False
+    assert payload["open_excluded"] == 1
     assert {r["harness"] for r in payload["rows"]} >= {"claude-code", "codex", "unknown"}
     rows = [json.loads(line) for line in export.read_text(encoding="utf-8").splitlines()]
     assert {r["session_id"]: r["outcome"] for r in rows} == {
