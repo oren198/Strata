@@ -233,6 +233,60 @@ def test_at_threshold_spawns_with_unset_session_id_via_deterministic_fallback(
     assert spawns.calls[0][0] == fallback_id
 
 
+def test_the_hook_finds_its_session_through_an_intermediate_shell(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Claude Code runs the hook as `/bin/sh -c 'sh <script>'` and that outer shell
+    survives, so the hook's parent is the shell (2000), not the claude process
+    (1000) that is the MCP server's parent. Found live in M3: the hook derived
+    sess_auto_2000, never found the session sess_auto_1000, and never blocked.
+    It now walks up its ancestors to the nearest one that has a session record."""
+    paths = _make_project(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("os.getppid", lambda: 2000)  # the intermediate shell
+    monkeypatch.setattr(freshness, "_parent_pid", {2000: 1000, 1000: 1}.get)
+    _seed_reads(_session_store(paths), NUDGE_MIN_READS, session_id="sess_auto_1000")
+    env = _env(paths)
+    del env["STRATA_AGENT_SESSION_ID"]
+
+    spawns = _Spawns()
+    freshness.run_stop_hook(_hook_stdin(), env=env, spawn_fn=spawns)
+
+    assert [c[0] for c in spawns.calls] == ["sess_auto_1000"]
+
+
+def test_the_nearest_ancestor_with_a_session_record_wins(tmp_path: Path, monkeypatch) -> None:
+    paths = _make_project(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("os.getppid", lambda: 3000)
+    monkeypatch.setattr(freshness, "_parent_pid", {3000: 2000, 2000: 1000, 1000: 1}.get)
+    store = _session_store(paths)
+    _seed_reads(store, NUDGE_MIN_READS, session_id="sess_auto_2000")
+    _seed_reads(store, NUDGE_MIN_READS, session_id="sess_auto_1000")
+    env = _env(paths)
+    del env["STRATA_AGENT_SESSION_ID"]
+
+    spawns = _Spawns()
+    freshness.run_stop_hook(_hook_stdin(), env=env, spawn_fn=spawns)
+
+    assert [c[0] for c in spawns.calls] == ["sess_auto_2000"]
+
+
+def test_an_explicit_session_id_is_never_replaced_by_an_ancestor_lookup(
+    tmp_path: Path, monkeypatch
+) -> None:
+    paths = _make_project(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("os.getppid", lambda: 2000)
+    monkeypatch.setattr(freshness, "_parent_pid", {2000: 1000, 1000: 1}.get)
+    _seed_reads(_session_store(paths), NUDGE_MIN_READS, session_id="sess_auto_1000")
+
+    spawns = _Spawns()  # env carries the explicit _SESSION_ID, which has no record
+    freshness.run_stop_hook(_hook_stdin(), env=_env(paths), spawn_fn=spawns)
+
+    assert spawns.calls == []
+
+
 def test_at_threshold_spawns_with_empty_string_session_id(tmp_path: Path, monkeypatch) -> None:
     """Empty string counts as unset — Codex ships a literal empty
     STRATA_AGENT_SESSION_ID — so it falls back the same way an absent var

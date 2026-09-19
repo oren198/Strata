@@ -129,25 +129,15 @@ def resolve_agent_session_id(env: dict[str, str] | None = None) -> str:
     absent var.
 
     The fallback — ``sess_auto_<parent pid>`` — is deterministic, not
-    random: the MCP server (``strata-mcp``) and the freshness Stop hook
-    (``strata freshness-hook``, invoked via ``exec`` from the shipped
-    ``strata-stop-hook`` shell wrapper — see ``src/strata/_hooks/``, no
-    intervening shell process survives) are both spawned directly by the
-    same harness process, so ``os.getppid()`` resolves to that harness
-    process's pid in both. Reading it independently in each process (no env
-    var, no file, no IPC) is how the two land on the identical session id
-    for the identical turn without coordinating.
-
-    This pairing relies on the harness spawning both the MCP server and the
-    hook as its own direct children — true for Claude Code today, and verified
-    for Codex (codex-cli 0.153.4, ``codex exec`` and the TUI, two concurrent
-    sessions): one ``strata-mcp`` per Codex session, parented by that session's
-    ``codex`` process, with the Stop hook parented by the same process. A harness
-    that instead routes hook invocations through a non-exec'ing intermediate
-    shell (a fresh subshell per hook call, rather than exec'ing into the
-    hook command) would see a different, and possibly a different-every-turn,
-    parent pid there, breaking the pairing; set ``STRATA_AGENT_SESSION_ID``
-    explicitly to sidestep that.
+    random: the MCP server (``strata-mcp``) is spawned by the harness process,
+    so ``os.getppid()`` is that process's pid. The freshness Stop hook must land
+    on the same id without IPC: when the harness runs the hook as a direct child
+    (Codex, verified on codex-cli 0.153.4 for ``codex exec`` and the TUI) its
+    ``os.getppid()`` is the same pid. Claude Code does not: it runs the hook as
+    ``/bin/sh -c 'sh <script>'`` and the outer shell survives, so the hook's
+    parent is that shell. :func:`strata.freshness._strata_session_id` therefore
+    walks up the hook's ancestors to the nearest one that has a session record;
+    this function is the server side and stays the plain parent pid.
 
     A caveat shared with any pid-derived id: pids are reused by the OS over
     time, so a stale session-state file from a past process that happened to

@@ -50,6 +50,7 @@ import contextlib
 import json
 import logging
 import os
+import subprocess
 import sys
 import time
 from collections.abc import Callable
@@ -236,16 +237,62 @@ def resolve_session_store(env: dict[str, str]) -> SessionStateStore | None:
         return None
 
 
-def _strata_session_id(env: dict[str, str]) -> str:
+#: How many ancestors above the hook's own parent to try when looking for the
+#: session. One intermediate shell is what Claude Code adds; a few more cover a
+#: wrapper script or two without wandering up into the user's terminal.
+_MAX_ANCESTOR_HOPS = 4
+
+
+def _parent_pid(pid: int) -> int | None:
+    """Return *pid*'s parent pid, or ``None`` when it cannot be read.
+
+    ``/proc`` where it exists (Linux); ``ps`` elsewhere (macOS). Best effort: the
+    hook must never raise.
+    """
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        # "<pid> (<comm>) <state> <ppid> ..." — comm may contain spaces/parens.
+        return int(stat.rsplit(")", 1)[1].split()[1])
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
+        result = subprocess.run(  # noqa: S603
+            ["ps", "-o", "ppid=", "-p", str(pid)],  # noqa: S607
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+        return int(result.stdout.strip())
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def _strata_session_id(env: dict[str, str], store: SessionStateStore | None = None) -> str:
     """Return the session id the #110 state file is keyed by.
 
     The MCP server keys session state by ``STRATA_AGENT_SESSION_ID``, or the
-    same deterministic fallback (``sess_auto_<parent pid>``) when unset or
-    empty — see :func:`strata.session_state.resolve_agent_session_id` for why
-    this hook process and the MCP server process land on the identical id
-    with no IPC and no env var required (both are spawned directly by the
-    same harness process, so ``os.getppid()`` matches).
+    deterministic fallback ``sess_auto_<parent pid>`` when unset or empty — see
+    :func:`strata.session_state.resolve_agent_session_id`. An explicit id is used
+    as-is. For the fallback, the hook's own parent is only the server's parent if
+    the harness runs the hook directly: Codex does (verified), but Claude Code runs
+    it as ``/bin/sh -c 'sh <script>'`` and that outer shell survives, so the hook's
+    parent is the shell and not the ``claude`` process the MCP server hangs off
+    (found live in M3). So with a *store*, walk up the hook's ancestors and take
+    the nearest one that has a session record; when none does, fall back to the
+    plain parent-pid id.
     """
+    explicit = env.get("STRATA_AGENT_SESSION_ID", "")
+    if explicit or store is None:
+        return resolve_agent_session_id(env)
+    pid: int | None = os.getppid()
+    for _ in range(_MAX_ANCESTOR_HOPS + 1):
+        if pid is None or pid <= 1:
+            break
+        candidate = f"sess_auto_{pid}"
+        if store.read(candidate) is not None:
+            return candidate
+        pid = _parent_pid(pid)
     return resolve_agent_session_id(env)
 
 
@@ -340,7 +387,6 @@ def _default_spawn(session_id: str, transcript_path: str, env: dict[str, str]) -
     strata`` so the child resolves to the same engine running the hook, with no
     PATH assumption.
     """
-    import subprocess  # noqa: PLC0415
 
     subprocess.Popen(
         [
@@ -405,7 +451,7 @@ def run_stop_hook(
     # unset/empty one resolves to the deterministic sess_auto_<parent pid>
     # fallback (issue #112 gap — previously this returned "" here and the
     # hook silently no-op'd for the entire zero-export launch path).
-    session_id = _strata_session_id(env)  # type: ignore[arg-type]
+    session_id = _strata_session_id(env, store)  # type: ignore[arg-type]
 
     strict = strict_enabled(env, resolve_project_root())  # type: ignore[arg-type]
     state = store.read(session_id)

@@ -376,9 +376,12 @@ _HISTORICAL_ARTIFACT_HASHES: dict[str, dict[str, object]] = {
         "historical": frozenset(),
     },
     "agents-md": {
-        "current": "58c0612121bc2f3061f7ba18fa32163a98ed15c88f279b194abe7f0bba5fbbe7",
+        "current": "4fdc5a5d4fc4a300487e49c0dd1c8449bc0518a32e4ae196990fcec334846c30",
         "historical": frozenset(
             {
+                # Shipped through M2 (before the never-end-silent line and the
+                # identity guidance fix).
+                "58c0612121bc2f3061f7ba18fa32163a98ed15c88f279b194abe7f0bba5fbbe7",
                 "f6df7e82395ba3199d3a52c1651db8afb93b2fdd139b496974f871d453535b68",
                 "ceea6568ab9160d54f2d3edd7131bc9b3bf2a694832226e67e7553de7325825f",
                 "d4e9b4da5543ad2faf75bedb17c426a8dab72e858955b1a48e7b718f72092aca",
