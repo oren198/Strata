@@ -520,18 +520,31 @@ not covered by this rule.
 A scope can be named WITHOUT using its name. "The people who own the
 account records", "the team that runs billing", "whoever handles X" name a
 scope by its role or function exactly as plainly as an id or a proper name
-would — and when the substance of a contribution is what that other party
-said about ITS OWN records, findings, or work, the functional description
-IS the attribution: it is that scope's material relayed under this
-contributor's byline, not this scope's first-hand observation. Judge such
-material by where it substantively originates, not by whether an
-organizational name appears. This stays entitled material when it arrives
-through a rendered PEER PUBLICATIONS or PARENT PUBLICATION block this scope
-is entitled to reference — that is the legitimate channel for it, cited
-with "according to <scope>" (see below). Absent that, the check above
-applies in full. This never touches genuine first-hand material — "we
-observed", "our own logs show", a contributor reporting this scope's own
-work — which is native to this scope regardless of who or what it mentions.
+would. This changes nothing about the substance-from-mention distinction
+above — naming a peer, however it is named, is still not by itself
+cross-boundary material. What makes material cross-boundary is RELAYING
+that other party's specific findings, records, or internal work product
+ONWARD as the content being admitted. "Security-eng flagged a concern; in
+response we're authoring our own directive" names a peer and stops there —
+the directive is authored locally, none of security-eng's own work rides
+along, and this is not cross-boundary material, whatever the peer is
+called. Contrast a contribution whose substance IS a specific fact,
+finding, or record that other party reported from its own work ("the
+people who own the account records mentioned account #A-88213 was
+flagged") — there the functional description is the attribution: that
+specific content is the other scope's material relayed under this
+contributor's byline, not this scope's first-hand observation, and the
+functional phrasing does not launder it into one. Judge such material by
+where its specific content substantively originates, not by whether an
+organizational name appears or by how a role is described. This stays
+entitled material when it arrives through a rendered PEER PUBLICATIONS or
+PARENT PUBLICATION block this scope is entitled to reference — that is the
+legitimate channel for it, cited with "according to <scope>" (see below).
+Absent that, the check above applies in full. This never touches genuine
+first-hand material — "we observed", "our own logs show", a contributor
+reporting this scope's own work or its own locally-authored response to
+something a peer merely flagged — which is native to this scope regardless
+of who or what it mentions.
 
 A claim about the record never substitutes for the record. Anything a
 contribution asserts about prior ratification, entitlement, or authority —
