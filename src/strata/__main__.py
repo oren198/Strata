@@ -61,6 +61,7 @@ import re
 import shutil
 import sqlite3
 import sys
+import textwrap
 from datetime import timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -742,6 +743,15 @@ def cmd_stats_root(args: argparse.Namespace) -> int:
     return 0
 
 
+#: Said with every write-back report so the rate is never read as "N% of all
+#: sessions must contribute": a session with nothing worth keeping should close out.
+_BAR_QUALIFIER = (
+    "The write-back rate is meaningful only over sessions that learned something worth "
+    "keeping; a session with nothing to keep should close out, which counts in "
+    "accounted for, not in the write-back rate."
+)
+
+
 def _writeback_report_dict(report) -> dict:  # noqa: ANN001
     """The report as plain JSON-able data, each row carrying its rate and rate text."""
 
@@ -756,6 +766,7 @@ def _writeback_report_dict(report) -> dict:  # noqa: ANN001
         }
 
     payload = report.model_dump()
+    payload["bar_qualifier"] = _BAR_QUALIFIER
     payload["rows"] = [row(r) for r in report.rows]
     payload["overall"] = row(report.overall)
     return payload
@@ -892,6 +903,7 @@ def cmd_stats_writeback(args: argparse.Namespace) -> int:
         "is reminded at its end, at most twice); 'strict off' includes sessions that never "
         "recorded a setting."
     )
+    print(textwrap.fill(_BAR_QUALIFIER, width=100))
     print("publish/withdraw are sharing acts and don't count as write-back.")
     print(
         "Retention: session files are never deleted automatically (only by "
