@@ -57,9 +57,12 @@ import copy
 import getpass
 import json
 import os
+import re
 import shutil
 import sqlite3
 import sys
+import textwrap
+from datetime import timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -730,6 +733,188 @@ def cmd_record(args: argparse.Namespace) -> int:
     return 0
 
 
+_stats_parser: argparse.ArgumentParser | None = None
+
+
+def cmd_stats_root(args: argparse.Namespace) -> int:
+    """``strata stats`` with no subcommand — print the group's help."""
+    if _stats_parser is not None:
+        _stats_parser.print_help()
+    return 0
+
+
+#: Said with every write-back report so the rate is never read as "N% of all
+#: sessions must contribute": a session with nothing worth keeping should close out.
+_BAR_QUALIFIER = (
+    "The write-back rate is meaningful only over sessions that learned something worth "
+    "keeping; a session with nothing to keep should close out, which counts in "
+    "accounted for, not in the write-back rate."
+)
+
+
+def _writeback_report_dict(report) -> dict:  # noqa: ANN001
+    """The report as plain JSON-able data, each row carrying its rate and rate text."""
+
+    def row(r) -> dict:  # noqa: ANN001
+        return {
+            **r.model_dump(),
+            "rate": r.rate,
+            "rate_text": r.rate_text,
+            "accounted": r.accounted,
+            "accounted_rate": r.accounted_rate,
+            "accounted_rate_text": r.accounted_rate_text,
+        }
+
+    payload = report.model_dump()
+    payload["bar_qualifier"] = _BAR_QUALIFIER
+    payload["rows"] = [row(r) for r in report.rows]
+    payload["overall"] = row(report.overall)
+    return payload
+
+
+_DURATION_RE = re.compile(r"^(\d+)([smhd]?)$")
+_DURATION_UNITS = {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}
+
+
+def _parse_duration(text: str) -> timedelta | None:
+    """Parse ``30m`` / ``24h`` / ``2d`` / ``90s`` (a bare number is seconds), or ``None``."""
+    match = _DURATION_RE.match(text.strip())
+    if match is None or int(match.group(1)) == 0:
+        return None
+    return timedelta(seconds=int(match.group(1)) * _DURATION_UNITS[match.group(2)])
+
+
+def _format_duration(seconds: int) -> str:
+    """Render a whole number of seconds as the largest exact h/m/s unit (86400 -> 24h)."""
+    for unit, size in (("h", 3600), ("m", 60)):
+        if seconds % size == 0:
+            return f"{seconds // size}{unit}"
+    return f"{seconds}s"
+
+
+def cmd_stats_writeback(args: argparse.Namespace) -> int:
+    """``strata stats writeback`` — the write-back rate, split by harness.
+
+    Of the sessions that connected, how many made at least one
+    ``strata_contribute`` call (any verdict). Counts ENDED sessions by default
+    (``--include-open`` adds the rest). Raw counts sit beside every percentage;
+    an empty row says "no sessions", never a rate. All aggregation lives in
+    :func:`strata.session_state.compute_writeback_report`.
+    """
+    import json
+
+    from strata.session_state import (
+        SessionStateStore,
+        compute_writeback_report,
+        sessions_dir_for,
+        writeback_export_rows,
+    )
+    from strata.settings import get_settings
+    from strata.stores import EmbeddedStoreError, open_embedded_stores
+
+    if args.idle_window is not None:
+        idle_window = _parse_duration(args.idle_window)
+        if idle_window is None:
+            print(
+                f"--idle-window {args.idle_window!r} must look like 30m, 24h, 2d or 90s.",
+                file=sys.stderr,
+            )
+            return 1
+    else:
+        idle_window = timedelta(seconds=get_settings().session_idle_window_seconds)
+
+    try:
+        stores = open_embedded_stores()
+    except EmbeddedStoreError as exc:
+        print(exc.message, file=sys.stderr)
+        return 1
+
+    selection = {
+        "since": args.since,
+        "include_open": args.include_open,
+        "idle_window": idle_window,
+    }
+    with stores:
+        store = SessionStateStore(sessions_dir_for(str(stores.summary_store.summaries_dir)))
+        try:
+            report = compute_writeback_report(store, **selection)
+            export_rows = writeback_export_rows(store, **selection) if args.export else None
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+
+    note_out = sys.stderr if args.json else sys.stdout
+    if export_rows is not None:
+        with open(args.export, "w", encoding="utf-8") as fh:
+            for row in export_rows:
+                fh.write(json.dumps(row) + "\n")
+        print(f"Exported {len(export_rows)} session outcome(s) to {args.export}", file=note_out)
+
+    if args.json:
+        print(json.dumps(_writeback_report_dict(report), indent=2))
+        return 0
+
+    window = (
+        f"{report.first_session_at} to {report.last_session_at}"
+        if report.first_session_at
+        else "no sessions"
+    )
+    since = f"since {report.since}" if report.since else "no --since bound"
+    idle = _format_duration(report.idle_window_seconds)
+    print("Write-back rate: sessions that made at least one strata_contribute call")
+    print("(any verdict — a declined contribution counts).")
+    print()
+    print(f"Window: {window} ({since})")
+    if report.include_open:
+        print("Note: this includes sessions still open — a session that has not ended yet")
+        print("counts as silent until it contributes or closes out.")
+    else:
+        print(
+            f"Counts ended sessions only (idle window {idle}: a session with no recorded "
+            "end counts as ended after that long)."
+        )
+        print(f"{report.open_excluded} open session(s) left out; add --include-open to count them.")
+    print()
+    print("write-back rate = sessions with at least one strata_contribute call, out of all")
+    print("sessions counted (the launch bar: at least 80 percent).")
+    print("accounted for = sessions that wrote back OR closed out with a reason, out of all")
+    print("sessions counted (reported alongside; it is not the bar).")
+    print()
+    table_rows = [*report.rows, report.overall, report.strict_on, report.strict_off]
+    width = max(len(r.harness) for r in table_rows)
+    print(
+        f"  {'harness':{width}}  sessions  contributed  accepted  closed out  silent  "
+        f"strict  {'write-back rate':<17}  accounted for"
+    )
+
+    def _pct(rate_text: str, count: int, n: int) -> str:
+        return "no sessions" if not n else f"{rate_text} ({count}/{n})"
+
+    for r in table_rows:
+        rate = _pct(r.rate_text, r.contributed, r.n)
+        accounted = _pct(r.accounted_rate_text, r.accounted, r.n)
+        print(
+            f"  {r.harness:{width}}  {r.n:<8}  {r.contributed:<11}  {r.accepted:<8}  "
+            f"{r.closed_out:<10}  {r.silent:<6}  {r.strict_on}/{r.n:<4}  {rate:<17}  {accounted}"
+        )
+    print()
+    print(
+        "strict = sessions that ran with strict Stop-hook enforcement on (a silent session "
+        "is reminded at its end, at most twice); 'strict off' includes sessions that never "
+        "recorded a setting."
+    )
+    print(textwrap.fill(_BAR_QUALIFIER, width=100))
+    print("publish/withdraw are sharing acts and don't count as write-back.")
+    print(
+        "Retention: session files are never deleted automatically (only by "
+        "`strata unregister --purge-data` or by hand), so the window above is every "
+        "session on disk."
+    )
+    if report.unreadable_files:
+        print(f"Not counted: {report.unreadable_files} unreadable session file(s).")
+    return 0
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     """Show the per-scope memory-freshness (staleness) metric — embedded read.
 
@@ -814,6 +999,75 @@ def _mcp_entry_is_migratable(entry: object, project_root: Path) -> bool:
 # failure line says how to fix it. Exits 0 when every check passes, 1
 # otherwise (mirrors `strata start`'s preflight, see `strata.preflight`).
 # ---------------------------------------------------------------------------
+
+
+def _check_strata_on_path(project_root: Path) -> Check:
+    """`strata doctor` check: the ``strata`` on PATH is the install that registered."""
+    import subprocess  # noqa: PLC0415
+
+    from strata.project_config import read_install_record
+
+    name = "strata on PATH"
+    on_path = shutil.which("strata")
+    if on_path is None:
+        return Check(
+            name=name,
+            kind="hard",
+            passed=False,
+            message=(
+                "no `strata` on PATH — the registered hooks call bare `strata`, so they "
+                "will fail. Put the install that registered this project on PATH "
+                "(pipx ensurepath), or re-run `strata register`."
+            ),
+        )
+    resolved = os.path.realpath(on_path)
+    try:
+        out = subprocess.run(  # noqa: S603
+            [resolved, "--version"], capture_output=True, text=True, timeout=10, check=False
+        ).stdout.strip()
+        found_version = out.split()[-1] if out else "unknown"
+    except (OSError, subprocess.SubprocessError):
+        found_version = "unknown"
+
+    recorded = read_install_record(project_root)
+    if recorded is None:
+        return Check(
+            name=name,
+            kind="soft",
+            passed=False,
+            message=(
+                f"{resolved} (version {found_version}); this project was registered before "
+                "the registering install was recorded, so it cannot be compared — re-run "
+                "`strata register` to record it."
+            ),
+        )
+    recorded_path, recorded_version = recorded
+    if resolved != os.path.realpath(recorded_path):
+        return Check(
+            name=name,
+            kind="hard",
+            passed=False,
+            message=(
+                f"`strata` on PATH is {resolved} (version {found_version}), but this project "
+                f"was registered by {recorded_path} (version {recorded_version}). The registered "
+                "hooks call bare `strata`, so they run the PATH one. Put the registering "
+                "install first on PATH (or uninstall the other one), or re-run "
+                "`strata register` with the install you want."
+            ),
+        )
+    note = ""
+    if found_version not in ("unknown", recorded_version):
+        note = (
+            f" (upgraded from {recorded_version} since register; re-run `strata register` "
+            "to refresh the project's skills and hooks)"
+        )
+    return Check(
+        name=name,
+        kind="hard",
+        passed=True,
+        message=f"{resolved} (version {found_version}), the install that registered this "
+        f"project{note}",
+    )
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:
@@ -1500,6 +1754,15 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     # contribution just sits unjudged until one is set). Never flips the
     # exit code.
     # -----------------------------------------------------------------------
+    # -----------------------------------------------------------------------
+    # 8b. The `strata` on PATH is the install that registered this project.
+    # Every registered hook calls bare `strata` (issue #207): if an older install
+    # is first on PATH the hooks silently run old code. Hard failure when the
+    # resolved executable is not the registering one; soft when register predates
+    # the record (nothing to compare).
+    # -----------------------------------------------------------------------
+    checks.append(_check_strata_on_path(project_root))
+
     if _judge_key_visible(project_root):
         checks.append(
             Check(
@@ -2282,13 +2545,15 @@ def _run_manager_refresh(scope_id: str, *, skip: bool = False) -> None:
                 continue
 
 
-#: Codex launch is schema-verified but not live-verified (README, "Using
-#: Strata with Codex CLI") — `strata launch` refuses honestly rather than
-#: handing off to a binding that has never been confirmed to actually work.
+#: `strata launch` does not launch Codex: its MCP server is handed only the config's
+#: env table, not the launching shell (verified, README "Using Strata with Codex CLI"),
+#: so there is nothing to bind by exporting. It refuses and says so.
 _CODEX_LAUNCH_NOT_WIRED_MESSAGE = (
-    "Codex launch is not wired yet: Codex's MCP env delivery is still being "
-    "verified live (see README, 'Using Strata with Codex CLI'). Start codex "
-    "manually after filling in the [mcp_servers.strata.env] values."
+    "Codex launch is not wired yet: Codex hands its MCP server only the "
+    "[mcp_servers.strata.env] table from its own config, not your shell's "
+    "environment, so there is nothing for `strata launch` to export (see README, "
+    "'Using Strata with Codex CLI'). Start codex directly; its identity comes "
+    "from that table."
 )
 
 
@@ -2951,6 +3216,39 @@ def cmd_register(args: argparse.Namespace) -> int:
             described = _describe_store(adopted_store, project_root)
             print(f"    adopted the store already in this project: {described}")
 
+    # Strict Stop-hook enforcement (M3): on by default, recorded in config.toml so
+    # every harness's hook reads the same per-project answer. A plain re-register
+    # adds the setting when absent but never undoes an existing opt-out;
+    # `--no-strict` turns it off.
+    current_config = (
+        body if not config_toml_already_registered else config_toml.read_bytes().decode("utf-8")
+    )
+    current_strict = install.read_freshness_strict_from_text(current_config)
+    if getattr(args, "no_strict", False):
+        desired_strict = False
+    else:
+        desired_strict = True if current_strict is None else current_strict
+    if desired_strict != current_strict:
+        if not diff_mode:
+            config_toml.write_bytes(
+                install.set_freshness_strict(current_config, desired_strict).encode("utf-8")
+            )
+        _act(f"set freshness strict = {str(desired_strict).lower()} in", config_toml)
+
+    # Record which strata install registered this project: the hooks call bare
+    # `strata`, so `strata doctor` compares this with what resolves on PATH later.
+    registering = install.registering_install()
+    if registering is not None:
+        current_config = (
+            config_toml.read_bytes().decode("utf-8") if config_toml.exists() else current_config
+        )
+        if install.read_install_record_from_text(current_config) != registering:
+            if not diff_mode:
+                config_toml.write_bytes(
+                    install.set_install_record(current_config, *registering).encode("utf-8")
+                )
+            _act(f"recorded the registering install ({registering[1]}) in", config_toml)
+
     # -----------------------------------------------------------------------
     # Step 4: Update .gitignore.
     # -----------------------------------------------------------------------
@@ -3347,12 +3645,10 @@ def cmd_register(args: argparse.Namespace) -> int:
         # broken .claude/settings.json in the same repo must not block a
         # codex-only registration — see test_register_codex.py).
         #
-        # Only claims what docs/marketing/CODEX-surface-2026-08.md marks
-        # [verified]: the MCP table shape and location are verified
-        # hands-on against codex-cli 0.149.0; the Stop-hook block is
-        # schema-verified only (accepted by `codex exec --strict-config`)
-        # — live firing and STRATA_AGENT_* env inheritance are pending
-        # live verification, and the merged block says so on its face.
+        # Claims only what was verified live (README "Using Strata with Codex
+        # CLI"): the MCP table shape and location (codex-cli 0.149.0), and on
+        # 0.153.4 the Stop hook firing once trusted, its env inheritance and
+        # its parent process. The merged block tells the reader to trust it.
         # ---------------------------------------------------------------
         # codex_config lives under $CODEX_HOME (default ~/.codex), NOT under
         # project_root — unlike every other artifact register touches, so it
@@ -3433,10 +3729,11 @@ def cmd_register(args: argparse.Namespace) -> int:
                 f"{codex_config}\n"
                 f"  can stay empty — the fleet has one scope ({first_scope!r}) and the "
                 "engine auto-binds to\n"
-                "  it. Fill them in only once the fleet grows past one scope. The "
-                "Stop-hook block is schema-\n"
-                '  verified only; see README "Using Strata with Codex CLI" for exactly '
-                "what is and isn't proven to work."
+                "  it. Fill them in only once the fleet grows past one scope. Leave "
+                "STRATA_AGENT_SESSION_ID blank.\n"
+                '  Codex asks you to trust the Stop hook once ("Hooks need review" — '
+                'choose "Trust all and continue");\n'
+                '  see README "Using Strata with Codex CLI".'
             )
         else:
             print(
@@ -3444,10 +3741,11 @@ def cmd_register(args: argparse.Namespace) -> int:
                 "STRATA_AGENT_SESSION_ID under\n"
                 f"  [mcp_servers.strata.env] in {codex_config} before running `codex` "
                 "(MCP env values are literal\n"
-                "  TOML strings — Codex does not interpolate them). The Stop-hook block "
-                "is schema-verified only;\n"
-                '  see README "Using Strata with Codex CLI" for exactly what is and '
-                "isn't proven to work."
+                "  TOML strings — Codex does not interpolate them). Leave "
+                "STRATA_AGENT_SESSION_ID blank. Codex asks you\n"
+                '  to trust the Stop hook once ("Hooks need review" — choose "Trust '
+                'all and continue");\n'
+                '  see README "Using Strata with Codex CLI".'
             )
 
     # -----------------------------------------------------------------------
@@ -4479,6 +4777,44 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_status.set_defaults(func=cmd_status)
 
+    global _stats_parser
+    p_stats = sub.add_parser("stats", help="Engine metrics computed from session state.")
+    _stats_parser = p_stats
+    p_stats.set_defaults(func=cmd_stats_root)
+    stats_sub = p_stats.add_subparsers(dest="stats_command", metavar="<stats-command>")
+    p_stats_wb = stats_sub.add_parser(
+        "writeback",
+        help="Write-back rate: sessions with at least one contribution, by harness.",
+    )
+    p_stats_wb.add_argument(
+        "--since",
+        default=None,
+        metavar="ISO",
+        help="Only sessions that connected at or after this ISO 8601 date/time.",
+    )
+    p_stats_wb.add_argument(
+        "--include-open",
+        action="store_true",
+        help="Also count sessions that have not ended (default: ended sessions only).",
+    )
+    p_stats_wb.add_argument(
+        "--idle-window",
+        default=None,
+        metavar="DURATION",
+        help=(
+            "A session with no recorded end counts as ended once idle this long "
+            "(e.g. 30m, 24h, 2d, 90s; default 24h, or STRATA_SESSION_IDLE_WINDOW_SECONDS)."
+        ),
+    )
+    p_stats_wb.add_argument("--json", action="store_true", help="Print the report as JSON.")
+    p_stats_wb.add_argument(
+        "--export",
+        default=None,
+        metavar="PATH",
+        help="Write one JSON line per session ({session_id, harness, outcome, accepted_count}).",
+    )
+    p_stats_wb.set_defaults(func=cmd_stats_writeback)
+
     p_doctor = sub.add_parser(
         "doctor",
         help="Diagnose a project's Strata wiring: config, DB, fleet, install, binding.",
@@ -4624,8 +4960,8 @@ def _build_parser() -> argparse.ArgumentParser:
             "Harness to start. Default: the project's recorded default "
             "(`strata set-default-harness`); else the single harness wired in "
             "this project, if exactly one is; else claude-code. 'codex' "
-            "currently exits 1 — Codex launch is schema-verified but not "
-            "live-verified (see README 'Using Strata with Codex CLI')."
+            "currently exits 1 — `strata launch` cannot bind Codex, whose MCP server "
+            "does not inherit your shell (see README 'Using Strata with Codex CLI')."
         ),
     )
     p_launch.set_defaults(func=cmd_launch)
@@ -4670,6 +5006,16 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "Idempotent brownfield installer — create .strata/config.toml, "
             "seed fleet.yaml, copy skills, merge MCP entry."
+        ),
+    )
+    p_register.add_argument(
+        "--no-strict",
+        dest="no_strict",
+        action="store_true",
+        help=(
+            "Turn off strict Stop-hook enforcement (on by default): a silent "
+            "session is no longer blocked once at its end; a background "
+            "evaluator drafts a contribution instead."
         ),
     )
     p_register.add_argument(

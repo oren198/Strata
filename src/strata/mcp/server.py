@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import logging
 import os
+import signal
 import sqlite3
 import sys
 import threading
@@ -60,6 +61,7 @@ from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.session import ServerSession
 from mcp.shared.message import ServerMessageMetadata
 from mcp.types import (
+    CallToolRequest,
     ClientCapabilities,
     ElicitationCapability,
     ElicitRequest,
@@ -87,6 +89,7 @@ from strata.record_store import ContributorRef, RecordStore
 from strata.session_state import (
     SessionState,
     SessionStateStore,
+    classify_harness,
     compute_nudge,
     resolve_agent_session_id,
     sessions_dir_for,
@@ -122,11 +125,13 @@ _sessions_dir: str = ""
 _record_store: RecordStore | None = None
 _summary_store: SummaryStore | None = None
 _session_store: SessionStateStore | None = None
+_project_root: Path | None = None
 
 
 def _set_paths(paths: StoragePaths) -> None:
     """Publish resolved storage paths to the module globals (no I/O)."""
-    global _db_path, _summaries_dir, _fleet_yaml_path, _sessions_dir
+    global _db_path, _summaries_dir, _fleet_yaml_path, _sessions_dir, _project_root
+    _project_root = paths.project_root
     _db_path = paths.db_path
     _summaries_dir = paths.summaries_dir
     _fleet_yaml_path = paths.fleet_yaml_path
@@ -265,6 +270,129 @@ def _drain_for_read(fleet, scope_id: str) -> tuple[int, list]:
     return max(0, pending - outcome.events_processed), outcome.processed_events
 
 
+def _client_harness() -> str | None:
+    """Return the harness the connected MCP client belongs to, or ``None``.
+
+    Read from the client's own ``initialize`` handshake (``clientInfo.name``)
+    via the request in flight, then held for the process's lifetime: one MCP
+    server serves exactly one client connection. ``None`` only when no request
+    context exists yet; a context with no client info is ``unknown``.
+    """
+    global _HARNESS  # noqa: PLW0603
+    if _HARNESS is not None:
+        return _HARNESS
+    try:
+        params = mcp.get_context().request_context.session.client_params
+        name = params.clientInfo.name if params is not None else None
+    except Exception:  # noqa: BLE001 - no request in flight: nothing to read
+        return None
+    _HARNESS = classify_harness(name)
+    return _HARNESS
+
+
+def _strict_now() -> bool:
+    """Whether strict Stop-hook enforcement is on for this project (see
+    :func:`strata.freshness.strict_enabled`), for the session record."""
+    from strata.freshness import strict_enabled  # noqa: PLC0415
+
+    return strict_enabled(dict(os.environ), _project_root)
+
+
+def _record_connect(session: object) -> None:
+    """Record this session's connect — the write-back denominator (M2).
+
+    Called once, when the client's ``initialized`` notification arrives, before
+    any tool call, so a session that then does nothing is still counted. Reads
+    the harness from the session's own ``initialize`` params. Best-effort like
+    every session-state write: never fails the connection.
+    """
+    global _HARNESS  # noqa: PLW0603
+    try:
+        params = session.client_params  # type: ignore[attr-defined]
+        name = params.clientInfo.name if params is not None else None
+    except Exception:  # noqa: BLE001 - no client info: unknown, never a guess
+        name = None
+    _HARNESS = classify_harness(name)
+    if _session_store is None or not _sessions_dir:
+        return
+    try:
+        _session_store.record_connect(
+            _AGENT_SESSION_ID, harness=_HARNESS, pid=os.getpid(), strict=_strict_now()
+        )
+    except OSError as exc:  # pragma: no cover - defensive; disk failure only
+        _logger.warning("failed to record connect for session %r: %s", _AGENT_SESSION_ID, exc)
+
+
+def _record_tool_call() -> None:
+    """Count one strata tool call for this session (best effort, M3b).
+
+    The strict Stop hook's second block fires only if the agent made no strata
+    call after the first, so every ``tools/call`` is counted, whatever it does.
+    """
+    if _session_store is None or not _sessions_dir:
+        return
+    try:
+        _session_store.record_tool_call(_AGENT_SESSION_ID)
+    except Exception as exc:  # noqa: BLE001 - never fail the call over a counter
+        _logger.warning("failed to count tool call for session %r: %s", _AGENT_SESSION_ID, exc)
+
+
+def _record_end() -> None:
+    """Stamp this session's ``ended_at`` — best effort, at connection end (M3).
+
+    Runs when the MCP connection closes (stdin EOF / transport close) or the
+    server is terminated by SIGTERM. A no-op unless this process owns the session
+    record, so an old server exiting after a newer connection reused its id cannot
+    end the newer session. A killed (SIGKILL) server never gets here; the
+    write-back report treats such a session as ended once it has been idle longer
+    than the idle window.
+    """
+    if _session_store is None or not _sessions_dir:
+        return
+    try:
+        _session_store.record_end(_AGENT_SESSION_ID, pid=os.getpid())
+    except Exception as exc:  # noqa: BLE001 - shutdown path: never raise
+        _logger.warning("failed to record end for session %r: %s", _AGENT_SESSION_ID, exc)
+
+
+def _terminate_cleanly(signum: int, frame: object) -> None:
+    """SIGTERM handler: stamp the session's end, then exit.
+
+    Raising ``SystemExit`` here would not exit: the stdio transport reads stdin on
+    a non-daemon worker thread that is still blocked, and the interpreter waits
+    for it. The end stamp is a single small file write, and the server holds no
+    other state that needs flushing, so it exits directly once that is done.
+    """
+    _record_end()
+    os._exit(0)
+
+
+def _install_connect_hook(server: FastMCP) -> None:
+    """Have *server* call :func:`_record_connect` on the first message after the
+    handshake (the client's ``initialized`` notification).
+
+    The MCP SDK completes ``initialize`` inside the session and forwards only
+    later messages to the server, so the first forwarded message is the earliest
+    seam that has both the session and its client info. Wraps this FastMCP's own
+    lowlevel server instance, so it never touches the SDK class.
+    """
+    lowlevel = server._mcp_server  # noqa: SLF001 - the SDK exposes no public seam
+    original = lowlevel._handle_message  # noqa: SLF001
+    connected = False
+
+    async def handle_message(message, session, *args, **kwargs):  # noqa: ANN001, ANN202
+        nonlocal connected
+        if not connected:
+            connected = True
+            _record_connect(session)
+        request = getattr(getattr(message, "request", None), "root", None)
+        if isinstance(request, CallToolRequest):
+            _record_tool_call()
+        return await original(message, session, *args, **kwargs)
+
+    lowlevel._handle_message = handle_message  # noqa: SLF001
+
+
 def _record_read(scope_id: str) -> None:
     """Record one perspective/summary read for this session (best-effort, #110).
 
@@ -276,7 +404,7 @@ def _record_read(scope_id: str) -> None:
     if _session_store is None:
         return
     try:
-        _session_store.record_read(_AGENT_SESSION_ID, scope_id)
+        _session_store.record_read(_AGENT_SESSION_ID, scope_id, harness=_client_harness())
     except OSError as exc:  # pragma: no cover - defensive; disk failure only
         _logger.warning("failed to record read receipt for session %r: %s", _AGENT_SESSION_ID, exc)
 
@@ -291,11 +419,25 @@ def _record_accepted_contribution(decision: str) -> None:
     if _session_store is None or decision not in ("accept_as_directive", "accept_as_context"):
         return
     try:
-        _session_store.record_contribution(_AGENT_SESSION_ID)
+        _session_store.record_contribution(_AGENT_SESSION_ID, harness=_client_harness())
     except OSError as exc:  # pragma: no cover - defensive; disk failure only
         _logger.warning(
             "failed to record contribution counter for session %r: %s", _AGENT_SESSION_ID, exc
         )
+
+
+def _record_submitted_contribution() -> None:
+    """Record one ``strata_contribute`` call for this session, whatever its verdict.
+
+    The write-back numerator (M2): a declined or unjudged contribution is still
+    the session writing back. Best-effort like the other counters.
+    """
+    if _session_store is None:
+        return
+    try:
+        _session_store.record_submission(_AGENT_SESSION_ID, harness=_client_harness())
+    except OSError as exc:  # pragma: no cover - defensive; disk failure only
+        _logger.warning("failed to record submission for session %r: %s", _AGENT_SESSION_ID, exc)
 
 
 def _record_decline() -> SessionState | None:
@@ -312,7 +454,7 @@ def _record_decline() -> SessionState | None:
     if _session_store is None:
         return None
     try:
-        return _session_store.record_decline(_AGENT_SESSION_ID)
+        return _session_store.record_decline(_AGENT_SESSION_ID, harness=_client_harness())
     except OSError as exc:  # pragma: no cover - defensive; disk failure only
         _logger.warning("failed to record decline for session %r: %s", _AGENT_SESSION_ID, exc)
         return None
@@ -370,6 +512,10 @@ def _build_scope_manager():
 _AGENT_SCOPE: str = os.environ.get("STRATA_AGENT_SCOPE", "")
 _AGENT_SKILL: str | None = os.environ.get("STRATA_AGENT_SKILL") or None
 _AGENT_SESSION_ID: str = resolve_agent_session_id()
+# The harness the connected client belongs to, from its initialize handshake;
+# resolved lazily on the first request (no client is connected at import) by
+# _client_harness() and held for the process's lifetime.
+_HARNESS: str | None = None
 
 # Soft-start state (dated addendum to ADR 0005 Decision 5 — see
 # docs/adr/0005-brownfield-install.md). A harness that swallows stderr (the
@@ -1058,10 +1204,11 @@ def _validate_binding(
        — a one-line notice on stderr names it (operator directive: a fresh
        install must work with minimum friction). When the scope was
        auto-bound and ``STRATA_AGENT_SKILL`` is also unset/empty, the scope's
-       ``default_skill`` (if any) is used the same way. An explicitly set
-       ``STRATA_AGENT_SCOPE`` is never touched by this — it behaves exactly
-       as before. Empty string counts as unset (Codex writes literal empty
-       env values into its config).
+       ``default_skill`` (if any) is used the same way — and so it is for an
+       explicitly named scope (step 3b), so an empty ``STRATA_AGENT_SKILL``
+       never blocks a scope that declares a default. An explicitly set
+       ``STRATA_AGENT_SCOPE`` is otherwise never touched by this. Empty string
+       counts as unset (Codex writes literal empty env values into its config).
     1. ``.strata/config.toml`` resolvable via walk-up. **config-class.**
     2. ``STRATA_AGENT_SCOPE`` env var set (after the auto-bind attempt above)
        — unset/empty against a fleet with zero or 2+ active scopes is still
@@ -1151,7 +1298,8 @@ def _validate_binding(
             "decides whose memory this session reads and writes. (Alternatively "
             "the server can be restarted with STRATA_AGENT_SCOPE/STRATA_AGENT_SKILL "
             "set in its environment — read once, at process start.)\n"
-            "  See README.md § 'Quick Start for an existing project' for the full setup."
+            "  See README.md § 'Quick start: two agents, one memory' "
+            "(Binding past one scope) for the full setup."
         )
 
     # 3. Scope must exist in fleet config and be active (skip when fleet not
@@ -1163,6 +1311,15 @@ def _validate_binding(
         scope_obj, exists_error = _check_scope_exists(fleet, resolved_scope, require_active=True)
         if exists_error is not None:
             binding_errors.append(exists_error)
+
+    # 3b. An unset/empty skill takes the scope's default_skill however the scope was
+    #     chosen. Auto-bind (step 0) already did this for the fleet's only scope;
+    #     an explicitly named scope needs the same, or a freshly registered project
+    #     (whose config ships STRATA_AGENT_SKILL empty) is refused until the skill
+    #     is set by hand — the M4 demo runner named its scope `demo` and hit this.
+    #     strata_bind has always resolved it this way (_resolve_skill_default).
+    if scope_obj is not None and not resolved_skill:
+        resolved_skill = _resolve_skill_default(scope_obj, resolved_skill)
 
     # 4. STRATA_AGENT_SKILL must be set — waived only when the scope is
     #    positively confirmed to declare no skills (no default_skill, no
@@ -1181,7 +1338,8 @@ def _validate_binding(
             "with STRATA_AGENT_SCOPE/STRATA_AGENT_SKILL set in its environment — "
             "read once, at process start.)\n"
             "  (A skill is optional when the scope declares none.)\n"
-            "  See README.md § 'Quick Start for an existing project' for the full setup."
+            "  See README.md § 'Quick start: two agents, one memory' "
+            "(Binding past one scope) for the full setup."
         )
 
     # 5. STRATA_AGENT_SKILL must be in permitted_skills (skip when scope or
@@ -1725,6 +1883,9 @@ mcp = FastMCP(
 )
 
 
+_install_connect_hook(mcp)
+
+
 # ---------------------------------------------------------------------------
 # Tool: strata_bind
 #
@@ -2037,7 +2198,7 @@ async def strata_bind(scope_id: str, skill: str | None = None, confirm: bool = F
             "or database). Fix the file(s) and restart the server — strata_bind "
             "cannot clear these."
         )
-    return _attach_fleet_notice(result)
+    return _attach_nudge(result)
 
 
 # ---------------------------------------------------------------------------
@@ -2166,7 +2327,9 @@ async def strata_contribute(
         # The contribution and a judgment-attempt-failed event are already in
         # the record (issue #57); a verdict is never fabricated. Surface the
         # contribution id and route the retry to strata_rejudge — calling
-        # strata_contribute again would duplicate the contribution.
+        # strata_contribute again would duplicate the contribution. It was still
+        # submitted: the session did write back.
+        _record_submitted_contribution()
         raise RuntimeError(
             f"Scope-manager judgment failed ({exc.error_class}): {exc}. "
             f"The contribution is recorded as {exc.contribution_id} with a "
@@ -2175,8 +2338,9 @@ async def strata_contribute(
             "call strata_contribute again, which would duplicate it."
         ) from exc
 
-    # Asymmetry release valve (#110): an accepted contribution resets the
-    # read/contribute gap for this session; a decline does not.
+    # Write-back (M2): any verdict is a submission. Asymmetry release valve
+    # (#110): only an accepted contribution resets the read/contribute gap.
+    _record_submitted_contribution()
     _record_accepted_contribution(outcome.decision)
 
     return _attach_fleet_notice(
@@ -3054,13 +3218,18 @@ async def strata_session_stats() -> dict:
     if _session_store is not None:
         state = _session_store.read(_AGENT_SESSION_ID)
         if state is not None:
-            return state.model_dump()
+            stats = state.model_dump()
+            nudge = compute_nudge(state)
+            if nudge is not None:
+                stats["nudge"] = nudge
+            return stats
     return {
         "session_id": _AGENT_SESSION_ID,
         "reads": 0,
         "contributions": 0,
         "declines": 0,
         "reads_by_scope": {},
+        "harness": "",
         "updated_at": "",
     }
 
@@ -3115,6 +3284,7 @@ async def strata_session_closeout(reason: str) -> dict:
         "contributions": 0,
         "declines": 0,
         "reads_by_scope": {},
+        "harness": "",
         "updated_at": "",
     }
 
@@ -3230,7 +3400,11 @@ def main() -> None:
         )
         sys.exit(1)
 
-    mcp.run(transport="stdio")
+    signal.signal(signal.SIGTERM, _terminate_cleanly)
+    try:
+        mcp.run(transport="stdio")
+    finally:
+        _record_end()
 
 
 if __name__ == "__main__":

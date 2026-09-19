@@ -349,6 +349,59 @@ def test_agent_session_id_falls_back_deterministically_when_unset(
     assert resolve_agent_session_id({}) == mod._AGENT_SESSION_ID
 
 
+class _FakeClientInfo:
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+
+class _FakeSession:
+    def __init__(self, client_name: str | None) -> None:
+        self.client_params = (
+            None
+            if client_name is None
+            else type("P", (), {"clientInfo": _FakeClientInfo(client_name)})()
+        )
+
+
+def _fake_context(client_name: str | None):
+    request_context = type("RC", (), {"session": _FakeSession(client_name)})()
+    return type("Ctx", (), {"request_context": request_context})()
+
+
+def test_reads_record_the_harness_named_by_the_mcp_client(tmp_path: Path, monkeypatch) -> None:
+    """The MCP client's own initialize handshake says which harness this
+    session runs in (Codex sends clientInfo.name 'codex-mcp-client'); the
+    server stamps it into the session state so M2 can split write-back by
+    harness."""
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fleet_yaml(tmp_path)
+    monkeypatch.delenv("STRATA_AGENT_SESSION_ID", raising=False)
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+    monkeypatch.setattr(mod.mcp, "get_context", lambda: _fake_context("codex-mcp-client"))
+
+    mod._record_read("g_root")
+
+    state = mod._session_store.read(mod._AGENT_SESSION_ID)
+    assert state is not None
+    assert state.harness == "codex"
+
+
+def test_harness_is_unknown_when_no_client_info_is_available(tmp_path: Path, monkeypatch) -> None:
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fleet_yaml(tmp_path)
+    monkeypatch.delenv("STRATA_AGENT_SESSION_ID", raising=False)
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+    monkeypatch.setattr(mod.mcp, "get_context", lambda: _fake_context(None))
+
+    mod._record_read("g_root")
+
+    state = mod._session_store.read(mod._AGENT_SESSION_ID)
+    assert state is not None
+    assert state.harness == "unknown"
+
+
 def test_agent_session_id_treats_empty_string_as_unset(tmp_path: Path, monkeypatch) -> None:
     """Empty string counts as unset — Codex ships literal empty env values —
     so _AGENT_SESSION_ID falls back the same way an absent var does, never
@@ -1455,6 +1508,9 @@ async def test_entitled_no_argument_returns_bound_scope_data(tmp_path: Path) -> 
     )
     assert self_layer["scope_id"] == "g_team"
 
+    # The two reads above wrote nothing back, so the record read carries the
+    # nudge (since M3 it fires from the first read); it is asserted elsewhere.
+    record_result.pop("nudge", None)
     assert record_result == {
         "contributions": [],
         "judgments": [],
@@ -2658,6 +2714,38 @@ async def test_accepted_contribution_increments_session_counter(tmp_path: Path) 
     assert state.contributions == 1
 
 
+async def test_a_declined_contribution_is_still_a_submission(tmp_path: Path) -> None:
+    """Write-back counts any strata_contribute call, whatever the verdict: the
+    submitted counter moves on a decline while the accepted counter does not."""
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fleet_yaml(tmp_path)
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+    fleet = FleetConfig.load(fleet_path)
+    declined = ScopeManagerJudgment(decision="decline", reasoning="no", new_summary=None)
+
+    scope_p, skill_p, session_p = _patch_agent_binding(mod, scope="g_backend", session_id="sess_d")
+    with (
+        scope_p,
+        skill_p,
+        session_p,
+        patch.object(mod, "_load_fleet", return_value=fleet),
+        patch("strata.scope_manager.ScopeManager.judge", return_value=declined),
+        patch("anthropic.Anthropic", return_value=MagicMock()),
+    ):
+        await mod.strata_contribute(
+            scope_id="g_arch",
+            content="lunch is at noon",
+            proposed_classification="context",
+            subject=None,
+            supersedes=None,
+        )
+
+    state = mod._session_store.read("sess_d")
+    assert state is not None
+    assert (state.submitted, state.contributions) == (1, 0)
+
+
 async def test_declined_contribution_does_not_increment_counter(tmp_path: Path) -> None:
     """A scope-manager decline is not an accepted contribution — no counter bump."""
     db_path = _make_db(tmp_path)
@@ -2756,8 +2844,15 @@ async def test_closeout_records_decline_without_building_judge(tmp_path: Path) -
     assert state.declines == 1
 
 
-async def test_no_nudge_below_threshold(tmp_path: Path) -> None:
-    """Reads below the threshold carry no nudge — the early-read silence (#111)."""
+_NUDGE_BOTH_EXITS = (
+    "contribute what you learned, or call strata_session_closeout(reason) "
+    "if nothing is worth keeping"
+)
+
+
+async def test_the_nudge_fires_from_the_first_read_with_soft_wording(tmp_path: Path) -> None:
+    """Zero write-back and one read is enough: the very first read carries a soft nudge
+    that names both exits (contribute, or a closeout with a reason)."""
     db_path = _make_db(tmp_path)
     summaries_dir = str(tmp_path / "summaries")
     fleet_path = _make_fleet_yaml(tmp_path)
@@ -2766,13 +2861,15 @@ async def test_no_nudge_below_threshold(tmp_path: Path) -> None:
     SummaryStore(summaries_dir).write("g_arch", _make_summary("g_arch", "ctx"))
     fleet = FleetConfig.load(fleet_path)
 
-    results = await _seed_and_read(mod, fleet, scope="g_backend", session_id="sess_nb", times=2)
+    results = await _seed_and_read(mod, fleet, scope="g_backend", session_id="sess_first", times=1)
 
-    assert all("nudge" not in r for r in results)
+    nudge = results[0]["nudge"]
+    assert "1 time" in nudge
+    assert _NUDGE_BOTH_EXITS in nudge
+    assert "stale" not in nudge  # the soft tier
 
 
-async def test_nudge_appears_at_threshold_with_current_counts(tmp_path: Path) -> None:
-    """At the threshold the nudge fires and names the CURRENT read count."""
+async def test_nudge_names_the_current_count_and_both_exits_at_each_read(tmp_path: Path) -> None:
     db_path = _make_db(tmp_path)
     summaries_dir = str(tmp_path / "summaries")
     fleet_path = _make_fleet_yaml(tmp_path)
@@ -2783,16 +2880,10 @@ async def test_nudge_appears_at_threshold_with_current_counts(tmp_path: Path) ->
 
     results = await _seed_and_read(mod, fleet, scope="g_backend", session_id="sess_th", times=3)
 
-    # First two reads (below threshold) stay silent; the third fires.
-    assert "nudge" not in results[0]
-    assert "nudge" not in results[1]
-    nudge = results[2]["nudge"]
-    # Names the current count and points at the two release valves. Base tier
-    # (not yet escalated) — the escalation marker is absent.
-    assert "3" in nudge
-    assert "strata_session_closeout" in nudge
-    assert "strata_contribute" in nudge
-    assert "stale" not in nudge
+    assert "1 time" in results[0]["nudge"]
+    assert "3 times" in results[2]["nudge"]
+    assert all(_NUDGE_BOTH_EXITS in r["nudge"] for r in results)
+    assert all("stale" not in r["nudge"] for r in results)
 
 
 async def test_nudge_escalates_at_higher_threshold(tmp_path: Path) -> None:
@@ -2812,7 +2903,50 @@ async def test_nudge_escalates_at_higher_threshold(tmp_path: Path) -> None:
 
     assert "6" in escalated
     assert "stale" in escalated  # escalation marker, absent from the base tier
+    assert _NUDGE_BOTH_EXITS in escalated
     assert escalated != base_nudge
+
+
+async def test_nudge_rides_strata_session_stats(tmp_path: Path) -> None:
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fleet_yaml(tmp_path)
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+    SummaryStore(summaries_dir).write("g_arch", _make_summary("g_arch", "ctx"))
+    fleet = FleetConfig.load(fleet_path)
+
+    scope_p, skill_p, session_p = _patch_agent_binding(mod, scope="g_backend", session_id="sess_st")
+    with scope_p, skill_p, session_p, patch.object(mod, "_load_fleet", return_value=fleet):
+        before_any_read = await mod.strata_session_stats()
+        await mod.strata_read_scope_summary("g_arch")
+        stats = await mod.strata_session_stats()
+
+    assert "nudge" not in before_any_read  # nothing read yet: nothing to say
+    assert _NUDGE_BOTH_EXITS in stats["nudge"]
+
+
+async def test_nudge_rides_the_strata_bind_result(tmp_path: Path) -> None:
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fleet_yaml(tmp_path)
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+    fleet = FleetConfig.load(fleet_path)
+    mod._session_store.record_read("sess_bind", "g_arch")  # one read, zero write-back
+
+    scope_p, skill_p, session_p = _patch_agent_binding(
+        mod, scope="g_backend", session_id="sess_bind"
+    )
+    with (
+        scope_p,
+        skill_p,
+        session_p,
+        patch.object(mod, "_load_fleet", return_value=fleet),
+    ):
+        result = await mod.strata_bind(scope_id="g_backend", confirm=True)
+
+    assert _NUDGE_BOTH_EXITS in result["nudge"]
 
 
 async def test_nudge_silent_after_contribution(tmp_path: Path) -> None:
@@ -2898,9 +3032,8 @@ async def test_nudge_rides_perspective_and_record_reads(tmp_path: Path) -> None:
         persp = [await mod.strata_read_perspective("g_backend") for _ in range(3)]
         record = await mod.strata_read_scope_record("g_backend")
 
-    assert "nudge" not in persp[0]
-    assert "nudge" in persp[2]
-    assert "3" in persp[2]["nudge"]
+    assert "1 time" in persp[0]["nudge"]  # fires from the first read
+    assert "3 times" in persp[2]["nudge"]
 
     # The record read carries the nudge but did not itself bump the counter.
     assert "nudge" in record

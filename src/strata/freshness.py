@@ -13,11 +13,12 @@ counters and #111's mechanical decline. Two cooperating pieces live here:
    noise) when there is no ``.strata`` project, no session state, no API key, or
    on any error — a broken hook must never break the user's session.
 
-   **Strict mode** (opt-in, off by default): when ``STRATA_FRESHNESS_STRICT=1``
-   the hook instead BLOCKS the stop once with the contribute-or-decline
-   instruction (``{"decision": "block", "reason": ...}``), respecting
-   ``stop_hook_active`` so it never loops. No evaluator is spawned in strict
-   mode.
+   **Strict mode** (the default since M3; see :func:`strict_enabled`): the hook
+   instead BLOCKS the stop once per session with the contribute-or-closeout
+   instruction (``{"decision": "block", "reason": ...}``). At most twice: a
+   second, blunter block only when no strata call followed the first; never a
+   third, so it cannot loop. No evaluator is spawned in strict mode. ``strata register --no-strict``
+   (or ``STRATA_FRESHNESS_STRICT=0``) restores the background evaluator.
 
 2. **The background evaluator** (:func:`run_evaluator`). A headless model run
    that reads the session transcript tail (the hook passes ``transcript_path``
@@ -49,6 +50,7 @@ import contextlib
 import json
 import logging
 import os
+import subprocess
 import sys
 import time
 from collections.abc import Callable
@@ -61,6 +63,7 @@ from strata.session_state import (
     SessionStateStore,
     resolve_agent_session_id,
     sessions_dir_for,
+    strict_blocks_so_far,
 )
 
 if TYPE_CHECKING:
@@ -79,8 +82,9 @@ _logger = logging.getLogger("strata.freshness")
 #: only *drafts*; the judge that admits or declines the draft is unchanged.
 DEFAULT_EVALUATOR_MODEL = "claude-haiku-4-5-20251001"
 
-#: Env var that opts a project into strict (blocking) mode. Any value other than
-#: exactly ``"1"`` leaves the default (non-blocking, background-evaluator) mode.
+#: Env var that overrides the project's strict (blocking) setting: ``1`` forces it
+#: on, ``0`` forces the non-blocking background-evaluator mode. Unset defers to the
+#: project's ``[freshness] strict`` and then to the default (on).
 STRICT_MODE_ENV = "STRATA_FRESHNESS_STRICT"
 
 #: Env var that overrides :data:`DEFAULT_EVALUATOR_MODEL`.
@@ -103,12 +107,43 @@ TRANSCRIPT_TAIL_BYTES = 16_000
 #: read-time nudge's contribute-or-decline framing (issue #111) so the agent
 #: sees one consistent ask.
 STRICT_BLOCK_REASON = (
-    "This session has read fleet memory but recorded nothing back to it. Before "
-    "finishing, contribute the session's outcomes with strata_contribute so the "
-    "fleet's memory reflects what happened — or, if there is genuinely nothing "
-    "to record, call strata_session_closeout so an empty session stays "
-    "distinguishable from a forgotten one."
+    "This session has read fleet memory but written nothing back to it. Before "
+    "finishing, use strata_contribute to write back what you learned, or call "
+    "strata_session_closeout(reason) if nothing is worth keeping — so the fleet's "
+    "memory reflects what happened, and an empty session stays distinguishable "
+    "from a forgotten one."
 )
+
+
+#: The second (and last) strict block: blunter, and only issued when the first
+#: reminder was followed by no strata tool call at all.
+STRICT_LAST_REMINDER_REASON = (
+    "This is the last reminder: this session has read fleet memory and still "
+    "written nothing back, and you have not called any strata tool since the last "
+    "reminder. Do one of these now, before you finish: use strata_contribute to "
+    "write back what you learned, or call strata_session_closeout(reason) if "
+    "nothing is worth keeping. You will not be asked again."
+)
+
+
+def strict_enabled(env: dict[str, str], project_root: Path | None) -> bool:
+    """Whether strict (blocking) Stop-hook enforcement is on for this session.
+
+    Strict is the default. Precedence: ``STRATA_FRESHNESS_STRICT`` set to ``1`` or
+    ``0`` wins; otherwise the project's ``[freshness] strict`` setting in
+    ``.strata/config.toml`` (``strata register --no-strict`` writes ``false``);
+    otherwise ON for a registered project. With no project (the env-var dev flow)
+    there is no hook to enforce, so it is off.
+    """
+    override = env.get(STRICT_MODE_ENV)
+    if override in ("0", "1"):
+        return override == "1"
+    if project_root is None:
+        return False
+    from strata.project_config import read_freshness_strict  # noqa: PLC0415
+
+    configured = read_freshness_strict(project_root)
+    return True if configured is None else configured
 
 
 # ---------------------------------------------------------------------------
@@ -162,8 +197,8 @@ def gate_open(state: SessionState | None) -> bool:
 
     Open — the session has consumed memory without giving anything back — iff
     the session has read at least :data:`~strata.session_state.NUDGE_MIN_READS`
-    times with zero contributions and zero declines. A contribution or a
-    mechanical decline (the asymmetry's release valve, issue #109) closes it.
+    times with no write-back: no ``strata_contribute`` call (any verdict) and no
+    closeout. Any of those (the asymmetry's release valve, issue #109) closes it.
 
     Identical in shape to the read-time nudge's fire condition
     (:func:`strata.session_state.compute_nudge`), reusing the same threshold
@@ -172,7 +207,7 @@ def gate_open(state: SessionState | None) -> bool:
     """
     if state is None:
         return False
-    if state.contributions > 0 or state.declines > 0:
+    if state.contributions > 0 or state.submitted > 0 or state.declines > 0:
         return False
     return state.reads >= NUDGE_MIN_READS
 
@@ -180,6 +215,17 @@ def gate_open(state: SessionState | None) -> bool:
 # ---------------------------------------------------------------------------
 # Session-context resolution
 # ---------------------------------------------------------------------------
+
+
+def resolve_project_root() -> Path | None:
+    """The registered project root the hook runs in, or ``None`` (best effort)."""
+    try:
+        from strata.project_config import resolve_storage_paths  # noqa: PLC0415
+
+        paths = resolve_storage_paths()
+        return paths.project_root if paths.source == "project" else None
+    except Exception:  # noqa: BLE001 — hook must never raise
+        return None
 
 
 def resolve_session_store(env: dict[str, str]) -> SessionStateStore | None:
@@ -203,16 +249,62 @@ def resolve_session_store(env: dict[str, str]) -> SessionStateStore | None:
         return None
 
 
-def _strata_session_id(env: dict[str, str]) -> str:
+#: How many ancestors above the hook's own parent to try when looking for the
+#: session. One intermediate shell is what Claude Code adds; a few more cover a
+#: wrapper script or two without wandering up into the user's terminal.
+_MAX_ANCESTOR_HOPS = 4
+
+
+def _parent_pid(pid: int) -> int | None:
+    """Return *pid*'s parent pid, or ``None`` when it cannot be read.
+
+    ``/proc`` where it exists (Linux); ``ps`` elsewhere (macOS). Best effort: the
+    hook must never raise.
+    """
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        # "<pid> (<comm>) <state> <ppid> ..." — comm may contain spaces/parens.
+        return int(stat.rsplit(")", 1)[1].split()[1])
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
+        result = subprocess.run(  # noqa: S603
+            ["ps", "-o", "ppid=", "-p", str(pid)],  # noqa: S607
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+        return int(result.stdout.strip())
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def _strata_session_id(env: dict[str, str], store: SessionStateStore | None = None) -> str:
     """Return the session id the #110 state file is keyed by.
 
     The MCP server keys session state by ``STRATA_AGENT_SESSION_ID``, or the
-    same deterministic fallback (``sess_auto_<parent pid>``) when unset or
-    empty — see :func:`strata.session_state.resolve_agent_session_id` for why
-    this hook process and the MCP server process land on the identical id
-    with no IPC and no env var required (both are spawned directly by the
-    same harness process, so ``os.getppid()`` matches).
+    deterministic fallback ``sess_auto_<parent pid>`` when unset or empty — see
+    :func:`strata.session_state.resolve_agent_session_id`. An explicit id is used
+    as-is. For the fallback, the hook's own parent is only the server's parent if
+    the harness runs the hook directly: Codex does (verified), but Claude Code runs
+    it as ``/bin/sh -c 'sh <script>'`` and that outer shell survives, so the hook's
+    parent is the shell and not the ``claude`` process the MCP server hangs off
+    (found live in M3). So with a *store*, walk up the hook's ancestors and take
+    the nearest one that has a session record; when none does, fall back to the
+    plain parent-pid id.
     """
+    explicit = env.get("STRATA_AGENT_SESSION_ID", "")
+    if explicit or store is None:
+        return resolve_agent_session_id(env)
+    pid: int | None = os.getppid()
+    for _ in range(_MAX_ANCESTOR_HOPS + 1):
+        if pid is None or pid <= 1:
+            break
+        candidate = f"sess_auto_{pid}"
+        if store.read(candidate) is not None:
+            return candidate
+        pid = _parent_pid(pid)
     return resolve_agent_session_id(env)
 
 
@@ -307,7 +399,6 @@ def _default_spawn(session_id: str, transcript_path: str, env: dict[str, str]) -
     strata`` so the child resolves to the same engine running the hook, with no
     PATH assumption.
     """
-    import subprocess  # noqa: PLC0415
 
     subprocess.Popen(
         [
@@ -372,19 +463,37 @@ def run_stop_hook(
     # unset/empty one resolves to the deterministic sess_auto_<parent pid>
     # fallback (issue #112 gap — previously this returned "" here and the
     # hook silently no-op'd for the entire zero-export launch path).
-    session_id = _strata_session_id(env)  # type: ignore[arg-type]
+    session_id = _strata_session_id(env, store)  # type: ignore[arg-type]
 
+    strict = strict_enabled(env, resolve_project_root())  # type: ignore[arg-type]
     state = store.read(session_id)
+    if state is not None and state.strict != strict:
+        # The session record says which enforcement it ran under, so the
+        # write-back rate can state it.
+        store.record_strict(session_id, strict)
     if not gate_open(state):
         return 0
 
-    strict = env.get(STRICT_MODE_ENV) == "1"  # type: ignore[union-attr]
     if strict:
-        # Strict mode blocks once. If the stop was already blocked by this hook
-        # (stop_hook_active), never block again — that would loop forever.
-        if hook_input.stop_hook_active:
+        # Strict mode blocks at most TWICE per session, never a third time. The
+        # session record enforces the cap (stop_hook_active only covers the
+        # immediate continuation, and a later turn starts with it False again):
+        # a first reminder, then one "last reminder" only if the agent made no
+        # strata tool call at all since the first block.
+        blocks = strict_blocks_so_far(state) if state is not None else 0
+        if blocks == 0:
+            # A stop another hook already blocked is not ours to pile onto.
+            if hook_input.stop_hook_active:
+                return 0
+            reason = STRICT_BLOCK_REASON
+        elif (
+            blocks == 1 and state is not None and state.tool_calls == state.tool_calls_at_last_block
+        ):
+            reason = STRICT_LAST_REMINDER_REASON
+        else:
             return 0
-        out.write(json.dumps({"decision": "block", "reason": STRICT_BLOCK_REASON}))
+        store.record_strict_block(session_id)
+        out.write(json.dumps({"decision": "block", "reason": reason}))
         return 0
 
     # Default mode: never block. Spawn the detached evaluator behind the gate and

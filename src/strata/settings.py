@@ -27,6 +27,8 @@ import os
 from pydantic import AliasChoices, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from strata.session_state import DEFAULT_SESSION_IDLE_WINDOW_SECONDS
+
 
 class Settings(BaseSettings):
     """Application-wide configuration driven by environment variables.
@@ -86,6 +88,10 @@ class Settings(BaseSettings):
     # anything — the rest is one cursor away. Raise it to walk a long record in
     # fewer round trips; lower it to fit a tighter response budget.
     record_page_size: int = Field(default=20, ge=1)
+    # M3: how long (seconds) a session with no recorded end may sit idle before
+    # the write-back rate counts it as ended (a killed server never stamps its
+    # own end). `strata stats writeback --idle-window` overrides it per run.
+    session_idle_window_seconds: int = Field(default=DEFAULT_SESSION_IDLE_WINDOW_SECONDS, ge=1)
     # ADR 0011 D3: how many queued contributions one judgment call may carry.
     # A cap keeps the prompt bounded and keeps a failed call from stranding
     # more than a cap's worth of contributions at once. 1 disables coalescing

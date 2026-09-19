@@ -190,11 +190,23 @@ def test_merge_codex_freshness_hook_preserves_existing_hooks() -> None:
     assert 'command = "strata freshness-hook"' in text  # ours appended
 
 
-def test_merge_codex_freshness_hook_labelled_pending_verification() -> None:
+def test_merge_codex_freshness_hook_tells_the_reader_to_trust_it() -> None:
     text, _ = install.merge_codex_freshness_hook("")
-    # The merged block itself must self-document the unverified live-firing
-    # gap so a user reading config.toml sees the caveat, not just the README.
-    assert "not verified" in text.lower() or "pending" in text.lower()
+    # Codex does not run a hook until it is trusted ("Hooks need review"); the block
+    # says so where a user reading config.toml will see it, and no longer claims the
+    # hook's behaviour is unverified (it was verified live on codex-cli 0.153.4).
+    assert "Trust all and continue" in text
+    assert "NOT verified" not in text
+
+
+def test_a_block_written_by_an_earlier_release_is_still_removed_cleanly() -> None:
+    older = install.CODEX_HOOK_BLOCK_HISTORICAL[0]
+    assert "NOT verified" in older  # the wording that shipped through M3
+
+    remaining, status = install.remove_codex_freshness_hook("model = 'x'\n\n" + older)
+
+    assert status == "removed"
+    assert "hooks.Stop" not in remaining
 
 
 # ---------------------------------------------------------------------------
