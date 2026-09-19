@@ -199,7 +199,27 @@ def test_directive_not_in_current_summary_is_404(client):
 def test_operator_stratum_ids_are_refused(client):
     resp = client.post("/scopes/g_active/directives/op_abc/retire", json={"reason": None})
     assert resp.status_code == 422
-    assert "command line" in str(resp.json()["detail"])
+    detail = str(resp.json()["detail"])
+    assert "command line" in detail
+    # Names the general rule this action follows, not just the op_ example
+    # (issue #183).
+    assert "'c_'" in detail
+
+
+def test_non_c_non_op_id_is_refused_with_the_general_rule(client):
+    """An id that is neither ``c_`` nor ``op_`` (a typo, an older-format id, a
+    hand-written fixture) is refused for the real reason — it does not start
+    with ``c_`` — not told about operator-stratum items as if that were what
+    it was (issue #183: hit while testing with ``d_``-prefixed ids).
+    """
+    resp = client.post("/scopes/g_active/directives/d_weird/retire", json={"reason": None})
+    assert resp.status_code == 422
+    detail = str(resp.json()["detail"])
+    # States what the check actually checks.
+    assert "'c_'" in detail
+    # The op_ case is still named, but only as the specific example, not as
+    # a claim about what THIS id is.
+    assert "operator-stratum" in detail.lower()
 
 
 def test_blank_content_is_refused(client):

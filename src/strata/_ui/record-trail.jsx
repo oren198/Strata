@@ -19,12 +19,24 @@ const FALLBACK_META = { label: "Awaiting judgment", chipClass: "at-pill", icon: 
 
 const JUDGE_FAILED_META = { label: "Judgment failed", chipClass: "at-pill at-pill-warn", icon: "alert-triangle" };
 
+// ADR 0014 pin 4: a manager-refresh contribution still awaiting its refresh's
+// judgment is NOT a judge outage — it is an input change that has not been
+// processed yet. Same "clock" family as FALLBACK_META (nothing has failed),
+// distinct label so it never reads as an ordinary stuck judgment.
+const REFRESH_PENDING_META = { label: "Refresh pending", chipClass: "at-pill", icon: "clock" };
+
 // Pure — decides the plain-language label, chip class, and icon for one
 // contribution's state. The single place these words are decided.
 // `attempts` is accepted for signature parity with the judge_failed
-// sentence builder below but does not affect the chip itself.
-function stateWords(stateEntry, attempts) {
-  if (!stateEntry) return FALLBACK_META;
+// sentence builder below but does not affect the chip itself. `subject` is
+// the contribution's own `subject` field (ADR 0014 pin 4): a
+// "manager-refresh" contribution still without a verdict is refresh-pending,
+// never plain "Awaiting judgment" — an operator scanning this list for
+// judge outages must not count it as one.
+function stateWords(stateEntry, attempts, subject) {
+  if (!stateEntry || stateEntry.state === "pending") {
+    return subject === "manager-refresh" ? REFRESH_PENDING_META : FALLBACK_META;
+  }
   if (stateEntry.state === "judge_failed") return JUDGE_FAILED_META;
   if (stateEntry.state === "judged") {
     return DECISION_META[stateEntry.decision] ?? FALLBACK_META;
@@ -193,7 +205,7 @@ function RecordTrailView({ state, scopeId, onSelectScope }) {
 }
 
 function RecordEntryRow({ contribution, stateEntry, judgment, attempts, open, onToggle, onOpen }) {
-  const meta = stateWords(stateEntry);
+  const meta = stateWords(stateEntry, attempts, contribution.subject);
   return (
     <div className="activity-row">
       <button
@@ -282,7 +294,9 @@ function RecordEntryModal({ scopeId, contributionId, onClose }) {
     return () => { cancelled = true; };
   }, [scopeId, contributionId]);
 
-  const meta = entry ? stateWords(entry.state) : FALLBACK_META;
+  const meta = entry
+    ? stateWords(entry.state, entry.judgment_attempts, entry.contribution.subject)
+    : FALLBACK_META;
 
   return (
     <Modal open={!!contributionId} onClose={onClose} title="Record entry" width={640}>

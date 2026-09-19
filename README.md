@@ -113,9 +113,11 @@ The seeded file has one scope, `g_root` — for the quickstart, keep it as
 is and bind to it in the next step; one scope is a complete, working
 setup. Grow the fleet later, when real roles emerge: add scopes, strata,
 and edges to match your team (larger starter examples ship in
-`src/strata/_templates/`). After hand-editing, validate with `strata bootstrap`;
-if a Console is already running, restart it to pick up the change — the
-Console's graph is how you *see* the result, not how you edit it.
+`src/strata/_templates/`). Either hand-edit and validate with `strata
+bootstrap`, or edit it in the Console (`strata start`, graph tab → Edit
+fleet) — both paths write the same `fleet.yaml`. A running Console picks
+up either kind of edit on its next read, no restart; an already-running
+agent session keeps the fleet it started with until you restart it.
 
 ### 5. Bind and work
 

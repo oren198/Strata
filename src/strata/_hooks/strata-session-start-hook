@@ -1,0 +1,20 @@
+#!/bin/sh
+# Strata session-start hook — managed by `strata register`.
+#
+# A Claude Code `SessionStart` hook — the READ-side trigger for shared
+# memory, symmetric with the `strata-stop-hook` WRITE-side trigger beside it.
+# Nothing fires on its own to make an agent read its perspective at session
+# start; static instructions compete with everything else in context and
+# lose. This hook prints one short instruction to stdout, which the harness
+# injects as session context: read your perspective before your first
+# substantive answer. It never prints memory content itself — only the
+# instruction to go read it, plus the fleet's scope ids when cheaply
+# available, so an unbound session's ask is concrete. No database access, no
+# LLM call, no judging. It degrades silently on any error — a broken hook
+# must never break the session.
+#
+# This wrapper `exec`s the installed engine so PATH resolution matches
+# `strata-mcp`; the JSON payload on stdin flows through unchanged. All logic
+# lives in `strata session-start-hook` so the engine ships exactly one
+# implementation.
+exec strata session-start-hook

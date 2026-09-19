@@ -179,3 +179,42 @@ def test_perspective_unknown_scope_is_404(client):
 def test_perspective_does_not_attach_a_session_nudge(client):
     body = client.get("/scopes/g_child/perspective").json()
     assert "nudge" not in body
+
+
+def test_perspective_carries_the_scopes_unprocessed_input_changes(client):
+    """ADR 0014 D5: the Console's perspective view shows what a scope still owes.
+
+    The reader is wired here exactly as it is in the MCP server — an operator
+    asking "what does this agent actually see" must see the pending notices
+    too, not a view that looks current.
+    """
+    from strata.record_store import ContributorRef, RecordStore
+
+    with RecordStore(client.db_path) as rs:
+        notice = rs.append_contribution(
+            scope_id="g_child",
+            content="[Input change chg_a: item p_1 was withdrawn.]",
+            proposed_classification="context",
+            subject="manager-refresh",
+            supersedes=None,
+            contributor=ContributorRef(
+                scope_id="g_child",
+                skill="scope-manager",
+                session_id="refresh",
+                ts="2026-09-05T00:00:00+00:00",
+            ),
+        )
+        rs.append_change_event(
+            change_id="chg_a",
+            contribution_id=notice.id,
+            scope_id="g_child",
+            item_id="p_1",
+            kind="withdrawn",
+            before="Ship behind a flag.",
+            after=None,
+        )
+
+    body = client.get("/scopes/g_child/perspective").json()
+
+    assert [e["item_id"] for e in body["input_changes"]] == ["p_1"]
+    assert body["input_changes"][0]["change_id"] == "chg_a"

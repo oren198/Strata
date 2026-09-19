@@ -75,12 +75,7 @@ class ScopeSummary(BaseModel):
       detect staleness. ``0`` is reserved as the sentinel for a *synthesized*
       summary that has never actually been written to disk (see ``exists``)
       — real writes start at ``1`` and increase monotonically from there, so
-      any real write is always newer than the "no summary yet" sentinel and
-      ``parent_version < version`` staleness detection holds even across a
-      parent's first write.
-    * ``parent_version`` — the parent scope's ``version`` at the time this
-      summary was built.  ``None`` for L0 (root) scopes which have no
-      inter-stratum parent.
+      any real write is always newer than the "no summary yet" sentinel.
 
     Issue #59: callers that read a scope with no on-disk summary yet (e.g.
     ``GET /scopes/{id}/summary``, ``strata_read_scope_summary``) synthesize
@@ -105,10 +100,6 @@ class ScopeSummary(BaseModel):
     ``0`` is the sentinel for a synthesized (never-written) summary — see
     ``exists`` and the class docstring."""
 
-    parent_version: int | None = None
-    """The parent scope's ``version`` when this summary was last refreshed.
-    ``None`` for root scopes (no inter-stratum parent)."""
-
     exists: bool = True
     """Whether this summary corresponds to a real on-disk write.
 
@@ -118,45 +109,25 @@ class ScopeSummary(BaseModel):
     (``version=1``, ``exists=True``), which otherwise look identical.
     :meth:`SummaryStore.write` always forces this to ``True``."""
 
+    condensed: bool = False
+    """Whether the write that produced this ``context`` shortened it (issue #202).
 
-def splice_parent_directives(summary: ScopeSummary, parent_summary: ScopeSummary) -> ScopeSummary:
-    """Copy new or changed parent directive rows into *summary*, byte-exactly.
+    A derived, deliberately over-approximate signal: :func:`derive_condensed`
+    sets it when an accepted amendment replaced a non-empty context with a
+    shorter non-empty one (by word count). "Shorter" is the only mechanical
+    evidence that material was condensed away rather than never admitted, and
+    the benchmark rule behind issue #202 is that both owe the reader the same
+    disclosure.
 
-    ADR 0011 D4: inherited directives reach a child summary mechanically, not
-    by asking an LLM to quote them — ids, content, and provenance are carried
-    across as the parent's own rows, so the class of paraphrase bugs the
-    prompt's old "quote parent directives VERBATIM" rule guarded against
-    cannot occur.
-
-    A parent directive the child does not have is appended (parent order,
-    after the child's existing rows); one the child has under the same id but
-    with different bytes is replaced by the parent's row — the parent is
-    authoritative for it (CONTEXT.md § Directive: broader stratum wins). The
-    child's own local directives are untouched, and a parent directive that
-    has since left the parent's summary is NOT removed here: removing a
-    directive is a retirement, and retirement is a judged, recorded act.
-
-    Returns *summary* unchanged (the same object) when there is nothing to
-    splice, so a caller can tell a no-op refresh by identity.
+    Per-write, not sticky: an amendment that grows the context writes
+    ``False`` even though an earlier write may have dropped material. The
+    cumulative half of the answer is the perspective's
+    ``context_contributions_absent`` count (see
+    :func:`strata.perspective.compose_perspective`), not this flag. A write
+    that leaves ``context`` untouched (an operator supersede, a directive
+    retirement) carries the flag forward unchanged, because what it claims —
+    "this context is a condensation" — is still true of that same text.
     """
-    if not parent_summary.directives:
-        return summary
-
-    by_id = {d.id: index for index, d in enumerate(summary.directives)}
-    directives = list(summary.directives)
-    changed = False
-    for parent_directive in parent_summary.directives:
-        index = by_id.get(parent_directive.id)
-        if index is None:
-            directives.append(parent_directive)
-            changed = True
-        elif directives[index] != parent_directive:
-            directives[index] = parent_directive
-            changed = True
-
-    if not changed:
-        return summary
-    return summary.model_copy(update={"directives": directives})
 
 
 # ---------------------------------------------------------------------------
@@ -164,6 +135,34 @@ def splice_parent_directives(summary: ScopeSummary, parent_summary: ScopeSummary
 # ---------------------------------------------------------------------------
 
 _NONE_YET = "_(none yet)_"
+
+
+def _word_count(text: str) -> int:
+    """Words in *text*, whitespace-separated — the condensation measure (issue #202)."""
+    return len(text.split())
+
+
+def derive_condensed(previous_context: str | None, new_context: str) -> bool:
+    """Whether replacing *previous_context* with *new_context* condensed it (issue #202).
+
+    ``True`` when both are non-empty and *new_context* has strictly fewer
+    words. Nothing else: no judge is asked, no paraphrase is detected. The
+    rule is over-approximate on purpose — a rewrite that is merely tighter
+    reads as condensation, which is the safe direction to err in for a
+    disclosure signal. It is also incomplete on its own (a same-length
+    rewrite can still drop material), which is why the perspective pairs it
+    with the count of accepted-as-context contributions absent from the
+    context.
+
+    ``None`` (no summary on disk yet) is not a shortening: a first write
+    condenses nothing, it admits.
+    """
+    if previous_context is None:
+        return False
+    if not previous_context.strip() or not new_context.strip():
+        return False
+    return _word_count(new_context) < _word_count(previous_context)
+
 
 # Matches:  ### [c_abc123] the directive heading text
 _DIRECTIVE_HEADING_RE = re.compile(r"^###\s+\[([^\]]+)\]\s*(.*)")
@@ -188,9 +187,10 @@ def _render_summary(summary: ScopeSummary) -> str:
         "scope_id": summary.scope_id,
         "version": summary.version,
         "updated_at": summary.updated_at,
+        # Issue #202: persisted like `version`, so a reader holding only the
+        # file still learns that this context is a condensation.
+        "condensed": summary.condensed,
     }
-    if summary.parent_version is not None:
-        frontmatter["parent_version"] = summary.parent_version
     lines.append("---")
     lines.append(yaml.dump(frontmatter, default_flow_style=False).rstrip())
     lines.append("---")
@@ -264,7 +264,9 @@ def _parse_summary(text: str) -> ScopeSummary:
     scope_id: str = fm["scope_id"]
     updated_at: str = fm["updated_at"]
     version: int = int(fm.get("version", 1))
-    parent_version: int | None = fm.get("parent_version")
+    # Absent from every file written before issue #202 — such a file asserts
+    # nothing, which reads as False rather than as a decided "not condensed".
+    condensed: bool = bool(fm.get("condensed", False))
 
     # Parse body line by line using a simple state machine.
     # States: OUTSIDE, IN_DIRECTIVES, IN_DIRECTIVE_BLOCK, IN_CONTEXT
@@ -382,7 +384,7 @@ def _parse_summary(text: str) -> ScopeSummary:
         context=context,
         updated_at=updated_at,
         version=version,
-        parent_version=parent_version,
+        condensed=condensed,
     )
 
 

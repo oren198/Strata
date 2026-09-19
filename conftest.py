@@ -46,3 +46,44 @@ def _reset_lock_dir():
     locks._lock_dir = None
     yield
     locks._lock_dir = None
+
+
+@pytest.fixture(autouse=True)
+def _isolate_project_config_discovery(request: pytest.FixtureRequest, tmp_path, monkeypatch):
+    """Never let ``resolve_storage_paths()`` discover a REAL ``.strata/config.toml``.
+
+    :func:`strata.project_config.load_project_config` walks up from ``Path.cwd()``
+    by default (no explicit ``start=``) looking for ``.strata/config.toml`` —
+    and wins over any explicit ``Settings``/``fleet_yaml_path`` a test built for
+    itself (``resolve_storage_paths``'s documented precedence). Every worktree
+    under this repo nests inside a directory tree that now has a REAL, live
+    ``.strata/config.toml`` at the repo root (the dogfood fleet an operator
+    registered for their own day-to-day use) — so any test that builds a
+    ``create_app``/``Settings`` with a tmp fleet path but never passes an
+    explicit ``start=`` was silently resolving through to that real project
+    instead, and a save-path test (``PUT /fleet``) landed a live write on the
+    operator's actual ``fleet.yaml``, clobbering it, before this guard existed
+    (the incident this fixture fixes).
+
+    The fix pins the walk's default start directory at this test's own
+    ``tmp_path`` (which never has a ``.strata/``) whenever a caller does not
+    pass ``start=`` itself — an explicit ``start=`` (every test in
+    ``test_project_config.py`` and ``test_v1_3_1_hardening.py`` passes one)
+    is never touched, so real-discovery behavior stays fully testable on its
+    own terms. Opt out with ``@pytest.mark.real_machine`` for a test that
+    must exercise the genuine cwd-walk.
+    """
+    if request.node.get_closest_marker("real_machine") is not None:
+        return
+
+    import strata.project_config as project_config
+
+    real_load_project_config = project_config.load_project_config
+    guard_root = tmp_path / "_autouse_no_project_config_guard"
+
+    def _guarded_load_project_config(start=None, **kwargs):
+        if start is None:
+            start = guard_root
+        return real_load_project_config(start=start, **kwargs)
+
+    monkeypatch.setattr(project_config, "load_project_config", _guarded_load_project_config)

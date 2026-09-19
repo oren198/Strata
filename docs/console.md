@@ -7,15 +7,18 @@ Four new tabs sit alongside the existing memory graph and settings tabs:
 **Turned down**, **Freshness**, **Record**, and **View as**. A fifth surface,
 **Operator corrections** (the "Replace" / "Retire" actions), is not a tab —
 it lives in place, as row-level actions on a directive inside the existing
-scope drawer (the memory graph's scope detail view). All five are described
-below: what each shows, where the number comes from, and what it proves.
+scope drawer (the memory graph's scope detail view). A sixth, **Editing the
+fleet**, is also not a persistent tab — it opens from an "Edit fleet" button
+in the graph tab's header. All six are described below: what each shows,
+where the number comes from, and what it proves.
 
 The Console's endpoints (`GET /scopes/{id}/declines`, `GET /staleness`,
 `GET /scopes/{id}/record`, `GET /scopes/{id}/record/{contribution_id}`,
 `GET /scopes/{id}/perspective`, `POST /scopes/{id}/directives/{id}/supersede`,
-`POST /scopes/{id}/directives/{id}/retire`) exist to serve the Console.
+`POST /scopes/{id}/directives/{id}/retire`, `GET /fleet`,
+`POST /fleet/validate`, `PUT /fleet`) exist to serve the Console.
 Nothing in the engine — the contribute/judge path, the MCP server, the CLI —
-depends on any of them. They are additive reads (and, for the last two, an
+depends on any of them. They are additive reads (and, for the last four, an
 explicit in-person write) layered on top of the same stores the engine
 already uses.
 
@@ -118,3 +121,41 @@ same scope summary response as everything else in the drawer, but that list
 is capped at the 50 most recent retirements for the scope — older ones stay
 in the record and are still retired, they just drop off this convenience
 list.
+
+## Editing the fleet
+
+The "Edit fleet" button in the graph tab's header opens a text editor over
+the raw `fleet.yaml` — comments, blank lines, and all. This is deliberately
+not a form: the file stays the source of truth, and what you type is exactly
+what gets written back, byte for byte. Structured add-a-scope forms may come
+later, layered on the same endpoints; today, editing the fleet in the
+Console and hand-editing `.strata/fleet.yaml` in a text editor produce the
+identical file.
+
+**Validate** is a free dry run: it sends the text to `POST
+/fleet/validate`, which loads it through the exact same code path `strata
+bootstrap` uses — never a separate reimplementation of the invariant checks
+— and reports either the resulting scope/edge counts or the first invariant
+it violated, in plain language. Nothing is written either way.
+
+**Save** does four things in order, every time:
+
+1. **Validate** the submitted text again (the same check Validate runs) — a
+   fleet that fails to load is never written, full stop.
+2. **Check the etag** — a hash of the fleet file's bytes taken when you last
+   loaded or saved it — against the file's current bytes. A mismatch means
+   someone or something else changed `fleet.yaml` since you started editing;
+   the save is refused with a "reload and reapply your edit" message rather
+   than silently overwriting that other change.
+3. **Back up** the current file to `fleet.yaml.bak` before touching it.
+4. **Write** the new text to a temp file and atomically replace the real
+   `fleet.yaml` with it.
+
+**This Console updates now** — every route that reads the fleet stats
+`fleet.yaml` before serving (the same lazy reload this backend has always
+used to pick up an out-of-band edit without a restart), so the graph, scope
+counts, and everything else reflect the save on their very next read. What
+does **not** update automatically is any agent session already running:
+each one loaded the fleet at startup (ADR 0002) and keeps that copy until
+you restart it — the Console repeats this after every save so it's never a
+surprise.

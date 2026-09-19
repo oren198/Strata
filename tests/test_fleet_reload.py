@@ -214,6 +214,53 @@ def test_file_deleted_after_good_load_keeps_serving_and_sets_warning(tmp_path: P
     assert "fleet.yaml" in reloader.warning
 
 
+def test_file_deleted_after_good_load_sets_source_missing(tmp_path: Path) -> None:
+    """`.source_missing` distinguishes a vanished SOURCE FILE from a merely
+    invalid edit — callers that must gate on the former without gating on
+    the latter (strata.mcp.server._require_bound_or_elicit) read this."""
+    fleet_path = tmp_path / "fleet.yaml"
+    _write_fleet(fleet_path, ["g_a"])
+
+    reloader = FleetReloader(fleet_path)
+    reloader.get()
+    assert reloader.source_missing is False
+
+    fleet_path.unlink()
+    reloader.get()
+    assert reloader.source_missing is True
+
+
+def test_invalid_edit_does_not_set_source_missing(tmp_path: Path) -> None:
+    """A present-but-invalid fleet.yaml sets `.warning` but NOT
+    `.source_missing` — the file is still there, just broken; reload-on-read
+    keeps serving stale content and this stays a non-gating condition."""
+    fleet_path = tmp_path / "fleet.yaml"
+    _write_fleet(fleet_path, ["g_a"])
+
+    reloader = FleetReloader(fleet_path)
+    reloader.get()
+
+    fleet_path.write_text("not: [valid, fleet, yaml", encoding="utf-8")
+    reloader.get()
+    assert reloader.warning is not None
+    assert reloader.source_missing is False
+
+
+def test_source_missing_clears_when_file_reappears(tmp_path: Path) -> None:
+    fleet_path = tmp_path / "fleet.yaml"
+    _write_fleet(fleet_path, ["g_a"])
+
+    reloader = FleetReloader(fleet_path)
+    reloader.get()
+    fleet_path.unlink()
+    reloader.get()
+    assert reloader.source_missing is True
+
+    _write_fleet(fleet_path, ["g_a", "g_b"])
+    reloader.get()
+    assert reloader.source_missing is False
+
+
 def test_missing_file_from_the_start_sets_no_warning(tmp_path: Path) -> None:
     """A fleet.yaml that never existed is a normal empty-fleet case, not a failure."""
     fleet_path = tmp_path / "does_not_exist.yaml"

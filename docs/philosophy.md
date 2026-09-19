@@ -59,6 +59,8 @@ The power of scope is that it makes reach explicit and structural instead of lea
 
 An agent does not see the whole store. It sees memory from its own scope and from every scope that contains it — it **inherits** the broader memory above it while remaining blind to memory in scopes that do not contain it.
 
+What it inherits from above is what *binds* it: the **directives** of every containing scope, in full, to any depth. It does not inherit those scopes' **context** — their working observations. A containing scope's observations are its own working memory, written for its own readers; what a descendant knows of an ancestor should be what that ancestor decided, plus whatever it deliberately chose to say. Inheritance carries authority downward, not the whole interior of every scope above. An ancestor that wants an observation read below it publishes it, like anyone else.
+
 This is the mechanism of shared *reading*. A fleet-wide decision is visible to every agent because every agent sits within the broadest scope. A team-specific fact is visible only within that team. Visibility falls directly out of the scope hierarchy: an agent sees what reaches it.
 
 Visibility is structural, and it stays structural. When a scope needs readers — or reading — beyond what its position provides, the answer is never to grant reach ad hoc: it is to add structure the whole fleet can see in its definition (an explicit reference, a published face). **Reach is never granted; structure is added.** The same rule governs delegation: an agent may spawn sub-agents bound only to its own scope or a narrower one — reach can only shrink through delegation, never widen.
@@ -79,7 +81,7 @@ The result is the resolution of the central tension. Every agent can influence s
 
 ### Where authority grounds: the operator
 
-One question remains: what gives the *broadest* scope its authority? Nothing inside the fleet can — every scope's authority is derived from the level above it. The chain grounds outside the system, in the **operator**: the human who defined the fleet in the first place. The operator is best understood as an implicit stratum above the broadest scope — not a special mechanism, but the top of the same structure. Like any stratum, the operator's layer carries both **directives** (binding) and **context** (informative), and the ordinary precedence rule is all that is needed: a fleet-wide native directive cannot contradict an operator directive for the same reason a team directive cannot contradict a fleet-wide one — nothing outranks the source of its own authority.
+One question remains: what gives the *broadest* scope its authority? Nothing inside the fleet can — every scope's authority is derived from the level above it. The chain grounds outside the system, in the **operator**: the human who defined the fleet in the first place. The operator is best understood as an implicit stratum above the broadest scope — not a special mechanism, but the top of the same structure. Like any stratum, what the operator's layer sends downward is **directives**, and the ordinary precedence rule is all that is needed: a fleet-wide native directive cannot contradict an operator directive for the same reason a team directive cannot contradict a fleet-wide one — nothing outranks the source of its own authority.
 
 Three things distinguish the operator layer, and all three follow from its position rather than from special rules:
 
@@ -99,18 +101,18 @@ Because memory is scoped and an agent inherits several scopes at once, a reader 
 
 Instead, an agent's memory is **composed**: presented as the layered set of scopes it inherits, each retaining its identity and reach, assembled into one coherent view at the moment of reading. Composition is a *mechanism* in service of sharing — it is how a scoped, hierarchical store presents itself to a single reader — not the purpose of the system.
 
-A helpful analogy is variable scope in programming: a local context, an enclosing context, and a global context are all visible at once as a single namespace, with inner contexts able to shadow outer ones, yet no one "merges" them into a single undifferentiated bag. Shared fleet memory composes the same way.
+A helpful analogy is variable scope in programming: a local context, an enclosing context, and a global context are all visible at once as a single namespace, each still identifiable as its own, yet no one "merges" them into a single undifferentiated bag. Shared fleet memory composes the same way — with one difference the analogy does not carry. An inner programming scope may shadow an outer one; an inner *fleet* scope may not. What reaches it from above is binding (Concept 5), so a narrower scope refines within an inherited directive rather than overriding it.
 
 ---
 
 ## Core concept 5: Precedence — directives versus context
 
-Once composition keeps multiple reaches side by side, conflicts between them must resolve by rule. The key insight is that the right rule **depends on the kind of memory**, and there are two kinds that obey opposite rules.
+Once composition keeps multiple reaches side by side, what a reader does when memory conflicts must be settled by rule. The key insight is that the right rule **depends on the kind of memory**, and the two kinds behave differently.
 
 - **Directives** are binding decisions — what the fleet (or a part of it) has resolved to do or to treat as true. For directives, **broader authority wins.** A narrower scope inherits a directive and may refine within it, but may not contradict it. A worker's local belief cannot repeal a fleet-wide decision.
-- **Context** is observation and working state — what is happening, what was just learned. For context, **the closest scope wins.** The most specific, most recent context is the most relevant when two pieces conflict.
+- **Context** is observation and working state — what is happening, what was just learned. Context does not cross scope boundaries by inheritance at all (Concept 2), so it never arrives from a competing scope to be ranked against. Its precedence rule operates *within* a scope: **the most recent observation wins**, and supersedes what it contradicts.
 
-These pull in opposite directions — authority flows *down* for directives, relevance flows *up* for context — and that is precisely why they must be distinguished. They rarely truly collide, because they govern different kinds of content; and a piece of context never overrides a directive, no matter how close or how recent. Distinguishing the two is what makes the composed view coherent rather than contradictory.
+The asymmetry is the point. A directive reaches every descendant and outranks anything narrower; an observation stays home and is arbitrated only against the same scope's own earlier observations. What a reader receives from elsewhere that is neither of these — another scope's published knowledge — is non-binding by construction (Concept 8) and so enters no precedence contest: it is read as a report, attributed to its source, and weighed. The rule that must never bend is the one across kinds: **a piece of context never overrides a directive**, no matter how close or how recent. Distinguishing the two is what makes the composed view coherent rather than contradictory.
 
 ---
 
@@ -132,13 +134,15 @@ There are several kinds of forgetting, and they are conceptually distinct:
 - **Decay** — memory that is rarely used or poorly trusted fades from relevance over time.
 - **Retirement** — an authority deliberately withdraws a piece of shared memory.
 
+These are not three flavours of the same act. Decay and supersession concern **relevance and currency**: the item was honestly held, and it stops being carried when it stops mattering or something newer covers it. Retirement, when it is a **correction**, concerns **truth**: the item should not have been held, and readers may have acted on it. That difference is not one of urgency — a fleet corrects what it notices, and no memory corrects what nobody notices — but of what is owed to whom. Decay owes nobody an announcement; a note that quietly stopped being interesting can quietly stop being carried. A correction owes notice to everyone the claim reached, for the reason Concept 8 gives: a reader who built on a claim cannot revise unless it is handed the retraction as evidence, and a claim that is merely absent looks the same as one that was never there. A system that treats correction as a species of decay will get the removal right and the notice wrong, which is the half that matters to everyone downstream.
+
 A useful principle is to separate the **record** from the **working memory**: the raw history of what was contributed can be kept immutably for accountability and recovery, while the curated memory that agents actually read is allowed to forget. Forgetting then operates on the working view without destroying the system's ability to look back.
 
 ---
 
 ## Core concept 8: Publication — how memory crosses sideways
 
-The concepts so far give memory two sanctioned directions of travel. Directives cross *downward*: an authority publishes, descendants are bound. Evidence crosses *upward*: contributions are judged, and what proves out is ratified into broader reach. But fleets also need memory to travel *sideways* — between scopes where neither contains the other. One team needs another's interfaces, conventions, findings, status: knowledge that is wider than its home scope but narrower than the common ancestor, and informative rather than binding.
+The concepts so far give memory two sanctioned directions of travel. Directives cross *downward*: an authority decides, descendants are bound. Evidence crosses *upward*: contributions are judged, and what proves out is ratified into broader reach. But fleets also need memory to travel *sideways* — between scopes where neither contains the other. One team needs another's interfaces, conventions, findings, status: knowledge that is wider than its home scope but narrower than the common ancestor, and informative rather than binding.
 
 Neither existing direction serves this. Sharing a scope's entire working face is naive sharing wearing labels: internal memory is written for internal readers — half-formed hypotheses, dead ends, low-trust observations — and exporting it wholesale is exactly the contamination and relevance collapse this design exists to prevent. Ratifying into a common ancestor forces every sideways share to escalate into a claim it doesn't mean: binding force, and relevance to everyone under the ancestor.
 
@@ -154,8 +158,9 @@ Publication carries obligations that follow from the concepts before it:
 - **Published within believed.** A scope publishes from its own memory only; it cannot publish what it does not hold. When the source memory is superseded or retired, its publication follows.
 - **Trust flows home.** Outcomes from readers acting on a publication feed back to the source memory — otherwise self-correction (Concept 6) is severed at exactly the boundary where errors travel farthest.
 - **Attribution survives condensation.** Memory that entered a scope from another's publication stays attributed to its source — "according to X" — not only when views are composed (Concept 4) but through every rewrite of the reader's own memory. Provenance that dissolves in summarization is provenance lost.
-- **No echo.** A publication never counts as corroboration for its own source. Wherever ratification weighs corroboration, corroboration must be provenance-independent — or one scope's hypothesis, republished by another, returns dressed as consensus.
-- **Forgetting, with extra force.** A stale publication contaminates other teams, not just its own. Withdrawal must be possible and must actually stop readers from acting on it.
+- **Attribution is a live claim, not a historical note.** "According to X" asserts that X stands behind the claim *now*. When X withdraws it, the attribution is no longer true and must go — and the claim goes with it, unless the reader re-grounds it on evidence of its own. Re-grounding is ordinary supersession inside the reader's memory: the attributed item is replaced by one the reader holds on its own account. Dropping the label while keeping the claim on no ground of one's own is not re-grounding; it is laundering, and it is how a retracted claim comes back as an echo.
+- **No echo.** A publication never counts as corroboration for its own source. Wherever ratification weighs corroboration, corroboration must be provenance-independent — or one scope's hypothesis, republished by another, returns dressed as consensus. Independence is a property of the *evidence*, not of who first said the words: a reader that has re-grounded a claim on its own outcomes corroborates it genuinely, even if the claim originated with the scope now reading it back.
+- **Forgetting, with extra force.** A stale publication contaminates other teams, not just its own. Withdrawal must be possible and must actually stop readers from acting on it. Because a publication never binds, a withdrawal cannot reach into a reader's memory and delete; it reaches the reader as *evidence* — the fact and identity of what was withdrawn, a reason if the source chooses to give one — and the reader's own authority revises. The new face alone is not enough: a claim that is merely absent looks the same as one that was never there, and a reader cannot act on a retraction it was never handed.
 
 Publication is demand-driven, not a duty. A scope nobody needs to read from is not failing by staying quiet; the system's job is to make publish-and-subscribe wiring legible enough that unmet demand is visible when it exists.
 
@@ -179,7 +184,7 @@ This is the deeper answer to the original goal. The fleet improves not because m
 | Visibility through inheritance | What memory can a given agent see? |
 | Authority and controlled contribution | What may an agent assert, and how far? |
 | Composition over merging | How are multiple reaches presented to one reader? |
-| Precedence (directives vs. context) | When sources conflict, which wins? |
+| Precedence (directives vs. context) | When memory conflicts, which wins? |
 | Provenance and earned trust | How reliable is a piece of memory, and who is accountable? |
 | Forgetting | How does memory stay relevant over time? |
 | Publication | How does memory travel sideways, without authority? |

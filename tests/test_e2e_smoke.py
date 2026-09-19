@@ -223,7 +223,11 @@ def test_e2e_full_loop(tmp_path):
 
         with RecordStore(db_path) as rs:
             contribs = rs.list_contributions(scope_id="g_arch")
-            assert len(contribs) == 2
+            # The two agent contributions, plus the scope's own notice that a
+            # directive its readers may have acted on was superseded (issue
+            # #197): a manager-refresh row nobody has to judge.
+            assert len([c for c in contribs if c.subject != "manager-refresh"]) == 2
+            assert [c.subject for c in contribs].count("manager-refresh") == 1
             judgments = rs.list_judgments(scope_id="g_arch")
             assert len(judgments) == 2
 
@@ -270,7 +274,13 @@ def test_e2e_full_loop(tmp_path):
         resp = client.get("/scopes/g_arch/record")
         assert resp.status_code == 200
         record_payload = resp.json()
-        assert len(record_payload["contributions"]) == 3
+        # Three agent contributions, plus the scope's own supersession notice
+        # to its readers (issue #197), which carries no judgment.
+        agent_contributions = [
+            c for c in record_payload["contributions"] if c["subject"] != "manager-refresh"
+        ]
+        assert len(agent_contributions) == 3
+        assert len(record_payload["contributions"]) == 4
         assert len(record_payload["judgments"]) == 3
 
         # ------------------------------------------------------------------

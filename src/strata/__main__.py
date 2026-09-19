@@ -67,7 +67,7 @@ if TYPE_CHECKING:
     from strata.fleet_config import FleetConfig
     from strata.record_store import RecordStore
     from strata.scope_manager import ScopeManager
-    from strata.summary_store import ScopeSummary, SummaryStore
+    from strata.summary_store import SummaryStore
 
 from strata import DISTRIBUTION_NAME, __version__, install
 from strata.install import (
@@ -83,6 +83,9 @@ from strata.install import (
     HOOK_SCRIPT_NAME as _HOOK_SCRIPT_NAME,
 )
 from strata.install import (
+    HOOK_SCRIPT_NAME_SESSION_START as _HOOK_SCRIPT_NAME_SESSION_START,
+)
+from strata.install import (
     MCP_ENTRY as _MCP_ENTRY,
 )
 from strata.install import (
@@ -93,6 +96,7 @@ from strata.install import (
     copy_hook,
     copy_skill,
     merge_mcp_server,
+    merge_session_start_hook,
     merge_stop_hook,
     render_action_line,
 )
@@ -148,6 +152,9 @@ from strata.install import (
     remove_gitignore_block as _remove_gitignore_block,
 )
 from strata.install import (
+    remove_session_start_hook as _remove_session_start_hook,
+)
+from strata.install import (
     remove_stop_hook as _remove_stop_hook,
 )
 from strata.install import (
@@ -158,6 +165,9 @@ from strata.install import (
 )
 from strata.install import (
     self_update_skill as _self_update_skill,
+)
+from strata.install import (
+    session_start_hook_present as _session_start_hook_present,
 )
 from strata.install import (
     skill_matches_shipped as _skill_matches_shipped,
@@ -818,11 +828,18 @@ def cmd_doctor(args: argparse.Namespace) -> int:
        ``.claude/settings.json`` copy if that's all that's present).
     5. Stop hook script present and matching the shipped version.
     6. ``hooks.Stop`` entry present in ``.claude/settings.json``.
+    6b. SessionStart hook script present and matching the shipped version —
+        the READ-side trigger, symmetric with check 5.
+    6c. ``hooks.SessionStart`` entry present in ``.claude/settings.json`` —
+        symmetric with check 6.
     7. Skills present in ``.claude/skills/``.
     8. Binding env vars (``STRATA_AGENT_SCOPE`` / ``_SKILL`` / ``_SESSION_ID``)
        set and valid against the fleet.
     9. Judge key (``JUDGE_API_KEY`` / ``ANTHROPIC_API_KEY``) resolvable —
        soft, like check 8's session-id half: never flips the exit code.
+    10. Refresh queue depth and oldest pending event (ADR 0014 D6, pin 4) —
+        soft, purely informational: an unprocessed ``change_events`` row is
+        an input change awaiting its refresh, never a judge outage.
     """
     from strata.bootstrap import load_fleet_config
     from strata.fleet_config import FleetConfigError
@@ -1006,9 +1023,17 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     settings_error: str | None = None
     if settings_json.exists():
         try:
-            settings_data = json.loads(settings_json.read_text(encoding="utf-8"))
+            loaded_settings_json = json.loads(settings_json.read_text(encoding="utf-8"))
         except json.JSONDecodeError as exc:
-            settings_error = str(exc)
+            settings_error = f"not valid JSON ({exc})"
+        else:
+            # Valid JSON but not an object (e.g. `[]`, `null`, a bare string)
+            # — .get()/settings lookups below assume a dict; route this
+            # through the same "fix the file" message rather than crashing.
+            if isinstance(loaded_settings_json, dict):
+                settings_data = loaded_settings_json
+            else:
+                settings_error = f"not a JSON object (got {type(loaded_settings_json).__name__})"
 
     # -----------------------------------------------------------------------
     # 4. MCP server entry present — checked in `.mcp.json`, the file Claude
@@ -1181,7 +1206,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                 kind="hard",
                 passed=False,
                 message=(
-                    f".claude/settings.json is not valid JSON ({settings_error}) — fix the "
+                    f".claude/settings.json is {settings_error} — fix the "
                     "file, then run 'strata register' to add the Stop hook entry."
                 ),
             )
@@ -1204,6 +1229,101 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                 message=(
                     "missing from .claude/settings.json hooks.Stop — run 'strata register' "
                     "to add it."
+                ),
+            )
+        )
+
+    # -----------------------------------------------------------------------
+    # 6b. SessionStart hook script present and matching shipped — the
+    # READ-side trigger, symmetric with check 5 above.
+    # -----------------------------------------------------------------------
+    session_start_hook_script = project_root / ".claude" / "hooks" / _HOOK_SCRIPT_NAME_SESSION_START
+    if not session_start_hook_script.exists():
+        checks.append(
+            Check(
+                name="SessionStart hook",
+                kind="hard",
+                passed=False,
+                message="script missing — run 'strata register' to restore it.",
+            )
+        )
+    else:
+        session_start_hook_status = _classify_hook_drift(
+            session_start_hook_script, _HOOK_SCRIPT_NAME_SESSION_START
+        )
+        if session_start_hook_status == "stale":
+            checks.append(
+                Check(
+                    name="SessionStart hook",
+                    kind="hard",
+                    passed=False,
+                    message=(
+                        "script present but does not match the shipped version (an older "
+                        "shipped version) — run 'strata register' to refresh it."
+                    ),
+                )
+            )
+        elif session_start_hook_status == "edited":
+            checks.append(
+                Check(
+                    name="SessionStart hook",
+                    kind="hard",
+                    passed=False,
+                    message=(
+                        "script present but does not match the shipped version — run "
+                        "'strata register' to restore it (or keep it if you edited it "
+                        "intentionally)."
+                    ),
+                )
+            )
+        else:
+            note = (
+                ""
+                if session_start_hook_status == "match"
+                else " (shipped version unavailable to compare)"
+            )
+            checks.append(
+                Check(
+                    name="SessionStart hook",
+                    kind="hard",
+                    passed=True,
+                    message=f"script present{note}",
+                )
+            )
+
+    # -----------------------------------------------------------------------
+    # 6c. hooks.SessionStart entry present — symmetric with check 6 above.
+    # -----------------------------------------------------------------------
+    if settings_error is not None:
+        checks.append(
+            Check(
+                name="SessionStart hook entry",
+                kind="hard",
+                passed=False,
+                message=(
+                    f".claude/settings.json is {settings_error} — fix the "
+                    "file, then run 'strata register' to add the SessionStart hook entry."
+                ),
+            )
+        )
+    elif _session_start_hook_present(settings_data):
+        checks.append(
+            Check(
+                name="SessionStart hook entry",
+                kind="hard",
+                passed=True,
+                message="present in .claude/settings.json hooks.SessionStart",
+            )
+        )
+    else:
+        checks.append(
+            Check(
+                name="SessionStart hook entry",
+                kind="hard",
+                passed=False,
+                message=(
+                    "missing from .claude/settings.json hooks.SessionStart — run "
+                    "'strata register' to add it."
                 ),
             )
         )
@@ -1301,12 +1421,11 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
     scope_obj = None
     if fleet_config is not None and scope:
-        scope_obj = fleet_config.get_scope(scope)
-        if scope_obj is None:
-            available = ", ".join(s.id for s in fleet_config.active_scopes())
-            binding_problems.append(
-                f"scope {scope!r} not found in fleet.yaml (available: {available or '(none)'})"
-            )
+        from strata.mcp.server import _check_scope_exists
+
+        scope_obj, exists_error = _check_scope_exists(fleet_config, scope, require_active=True)
+        if exists_error is not None:
+            binding_problems.append(exists_error)
 
     # A scope that declares no skills (no default_skill, no permitted_skills)
     # may bind skill-less — mirrors strata.mcp.server._validate_binding.
@@ -1404,6 +1523,87 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             )
         )
 
+    # -----------------------------------------------------------------------
+    # 10. Refresh queue (ADR 0014 D6, pin 4). Soft and purely informational —
+    # never flips the exit code: an unprocessed change_events row is an input
+    # change waiting for its refresh to run, NOT a judge outage, so it is
+    # reported on its own line rather than folded into any pending/failed
+    # judgment count. Read-only sqlite3 URI, exactly like check 2 — this must
+    # never create the table it is reporting on.
+    # -----------------------------------------------------------------------
+    if paths is None:
+        checks.append(
+            Check(
+                name="Refresh queue",
+                kind="soft",
+                passed=True,
+                message="skipped — fix the project config check above first.",
+            )
+        )
+    else:
+        refresh_db_file = Path(paths.db_path)
+        conn: sqlite3.Connection | None = None
+        try:
+            if not refresh_db_file.exists():
+                raise sqlite3.OperationalError("no database file")
+            conn = sqlite3.connect(f"file:{refresh_db_file}?mode=ro", uri=True)
+            row = conn.execute(
+                """
+                SELECT COUNT(*), MIN(created_at)
+                FROM change_events
+                WHERE processed_at IS NULL
+                """
+            ).fetchone()
+            depth, oldest_at = row[0], row[1]
+            oldest_scope = None
+            if depth:
+                oldest_scope = conn.execute(
+                    """
+                    SELECT scope_id FROM change_events
+                    WHERE processed_at IS NULL
+                    ORDER BY created_at ASC, rowid ASC LIMIT 1
+                    """
+                ).fetchone()[0]
+        except sqlite3.Error:
+            # No database yet, unreachable, or change_events doesn't exist
+            # (migration 0010 not applied) — the DB check above already
+            # reports that; this check just has nothing to add rather than
+            # repeating it.
+            checks.append(
+                Check(
+                    name="Refresh queue",
+                    kind="soft",
+                    passed=True,
+                    message="skipped — see the Database check above.",
+                )
+            )
+        else:
+            if depth:
+                checks.append(
+                    Check(
+                        name="Refresh queue",
+                        kind="soft",
+                        passed=True,
+                        message=(
+                            f"{depth} pending — oldest queued at {oldest_at} "
+                            f"({oldest_scope}); a refresh has not yet processed it "
+                            "(ADR 0014 D6 — not a judge outage)."
+                        ),
+                    )
+                )
+            else:
+                checks.append(
+                    Check(
+                        name="Refresh queue",
+                        kind="soft",
+                        passed=True,
+                        message="0 pending — no input change is waiting on a refresh.",
+                    )
+                )
+        finally:
+            if conn is not None:
+                conn.close()
+
     return _run_preflight(checks)
 
 
@@ -1445,8 +1645,8 @@ def cmd_operator_publish(args: argparse.Namespace) -> int:
         item = operator_publish(
             args.scope_id,
             args.content,
-            args.kind,
             args.subject,
+            fleet=stores.fleet_config,
             record_store=stores.record_store,
             summaries_dir=stores.summary_store.summaries_dir,
         )
@@ -1484,10 +1684,11 @@ def cmd_operator_supersede(args: argparse.Namespace) -> int:
                     item_id,
                     args.content,
                     args.subject,
+                    fleet=stores.fleet_config,
                     record_store=stores.record_store,
                     summaries_dir=stores.summary_store.summaries_dir,
                 )
-            except KeyError as exc:
+            except (KeyError, ValueError) as exc:
                 print(str(exc), file=sys.stderr)
                 return 1
             print(
@@ -1550,6 +1751,7 @@ def cmd_operator_retire(args: argparse.Namespace) -> int:
                 act = operator_retire_item(
                     args.scope_id,
                     item_id,
+                    fleet=stores.fleet_config,
                     record_store=stores.record_store,
                     summaries_dir=stores.summary_store.summaries_dir,
                 )
@@ -1747,6 +1949,7 @@ def cmd_publication_bootstrap(args: argparse.Namespace) -> int:
                 record_store=stores.record_store,
                 summary_store=stores.summary_store,
                 scope_manager=manager,
+                publication_max_words=settings.publication_max_words,
             )
         except ValueError as exc:
             print(str(exc), file=sys.stderr)
@@ -1816,19 +2019,6 @@ def cmd_export_fleet(args: argparse.Namespace) -> int:
     return 0
 
 
-def _is_stale(summary: ScopeSummary, parent_summary: ScopeSummary) -> bool:
-    """Return True when *summary* was built from an older parent version.
-
-    A summary is stale when its ``parent_version`` stamp is less than the
-    parent scope's current ``version`` stamp.  A missing ``parent_version``
-    (``None``) is treated as stale so that legacy summaries without stamps
-    get refreshed on the next launch.
-    """
-    if summary.parent_version is None:
-        return True
-    return summary.parent_version < parent_summary.version
-
-
 def _refresh_scope(
     scope_id: str,
     *,
@@ -1839,29 +2029,31 @@ def _refresh_scope(
     summary_max_words: int,
     window_verbatim_tail: int | None = None,
     recency_window_size: int | None = None,
-    _visited: set[str] | None = None,
 ) -> None:
-    """Refresh the summary for *scope_id*: mechanical splice, then one LLM call.
+    """Refresh one scope by draining it — the same call the MCP read makes.
 
-    Recursively refreshes stale ancestors first (root-first order).  Uses a
-    ``_visited`` set to guard against cycles (which validation prevents, but
-    this is defensive).
+    ONE mechanism (ADR 0014 implementation pin 6): the refresh is
+    :func:`strata.app.drain_scope`, and it is the input-change drain (ADR 0014
+    D6). The mechanical parent-directive splice that used to run alongside it
+    is gone with ADR 0015 D1 — a directive lives in its owner's summary and a
+    descendant assembles it on read — and so is the version-comparison
+    staleness detection this function once carried, which said only "the
+    parent moved", a proxy for what the change events now say outright.
 
-    ADR 0011 D4 splits the refresh in two: the parent's directives are
-    incorporated MECHANICALLY (:func:`~strata.summary_store.splice_parent_directives`
-    — byte-exact, ids and provenance preserved, no LLM), and the judge call
-    that follows reconciles the context digest with that refreshed state. Its
-    amendment may carry only ``new_context`` and lifecycle ops. The refresh
-    contribution and its judgment are recorded exactly as before: the summary
-    never moves without a record trail.
+    What is left here is the CLI's share: resolving the scope, and reporting.
 
-    ADR 0004 Decision 4 — last-write-wins; no lock.
+    Ancestors are NOT walked here — :func:`_run_manager_refresh` and
+    :func:`cmd_refresh` do the root-first walk, so this refreshes exactly the
+    scope it was given.
+
+    Raises:
+        DrainFailed: the refresh's judge call failed. Reported here, re-raised
+            for the caller to decide: a launch swallows it, the operator's
+            ``strata refresh`` reports a non-zero exit.
     """
-    from datetime import UTC, datetime
-
-    from strata.record_store import RECENCY_WINDOW_SIZE, ContributorRef
+    from strata.app import DrainFailed, drain_scope
+    from strata.record_store import RECENCY_WINDOW_SIZE
     from strata.scope_manager import WINDOW_VERBATIM_TAIL
-    from strata.summary_store import ScopeSummary, splice_parent_directives
 
     # The engine defaults when the caller has no settings in hand (ADR 0011 D2).
     # Resolved here rather than in the signature: scope_manager owns the
@@ -1872,169 +2064,170 @@ def _refresh_scope(
     if recency_window_size is None:
         recency_window_size = RECENCY_WINDOW_SIZE
 
-    if _visited is None:
-        _visited = set()
-    if scope_id in _visited:
-        return
-    _visited.add(scope_id)
-
-    scope = fleet_config.get_scope(scope_id)
-    if scope is None:
+    if fleet_config.get_scope(scope_id) is None:
         print(
             f"  [refresh] scope {scope_id!r} not found in fleet config — skipping",
             file=sys.stderr,
         )
         return
 
-    stratum_map = {s.id: s for s in fleet_config.strata}
-    stratum = stratum_map.get(scope.stratum_id)
-    if stratum is None:
+    try:
+        outcome = drain_scope(
+            scope_id,
+            fleet=fleet_config,
+            record_store=record_store,
+            summary_store=summary_store,
+            scope_manager=manager,
+            summary_max_words=summary_max_words,
+            window_verbatim_tail=window_verbatim_tail,
+            recency_window_size=recency_window_size,
+        )
+    except DrainFailed as exc:
+        print(
+            f"  [refresh] scope {scope_id!r}: judge unavailable ({exc.error_class}); "
+            f"{exc.pending} input change(s) still pending",
+            file=sys.stderr,
+        )
+        raise
+    except RuntimeError as exc:
+        # The scope resolves but its stratum does not — a fleet config a
+        # launch should report rather than die on.
+        print(f"  [refresh] scope {scope_id!r}: {exc}", file=sys.stderr)
         return
 
-    # Resolve inter-stratum parent
-    parent_scope = fleet_config.inter_stratum_parent(scope_id)
-
-    # If there is a parent, ensure it is fresh first (recursive bottom-out at L0)
-    if parent_scope is not None:
-        parent_summary = summary_store.read(parent_scope.id)
-        my_summary = summary_store.read(scope_id)
-
-        # `parent_summary is not None` MUST come first — `_is_stale`'s signature
-        # requires a non-None parent_summary. Without the short-circuit, a child
-        # whose parent_version stamp is non-None but whose parent summary has
-        # been deleted from disk would crash with AttributeError.
-        already_fresh = (
-            parent_summary is not None
-            and my_summary is not None
-            and not _is_stale(my_summary, parent_summary)
+    if outcome.judged:
+        print(
+            f"  [refresh] scope {scope_id!r} refreshed "
+            f"({outcome.events_processed} input change(s))",
+            file=sys.stderr,
         )
-        if parent_summary is None or already_fresh:
-            # Either parent has no on-disk summary yet, or my summary is already
-            # fresh against the parent's current version → no need to recurse.
-            pass
-        else:
-            # Parent is missing or my summary is stale → refresh parent first
-            _refresh_scope(
-                parent_scope.id,
-                fleet_config=fleet_config,
-                record_store=record_store,
-                summary_store=summary_store,
-                manager=manager,
-                summary_max_words=summary_max_words,
-                window_verbatim_tail=window_verbatim_tail,
-                recency_window_size=recency_window_size,
-                _visited=_visited,
-            )
-
-        # Re-read parent summary after potential refresh
-        parent_summary = summary_store.read(parent_scope.id)
-    else:
-        parent_summary = None
-
-    # Now refresh this scope
-    current_summary = summary_store.read(scope_id)
-    # ADR 0011 D2: the mechanical recency digest, same windowed read the
-    # contribute path uses.
-    recent_contributions = record_store.list_recent_contributions(
-        scope_id=scope_id, limit=recency_window_size
-    )
-
-    ts = datetime.now(tz=UTC).isoformat()
-
-    # ADR 0011 D4: incorporate the parent's directives mechanically, before
-    # the judge sees anything. A child with no summary of its own still gets
-    # them — that is what makes a fresh child inherit on its first launch.
-    if parent_summary is not None and parent_summary.directives:
-        base_summary = (
-            current_summary
-            if current_summary is not None
-            else ScopeSummary(scope_id=scope_id, directives=[], context="", updated_at=ts)
-        )
-        current_summary = splice_parent_directives(base_summary, parent_summary)
-
-    # The refresh request is itself a contribution: it is appended to the
-    # record BEFORE judgment and its judgment is recorded after, so the
-    # summary never changes without a record trail ("the record is sacred" —
-    # ROADMAP principle 4; CONTEXT.md § Contribution).
-    refresh_contribution = record_store.append_contribution(
-        scope_id=scope_id,
-        content=(
-            "[Manager refresh triggered by strata launch"
-            " — parent directives already incorporated mechanically;"
-            " reconcile the context digest with the refreshed state.]"
-        ),
-        proposed_classification="context",
-        subject="manager-refresh",
-        supersedes=None,
-        contributor=ContributorRef(
-            scope_id=scope_id,
-            skill="scope-manager",
-            session_id="refresh",
-            ts=ts,
-        ),
-    )
-
-    from strata.operator import operator_memory_binding
-
-    print(f"  [refresh] refreshing scope {scope_id!r}...", file=sys.stderr)
-    judgment = manager.judge(
-        scope=scope,
-        stratum=stratum,
-        parent_summary=parent_summary,
-        current_summary=current_summary,
-        recent_contributions=recent_contributions,
-        new_contribution=refresh_contribution,
-        summary_max_words=summary_max_words,
-        window_verbatim_tail=window_verbatim_tail,
-        entitlement=fleet_config.entitlement_view(scope_id),
-        operator_memory=operator_memory_binding(
-            scope_id, fleet=fleet_config, summaries_dir=summary_store.summaries_dir
-        ),
-        # ADR 0011 D4 — the refresh amendment is context + lifecycle ops only.
-        amendment_context_only=True,
-    )
-
-    record_store.record_judgment(
-        contribution_id=refresh_contribution.id,
-        decision=judgment.decision,
-        judged_by="scope-manager",
-        notes=judgment.record_notes,
-    )
-
-    if judgment.new_summary is not None:
-        # Stamp the parent_version before writing
-        parent_ver = parent_summary.version if parent_summary is not None else None
-        to_write = judgment.new_summary.model_copy(update={"parent_version": parent_ver})
-        summary_store.write(scope_id, to_write)
-        # A retire op removes a directive with no replacement, so the record
-        # carries a retirement event for it (ADR 0011 D1).
-        for directive_id in judgment.retired_directive_ids:
-            record_store.append_retirement(
-                scope_id=scope_id,
-                directive_id=directive_id,
-                retired_by="scope-manager",
-                reason=judgment.reasoning,
-            )
-        print(f"  [refresh] scope {scope_id!r} summary updated", file=sys.stderr)
 
 
-def _run_manager_refresh(scope_id: str, *, skip: bool = False) -> None:
-    """Run the pre-session manager-refresh step for *scope_id*.
+def _refresh_order(fleet_config: FleetConfig) -> list[str]:
+    """Every active scope, root-first: broader stratum before narrower.
 
-    Walks the inter-stratum ancestor chain (root-first), refreshes any stale
-    ancestors, then refreshes *scope_id* itself.  Skipped when:
-
-    - ``skip`` is True (``--skip-refresh`` flag).
-    - No judge API key is available (soft — prints a warning).
-    - Any ancestor/scope is missing from the fleet config (non-fatal warning).
-
-    ADR 0004 Decision 4 — last-write-wins, no lock.
+    Stratum ordinal then scope id, so an ancestor is always refreshed before
+    its descendants (a chain edge always crosses strata) and the order is
+    stable for an operator reading the output.
     """
+    ordinals = {s.id: s.ordinal for s in fleet_config.strata}
+    return [
+        scope.id
+        for scope in sorted(
+            fleet_config.active_scopes(),
+            key=lambda s: (ordinals.get(s.stratum_id, 0), s.id),
+        )
+    ]
+
+
+def _refresh_stores(settings):  # noqa: ANN001, ANN201
+    """Open the fleet, record store, summary store and judge for a refresh run."""
     from strata.fleet_config import FleetConfig
     from strata.record_store import RecordStore
     from strata.scope_manager import ScopeManager
-    from strata.settings import get_settings
     from strata.summary_store import SummaryStore
+
+    paths = _storage_paths()
+    fleet_config = FleetConfig.load(Path(paths.fleet_yaml_path))
+    record_store = RecordStore(paths.db_path)
+    summary_store = SummaryStore(paths.summaries_dir)
+    manager = ScopeManager(client=settings.build_judge_client(), model=settings.manager_model)
+    return fleet_config, record_store, summary_store, manager
+
+
+def cmd_refresh(args: argparse.Namespace) -> int:
+    """``strata refresh [SCOPE | --all]`` — drain pending input changes now (ADR 0014 D6).
+
+    The queue is normally drained by the MCP server when a scope is bound or
+    read, so the system is correct for a user who never runs a CLI command at
+    all. This is the operator's way to drain on demand: one scope, or every
+    scope in the fleet, root-first.
+
+    Runs the SAME :func:`_refresh_scope` ``strata launch`` runs — one
+    mechanism, not two (implementation pin 6).
+    """
+    from strata.app import DrainFailed
+    from strata.settings import get_settings
+
+    settings = get_settings()
+    if not (settings.judge_api_key or settings.anthropic_api_key):
+        print(
+            "JUDGE_API_KEY is not set — a refresh judges, so it cannot run without one.",
+            file=sys.stderr,
+        )
+        return 1
+
+    paths = _storage_paths()
+    if not Path(paths.fleet_yaml_path).exists():
+        print(f"Fleet config not found at {paths.fleet_yaml_path!r}.", file=sys.stderr)
+        return 1
+
+    fleet_config, record_store, summary_store, manager = _refresh_stores(settings)
+    failed: list[str] = []
+
+    with record_store:
+        if getattr(args, "all", False):
+            scope_ids = _refresh_order(fleet_config)
+        else:
+            scope_id = getattr(args, "scope", None)
+            if not scope_id:
+                print("Name a scope to refresh, or pass --all.", file=sys.stderr)
+                return 1
+            if fleet_config.get_scope(scope_id) is None:
+                print(f"Scope {scope_id!r} not found in the fleet config.", file=sys.stderr)
+                return 1
+            scope_ids = [scope_id]
+
+        for target in scope_ids:
+            try:
+                _refresh_scope(
+                    target,
+                    fleet_config=fleet_config,
+                    record_store=record_store,
+                    summary_store=summary_store,
+                    manager=manager,
+                    summary_max_words=settings.summary_max_words,
+                    window_verbatim_tail=settings.window_verbatim_tail,
+                    recency_window_size=settings.recency_window_size,
+                )
+            except DrainFailed:
+                # Already reported by _refresh_scope. The events stay pending,
+                # so --all keeps going and the operator retries.
+                failed.append(target)
+
+    if failed:
+        print(
+            f"Refresh incomplete for: {', '.join(failed)} — those input changes are "
+            "still pending, so run it again once the scope-manager is available.",
+            file=sys.stderr,
+        )
+        return 1
+    return 0
+
+
+def _run_manager_refresh(scope_id: str, *, skip: bool = False) -> None:
+    """Run the pre-session refresh for *scope_id* and its ancestors.
+
+    Walks the inter-stratum ancestor chain root-first and refreshes each scope,
+    then *scope_id* itself — with no staleness test anywhere (implementation
+    pin 6): :func:`_refresh_scope` drains what is actually pending, so a scope
+    with nothing to do costs nothing.
+
+    Skipped when:
+
+    - ``skip`` is True (``--skip-refresh`` flag).
+    - No judge API key is available (soft — prints a warning).
+    - The fleet config is missing or unreadable (non-fatal warning).
+
+    A judge outage is reported and swallowed: a launch must not be blocked by a
+    refresh that could not run, and the pending events survive for the next
+    attempt (ADR 0014 D6).
+
+    The drain takes the scope lock (ADR 0012).
+    """
+    from strata.app import DrainFailed
+    from strata.fleet_config import FleetConfig
+    from strata.settings import get_settings
 
     if skip:
         return
@@ -2058,7 +2251,7 @@ def _run_manager_refresh(scope_id: str, *, skip: bool = False) -> None:
         return
 
     try:
-        fleet_config = FleetConfig.load(Path(fleet_yaml))
+        FleetConfig.load(Path(fleet_yaml))
     except Exception as exc:
         print(
             f"  [refresh] cannot load fleet config: {exc} — skipping manager refresh",
@@ -2066,26 +2259,15 @@ def _run_manager_refresh(scope_id: str, *, skip: bool = False) -> None:
         )
         return
 
-    db_path = paths.db_path
-    summaries_dir = paths.summaries_dir
+    fleet_config, record_store, summary_store, manager = _refresh_stores(settings)
 
-    client = settings.build_judge_client()
-    manager = ScopeManager(client=client, model=settings.manager_model)
-
-    with RecordStore(db_path) as record_store:
-        summary_store = SummaryStore(summaries_dir)
-
-        # Walk ancestors root-first; refresh stale ones first, then the target scope.
-        ancestors = fleet_config.inter_stratum_ancestors(scope_id)
-
-        visited: set[str] = set()
-        # Refresh stale ancestors (root-first)
-        for ancestor in ancestors:
-            ancestor_summary = summary_store.read(ancestor.id)
-            if ancestor_summary is None:
-                # No existing summary — refresh it
+    with record_store:
+        # Root-first: every inter-stratum ancestor, then the target scope.
+        chain = [*(a.id for a in fleet_config.inter_stratum_ancestors(scope_id)), scope_id]
+        for target in chain:
+            try:
                 _refresh_scope(
-                    ancestor.id,
+                    target,
                     fleet_config=fleet_config,
                     record_store=record_store,
                     summary_store=summary_store,
@@ -2093,45 +2275,11 @@ def _run_manager_refresh(scope_id: str, *, skip: bool = False) -> None:
                     summary_max_words=settings.summary_max_words,
                     window_verbatim_tail=settings.window_verbatim_tail,
                     recency_window_size=settings.recency_window_size,
-                    _visited=visited,
                 )
-            else:
-                # Check if this ancestor is stale relative to its own parent
-                ancestor_parent = fleet_config.inter_stratum_parent(ancestor.id)
-                if ancestor_parent is not None:
-                    ap_summary = summary_store.read(ancestor_parent.id)
-                    if ap_summary is not None and _is_stale(ancestor_summary, ap_summary):
-                        _refresh_scope(
-                            ancestor.id,
-                            fleet_config=fleet_config,
-                            record_store=record_store,
-                            summary_store=summary_store,
-                            manager=manager,
-                            summary_max_words=settings.summary_max_words,
-                            window_verbatim_tail=settings.window_verbatim_tail,
-                            _visited=visited,
-                        )
-
-        # Refresh the target scope itself
-        my_summary = summary_store.read(scope_id)
-        parent_scope = fleet_config.inter_stratum_parent(scope_id)
-        parent_summary = summary_store.read(parent_scope.id) if parent_scope is not None else None
-
-        needs_refresh = my_summary is None or (
-            parent_summary is not None and _is_stale(my_summary, parent_summary)
-        )
-        if needs_refresh:
-            _refresh_scope(
-                scope_id,
-                fleet_config=fleet_config,
-                record_store=record_store,
-                summary_store=summary_store,
-                manager=manager,
-                summary_max_words=settings.summary_max_words,
-                window_verbatim_tail=settings.window_verbatim_tail,
-                recency_window_size=settings.recency_window_size,
-                _visited=visited,
-            )
+            except DrainFailed:
+                # Reported inside _refresh_scope. A launch is never blocked by
+                # a judge outage; the events stay pending for the next attempt.
+                continue
 
 
 #: Codex launch is schema-verified but not live-verified (README, "Using
@@ -2533,6 +2681,30 @@ def _offer_judge_key_capture(project_root: Path, *, skip_prompt: bool) -> None:
     print(f"judge key: {verb} {env_path.relative_to(project_root)}")
 
 
+def _store_rel(path: Path, project_root: Path) -> str:
+    """Render *path* as the project-relative string ``config.toml`` records."""
+    try:
+        return str(path.resolve().relative_to(project_root.resolve()))
+    except ValueError:
+        return str(path)
+
+
+def _describe_store(candidate, project_root: Path) -> str:
+    """One line naming a store and the evidence that it is one (issue #178).
+
+    The operator picks between candidates on this line, so it carries what
+    distinguishes them: where the fleet is, how many scopes it declares, and
+    how much memory sits beside it.
+    """
+    where = _store_rel(candidate.fleet_yaml, project_root)
+    bits = [f"{candidate.scopes} scope(s)"]
+    if candidate.db_bytes:
+        bits.append(f"{candidate.db_bytes // 1024}KB database")
+    if candidate.summary_count:
+        bits.append(f"{candidate.summary_count} summary file(s)")
+    return f"{where} — {', '.join(bits)}"
+
+
 def cmd_register(args: argparse.Namespace) -> int:
     """Idempotent brownfield installer — per ADR 0005 Decision 4.
 
@@ -2623,8 +2795,22 @@ def cmd_register(args: argparse.Namespace) -> int:
     # prevents register from running against a half-initialised state from
     # an interrupted prior register.
     # -----------------------------------------------------------------------
+    # Exception (issue #178): a `.strata/` that holds a real store — a
+    # loadable fleet with memory beside it — is not a foreign directory or a
+    # half-initialised register. It is a store that predates project config
+    # (or whose config.toml was lost), and Step 1c below adopts it or asks
+    # which store to use. Refusing here would send the operator to "remove or
+    # rename it", i.e. to delete real memory.
     candidate_strata = project_root / ".strata"
-    if candidate_strata.exists() and not (candidate_strata / "config.toml").exists():
+    _strata_is_a_store = any(
+        c.root.resolve() == candidate_strata.resolve()
+        for c in install.find_existing_stores(project_root)
+    )
+    if (
+        candidate_strata.exists()
+        and not (candidate_strata / "config.toml").exists()
+        and not _strata_is_a_store
+    ):
         print(
             f"Existing .strata/ directory at {candidate_strata} does not look like a Strata "
             f"workspace (no config.toml).\n"
@@ -2637,7 +2823,16 @@ def cmd_register(args: argparse.Namespace) -> int:
     # Helper: print action or diff line.
     # -----------------------------------------------------------------------
     def _rel(path: str | Path) -> Path:
-        return Path(path).relative_to(project_root) if Path(path).is_absolute() else Path(path)
+        p = Path(path)
+        if not p.is_absolute():
+            return p
+        try:
+            return p.relative_to(project_root)
+        except ValueError:
+            # Outside the project tree (issue #184: a configured fleet_yaml
+            # can point anywhere) — show the absolute path rather than
+            # crashing on relative_to.
+            return p
 
     def _act(action: str, path: str | Path, *, skipped: bool = False) -> None:
         print(render_action_line(action, _rel(path), diff_mode=diff_mode, skipped=skipped))
@@ -2677,6 +2872,53 @@ def cmd_register(args: argparse.Namespace) -> int:
         print("no harness detected on this machine — wiring claude-code (the default)")
 
     # -----------------------------------------------------------------------
+    # Step 1c: Adopt an existing store rather than shadowing it (issue #178).
+    #
+    # Writing .strata/config.toml flips storage resolution from the env
+    # fallback to the project branch, so seeding beside a store the project
+    # already uses does not add a second store — it makes the first one
+    # unreachable, silently. Detection runs only when this project is not
+    # already registered: an existing config.toml IS the registration marker
+    # (project_config.load_project_config walks up, first match wins), so
+    # there is nothing to decide when one is present.
+    # -----------------------------------------------------------------------
+    adopted_store = None
+    if not (project_root / ".strata" / "config.toml").exists() and not getattr(
+        args, "fresh", False
+    ):
+        candidates = install.find_existing_stores(project_root)
+        adopt_arg = getattr(args, "adopt", None)
+
+        if adopt_arg:
+            wanted = Path(adopt_arg).expanduser().resolve()
+            adopted_store = next((c for c in candidates if c.root.resolve() == wanted), None)
+            if adopted_store is None:
+                print(f"--adopt: no Strata store found at {adopt_arg}")
+                if candidates:
+                    print("stores found in this project:")
+                    for c in candidates:
+                        print(f"  {_describe_store(c, project_root)}")
+                else:
+                    print(
+                        "a store needs a loadable fleet.yaml and memory beside it "
+                        "(a non-empty strata.db or a summaries/ directory with files)."
+                    )
+                return 1
+        elif len(candidates) > 1:
+            print("this project already has more than one Strata store:")
+            for c in candidates:
+                print(f"  {_describe_store(c, project_root)}")
+            print(
+                "\nregister will not choose for you — picking wrong would hide the "
+                "other one.\n"
+                "  strata register --adopt <path>   use that store\n"
+                "  strata register --fresh          seed a new, empty store anyway"
+            )
+            return 1
+        elif len(candidates) == 1:
+            adopted_store = candidates[0]
+
+    # -----------------------------------------------------------------------
     # Step 2: Create .strata/ directory.
     # -----------------------------------------------------------------------
     strata_dir = project_root / ".strata"
@@ -2689,12 +2931,25 @@ def cmd_register(args: argparse.Namespace) -> int:
     # Step 3: Write .strata/config.toml.
     # -----------------------------------------------------------------------
     config_toml = strata_dir / "config.toml"
-    if config_toml.exists():
+    config_toml_already_registered = config_toml.exists()
+    if config_toml_already_registered:
         _act("skip", config_toml, skipped=True)
     else:
+        if adopted_store is not None:
+            body = install.config_toml_for(
+                db=_store_rel(adopted_store.root / "strata.db", project_root),
+                fleet_yaml=_store_rel(adopted_store.fleet_yaml, project_root),
+                summaries_dir=_store_rel(adopted_store.root / "summaries", project_root),
+                adopted=True,
+            )
+        else:
+            body = _CONFIG_TOML
         if not diff_mode:
-            config_toml.write_text(_CONFIG_TOML, encoding="utf-8")
+            config_toml.write_text(body, encoding="utf-8")
         _act("wrote", config_toml)
+        if adopted_store is not None:
+            described = _describe_store(adopted_store, project_root)
+            print(f"    adopted the store already in this project: {described}")
 
     # -----------------------------------------------------------------------
     # Step 4: Update .gitignore.
@@ -2714,13 +2969,47 @@ def cmd_register(args: argparse.Namespace) -> int:
 
     # -----------------------------------------------------------------------
     # Step 5: Seed .strata/fleet.yaml from templates/minimal.yaml.
+    #
+    # A project already carrying a config.toml is already registered — its
+    # config.toml is the source of truth for where the fleet lives, and may
+    # point anywhere (issue #184: seen pointing at an absolute path outside
+    # the project tree). Seeding must ask the resolver, not assume the
+    # default `.strata/fleet.yaml` layout, or it plants a second, misleading
+    # fleet file nothing reads while the project's real one goes untouched.
     # -----------------------------------------------------------------------
-    fleet_yaml = strata_dir / "fleet.yaml"
+    if adopted_store is not None:
+        fleet_yaml = adopted_store.fleet_yaml
+    elif config_toml_already_registered:
+        from strata.project_config import (  # noqa: PLC0415
+            ProjectConfigError,
+            load_project_config,
+        )
+
+        try:
+            existing_project_config = load_project_config(project_root)
+        except ProjectConfigError:
+            # Malformed config.toml — not this step's problem to diagnose
+            # (doctor covers that). Fall back to the default layout so
+            # register can still finish the rest of its work.
+            existing_project_config = None
+        fleet_yaml = (
+            existing_project_config.fleet_yaml
+            if existing_project_config is not None
+            else strata_dir / "fleet.yaml"
+        )
+    else:
+        fleet_yaml = strata_dir / "fleet.yaml"
     minimal_template = _TEMPLATES_DIR / "minimal.yaml"
     if fleet_yaml.exists():
         _act("skip", fleet_yaml, skipped=True)
     else:
         if not diff_mode:
+            # The configured fleet path can point anywhere (issue #184),
+            # including a directory that no longer exists — e.g. the
+            # recovery path `strata start` documents ("fleet.yaml missing
+            # ... Re-run `strata register` ... to re-seed it") must actually
+            # work even when the parent directory was removed too.
+            fleet_yaml.parent.mkdir(parents=True, exist_ok=True)
             if minimal_template.exists():
                 shutil.copy(minimal_template, fleet_yaml)
             else:
@@ -2812,6 +3101,35 @@ def cmd_register(args: argparse.Namespace) -> int:
                 _report_self_update(dest_hook, hook_status)
 
         # -------------------------------------------------------------------
+        # Step 6c: Copy the SessionStart-hook script to .claude/hooks/ — the
+        # READ-side trigger, symmetric with step 6b above. Nothing fires on
+        # its own to make an agent read its perspective at session start;
+        # this closes that gap the same way the Stop hook closed the
+        # WRITE-side one.
+        # -------------------------------------------------------------------
+        dest_session_start_hook = claude_hooks_dir / _HOOK_SCRIPT_NAME_SESSION_START
+        if not dest_session_start_hook.exists():
+            session_start_hook_copied = copy_hook(
+                hooks_root,
+                claude_hooks_dir,
+                script_name=_HOOK_SCRIPT_NAME_SESSION_START,
+                dry_run=diff_mode,
+            )
+            _act(
+                "copied" if session_start_hook_copied else "skip",
+                dest_session_start_hook,
+                skipped=not session_start_hook_copied,
+            )
+        else:
+            session_start_hook_status = _self_update_hook(
+                dest_session_start_hook, _HOOK_SCRIPT_NAME_SESSION_START, dry_run=diff_mode
+            )
+            if session_start_hook_status == "match":
+                _act("skip", dest_session_start_hook, skipped=True)
+            else:
+                _report_self_update(dest_session_start_hook, session_start_hook_status)
+
+        # -------------------------------------------------------------------
         # Step 7: Merge strata into the project's `.mcp.json` — the file
         # Claude Code actually reads for project-scoped MCP servers
         # (`.claude/settings.json` has no `mcpServers` key in its schema;
@@ -2832,12 +3150,12 @@ def cmd_register(args: argparse.Namespace) -> int:
         settings_json = project_root / ".claude" / "settings.json"
         if settings_json.exists():
             try:
-                settings_data: dict = json.loads(settings_json.read_text(encoding="utf-8"))
+                loaded_settings_json = json.loads(settings_json.read_text(encoding="utf-8"))
             except json.JSONDecodeError as exc:
                 # NEVER fall through to a write here: writing with an empty dict
                 # would replace the user's entire settings file with just the
                 # Stop hook entry. Skip the merge outright and fail the run so
-                # the user notices ("never overwrite user state" — ADR 0005 D6).
+                # the user notices ("never overwrite user state").
                 print(
                     f"  {_glyph('fail')} .claude/settings.json exists but is not valid JSON "
                     f"({exc}).\n"
@@ -2846,7 +3164,23 @@ def cmd_register(args: argparse.Namespace) -> int:
                     file=sys.stderr,
                 )
                 settings_unreadable = True
-                settings_data = {}
+                settings_data: dict = {}
+            else:
+                # Valid JSON but not an object (`[]`, `null`, ...) — never
+                # fall through to a write here either; the merge below
+                # assumes a dict.
+                if isinstance(loaded_settings_json, dict):
+                    settings_data = loaded_settings_json
+                else:
+                    print(
+                        f"  {_glyph('fail')} .claude/settings.json exists but is not a JSON "
+                        f"object (got {type(loaded_settings_json).__name__}).\n"
+                        "    Fix the file, then re-run `strata register` to add the freshness "
+                        "Stop hook entry.",
+                        file=sys.stderr,
+                    )
+                    settings_unreadable = True
+                    settings_data = {}
         else:
             settings_data = {}
 
@@ -2986,9 +3320,21 @@ def cmd_register(args: argparse.Namespace) -> int:
                 settings_changed = True
                 _act("merged Stop hook into", settings_json)
 
+        # Step 7c: additively merge the hooks.SessionStart entry — the
+        # READ-side trigger, symmetric with step 7b above. A user's own
+        # SessionStart hooks — and every other settings key — are preserved;
+        # the Strata group is appended only when absent.
+        if not settings_unreadable:
+            if _session_start_hook_present(settings_data):
+                _act("skip SessionStart hook in", settings_json, skipped=True)
+            else:
+                merge_session_start_hook(settings_data)
+                settings_changed = True
+                _act("merged SessionStart hook into", settings_json)
+
         # One write for the settings.json changes (legacy-entry removal and/or
-        # the Stop hook merge) — so bootstrap-venv (step 8) reads the
-        # up-to-date file back.
+        # the Stop/SessionStart hook merges) — so bootstrap-venv (step 8) reads
+        # the up-to-date file back.
         if settings_changed and not diff_mode:
             (project_root / ".claude").mkdir(parents=True, exist_ok=True)
             settings_json.write_text(json.dumps(settings_data, indent=2) + "\n", encoding="utf-8")
@@ -3015,8 +3361,12 @@ def cmd_register(args: argparse.Namespace) -> int:
         # the absolute path, via the same render_action_line used everywhere
         # else for consistent [would create/update]/kept-user's wording.
         codex_config = _codex_config_path()
+        # read_bytes, not read_text: text-mode I/O strips \r via universal
+        # newline translation before it ever reaches the CRLF-preserving
+        # merge logic — same bug class as AGENTS.md above (final fix wave,
+        # item 3).
         existing_codex_text = (
-            codex_config.read_text(encoding="utf-8") if codex_config.exists() else ""
+            codex_config.read_bytes().decode("utf-8") if codex_config.exists() else ""
         )
 
         def _act_codex(action: str, *, skipped: bool) -> None:
@@ -3042,7 +3392,7 @@ def cmd_register(args: argparse.Namespace) -> int:
 
         if not diff_mode and (mcp_added or hook_added):
             codex_config.parent.mkdir(parents=True, exist_ok=True)
-            codex_config.write_text(merged_text, encoding="utf-8")
+            codex_config.write_bytes(merged_text.encode("utf-8"))
 
         # Codex has no skills mechanism (unlike Claude Code's
         # .claude/skills/) — seed the same memory-move guidance into the
@@ -3245,7 +3595,7 @@ def cmd_register(args: argparse.Namespace) -> int:
 
         print()
         print("Done. Next steps:")
-        print(f"  1. Edit {fleet_yaml.relative_to(project_root)} for your team's structure")
+        print(f"  1. Edit {_rel(fleet_yaml)} for your team's structure")
         print()
         if single_scope:
             # Single-scope auto-bind (operator directive): a fresh install
@@ -3373,9 +3723,19 @@ def _wired_harnesses(project_root: Path) -> list[str]:
             # Corrupt JSON is not proof there's nothing wired — treat it as
             # conservatively "possibly wired".
             return True
+        if not isinstance(data, dict):
+            # Valid JSON but not an object (`[]`, `null`, ...) — same
+            # "possibly wired" conservatism as corrupt JSON; the actual
+            # unregister step below reports this properly instead of
+            # crashing.
+            return True
         # `_mcp_server_present` here also catches a not-yet-migrated legacy
         # entry (earlier releases wrote mcpServers.strata into settings.json).
-        return _mcp_server_present(data) or _stop_hook_present(data)
+        return (
+            _mcp_server_present(data)
+            or _stop_hook_present(data)
+            or _session_start_hook_present(data)
+        )
 
     def _codex_wired() -> bool:
         # Codex "wiredness" must be project-scoped, not machine-scoped
@@ -3593,14 +3953,25 @@ def cmd_unregister(args: argparse.Namespace) -> int:
         if not settings_json.exists():
             _ok(".claude/settings.json: nothing to do (no settings.json)")
         else:
+            settings_data: dict | None
             try:
-                settings_data: dict = json.loads(settings_json.read_text(encoding="utf-8"))
+                loaded_settings_json = json.loads(settings_json.read_text(encoding="utf-8"))
             except json.JSONDecodeError as exc:
                 _left(
                     f".claude/settings.json: not valid JSON ({exc}) — left untouched "
                     "(fix it, then re-run)"
                 )
-                settings_data = None  # type: ignore[assignment]
+                settings_data = None
+            else:
+                if isinstance(loaded_settings_json, dict):
+                    settings_data = loaded_settings_json
+                else:
+                    _left(
+                        f".claude/settings.json: must be a JSON object, got "
+                        f"{type(loaded_settings_json).__name__} — left untouched (fix it, "
+                        "then re-run)"
+                    )
+                    settings_data = None
 
             if settings_data is not None:
                 settings_changed = False
@@ -3650,6 +4021,20 @@ def cmd_unregister(args: argparse.Namespace) -> int:
                     )
                 else:  # absent
                     _ok(".claude/settings.json: nothing to do (no freshness Stop hook)")
+
+                # hooks.SessionStart entry — the READ-side trigger, same
+                # byte-identity rule, symmetric with the Stop hook above.
+                session_start_hook_status = _remove_session_start_hook(settings_data)
+                if session_start_hook_status == "removed":
+                    settings_changed = True
+                    _ok(f".claude/settings.json: {_would('remove', 'removed')} SessionStart hook")
+                elif session_start_hook_status == "edited":
+                    _left(
+                        ".claude/settings.json: SessionStart hook was edited "
+                        "(differs from the canonical entry) — left in place"
+                    )
+                else:  # absent
+                    _ok(".claude/settings.json: nothing to do (no SessionStart hook)")
 
                 if settings_changed and not dry_run:
                     settings_json.write_text(
@@ -3721,6 +4106,35 @@ def cmd_unregister(args: argparse.Namespace) -> int:
                     "(differs from shipped) — left in place"
                 )
 
+        # -----------------------------------------------------------------------
+        # Step 3c: the vendored SessionStart-hook script — the READ-side
+        # trigger, symmetric with step 3b above.
+        # -----------------------------------------------------------------------
+        session_start_hook_script = claude_hooks_dir / _HOOK_SCRIPT_NAME_SESSION_START
+        if not session_start_hook_script.exists():
+            _ok(f"hook {_HOOK_SCRIPT_NAME_SESSION_START}: nothing to do (not installed)")
+        else:
+            session_start_hook_match = _hook_matches_shipped(
+                session_start_hook_script, _HOOK_SCRIPT_NAME_SESSION_START
+            )
+            if session_start_hook_match is True:
+                if not dry_run:
+                    session_start_hook_script.unlink()
+                _ok(
+                    f"hook {_HOOK_SCRIPT_NAME_SESSION_START}: {_would('remove', 'removed')} "
+                    "(matched shipped version)"
+                )
+            elif session_start_hook_match is None:
+                _left(
+                    f"hook {_HOOK_SCRIPT_NAME_SESSION_START}: could not read the shipped "
+                    "reference to compare — left in place"
+                )
+            else:  # False — differs
+                _left(
+                    f"hook {_HOOK_SCRIPT_NAME_SESSION_START}: modified or from an older "
+                    "Strata version (differs from shipped) — left in place"
+                )
+
         # Tidy up register-created empty parent dirs so a clean unregister restores
         # the tree exactly. Only ever removes directories that are already empty.
         if not dry_run:
@@ -3741,7 +4155,9 @@ def cmd_unregister(args: argparse.Namespace) -> int:
         if not codex_config.exists():
             _ok(f"{codex_config}: nothing to do (no Codex config.toml)")
         else:
-            codex_text = codex_config.read_text(encoding="utf-8")
+            # read_bytes, not read_text — see the matching comment in
+            # _register_codex (final fix wave, item 3).
+            codex_text = codex_config.read_bytes().decode("utf-8")
             codex_changed = False
 
             new_text, mcp_status = _remove_codex_mcp_server(codex_text)
@@ -3787,7 +4203,7 @@ def cmd_unregister(args: argparse.Namespace) -> int:
                 _ok(f"{codex_config}: nothing to do (no freshness Stop-hook block)")
 
             if codex_changed and not dry_run:
-                codex_config.write_text(codex_text, encoding="utf-8")
+                codex_config.write_bytes(codex_text.encode("utf-8"))
 
         # Reverse of the AGENTS.md seed in `strata register --harness codex`
         # (Task 6, harness parity). AGENTS.md lives at the project root, not
@@ -3956,6 +4372,31 @@ def cmd_freshness_evaluator(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# strata session-start-hook — the READ-side trigger, symmetric with
+# freshness-hook above. Hidden subcommand: it is the engine the installed
+# `.claude/hooks/strata-session-start-hook` wrapper invokes, not a command a
+# user runs by hand.
+# ---------------------------------------------------------------------------
+
+
+def cmd_session_start_hook(args: argparse.Namespace) -> int:
+    """Print the SessionStart hook's read-side trigger instruction.
+
+    Reads (and discards) the hook JSON on stdin — mirroring
+    ``cmd_freshness_hook``'s stdin handling, though nothing here is
+    load-bearing for what gets printed, unlike the Stop hook's asymmetry
+    gate. Always exits 0 — a broken hook must never break the session.
+    """
+    if not sys.stdin.isatty():
+        sys.stdin.read()
+
+    from strata.session_start import run_session_start_hook  # noqa: PLC0415
+
+    run_session_start_hook(out=sys.stdout)
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Parser construction
 # ---------------------------------------------------------------------------
 
@@ -4054,7 +4495,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "operator",
         help=(
             "Operator stratum: publish/supersede/retire operator memory, or "
-            "correct a scope's native memory in person (ADR 0008)."
+            "correct a scope's native memory in person."
         ),
     )
     _operator_parser = p_operator
@@ -4065,9 +4506,6 @@ def _build_parser() -> argparse.ArgumentParser:
         "publish", help="Publish a new operator memory item attached at a scope."
     )
     p_op_publish.add_argument("scope_id")
-    p_op_publish.add_argument(
-        "--kind", choices=["directive", "context"], required=True, help="Operator memory kind."
-    )
     p_op_publish.add_argument("--content", required=True, help="Verbatim operator memory text.")
     p_op_publish.add_argument("--subject", default=None, help="Optional short subject line.")
     p_op_publish.set_defaults(func=cmd_operator_publish)
@@ -4100,7 +4538,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_op_retire.set_defaults(func=cmd_operator_retire)
 
     p_op_show = operator_sub.add_parser(
-        "show", help="Print operator memory verbatim, plus the health signal (ADR 0008 D6)."
+        "show", help="Print operator memory verbatim, plus the health signal."
     )
     p_op_show.add_argument(
         "scope_id",
@@ -4118,9 +4556,7 @@ def _build_parser() -> argparse.ArgumentParser:
     global _publication_parser
     p_publication = sub.add_parser(
         "publication",
-        help=(
-            "Show a scope's publication artifact, or bootstrap its initial publication (ADR 0007)."
-        ),
+        help=("Show a scope's publication artifact, or bootstrap its initial publication."),
     )
     _publication_parser = p_publication
     p_publication.set_defaults(func=cmd_publication_root)
@@ -4142,14 +4578,14 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_pub_bootstrap = publication_sub.add_parser(
         "bootstrap",
-        help="Bootstrap a scope's initial publication from its current summary (ADR 0007 D4).",
+        help="Bootstrap a scope's initial publication from its current summary.",
     )
     p_pub_bootstrap.add_argument("scope_id")
     p_pub_bootstrap.set_defaults(func=cmd_publication_bootstrap)
 
     p_launch = sub.add_parser(
         "launch",
-        help="Resolve scope/skill binding and exec claude with STRATA_AGENT_* set (ADR 0003).",
+        help="Resolve scope/skill binding and exec claude with STRATA_AGENT_* set.",
     )
     p_launch.add_argument(
         "scope_id",
@@ -4169,7 +4605,7 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         dest="skip_refresh",
         help=(
-            "Skip the pre-session manager-refresh step (ADR 0004 D4). "
+            "Skip the pre-session manager-refresh step. "
             "Use when the API key is unavailable or for debugging."
         ),
     )
@@ -4194,6 +4630,25 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_launch.set_defaults(func=cmd_launch)
 
+    p_refresh = sub.add_parser(
+        "refresh",
+        help=(
+            "Judge a scope's pending input changes now (normally drained by the "
+            "MCP server on bind or read)."
+        ),
+    )
+    p_refresh.add_argument(
+        "scope",
+        nargs="?",
+        help="The scope to refresh. Omit and pass --all to refresh the whole fleet.",
+    )
+    p_refresh.add_argument(
+        "--all",
+        action="store_true",
+        help="Refresh every active scope, root-first (broader strata before narrower).",
+    )
+    p_refresh.set_defaults(func=cmd_refresh)
+
     p_export = sub.add_parser(
         "export-fleet",
         help="Export V1 fleet tables to fleet.yaml for V1.2 upgrade.",
@@ -4214,7 +4669,29 @@ def _build_parser() -> argparse.ArgumentParser:
         "register",
         help=(
             "Idempotent brownfield installer — create .strata/config.toml, "
-            "seed fleet.yaml, copy skills, merge MCP entry (ADR 0005)."
+            "seed fleet.yaml, copy skills, merge MCP entry."
+        ),
+    )
+    p_register.add_argument(
+        "--adopt",
+        dest="adopt",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Use the existing Strata store at PATH instead of creating one. "
+            "Only needed when this project has more than one store and "
+            "register cannot tell which is yours — with a single store it is "
+            "adopted automatically."
+        ),
+    )
+    p_register.add_argument(
+        "--fresh",
+        dest="fresh",
+        action="store_true",
+        help=(
+            "Create a new, empty store even though this project already has "
+            "one. The existing store is left on disk but stops being the one "
+            "this project reads and writes."
         ),
     )
     p_register.add_argument(
@@ -4382,6 +4859,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p_fresh_eval.add_argument("--session-id", dest="session_id", required=True)
     p_fresh_eval.add_argument("--transcript-path", dest="transcript_path", required=True)
     p_fresh_eval.set_defaults(func=cmd_freshness_evaluator)
+
+    p_session_start_hook = sub.add_parser("session-start-hook", help=argparse.SUPPRESS)
+    p_session_start_hook.set_defaults(func=cmd_session_start_hook)
 
     return parser
 

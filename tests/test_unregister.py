@@ -319,6 +319,33 @@ def test_unregister_null_mcp_json_does_not_crash(tmp_path: Path, capsys) -> None
     assert ".mcp.json" in captured.err
 
 
+def test_unregister_non_dict_settings_json_does_not_crash(tmp_path: Path, capsys) -> None:
+    """`.claude/settings.json` containing valid JSON that isn't an object
+    (e.g. `[]`) must be reported, not crash with AttributeError."""
+    _init_project(tmp_path)
+    cmd_register(_register_args(str(tmp_path)))
+    (tmp_path / ".claude" / "settings.json").write_text("[]", encoding="utf-8")
+
+    rc = cmd_unregister(_unregister_args(str(tmp_path)))
+
+    assert rc == 1
+    captured = capsys.readouterr()
+    assert ".claude/settings.json" in captured.err
+
+
+def test_unregister_null_settings_json_does_not_crash(tmp_path: Path, capsys) -> None:
+    """`null` is valid JSON but not an object — must not crash either."""
+    _init_project(tmp_path)
+    cmd_register(_register_args(str(tmp_path)))
+    (tmp_path / ".claude" / "settings.json").write_text("null", encoding="utf-8")
+
+    rc = cmd_unregister(_unregister_args(str(tmp_path)))
+
+    assert rc == 1
+    captured = capsys.readouterr()
+    assert ".claude/settings.json" in captured.err
+
+
 # ---------------------------------------------------------------------------
 # LOW (fix round): --dry-run also previews the .mcp.json deletion.
 # ---------------------------------------------------------------------------

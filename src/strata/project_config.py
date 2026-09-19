@@ -197,6 +197,14 @@ def _parse_config(config_path: Path, project_root: Path) -> ProjectConfig:
 # ---------------------------------------------------------------------------
 
 
+class _Unset:
+    """Sentinel distinguishing "no project= argument given" from
+    "project=None was passed deliberately" (see resolve_storage_paths)."""
+
+
+_UNSET = _Unset()
+
+
 @dataclass(frozen=True)
 class StoragePaths:
     """The one resolved answer to "where does Strata state live?".
@@ -250,6 +258,7 @@ def resolve_storage_paths(
     settings: Settings | None = None,
     *,
     start: Path | None = None,
+    project: ProjectConfig | None | _Unset = _UNSET,
 ) -> StoragePaths:
     """Resolve storage paths: project config wins, env settings are the fallback.
 
@@ -258,13 +267,25 @@ def resolve_storage_paths(
     1. ``.strata/config.toml`` discovered by walking up from *start* (cwd).
     2. Env-var-driven :class:`~strata.settings.Settings` defaults.
 
+    This is the ONE place that precedence rule is decided — every entry
+    point resolves storage paths by calling this function, never by
+    re-implementing the "project wins, env falls back" logic inline.
+
     Args:
         settings: Optional pre-built settings (tests / ``create_app``).
                   When None, the cached :func:`~strata.settings.get_settings`
                   singleton is used for the fallback values.
         start:    Directory to begin the config walk-up from (default: cwd).
+        project:  Optional already-resolved :class:`ProjectConfig` (or
+                  ``None`` for "no project config applies"), for a caller
+                  that already called :func:`load_project_config` itself —
+                  e.g. to catch and handle :class:`ProjectConfigError`
+                  before this function would otherwise call it again and
+                  raise the same error a second time, uncaught. When
+                  omitted, this function performs the walk itself.
     """
-    project = load_project_config(start)
+    if isinstance(project, _Unset):
+        project = load_project_config(start)
     if project is not None:
         return StoragePaths(
             db_path=str(project.db),
