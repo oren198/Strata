@@ -83,6 +83,8 @@ exists for one reason, the **Console** (step 7); agents never depend on it.
 pipx install strata-mem      # strata + strata-mcp on PATH, in an isolated env
 ```
 
+Strata 1.12.0 ships with this release; the latest on PyPI is 1.10.5 until then.
+
 `pipx` is the supported install. `pip install strata-mem` inside a Python 3.11+
 virtualenv also gives you working `strata` and `strata-mcp` commands (checked with
 `python3.11 -m venv` + `pip install`); then run `strata` from that environment, or
@@ -161,10 +163,10 @@ What to expect the first time in Claude Code (verified on Claude Code 2.1.278):
 
 - It asks whether you **trust this folder** — choose *Yes, I trust this folder*
   (the highlighted default is *No, exit*).
-- It then reports **"New MCP server found in this project: strata"**. Choose
-  **Use this MCP server** (or *Use this and all future MCP servers in this project*).
-  The highlighted default is *Continue without using this MCP server*, and without
-  the server the agent has no Strata tools.
+- It then reports **"New MCP server found in this project: strata"**. **The
+  highlighted default is *Continue without using this MCP server*. Pick *Use this
+  MCP server* (or *Use this and all future MCP servers in this project*) instead:
+  accepting the default gives you a memory-blind session with no Strata tools.**
 
 **Terminal 2 — Codex**
 
@@ -184,12 +186,14 @@ What to expect the first time in Codex (all verified on codex-cli 0.153.4):
   blank). Each Codex session gets its own id automatically, and the hook lands on
   the same id as the MCP server; exporting a value would reach the hook but not the
   server and split one session in two.
-- Codex asks before each Strata tool call: *Allow*, *Allow for this session*,
-  *Always allow* or *Cancel*. "Always allow" is remembered per tool, so each Strata
-  tool asks once. To stop the prompts for every Strata tool at once (and to make
-  `codex exec` able to call Strata at all — under `codex exec` an MCP call is
-  otherwise refused), add `default_tools_approval_mode = "approve"` under
-  `[mcp_servers.strata]` in `~/.codex/config.toml`.
+- **Set `default_tools_approval_mode = "approve"` under `[mcp_servers.strata]` in
+  `~/.codex/config.toml` (or answer every per-tool prompt with *Allow*). Under
+  `codex exec` an MCP call that is not approved is refused, so without this
+  `codex exec` gets no Strata tools; in the interactive `codex`, cancelling the
+  prompts does the same. Either way that is a memory-blind session.** The
+  interactive prompts are *Allow*, *Allow for this session*, *Always allow* or
+  *Cancel*; "Always allow" is remembered per tool, so each Strata tool asks once,
+  and the config key covers all of them at once.
 
 In Claude Code the session-start hook tells the agent to read its perspective
 first; in Codex the seeded `AGENTS.md` does. In both, the agent has these tools:
