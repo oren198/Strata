@@ -195,6 +195,11 @@ What to expect the first time in Codex (all verified on codex-cli 0.153.4):
   *Cancel*; "Always allow" is remembered per tool, so each Strata tool asks once,
   and the config key covers all of them at once.
 
+Codex's `workspace-write` sandbox mounts `.git/refs` read-only, so a Codex session
+cannot create git tags or refs itself (observed on codex-cli 0.153.4 under `codex exec
+-s workspace-write`: `git tag` failed inside the sandbox). Have another session, or
+you, do the tagging.
+
 In Claude Code the session-start hook tells the agent to read its perspective
 first; in Codex the seeded `AGENTS.md` does. In both, the agent has these tools:
 `strata_read_perspective`, `strata_contribute`, `strata_session_closeout`, and
@@ -261,19 +266,22 @@ resolves the skill, generates a session ID and starts the harness already bound
 
 ## What the demo shows
 
-> **Not yet filled in.** The blanks below are completed from the recorded demo
-> run, and only from it; nothing here is a claim until it has been.
+From one recorded run on 2026-09-19: strata build `f4e7272` (release/v1.12.0-mvp,
+installed non-editably into a fresh virtualenv), **codex-cli 0.153.4**,
+**Claude Code 2.1.278**, and the judge **`qwen/qwen3-235b-a22b-2507` via
+OpenRouter**. Every verdict below is that judge's. Nothing here says how the
+default judge (`claude-haiku`) behaves: it was not measured. The samples are small
+and scripted — one lesson per direction — so read them as "it happened", not as
+rates.
 
 | | |
 |---|---|
-| Run | [LEAVE BLANK — date, `strata` version, Claude Code and Codex versions, judge model] |
-| A lesson learned in terminal 1 | [LEAVE BLANK] |
-| The judge's verdict and its reason | [LEAVE BLANK] |
-| What terminal 2 did with it in a later session | [LEAVE BLANK] |
-| Something the judge kept out, and why | [LEAVE BLANK] |
-| Write-back rate, by harness (`strata stats writeback`) | [LEAVE BLANK — `k/n` per harness and overall, strict on or off] |
-| Accounted for (contributed + closed out) | [LEAVE BLANK — `k/n`] |
-| Where the evidence lives | [LEAVE BLANK] |
+| **Codex → Claude Code** — **PASS 1/1** | A lesson given only to Codex ("release tags use the prefix `rel-`, never `v`") was contributed and **admitted as context** by the judge. A fresh Claude Code session, asked only to tag the release, read it from shared memory, created `rel-1.0.0` (not `v1.0.0`) and said why: *"the project's shared memory says the maintainers' release tags always start with `rel-` and never `v`."* |
+| **Claude Code → Codex** — **PASS 1/1** | "The version lives only in `VERSION.txt` as a plain semver string" was contributed by Claude Code and **admitted as a directive**. A fresh Codex session read that directive from shared memory, searched the usual version-file locations before writing, and wrote only `VERSION.txt` = `2.1.0`. |
+| **Junk kept out** | Given a task that also included an irrelevant aside ("parking is validated at the front desk"), the agent did the real task, contributed only the relevant policy, and said it did not save the parking note because it is not about the project. That is the *agent* declining to contribute; the judge never saw it. Judge-side junk admission: [LEAVE BLANK] |
+| **Never-stored honesty, supersession** | Both **PASS** in the live demo eval (`python -m strata_evals.demo`) on the same build and judge. |
+| **Write-back rate** (`strata stats writeback`) | Every session in the run contributed — 3 of 3 in one repository and 2 of 2 in the other (Claude Code 2/2 and Codex 1/1 in the first, one each in the second) — with strict mode on. A small scripted sample, not a population rate. |
+| **Where the evidence lives** | The strata-evals repository, `results/m4-cross-harness-2026-09-19.md` (commit `a264895`), with the raw transcripts, the Console JSON and the `strata stats writeback` output. |
 
 ## Out of the MVP
 
