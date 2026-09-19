@@ -1599,6 +1599,59 @@ def test_system_prompt_admission_step_is_generic() -> None:
     assert PEER_SCOPE.id not in _SYSTEM_PROMPT
 
 
+def test_system_prompt_names_functional_origin_descriptions_as_attribution() -> None:
+    """M5b (j4-407, laundered_resharing) — an oblique role-name still origins the material.
+
+    "The people who own the account records", "the team that runs billing"
+    identify a scope by function rather than by name; the origin check must
+    apply to material attributed this way exactly as it would to an
+    explicit scope name, and the rule must still carve out genuine
+    first-hand material ("we observed") as native to this scope.
+    """
+    origin_idx = _SYSTEM_PROMPT.index("A scope can be named WITHOUT using its name")
+    admission_idx = _SYSTEM_PROMPT.index("ADMISSION CHECK")
+    classification_idx = _SYSTEM_PROMPT.index("Concepts you must know")
+    assert admission_idx < origin_idx < classification_idx
+
+    flat = " ".join(_SYSTEM_PROMPT.split()).lower()
+    assert "the people who own the account records" in flat
+    assert "the team that runs billing" in flat
+    assert "we observed" in flat
+    assert "according to <scope>" in _SYSTEM_PROMPT
+
+
+def test_system_prompt_declines_bare_removal_without_a_reason() -> None:
+    """M5b (j4-207, summary_vandalism) — a bare supersede/retire needs a real reason.
+
+    "Just remove it, no replacement needed" restates the wish for removal,
+    not a reason, and must be declined even when the contributor belongs to
+    the directive's own scope. A contribution naming what actually changed
+    (a precondition gone, a process that replaced the old one) is a genuine
+    reason and stays acceptable — as a retire-with-context amendment.
+    """
+    bare_removal_idx = _SYSTEM_PROMPT.index("A BARE REMOVAL")
+    supersedes_idx = _SYSTEM_PROMPT.index('carries a "supersedes" reference')
+    classification_idx = _SYSTEM_PROMPT.index("When accepting, you do NOT rewrite")
+    assert supersedes_idx < bare_removal_idx < classification_idx
+
+    assert "no replacement needed" in _SYSTEM_PROMPT
+    assert "restates the wish for removal" in _SYSTEM_PROMPT
+    assert "no longer applies" in _SYSTEM_PROMPT or "no longer exists" in _SYSTEM_PROMPT
+
+
+def test_system_prompt_decline_reasoning_names_the_violated_rule() -> None:
+    """M5b acceptance criterion 5 — a decline's reasoning must name its ground.
+
+    The Console's declines view shows only the reasoning sentence; it must
+    be legible on its own, not merely a verdict, so the closing instruction
+    requires the ground be named in plain words.
+    """
+    assert "must name the rule it violated" in _SYSTEM_PROMPT
+    closing_idx = _SYSTEM_PROMPT.index("must name the rule it violated")
+    tool_idx = _SYSTEM_PROMPT.index("You must call the `submit_judgment` tool exactly once")
+    assert tool_idx < closing_idx
+
+
 def test_system_prompt_verifies_authority_claims_against_rendered_summaries() -> None:
     """Issue #79 — entitlement/ratification/authority claims are cross-checked.
 
