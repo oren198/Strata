@@ -84,7 +84,7 @@ See [What `strata register` does](#what-strata-register-does) for the full
 list of what this creates: a `.strata/` workspace, a starter `fleet.yaml`,
 the harness skills/config, and a freshness `Stop`-hook.
 
-Strict mode is on by default — a session that read fleet memory and wrote nothing back is blocked once at its end and asked to contribute or close out — and `strata register --no-strict` turns it off.
+Strict mode is on by default — a session that read fleet memory and wrote nothing back is reminded at its end to contribute or close out (at most twice) — and `strata register --no-strict` turns it off.
 
 ### 3. Set your judge API key
 
@@ -346,13 +346,15 @@ nothing back — no `strata_contribute` call (any verdict) and no
 `strata_session_closeout` — the *gate* opens, from the session's first read. What
 happens then depends on the mode:
 
-- **Strict (blocking) mode — the default.** The hook blocks the stop **once per
-  session** with an instruction naming both exits — contribute what you learned,
-  or call `strata_session_closeout(reason)` if nothing is worth keeping — then
-  lets the agent proceed. It never loops: it respects the harness's
-  `stop_hook_active` flag, and the session's state records that it already
-  blocked (a later turn would otherwise start with the flag cleared and block
-  again). No evaluator is spawned. The setting is per project, `[freshness]
+- **Strict (blocking) mode — the default.** The hook blocks the stop with an
+  instruction naming both exits — contribute what you learned, or call
+  `strata_session_closeout(reason)` if nothing is worth keeping — then lets the
+  agent proceed. It blocks **at most twice per session**: a first reminder, and a
+  blunter "last reminder" only if the agent made no strata tool call at all
+  after the first. It never blocks a third time, so it cannot loop (that cap —
+  kept in the session's state — is what guarantees it, not the harness's
+  `stop_hook_active` flag, which a later turn resets). No evaluator is spawned.
+  The setting is per project, `[freshness]
   strict` in `.strata/config.toml`, so every harness's hook reads the same
   answer (Codex's own `config.toml` is global to the machine, so it cannot hold a
   per-project switch). `strata register` writes `strict = true`; `strata

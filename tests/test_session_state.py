@@ -1075,3 +1075,43 @@ def test_nudge_is_silent_once_a_contribute_call_was_made_whatever_the_verdict(
     store.record_submission("s1")  # declined by the judge: still written back
 
     assert compute_nudge(store.read("s1")) is None
+
+
+def test_tool_calls_are_counted_and_a_block_snapshots_the_count(tmp_path: Path) -> None:
+    store = SessionStateStore(tmp_path / "sessions")
+    store.record_tool_call("s1")
+    store.record_tool_call("s1")
+    store.record_strict_block("s1")
+    store.record_tool_call("s1")
+
+    state = store.read("s1")
+    assert state is not None
+    assert (state.tool_calls, state.strict_blocks, state.tool_calls_at_last_block) == (3, 1, 2)
+
+
+def _accounted_store(tmp_path: Path) -> SessionStateStore:
+    store = SessionStateStore(tmp_path / "sessions")
+    for sid in ("contrib", "closed", "silent", "silent2"):
+        store.record_connect(sid, harness="codex", pid=1)
+    store.record_submission("contrib")
+    store.record_decline("closed")
+    return store
+
+
+def test_accounted_for_is_contributed_plus_closed_out(tmp_path: Path) -> None:
+    report = compute_writeback_report(_accounted_store(tmp_path), include_open=True)
+    codex = next(r for r in report.rows if r.harness == "codex")
+
+    assert (codex.n, codex.contributed, codex.closed_out, codex.silent) == (4, 1, 1, 2)
+    assert codex.accounted == 2
+    assert codex.accounted_rate == 0.5
+    assert codex.accounted_rate_text == "50%"
+    assert codex.rate == 0.25  # the launch bar is still contributed / n
+    assert report.overall.accounted == 2
+
+
+def test_accounted_for_says_no_sessions_for_an_empty_row(tmp_path: Path) -> None:
+    report = compute_writeback_report(SessionStateStore(tmp_path / "sessions"))
+
+    assert report.overall.accounted_rate is None
+    assert report.overall.accounted_rate_text == "no sessions"

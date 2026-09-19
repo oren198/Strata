@@ -746,7 +746,14 @@ def _writeback_report_dict(report) -> dict:  # noqa: ANN001
     """The report as plain JSON-able data, each row carrying its rate and rate text."""
 
     def row(r) -> dict:  # noqa: ANN001
-        return {**r.model_dump(), "rate": r.rate, "rate_text": r.rate_text}
+        return {
+            **r.model_dump(),
+            "rate": r.rate,
+            "rate_text": r.rate_text,
+            "accounted": r.accounted,
+            "accounted_rate": r.accounted_rate,
+            "accounted_rate_text": r.accounted_rate_text,
+        }
 
     payload = report.model_dump()
     payload["rows"] = [row(r) for r in report.rows]
@@ -857,23 +864,33 @@ def cmd_stats_writeback(args: argparse.Namespace) -> int:
         )
         print(f"{report.open_excluded} open session(s) left out; add --include-open to count them.")
     print()
+    print("write-back rate = sessions with at least one strata_contribute call, out of all")
+    print("sessions counted (the launch bar: at least 80 percent).")
+    print("accounted for = sessions that wrote back OR closed out with a reason, out of all")
+    print("sessions counted (reported alongside; it is not the bar).")
+    print()
     table_rows = [*report.rows, report.overall, report.strict_on, report.strict_off]
     width = max(len(r.harness) for r in table_rows)
     print(
         f"  {'harness':{width}}  sessions  contributed  accepted  closed out  silent  "
-        "strict  write-back rate"
+        f"strict  {'write-back rate':<17}  accounted for"
     )
+
+    def _pct(rate_text: str, count: int, n: int) -> str:
+        return "no sessions" if not n else f"{rate_text} ({count}/{n})"
+
     for r in table_rows:
-        rate = "no sessions" if r.rate is None else f"{r.rate_text} ({r.contributed}/{r.n})"
+        rate = _pct(r.rate_text, r.contributed, r.n)
+        accounted = _pct(r.accounted_rate_text, r.accounted, r.n)
         print(
             f"  {r.harness:{width}}  {r.n:<8}  {r.contributed:<11}  {r.accepted:<8}  "
-            f"{r.closed_out:<10}  {r.silent:<6}  {r.strict_on}/{r.n:<4}  {rate}"
+            f"{r.closed_out:<10}  {r.silent:<6}  {r.strict_on}/{r.n:<4}  {rate:<17}  {accounted}"
         )
     print()
     print(
         "strict = sessions that ran with strict Stop-hook enforcement on (a silent session "
-        "is blocked once at its end); 'strict off' includes sessions that never recorded "
-        "a setting."
+        "is reminded at its end, at most twice); 'strict off' includes sessions that never "
+        "recorded a setting."
     )
     print("publish/withdraw are sharing acts and don't count as write-back.")
     print(

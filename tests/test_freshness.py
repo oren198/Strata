@@ -474,26 +474,106 @@ def test_the_env_var_overrides_the_project_setting(tmp_path: Path, monkeypatch) 
     assert _run_hook(paths, _env(paths, strict=False)) == ""  # STRATA_FRESHNESS_STRICT=0
 
 
-def test_strict_blocks_exactly_once_per_session_even_across_turns(
+def test_a_second_block_fires_only_when_the_first_was_followed_by_no_strata_call(
     tmp_path: Path, monkeypatch
 ) -> None:
-    """stop_hook_active is per-continuation; the next user turn starts with it False
-    again. The session-level record is what keeps the block to once."""
     paths = _make_project(tmp_path)
     monkeypatch.chdir(tmp_path)
     _seed_reads(_session_store(paths), NUDGE_MIN_READS)
     env = _default_env(paths)
 
-    first = _run_hook(paths, env, active=False)
-    second = _run_hook(paths, env, active=False)  # a later turn, still silent
-    third = _run_hook(paths, env, active=True)
+    first = json.loads(_run_hook(paths, env))
+    second = json.loads(_run_hook(paths, env, active=True))  # the immediate continuation
 
-    assert json.loads(first)["decision"] == "block"
-    assert second == ""
-    assert third == ""
+    assert first["decision"] == second["decision"] == "block"
+    assert "last reminder" in second["reason"]
+    assert "last reminder" not in first["reason"]
     state = _session_store(paths).read(_SESSION_ID)
     assert state is not None
-    assert state.strict_blocked_at != ""
+    assert state.strict_blocks == 2
+
+
+def test_no_second_block_when_a_strata_call_followed_the_first(tmp_path: Path, monkeypatch) -> None:
+    paths = _make_project(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    store = _session_store(paths)
+    _seed_reads(store, NUDGE_MIN_READS)
+    env = _default_env(paths)
+
+    assert json.loads(_run_hook(paths, env))["decision"] == "block"
+    store.record_tool_call(_SESSION_ID)  # the agent did react: it called a strata tool
+
+    assert _run_hook(paths, env, active=True) == ""
+    assert _run_hook(paths, env, active=False) == ""
+    state = store.read(_SESSION_ID)
+    assert state is not None
+    assert state.strict_blocks == 1
+
+
+def test_a_strata_call_before_the_first_block_does_not_count_as_a_reaction(
+    tmp_path: Path, monkeypatch
+) -> None:
+    paths = _make_project(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    store = _session_store(paths)
+    _seed_reads(store, NUDGE_MIN_READS)
+    store.record_tool_call(_SESSION_ID)  # e.g. the read itself
+    env = _default_env(paths)
+
+    first = _run_hook(paths, env)
+    second = _run_hook(paths, env, active=True)
+
+    assert json.loads(first)["decision"] == json.loads(second)["decision"] == "block"
+
+
+def test_a_third_stop_never_blocks_whatever_stop_hook_active_says(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The no-loop guarantee is the hard cap of two, not stop_hook_active."""
+    paths = _make_project(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    _seed_reads(_session_store(paths), NUDGE_MIN_READS)
+    env = _default_env(paths)
+
+    outputs = [_run_hook(paths, env, active=False) for _ in range(2)]
+    later = [_run_hook(paths, env, active=flag) for flag in (True, False, True, False, False)]
+
+    assert all(json.loads(o)["decision"] == "block" for o in outputs)
+    assert later == [""] * 5
+    state = _session_store(paths).read(_SESSION_ID)
+    assert state is not None
+    assert state.strict_blocks == 2
+
+
+def test_the_first_block_still_ignores_a_stop_that_another_hook_already_blocked(
+    tmp_path: Path, monkeypatch
+) -> None:
+    paths = _make_project(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    _seed_reads(_session_store(paths), NUDGE_MIN_READS)
+
+    assert _run_hook(paths, _default_env(paths), active=True) == ""
+
+
+def test_a_pre_cap_two_record_with_one_block_counts_as_one_block(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Records written by M3 carry strict_blocked_at but no strict_blocks counter."""
+    paths = _make_project(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    store = _session_store(paths)
+    _seed_reads(store, NUDGE_MIN_READS)
+    store.record_strict_block(_SESSION_ID)
+    state = store.read(_SESSION_ID)
+    assert state is not None
+    state.strict_blocks = 0  # what an M3-era file deserializes to
+    store._write(state)  # noqa: SLF001
+
+    second = json.loads(_run_hook(paths, _default_env(paths), active=True))
+    third = _run_hook(paths, _default_env(paths), active=True)
+
+    assert "last reminder" in second["reason"]
+    assert third == ""
 
 
 def test_the_block_message_names_both_exits() -> None:
@@ -870,3 +950,12 @@ def test_read_transcript_tail_missing_file_is_empty() -> None:
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
+
+
+def test_the_last_reminder_is_blunter_and_still_names_both_exits() -> None:
+    reason = freshness.STRICT_LAST_REMINDER_REASON
+
+    assert "last reminder" in reason
+    assert "strata_contribute" in reason
+    assert "strata_session_closeout(reason)" in reason
+    assert reason != freshness.STRICT_BLOCK_REASON

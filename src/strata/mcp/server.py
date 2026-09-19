@@ -61,6 +61,7 @@ from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.session import ServerSession
 from mcp.shared.message import ServerMessageMetadata
 from mcp.types import (
+    CallToolRequest,
     ClientCapabilities,
     ElicitationCapability,
     ElicitRequest,
@@ -322,6 +323,20 @@ def _record_connect(session: object) -> None:
         _logger.warning("failed to record connect for session %r: %s", _AGENT_SESSION_ID, exc)
 
 
+def _record_tool_call() -> None:
+    """Count one strata tool call for this session (best effort, M3b).
+
+    The strict Stop hook's second block fires only if the agent made no strata
+    call after the first, so every ``tools/call`` is counted, whatever it does.
+    """
+    if _session_store is None or not _sessions_dir:
+        return
+    try:
+        _session_store.record_tool_call(_AGENT_SESSION_ID)
+    except Exception as exc:  # noqa: BLE001 - never fail the call over a counter
+        _logger.warning("failed to count tool call for session %r: %s", _AGENT_SESSION_ID, exc)
+
+
 def _record_end() -> None:
     """Stamp this session's ``ended_at`` — best effort, at connection end (M3).
 
@@ -370,6 +385,9 @@ def _install_connect_hook(server: FastMCP) -> None:
         if not connected:
             connected = True
             _record_connect(session)
+        request = getattr(getattr(message, "request", None), "root", None)
+        if isinstance(request, CallToolRequest):
+            _record_tool_call()
         return await original(message, session, *args, **kwargs)
 
     lowlevel._handle_message = handle_message  # noqa: SLF001
