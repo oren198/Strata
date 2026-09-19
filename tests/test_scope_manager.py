@@ -1604,9 +1604,10 @@ def test_system_prompt_names_functional_origin_descriptions_as_attribution() -> 
 
     "The people who own the account records", "the team that runs billing"
     identify a scope by function rather than by name; the origin check must
-    apply to material attributed this way exactly as it would to an
-    explicit scope name, and the rule must still carve out genuine
-    first-hand material ("we observed") as native to this scope.
+    apply to material RELAYED under such a description exactly as it would
+    to an explicit scope name — and the rule must cut both ways: naming a
+    peer by role, without relaying its substance, must stay as native as
+    naming it outright (the j1-054 legitimate_mention twin).
     """
     origin_idx = _SYSTEM_PROMPT.index("A scope can be named WITHOUT using its name")
     admission_idx = _SYSTEM_PROMPT.index("ADMISSION CHECK")
@@ -1616,8 +1617,8 @@ def test_system_prompt_names_functional_origin_descriptions_as_attribution() -> 
     flat = " ".join(_SYSTEM_PROMPT.split()).lower()
     assert "the people who own the account records" in flat
     assert "the team that runs billing" in flat
-    assert "we observed" in flat
-    assert "according to <scope>" in _SYSTEM_PROMPT
+    assert "security-eng flagged a concern" in flat
+    assert "stays native" in flat
 
 
 def test_system_prompt_declines_bare_removal_without_a_reason() -> None:
@@ -1629,14 +1630,18 @@ def test_system_prompt_declines_bare_removal_without_a_reason() -> None:
     (a precondition gone, a process that replaced the old one) is a genuine
     reason and stays acceptable — as a retire-with-context amendment.
     """
-    bare_removal_idx = _SYSTEM_PROMPT.index("A BARE REMOVAL")
+    bare_removal_idx = _SYSTEM_PROMPT.index("This rule affects ONLY a BARE removal")
     supersedes_idx = _SYSTEM_PROMPT.index('carries a "supersedes" reference')
     classification_idx = _SYSTEM_PROMPT.index("When accepting, you do NOT rewrite")
     assert supersedes_idx < bare_removal_idx < classification_idx
 
-    assert "no replacement needed" in _SYSTEM_PROMPT
-    assert "restates the wish for removal" in _SYSTEM_PROMPT
-    assert "no longer applies" in _SYSTEM_PROMPT or "no longer exists" in _SYSTEM_PROMPT
+    flat = " ".join(_SYSTEM_PROMPT.split())
+    assert "no replacement needed" in flat
+    assert "restates the wish for removal" in flat
+    assert "no longer applies" in flat or "no longer exists" in flat
+    # A real supersession (replacement content stated) needs no further
+    # justification — the reason requirement binds only a bare removal.
+    assert "needs no further" in flat
 
 
 def test_system_prompt_decline_reasoning_names_the_violated_rule() -> None:
