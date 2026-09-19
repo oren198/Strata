@@ -1204,10 +1204,11 @@ def _validate_binding(
        — a one-line notice on stderr names it (operator directive: a fresh
        install must work with minimum friction). When the scope was
        auto-bound and ``STRATA_AGENT_SKILL`` is also unset/empty, the scope's
-       ``default_skill`` (if any) is used the same way. An explicitly set
-       ``STRATA_AGENT_SCOPE`` is never touched by this — it behaves exactly
-       as before. Empty string counts as unset (Codex writes literal empty
-       env values into its config).
+       ``default_skill`` (if any) is used the same way — and so it is for an
+       explicitly named scope (step 3b), so an empty ``STRATA_AGENT_SKILL``
+       never blocks a scope that declares a default. An explicitly set
+       ``STRATA_AGENT_SCOPE`` is otherwise never touched by this. Empty string
+       counts as unset (Codex writes literal empty env values into its config).
     1. ``.strata/config.toml`` resolvable via walk-up. **config-class.**
     2. ``STRATA_AGENT_SCOPE`` env var set (after the auto-bind attempt above)
        — unset/empty against a fleet with zero or 2+ active scopes is still
@@ -1309,6 +1310,15 @@ def _validate_binding(
         scope_obj, exists_error = _check_scope_exists(fleet, resolved_scope, require_active=True)
         if exists_error is not None:
             binding_errors.append(exists_error)
+
+    # 3b. An unset/empty skill takes the scope's default_skill however the scope was
+    #     chosen. Auto-bind (step 0) already did this for the fleet's only scope;
+    #     an explicitly named scope needs the same, or a freshly registered project
+    #     (whose config ships STRATA_AGENT_SKILL empty) is refused until the skill
+    #     is set by hand — the M4 demo runner named its scope `demo` and hit this.
+    #     strata_bind has always resolved it this way (_resolve_skill_default).
+    if scope_obj is not None and not resolved_skill:
+        resolved_skill = _resolve_skill_default(scope_obj, resolved_skill)
 
     # 4. STRATA_AGENT_SKILL must be set — waived only when the scope is
     #    positively confirmed to declare no skills (no default_skill, no
