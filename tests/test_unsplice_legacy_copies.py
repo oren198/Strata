@@ -322,7 +322,10 @@ def test_the_mcp_read_path_unsplices_a_quiet_legacy_scope(env, monkeypatch) -> N
         ),
     )
 
-    pending = server._drain_for_read(fleet, "g_child")
+    pending, drained = server._drain_for_read(fleet, "g_child")
 
     assert pending == 0
+    # A quiet legacy scope has no change events, so the drain consumed none
+    # and owes this read no just-drained notice (ADR 0014 D5, issue #203).
+    assert drained == []
     assert [d.id for d in summary_store.read("g_child").directives] == []

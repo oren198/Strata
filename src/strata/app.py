@@ -83,7 +83,7 @@ import sqlite3
 import tempfile
 from collections.abc import AsyncGenerator, Generator, Sequence
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Literal
 
@@ -136,7 +136,7 @@ from strata.session_state import (
     sessions_dir_for,
 )
 from strata.settings import Settings, get_settings
-from strata.summary_store import Directive, ScopeSummary, SummaryStore
+from strata.summary_store import Directive, ScopeSummary, SummaryStore, derive_condensed
 
 # Console UI static files bundled as package data (same vendoring pattern as
 # _skills/ / _migrations/ / _templates/), so the static mount works regardless
@@ -672,7 +672,19 @@ def _write_amendment(
     # a backstop budget that restarts at zero on each derivation is not a
     # backstop.
     change_ids = judgment.wave_ids or [new_change_id()]
-    written = summary_store.write(scope.id, judgment.new_summary)
+    # Issue #202: the condensation signal is stamped HERE, at the one site
+    # that holds both halves of the comparison — the context this amendment
+    # replaced and the context it writes. `SummaryStore.write` cannot derive
+    # it (it sees only the new summary), and a reader who is never told the
+    # context was shortened cannot tell "condensed away" from "never
+    # admitted". Derived and over-approximate; see `derive_condensed`.
+    condensed = derive_condensed(
+        previous_summary.context if previous_summary is not None else None,
+        judgment.new_summary.context,
+    )
+    written = summary_store.write(
+        scope.id, judgment.new_summary.model_copy(update={"condensed": condensed})
+    )
     # Migration 0013: the record says which version this amendment wrote —
     # one value on every accepted row, so a batch's N verdicts tie to their
     # one write without anyone counting rows against `version`.
@@ -753,6 +765,61 @@ def _write_amendment(
         change_ids=change_ids,
         hop=judgment.hop,
     )
+
+    # Issue #197, the context half: a contribution that supersedes an earlier
+    # one whose claim lived in CONTEXT moves no directive, so the diff above is
+    # silent about it — yet the scope's own readers relied on that claim and
+    # are owed the same `withdrawn` notice a published item's readers get.
+    # Directive supersessions are already covered by the directive-set diff.
+    _emit_context_supersession_self_notices(
+        judged_contribution_ids,
+        scope=scope,
+        record_store=record_store,
+        removed_directive_ids=set(judgment.removed_directive_ids),
+        change_ids=change_ids,
+        hop=judgment.hop,
+    )
+
+
+def _emit_context_supersession_self_notices(
+    judged_contribution_ids: Sequence[str],
+    *,
+    scope: Scope,
+    record_store: RecordStore,
+    removed_directive_ids: set[str],
+    change_ids: Sequence[str],
+    hop: int,
+) -> None:
+    """Self-notice the scope's readers of every context claim this amendment
+    superseded (issue #197). Born-processed, like every self-notice: the
+    scope's judge authored the retraction, so no refresh is owed."""
+    from strata.change_events import (
+        _emit_self_notice,  # noqa: PLC0415 — one caller outside the module
+    )
+
+    for contribution_id in judged_contribution_ids:
+        contribution = record_store.get_contribution(contribution_id)
+        target_id = contribution.supersedes if contribution is not None else None
+        if not target_id or target_id in removed_directive_ids:
+            continue
+        target = record_store.get_contribution(target_id)
+        if target is None or target.scope_id != scope.id:
+            continue
+        # A superseded DIRECTIVE is announced by the directive-set diff; only
+        # a claim that lived in context has nothing else speaking for it.
+        target_judgment = record_store.get_judgment(target_id)
+        if target_judgment is not None and target_judgment.decision == "accept_as_directive":
+            continue
+        _emit_self_notice(
+            record_store,
+            change_ids=change_ids,
+            item=target_id,
+            kind="withdrawn",
+            source_scope_id=scope.id,
+            before=target.content,
+            after=None,
+            hop=hop,
+        )
 
 
 def _emit_directive_set_change(
@@ -1273,12 +1340,19 @@ class DrainOutcome:
     or a queue whose notices already carry verdicts. A caller reporting
     "refresh pending: N" reads ``events_processed``; it is never a count of
     judge outages (pin 4), which are a different thing entirely.
+
+    ``processed_events`` are those same events, in full. A read surface hands
+    them to :func:`~strata.perspective.compose_perspective` as
+    ``just_processed`` so the reader that paid for the refresh is TOLD what
+    changed on that read (ADR 0014 D5, issue #203) — composition filters to
+    unprocessed events, and the drain has just made these processed.
     """
 
     scope_id: str
     events_processed: int
     judged: bool
     outcomes: list[ContributionOutcome]
+    processed_events: list[ChangeEvent] = field(default_factory=list)
 
 
 def drain_is_noop(
@@ -1637,6 +1711,7 @@ def drain_scope(
                 events_processed=len(events),
                 judged=False,
                 outcomes=[],
+                processed_events=list(events),
             )
 
         change_ids = list(dict.fromkeys(event.change_id for event in events))
@@ -1679,6 +1754,9 @@ def drain_scope(
             events_processed=len(events),
             judged=True,
             outcomes=[r for r in results if isinstance(r, ContributionOutcome)],
+            # The events as they were BEFORE the marking above: what a read
+            # surface shows its reader on this very read (ADR 0014 D5, #203).
+            processed_events=list(events),
         )
 
 
@@ -2204,6 +2282,11 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
         # the MCP surface composes, so an operator asking "what does this agent
         # actually see" sees the pending notices too. compose_perspective
         # filters to unprocessed itself.
+        #
+        # This route does NOT drain and does NOT stamp what it shows: an
+        # operator looking in is a viewer, not the audience issue #197 names,
+        # so a scope's own undelivered retraction notice stays composed here
+        # until one of the scope's OWN reads carries it away.
         def _change_event_reader(target_scope_id: str) -> list:
             return record_store.list_change_events(scope_id=target_scope_id)
 

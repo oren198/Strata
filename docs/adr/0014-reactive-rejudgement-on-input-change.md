@@ -51,6 +51,20 @@ withdrawal. Termination is solved in D4, not by narrowing the trigger.
 
 A scope's own contribution is not a trigger; it already has a path.
 
+> **Amended at the 1.11.0 gate (#197).** A scope's own contribution is never a
+> *refresh* trigger for itself — its judge authored it, so there is nothing
+> left to reconcile — but a **retraction** IS notice to the scope's own
+> readers. When an amendment retires or supersedes one of the scope's own
+> directives, or withdraws one of its own published items, a change event is
+> written to the scope itself (`source_scope_id` = the scope), *born
+> processed*: no refresh is queued and `drain_is_noop` stays true. The reason
+> is the fleet premise itself — a scope is a mix of agents, not one mind, and
+> another agent in it may have read the item and acted on it. Silent removal
+> is how decay behaves; a retraction is a correction, and a correction owes
+> notice. Additions are outside this: nothing a reader already holds stops
+> being true when a directive is appended, and the reader's own next read
+> composes it.
+
 ### D2 — The trigger runs the manager-refresh path; `publish` allowed, `append` not
 
 > **Amendment (2026-09-06, ADR 0015 D1/D6):** the parent-splice refresh this
@@ -82,6 +96,46 @@ provenance: this entered because input X changed.
 
 The engine never edits the scope's memory. Only the scope's judge does,
 exercising the scope's authority.
+
+> **Amended at the 1.11.0 gate (#198).** `publish` is dropped on an
+> input-change refresh as well as `append`. The memory-governance-bench run
+> showed the judge re-admitting every notice as the hearer's own material — a
+> peer's *note* republished as the hearer's binding *rule*, an ancestor's or
+> operator's directive republished "per inherited directive" — with the hearer
+> as origin, so a withdrawal at the source never reached the copy (D4b cascades
+> relays only). The changed input is already composed for every reader
+> (ADR 0013/0015); the refresh has nothing of its own to admit from it. The
+> amendment on this path is `new_context` (never restating the changed input),
+> `supersede`/`retire` of the scope's own directives, and `withdraw_published`
+> of its own face — ADR 0011 D4's shape with `withdraw_published` kept. The
+> rationale above ("a directive published from the notice carries honest
+> provenance") was true and beside the point: provenance was honest, authority
+> was manufactured.
+
+> **Amended again (2026-09-08, #198 third form).** The refresh's `new_context`
+> is now mechanically dropped when every pending event on the refresh is an
+> **addition** — `published`, `amended`, `directive_appended`. The amendment
+> may then carry lifecycle ops (`supersede`, `retire`) and `withdraw_published`
+> only; the drop is noted in the judgment record. When at least one pending
+> event is a **removal** — `withdrawn`, `directive_retired`,
+> `directive_superseded`, `operator_directive_changed` — `new_context` stays,
+> because the scope may be asserting something its inputs no longer support and
+> dropping that belief is the refresh's whole purpose. `directive_unspliced`
+> (ADR 0015 D5) is neither, and an unrecognised kind is neither: the rule locks
+> on a positive classification, never on the absence of a removal, so anything
+> unclassified keeps the old behaviour. `append`/`publish` stay dropped on
+> every refresh; an ordinary contribution is untouched.
+>
+> Why mechanical, when the prompt already said it: the paragraph above forbids
+> restating the changed input, and a 235B judge restated a peer's publication
+> into the listener's own context *with attribution* — "…— according to
+> billing" — and called that acknowledging. The reader was then shown the same
+> claim twice, once in the publication layer with billing as origin and a
+> receipt, once in its own context with no receipt. A prompt obligation is a
+> request; the reader's guarantee has to be a property of the engine. On an
+> addition there is nothing of the scope's own to reconcile, so the only thing
+> a rewrite can carry IS the restatement — which is what makes the drop safe
+> rather than lossy.
 
 ### D3 — The affected set is topological, one rule for every kind of change
 
@@ -143,6 +197,23 @@ permanent auditable notice, the judge's input on the refresh, and mechanical
 it, whatever the verdict; the record keeps it forever. Notice is never left to
 the judge's prose — prose condenses away under a word budget, and notice that
 can vanish is not notice.
+
+> **Amended at the 1.11.0 gate (#203, #197).** "Notice is immediate; only
+> absorption is deferred" needs two things this decision left implicit,
+> because a read DRAINS before it composes (D6) and composition filtered to
+> unprocessed events — so a successful drain handed the agent a reconciled
+> summary and no notice at all, the reader who paid for the refresh being the
+> one reader never told.
+>
+> 1. **The read that drains shows what it drained.** `drain_scope` returns the
+>    events it processed; the read surface composes them into `input_changes`
+>    on that read, and they are gone on the next. A bind drains too, and hands
+>    them back on its own result in the same verbatim shape.
+> 2. **A notice with no refresh behind it is consumed by being shown, not by
+>    being drained.** The own-retraction notice of D1's amendment is born
+>    processed, so the drain will never consume it; it carries `shown_at`
+>    instead, and is composed until one read of the scope delivers it. One new
+>    column, no second queue.
 
 ### D6 — Refresh runs inside the MCP server, on read; no daemon, no CLI needed
 
@@ -210,6 +281,15 @@ across the fleet. Revisit with data on how often the gap bites.
 - Judge schema and prompt change (`context_sources`, admitting ops on refresh).
   The release's eval gate covers it; any bridge run before this lands is stale.
 - Perspective gains `input_changes`; touches composition, MCP surface, Console.
+- 2026-09-08 (#202): the self layer also gains `condensation` —
+  `{condensed, context_contributions_absent}`. A refresh that reflows context
+  is exactly the shortening D5's notices set in motion, and until now nothing
+  told the reader it had happened: a reader cannot distinguish "condensed
+  away" from "never admitted", so both owe the same disclosure. Both halves
+  are derived from the summary and the record with no judge in the loop, and
+  both over-approximate (word count cannot see a same-length rewrite;
+  a substring test counts a paraphrase as absent) — deliberately, since
+  over-disclosure is the safe direction for a signal about what is missing.
 - ADR 0011 D4 is amended as in D2. CONTEXT.md needs § Change event, § Refresh,
   and an amended § Perspective — done, this release (§ Publication, §
   Directive and § Operator amended too, each noting it is a source of change

@@ -1438,3 +1438,67 @@ class TestChangeEvents:
                 item_id="pub_1",
                 kind="withdrawn",
             )
+
+
+# ---------------------------------------------------------------------------
+# Scenario — accepted-as-context contributions, the condensation read (#202)
+# ---------------------------------------------------------------------------
+
+
+def test_list_accepted_context_contributions_excludes_directives_and_declines(
+    tmp_path: Path,
+) -> None:
+    """Only ``accept_as_context`` rows come back, oldest first.
+
+    Issue #202: these are exactly the contributions admitted INTO the
+    context, so their absence from it is evidence of condensation. A
+    directive keeps its own identity in the summary and an unjudged or
+    declined contribution was never admitted, so neither belongs here.
+    """
+    db_path = str(tmp_path / "strata.db")
+    store = _open_store(db_path)
+
+    decisions = {
+        "context one": "accept_as_context",
+        "a directive": "accept_as_directive",
+        "context two": "accept_as_context",
+        "rejected": "decline",
+    }
+    for content, decision in decisions.items():
+        contribution = store.append_contribution(
+            scope_id="g_arch",
+            content=content,
+            proposed_classification="context",
+            subject=None,
+            supersedes=None,
+            contributor=_CONTRIBUTOR,
+        )
+        store.record_judgment(
+            contribution_id=contribution.id,
+            decision=decision,
+            judged_by="scope-manager",
+        )
+    # An unjudged contribution — no verdict, so nothing was admitted.
+    store.append_contribution(
+        scope_id="g_arch",
+        content="still pending",
+        proposed_classification="context",
+        subject=None,
+        supersedes=None,
+        contributor=_CONTRIBUTOR,
+    )
+    # Another scope's accepted context must not leak into this scope's count.
+    other = store.append_contribution(
+        scope_id="g_other",
+        content="someone else's context",
+        proposed_classification="context",
+        subject=None,
+        supersedes=None,
+        contributor=_CONTRIBUTOR,
+    )
+    store.record_judgment(
+        contribution_id=other.id, decision="accept_as_context", judged_by="scope-manager"
+    )
+
+    rows = store.list_accepted_context_contributions(scope_id="g_arch")
+    assert [r.content for r in rows] == ["context one", "context two"]

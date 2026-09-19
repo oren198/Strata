@@ -12,6 +12,7 @@ Decision 2 tests (parent summary in user message):
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import os
@@ -733,7 +734,8 @@ def test_accept_with_empty_amendment_still_produces_a_summary() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Test 6: response with no tool_use block → ValueError
+# Test 6: response with no tool_use block → ValueError, after one corrective
+# re-ask (issue #201 — the same `return_value` answers both calls)
 # ---------------------------------------------------------------------------
 
 
@@ -757,6 +759,8 @@ def test_missing_tool_use_block_raises() -> None:
             recent_contributions=[],
             new_contribution=NEW_CONTRIBUTION,
         )
+
+    assert mock_client.messages.create.call_count == 2
 
 
 # ---------------------------------------------------------------------------
@@ -3445,8 +3449,10 @@ def test_refresh_block_rendered_in_input_change_refresh_mode() -> None:
     assert "INPUT-CHANGE REFRESH" not in ordinary
 
 
-def test_input_change_refresh_amendment_drops_append_but_keeps_publish() -> None:
-    """A refresh may publish the judge's own words; it may never copy the notice's."""
+def test_input_change_refresh_amendment_drops_admitting_ops_keeps_lifecycle() -> None:
+    """#198: a refresh admits nothing — not the notice's bytes, not the judge's
+    own words about it. It may retire, supersede, withdraw, and rewrite its
+    own context."""
     manager, _ = _make_manager(
         {
             "decision": "accept_as_context",
@@ -3471,9 +3477,9 @@ def test_input_change_refresh_amendment_drops_append_but_keeps_publish() -> None
 
     assert judgment.new_summary is not None
     assert judgment.new_summary.context == "Reconciled context."
-    assert [op.op for op in judgment.directive_ops] == ["publish", "retire"]
-    assert judgment.dropped_ops == ["append"]
-    assert "append" in judgment.record_notes
+    assert [op.op for op in judgment.directive_ops] == ["retire"]
+    assert len(judgment.dropped_ops) == 2
+    assert "publish" in judgment.record_notes and "append" in judgment.record_notes
 
 
 # ---------------------------------------------------------------------------
@@ -4601,3 +4607,854 @@ def test_batch_hop_reaches_a_real_batch() -> None:
     mock_client.messages.create.return_value = _fake_response(_batch_input())
 
     assert _judge_batch(mock_client, change_ids=["chg_a"], hop=2).hop == 2
+
+
+# ---------------------------------------------------------------------------
+# Issue #201 — judge protocol slips: a missing op id defaulted from the
+# contribution, and one corrective re-ask for the remaining slip shapes.
+# Both are protocol robustness (ADR 0011 D1's one-retry discipline), never a
+# judging change.
+# ---------------------------------------------------------------------------
+
+
+def _contribution_superseding(target_id: str) -> Contribution:
+    """A contribution whose record names the directive it replaces."""
+    return dataclasses.replace(NEW_CONTRIBUTION, supersedes=target_id)
+
+
+def _fake_prose_response(text: str = "Here is my judgment in prose.") -> MagicMock:
+    """A response carrying no tool_use block at all — slip shape (a)."""
+    block = MagicMock()
+    block.type = "text"
+    block.text = text
+
+    response = MagicMock()
+    response.content = [block]
+    return response
+
+
+def test_supersede_op_with_no_id_takes_it_from_the_contribution() -> None:
+    """#201: the record already names the target, so the op is repaired, not rejected."""
+    contribution = _contribution_superseding(EXISTING_DIRECTIVE.id)
+    manager, mock_client = _make_manager(
+        {
+            "decision": "accept_as_directive",
+            "reasoning": "replaces the old rule",
+            "directive_ops": [{"op": "supersede"}, {"op": "append"}],
+            "new_context": None,
+        }
+    )
+
+    judgment = manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=contribution,
+    )
+
+    # Exactly one call: the default is mechanical, never a re-ask.
+    assert mock_client.messages.create.call_count == 1
+    supersede = next(op for op in judgment.directive_ops if op.op == "supersede")
+    assert supersede.id == EXISTING_DIRECTIVE.id
+    assert judgment.removed_directive_ids == [EXISTING_DIRECTIVE.id]
+    assert EXISTING_DIRECTIVE.id in judgment.record_notes
+    assert "supersedes" in judgment.record_notes
+
+
+def test_retire_op_with_no_id_and_no_supersedes_still_fails() -> None:
+    """No target in the record leaves the op invalid exactly as before."""
+    bad = {
+        "decision": "accept_as_directive",
+        "reasoning": "dropping the old rule",
+        "directive_ops": [{"op": "retire"}],
+        "new_context": None,
+    }
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [_fake_response(bad), _fake_response(bad)]
+    manager = ScopeManager(client=mock_client)
+
+    with pytest.raises(ValueError, match="retire op with no id"):
+        manager.judge(
+            scope=SCOPE,
+            stratum=STRATUM,
+            current_summary=CURRENT_SUMMARY,
+            recent_contributions=[],
+            new_contribution=NEW_CONTRIBUTION,
+        )
+
+
+def test_batch_supersede_op_with_no_id_takes_it_from_its_member() -> None:
+    """#201, batch path: the op's own member names the target (ADR 0011 D3)."""
+    superseding = _contribution_superseding(EXISTING_DIRECTIVE.id)
+    batch = [superseding, SECOND_CONTRIBUTION, THIRD_CONTRIBUTION]
+    mock_client = MagicMock()
+    mock_client.messages.create.return_value = _fake_response(
+        _batch_input(
+            directive_ops=[
+                {"op": "supersede", "contribution_id": superseding.id},
+                {"op": "append", "contribution_id": superseding.id},
+                {"op": "append", "contribution_id": SECOND_CONTRIBUTION.id},
+            ]
+        )
+    )
+
+    judgment = _judge_batch(mock_client, contributions=batch)
+
+    assert mock_client.messages.create.call_count == 1
+    supersede = next(op for op in judgment.directive_ops if op.op == "supersede")
+    assert supersede.id == EXISTING_DIRECTIVE.id
+    notes = judgment.record_notes_for(superseding.id)
+    assert EXISTING_DIRECTIVE.id in notes
+    assert "supersedes" in notes
+
+
+def test_batch_supersede_op_with_no_id_and_no_supersedes_still_fails() -> None:
+    """A member naming no target leaves the op invalid, as today."""
+    payload = _batch_input(
+        directive_ops=[
+            {"op": "supersede", "contribution_id": NEW_CONTRIBUTION.id},
+            {"op": "append", "contribution_id": NEW_CONTRIBUTION.id},
+        ]
+    )
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [
+        _fake_response(payload),
+        _fake_response(payload),
+    ]
+
+    with pytest.raises(ValueError, match="supersede op with no id"):
+        _judge_batch(mock_client)
+
+
+def test_no_tool_use_block_gets_one_corrective_reask() -> None:
+    """Slip (a): prose instead of a tool call earns one correction, then parses."""
+    prose = _fake_prose_response()
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [
+        prose,
+        _fake_response(_accept_directive_input()),
+    ]
+    manager = ScopeManager(client=mock_client)
+
+    judgment = manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+    )
+
+    assert mock_client.messages.create.call_count == 2
+    assert judgment.decision == "accept_as_directive"
+
+    second_messages = mock_client.messages.create.call_args_list[1].kwargs["messages"]
+    assert second_messages[1] == {"role": "assistant", "content": prose.content}
+    followup = second_messages[2]
+    assert followup["role"] == "user"
+    # No tool_use block means there is no tool_use id to answer with a result.
+    assert all(b["type"] == "text" for b in followup["content"])
+    assert "Respond only by calling" in followup["content"][0]["text"]
+    assert "submit_judgment" in followup["content"][0]["text"]
+    # The re-ask is on the record, exactly as a dropped op would be.
+    assert "re-ask" in judgment.record_notes
+
+
+def test_no_tool_use_block_twice_still_raises() -> None:
+    """One retry, never a loop: the second slip fails exactly as today."""
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [
+        _fake_prose_response(),
+        _fake_prose_response(),
+    ]
+    manager = ScopeManager(client=mock_client)
+
+    with pytest.raises(ValueError, match="tool_use"):
+        manager.judge(
+            scope=SCOPE,
+            stratum=STRATUM,
+            current_summary=CURRENT_SUMMARY,
+            recent_contributions=[],
+            new_contribution=NEW_CONTRIBUTION,
+        )
+
+    assert mock_client.messages.create.call_count == 2
+
+
+def test_decline_with_amendment_corrective_asks_for_a_clean_decline() -> None:
+    """Slip (c): the correction names the two ways out, and the retry recovers."""
+    slip = {
+        "decision": "decline",
+        "reasoning": "outside this scope's entitlement",
+        "directive_ops": [{"op": "append"}],
+        "new_context": "something",
+    }
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [
+        _fake_response(slip),
+        _fake_response(
+            {
+                "decision": "decline",
+                "reasoning": "outside this scope's entitlement",
+                "directive_ops": [],
+                "new_context": None,
+            }
+        ),
+    ]
+    manager = ScopeManager(client=mock_client)
+
+    judgment = manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+    )
+
+    assert mock_client.messages.create.call_count == 2
+    assert judgment.decision == "decline"
+    assert "re-ask" in judgment.record_notes
+
+    followup = mock_client.messages.create.call_args_list[1].kwargs["messages"][2]
+    text = next(b["text"] for b in followup["content"] if b["type"] == "text")
+    assert "empty amendment" in text
+    assert "accept" in text
+
+
+def test_unparseable_ops_corrective_echoes_the_op_schema() -> None:
+    """Slip (b): the correction echoes what an op is, and the retry recovers."""
+    garbage = {
+        "decision": "accept_as_directive",
+        "reasoning": "a clear standard",
+        "directive_ops": "not a list at all",
+        "new_context": None,
+    }
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [
+        _fake_response(garbage),
+        _fake_response(_accept_directive_input()),
+    ]
+    manager = ScopeManager(client=mock_client)
+
+    judgment = manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+    )
+
+    assert mock_client.messages.create.call_count == 2
+    followup = mock_client.messages.create.call_args_list[1].kwargs["messages"][2]
+    text = next(b["text"] for b in followup["content"] if b["type"] == "text")
+    assert "`op` field" in text
+    assert "re-ask" in judgment.record_notes
+
+
+def test_a_clean_first_answer_makes_exactly_one_call_and_notes_nothing() -> None:
+    """Vacuous-pass guard: no slip, no extra call, no protocol note."""
+    manager, mock_client = _make_manager(_accept_directive_input())
+
+    judgment = manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+    )
+
+    assert mock_client.messages.create.call_count == 1
+    assert "re-ask" not in judgment.record_notes
+    assert judgment.record_notes == judgment.reasoning
+
+
+def test_batch_no_tool_use_block_gets_one_corrective_reask() -> None:
+    """The same one-retry protocol correction on the batch path (ADR 0011 D3)."""
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [
+        _fake_prose_response(),
+        _fake_response(_batch_input()),
+    ]
+
+    judgment = _judge_batch(mock_client)
+
+    assert mock_client.messages.create.call_count == 2
+    followup = mock_client.messages.create.call_args_list[1].kwargs["messages"][2]
+    assert "submit_batch_judgment" in followup["content"][0]["text"]
+    assert "re-ask" in judgment.record_notes_for(NEW_CONTRIBUTION.id)
+
+
+# ---------------------------------------------------------------------------
+# Issue #199 — a superseded or retracted claim leaves the context
+# ---------------------------------------------------------------------------
+
+
+_SUPERSEDED_CONTEXT_CONTENT = RECENT_CONTRIBUTION.content
+"""The replaced CONTEXT claim's own words — what must not come back."""
+
+_CLEAN_CONTEXT = "Code style is now tracked by the formatter's own configuration."
+
+
+def test_system_prompt_says_a_superseded_claim_leaves_the_context() -> None:
+    """#199: the rule the judge broke by narrating "previously X, now Y"."""
+    flat = " ".join(_SYSTEM_PROMPT.split())
+
+    assert "A SUPERSEDED OR RETRACTED CLAIM LEAVES THE CONTEXT." in flat
+    assert "the replaced claim leaves `new_context` ENTIRELY" in flat
+    assert "do not restate it, do not cite it, and do not narrate the transition" in flat
+    # The mechanism the benchmark author named: a citation is not a removal.
+    assert "it gives the dead claim a new home with a footnote" in flat
+    assert "The record keeps the history" in flat
+    # Retraction is covered by the same sentence, not left to inference.
+    assert "supersedes or retracts an earlier one" in flat
+    # Paraphrase is inside the prompt rule, since no string check can reach it.
+    assert "This binds paraphrase exactly as it binds a verbatim copy" in flat
+
+
+def test_batch_prompt_inherits_the_superseded_claim_rule() -> None:
+    """The batch prompt prefixes the single one, so the rule travels (ADR 0011 D3)."""
+    assert "A SUPERSEDED OR RETRACTED CLAIM LEAVES THE CONTEXT." in " ".join(
+        _BATCH_SYSTEM_PROMPT.split()
+    )
+
+
+def _context_supersession_input(context: str, *, decision: str = "accept_as_context") -> dict:
+    """An accept that replaces the window's prior CONTEXT claim — no ops at all."""
+    return {
+        "decision": decision,
+        "reasoning": "The newer observation replaces the earlier one.",
+        "directive_ops": [],
+        "new_context": context,
+    }
+
+
+def _judge_context_supersession(mock_client: MagicMock) -> ScopeManagerJudgment:
+    """The observed #199 shape: a context contribution with a `supersedes` reference."""
+    return ScopeManager(client=mock_client).judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[RECENT_ROW],
+        new_contribution=_contribution_superseding(RECENT_CONTRIBUTION.id),
+    )
+
+
+def test_resurrected_context_claim_triggers_one_corrective_naming_the_rule() -> None:
+    """The replaced claim is back in `new_context` — exactly one re-ask, then the clean text."""
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [
+        _fake_response(
+            _context_supersession_input(
+                f"Previously: {_SUPERSEDED_CONTEXT_CONTENT} That no longer holds."
+            )
+        ),
+        _fake_response(_context_supersession_input(_CLEAN_CONTEXT)),
+    ]
+
+    judgment = _judge_context_supersession(mock_client)
+
+    assert mock_client.messages.create.call_count == 2
+    followup = mock_client.messages.create.call_args_list[1].kwargs["messages"][-1]
+    text = [b for b in followup["content"] if b["type"] == "text"][0]["text"]
+    assert RECENT_CONTRIBUTION.id in text
+    assert "LEAVES THE CONTEXT ENTIRELY" in text
+    # Not one of the other correctives' wordings.
+    assert "could not be parsed" not in text
+    assert "RULE 2" not in text
+    assert "BUDGET" not in text
+
+    assert judgment.new_summary is not None
+    assert judgment.new_summary.context == _CLEAN_CONTEXT
+    assert judgment.dropped_superseded_context is False
+
+
+def test_resurrected_directive_claim_triggers_the_same_corrective() -> None:
+    """A `supersede` op's target counts too, not only the contribution's reference."""
+    ops = [{"op": "supersede", "id": EXISTING_DIRECTIVE.id}, {"op": "append"}]
+    carrying = {
+        "decision": "accept_as_directive",
+        "reasoning": "Replaces the naming rule.",
+        "directive_ops": ops,
+        "new_context": f"Historically: {EXISTING_DIRECTIVE.content} It has been replaced.",
+    }
+    clean = {**carrying, "new_context": _CLEAN_CONTEXT}
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [
+        _fake_response(carrying),
+        _fake_response(clean),
+    ]
+
+    judgment = ScopeManager(client=mock_client).judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+    )
+
+    assert mock_client.messages.create.call_count == 2
+    followup = mock_client.messages.create.call_args_list[1].kwargs["messages"][-1]
+    text = [b for b in followup["content"] if b["type"] == "text"][0]["text"]
+    assert EXISTING_DIRECTIVE.id in text
+
+    assert judgment.new_summary is not None
+    assert judgment.new_summary.context == _CLEAN_CONTEXT
+
+
+def test_retire_op_target_is_checked_the_same_way() -> None:
+    """A retraction leaks identically; `retire` is covered by the same backstop."""
+    retiring = {
+        "decision": "accept_as_context",
+        "reasoning": "The naming rule is withdrawn.",
+        "directive_ops": [{"op": "retire", "id": EXISTING_DIRECTIVE.id}],
+        "new_context": f"Formerly the rule was: {EXISTING_DIRECTIVE.content}",
+    }
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [
+        _fake_response(retiring),
+        _fake_response({**retiring, "new_context": _CLEAN_CONTEXT}),
+    ]
+
+    judgment = ScopeManager(client=mock_client).judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+    )
+
+    assert mock_client.messages.create.call_count == 2
+    assert judgment.new_summary is not None
+    assert judgment.new_summary.context == _CLEAN_CONTEXT
+
+
+def test_second_answer_still_carrying_the_claim_drops_the_context_and_keeps_the_ops() -> None:
+    """Exactly two calls, then the rewrite goes and the removal stands."""
+    carrying = _context_supersession_input(
+        f"Still here: {_SUPERSEDED_CONTEXT_CONTENT} (per {RECENT_CONTRIBUTION.id})"
+    )
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [
+        _fake_response(carrying),
+        _fake_response(carrying),
+    ]
+
+    judgment = _judge_context_supersession(mock_client)
+
+    assert mock_client.messages.create.call_count == 2
+    assert judgment.decision == "accept_as_context"
+    assert judgment.new_context is None
+    assert judgment.dropped_superseded_context is True
+    # An omitted section is not an emptied one: the previous context stands.
+    assert judgment.new_summary is not None
+    assert judgment.new_summary.context == CURRENT_SUMMARY.context
+    assert "Dropped new_context" in judgment.record_notes
+    assert "#199" in judgment.record_notes
+
+
+def test_dropping_the_context_keeps_the_supersede_and_append_ops() -> None:
+    """The ops are what actually remove the replaced item — dropping them would defeat the rule."""
+    carrying = {
+        "decision": "accept_as_directive",
+        "reasoning": "Replaces the naming rule.",
+        "directive_ops": [{"op": "supersede", "id": EXISTING_DIRECTIVE.id}, {"op": "append"}],
+        "new_context": f"Kept anyway: {EXISTING_DIRECTIVE.content}",
+    }
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [
+        _fake_response(carrying),
+        _fake_response(carrying),
+    ]
+
+    judgment = ScopeManager(client=mock_client).judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+    )
+
+    assert judgment.dropped_superseded_context is True
+    assert judgment.removed_directive_ids == [EXISTING_DIRECTIVE.id]
+    assert judgment.new_summary is not None
+    summary_ids = [d.id for d in judgment.new_summary.directives]
+    assert EXISTING_DIRECTIVE.id not in summary_ids
+    assert NEW_CONTRIBUTION.id in summary_ids
+
+
+def test_clean_first_answer_makes_exactly_one_call() -> None:
+    """Vacuous-pass guard: a supersession whose context is clean is not re-asked."""
+    manager, mock_client = _make_manager(_context_supersession_input(_CLEAN_CONTEXT))
+
+    judgment = manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[RECENT_ROW],
+        new_contribution=_contribution_superseding(RECENT_CONTRIBUTION.id),
+    )
+
+    assert mock_client.messages.create.call_count == 1
+    assert judgment.dropped_superseded_context is False
+    assert judgment.new_summary is not None
+    assert judgment.new_summary.context == _CLEAN_CONTEXT
+
+
+def test_paraphrase_of_a_superseded_claim_is_not_re_asked() -> None:
+    """Documented limit: the backstop is verbatim-only; paraphrase is prompt-only (#199)."""
+    paraphrase = "An older note about how the team writes code no longer applies."
+    manager, mock_client = _make_manager(_context_supersession_input(paraphrase))
+
+    judgment = manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[RECENT_ROW],
+        new_contribution=_contribution_superseding(RECENT_CONTRIBUTION.id),
+    )
+
+    assert mock_client.messages.create.call_count == 1
+    assert judgment.dropped_superseded_context is False
+    assert judgment.new_summary is not None
+    assert judgment.new_summary.context == paraphrase
+
+
+def test_whitespace_and_case_differences_do_not_evade_the_backstop() -> None:
+    """Re-wrapping or re-casing a pasted claim is still the same claim."""
+    remangled = _SUPERSEDED_CONTEXT_CONTENT.upper().replace(" ", "\n  ")
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [
+        _fake_response(_context_supersession_input(f"Note:\n{remangled}")),
+        _fake_response(_context_supersession_input(_CLEAN_CONTEXT)),
+    ]
+
+    judgment = _judge_context_supersession(mock_client)
+
+    assert mock_client.messages.create.call_count == 2
+    assert judgment.new_summary is not None
+    assert judgment.new_summary.context == _CLEAN_CONTEXT
+
+
+def test_superseded_claim_corrective_failure_drops_the_context() -> None:
+    """Keep-first would keep the resurrected claim, so an unusable retry drops instead."""
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [
+        _fake_response(_context_supersession_input(f"Back again: {_SUPERSEDED_CONTEXT_CONTENT}")),
+        RuntimeError("api unavailable"),
+    ]
+
+    judgment = _judge_context_supersession(mock_client)
+
+    assert mock_client.messages.create.call_count == 2
+    assert judgment.decision == "accept_as_context"
+    assert judgment.dropped_superseded_context is True
+    assert judgment.new_context is None
+
+
+def test_superseded_claim_corrective_may_not_flip_the_verdict() -> None:
+    """Text-only, like the attribution re-ask: a decision change is discarded whole."""
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [
+        _fake_response(_context_supersession_input(f"Back again: {_SUPERSEDED_CONTEXT_CONTENT}")),
+        _fake_response(_context_supersession_input(_CLEAN_CONTEXT, decision="accept_as_directive")),
+    ]
+
+    judgment = _judge_context_supersession(mock_client)
+
+    assert mock_client.messages.create.call_count == 2
+    assert judgment.decision == "accept_as_context"
+    # The discarded retry leaves the first judgment still carrying the claim.
+    assert judgment.dropped_superseded_context is True
+    assert judgment.new_context is None
+
+
+def test_a_supersedes_target_outside_the_window_is_not_checked() -> None:
+    """Best-effort: with no content to compare, nothing is asserted about the rewrite."""
+    context = f"Carrying on: {_SUPERSEDED_CONTEXT_CONTENT}"
+    manager, mock_client = _make_manager(_context_supersession_input(context))
+
+    judgment = manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],  # the replaced row has aged out
+        new_contribution=_contribution_superseding(RECENT_CONTRIBUTION.id),
+    )
+
+    assert mock_client.messages.create.call_count == 1
+    assert judgment.new_summary is not None
+    assert judgment.new_summary.context == context
+
+
+def test_a_decline_naming_a_supersedes_target_is_not_checked() -> None:
+    """A decline amends nothing, so there is no rewrite to police."""
+    manager, mock_client = _make_manager(
+        {
+            "decision": "decline",
+            "reasoning": "The replacement is not supported by the record.",
+            "directive_ops": [],
+            "new_context": None,
+        }
+    )
+
+    judgment = manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[RECENT_ROW],
+        new_contribution=_contribution_superseding(RECENT_CONTRIBUTION.id),
+    )
+
+    assert mock_client.messages.create.call_count == 1
+    assert judgment.decision == "decline"
+    assert judgment.dropped_superseded_context is False
+
+
+# ---------------------------------------------------------------------------
+# Issue #200 — "not a decision" is never a reason to decline context
+# ---------------------------------------------------------------------------
+
+
+def test_system_prompt_forbids_declining_context_for_lacking_directive_weight() -> None:
+    """#200: the judge declined proper scope-appropriate content for binding nothing."""
+    flat = " ".join(_SYSTEM_PROMPT.split())
+
+    assert '"NOT A DECISION" IS NEVER A REASON TO DECLINE CONTEXT.' in flat
+    assert (
+        "An observation an entitled agent recorded is admitted as context unless "
+        "one of the named decline grounds applies" in flat
+    )
+    # The grounds are named, so "decline" has a closed list to answer to.
+    assert "it contradicts a directive or operator memory binding this scope" in flat
+    assert "it duplicates or restates what this scope's memory already holds" in flat
+    assert "its substantive origin is outside this scope's entitlement" in flat
+    assert "it asserts authority or ratification the rendered message does not show" in flat
+    # And the observed non-grounds are named as non-grounds, in the judge's words.
+    assert "Lacking directive weight, being an observation rather than a decision" in flat
+    assert '"transient", "a single data point", or "not actionable"' in flat
+    assert "is NEVER grounds to decline" in flat
+    assert "context informs and directives bind, and BOTH are memory" in flat
+    assert (
+        "it is the fleet failing to carry what one agent learned to the agent who needs it" in flat
+    )
+
+
+def test_batch_prompt_inherits_the_context_admission_rule() -> None:
+    """The batch prompt prefixes the single one, so the rule travels (ADR 0011 D3)."""
+    assert '"NOT A DECISION" IS NEVER A REASON TO DECLINE CONTEXT.' in " ".join(
+        _BATCH_SYSTEM_PROMPT.split()
+    )
+
+
+def test_admission_rule_sits_in_step_1_before_classification() -> None:
+    """It is an ADMISSION rule: it must be read before the note/rule choice is made."""
+    assert _SYSTEM_PROMPT.index('"NOT A DECISION" IS NEVER A REASON') < _SYSTEM_PROMPT.index(
+        "STEP 2 — CLASSIFICATION"
+    )
+
+
+def test_declining_an_observation_leaves_its_reasoning_as_the_only_record() -> None:
+    """#200 has no mechanical backstop: the judgment notes are the eval's only hook.
+
+    Nothing in the engine can tell a well-reasoned decline from the one the
+    issue observed — only the notes say why, and they are what an eval reads.
+    """
+    reasoning = "No directive weight of its own; declining pending clarification."
+    manager, _mock_client = _make_manager(
+        {
+            "decision": "decline",
+            "reasoning": reasoning,
+            "directive_ops": [],
+            "new_context": None,
+        }
+    )
+
+    judgment = manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+    )
+
+    assert judgment.decision == "decline"
+    assert judgment.new_summary is None
+    assert judgment.record_notes == reasoning
+
+
+def test_budget_rewrite_may_not_resurrect_the_superseded_claim() -> None:
+    """Ordering: the overflow re-ask runs last, so its rewrite gets the drop re-applied (#199).
+
+    The stale-claim re-ask has already been spent by then, so a shorter
+    `new_context` that puts the replaced claim back is dropped rather than
+    re-asked — otherwise a budget correction would silently undo the drop.
+    """
+    stale = _context_supersession_input(f"Back again: {_SUPERSEDED_CONTEXT_CONTENT}")
+    over_budget = _context_supersession_input(
+        _CLEAN_CONTEXT + " " + " ".join(f"word{i}" for i in range(40))
+    )
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [
+        _fake_response(stale),
+        _fake_response(over_budget),
+        _fake_response(stale),
+    ]
+
+    # EXISTING_DIRECTIVE is 5 words: the clean rewrite fits, the padded one
+    # does not, so the overflow re-ask fires after the stale-claim one.
+    judgment = ScopeManager(client=mock_client).judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[RECENT_ROW],
+        new_contribution=_contribution_superseding(RECENT_CONTRIBUTION.id),
+        summary_max_words=20,
+    )
+
+    assert mock_client.messages.create.call_count == 3
+    overflow_text = [
+        b
+        for b in mock_client.messages.create.call_args_list[2].kwargs["messages"][-1]["content"]
+        if b["type"] == "text"
+    ][0]["text"]
+    assert "BUDGET" in overflow_text
+
+    assert judgment.dropped_superseded_context is True
+    assert judgment.new_context is None
+    assert judgment.new_summary is not None
+    assert judgment.new_summary.context == CURRENT_SUMMARY.context
+
+
+# -- extension supersession: the old text is present because the NEW claim
+#    contains it, not because the dead claim was kept (#199 carve-out) ------
+
+
+_EXTENSION_CONTRIBUTION = _contribution(
+    "c_ext01",
+    f"{EXISTING_DIRECTIVE.content} Also annotate every public function.",
+    subject="naming",
+)
+"""A supersession that EXTENDS its target: the old sentence is inside the new one."""
+
+_EXTENSION_OPS = [{"op": "supersede", "id": EXISTING_DIRECTIVE.id}, {"op": "append"}]
+
+
+def test_extension_supersession_is_not_treated_as_a_resurrection() -> None:
+    """The replaced text is in `new_context` because the NEW claim says it — one call, no drop."""
+    manager, mock_client = _make_manager(
+        {
+            "decision": "accept_as_directive",
+            "reasoning": "Extends the naming rule with annotations.",
+            "directive_ops": _EXTENSION_OPS,
+            "new_context": f"Style now covers: {_EXTENSION_CONTRIBUTION.content}",
+        }
+    )
+
+    judgment = manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=_EXTENSION_CONTRIBUTION,
+    )
+
+    assert mock_client.messages.create.call_count == 1
+    assert judgment.dropped_superseded_context is False
+    assert judgment.new_summary is not None
+    assert _EXTENSION_CONTRIBUTION.content in judgment.new_summary.context
+
+
+def test_extension_carve_out_does_not_excuse_a_transition_narrative() -> None:
+    """The contrast: a target the new contribution does NOT contain still fires."""
+    narrating = {
+        "decision": "accept_as_directive",
+        "reasoning": "Replaces the naming rule.",
+        "directive_ops": _EXTENSION_OPS,
+        "new_context": f"Previously: {EXISTING_DIRECTIVE.content} Now type hints are required.",
+    }
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [
+        _fake_response(narrating),
+        _fake_response({**narrating, "new_context": _CLEAN_CONTEXT}),
+    ]
+
+    # NEW_CONTRIBUTION is about type annotations and does not contain the
+    # superseded sentence, so nothing excuses the narration.
+    judgment = ScopeManager(client=mock_client).judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+    )
+
+    assert mock_client.messages.create.call_count == 2
+    assert judgment.new_summary is not None
+    assert judgment.new_summary.context == _CLEAN_CONTEXT
+
+
+def test_extension_supersession_via_publish_is_not_treated_as_a_resurrection() -> None:
+    """The carve-out covers an extension admitted in the judge's own words.
+
+    A `publish` op carries the combined text instead of the contribution's
+    bytes; the old sentence is in `new_context` because the LIVE claim says
+    it, exactly as with `append`. One call, no drop.
+    """
+    combined = f"{EXISTING_DIRECTIVE.content} Also annotate every public function."
+    terse = _contribution("c_ext02", "Add type hints to the naming rule.", subject="naming")
+    manager, mock_client = _make_manager(
+        {
+            "decision": "accept_as_directive",
+            "reasoning": "Extends the naming rule with annotations, in my own words.",
+            "directive_ops": [
+                {"op": "supersede", "id": EXISTING_DIRECTIVE.id},
+                {"op": "publish", "content": combined, "subject": "naming"},
+            ],
+            "new_context": f"Style now covers: {combined}",
+        }
+    )
+
+    judgment = manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=terse,
+    )
+
+    assert mock_client.messages.create.call_count == 1
+    assert judgment.dropped_superseded_context is False
+    assert judgment.new_summary is not None
+    assert combined in judgment.new_summary.context
+
+
+def test_an_empty_response_is_re_asked_without_echoing_an_empty_assistant_turn() -> None:
+    """Slip (a), truncated to nothing: no blocks at all.
+
+    Echoing `{"role": "assistant", "content": []}` is rejected by the API, so
+    the correction goes out as a fresh user turn on its own — and the judgment
+    still recovers on the second call.
+    """
+    empty = MagicMock()
+    empty.content = []
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [
+        empty,
+        _fake_response(_accept_directive_input()),
+    ]
+    manager = ScopeManager(client=mock_client)
+
+    judgment = manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+    )
+
+    assert mock_client.messages.create.call_count == 2
+    assert judgment.decision == "accept_as_directive"
+    second_messages = mock_client.messages.create.call_args_list[1].kwargs["messages"]
+    assert all(m["role"] != "assistant" or m["content"] for m in second_messages)
+    assert second_messages[-1]["role"] == "user"
+    assert "submit_judgment" in second_messages[-1]["content"][0]["text"]

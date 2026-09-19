@@ -109,12 +109,60 @@ class ScopeSummary(BaseModel):
     (``version=1``, ``exists=True``), which otherwise look identical.
     :meth:`SummaryStore.write` always forces this to ``True``."""
 
+    condensed: bool = False
+    """Whether the write that produced this ``context`` shortened it (issue #202).
+
+    A derived, deliberately over-approximate signal: :func:`derive_condensed`
+    sets it when an accepted amendment replaced a non-empty context with a
+    shorter non-empty one (by word count). "Shorter" is the only mechanical
+    evidence that material was condensed away rather than never admitted, and
+    the benchmark rule behind issue #202 is that both owe the reader the same
+    disclosure.
+
+    Per-write, not sticky: an amendment that grows the context writes
+    ``False`` even though an earlier write may have dropped material. The
+    cumulative half of the answer is the perspective's
+    ``context_contributions_absent`` count (see
+    :func:`strata.perspective.compose_perspective`), not this flag. A write
+    that leaves ``context`` untouched (an operator supersede, a directive
+    retirement) carries the flag forward unchanged, because what it claims —
+    "this context is a condensation" — is still true of that same text.
+    """
+
 
 # ---------------------------------------------------------------------------
 # Markdown serialisation helpers
 # ---------------------------------------------------------------------------
 
 _NONE_YET = "_(none yet)_"
+
+
+def _word_count(text: str) -> int:
+    """Words in *text*, whitespace-separated — the condensation measure (issue #202)."""
+    return len(text.split())
+
+
+def derive_condensed(previous_context: str | None, new_context: str) -> bool:
+    """Whether replacing *previous_context* with *new_context* condensed it (issue #202).
+
+    ``True`` when both are non-empty and *new_context* has strictly fewer
+    words. Nothing else: no judge is asked, no paraphrase is detected. The
+    rule is over-approximate on purpose — a rewrite that is merely tighter
+    reads as condensation, which is the safe direction to err in for a
+    disclosure signal. It is also incomplete on its own (a same-length
+    rewrite can still drop material), which is why the perspective pairs it
+    with the count of accepted-as-context contributions absent from the
+    context.
+
+    ``None`` (no summary on disk yet) is not a shortening: a first write
+    condenses nothing, it admits.
+    """
+    if previous_context is None:
+        return False
+    if not previous_context.strip() or not new_context.strip():
+        return False
+    return _word_count(new_context) < _word_count(previous_context)
+
 
 # Matches:  ### [c_abc123] the directive heading text
 _DIRECTIVE_HEADING_RE = re.compile(r"^###\s+\[([^\]]+)\]\s*(.*)")
@@ -139,6 +187,9 @@ def _render_summary(summary: ScopeSummary) -> str:
         "scope_id": summary.scope_id,
         "version": summary.version,
         "updated_at": summary.updated_at,
+        # Issue #202: persisted like `version`, so a reader holding only the
+        # file still learns that this context is a condensation.
+        "condensed": summary.condensed,
     }
     lines.append("---")
     lines.append(yaml.dump(frontmatter, default_flow_style=False).rstrip())
@@ -213,6 +264,9 @@ def _parse_summary(text: str) -> ScopeSummary:
     scope_id: str = fm["scope_id"]
     updated_at: str = fm["updated_at"]
     version: int = int(fm.get("version", 1))
+    # Absent from every file written before issue #202 — such a file asserts
+    # nothing, which reads as False rather than as a decided "not condensed".
+    condensed: bool = bool(fm.get("condensed", False))
 
     # Parse body line by line using a simple state machine.
     # States: OUTSIDE, IN_DIRECTIVES, IN_DIRECTIVE_BLOCK, IN_CONTEXT
@@ -330,6 +384,7 @@ def _parse_summary(text: str) -> ScopeSummary:
         context=context,
         updated_at=updated_at,
         version=version,
+        condensed=condensed,
     )
 
 

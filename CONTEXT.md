@@ -279,7 +279,11 @@ one — a **refresh**'s admitted directive, a relayed withdrawal — inherits
 it, carrying forward how many hops removed it is from the change that
 started it. A scope refreshes for a given change id at most once, however
 many of its notices arrive; the notice itself is never suppressed, only the
-refresh it would otherwise trigger.
+refresh it would otherwise trigger. A scope that **retracts** — retires or
+supersedes one of its own directives, withdraws one of its own published
+items — is also told, in its own record: no refresh is owed, since its own
+judge acted, but another agent reading the scope may have acted on what is
+now gone, and that notice stands until one read of the scope carries it.
 
 ## Refresh
 
@@ -326,7 +330,13 @@ no tombstone is left in the summary.
 
 Retirement exists only for **directives**. Context "forgetting" requires no
 ceremony — the scope-manager simply omits stale context from the next
-summary it rewrites.
+summary it rewrites. No ceremony is not the same as no obligation: when a
+contribution supersedes or retracts an earlier one, the replaced claim
+**leaves the context entirely** — not restated, not cited, not narrated as
+"previously X, now Y". A correction that leaves the original in circulation
+has corrected nothing, and citing a withdrawn claim by its id does not
+remove it, it gives the dead claim a new home with a footnote. The history
+lives in the **record**.
 
 ## Fleet
 
@@ -353,7 +363,11 @@ assembles:
 - The **publications** of the scopes one edge away: the agent's parent, and
   any scope its own scope references,
 - The scope's own unprocessed **change events** — notices of input changes
-  it has not yet been **refresh**ed against.
+  it has not yet been **refresh**ed against,
+- A **condensation** signal on its own layer — whether the last amendment
+  shortened the context, and how many accepted-as-context **contribution**s
+  no longer appear in it — both derived mechanically and over-approximate, so
+  that a reader can tell condensed-away material from material never admitted.
 
 Each piece in the perspective is labelled with the scope it came from —
 composition is **provenance-preserving**, not flattened. Directives compose
