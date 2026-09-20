@@ -23,11 +23,100 @@ from __future__ import annotations
 
 import functools
 import os
+from collections.abc import Mapping
+from dataclasses import dataclass
 
-from pydantic import AliasChoices, Field, model_validator
+from pydantic import AliasChoices, Field, PrivateAttr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from strata.session_state import DEFAULT_SESSION_IDLE_WINDOW_SECONDS
+
+
+#: The default judge (measured 2026-09-20; see the README's "Choosing a judge").
+DEFAULT_JUDGE_MODEL = "qwen/qwen3-235b-a22b-2507"
+DEFAULT_JUDGE_BASE_URL = "https://openrouter.ai/api"
+#: What an install that only ever had an Anthropic key keeps judging with.
+KEPT_JUDGE_MODEL = "claude-haiku-4-5"
+
+#: Why the judge resolved the way it did (:attr:`ResolvedJudge.reason`).
+JUDGE_REASON_DEFAULT = "default"
+JUDGE_REASON_KEPT = "kept_anthropic"
+JUDGE_REASON_OVERRIDE = "override"
+
+_ANTHROPIC_KEY_PREFIX = "sk-ant-"
+
+
+@dataclass(frozen=True)
+class ResolvedJudge:
+    """The judge Strata will actually use, and why. ``base_url`` None = api.anthropic.com."""
+
+    model: str
+    base_url: str | None
+    api_key: str | None
+    reason: str
+
+
+def resolve_judge(
+    *,
+    model: str | None,
+    base_url: str | None,
+    judge_api_key: str | None,
+    anthropic_api_key: str | None,
+) -> ResolvedJudge:
+    """The single place that decides which judge model and endpoint are used.
+
+    Inputs are the *explicit* settings only (None = not set): ``model`` is
+    ``JUDGE_MODEL`` / ``STRATA_MANAGER_MODEL``; ``base_url`` is
+    ``JUDGE_BASE_URL``; the two keys are ``JUDGE_API_KEY`` and the old
+    ``ANTHROPIC_API_KEY`` / ``STRATA_ANTHROPIC_API_KEY``.
+
+    The rule (no silent switch — an upgrade must never change a judge, or post a
+    user's Anthropic key to a third-party router):
+
+    * an explicit model / base URL always wins;
+    * an Anthropic key with no explicit ``JUDGE_BASE_URL`` stays on the Anthropic
+      endpoint (model = the explicit one, else ``claude-haiku-4-5``). Two cases count
+      as an Anthropic key, each for a reason:
+
+      - **An ``sk-ant-`` ``JUDGE_API_KEY`` is an Anthropic key.** ``strata register``
+        wrote ``JUDGE_API_KEY=<key>`` before the default changed, so an existing
+        install's Anthropic key lives under that name; without this it would be sent to
+        OpenRouter on upgrade.
+      - **An explicit model with only an Anthropic key keeps the Anthropic endpoint.**
+        ``JUDGE_MODEL`` / ``STRATA_MANAGER_MODEL`` alone chose a model, not a provider;
+        moving the endpoint too would send the Anthropic key to a router.
+
+    * otherwise the default judge: ``qwen/qwen3-235b-a22b-2507`` on
+      ``https://openrouter.ai/api``, each half replaced by its explicit setting.
+    """
+    key = judge_api_key or anthropic_api_key
+    key_is_anthropic = bool(key) and (
+        not judge_api_key or judge_api_key.startswith(_ANTHROPIC_KEY_PREFIX)
+    )
+    if not base_url and key_is_anthropic:
+        model = model or KEPT_JUDGE_MODEL
+        reason = JUDGE_REASON_KEPT if model == KEPT_JUDGE_MODEL else JUDGE_REASON_OVERRIDE
+        return ResolvedJudge(model, None, key, reason)
+    model = model or DEFAULT_JUDGE_MODEL
+    base_url = base_url or DEFAULT_JUDGE_BASE_URL
+    # Explicit lines that just restate the default (what `strata register` writes beside
+    # a captured key) are still the default judge — "configured" only when they differ.
+    is_default = model == DEFAULT_JUDGE_MODEL and base_url == DEFAULT_JUDGE_BASE_URL
+    return ResolvedJudge(
+        model, base_url, key, JUDGE_REASON_DEFAULT if is_default else JUDGE_REASON_OVERRIDE
+    )
+
+
+def resolve_judge_from_env(env: Mapping[str, str]) -> ResolvedJudge:
+    """:func:`resolve_judge` over a raw env mapping (callers with no :class:`Settings`)."""
+    return resolve_judge(
+        model=env.get("STRATA_MANAGER_MODEL") or env.get("JUDGE_MODEL") or None,
+        base_url=env.get("STRATA_JUDGE_BASE_URL") or env.get("JUDGE_BASE_URL") or None,
+        judge_api_key=env.get("STRATA_JUDGE_API_KEY") or env.get("JUDGE_API_KEY") or None,
+        anthropic_api_key=env.get("STRATA_ANTHROPIC_API_KEY")
+        or env.get("ANTHROPIC_API_KEY")
+        or None,
+    )
 
 
 class Settings(BaseSettings):
@@ -57,7 +146,7 @@ class Settings(BaseSettings):
     # validation_alias suppresses pydantic-settings' auto-generated
     # STRATA_-prefixed mapping. STRATA_MANAGER_MODEL wins when both are set.
     manager_model: str = Field(
-        default="claude-haiku-4-5",
+        default=DEFAULT_JUDGE_MODEL,
         validation_alias=AliasChoices("STRATA_MANAGER_MODEL", "JUDGE_MODEL"),
     )
     summary_max_words: int = Field(default=500, ge=1)
@@ -124,10 +213,14 @@ class Settings(BaseSettings):
         default=None,
         validation_alias=AliasChoices("STRATA_JUDGE_API_KEY", "JUDGE_API_KEY"),
     )
+    # Defaults to OpenRouter; resolve_judge() keeps an Anthropic-key-only install on
+    # the Anthropic endpoint (None) — see there. Read the *resolved* value here.
     judge_base_url: str | None = Field(
-        default=None,
+        default=DEFAULT_JUDGE_BASE_URL,
         validation_alias=AliasChoices("STRATA_JUDGE_BASE_URL", "JUDGE_BASE_URL"),
     )
+
+    _resolved_judge: ResolvedJudge | None = PrivateAttr(default=None)
 
     @model_validator(mode="after")
     def _fallback_api_key(self) -> Settings:
@@ -142,7 +235,25 @@ class Settings(BaseSettings):
             self.anthropic_api_key = os.environ.get("ANTHROPIC_API_KEY")
         if self.judge_api_key is None:
             self.judge_api_key = os.environ.get("JUDGE_API_KEY")
+        # Resolve the judge from what was *explicitly* set, then write the result back
+        # so every reader of manager_model / judge_base_url sees the resolved judge.
+        given = self.model_fields_set
+        resolved = resolve_judge(
+            model=self.manager_model if "manager_model" in given else None,
+            base_url=self.judge_base_url if "judge_base_url" in given else None,
+            judge_api_key=self.judge_api_key,
+            anthropic_api_key=self.anthropic_api_key,
+        )
+        self.manager_model = resolved.model
+        self.judge_base_url = resolved.base_url
+        self._resolved_judge = resolved
         return self
+
+    @property
+    def resolved_judge(self) -> ResolvedJudge:
+        """The judge in effect, and why (:func:`resolve_judge`)."""
+        assert self._resolved_judge is not None
+        return self._resolved_judge
 
     def build_judge_client(self):  # -> anthropic.Anthropic
         """Construct the judge's Anthropic-Messages-API client.
@@ -196,14 +307,8 @@ def resolve_judge_credentials(env: dict[str, str]) -> tuple[str | None, str | No
     ``ANTHROPIC_API_KEY`` / ``STRATA_ANTHROPIC_API_KEY`` names are a working
     fallback.
     """
-    api_key = (
-        env.get("STRATA_JUDGE_API_KEY")
-        or env.get("JUDGE_API_KEY")
-        or env.get("STRATA_ANTHROPIC_API_KEY")
-        or env.get("ANTHROPIC_API_KEY")
-    )
-    base_url = env.get("STRATA_JUDGE_BASE_URL") or env.get("JUDGE_BASE_URL")
-    return api_key, base_url
+    resolved = resolve_judge_from_env(env)
+    return resolved.api_key, resolved.base_url
 
 
 @functools.lru_cache(maxsize=1)

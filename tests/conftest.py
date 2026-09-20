@@ -63,6 +63,11 @@ def _isolate_harness_detection_and_codex_home(
         return
 
     monkeypatch.setattr(install, "detect_harnesses", lambda *a, **k: [])
+    # `strata doctor` probes the resolved judge over the network; never in the suite.
+    # Tests of the probe call `_probe_judge_live` with a fake client.
+    import strata.__main__ as _cli
+
+    monkeypatch.setattr(_cli, "_probe_judge", lambda resolved: None)
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / "_autouse_codex_home_guard"))
 
     # (d) The `strata` on PATH is the install running the suite. `strata doctor`
