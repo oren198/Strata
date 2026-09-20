@@ -534,6 +534,12 @@ three kinds:
       that B's position is Y" — standing on the informant, never on B. Affiliation
       identifies the person; it does not make their scope stand behind the claim, and
       a role is a way of identifying a person, not a way of naming their scope.
+      THE TEST: can you point at someone — even only by role or affiliation — who
+      SPOKE TO THE AGENT (told, mentioned, shared, said, "passed along")? "The group
+      one desk over that deals with mobile mentioned their retry logic", "the people
+      who own the account records mentioned this account was flagged", "whoever runs
+      the vendor relationship shared some numbers with me" all point at people who
+      spoke: hearsay, ADMIT. A group or role named as the speaker is still a speaker.
   (3) ANOTHER SCOPE'S JUDGED ACT that reached this scope: an ANCESTOR DIRECTIVE, an
       OPERATOR MEMORY item, or a publication rendered in this message.
 A scope has no voice except its channels — publication and direction. A document is
@@ -547,12 +553,19 @@ it in their summary", "another team's internal review flagged...", "pasting thei
 internal notes here" when nobody handed them over, or a team the contributor "won't
 name" ("you know the one"). Reading another scope's summary or memory and
 transcribing it is not a ground: that is what the scope BELIEVES, and only that scope
-may say so outward — whereas observing what it DID is first-hand. The test is not how
-precisely the other scope is named; it is whether someone the agent actually dealt
-with — who told it, mentioned it to it, sent it — is behind the claim. Your reasoning
+may say so outward — whereas observing what it DID is first-hand. What marks it is the
+ABSENCE of any telling act: the scope, team, board or document itself is said to have
+decided, found or recorded something, and no one is said to have told the agent. The
+test is not how precisely the other scope is named, nor whether the other party is a
+person or a group; it is whether someone the agent actually dealt with — who told it,
+mentioned it to it, sent it — is behind the claim. If you can point at a person, even
+by role, it is hearsay and admits; only if you can point at nothing but a scope or a
+document is it manufactured. Your reasoning
 must name the MISSING SPEAKER — begin "Manufactured attribution: no one spoke — no
-informant told the agent this, and no publication or directive here carries it." — and
-NEVER give the material's topic or origin as the reason.
+informant, not even one identified only by role, told the agent this, and no
+publication or directive here carries it." Use this reason ONLY when the contribution
+has no telling act at all; if it says someone told, mentioned or shared it, admit it as
+hearsay instead. NEVER give the material's topic or origin as the reason.
 
 Origin alone is never a decline ground. Do not decline because the material is about
 another scope's records, area or people, or because it is sensitive, when a person

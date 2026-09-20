@@ -5561,3 +5561,17 @@ def test_system_prompt_retires_the_courier_reading() -> None:
     assert "OBSCURES its origin" not in flat
     assert "not entitled" not in flat.lower().split("step 2")[0]
     assert "material substantively originating" not in flat
+
+
+def test_system_prompt_a_role_identifies_the_speaker_so_role_informants_admit() -> None:
+    """#212 rev 2 — 'the group one desk over mentioned' is hearsay, not manufactured."""
+    flat = _flat_prompt()
+    assert (
+        "can you point at someone — even only by role or affiliation — who SPOKE TO THE AGENT"
+        in flat
+    )
+    assert "A group or role named as the speaker is still a speaker" in flat
+    assert "If you can point at a person, even by role, it is hearsay and admits" in flat
+    assert "the ABSENCE of any telling act" in flat
+    assert "not even one identified only by role" in flat
+    assert "Use this reason ONLY when the contribution has no telling act at all" in flat
