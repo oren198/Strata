@@ -57,6 +57,7 @@ import json
 import logging
 import re
 from collections.abc import Callable, Collection, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Literal, Protocol, TypeVar
 
@@ -85,6 +86,275 @@ WINDOW_VERBATIM_TAIL = 3
 #: a scope with nothing in it keeps today's behaviour exactly. Mirrors
 #: ``Settings.implied_purpose_min_words`` (``STRATA_IMPLIED_PURPOSE_MIN_WORDS``).
 IMPLIED_PURPOSE_MIN_WORDS = 50
+
+#: A ``retire`` op's ``ground`` must be at least this many words. A real changed
+#: circumstance ("the manual snapshot step no longer exists") needs a handful of words;
+#: "obsolete" or "not needed" is a verdict, not a ground. Mirrors
+#: ``Settings.retire_ground_min_words`` (``STRATA_RETIRE_GROUND_MIN_WORDS``).
+RETIRE_GROUND_MIN_WORDS = 4
+
+#: ...and carry at least this many SUBSTANTIVE words: words that are neither filler nor
+#: the vocabulary of a removal request (remove, replacement, needed, obsolete, ...). A
+#: ground made only of request words says nothing about what changed. Mirrors
+#: ``Settings.retire_ground_min_substantive_words``.
+RETIRE_GROUND_MIN_SUBSTANTIVE_WORDS = 2
+
+#: A ground is rejected as a restatement when at least this fraction of its content
+#: words already appear in the contribution's own removal sentence(s) — the clauses
+#: that ask for the removal. 0.7 sits well clear of genuine grounds, which name the
+#: directive they retire (a few shared words) but are mostly the changed circumstance:
+#: the genuine examples in the tests overlap by 0.13-0.5. Mirrors
+#: ``Settings.retire_ground_max_restatement``.
+RETIRE_GROUND_MAX_RESTATEMENT = 0.7
+
+
+@dataclass(frozen=True)
+class RetireGroundPolicy:
+    """The three mechanical floors a ``retire`` op's ground must clear (#209).
+
+    A retirement removes a directive with nothing replacing it, so the contribution
+    must say WHAT CHANGED. These checks are deterministic — no LLM call — and reject a
+    ground that is absent, too short, or merely the removal request said again.
+    """
+
+    min_words: int = RETIRE_GROUND_MIN_WORDS
+    min_substantive: int = RETIRE_GROUND_MIN_SUBSTANTIVE_WORDS
+    max_restatement: float = RETIRE_GROUND_MAX_RESTATEMENT
+
+
+DEFAULT_RETIRE_GROUND_POLICY = RetireGroundPolicy()
+
+_GROUND_STOPWORDS = frozenset(
+    [
+        "a",
+        "an",
+        "the",
+        "this",
+        "that",
+        "these",
+        "those",
+        "it",
+        "its",
+        "is",
+        "are",
+        "was",
+        "were",
+        "be",
+        "been",
+        "being",
+        "am",
+        "do",
+        "does",
+        "did",
+        "of",
+        "to",
+        "in",
+        "on",
+        "at",
+        "by",
+        "for",
+        "with",
+        "from",
+        "as",
+        "and",
+        "or",
+        "but",
+        "if",
+        "so",
+        "then",
+        "than",
+        "too",
+        "very",
+        "not",
+        "no",
+        "nor",
+        "i",
+        "we",
+        "you",
+        "they",
+        "he",
+        "she",
+        "them",
+        "us",
+        "our",
+        "your",
+        "their",
+        "my",
+        "me",
+        "there",
+        "here",
+        "now",
+        "longer",
+        "also",
+        "which",
+        "who",
+        "whom",
+        "what",
+        "when",
+        "where",
+        "why",
+        "how",
+        "has",
+        "have",
+        "had",
+        "will",
+        "would",
+        "shall",
+        "should",
+        "can",
+        "could",
+        "may",
+        "might",
+        "must",
+        "into",
+        "onto",
+        "over",
+        "under",
+        "up",
+        "down",
+        "out",
+        "off",
+        "about",
+        "again",
+        "further",
+        "once",
+    ]
+)
+
+# Words that make a removal REQUEST rather than describe a change: the removal verbs,
+# and the filler that decorates them ("just", "no replacement needed", "obsolete").
+_REMOVAL_WORD_RE = re.compile(
+    r"(?:remov|delet|drop|retir|withdr|discard|revok|rescind|cancel|scrap|eliminat|supersed)",
+)
+_REQUEST_WORDS = frozenset(
+    [
+        "directive",
+        "directives",
+        "rule",
+        "rules",
+        "just",
+        "please",
+        "need",
+        "needs",
+        "needed",
+        "replacement",
+        "replace",
+        "obsolete",
+        "outdated",
+        "stale",
+        "unnecessary",
+        "redundant",
+        "gone",
+        "anymore",
+        "go",
+        "away",
+    ]
+)
+_CLAUSE_SPLIT_RE = re.compile(r"[.;:!?\n]+|\s[—–-]{1,2}\s|,")
+_GET_RID_RE = re.compile(r"\bget(?:s|ting)? rid\b", re.IGNORECASE)
+
+
+def _stem(word: str) -> str:
+    """A crude stem — enough to see that remove/removed/removes are one word."""
+    for suffix in ("ing", "ed", "es", "s"):
+        if word.endswith(suffix) and len(word) - len(suffix) >= 3:
+            word = word[: -len(suffix)]
+            break
+    return word[:-1] if word.endswith("e") and len(word) > 3 else word
+
+
+def _content_tokens(text: str) -> list[str]:
+    """Lower-cased alphanumeric words of *text* without filler, as stems."""
+    words = re.findall(r"[a-z0-9]+", text.lower())
+    return [_stem(w) for w in words if len(w) > 1 and w not in _GROUND_STOPWORDS]
+
+
+_REQUEST_STEMS = frozenset(_stem(w) for w in _REQUEST_WORDS)
+
+
+def _is_request_word(token: str) -> bool:
+    return bool(_REMOVAL_WORD_RE.match(token)) or token in _REQUEST_STEMS
+
+
+def _removal_clauses(text: str) -> list[str]:
+    """The clauses of *text* that ask for something to be removed."""
+    clauses = [c for c in _CLAUSE_SPLIT_RE.split(text) if c and c.strip()]
+    return [c for c in clauses if _GET_RID_RE.search(c) or _REMOVAL_WORD_RE.search(c.lower())]
+
+
+def _ground_defect(
+    ground: str | None, contribution_text: str | None, policy: RetireGroundPolicy
+) -> str | None:
+    """Why *ground* is not a ground, or ``None`` when it clears every floor (#209).
+
+    (a) absent, empty or whitespace; (b) under ``policy.min_words`` words; (c) merely
+    restating the removal request — fewer than ``policy.min_substantive`` substantive
+    words, or at least ``policy.max_restatement`` of its content words already in the
+    contribution's own removal sentence(s). The overlap half of (c) does not apply when
+    the contribution has no removal sentence (an overflow retire to fit the budget).
+    """
+    text = (ground or "").strip()
+    if not text:
+        return "no ground stated"
+    words = text.split()
+    if len(words) < policy.min_words:
+        return f"a ground that is too short ({len(words)} words; at least {policy.min_words})"
+    tokens = _content_tokens(text)
+    substantive = [t for t in tokens if not _is_request_word(t)]
+    restates = "a ground that merely restates the removal request"
+    if len(substantive) < policy.min_substantive:
+        return restates
+    if tokens and contribution_text:
+        removal_tokens = {
+            t for clause in _removal_clauses(contribution_text) for t in _content_tokens(clause)
+        }
+        if removal_tokens:
+            overlap = sum(1 for t in tokens if t in removal_tokens) / len(tokens)
+            if overlap >= policy.max_restatement:
+                return restates
+    return None
+
+
+class _RetireWithoutGround(ValueError):
+    """One or more ``retire`` ops carry no usable ground (#209).
+
+    Raised by :func:`_parse_directive_ops` alongside the unpaired-supersede rejection,
+    so the judge gets the ordinary single protocol re-ask; a second failure is turned
+    into a DECLINE naming the missing ground (see :class:`_GroundGate`).
+    """
+
+    def __init__(self, defects: list[tuple[DirectiveOp, str]]) -> None:
+        self.defects = defects
+        listed = "; ".join(f"retire {op.id}: {defect}" for op, defect in defects)
+        super().__init__(
+            f"submit_judgment returned a retire op with no usable ground ({listed}). "
+            "A retirement needs a `ground`: the changed circumstance, in the "
+            "contribution's own words."
+        )
+
+    def decline_reasoning(self) -> str:
+        """The decline's reason: names the missing ground and teaches the fix."""
+        ids = ", ".join(op.id or "?" for op, _ in self.defects)
+        why = "; ".join(defect for _, defect in self.defects)
+        return (
+            "Declined: retirement without a stated ground. The contribution asks to remove "
+            f"directive {ids} but states no changed circumstance that justifies it ({why}). "
+            "To retire a directive, the contribution itself must say why it no longer holds "
+            "— what changed — in its own words."
+        )
+
+
+@dataclass
+class _GroundGate:
+    """Set ``final`` once the single protocol re-ask has been spent (#209).
+
+    A ground-less retire is rejected with a re-ask first; on the attempt AFTER that
+    re-ask the parse layer turns the same defect into a decline instead of raising, so
+    there is exactly one re-ask and then a verdict, never a stranded contribution.
+    """
+
+    final: bool = False
+
 
 #: ADR 0013 D3 — the word budget for a scope's published face (its own
 #: current publication plus whatever a ``publish`` act would add). The
@@ -287,7 +557,8 @@ JUDGE_TOOL: dict = {
                                 "(requires content). supersede: remove the directive named "
                                 "by id, replaced by the directive this amendment admits "
                                 "(valid only alongside an append or a publish). retire: "
-                                "remove the directive named by id with no replacement."
+                                "remove the directive named by id with no replacement — "
+                                "REQUIRES a ground (below)."
                             ),
                         },
                         "content": {
@@ -313,6 +584,17 @@ JUDGE_TOOL: dict = {
                             "description": (
                                 "supersede / retire only: the id of the directive to "
                                 "remove, exactly as it appears in the CURRENT SUMMARY."
+                            ),
+                        },
+                        "ground": {
+                            "type": ["string", "null"],
+                            "description": (
+                                "retire only, REQUIRED for a retire op: the changed "
+                                "circumstance that makes the directive no longer hold, in "
+                                "the contribution's own words. It must come from the "
+                                "contribution, never invented; a retirement with no stated "
+                                "ground is not a retirement. If the contribution only asks "
+                                "for the removal, state no ground: decline it instead."
                             ),
                         },
                     },
@@ -609,8 +891,14 @@ STEP 2 — CLASSIFICATION. Concepts you must know (from CONTEXT.md):
     Supersession replaces, so an unpaired `supersede` is a retirement
     wearing the wrong name and is rejected at parse; to remove a directive
     nothing replaces, use `retire`.
-  - `retire` — {"op": "retire", "id": <directive id>}: remove that
-    directive with no replacement. The retirement is recorded in the
+  - `retire` — {"op": "retire", "id": <directive id>, "ground": "<the
+    changed circumstance, in the contribution's own words>"}: remove that
+    directive with no replacement. The `ground` is REQUIRED: what changed that
+    makes the directive no longer hold, taken from the contribution — never
+    invented by you; a retirement with no stated ground is not a retirement: a
+    contribution that only asks for the removal ("just remove it", "no
+    replacement needed", "this supersedes X") states no ground, so DECLINE it
+    and use no `retire` op. The retirement is recorded in the
     scope's record; no tombstone stays in the summary.
   Name only directive ids that appear in the CURRENT SUMMARY rendered
   below, each at most once.
@@ -1092,6 +1380,10 @@ class DirectiveOp(BaseModel):
     id: str | None = None
     """``supersede`` / ``retire`` only: the directive id being removed."""
 
+    ground: str | None = None
+    """``retire`` only: the changed circumstance that justifies the retirement, in the
+    contribution's own words (#209). Required and mechanically checked at parse."""
+
     contribution_id: str | None = None
     """BATCH mode only: the batch member this op is attributed to.
 
@@ -1154,6 +1446,10 @@ def _parse_directive_ops(  # noqa: ANN001 — raw tool-call field
     raw_ops,
     *,
     supersedes_for: Callable[[DirectiveOp], str | None] = lambda _op: None,
+    contribution_text_for: Callable[[DirectiveOp], str | None] = lambda _op: None,
+    ground_policy: RetireGroundPolicy = DEFAULT_RETIRE_GROUND_POLICY,
+    ungrounded_out: list[tuple[DirectiveOp, str]] | None = None,
+    require_ground: bool = True,
 ) -> tuple[list[DirectiveOp], list[str]]:
     """Parse the ``directive_ops`` field of a ``submit_judgment`` payload.
 
@@ -1173,6 +1469,17 @@ def _parse_directive_ops(  # noqa: ANN001 — raw tool-call field
     the contribution under judgment on the single path, the member the op's
     ``contribution_id`` names in a batch (ADR 0011 D3). A contribution naming
     no target leaves the op invalid exactly as before.
+
+    Ground (#209): a ``retire`` removes a directive with nothing replacing it, so its
+    ``ground`` — the changed circumstance, from the contribution — is checked here
+    mechanically, in the same layer, with no LLM call: absent, under the word floor, or
+    merely the contribution's own removal request said again (:func:`_ground_defect`).
+    *contribution_text_for* resolves an op to the text it is checked against, as
+    *supersedes_for* does for ids. Every ungrounded op raises
+    :class:`_RetireWithoutGround` (a ``ValueError``) at once — unless *ungrounded_out* is
+    given (the attempt after the one re-ask), in which case they are appended to it and
+    returned with the rest for the caller to turn into a decline. *require_ground* False
+    (an input-change refresh, where no contribution exists to ground it) skips the check.
 
     Returns:
         The parsed ops, and the mechanical notes for any id defaulted this
@@ -1213,6 +1520,7 @@ def _parse_directive_ops(  # noqa: ANN001 — raw tool-call field
             subject=entry.get("subject"),
             supersedes=entry.get("supersedes"),
             id=entry.get("id"),
+            ground=(str(entry["ground"]).strip() or None) if entry.get("ground") else None,
             # Batch mode only (ADR 0011 D3); absent, and unused, on the
             # single-contribution path, where the binding stays implicit.
             contribution_id=entry.get("contribution_id"),
@@ -1246,6 +1554,18 @@ def _parse_directive_ops(  # noqa: ANN001 — raw tool-call field
             "same amendment. Supersession replaces: an unpaired supersede is a "
             "retirement — use a retire op instead."
         )
+
+    ungrounded = [
+        (op, defect)
+        for op in ops
+        if require_ground
+        and op.op == "retire"
+        and (defect := _ground_defect(op.ground, contribution_text_for(op), ground_policy))
+    ]
+    if ungrounded:
+        if ungrounded_out is None:
+            raise _RetireWithoutGround(ungrounded)
+        ungrounded_out.extend(ungrounded)
     return ops, notes
 
 
@@ -1682,6 +2002,10 @@ class _AmendmentJudgment(BaseModel):
         return [
             (op.id, op.contribution_id) for op in self.directive_ops if op.op == "retire" and op.id
         ]
+
+    def retirement_grounds(self) -> dict[str, str | None]:
+        """``directive id retired -> the ground its retire op stated`` (#209)."""
+        return {op.id: op.ground for op in self.directive_ops if op.op == "retire" and op.id}
 
 
 #: Either judgment shape — what :meth:`ScopeManager._call_with_correctives`
@@ -2852,6 +3176,8 @@ class ScopeManager:
         implied_purpose_min_words: Words of existing memory a scope with no
                 description needs before that memory counts as its implied purpose
                 (#210); see :data:`IMPLIED_PURPOSE_MIN_WORDS`.
+        retire_ground_policy: The floors a ``retire`` op's ground must clear
+                (#209); see :class:`RetireGroundPolicy`.
     """
 
     def __init__(
@@ -2860,10 +3186,12 @@ class ScopeManager:
         client: anthropic.Anthropic,
         model: str = "claude-haiku-4-5",
         implied_purpose_min_words: int = IMPLIED_PURPOSE_MIN_WORDS,
+        retire_ground_policy: RetireGroundPolicy = DEFAULT_RETIRE_GROUND_POLICY,
     ) -> None:
         self._client = client
         self._model = model
         self._implied_purpose_min_words = implied_purpose_min_words
+        self._retire_ground_policy = retire_ground_policy
 
     def judge(
         self,
@@ -3084,8 +3412,12 @@ class ScopeManager:
             current_publication, peer_publications, parent_publication
         )
 
+        ground_gate = _GroundGate()
+
         def _parse(block) -> ScopeManagerJudgment:  # noqa: ANN001 — tool_use block
             return self._parse_judgment(
+                ground_gate=ground_gate,
+                ground_policy=self._retire_ground_policy,
                 scope=scope,
                 tool_use_block=block,
                 current_summary=current_summary,
@@ -3205,6 +3537,7 @@ class ScopeManager:
             max_tokens=JUDGE_MAX_TOKENS,
             summary_max_words=summary_max_words,
             parse=_parse,
+            ground_gate=ground_gate,
             invalid_ops=_invalid_ops,
             invalid_corrective=_invalid_corrective,
             drop_invalid=_drop_invalid,
@@ -3241,6 +3574,7 @@ class ScopeManager:
         stale_claims: Callable[[_JudgmentT], list[str]] | None = None,
         stale_claim_corrective: Callable[[Sequence[str]], str] | None = None,
         drop_stale_context: Callable[[_JudgmentT], _JudgmentT] | None = None,
+        ground_gate: _GroundGate | None = None,
     ) -> _JudgmentT:
         """Run one judgment call and its correctives, one retry each.
 
@@ -3336,6 +3670,15 @@ class ScopeManager:
                     "Your response contained no tool_use block. Respond only by "
                     f"calling `{tool_name}`; no prose."
                 )
+            if isinstance(error, _RetireWithoutGround):
+                return (
+                    f"Your {tool_name} call had a retire op without a usable ground: {error} "
+                    f"Call {tool_name} again with the SAME {verdict_noun}. Give each `retire` "
+                    "a `ground` — the changed circumstance that makes the directive no "
+                    "longer hold, in the contribution's own words, never invented. If the "
+                    "contribution states no such circumstance (it only asks for the "
+                    "removal), do not retire: DECLINE it, with no amendment."
+                )
             if isinstance(error, _DeclineWithAmendment):
                 return (
                     f"Your {tool_name} call declined but carried an amendment: {error} "
@@ -3353,6 +3696,8 @@ class ScopeManager:
             """What the record says about the re-ask (issue #201)."""
             if isinstance(error, _NoToolUseBlock):
                 slip = "the first response carried no tool_use block"
+            elif isinstance(error, _RetireWithoutGround):
+                slip = "the first response retired a directive without a usable ground"
             elif isinstance(error, _DeclineWithAmendment):
                 slip = "the first response declined while carrying an amendment"
             else:
@@ -3401,6 +3746,10 @@ class ScopeManager:
             retry_messages = [*first_messages, *correction]
             response = _call(retry_messages)
             tool_use_block = self._extract_tool_use_block(response)
+            if ground_gate is not None:
+                # The one re-ask is spent: a retire still without a ground is now
+                # turned into a decline by the parse layer instead of raising (#209).
+                ground_gate.final = True
             judgment = parse(tool_use_block)
             protocol_notes.append(_protocol_note(parse_error))
             # Chain the correctives below onto this turn: their follow-ups
@@ -3533,8 +3882,10 @@ class ScopeManager:
                     f"— over the BUDGET of {summary_max_words} words. Call "
                     f"{tool_name} again with the SAME {decision_noun} and an amendment "
                     f"that fits within {summary_max_words} words: `retire` directives "
-                    "that no longer earn their words, and/or return a shorter "
-                    "`new_context`. Directives you do not name stay exactly as they "
+                    "that no longer earn their words (each `retire` needs a `ground` — "
+                    "here, that the directive no longer earns its words under the "
+                    "BUDGET, and why), and/or return a shorter `new_context`. "
+                    "Directives you do not name stay exactly as they "
                     "are — do not restate them. Do not change your verdict — this is "
                     "a budget correction only."
                 )
@@ -3736,8 +4087,12 @@ class ScopeManager:
             current_publication, peer_publications, parent_publication
         )
 
+        ground_gate = _GroundGate()
+
         def _parse(block) -> ScopeManagerBatchJudgment:  # noqa: ANN001 — tool_use block
             return self._parse_batch_judgment(
+                ground_gate=ground_gate,
+                ground_policy=self._retire_ground_policy,
                 scope=scope,
                 tool_use_block=block,
                 current_summary=current_summary,
@@ -3792,6 +4147,7 @@ class ScopeManager:
             max_tokens=_batch_max_tokens(len(new_contributions)),
             summary_max_words=summary_max_words,
             parse=_parse,
+            ground_gate=ground_gate,
             invalid_ops=_invalid_ops,
             invalid_corrective=_invalid_corrective,
             drop_invalid=_drop_invalid,
@@ -3818,6 +4174,8 @@ class ScopeManager:
         change_ids: Sequence[str] = (),
         hop: int = 0,
         rendered_item_ids: Sequence[str] = (),
+        ground_gate: _GroundGate | None = None,
+        ground_policy: RetireGroundPolicy = DEFAULT_RETIRE_GROUND_POLICY,
     ) -> ScopeManagerBatchJudgment:
         """Validate a ``submit_batch_judgment`` payload and apply its amendment.
 
@@ -3841,13 +4199,51 @@ class ScopeManager:
         # Issue #201: an id-addressed op with no id reads it off the member it
         # names — an op whose contribution_id is missing or unknown resolves to
         # nothing and stays invalid, as before.
+        ungrounded: list[tuple[DirectiveOp, str]] = []
         ops, protocol_notes = _parse_directive_ops(
             raw.get("directive_ops"),
             supersedes_for=lambda op: getattr(
                 contributions.get(op.contribution_id or ""), "supersedes", None
             ),
+            contribution_text_for=lambda op: getattr(
+                contributions.get(op.contribution_id or ""), "content", None
+            ),
+            ground_policy=ground_policy,
+            ungrounded_out=ungrounded if (ground_gate and ground_gate.final) else None,
+            require_ground=mode == "ordinary",
         )
         new_context = _parse_new_context(raw.get("new_context"))
+        if ungrounded:
+            # After the one re-ask (#209): each member whose retire has no ground is
+            # DECLINED (an op with no valid member declines every accepted one), its
+            # ops go with it, and the cumulative new_context — which may carry what
+            # that member said — is dropped rather than admitted on its account.
+            accepted_now = {v.contribution_id for v in verdicts if v.decision != "decline"}
+            declined: dict[str, list[tuple[DirectiveOp, str]]] = {}
+            for op, defect in ungrounded:
+                owners = (
+                    [op.contribution_id] if op.contribution_id in contributions else accepted_now
+                )
+                for owner in owners:
+                    declined.setdefault(str(owner), []).append((op, defect))
+            verdicts = [
+                BatchVerdict(
+                    contribution_id=v.contribution_id,
+                    decision="decline",
+                    reasoning=_RetireWithoutGround(declined[v.contribution_id]).decline_reasoning(),
+                )
+                if v.contribution_id in declined and v.decision != "decline"
+                else v
+                for v in verdicts
+            ]
+            ops = [op for op in ops if op.contribution_id not in declined]
+            new_context = None
+            protocol_notes = [
+                *protocol_notes,
+                "Retire op(s) rejected for want of a ground; the contribution(s) "
+                f"{', '.join(sorted(declined))} declined and new_context dropped "
+                "(the judge had its one re-ask).",
+            ]
 
         # ADR 0007 D3/D5, exactly as on the single path: always a list, never
         # None, so callers never need a null-check.
@@ -4079,6 +4475,8 @@ class ScopeManager:
         change_id: str | None = None,
         hop: int = 0,
         rendered_item_ids: Sequence[str] = (),
+        ground_gate: _GroundGate | None = None,
+        ground_policy: RetireGroundPolicy = DEFAULT_RETIRE_GROUND_POLICY,
     ) -> ScopeManagerJudgment:
         """Validate a ``submit_judgment`` payload and apply its amendment.
 
@@ -4101,10 +4499,34 @@ class ScopeManager:
 
         # Issue #201: an id-addressed op with no id reads it off the
         # contribution under judgment, whose record names what it replaces.
+        ungrounded: list[tuple[DirectiveOp, str]] = []
         ops, protocol_notes = _parse_directive_ops(
             raw.get("directive_ops"),
             supersedes_for=lambda _op: new_contribution.supersedes,
+            contribution_text_for=lambda _op: new_contribution.content,
+            ground_policy=ground_policy,
+            # After the one re-ask a still-ungrounded retire is not raised again: it
+            # becomes a decline (#209), so a judge that cannot supply the ground costs
+            # the contribution its admission, never its verdict.
+            ungrounded_out=ungrounded if (ground_gate and ground_gate.final) else None,
+            # An input-change refresh has no contribution to ground a retirement in:
+            # what justifies it is the changed input the INPUT CHANGES block names.
+            require_ground=mode == "ordinary",
         )
+        if ungrounded:
+            failure = _RetireWithoutGround(ungrounded)
+            return ScopeManagerJudgment(
+                decision="decline",
+                reasoning=failure.decline_reasoning(),
+                new_summary=None,
+                change_id=change_id,
+                hop=hop,
+                protocol_notes=[
+                    *protocol_notes,
+                    "Retire op rejected for want of a ground; the contribution was "
+                    "declined (the judge had its one re-ask).",
+                ],
+            )
         new_context = _parse_new_context(raw.get("new_context"))
 
         # ADR 0007 D3/D5: published item ids this amendment invalidates. Parsed
