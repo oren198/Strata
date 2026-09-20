@@ -233,7 +233,11 @@ def get_scope_manager(
     settings: Settings = Depends(get_settings),
 ) -> ScopeManager:
     """Return a :class:`ScopeManager` bound to the configured model."""
-    return ScopeManager(client=client, model=settings.manager_model)
+    return ScopeManager(
+        client=client,
+        model=settings.manager_model,
+        implied_purpose_min_words=settings.implied_purpose_min_words,
+    )
 
 
 def get_fleet_config(request: Request) -> FleetConfig:

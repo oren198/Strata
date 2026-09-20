@@ -88,6 +88,11 @@ class Settings(BaseSettings):
     # anything — the rest is one cursor away. Raise it to walk a long record in
     # fewer round trips; lower it to fit a tighter response budget.
     record_page_size: int = Field(default=20, ge=1)
+    # #210: a scope with no description is judged for relevance against its existing
+    # memory only once that memory reaches this many words (summary context plus
+    # directive text); below it there is nothing to tell what the scope is about and
+    # no relevance judgement is made. Mirrors scope_manager.IMPLIED_PURPOSE_MIN_WORDS.
+    implied_purpose_min_words: int = Field(default=50, ge=1)
     # M3: how long (seconds) a session with no recorded end may sit idle before
     # the write-back rate counts it as ended (a killed server never stamps its
     # own end). `strata stats writeback --idle-window` overrides it per run.

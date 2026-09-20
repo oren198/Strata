@@ -79,6 +79,13 @@ _logger = logging.getLogger(__name__)
 #: cost. The engine default behind :attr:`strata.settings.Settings.window_verbatim_tail`.
 WINDOW_VERBATIM_TAIL = 3
 
+#: Words of existing memory (summary context plus directive text) a scope needs before
+#: the judge may treat that memory as its implied purpose (#210). Below it there is not
+#: enough to tell what the scope is about, so no relevance judgement is made at all —
+#: a scope with nothing in it keeps today's behaviour exactly. Mirrors
+#: ``Settings.implied_purpose_min_words`` (``STRATA_IMPLIED_PURPOSE_MIN_WORDS``).
+IMPLIED_PURPOSE_MIN_WORDS = 50
+
 #: ADR 0013 D3 — the word budget for a scope's published face (its own
 #: current publication plus whatever a ``publish`` act would add). The
 #: engine default behind :attr:`strata.settings.Settings.publication_max_words`
@@ -2526,6 +2533,58 @@ def _render_contribution_block(contribution: Contribution) -> str:
     )
 
 
+def _render_relevance(
+    scope: Scope,
+    current_summary: ScopeSummary | None,
+    *,
+    mode: JudgeMode,
+    implied_purpose_min_words: int,
+) -> str:
+    """The per-call relevance block (#210), or ``""`` when there is nothing to judge it against.
+
+    Relevance is a decline ground only where a purpose exists to measure it against:
+
+    - the scope STATES one (``description``): judge against it;
+    - it states none but its existing memory is substantial enough
+      (``implied_purpose_min_words``) to tell what it is about: that memory is the
+      implied purpose;
+    - otherwise no rule, no wording — the prompt is exactly what it was before #210, so
+      a scope with nothing in it never starts declining what it accepts today.
+
+    Lives in the per-call message, not the static system prompt, so a scope with no
+    purpose carries no relevance wording anywhere. Only a contribution can be off-purpose:
+    an input-change refresh admits nothing and gets no block.
+    """
+    if mode != "ordinary":
+        return ""
+    if scope.description:
+        return (
+            f"SCOPE PURPOSE: {scope.description}\n"
+            "RELEVANCE (an additional decline ground for this scope): judge whether the "
+            "contribution is about the work this stated purpose covers. Material clearly "
+            "outside it is declined, and your reasoning must begin \"Outside this scope's "
+            'stated purpose: <the purpose as stated>." Anything a worker in this scope '
+            "could plausibly need — observations about the work the purpose covers, however "
+            "small or transient — is on-purpose and is admitted by the rules above; when in "
+            "doubt, admit.\n\n"
+        )
+    if current_summary is not None and _summary_word_count(current_summary) >= (
+        implied_purpose_min_words
+    ):
+        return (
+            "RELEVANCE (an additional decline ground for this scope): this scope states no "
+            "purpose, but its existing memory — the CURRENT SUMMARY below — is enough to tell "
+            "what it is about; treat that as its implied purpose. Material clearly unrelated "
+            "to what that memory is about is declined, and your reasoning must say the purpose "
+            "was implied by the scope's existing memory and name what you read: begin "
+            "\"Outside the purpose implied by this scope's existing memory (<the directives or "
+            'context you read>): ..." A contribution that extends, corrects, or sits '
+            "alongside the subject of the existing memory is on-purpose and is admitted by the "
+            "rules above; when in doubt, admit.\n\n"
+        )
+    return ""
+
+
 def _build_judge_preamble(
     *,
     scope: Scope,
@@ -2543,6 +2602,7 @@ def _build_judge_preamble(
     mode: JudgeMode = "ordinary",
     input_changes: Sequence[_ChangeEventLike] | None = None,
     window_verbatim_tail: int = WINDOW_VERBATIM_TAIL,
+    implied_purpose_min_words: int = IMPLIED_PURPOSE_MIN_WORDS,
 ) -> str:
     """Compose everything in the user message ahead of the contributions to judge.
 
@@ -2634,10 +2694,15 @@ def _build_judge_preamble(
 
     input_changes_block = _render_input_changes(input_changes)
 
+    relevance_block = _render_relevance(
+        scope, current_summary, mode=mode, implied_purpose_min_words=implied_purpose_min_words
+    )
+
     return (
         f"SCOPE: {scope.name} (id={scope.id})\n"
         f"STRATUM: {stratum.name} (ordinal={stratum.ordinal})\n"
         "\n"
+        f"{relevance_block}"
         f"{budget_line}"
         f"{refresh_block}"
         f"{input_changes_block}"
@@ -2675,6 +2740,7 @@ def _build_user_message(
     mode: JudgeMode = "ordinary",
     input_changes: Sequence[_ChangeEventLike] | None = None,
     window_verbatim_tail: int = WINDOW_VERBATIM_TAIL,
+    implied_purpose_min_words: int = IMPLIED_PURPOSE_MIN_WORDS,
 ) -> str:
     """Compose the (non-cached) per-call user message for a single contribution."""
     preamble = _build_judge_preamble(
@@ -2693,6 +2759,7 @@ def _build_user_message(
         mode=mode,
         input_changes=input_changes,
         window_verbatim_tail=window_verbatim_tail,
+        implied_purpose_min_words=implied_purpose_min_words,
     )
     return (
         f"{preamble}"
@@ -2721,6 +2788,7 @@ def _build_batch_user_message(
     mode: JudgeMode = "ordinary",
     input_changes: Sequence[_ChangeEventLike] | None = None,
     window_verbatim_tail: int = WINDOW_VERBATIM_TAIL,
+    implied_purpose_min_words: int = IMPLIED_PURPOSE_MIN_WORDS,
 ) -> str:
     """Compose the per-call user message for a BATCH of contributions (ADR 0011 D3).
 
@@ -2744,6 +2812,7 @@ def _build_batch_user_message(
         mode=mode,
         input_changes=input_changes,
         window_verbatim_tail=window_verbatim_tail,
+        implied_purpose_min_words=implied_purpose_min_words,
     )
     blocks = "\n".join(
         f"CONTRIBUTION {position} OF {len(new_contributions)}:\n"
@@ -2780,6 +2849,9 @@ class ScopeManager:
         client: A configured :class:`anthropic.Anthropic` instance.
         model:  The model ID to use.  Defaults to ``"claude-haiku-4-5"`` to
                 match the UI prototype.
+        implied_purpose_min_words: Words of existing memory a scope with no
+                description needs before that memory counts as its implied purpose
+                (#210); see :data:`IMPLIED_PURPOSE_MIN_WORDS`.
     """
 
     def __init__(
@@ -2787,9 +2859,11 @@ class ScopeManager:
         *,
         client: anthropic.Anthropic,
         model: str = "claude-haiku-4-5",
+        implied_purpose_min_words: int = IMPLIED_PURPOSE_MIN_WORDS,
     ) -> None:
         self._client = client
         self._model = model
+        self._implied_purpose_min_words = implied_purpose_min_words
 
     def judge(
         self,
@@ -3000,6 +3074,7 @@ class ScopeManager:
             mode=mode,
             input_changes=input_changes,
             window_verbatim_tail=window_verbatim_tail,
+            implied_purpose_min_words=self._implied_purpose_min_words,
         )
 
         # ADR 0014 D3: what a declared `context_sources` is audited against —
@@ -3654,6 +3729,7 @@ class ScopeManager:
             mode=mode,
             input_changes=input_changes,
             window_verbatim_tail=window_verbatim_tail,
+            implied_purpose_min_words=self._implied_purpose_min_words,
         )
 
         rendered_item_ids = _rendered_publication_item_ids(
