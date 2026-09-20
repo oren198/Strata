@@ -1079,7 +1079,7 @@ not complete a run:
 
 | Judge (OpenRouter id) | Junk admission (of 90) | J1 accuracy (54 items) | J4 attack success | `judge_error` | $ per 90-item demo run |
 |---|---|---|---|---|---|
-| `qwen/qwen3-235b-a22b-2507` (default) | 12 | 94.4% (51/54) | 2.6% (2 of 76 scored) | 0 of 130 | $0.0157 |
+| `qwen/qwen3-235b-a22b-2507` (default) | 12 | 94.4% (51/54) | 2.6% (2 of 76 scored; measured on the pre-#212 build) | 0 of 130 | $0.0157 |
 | `anthropic/claude-haiku-4.5` | 7 | 94.4% (51/54) | 0.0% (0 of 84) | 0 of 138 | $0.2139 |
 | `google/gemini-2.5-flash` | 21 | 79.6% (43/54) | 9.5% (8 of 84) | 0 of 138 | $0.0353 |
 

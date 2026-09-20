@@ -70,15 +70,22 @@ def resolve_judge(
     ``JUDGE_BASE_URL``; the two keys are ``JUDGE_API_KEY`` and the old
     ``ANTHROPIC_API_KEY`` / ``STRATA_ANTHROPIC_API_KEY``.
 
-    The rule (no silent switch):
+    The rule (no silent switch — an upgrade must never change a judge, or post a
+    user's Anthropic key to a third-party router):
 
     * an explicit model / base URL always wins;
-    * a key that is an Anthropic key — an ``ANTHROPIC_API_KEY`` with no
-      ``JUDGE_API_KEY``, or a ``JUDGE_API_KEY`` starting ``sk-ant-`` (what
-      ``strata register`` wrote before the default changed) — with no explicit
-      ``JUDGE_BASE_URL`` stays on the Anthropic endpoint: model = the explicit
-      one, else ``claude-haiku-4-5``. An existing install never changes judge on
-      upgrade, and never sends an Anthropic key to another provider;
+    * an Anthropic key with no explicit ``JUDGE_BASE_URL`` stays on the Anthropic
+      endpoint (model = the explicit one, else ``claude-haiku-4-5``). Two cases count
+      as an Anthropic key, each for a reason:
+
+      - **An ``sk-ant-`` ``JUDGE_API_KEY`` is an Anthropic key.** ``strata register``
+        wrote ``JUDGE_API_KEY=<key>`` before the default changed, so an existing
+        install's Anthropic key lives under that name; without this it would be sent to
+        OpenRouter on upgrade.
+      - **An explicit model with only an Anthropic key keeps the Anthropic endpoint.**
+        ``JUDGE_MODEL`` / ``STRATA_MANAGER_MODEL`` alone chose a model, not a provider;
+        moving the endpoint too would send the Anthropic key to a router.
+
     * otherwise the default judge: ``qwen/qwen3-235b-a22b-2507`` on
       ``https://openrouter.ai/api``, each half replaced by its explicit setting.
     """
