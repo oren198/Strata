@@ -1130,3 +1130,38 @@ def test_publication_bootstrap_unknown_scope_returns_1(
     assert rc == 1
     err = capsys.readouterr().err
     assert "Scope not found" in err
+
+
+def test_stats_writeback_warns_when_the_connect_seam_was_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#206 — sessions that never read or contributed are missing; say the rate may read high."""
+    import json
+    import re
+
+    from strata.session_state import SessionStateStore, sessions_dir_for
+
+    _seed_fleet(tmp_path, monkeypatch)
+    _seed_writeback_sessions(tmp_path)
+    SessionStateStore(sessions_dir_for(str(tmp_path / "summaries"))).record_connect_seam_unavailable(
+        "the MCP SDK no longer has _handle_message"
+    )
+
+    assert main(["stats", "writeback"]) == 0
+    text = re.sub(r"\s+", " ", capsys.readouterr().out)
+    assert "denominator may undercount" in text
+    assert "the MCP SDK no longer has _handle_message" in text
+
+    assert main(["stats", "writeback", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["denominator_may_undercount"] is True
+    assert "_handle_message" in payload["denominator_note"]
+
+
+def test_stats_writeback_has_no_undercount_warning_normally(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _seed_fleet(tmp_path, monkeypatch)
+    _seed_writeback_sessions(tmp_path)
+    assert main(["stats", "writeback"]) == 0
+    assert "undercount" not in capsys.readouterr().out

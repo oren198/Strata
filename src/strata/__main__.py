@@ -912,6 +912,8 @@ def cmd_stats_writeback(args: argparse.Namespace) -> int:
     )
     if report.unreadable_files:
         print(f"Not counted: {report.unreadable_files} unreadable session file(s).")
+    if report.denominator_note:
+        print(f"Warning — {report.denominator_note}")
     return 0
 
 
