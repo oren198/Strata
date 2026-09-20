@@ -57,7 +57,6 @@ import json
 import logging
 import re
 from collections.abc import Callable, Collection, Mapping, Sequence
-from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Literal, Protocol, TypeVar
 
@@ -86,331 +85,6 @@ WINDOW_VERBATIM_TAIL = 3
 #: a scope with nothing in it keeps today's behaviour exactly. Mirrors
 #: ``Settings.implied_purpose_min_words`` (``STRATA_IMPLIED_PURPOSE_MIN_WORDS``).
 IMPLIED_PURPOSE_MIN_WORDS = 50
-
-#: A ``retire`` op's ``changed_circumstance`` must be at least this many words. A real changed
-#: circumstance ("the manual snapshot step no longer exists") needs a handful of words;
-#: "obsolete" or "not needed" is a verdict, not a changed circumstance. Mirrors
-#: ``Settings.retire_circumstance_min_words`` (``STRATA_RETIRE_CIRCUMSTANCE_MIN_WORDS``).
-RETIRE_CIRCUMSTANCE_MIN_WORDS = 4
-
-#: ...and carry at least this many SUBSTANTIVE words: words that are neither filler nor
-#: the vocabulary of a removal request (remove, replacement, needed, obsolete, ...). A
-#: changed circumstance made only of request words says nothing about what changed. Mirrors
-#: ``Settings.retire_circumstance_min_substantive_words``.
-RETIRE_CIRCUMSTANCE_MIN_SUBSTANTIVE_WORDS = 2
-
-#: A changed circumstance is rejected as a restatement when at least this fraction of its content
-#: words already appear in the contribution's own removal sentence(s) — the clauses
-#: that ask for the removal. 0.7 sits well clear of genuine changed circumstances, which name the
-#: directive they retire (a few shared words) but are mostly the changed circumstance:
-#: the genuine examples in the tests overlap by 0.13-0.5. Mirrors
-#: ``Settings.retire_circumstance_max_restatement``.
-RETIRE_CIRCUMSTANCE_MAX_RESTATEMENT = 0.7
-
-
-@dataclass(frozen=True)
-class RetireCircumstancePolicy:
-    """The three mechanical floors a ``retire`` op's changed circumstance must clear (#209).
-
-    A retirement removes a directive with nothing replacing it, so the contribution
-    must say WHAT CHANGED. These checks are deterministic — no LLM call — and reject a
-    changed circumstance that is absent, too short, or merely the removal request said again.
-
-    A changed circumstance is required only where a CONTRIBUTION asks for the removal.
-    Two retires are exempt, because no contribution asked for them: an input-change
-    refresh (what justifies it is the changed input the INPUT CHANGES block names), and
-    the budget overflow re-ask (engine-initiated: the summary is over budget, and making
-    the judge invent a circumstance for a budget action would risk declining a
-    contribution over something unrelated to it).
-    """
-
-    min_words: int = RETIRE_CIRCUMSTANCE_MIN_WORDS
-    min_substantive: int = RETIRE_CIRCUMSTANCE_MIN_SUBSTANTIVE_WORDS
-    max_restatement: float = RETIRE_CIRCUMSTANCE_MAX_RESTATEMENT
-
-
-DEFAULT_RETIRE_CIRCUMSTANCE_POLICY = RetireCircumstancePolicy()
-
-_FILLER_WORDS = frozenset(
-    [
-        "a",
-        "an",
-        "the",
-        "this",
-        "that",
-        "these",
-        "those",
-        "it",
-        "its",
-        "is",
-        "are",
-        "was",
-        "were",
-        "be",
-        "been",
-        "being",
-        "am",
-        "do",
-        "does",
-        "did",
-        "of",
-        "to",
-        "in",
-        "on",
-        "at",
-        "by",
-        "for",
-        "with",
-        "from",
-        "as",
-        "and",
-        "or",
-        "but",
-        "if",
-        "so",
-        "then",
-        "than",
-        "too",
-        "very",
-        "not",
-        "no",
-        "nor",
-        "i",
-        "we",
-        "you",
-        "they",
-        "he",
-        "she",
-        "them",
-        "us",
-        "our",
-        "your",
-        "their",
-        "my",
-        "me",
-        "there",
-        "here",
-        "now",
-        "longer",
-        "also",
-        "which",
-        "who",
-        "whom",
-        "what",
-        "when",
-        "where",
-        "why",
-        "how",
-        "has",
-        "have",
-        "had",
-        "will",
-        "would",
-        "shall",
-        "should",
-        "can",
-        "could",
-        "may",
-        "might",
-        "must",
-        "into",
-        "onto",
-        "over",
-        "under",
-        "up",
-        "down",
-        "out",
-        "off",
-        "about",
-        "again",
-        "further",
-        "once",
-    ]
-)
-
-# Words that make a removal REQUEST rather than describe a change: the removal verbs,
-# and the filler that decorates them ("just", "no replacement needed", "obsolete").
-_REMOVAL_WORD_RE = re.compile(
-    r"(?:remov|delet|drop|retir|withdr|discard|revok|rescind|cancel|scrap|eliminat|supersed)",
-)
-_REQUEST_WORDS = frozenset(
-    [
-        "directive",
-        "directives",
-        "rule",
-        "rules",
-        "just",
-        "please",
-        "need",
-        "needs",
-        "needed",
-        "replacement",
-        "replace",
-        "obsolete",
-        "outdated",
-        "stale",
-        "unnecessary",
-        "redundant",
-        "gone",
-        "anymore",
-        "go",
-        "away",
-    ]
-)
-_CLAUSE_SPLIT_RE = re.compile(r"[.;:!?\n]+|\s[—–-]{1,2}\s|,")
-_GET_RID_RE = re.compile(r"\bget(?:s|ting)? rid\b", re.IGNORECASE)
-
-
-def _stem(word: str) -> str:
-    """A crude stem — enough to see that remove/removed/removes are one word."""
-    for suffix in ("ing", "ed", "es", "s"):
-        if word.endswith(suffix) and len(word) - len(suffix) >= 3:
-            word = word[: -len(suffix)]
-            break
-    return word[:-1] if word.endswith("e") and len(word) > 3 else word
-
-
-def _content_tokens(text: str) -> list[str]:
-    """Lower-cased alphanumeric words of *text* without filler, as stems."""
-    words = re.findall(r"[a-z0-9]+", text.lower())
-    return [_stem(w) for w in words if len(w) > 1 and w not in _FILLER_WORDS]
-
-
-_REQUEST_STEMS = frozenset(_stem(w) for w in _REQUEST_WORDS)
-
-
-def _is_request_word(token: str) -> bool:
-    return bool(_REMOVAL_WORD_RE.match(token)) or token in _REQUEST_STEMS
-
-
-def _removal_clauses(text: str) -> list[str]:
-    """The clauses of *text* that ask for something to be removed."""
-    clauses = [c for c in _CLAUSE_SPLIT_RE.split(text) if c and c.strip()]
-    return [c for c in clauses if _GET_RID_RE.search(c) or _REMOVAL_WORD_RE.search(c.lower())]
-
-
-_CONNECTIVE_EDGES_RE = re.compile(
-    r"^(?:[\s,;:.\-—–]|(?:so|and|but|therefore|thus|please|also)\b)+|"
-    r"(?:[\s,;:.\-—–]|\b(?:so|and|but|therefore|thus|please|also))+$",
-    re.IGNORECASE,
-)
-
-
-def _stated_circumstance(contribution_text: str | None, policy: RetireCircumstancePolicy) -> str:
-    """The contribution's own words apart from its removal request, if they could stand as
-    a changed circumstance; ``""`` when the contribution states only the removal (#209).
-
-    Cut out the clauses that ask for the removal and tidy the joins. Offered back to a
-    judge that omitted the field so it can COPY the contributor's words, never invent
-    them; it is offered only if it would itself clear the floors, so a bare removal
-    ("just remove it, no replacement needed") has nothing to quote.
-    """
-    text = (contribution_text or "").strip()
-    if not text:
-        return ""
-    for clause in _removal_clauses(text):
-        text = text.replace(clause, " ")
-    text = _CONNECTIVE_EDGES_RE.sub("", " ".join(text.split()))
-    if not text or _circumstance_defect(text, contribution_text, policy):
-        return ""
-    return text
-
-
-def _circumstance_defect(
-    changed_circumstance: str | None,
-    contribution_text: str | None,
-    policy: RetireCircumstancePolicy,
-) -> str | None:
-    """Why *changed_circumstance* is not one, or ``None`` when it clears every floor (#209).
-
-    (a) absent, empty or whitespace; (b) under ``policy.min_words`` words; (c) merely
-    restating the removal request — fewer than ``policy.min_substantive`` substantive
-    words, or at least ``policy.max_restatement`` of its content words already in the
-    contribution's own removal sentence(s). The overlap half of (c) does not apply when
-    the contribution has no removal sentence (an overflow retire to fit the budget).
-    """
-    text = (changed_circumstance or "").strip()
-    if not text:
-        return "no changed circumstance stated"
-    words = text.split()
-    if len(words) < policy.min_words:
-        return (
-            f"a changed circumstance that is too short ({len(words)} words; "
-            f"at least {policy.min_words})"
-        )
-    tokens = _content_tokens(text)
-    substantive = [t for t in tokens if not _is_request_word(t)]
-    restates = "a changed circumstance that merely restates the removal request"
-    if len(substantive) < policy.min_substantive:
-        return restates
-    if tokens and contribution_text:
-        removal_tokens = {
-            t for clause in _removal_clauses(contribution_text) for t in _content_tokens(clause)
-        }
-        if removal_tokens:
-            overlap = sum(1 for t in tokens if t in removal_tokens) / len(tokens)
-            if overlap >= policy.max_restatement:
-                return restates
-    return None
-
-
-class _RetireWithoutCircumstance(ValueError):
-    """One or more ``retire`` ops carry no usable changed circumstance (#209).
-
-    Raised by :func:`_parse_directive_ops` alongside the unpaired-supersede rejection,
-    so the judge gets the ordinary single protocol re-ask; a second failure is turned
-    into a DECLINE naming the missing changed circumstance (see :class:`_CircumstanceGate`).
-    """
-
-    def __init__(self, defects: list[tuple[DirectiveOp, str]], stated: str = "") -> None:
-        self.defects = defects
-        listed = "; ".join(f"retire {op.id}: {defect}" for op, defect in defects)
-        # What the judge can act on: the contribution's own words to copy, or the fact
-        # that there are none and the right move is to decline (#209). A live capture
-        # showed a cheap judge sends the field EMPTY and repeats itself after a bare
-        # re-ask, so the re-ask quotes the words back instead of only naming the gap.
-        if stated:
-            hint = (
-                f' The contribution\'s own words apart from the removal request: "{stated}". '
-                "If those state what changed, copy them verbatim into `changed_circumstance`."
-            )
-        else:
-            hint = (
-                " The contribution states only the removal request and nothing that "
-                "changed, so there is nothing to copy: DECLINE it."
-            )
-        super().__init__(
-            f"submit_judgment returned a retire op with no usable changed circumstance ({listed})."
-            f"{hint}"
-        )
-
-    def decline_reasoning(self) -> str:
-        """The decline's reason: names the missing changed circumstance and teaches the fix."""
-        ids = ", ".join(op.id or "?" for op, _ in self.defects)
-        why = "; ".join(defect for _, defect in self.defects)
-        return (
-            "Declined: retirement without a stated changed circumstance. The contribution "
-            "asks to remove "
-            f"directive {ids} but states no changed circumstance that justifies it ({why}). "
-            "To retire a directive, the contribution itself must say why it no longer holds "
-            "— what changed — in its own words."
-        )
-
-
-@dataclass
-class _CircumstanceGate:
-    """Set ``final`` once the single protocol re-ask has been spent (#209).
-
-    A circumstance-less retire is rejected with a re-ask first; on the attempt AFTER that
-    re-ask the parse layer turns the same defect into a decline instead of raising, so
-    there is exactly one re-ask and then a verdict, never a stranded contribution.
-    """
-
-    final: bool = False
-    exempt: bool = False
-    """True while parsing the budget overflow re-ask: an engine-initiated retire that no
-    contribution asked for needs no changed circumstance."""
-
 
 #: ADR 0013 D3 — the word budget for a scope's published face (its own
 #: current publication plus whatever a ``publish`` act would add). The
@@ -613,8 +287,8 @@ JUDGE_TOOL: dict = {
                                 "(requires content). supersede: remove the directive named "
                                 "by id, replaced by the directive this amendment admits "
                                 "(valid only alongside an append or a publish). retire: "
-                                "remove the directive named by id with no replacement — "
-                                "REQUIRES a changed circumstance (below)."
+                                "remove the directive named by id with no replacement, "
+                                "stating its changed_circumstance."
                             ),
                         },
                         "content": {
@@ -645,15 +319,15 @@ JUDGE_TOOL: dict = {
                         "changed_circumstance": {
                             "type": ["string", "null"],
                             "description": (
-                                "retire only, REQUIRED for a retire op. Copy the "
-                                "contributor's stated changed circumstance verbatim: what "
-                                "changed that makes the directive no longer hold (for "
-                                "'X no longer exists, so remove Y', it is 'X no longer "
-                                "exists'). It must come from the "
+                                "retire only: what changed that makes the directive no "
+                                "longer hold. Copy the contributor's stated changed "
+                                "circumstance verbatim (for 'X no longer exists, so remove "
+                                "Y', it is 'X no longer exists'). It must come from the "
                                 "contribution, never invented; a retirement with no stated "
                                 "changed circumstance is not a retirement. If the "
-                                "contribution only asks for the removal, state no changed "
-                                "circumstance: decline it instead."
+                                "contribution only asks for the removal, state none: "
+                                "decline it instead. Recorded on the retirement so an "
+                                "operator can see why a rule went away."
                             ),
                         },
                     },
@@ -952,12 +626,12 @@ STEP 2 — CLASSIFICATION. Concepts you must know (from CONTEXT.md):
     nothing replaces, use `retire`.
   - `retire` — {"op": "retire", "id": <directive id>, "changed_circumstance": "<the
     changed circumstance, in the contribution's own words>"}: remove that
-    directive with no replacement. The `changed_circumstance` is REQUIRED: what changed that
-    makes the directive no longer hold, taken from the contribution — never
-    invented by you; a retirement with no stated changed circumstance is not a retirement: a
-    contribution that only asks for the removal ("just remove it", "no
-    replacement needed", "this supersedes X") states no changed circumstance, so DECLINE it
-    and use no `retire` op. The retirement is recorded in the
+    directive with no replacement. State the `changed_circumstance`: what changed
+    that makes the directive no longer hold, taken from the contribution — never
+    invented by you; a retirement with no stated changed circumstance is not a
+    retirement: a contribution that only asks for the removal ("just remove it",
+    "no replacement needed", "this supersedes X") states none, so DECLINE it and
+    use no `retire` op. The retirement is recorded in the
     scope's record; no tombstone stays in the summary.
   Name only directive ids that appear in the CURRENT SUMMARY rendered
   below, each at most once.
@@ -1440,8 +1114,19 @@ class DirectiveOp(BaseModel):
     """``supersede`` / ``retire`` only: the directive id being removed."""
 
     changed_circumstance: str | None = None
-    """``retire`` only: the changed circumstance that justifies the retirement, in the
-    contribution's own words (#209). Required and mechanically checked at parse."""
+    """``retire`` only: what changed that makes the directive no longer hold, in the
+    contribution's own words (#209). Recorded on the retirement event and shown in the
+    Console so an operator can see why a rule went away.
+
+    ADVISORY, not enforced. A mechanical requirement was built and withdrawn: no judge
+    measured (qwen3-235b, gpt-5-mini, gemini, glm, deepseek) fills a required tool field
+    reliably — qwen never did, on either call, even when the re-ask quoted the contribution
+    back — so the retirement backstop is a request to the judge, not a check, and a bare
+    removal request ("this supersedes X — just remove it") can still be accepted (j4-207).
+    A retirement has no contribution to state a circumstance for an input-change refresh or
+    a budget overflow re-ask, so the field is only ever asked for where a CONTRIBUTION asks
+    for the removal. Known limit, tracked in #209.
+    """
 
     contribution_id: str | None = None
     """BATCH mode only: the batch member this op is attributed to.
@@ -1505,10 +1190,6 @@ def _parse_directive_ops(  # noqa: ANN001 — raw tool-call field
     raw_ops,
     *,
     supersedes_for: Callable[[DirectiveOp], str | None] = lambda _op: None,
-    contribution_text_for: Callable[[DirectiveOp], str | None] = lambda _op: None,
-    circumstance_policy: RetireCircumstancePolicy = DEFAULT_RETIRE_CIRCUMSTANCE_POLICY,
-    missing_out: list[tuple[DirectiveOp, str]] | None = None,
-    require_circumstance: bool = True,
 ) -> tuple[list[DirectiveOp], list[str]]:
     """Parse the ``directive_ops`` field of a ``submit_judgment`` payload.
 
@@ -1528,17 +1209,6 @@ def _parse_directive_ops(  # noqa: ANN001 — raw tool-call field
     the contribution under judgment on the single path, the member the op's
     ``contribution_id`` names in a batch (ADR 0011 D3). A contribution naming
     no target leaves the op invalid exactly as before.
-
-    Changed circumstance (#209): a ``retire`` removes a directive with nothing replacing it, so its
-    ``changed_circumstance`` — the changed circumstance, from the contribution — is checked here
-    mechanically, in the same layer, with no LLM call: absent, under the word floor, or
-    merely the contribution's own removal request said again (:func:`_circumstance_defect`).
-    *contribution_text_for* resolves an op to the text it is checked against, as
-    *supersedes_for* does for ids. Every missing op raises
-    :class:`_RetireWithoutCircumstance` (a ``ValueError``) at once — unless *missing_out* is
-    given (the attempt after the one re-ask), in which case they are appended to it and
-    returned with the rest for the caller to turn into a decline. *require_circumstance* False
-    (an input-change refresh, where no contribution exists to state one) skips the check.
 
     Returns:
         The parsed ops, and the mechanical notes for any id defaulted this
@@ -1579,9 +1249,11 @@ def _parse_directive_ops(  # noqa: ANN001 — raw tool-call field
             subject=entry.get("subject"),
             supersedes=entry.get("supersedes"),
             id=entry.get("id"),
-            changed_circumstance=(str(entry["changed_circumstance"]).strip() or None)
-            if entry.get("changed_circumstance")
-            else None,
+            changed_circumstance=(
+                str(entry["changed_circumstance"]).strip() or None
+                if entry.get("changed_circumstance")
+                else None
+            ),
             # Batch mode only (ADR 0011 D3); absent, and unused, on the
             # single-contribution path, where the binding stays implicit.
             contribution_id=entry.get("contribution_id"),
@@ -1615,27 +1287,6 @@ def _parse_directive_ops(  # noqa: ANN001 — raw tool-call field
             "same amendment. Supersession replaces: an unpaired supersede is a "
             "retirement — use a retire op instead."
         )
-
-    missing = [
-        (op, defect)
-        for op in ops
-        if require_circumstance
-        and op.op == "retire"
-        and (
-            defect := _circumstance_defect(
-                op.changed_circumstance, contribution_text_for(op), circumstance_policy
-            )
-        )
-    ]
-    if missing:
-        if missing_out is None:
-            raise _RetireWithoutCircumstance(
-                missing,
-                stated=_stated_circumstance(
-                    contribution_text_for(missing[0][0]), circumstance_policy
-                ),
-            )
-        missing_out.extend(missing)
     return ops, notes
 
 
@@ -2074,7 +1725,10 @@ class _AmendmentJudgment(BaseModel):
         ]
 
     def retirement_circumstances(self) -> dict[str, str | None]:
-        """``directive id retired -> the changed circumstance its retire op stated`` (#209)."""
+        """``directive id retired -> the changed circumstance its retire op stated`` (#209).
+
+        ``None`` when the judge stated none: the field is advisory, never enforced.
+        """
         return {
             op.id: op.changed_circumstance
             for op in self.directive_ops
@@ -3250,8 +2904,6 @@ class ScopeManager:
         implied_purpose_min_words: Words of existing memory a scope with no
                 description needs before that memory counts as its implied purpose
                 (#210); see :data:`IMPLIED_PURPOSE_MIN_WORDS`.
-        retire_circumstance_policy: The floors a ``retire`` op's changed circumstance must clear
-                (#209); see :class:`RetireCircumstancePolicy`.
     """
 
     def __init__(
@@ -3260,12 +2912,10 @@ class ScopeManager:
         client: anthropic.Anthropic,
         model: str = "claude-haiku-4-5",
         implied_purpose_min_words: int = IMPLIED_PURPOSE_MIN_WORDS,
-        retire_circumstance_policy: RetireCircumstancePolicy = DEFAULT_RETIRE_CIRCUMSTANCE_POLICY,
     ) -> None:
         self._client = client
         self._model = model
         self._implied_purpose_min_words = implied_purpose_min_words
-        self._retire_circumstance_policy = retire_circumstance_policy
 
     def judge(
         self,
@@ -3486,12 +3136,8 @@ class ScopeManager:
             current_publication, peer_publications, parent_publication
         )
 
-        circumstance_gate = _CircumstanceGate()
-
         def _parse(block) -> ScopeManagerJudgment:  # noqa: ANN001 — tool_use block
             return self._parse_judgment(
-                circumstance_gate=circumstance_gate,
-                circumstance_policy=self._retire_circumstance_policy,
                 scope=scope,
                 tool_use_block=block,
                 current_summary=current_summary,
@@ -3611,7 +3257,6 @@ class ScopeManager:
             max_tokens=JUDGE_MAX_TOKENS,
             summary_max_words=summary_max_words,
             parse=_parse,
-            circumstance_gate=circumstance_gate,
             invalid_ops=_invalid_ops,
             invalid_corrective=_invalid_corrective,
             drop_invalid=_drop_invalid,
@@ -3648,7 +3293,6 @@ class ScopeManager:
         stale_claims: Callable[[_JudgmentT], list[str]] | None = None,
         stale_claim_corrective: Callable[[Sequence[str]], str] | None = None,
         drop_stale_context: Callable[[_JudgmentT], _JudgmentT] | None = None,
-        circumstance_gate: _CircumstanceGate | None = None,
     ) -> _JudgmentT:
         """Run one judgment call and its correctives, one retry each.
 
@@ -3744,16 +3388,6 @@ class ScopeManager:
                     "Your response contained no tool_use block. Respond only by "
                     f"calling `{tool_name}`; no prose."
                 )
-            if isinstance(error, _RetireWithoutCircumstance):
-                return (
-                    f"Your {tool_name} call had a retire op without a usable changed "
-                    f"circumstance: {error} "
-                    f"Call {tool_name} again with the SAME {verdict_noun}. Give each `retire` "
-                    "a `changed_circumstance` — what changed that makes the directive no "
-                    "longer hold, in the contribution's own words, never invented. If the "
-                    "contribution states no such circumstance (it only asks for the "
-                    "removal), do not retire: DECLINE it, with no amendment."
-                )
             if isinstance(error, _DeclineWithAmendment):
                 return (
                     f"Your {tool_name} call declined but carried an amendment: {error} "
@@ -3771,10 +3405,6 @@ class ScopeManager:
             """What the record says about the re-ask (issue #201)."""
             if isinstance(error, _NoToolUseBlock):
                 slip = "the first response carried no tool_use block"
-            elif isinstance(error, _RetireWithoutCircumstance):
-                slip = (
-                    "the first response retired a directive without a usable changed circumstance"
-                )
             elif isinstance(error, _DeclineWithAmendment):
                 slip = "the first response declined while carrying an amendment"
             else:
@@ -3823,10 +3453,6 @@ class ScopeManager:
             retry_messages = [*first_messages, *correction]
             response = _call(retry_messages)
             tool_use_block = self._extract_tool_use_block(response)
-            if circumstance_gate is not None:
-                # The one re-ask is spent: a retire still without a changed circumstance is now
-                # turned into a decline by the parse layer instead of raising (#209).
-                circumstance_gate.final = True
             judgment = parse(tool_use_block)
             protocol_notes.append(_protocol_note(parse_error))
             # Chain the correctives below onto this turn: their follow-ups
@@ -3959,11 +3585,8 @@ class ScopeManager:
                     f"— over the BUDGET of {summary_max_words} words. Call "
                     f"{tool_name} again with the SAME {decision_noun} and an amendment "
                     f"that fits within {summary_max_words} words: `retire` directives "
-                    "that no longer earn their words (each `retire` needs a "
-                    "`changed_circumstance` — "
-                    "here, that the directive no longer earns its words under the "
-                    "BUDGET, and why), and/or return a shorter `new_context`. "
-                    "Directives you do not name stay exactly as they "
+                    "that no longer earn their words, and/or return a shorter "
+                    "`new_context`. Directives you do not name stay exactly as they "
                     "are — do not restate them. Do not change your verdict — this is "
                     "a budget correction only."
                 )
@@ -3982,8 +3605,6 @@ class ScopeManager:
                 try:
                     second_response = _call(second_messages)
                     second_block = self._extract_tool_use_block(second_response)
-                    if circumstance_gate is not None:
-                        circumstance_gate.exempt = True  # engine-initiated: see the policy
                     second_judgment = parse(second_block)
                     # A retry that resolves the budget by naming a bad id is
                     # still subject to D1's drop-and-note rule — never a
@@ -4003,9 +3624,6 @@ class ScopeManager:
                         second_judgment = drop_stale_context(second_judgment)
                 except Exception:  # noqa: BLE001 — deliberate: retry is best-effort
                     second_judgment = None
-                finally:
-                    if circumstance_gate is not None:
-                        circumstance_gate.exempt = False
                 if second_judgment is not None and second_judgment.new_summary is not None:
                     judgment = second_judgment
 
@@ -4170,12 +3788,8 @@ class ScopeManager:
             current_publication, peer_publications, parent_publication
         )
 
-        circumstance_gate = _CircumstanceGate()
-
         def _parse(block) -> ScopeManagerBatchJudgment:  # noqa: ANN001 — tool_use block
             return self._parse_batch_judgment(
-                circumstance_gate=circumstance_gate,
-                circumstance_policy=self._retire_circumstance_policy,
                 scope=scope,
                 tool_use_block=block,
                 current_summary=current_summary,
@@ -4230,7 +3844,6 @@ class ScopeManager:
             max_tokens=_batch_max_tokens(len(new_contributions)),
             summary_max_words=summary_max_words,
             parse=_parse,
-            circumstance_gate=circumstance_gate,
             invalid_ops=_invalid_ops,
             invalid_corrective=_invalid_corrective,
             drop_invalid=_drop_invalid,
@@ -4257,8 +3870,6 @@ class ScopeManager:
         change_ids: Sequence[str] = (),
         hop: int = 0,
         rendered_item_ids: Sequence[str] = (),
-        circumstance_gate: _CircumstanceGate | None = None,
-        circumstance_policy: RetireCircumstancePolicy = DEFAULT_RETIRE_CIRCUMSTANCE_POLICY,
     ) -> ScopeManagerBatchJudgment:
         """Validate a ``submit_batch_judgment`` payload and apply its amendment.
 
@@ -4282,54 +3893,13 @@ class ScopeManager:
         # Issue #201: an id-addressed op with no id reads it off the member it
         # names — an op whose contribution_id is missing or unknown resolves to
         # nothing and stays invalid, as before.
-        missing: list[tuple[DirectiveOp, str]] = []
         ops, protocol_notes = _parse_directive_ops(
             raw.get("directive_ops"),
             supersedes_for=lambda op: getattr(
                 contributions.get(op.contribution_id or ""), "supersedes", None
             ),
-            contribution_text_for=lambda op: getattr(
-                contributions.get(op.contribution_id or ""), "content", None
-            ),
-            circumstance_policy=circumstance_policy,
-            missing_out=missing if (circumstance_gate and circumstance_gate.final) else None,
-            require_circumstance=mode == "ordinary"
-            and not (circumstance_gate and circumstance_gate.exempt),
         )
         new_context = _parse_new_context(raw.get("new_context"))
-        if missing:
-            # After the one re-ask (#209): each member whose retire has no changed circumstance is
-            # DECLINED (an op with no valid member declines every accepted one), its
-            # ops go with it, and the cumulative new_context — which may carry what
-            # that member said — is dropped rather than admitted on its account.
-            accepted_now = {v.contribution_id for v in verdicts if v.decision != "decline"}
-            declined: dict[str, list[tuple[DirectiveOp, str]]] = {}
-            for op, defect in missing:
-                owners = (
-                    [op.contribution_id] if op.contribution_id in contributions else accepted_now
-                )
-                for owner in owners:
-                    declined.setdefault(str(owner), []).append((op, defect))
-            verdicts = [
-                BatchVerdict(
-                    contribution_id=v.contribution_id,
-                    decision="decline",
-                    reasoning=_RetireWithoutCircumstance(
-                        declined[v.contribution_id]
-                    ).decline_reasoning(),
-                )
-                if v.contribution_id in declined and v.decision != "decline"
-                else v
-                for v in verdicts
-            ]
-            ops = [op for op in ops if op.contribution_id not in declined]
-            new_context = None
-            protocol_notes = [
-                *protocol_notes,
-                "Retire op(s) rejected for want of a changed circumstance; the contribution(s) "
-                f"{', '.join(sorted(declined))} declined and new_context dropped "
-                "(the judge had its one re-ask).",
-            ]
 
         # ADR 0007 D3/D5, exactly as on the single path: always a list, never
         # None, so callers never need a null-check.
@@ -4561,8 +4131,6 @@ class ScopeManager:
         change_id: str | None = None,
         hop: int = 0,
         rendered_item_ids: Sequence[str] = (),
-        circumstance_gate: _CircumstanceGate | None = None,
-        circumstance_policy: RetireCircumstancePolicy = DEFAULT_RETIRE_CIRCUMSTANCE_POLICY,
     ) -> ScopeManagerJudgment:
         """Validate a ``submit_judgment`` payload and apply its amendment.
 
@@ -4585,35 +4153,10 @@ class ScopeManager:
 
         # Issue #201: an id-addressed op with no id reads it off the
         # contribution under judgment, whose record names what it replaces.
-        missing: list[tuple[DirectiveOp, str]] = []
         ops, protocol_notes = _parse_directive_ops(
             raw.get("directive_ops"),
             supersedes_for=lambda _op: new_contribution.supersedes,
-            contribution_text_for=lambda _op: new_contribution.content,
-            circumstance_policy=circumstance_policy,
-            # After the one re-ask a still-missing retire is not raised again: it
-            # becomes a decline (#209), so a judge that cannot supply the changed circumstance costs
-            # the contribution its admission, never its verdict.
-            missing_out=missing if (circumstance_gate and circumstance_gate.final) else None,
-            # An input-change refresh has no contribution to state a circumstance:
-            # what justifies it is the changed input the INPUT CHANGES block names.
-            require_circumstance=mode == "ordinary"
-            and not (circumstance_gate and circumstance_gate.exempt),
         )
-        if missing:
-            failure = _RetireWithoutCircumstance(missing)
-            return ScopeManagerJudgment(
-                decision="decline",
-                reasoning=failure.decline_reasoning(),
-                new_summary=None,
-                change_id=change_id,
-                hop=hop,
-                protocol_notes=[
-                    *protocol_notes,
-                    "Retire op rejected for want of a changed circumstance; the contribution was "
-                    "declined (the judge had its one re-ask).",
-                ],
-            )
         new_context = _parse_new_context(raw.get("new_context"))
 
         # ADR 0007 D3/D5: published item ids this amendment invalidates. Parsed

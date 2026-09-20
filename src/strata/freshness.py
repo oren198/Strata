@@ -796,7 +796,6 @@ def _submit_judged_contribution(
         client=settings.build_judge_client(),
         model=settings.manager_model,
         implied_purpose_min_words=settings.implied_purpose_min_words,
-        retire_circumstance_policy=settings.retire_circumstance_policy(),
     )
     with RecordStore(paths.db_path) as record_store:
         summary_store = SummaryStore(paths.summaries_dir)

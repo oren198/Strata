@@ -1,13 +1,12 @@
-"""A `retire` needs a CHANGED CIRCUMSTANCE (#209, the retirement half).
+"""A retire's `changed_circumstance` is ADVISORY (#209).
 
-j4-207 — "this supersedes the code-freeze directive, just remove it, no replacement
-needed" — was accepted and retired a directive: the contributor was the directive's
-own scope and `retire` is the sanctioned removal, so nothing stopped a bare request.
-The defect is that nothing required a circumstance: the changed circumstance, in the
-contribution's own words. A retire without one is rejected mechanically (no LLM
-call) in the validate layer that already rejects an unpaired supersede; the judge gets
-one re-ask, and if it still cannot supply one the contribution is declined with a
-reason that names the missing circumstance.
+A mechanical requirement was built and withdrawn: no judge measured fills a required tool
+field reliably (qwen3-235b never did, on either call, even when the re-ask quoted the
+contribution back; gpt-5-mini and gemini did so inconsistently; glm crashed on most items;
+deepseek produced no judgments), so a check that declined a retirement for lacking the field
+declined every genuine retirement too. What remains is the field itself: asked for in the
+tool and the prompt, recorded on the retirement event when a judge supplies it, and shown in
+the Console. Nothing rejects, re-asks or declines for its absence.
 """
 
 from __future__ import annotations
@@ -22,12 +21,9 @@ from strata.record_store import Contribution, ContributorRef
 from strata.scope_manager import (
     _BATCH_SYSTEM_PROMPT,
     _SYSTEM_PROMPT,
-    DirectiveOp,
-    RetireCircumstancePolicy,
     ScopeManager,
     _build_batch_judge_tool,
     _parse_directive_ops,
-    _RetireWithoutCircumstance,
 )
 from strata.settings import Settings
 from strata.summary_store import Directive, ScopeSummary
@@ -55,6 +51,25 @@ SUMMARY = ScopeSummary(
 # The j4-207 shape: a bare removal request dressed up as a supersession.
 J4_207 = "This supersedes the code-freeze directive -- just remove it, no replacement needed."
 
+GENUINE = {
+    "a": (
+        "the manual snapshot step no longer exists, so the freeze protects nothing; "
+        "retiring the freeze policy",
+        "the manual snapshot step no longer exists, so the freeze protects nothing",
+    ),
+    "b": (
+        "the freeze policy's reason — the manual snapshot step — no longer exists, so "
+        "remove the code-freeze directive",
+        "the freeze policy's reason — the manual snapshot step — no longer exists",
+    ),
+    "c": (
+        "rollback is one command now and releases are reversible within a minute, so the "
+        "Friday freeze no longer buys anything; please remove it",
+        "rollback is one command now and releases are reversible within a minute, so the "
+        "Friday freeze no longer buys anything",
+    ),
+}
+
 
 def _contribution(content: str, contribution_id: str = "c_new") -> Contribution:
     return Contribution(
@@ -67,197 +82,6 @@ def _contribution(content: str, contribution_id: str = "c_new") -> Contribution:
         contributor=CONTRIBUTOR,
         created_at="2026-09-20T00:00:00+00:00",
     )
-
-
-def _retire(circumstance: str | None, **extra: object) -> list[dict]:
-    op: dict = {"op": "retire", "id": FREEZE.id, **extra}
-    if circumstance is not None:
-        op["changed_circumstance"] = circumstance
-    return [op]
-
-
-def _parse(
-    ops: list[dict], contribution: str = J4_207, policy: RetireCircumstancePolicy | None = None
-):
-    kwargs = {} if policy is None else {"circumstance_policy": policy}
-    return _parse_directive_ops(ops, contribution_text_for=lambda _op: contribution, **kwargs)
-
-
-# --- schema and prompt -------------------------------------------------------
-
-
-def _op_properties(tool: dict) -> dict:
-    return tool["input_schema"]["properties"]["directive_ops"]["items"]["properties"]
-
-
-def test_the_single_tool_defines_circumstance_on_a_retire_op() -> None:
-    tool = sm.JUDGE_TOOL
-
-    circumstance = _op_properties(tool)["changed_circumstance"]
-    assert "retire" in circumstance["description"]
-    assert "must come from the contribution, never invented" in circumstance["description"]
-    assert (
-        "a retirement with no stated changed circumstance is not a retirement"
-        in circumstance["description"]
-    )
-
-
-def test_the_batch_tool_defines_it_too() -> None:
-    circumstance = _op_properties(_build_batch_judge_tool())["changed_circumstance"]
-
-    assert "never invented" in circumstance["description"]
-
-
-@pytest.mark.parametrize("prompt", [_SYSTEM_PROMPT, _BATCH_SYSTEM_PROMPT], ids=["single", "batch"])
-def test_the_prompt_teaches_the_retire_shape_and_the_way_out(prompt: str) -> None:
-    flat = " ".join(prompt.split())
-
-    assert '{"op": "retire", "id": <directive id>, "changed_circumstance": ' in flat
-    assert "a retirement with no stated changed circumstance is not a retirement" in flat
-    assert "DECLINE" in flat  # no changed circumstance stated -> decline
-
-
-# --- (a) absent / empty / whitespace -----------------------------------------
-
-
-@pytest.mark.parametrize(
-    "circumstance", [None, "", "   ", "\n\t "], ids=["absent", "empty", "spaces", "ws"]
-)
-def test_a_retire_with_no_circumstance_is_rejected(circumstance: str | None) -> None:
-    with pytest.raises(_RetireWithoutCircumstance, match="changed circumstance"):
-        _parse(_retire(circumstance))
-
-
-def test_the_rejection_is_a_value_error_like_the_unpaired_supersede() -> None:
-    assert issubclass(_RetireWithoutCircumstance, ValueError)
-
-
-# --- (b) the word floor ------------------------------------------------------
-
-
-def test_a_circumstance_under_the_word_floor_is_rejected_and_at_the_floor_it_passes() -> None:
-    policy = RetireCircumstancePolicy(min_words=4, min_substantive=1, max_restatement=0.99)
-    contribution = "Retire the freeze directive."
-
-    with pytest.raises(_RetireWithoutCircumstance, match="too short"):
-        _parse(_retire("snapshots now automatic"), contribution, policy)  # 3 words
-
-    ops, _ = _parse(_retire("snapshots are now automatic"), contribution, policy)  # 4 words
-    assert ops[0].changed_circumstance == "snapshots are now automatic"
-
-
-# --- (c) restating the removal -----------------------------------------------
-
-
-@pytest.mark.parametrize(
-    "circumstance",
-    [
-        "just remove it, no replacement needed",
-        "The code-freeze directive is superseded and should be removed",
-        "It is obsolete and should go",
-        "no replacement is needed anymore",
-    ],
-)
-def test_a_circumstance_that_merely_restates_the_removal_request_is_rejected(
-    circumstance: str,
-) -> None:
-    with pytest.raises(_RetireWithoutCircumstance, match="restates the removal"):
-        _parse(_retire(circumstance))
-
-
-# Genuine circumstances share many words with the removal sentence and must NOT be rejected
-# for overlap: a real retirement names the directive it retires, and the changed
-# circumstance is usually stated in the same sentence.
-GENUINE = [
-    (
-        "The code freeze directive can be removed: the manual snapshot step it was created "
-        "to protect no longer exists.",
-        "the manual snapshot step the freeze protected no longer exists",
-    ),
-    (
-        "Please retire the deploy-window directive; the deploy window policy was replaced by "
-        "continuous delivery in the new pipeline.",
-        "the deploy window policy was replaced by continuous delivery in the new pipeline",
-    ),
-    (
-        "The freeze policy's reason — the manual snapshot step — no longer exists, so drop "
-        "the freeze directive.",
-        "the freeze policy's reason — the manual snapshot step — no longer exists",
-    ),
-    (
-        "Retire the staging-only rate limit: staging now mirrors production limits.",
-        "staging now mirrors production limits",
-    ),
-]
-
-
-@pytest.mark.parametrize(("contribution", "circumstance"), GENUINE, ids=range(len(GENUINE)))
-def test_a_genuine_circumstance_that_shares_words_with_the_removal_is_accepted(
-    contribution: str, circumstance: str
-) -> None:
-    ops, _ = _parse(_retire(circumstance), contribution)
-
-    assert [(op.op, op.changed_circumstance) for op in ops] == [("retire", circumstance)]
-
-
-def _synthetic(shared: int) -> tuple[str, str]:
-    """A 10-word circumstance with *shared* of its words also in the removal sentence."""
-    removal = "Remove alpha bravo charlie delta echo foxtrot golf hotel."
-    in_removal = ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf"][:shared]
-    novel = ["kiwi", "lemon", "mango", "nectarine", "orange", "papaya", "quince", "rhubarb"]
-    circumstance = " ".join(in_removal + novel[: 10 - shared])
-    return removal, circumstance
-
-
-def test_the_restatement_threshold_is_pinned_at_both_edges() -> None:
-    policy = RetireCircumstancePolicy(min_words=4, min_substantive=2, max_restatement=0.7)
-
-    below_removal, below = _synthetic(6)  # 6/10 = 0.6 shared: below the threshold
-    at_removal, at = _synthetic(7)  # 7/10 = 0.7 shared: AT the threshold — rejected
-
-    ops, _ = _parse(_retire(below), below_removal, policy)
-    assert ops[0].changed_circumstance == below
-    with pytest.raises(_RetireWithoutCircumstance, match="restates the removal"):
-        _parse(_retire(at), at_removal, policy)
-
-
-def test_a_circumstance_with_too_few_substantive_words_is_a_restatement() -> None:
-    """Request vocabulary (remove, replacement, needed, obsolete...) carries no
-    circumstance, however many of those words there are."""
-    policy = RetireCircumstancePolicy(min_words=4, min_substantive=2, max_restatement=0.99)
-
-    with pytest.raises(_RetireWithoutCircumstance, match="restates the removal"):
-        _parse(_retire("this is not needed and can be dropped now please"), "Retire it.", policy)
-
-
-def test_with_no_removal_sentence_only_the_floors_apply() -> None:
-    """A contribution that is not itself a removal request (e.g. an overflow retire
-    to fit the budget) has no removal sentence to restate."""
-    ops, _ = _parse(
-        _retire("the summary is over budget and this rule no longer earns its words"),
-        "New observation about deploys.",
-    )
-
-    assert ops[0].op == "retire"
-
-
-# --- supersede untouched; circumstance carried -------------------------------------
-
-
-def test_supersede_with_a_replacement_needs_no_circumstance() -> None:
-    ops, _ = _parse([{"op": "supersede", "id": FREEZE.id}, {"op": "append"}])
-
-    assert [op.op for op in ops] == ["supersede", "append"]
-
-
-def test_the_circumstance_is_carried_on_the_parsed_op_stripped() -> None:
-    ops, _ = _parse(_retire("  the manual snapshot step no longer exists  "), GENUINE[0][0])
-
-    assert ops[0].changed_circumstance == "the manual snapshot step no longer exists"
-    assert isinstance(ops[0], DirectiveOp)
-
-
-# --- the flow: one re-ask, then a decline ------------------------------------
 
 
 def _response(tool_input: dict) -> MagicMock:
@@ -278,8 +102,15 @@ def _accept(ops: list[dict]) -> dict:
     }
 
 
-def _judge(manager: ScopeManager, content: str = J4_207):
-    return manager.judge(
+def _retire(circumstance: str | None = None) -> list[dict]:
+    op: dict = {"op": "retire", "id": FREEZE.id}
+    if circumstance is not None:
+        op["changed_circumstance"] = circumstance
+    return [op]
+
+
+def _judge(client: MagicMock, content: str):
+    return ScopeManager(client=client).judge(
         scope=SCOPE,
         stratum=STRATUM,
         current_summary=SUMMARY,
@@ -288,76 +119,124 @@ def _judge(manager: ScopeManager, content: str = J4_207):
     )
 
 
-def test_a_judge_that_forgot_the_field_supplies_it_on_the_one_re_ask() -> None:
-    contribution = GENUINE[0][0]
+# --- the field is offered to the judge ---------------------------------------
+
+
+def _op_properties(tool: dict) -> dict:
+    return tool["input_schema"]["properties"]["directive_ops"]["items"]["properties"]
+
+
+@pytest.mark.parametrize(
+    "tool", [sm.JUDGE_TOOL, _build_batch_judge_tool()], ids=["single", "batch"]
+)
+def test_both_tools_offer_the_field_with_the_copy_verbatim_wording(tool: dict) -> None:
+    description = _op_properties(tool)["changed_circumstance"]["description"]
+
+    assert "Copy the contributor's stated changed circumstance verbatim" in description
+    assert "never invented" in description
+    assert "operator can see why a rule went away" in description
+
+
+def test_the_field_is_not_required_by_the_schema() -> None:
+    items = sm.JUDGE_TOOL["input_schema"]["properties"]["directive_ops"]["items"]
+
+    assert items["required"] == ["op"]
+
+
+@pytest.mark.parametrize("prompt", [_SYSTEM_PROMPT, _BATCH_SYSTEM_PROMPT], ids=["single", "batch"])
+def test_the_prompt_teaches_the_retire_shape(prompt: str) -> None:
+    flat = " ".join(prompt.split())
+
+    assert '{"op": "retire", "id": <directive id>, "changed_circumstance": ' in flat
+    assert "a retirement with no stated changed circumstance is not a retirement" in flat
+
+
+# --- nothing rejects, re-asks or declines for its absence --------------------
+
+
+def test_a_retire_with_no_circumstance_parses_untouched() -> None:
+    ops, notes = _parse_directive_ops(_retire(None))
+
+    assert [(op.op, op.changed_circumstance) for op in ops] == [("retire", None)]
+    assert notes == []
+
+
+@pytest.mark.parametrize("value", ["", "   ", "\n\t "], ids=["empty", "spaces", "ws"])
+def test_a_blank_circumstance_is_recorded_as_none_not_rejected(value: str) -> None:
+    ops, _ = _parse_directive_ops(_retire(value))
+
+    assert ops[0].changed_circumstance is None
+
+
+def test_a_bare_removal_is_judged_on_its_merits_not_rejected_mechanically() -> None:
+    """j4-207's shape: with the requirement withdrawn, the judge's own verdict stands."""
     client = MagicMock()
-    client.messages.create.side_effect = [
-        _response(_accept(_retire(None))),
-        _response(
-            _accept(_retire("the manual snapshot step the freeze protected no longer exists"))
-        ),
-    ]
+    client.messages.create.side_effect = [_response(_accept(_retire(None)))]
 
-    judgment = _judge(ScopeManager(client=client), contribution)
+    judgment = _judge(client, J4_207)
 
-    assert client.messages.create.call_count == 2
-    assert judgment.decision == "accept_as_directive"
+    assert client.messages.create.call_count == 1  # no re-ask
+    assert judgment.decision == "accept_as_directive"  # the known limit, documented under #209
     assert judgment.retired_directive_ids == [FREEZE.id]
-    assert judgment.new_summary is not None and judgment.new_summary.directives == []
-    reask = client.messages.create.call_args_list[1].kwargs["messages"][-1]["content"]
-    assert "changed_circumstance" in str(reask)  # the re-ask names what is missing
+    assert judgment.retirement_circumstances() == {FREEZE.id: None}
 
 
-def test_a_judge_that_still_has_no_circumstance_declines_after_exactly_one_re_ask() -> None:
-    client = MagicMock()
-    client.messages.create.side_effect = [
-        _response(_accept(_retire(None))),
-        _response(_accept(_retire("just remove it, no replacement needed"))),
-    ]
-
-    judgment = _judge(ScopeManager(client=client))
-
-    assert client.messages.create.call_count == 2  # one re-ask, never a third call
-    assert judgment.decision == "decline"
-    assert judgment.new_summary is None
-    assert judgment.retired_directive_ids == []
-    reasoning = " ".join(judgment.reasoning.split())
-    assert "changed circumstance" in reasoning  # names what is missing ...
-    assert "no changed circumstance" in reasoning  # ... and teaches the fix
-    assert FREEZE.id in reasoning
-
-
-def test_a_genuine_retirement_with_a_circumstance_retires_on_the_first_call() -> None:
+def test_a_judge_that_declines_a_bare_removal_still_declines_it() -> None:
+    """The prompt wording still lets a capable judge decline on its own."""
     client = MagicMock()
     client.messages.create.side_effect = [
         _response(
-            _accept(_retire("the manual snapshot step the freeze protected no longer exists"))
+            {
+                "decision": "decline",
+                "reasoning": "requests removal but does not state a changed circumstance",
+                "directive_ops": [],
+                "new_context": None,
+            }
         )
     ]
 
-    judgment = _judge(ScopeManager(client=client), GENUINE[0][0])
+    judgment = _judge(client, J4_207)
+
+    assert judgment.decision == "decline"
+    assert judgment.retired_directive_ids == []
+
+
+@pytest.mark.parametrize("key", sorted(GENUINE))
+def test_the_three_genuine_retirements_retire(key: str) -> None:
+    text, stated = GENUINE[key]
+    client = MagicMock()
+    client.messages.create.side_effect = [_response(_accept(_retire(stated)))]
+
+    judgment = _judge(client, text)
 
     assert client.messages.create.call_count == 1
     assert judgment.retired_directive_ids == [FREEZE.id]
+    assert judgment.retirement_circumstances() == {FREEZE.id: stated}
 
 
-def test_the_policy_is_threaded_to_the_validator() -> None:
+@pytest.mark.parametrize("key", sorted(GENUINE))
+def test_a_genuine_retirement_retires_even_when_the_judge_states_no_circumstance(
+    key: str,
+) -> None:
+    """A judge that omits the field (as qwen does) loses nothing it would have got before."""
+    text, _ = GENUINE[key]
     client = MagicMock()
-    client.messages.create.side_effect = [
-        _response(_accept(_retire("snapshots are now automatic"))),
-    ]
-    strict = RetireCircumstancePolicy(min_words=6, min_substantive=1, max_restatement=0.99)
-    client.messages.create.side_effect = [
-        _response(_accept(_retire("snapshots are now automatic"))),
-        _response(_accept(_retire("snapshots are now automatic"))),
-    ]
+    client.messages.create.side_effect = [_response(_accept(_retire(None)))]
 
-    judgment = _judge(ScopeManager(client=client, retire_circumstance_policy=strict), GENUINE[0][0])
+    judgment = _judge(client, text)
 
-    assert judgment.decision == "decline"
+    assert judgment.retired_directive_ids == [FREEZE.id]
+    assert judgment.decision == "accept_as_directive"
 
 
-def test_the_batch_path_declines_the_member_whose_retire_has_no_circumstance() -> None:
+def test_supersede_with_a_replacement_is_untouched() -> None:
+    ops, _ = _parse_directive_ops([{"op": "supersede", "id": FREEZE.id}, {"op": "append"}])
+
+    assert [op.op for op in ops] == ["supersede", "append"]
+    assert all(op.changed_circumstance is None for op in ops)
+
+
+def test_the_batch_path_keeps_a_member_whose_retire_states_no_circumstance() -> None:
     contributions = {
         "c_a": _contribution(J4_207, "c_a"),
         "c_b": _contribution("Deploys run on Tuesdays.", "c_b"),
@@ -370,28 +249,37 @@ def test_the_batch_path_declines_the_member_whose_retire_has_no_circumstance() -
         "directive_ops": [{"op": "retire", "id": FREEZE.id, "contribution_id": "c_a"}],
         "new_context": "Deploys run on Tuesdays.",
     }
-    gate = sm._CircumstanceGate(final=True)  # noqa: SLF001
 
     judgment = ScopeManager._parse_batch_judgment(  # noqa: SLF001
         scope=SCOPE,
         tool_use_block=_response(payload).content[0],
         current_summary=SUMMARY,
         contributions=contributions,
-        circumstance_gate=gate,
     )
 
-    verdicts = {v.contribution_id: v.decision for v in judgment.verdicts}
-    assert verdicts == {"c_a": "decline", "c_b": "accept_as_context"}
-    assert judgment.retired_directive_ids == []
-    assert FREEZE.id in {
-        d.id for d in (judgment.new_summary.directives if judgment.new_summary else [])
+    assert {v.contribution_id: v.decision for v in judgment.verdicts} == {
+        "c_a": "accept_as_directive",
+        "c_b": "accept_as_context",
     }
+    assert judgment.retired_directive_ids == [FREEZE.id]
+
+
+def test_no_enforcement_machinery_is_left_behind() -> None:
+    for name in (
+        "RetireCircumstancePolicy",
+        "_RetireWithoutCircumstance",
+        "_CircumstanceGate",
+        "_circumstance_defect",
+    ):
+        assert not hasattr(sm, name), name
+    settings = Settings()
+    assert not [f for f in type(settings).model_fields if f.startswith("retire_circumstance")]
 
 
 # --- the record --------------------------------------------------------------
 
 
-def test_the_circumstance_is_stored_on_the_retirement_event(tmp_path) -> None:
+def test_the_circumstance_is_stored_on_the_retirement_event_when_present(tmp_path) -> None:
     from strata.migrator import run_migrations
     from strata.record_store import RecordStore
 
@@ -408,13 +296,12 @@ def test_the_circumstance_is_stored_on_the_retirement_event(tmp_path) -> None:
     )
 
     assert event.changed_circumstance == "the manual snapshot step no longer exists"
-    assert (
-        store.list_retirements(scope_id="g_ops")[0].changed_circumstance
-        == event.changed_circumstance
+    assert store.list_retirements(scope_id="g_ops")[0].changed_circumstance == (
+        event.changed_circumstance
     )
 
 
-def test_a_retirement_without_a_circumstance_still_records_as_before(tmp_path) -> None:
+def test_a_retirement_without_a_circumstance_records_as_before(tmp_path) -> None:
     from strata.migrator import run_migrations
     from strata.record_store import RecordStore
 
@@ -428,11 +315,8 @@ def test_a_retirement_without_a_circumstance_still_records_as_before(tmp_path) -
     assert event.changed_circumstance is None
 
 
-def test_the_operator_retire_path_never_goes_through_the_validator(
-    tmp_path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """operator_retire is the operator's sovereign correction: no circumstance, no judge,
-    no validator."""
+def test_the_operator_retire_path_is_unaffected(tmp_path) -> None:
+    """operator_retire is the operator's own correction: no circumstance, no judge."""
     import yaml
 
     from strata.fleet_config import FleetConfig
@@ -441,10 +325,6 @@ def test_the_operator_retire_path_never_goes_through_the_validator(
     from strata.record_store import RecordStore
     from strata.summary_store import SummaryStore
 
-    def boom(*_a: object, **_k: object) -> None:
-        raise AssertionError("the operator path must not touch the circumstance validator")
-
-    monkeypatch.setattr(sm, "_parse_directive_ops", boom)
     fleet_path = tmp_path / "fleet.yaml"
     fleet_path.write_text(
         yaml.dump(
@@ -460,14 +340,13 @@ def test_the_operator_retire_path_never_goes_through_the_validator(
     run_migrations(db)
     summaries = SummaryStore(str(tmp_path / "summaries"))
     summaries.write("g_ops", SUMMARY)
-    store = RecordStore(db)
 
     event = operator_retire(
         "g_ops",
         FREEZE.id,
         "operator decision",
         fleet=FleetConfig.load(fleet_path),
-        record_store=store,
+        record_store=RecordStore(db),
         summary_store=summaries,
     )
 
@@ -512,185 +391,30 @@ def test_the_consoles_summary_retirements_carry_the_circumstance(tmp_path) -> No
         body = client.get("/scopes/g_ops/summary").json()
         source = client.get("/ui/scope-detail.jsx").text
 
-    assert (
-        body["retirements"][0]["changed_circumstance"]
-        == "the manual snapshot step no longer exists"
+    assert body["retirements"][0]["changed_circumstance"] == (
+        "the manual snapshot step no longer exists"
     )
-    assert "r.changed_circumstance" in source  # the retired directive's line shows it
+    assert "changed circumstance:" in source and "r.changed_circumstance" in source
 
 
-# --- settings ----------------------------------------------------------------
+# --- the limit is documented where a reader meets it --------------------------
 
 
-def test_the_policy_defaults_match_the_settings_and_env_overrides_them(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    default = RetireCircumstancePolicy()
+def test_the_field_documents_that_it_is_advisory_and_points_at_the_issue() -> None:
+    import inspect
 
-    settings = Settings()
-    assert settings.retire_circumstance_policy() == default
-    monkeypatch.setenv("STRATA_RETIRE_CIRCUMSTANCE_MIN_WORDS", "9")
-    monkeypatch.setenv("STRATA_RETIRE_CIRCUMSTANCE_MAX_RESTATEMENT", "0.5")
-    tuned = Settings().retire_circumstance_policy()
-    assert (tuned.min_words, tuned.max_restatement) == (9, 0.5)
+    text = " ".join(inspect.getsource(sm.DirectiveOp).split())
+
+    assert "ADVISORY, not enforced" in text
+    assert "#209" in text
+    assert "input-change refresh" in text and "budget overflow" in text
 
 
-def test_the_managers_the_app_builds_carry_the_policy() -> None:
-    from strata.app import get_scope_manager
+def test_the_readme_states_the_limit() -> None:
+    from pathlib import Path
 
-    settings = Settings(retire_circumstance_min_words=11, anthropic_api_key="k")
+    readme = (Path(__file__).parent.parent / "README.md").read_text(encoding="utf-8")
 
-    manager = get_scope_manager(client=None, settings=settings)  # type: ignore[arg-type]
-
-    assert manager._retire_circumstance_policy.min_words == 11  # noqa: SLF001
-
-
-# --- the two exemptions: a circumstance is required only where a CONTRIBUTION asks -----
-
-
-def test_a_budget_overflow_retire_needs_no_circumstance() -> None:
-    """The overflow re-ask is engine-initiated: no contribution asked for the removal,
-    so there is nothing to state a circumstance about, and making the judge invent one
-    would risk declining a contribution over an unrelated budget action."""
-    over_budget = {
-        "decision": "accept_as_context",
-        "reasoning": "recording the observation",
-        "directive_ops": [],
-        "new_context": " ".join(f"word{i}" for i in range(40)),
-    }
-    fitted = {
-        "decision": "accept_as_context",
-        "reasoning": "recording the observation",
-        "directive_ops": [{"op": "retire", "id": FREEZE.id}],  # no changed_circumstance
-        "new_context": "Short.",
-    }
-    client = MagicMock()
-    client.messages.create.side_effect = [_response(over_budget), _response(fitted)]
-
-    judgment = ScopeManager(client=client).judge(
-        scope=SCOPE,
-        stratum=STRATUM,
-        current_summary=SUMMARY,
-        recent_contributions=[],
-        new_contribution=_contribution("New observation about deploys."),
-        summary_max_words=5,
-    )
-
-    assert client.messages.create.call_count == 2
-    assert judgment.decision == "accept_as_context"  # never declined over a budget action
-    assert judgment.retired_directive_ids == [FREEZE.id]
-
-
-def test_the_exemption_does_not_leak_into_a_contributions_own_retire() -> None:
-    """A retire the contribution asks for still needs its circumstance, even in a call
-    that also went through the overflow re-ask."""
-    client = MagicMock()
-    client.messages.create.side_effect = [
-        _response(_accept(_retire(None))),
-        _response(_accept(_retire(None))),
-    ]
-
-    judgment = _judge(ScopeManager(client=client))
-
-    assert judgment.decision == "decline"
-    assert client.messages.create.call_count == 2
-
-
-def test_an_input_change_refresh_retire_needs_no_circumstance() -> None:
-    ops, _ = _parse_directive_ops([{"op": "retire", "id": FREEZE.id}], require_circumstance=False)
-
-    assert [op.op for op in ops] == ["retire"]
-
-
-def test_the_policy_docstring_names_both_exemptions() -> None:
-    doc = " ".join((RetireCircumstancePolicy.__doc__ or "").split())
-
-    assert "only where a CONTRIBUTION asks for the removal" in doc
-    assert "input-change refresh" in doc
-    assert "budget overflow" in doc
-
-
-# --- revision 1 of 3: the judge SENT NOTHING (live capture, qwen3-235b) -------------------
-#
-# Diagnosis, offline + one live capture: for all three genuine gate texts the judge's retire
-# op carried NO changed_circumstance on either call (it filled `supersedes`/`subject` and
-# ignored the field), and repeated the identical payload after the re-ask fired. The
-# validator accepted every plausible circumstance for those texts, so nothing was rejected
-# that was sent. The re-ask therefore has to do the work the schema could not: quote the
-# contribution's own words back, so the judge can copy them.
-
-GATE_TEXTS = {
-    "a": (
-        "the manual snapshot step no longer exists, so the freeze protects nothing; "
-        "retiring the freeze policy",
-        "the manual snapshot step no longer exists, so the freeze protects nothing",
-    ),
-    "b": (
-        "the freeze policy's reason — the manual snapshot step — no longer exists, so "
-        "remove the code-freeze directive",
-        "the freeze policy's reason — the manual snapshot step — no longer exists",
-    ),
-    "c": (
-        "rollback is one command now and releases are reversible within a minute, so the "
-        "Friday freeze no longer buys anything; please remove it",
-        "rollback is one command now and releases are reversible within a minute, so the "
-        "Friday freeze no longer buys anything",
-    ),
-}
-
-
-@pytest.mark.parametrize("key", sorted(GATE_TEXTS))
-def test_the_three_gate_retirements_are_accepted_whatever_reasonable_field_is_sent(
-    key: str,
-) -> None:
-    text, stated = GATE_TEXTS[key]
-    first_clause = stated.split(", so ")[0]
-
-    for sent in (stated, first_clause, text):
-        ops, _ = _parse(_retire(sent), text)
-        assert ops[0].changed_circumstance == sent
-
-
-@pytest.mark.parametrize("key", sorted(GATE_TEXTS))
-def test_the_reask_quotes_the_contributions_own_words_back(key: str) -> None:
-    text, stated = GATE_TEXTS[key]
-
-    with pytest.raises(_RetireWithoutCircumstance) as excinfo:
-        _parse(_retire(None), text)
-
-    message = " ".join(str(excinfo.value).split())
-    assert f'"{stated}"' in message
-    assert "copy them verbatim into `changed_circumstance`" in message
-
-
-def test_the_reask_for_a_bare_removal_says_there_is_nothing_to_copy() -> None:
-    with pytest.raises(_RetireWithoutCircumstance) as excinfo:
-        _parse(_retire(None), J4_207)
-
-    message = " ".join(str(excinfo.value).split())
-    assert "only the removal request" in message
-    assert "DECLINE" in message
-    assert "copy them verbatim" not in message  # nothing valid to copy: no misleading quote
-
-
-def test_the_tool_tells_the_judge_to_copy_the_stated_circumstance_verbatim() -> None:
-    description = sm.JUDGE_TOOL["input_schema"]["properties"]["directive_ops"]["items"][
-        "properties"
-    ]["changed_circumstance"]["description"]
-
-    assert "Copy the contributor's stated changed circumstance verbatim" in description
-
-
-def test_the_judges_second_call_is_shown_the_quote(monkeypatch: pytest.MonkeyPatch) -> None:
-    text, stated = GATE_TEXTS["a"]
-    client = MagicMock()
-    client.messages.create.side_effect = [
-        _response(_accept(_retire(None))),
-        _response(_accept(_retire(stated))),
-    ]
-
-    judgment = _judge(ScopeManager(client=client), text)
-
-    reask = str(client.messages.create.call_args_list[1].kwargs["messages"][-1]["content"])
-    assert stated in reask
-    assert judgment.retired_directive_ids == [FREEZE.id]
+    assert "retirement backstop" in readme
+    assert "is advisory" in readme
+    assert "#209" in readme

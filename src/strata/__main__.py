@@ -2224,7 +2224,6 @@ def cmd_publication_bootstrap(args: argparse.Namespace) -> int:
             client=settings.build_judge_client(),
             model=settings.manager_model,
             implied_purpose_min_words=settings.implied_purpose_min_words,
-            retire_circumstance_policy=settings.retire_circumstance_policy(),
         )
 
         try:
@@ -2420,7 +2419,6 @@ def _refresh_stores(settings):  # noqa: ANN001, ANN201
         client=settings.build_judge_client(),
         model=settings.manager_model,
         implied_purpose_min_words=settings.implied_purpose_min_words,
-        retire_circumstance_policy=settings.retire_circumstance_policy(),
     )
     return fleet_config, record_store, summary_store, manager
 

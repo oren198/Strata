@@ -237,7 +237,6 @@ def get_scope_manager(
         client=client,
         model=settings.manager_model,
         implied_purpose_min_words=settings.implied_purpose_min_words,
-        retire_circumstance_policy=settings.retire_circumstance_policy(),
     )
 
 
