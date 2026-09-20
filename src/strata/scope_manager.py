@@ -289,6 +289,33 @@ def _removal_clauses(text: str) -> list[str]:
     return [c for c in clauses if _GET_RID_RE.search(c) or _REMOVAL_WORD_RE.search(c.lower())]
 
 
+_CONNECTIVE_EDGES_RE = re.compile(
+    r"^(?:[\s,;:.\-—–]|(?:so|and|but|therefore|thus|please|also)\b)+|"
+    r"(?:[\s,;:.\-—–]|\b(?:so|and|but|therefore|thus|please|also))+$",
+    re.IGNORECASE,
+)
+
+
+def _stated_circumstance(contribution_text: str | None, policy: RetireCircumstancePolicy) -> str:
+    """The contribution's own words apart from its removal request, if they could stand as
+    a changed circumstance; ``""`` when the contribution states only the removal (#209).
+
+    Cut out the clauses that ask for the removal and tidy the joins. Offered back to a
+    judge that omitted the field so it can COPY the contributor's words, never invent
+    them; it is offered only if it would itself clear the floors, so a bare removal
+    ("just remove it, no replacement needed") has nothing to quote.
+    """
+    text = (contribution_text or "").strip()
+    if not text:
+        return ""
+    for clause in _removal_clauses(text):
+        text = text.replace(clause, " ")
+    text = _CONNECTIVE_EDGES_RE.sub("", " ".join(text.split()))
+    if not text or _circumstance_defect(text, contribution_text, policy):
+        return ""
+    return text
+
+
 def _circumstance_defect(
     changed_circumstance: str | None,
     contribution_text: str | None,
@@ -335,13 +362,26 @@ class _RetireWithoutCircumstance(ValueError):
     into a DECLINE naming the missing changed circumstance (see :class:`_CircumstanceGate`).
     """
 
-    def __init__(self, defects: list[tuple[DirectiveOp, str]]) -> None:
+    def __init__(self, defects: list[tuple[DirectiveOp, str]], stated: str = "") -> None:
         self.defects = defects
         listed = "; ".join(f"retire {op.id}: {defect}" for op, defect in defects)
+        # What the judge can act on: the contribution's own words to copy, or the fact
+        # that there are none and the right move is to decline (#209). A live capture
+        # showed a cheap judge sends the field EMPTY and repeats itself after a bare
+        # re-ask, so the re-ask quotes the words back instead of only naming the gap.
+        if stated:
+            hint = (
+                f' The contribution\'s own words apart from the removal request: "{stated}". '
+                "If those state what changed, copy them verbatim into `changed_circumstance`."
+            )
+        else:
+            hint = (
+                " The contribution states only the removal request and nothing that "
+                "changed, so there is nothing to copy: DECLINE it."
+            )
         super().__init__(
-            f"submit_judgment returned a retire op with no usable changed circumstance ({listed}). "
-            "A retirement needs a `changed_circumstance`: the changed circumstance, in the "
-            "contribution's own words."
+            f"submit_judgment returned a retire op with no usable changed circumstance ({listed})."
+            f"{hint}"
         )
 
     def decline_reasoning(self) -> str:
@@ -605,9 +645,11 @@ JUDGE_TOOL: dict = {
                         "changed_circumstance": {
                             "type": ["string", "null"],
                             "description": (
-                                "retire only, REQUIRED for a retire op: the changed "
-                                "circumstance that makes the directive no longer hold, in "
-                                "the contribution's own words. It must come from the "
+                                "retire only, REQUIRED for a retire op. Copy the "
+                                "contributor's stated changed circumstance verbatim: what "
+                                "changed that makes the directive no longer hold (for "
+                                "'X no longer exists, so remove Y', it is 'X no longer "
+                                "exists'). It must come from the "
                                 "contribution, never invented; a retirement with no stated "
                                 "changed circumstance is not a retirement. If the "
                                 "contribution only asks for the removal, state no changed "
@@ -1587,7 +1629,12 @@ def _parse_directive_ops(  # noqa: ANN001 — raw tool-call field
     ]
     if missing:
         if missing_out is None:
-            raise _RetireWithoutCircumstance(missing)
+            raise _RetireWithoutCircumstance(
+                missing,
+                stated=_stated_circumstance(
+                    contribution_text_for(missing[0][0]), circumstance_policy
+                ),
+            )
         missing_out.extend(missing)
     return ops, notes
 

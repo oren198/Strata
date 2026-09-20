@@ -124,7 +124,7 @@ def test_the_prompt_teaches_the_retire_shape_and_the_way_out(prompt: str) -> Non
     "circumstance", [None, "", "   ", "\n\t "], ids=["absent", "empty", "spaces", "ws"]
 )
 def test_a_retire_with_no_circumstance_is_rejected(circumstance: str | None) -> None:
-    with pytest.raises(_RetireWithoutCircumstance, match="changed_circumstance"):
+    with pytest.raises(_RetireWithoutCircumstance, match="changed circumstance"):
         _parse(_retire(circumstance))
 
 
@@ -608,3 +608,89 @@ def test_the_policy_docstring_names_both_exemptions() -> None:
     assert "only where a CONTRIBUTION asks for the removal" in doc
     assert "input-change refresh" in doc
     assert "budget overflow" in doc
+
+
+# --- revision 1 of 3: the judge SENT NOTHING (live capture, qwen3-235b) -------------------
+#
+# Diagnosis, offline + one live capture: for all three genuine gate texts the judge's retire
+# op carried NO changed_circumstance on either call (it filled `supersedes`/`subject` and
+# ignored the field), and repeated the identical payload after the re-ask fired. The
+# validator accepted every plausible circumstance for those texts, so nothing was rejected
+# that was sent. The re-ask therefore has to do the work the schema could not: quote the
+# contribution's own words back, so the judge can copy them.
+
+GATE_TEXTS = {
+    "a": (
+        "the manual snapshot step no longer exists, so the freeze protects nothing; "
+        "retiring the freeze policy",
+        "the manual snapshot step no longer exists, so the freeze protects nothing",
+    ),
+    "b": (
+        "the freeze policy's reason — the manual snapshot step — no longer exists, so "
+        "remove the code-freeze directive",
+        "the freeze policy's reason — the manual snapshot step — no longer exists",
+    ),
+    "c": (
+        "rollback is one command now and releases are reversible within a minute, so the "
+        "Friday freeze no longer buys anything; please remove it",
+        "rollback is one command now and releases are reversible within a minute, so the "
+        "Friday freeze no longer buys anything",
+    ),
+}
+
+
+@pytest.mark.parametrize("key", sorted(GATE_TEXTS))
+def test_the_three_gate_retirements_are_accepted_whatever_reasonable_field_is_sent(
+    key: str,
+) -> None:
+    text, stated = GATE_TEXTS[key]
+    first_clause = stated.split(", so ")[0]
+
+    for sent in (stated, first_clause, text):
+        ops, _ = _parse(_retire(sent), text)
+        assert ops[0].changed_circumstance == sent
+
+
+@pytest.mark.parametrize("key", sorted(GATE_TEXTS))
+def test_the_reask_quotes_the_contributions_own_words_back(key: str) -> None:
+    text, stated = GATE_TEXTS[key]
+
+    with pytest.raises(_RetireWithoutCircumstance) as excinfo:
+        _parse(_retire(None), text)
+
+    message = " ".join(str(excinfo.value).split())
+    assert f'"{stated}"' in message
+    assert "copy them verbatim into `changed_circumstance`" in message
+
+
+def test_the_reask_for_a_bare_removal_says_there_is_nothing_to_copy() -> None:
+    with pytest.raises(_RetireWithoutCircumstance) as excinfo:
+        _parse(_retire(None), J4_207)
+
+    message = " ".join(str(excinfo.value).split())
+    assert "only the removal request" in message
+    assert "DECLINE" in message
+    assert "copy them verbatim" not in message  # nothing valid to copy: no misleading quote
+
+
+def test_the_tool_tells_the_judge_to_copy_the_stated_circumstance_verbatim() -> None:
+    description = sm.JUDGE_TOOL["input_schema"]["properties"]["directive_ops"]["items"][
+        "properties"
+    ]["changed_circumstance"]["description"]
+
+    assert "Copy the contributor's stated changed circumstance verbatim" in description
+
+
+def test_the_judges_second_call_is_shown_the_quote(monkeypatch: pytest.MonkeyPatch) -> None:
+    text, stated = GATE_TEXTS["a"]
+    client = MagicMock()
+    client.messages.create.side_effect = [
+        _response(_accept(_retire(None))),
+        _response(_accept(_retire(stated))),
+    ]
+
+    judgment = _judge(ScopeManager(client=client), text)
+
+    reask = str(client.messages.create.call_args_list[1].kwargs["messages"][-1]["content"])
+    assert stated in reask
+    assert judgment.retired_directive_ids == [FREEZE.id]
