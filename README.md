@@ -154,12 +154,14 @@ Console); binding becomes an explicit choice once there are two or more scopes â
 see [Binding past one scope](#binding-past-one-scope).
 
 Give each scope a one-line `description:` in `fleet.yaml` â€” what its memory is for.
-The judge measures relevance against it: with a description it declines material
-"outside this scope's stated purpose"; without one it only turns away what is "not
-about the project's work" (its decline reason says which rule applied, so the
-Turned down view shows you when a description is missing). `strata doctor` warns
-once per scope that has none, and the Console shows the description in the scope
-header ("no description" when unset).
+The judge measures relevance against it: material "outside this scope's stated
+purpose" is declined, and the decline reason quotes the purpose. Without a
+description the judge may use what the scope already holds as an implied purpose,
+but only once there is enough of it to tell what the scope is about (about 50 words
+of summary and directives; `STRATA_IMPLIED_PURPOSE_MIN_WORDS`); a scope with an
+empty summary is judged exactly as before, with no relevance rule at all. `strata
+doctor` warns once per scope that has no description, and the Console shows it in
+the scope header ("no description" when unset).
 
 ### 6. Two terminals, same project
 

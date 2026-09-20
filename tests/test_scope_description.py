@@ -27,6 +27,7 @@ from strata.scope_manager import (
     _build_user_message,
 )
 from strata.settings import Settings
+from strata.summary_store import Directive, ScopeSummary
 
 _STRATUM = Stratum(id="L1", name="function", ordinal=1)
 
@@ -176,6 +177,11 @@ def test_an_existing_fleet_is_never_rewritten_by_the_description_flag(tmp_path: 
 
 
 # --- the judge prompts -------------------------------------------------------
+#
+# Relevance is judged only where there is something to measure it against: a stated
+# purpose (a description), or — with none — a scope whose existing memory is enough
+# to tell what it is about. A scope with neither keeps today's behaviour exactly, so
+# NO relevance wording may appear anywhere in its prompt (system prompt included).
 
 
 def _contribution() -> Contribution:
@@ -193,66 +199,201 @@ def _contribution() -> Contribution:
     )
 
 
-def _message(description: str | None) -> str:
+_POPULATED_CONTEXT = (
+    "The billing service issues invoices, retries failed card payments three times and "
+    "reconciles payouts nightly. Invoices are stored in the ledger database and exported "
+    "to the finance team as CSV every month. Refunds are approved by support leads and "
+    "recorded against the original invoice. Tax rates come from the pricing service and "
+    "are cached for a day. Payment provider webhooks arrive out of order, so handlers "
+    "must be idempotent."
+)
+
+
+def _summary(context: str = "", directives: list[Directive] | None = None) -> ScopeSummary:
+    return ScopeSummary(
+        scope_id="a",
+        directives=directives or [],
+        context=context,
+        updated_at="2026-09-20T00:00:00+00:00",
+        version=1,
+    )
+
+
+def _message(
+    description: str | None = None,
+    summary: ScopeSummary | None = None,
+    *,
+    min_words: int | None = None,
+    mode: str = "ordinary",
+) -> str:
+    extra = {} if min_words is None else {"implied_purpose_min_words": min_words}
     return _build_user_message(
         scope=Scope(id="a", name="A", stratum_id="L1", description=description),
         stratum=_STRATUM,
         ancestor_directives=None,
-        current_summary=None,
+        current_summary=summary,
         recent_contributions=[],
         new_contribution=_contribution(),
+        mode=mode,  # type: ignore[arg-type]
+        **extra,
     )
 
 
-def test_the_prompt_carries_the_description_as_the_scopes_stated_purpose() -> None:
-    message = _message("Billing service: invoices and payouts.")
+def _flat(text: str) -> str:
+    return " ".join(text.split())
+
+
+_RELEVANCE_MARKERS = ("RELEVANCE", "SCOPE PURPOSE", "stated purpose", "implied by")
+
+
+def test_with_a_description_relevance_is_judged_against_it() -> None:
+    message = _flat(_message("Billing service: invoices and payouts."))
 
     assert "SCOPE PURPOSE: Billing service: invoices and payouts." in message
+    assert "RELEVANCE" in message
+    assert 'begin "Outside this scope\'s stated purpose: <the purpose as stated>."' in message
 
 
-def test_the_prompt_has_no_placeholder_when_there_is_no_description() -> None:
-    message = _message(None)
+def test_a_described_scope_still_admits_on_purpose_work() -> None:
+    """Must-still-accept twin, description path."""
+    message = _flat(_message("Billing service: invoices and payouts."))
 
-    assert "SCOPE PURPOSE" not in message
-    assert "None" not in message.split("NEW CONTRIBUTION TO JUDGE")[0]
+    assert "on-purpose" in message
+    assert "when in doubt, admit" in message.lower()
 
 
-def test_the_batch_message_carries_the_purpose_too() -> None:
-    message = _build_batch_user_message(
-        scope=Scope(id="a", name="A", stratum_id="L1", description="Billing purpose."),
-        stratum=_STRATUM,
-        ancestor_directives=None,
-        current_summary=None,
-        recent_contributions=[],
-        new_contributions=[_contribution()],
+def test_the_batch_message_carries_the_purpose_and_rule_too() -> None:
+    message = _flat(
+        _build_batch_user_message(
+            scope=Scope(id="a", name="A", stratum_id="L1", description="Billing purpose."),
+            stratum=_STRATUM,
+            ancestor_directives=None,
+            current_summary=None,
+            recent_contributions=[],
+            new_contributions=[_contribution()],
+        )
     )
 
     assert "SCOPE PURPOSE: Billing purpose." in message
+    assert "Outside this scope's stated purpose:" in message
 
 
-@pytest.mark.parametrize("prompt", [_SYSTEM_PROMPT, _BATCH_SYSTEM_PROMPT], ids=["single", "batch"])
-def test_the_relevance_rule_names_which_rule_applied_in_the_decline_reason(prompt: str) -> None:
-    prompt = " ".join(prompt.split())  # the prompt is hard-wrapped
-    assert "RELEVANCE" in prompt
-    # Both decline reasons are pinned, so the declines view teaches the operator to
-    # add a description when there is none.
-    assert "no stated purpose; not about the project's work" in prompt.lower()
-    assert "outside this scope's stated purpose:" in prompt.lower()
-    # Absent description: project work is the bar.
-    assert "code" in prompt and "decisions" in prompt and "operations" in prompt
-    assert "tooling" in prompt
+@pytest.mark.parametrize(
+    "summary",
+    [None, _summary(), _summary("Coffee is upstairs."), _summary("A short note.")],
+    ids=["no-summary", "empty-summary", "few-words", "near-empty"],
+)
+def test_a_scope_with_no_description_and_no_real_memory_carries_no_relevance_rule(
+    summary: ScopeSummary | None,
+) -> None:
+    """Today's behaviour, exactly: a scope with nothing in it must not start declining
+    things it accepts today, so nothing about relevance is in its prompt — not the
+    per-call message, not the system prompt."""
+    prompts = [_message(None, summary), _SYSTEM_PROMPT, _BATCH_SYSTEM_PROMPT]
+
+    for prompt in prompts:
+        for marker in _RELEVANCE_MARKERS:
+            assert marker not in prompt, marker
+    assert "None" not in _message(None, summary).split("NEW CONTRIBUTION TO JUDGE")[0]
 
 
-@pytest.mark.parametrize("prompt", [_SYSTEM_PROMPT, _BATCH_SYSTEM_PROMPT], ids=["single", "batch"])
-def test_the_relevance_rule_keeps_on_purpose_observations_admissible(prompt: str) -> None:
-    """The must-still-accept twins: irrelevance is a named decline ground, and a
-    project observation is explicitly on-purpose — the rule is not a licence to turn
-    away well-formed context."""
-    lowered = " ".join(prompt.split()).lower()
-    assert "never a reason to decline" in lowered  # the existing observation rule stays
-    assert "not relevant to this scope (relevance" in lowered  # ... and lists relevance
-    assert "always on-purpose" in lowered  # the twin guard
-    assert "flaky" in lowered  # a concrete on-purpose example
+def test_a_populated_scope_with_no_description_gets_an_implied_purpose_rule() -> None:
+    message = _flat(_message(None, _summary(_POPULATED_CONTEXT)))
+
+    assert "RELEVANCE" in message
+    assert "SCOPE PURPOSE" not in message  # no purpose is stated — it is implied
+    assert "implied by this scope's existing memory" in message
+    # A decline on this path says the purpose was implied and names what it read.
+    assert "Outside the purpose implied by this scope's existing memory (" in message
+    assert "name what you read" in message
+
+
+def test_directives_count_toward_a_populated_scope() -> None:
+    directives = [
+        Directive(
+            id="c_1",
+            content=_POPULATED_CONTEXT,
+            subject=None,
+            source_scope_id="a",
+            source_skill=None,
+            created_at="2026-09-20T00:00:00+00:00",
+        )
+    ]
+
+    assert "implied by this scope's existing memory" in _flat(
+        _message(None, _summary("", directives))
+    )
+
+
+def test_a_populated_scope_still_admits_on_topic_work() -> None:
+    """Must-still-accept twin, implied-purpose path."""
+    message = _flat(_message(None, _summary(_POPULATED_CONTEXT)))
+
+    assert "extends, corrects, or sits alongside" in message
+    assert "when in doubt, admit" in message.lower()
+
+
+def test_the_words_needed_to_imply_a_purpose_are_tunable() -> None:
+    assert "implied by" not in _message(None, _summary("Coffee is upstairs on the third floor."))
+    assert "implied by" in _message(
+        None, _summary("Coffee is upstairs on the third floor."), min_words=3
+    )
+
+
+def test_an_input_change_refresh_has_nothing_to_judge_for_relevance() -> None:
+    message = _message(
+        "Billing purpose.", _summary(_POPULATED_CONTEXT), mode="input_change_refresh"
+    )
+
+    assert "RELEVANCE" not in message
+
+
+def test_the_scope_manager_threads_its_threshold_to_the_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import MagicMock
+
+    import strata.scope_manager as sm
+
+    seen: dict = {}
+
+    def spy(**kwargs: object) -> str:
+        seen.update(kwargs)
+        raise RuntimeError("stop after the prompt is built")
+
+    monkeypatch.setattr(sm, "_build_user_message", spy)
+    manager = sm.ScopeManager(client=MagicMock(), implied_purpose_min_words=7)
+
+    with pytest.raises(RuntimeError, match="stop after"):
+        manager.judge(
+            scope=Scope(id="a", name="A", stratum_id="L1"),
+            stratum=_STRATUM,
+            current_summary=None,
+            recent_contributions=[],
+            new_contribution=_contribution(),
+        )
+
+    assert seen["implied_purpose_min_words"] == 7
+
+
+def test_the_threshold_is_a_setting_with_an_engine_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from strata.scope_manager import IMPLIED_PURPOSE_MIN_WORDS
+
+    assert Settings().implied_purpose_min_words == IMPLIED_PURPOSE_MIN_WORDS
+    monkeypatch.setenv("STRATA_IMPLIED_PURPOSE_MIN_WORDS", "12")
+    assert Settings().implied_purpose_min_words == 12
+
+
+def test_the_managers_the_app_builds_carry_the_setting() -> None:
+    from strata.app import get_scope_manager
+
+    settings = Settings(implied_purpose_min_words=17, anthropic_api_key="k")
+
+    manager = get_scope_manager(client=None, settings=settings)  # type: ignore[arg-type]
+
+    assert manager._implied_purpose_min_words == 17
 
 
 # --- strata doctor -----------------------------------------------------------

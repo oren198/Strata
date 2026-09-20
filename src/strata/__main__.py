@@ -2223,6 +2223,7 @@ def cmd_publication_bootstrap(args: argparse.Namespace) -> int:
         manager = ScopeManager(
             client=settings.build_judge_client(),
             model=settings.manager_model,
+            implied_purpose_min_words=settings.implied_purpose_min_words,
         )
 
         try:
@@ -2414,7 +2415,11 @@ def _refresh_stores(settings):  # noqa: ANN001, ANN201
     fleet_config = FleetConfig.load(Path(paths.fleet_yaml_path))
     record_store = RecordStore(paths.db_path)
     summary_store = SummaryStore(paths.summaries_dir)
-    manager = ScopeManager(client=settings.build_judge_client(), model=settings.manager_model)
+    manager = ScopeManager(
+        client=settings.build_judge_client(),
+        model=settings.manager_model,
+        implied_purpose_min_words=settings.implied_purpose_min_words,
+    )
     return fleet_config, record_store, summary_store, manager
 
 
