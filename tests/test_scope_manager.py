@@ -5552,8 +5552,8 @@ def test_system_prompt_separates_conduct_from_interior() -> None:
 def test_system_prompt_declines_a_restricted_class_by_directive_not_by_origin() -> None:
     flat = _flat_prompt()
     assert "Origin alone is never a decline ground" in flat
-    assert "DECLINE BY DIRECTIVE and name that directive" in flat
-    assert "With no such directive, admit." in flat
+    assert "DECLINE BY DIRECTIVE: name that directive" in flat
+    assert "With no directive restricting the class, admit." in flat
 
 
 def test_system_prompt_retires_the_courier_reading() -> None:
@@ -5575,3 +5575,22 @@ def test_system_prompt_a_role_identifies_the_speaker_so_role_informants_admit() 
     assert "the ABSENCE of any telling act" in flat
     assert "not even one identified only by role" in flat
     assert "Use this reason ONLY when the contribution has no telling act at all" in flat
+
+
+def test_system_prompt_orders_the_directive_check_after_the_ground_check() -> None:
+    """#212 rev 3 — an admissible informant claim is still checked against restricting directives."""
+    flat = _flat_prompt()
+    ground = flat.index("MANUFACTURED ATTRIBUTION is DECLINED")
+    directive = flat.index("STEP 1b — DIRECTIVE CHECK")
+    classify = flat.index("Concepts you must know")
+    assert ground < directive < classify
+    assert "The ground answers WHO stands behind a claim; it does not answer WHETHER this scope may hold it" in flat
+    assert "even when the ground is sound — first-hand, or an informant's word — read every directive" in flat
+    assert "the informant, the topic or the origin" in flat
+
+
+def test_system_prompt_directive_check_does_not_decline_for_an_unrelated_directive() -> None:
+    flat = _flat_prompt()
+    assert "A directive about something else restricts nothing here" in flat
+    assert "it must not change how you treat an admissible informant claim" in flat
+    assert 'End your reasoning with one line, "Directive check:' in flat
