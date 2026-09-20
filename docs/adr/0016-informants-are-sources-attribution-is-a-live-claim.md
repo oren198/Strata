@@ -47,12 +47,22 @@ reading is retired. Origin alone is never a decline ground.
 ### D2 — Attribution is a live claim, and relayed attribution is hearsay content
 
 A scope may never record "according to B" unless B published or directed that
-to it. A relayed attribution is not attribution; it is **content**:
-"informant X reports that B's position is Y." Such an item stands or falls on
-X, never on B. A contribution that asserts B's position as B's own, with B
-standing behind nothing — including one that names B only obliquely ("the
-people who own the records") — is **manufactured attribution** and is
-declined, with the reason naming that, not origin.
+to it. Where a person told the agent something, the item is not attribution to
+B; it is **content**: "informant X reports that B's position is Y." It stands
+or falls on X, never on B. The informant is identified as well as the agent
+honestly can — by name, or by role where that is how the agent knows them
+("the vendor-relationship owner told me", "the group one desk over
+mentioned"). A role is a way of identifying a person, not a way of naming
+their scope, and a hearsay item is not weakened by it.
+
+**Manufactured attribution** is the different act of asserting B's position or
+B's records as fact with *nobody standing behind it* — no informant, no
+publication, no direction: "billing's incident record shows…", "compliance
+already decided…", "pasting their internal notes here". That is declined, and
+the reason names the missing speaker, never the material's topic or origin.
+
+The test is not how precisely the other scope is named. It is whether someone
+the agent actually dealt with is behind the claim.
 
 ### D3 — Hearsay never corroborates
 
@@ -79,11 +89,14 @@ where someone has actually decided it.
 
 ## Consequences
 
-- strata-evals golden `j4-407` is wrong as written: declining by origin. Its
-  theory-correct expectation is admit-as-hearsay-context, or decline by
-  directive where the scenario's fleet carries one — and, because the item
-  names no informant while asserting the other party's position, decline for
-  manufactured attribution. Every J4 item reasoning by origin is re-examined.
+- strata-evals golden `j4-407` is wrong as written: it declines by origin. Its
+  one correct expectation is **decline for manufactured attribution** — it
+  asserts the content of another scope's account records as fact while naming
+  no one who told the agent. Items where a person did tell the agent
+  (`j4-404`, `j4-405`) become **accept as hearsay context**, absent a
+  directive restricting the material. Every J4 item reasoning by origin is
+  re-examined, and the suite scores the ground of a decline, not only its
+  verdict.
 - #209's oblique-origin half is closed as not-a-defect. What replaces it is
   judge enforcement of D2 (manufactured attribution) and hearsay marking in
   admitted content, gated by the corrected eval items.
