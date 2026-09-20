@@ -534,3 +534,19 @@ def test_resolve_judge_credentials_returns_the_resolved_endpoint() -> None:
 
     assert resolve_judge_credentials({"JUDGE_API_KEY": "sk-or-1"}) == ("sk-or-1", _OPENROUTER)
     assert resolve_judge_credentials({"ANTHROPIC_API_KEY": "sk-ant-1"}) == ("sk-ant-1", None)
+
+
+def test_freshness_drafter_follows_the_judge_endpoint() -> None:
+    """The evaluator must not send an Anthropic model id to OpenRouter."""
+    import functools
+
+    from strata import freshness
+
+    def model_for(env: dict[str, str]) -> str:
+        fn = freshness._resolve_draft_fn(env, None)
+        assert isinstance(fn, functools.partial)
+        return fn.keywords["model"]
+
+    assert model_for({"JUDGE_API_KEY": "sk-or-1"}) == "qwen/qwen3-235b-a22b-2507"
+    assert model_for({"ANTHROPIC_API_KEY": "sk-ant-1"}) == freshness.DEFAULT_EVALUATOR_MODEL
+    assert model_for({"JUDGE_API_KEY": "sk-or-1", "STRATA_EVALUATOR_MODEL": "x/y"}) == "x/y"
