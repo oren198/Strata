@@ -304,12 +304,14 @@ def test_marker_present_never_prompts(tmp_path: Path, monkeypatch, capsys) -> No
     monkeypatch.setattr("sys.stdin.isatty", lambda: True)
     monkeypatch.setattr("sys.stdout.isatty", lambda: True)
     called = []
-    monkeypatch.setattr("builtins.input", lambda prompt="": called.append(prompt) or "n")
+    monkeypatch.setattr("builtins.input", lambda prompt="": called.append(prompt) or "")
 
     rc = _run_register(tmp_path)
 
     assert rc == 0
-    assert called == [], "input() must not be called when a project marker is present"
+    # The markerless-directory confirmation is never asked. (In an interactive terminal
+    # register does ask, once, what the first scope's memory is for — #210.)
+    assert all("What is this scope's memory for" in p for p in called), called
 
 
 # ---------------------------------------------------------------------------

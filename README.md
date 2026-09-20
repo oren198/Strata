@@ -115,6 +115,8 @@ database directory), appends a `# Strata` block to `.gitignore`, and then:
 
 Strict mode is on by default — a session that read fleet memory and wrote nothing back is reminded at its end to contribute or close out (at most twice) — and `strata register --no-strict` turns it off.
 
+In an interactive terminal `strata register` also asks what the first scope's memory is for (one line; Enter skips it). Scripts pass `--description "..."`; a non-interactive run never asks. It is written to `fleet.yaml` as the scope's `description:`.
+
 See [What `strata register` does](#what-strata-register-does) for the full list.
 
 ### 4. Set your judge API key
@@ -150,6 +152,14 @@ for either harness. Grow the fleet later, when real roles emerge (edit
 `.strata/fleet.yaml` and validate with `strata bootstrap`, or edit it in the
 Console); binding becomes an explicit choice once there are two or more scopes —
 see [Binding past one scope](#binding-past-one-scope).
+
+Give each scope a one-line `description:` in `fleet.yaml` — what its memory is for.
+The judge measures relevance against it: with a description it declines material
+"outside this scope's stated purpose"; without one it only turns away what is "not
+about the project's work" (its decline reason says which rule applied, so the
+Turned down view shows you when a description is missing). `strata doctor` warns
+once per scope that has none, and the Console shows the description in the scope
+header ("no description" when unset).
 
 ### 6. Two terminals, same project
 

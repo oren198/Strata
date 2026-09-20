@@ -1763,6 +1763,26 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     # -----------------------------------------------------------------------
     checks.append(_check_strata_on_path(project_root))
 
+    # -----------------------------------------------------------------------
+    # 8c. Every active scope states its purpose (#210). Soft: a scope without a
+    # description works, but the judge can only fall back to "the project's work"
+    # and cannot tell what is irrelevant to it. One warning per scope.
+    # -----------------------------------------------------------------------
+    if fleet_config is not None:
+        for scope in fleet_config.active_scopes():
+            if not scope.description:
+                checks.append(
+                    Check(
+                        name=f"Scope description ({scope.id})",
+                        kind="soft",
+                        passed=False,
+                        message=(
+                            "no description — the judge can't tell what's irrelevant to it; "
+                            "add one in fleet.yaml (a `description:` line under the scope)."
+                        ),
+                    )
+                )
+
     if _judge_key_visible(project_root):
         checks.append(
             Check(
@@ -2880,6 +2900,29 @@ def _judge_key_visible(project_root: Path) -> bool:
     return bool(settings.judge_api_key or settings.anthropic_api_key)
 
 
+def _interactive_terminal() -> bool:
+    """Whether both ends of the terminal are interactive (a person is there to ask)."""
+    return sys.stdin.isatty() and sys.stdout.isatty()
+
+
+def _ask_scope_description(*, allowed: bool) -> str | None:
+    """Ask for the first scope's description (#210); blank, EOF or a non-tty is fine.
+
+    Never blocks a CI/non-interactive run: with ``allowed`` false (``--yes``), or no
+    terminal, it does not ask. A blank answer means no description, which is the default.
+    """
+    if not allowed or not _interactive_terminal():
+        return None
+    try:
+        answer = input(
+            "What is this scope's memory for? One line — the judge uses it to tell what "
+            "is irrelevant (Enter to skip): "
+        )
+    except (EOFError, OSError, KeyboardInterrupt):
+        return None
+    return answer.strip() or None
+
+
 def _offer_judge_key_capture(project_root: Path, *, skip_prompt: bool) -> None:
     """End-of-register step: offer to capture the judge key (operator-directed).
 
@@ -3301,6 +3344,16 @@ def cmd_register(args: argparse.Namespace) -> int:
     if fleet_yaml.exists():
         _act("skip", fleet_yaml, skipped=True)
     else:
+        # The first scope's description (#210): the flag, else ask when a person is
+        # there to answer. Only ever for a fleet this run seeds; never in --diff.
+        scope_description: str | None = None
+        if not diff_mode:
+            flagged = getattr(args, "description", None)
+            scope_description = (
+                flagged.strip() or None
+                if flagged is not None
+                else _ask_scope_description(allowed=not getattr(args, "yes", False))
+            )
         if not diff_mode:
             # The configured fleet path can point anywhere (issue #184),
             # including a directory that no longer exists — e.g. the
@@ -3317,6 +3370,13 @@ def cmd_register(args: argparse.Namespace) -> int:
                     "strata:\n  - id: L0\n    name: root\n    ordinal: 0\n"
                     "scopes:\n  - id: g_root\n    name: Root\n    stratum_id: L0\n"
                     "edges: []\n",
+                    encoding="utf-8",
+                )
+            if scope_description:
+                fleet_yaml.write_text(
+                    install.seed_scope_description(
+                        fleet_yaml.read_text(encoding="utf-8"), scope_description
+                    ),
                     encoding="utf-8",
                 )
         _act("seeded", fleet_yaml)
@@ -5006,6 +5066,17 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "Idempotent brownfield installer — create .strata/config.toml, "
             "seed fleet.yaml, copy skills, merge MCP entry."
+        ),
+    )
+    p_register.add_argument(
+        "--description",
+        dest="description",
+        default=None,
+        metavar="TEXT",
+        help=(
+            "What the first scope's memory is for — written to the seeded fleet.yaml. "
+            "The judge measures relevance against it. Without the flag, an interactive "
+            "run asks once (blank is fine); a non-interactive run never asks."
         ),
     )
     p_register.add_argument(

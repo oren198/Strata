@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import Annotated, Literal
 
 import yaml
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
 # ---------------------------------------------------------------------------
 # Error
@@ -164,6 +164,16 @@ class Scope(BaseModel):
     status: Literal["active", "archived"] = "active"
     default_skill: str | None = None
     permitted_skills: list[str] | None = None
+    description: str | None = None
+    """What this scope's memory is for — its stated purpose (#210). The judge measures
+    relevance against it; without one it falls back to "the project's work". Optional:
+    absent (or blank) is ``None`` and existing fleets load unchanged."""
+
+    @field_validator("description")
+    @classmethod
+    def _blank_description_is_none(cls, value: str | None) -> str | None:
+        stripped = value.strip() if value is not None else None
+        return stripped or None
 
 
 #: The two kinds of edge a fleet may declare (ADR 0010). A **chain edge**
@@ -867,6 +877,7 @@ class FleetConfig(BaseModel):
         status: Literal["active", "archived"] = "active",
         default_skill: str | None = None,
         permitted_skills: list[str] | None = None,
+        description: str | None = None,
     ) -> None:
         """Add a new scope and persist to disk.
 
@@ -887,6 +898,8 @@ class FleetConfig(BaseModel):
                 entry["default_skill"] = default_skill
             if permitted_skills is not None:
                 entry["permitted_skills"] = permitted_skills
+            if description is not None and description.strip():
+                entry["description"] = description.strip()
             raw["scopes"].append(entry)
             self._commit(raw)
 

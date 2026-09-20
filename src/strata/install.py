@@ -1837,6 +1837,38 @@ def read_freshness_strict_from_text(config_text: str) -> bool | None:
     return value if isinstance(value, bool) else None
 
 
+_DESCRIPTION_HINT_RE = re.compile(r"(?m)^([ \t]*)# description:[^\r\n]*")
+
+
+def seed_scope_description(fleet_text: str, description: str) -> str:
+    """Write *description* into a freshly seeded ``fleet.yaml`` (#210).
+
+    The minimal template carries a ``# description:`` hint under the first scope's
+    name; this turns that hint into the real key, quoted so any text is valid YAML.
+    A fleet without the hint (the inline fallback, an older template) gets the key
+    right after the first ``name:`` line under ``scopes:``. Blank text changes nothing.
+    """
+    text = description.strip()
+    if not text:
+        return fleet_text
+    quoted = json.dumps(text, ensure_ascii=False)
+    hint = _DESCRIPTION_HINT_RE.search(fleet_text)
+    if hint is not None:
+        return (
+            fleet_text[: hint.start()]
+            + f"{hint.group(1)}description: {quoted}"
+            + fleet_text[hint.end() :]
+        )
+    scopes_at = fleet_text.find("scopes:")
+    name = re.compile(r"(?m)^([ \t]*)name:[^\r\n]*").search(fleet_text, max(scopes_at, 0))
+    if name is None:
+        return fleet_text
+    insert_at = name.end()
+    return (
+        fleet_text[:insert_at] + f"\n{name.group(1)}description: {quoted}" + fleet_text[insert_at:]
+    )
+
+
 _INSTALL_HEADER_RE = re.compile(r"(?m)^\[install\][ \t]*\r?$")
 
 
