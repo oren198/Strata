@@ -80,7 +80,9 @@ NEW_CONTRIBUTION = Contribution(
 
 #: A valid ground for the many tests that retire a directive for some other reason
 #: (#209): the changed circumstance, stated in words that do not restate a removal.
-_GROUND = "the naming convention was replaced by a linter-enforced standard in the new toolchain"
+_CIRCUMSTANCE = (
+    "the naming convention was replaced by a linter-enforced standard in the new toolchain"
+)
 
 EXISTING_DIRECTIVE = Directive(
     id="c_old001",
@@ -689,7 +691,9 @@ def test_decline_with_directive_ops_raises() -> None:
     bad_input = {
         "decision": "decline",
         "reasoning": "Declining.",
-        "directive_ops": [{"op": "retire", "id": EXISTING_DIRECTIVE.id, "ground": _GROUND}],
+        "directive_ops": [
+            {"op": "retire", "id": EXISTING_DIRECTIVE.id, "changed_circumstance": _CIRCUMSTANCE}
+        ],
         "new_context": None,
     }
     manager, _ = _make_manager(bad_input)
@@ -2699,7 +2703,7 @@ def test_j1_untouched_directive_rows_are_byte_identical_across_judgments() -> No
             _contribution("c_a2", "Several teams keep interfaces narrow."),
         ),
         (
-            {"op": "retire", "id": doomed.id, "ground": _GROUND},
+            {"op": "retire", "id": doomed.id, "changed_circumstance": _CIRCUMSTANCE},
             _contribution("c_a3", "That rule is obsolete."),
         ),
     ]
@@ -2922,7 +2926,13 @@ def test_retire_op_removes_the_directive_and_is_reported_for_the_record() -> Non
             {
                 "decision": "accept_as_context",
                 "reasoning": "the naming rule no longer applies",
-                "directive_ops": [{"op": "retire", "id": EXISTING_DIRECTIVE.id, "ground": _GROUND}],
+                "directive_ops": [
+                    {
+                        "op": "retire",
+                        "id": EXISTING_DIRECTIVE.id,
+                        "changed_circumstance": _CIRCUMSTANCE,
+                    }
+                ],
                 "new_context": "ctx",
             }
         ),
@@ -2965,7 +2975,9 @@ def _retire_input(directive_id: str, *, reasoning: str = "retiring") -> dict:
     return {
         "decision": "accept_as_context",
         "reasoning": reasoning,
-        "directive_ops": [{"op": "retire", "id": directive_id, "ground": _GROUND}],
+        "directive_ops": [
+            {"op": "retire", "id": directive_id, "changed_circumstance": _CIRCUMSTANCE}
+        ],
         "new_context": "Context after the retirement.",
     }
 
@@ -3007,7 +3019,10 @@ def test_invalid_id_twice_drops_the_op_and_notes_it_without_losing_the_verdict()
     first = {
         "decision": "accept_as_directive",
         "reasoning": "admitting the new rule and retiring a stale one",
-        "directive_ops": [{"op": "append"}, {"op": "retire", "id": "c_ghost", "ground": _GROUND}],
+        "directive_ops": [
+            {"op": "append"},
+            {"op": "retire", "id": "c_ghost", "changed_circumstance": _CIRCUMSTANCE},
+        ],
         "new_context": "Context after the amendment.",
     }
     mock_client = MagicMock()
@@ -3059,7 +3074,7 @@ def test_an_op_naming_an_ancestor_directive_is_dropped_as_an_invalid_target() ->
         "reasoning": "admitting the new rule and retiring the inherited one",
         "directive_ops": [
             {"op": "append"},
-            {"op": "retire", "id": ancestor_directive_id, "ground": _GROUND},
+            {"op": "retire", "id": ancestor_directive_id, "changed_circumstance": _CIRCUMSTANCE},
         ],
         "new_context": "Context after the amendment.",
     }
@@ -3116,8 +3131,8 @@ def test_already_retired_id_named_twice_is_invalid() -> None:
         "decision": "accept_as_context",
         "reasoning": "retiring",
         "directive_ops": [
-            {"op": "retire", "id": EXISTING_DIRECTIVE.id, "ground": _GROUND},
-            {"op": "retire", "id": EXISTING_DIRECTIVE.id, "ground": _GROUND},
+            {"op": "retire", "id": EXISTING_DIRECTIVE.id, "changed_circumstance": _CIRCUMSTANCE},
+            {"op": "retire", "id": EXISTING_DIRECTIVE.id, "changed_circumstance": _CIRCUMSTANCE},
         ],
         "new_context": "ctx",
     }
@@ -3149,7 +3164,7 @@ def test_overflow_retry_may_retire_to_fit() -> None:
     second = {
         "decision": "accept_as_context",
         "reasoning": "recording the observation",
-        "directive_ops": [{"op": "retire", "id": EXISTING_DIRECTIVE.id, "ground": _GROUND}],
+        "directive_ops": [{"op": "retire", "id": EXISTING_DIRECTIVE.id}],
         "new_context": "Short.",
     }
     mock_client = MagicMock()
@@ -3470,7 +3485,11 @@ def test_input_change_refresh_amendment_drops_admitting_ops_keeps_lifecycle() ->
             "directive_ops": [
                 {"op": "append"},
                 {"op": "publish", "content": "Something new."},
-                {"op": "retire", "id": EXISTING_DIRECTIVE.id, "ground": _GROUND},
+                {
+                    "op": "retire",
+                    "id": EXISTING_DIRECTIVE.id,
+                    "changed_circumstance": _CIRCUMSTANCE,
+                },
             ],
             "new_context": "Reconciled context.",
         }
@@ -4099,7 +4118,7 @@ def test_lifecycle_op_without_a_contribution_id_is_dropped_too() -> None:
     unattributed_retire = _batch_input(
         directive_ops=[
             {"op": "append", "contribution_id": NEW_CONTRIBUTION.id},
-            {"op": "retire", "id": EXISTING_DIRECTIVE.id, "ground": _GROUND},
+            {"op": "retire", "id": EXISTING_DIRECTIVE.id, "changed_circumstance": _CIRCUMSTANCE},
         ]
     )
     mock_client = MagicMock()
@@ -4129,7 +4148,7 @@ def test_lifecycle_op_attributed_to_a_declined_member_is_a_parse_failure() -> No
             {
                 "op": "retire",
                 "id": EXISTING_DIRECTIVE.id,
-                "ground": _GROUND,
+                "changed_circumstance": _CIRCUMSTANCE,
                 "contribution_id": THIRD_CONTRIBUTION.id,
             },
         ]
@@ -4210,7 +4229,7 @@ def test_invalid_directive_id_in_a_batch_is_dropped_and_noted_on_its_own_op() ->
             {
                 "op": "retire",
                 "id": "c_ghost",
-                "ground": _GROUND,
+                "changed_circumstance": _CIRCUMSTANCE,
                 "contribution_id": SECOND_CONTRIBUTION.id,
             },
         ]
@@ -4377,7 +4396,9 @@ def test_change_id_survives_the_invalid_op_drop() -> None:
     payload = {
         "decision": "accept_as_directive",
         "reasoning": "admitted",
-        "directive_ops": [{"op": "retire", "id": "c_nosuch", "ground": _GROUND}],
+        "directive_ops": [
+            {"op": "retire", "id": "c_nosuch", "changed_circumstance": _CIRCUMSTANCE}
+        ],
         "new_context": None,
     }
     manager, _ = _make_manager(payload)
@@ -5022,7 +5043,9 @@ def test_retire_op_target_is_checked_the_same_way() -> None:
     retiring = {
         "decision": "accept_as_context",
         "reasoning": "The naming rule is withdrawn.",
-        "directive_ops": [{"op": "retire", "id": EXISTING_DIRECTIVE.id, "ground": _GROUND}],
+        "directive_ops": [
+            {"op": "retire", "id": EXISTING_DIRECTIVE.id, "changed_circumstance": _CIRCUMSTANCE}
+        ],
         "new_context": f"Formerly the rule was: {EXISTING_DIRECTIVE.content}",
     }
     mock_client = MagicMock()

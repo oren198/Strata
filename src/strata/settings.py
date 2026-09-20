@@ -93,20 +93,20 @@ class Settings(BaseSettings):
     # directive text); below it there is nothing to tell what the scope is about and
     # no relevance judgement is made. Mirrors scope_manager.IMPLIED_PURPOSE_MIN_WORDS.
     implied_purpose_min_words: int = Field(default=50, ge=1)
-    # #209: the floors a scope-manager `retire` op's ground must clear. Mirror
-    # scope_manager.RETIRE_GROUND_* (see RetireGroundPolicy for what each means).
-    retire_ground_min_words: int = Field(default=4, ge=1)
-    retire_ground_min_substantive_words: int = Field(default=2, ge=0)
-    retire_ground_max_restatement: float = Field(default=0.7, gt=0.0, le=1.0)
+    # #209: the floors a scope-manager `retire` op's changed circumstance must clear. Mirror
+    # scope_manager.RETIRE_CIRCUMSTANCE_* (see RetireCircumstancePolicy for what each means).
+    retire_circumstance_min_words: int = Field(default=4, ge=1)
+    retire_circumstance_min_substantive_words: int = Field(default=2, ge=0)
+    retire_circumstance_max_restatement: float = Field(default=0.7, gt=0.0, le=1.0)
 
-    def retire_ground_policy(self):  # noqa: ANN201 — RetireGroundPolicy, imported lazily
-        """The retire-ground floors as the policy object the judge takes (#209)."""
-        from strata.scope_manager import RetireGroundPolicy  # noqa: PLC0415
+    def retire_circumstance_policy(self):  # noqa: ANN201 — RetireCircumstancePolicy, imported lazily
+        """The retire-changed circumstance floors as the policy object the judge takes (#209)."""
+        from strata.scope_manager import RetireCircumstancePolicy  # noqa: PLC0415
 
-        return RetireGroundPolicy(
-            min_words=self.retire_ground_min_words,
-            min_substantive=self.retire_ground_min_substantive_words,
-            max_restatement=self.retire_ground_max_restatement,
+        return RetireCircumstancePolicy(
+            min_words=self.retire_circumstance_min_words,
+            min_substantive=self.retire_circumstance_min_substantive_words,
+            max_restatement=self.retire_circumstance_max_restatement,
         )
 
     # M3: how long (seconds) a session with no recorded end may sit idle before

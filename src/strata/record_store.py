@@ -437,7 +437,7 @@ class Retirement:
     retired_by: str
     reason: str | None
     created_at: str
-    ground: str | None = None
+    changed_circumstance: str | None = None
     """The changed circumstance the scope-manager stated for a judged retirement (#209),
     in the contribution's own words; ``None`` for an operator retirement or a row that
     predates the column."""
@@ -1541,7 +1541,7 @@ class RecordStore:
         directive_id: str,
         retired_by: str,
         reason: str | None = None,
-        ground: str | None = None,
+        changed_circumstance: str | None = None,
     ) -> Retirement:
         """Append a retirement event to *scope_id*'s own record.
 
@@ -1556,7 +1556,7 @@ class RecordStore:
             retired_by:   Provenance of the retiring authority (``"operator"``
                           for an ADR 0008 correction).
             reason:       Optional free-text rationale.
-            ground:       The changed circumstance a judged retirement was
+            changed circumstance:       The changed circumstance a judged retirement was
                           required to state (#209); ``None`` for an operator
                           retirement.
 
@@ -1566,15 +1566,18 @@ class RecordStore:
         retirement_id = _new_retirement_id()
         self._conn.execute(
             """
-            INSERT INTO retirements (id, scope_id, directive_id, retired_by, reason, ground)
+            INSERT INTO retirements (
+                id, scope_id, directive_id, retired_by, reason, changed_circumstance
+            )
             VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (retirement_id, scope_id, directive_id, retired_by, reason, ground),
+            (retirement_id, scope_id, directive_id, retired_by, reason, changed_circumstance),
         )
         self._conn.commit()
         row = self._conn.execute(
             """
-            SELECT id, scope_id, directive_id, retired_by, reason, created_at, ground
+            SELECT id, scope_id, directive_id, retired_by, reason, created_at,
+                       changed_circumstance
             FROM retirements WHERE id = ?
             """,
             (retirement_id,),
@@ -1592,7 +1595,8 @@ class RecordStore:
         if scope_id is not None:
             rows = self._conn.execute(
                 """
-                SELECT id, scope_id, directive_id, retired_by, reason, created_at, ground
+                SELECT id, scope_id, directive_id, retired_by, reason, created_at,
+                       changed_circumstance
                 FROM retirements
                 WHERE scope_id = ?
                 ORDER BY created_at ASC, rowid ASC
@@ -1602,7 +1606,8 @@ class RecordStore:
         else:
             rows = self._conn.execute(
                 """
-                SELECT id, scope_id, directive_id, retired_by, reason, created_at, ground
+                SELECT id, scope_id, directive_id, retired_by, reason, created_at,
+                       changed_circumstance
                 FROM retirements
                 ORDER BY created_at ASC, rowid ASC
                 """
