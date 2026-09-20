@@ -2889,7 +2889,9 @@ def _self_install_spec() -> str | None:
 #: same thing.
 _JUDGE_KEY_LATER_NOTE = (
     "judge key: not set — add JUDGE_API_KEY=... to .env in this project "
-    "(or export it) when ready; contributions wait unjudged until then."
+    "(or export it) when ready; contributions wait unjudged until then. The default "
+    "judge is qwen/qwen3-235b-a22b-2507 on OpenRouter, so that key must be an OpenRouter "
+    "key; to judge with Anthropic instead, set ANTHROPIC_API_KEY."
 )
 
 
@@ -3074,9 +3076,12 @@ def _offer_judge_key_capture(project_root: Path, *, skip_prompt: bool) -> None:
 
     try:
         value = getpass.getpass(
-            "Judge key — the LLM that reviews contributions (Anthropic, or any "
-            "Messages-API endpoint). Paste to store it in .env, or press Enter "
-            "to skip: "
+            "Judge key — the LLM that reviews contributions. The default judge is "
+            "qwen/qwen3-235b-a22b-2507 on OpenRouter, so paste an OpenRouter key "
+            "(openrouter.ai/keys) to store it in .env; to use Anthropic instead, "
+            "paste an Anthropic key, or press Enter to skip and set ANTHROPIC_API_KEY "
+            "yourself (any other Messages-API endpoint: JUDGE_BASE_URL + JUDGE_MODEL). "
+            "Paste key, or Enter to skip: "
         )
     except (EOFError, OSError, KeyboardInterrupt):
         value = ""
@@ -3100,6 +3105,25 @@ def _offer_judge_key_capture(project_root: Path, *, skip_prompt: bool) -> None:
     action = install.write_env_judge_key(env_path, value)
     verb = {"created": "wrote", "replaced": "updated", "appended": "appended to"}[action]
     print(f"judge key: {verb} {env_path.relative_to(project_root)}")
+
+    # Write the model and endpoint beside the key so the .env states what the key is for
+    # — but only for a key that is not an Anthropic key: pairing an sk-ant- key with the
+    # OpenRouter default would send it to the wrong provider. An Anthropic key alone
+    # resolves to claude-haiku-4-5 on api.anthropic.com (settings.resolve_judge).
+    if value.startswith("sk-ant-"):
+        print(_judge_line_for_register("claude-haiku-4-5", None))
+        return
+    wrote = install.write_env_judge_defaults(env_path)
+    if wrote:
+        print(f"judge: wrote {', '.join(wrote)} beside the key — {_judge_line_for_register()}")
+    else:
+        print("judge: left your existing JUDGE_* lines as they are")
+
+
+def _judge_line_for_register(
+    model: str = "qwen/qwen3-235b-a22b-2507", base_url: str | None = "https://openrouter.ai/api"
+) -> str:
+    return f"judge: {model} @ {_judge_endpoint_label(base_url)}"
 
 
 def _store_rel(path: Path, project_root: Path) -> str:
