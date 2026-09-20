@@ -287,7 +287,8 @@ JUDGE_TOOL: dict = {
                                 "(requires content). supersede: remove the directive named "
                                 "by id, replaced by the directive this amendment admits "
                                 "(valid only alongside an append or a publish). retire: "
-                                "remove the directive named by id with no replacement."
+                                "remove the directive named by id with no replacement, "
+                                "stating its changed_circumstance."
                             ),
                         },
                         "content": {
@@ -313,6 +314,20 @@ JUDGE_TOOL: dict = {
                             "description": (
                                 "supersede / retire only: the id of the directive to "
                                 "remove, exactly as it appears in the CURRENT SUMMARY."
+                            ),
+                        },
+                        "changed_circumstance": {
+                            "type": ["string", "null"],
+                            "description": (
+                                "retire only: what changed that makes the directive no "
+                                "longer hold. Copy the contributor's stated changed "
+                                "circumstance verbatim (for 'X no longer exists, so remove "
+                                "Y', it is 'X no longer exists'). It must come from the "
+                                "contribution, never invented; a retirement with no stated "
+                                "changed circumstance is not a retirement. If the "
+                                "contribution only asks for the removal, state none: "
+                                "decline it instead. Recorded on the retirement so an "
+                                "operator can see why a rule went away."
                             ),
                         },
                     },
@@ -609,8 +624,14 @@ STEP 2 — CLASSIFICATION. Concepts you must know (from CONTEXT.md):
     Supersession replaces, so an unpaired `supersede` is a retirement
     wearing the wrong name and is rejected at parse; to remove a directive
     nothing replaces, use `retire`.
-  - `retire` — {"op": "retire", "id": <directive id>}: remove that
-    directive with no replacement. The retirement is recorded in the
+  - `retire` — {"op": "retire", "id": <directive id>, "changed_circumstance": "<the
+    changed circumstance, in the contribution's own words>"}: remove that
+    directive with no replacement. State the `changed_circumstance`: what changed
+    that makes the directive no longer hold, taken from the contribution — never
+    invented by you; a retirement with no stated changed circumstance is not a
+    retirement: a contribution that only asks for the removal ("just remove it",
+    "no replacement needed", "this supersedes X") states none, so DECLINE it and
+    use no `retire` op. The retirement is recorded in the
     scope's record; no tombstone stays in the summary.
   Name only directive ids that appear in the CURRENT SUMMARY rendered
   below, each at most once.
@@ -1092,6 +1113,21 @@ class DirectiveOp(BaseModel):
     id: str | None = None
     """``supersede`` / ``retire`` only: the directive id being removed."""
 
+    changed_circumstance: str | None = None
+    """``retire`` only: what changed that makes the directive no longer hold, in the
+    contribution's own words (#209). Recorded on the retirement event and shown in the
+    Console so an operator can see why a rule went away.
+
+    ADVISORY, not enforced. A mechanical requirement was built and withdrawn: no judge
+    measured (qwen3-235b, gpt-5-mini, gemini, glm, deepseek) fills a required tool field
+    reliably — qwen never did, on either call, even when the re-ask quoted the contribution
+    back — so the retirement backstop is a request to the judge, not a check, and a bare
+    removal request ("this supersedes X — just remove it") can still be accepted (j4-207).
+    A retirement has no contribution to state a circumstance for an input-change refresh or
+    a budget overflow re-ask, so the field is only ever asked for where a CONTRIBUTION asks
+    for the removal. Known limit, tracked in #209.
+    """
+
     contribution_id: str | None = None
     """BATCH mode only: the batch member this op is attributed to.
 
@@ -1213,6 +1249,11 @@ def _parse_directive_ops(  # noqa: ANN001 — raw tool-call field
             subject=entry.get("subject"),
             supersedes=entry.get("supersedes"),
             id=entry.get("id"),
+            changed_circumstance=(
+                str(entry["changed_circumstance"]).strip() or None
+                if entry.get("changed_circumstance")
+                else None
+            ),
             # Batch mode only (ADR 0011 D3); absent, and unused, on the
             # single-contribution path, where the binding stays implicit.
             contribution_id=entry.get("contribution_id"),
@@ -1682,6 +1723,17 @@ class _AmendmentJudgment(BaseModel):
         return [
             (op.id, op.contribution_id) for op in self.directive_ops if op.op == "retire" and op.id
         ]
+
+    def retirement_circumstances(self) -> dict[str, str | None]:
+        """``directive id retired -> the changed circumstance its retire op stated`` (#209).
+
+        ``None`` when the judge stated none: the field is advisory, never enforced.
+        """
+        return {
+            op.id: op.changed_circumstance
+            for op in self.directive_ops
+            if op.op == "retire" and op.id
+        }
 
 
 #: Either judgment shape — what :meth:`ScopeManager._call_with_correctives`

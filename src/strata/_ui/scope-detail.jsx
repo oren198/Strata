@@ -312,7 +312,7 @@ function BackendScopeSummary({ scope, summary, loading, error, onRefetch, onFlas
               <li key={r.id} className="at-caption" style={{ color: "var(--at-muted)" }}>
                 <code style={{ fontFamily: "var(--font-mono)" }}>{r.directive_id}</code>
                 {" retired "}{humanAgo(r.created_at)}
-                {r.reason ? ` — ${r.reason}` : ""}
+                {r.changed_circumstance ? ` — changed circumstance: ${r.changed_circumstance}` : (r.reason ? ` — ${r.reason}` : "")}
               </li>
             ))}
           </ul>

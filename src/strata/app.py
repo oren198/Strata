@@ -615,7 +615,10 @@ def _judge_and_record(
             record_store=record_store,
             summary_store=summary_store,
             previous_summary=inputs.current_summary,
-            retirements=[(d, judgment.reasoning) for d in judgment.retired_directive_ids],
+            retirements=[
+                (d, judgment.reasoning, judgment.retirement_circumstances().get(d))
+                for d in judgment.retired_directive_ids
+            ],
             removals=[(d, contribution.id) for d in judgment.removed_directive_ids],
             withdraw_reasoning=judgment.reasoning,
             judged_contribution_ids=[contribution.id],
@@ -638,7 +641,7 @@ def _write_amendment(
     record_store: RecordStore,
     summary_store: SummaryStore,
     previous_summary: ScopeSummary | None,
-    retirements: Sequence[tuple[str, str]],
+    retirements: Sequence[tuple[str, str, str | None]],
     removals: Sequence[tuple[str, str]],
     withdraw_reasoning: str,
     judged_contribution_ids: Sequence[str],
@@ -651,7 +654,7 @@ def _write_amendment(
 
     The three record consequences carry attribution the CALLER resolved, since
     only it knows which contribution owns each op: *retirements* are
-    ``(directive_id, reason)`` pairs, *removals* are ``(directive_id,
+    ``(directive_id, reason, changed circumstance)`` triples, *removals* are ``(directive_id,
     trigger_contribution_id)`` pairs, and *withdraw_reasoning* explains the
     judged withdrawals. On the single path all three come from the one judged
     contribution; in a batch each op names its own member (ADR 0011 D3), and
@@ -700,12 +703,13 @@ def _write_amendment(
     # reserved for exactly this scope-manager explicit-retire. Superseded
     # directives get none: their explanation is the incoming directive's
     # own supersedes reference.
-    for directive_id, reason in retirements:
+    for directive_id, reason, changed_circumstance in retirements:
         record_store.append_retirement(
             scope_id=scope.id,
             directive_id=directive_id,
             retired_by="scope-manager",
             reason=reason,
+            changed_circumstance=changed_circumstance,
         )
 
     # ADR 0007 D3 — staleness propagation, two paths, both under the
@@ -1000,8 +1004,13 @@ def _judge_batch_and_record(
         # Every op names the batch member that motivated it (ADR 0011 D3), so
         # each retirement's reason and each withdrawal's trigger come off the
         # op itself — the record never guesses which contribution meant it.
+        circumstances = batch.retirement_circumstances()
         retirements = [
-            (directive_id, batch.verdict_reasoning(contribution_id or ""))
+            (
+                directive_id,
+                batch.verdict_reasoning(contribution_id or ""),
+                circumstances.get(directive_id),
+            )
             for directive_id, contribution_id in batch.directive_retirements()
         ]
         removals = [
