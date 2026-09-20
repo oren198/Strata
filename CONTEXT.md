@@ -352,6 +352,39 @@ through composition into **perspectives** so readers know where each piece
 came from; it is the basis for accountability and for aggregating **trust**
 along any of its dimensions.
 
+## Ground
+
+The act by which some party stands behind a claim toward this scope. There are
+exactly three kinds:
+
+1. the contributor's own first-hand observation of the world;
+2. an **informant**'s word, carried as hearsay content that stands on the
+   informant (ADR 0016);
+3. another scope's judged act that reached this scope — a **directive** from
+   above, or a **publication**.
+
+A copy of another scope's unpublished memory is not a ground of any kind: it
+is what the boundary rule exists to stop, whatever its truth value. Truth is
+not the admissibility test; standing-behind is. So the scope-manager's question
+is never "did the contributor cite a source" but "is the cited ground a
+sanctioned one".
+
+One distinction this keeps sharp. Observing another scope's **conduct** is
+first-hand observation of the world and has ground (1): "vendor-mgmt's agent
+refused our escalation twice." Reading its **interior** — its memory text —
+has no ground: "vendor-mgmt's summary says vendor Z is blacklisted." The first
+is about what happened; the second is about what that scope believes, and only
+that scope may say that outward.
+
+## Informant
+
+A party outside a scope's authority chain who tells an agent something — a
+person, a customer, another scope's agent. An informant is a **party, never a
+scope**: a scope has no voice except its channels. Their word enters as
+context attributed to them (ground 2), never as a **directive**, and never as
+corroboration of anything the party they spoke about later publishes
+(ADR 0016).
+
 ## Perspective
 
 An agent's composed view of long-term memory at read time. A perspective
