@@ -121,13 +121,20 @@ See [What `strata register` does](#what-strata-register-does) for the full list.
 
 ### 4. Set your judge API key
 
+The default judge is `qwen/qwen3-235b-a22b-2507` on OpenRouter, so the key is an
+**OpenRouter key** ([openrouter.ai/keys](https://openrouter.ai/keys)). To judge with
+Anthropic instead, use an Anthropic key — see [Choosing a judge](#choosing-a-judge).
+
 Put it in a `.env` file at the project root. `strata register` already adds `.env`
 to `.gitignore`, and every entry point (the MCP server, the CLI and the Console
 backend) loads it:
 
 ```
-JUDGE_API_KEY=sk-...
+JUDGE_API_KEY=sk-or-...
 ```
+
+`strata register` offers to capture the key for you and writes `JUDGE_MODEL` and
+`JUDGE_BASE_URL` beside it, so the `.env` states which judge the key is for.
 
 **With Codex, use the `.env` file, not an export.** Codex starts its MCP server with
 only the `[mcp_servers.strata.env]` table from its own config, not your shell's
@@ -1055,6 +1062,54 @@ strata = "/home/you/.local/pipx/venvs/strata-mem/bin/strata"
 version = "1.12.0"
 ```
 
+### Choosing a judge
+
+The judge is the model that reviews every contribution. With `JUDGE_API_KEY` set to an
+OpenRouter key and nothing else, it is `qwen/qwen3-235b-a22b-2507` on
+`https://openrouter.ai/api`. An install that only ever had an Anthropic key —
+`ANTHROPIC_API_KEY`, or a `JUDGE_API_KEY` that starts `sk-ant-` — and sets no
+`JUDGE_BASE_URL` keeps `claude-haiku-4-5` on `api.anthropic.com`: upgrading never changes
+your judge. `strata doctor` prints the judge in effect, and whether it answers.
+
+**What was measured** — 2026-09-20, engine build `release/v1.13.0` @ `5f5bf49`, every
+model called through OpenRouter's Anthropic Messages endpoint, one repetition of each
+suite (small differences are within noise). Full study, including the models that did
+not complete a run:
+[docs/evidence/judge-baseline-2026-09-20.md](docs/evidence/judge-baseline-2026-09-20.md).
+
+| Judge (OpenRouter id) | Junk admission (of 90) | J1 accuracy (54 items) | J4 attack success | `judge_error` | $ per 90-item demo run |
+|---|---|---|---|---|---|
+| `qwen/qwen3-235b-a22b-2507` (default) | 12 | 94.4% (51/54) | 2.6% (2 of 76 scored; measured on the pre-#212 build) | 0 of 130 | $0.0157 |
+| `anthropic/claude-haiku-4.5` | 7 | 94.4% (51/54) | 0.0% (0 of 84) | 0 of 138 | $0.2139 |
+| `google/gemini-2.5-flash` | 21 | 79.6% (43/54) | 9.5% (8 of 84) | 0 of 138 | $0.0353 |
+
+Junk admission counts the junk contributions (trivia, chit-chat, unsupported claims,
+injection attempts) the judge admitted. J4 attack success counts the adversarial items
+(spoofed authority, injected directives, laundered attribution) the judge admitted. This table states what was measured, when and
+against which build; it does not rank the judges, and a judge that is not in it is
+unmeasured, not worse.
+
+Two caveats that matter when you choose:
+
+- **Purpose-aware relevance.** With a scope purpose set (`description:` in `fleet.yaml`),
+  `claude-haiku-4.5` over-declined 2 of 6 legitimate operational notes (`wi-102`,
+  `wi-103`); qwen and gemini-2.5-flash declined 0 of 6. The other numbers above do not
+  show this — it appeared only in that check.
+- **A model id ages.** Routers rename and retire models, and the default id was
+  measured on the date above. If it stops resolving, `strata doctor` says so and prints
+  the override lines. To pin the measured judge so nothing can change under you, put
+  `JUDGE_MODEL=qwen/qwen3-235b-a22b-2507` in `.env`; to use another model, set
+  `JUDGE_MODEL` to an id your endpoint serves (ids differ by provider — OpenRouter's
+  Haiku is `anthropic/claude-haiku-4.5`, Anthropic's own is `claude-haiku-4-5`).
+
+**Override to any Anthropic-Messages endpoint** — a router, a gateway, the Anthropic API:
+
+```
+JUDGE_API_KEY=<a key for that endpoint>
+JUDGE_BASE_URL=https://your-gateway.example/api
+JUDGE_MODEL=<a model id that endpoint serves>
+```
+
 ### Environment variables
 
 Most settings are env-var driven, prefixed `STRATA_` (the judge configuration
@@ -1070,12 +1125,12 @@ server (project config wins):
 | `STRATA_AGENT_SCOPE` | (auto-bind) | The scope this session acts at. Required only when the fleet has 2+ scopes — with exactly one scope, an unset (or empty-string) value auto-binds to it. With zero or 2+ scopes and this unset, the server still starts (soft-start): every memory tool returns an actionable error until bound via `strata_bind`, or the process is restarted with this set |
 | `STRATA_AGENT_SKILL` | (optional) | The skill identifier for provenance — required only when the scope declares `default_skill`/`permitted_skills` in `fleet.yaml`, unless the scope was auto-bound, in which case its `default_skill` fills this in when unset |
 | `STRATA_AGENT_SESSION_ID` | (auto) | Session identifier. Absent or empty-string resolves to the deterministic `sess_auto_<parent pid>` (the freshness Stop hook resolves the same fallback independently — see [Memory-freshness Stop-hook](#memory-freshness-stop-hook)) |
-| `JUDGE_API_KEY` | (unset) | The judge's API key. `STRATA_JUDGE_API_KEY` also works and wins if both are set. Works against any endpoint that speaks the Anthropic Messages API. |
-| `JUDGE_BASE_URL` | (unset) | Optional. Points the judge at a router/proxy/self-hosted gateway instead of the direct Anthropic API — the endpoint must speak the Anthropic Messages API. `STRATA_JUDGE_BASE_URL` also works. |
-| `JUDGE_MODEL` | `claude-haiku-4-5` | Model used by the judge. `STRATA_MANAGER_MODEL` is the original name and still works (wins if both are set). |
-| `ANTHROPIC_API_KEY` / `STRATA_ANTHROPIC_API_KEY` | (unset) | **Deprecated**, kept as a working fallback: used only when `JUDGE_API_KEY` is unset. |
+| `JUDGE_API_KEY` | (unset) | The judge's API key — for the endpoint in `JUDGE_BASE_URL` (OpenRouter by default). `STRATA_JUDGE_API_KEY` also works and wins if both are set. Works against any endpoint that speaks the Anthropic Messages API. |
+| `JUDGE_BASE_URL` | `https://openrouter.ai/api` | Points the judge at a router/proxy/self-hosted gateway — the endpoint must speak the Anthropic Messages API. `STRATA_JUDGE_BASE_URL` also works. **Exception:** with only an Anthropic key set (see [Choosing a judge](#choosing-a-judge)) the default stays the Anthropic API. |
+| `JUDGE_MODEL` | `qwen/qwen3-235b-a22b-2507` | Model used by the judge (an id the endpoint serves). `STRATA_MANAGER_MODEL` is the original name and still works (wins if both are set). **Exception:** with only an Anthropic key set the default stays `claude-haiku-4-5`. |
+| `ANTHROPIC_API_KEY` / `STRATA_ANTHROPIC_API_KEY` | (unset) | **Deprecated**, kept as a working fallback: used only when `JUDGE_API_KEY` is unset. On its own it keeps `claude-haiku-4-5` on the Anthropic API. |
 | `STRATA_FRESHNESS_STRICT` | (unset) | `1`/`0` forces the freshness `Stop`-hook strict (blocking) or background; unset defers to the project's `[freshness] strict`, default on ([details](#memory-freshness-stop-hook)) |
-| `STRATA_EVALUATOR_MODEL` | `claude-haiku-4-5-20251001` | Model the freshness evaluator drafts with (the judge is unaffected) |
+| `STRATA_EVALUATOR_MODEL` | `claude-haiku-4-5-20251001` on the Anthropic API, otherwise the judge's model | Model the freshness evaluator drafts with (the judge is unaffected) |
 
 A local `.env` file is loaded automatically for every name above.
 
