@@ -94,12 +94,16 @@ def resolve_judge(
         not judge_api_key or judge_api_key.startswith(_ANTHROPIC_KEY_PREFIX)
     )
     if not base_url and key_is_anthropic:
-        if model:
-            return ResolvedJudge(model, None, key, JUDGE_REASON_OVERRIDE)
-        return ResolvedJudge(KEPT_JUDGE_MODEL, None, key, JUDGE_REASON_KEPT)
-    reason = JUDGE_REASON_OVERRIDE if (model or base_url) else JUDGE_REASON_DEFAULT
+        model = model or KEPT_JUDGE_MODEL
+        reason = JUDGE_REASON_KEPT if model == KEPT_JUDGE_MODEL else JUDGE_REASON_OVERRIDE
+        return ResolvedJudge(model, None, key, reason)
+    model = model or DEFAULT_JUDGE_MODEL
+    base_url = base_url or DEFAULT_JUDGE_BASE_URL
+    # Explicit lines that just restate the default (what `strata register` writes beside
+    # a captured key) are still the default judge — "configured" only when they differ.
+    is_default = model == DEFAULT_JUDGE_MODEL and base_url == DEFAULT_JUDGE_BASE_URL
     return ResolvedJudge(
-        model or DEFAULT_JUDGE_MODEL, base_url or DEFAULT_JUDGE_BASE_URL, key, reason
+        model, base_url, key, JUDGE_REASON_DEFAULT if is_default else JUDGE_REASON_OVERRIDE
     )
 
 

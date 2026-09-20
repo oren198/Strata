@@ -2925,19 +2925,19 @@ def _judge_endpoint_label(base_url: str | None) -> str:
 
 
 def _judge_line(resolved: object) -> str:
-    """The one-line statement of which judge is in effect and why (`strata doctor`)."""
+    """Which judge is in effect and why, for the doctor's ``Judge:`` line (no label of its own)."""
     from strata.settings import (  # noqa: PLC0415
         JUDGE_REASON_DEFAULT,
         JUDGE_REASON_KEPT,
     )
 
-    head = f"judge: {resolved.model} @ {_judge_endpoint_label(resolved.base_url)}"  # type: ignore[attr-defined]
+    head = f"{resolved.model} @ {_judge_endpoint_label(resolved.base_url)}"  # type: ignore[attr-defined]
     reason = resolved.reason  # type: ignore[attr-defined]
     if reason == JUDGE_REASON_DEFAULT:
         return f"{head} (default, measured {_JUDGE_MEASURED_DATE})"
     if reason == JUDGE_REASON_KEPT:
         return (
-            f"{head} (kept: ANTHROPIC_API_KEY set and no JUDGE_*; measured "
+            f"{head} (kept: an Anthropic key is set and no JUDGE_MODEL/JUDGE_BASE_URL; measured "
             f'{_JUDGE_MEASURED_DATE} — see "Choosing a judge" in the README)'
         )
     return (
