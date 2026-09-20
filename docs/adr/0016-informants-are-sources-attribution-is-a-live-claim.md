@@ -44,6 +44,13 @@ legitimate source of evidence for that scope's memory: of *exactly what the
 informant said*, attributed to the informant, admitted as context. The courier
 reading is retired. Origin alone is never a decline ground.
 
+B's own agent messaging A's agent is an informant too. That does not reopen
+the sideways channel ADR 0007/0013 closed: what enters A is that agent's word
+as hearsay content — non-corroborating (D3), never a directive (D4), judged
+like anything else, and declinable by directive (D5) — with the speaking agent
+on the record. Whether B's agents should be relaying B's working memory at all
+is a directive question inside B, not a question about what A may admit.
+
 ### D2 — Attribution is a live claim, and relayed attribution is hearsay content
 
 A scope may never record "according to B" unless B published or directed that
@@ -53,12 +60,24 @@ or falls on X, never on B. The informant is identified as well as the agent
 honestly can — by name, or by role where that is how the agent knows them
 ("the vendor-relationship owner told me", "the group one desk over
 mentioned"). A role is a way of identifying a person, not a way of naming
-their scope, and a hearsay item is not weakened by it.
+their scope, and a hearsay item is not weakened *for admissibility* by it
+(trust, once Strata has any, may weigh a named informant differently from an
+anonymous one).
+
+An informant is a **party, never a scope**. A scope has no voice except its
+channels — publication and direction. "Billing told me", with no person behind
+it, is manufactured attribution; "someone in billing told me" is a person
+identified by affiliation. Affiliation is part of how the informant is
+identified; it does not transfer the claim to their scope, and it does not
+make B stand behind it.
 
 **Manufactured attribution** is the different act of asserting B's position or
 B's records as fact with *nobody standing behind it* — no informant, no
 publication, no direction: "billing's incident record shows…", "compliance
-already decided…", "pasting their internal notes here". That is declined, and
+already decided…". A document is not a speaker, but whoever handed it over is:
+"pasting their internal notes here" is manufactured only when nobody handed
+them over. Where someone did, the item is hearsay on that person and only D5
+can decline it. Manufactured attribution is declined, and
 the reason names the missing speaker, never the material's topic or origin.
 
 The test is not how precisely the other scope is named. It is whether someone
@@ -67,10 +86,18 @@ the agent actually dealt with is behind the claim.
 ### D3 — Hearsay never corroborates
 
 A hearsay item is provenance-dependent on B and never counts as independent
-corroboration of anything B later publishes. If B publishes Y first-hand, the
-scope re-grounds on that item and the hearsay is superseded by it. If B
-publishes not-Y, or withdraws, the hearsay loses its ground when it is
-re-judged (ADR 0014's reactive re-judgement is the mechanism; no new path).
+corroboration of anything B later publishes: two items asserting Y in A's
+memory would read as two sources, which is the echo the whole rule exists to
+prevent. When B publishes Y first-hand, A's hearsay item is **superseded** by
+that publication — not re-grounded: A holds B's publication attributed to B,
+not Y on its own account. If B later withdraws Y, or publishes not-Y, the
+superseded hearsay **does not revive**; a retracted claim returning as an echo
+is precisely the failure this forbids. What the hearsay loses is currency and
+weight against first-hand contradiction, never its ground: X's word still
+happened, and the record keeps it (that is also where earned trust, once it
+exists, will read an informant's track record).
+
+Re-judging on changed inputs is ADR 0014's existing mechanism; no new path.
 
 ### D4 — Informants supply evidence, never authority
 
@@ -83,9 +110,9 @@ decision at all; they act through operator memory or the ordinary chain.
 Whether a scope may hold a class of material at all (customer account states,
 personal data, secrets) is decided by the operator or a containing scope and
 enforced as a directive. The judge declines such material **by directive**,
-never by origin. The `#A-88213` case keeps its answer — support-docs probably
-should not hold customer account states — but for the right reason, and only
-where someone has actually decided it.
+never by origin. Absent such a directive, the item is admitted. Whether
+support-docs should hold customer account states is a decision someone has to
+make; until they do, "this is sensitive" is not a decline ground.
 
 ## Consequences
 
