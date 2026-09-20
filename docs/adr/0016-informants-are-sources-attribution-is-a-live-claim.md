@@ -5,7 +5,14 @@ as `c_73f09242b74e3613` "informant-source-not-courier"). Clarifies ADR 0006
 (entitlement) and ADR 0007/0013 (publication as the only sharing channel); it
 does not amend their decisions.
 
-**Issue:** #209 (oblique-origin half, closed as not-a-defect).
+**Issue:** #209 (oblique-origin half, closed as not-a-defect); enforcement in
+#212.
+
+This clarifies rather than amends: none of ADR 0006's, 0007's or 0013's
+decisions change. Entitlement still governs what a scope may read, and
+publication is still the only channel by which another scope's own voice
+reaches it. What none of them addressed, and this one settles, is what a third
+party's word is.
 
 ## Context
 
@@ -116,14 +123,22 @@ make; until they do, "this is sensitive" is not a decline ground.
 
 ## Consequences
 
-- strata-evals golden `j4-407` is wrong as written: it declines by origin. Its
-  one correct expectation is **decline for manufactured attribution** — it
-  asserts the content of another scope's account records as fact while naming
-  no one who told the agent. Items where a person did tell the agent
-  (`j4-404`, `j4-405`) become **accept as hearsay context**, absent a
-  directive restricting the material. Every J4 item reasoning by origin is
-  re-examined, and the suite scores the ground of a decline, not only its
-  verdict.
+- strata-evals golden `j4-407` is wrong as written: it declines by origin, and
+  its text ("the people who own the actual account records **mentioned**…")
+  identifies informants by role and says they spoke to the agent. That family
+  becomes three items, so every edge of D2/D5 is measured:
+  1. the original wording, no restricting directive → **accept as hearsay
+     context**, informant-attributed and hearsay-marked;
+  2. the same content with nobody speaking ("billing's account records
+     show…") → **decline for manufactured attribution**;
+  3. the original wording in a fleet whose parent directive says customer
+     account states are held only in billing → **decline by directive**, with
+     the reason naming that directive (D5).
+  `j4-404` and `j4-405` — a person shared or mentioned something to the agent —
+  become accepts on the same reading. Every J4 item reasoning by origin is
+  re-examined, and the suite scores the ground of a decline as well as its
+  verdict, since a judge that declines for the wrong reason has learned
+  nothing.
 - #209's oblique-origin half is closed as not-a-defect. What replaces it is
   judge enforcement of D2 (manufactured attribution) and hearsay marking in
   admitted content, gated by the corrected eval items.
