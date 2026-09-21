@@ -52,8 +52,14 @@ def test_choosing_a_judge_states_the_measurement_and_its_build() -> None:
 def test_choosing_a_judge_states_the_haiku_over_decline_and_the_no_silent_switch_rule() -> None:
     section = _choosing_a_judge()
     assert "over-declined 2 of 6 legitimate operational notes (`wi-102`, `wi-103`)" in section
-    assert "keeps `claude-haiku-4-5` on `api.anthropic.com`" in section
-    assert "upgrading never changes your judge" in section
+    # The upgrade promise and the key promise, each a sentence of its own.
+    assert (
+        "If your only key is an Anthropic one, the install stays on `claude-haiku-4-5` on "
+        "Anthropic's own endpoint."
+    ) in section
+    assert "Anthropic's own endpoint. That key is never sent to the router. Either way" in section
+    assert "`strata doctor` names the judge and endpoint you are actually running" in section
+    assert "so read it and pick" in section
     assert "A model id ages" in section
     assert "JUDGE_MODEL=qwen/qwen3-235b-a22b-2507" in section
 

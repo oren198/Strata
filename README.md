@@ -1062,12 +1062,17 @@ version = "1.12.0"
 
 ### Choosing a judge
 
-The judge is the model that reviews every contribution. With `JUDGE_API_KEY` set to an
-OpenRouter key and nothing else, it is `qwen/qwen3-235b-a22b-2507` on
-`https://openrouter.ai/api`. An install that only ever had an Anthropic key —
-`ANTHROPIC_API_KEY`, or a `JUDGE_API_KEY` that starts `sk-ant-` — and sets no
-`JUDGE_BASE_URL` keeps `claude-haiku-4-5` on `api.anthropic.com`: upgrading never changes
-your judge. `strata doctor` prints the judge in effect, and whether it answers.
+Strata's judging runs on a model you choose, and six of them were tried against the
+same suites; three completed every one. The full table is in this repo
+([docs/evidence/judge-baseline-2026-09-20.md](docs/evidence/judge-baseline-2026-09-20.md)):
+for each model, how much junk it let in, how many adversarial items got through, its
+accuracy, its error rate, how long it took per item and what a run cost. A fresh install
+is pointed at `qwen/qwen3-235b-a22b-2507` through OpenRouter, the model those numbers were
+taken on. If your only key is an Anthropic one, the install stays on `claude-haiku-4-5` on
+Anthropic's own endpoint. That key is never sent to the router. Either way, `strata doctor`
+names the judge and endpoint you are actually running. The models differ in ways the table
+states plainly — how strictly each reads a scope's stated purpose, and what each costs per
+run — so read it and pick. The table names what was measured, when, and on which build.
 
 **What was measured** — 2026-09-20, engine build `release/v1.13.0` @ `5f5bf49`, every
 model called through OpenRouter's Anthropic Messages endpoint, one repetition of each
