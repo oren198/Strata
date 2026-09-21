@@ -35,7 +35,9 @@ def _clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
 def _register(tmp_path: Path, yes: bool = False) -> int:
     (tmp_path / ".git").mkdir(exist_ok=True)
     return cmd_register(
-        argparse.Namespace(path=str(tmp_path), diff=False, bootstrap_venv=False, harness=None, yes=yes)
+        argparse.Namespace(
+            path=str(tmp_path), diff=False, bootstrap_venv=False, harness=None, yes=yes
+        )
     )
 
 
@@ -126,7 +128,7 @@ def test_interactive_never_overwrites_existing_judge_lines(tmp_path: Path, monke
     assert "JUDGE_MODEL=my/model" in lines
     assert "JUDGE_BASE_URL=https://gw.example" in lines
     assert "JUDGE_API_KEY=sk-or-v1-abc" in lines
-    assert not any(l.startswith("JUDGE_MODEL=qwen") for l in lines)
+    assert not any(line.startswith("JUDGE_MODEL=qwen") for line in lines)
     assert len(lines) == 3
 
 

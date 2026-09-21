@@ -1143,9 +1143,9 @@ def test_stats_writeback_warns_when_the_connect_seam_was_unavailable(
 
     _seed_fleet(tmp_path, monkeypatch)
     _seed_writeback_sessions(tmp_path)
-    SessionStateStore(sessions_dir_for(str(tmp_path / "summaries"))).record_connect_seam_unavailable(
-        "the MCP SDK no longer has _handle_message"
-    )
+    SessionStateStore(
+        sessions_dir_for(str(tmp_path / "summaries"))
+    ).record_connect_seam_unavailable("the MCP SDK no longer has _handle_message")
 
     assert main(["stats", "writeback"]) == 0
     text = re.sub(r"\s+", " ", capsys.readouterr().out)

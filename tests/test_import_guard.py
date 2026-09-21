@@ -19,7 +19,9 @@ _ROOT = Path(__file__).resolve().parent.parent
 
 
 def _conftest():
-    spec = importlib.util.spec_from_file_location("_root_conftest_under_test", _ROOT / "conftest.py")
+    spec = importlib.util.spec_from_file_location(
+        "_root_conftest_under_test", _ROOT / "conftest.py"
+    )
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module

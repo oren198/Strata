@@ -31,7 +31,6 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from strata.session_state import DEFAULT_SESSION_IDLE_WINDOW_SECONDS
 
-
 #: The default judge (measured 2026-09-20; see the README's "Choosing a judge").
 DEFAULT_JUDGE_MODEL = "qwen/qwen3-235b-a22b-2507"
 DEFAULT_JUDGE_BASE_URL = "https://openrouter.ai/api"
