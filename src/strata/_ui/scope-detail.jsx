@@ -75,6 +75,16 @@ function ScopeDetail({ scope_id, state, dispatch, onBack, onFlash, embedded = fa
           }}>
             {state.strata.find((s) => s.id === scope.stratum_id)?.name || "—"}
           </span>
+          <span
+            title={scope.description || "no description"}
+            style={{
+              fontSize: 13, color: scope.description ? "var(--at-ink-soft)" : "var(--at-muted)",
+              fontStyle: scope.description ? "normal" : "italic",
+              overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", minWidth: 0,
+            }}
+          >
+            {scope.description || "no description"}
+          </span>
           <div style={{ flex: 1 }} />
         </div>
       )}
@@ -123,6 +133,19 @@ function ScopeDetail({ scope_id, state, dispatch, onBack, onFlash, embedded = fa
                 borderRadius: 8,
               }}>
                 {scope.name}
+              </div>
+            </Field>
+            <Field label="Description">
+              <div style={{
+                fontSize: 14,
+                color: scope.description ? "var(--at-ink)" : "var(--at-muted)",
+                fontStyle: scope.description ? "normal" : "italic",
+                padding: "8px 10px",
+                background: "var(--at-bg)",
+                border: "1px solid var(--at-rule)",
+                borderRadius: 8,
+              }}>
+                {scope.description || "no description"}
               </div>
             </Field>
             <Field label="Stratum">
@@ -289,7 +312,7 @@ function BackendScopeSummary({ scope, summary, loading, error, onRefetch, onFlas
               <li key={r.id} className="at-caption" style={{ color: "var(--at-muted)" }}>
                 <code style={{ fontFamily: "var(--font-mono)" }}>{r.directive_id}</code>
                 {" retired "}{humanAgo(r.created_at)}
-                {r.reason ? ` — ${r.reason}` : ""}
+                {r.changed_circumstance ? ` — changed circumstance: ${r.changed_circumstance}` : (r.reason ? ` — ${r.reason}` : "")}
               </li>
             ))}
           </ul>

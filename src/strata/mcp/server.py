@@ -43,6 +43,7 @@ STRATA_AGENT_SESSION_ID
 
 from __future__ import annotations
 
+import inspect
 import logging
 import os
 import signal
@@ -157,6 +158,7 @@ def _init_stores() -> None:
     _record_store = RecordStore(_db_path)
     _summary_store = SummaryStore(_summaries_dir)
     _session_store = SessionStateStore(_sessions_dir)
+    _publish_connect_seam_problem()
 
 
 def _drain_for_read(fleet, scope_id: str) -> tuple[int, list]:
@@ -367,15 +369,59 @@ def _terminate_cleanly(signum: int, frame: object) -> None:
     os._exit(0)
 
 
-def _install_connect_hook(server: FastMCP) -> None:
+#: Whether the connect hook / tool-call counter is wrapped on the SDK (set on success).
+_CONNECT_HOOK_INSTALLED = False
+#: Why it could not be (None when it was, or has not been tried) — published to the
+#: session store so the write-back report can say its denominator may undercount.
+_connect_seam_problem: str | None = None
+
+
+def _connect_seam_check(server: object) -> str | None:
+    """Why *server* has no usable ``_mcp_server._handle_message`` seam, or ``None`` if it does."""
+    lowlevel = getattr(server, "_mcp_server", None)
+    if lowlevel is None:
+        return "the FastMCP server has no `_mcp_server` (the MCP SDK moved it)"
+    handler = getattr(lowlevel, "_handle_message", None)
+    if handler is None or not callable(handler):
+        return "the MCP SDK's lowlevel server has no `_handle_message`"
+    if not inspect.iscoroutinefunction(handler):
+        return "the MCP SDK's `_handle_message` is no longer async"
+    try:
+        params = list(inspect.signature(handler).parameters)
+    except (TypeError, ValueError):
+        return "the MCP SDK's `_handle_message` signature cannot be read"
+    if params[:2] != ["message", "session"]:
+        return f"the MCP SDK's `_handle_message` signature changed ({', '.join(params)})"
+    return None
+
+
+def _install_connect_hook(server: FastMCP) -> bool:
     """Have *server* call :func:`_record_connect` on the first message after the
-    handshake (the client's ``initialized`` notification).
+    handshake (the client's ``initialized`` notification). Returns whether it did.
 
     The MCP SDK completes ``initialize`` inside the session and forwards only
     later messages to the server, so the first forwarded message is the earliest
     seam that has both the session and its client info. Wraps this FastMCP's own
     lowlevel server instance, so it never touches the SDK class.
+
+    The seam is a PRIVATE SDK attribute (pyproject pins ``mcp <1.30``, #206). If it is
+    missing or changed, this logs a warning and runs WITHOUT connect-time recording
+    instead of raising at startup: a memory-blind session is worse than an unmeasured
+    denominator. The reason is remembered so the write-back report can say its
+    denominator may undercount (:func:`_publish_connect_seam_problem`).
     """
+    global _CONNECT_HOOK_INSTALLED, _connect_seam_problem
+    problem = _connect_seam_check(server)
+    if problem is not None:
+        _connect_seam_problem = problem
+        _logger.warning(
+            "MCP connect hook NOT installed: %s. Running WITHOUT connect-time session "
+            "recording and tool-call counting; write-back denominators may undercount. "
+            "Strata is verified on mcp >=1.28,<1.30 (#206).",
+            problem,
+        )
+        return False
+
     lowlevel = server._mcp_server  # noqa: SLF001 - the SDK exposes no public seam
     original = lowlevel._handle_message  # noqa: SLF001
     connected = False
@@ -391,6 +437,19 @@ def _install_connect_hook(server: FastMCP) -> None:
         return await original(message, session, *args, **kwargs)
 
     lowlevel._handle_message = handle_message  # noqa: SLF001
+    _connect_seam_problem = None
+    _CONNECT_HOOK_INSTALLED = True
+    return True
+
+
+def _publish_connect_seam_problem() -> None:
+    """Tell the session store this server runs without connect-time recording (#206)."""
+    if _connect_seam_problem is None or _session_store is None:
+        return
+    try:
+        _session_store.record_connect_seam_unavailable(_connect_seam_problem)
+    except OSError as exc:  # pragma: no cover - defensive; disk failure only
+        _logger.warning("failed to record the connect-seam marker: %s", exc)
 
 
 def _record_read(scope_id: str) -> None:
@@ -496,6 +555,7 @@ def _build_scope_manager():
     return ScopeManager(
         client=_settings.build_judge_client(),
         model=_settings.manager_model,
+        implied_purpose_min_words=_settings.implied_purpose_min_words,
     )
 
 

@@ -1837,6 +1837,38 @@ def read_freshness_strict_from_text(config_text: str) -> bool | None:
     return value if isinstance(value, bool) else None
 
 
+_DESCRIPTION_HINT_RE = re.compile(r"(?m)^([ \t]*)# description:[^\r\n]*")
+
+
+def seed_scope_description(fleet_text: str, description: str) -> str:
+    """Write *description* into a freshly seeded ``fleet.yaml`` (#210).
+
+    The minimal template carries a ``# description:`` hint under the first scope's
+    name; this turns that hint into the real key, quoted so any text is valid YAML.
+    A fleet without the hint (the inline fallback, an older template) gets the key
+    right after the first ``name:`` line under ``scopes:``. Blank text changes nothing.
+    """
+    text = description.strip()
+    if not text:
+        return fleet_text
+    quoted = json.dumps(text, ensure_ascii=False)
+    hint = _DESCRIPTION_HINT_RE.search(fleet_text)
+    if hint is not None:
+        return (
+            fleet_text[: hint.start()]
+            + f"{hint.group(1)}description: {quoted}"
+            + fleet_text[hint.end() :]
+        )
+    scopes_at = fleet_text.find("scopes:")
+    name = re.compile(r"(?m)^([ \t]*)name:[^\r\n]*").search(fleet_text, max(scopes_at, 0))
+    if name is None:
+        return fleet_text
+    insert_at = name.end()
+    return (
+        fleet_text[:insert_at] + f"\n{name.group(1)}description: {quoted}" + fleet_text[insert_at:]
+    )
+
+
 _INSTALL_HEADER_RE = re.compile(r"(?m)^\[install\][ \t]*\r?$")
 
 
@@ -1931,6 +1963,41 @@ def gitignore_covers_dotenv(gitignore_text: str) -> bool:
     actually provide.
     """
     return any(line.strip() == ".env" for line in gitignore_text.splitlines())
+
+
+#: Matches an existing judge model / endpoint assignment (either spelling).
+_ENV_JUDGE_MODEL_LINE_RE = re.compile(r"^(?:STRATA_MANAGER_MODEL|JUDGE_MODEL|STRATA_JUDGE_MODEL)=")
+_ENV_JUDGE_BASE_URL_LINE_RE = re.compile(r"^(?:STRATA_)?JUDGE_BASE_URL=")
+
+
+def write_env_judge_defaults(env_path: Path) -> list[str]:
+    """Append ``JUDGE_MODEL`` / ``JUDGE_BASE_URL`` (the default judge) to *env_path*.
+
+    Each line is written only if *env_path* has no assignment for it under either
+    spelling — an existing ``JUDGE_*`` line is never overwritten. Everything else
+    in the file is preserved byte-for-byte. Returns the names written, in order.
+    """
+    from strata.settings import DEFAULT_JUDGE_BASE_URL, DEFAULT_JUDGE_MODEL  # noqa: PLC0415
+
+    existing = env_path.read_bytes().decode("utf-8") if env_path.exists() else ""
+    stripped = [line.strip() for line in existing.split("\n")]
+    wanted = [
+        ("JUDGE_MODEL", DEFAULT_JUDGE_MODEL, _ENV_JUDGE_MODEL_LINE_RE),
+        ("JUDGE_BASE_URL", DEFAULT_JUDGE_BASE_URL, _ENV_JUDGE_BASE_URL_LINE_RE),
+    ]
+    written: list[str] = []
+    additions = ""
+    for name, value, pattern in wanted:
+        if any(pattern.match(line) for line in stripped):
+            continue
+        additions += f"{name}={value}\n"
+        written.append(name)
+    if additions:
+        prefix = existing
+        if prefix and not prefix.endswith("\n"):
+            prefix += "\n"
+        env_path.write_bytes((prefix + additions).encode("utf-8"))
+    return written
 
 
 def write_env_judge_key(env_path: Path, key: str) -> str:

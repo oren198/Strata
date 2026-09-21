@@ -160,13 +160,15 @@ def test_judge_base_url_from_process_env(tmp_path: Path, monkeypatch: pytest.Mon
     assert get_settings().judge_base_url == "https://router.example/v1"
 
 
-def test_judge_base_url_defaults_to_none(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_judge_base_url_defaults_to_openrouter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     monkeypatch.chdir(tmp_path)
     _clear_judge_env(monkeypatch)
 
     from strata.settings import get_settings
 
-    assert get_settings().judge_base_url is None
+    assert get_settings().judge_base_url == "https://openrouter.ai/api"
 
 
 def test_judge_model_alias_reaches_manager_model(
@@ -278,7 +280,7 @@ def test_build_judge_client_omits_base_url_when_unset(
 ) -> None:
     monkeypatch.chdir(tmp_path)
     _clear_judge_env(monkeypatch)
-    monkeypatch.setenv("JUDGE_API_KEY", "judge-key")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-judge-key")
 
     from strata.settings import get_settings
 
@@ -298,6 +300,29 @@ def test_build_judge_client_omits_base_url_when_unset(
     assert "base_url" not in captured
 
 
+def test_build_judge_client_uses_the_default_endpoint_for_the_default_judge(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _clear_judge_env(monkeypatch)
+    monkeypatch.setenv("JUDGE_API_KEY", "sk-or-key")
+
+    from strata.settings import get_settings
+
+    captured: dict = {}
+
+    class _FakeAnthropic:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    import anthropic
+
+    monkeypatch.setattr(anthropic, "Anthropic", _FakeAnthropic)
+    get_settings().build_judge_client()
+
+    assert captured == {"api_key": "sk-or-key", "base_url": "https://openrouter.ai/api"}
+
+
 # ---------------------------------------------------------------------------
 # resolve_judge_credentials — the raw-env-dict counterpart used by callers
 # that don't have a constructed Settings object (the freshness evaluator).
@@ -310,7 +335,7 @@ def test_resolve_judge_credentials_prefers_judge_api_key() -> None:
     env = {"JUDGE_API_KEY": "jk", "ANTHROPIC_API_KEY": "ak"}
     api_key, base_url = resolve_judge_credentials(env)
     assert api_key == "jk"
-    assert base_url is None
+    assert base_url == "https://openrouter.ai/api"
 
 
 def test_resolve_judge_credentials_prefixed_wins() -> None:
@@ -336,3 +361,192 @@ def test_resolve_judge_credentials_base_url() -> None:
     api_key, base_url = resolve_judge_credentials(env)
     assert api_key == "jk"
     assert base_url == "https://router.example/v1"
+
+
+# ---------------------------------------------------------------------------
+# Default judge (qwen on OpenRouter) and the no-silent-switch rule.
+# ---------------------------------------------------------------------------
+
+_QWEN = "qwen/qwen3-235b-a22b-2507"
+_OPENROUTER = "https://openrouter.ai/api"
+
+
+def test_settings_default_judge_is_the_measured_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _clear_judge_env(monkeypatch)
+    from strata.settings import Settings
+
+    s = Settings()
+    assert s.manager_model == _QWEN
+    assert s.judge_base_url == _OPENROUTER
+    assert s.resolved_judge.reason == "default"
+
+
+def test_settings_judge_key_alone_gets_the_default_judge(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """JUDGE_API_KEY (an OpenRouter key) and nothing else -> the default judge."""
+    monkeypatch.chdir(tmp_path)
+    _clear_judge_env(monkeypatch)
+    monkeypatch.setenv("JUDGE_API_KEY", "sk-or-abc")
+    from strata.settings import Settings
+
+    s = Settings()
+    assert (s.manager_model, s.judge_base_url) == (_QWEN, _OPENROUTER)
+
+
+def test_settings_anthropic_key_alone_keeps_haiku_on_anthropic(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An existing install (only ANTHROPIC_API_KEY) never changes judge on upgrade."""
+    monkeypatch.chdir(tmp_path)
+    _clear_judge_env(monkeypatch)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-abc")
+    from strata.settings import Settings
+
+    s = Settings()
+    assert s.manager_model == "claude-haiku-4-5"
+    assert s.judge_base_url is None
+    assert s.resolved_judge.reason == "kept_anthropic"
+
+
+def test_settings_strata_anthropic_key_alone_keeps_haiku(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _clear_judge_env(monkeypatch)
+    monkeypatch.setenv("STRATA_ANTHROPIC_API_KEY", "anything")
+    from strata.settings import Settings
+
+    assert Settings().manager_model == "claude-haiku-4-5"
+
+
+def test_settings_anthropic_key_in_dotenv_keeps_haiku(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _clear_judge_env(monkeypatch)
+    (tmp_path / ".env").write_text("ANTHROPIC_API_KEY=sk-ant-x\n")
+    from strata.settings import Settings
+
+    s = Settings()
+    assert (s.manager_model, s.judge_base_url) == ("claude-haiku-4-5", None)
+
+
+def test_settings_judge_key_wins_so_anthropic_key_alongside_gets_the_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A JUDGE_API_KEY (non-Anthropic) beside an old ANTHROPIC key: the JUDGE_* choice wins."""
+    monkeypatch.chdir(tmp_path)
+    _clear_judge_env(monkeypatch)
+    monkeypatch.setenv("JUDGE_API_KEY", "sk-or-abc")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-abc")
+    from strata.settings import Settings
+
+    s = Settings()
+    assert (s.manager_model, s.judge_base_url) == (_QWEN, _OPENROUTER)
+
+
+def test_settings_judge_key_that_is_an_anthropic_key_is_kept_on_anthropic(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`register` v1.12 wrote JUDGE_API_KEY=<key>; an sk-ant- key there is an existing install."""
+    monkeypatch.chdir(tmp_path)
+    _clear_judge_env(monkeypatch)
+    monkeypatch.setenv("JUDGE_API_KEY", "sk-ant-api03-zzz")
+    from strata.settings import Settings
+
+    s = Settings()
+    assert (s.manager_model, s.judge_base_url) == ("claude-haiku-4-5", None)
+
+
+def test_settings_manager_model_override_alone_keeps_the_anthropic_endpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """STRATA_MANAGER_MODEL / JUDGE_MODEL beside an Anthropic key: the endpoint stays."""
+    monkeypatch.chdir(tmp_path)
+    _clear_judge_env(monkeypatch)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-abc")
+    monkeypatch.setenv("STRATA_MANAGER_MODEL", "claude-sonnet-4-5")
+    from strata.settings import Settings
+
+    s = Settings()
+    assert (s.manager_model, s.judge_base_url) == ("claude-sonnet-4-5", None)
+    assert s.resolved_judge.reason == "override"
+
+
+def test_settings_explicit_overrides_win_over_defaults(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _clear_judge_env(monkeypatch)
+    monkeypatch.setenv("JUDGE_API_KEY", "k")
+    monkeypatch.setenv("JUDGE_MODEL", "my/model")
+    monkeypatch.setenv("JUDGE_BASE_URL", "https://gw.example")
+    from strata.settings import Settings
+
+    s = Settings()
+    assert (s.manager_model, s.judge_base_url) == ("my/model", "https://gw.example")
+    assert s.resolved_judge.reason == "override"
+
+
+def test_settings_model_override_with_judge_key_takes_the_default_endpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _clear_judge_env(monkeypatch)
+    monkeypatch.setenv("JUDGE_API_KEY", "sk-or-k")
+    monkeypatch.setenv("JUDGE_MODEL", "anthropic/claude-haiku-4.5")
+    from strata.settings import Settings
+
+    s = Settings()
+    assert (s.manager_model, s.judge_base_url) == ("anthropic/claude-haiku-4.5", _OPENROUTER)
+
+
+def test_settings_explicit_kwargs_count_as_overrides() -> None:
+    from strata.settings import Settings
+
+    s = Settings(manager_model="claude-haiku-4-5", judge_base_url=None, anthropic_api_key="ak")
+    assert (s.manager_model, s.judge_base_url) == ("claude-haiku-4-5", None)
+
+
+def test_resolve_judge_from_env_matches_settings_for_every_combination() -> None:
+    from strata.settings import resolve_judge_from_env
+
+    assert resolve_judge_from_env({}).model == _QWEN
+    assert resolve_judge_from_env({"JUDGE_API_KEY": "sk-or-1"}).base_url == _OPENROUTER
+    kept = resolve_judge_from_env({"ANTHROPIC_API_KEY": "sk-ant-1"})
+    assert (kept.model, kept.base_url, kept.api_key, kept.reason) == (
+        "claude-haiku-4-5",
+        None,
+        "sk-ant-1",
+        "kept_anthropic",
+    )
+    both = resolve_judge_from_env({"JUDGE_MODEL": "m", "ANTHROPIC_API_KEY": "sk-ant-1"})
+    assert (both.model, both.base_url) == ("m", None)
+
+
+def test_resolve_judge_credentials_returns_the_resolved_endpoint() -> None:
+    """The freshness drafter and the judge must land on the same endpoint."""
+    from strata.settings import resolve_judge_credentials
+
+    assert resolve_judge_credentials({"JUDGE_API_KEY": "sk-or-1"}) == ("sk-or-1", _OPENROUTER)
+    assert resolve_judge_credentials({"ANTHROPIC_API_KEY": "sk-ant-1"}) == ("sk-ant-1", None)
+
+
+def test_freshness_drafter_follows_the_judge_endpoint() -> None:
+    """The evaluator must not send an Anthropic model id to OpenRouter."""
+    import functools
+
+    from strata import freshness
+
+    def model_for(env: dict[str, str]) -> str:
+        fn = freshness._resolve_draft_fn(env, None)
+        assert isinstance(fn, functools.partial)
+        return fn.keywords["model"]
+
+    assert model_for({"JUDGE_API_KEY": "sk-or-1"}) == "qwen/qwen3-235b-a22b-2507"
+    assert model_for({"ANTHROPIC_API_KEY": "sk-ant-1"}) == freshness.DEFAULT_EVALUATOR_MODEL
+    assert model_for({"JUDGE_API_KEY": "sk-or-1", "STRATA_EVALUATOR_MODEL": "x/y"}) == "x/y"

@@ -36,6 +36,26 @@ from strata.project_config import StoragePaths
 _MIGRATIONS_DIR = Path(__file__).resolve().parent.parent / "src" / "strata" / "_migrations"
 
 
+@pytest.fixture(autouse=True)
+def _port_is_not_under_test(monkeypatch: pytest.MonkeyPatch) -> None:
+    """These tests are about the V1 upgrade guard, not the port (#208).
+
+    `main(["start"])` runs preflight, whose hard check binds 127.0.0.1:8000 — so every
+    test here failed whenever a real Console held that port. The port check has its own
+    tests (tests/test_preflight.py); here it always passes, so the suite never depends on
+    what the machine has on port 8000.
+    """
+    from strata import preflight
+
+    monkeypatch.setattr(
+        preflight,
+        "_check_port_available",
+        lambda port: preflight.Check(
+            name=f"port {port} available", kind="hard", passed=True, message="stubbed"
+        ),
+    )
+
+
 def _build_v1_db(db_path: str, tmp_path: Path) -> None:
     """Apply only 0001_initial.sql, leaving 0002_drop_fleet_tables.sql unapplied.
 
@@ -429,3 +449,42 @@ def test_helper_handles_no_migrations_table(tmp_path: Path) -> None:
 
     result = _v1_upgrade_guard_should_refuse(db_path, fleet_yaml_path, skip=False)
     assert result is True
+
+
+def test_guard_tests_do_not_depend_on_the_port_being_free(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#208 — with the port genuinely held, the guard still behaves as asserted above."""
+    import socket
+
+    holder = socket.socket()
+    holder.bind(("127.0.0.1", 0))
+    holder.listen(1)
+    port = holder.getsockname()[1]
+    try:
+        db_path = str(tmp_path / "strata.db")
+        fleet_yaml_path = str(tmp_path / "fleet.yaml")
+        _build_v1_db(db_path, tmp_path)
+        _seed_v1_fleet(db_path)
+        with (
+            patch("strata.migrator.run_migrations", return_value=[]) as mock_migrate,
+            patch("uvicorn.run"),
+            patch(
+                "strata.__main__._storage_paths",
+                return_value=StoragePaths(
+                    db_path=db_path,
+                    summaries_dir=str(Path(db_path).parent / "summaries"),
+                    fleet_yaml_path=fleet_yaml_path,
+                    source="env",
+                    project_root=None,
+                ),
+            ),
+        ):
+            rc = main(["start", "--port", str(port)])
+        assert rc == 1  # refused by the upgrade guard, not by the held port
+        mock_migrate.assert_not_called()
+        err = capsys.readouterr().err
+        assert "strata export-fleet" in err
+        assert "already in use" not in err
+    finally:
+        holder.close()

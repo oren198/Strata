@@ -22,3 +22,11 @@ has an owner. The operator's steps are approvals on GitHub; nobody uploads to Py
 6. **Verify on PyPI** once the run succeeds: `pipx install strata-mem==X.Y.Z`
    from a clean `HOME`, then `strata --version` prints `X.Y.Z`.
 7. **Sync branches.** Fast-forward `dev` (and the version branch, if kept) to `main`.
+
+8. **Evidence before claims.** Any measurement a public claim rests on lives in THIS repo,
+   verbatim, before the claim is made — `docs/evidence/`, with local paths and key references
+   scrubbed. The eval repository is not public, so a link to it is a 404 for every reader (the
+   1.11.0 notes hit exactly that).
+9. **Check the default judge model id still resolves before tagging.** The wheel-smoke CI step
+   makes no network call, so a router outage or a retired model id would surface only in
+   `strata doctor`, on a stranger's first run.

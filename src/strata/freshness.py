@@ -702,9 +702,17 @@ def _resolve_draft_fn(env: dict[str, str], draft_fn: DraftFn | None) -> DraftFn:
         return draft_fn
     import functools  # noqa: PLC0415
 
-    from strata.settings import resolve_judge_credentials  # noqa: PLC0415
+    from strata.settings import (  # noqa: PLC0415
+        resolve_judge_credentials,
+        resolve_judge_from_env,
+    )
 
-    model = env.get(EVALUATOR_MODEL_ENV) or DEFAULT_EVALUATOR_MODEL
+    # The drafter speaks to the same endpoint as the judge, so its default model id must
+    # be one that endpoint serves: cheap Haiku on the Anthropic endpoint, otherwise the
+    # judge's own model. STRATA_EVALUATOR_MODEL overrides either.
+    resolved = resolve_judge_from_env(env)
+    default_model = DEFAULT_EVALUATOR_MODEL if resolved.base_url is None else resolved.model
+    model = env.get(EVALUATOR_MODEL_ENV) or default_model
     api_key, base_url = resolve_judge_credentials(env)
     return functools.partial(_default_draft_fn, api_key=api_key, base_url=base_url, model=model)
 
@@ -795,6 +803,7 @@ def _submit_judged_contribution(
     manager = ScopeManager(
         client=settings.build_judge_client(),
         model=settings.manager_model,
+        implied_purpose_min_words=settings.implied_purpose_min_words,
     )
     with RecordStore(paths.db_path) as record_store:
         summary_store = SummaryStore(paths.summaries_dir)
