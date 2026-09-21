@@ -37,7 +37,13 @@ def test_choosing_a_judge_states_the_measurement_and_its_build() -> None:
     assert "2026-09-20" in section
     assert "`release/v1.13.0` @ `5f5bf49`" in section
     assert "docs/evidence/judge-baseline-2026-09-20.md" in section
-    for figure in ("12", "94.4% (51/54)", "2.6% (2 of 76 scored; measured on the pre-#212 build)", "0 of 130", "$0.0157"):
+    for figure in (
+        "12",
+        "94.4% (51/54)",
+        "2.6% (2 of 76 scored; measured on the pre-#212 build)",
+        "0 of 130",
+        "$0.0157",
+    ):
         assert figure in section  # qwen row
     for figure in ("7", "0.0% (0 of 84)", "$0.2139"):
         assert figure in section  # haiku row

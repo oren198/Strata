@@ -21,7 +21,6 @@ from strata.session_state import (
     compute_writeback_report,
 )
 
-
 # --- CI tripwire: the seam is there on the pinned SDK -------------------------------------
 
 

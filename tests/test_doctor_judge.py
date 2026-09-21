@@ -37,7 +37,9 @@ def project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     (tmp_path / ".git").mkdir()
     monkeypatch.chdir(tmp_path)
     rc = cmd_register(
-        argparse.Namespace(path=str(tmp_path), diff=False, bootstrap_venv=False, harness=None, yes=True)
+        argparse.Namespace(
+            path=str(tmp_path), diff=False, bootstrap_venv=False, harness=None, yes=True
+        )
     )
     assert rc == 0
     from strata.migrator import run_migrations
@@ -60,7 +62,9 @@ def test_doctor_names_the_default_judge(project, monkeypatch, capsys) -> None:
     monkeypatch.setenv("JUDGE_API_KEY", "sk-or-abc")
     rc, out = _doctor(capsys)
     assert rc == 0
-    assert "Judge: qwen/qwen3-235b-a22b-2507 @ openrouter.ai/api (default, measured 2026-09-20)" in out
+    assert (
+        "Judge: qwen/qwen3-235b-a22b-2507 @ openrouter.ai/api (default, measured 2026-09-20)" in out
+    )
 
 
 def test_doctor_names_the_kept_anthropic_judge(project, monkeypatch, capsys) -> None:
@@ -70,7 +74,7 @@ def test_doctor_names_the_kept_anthropic_judge(project, monkeypatch, capsys) -> 
     assert (
         "Judge: claude-haiku-4-5 @ api.anthropic.com (kept: an Anthropic key is set and no "
         "JUDGE_MODEL/JUDGE_BASE_URL; "
-        "measured 2026-09-20 — see \"Choosing a judge\" in the README)"
+        'measured 2026-09-20 — see "Choosing a judge" in the README)'
     ) in out
 
 
@@ -86,7 +90,9 @@ def test_doctor_names_a_configured_judge(project, monkeypatch, capsys) -> None:
 def test_doctor_names_the_judge_even_with_no_key(project, capsys) -> None:
     rc, out = _doctor(capsys)
     assert rc == 0
-    assert "Judge: qwen/qwen3-235b-a22b-2507 @ openrouter.ai/api (default, measured 2026-09-20)" in out
+    assert (
+        "Judge: qwen/qwen3-235b-a22b-2507 @ openrouter.ai/api (default, measured 2026-09-20)" in out
+    )
     assert "no judge key found" in out
 
 
@@ -124,7 +130,9 @@ def test_doctor_model_id_not_resolving_prints_the_override_lines(
 ) -> None:
     monkeypatch.setenv("JUDGE_API_KEY", "sk-or-abc")
     monkeypatch.setattr(
-        cli, "_probe_judge", lambda r: "the endpoint does not serve model id 'qwen/qwen3-235b-a22b-2507'"
+        cli,
+        "_probe_judge",
+        lambda r: "the endpoint does not serve model id 'qwen/qwen3-235b-a22b-2507'",
     )
     _, out = _doctor(capsys)
     assert "does not serve model id 'qwen/qwen3-235b-a22b-2507'" in out
