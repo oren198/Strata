@@ -57,19 +57,44 @@ Nothing new is stored beyond that reference. The report is judged like any
 other contribution: it can be declined, it carries provenance, it lives in the
 record.
 
-### D3 — The judge reads an outcome report as corroboration or as correction
+### D3 — The judge reads an outcome as corroboration or as correction, and the two are not the same act
 
 A report that the item held reads as **corroboration**, and it is
-provenance-independent: it is this scope's own outcome, not an echo of whoever
-supplied the claim. A report that the item failed reads as an ordinary
-**correction** — a contribution claiming the earlier one is wrong — and takes
-the ordinary path: supersession, with the replaced claim leaving the context.
+provenance-independent: independence is a property of the evidence, not of who
+first said the words, so a scope may corroborate its own earlier claim by
+acting on it. **An outcome corroborates only if the action could have failed**:
+"acted on it and it held" is evidence; "reviewed it and confirmed it" is echo
+wearing an outcome's clothes. Provenance holds a reporter accountable that
+claims otherwise, and ratification upward still reads breadth through the
+ancestor's judgment, so a scope's repeated self-outcomes raise its own item's
+standing without becoming the fleet's consensus.
+
+A report that the item failed is **not automatically a supersession**. The
+judge decides which happened, because the two acts differ in what they owe:
+
+- **Correction** — the claim was wrong. Correction concerns truth, and it owes
+  notice to everyone the claim reached.
+- **Supersession** — the claim was right and the world moved on. Supersession
+  concerns currency, and owes nobody notice.
+
+Treating correction as a species of decay gets the removal right and the notice
+wrong. Where the item had been **published**, published-within-believed means
+the publication follows the item, and the withdrawal reaches its readers as
+evidence, never as silent absence.
 
 ### D4 — What standing feeds
 
-Decay (a poorly standing context item fades sooner), the corroboration weight
-ratification reads, and the weight a reader gives an item in a conflict
-**within its own kind**. Nothing else.
+Three things, and nothing else:
+
+1. decay — a poorly standing context item fades sooner;
+2. the corroboration weight ratification reads;
+3. the weight judgment gives a standing item when a contribution contradicts
+   it — **not** the precedence between accepted items, which stays recency
+   within context and authority for directives.
+
+Standing bears at judgment, on whether a contradicting contribution displaces
+the standing item at all. Once both are accepted, precedence is settled by the
+ordinary rules.
 
 ### D5 — Standing never touches admissibility
 
@@ -99,8 +124,12 @@ notice, where a correction does.
   vendor-relationship owner's statements on vendor status as authoritative
   context"), or the party becomes a scope. Standing that matters is decided by
   position and is revisable; it is never accumulated by a score nobody decided.
-- No new concept enters the vocabulary. "Outcome report" names a shape of
-  contribution we already had; the only addition is the reference it carries.
+- No new concept enters the vocabulary. "Outcome report" is prose — a genus
+  over two things the theory already has, corroboration and correction, plus
+  the reference. It passes only as a description. The moment it becomes a
+  stored type, a field, or a classification the judge assigns, it has become a
+  concept nobody derived; the judge's named outputs stay corroboration and
+  correction.
 - The code — how a report references its item, how corroboration reaches
   ratification, how standing enters decay — is scoped from this ADR in a later
   cycle, with its own eval gate.
