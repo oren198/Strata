@@ -1062,11 +1062,11 @@ version = "1.12.0"
 
 ### Choosing a judge
 
-Strata's judging runs on a model you choose, and six of them were tried against the
-same suites; three completed every one. The full table is in this repo
-([docs/evidence/judge-baseline-2026-09-20.md](docs/evidence/judge-baseline-2026-09-20.md)):
-for each model, how much junk it let in, how many adversarial items got through, its
-accuracy, its error rate, how long it took per item and what a run cost. A fresh install
+Strata's judging runs on a model you choose. I tried six of them against the same suites;
+three completed every one, and the table in this repo
+([docs/evidence/judge-baseline-2026-09-20.md](docs/evidence/judge-baseline-2026-09-20.md))
+shows what each did and where a cell is empty — one produced no judgments at all, one
+errored on most of the adversarial set, one ran partially. A fresh install
 is pointed at `qwen/qwen3-235b-a22b-2507` through OpenRouter, the model those numbers were
 taken on. If your only key is an Anthropic one, the install stays on `claude-haiku-4-5` on
 Anthropic's own endpoint. That key is never sent to the router. Either way, `strata doctor`

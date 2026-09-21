@@ -58,6 +58,13 @@ def test_choosing_a_judge_states_the_haiku_over_decline_and_the_no_silent_switch
         "Anthropic's own endpoint."
     ) in section
     assert "Anthropic's own endpoint. That key is never sent to the router. Either way" in section
+    assert (
+        "Strata's judging runs on a model you choose. I tried six of them against the same "
+        "suites; three completed every one, and the table in this repo "
+        "([docs/evidence/judge-baseline-2026-09-20.md](docs/evidence/judge-baseline-2026-09-20.md)) "
+        "shows what each did and where a cell is empty — one produced no judgments at all, "
+        "one errored on most of the adversarial set, one ran partially."
+    ) in section
     assert "`strata doctor` names the judge and endpoint you are actually running" in section
     assert "so read it and pick" in section
     assert "A model id ages" in section
