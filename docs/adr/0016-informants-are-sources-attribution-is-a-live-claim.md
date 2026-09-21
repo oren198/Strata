@@ -147,8 +147,23 @@ make; until they do, "this is sensitive" is not a decline ground.
 
 ## The gap this leans on
 
-D1 admits a first-time informant's report on the same footing as a trusted
-one: Strata has no earned trust, so hearsay cannot be down-weighted by the
-informant's track record. The protection today is that hearsay is context,
-never corroborating, and falls when contradicted. Earned trust is a roadmap
-item, not a prerequisite for this ruling.
+**Amended 2026-09-22 (philosopher's ruling on #213).** This section first said
+that Strata has no earned trust, so a first-time informant's hearsay cannot be
+down-weighted by the informant's track record. That framed trust as a party's
+reputation, which the theory does not ask for: earned trust attaches to a
+memory ITEM and is revised by the outcomes of acting on it, never to a party.
+Weighing an item by who said it is the echo D3 forbids — the item still has
+one ground, merely heavier. Weighing it by how acting on it turned out is
+re-grounding in the theory's own sense: the item then stands partly on this
+scope's own evidence.
+
+So the gap is not a missing trust score. It is that **outcomes of acting on an
+item do not yet return to the item** — and that gap applies to all context,
+not to hearsay in particular. What protects this ruling today is unchanged:
+hearsay is context, never corroborating, and it falls when contradicted.
+
+A fleet that wants to lean on a recurring informant does not wait for a score.
+An authority grants that standing by directive ("treat the vendor-relationship
+owner's statements on vendor status as authoritative context"), or the party
+becomes a scope. Standing that matters is decided by position and is
+revisable; it is never accumulated by a score nobody decided.
