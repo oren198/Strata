@@ -2017,9 +2017,16 @@ def _rendered_binding_directive_ids(
     What the judge's ``directives_weighed`` and ``declined_by_directive`` are audited
     against: the directives that bind this scope from ABOVE — the ANCESTOR DIRECTIVES
     blocks and the OPERATOR MEMORY items of kind ``directive`` (operator context binds
-    nothing). This scope's own summary directives are deliberately not in the set: D5 is
-    the question of whether a scope may hold a CLASS of material at all, which its
-    ancestors and the operator answer.
+    nothing).
+
+    KNOWN LIMIT, chosen knowingly (v1.14 first cut): the binding set is ancestor and
+    operator directives. A scope's OWN summary directives are not weighed, so a
+    restricting directive decided in this scope ("we hold no customer account states")
+    does not yet produce a decline by directive. ADR 0016 D5's wording names the operator
+    or a containing scope; the theory binds a scope to its own directive too, since where
+    a directive was decided does not change that it binds its judge. Next cut: widen the
+    set to the scope's own directives, starting from j4-830 (the j4-822 content with the
+    restricting directive in the scope's own summary), which this cut is expected to fail.
 
     Computed from the same arguments the message is built from, never looked up, so the
     check can never disagree with the prompt about what "rendered" meant for this call.
