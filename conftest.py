@@ -7,6 +7,7 @@ is the installed location and would shadow worktree changes.
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -16,6 +17,74 @@ import pytest
 _worktree_src = str(Path(__file__).parent / "src")
 if _worktree_src not in sys.path:
     sys.path.insert(0, _worktree_src)
+
+# Child processes (`python -m strata`, hook scripts, the MCP server under test) resolve
+# `strata` from the environment, not from this process's sys.path — and the shared venv
+# is an editable install of the MAIN checkout. Put this tree's src first for them too (#205).
+_pythonpath = os.environ.get("PYTHONPATH", "").split(os.pathsep)
+if not _pythonpath or _pythonpath[0] != _worktree_src:
+    os.environ["PYTHONPATH"] = os.pathsep.join(
+        [_worktree_src, *(p for p in _pythonpath if p and p != _worktree_src)]
+    )
+
+
+def strata_import_problem(
+    strata_file: str, repo_root: Path, search_path: list[str] | None = None
+) -> str | None:
+    """Why the imported ``strata`` is not this tree's, or None when it is (#205).
+
+    Fine when the imported file lives under *repo_root*. Also fine when it lives
+    elsewhere but is a regular (non-editable) install of THIS tree: pip records the
+    source directory in the distribution's ``direct_url.json``. Anything else — the
+    shared venv's editable install of another checkout, the classic worktree trap —
+    is a problem, and the message carries the fix.
+    """
+    root = repo_root.resolve()
+    imported = Path(strata_file).resolve()
+    if imported.is_relative_to(root):
+        return None
+    if _installed_from(root, search_path):
+        return None
+    return (
+        f"strata was imported from {imported}, not from this tree ({root}). The tests "
+        "would exercise the wrong code. Fix: run with PYTHONPATH=$PWD/src, or install "
+        "this tree (pip install -e . / pip install .) into the environment running pytest."
+    )
+
+
+def _installed_from(root: Path, search_path: list[str] | None) -> bool:
+    """Whether an installed ``strata`` distribution was built from *root* (direct_url.json)."""
+    import importlib.metadata as md
+    import json
+    from urllib.parse import unquote, urlparse
+
+    kwargs = {"path": search_path} if search_path is not None else {}
+    for dist in md.distributions(**kwargs):
+        if (dist.metadata["Name"] or "").lower() != "strata":
+            continue
+        raw = dist.read_text("direct_url.json")
+        if not raw:
+            continue
+        try:
+            url = urlparse(json.loads(raw).get("url", ""))
+        except ValueError:
+            continue
+        if url.scheme == "file" and Path(unquote(url.path)).resolve() == root:
+            return True
+    return False
+
+
+def enforce_strata_import(repo_root: Path) -> None:
+    """Abort the run, loudly, if ``strata`` did not come from *repo_root* (#205)."""
+    import strata
+
+    problem = strata_import_problem(strata.__file__, repo_root)
+    if problem is not None:
+        pytest.exit(problem, returncode=3)
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    enforce_strata_import(Path(__file__).parent)
 
 
 @pytest.fixture(autouse=True)

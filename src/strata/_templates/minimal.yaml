@@ -17,6 +17,7 @@ strata:
 scopes:
   - id: g_root
     name: Root
+    # description: what this scope's memory is for (the judge uses it to tell what is irrelevant to it)
     stratum_id: L0
     default_skill: strata-worker
     # No permitted_skills restriction — any skill may bind while you are

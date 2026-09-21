@@ -282,6 +282,10 @@ def strict_blocks_so_far(state: SessionState) -> int:
 # ---------------------------------------------------------------------------
 
 
+#: File (in the sessions dir, not ``*.json``) recording that connect-time recording was off.
+CONNECT_SEAM_MARKER = ".connect-seam-unavailable"
+
+
 class SessionStateStore:
     """Owns the per-session JSON state files under a sessions directory.
 
@@ -383,6 +387,41 @@ class SessionStateStore:
             except (json.JSONDecodeError, ValueError, OSError):
                 unreadable += 1
         return states, unreadable
+
+    # ------------------------------------------------------------------
+    # The "connect seam unavailable" marker (#206)
+    # ------------------------------------------------------------------
+
+    @property
+    def _seam_marker_path(self) -> Path:
+        # Not `*.json`: the marker is not a session and must never be scanned as one.
+        return self._dir / CONNECT_SEAM_MARKER
+
+    def record_connect_seam_unavailable(self, reason: str, *, now: datetime | None = None) -> None:
+        """Note that a server ran WITHOUT connect-time recording (the MCP SDK seam moved).
+
+        Sessions that connect, read nothing and contribute nothing leave no file at all in
+        that case, so the write-back denominator may undercount. Keeps the first time it
+        was seen and updates the last.
+        """
+        stamp = (now or datetime.now(UTC)).isoformat()
+        existing = self.connect_seam_unavailable()
+        marker = {
+            "reason": reason,
+            "first_at": (existing or {}).get("first_at", stamp),
+            "last_at": stamp,
+        }
+        tmp = self._seam_marker_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(marker), encoding="utf-8")
+        os.replace(tmp, self._seam_marker_path)
+
+    def connect_seam_unavailable(self) -> dict | None:
+        """The marker (``reason``, ``first_at``, ``last_at``), or ``None`` if never written."""
+        try:
+            data = json.loads(self._seam_marker_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        return data if isinstance(data, dict) else None
 
     def all_states(self) -> list[SessionState]:
         """Return every readable session state in the directory.
@@ -950,6 +989,11 @@ class WritebackReport(BaseModel):
     """Open sessions left out of the counts (0 when ``include_open``)."""
     idle_window_seconds: int = DEFAULT_SESSION_IDLE_WINDOW_SECONDS
     """A session with no recorded end counts as ended once idle longer than this."""
+    denominator_may_undercount: bool = False
+    """True when a server ran without connect-time recording (#206): a session that
+    connected but never read or contributed left no file, so it is not in the counts."""
+    denominator_note: str | None = None
+    """What to tell the reader when :attr:`denominator_may_undercount` is true."""
 
 
 def _session_time(state: SessionState) -> str:
@@ -1077,7 +1121,18 @@ def compute_writeback_report(
                 target.strict_on += 1
 
     parsed_times = sorted(t for t in times if _parse_ts(t) is not None)
+    marker = store.connect_seam_unavailable()
+    note = None
+    if marker is not None:
+        note = (
+            f"denominator may undercount: since {marker.get('first_at', 'an unknown time')} a "
+            f"server ran without connect-time recording ({marker.get('reason', 'unknown')}), "
+            "so a session that connected but never read or contributed left no record and "
+            "is not counted; the write-back rate may read higher than it is."
+        )
     return WritebackReport(
+        denominator_may_undercount=marker is not None,
+        denominator_note=note,
         rows=list(rows.values()),
         overall=overall,
         strict_on=strict_on,

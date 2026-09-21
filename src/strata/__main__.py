@@ -912,6 +912,8 @@ def cmd_stats_writeback(args: argparse.Namespace) -> int:
     )
     if report.unreadable_files:
         print(f"Not counted: {report.unreadable_files} unreadable session file(s).")
+    if report.denominator_note:
+        print(f"Warning — {report.denominator_note}")
     return 0
 
 
@@ -1091,6 +1093,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
        set and valid against the fleet.
     9. Judge key (``JUDGE_API_KEY`` / ``ANTHROPIC_API_KEY``) resolvable —
        soft, like check 8's session-id half: never flips the exit code.
+    9b. The judge in effect (model and endpoint, with why) and, when a key
+        resolves, whether it answers — soft; failure prints the override lines.
     10. Refresh queue depth and oldest pending event (ADR 0014 D6, pin 4) —
         soft, purely informational: an unprocessed ``change_events`` row is
         an input change awaiting its refresh, never a judge outage.
@@ -1763,6 +1767,26 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     # -----------------------------------------------------------------------
     checks.append(_check_strata_on_path(project_root))
 
+    # -----------------------------------------------------------------------
+    # 8c. Every active scope states its purpose (#210). Soft: a scope without a
+    # description works, but the judge can only fall back to "the project's work"
+    # and cannot tell what is irrelevant to it. One warning per scope.
+    # -----------------------------------------------------------------------
+    if fleet_config is not None:
+        for scope in fleet_config.active_scopes():
+            if not scope.description:
+                checks.append(
+                    Check(
+                        name=f"Scope description ({scope.id})",
+                        kind="soft",
+                        passed=False,
+                        message=(
+                            "no description — the judge can't tell what's irrelevant to it; "
+                            "add one in fleet.yaml (a `description:` line under the scope)."
+                        ),
+                    )
+                )
+
     if _judge_key_visible(project_root):
         checks.append(
             Check(
@@ -1785,6 +1809,11 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                 ),
             )
         )
+
+    # 9b. The judge that will actually be used — model and endpoint, in every
+    # case — and, when a key resolves, whether it answers. Soft: never flips the
+    # exit code. A stranger must never meet a bare judge error on first run.
+    checks.append(_check_judge(project_root))
 
     # -----------------------------------------------------------------------
     # 10. Refresh queue (ADR 0014 D6, pin 4). Soft and purely informational —
@@ -2203,6 +2232,7 @@ def cmd_publication_bootstrap(args: argparse.Namespace) -> int:
         manager = ScopeManager(
             client=settings.build_judge_client(),
             model=settings.manager_model,
+            implied_purpose_min_words=settings.implied_purpose_min_words,
         )
 
         try:
@@ -2394,7 +2424,11 @@ def _refresh_stores(settings):  # noqa: ANN001, ANN201
     fleet_config = FleetConfig.load(Path(paths.fleet_yaml_path))
     record_store = RecordStore(paths.db_path)
     summary_store = SummaryStore(paths.summaries_dir)
-    manager = ScopeManager(client=settings.build_judge_client(), model=settings.manager_model)
+    manager = ScopeManager(
+        client=settings.build_judge_client(),
+        model=settings.manager_model,
+        implied_purpose_min_words=settings.implied_purpose_min_words,
+    )
     return fleet_config, record_store, summary_store, manager
 
 
@@ -2857,7 +2891,9 @@ def _self_install_spec() -> str | None:
 #: same thing.
 _JUDGE_KEY_LATER_NOTE = (
     "judge key: not set — add JUDGE_API_KEY=... to .env in this project "
-    "(or export it) when ready; contributions wait unjudged until then."
+    "(or export it) when ready; contributions wait unjudged until then. The default "
+    "judge is qwen/qwen3-235b-a22b-2507 on OpenRouter, so that key must be an OpenRouter "
+    "key; to judge with Anthropic instead, set ANTHROPIC_API_KEY."
 )
 
 
@@ -2878,6 +2914,130 @@ def _judge_key_visible(project_root: Path) -> bool:
 
     settings = Settings(_env_file=project_root / ".env")
     return bool(settings.judge_api_key or settings.anthropic_api_key)
+
+
+_JUDGE_MEASURED_DATE = "2026-09-20"
+
+
+def _judge_endpoint_label(base_url: str | None) -> str:
+    """``https://openrouter.ai/api`` -> ``openrouter.ai/api``; ``None`` -> the Anthropic host."""
+    if not base_url:
+        return "api.anthropic.com"
+    return base_url.split("://", 1)[-1].rstrip("/")
+
+
+def _judge_line(resolved: object) -> str:
+    """Which judge is in effect and why, for the doctor's ``Judge:`` line (no label of its own)."""
+    from strata.settings import (  # noqa: PLC0415
+        JUDGE_REASON_DEFAULT,
+        JUDGE_REASON_KEPT,
+    )
+
+    head = f"{resolved.model} @ {_judge_endpoint_label(resolved.base_url)}"  # type: ignore[attr-defined]
+    reason = resolved.reason  # type: ignore[attr-defined]
+    if reason == JUDGE_REASON_DEFAULT:
+        return f"{head} (default, measured {_JUDGE_MEASURED_DATE})"
+    if reason == JUDGE_REASON_KEPT:
+        return (
+            f"{head} (kept: an Anthropic key is set and no JUDGE_MODEL/JUDGE_BASE_URL; measured "
+            f'{_JUDGE_MEASURED_DATE} — see "Choosing a judge" in the README)'
+        )
+    return (
+        f"{head} (configured via JUDGE_*; the README's measurements cover only the "
+        'judges in its "Choosing a judge" table)'
+    )
+
+
+def _build_probe_client(resolved: object):  # -> anthropic.Anthropic
+    """A one-shot client for the doctor probe: short timeout, no retries."""
+    import anthropic  # noqa: PLC0415
+
+    kwargs: dict = {"api_key": resolved.api_key, "max_retries": 0, "timeout": 10.0}  # type: ignore[attr-defined]
+    if resolved.base_url:  # type: ignore[attr-defined]
+        kwargs["base_url"] = resolved.base_url  # type: ignore[attr-defined]
+    return anthropic.Anthropic(**kwargs)
+
+
+def _probe_judge_live(resolved: object) -> str | None:
+    """Ask the resolved judge for one token. ``None`` if it answered, else why it did not.
+
+    A ``messages.create(max_tokens=1)`` is the one call every Anthropic-Messages
+    endpoint (a router, a gateway) is guaranteed to serve; a model listing is not.
+    """
+    import anthropic  # noqa: PLC0415
+
+    model = resolved.model  # type: ignore[attr-defined]
+    try:
+        client = _build_probe_client(resolved)
+        client.messages.create(
+            model=model, max_tokens=1, messages=[{"role": "user", "content": "ping"}]
+        )
+    except anthropic.APIConnectionError as exc:
+        return f"the endpoint is unreachable ({type(exc).__name__})"
+    except anthropic.NotFoundError:
+        return f"the endpoint does not serve model id '{model}'"
+    except anthropic.AuthenticationError:
+        return "the endpoint rejected the key (wrong provider, or revoked?)"
+    except anthropic.APIStatusError as exc:
+        return f"the endpoint returned an error (HTTP {exc.status_code})"
+    except Exception as exc:  # noqa: BLE001 — a diagnostic must never crash doctor
+        return f"the judge could not be checked ({type(exc).__name__})"
+    return None
+
+
+def _probe_judge(resolved: object) -> str | None:
+    """Indirection so tests never touch the network (see tests/conftest.py)."""
+    return _probe_judge_live(resolved)
+
+
+def _check_judge(project_root: Path) -> Check:
+    """Doctor's judge line: what will judge, and (with a key) whether it answers."""
+    from strata.settings import Settings  # noqa: PLC0415
+
+    resolved = Settings(_env_file=project_root / ".env").resolved_judge
+    line = _judge_line(resolved)
+    if not resolved.api_key:
+        return Check(name="Judge", kind="soft", passed=True, message=line)
+    failure = _probe_judge(resolved)
+    if failure is None:
+        return Check(name="Judge", kind="soft", passed=True, message=line)
+    return Check(
+        name="Judge",
+        kind="soft",
+        passed=False,
+        message=(
+            f"{line}\n"
+            f"    {failure}. Contributions wait unjudged until this is fixed. "
+            "Set these in .env in this project (or export them):\n"
+            "      JUDGE_API_KEY=<a key for that endpoint's provider>\n"
+            f"      JUDGE_MODEL=<a model id that endpoint serves>   # now: {resolved.model}\n"
+            "      JUDGE_BASE_URL=<any Anthropic-Messages endpoint>  "
+            f"# now: {_judge_endpoint_label(resolved.base_url)}"
+        ),
+    )
+
+
+def _interactive_terminal() -> bool:
+    """Whether both ends of the terminal are interactive (a person is there to ask)."""
+    return sys.stdin.isatty() and sys.stdout.isatty()
+
+
+def _ask_scope_description(*, allowed: bool) -> str | None:
+    """Ask for the first scope's description (#210); blank, EOF or a non-tty is fine.
+
+    Never blocks a CI/non-interactive run: with ``allowed`` false (``--yes``), or no
+    terminal, it does not ask. A blank answer means no description, which is the default.
+    """
+    if not allowed or not _interactive_terminal():
+        return None
+    try:
+        answer = input(
+            "What is this scope's memory for? One line — the judge uses it to tell what "
+            "is irrelevant (Enter to skip): "
+        )
+    except (EOFError, OSError, KeyboardInterrupt):
+        return None
+    return answer.strip() or None
 
 
 def _offer_judge_key_capture(project_root: Path, *, skip_prompt: bool) -> None:
@@ -2918,9 +3078,12 @@ def _offer_judge_key_capture(project_root: Path, *, skip_prompt: bool) -> None:
 
     try:
         value = getpass.getpass(
-            "Judge key — the LLM that reviews contributions (Anthropic, or any "
-            "Messages-API endpoint). Paste to store it in .env, or press Enter "
-            "to skip: "
+            "Judge key — the LLM that reviews contributions. The default judge is "
+            "qwen/qwen3-235b-a22b-2507 on OpenRouter, so paste an OpenRouter key "
+            "(openrouter.ai/keys) to store it in .env; to use Anthropic instead, "
+            "paste an Anthropic key, or press Enter to skip and set ANTHROPIC_API_KEY "
+            "yourself (any other Messages-API endpoint: JUDGE_BASE_URL + JUDGE_MODEL). "
+            "Paste key, or Enter to skip: "
         )
     except (EOFError, OSError, KeyboardInterrupt):
         value = ""
@@ -2944,6 +3107,25 @@ def _offer_judge_key_capture(project_root: Path, *, skip_prompt: bool) -> None:
     action = install.write_env_judge_key(env_path, value)
     verb = {"created": "wrote", "replaced": "updated", "appended": "appended to"}[action]
     print(f"judge key: {verb} {env_path.relative_to(project_root)}")
+
+    # Write the model and endpoint beside the key so the .env states what the key is for
+    # — but only for a key that is not an Anthropic key: pairing an sk-ant- key with the
+    # OpenRouter default would send it to the wrong provider. An Anthropic key alone
+    # resolves to claude-haiku-4-5 on api.anthropic.com (settings.resolve_judge).
+    if value.startswith("sk-ant-"):
+        print(_judge_line_for_register("claude-haiku-4-5", None))
+        return
+    wrote = install.write_env_judge_defaults(env_path)
+    if wrote:
+        print(f"judge: wrote {', '.join(wrote)} beside the key — {_judge_line_for_register()}")
+    else:
+        print("judge: left your existing JUDGE_* lines as they are")
+
+
+def _judge_line_for_register(
+    model: str = "qwen/qwen3-235b-a22b-2507", base_url: str | None = "https://openrouter.ai/api"
+) -> str:
+    return f"judge: {model} @ {_judge_endpoint_label(base_url)}"
 
 
 def _store_rel(path: Path, project_root: Path) -> str:
@@ -3301,6 +3483,16 @@ def cmd_register(args: argparse.Namespace) -> int:
     if fleet_yaml.exists():
         _act("skip", fleet_yaml, skipped=True)
     else:
+        # The first scope's description (#210): the flag, else ask when a person is
+        # there to answer. Only ever for a fleet this run seeds; never in --diff.
+        scope_description: str | None = None
+        if not diff_mode:
+            flagged = getattr(args, "description", None)
+            scope_description = (
+                flagged.strip() or None
+                if flagged is not None
+                else _ask_scope_description(allowed=not getattr(args, "yes", False))
+            )
         if not diff_mode:
             # The configured fleet path can point anywhere (issue #184),
             # including a directory that no longer exists — e.g. the
@@ -3317,6 +3509,13 @@ def cmd_register(args: argparse.Namespace) -> int:
                     "strata:\n  - id: L0\n    name: root\n    ordinal: 0\n"
                     "scopes:\n  - id: g_root\n    name: Root\n    stratum_id: L0\n"
                     "edges: []\n",
+                    encoding="utf-8",
+                )
+            if scope_description:
+                fleet_yaml.write_text(
+                    install.seed_scope_description(
+                        fleet_yaml.read_text(encoding="utf-8"), scope_description
+                    ),
                     encoding="utf-8",
                 )
         _act("seeded", fleet_yaml)
@@ -5006,6 +5205,17 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "Idempotent brownfield installer — create .strata/config.toml, "
             "seed fleet.yaml, copy skills, merge MCP entry."
+        ),
+    )
+    p_register.add_argument(
+        "--description",
+        dest="description",
+        default=None,
+        metavar="TEXT",
+        help=(
+            "What the first scope's memory is for — written to the seeded fleet.yaml. "
+            "The judge measures relevance against it. Without the flag, an interactive "
+            "run asks once (blank is fine); a non-interactive run never asks."
         ),
     )
     p_register.add_argument(

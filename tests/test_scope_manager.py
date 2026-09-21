@@ -78,6 +78,12 @@ NEW_CONTRIBUTION = Contribution(
     created_at="2026-05-01T10:00:00+00:00",
 )
 
+#: A valid ground for the many tests that retire a directive for some other reason
+#: (#209): the changed circumstance, stated in words that do not restate a removal.
+_CIRCUMSTANCE = (
+    "the naming convention was replaced by a linter-enforced standard in the new toolchain"
+)
+
 EXISTING_DIRECTIVE = Directive(
     id="c_old001",
     content="Use snake_case for all identifiers.",
@@ -685,7 +691,9 @@ def test_decline_with_directive_ops_raises() -> None:
     bad_input = {
         "decision": "decline",
         "reasoning": "Declining.",
-        "directive_ops": [{"op": "retire", "id": EXISTING_DIRECTIVE.id}],
+        "directive_ops": [
+            {"op": "retire", "id": EXISTING_DIRECTIVE.id, "changed_circumstance": _CIRCUMSTANCE}
+        ],
         "new_context": None,
     }
     manager, _ = _make_manager(bad_input)
@@ -1523,7 +1531,7 @@ def test_entitlement_block_present_with_correct_groups() -> None:
     descendants_names_idx = content.index(f"{DESCENDANT_SCOPE.id} ({DESCENDANT_SCOPE.name})")
     peer_header_idx = content.index("entitled for CONTEXT only")
     peer_names_idx = content.index(f"{PEER_SCOPE.id} ({PEER_SCOPE.name})")
-    other_header_idx = content.index("NOT entitled")
+    other_header_idx = content.index("no channel to this scope")
     other_names_idx = content.index(f"{OTHER_SCOPE.id} ({OTHER_SCOPE.name})")
 
     assert (
@@ -2694,7 +2702,10 @@ def test_j1_untouched_directive_rows_are_byte_identical_across_judgments() -> No
             {"op": "publish", "content": "Ratified: keep interfaces narrow."},
             _contribution("c_a2", "Several teams keep interfaces narrow."),
         ),
-        ({"op": "retire", "id": doomed.id}, _contribution("c_a3", "That rule is obsolete.")),
+        (
+            {"op": "retire", "id": doomed.id, "changed_circumstance": _CIRCUMSTANCE},
+            _contribution("c_a3", "That rule is obsolete."),
+        ),
     ]
 
     for op, contribution in amendments:
@@ -2915,7 +2926,13 @@ def test_retire_op_removes_the_directive_and_is_reported_for_the_record() -> Non
             {
                 "decision": "accept_as_context",
                 "reasoning": "the naming rule no longer applies",
-                "directive_ops": [{"op": "retire", "id": EXISTING_DIRECTIVE.id}],
+                "directive_ops": [
+                    {
+                        "op": "retire",
+                        "id": EXISTING_DIRECTIVE.id,
+                        "changed_circumstance": _CIRCUMSTANCE,
+                    }
+                ],
                 "new_context": "ctx",
             }
         ),
@@ -2958,7 +2975,9 @@ def _retire_input(directive_id: str, *, reasoning: str = "retiring") -> dict:
     return {
         "decision": "accept_as_context",
         "reasoning": reasoning,
-        "directive_ops": [{"op": "retire", "id": directive_id}],
+        "directive_ops": [
+            {"op": "retire", "id": directive_id, "changed_circumstance": _CIRCUMSTANCE}
+        ],
         "new_context": "Context after the retirement.",
     }
 
@@ -3000,7 +3019,10 @@ def test_invalid_id_twice_drops_the_op_and_notes_it_without_losing_the_verdict()
     first = {
         "decision": "accept_as_directive",
         "reasoning": "admitting the new rule and retiring a stale one",
-        "directive_ops": [{"op": "append"}, {"op": "retire", "id": "c_ghost"}],
+        "directive_ops": [
+            {"op": "append"},
+            {"op": "retire", "id": "c_ghost", "changed_circumstance": _CIRCUMSTANCE},
+        ],
         "new_context": "Context after the amendment.",
     }
     mock_client = MagicMock()
@@ -3050,7 +3072,10 @@ def test_an_op_naming_an_ancestor_directive_is_dropped_as_an_invalid_target() ->
     verdict = {
         "decision": "accept_as_directive",
         "reasoning": "admitting the new rule and retiring the inherited one",
-        "directive_ops": [{"op": "append"}, {"op": "retire", "id": ancestor_directive_id}],
+        "directive_ops": [
+            {"op": "append"},
+            {"op": "retire", "id": ancestor_directive_id, "changed_circumstance": _CIRCUMSTANCE},
+        ],
         "new_context": "Context after the amendment.",
     }
     mock_client = MagicMock()
@@ -3106,8 +3131,8 @@ def test_already_retired_id_named_twice_is_invalid() -> None:
         "decision": "accept_as_context",
         "reasoning": "retiring",
         "directive_ops": [
-            {"op": "retire", "id": EXISTING_DIRECTIVE.id},
-            {"op": "retire", "id": EXISTING_DIRECTIVE.id},
+            {"op": "retire", "id": EXISTING_DIRECTIVE.id, "changed_circumstance": _CIRCUMSTANCE},
+            {"op": "retire", "id": EXISTING_DIRECTIVE.id, "changed_circumstance": _CIRCUMSTANCE},
         ],
         "new_context": "ctx",
     }
@@ -3460,7 +3485,11 @@ def test_input_change_refresh_amendment_drops_admitting_ops_keeps_lifecycle() ->
             "directive_ops": [
                 {"op": "append"},
                 {"op": "publish", "content": "Something new."},
-                {"op": "retire", "id": EXISTING_DIRECTIVE.id},
+                {
+                    "op": "retire",
+                    "id": EXISTING_DIRECTIVE.id,
+                    "changed_circumstance": _CIRCUMSTANCE,
+                },
             ],
             "new_context": "Reconciled context.",
         }
@@ -4089,7 +4118,7 @@ def test_lifecycle_op_without_a_contribution_id_is_dropped_too() -> None:
     unattributed_retire = _batch_input(
         directive_ops=[
             {"op": "append", "contribution_id": NEW_CONTRIBUTION.id},
-            {"op": "retire", "id": EXISTING_DIRECTIVE.id},
+            {"op": "retire", "id": EXISTING_DIRECTIVE.id, "changed_circumstance": _CIRCUMSTANCE},
         ]
     )
     mock_client = MagicMock()
@@ -4119,6 +4148,7 @@ def test_lifecycle_op_attributed_to_a_declined_member_is_a_parse_failure() -> No
             {
                 "op": "retire",
                 "id": EXISTING_DIRECTIVE.id,
+                "changed_circumstance": _CIRCUMSTANCE,
                 "contribution_id": THIRD_CONTRIBUTION.id,
             },
         ]
@@ -4196,7 +4226,12 @@ def test_invalid_directive_id_in_a_batch_is_dropped_and_noted_on_its_own_op() ->
     ghost_retire = _batch_input(
         directive_ops=[
             {"op": "append", "contribution_id": NEW_CONTRIBUTION.id},
-            {"op": "retire", "id": "c_ghost", "contribution_id": SECOND_CONTRIBUTION.id},
+            {
+                "op": "retire",
+                "id": "c_ghost",
+                "changed_circumstance": _CIRCUMSTANCE,
+                "contribution_id": SECOND_CONTRIBUTION.id,
+            },
         ]
     )
     mock_client = MagicMock()
@@ -4361,7 +4396,9 @@ def test_change_id_survives_the_invalid_op_drop() -> None:
     payload = {
         "decision": "accept_as_directive",
         "reasoning": "admitted",
-        "directive_ops": [{"op": "retire", "id": "c_nosuch"}],
+        "directive_ops": [
+            {"op": "retire", "id": "c_nosuch", "changed_circumstance": _CIRCUMSTANCE}
+        ],
         "new_context": None,
     }
     manager, _ = _make_manager(payload)
@@ -5006,7 +5043,9 @@ def test_retire_op_target_is_checked_the_same_way() -> None:
     retiring = {
         "decision": "accept_as_context",
         "reasoning": "The naming rule is withdrawn.",
-        "directive_ops": [{"op": "retire", "id": EXISTING_DIRECTIVE.id}],
+        "directive_ops": [
+            {"op": "retire", "id": EXISTING_DIRECTIVE.id, "changed_circumstance": _CIRCUMSTANCE}
+        ],
         "new_context": f"Formerly the rule was: {EXISTING_DIRECTIVE.content}",
     }
     mock_client = MagicMock()
@@ -5227,7 +5266,8 @@ def test_system_prompt_forbids_declining_context_for_lacking_directive_weight() 
     # The grounds are named, so "decline" has a closed list to answer to.
     assert "it contradicts a directive or operator memory binding this scope" in flat
     assert "it duplicates or restates what this scope's memory already holds" in flat
-    assert "its substantive origin is outside this scope's entitlement" in flat
+    assert "it is manufactured attribution (no one stands behind it)" in flat
+    assert "it falls in a class of material a directive binding this scope restricts" in flat
     assert "it asserts authority or ratification the rendered message does not show" in flat
     # And the observed non-grounds are named as non-grounds, in the judge's words.
     assert "Lacking directive weight, being an observation rather than a decision" in flat
@@ -5458,3 +5498,80 @@ def test_an_empty_response_is_re_asked_without_echoing_an_empty_assistant_turn()
     assert all(m["role"] != "assistant" or m["content"] for m in second_messages)
     assert second_messages[-1]["role"] == "user"
     assert "submit_judgment" in second_messages[-1]["content"][0]["text"]
+
+
+# ---------------------------------------------------------------------------
+# Issue #212 — ADR 0016: informants are sources; attribution is a live claim
+# ---------------------------------------------------------------------------
+
+
+def _flat_prompt() -> str:
+    return " ".join(_SYSTEM_PROMPT.split())
+
+
+def test_system_prompt_names_exactly_three_grounds() -> None:
+    flat = _flat_prompt()
+    assert "every claim stands on a GROUND" in flat
+    assert "(1) FIRST-HAND" in flat
+    assert "(2) AN INFORMANT'S WORD" in flat
+    assert "(3) ANOTHER SCOPE'S JUDGED ACT" in flat
+    assert "(4)" not in _SYSTEM_PROMPT.split("STEP 2")[0].split("STEP 1")[1]
+
+
+def test_system_prompt_declines_manufactured_attribution_naming_the_missing_speaker() -> None:
+    flat = _flat_prompt()
+    assert "MANUFACTURED ATTRIBUTION is DECLINED" in flat
+    assert "with NOBODY standing behind it" in flat
+    assert "Your reasoning must name the MISSING SPEAKER" in flat
+    assert "NEVER give the material's topic or origin as the reason" in flat
+
+
+def test_system_prompt_admits_informant_word_as_hearsay_standing_on_the_informant() -> None:
+    flat = _flat_prompt()
+    assert "identified by name or by role or affiliation" in flat
+    assert "admitted as HEARSAY CONTENT" in flat
+    assert "standing on the informant, never on B" in flat
+    assert '"<informant> reports that ..."' in flat
+
+
+def test_system_prompt_hearsay_is_never_a_directive_whatever_was_proposed() -> None:
+    flat = _flat_prompt()
+    assert "Hearsay is context only" in flat
+    assert "an informant supplies evidence, never authority" in flat
+    assert "admit informant-sourced material as CONTEXT, never as a directive" in flat
+    assert "It never corroborates anything that scope later publishes" in flat
+
+
+def test_system_prompt_separates_conduct_from_interior() -> None:
+    flat = _flat_prompt()
+    assert "what another scope DID in its dealings with this one" in flat
+    assert "Observing another scope's conduct is first-hand and is admitted" in flat
+    assert "that is what the scope BELIEVES, and only that scope may say so outward" in flat
+
+
+def test_system_prompt_declines_a_restricted_class_by_directive_not_by_origin() -> None:
+    flat = _flat_prompt()
+    assert "Origin alone is never a decline ground" in flat
+    assert "DECLINE BY DIRECTIVE and name that directive" in flat
+    assert "With no such directive, admit." in flat
+
+
+def test_system_prompt_retires_the_courier_reading() -> None:
+    flat = _flat_prompt()
+    assert "OBSCURES its origin" not in flat
+    assert "not entitled" not in flat.lower().split("step 2")[0]
+    assert "material substantively originating" not in flat
+
+
+def test_system_prompt_a_role_identifies_the_speaker_so_role_informants_admit() -> None:
+    """#212 rev 2 — 'the group one desk over mentioned' is hearsay, not manufactured."""
+    flat = _flat_prompt()
+    assert (
+        "can you point at someone — even only by role or affiliation — who SPOKE TO THE AGENT"
+        in flat
+    )
+    assert "A group or role named as the speaker is still a speaker" in flat
+    assert "If you can point at a person, even by role, it is hearsay and admits" in flat
+    assert "the ABSENCE of any telling act" in flat
+    assert "not even one identified only by role" in flat
+    assert "Use this reason ONLY when the contribution has no telling act at all" in flat
