@@ -363,6 +363,29 @@ JUDGE_TOOL: dict = {
                     "item."
                 ),
             },
+            "directives_weighed": {
+                "type": ["array", "null"],
+                "items": {"type": "string"},
+                "description": (
+                    "v1.14 M1 (ADR 0016 D5): the ids of the binding directives you weighed "
+                    "against THIS contribution — ids exactly as rendered under ANCESTOR "
+                    "DIRECTIVES and as OPERATOR MEMORY directives, including any you checked "
+                    "and set aside. Whether this scope may hold a class of material is a "
+                    "directive question, and this is where you answer it: a verdict that "
+                    "names none of the directives rendered is sent back. Empty only when no "
+                    "binding directive was rendered."
+                ),
+            },
+            "declined_by_directive": {
+                "type": ["string", "null"],
+                "description": (
+                    "decline only: the id of the binding directive whose restriction on a "
+                    "CLASS of material this contribution falls in grounds the decline. Null "
+                    "for every other decline and for every accept. It must be an id "
+                    "rendered to you: a decline cannot be grounded in a directive this "
+                    "scope does not hold."
+                ),
+            },
         },
         "required": ["decision", "reasoning", "directive_ops", "new_context"],
     },
@@ -402,6 +425,10 @@ def _build_batch_judge_tool() -> dict:
     schema = copy.deepcopy(JUDGE_TOOL["input_schema"])
     schema["properties"].pop("decision")
     schema["properties"].pop("reasoning")
+    # Directive attestation (v1.14 M1) is a single-judgment obligation for now; the batch
+    # verdicts carry neither field, so the tool does not offer them.
+    schema["properties"].pop("directives_weighed")
+    schema["properties"].pop("declined_by_directive")
     schema["properties"]["directive_ops"] = op_schema
     schema["properties"]["verdicts"] = {
         "type": "array",
@@ -575,7 +602,11 @@ personal data, secrets) is a decision a DIRECTIVE makes: when a directive bindin
 scope — an ANCESTOR DIRECTIVE or OPERATOR MEMORY item — restricts the class this
 contribution falls in, DECLINE BY DIRECTIVE and name that directive ("Declined by
 directive <id or subject>: <what it restricts>"), never by origin. With no such
-directive, admit.
+directive, admit. Record this in the verdict itself: list in `directives_weighed` the ids of
+the binding directives (the ANCESTOR DIRECTIVES and OPERATOR MEMORY directives rendered to
+you) you weighed against this contribution, and when a decline rests on a restricting
+directive set `declined_by_directive` to its id — a decline cannot be grounded in a
+directive that was not rendered to you.
 
 Hearsay is context only: an informant supplies evidence, never authority (ADR 0016
 D4). Whatever classification was proposed — even "making that our directive now" —
@@ -1977,6 +2008,161 @@ def _with_superseded_context_note(reasoning: str, dropped: bool) -> str:
     )
 
 
+def _rendered_binding_directive_ids(
+    ancestor_directives: Sequence[tuple[str, Sequence[Directive]]] | None,
+    operator_memory: Sequence[tuple[str, Sequence[OperatorItem]]] | None,
+) -> list[str]:
+    """The binding-directive ids a judge call renders (v1.14 M1, ADR 0016 D5).
+
+    What the judge's ``directives_weighed`` and ``declined_by_directive`` are audited
+    against: the directives that bind this scope from ABOVE — the ANCESTOR DIRECTIVES
+    blocks and the OPERATOR MEMORY items of kind ``directive`` (operator context binds
+    nothing). This scope's own summary directives are deliberately not in the set: D5 is
+    the question of whether a scope may hold a CLASS of material at all, which its
+    ancestors and the operator answer.
+
+    Computed from the same arguments the message is built from, never looked up, so the
+    check can never disagree with the prompt about what "rendered" meant for this call.
+    """
+    ids: list[str] = []
+    for _ancestor_scope_id, directives in ancestor_directives or ():
+        ids.extend(d.id for d in directives)
+    for _attachment_scope_id, items in operator_memory or ():
+        ids.extend(item.id for item in items if item.kind == "directive")
+    return list(dict.fromkeys(ids))
+
+
+def _parse_id_list(raw: object) -> list[str]:
+    """A list of ids from a tool field, tolerating a JSON-encoded or comma-joined string."""
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return []
+        try:
+            decoded = json.loads(text)
+        except ValueError:
+            decoded = [part.strip() for part in text.split(",")]
+        raw = decoded
+    if not isinstance(raw, list):
+        return []
+    return [str(x).strip() for x in raw if isinstance(x, str | int) and str(x).strip()]
+
+
+#: How a judgment's directive check stands (v1.14 M1).
+ATTEST_NOT_REQUIRED = "not_required"  # no binding directive was rendered
+ATTEST_ATTESTED = "attested"
+ATTEST_NOT_ATTESTED = "not_attested"  # the verdict stands, but the check was not attested
+
+
+def _attestation_problem(judgment: object, rendered_ids: Sequence[str]) -> str | None:
+    """Why *judgment*'s directive attestation is malformed, or ``None`` if it is fine.
+
+    Mechanical: names none of the rendered directives; names one that is not rendered;
+    grounds a decline in a directive the scope does not hold; or carries a ground on a
+    verdict that is not a decline. Only the ids and the shape are checked — never
+    whether the directives named actually bear on the contribution.
+    """
+    rendered = set(rendered_ids)
+    weighed: list[str] = getattr(judgment, "directives_weighed", [])
+    ground: str | None = getattr(judgment, "declined_by_directive", None)
+    decision = getattr(judgment, "decision", None)
+    problems: list[str] = []
+    if rendered and not weighed:
+        problems.append("`directives_weighed` names none of the binding directives rendered")
+    unknown = [i for i in weighed if i not in rendered]
+    # With nothing rendered there is nothing to attest and nothing worth a call: stray ids
+    # are dropped at finalize without a re-ask.
+    if unknown and rendered:
+        problems.append(f"`directives_weighed` names {', '.join(unknown)}, which are not rendered")
+    if ground is not None:
+        if ground not in rendered:
+            problems.append(
+                f"`declined_by_directive` names {ground}, a directive this scope does not hold"
+            )
+        elif decision != "decline":
+            problems.append("`declined_by_directive` is set on a verdict that is not a decline")
+    return "; ".join(problems) or None
+
+
+def _attestation_corrective(problem: str, rendered_ids: Sequence[str]) -> str:
+    """The one re-ask for a malformed attestation. Neutral: it asks for the accounting,
+    never for a particular verdict."""
+    listed = (
+        ", ".join(rendered_ids) if rendered_ids else "(none — no binding directive was rendered)"
+    )
+    return (
+        f"Your submit_judgment call did not account for this scope's binding directives: "
+        f"{problem}. The binding directives rendered to you are: {listed}. Call "
+        "submit_judgment again: set `directives_weighed` to the ids of the binding "
+        "directives you weighed against this contribution, and if one of them restricts "
+        "the class of material this contribution falls in, decline and set "
+        "`declined_by_directive` to that id; leave it null for any other verdict. If "
+        "weighing them changes your verdict, change it; if it does not, keep it."
+    )
+
+
+def _finalize_attestation(judgment, rendered_ids: Sequence[str]):  # noqa: ANN001, ANN202
+    """Set *judgment*'s attestation state and keep only what the scope actually holds.
+
+    Runs once, on whichever judgment survived the correctives. It never changes the
+    verdict or the amendment: an unattested check is recorded, not punished (the
+    contributor did nothing wrong). Ids the scope does not hold are removed — a decline
+    cannot be grounded in a directive that is not there — and the removal is kept for
+    the record note.
+    """
+    rendered = set(rendered_ids)
+    problem = _attestation_problem(judgment, rendered_ids)
+    weighed = [i for i in judgment.directives_weighed if i in rendered]
+    ground = judgment.declined_by_directive
+    dropped_ground = None
+    if ground is not None and (ground not in rendered or judgment.decision != "decline"):
+        dropped_ground = ground
+        ground = None
+    if not rendered and problem is None and dropped_ground is None:
+        state = ATTEST_NOT_REQUIRED
+    else:
+        state = ATTEST_NOT_ATTESTED if problem is not None else ATTEST_ATTESTED
+    return judgment.model_copy(
+        update={
+            "directives_weighed": weighed,
+            "declined_by_directive": ground,
+            "dropped_declined_by_directive": dropped_ground,
+            "rendered_directive_ids": list(rendered_ids),
+            "attestation": state,
+        }
+    )
+
+
+def _with_attestation_note(reasoning: str, judgment: object) -> str:
+    """Return *reasoning* plus the fixed-format directive-attestation line (v1.14 M1).
+
+    Fixed format so the record and the declines view read the same on every row, and
+    "names ALL rendered directives or a subset" is a grep, not a reading:
+    ``[Directives weighed: a, b (2 of 3 rendered)]``, ``[Declined by directive: a]``,
+    ``[Directive check not attested after re-ask]``.
+    """
+    rendered = getattr(judgment, "rendered_directive_ids", [])
+    state = getattr(judgment, "attestation", ATTEST_NOT_REQUIRED)
+    dropped = getattr(judgment, "dropped_declined_by_directive", None)
+    if not rendered and dropped is None:
+        return reasoning
+    parts = [reasoning]
+    if rendered:
+        weighed = getattr(judgment, "directives_weighed", [])
+        names = ", ".join(weighed) if weighed else "none"
+        parts.append(f" [Directives weighed: {names} ({len(weighed)} of {len(rendered)} rendered)]")
+    ground = getattr(judgment, "declined_by_directive", None)
+    if ground:
+        parts.append(f" [Declined by directive: {ground}]")
+    if dropped:
+        parts.append(f" [Ground {dropped} not held by this scope; not used]")
+    if state == ATTEST_NOT_ATTESTED:
+        parts.append(" [Directive check not attested after re-ask]")
+    return "".join(parts)
+
+
 def _with_protocol_notes(reasoning: str, protocol_notes: Sequence[str]) -> str:
     """Return *reasoning* plus a mechanical note per protocol repair (#201).
 
@@ -2014,6 +2200,25 @@ class ScopeManagerJudgment(_AmendmentJudgment):
     reasoning: str
     """Brief explanation of the verdict — written to the judgment record."""
 
+    directives_weighed: list[str] = Field(default_factory=list)
+    """The binding-directive ids the judge says it weighed (v1.14 M1) — only ids this
+    scope actually holds (the rest are dropped at finalize)."""
+
+    declined_by_directive: str | None = None
+    """For a decline grounded in a restricting directive: WHICH one (ADR 0016 D5)."""
+
+    rendered_directive_ids: list[str] = Field(default_factory=list)
+    """The binding-directive ids that were rendered to the call — what the two fields
+    above are audited against, and the denominator of "N of M rendered"."""
+
+    dropped_declined_by_directive: str | None = None
+    """A ground the judge named that this scope does not hold (kept for the note)."""
+
+    attestation: Literal["not_required", "attested", "not_attested"] = "not_required"
+    """How the directive check stands: ``not_required`` (nothing rendered), ``attested``,
+    or ``not_attested`` (the one re-ask did not produce a well-formed attestation; the
+    verdict stands and the record says so)."""
+
     @property
     def record_notes(self) -> str:
         """The verdict text written to the judgment record.
@@ -2030,7 +2235,9 @@ class ScopeManagerJudgment(_AmendmentJudgment):
             _with_superseded_context_note(
                 _with_dropped_context_note(
                     _with_dropped_sources_note(
-                        _with_dropped_note(self.reasoning, self.dropped_ops),
+                        _with_dropped_note(
+                            _with_attestation_note(self.reasoning, self), self.dropped_ops
+                        ),
                         self.dropped_context_sources,
                     ),
                     self.dropped_new_context,
@@ -3186,6 +3393,10 @@ class ScopeManager:
         rendered_item_ids = _rendered_publication_item_ids(
             current_publication, peer_publications, parent_publication
         )
+        # v1.14 M1: what the judge's directive attestation is audited against.
+        rendered_directive_ids = _rendered_binding_directive_ids(
+            ancestor_directives, operator_memory
+        )
 
         def _parse(block) -> ScopeManagerJudgment:  # noqa: ANN001 — tool_use block
             return self._parse_judgment(
@@ -3204,7 +3415,17 @@ class ScopeManager:
                 change_id=change_id,
                 hop=hop,
                 rendered_item_ids=rendered_item_ids,
+                rendered_directive_ids=rendered_directive_ids,
             )
+
+        def _attest_problem(judgment: ScopeManagerJudgment) -> str | None:
+            return _attestation_problem(judgment, rendered_directive_ids)
+
+        def _attest_corrective(problem: str) -> str:
+            return _attestation_corrective(problem, rendered_directive_ids)
+
+        def _attest_finalize(judgment: ScopeManagerJudgment) -> ScopeManagerJudgment:
+            return _finalize_attestation(judgment, rendered_directive_ids)
 
         def _invalid_ops(judgment: ScopeManagerJudgment) -> list[DirectiveOp]:
             _, invalid = _partition_ops(judgment.directive_ops, current_summary)
@@ -3322,6 +3543,9 @@ class ScopeManager:
             stale_claims=_stale_claims,
             stale_claim_corrective=_stale_claim_corrective,
             drop_stale_context=_drop_stale_context,
+            attestation_problem=_attest_problem,
+            attestation_corrective=_attest_corrective,
+            finalize_attestation=_attest_finalize,
         )
 
     def _call_with_correctives(
@@ -3344,6 +3568,9 @@ class ScopeManager:
         stale_claims: Callable[[_JudgmentT], list[str]] | None = None,
         stale_claim_corrective: Callable[[Sequence[str]], str] | None = None,
         drop_stale_context: Callable[[_JudgmentT], _JudgmentT] | None = None,
+        attestation_problem: Callable[[_JudgmentT], str | None] | None = None,
+        attestation_corrective: Callable[[str], str] | None = None,
+        finalize_attestation: Callable[[_JudgmentT], _JudgmentT] | None = None,
     ) -> _JudgmentT:
         """Run one judgment call and its correctives, one retry each.
 
@@ -3510,6 +3737,42 @@ class ScopeManager:
             # must build on the retry's conversation, not the discarded first
             # turn.
             first_messages = retry_messages
+
+        # Directive attestation (v1.14 M1, ADR 0016 D5). A verdict that names none of
+        # the binding directives rendered — or grounds a decline in one the scope does
+        # not hold — is malformed, and gets the ONE re-ask the protocol path gets: the
+        # same single budget (a slip already re-asked leaves none), the same corrective
+        # turn. Two deliberate differences from every other stage here:
+        #
+        # * The retry is adopted whatever its decision. The re-ask exists so the judge
+        #   weighs the directives, and weighing them may flip accept into decline (a
+        #   restricting directive) — the very outcome the text correctives discard.
+        # * It never raises. After the re-ask an unattested verdict is USED AS RETURNED
+        #   and the record says so (`_finalize_attestation`): the contributor did
+        #   nothing wrong, so the judge's failure to attest must not cost them their
+        #   contribution — the protocol path's "second slip propagates" would.
+        if attestation_problem is not None and attestation_corrective is not None:
+            problem = attestation_problem(judgment)
+            if problem is not None and not protocol_notes:
+                retry_messages = [
+                    *first_messages,
+                    *_corrective_turn(response, tool_use_block, attestation_corrective(problem)),
+                ]
+                try:
+                    retry_response = _call(retry_messages)
+                    retry_block = self._extract_tool_use_block(retry_response)
+                    retry_judgment = parse(retry_block)
+                except Exception:  # noqa: BLE001 — deliberate: retry is best-effort
+                    retry_judgment = None
+                if retry_judgment is not None:
+                    judgment = retry_judgment
+                    response = retry_response
+                    tool_use_block = retry_block
+                    first_messages = retry_messages
+                    protocol_notes.append(
+                        "Corrective re-ask: the first response did not account for the "
+                        "binding directives."
+                    )
 
         # Invalid-id corrective (ADR 0011 D1): an op naming a directive id
         # that is not in the current summary — or, in a batch, a contribution
@@ -3678,6 +3941,9 @@ class ScopeManager:
                 if second_judgment is not None and second_judgment.new_summary is not None:
                     judgment = second_judgment
 
+        if finalize_attestation is not None:
+            judgment = finalize_attestation(judgment)
+
         if protocol_notes:
             # Issue #201: whichever judgment survived the correctives above
             # carries the record's note about the protocol re-ask that
@@ -3719,6 +3985,11 @@ class ScopeManager:
         sequentially inside the call, each against the summary as amended by
         its predecessors, so the verdicts are the ones serial judgment would
         produce; one declined contribution never costs the others theirs.
+
+        KNOWN LIMIT (v1.14 M1): the directive attestation (``directives_weighed`` /
+        ``declined_by_directive``, ADR 0016 D5) is NOT applied on a coalesced batch of two
+        or more — the batch tool offers neither field, so a restricting directive is
+        unenforced there. A batch of one goes through :meth:`judge` and is attested.
 
         A batch of ONE is not batched at all: it delegates to :meth:`judge`
         and wraps the result, so the single-contribution call — its tool
@@ -4182,6 +4453,7 @@ class ScopeManager:
         change_id: str | None = None,
         hop: int = 0,
         rendered_item_ids: Sequence[str] = (),
+        rendered_directive_ids: Sequence[str] = (),
     ) -> ScopeManagerJudgment:
         """Validate a ``submit_judgment`` payload and apply its amendment.
 
@@ -4222,6 +4494,14 @@ class ScopeManager:
         # which is expected rather than a bug.
         declared_sources = [str(x) for x in (raw.get("context_sources") or []) if x]
 
+        # v1.14 M1: the directive attestation, as the judge sent it. Audited and
+        # finalized by the caller (`_finalize_attestation`) — parse only reads it.
+        directives_weighed = _parse_id_list(raw.get("directives_weighed"))
+        declined_by = raw.get("declined_by_directive")
+        declined_by_directive = (
+            declined_by.strip() if isinstance(declined_by, str) and declined_by.strip() else None
+        )
+
         # A decline carries no amendment — the same consistency rule the
         # decline-with-new_summary check enforced before ADR 0011 D1.
         if decision == "decline":
@@ -4242,6 +4522,9 @@ class ScopeManager:
                 change_id=change_id,
                 hop=hop,
                 protocol_notes=protocol_notes,
+                directives_weighed=directives_weighed,
+                declined_by_directive=declined_by_directive,
+                rendered_directive_ids=list(rendered_directive_ids),
             )
 
         context_sources, dropped_sources = _validate_context_sources(
@@ -4290,6 +4573,9 @@ class ScopeManager:
             context_sources=context_sources,
             dropped_context_sources=dropped_sources,
             protocol_notes=protocol_notes,
+            directives_weighed=directives_weighed,
+            declined_by_directive=declined_by_directive,
+            rendered_directive_ids=list(rendered_directive_ids),
         )
 
     # ------------------------------------------------------------------

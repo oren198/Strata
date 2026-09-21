@@ -3247,6 +3247,9 @@ def _echo_input(
         "reasoning": reasoning,
         "directive_ops": ops or [],
         "new_context": context,
+        # v1.14 M1: these tests are about the attribution corrective, not the directive
+        # attestation — the verdict attests, so no second call muddies their call counts.
+        "directives_weighed": [OPERATOR_DIRECTIVE.id],
     }
 
 
@@ -3351,6 +3354,7 @@ def test_decline_citing_an_operator_directive_gets_no_corrective() -> None:
             ),
             "directive_ops": [],
             "new_context": None,
+            "directives_weighed": [OPERATOR_DIRECTIVE.id],
         }
     )
 
@@ -3398,6 +3402,7 @@ def test_appended_contribution_bytes_carrying_the_attribution_get_no_corrective(
             "reasoning": _CITING_REASONING,
             "directive_ops": [{"op": "append"}],
             "new_context": None,
+            "directives_weighed": [OPERATOR_DIRECTIVE.id],
         }
     )
 
