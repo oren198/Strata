@@ -52,8 +52,22 @@ def test_choosing_a_judge_states_the_measurement_and_its_build() -> None:
 def test_choosing_a_judge_states_the_haiku_over_decline_and_the_no_silent_switch_rule() -> None:
     section = _choosing_a_judge()
     assert "over-declined 2 of 6 legitimate operational notes (`wi-102`, `wi-103`)" in section
-    assert "keeps `claude-haiku-4-5` on `api.anthropic.com`" in section
-    assert "upgrading never changes your judge" in section
+    # The upgrade promise and the key promise, each a sentence of its own.
+    assert (
+        "If your only key is an Anthropic one, the install stays on `claude-haiku-4-5` on "
+        "Anthropic's own endpoint."
+    ) in section
+    assert "Anthropic's own endpoint. That key is never sent to the router. Either way" in section
+    assert (
+        "Strata's judging runs on a model you choose. I tried six of them against the same "
+        "suites; three completed every one, and the table in this repo "
+        "([docs/evidence/judge-baseline-2026-09-20.md]"
+        "(docs/evidence/judge-baseline-2026-09-20.md)) "
+        "shows what each did and where a cell is empty — one produced no judgments at all, "
+        "one errored on most of the adversarial set, one ran partially."
+    ) in section
+    assert "`strata doctor` names the judge and endpoint you are actually running" in section
+    assert "so read it and pick" in section
     assert "A model id ages" in section
     assert "JUDGE_MODEL=qwen/qwen3-235b-a22b-2507" in section
 
@@ -64,3 +78,34 @@ def test_choosing_a_judge_never_ranks_a_judge() -> None:
     for word in ("best", "recommend", "better", "safest", "superior", "strongest"):
         assert word not in section, word
     assert "it does not rank the judges" in section
+
+
+# --- "What the demo shows": the three sentences 1.13 made false (Show HN fix) -------------
+
+
+def test_the_demo_section_no_longer_claims_haiku_was_unmeasured() -> None:
+    assert "it was not measured" not in _README
+    assert "Nothing is claimed about the default Claude judge" not in _README
+    assert "qwen is also the default judge as of 1.13.0" in _README
+    assert "including `claude-haiku-4.5`" in _README
+
+
+def test_the_demo_section_states_the_oblique_origin_class_is_closed_not_open() -> None:
+    assert (
+        "is no longer an open limit: ADR 0016 closed it as not a defect — that is "
+        "admissible hearsay, not a leak — and #212 tracks the remaining attribution gap "
+        "(D5, above)."
+    ) in _README
+    # The old framing — grouped with the retirement backstop as one pair of open limits —
+    # is gone; only the retirement backstop remains tracked under #209.
+    assert "and another scope's material relayed with an oblique origin" not in _README
+    assert "A fix that declined both classes was tried, regressed elsewhere" not in _README
+
+
+def test_the_demo_section_keeps_the_112_figure_and_adds_the_113_one() -> None:
+    assert "the judge admitted 2 of 72 hard adversarial items (1.12 measurement)" in _README
+    assert (
+        "measured against the 84-item J4 adversarial set, the judge admitted 1 of 84 "
+        "(`j4-822`) — a restricting directive held by the scope's own summary that the "
+        "judge did not yet weigh"
+    ) in _README
