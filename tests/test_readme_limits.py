@@ -78,3 +78,34 @@ def test_choosing_a_judge_never_ranks_a_judge() -> None:
     for word in ("best", "recommend", "better", "safest", "superior", "strongest"):
         assert word not in section, word
     assert "it does not rank the judges" in section
+
+
+# --- "What the demo shows": the three sentences 1.13 made false (Show HN fix) -------------
+
+
+def test_the_demo_section_no_longer_claims_haiku_was_unmeasured() -> None:
+    assert "it was not measured" not in _README
+    assert "Nothing is claimed about the default Claude judge" not in _README
+    assert "qwen is also the default judge as of 1.13.0" in _README
+    assert "including `claude-haiku-4.5`" in _README
+
+
+def test_the_demo_section_states_the_oblique_origin_class_is_closed_not_open() -> None:
+    assert (
+        "is no longer an open limit: ADR 0016 closed it as not a defect — that is "
+        "admissible hearsay, not a leak — and #212 tracks the remaining attribution gap "
+        "(D5, above)."
+    ) in _README
+    # The old framing — grouped with the retirement backstop as one pair of open limits —
+    # is gone; only the retirement backstop remains tracked under #209.
+    assert "and another scope's material relayed with an oblique origin" not in _README
+    assert "A fix that declined both classes was tried, regressed elsewhere" not in _README
+
+
+def test_the_demo_section_keeps_the_112_figure_and_adds_the_113_one() -> None:
+    assert "the judge admitted 2 of 72 hard adversarial items (1.12 measurement)" in _README
+    assert (
+        "measured against the 84-item J4 adversarial set, the judge admitted 1 of 84 "
+        "(`j4-822`) — a restricting directive held by the scope's own summary that the "
+        "judge did not yet weigh"
+    ) in _README
