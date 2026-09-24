@@ -1502,3 +1502,124 @@ def test_list_accepted_context_contributions_excludes_directives_and_declines(
 
     rows = store.list_accepted_context_contributions(scope_id="g_arch")
     assert [r.content for r in rows] == ["context one", "context two"]
+
+
+# ---------------------------------------------------------------------------
+# v1.15 P1 (ADR 0017) — `acted_on` round-trips through every read path.
+# ---------------------------------------------------------------------------
+
+
+def _seed_target_and_outcome(store: RecordStore, *, scope_id: str = "g_p1") -> tuple[str, str]:
+    """Append an admitted contribution, judge it, then append a second one that
+    references it via `acted_on`. Returns (target_id, outcome_id)."""
+    target = store.append_contribution(
+        scope_id=scope_id,
+        content="Release tags use the prefix rel-, never v.",
+        proposed_classification="context",
+        subject="release-tags",
+        supersedes=None,
+        contributor=_CONTRIBUTOR,
+    )
+    store.record_judgment(
+        contribution_id=target.id, decision="accept_as_context", judged_by="scope-manager"
+    )
+    outcome = store.append_contribution(
+        scope_id=scope_id,
+        content="Tagged the release rel-2.0.0 following the convention; it worked.",
+        proposed_classification="context",
+        subject="release-tags-outcome",
+        supersedes=None,
+        contributor=_CONTRIBUTOR,
+        acted_on=target.id,
+    )
+    return target.id, outcome.id
+
+
+def test_acted_on_round_trips_through_append_and_get(tmp_path: Path) -> None:
+    store = _open_store(str(tmp_path / "strata.db"))
+    target_id, outcome_id = _seed_target_and_outcome(store)
+
+    fetched = store.get_contribution(outcome_id)
+    assert fetched is not None
+    assert fetched.acted_on == target_id
+    # The target itself never had one — acted_on is optional and defaults to None.
+    assert store.get_contribution(target_id).acted_on is None
+
+
+def test_acted_on_round_trips_through_list_contributions(tmp_path: Path) -> None:
+    store = _open_store(str(tmp_path / "strata.db"))
+    target_id, outcome_id = _seed_target_and_outcome(store)
+
+    by_id = {c.id: c for c in store.list_contributions(scope_id="g_p1")}
+    assert by_id[outcome_id].acted_on == target_id
+    assert by_id[target_id].acted_on is None
+
+
+def test_acted_on_round_trips_through_page_record(tmp_path: Path) -> None:
+    store = _open_store(str(tmp_path / "strata.db"))
+    target_id, outcome_id = _seed_target_and_outcome(store)
+
+    page = store.page_record(scope_id="g_p1")
+    by_id = {c.id: c for c in page.contributions}
+    assert by_id[outcome_id].acted_on == target_id
+
+
+def test_acted_on_round_trips_through_list_recent_contributions(tmp_path: Path) -> None:
+    store = _open_store(str(tmp_path / "strata.db"))
+    target_id, outcome_id = _seed_target_and_outcome(store)
+
+    rows = store.list_recent_contributions(scope_id="g_p1", limit=10)
+    by_id = {r.contribution.id: r.contribution for r in rows}
+    assert by_id[outcome_id].acted_on == target_id
+
+
+def test_acted_on_round_trips_through_list_accepted_context_contributions(
+    tmp_path: Path,
+) -> None:
+    store = _open_store(str(tmp_path / "strata.db"))
+    target_id, outcome_id = _seed_target_and_outcome(store)
+    store.record_judgment(
+        contribution_id=outcome_id, decision="accept_as_context", judged_by="scope-manager"
+    )
+
+    by_id = {c.id: c for c in store.list_accepted_context_contributions(scope_id="g_p1")}
+    assert by_id[outcome_id].acted_on == target_id
+
+
+def test_acted_on_round_trips_through_page_declines(tmp_path: Path) -> None:
+    store = _open_store(str(tmp_path / "strata.db"))
+    target_id, outcome_id = _seed_target_and_outcome(store)
+    store.record_judgment(contribution_id=outcome_id, decision="decline", judged_by="scope-manager")
+
+    page = store.page_declines(scope_id="g_p1")
+    by_id = {d.contribution.id: d.contribution for d in page.declines}
+    assert by_id[outcome_id].acted_on == target_id
+
+
+def test_acted_on_round_trips_through_get_latest_accepted_contribution(tmp_path: Path) -> None:
+    store = _open_store(str(tmp_path / "strata.db"))
+    target_id, outcome_id = _seed_target_and_outcome(store)
+    store.record_judgment(
+        contribution_id=outcome_id, decision="accept_as_context", judged_by="scope-manager"
+    )
+
+    latest = store.get_latest_accepted_contribution(scope_id="g_p1")
+    assert latest is not None
+    assert latest.id == outcome_id
+    assert latest.acted_on == target_id
+
+
+def test_acted_on_rejects_a_missing_target_at_the_store_layer(tmp_path: Path) -> None:
+    """The store layer enforces the FK; the app-boundary validator (below) gives a
+    friendlier message, but the store must never silently accept a dangling reference."""
+    store = _open_store(str(tmp_path / "strata.db"))
+    with pytest.raises(sqlite3.IntegrityError):
+        store.append_contribution(
+            scope_id="g_p1",
+            content="An outcome pointing nowhere.",
+            proposed_classification="context",
+            subject=None,
+            supersedes=None,
+            contributor=_CONTRIBUTOR,
+            acted_on="c_does_not_exist",
+        )

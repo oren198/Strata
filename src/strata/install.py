@@ -383,7 +383,7 @@ _HISTORICAL_ARTIFACT_HASHES: dict[str, dict[str, object]] = {
         ),
     },
     "agents-md": {
-        "current": "4fdc5a5d4fc4a300487e49c0dd1c8449bc0518a32e4ae196990fcec334846c30",
+        "current": "6d0eeeb50157a3914458bb6d45e1bef5ea3359ec6d7d7149646d1e0a19b60905",
         "historical": frozenset(
             {
                 # Shipped through M2 (before the never-end-silent line and the
@@ -392,6 +392,8 @@ _HISTORICAL_ARTIFACT_HASHES: dict[str, dict[str, object]] = {
                 "f6df7e82395ba3199d3a52c1651db8afb93b2fdd139b496974f871d453535b68",
                 "ceea6568ab9160d54f2d3edd7131bc9b3bf2a694832226e67e7553de7325825f",
                 "d4e9b4da5543ad2faf75bedb17c426a8dab72e858955b1a48e7b718f72092aca",
+                # Shipped through v1.14.0 (before ADR 0017 P1's acted_on line).
+                "4fdc5a5d4fc4a300487e49c0dd1c8449bc0518a32e4ae196990fcec334846c30",
             }
         ),
     },

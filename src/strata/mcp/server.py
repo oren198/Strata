@@ -959,6 +959,60 @@ def _check_entitled(fleet: FleetConfig, agent_scope: str, scope_id: str) -> None
         )
 
 
+#: Verdicts that count as "admitted into memory" — a decline never entered it, and
+#: neither does an unjudged / judge-failed contribution (no verdict at all). Same rule
+#: :data:`strata.record_store` applies internally; duplicated here (not imported) since
+#: the module keeps that name private and this check belongs to the write boundary, not
+#: the store.
+_ACTED_ON_ADMITTED_DECISIONS = frozenset({"accept_as_directive", "accept_as_context"})
+
+
+def _validate_acted_on(
+    fleet: FleetConfig,
+    record_store: RecordStore,
+    *,
+    acted_on: str | None,
+    supersedes: str | None,
+    agent_scope: str,
+) -> None:
+    """Enforce every ADR 0017 P1 rule on ``acted_on`` before a contribution is appended.
+
+    Rejected at the tool boundary, each with a message naming which rule failed, in this
+    order:
+
+    1. ``acted_on`` together with ``supersedes`` — a correction is the judge's call
+       (P3), never the contributor's.
+    2. The referenced contribution must exist.
+    3. Its scope must be within this agent's entitled READ surface — the same
+       chain-only check :func:`_check_entitled` runs for a by-id lookup
+       (``strata_read_contribution``): you can act on what you may read by id.
+    4. It must have been ADMITTED (an accepting judgment) — a declined, pending, or
+       judge-failed contribution never entered memory, so nothing was there to act on
+       (CEO add).
+
+    A no-op when ``acted_on`` is ``None`` — every pre-P1 call site is unaffected.
+    """
+    if acted_on is None:
+        return
+    if supersedes is not None:
+        raise RuntimeError(
+            "acted_on and supersedes cannot both be set: an outcome that shows the item "
+            "acted on was WRONG is a correction, which the judge decides from the outcome "
+            "you report — not something you assert yourself via supersedes. Submit the "
+            "outcome with acted_on alone and let the judge classify it."
+        )
+    entry = record_store.get_record_entry(acted_on)
+    if entry is None:
+        raise RuntimeError(f"acted_on={acted_on!r} does not reference an existing contribution.")
+    _check_entitled(fleet, agent_scope, entry.contribution.scope_id)
+    if entry.judgment is None or entry.judgment.decision not in _ACTED_ON_ADMITTED_DECISIONS:
+        raise RuntimeError(
+            f"acted_on={acted_on!r} references a contribution that was never admitted "
+            "into memory (it was declined, or has no verdict yet) — you can only report "
+            "an outcome for an item that actually entered the scope's memory."
+        )
+
+
 # ---------------------------------------------------------------------------
 # Entitled context surface (ADR 0006 D3/D4 — scope summary reads widen beyond
 # the chain-only surface). A chain-referenced peer's summary is composed into
@@ -2273,6 +2327,7 @@ async def strata_contribute(
     proposed_classification: Literal["directive", "context"],
     subject: str | None = None,
     supersedes: str | None = None,
+    acted_on: str | None = None,
 ) -> dict:
     """Submit a contribution to a scope's scope-manager for judgment.
 
@@ -2312,13 +2367,27 @@ async def strata_contribute(
             ``rpc-protocol``), used for supersession matching.
         supersedes: Optional ID of a prior directive this contribution
             replaces (supersession pattern).
+        acted_on: Optional ID of a prior contribution this one reports the
+            OUTCOME of acting on (ADR 0017 P1) — "I acted on that item, and
+            here is what happened." It counts as an outcome only if the
+            action could have failed and did not: confirming something you
+            read but never acted on is not an outcome (the judge treats that
+            as ordinary context at most, never as corroboration). Mutually
+            exclusive with ``supersedes`` — a correction is the judge's call
+            from what you report, not something you assert yourself. The
+            referenced contribution must exist, be within your entitled read
+            surface, and have actually been admitted into memory (declined,
+            pending, or judge-failed contributions were never there to act
+            on). If you acted on something from memory, say which item and
+            how it went.
 
     Returns:
         ``contribution_id`` and ``judgment`` (decision, reasoning, summary_updated).
 
     Raises:
         RuntimeError: If the scope is not found, is archived, or is outside
-            this agent's entitled write surface.
+            this agent's entitled write surface; or if ``acted_on`` fails any
+            of its own rules (see the ``acted_on`` argument above).
     """
     await _require_bound_or_elicit()
 
@@ -2339,6 +2408,13 @@ async def strata_contribute(
         raise RuntimeError(f"Scope is archived and not accepting contributions: {scope_id!r}")
     _check_entitled_write(
         fleet, agent_scope, scope_id, agent_skill=agent_skill, agent_session_id=agent_session_id
+    )
+    _validate_acted_on(
+        fleet,
+        _record_store,
+        acted_on=acted_on,
+        supersedes=supersedes,
+        agent_scope=agent_scope,
     )
 
     stratum = next((s for s in fleet.strata if s.id == scope.stratum_id), None)
@@ -2373,6 +2449,7 @@ async def strata_contribute(
             proposed_classification=proposed_classification,
             subject=subject,
             supersedes=supersedes,
+            acted_on=acted_on,
             contributor=contributor,
             fleet=fleet,
             record_store=_record_store,

@@ -9,6 +9,8 @@ never independently drift on what the corpus contains.
 
 from __future__ import annotations
 
+import dataclasses
+
 from strata.fleet_config import EntitlementView, Scope, Stratum
 from strata.operator import OperatorItem
 from strata.record_store import Contribution, ContributorRef, RecentContribution
@@ -129,7 +131,7 @@ def capture_corpus(*, acted_on: str | None = None) -> dict[str, str]:
     for name, kwargs in _SINGLE_CASES.items():
         contribution = _BASE_CONTRIBUTIONS[name]
         if acted_on is not None:
-            contribution = contribution.model_copy(update={"acted_on": acted_on})
+            contribution = dataclasses.replace(contribution, acted_on=acted_on)
         call_kwargs = {"ancestor_directives": None, **kwargs}
         rendered[name] = _build_user_message(
             scope=SCOPE,
@@ -149,7 +151,7 @@ def capture_corpus(*, acted_on: str | None = None) -> dict[str, str]:
         ),
     ]
     if acted_on is not None:
-        batch_members = [c.model_copy(update={"acted_on": acted_on}) for c in batch_members]
+        batch_members = [dataclasses.replace(c, acted_on=acted_on) for c in batch_members]
     rendered["batch_of_3"] = _build_batch_user_message(
         scope=SCOPE,
         stratum=STRATUM,

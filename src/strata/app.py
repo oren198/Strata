@@ -1093,6 +1093,7 @@ def run_contribution(
     recency_window_size: int = RECENCY_WINDOW_SIZE,
     batch_cap: int = BATCH_CAP,
     queue_timeout_s: float = QUEUE_WAIT_TIMEOUT_S,
+    acted_on: str | None = None,
 ) -> ContributionOutcome:
     """Append a contribution to the record and get it judged (ADR 0011 D3).
 
@@ -1116,9 +1117,19 @@ def run_contribution(
             it expired. The contribution and a judgment-attempt event are
             already in the record; retry via :func:`rejudge_contribution`,
             never a fresh contribute (which would duplicate the contribution).
-        sqlite3.IntegrityError: *supersedes* references a missing contribution
-            (a client-input error the caller maps to its surface's error shape).
+        sqlite3.IntegrityError: *supersedes* or *acted_on* references a missing
+            contribution (a client-input error the caller maps to its surface's
+            error shape).
+        ValueError: *acted_on* and *supersedes* were both given (ADR 0017 P1) —
+            a correction is the judge's call, from an outcome report, never
+            something the contributor asserts directly. Callers that accept
+            richer client input (e.g. :mod:`strata.mcp.server`) validate this
+            and every other ``acted_on`` rule earlier, with a friendlier
+            message; this is the backstop for every caller of this shared
+            choke point, not the primary check.
     """
+    if acted_on is not None and supersedes is not None:
+        raise ValueError("acted_on and supersedes cannot both be set on one contribution.")
     queue = _scope_queue(scope.id)
     with _scope_append_lock(scope.id):
         contribution = record_store.append_contribution(
@@ -1128,6 +1139,7 @@ def run_contribution(
             subject=subject,
             supersedes=supersedes,
             contributor=contributor,
+            acted_on=acted_on,
         )
         ticket = queue.enqueue(contribution.id, contribution)
 

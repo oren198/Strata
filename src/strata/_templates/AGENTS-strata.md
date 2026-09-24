@@ -13,6 +13,7 @@ across sessions.
   scope-manager decides what sticks.
 - **Never end silent.**
   Before you finish, either contribute what you learned or call `strata_session_closeout` with a reason — never end silent.
+- **Say what you acted on.** If you acted on something from memory, say which item and how it went.
 
 Memory access is only through the strata MCP tools `strata_read_perspective`,
 `strata_contribute`, and `strata_rejudge` (and their read-only siblings)

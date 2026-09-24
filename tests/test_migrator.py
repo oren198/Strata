@@ -97,6 +97,7 @@ def test_full_chain_drops_fleet_tables_and_preserves_record(tmp_path: Path) -> N
         "0013_judgment_summary_version.sql",
         "0014_self_notice.sql",
         "0015_retirement_circumstance.sql",
+        "0016_acted_on.sql",
     ]
 
     # Fleet tables gone.
@@ -352,6 +353,7 @@ def test_idempotent_reapply(tmp_path: Path) -> None:
         "0013_judgment_summary_version.sql",
         "0014_self_notice.sql",
         "0015_retirement_circumstance.sql",
+        "0016_acted_on.sql",
     ]
 
     second = run_migrations(db_path, migrations_dir=migrations_dir)
@@ -563,6 +565,7 @@ def test_crash_at_tracking_insert_rolls_back_script_too(
         "0013_judgment_summary_version.sql",
         "0014_self_notice.sql",
         "0015_retirement_circumstance.sql",
+        "0016_acted_on.sql",
     ]
 
 
@@ -930,6 +933,7 @@ def test_0011_preserves_change_events_written_before_it(tmp_path: Path) -> None:
         "0013_judgment_summary_version.sql",
         "0014_self_notice.sql",
         "0015_retirement_circumstance.sql",
+        "0016_acted_on.sql",
     ]
 
     conn = sqlite3.connect(db_path)
