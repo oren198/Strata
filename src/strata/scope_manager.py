@@ -2093,20 +2093,39 @@ def _attestation_problem(judgment: object, rendered_ids: Sequence[str]) -> str |
     return "; ".join(problems) or None
 
 
+def _directive_attestation_reminder(rendered_ids: Sequence[str]) -> str:
+    """The sentence naming the binding-directive ids to account for (v1.14 M1b, #212).
+
+    Used verbatim in two places — the FIRST prompt, right where the binding directives
+    are rendered, and the one corrective re-ask when the first response's attestation is
+    malformed — same wording, same ids. The re-ask fixing what the first prompt already
+    said is the backstop for a judge that ignores a schema field wired into the tool but
+    not into the prompt it actually reads (measured: qwen never filled the fields from
+    the schema alone); this is not a new instruction, only a repeat of one already given.
+    """
+    listed = ", ".join(rendered_ids)
+    return (
+        f"Account for these directive ids: {listed}. Set `directives_weighed` to the ids "
+        "you weighed against this contribution, and if one of them restricts the class of "
+        "material this contribution falls in, decline and set `declined_by_directive` to "
+        "that id; leave it null for any other verdict."
+    )
+
+
 def _attestation_corrective(problem: str, rendered_ids: Sequence[str]) -> str:
     """The one re-ask for a malformed attestation. Neutral: it asks for the accounting,
     never for a particular verdict."""
-    listed = (
-        ", ".join(rendered_ids) if rendered_ids else "(none — no binding directive was rendered)"
-    )
+    if not rendered_ids:
+        return (
+            "Your submit_judgment call did not account for this scope's binding "
+            f"directives: {problem}. No binding directive was rendered to you."
+        )
     return (
         f"Your submit_judgment call did not account for this scope's binding directives: "
-        f"{problem}. The binding directives rendered to you are: {listed}. Call "
-        "submit_judgment again: set `directives_weighed` to the ids of the binding "
-        "directives you weighed against this contribution, and if one of them restricts "
-        "the class of material this contribution falls in, decline and set "
-        "`declined_by_directive` to that id; leave it null for any other verdict. If "
-        "weighing them changes your verdict, change it; if it does not, keep it."
+        f"{problem}. The binding directives rendered to you are: "
+        f"{', '.join(rendered_ids)}. Call submit_judgment again. "
+        f"{_directive_attestation_reminder(rendered_ids)} If weighing them changes your "
+        "verdict, change it; if it does not, keep it."
     )
 
 
@@ -2920,6 +2939,7 @@ def _build_judge_preamble(
     input_changes: Sequence[_ChangeEventLike] | None = None,
     window_verbatim_tail: int = WINDOW_VERBATIM_TAIL,
     implied_purpose_min_words: int = IMPLIED_PURPOSE_MIN_WORDS,
+    attestation_hint_ids: Sequence[str] = (),
 ) -> str:
     """Compose everything in the user message ahead of the contributions to judge.
 
@@ -2927,6 +2947,13 @@ def _build_judge_preamble(
     and the batch message (:func:`_build_batch_user_message`, ADR 0011 D3) —
     the scope's rendered state is identical either way; only the block of
     contributions under judgment differs.
+
+    *attestation_hint_ids* (v1.14 M1b, #212): the binding-directive ids the judge should
+    account for, exactly as :func:`_rendered_binding_directive_ids` computed them — empty
+    for a call that renders none, and never passed by the batch path (the batch tool
+    carries no attestation fields). Placed right where the binding directives themselves
+    are rendered, so the judge reads the instruction beside the thing it is about; the
+    default keeps every call site that does not pass it byte-identical to before M1b.
     """
     _check_mode(mode)
     if current_summary is not None:
@@ -2962,6 +2989,12 @@ def _build_judge_preamble(
         # An ancestor that has admitted nothing binds nothing: a block saying
         # so is noise in every descendant's prompt, forever.
         if directives
+    )
+
+    attestation_block = (
+        f"{_directive_attestation_reminder(attestation_hint_ids)}\n\n"
+        if attestation_hint_ids
+        else ""
     )
 
     entitlement_block = ""
@@ -3025,6 +3058,7 @@ def _build_judge_preamble(
         f"{input_changes_block}"
         f"{operator_block}"
         f"{ancestor_block}"
+        f"{attestation_block}"
         f"{entitlement_block}"
         f"{publication_block}"
         f"{parent_publication_block}"
@@ -3077,6 +3111,9 @@ def _build_user_message(
         input_changes=input_changes,
         window_verbatim_tail=window_verbatim_tail,
         implied_purpose_min_words=implied_purpose_min_words,
+        # v1.14 M1b (#212): say it once, up front, in the same words the one
+        # corrective re-ask would use — measured to cut how often that re-ask fires.
+        attestation_hint_ids=_rendered_binding_directive_ids(ancestor_directives, operator_memory),
     )
     return (
         f"{preamble}"

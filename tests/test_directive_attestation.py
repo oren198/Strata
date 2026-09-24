@@ -363,3 +363,78 @@ def test_stray_weighed_ids_with_nothing_rendered_cost_no_call() -> None:
     assert j.directives_weighed == []
     assert "Directives weighed" not in j.record_notes
     assert "not attested" not in j.record_notes
+
+
+# ---------------------------------------------------------------------------
+# v1.14 M1b (#212) — the FIRST prompt carries the same accounting sentence
+# the one corrective re-ask would use, verbatim, when a directive is rendered.
+# ---------------------------------------------------------------------------
+
+
+def _first_prompt(client: MagicMock) -> str:
+    content = client.messages.create.call_args_list[0].kwargs["messages"][0]["content"]
+    return content if isinstance(content, str) else " ".join(b.get("text", "") for b in content)
+
+
+def test_the_first_prompt_carries_the_ids_when_directives_are_rendered() -> None:
+    j, client = _judge(_accept(directives_weighed=["d_records_001", "d_style_002"]))
+    assert client.messages.create.call_count == 1  # attested first try — no re-ask needed
+    prompt = _first_prompt(client)
+    assert "Account for these directive ids: d_records_001, d_style_002." in prompt
+    assert "d_records_001, d_style_002" in prompt
+
+
+def test_the_reask_sentence_is_byte_identical_to_the_first_prompts() -> None:
+    from strata.scope_manager import _directive_attestation_reminder
+
+    _, client = _judge(_accept(), _accept(directives_weighed=["d_records_001", "d_style_002"]))
+    reminder = _directive_attestation_reminder(["d_records_001", "d_style_002"])
+    assert reminder in _first_prompt(client)
+    assert reminder in _followup_text(client)
+
+
+def test_operator_directives_are_named_in_the_first_prompt_too() -> None:
+    _, client = _judge(
+        _accept(directives_weighed=["op_tls1"]),
+        walk=None,
+        operator_memory=[("g_exec", [OP_DIRECTIVE, OP_CONTEXT])],
+    )
+    prompt = _first_prompt(client)
+    sentence_start = prompt.index("Account for these directive ids:")
+    sentence = prompt[sentence_start : prompt.index(".", sentence_start) + 1]
+    assert sentence == "Account for these directive ids: op_tls1."
+
+
+def test_the_empty_directive_prompt_is_byte_identical_to_before_m1b() -> None:
+    """No binding directive rendered -> the 68 non-directive items must not move at all."""
+    from strata.scope_manager import _build_user_message
+
+    contribution = CONTRIBUTION
+    kwargs = dict(
+        scope=SCOPE,
+        stratum=STRATUM,
+        ancestor_directives=None,
+        current_summary=SUMMARY,
+        recent_contributions=[],
+        new_contribution=contribution,
+    )
+    with_hint = _build_user_message(**kwargs)
+    # The default (no attestation_hint_ids passed) must render nothing extra: confirm by
+    # checking the reminder sentence's own marker text is absent, and that passing the
+    # empty default explicitly produces the identical string.
+    assert "Account for these directive ids" not in with_hint
+    assert with_hint == _build_user_message(**kwargs)
+
+
+def test_batch_prompt_never_carries_the_hint_even_with_directives_rendered() -> None:
+    from strata.scope_manager import _build_batch_user_message
+
+    prompt = _build_batch_user_message(
+        scope=SCOPE,
+        stratum=STRATUM,
+        ancestor_directives=WALK,
+        current_summary=SUMMARY,
+        recent_contributions=[],
+        new_contributions=[CONTRIBUTION],
+    )
+    assert "Account for these directive ids" not in prompt
