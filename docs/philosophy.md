@@ -120,7 +120,7 @@ The asymmetry is the point. A directive reaches every descendant and outranks an
 
 Because contributions vary in reliability, every piece of shared memory must carry its **provenance** — where it came from. Provenance is what makes accountability and recovery possible: if a source proves unreliable, its contributions can be identified and removed wholesale. It is also what lets retrieval weigh a claim from an authoritative source more heavily than the same claim from elsewhere.
 
-Trust, unlike provenance, is **earned and revised.** Acting on a memory that leads to good outcomes should raise its standing; acting on one that leads to bad outcomes should lower it. Over time the store should self-correct, with reliable memory rising in influence and unreliable memory falling. This is a primary defense against contamination: a wrong contribution does not carry equal weight forever simply because it was written down.
+Trust, unlike provenance, is **earned and revised.** Acting on a memory that leads to good outcomes should raise its standing; acting on one that leads to bad outcomes should lower it. Over time the store should self-correct, with reliable memory rising in influence and unreliable memory falling. This is a primary defense against contamination: a wrong contribution does not carry equal weight forever simply because it was written down. Trust attaches to memory items and bears on context only; a directive is never weighed down by outcomes — outcomes that contradict it are evidence to the authority that issued it, which may revise.
 
 ---
 

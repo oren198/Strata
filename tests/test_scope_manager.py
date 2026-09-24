@@ -5575,3 +5575,65 @@ def test_system_prompt_a_role_identifies_the_speaker_so_role_informants_admit() 
     assert "the ABSENCE of any telling act" in flat
     assert "not even one identified only by role" in flat
     assert "Use this reason ONLY when the contribution has no telling act at all" in flat
+
+
+# ---------------------------------------------------------------------------
+# #204 — batch path: the end-to-end "verdict stands after two misses" guarantee,
+# on judge_batch itself (not just the strict-parser unit test above).
+# ---------------------------------------------------------------------------
+
+
+def test_batch_judgment_survives_missing_reasoning_on_one_member_twice() -> None:
+    """One member's `reasoning` is missing on BOTH calls: no crash, no third call, that
+    member's verdict is recorded with empty reasoning and a note, the rest are untouched.
+    """
+    missing_reasoning_input = _batch_input(
+        verdicts=[
+            {
+                "contribution_id": NEW_CONTRIBUTION.id,
+                "decision": "accept_as_directive",
+                # reasoning omitted entirely, both times.
+            },
+            {
+                "contribution_id": SECOND_CONTRIBUTION.id,
+                "decision": "accept_as_directive",
+                "reasoning": "also enforceable",
+            },
+            {
+                "contribution_id": THIRD_CONTRIBUTION.id,
+                "decision": "decline",
+                "reasoning": "material originating outside this scope's entitlement",
+            },
+        ]
+    )
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [
+        _fake_response(missing_reasoning_input),
+        _fake_response(missing_reasoning_input),
+    ]
+
+    judgment = _judge_batch(mock_client)
+
+    assert mock_client.messages.create.call_count == 2  # one re-ask, never a third call
+
+    by_id = {v.contribution_id: v for v in judgment.verdicts}
+    first = by_id[NEW_CONTRIBUTION.id]
+    assert first.decision == "accept_as_directive"
+    assert first.reasoning == ""
+
+    second = by_id[SECOND_CONTRIBUTION.id]
+    assert second.decision == "accept_as_directive"
+    assert second.reasoning == "also enforceable"
+
+    third = by_id[THIRD_CONTRIBUTION.id]
+    assert third.decision == "decline"
+    assert third.reasoning == "material originating outside this scope's entitlement"
+
+    # The amendment still applies — a batch-wide crash would have lost it entirely.
+    assert judgment.new_summary is not None
+    # Protocol notes render on every member's row (record_notes_for), same as the
+    # single-judgment path's record_notes.
+    assert (
+        "Judge supplied no `reasoning` even after the corrective re-ask"
+        in judgment.record_notes_for(NEW_CONTRIBUTION.id)
+    )
