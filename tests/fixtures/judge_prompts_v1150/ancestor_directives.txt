@@ -1,0 +1,60 @@
+SCOPE: p1-corpus (id=g_p1corpus)
+STRATUM: function (ordinal=1)
+
+BUDGET: once your amendment is applied, this summary must be at most 500 words (context plus every directive's content).
+
+ANCESTOR DIRECTIVES — g_p1parent (inherited, binding)
+---
+### [c_parent01] All sub-teams must adhere to the company security policy.
+- subject: security-policy
+- source: scope=g_p1parent · at=2026-01-01T00:00:00+00:00
+---
+
+ENTITLEMENT (relative to this scope)
+- This scope and its ancestors (entitled — directives and context):
+    g_p1corpus (p1-corpus)
+- Scopes below this scope (entitled — evidence proposed upward for this scope to judge on its merits):
+    (none)
+- Scopes referenced by this chain (entitled for CONTEXT only):
+    (none)
+- All other scopes in this fleet, including archived ones (no channel to this scope — their position reaches it only through a person's report or the contributor's own observation, never asserted as their own):
+    (none)
+
+CURRENT SUMMARY
+---
+---
+condensed: false
+scope_id: g_p1corpus
+updated_at: '2026-08-01T09:00:00+00:00'
+version: 1
+---
+
+# Scope: g_p1corpus
+
+## Directives
+
+### [c_existing01] Use snake_case for identifiers.
+- subject: naming
+- source: scope=g_p1corpus · skill=architect · at=2026-08-01T09:00:00+00:00
+
+> Use snake_case for identifiers.
+
+## Context
+
+The team favours minimal abstractions.
+
+---
+
+RECENT CONTRIBUTIONS (oldest first — mechanical digest; the newest 3 PRIOR contributions carry full content):
+[c_recent01] at=2026-08-15T08:00:00+00:00 subject=(none) state=judged decision=accept_as_context reasoning=Accepted as context: an observation, not a binding rule. content='An earlier observation about code style.'
+
+NEW CONTRIBUTION TO JUDGE:
+- id: c_p1_ancestor
+- proposed classification: context
+- subject: corpus-item
+- supersedes: (none)
+- contributor: skill=engineer scope=g_p1other at=2026-09-24T10:00:00+00:00
+- content:
+    An observation judged alongside an inherited directive.
+
+Judge it. Call `submit_judgment` exactly once.
