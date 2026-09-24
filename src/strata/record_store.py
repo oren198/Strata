@@ -65,6 +65,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
+from strata.fleet_config import FleetConfig
+
 # ---------------------------------------------------------------------------
 # ID helpers
 # ---------------------------------------------------------------------------
@@ -1326,6 +1328,49 @@ class RecordStore:
             judgment_attempts=judgment_attempts,
         )
 
+    def list_outcomes(self, *, acted_on: str) -> list[Contribution]:
+        """Return every contribution reporting an outcome for *acted_on*, oldest first.
+
+        ADR 0017 P2: the raw candidates for one item's standing evidence, across every
+        scope (an outcome need not share the item's own scope — P1 requires only that
+        its reporter could READ the item at write time). Each candidate is filtered and
+        classified by :func:`standing_evidence`; this is the unfiltered read.
+        """
+        rows = self._conn.execute(
+            """
+            SELECT id, scope_id, content, proposed_classification,
+                   subject, supersedes, acted_on,
+                   contributor_scope_id, contributor_skill,
+                   contributor_session_id, contributor_ts,
+                   created_at
+            FROM contributions
+            WHERE acted_on = ?
+            ORDER BY created_at ASC, rowid ASC
+            """,
+            (acted_on,),
+        ).fetchall()
+        return [_contribution_from_row(row) for row in rows]
+
+    def is_superseded(self, contribution_id: str) -> bool:
+        """Return whether some ACCEPTED contribution names *contribution_id* as its
+        ``supersedes`` — the one existing, general mechanism by which a contribution
+        (directive or context) is replaced (ADR 0011; see
+        :func:`strata.scope_manager._superseded_claim_contents`'s docstring for the
+        context half). A ``supersedes`` reference on a contribution that was itself
+        DECLINED never took effect, so it does not count.
+        """
+        row = self._conn.execute(
+            """
+            SELECT 1
+            FROM contributions c
+            JOIN judgments j ON j.contribution_id = c.id
+            WHERE c.supersedes = ? AND j.decision IN (?, ?)
+            LIMIT 1
+            """,
+            (contribution_id, *_ACCEPTED_DECISIONS),
+        ).fetchone()
+        return row is not None
+
     def _judgments_for(self, contribution_ids: list[str]) -> list[Judgment]:
         """Return the judgments on *contribution_ids*, oldest verdict first."""
         if not contribution_ids:
@@ -2318,6 +2363,185 @@ def _derive_publication_act_state(
         error_message=last_failure.message if last_failure is not None else None,
         failed_at=last_failure.attempted_at if last_failure is not None else None,
     )
+
+
+@dataclass(frozen=True)
+class StandingEvidence:
+    """One outcome's evidence toward a memory item's standing (ADR 0017 P1/P2).
+
+    Returned by :func:`standing_evidence` — a LIST of these, never a number. Standing is
+    a property of an item, DERIVED from the record every time it is asked for; nothing
+    here is stored anywhere (see tests/test_p2_no_migration.py). Deliberately NOT
+    computed: any score, count, weight or rank — that reduction is ratification's own
+    judgment, reading this evidence directly (ADR 0017 P7), never made here.
+    """
+
+    contribution_id: str
+    """The outcome contribution's own id — the record's provenance trail starts here."""
+    reporter_scope_id: str
+    reporter_skill: str | None
+    reporter_session_id: str
+    reported_at: str
+    """The outcome's ``created_at`` — the record's own total order (created_at, rowid)
+    is what "preceding" in :attr:`target_replaced`'s docstring refers to."""
+    independent_of_source: bool
+    """``True`` when the reporter's scope differs from the item's own source scope. A
+    scope's own outcome on its own claim still counts in full toward THAT item's
+    standing (Concept 8 — independence is a property of the evidence, not of who first
+    said the words) — this flag is what ratification (P7) reads to tell the two apart;
+    it is never used here to weight or exclude anything."""
+    target_replaced: bool
+    """``True`` when the ITEM ACTED ON (not this outcome) was later superseded by some
+    other accepted contribution. The outcome still appears — it is history, not
+    invalidated by what came after — merely marked as preceding the item's replacement."""
+    reporter_entitlement_current: bool
+    """``True`` unless the reporter's scope can no longer read the item's scope UNDER
+    THE FLEET CONFIG AS IT STANDS NOW. P1 checked entitlement once, at write time; the
+    record is never rewritten when fleet.yaml changes later, so this is a live check
+    against the *current* fleet — re-checked, never assumed, and marking rather than
+    silently dropping the evidence when it no longer holds (CEO add)."""
+
+
+#: How one outcome contribution counts toward its target's standing (ADR 0017 P2/P3).
+_READING_EXCLUDED = "excluded"
+_READING_HELD = "held"
+_READING_REPLACED = "replaced"
+
+
+def _outcome_reading(judgment: Judgment | None, *, outcome_itself_superseded: bool) -> str:
+    """Classify one outcome contribution as excluded, held, or (once P4 exists) replaced.
+
+    THE FINAL RULE (philosopher/CEO ruling, option c', 2026-09-24 — see the plan's
+    "Ruling on failed outcomes (final: option c')"): for an accepted contribution
+    carrying ``acted_on``, look for a change event linking IT to its target — a
+    ``claim_corrected`` event, or a supersession event, whose SOURCE is this
+    contribution and whose TARGET is ``acted_on``.
+
+    - No such event → ``held`` (corroboration).
+    - Such an event exists → ``replaced``, its KIND (correction or supersession) read
+      off the event itself, never re-derived here.
+    - Declined (or pending, or judge-failed — no accepting judgment at all) →
+      ``excluded``.
+
+    P1's ``acted_on``+``supersedes`` exclusivity stands (an earlier reversal was
+    considered and withdrawn): a contribution cannot name its own replacement, so the
+    ENGINE mints the linking event once a future judge (P3) reads an outcome's content
+    as a correction or supersession and the engine records it (P4) — nothing here, or
+    at the contribution level, ever links an outcome to a replacement by id.
+
+    THAT MACHINERY DOES NOT EXIST YET (P3/P4). No claim_corrected or supersession event
+    naming an outcome as its source has ever been minted, so this function ALWAYS
+    RETURNS held for an accepted outcome TODAY — not because held is assumed, but
+    because there is nothing yet to find. That reading is sound only because of P3's
+    own closure (an outcome the judge cannot classify as a clean hold or a clean failure
+    is declined, never accepted ambiguously) — see the plan's P3 section. When P4 ships
+    the event, this is the one function that changes: replace the "no such event" branch
+    with a real lookup.
+
+    Separately (rule 3, settled before the c/c' debate and unaffected by it): an
+    outcome that was ITSELF later superseded or withdrawn drops out entirely —
+    *outcome_itself_superseded* — a retracted report is not evidence of anything,
+    whether it once read as held or (once reachable) replaced.
+    """
+    if judgment is None or judgment.decision not in _ACCEPTED_DECISIONS:
+        return _READING_EXCLUDED
+    if outcome_itself_superseded:
+        return _READING_EXCLUDED
+    # No claim_corrected / supersession event lookup exists yet (P4) — always held.
+    return _READING_HELD
+
+
+def standing_evidence(
+    record_store: RecordStore, fleet: FleetConfig, item_id: str
+) -> list[StandingEvidence]:
+    """Every outcome contribution's evidence toward *item_id*'s standing (ADR 0017 P2).
+
+    WHAT THIS COMPUTES: for the memory item *item_id*, one :class:`StandingEvidence` per
+    contribution that reports an outcome of acting on it (``acted_on == item_id``),
+    ACCEPTED (:func:`_outcome_reading` != excluded), read fresh from the record on every
+    call. Nothing is stored, counted, or cached — see tests/test_p2_no_migration.py.
+
+    WHAT THIS DELIBERATELY DOES NOT COMPUTE: any score, count, weight, or rank; whether
+    the evidence, taken together, is enough to call the item generally trusted or to
+    ratify it into a directive — that reduction is ratification's own judgment (ADR 0017
+    P7), reading this list directly, never made here.
+
+    RULES, each with its own test in tests/test_p2_standing_evidence.py:
+
+    - Declined, pending, and judge-failed outcomes never appear (:func:`_outcome_reading`).
+    - Never on a directive (D6): if *item_id*'s own JUDGMENT (not its proposed
+      classification — a context proposal can be accepted as a directive) is
+      ``accept_as_directive``, or if it has no accepting judgment at all, this returns
+      ``[]`` — nothing to have acted on.
+    - An outcome whose TARGET was later superseded by some other accepted contribution
+      still appears, marked ``target_replaced=True`` — it is history, not invalidated.
+    - An outcome that was ITSELF later superseded (:meth:`RecordStore.is_superseded`)
+      drops out entirely — a retracted report is not evidence of anything.
+    - An outcome from a scope that can no longer read the item under the CURRENT fleet
+      config still appears, marked ``reporter_entitlement_current=False`` (CEO add): P1
+      checked entitlement once, at write time, and the record is never rewritten.
+
+    THE CLOSURE THIS RELIES ON (P3, not yet built): "accepted + acted_on + not replaced
+    means held" is true only once P3's judge instruction makes an ``acted_on``
+    contribution DECLINE whenever it reports anything other than a clean hold or a clean
+    failure (an echo, an ambiguous report, a pending one) — see the plan's P3 section,
+    "the closure". Until then, an accepted outcome is read as held by construction
+    (:data:`_READING_HELD`), which is only as sound as that future judge behaviour makes
+    it; :func:`_outcome_reading` is the one place that reading changes when P3 lands.
+    """
+    target = record_store.get_record_entry(item_id)
+    if target is None or target.judgment is None:
+        return []
+    if target.judgment.decision != "accept_as_context":
+        # accept_as_directive: D6, directives have no standing.
+        # decline / (no branch reached — judgment is None handled above): nothing was
+        # ever admitted, so there is nothing to have acted on.
+        return []
+
+    target_replaced = record_store.is_superseded(item_id)
+
+    evidence: list[StandingEvidence] = []
+    for outcome in record_store.list_outcomes(acted_on=item_id):
+        judgment = record_store.get_judgment(outcome.id)
+        reading = _outcome_reading(
+            judgment, outcome_itself_superseded=record_store.is_superseded(outcome.id)
+        )
+        if reading == _READING_EXCLUDED:
+            continue
+        entitled = _currently_entitled(
+            fleet, outcome.contributor.scope_id, target.contribution.scope_id
+        )
+        evidence.append(
+            StandingEvidence(
+                contribution_id=outcome.id,
+                reporter_scope_id=outcome.contributor.scope_id,
+                reporter_skill=outcome.contributor.skill,
+                reporter_session_id=outcome.contributor.session_id,
+                reported_at=outcome.created_at,
+                independent_of_source=(
+                    outcome.contributor.scope_id != target.contribution.scope_id
+                ),
+                target_replaced=target_replaced,
+                reporter_entitlement_current=entitled,
+            )
+        )
+    return evidence
+
+
+def _currently_entitled(fleet: FleetConfig, reporter_scope: str, item_scope: str) -> bool:
+    """Whether *item_scope* is within *reporter_scope*'s chain-only entitled surface,
+    under *fleet* AS IT STANDS NOW.
+
+    The read-time counterpart of the same check :func:`strata.app.validate_acted_on` runs
+    once at write time (duplicated here, not imported: that one is write-boundary
+    validation that raises; this one is a read-time predicate for a live re-check, and
+    the two-line computation — a scope plus its inter-stratum ancestors — is cheap
+    enough that citing it is safer than adding a cross-module dependency for it).
+    """
+    if fleet.get_scope(reporter_scope) is None:
+        return False
+    ancestors = fleet.inter_stratum_ancestors(reporter_scope)
+    return item_scope in {reporter_scope, *(s.id for s in ancestors)}
 
 
 def _contribution_from_row(row: sqlite3.Row) -> Contribution:
