@@ -312,6 +312,99 @@ plan, and ruled on by the CEO. They bind v1.15 alongside the plan above.
 6. **Copy.** *"Outcome loop: plumbing shipped, adoption measured"* — never
    "standing works" — until the adoption number exists.
 
+## Ruling on failed outcomes (final: option c′, philosopher and CEO, 2026-09-24)
+
+**History, stated honestly.** Building P2 exposed a hole: the plan read
+"replaced" from a record fact that did not exist for context items. A first
+ruling (option c) had the contributor propose the replacement through
+`supersedes` and reversed P1's rejection of `acted_on` + `supersedes`. The
+philosopher then withdrew it in favour of the CEO's option c′, because option c
+left the choice between correction and supersession in a place this judge does
+not reliably fill. The CEO adopted c′. **P1's rejection of `acted_on` +
+`supersedes` stands; the P1 follow-up that would have reversed it is cancelled.**
+
+**The four dispositions.** For a contribution carrying `acted_on`, the judge's
+decision is exactly one of:
+
+| decision | what happens |
+|---|---|
+| `held` | accepted as context; the item stands |
+| `failed_corrected` | accepted; the engine mints `claim_corrected`, linking the outcome to its target |
+| `failed_superseded` | accepted; the engine mints a supersession, linking the outcome to its target |
+| `decline` | nothing enters; the missing ground is named first |
+
+**They are acts, not the refused label.** The test, in the contract so nobody
+has to reconcile two rulings: a decision value is an **act** if it is a
+**disposition**, determining what happens to the contribution and the item. A
+**label** sits beside the decision and changes only how the record counts. If
+two values ever produce the same disposition and differ only in counting, that
+pair is the refused label. As specified, no two of the four share a disposition,
+just as `accept_as_directive` and `accept_as_context` do not.
+
+**Why the decision.** The notice is "the half that matters" (Concept 7). The
+decision is the one field this judge always fills, so the choice between
+correction and supersession goes there, where it will actually be made.
+
+**Four required lines in P3's contract.**
+
+1. **"Held" is defined as "an action that could have failed confirmed the
+   item"** — never as "the claim is true". An echo answers yes to "is it true";
+   item 3 is the gate, and the name is not the safeguard.
+2. **Fail-closed is not silent.** A malformed or missing disposition gets the
+   one re-ask; if it is still unreadable, the contribution is declined — and
+   that decline is **distinguishable in the record** from a decline for missing
+   ground, so the record shows the judge failed, not the contributor.
+3. **Default to `failed_corrected`** when the judge cannot tell correction from
+   supersession: a needless notice costs attention; a missing one leaves readers
+   acting on a falsehood. Eval item **4b**: an ambiguous failure →
+   `claim_corrected` raised.
+4. **The correcting content is the report's own observation** — "used 8443; the
+   service refused; the right port is unknown" is a first-hand negative
+   observation that contradicts the claim and supersedes it under Concept 5.
+   There is no known-wrong state, no lowered standing, and no retirement.
+
+**The reading rule — what P2 derives.** Accepted + `acted_on` + disposition
+`held` → **corroboration**. `failed_corrected` / `failed_superseded` →
+**replaced**, its kind the disposition. The link is `acted_on` itself (P1's
+column); no other reference is needed.
+
+**Implementation note: the record stores no new decision values.** The judgments
+table's `decision` column is CHECK-constrained to `accept_as_directive`,
+`accept_as_context` and `decline` (migrations 0001/0006), and every reader of
+`decision` (record views, the Console, write-back stats, the evals) knows those
+three. Widening it means a table-rebuild migration and a change to each reader.
+The ruling does not require it: the four values are the judge's **tool-level**
+decision, and each maps to a distinct, already-storable record fact —
+
+- `held` → `accept_as_context`, **no** change event;
+- `failed_corrected` → `accept_as_context` **plus** a `claim_corrected` event
+  whose source is the outcome and whose target is `acted_on`;
+- `failed_superseded` → `accept_as_context` **plus** a supersession event, same
+  link;
+- `decline` → `decline`, with the unreadable-judgment case carrying its own
+  recorded reason (line 2).
+
+The four dispositions stay four distinct record facts, so the acts-not-labels
+test still holds, and P2 reads the disposition from those facts. For a failed
+outcome, the engine reuses the existing context-supersession path (#199,
+`_superseded_claim_contents`) with `acted_on` as the effective target, so the
+replaced claim leaves the context as it does today, with the same recency-window
+bound.
+
+**What exists today, checked in code.** A context contribution already replaces
+an earlier one by id, and the #199 backstop rejects a rewrite that keeps the
+replaced claim's content. **Its bound:** the backstop checks only targets whose
+content it can see — in the current summary or the 20-row recency window. P3's
+gate includes a failed outcome whose target sits outside that window, so the
+behaviour there is measured rather than assumed.
+
+**P2 and P3 tag together, or neither does** (CEO rule). If P3 misses its bound,
+P2's function either ships unexposed — no consumer, no copy — or is reverted;
+the architect decides which at that point and reports it. **"Held" quotes its
+observable** (CEO add): the held disposition's reason quotes, in one clause, the
+observed result it relied on, so the record shows what held — which P7's
+ratification will read.
+
 ## Risks and open questions
 
 1. **Will the judge apply "could have failed"?** It is a judgment, not a
