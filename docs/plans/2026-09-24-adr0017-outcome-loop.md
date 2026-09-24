@@ -22,7 +22,7 @@ weighs a directive down.
 | A reference from one contribution to another | Only `supersedes` — an FK to `contributions(id)`, meaning *this replaces that* (`_migrations/0001_initial.sql`; `app.py` `Contribution`). `subject` is a free-text label for matching, not a reference. | A reference that means *I acted on that*. `supersedes` must not be reused: it already means replacement, and an outcome that corroborates replaces nothing. |
 | Correction vs supersession | Both emit the same retraction-kind change event (`change_events.py` `RETRACTION_KINDS`), and ADR 0014 refreshes one-hop readers identically. | ADR 0017 D3 splits them: correction owes notice to everyone the claim reached; supersession owes nobody notice. |
 | Ratification input | No count or weight is stored. The judge reads corroboration qualitatively from the recency window and peer publications. CONTEXT.md: a publication is never self-corroborating. | The judge needs to see which items have been corroborated by outcomes, and by whose. |
-| Decay | **None.** The only forgetting is condensation: under `summary_max_words` the scope-manager omits older context when it rewrites (CONTEXT.md, Retirement), and a mechanical signal reports what was dropped (#202). `freshness.py` is about sessions, not items. | "A poorly standing context item fades sooner" (D4) has nothing to hook into except condensation. |
+| Decay | **None.** The only forgetting is condensation: under `summary_max_words` the scope-manager omits older context when it rewrites (CONTEXT.md, Retirement), and a mechanical signal reports what was dropped (#202). `freshness.py` is about sessions, not items. | Unexamined context fading first (D4) has nothing to hook into except condensation. |
 | Standing | No weight, score or trust field anywhere in the schema. | See D-plan-2: standing is **derived** from the record, never stored. |
 
 ## Design
@@ -63,11 +63,13 @@ What the derivation counts, per the philosopher's tests:
 - **Only outcomes that could have failed.** The judge applies the test (P3). An
   outcome it reads as "reviewed and confirmed" is admitted, if at all, as
   context, **and it does not count** toward standing.
-- **Provenance-independence.** A scope may corroborate its own earlier claim by
-  acting on it (Concept 8), so self-outcomes count toward *that scope's* item.
-  But ratification upward reads **breadth through the ancestor's judgment** —
-  one scope's repeated self-outcomes raise its own item's standing without
-  becoming the fleet's consensus (D3).
+- **A scope's own outcomes are full corroboration.** Independence is a property
+  of the evidence, not of who first said the words (Concept 8), and each action
+  could have failed — so outcomes a scope reports on its own claim count in
+  full toward that item's standing. What they cannot establish is
+  **generality**: standing is earned where the outcomes occurred. Ratification
+  reads breadth because reach is a claim about generality, and P7's reporter
+  scopes and their independence already carry that.
 - **Never on directives.** Outcomes against a directive are routed as
   *evidence to its issuer* (P5); they never enter a directive's standing,
   because a directive has none (D6).
@@ -104,6 +106,18 @@ publication follows the item, and its withdrawal reaches readers as evidence,
 never as silent absence). Supersession keeps today's behaviour. ADR 0014's
 refresh machinery is reused; no new delivery path.
 
+**What `claim_corrected` carries.** The identity of the corrected claim and the
+correcting content, arriving at each reader **as evidence its own judge acts
+on**. It never deletes anything from the reader: the reader's judge decides
+what the correction means for what that scope holds, exactly as with any other
+input change.
+
+**After the split, supersession must not signal wrongness.** "This changed" and
+"this was wrong" owe different things. The supersession refresh keeps its
+existing kind and wording and must never read as a correction; a test pins that
+a supersession's notice carries no correction language and no correcting
+content.
+
 **CEO add — the fan-out is bounded, and the bound is stated.** `claim_corrected`
 is an input change under ADR 0014 and inherits its termination rule (D4): the
 correction mints one change id; every change derived from processing it
@@ -114,33 +128,51 @@ as the recorded backstop. So a correction reaches every reader once, and a
 reference cycle cannot turn it into a wave. The eval gate carries an item for it
 (item 8).
 
-### P5 — outcomes that contradict a directive
+### P5 — outcomes that bear on a directive
 
-Never weigh the directive down. The judge admits such an outcome as context
-(the observation stands), and the engine raises it to the directive's issuer as
-evidence — for a scope-manager, a change event on its own scope; for an
-operator directive, a note in the operator's view. The issuer revises through
-the ordinary channel or doesn't. Nothing binding erodes quietly (D6).
+The theory draws a line here, and the judge holds it.
+
+- **A contribution that asserts a contrary rule is declined.** "Use 9443" set
+  against a directive that says 8443 is a rule competing with a rule; context
+  never overrides a directive (Concept 5), so it is declined, as today.
+- **An outcome that reports a consequence of following the directive is
+  admitted as context, and raised to the issuing scope.** "Used 8443 as
+  directed; the service refused connections" is an observation of the world,
+  and it stands. The directive is never weighed down (D6).
+
+**Raised to whom, and how.** To the scope that **issued** the directive, not to
+the scope where the outcome occurred: the issuer of an inherited directive is an
+ancestor. The channel is the ordinary one — an **upward contribution** to the
+issuing scope, judged there like any other, with the reporting scope's
+provenance. For an operator directive, the issuer is the operator, and the
+evidence appears in the operator's view. The issuer revises through the
+ordinary channel, or doesn't. Nothing binding erodes quietly.
 
 ### P6 — decay, the smallest honest version
 
 There is no decay today, so this plan does not invent a clock. It adds standing
 where forgetting already happens: **condensation**. When the scope-manager
 rewrites a summary under the word budget, the rewrite prompt lists, for each
-context item it carries, whether outcomes have corroborated or corrected it.
-The instruction: under budget pressure, drop uncorroborated context before
-corroborated context. The #202 condensation signal already reports what was
+context item it carries, whether outcomes have corroborated it. The
+instruction: under budget pressure, drop **unexamined** context before
+**corroborated** context. (A corrected item is not in the order at all: it has
+already been replaced.) The #202 condensation signal already reports what was
 dropped, so the effect is measurable.
 
 **CEO add — the order is recorded, not only tested.** The #202 condensation
 signal records, for each context item dropped, whether it was corroborated,
 corrected or unexamined at the time, so a stranger reading the record can see
-that uncorroborated context went first — the claim is visible in the product,
+that unexamined context went first — the claim is visible in the product,
 not only asserted by a test.
 
-This realises D4.1 ("a poorly standing context item fades sooner") without a
-time model. A real time-based decay is a separate decision, and this plan does
-not take it.
+This realises D4.1 without a time model, and the plan's wording is
+**unexamined**, never "poorly standing": an item nobody has acted on has not
+been judged poor, only untested.
+
+`acted_on` is also a **usage** signal: an item somebody acted on is an item in
+use. So the one reference serves both of Concept 7's decay drivers — how an
+item has fared, and whether it is used — without a second mechanism. A
+time-based decay model stays out of scope; it is a separate decision.
 
 ### P7 — ratification
 
@@ -187,12 +219,18 @@ Each item sits in a scope holding the item acted on. Goldens state decision
 4. **Supersession, not correction** — "the port was 8443 until today's
    migration; it is now 9443" → replaced, **no** correction notice.
 5. **Self-corroboration** — the scope's own earlier claim, acted on, held →
-   counts toward its own item; a second item checks that three self-outcomes
-   from one scope do not appear as fleet consensus in ratification.
-6. **Against a directive** — an outcome contradicting an operator directive →
-   admitted as context, the directive unchanged, evidence raised to the issuer.
-7. **Decay** — a scope over budget with one corroborated and one uncorroborated
-   context item of similar length → the uncorroborated one is dropped first
+   counts in full toward its own item's standing.
+   **5b. Generality** — three such outcomes, all from the one scope → when the
+   ancestor considers ratification, the evidence shows one reporting scope, and
+   the judge's reason treats it as local standing, not as evidence of reach.
+6. **Consequence of following a directive** — "used 8443 as directed; the
+   service refused connections", against an inherited directive → accepted as
+   context, the directive unchanged, and the evidence raised as an upward
+   contribution to the ISSUING scope (an ancestor), not the reporting one.
+   **6b. Contrary rule** — "use 9443", against the same 8443 directive →
+   declined (Concept 5).
+7. **Decay** — a scope over budget with one corroborated and one unexamined
+   context item of similar length → the unexamined one is dropped first
    (read from the #202 condensation signal, which records the drop order).
 8. **Correction fan-out, bounded** — a corrected claim that had been published
    to two readers → both receive the `claim_corrected` notice exactly once, and
