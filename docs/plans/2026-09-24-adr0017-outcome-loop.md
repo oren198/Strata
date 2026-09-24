@@ -257,6 +257,32 @@ to be noisy.
 - **Measurement:** the new family (~10 items), J1 reps=3 and J4 on two trees —
   well under $0.20 on the current OpenRouter judge.
 
+## CEO rulings (2026-09-24)
+
+Six product questions, raised when the operator had another agent review this
+plan, and ruled on by the CEO. They bind v1.15 alongside the plan above.
+
+1. **Adoption is measured, not gated.** The nudge and the AGENTS.md line are the
+   forcing function. If P1's live run shows zero unprompted `acted_on`, P2–P4
+   still ship; the README says *"plumbing shipped; adoption measured: N of M
+   sessions"*; and a structured affordance becomes a design decision taken with
+   a number in hand. (This replaces P1's "at least one unprompted `acted_on`
+   passes" with "the number is measured and reported".)
+2. **Correction blast radius.** A correction may reach any published item,
+   bounded by ADR 0014 D4 and pinned by P4's tests (eval item 8). The dogfood is
+   our own fleet: the first multi-scope correction runs in Strata's own scopes,
+   with the architect watching the record.
+3. **Self-corroboration has no cap.** A cap is a number nobody decided. Local
+   standing can be high; fleet reach stays the ancestor's judgment at
+   ratification. This is stated as an explicit acceptance, not an oversight.
+4. **P4 is must-ship.** If `claim_corrected` slips, v1.15 does not tag. P4's
+   value stands independent of adoption: it fixes the collapse of correction
+   into supersession for **every** path, not only for outcome reports.
+5. **Eval item 3 is a hard stop.** If the judge counts "reviewed and confirmed"
+   as corroboration, the release is blocked. No override with a known miss.
+6. **Copy.** *"Outcome loop: plumbing shipped, adoption measured"* — never
+   "standing works" — until the adoption number exists.
+
 ## Risks and open questions
 
 1. **Will the judge apply "could have failed"?** It is a judgment, not a
