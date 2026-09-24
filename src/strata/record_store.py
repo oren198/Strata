@@ -160,6 +160,12 @@ class Contribution:
     supersedes: str | None
     contributor: ContributorRef
     created_at: str
+    acted_on: str | None = None
+    """The item this contribution reports acting on (ADR 0017 P1, v1.15) — an FK to
+    another contribution's id. Mutually exclusive with `supersedes`, rejected together
+    at the app boundary (`validate_acted_on`): a correction is the judge's call, not the
+    contributor's. Defaults to None so every pre-P1 call site building a Contribution by
+    hand (tests, fixtures) keeps working unchanged."""
 
 
 @dataclass(frozen=True)
@@ -680,6 +686,7 @@ class RecordStore:
         subject: str | None,
         supersedes: str | None,
         contributor: ContributorRef,
+        acted_on: str | None = None,
     ) -> Contribution:
         """Append a contribution to the scope's immutable record and return it.
 
@@ -701,13 +708,19 @@ class RecordStore:
                                      one supersedes.
             contributor:             Provenance — the contributing agent's
                                      ``(scope, skill, session, timestamp)``.
+            acted_on:                Optional ID of a prior contribution this one
+                                     reports acting on (ADR 0017 P1). Callers
+                                     validate mutual exclusivity with *supersedes*
+                                     and every other `acted_on` rule before calling
+                                     this (:func:`validate_acted_on`) — this layer
+                                     only persists what it is given.
 
         Returns:
             The newly appended :class:`Contribution`.
 
         Raises:
-            sqlite3.IntegrityError: If *supersedes* references a non-existent
-                contribution.
+            sqlite3.IntegrityError: If *supersedes* or *acted_on* references a
+                non-existent contribution.
         """
         contribution_id = self._insert_contribution(
             scope_id=scope_id,
@@ -716,6 +729,7 @@ class RecordStore:
             subject=subject,
             supersedes=supersedes,
             contributor=contributor,
+            acted_on=acted_on,
         )
         self._conn.commit()
         return self._fetch_contribution(contribution_id)
@@ -729,6 +743,7 @@ class RecordStore:
         subject: str | None,
         supersedes: str | None,
         contributor: ContributorRef,
+        acted_on: str | None = None,
     ) -> str:
         """INSERT one contribution row and return its id. Does NOT commit.
 
@@ -744,8 +759,9 @@ class RecordStore:
                 id, scope_id, content, proposed_classification,
                 subject, supersedes,
                 contributor_scope_id, contributor_skill,
-                contributor_session_id, contributor_ts
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                contributor_session_id, contributor_ts,
+                acted_on
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 contribution_id,
@@ -758,6 +774,7 @@ class RecordStore:
                 contributor.skill,
                 contributor.session_id,
                 contributor.ts,
+                acted_on,
             ),
         )
         return contribution_id
@@ -781,7 +798,7 @@ class RecordStore:
         """
         base = """
             SELECT id, scope_id, content, proposed_classification,
-                   subject, supersedes,
+                   subject, supersedes, acted_on,
                    contributor_scope_id, contributor_skill,
                    contributor_session_id, contributor_ts,
                    created_at
@@ -823,7 +840,7 @@ class RecordStore:
         rows = self._conn.execute(
             """
             SELECT c.id, c.scope_id, c.content, c.proposed_classification,
-                   c.subject, c.supersedes,
+                   c.subject, c.supersedes, c.acted_on,
                    c.contributor_scope_id, c.contributor_skill,
                    c.contributor_session_id, c.contributor_ts,
                    c.created_at
@@ -853,7 +870,7 @@ class RecordStore:
         row = self._conn.execute(
             """
             SELECT id, scope_id, content, proposed_classification,
-                   subject, supersedes,
+                   subject, supersedes, acted_on,
                    contributor_scope_id, contributor_skill,
                    contributor_session_id, contributor_ts,
                    created_at
@@ -1144,7 +1161,7 @@ class RecordStore:
 
         base = """
             SELECT id, scope_id, content, proposed_classification,
-                   subject, supersedes,
+                   subject, supersedes, acted_on,
                    contributor_scope_id, contributor_skill,
                    contributor_session_id, contributor_ts,
                    created_at
@@ -1243,7 +1260,7 @@ class RecordStore:
 
         base = """
             SELECT c.id, c.scope_id, c.content, c.proposed_classification,
-                   c.subject, c.supersedes,
+                   c.subject, c.supersedes, c.acted_on,
                    c.contributor_scope_id, c.contributor_skill,
                    c.contributor_session_id, c.contributor_ts,
                    c.created_at,
@@ -1372,7 +1389,7 @@ class RecordStore:
         rows = self._conn.execute(
             """
             SELECT c.id, c.scope_id, c.content, c.proposed_classification,
-                   c.subject, c.supersedes,
+                   c.subject, c.supersedes, c.acted_on,
                    c.contributor_scope_id, c.contributor_skill,
                    c.contributor_session_id, c.contributor_ts,
                    c.created_at,
@@ -1415,7 +1432,7 @@ class RecordStore:
         row = self._conn.execute(
             f"""
             SELECT c.id, c.scope_id, c.content, c.proposed_classification,
-                   c.subject, c.supersedes,
+                   c.subject, c.supersedes, c.acted_on,
                    c.contributor_scope_id, c.contributor_skill,
                    c.contributor_session_id, c.contributor_ts,
                    c.created_at

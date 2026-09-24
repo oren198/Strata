@@ -2273,6 +2273,7 @@ async def strata_contribute(
     proposed_classification: Literal["directive", "context"],
     subject: str | None = None,
     supersedes: str | None = None,
+    acted_on: str | None = None,
 ) -> dict:
     """Submit a contribution to a scope's scope-manager for judgment.
 
@@ -2312,13 +2313,27 @@ async def strata_contribute(
             ``rpc-protocol``), used for supersession matching.
         supersedes: Optional ID of a prior directive this contribution
             replaces (supersession pattern).
+        acted_on: Optional ID of a prior contribution this one reports the
+            OUTCOME of acting on (ADR 0017 P1) — "I acted on that item, and
+            here is what happened." It counts as an outcome only if the
+            action could have failed and did not: confirming something you
+            read but never acted on is not an outcome (the judge treats that
+            as ordinary context at most, never as corroboration). Mutually
+            exclusive with ``supersedes`` — a correction is the judge's call
+            from what you report, not something you assert yourself. The
+            referenced contribution must exist, be within your entitled read
+            surface, and have actually been admitted into memory (declined,
+            pending, or judge-failed contributions were never there to act
+            on). If you acted on something from memory, say which item and
+            how it went.
 
     Returns:
         ``contribution_id`` and ``judgment`` (decision, reasoning, summary_updated).
 
     Raises:
         RuntimeError: If the scope is not found, is archived, or is outside
-            this agent's entitled write surface.
+            this agent's entitled write surface; or if ``acted_on`` fails any
+            of its own rules (see the ``acted_on`` argument above).
     """
     await _require_bound_or_elicit()
 
@@ -2339,6 +2354,18 @@ async def strata_contribute(
         raise RuntimeError(f"Scope is archived and not accepting contributions: {scope_id!r}")
     _check_entitled_write(
         fleet, agent_scope, scope_id, agent_skill=agent_skill, agent_session_id=agent_session_id
+    )
+    # Imported lazily, like run_contribution below: keeps the import path light until a
+    # contribution actually happens, and is the single canonical check both write
+    # surfaces (this tool and POST /contribute) call — never a second copy to drift.
+    from strata.app import validate_acted_on  # noqa: PLC0415
+
+    validate_acted_on(
+        fleet,
+        _record_store,
+        acted_on=acted_on,
+        supersedes=supersedes,
+        agent_scope=agent_scope,
     )
 
     stratum = next((s for s in fleet.strata if s.id == scope.stratum_id), None)
@@ -2373,6 +2400,7 @@ async def strata_contribute(
             proposed_classification=proposed_classification,
             subject=subject,
             supersedes=supersedes,
+            acted_on=acted_on,
             contributor=contributor,
             fleet=fleet,
             record_store=_record_store,

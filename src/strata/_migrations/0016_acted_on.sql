@@ -1,0 +1,11 @@
+-- Strata migration: a contribution may reference the item it reports acting on (ADR
+-- 0017 P1, v1.15).
+--
+-- `acted_on` is the second-ever inter-contribution reference, after `supersedes`
+-- (0001_initial.sql) — and it means something different: *this contribution reports
+-- what happened when I acted on that item*, never *this replaces that*. Nullable,
+-- nothing else stored: no type, no classification, no standing (ADR 0017 D1/D2 —
+-- standing is derived from the record, never a column). A contribution may carry
+-- `acted_on`, `supersedes`, or neither; the app layer rejects both together (a
+-- correction is the judge's call, not the contributor's).
+ALTER TABLE contributions ADD COLUMN acted_on TEXT REFERENCES contributions(id);

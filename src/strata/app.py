@@ -325,6 +325,11 @@ class ContributeRequest(BaseModel):
     proposed_classification: Literal["directive", "context"]
     subject: str | None = None
     supersedes: str | None = None
+    acted_on: str | None = None
+    """ADR 0017 P1: the id of a prior contribution this one reports the outcome of
+    acting on. Mutually exclusive with ``supersedes``; validated the same way and with
+    the same messages as ``strata_contribute``'s ``acted_on`` (see
+    :func:`strata.app.validate_acted_on`)."""
     contributor: ContributorRefBody
 
 
@@ -1075,6 +1080,87 @@ def _fail_batch(
     return results
 
 
+#: Verdicts that count as "admitted into memory" for ADR 0017 P1's acted_on rule — a
+#: decline never entered it, and neither does an unjudged / judge-failed contribution
+#: (no verdict at all). Mirrors record_store's own accepted-decision set (kept separate:
+#: that one is private, and this check belongs to the write boundary, not the store).
+ACTED_ON_ADMITTED_DECISIONS = frozenset({"accept_as_directive", "accept_as_context"})
+
+
+def validate_acted_on(
+    fleet: FleetConfig,
+    record_store: RecordStore,
+    *,
+    acted_on: str | None,
+    supersedes: str | None,
+    agent_scope: str,
+) -> None:
+    """Enforce every ADR 0017 P1 rule on ``acted_on`` before a contribution is appended.
+
+    The single canonical check — both write surfaces (``strata_contribute`` in
+    :mod:`strata.mcp.server` and ``POST /contribute`` below) call this one function, so
+    a rule can never drift between them. *agent_scope* is the scope on whose behalf the
+    reference is made: the MCP tool's bound scope, or the HTTP body's own
+    ``contributor.scope_id`` — either way, "the scope this contribution is stamped as."
+
+    Rejected at the write boundary, each with a message naming which rule failed, in
+    this order:
+
+    1. ``acted_on`` together with ``supersedes`` — a correction is the judge's call
+       (P3), never the contributor's.
+    2. The referenced contribution must exist.
+    3. Its scope must be within *agent_scope*'s entitled READ surface — the same
+       chain-only check a by-id record lookup runs (``strata_read_contribution``):
+       you can act on what you may read by id.
+    4. It must have been ADMITTED (an accepting judgment) — a declined, pending, or
+       judge-failed contribution never entered memory, so nothing was there to act on
+       (CEO add).
+
+    A no-op when ``acted_on`` is ``None`` — every pre-P1 call site is unaffected.
+
+    Raises:
+        RuntimeError: any of the four rules above failed.
+    """
+    if acted_on is None:
+        return
+    if supersedes is not None:
+        raise RuntimeError(
+            "acted_on and supersedes cannot both be set: an outcome that shows the item "
+            "acted on was WRONG is a correction, which the judge decides from the outcome "
+            "you report — not something you assert yourself via supersedes. Submit the "
+            "outcome with acted_on alone and let the judge classify it."
+        )
+    entry = record_store.get_record_entry(acted_on)
+    if entry is None:
+        raise RuntimeError(f"acted_on={acted_on!r} does not reference an existing contribution.")
+    if fleet.get_scope(agent_scope) is None:
+        raise RuntimeError(
+            f"your bound scope {agent_scope!r} no longer exists in the fleet "
+            "config — fleet.yaml changed since this session started. Restore "
+            "the scope in fleet.yaml or relaunch with a valid binding."
+        )
+    ancestors = fleet.inter_stratum_ancestors(agent_scope)
+    entitled = {agent_scope, *(s.id for s in ancestors)}
+    if entry.contribution.scope_id not in entitled:
+        raise RuntimeError(
+            f"scope {entry.contribution.scope_id!r} is outside your entitled surface "
+            f"(your scope {agent_scope!r} plus its inter-stratum ancestors). "
+            "Records and perspective targets stay chain-only: a record "
+            "audits the authority that binds you, and a perspective is "
+            "composed for your own chain, not a peer's. A scope reachable "
+            "only through a reference edge informs you via "
+            "strata_read_scope_summary and as a non-binding peer_reference "
+            "layer inside your own perspective — never as its own record or "
+            "perspective target."
+        )
+    if entry.judgment is None or entry.judgment.decision not in ACTED_ON_ADMITTED_DECISIONS:
+        raise RuntimeError(
+            f"acted_on={acted_on!r} references a contribution that was never admitted "
+            "into memory (it was declined, or has no verdict yet) — you can only report "
+            "an outcome for an item that actually entered the scope's memory."
+        )
+
+
 def run_contribution(
     *,
     scope: Scope,
@@ -1093,6 +1179,7 @@ def run_contribution(
     recency_window_size: int = RECENCY_WINDOW_SIZE,
     batch_cap: int = BATCH_CAP,
     queue_timeout_s: float = QUEUE_WAIT_TIMEOUT_S,
+    acted_on: str | None = None,
 ) -> ContributionOutcome:
     """Append a contribution to the record and get it judged (ADR 0011 D3).
 
@@ -1116,9 +1203,19 @@ def run_contribution(
             it expired. The contribution and a judgment-attempt event are
             already in the record; retry via :func:`rejudge_contribution`,
             never a fresh contribute (which would duplicate the contribution).
-        sqlite3.IntegrityError: *supersedes* references a missing contribution
-            (a client-input error the caller maps to its surface's error shape).
+        sqlite3.IntegrityError: *supersedes* or *acted_on* references a missing
+            contribution (a client-input error the caller maps to its surface's
+            error shape).
+        ValueError: *acted_on* and *supersedes* were both given (ADR 0017 P1) —
+            a correction is the judge's call, from an outcome report, never
+            something the contributor asserts directly. Callers that accept
+            richer client input (e.g. :mod:`strata.mcp.server`) validate this
+            and every other ``acted_on`` rule earlier, with a friendlier
+            message; this is the backstop for every caller of this shared
+            choke point, not the primary check.
     """
+    if acted_on is not None and supersedes is not None:
+        raise ValueError("acted_on and supersedes cannot both be set on one contribution.")
     queue = _scope_queue(scope.id)
     with _scope_append_lock(scope.id):
         contribution = record_store.append_contribution(
@@ -1128,6 +1225,7 @@ def run_contribution(
             subject=subject,
             supersedes=supersedes,
             contributor=contributor,
+            acted_on=acted_on,
         )
         ticket = queue.enqueue(contribution.id, contribution)
 
@@ -1882,6 +1980,24 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
                 detail={"error": "scope_not_active", "scope_id": body.scope_id},
             )
 
+        # ADR 0017 P1: the same canonical check strata_contribute runs, stamped
+        # against this contribution's OWN scope (an HTTP caller has no bound agent
+        # scope the way an MCP session does — the scope it contributes as is the
+        # closest analogue to "the scope this reference is made on behalf of").
+        try:
+            validate_acted_on(
+                fleet,
+                record_store,
+                acted_on=body.acted_on,
+                supersedes=body.supersedes,
+                agent_scope=body.contributor.scope_id,
+            )
+        except RuntimeError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail={"error": "acted_on_invalid", "detail": str(exc)},
+            ) from exc
+
         # Resolve stratum from FleetConfig for scope-manager context.
         stratum = next(
             (s for s in fleet.strata if s.id == scope.stratum_id),
@@ -1915,6 +2031,7 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
                 proposed_classification=body.proposed_classification,
                 subject=body.subject,
                 supersedes=body.supersedes,
+                acted_on=body.acted_on,
                 contributor=contributor_ref,
                 fleet=fleet,
                 record_store=record_store,

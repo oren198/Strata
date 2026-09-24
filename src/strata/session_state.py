@@ -851,6 +851,10 @@ NUDGE_BOTH_EXITS = (
     "if nothing is worth keeping"
 )
 
+#: ADR 0017 P1 (v1.15): the one line every agent-facing nudge/norm gains, verbatim —
+#: an optional reference nobody is told about is never set.
+ACTED_ON_NUDGE_LINE = "If you acted on something from memory, say which item and how it went."
+
 
 def compute_nudge(state: SessionState | None) -> str | None:
     """Return the read-time nudge line for a session's counters, or ``None``.
@@ -887,11 +891,11 @@ def compute_nudge(state: SessionState | None) -> str | None:
         return (
             f"this session has read fleet memory {times} and still written nothing "
             "back — your scope's memory is going stale while you rely on it. Before "
-            f"you finish: {NUDGE_BOTH_EXITS}."
+            f"you finish: {NUDGE_BOTH_EXITS}. {ACTED_ON_NUDGE_LINE}"
         )
     return (
         f"this session has read fleet memory {times} and written nothing back yet; "
-        f"{NUDGE_BOTH_EXITS}."
+        f"{NUDGE_BOTH_EXITS}. {ACTED_ON_NUDGE_LINE}"
     )
 
 

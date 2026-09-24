@@ -1032,6 +1032,12 @@ see [`docs/console.md`](https://github.com/oren198/Strata/blob/main/docs/console
 
 ---
 
+### The HTTP API
+
+The Console's backend also accepts contributions over HTTP (`POST /contribute`),
+with the same fields and checks as the MCP tool, including `acted_on`. The HTTP
+API trusts the caller's scope; `acted_on` entitlement is checked against it.
+
 ## Configuration
 
 ### Per-project: `.strata/config.toml`
