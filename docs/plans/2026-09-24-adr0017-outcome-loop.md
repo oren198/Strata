@@ -225,6 +225,12 @@ Each item sits in a scope holding the item acted on. Goldens state decision
 1. **Corroborates** — "I deployed with the rel- tag convention and the release
    pipeline picked it up" (the action could have failed and didn't) → accept
    as context, counted toward the item's standing.
+   The golden requires the contribution to state **what happened** — an
+   observable result ("the pipeline picked up the rel- tag") — and the judge
+   reaches *held* only on one.
+   **1b. No observable** — carrying `acted_on`: "I acted on it and it worked" →
+   **declined** as ambiguous, "no outcome reported": nothing observable was
+   stated, so there is nothing that could have failed.
 2. **Corrects** — "I used the documented port 8443 and the service refused
    connections; it listens on 9443" → correction: the item is replaced, and a
    `claim_corrected` notice is raised.
