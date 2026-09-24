@@ -1,7 +1,10 @@
 # Plan: the outcome loop (ADR 0017) — v1.15 candidate
 
-**Status:** plan only, for review. No code. Written 2026-09-24 against
-`release/v1.14.0` @ f9fbb14.
+**Status:** approved by the CEO 2026-09-24 as the v1.15 spec, with three additions
+(below, marked **CEO add**); the philosopher's four-test check is the last gate
+before P1 starts. Written against `release/v1.14.0` @ f9fbb14. No code.
+
+**Cadence.** v1.15 = P1–P4, one cycle, 3-revision bound. P5–P7 the cycle after.
 
 **Contract:** [ADR 0017](../adr/0017-outcomes-return-to-the-item-acted-on.md).
 Earned trust is the standing of a memory **item**, revised by the outcomes of
@@ -38,6 +41,13 @@ literally: one column, no type, no classification. Per the philosopher's
 vocabulary test, **"outcome report" never becomes a stored type, a field value
 or a judge classification** — it stays prose for a contribution that carries
 `acted_on`.
+
+**CEO add — agents must be told.** An optional reference nobody is told about
+is never set. The read-time nudge and the seeded AGENTS.md norm each gain one
+line: *"If you acted on something from memory, say which item and how it
+went."* This is part of P1's gate: the demo eval's write-back run must show at
+least one `acted_on` set by an agent that was not prompted to set it — or the
+report says plainly that it does not happen, which is itself the finding.
 
 ### P2 — standing is derived, never stored
 
@@ -94,6 +104,16 @@ publication follows the item, and its withdrawal reaches readers as evidence,
 never as silent absence). Supersession keeps today's behaviour. ADR 0014's
 refresh machinery is reused; no new delivery path.
 
+**CEO add — the fan-out is bounded, and the bound is stated.** `claim_corrected`
+is an input change under ADR 0014 and inherits its termination rule (D4): the
+correction mints one change id; every change derived from processing it
+inherits that id; a scope refreshes for a given change id **at most once**;
+coalescing collapses several pending changes into one refresh; fixpoint damping
+means a refresh that changes nothing emits nothing; and the hop budget remains
+as the recorded backstop. So a correction reaches every reader once, and a
+reference cycle cannot turn it into a wave. The eval gate carries an item for it
+(item 8).
+
 ### P5 — outcomes that contradict a directive
 
 Never weigh the directive down. The judge admits such an outcome as context
@@ -111,6 +131,12 @@ context item it carries, whether outcomes have corroborated or corrected it.
 The instruction: under budget pressure, drop uncorroborated context before
 corroborated context. The #202 condensation signal already reports what was
 dropped, so the effect is measurable.
+
+**CEO add — the order is recorded, not only tested.** The #202 condensation
+signal records, for each context item dropped, whether it was corroborated,
+corrected or unexamined at the time, so a stranger reading the record can see
+that uncorroborated context went first — the claim is visible in the product,
+not only asserted by a test.
 
 This realises D4.1 ("a poorly standing context item fades sooner") without a
 time model. A real time-based decay is a separate decision, and this plan does
@@ -167,7 +193,13 @@ Each item sits in a scope holding the item acted on. Goldens state decision
    admitted as context, the directive unchanged, evidence raised to the issuer.
 7. **Decay** — a scope over budget with one corroborated and one uncorroborated
    context item of similar length → the uncorroborated one is dropped first
-   (read from the #202 condensation signal).
+   (read from the #202 condensation signal, which records the drop order).
+8. **Correction fan-out, bounded** — a corrected claim that had been published
+   to two readers → both receive the `claim_corrected` notice exactly once, and
+   nothing loops (a reference cycle between the two readers is included).
+9. **Unprompted `acted_on`** — in the demo eval's write-back run, an agent that
+   was not told to set the reference sets it at least once; or the report says
+   it does not happen.
 
 **No-regression gate — run first, not last** (the v1.14 lesson): J1 at reps=3
 against the release head, and J4, with every item that does not carry
