@@ -20,6 +20,7 @@ from fastapi.testclient import TestClient
 
 from strata.app import create_app, get_scope_manager
 from strata.migrator import run_migrations
+from strata.record_store import ContributorRef as _ContributorRef
 from strata.record_store import RecordStore
 from strata.scope_manager import ScopeManager, ScopeManagerJudgment
 from strata.settings import Settings
@@ -80,6 +81,10 @@ _FLEET_YAML_SIMPLE = textwrap.dedent("""
         name: Archived Scope
         stratum_id: L1
         status: archived
+      - id: g_unrelated
+        name: Unrelated Scope
+        stratum_id: L1
+        status: active
 
     edges: []
 """).strip()
@@ -569,6 +574,111 @@ class TestContribute:
         )
         assert resp.status_code == 500
         assert "scope_manager_failure" in str(resp.json())
+
+
+class TestContributeActedOn:
+    """POST /contribute — ADR 0017 P1's acted_on, mirroring strata_contribute's rules."""
+
+    _CONTRIBUTOR_IN_FLEET = {
+        "scope_id": "g_active",
+        "skill": "architect",
+        "session_id": "sess_001",
+        "ts": "2026-05-23T20:00:00Z",
+    }
+
+    def _post(self, client, **overrides):
+        payload = {
+            "scope_id": "g_active",
+            "content": "An observation.",
+            "proposed_classification": "context",
+            "contributor": self._CONTRIBUTOR_IN_FLEET,
+        }
+        payload.update(overrides)
+        return client.post("/contribute", json=payload)
+
+    def test_acted_on_together_with_supersedes_is_rejected(self, client):
+        resp = self._post(client, supersedes="c_whatever", acted_on="c_whatever_else")
+        assert resp.status_code == 422
+        data = resp.json()
+        assert data["detail"]["error"] == "acted_on_invalid"
+        assert "cannot both be set" in data["detail"]["detail"]
+
+    def test_acted_on_referencing_nothing_is_rejected(self, client):
+        resp = self._post(client, acted_on="c_does_not_exist")
+        assert resp.status_code == 422
+        assert "does not reference an existing contribution" in resp.json()["detail"]["detail"]
+
+    def test_acted_on_referencing_an_unentitled_scope_is_rejected(self, client):
+        # g_unrelated is a real, active scope in this fleet with no edge to g_active
+        # (_FLEET_YAML_SIMPLE has none at all) — an admitted contribution there is
+        # still not readable-by-id from g_active.
+        client.mock_manager.judge.return_value = _make_judgment(
+            decision="accept_as_context",
+            summary=_make_summary("g_unrelated", "accept_as_context"),
+        )
+        other = self._post(
+            client,
+            scope_id="g_unrelated",
+            content="Something in an unrelated scope.",
+            contributor={**self._CONTRIBUTOR_IN_FLEET, "scope_id": "g_unrelated"},
+        )
+        assert other.status_code == 200
+        other_id = other.json()["contribution_id"]
+
+        client.mock_manager.judge.return_value = _make_judgment(
+            decision="accept_as_context", summary=_make_summary("g_active", "accept_as_context")
+        )
+        resp = self._post(client, acted_on=other_id)
+        assert resp.status_code == 422
+        assert "outside your entitled surface" in resp.json()["detail"]["detail"]
+
+    def test_acted_on_referencing_a_declined_contribution_is_rejected(self, client):
+        client.mock_manager.judge.return_value = _make_judgment(decision="decline")
+        declined = self._post(client, content="Trivia.")
+        assert declined.status_code == 200
+        declined_id = declined.json()["contribution_id"]
+
+        client.mock_manager.judge.return_value = _make_judgment(
+            decision="accept_as_context", summary=_make_summary("g_active", "accept_as_context")
+        )
+        resp = self._post(client, acted_on=declined_id)
+        assert resp.status_code == 422
+        assert "never admitted into memory" in resp.json()["detail"]["detail"]
+
+    def test_acted_on_referencing_a_pending_contribution_is_rejected(self, client):
+        store = RecordStore(client.db_path)
+        pending = store.append_contribution(
+            scope_id="g_active",
+            content="Unjudged so far.",
+            proposed_classification="context",
+            subject=None,
+            supersedes=None,
+            contributor=_ContributorRef(
+                scope_id="g_active", skill=None, session_id="s1", ts="2026-01-01T00:00:00Z"
+            ),
+        )
+        resp = self._post(client, acted_on=pending.id)
+        assert resp.status_code == 422
+        assert "never admitted into memory" in resp.json()["detail"]["detail"]
+
+    def test_acted_on_referencing_an_admitted_contribution_succeeds(self, client):
+        client.mock_manager.judge.return_value = _make_judgment(
+            decision="accept_as_context", summary=_make_summary("g_active", "accept_as_context")
+        )
+        target = self._post(client, content="Release tags use rel-, never v.")
+        assert target.status_code == 200
+        target_id = target.json()["contribution_id"]
+
+        resp = self._post(
+            client,
+            content="Tagged rel-2.0.0 following the convention; it worked.",
+            acted_on=target_id,
+        )
+        assert resp.status_code == 200
+
+        record = client.get(f"/scopes/g_active/record/{resp.json()['contribution_id']}")
+        assert record.status_code == 200
+        assert record.json()["contribution"]["acted_on"] == target_id
 
 
 class TestScopeRecord:
