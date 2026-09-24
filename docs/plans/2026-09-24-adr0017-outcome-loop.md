@@ -60,9 +60,11 @@ outcome) changes standing with no migration.
 
 What the derivation counts, per the philosopher's tests:
 
-- **Only outcomes that could have failed.** The judge applies the test (P3). An
-  outcome it reads as "reviewed and confirmed" is admitted, if at all, as
-  context, **and it does not count** toward standing.
+- **Only outcomes that could have failed — and nothing is stored to say so.**
+  The judge applies the test (P3), and the closure below makes the record
+  carry the reading by construction: an **accepted** `acted_on` contribution
+  that did not replace the item **held**. No judge-assigned reading is ever
+  stored.
 - **A scope's own outcomes are full corroboration.** Independence is a property
   of the evidence, not of who first said the words (Concept 8), and each action
   could have failed — so outcomes a scope reports on its own claim count in
@@ -91,6 +93,19 @@ a short instruction with three outcomes it may reach:
 
 Plus the existing outcomes: decline (e.g. "reviewed and confirmed" presented as
 evidence, or no ground), and the ordinary kinds rules.
+
+**The closure (philosopher, confirmed by the CEO, 2026-09-24).** An `acted_on`
+contribution is **accepted only when it reports that the item HELD**
+(corroboration; nothing replaced) **or that it FAILED** (correction or
+supersession; the item is replaced). **Any other `acted_on` contribution is
+declined** — an echo ("reviewed it and confirmed it"), an ambiguous report
+("partially worked"), a pending one ("result unclear"). The reason must first
+**name the missing ground** — *"no outcome: the action could not have failed"*,
+or *"no outcome reported"* — and only then, as guidance, say it may be
+resubmitted without `acted_on` if it is worth keeping as ordinary context. The
+same content without `acted_on` is judged as ordinary context, as today. With
+that closure, *accepted and not replaced* means *held*, so P2's derivation
+cannot over-count, and no judge-assigned reading is ever stored.
 
 **This block is added only for contributions that carry `acted_on`.** That is
 the lesson of v1.14's M1 (#212): adding directive ids to every prompt fixed the
@@ -210,12 +225,22 @@ Each item sits in a scope holding the item acted on. Goldens state decision
 1. **Corroborates** — "I deployed with the rel- tag convention and the release
    pipeline picked it up" (the action could have failed and didn't) → accept
    as context, counted toward the item's standing.
+   The golden requires the contribution to state **what happened** — an
+   observable result ("the pipeline picked up the rel- tag") — and the judge
+   reaches *held* only on one.
+   **1b. No observable** — carrying `acted_on`: "I acted on it and it worked" →
+   **declined** as ambiguous, "no outcome reported": nothing observable was
+   stated, so there is nothing that could have failed.
 2. **Corrects** — "I used the documented port 8443 and the service refused
    connections; it listens on 9443" → correction: the item is replaced, and a
    `claim_corrected` notice is raised.
-3. **Echo, must not count** — "I reviewed the runbook entry and confirm it is
-   right" → admitted as context at most, **not** counted toward standing;
-   decline if presented as evidence.
+3. **Echo, must not count** — carrying `acted_on`: "I reviewed the runbook
+   entry and confirm it is right" → **declined**, the reason naming the missing
+   ground ("no outcome: the action could not have failed") before the
+   resubmit-without-`acted_on` guidance. Hard stop for the release (CEO
+   ruling 5).
+   **3b. Ambiguous or pending** — carrying `acted_on`: "it partially worked" /
+   "result unclear so far" → **declined**, "no outcome reported".
 4. **Supersession, not correction** — "the port was 8443 until today's
    migration; it is now 9443" → replaced, **no** correction notice.
 5. **Self-corroboration** — the scope's own earlier claim, acted on, held →
@@ -235,6 +260,10 @@ Each item sits in a scope holding the item acted on. Goldens state decision
 8. **Correction fan-out, bounded** — a corrected claim that had been published
    to two readers → both receive the `claim_corrected` notice exactly once, and
    nothing loops (a reference cycle between the two readers is included).
+**Hazard pin for P7 (next cycle).** A summary holding a restatement of an item
+and no `acted_on` outcome for it → when ratification is considered, the reason
+cites **no corroboration**. A restatement is never read as evidence.
+
 9. **Unprompted `acted_on`** — in the demo eval's write-back run, an agent that
    was not told to set the reference sets it at least once; or the report says
    it does not happen.
