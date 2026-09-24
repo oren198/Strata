@@ -312,6 +312,71 @@ plan, and ruled on by the CEO. They bind v1.15 alongside the plan above.
 6. **Copy.** *"Outcome loop: plumbing shipped, adoption measured"* — never
    "standing works" — until the adoption number exists.
 
+## Ruling on failed outcomes (philosopher, adopted by the CEO, 2026-09-24)
+
+Building P2 exposed a hole: the plan read "replaced" from a record fact that did
+not exist for context items. The ruling closes it with no new mechanism.
+
+**The contributor proposes; the judge disposes.** P1's "correction is the
+judge's call, not the contributor's" conflated *proposing* a replacement with
+*classifying* it. Any contributor may propose that a newer observation replaces
+an older claim (Concept 5); what the judge reserves is the disposition —
+whether the replacement holds up, and whether the act is a correction (the claim
+was wrong) or a supersession (the world moved on). So:
+
+- **Held outcome** = a contribution carrying `acted_on` = X and **no**
+  `supersedes`.
+- **Failed outcome** = a contribution carrying `acted_on` = X **and**
+  `supersedes` = X, whose content states what was observed and what now holds.
+- **`acted_on` and `supersedes` naming different items are rejected** (a record
+  constraint: otherwise X would read as held while Y was replaced).
+
+This **reverses** P1's rejection of `acted_on` + `supersedes` — the P1 follow-up
+narrows it to "different items → rejected".
+
+**A failure with no known fix is not a special case: the negative observation
+is the replacement.** "Used 8443; the service refused; the right port is
+unknown" is a first-hand claim that contradicts "listens on 8443" and supersedes
+it. The record holds it exactly as any failure: accepted, `acted_on`,
+`supersedes`. There is no "known-wrong" state, no lowered standing (a known-false
+item kept at a low score is Concept 6's named failure), and no retirement
+(there is something to hold in its place).
+
+**The reading rule — what P2 derives.** Accepted + `acted_on` + no
+`supersedes` → **held**. Accepted + `acted_on` + `supersedes` = `acted_on` →
+**replaced**, its kind (correction or supersession) the judge's act, recorded as
+P4's change event. Nothing new is stored: the link is the contribution's own
+`supersedes` FK, which already exists.
+
+**Default to correction.** When the judge cannot tell correction from
+supersession, the act is recorded as a **correction** and notice goes out: a
+needless notice costs attention; a missing one leaves readers acting on a
+falsehood (Concept 7, "the half that matters"). A malformed disposition gets the
+one re-ask and then defaults to correction — never to held. Eval item **4b**:
+an ambiguous failure → `claim_corrected` raised.
+
+**The closure still bites.**
+- An `acted_on` contribution whose text reports a failure but proposes no
+  replacement (no `supersedes`) is ambiguous → **declined**, the missing ground
+  named first, with guidance to resubmit carrying the replacement — the
+  negative observation counts. So a failure can never be silently counted as
+  held.
+- If the judge believes the action happened but does not accept that it
+  falsified the claim (network down, wrong host), neither held nor failed was
+  established → **declined**, ground named, resubmittable as ordinary context.
+
+**What exists today, checked in code (`scope_manager.py`,
+`_superseded_claim_contents`, #199).** A context contribution already replaces
+an earlier one through its own `supersedes` reference, with no ops, and the
+#199 backstop mechanically rejects a rewrite that keeps the superseded claim's
+content. So replacing a context item by id works end to end today. **Its bound,
+stated plainly:** the backstop can check only targets whose content it can see —
+in the current summary or within the recency window (20 rows). An older target
+that has already left the summary is not checked; that is the same bound the
+judge itself is shown. P3's gate therefore includes a failed outcome whose
+target sits outside the recency window, so the behaviour there is measured
+rather than assumed.
+
 ## Risks and open questions
 
 1. **Will the judge apply "could have failed"?** It is a judgment, not a
