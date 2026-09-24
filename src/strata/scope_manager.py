@@ -1236,6 +1236,40 @@ class _DeclineWithAmendment(ValueError):
     """
 
 
+class _MissingReasoning(ValueError):
+    """A ``submit_judgment``/``submit_batch_judgment`` payload with no ``reasoning`` (#204).
+
+    A ``ValueError`` subclass, exactly like its siblings above — the one corrective
+    re-ask fixes it the same way. It differs from every other protocol slip in what
+    happens if the re-ask ALSO comes back without it: reasoning is never the thing being
+    judged, so a still-missing explanation must not cost the contributor their verdict
+    (:func:`ScopeManager._call_with_correctives` records it empty and notes it, rather
+    than letting a second miss propagate as every other slip does).
+    """
+
+
+def _read_reasoning(raw: dict, *, tool_name: str, require: bool = True) -> str:
+    """Read ``reasoning`` off a tool payload, tolerating its absence when *require* is False.
+
+    The single site both :meth:`ScopeManager._parse_judgment` and
+    :func:`_parse_batch_verdicts` (via each verdict entry) route through, so the two
+    payload shapes cannot drift on what counts as "missing": absent, non-string, or
+    blank/whitespace-only all count. ``require=True`` (the default, and every FIRST
+    attempt) raises :class:`_MissingReasoning`, which the one corrective re-ask already
+    catches like any other protocol slip (#201/#204). ``require=False`` is used only for
+    the retry that follows that one re-ask — never for a first attempt — so a judge that
+    still supplies nothing gets recorded with an empty reasoning instead of a second crash.
+    """
+    reasoning = raw.get("reasoning")
+    if isinstance(reasoning, str) and reasoning.strip():
+        return reasoning
+    if require:
+        raise _MissingReasoning(
+            f"{tool_name} returned no `reasoning` value (or a non-string/blank one)."
+        )
+    return ""
+
+
 def _parse_directive_ops(  # noqa: ANN001 — raw tool-call field
     raw_ops,
     *,
@@ -1340,7 +1374,9 @@ def _parse_directive_ops(  # noqa: ANN001 — raw tool-call field
     return ops, notes
 
 
-def _parse_batch_verdicts(raw_verdicts, *, batch_ids: Sequence[str]) -> list[BatchVerdict]:  # noqa: ANN001 — raw tool-call field
+def _parse_batch_verdicts(
+    raw_verdicts, *, batch_ids: Sequence[str], require_reasoning: bool = True
+) -> list[BatchVerdict]:  # noqa: ANN001 — raw tool-call field
     """Parse ``verdicts`` of a ``submit_batch_judgment`` payload (ADR 0011 D3).
 
     Every contribution in the batch must carry exactly one verdict. A verdict
@@ -1396,12 +1432,15 @@ def _parse_batch_verdicts(raw_verdicts, *, batch_ids: Sequence[str]) -> list[Bat
                 f"submit_batch_judgment returned an unknown decision {decision!r} for "
                 f"{contribution_id}; expected one of {', '.join(_BATCH_DECISIONS)}."
             )
-        reasoning = entry.get("reasoning")
-        if not isinstance(reasoning, str):
-            raise ValueError(
+        try:
+            reasoning = _read_reasoning(
+                entry, tool_name="submit_batch_judgment", require=require_reasoning
+            )
+        except _MissingReasoning as exc:
+            raise _MissingReasoning(
                 f"submit_batch_judgment returned no reasoning for {contribution_id}; "
                 "every verdict carries its own one-or-two-sentence explanation."
-            )
+            ) from exc
         by_id[contribution_id] = BatchVerdict(
             contribution_id=contribution_id, decision=decision, reasoning=reasoning
         )
@@ -3206,6 +3245,24 @@ class ScopeManager:
                 rendered_item_ids=rendered_item_ids,
             )
 
+        def _parse_lenient(block) -> ScopeManagerJudgment:  # noqa: ANN001 — tool_use block
+            """#204: the retry after the one reasoning re-ask never crashes on a second miss."""
+            return self._parse_judgment(
+                scope=scope,
+                tool_use_block=block,
+                current_summary=current_summary,
+                new_contribution=new_contribution,
+                mode=mode,
+                context_locked=(
+                    mode == "input_change_refresh"
+                    and _refresh_events_are_all_additions(input_changes)
+                ),
+                change_id=change_id,
+                hop=hop,
+                rendered_item_ids=rendered_item_ids,
+                require_reasoning=False,
+            )
+
         def _invalid_ops(judgment: ScopeManagerJudgment) -> list[DirectiveOp]:
             _, invalid = _partition_ops(judgment.directive_ops, current_summary)
             return invalid
@@ -3322,6 +3379,7 @@ class ScopeManager:
             stale_claims=_stale_claims,
             stale_claim_corrective=_stale_claim_corrective,
             drop_stale_context=_drop_stale_context,
+            parse_lenient=_parse_lenient,
         )
 
     def _call_with_correctives(
@@ -3344,6 +3402,7 @@ class ScopeManager:
         stale_claims: Callable[[_JudgmentT], list[str]] | None = None,
         stale_claim_corrective: Callable[[Sequence[str]], str] | None = None,
         drop_stale_context: Callable[[_JudgmentT], _JudgmentT] | None = None,
+        parse_lenient: Callable[[object], _JudgmentT] | None = None,
     ) -> _JudgmentT:
         """Run one judgment call and its correctives, one retry each.
 
@@ -3446,6 +3505,12 @@ class ScopeManager:
                     "amendment (no `directive_ops`, `new_context` null), OR an accept "
                     "that earns the amendment you sent. Do not send both."
                 )
+            if isinstance(error, _MissingReasoning):
+                return (
+                    f"Your {tool_name} call did not include `reasoning`. Call {tool_name} "
+                    f"again with the SAME {verdict_noun}, this time including `reasoning` "
+                    "— one or two sentences explaining it."
+                )
             return (
                 f"Your {tool_name} call could not be parsed: {error} "
                 f"Call {tool_name} again with the SAME {verdict_noun}, returning the "
@@ -3458,6 +3523,8 @@ class ScopeManager:
                 slip = "the first response carried no tool_use block"
             elif isinstance(error, _DeclineWithAmendment):
                 slip = "the first response declined while carrying an amendment"
+            elif isinstance(error, _MissingReasoning):
+                slip = "the first response omitted `reasoning`"
             else:
                 slip = "the first response did not parse"
             return f"Corrective re-ask: {slip}."
@@ -3504,8 +3571,23 @@ class ScopeManager:
             retry_messages = [*first_messages, *correction]
             response = _call(retry_messages)
             tool_use_block = self._extract_tool_use_block(response)
-            judgment = parse(tool_use_block)
-            protocol_notes.append(_protocol_note(parse_error))
+            try:
+                judgment = parse(tool_use_block)
+            except _MissingReasoning:
+                # #204: reasoning is never the thing being judged, so a SECOND miss —
+                # after the one re-ask every protocol slip gets — must not propagate the
+                # way every other slip's second miss does. Re-parse tolerating its
+                # absence (parse_lenient) and record the verdict with reasoning empty;
+                # the contributor keeps their judgment.
+                if parse_lenient is None:
+                    raise
+                judgment = parse_lenient(tool_use_block)
+                protocol_notes.append(
+                    "Judge supplied no `reasoning` even after the corrective re-ask; "
+                    "recorded with an empty reasoning."
+                )
+            else:
+                protocol_notes.append(_protocol_note(parse_error))
             # Chain the correctives below onto this turn: their follow-ups
             # must build on the retry's conversation, not the discarded first
             # turn.
@@ -3856,6 +3938,24 @@ class ScopeManager:
                 rendered_item_ids=rendered_item_ids,
             )
 
+        def _parse_lenient(block) -> ScopeManagerBatchJudgment:  # noqa: ANN001 — tool_use block
+            """#204: the retry after the one reasoning re-ask never crashes on a second miss."""
+            return self._parse_batch_judgment(
+                scope=scope,
+                tool_use_block=block,
+                current_summary=current_summary,
+                contributions=contributions,
+                mode=mode,
+                context_locked=(
+                    mode == "input_change_refresh"
+                    and _refresh_events_are_all_additions(input_changes)
+                ),
+                change_ids=wave_ids,
+                hop=hop,
+                rendered_item_ids=rendered_item_ids,
+                require_reasoning=False,
+            )
+
         def _invalid_ops(judgment: ScopeManagerBatchJudgment) -> list[DirectiveOp]:
             _, invalid = _partition_ops(
                 judgment.directive_ops, current_summary, batch_ids=batch_ids
@@ -3907,6 +4007,7 @@ class ScopeManager:
                 "publish), neither of them a string nor strings, and `new_context` a "
                 "string or null."
             ),
+            parse_lenient=_parse_lenient,
         )
 
     @staticmethod
@@ -3921,6 +4022,7 @@ class ScopeManager:
         change_ids: Sequence[str] = (),
         hop: int = 0,
         rendered_item_ids: Sequence[str] = (),
+        require_reasoning: bool = True,
     ) -> ScopeManagerBatchJudgment:
         """Validate a ``submit_batch_judgment`` payload and apply its amendment.
 
@@ -3940,7 +4042,9 @@ class ScopeManager:
         raw: dict = tool_use_block.input
         batch_ids = list(contributions)
 
-        verdicts = _parse_batch_verdicts(raw.get("verdicts"), batch_ids=batch_ids)
+        verdicts = _parse_batch_verdicts(
+            raw.get("verdicts"), batch_ids=batch_ids, require_reasoning=require_reasoning
+        )
         # Issue #201: an id-addressed op with no id reads it off the member it
         # names — an op whose contribution_id is missing or unknown resolves to
         # nothing and stays invalid, as before.
@@ -4182,6 +4286,7 @@ class ScopeManager:
         change_id: str | None = None,
         hop: int = 0,
         rendered_item_ids: Sequence[str] = (),
+        require_reasoning: bool = True,
     ) -> ScopeManagerJudgment:
         """Validate a ``submit_judgment`` payload and apply its amendment.
 
@@ -4200,7 +4305,9 @@ class ScopeManager:
         _check_mode(mode)
         raw: dict = tool_use_block.input
         decision: str = raw["decision"]
-        reasoning: str = raw["reasoning"]
+        reasoning: str = _read_reasoning(
+            raw, tool_name="submit_judgment", require=require_reasoning
+        )
 
         # Issue #201: an id-addressed op with no id reads it off the
         # contribution under judgment, whose record names what it replaces.
@@ -4483,7 +4590,12 @@ class ScopeManager:
         )
         tool_use_block = self._extract_tool_use_block(response)
         raw: dict = tool_use_block.input
-        return PublicationJudgment(decision=raw["decision"], reasoning=raw["reasoning"])
+        # #204: no corrective machinery runs on this single-call path (unlike
+        # judge()/judge_batch()) — tolerate a missing `reasoning` rather than KeyError.
+        return PublicationJudgment(
+            decision=raw["decision"],
+            reasoning=_read_reasoning(raw, tool_name="submit_publication_judgment", require=False),
+        )
 
     # ------------------------------------------------------------------
     # Bootstrap judging (ADR 0007 D4) — the one-shot migration primitive.
@@ -4616,7 +4728,8 @@ class ScopeManager:
         # It stays loud in two ways: the structured `trimmed` flag on the
         # returned judgment, and a warning log line here, at the point the
         # silent drop used to happen.
-        reasoning = raw["reasoning"]
+        # #204: same tolerant read as judge_publication — this path has no re-ask either.
+        reasoning = _read_reasoning(raw, tool_name="submit_bootstrap_judgment", require=False)
         trimmed = False
         if items:
             kept: list[BootstrapPublishedItemInput] = []
