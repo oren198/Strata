@@ -18,6 +18,7 @@ from strata.scope_manager import (
     ActedOnTarget,
     ScopeManager,
     _build_batch_judge_tool,
+    _judge_tool_for,
 )
 from strata.summary_store import ScopeSummary
 
@@ -152,8 +153,13 @@ def _followup_text(client: MagicMock, call: int = 1) -> str:
 # --- schema --------------------------------------------------------------------------
 
 
-def test_the_tool_carries_outcome_disposition() -> None:
-    props = JUDGE_TOOL["input_schema"]["properties"]
+def test_the_tool_carries_outcome_disposition_only_for_an_acted_on_target() -> None:
+    # ADR 0017 P3 rev2 (M1/#212 lesson): outcome_disposition is offered ONLY on the
+    # variant derived for an acted_on contribution — never on the base JUDGE_TOOL every
+    # ordinary judge call sees. See tests/test_p3_tool_schema_pins.py for the full pin.
+    assert "outcome_disposition" not in JUDGE_TOOL["input_schema"]["properties"]
+
+    props = _judge_tool_for(CONTEXT_TARGET)["input_schema"]["properties"]
     assert props["outcome_disposition"]["type"] == ["string", "null"]
     assert "held" in props["outcome_disposition"]["description"]
 

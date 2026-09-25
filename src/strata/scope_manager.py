@@ -364,28 +364,52 @@ JUDGE_TOOL: dict = {
                     "item."
                 ),
             },
-            "outcome_disposition": {
-                "type": ["string", "null"],
-                "description": (
-                    "ADR 0017 P3: REQUIRED, and ONLY meaningful, when the contribution "
-                    "under judgment carries `acted_on` — an OUTCOME REPORT block will be "
-                    "rendered above when that is so, and this field must then be exactly "
-                    "one of: `held` (an action that could have failed CONFIRMED the item "
-                    "— never merely that the claim reads as true), `failed_corrected` "
-                    "(the claim was wrong; the report's own observation replaces it), "
-                    "`failed_superseded` (the claim was right but the world moved on; "
-                    "the report's own observation replaces it), or `decline` (the report "
-                    "establishes neither a clean hold nor a clean failure — an echo, an "
-                    "ambiguous result, or a pending one). `decision` must then read "
-                    "`accept_as_context` for held/failed_corrected/failed_superseded, or "
-                    "`decline` for `decline` — the two fields must agree. Null (omitted) "
-                    "for every contribution that does NOT carry `acted_on`."
-                ),
-            },
         },
         "required": ["decision", "reasoning", "directive_ops", "new_context"],
     },
 }
+
+#: ADR 0017 P3: appended to :data:`JUDGE_TOOL`'s ``input_schema.properties`` ONLY for
+#: an ``acted_on`` contribution's single-contribution judge call (see
+#: :func:`_judge_tool_for`) — never unconditionally, per the M1/#212 lesson that a new
+#: field on EVERY call (schema, not just prompt text) measurably degrades general
+#: judging even when unused. An ordinary judge call's tool dict must stay byte-identical
+#: to what shipped before P3 (pinned against ``tests/fixtures/judge_tools_v1150/``).
+_OUTCOME_DISPOSITION_PROPERTY: dict = {
+    "type": ["string", "null"],
+    "description": (
+        "ADR 0017 P3: REQUIRED, and ONLY meaningful, when the contribution "
+        "under judgment carries `acted_on` — an OUTCOME REPORT block will be "
+        "rendered above when that is so, and this field must then be exactly "
+        "one of: `held` (an action that could have failed CONFIRMED the item "
+        "— never merely that the claim reads as true), `failed_corrected` "
+        "(the claim was wrong; the report's own observation replaces it), "
+        "`failed_superseded` (the claim was right but the world moved on; "
+        "the report's own observation replaces it), or `decline` (the report "
+        "establishes neither a clean hold nor a clean failure — an echo, an "
+        "ambiguous result, or a pending one). `decision` must then read "
+        "`accept_as_context` for held/failed_corrected/failed_superseded, or "
+        "`decline` for `decline` — the two fields must agree. Null (omitted) "
+        "for every contribution that does NOT carry `acted_on`."
+    ),
+}
+
+
+def _judge_tool_for(acted_on_target: ActedOnTarget | None) -> dict:
+    """The single-contribution judge tool: :data:`JUDGE_TOOL` unchanged, unless this
+    call judges an ``acted_on`` contribution, in which case a deep-copied variant
+    carrying ``outcome_disposition`` is returned instead (ADR 0017 P3).
+
+    Deliberately NOT a module-level constant: doing that once, unconditionally, is
+    exactly the M1/#212 mistake this function exists to avoid.
+    """
+    if acted_on_target is None:
+        return JUDGE_TOOL
+    tool = copy.deepcopy(JUDGE_TOOL)
+    tool["input_schema"]["properties"]["outcome_disposition"] = copy.deepcopy(
+        _OUTCOME_DISPOSITION_PROPERTY
+    )
+    return tool
 
 
 def _build_batch_judge_tool() -> dict:
@@ -423,8 +447,9 @@ def _build_batch_judge_tool() -> dict:
     schema["properties"].pop("reasoning")
     # ADR 0017 P3: acted_on outcome judging is a single-contribution-only surface for
     # now (same limit M1's directive attestation set for batches) — the field makes
-    # no sense per-batch-verdict yet, so it is not offered here.
-    schema["properties"].pop("outcome_disposition")
+    # no sense per-batch-verdict yet. JUDGE_TOOL itself never carries it (see
+    # _judge_tool_for), so there is nothing to pop here any more; this batch tool is
+    # simply never offered the field.
     schema["properties"]["directive_ops"] = op_schema
     schema["properties"]["verdicts"] = {
         "type": "array",
@@ -3625,7 +3650,7 @@ class ScopeManager:
         return self._call_with_correctives(
             user_message=user_message,
             system_prompt=_SYSTEM_PROMPT,
-            tool=JUDGE_TOOL,
+            tool=_judge_tool_for(acted_on_target),
             max_tokens=JUDGE_MAX_TOKENS,
             summary_max_words=summary_max_words,
             parse=_parse,
