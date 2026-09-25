@@ -212,6 +212,49 @@ class TestAffectedScopes:
         with pytest.raises(ValueError, match="kind"):
             affected_scopes(fleet, item="pub_1", kind="deleted", source_scope_id="g_funcA")
 
+    def test_claim_superseded_is_still_refused(self, fleet: FleetConfig) -> None:
+        """ADR 0017 P4: claim_corrected gets its own rule; claim_superseded does not —
+        P3's "recorded, no notice" stands, so it is still an unrecognised kind here."""
+        with pytest.raises(ValueError, match="kind"):
+            affected_scopes(fleet, item="c_1", kind="claim_superseded", source_scope_id="g_funcA")
+
+    def test_claim_corrected_reaches_the_holding_scopes_readers_same_topology_as_publication(
+        self, fleet: FleetConfig
+    ) -> None:
+        """ADR 0017 P4: who reads a corrected claim is who reads the holding scope's
+        face — the same rule PUBLICATION_KINDS already uses."""
+        assert affected_scopes(
+            fleet, item="c_1", kind="claim_corrected", source_scope_id="g_funcA"
+        ) == ["g_funcB", "g_teamX", "g_teamY"]
+
+    def test_claim_corrected_by_owner_excludes_the_holding_scope_by_default(
+        self, fleet: FleetConfig
+    ) -> None:
+        """Same-scope (the holding scope authored its own correction, `by_owner=True`
+        the default): it is excluded from its own affected set exactly like any other
+        self-authored retraction — reached instead by `emit`'s self-notice."""
+        assert "g_funcA" not in affected_scopes(
+            fleet, item="c_1", kind="claim_corrected", source_scope_id="g_funcA"
+        )
+
+    def test_claim_corrected_by_owner_false_notifies_the_holding_scope_alone(
+        self, fleet: FleetConfig
+    ) -> None:
+        """Cross-scope (a DIFFERENT scope's outcome caused the correction,
+        `by_owner=False`): the holding scope did nothing itself, so it is told as an
+        ordinary reader owed a refresh — but its OWN readers (chain children,
+        referencing peers) are NOT told directly here. Caught by strata-evals'
+        unpublished-claim control: nobody but the holding scope may have actually
+        seen the claim, so the fan-out to readers happens only through the holding
+        scope's OWN subsequent withdrawal (`by_owner=True`), never from this call."""
+        assert affected_scopes(
+            fleet,
+            item="c_1",
+            kind="claim_corrected",
+            source_scope_id="g_funcA",
+            by_owner=False,
+        ) == ["g_funcA"]
+
 
 # ---------------------------------------------------------------------------
 # ADR 0014 D4/D5 — emission
@@ -556,3 +599,61 @@ class TestEmit:
         assert change_id.startswith("chg_")
         assert "the fleet is unreadable" in caplog.text
         assert record_store.list_change_events(scope_id="g_teamX") == []
+
+    # -----------------------------------------------------------------------
+    # ADR 0017 P4 — claim_corrected's split fan-out (self-notice vs. cross-scope)
+    # -----------------------------------------------------------------------
+
+    def test_claim_corrected_same_scope_self_notices_and_does_not_enqueue_the_holder(
+        self, fleet: FleetConfig, record_store: RecordStore
+    ) -> None:
+        """by_owner=True (the default): the holding scope authored its own
+        correction, so it gets the #197-style self-notice (born processed, no
+        refresh) — never an ordinary unprocessed row alongside its readers'."""
+        (change_id,) = emit(
+            fleet=fleet,
+            record_store=record_store,
+            item="c_1",
+            kind="claim_corrected",
+            source_scope_id="g_funcA",
+            before="the old claim",
+            after="the corrected claim",
+        )
+
+        for scope_id in ("g_teamX", "g_teamY", "g_funcB"):
+            events = record_store.list_change_events(scope_id=scope_id)
+            assert len(events) == 1
+            assert events[0].kind == "claim_corrected"
+            assert events[0].processed_at is None  # an ordinary, enqueued refresh
+
+        holder_events = record_store.list_change_events(scope_id="g_funcA")
+        assert len(holder_events) == 1
+        assert holder_events[0].change_id == change_id
+        assert holder_events[0].self_notice == 1
+        assert holder_events[0].processed_at is not None  # born processed, no refresh
+        assert "the corrected claim" in holder_events[0].after
+
+    def test_claim_corrected_cross_scope_enqueues_the_holder_as_an_ordinary_reader(
+        self, fleet: FleetConfig, record_store: RecordStore
+    ) -> None:
+        """by_owner=False: a DIFFERENT scope's outcome caused this — the holding
+        scope did nothing itself, so it gets an ordinary UNPROCESSED row like any
+        other affected scope, never a self-notice (a born-processed row would never
+        wake its own judge)."""
+        emit(
+            fleet=fleet,
+            record_store=record_store,
+            item="c_1",
+            kind="claim_corrected",
+            source_scope_id="g_funcA",
+            before="the old claim",
+            after="the corrected claim",
+            by_owner=False,
+        )
+
+        holder_events = record_store.list_change_events(scope_id="g_funcA")
+        assert len(holder_events) == 1
+        assert holder_events[0].self_notice == 0
+        assert holder_events[0].processed_at is None  # enqueued, an ordinary refresh
+        assert holder_events[0].kind == "claim_corrected"
+        assert "the corrected claim" in holder_events[0].after

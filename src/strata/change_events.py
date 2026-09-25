@@ -86,6 +86,19 @@ anyway.
 
 DIRECTIVE_KINDS = frozenset({"directive_appended", "directive_superseded", "directive_retired"})
 
+CLAIM_CORRECTED = "claim_corrected"
+"""ADR 0017 P4: a context claim the judge found WRONG (``failed_corrected``),
+reaching every reader it did — never ``claim_superseded`` (recorded, no notice; P3's
+"the item is replaced; no notice" stands). Not in :data:`PUBLICATION_KINDS`: a
+correction is a distinct fact from a publication change, even though its topological
+audience (see :func:`affected_scopes`) is computed the same way."""
+
+_SELF_NOTICING_KINDS = RETRACTION_KINDS | frozenset({CLAIM_CORRECTED})
+"""Kinds whose SOURCE, when excluded from its own change's affected set, is still
+owed a self-notice (issue #197's rule, extended by ADR 0017 P4 to the claim owner's
+readers: a correction is a retraction of the wrong claim's standing, and a correction
+owes notice exactly as a retraction does)."""
+
 #: The one-off unsplice of a legacy spliced row (ADR 0015 D5). NOT in
 #: :data:`DIRECTIVE_KINDS`: those three say a scope's directive set moved and
 #: are due every descendant a refresh. This one says the opposite — a row that
@@ -130,6 +143,7 @@ def affected_scopes(
     kind: str,
     source_scope_id: str,
     by_operator: bool = False,
+    by_owner: bool = True,
 ) -> list[str]:
     """Return the ids of the scopes that compose *item*, in a deterministic order.
 
@@ -161,6 +175,19 @@ def affected_scopes(
             change on S affects S and its descendants". The scope is a
             reader of what the operator did to it, not its author. Ignored
             for a publication change, which never reaches its own source.
+        by_owner: :data:`CLAIM_CORRECTED` only (ADR 0017 P4). ``True`` (the
+            default) when the HOLDING scope's own judge authored the
+            correction (a same-scope outcome) — its DOWNSTREAM readers
+            (chain children, referencing peers) are the affected set, and the
+            holding scope itself is excluded, reached instead by
+            :func:`emit`'s self-notice. ``False`` when a DIFFERENT scope's
+            outcome caused it (a cross-scope, chain-only ``acted_on`` per P1):
+            the affected set is the holding scope ALONE — never its readers
+            directly, since nobody but the holding scope has necessarily seen
+            the claim. Its readers are reached only if and when the holding
+            scope's OWN subsequent refresh withdraws something, which fans
+            out through this same rule with ``by_owner=True``, under the
+            SAME change id (ADR 0014 D4). Ignored for every other kind.
 
     Returns:
         Affected scope ids, sorted, each at most once. *source_scope_id* is
@@ -197,11 +224,30 @@ def affected_scopes(
         # authored this change; the operator did, from outside.
         affected = {s.id for s in fleet.chain_descendants(source_scope_id)}
         _add_source_if_active(affected, fleet, source_scope_id)
+    elif kind == CLAIM_CORRECTED:
+        # ADR 0017 P4 (fixed after strata-evals' unpublished-claim control caught
+        # the first version over-notifying): a corrected claim's DOWNSTREAM
+        # audience is who reads the HOLDING scope's PUBLICATION — never reached
+        # directly from the correction itself, only from the holding scope's OWN
+        # subsequent withdrawal (the `by_owner=True`/same-scope path, exercised a
+        # second time when a cross-scope correction's own refresh withdraws
+        # something). A cross-scope correction (`by_owner=False`) therefore tells
+        # ONLY the holding scope — never its chain children or referencing peers
+        # directly, whether or not the corrected claim was ever actually
+        # published: nobody but the holding scope itself may have seen it.
+        if by_owner:
+            affected = {s.id for s in fleet.chain_children(source_scope_id)}
+            affected |= {s.id for s in fleet.referenced_by(source_scope_id)}
+        else:
+            affected = set()
+            _add_source_if_active(affected, fleet, source_scope_id)
     else:
+        known = sorted(
+            PUBLICATION_KINDS | DIRECTIVE_KINDS | {OPERATOR_DIRECTIVE_CHANGED, CLAIM_CORRECTED}
+        )
         raise ValueError(
             f"Unknown change-event kind {kind!r} for item {item!r} in scope "
-            f"{source_scope_id!r} — expected one of "
-            f"{sorted(PUBLICATION_KINDS | DIRECTIVE_KINDS | {OPERATOR_DIRECTIVE_CHANGED})}."
+            f"{source_scope_id!r} — expected one of {known}."
         )
     return sorted(affected)
 
@@ -280,6 +326,7 @@ def emit(
     wave_ids: Sequence[str] = (),
     hop: int = 0,
     by_operator: bool = False,
+    by_owner: bool = True,
 ) -> list[str]:
     """Notify every scope affected by a change to *item*, and return its change ids.
 
@@ -354,6 +401,7 @@ def emit(
             kind=kind,
             source_scope_id=source_scope_id,
             by_operator=by_operator,
+            by_owner=by_owner,
         )
     except Exception:  # noqa: BLE001 — the notice, never the act
         # An unknown kind is a bug in the caller and a broken traversal a bug
@@ -444,13 +492,14 @@ def emit(
                 affected_scope_id=scope_id,
             )
 
-    if kind in RETRACTION_KINDS and source_scope_id not in scope_ids:
-        # ADR 0014 D1 as amended (issue #197): the retracting scope's OWN
-        # readers are inside the audience of the retraction. Skipped when the
-        # source is already in the affected set — an operator correction
-        # (`by_operator`, OPERATOR_DIRECTIVE_CHANGED) reaches the scope as an
-        # ordinary refresh trigger, and a second row would be the same notice
-        # twice.
+    if kind in _SELF_NOTICING_KINDS and source_scope_id not in scope_ids:
+        # ADR 0014 D1 as amended (issue #197), extended by ADR 0017 P4: the
+        # retracting/correcting scope's OWN readers are inside the audience.
+        # Skipped when the source is already in the affected set — an
+        # operator correction (`by_operator`, OPERATOR_DIRECTIVE_CHANGED)
+        # reaches the scope as an ordinary refresh trigger, and so does a
+        # cross-scope `claim_corrected` (`by_owner=False`) — either way a
+        # second row would be the same notice twice.
         _emit_self_notice(
             record_store,
             change_ids=change_ids,

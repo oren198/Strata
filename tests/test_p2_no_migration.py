@@ -82,8 +82,24 @@ def test_standing_evidence_writes_nothing_anywhere(tmp_path: Path) -> None:
     db_path = str(tmp_path / "strata.db")
     summaries_dir = tmp_path / "summaries"
     summaries_dir.mkdir()
-    (summaries_dir / "g_test.md").write_text("some pre-existing summary content\n")
     run_migrations(db_path)
+
+    from strata.summary_store import ScopeSummary, SummaryStore
+
+    # ADR 0017 P4: standing_evidence now READS the holding scope's summary (see
+    # below), so this pre-existing file must be one it can actually parse — a real
+    # write, not opaque garbage text, still proves the point: the before/after
+    # snapshot equality below is what shows nothing gets WRITTEN by the read.
+    summary_store = SummaryStore(str(summaries_dir))
+    summary_store.write(
+        "g_test",
+        ScopeSummary(
+            scope_id="g_test",
+            directives=[],
+            context="some pre-existing summary content",
+            updated_at="2026-01-01T00:00:00Z",
+        ),
+    )
 
     store = RecordStore(db_path)
     contributor = ContributorRef(
@@ -124,7 +140,11 @@ def test_standing_evidence_writes_nothing_anywhere(tmp_path: Path) -> None:
     before_db = _db_content_snapshot(db_path)
     before_files = _summaries_snapshot(summaries_dir)
 
-    evidence = standing_evidence(store, fleet, target.id)
+    # ADR 0017 P4: standing_evidence now READS the holding scope's current summary
+    # (never writes it) — the pre-seeded real summary above strengthens this pin
+    # rather than weakening it: the file snapshot below proves the read touched
+    # nothing.
+    evidence = standing_evidence(store, fleet, target.id, summary_store=summary_store)
     assert evidence  # sanity: the call actually found something to read
 
     after_db = _db_content_snapshot(db_path)

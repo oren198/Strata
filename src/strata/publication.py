@@ -1229,6 +1229,8 @@ def apply_judged_withdrawals(
     summaries_dir: str,
     change_ids: Sequence[str] = (),
     hop: int = 0,
+    notice_kind: str = "withdrawn",
+    correcting_after: str | None = None,
 ) -> list[PublishedItem]:
     """Withdraw published items named by a contribution judgment's ``withdraw_published``.
 
@@ -1265,6 +1267,17 @@ def apply_judged_withdrawals(
             up). Empty makes each withdrawal an independent change.
         hop: How far along the wave the judgment that ordered this sat (see
             :func:`propagate_directive_removals`).
+        notice_kind: ADR 0017 P4. ``"withdrawn"`` (the default) for an ordinary
+            withdrawal. ``"claim_corrected"`` when this withdrawal is the
+            HOLDING scope's own response to a correction — its own outcome
+            judgment (same-scope) or a refresh reacting to one (cross-scope) —
+            so the fan-out to ITS readers carries the correction, not a bare
+            removal. Threaded straight to :func:`~strata.change_events.emit`;
+            never invented here.
+        correcting_after: ``claim_corrected`` only — the correcting content to
+            carry as ``after`` instead of the withdrawal's usual ``None``
+            ("this input is gone"): a correction replaces, it does not merely
+            remove (P3 ruling line (d)).
 
     Returns:
         The published items actually withdrawn.
@@ -1325,9 +1338,10 @@ def apply_judged_withdrawals(
             fleet=fleet,
             record_store=record_store,
             item=item.id,
-            kind="withdrawn",
+            kind=notice_kind,
             source_scope_id=scope_id,
             before=item.content,
+            after=correcting_after if notice_kind == "claim_corrected" else None,
             wave_ids=change_ids,
             hop=hop,
         )

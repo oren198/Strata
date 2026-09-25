@@ -1,5 +1,7 @@
 """v1.15 P3, ADR 0017 — end to end: a failed outcome, through HTTP and MCP, atomically
-recorded, never emitted/composed as an input change, and read back by standing_evidence.
+recorded and read back by standing_evidence. P3's own claim_superseded pin ("never
+emitted/composed") still holds here; P4 deliberately reverses it for claim_corrected
+(cross-scope fan-out to the holding scope) — see the HTTP test below.
 """
 
 from __future__ import annotations
@@ -144,8 +146,13 @@ def test_http_failed_corrected_end_to_end(http_client) -> None:
         }
     )
     from strata.record_store import standing_evidence
+    from strata.summary_store import SummaryStore
 
-    result = standing_evidence(store, fleet, target_id)
+    # g_source's own summary is never written by this flow (the mocked judgment's
+    # new_summary belongs to g_reporter, the judged scope) — read as "gone" (P4's
+    # default when the holding scope has no summary at all), so this stays `replaced`.
+    summary_store_ = SummaryStore(str(Path(http_client.db_path).parent / "summaries"))
+    result = standing_evidence(store, fleet, target_id, summary_store=summary_store_)
     assert len(result) == 1
     assert result[0].contribution_id == outcome_id
     assert result[0].replaced_kind == "claim_corrected"
@@ -157,11 +164,23 @@ def test_http_failed_corrected_end_to_end(http_client) -> None:
     assert event.scope_id == "g_reporter"
     assert event.source_scope_id == "g_source"
 
-    # Condition 1: not emitted — no pending (unprocessed) row exists anywhere.
+    # ADR 0017 P4, deliberately REVERSING P3's own "never emitted, never composed"
+    # pins for claim_corrected only (acceptance criterion #6): this is the
+    # CROSS-SCOPE case (g_reporter, a chain child, reported on g_source's own
+    # item) — g_source did nothing itself, so it is told directly, as an ordinary
+    # unprocessed input change, for its OWN refresh judge to act on.
+    # The outcome's own scope (g_reporter) still gets nothing outward — it already
+    # holds the P3 audit row and is not itself a READER of the correction.
     assert store.list_change_events(scope_id="g_reporter", unprocessed_only=True) == []
-    assert store.list_change_events(scope_id="g_source", unprocessed_only=True) == []
+    holder_events = store.list_change_events(scope_id="g_source", unprocessed_only=True)
+    assert len(holder_events) == 1
+    assert holder_events[0].kind == "claim_corrected"
+    assert holder_events[0].self_notice == 0  # g_source didn't author this itself
+    assert "unknown" in holder_events[0].after
 
-    # Condition 2: not composed as an input change, in EITHER scope's perspective.
+    # Condition 2 (unchanged — claim_superseded's own row, tested elsewhere, still
+    # composes nothing anywhere): not composed as an input change in EITHER scope's
+    # perspective UNTIL a drain actually processes the notice above.
     persp_reporter = http_client.get("/scopes/g_reporter/summary")
     assert persp_reporter.status_code == 200
 
