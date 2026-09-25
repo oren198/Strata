@@ -260,6 +260,10 @@ function RecordEntryRow({ contribution, stateEntry, judgment, attempts, open, on
             <div className="at-caption">Replaces <code>{contribution.supersedes}</code></div>
           )}
 
+          {contribution.acted_on && (
+            <div className="at-caption">Outcome for <code>{contribution.acted_on}</code></div>
+          )}
+
           <div style={{ fontFamily: "var(--font-mono)", fontSize: 11, color: "var(--at-muted)" }}>
             {contribution.id} · {contribution.contributor.session_id} · {absoluteTime(contribution.created_at)}
           </div>
@@ -342,6 +346,10 @@ function RecordEntryModal({ scopeId, contributionId, onClose }) {
 
           {entry.contribution.supersedes && (
             <div className="at-caption">Replaces <code>{entry.contribution.supersedes}</code></div>
+          )}
+
+          {entry.contribution.acted_on && (
+            <div className="at-caption">Outcome for <code>{entry.contribution.acted_on}</code></div>
           )}
 
           <div style={{ fontFamily: "var(--font-mono)", fontSize: 11, color: "var(--at-muted)" }}>

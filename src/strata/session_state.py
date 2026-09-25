@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -851,8 +852,28 @@ NUDGE_BOTH_EXITS = (
     "if nothing is worth keeping"
 )
 
+#: ADR 0017 P1 (v1.15): the one line every agent-facing nudge/norm gains, verbatim —
+#: an optional reference nobody is told about is never set.
+ACTED_ON_NUDGE_LINE = "If you acted on something from memory, say which item and how it went."
 
-def compute_nudge(state: SessionState | None) -> str | None:
+
+def _render_context_items_clause(items: Sequence[dict]) -> str:
+    """``"c_id1 (label1) and c_id2 (label2)"`` / ``"..., c_id3 (label3)"`` for 3+.
+
+    ADR 0017 P1b: the join a reader recognises as an ordinary list, whatever its
+    length — one item names itself, two are joined by "and", three or more get an
+    Oxford-free "a, b and c" (no serial comma; nothing here is prose meant to read as
+    a sentence on its own, only this clause of one).
+    """
+    parts = [f"{item['id']} ({item['label']})" for item in items]
+    if len(parts) == 1:
+        return parts[0]
+    return ", ".join(parts[:-1]) + f" and {parts[-1]}"
+
+
+def compute_nudge(
+    state: SessionState | None, *, context_items: Sequence[dict] | None = None
+) -> str | None:
     """Return the read-time nudge line for a session's counters, or ``None``.
 
     The stateful read-time nudge (issue #111): the MCP server appends this to
@@ -873,6 +894,16 @@ def compute_nudge(state: SessionState | None) -> str | None:
     string, which would become wallpaper) and both exits
     (:data:`NUDGE_BOTH_EXITS`), and escalates in tone once the count reaches
     :data:`NUDGE_ESCALATE_READS`.
+
+    *context_items* (ADR 0017 P1b): the perspective's self-layer ``context_items`` —
+    ``{"id", "label"}`` dicts for the accepted context this read just showed the agent,
+    still present verbatim (never one condensed away — see
+    :func:`strata.perspective._present_context_items`). Only ``strata_read_perspective``
+    has these to give; every other caller of this function passes nothing, and gets the
+    generic :data:`ACTED_ON_NUDGE_LINE` exactly as before. When given and non-empty, the
+    nudge instead NAMES the ids this session was actually shown — "an agent cannot
+    reference an item it never saw an id for" is the root cause this closes (the P1
+    adoption run came back 0 of 6).
     """
     if state is None:
         return None
@@ -883,15 +914,21 @@ def compute_nudge(state: SessionState | None) -> str | None:
     if reads < NUDGE_MIN_READS:
         return None
     times = "1 time" if reads == 1 else f"{reads} times"
+    acted_on_clause = ACTED_ON_NUDGE_LINE
+    if context_items:
+        acted_on_clause = (
+            f"This session read {_render_context_items_clause(context_items)}; if you "
+            "acted on one, pass acted_on=<that id> and say what happened."
+        )
     if reads >= NUDGE_ESCALATE_READS:
         return (
             f"this session has read fleet memory {times} and still written nothing "
             "back — your scope's memory is going stale while you rely on it. Before "
-            f"you finish: {NUDGE_BOTH_EXITS}."
+            f"you finish: {NUDGE_BOTH_EXITS}. {acted_on_clause}"
         )
     return (
         f"this session has read fleet memory {times} and written nothing back yet; "
-        f"{NUDGE_BOTH_EXITS}."
+        f"{NUDGE_BOTH_EXITS}. {acted_on_clause}"
     )
 
 

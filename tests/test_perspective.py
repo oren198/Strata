@@ -1503,3 +1503,127 @@ def test_self_layer_count_is_none_without_a_contribution_reader(tmp_path: Path) 
         "condensed": False,
         "context_contributions_absent": None,
     }
+
+
+# ---------------------------------------------------------------------------
+# ADR 0017 P1b — context_items: the accepted context ids and labels an agent
+# can pass back as acted_on. Reuses #202's own presence test — never an id for
+# material condensed away.
+# ---------------------------------------------------------------------------
+
+
+def test_self_layer_lists_present_context_items_with_ids_and_labels(tmp_path: Path) -> None:
+    """The golden output: present items listed with id + label, absent ones NOT
+    listed, and the existing condensation count unchanged."""
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fixture_fleet_yaml(tmp_path)
+    _seed_summaries(summaries_dir)
+    store = SummaryStore(summaries_dir)
+    fleet = FleetConfig.load(fleet_path)
+
+    store.write(
+        "g_team",
+        ScopeSummary(
+            scope_id="g_team",
+            directives=[],
+            context=(
+                "The build is pinned to Python 3.12. Release tags use the prefix rel-, never v."
+            ),
+            updated_at="2026-09-08T00:00:00+00:00",
+            condensed=True,
+        ),
+    )
+    record_store = _seed_accepted_context(
+        str(tmp_path / "strata.db"),
+        scope_id="g_team",
+        contents=[
+            "The build is pinned to Python 3.12.",  # present
+            "Release tags use the prefix rel-, never v.",  # present
+            "The staging cluster reboots on Sundays.",  # condensed away
+        ],
+    )
+    present_ids = [
+        c.id
+        for c in record_store.list_accepted_context_contributions(scope_id="g_team")
+        if "Sundays" not in c.content
+    ]
+
+    def _contribution_reader(scope_id: str) -> list:
+        return record_store.list_accepted_context_contributions(scope_id=scope_id)
+
+    result = compose_perspective(
+        "g_team",
+        fleet=fleet,
+        summary_store=store,
+        contribution_reader=_contribution_reader,
+    )
+
+    self_layer = next(layer for layer in result["layers"] if layer["relation"] == "self")
+    assert self_layer["condensation"] == {
+        "condensed": True,
+        "context_contributions_absent": 1,
+    }
+    assert self_layer["context_items"] == [
+        {"id": present_ids[0], "label": "The build is pinned to Python 3.12."},
+        {"id": present_ids[1], "label": "Release tags use the prefix rel-, never v."},
+    ]
+    # Only the self layer carries it.
+    assert all(
+        "context_items" not in layer for layer in result["layers"] if layer["relation"] != "self"
+    )
+
+
+def test_context_items_is_none_without_a_contribution_reader(tmp_path: Path) -> None:
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fixture_fleet_yaml(tmp_path)
+    store = _seed_summaries(summaries_dir)
+    fleet = FleetConfig.load(fleet_path)
+
+    result = compose_perspective("g_team", fleet=fleet, summary_store=store)
+
+    self_layer = next(layer for layer in result["layers"] if layer["relation"] == "self")
+    assert self_layer["context_items"] is None
+
+
+def test_context_items_is_empty_list_when_nothing_is_present(tmp_path: Path) -> None:
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fixture_fleet_yaml(tmp_path)
+    _seed_summaries(summaries_dir)
+    store = SummaryStore(summaries_dir)
+    fleet = FleetConfig.load(fleet_path)
+
+    record_store = _seed_accepted_context(
+        str(tmp_path / "strata.db"),
+        scope_id="g_team",
+        contents=["Something that never made it into the context."],
+    )
+
+    def _contribution_reader(scope_id: str) -> list:
+        return record_store.list_accepted_context_contributions(scope_id=scope_id)
+
+    result = compose_perspective(
+        "g_team", fleet=fleet, summary_store=store, contribution_reader=_contribution_reader
+    )
+    self_layer = next(layer for layer in result["layers"] if layer["relation"] == "self")
+    assert self_layer["context_items"] == []
+
+
+def test_context_item_label_is_exactly_eight_words_untruncated() -> None:
+    from strata.perspective import _context_item_label
+
+    content = "one two three four five six seven eight"
+    assert len(content.split()) == 8
+    assert _context_item_label(content) == content
+
+
+def test_context_item_label_truncates_the_ninth_word_with_an_ellipsis() -> None:
+    from strata.perspective import _context_item_label
+
+    content = "one two three four five six seven eight nine"
+    assert _context_item_label(content) == "one two three four five six seven eight…"
+
+
+def test_context_item_label_leaves_a_short_label_untouched() -> None:
+    from strata.perspective import _context_item_label
+
+    assert _context_item_label("Short and sweet.") == "Short and sweet."

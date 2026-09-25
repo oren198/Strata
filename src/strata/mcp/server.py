@@ -519,7 +519,7 @@ def _record_decline() -> SessionState | None:
         return None
 
 
-def _attach_nudge(result: dict) -> dict:
+def _attach_nudge(result: dict, *, context_items: list[dict] | None = None) -> dict:
     """Attach the stateful read-time nudge to a read tool's response (#111).
 
     The nudge rides in a dedicated ``"nudge"`` key that is present ONLY when the
@@ -527,6 +527,11 @@ def _attach_nudge(result: dict) -> dict:
     response shape consumers already parse is never disturbed. The policy
     (thresholds, wording) is engine-owned in :func:`strata.session_state.compute_nudge`;
     this only reads the current counters and, when a line comes back, tacks it on.
+
+    *context_items* (ADR 0017 P1b): forwarded to :func:`compute_nudge` verbatim — only
+    ``strata_read_perspective`` has these to give (the perspective's own self-layer
+    ``context_items``); every other caller leaves this ``None`` and gets the generic
+    nudge exactly as before.
 
     Best-effort: a missing or unreadable session store simply yields no nudge,
     never an error on the read the agent actually asked for.
@@ -537,7 +542,7 @@ def _attach_nudge(result: dict) -> dict:
     on for reads.
     """
     if _session_store is not None:
-        nudge = compute_nudge(_session_store.read(_AGENT_SESSION_ID))
+        nudge = compute_nudge(_session_store.read(_AGENT_SESSION_ID), context_items=context_items)
         if nudge is not None:
             result["nudge"] = nudge
     return _attach_fleet_notice(result)
@@ -2273,6 +2278,7 @@ async def strata_contribute(
     proposed_classification: Literal["directive", "context"],
     subject: str | None = None,
     supersedes: str | None = None,
+    acted_on: str | None = None,
 ) -> dict:
     """Submit a contribution to a scope's scope-manager for judgment.
 
@@ -2312,13 +2318,30 @@ async def strata_contribute(
             ``rpc-protocol``), used for supersession matching.
         supersedes: Optional ID of a prior directive this contribution
             replaces (supersession pattern).
+        acted_on: Optional ID of a prior contribution this one reports the
+            OUTCOME of acting on (ADR 0017 P1) — "I acted on that item, and
+            here is what happened." It counts as an outcome only if the
+            action could have failed and did not: confirming something you
+            read but never acted on is not an outcome (the judge treats that
+            as ordinary context at most, never as corroboration). Mutually
+            exclusive with ``supersedes`` — a correction is the judge's call
+            from what you report, not something you assert yourself. The
+            referenced contribution must exist, be within your entitled read
+            surface, and have actually been admitted into memory (declined,
+            pending, or judge-failed contributions were never there to act
+            on). If you acted on something from memory, say which item and
+            how it went — the id comes from ``strata_read_perspective``'s self
+            layer, ``context_items`` (ADR 0017 P1b): each entry there is
+            ``{"id", "label"}`` for one piece of context you were actually
+            shown, and its ``id`` is what you pass here.
 
     Returns:
         ``contribution_id`` and ``judgment`` (decision, reasoning, summary_updated).
 
     Raises:
         RuntimeError: If the scope is not found, is archived, or is outside
-            this agent's entitled write surface.
+            this agent's entitled write surface; or if ``acted_on`` fails any
+            of its own rules (see the ``acted_on`` argument above).
     """
     await _require_bound_or_elicit()
 
@@ -2339,6 +2362,18 @@ async def strata_contribute(
         raise RuntimeError(f"Scope is archived and not accepting contributions: {scope_id!r}")
     _check_entitled_write(
         fleet, agent_scope, scope_id, agent_skill=agent_skill, agent_session_id=agent_session_id
+    )
+    # Imported lazily, like run_contribution below: keeps the import path light until a
+    # contribution actually happens, and is the single canonical check both write
+    # surfaces (this tool and POST /contribute) call — never a second copy to drift.
+    from strata.app import validate_acted_on  # noqa: PLC0415
+
+    validate_acted_on(
+        fleet,
+        _record_store,
+        acted_on=acted_on,
+        supersedes=supersedes,
+        agent_scope=agent_scope,
     )
 
     stratum = next((s for s in fleet.strata if s.id == scope.stratum_id), None)
@@ -2373,6 +2408,7 @@ async def strata_contribute(
             proposed_classification=proposed_classification,
             subject=subject,
             supersedes=supersedes,
+            acted_on=acted_on,
             contributor=contributor,
             fleet=fleet,
             record_store=_record_store,
@@ -2888,7 +2924,10 @@ async def strata_read_perspective(scope_id: str | None = None) -> dict:
     (``True`` for self/ancestor layers, ``False`` for every publication
     layer, wherever it came from). Publication layers are non-binding at any
     stratum distance or edge type, each labelled with the source scope's own
-    stratum. Self layers carry that scope's full ``summary``; ancestor
+    stratum. Self layers carry that scope's full ``summary``, plus
+    ``context_items`` (ADR 0017 P1b) — the accepted context still present in
+    that summary, each as ``{"id", "label"}``: the ids you may pass to
+    ``strata_contribute`` as ``acted_on``. Ancestor
     layers carry ``directives`` only (a list, never a ``summary`` or
     ``context`` key); publication layers carry the source scope's CURRENT
     ``publication`` (``{"items": [...]}``, verbatim, never its internal
@@ -3021,7 +3060,13 @@ async def strata_read_perspective(scope_id: str | None = None) -> dict:
     # dict, and a stale one announces itself.
     if refresh_pending:
         perspective["refresh_pending"] = refresh_pending
-    return _attach_nudge(perspective)
+    # ADR 0017 P1b: name the ids this read actually showed, so the nudge (if it fires)
+    # can be acted on — an agent cannot pass acted_on=<id> for an id it was never given.
+    self_layer = next(
+        (layer for layer in perspective["layers"] if layer["relation"] == "self"), None
+    )
+    context_items = None if self_layer is None else self_layer.get("context_items")
+    return _attach_nudge(perspective, context_items=context_items)
 
 
 # ---------------------------------------------------------------------------

@@ -65,6 +65,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
+from strata.fleet_config import FleetConfig
+from strata.summary_store import SummaryStore
+
 # ---------------------------------------------------------------------------
 # ID helpers
 # ---------------------------------------------------------------------------
@@ -160,6 +163,12 @@ class Contribution:
     supersedes: str | None
     contributor: ContributorRef
     created_at: str
+    acted_on: str | None = None
+    """The item this contribution reports acting on (ADR 0017 P1, v1.15) — an FK to
+    another contribution's id. Mutually exclusive with `supersedes`, rejected together
+    at the app boundary (`validate_acted_on`): a correction is the judge's call, not the
+    contributor's. Defaults to None so every pre-P1 call site building a Contribution by
+    hand (tests, fixtures) keeps working unchanged."""
 
 
 @dataclass(frozen=True)
@@ -615,6 +624,31 @@ class ChangeEvent:
     shown_at: str | None = None
 
 
+@dataclass(frozen=True)
+class ClaimEventInput:
+    """What :meth:`RecordStore.record_judgment` needs to write a failed outcome's
+    linking event, atomically with its judgment (ADR 0017 P3).
+
+    ``kind`` is ``'claim_corrected'`` or ``'claim_superseded'`` (migration 0017).
+    ``contribution_id`` is the OUTCOME (the source); ``item_id`` is ``acted_on`` (the
+    target); ``scope_id`` is the outcome's own scope; ``source_scope_id`` is the
+    target's scope (a different fact — an item id does not name its holder, exactly as
+    :meth:`RecordStore.append_change_event`'s own docstring says). ``before`` is the
+    target's content as it stood; ``after`` is the outcome's own content — the report's
+    observation that replaces it (ruling line (d): the correcting content is the
+    report's own observation, never anything invented).
+    """
+
+    change_id: str
+    contribution_id: str
+    scope_id: str
+    source_scope_id: str
+    item_id: str
+    kind: Literal["claim_corrected", "claim_superseded"]
+    before: str | None
+    after: str | None
+
+
 # ---------------------------------------------------------------------------
 # RecordStore
 # ---------------------------------------------------------------------------
@@ -680,6 +714,7 @@ class RecordStore:
         subject: str | None,
         supersedes: str | None,
         contributor: ContributorRef,
+        acted_on: str | None = None,
     ) -> Contribution:
         """Append a contribution to the scope's immutable record and return it.
 
@@ -701,13 +736,19 @@ class RecordStore:
                                      one supersedes.
             contributor:             Provenance — the contributing agent's
                                      ``(scope, skill, session, timestamp)``.
+            acted_on:                Optional ID of a prior contribution this one
+                                     reports acting on (ADR 0017 P1). Callers
+                                     validate mutual exclusivity with *supersedes*
+                                     and every other `acted_on` rule before calling
+                                     this (:func:`validate_acted_on`) — this layer
+                                     only persists what it is given.
 
         Returns:
             The newly appended :class:`Contribution`.
 
         Raises:
-            sqlite3.IntegrityError: If *supersedes* references a non-existent
-                contribution.
+            sqlite3.IntegrityError: If *supersedes* or *acted_on* references a
+                non-existent contribution.
         """
         contribution_id = self._insert_contribution(
             scope_id=scope_id,
@@ -716,6 +757,7 @@ class RecordStore:
             subject=subject,
             supersedes=supersedes,
             contributor=contributor,
+            acted_on=acted_on,
         )
         self._conn.commit()
         return self._fetch_contribution(contribution_id)
@@ -729,6 +771,7 @@ class RecordStore:
         subject: str | None,
         supersedes: str | None,
         contributor: ContributorRef,
+        acted_on: str | None = None,
     ) -> str:
         """INSERT one contribution row and return its id. Does NOT commit.
 
@@ -744,8 +787,9 @@ class RecordStore:
                 id, scope_id, content, proposed_classification,
                 subject, supersedes,
                 contributor_scope_id, contributor_skill,
-                contributor_session_id, contributor_ts
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                contributor_session_id, contributor_ts,
+                acted_on
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 contribution_id,
@@ -758,6 +802,7 @@ class RecordStore:
                 contributor.skill,
                 contributor.session_id,
                 contributor.ts,
+                acted_on,
             ),
         )
         return contribution_id
@@ -781,7 +826,7 @@ class RecordStore:
         """
         base = """
             SELECT id, scope_id, content, proposed_classification,
-                   subject, supersedes,
+                   subject, supersedes, acted_on,
                    contributor_scope_id, contributor_skill,
                    contributor_session_id, contributor_ts,
                    created_at
@@ -823,7 +868,7 @@ class RecordStore:
         rows = self._conn.execute(
             """
             SELECT c.id, c.scope_id, c.content, c.proposed_classification,
-                   c.subject, c.supersedes,
+                   c.subject, c.supersedes, c.acted_on,
                    c.contributor_scope_id, c.contributor_skill,
                    c.contributor_session_id, c.contributor_ts,
                    c.created_at
@@ -853,7 +898,7 @@ class RecordStore:
         row = self._conn.execute(
             """
             SELECT id, scope_id, content, proposed_classification,
-                   subject, supersedes,
+                   subject, supersedes, acted_on,
                    contributor_scope_id, contributor_skill,
                    contributor_session_id, contributor_ts,
                    created_at
@@ -876,6 +921,7 @@ class RecordStore:
         decision: Literal["accept_as_directive", "accept_as_context", "decline"],
         judged_by: str,
         notes: str | None = None,
+        claim_event: ClaimEventInput | None = None,
     ) -> Judgment:
         """Record the scope-manager's verdict on a contribution.
 
@@ -889,23 +935,48 @@ class RecordStore:
             judged_by:       Identifier of the scope-manager (agent session or
                              system component) issuing the judgment.
             notes:           Optional free-text rationale.
+            claim_event:     ADR 0017 P3. When given, a ``claim_corrected`` or
+                             ``claim_superseded`` change-event row is written in
+                             the SAME transaction as the judgment — a failed
+                             outcome's disposition and its record fact are one
+                             atomic write, never a judgment with no event or an
+                             event with no judgment. Stamped ``processed_at`` at
+                             birth (:meth:`append_change_event`'s ``processed``
+                             flag): P3 has nothing left to drain it for — P4
+                             defines the correction notice.
 
         Returns:
             The newly recorded :class:`Judgment`.
 
         Raises:
             sqlite3.IntegrityError: If *contribution_id* does not exist (FK)
-                or already has a judgment (UNIQUE).
+                or already has a judgment (UNIQUE); or, with *claim_event*, if
+                its own referenced contribution/item does not exist. Nothing
+                is written — the transaction rolls back, so a judgment never
+                survives without its event, or the reverse.
         """
         judgment_id = _new_judgment_id()
-        self._conn.execute(
-            """
-            INSERT INTO judgments (id, contribution_id, decision, judged_by, notes)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (judgment_id, contribution_id, decision, judged_by, notes),
-        )
-        self._conn.commit()
+        with self._conn:  # one transaction: the judgment, and the event if given
+            self._conn.execute(
+                """
+                INSERT INTO judgments (id, contribution_id, decision, judged_by, notes)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (judgment_id, contribution_id, decision, judged_by, notes),
+            )
+            if claim_event is not None:
+                self._insert_change_event(
+                    change_id=claim_event.change_id,
+                    contribution_id=claim_event.contribution_id,
+                    scope_id=claim_event.scope_id,
+                    source_scope_id=claim_event.source_scope_id,
+                    item_id=claim_event.item_id,
+                    kind=claim_event.kind,
+                    before=claim_event.before,
+                    after=claim_event.after,
+                    hop=0,
+                    processed=True,
+                )
         return self._fetch_judgment(judgment_id)
 
     def stamp_summary_version(self, contribution_ids: Sequence[str], *, version: int) -> None:
@@ -1144,7 +1215,7 @@ class RecordStore:
 
         base = """
             SELECT id, scope_id, content, proposed_classification,
-                   subject, supersedes,
+                   subject, supersedes, acted_on,
                    contributor_scope_id, contributor_skill,
                    contributor_session_id, contributor_ts,
                    created_at
@@ -1243,7 +1314,7 @@ class RecordStore:
 
         base = """
             SELECT c.id, c.scope_id, c.content, c.proposed_classification,
-                   c.subject, c.supersedes,
+                   c.subject, c.supersedes, c.acted_on,
                    c.contributor_scope_id, c.contributor_skill,
                    c.contributor_session_id, c.contributor_ts,
                    c.created_at,
@@ -1309,6 +1380,67 @@ class RecordStore:
             judgment_attempts=judgment_attempts,
         )
 
+    def list_outcomes(self, *, acted_on: str) -> list[Contribution]:
+        """Return every contribution reporting an outcome for *acted_on*, oldest first.
+
+        ADR 0017 P2: the raw candidates for one item's standing evidence, across every
+        scope (an outcome need not share the item's own scope — P1 requires only that
+        its reporter could READ the item at write time). Each candidate is filtered and
+        classified by :func:`standing_evidence`; this is the unfiltered read.
+        """
+        rows = self._conn.execute(
+            """
+            SELECT id, scope_id, content, proposed_classification,
+                   subject, supersedes, acted_on,
+                   contributor_scope_id, contributor_skill,
+                   contributor_session_id, contributor_ts,
+                   created_at
+            FROM contributions
+            WHERE acted_on = ?
+            ORDER BY created_at ASC, rowid ASC
+            """,
+            (acted_on,),
+        ).fetchall()
+        return [_contribution_from_row(row) for row in rows]
+
+    def is_superseded(self, contribution_id: str) -> bool:
+        """Return whether some ACCEPTED contribution names *contribution_id* as its
+        ``supersedes`` — the one existing, general mechanism by which a contribution
+        (directive or context) is replaced (ADR 0011; see
+        :func:`strata.scope_manager._superseded_claim_contents`'s docstring for the
+        context half). A ``supersedes`` reference on a contribution that was itself
+        DECLINED never took effect, so it does not count.
+        """
+        row = self._conn.execute(
+            """
+            SELECT 1
+            FROM contributions c
+            JOIN judgments j ON j.contribution_id = c.id
+            WHERE c.supersedes = ? AND j.decision IN (?, ?)
+            LIMIT 1
+            """,
+            (contribution_id, *_ACCEPTED_DECISIONS),
+        ).fetchone()
+        return row is not None
+
+    def claim_event_for(self, contribution_id: str) -> ChangeEvent | None:
+        """The ``claim_corrected``/``claim_superseded`` event this contribution minted
+        as its source, or ``None`` (ADR 0017 P3). At most one exists per outcome —
+        ``record_judgment``'s ``claim_event`` writes it once, atomically with the
+        judgment, and a contribution is judged exactly once.
+        """
+        row = self._conn.execute(
+            """
+            SELECT id, change_id, contribution_id, scope_id, source_scope_id, item_id, kind,
+                   before, after, hop, processed_at, created_at, self_notice, shown_at
+            FROM change_events
+            WHERE contribution_id = ? AND kind IN ('claim_corrected', 'claim_superseded')
+            LIMIT 1
+            """,
+            (contribution_id,),
+        ).fetchone()
+        return ChangeEvent(**dict(row)) if row is not None else None
+
     def _judgments_for(self, contribution_ids: list[str]) -> list[Judgment]:
         """Return the judgments on *contribution_ids*, oldest verdict first."""
         if not contribution_ids:
@@ -1372,7 +1504,7 @@ class RecordStore:
         rows = self._conn.execute(
             """
             SELECT c.id, c.scope_id, c.content, c.proposed_classification,
-                   c.subject, c.supersedes,
+                   c.subject, c.supersedes, c.acted_on,
                    c.contributor_scope_id, c.contributor_skill,
                    c.contributor_session_id, c.contributor_ts,
                    c.created_at,
@@ -1415,7 +1547,7 @@ class RecordStore:
         row = self._conn.execute(
             f"""
             SELECT c.id, c.scope_id, c.content, c.proposed_classification,
-                   c.subject, c.supersedes,
+                   c.subject, c.supersedes, c.acted_on,
                    c.contributor_scope_id, c.contributor_skill,
                    c.contributor_session_id, c.contributor_ts,
                    c.created_at
@@ -2301,6 +2433,254 @@ def _derive_publication_act_state(
         error_message=last_failure.message if last_failure is not None else None,
         failed_at=last_failure.attempted_at if last_failure is not None else None,
     )
+
+
+@dataclass(frozen=True)
+class StandingEvidence:
+    """One outcome's evidence toward a memory item's standing (ADR 0017 P1/P2).
+
+    Returned by :func:`standing_evidence` — a LIST of these, never a number. Standing is
+    a property of an item, DERIVED from the record every time it is asked for; nothing
+    here is stored anywhere (see tests/test_p2_no_migration.py). Deliberately NOT
+    computed: any score, count, weight or rank — that reduction is ratification's own
+    judgment, reading this evidence directly (ADR 0017 P7), never made here.
+    """
+
+    contribution_id: str
+    """The outcome contribution's own id — the record's provenance trail starts here."""
+    reporter_scope_id: str
+    reporter_skill: str | None
+    reporter_session_id: str
+    reported_at: str
+    """The outcome's ``created_at`` — the record's own total order (created_at, rowid)
+    is what "preceding" in :attr:`target_replaced`'s docstring refers to."""
+    independent_of_source: bool
+    """``True`` when the reporter's scope differs from the item's own source scope. A
+    scope's own outcome on its own claim still counts in full toward THAT item's
+    standing (Concept 8 — independence is a property of the evidence, not of who first
+    said the words) — this flag is what ratification (P7) reads to tell the two apart;
+    it is never used here to weight or exclude anything."""
+    target_replaced: bool
+    """``True`` when the ITEM ACTED ON (not this outcome) was later superseded by some
+    other accepted contribution. The outcome still appears — it is history, not
+    invalidated by what came after — merely marked as preceding the item's replacement."""
+    reporter_entitlement_current: bool
+    """``True`` unless the reporter's scope can no longer read the item's scope UNDER
+    THE FLEET CONFIG AS IT STANDS NOW. P1 checked entitlement once, at write time; the
+    record is never rewritten when fleet.yaml changes later, so this is a live check
+    against the *current* fleet — re-checked, never assumed, and marking rather than
+    silently dropping the evidence when it no longer holds (CEO add)."""
+    replaced_kind: Literal["claim_corrected", "claim_superseded"] | None = None
+    """ADR 0017 P3/P4: set when THIS outcome's own disposition was failed_corrected or
+    failed_superseded **and** the holding scope's CURRENT summary no longer carries the
+    target's content verbatim — i.e. the correction actually took, not merely that the
+    judge said so (P4: the P3 row alone over-reported "replaced" in the cross-scope
+    case, and same-scope whenever #199's backstop had nothing to see). ``None`` means
+    either this outcome held, or its correction is still pending
+    (:attr:`correction_pending_kind`). Distinct from :attr:`target_replaced`, which
+    asks whether the TARGET was replaced by ANYTHING (any accepted contribution's
+    ``supersedes``) — an outcome can hold (``replaced_kind is None``) even while its
+    target was later replaced by a different, later act (``target_replaced=True``)."""
+    correction_pending_kind: Literal["claim_corrected", "claim_superseded"] | None = None
+    """ADR 0017 P4: set when this outcome minted a claim_corrected/claim_superseded
+    event but the holding scope's CURRENT summary still carries the target's content
+    verbatim — a correction reported, the owner not yet acted on it. Never counted as
+    :attr:`replaced_kind` until the owner's own summary drops the claim. Derived live,
+    the same verbatim substring test #202's condensation signal uses
+    (:func:`strata.perspective._context_contributions_absent`, mirrored here to avoid
+    a `perspective` -> `record_store` import cycle) — so it shares that test's
+    over-approximation: a PARAPHRASE the owner wrote before any correction reads as
+    "absent" too, which would read as :attr:`replaced_kind` here even though the owner
+    never acted on THIS correction. Not solved; the same direction #202 already
+    accepted (over-disclosure, never under)."""
+
+
+#: How one outcome contribution counts toward its target's standing (ADR 0017 P2/P3/P4).
+_READING_EXCLUDED = "excluded"
+_READING_HELD = "held"
+_READING_REPLACED = "replaced"
+_READING_CORRECTION_PENDING = "correction_pending"
+
+
+def _claim_content_absent(holding_summary_context: str | None, content: str) -> bool:
+    """Is *content* no longer present verbatim in *holding_summary_context* (ADR 0017 P4)?
+
+    Mirrors :func:`strata.perspective._context_contributions_absent`'s exact
+    normalisation and substring test — duplicated rather than imported, since
+    ``perspective`` imports this module and importing back would cycle. Same
+    over-approximation, same direction (#202): a PARAPHRASE reads as absent too, so
+    this can say "gone" when the owner only paraphrased it before ever seeing this
+    correction. Never the reverse — it never says "gone" when the exact bytes are
+    still there.
+    """
+    if holding_summary_context is None:
+        return True
+    haystack = " ".join(holding_summary_context.split())
+    needle = " ".join(content.split())
+    return not needle or needle not in haystack
+
+
+def _outcome_reading(
+    judgment: Judgment | None,
+    *,
+    outcome_itself_superseded: bool,
+    claim_event_kind: str | None,
+    claim_content_absent: bool,
+) -> str:
+    """Classify one outcome contribution as excluded, held, replaced, or
+    correction_pending (ADR 0017 P3/P4).
+
+    THE RULE (philosopher/CEO ruling, option c', 2026-09-24 — "Ruling on failed
+    outcomes (final: option c')"): for an accepted contribution carrying ``acted_on``,
+    look for a change event linking IT to its target — a ``claim_corrected`` event, or
+    a ``claim_superseded`` event, whose SOURCE is this contribution and whose TARGET is
+    ``acted_on`` (:meth:`RecordStore.claim_event_for`, written atomically with the
+    judgment by :meth:`RecordStore.record_judgment`'s ``claim_event``).
+
+    - No such event (*claim_event_kind* is ``None``) → ``held`` (corroboration).
+    - Such an event exists AND the target's content is gone from the holding scope's
+      CURRENT summary (*claim_content_absent*) → ``replaced``; its KIND is read off
+      the event by the caller (:func:`standing_evidence`), never re-derived here.
+    - Such an event exists but the content is STILL THERE (P4: the cross-scope case,
+      where the judge that produced the disposition cannot touch the holding scope at
+      all; or same-scope when #199's backstop had nothing in its window to catch) →
+      ``correction_pending`` — a correction was reported, the owner has not acted on
+      it yet. Never counted as ``replaced`` by assertion.
+    - Declined (or pending, or judge-failed — no accepting judgment at all) →
+      ``excluded``.
+
+    P1's ``acted_on``+``supersedes`` exclusivity stands: a contribution cannot name its
+    own replacement itself. The judge (P3) reads the outcome's content as a
+    corroboration, a correction, or a supersession, and the ENGINE (P3's
+    ``run_contribution`` wiring) mints the linking event when the disposition is
+    failed_corrected/failed_superseded — never a directive target (D6).
+
+    Separately (rule 3, settled before the c/c' debate and unaffected by it): an
+    outcome that was ITSELF later superseded or withdrawn drops out entirely —
+    *outcome_itself_superseded* — a retracted report is not evidence of anything,
+    whether it read as held or replaced.
+    """
+    if judgment is None or judgment.decision not in _ACCEPTED_DECISIONS:
+        return _READING_EXCLUDED
+    if outcome_itself_superseded:
+        return _READING_EXCLUDED
+    if claim_event_kind is None:
+        return _READING_HELD
+    return _READING_REPLACED if claim_content_absent else _READING_CORRECTION_PENDING
+
+
+def standing_evidence(
+    record_store: RecordStore, fleet: FleetConfig, item_id: str, *, summary_store: SummaryStore
+) -> list[StandingEvidence]:
+    """Every outcome contribution's evidence toward *item_id*'s standing (ADR 0017 P2).
+
+    WHAT THIS COMPUTES: for the memory item *item_id*, one :class:`StandingEvidence` per
+    contribution that reports an outcome of acting on it (``acted_on == item_id``),
+    ACCEPTED (:func:`_outcome_reading` != excluded), read fresh from the record on every
+    call. Nothing is stored, counted, or cached — see tests/test_p2_no_migration.py.
+
+    WHAT THIS DELIBERATELY DOES NOT COMPUTE: any score, count, weight, or rank; whether
+    the evidence, taken together, is enough to call the item generally trusted or to
+    ratify it into a directive — that reduction is ratification's own judgment (ADR 0017
+    P7), reading this list directly, never made here.
+
+    RULES, each with its own test in tests/test_p2_standing_evidence.py:
+
+    - Declined, pending, and judge-failed outcomes never appear (:func:`_outcome_reading`).
+    - Never on a directive (D6): if *item_id*'s own JUDGMENT (not its proposed
+      classification — a context proposal can be accepted as a directive) is
+      ``accept_as_directive``, or if it has no accepting judgment at all, this returns
+      ``[]`` — nothing to have acted on.
+    - An outcome whose TARGET was later superseded by some other accepted contribution
+      still appears, marked ``target_replaced=True`` — it is history, not invalidated.
+    - An outcome that was ITSELF later superseded (:meth:`RecordStore.is_superseded`)
+      drops out entirely — a retracted report is not evidence of anything.
+    - An outcome from a scope that can no longer read the item under the CURRENT fleet
+      config still appears, marked ``reporter_entitlement_current=False`` (CEO add): P1
+      checked entitlement once, at write time, and the record is never rewritten.
+    - An outcome whose OWN disposition was failed_corrected/failed_superseded (P3) is
+      marked ``replaced_kind`` accordingly, read off its own ``claim_event_for`` row —
+      but ONLY once the holding scope's CURRENT summary (*summary_store*) no longer
+      carries the target's content verbatim (P4): until then it is marked
+      ``correction_pending_kind`` instead, never ``replaced_kind`` by assertion. See
+      :attr:`StandingEvidence.correction_pending_kind` for the known over-approximation
+      (a paraphrase reads as dropped too, same direction as #202).
+
+    THE CLOSURE THIS RELIES ON (P3): "accepted + acted_on + disposition held means
+    held" is true only because P3's judge instruction makes an ``acted_on``
+    contribution DECLINE whenever it reports anything other than a clean hold or a
+    clean failure (an echo, an ambiguous report, a pending one) — see the plan's P3
+    section, "the closure". :func:`_outcome_reading` is the one function that reads
+    the disposition off the record.
+    """
+    target = record_store.get_record_entry(item_id)
+    if target is None or target.judgment is None:
+        return []
+    if target.judgment.decision != "accept_as_context":
+        # accept_as_directive: D6, directives have no standing.
+        # decline / (no branch reached — judgment is None handled above): nothing was
+        # ever admitted, so there is nothing to have acted on.
+        return []
+
+    target_replaced = record_store.is_superseded(item_id)
+    # ADR 0017 P4: the HOLDING scope's CURRENT summary — read once, outside the loop,
+    # since every outcome on this item shares the same target and the same owner.
+    holding_summary = summary_store.read(target.contribution.scope_id)
+    holding_context = holding_summary.context if holding_summary is not None else None
+
+    evidence: list[StandingEvidence] = []
+    for outcome in record_store.list_outcomes(acted_on=item_id):
+        judgment = record_store.get_judgment(outcome.id)
+        claim_event = record_store.claim_event_for(outcome.id)
+        claim_kind = claim_event.kind if claim_event is not None else None
+        reading = _outcome_reading(
+            judgment,
+            outcome_itself_superseded=record_store.is_superseded(outcome.id),
+            claim_event_kind=claim_kind,
+            claim_content_absent=_claim_content_absent(
+                holding_context, target.contribution.content
+            ),
+        )
+        if reading == _READING_EXCLUDED:
+            continue
+        entitled = _currently_entitled(
+            fleet, outcome.contributor.scope_id, target.contribution.scope_id
+        )
+        evidence.append(
+            StandingEvidence(
+                contribution_id=outcome.id,
+                reporter_scope_id=outcome.contributor.scope_id,
+                reporter_skill=outcome.contributor.skill,
+                reporter_session_id=outcome.contributor.session_id,
+                reported_at=outcome.created_at,
+                independent_of_source=(
+                    outcome.contributor.scope_id != target.contribution.scope_id
+                ),
+                target_replaced=target_replaced,
+                reporter_entitlement_current=entitled,
+                replaced_kind=claim_kind if reading == _READING_REPLACED else None,
+                correction_pending_kind=(
+                    claim_kind if reading == _READING_CORRECTION_PENDING else None
+                ),
+            )
+        )
+    return evidence
+
+
+def _currently_entitled(fleet: FleetConfig, reporter_scope: str, item_scope: str) -> bool:
+    """Whether *item_scope* is within *reporter_scope*'s chain-only entitled surface,
+    under *fleet* AS IT STANDS NOW.
+
+    The read-time counterpart of the same check :func:`strata.app.validate_acted_on` runs
+    once at write time (duplicated here, not imported: that one is write-boundary
+    validation that raises; this one is a read-time predicate for a live re-check, and
+    the two-line computation — a scope plus its inter-stratum ancestors — is cheap
+    enough that citing it is safer than adding a cross-module dependency for it).
+    """
+    if fleet.get_scope(reporter_scope) is None:
+        return False
+    ancestors = fleet.inter_stratum_ancestors(reporter_scope)
+    return item_scope in {reporter_scope, *(s.id for s in ancestors)}
 
 
 def _contribution_from_row(row: sqlite3.Row) -> Contribution:

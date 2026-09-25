@@ -96,6 +96,7 @@ class _MarkerManager:
         change_id=None,
         hop=0,
         window_verbatim_tail=None,
+        acted_on_target=None,
     ):  # noqa: ANN001, ANN201, E501
         existing = list(current_summary.directives) if current_summary is not None else []
         time.sleep(self.delay)

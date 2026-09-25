@@ -36,3 +36,9 @@ has an owner. The operator's steps are approvals on GitHub; nobody uploads to Py
 11. **Check the default judge model id still resolves before tagging.** The wheel-smoke CI step
    makes no network call, so a router outage or a retired model id would surface only in
    `strata doctor`, on a stranger's first run.
+12. **Run the strata-evals mechanical suite against the merged tree.** Add it to every
+   merged-tree verification, alongside lint and the Strata suite:
+   `STRATA_EVALS_STRATA_REPO=<merged tree> PYTHONPATH=<merged tree>/src:src pytest` in
+   strata-evals. It is the only check that calls the judge interface from outside this repo. In
+   v1.15, P3 passed a new keyword to every `judge()` call; all in-repo fakes were updated, so the
+   Strata suite passed, while every out-of-repo judge broke with a 500 on each `/contribute`.

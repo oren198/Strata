@@ -167,12 +167,13 @@ ChangeEventReader = Callable[[str], Sequence[_ChangeEventLike]]
 class _ContributionLike(Protocol):
     """Structural shape ``compose_perspective`` needs from a contribution.
 
-    Only the admitted text — the condensation count compares it against the
-    composed context and nothing else. A lightweight protocol for the same
-    reason as the readers above: this module never imports
-    :mod:`strata.record_store`.
+    The condensation count (issue #202) compares ``content`` against the composed
+    context; the context-ids list (ADR 0017 P1b) additionally needs ``id`` — the id an
+    agent can pass back as ``acted_on``. A lightweight protocol for the same reason as
+    the readers above: this module never imports :mod:`strata.record_store`.
     """
 
+    id: str
     content: str
 
 
@@ -193,6 +194,50 @@ def _normalised(text: str) -> str:
     match exactly.
     """
     return " ".join(text.split())
+
+
+#: ADR 0017 P1b: the label is a deterministic TRUNCATION of the content, never an LLM
+#: summary — the same content every time, for the same reason the condensation count is
+#: mechanical (issue #202): nothing here may vary call to call or cost a judge call.
+_CONTEXT_ITEM_LABEL_MAX_WORDS = 8
+
+
+def _context_item_label(content: str, *, max_words: int = _CONTEXT_ITEM_LABEL_MAX_WORDS) -> str:
+    """The first *max_words* words of *content*, joined by single spaces.
+
+    Truncated content is marked with a trailing ellipsis so a reader can tell a label
+    from a short contribution's full content at a glance. Exactly *max_words* words is
+    NOT truncated (no accepted contribution is ever exactly at the boundary in a way
+    that matters — the cap is on what is SHOWN, not a claim about what the full content
+    says).
+    """
+    words = content.split()
+    if len(words) <= max_words:
+        return " ".join(words)
+    return " ".join(words[:max_words]) + "\u2026"
+
+
+def _present_context_items(context: str, contributions: Sequence[_ContributionLike]) -> list[dict]:
+    """The accepted context contributions still findable, verbatim, in *context* (ADR
+    0017 P1b) — each as ``{"id": ..., "label": ...}``, in *contributions*' own order.
+
+    Reuses :func:`_context_contributions_absent`'s exact presence test (issue #202): an
+    agent must never be offered an id for material that was condensed away, since acting
+    on an id it cannot actually see defeats the reference (P1's own entitlement rule:
+    "you can act on what you may read" — here, what you were actually SHOWN). Paraphrase
+    still over-counts as absent here too, for the same reason condensation does: a
+    substring test cannot tell a paraphrase from a deletion, and omitting the id is the
+    safe direction, never fabricating one for text the agent cannot verify appears.
+    """
+    haystack = _normalised(context)
+    items: list[dict] = []
+    for contribution in contributions:
+        needle = _normalised(contribution.content)
+        if needle and needle in haystack:
+            items.append(
+                {"id": contribution.id, "label": _context_item_label(contribution.content)}
+            )
+    return items
 
 
 def _context_contributions_absent(context: str, contributions: Sequence[_ContributionLike]) -> int:
@@ -507,15 +552,17 @@ def compose_perspective(
             told what changed: the drain marks the events processed and the
             filter above then hides exactly those. Notice is immediate; only
             absorption is deferred.
-        contribution_reader: Issue #202. When given, called once with
-            *scope_id* and expected to return the contributions that scope
-            judged ``accept_as_context``; the self layer's
-            ``condensation.context_contributions_absent`` is then how many of
-            them no longer appear verbatim in the composed context (see
+        contribution_reader: Issue #202, extended by ADR 0017 P1b. When given, called
+            ONCE with *scope_id* and expected to return the contributions that scope
+            judged ``accept_as_context``; feeds both self-layer disclosures from that
+            one call. ``condensation.context_contributions_absent`` is how many no
+            longer appear verbatim in the composed context (see
             :func:`_context_contributions_absent` — paraphrase over-counts).
-            ``None`` (the default) leaves that count ``None`` — honestly "not
-            computed", never a misleading ``0`` — while
-            ``condensation.condensed`` is present either way, since it comes
+            ``context_items`` is the ids-and-labels list of the ones that DO still
+            appear (see :func:`_present_context_items`) — what an agent may pass back
+            as ``acted_on``. ``None`` (the default) leaves the count ``None`` — honestly
+            "not computed", never a misleading ``0`` — and ``context_items`` ``None``
+            too, while ``condensation.condensed`` is present either way, since it comes
             from the summary itself.
 
     Returns:
@@ -528,7 +575,17 @@ def compose_perspective(
         ``"condensation": {"condensed": bool, "context_contributions_absent":
         int | None}`` — the issue #202 disclosure that material may have been
         condensed away rather than never admitted; both halves are mechanical
-        and over-approximate. Self/extra-context layers carry ``"summary"``;
+        and over-approximate — and ``"context_items": [{"id": str, "label":
+        str}] | None`` (ADR 0017 P1b): the accepted context contributions
+        still findable, verbatim, in this layer's own ``context`` text, each
+        with a deterministic (never LLM-generated) label truncated to at most
+        8 words. ``None`` without a *contribution_reader*, exactly like
+        ``context_contributions_absent`` — the same reader backs both, called
+        once. These are the ids an agent can pass back as
+        ``strata_contribute``'s ``acted_on`` — never an id for material this
+        layer no longer shows, reusing #202's own presence test so the two
+        disclosures can never disagree about what "still there" means.
+        Self/extra-context layers carry ``"summary"``;
         ancestor layers carry ``"directives"`` (a list of directive dicts)
         and never ``"summary"`` or ``"context"``; publication layers carry
         ``"publication"``. When *operator_reader* is given, an operator
@@ -575,6 +632,9 @@ def compose_perspective(
             # Self: unaffected by ADR 0013 — full summary, directives and
             # context alike, still feeds this scope's own judgments.
             self_summary = summary_for_scope(s.id, summary_store=summary_store)
+            # One call, shared by the condensation count and the context-ids list below
+            # (ADR 0017 P1b) — both read the same accepted-context contributions.
+            accepted_context = None if contribution_reader is None else contribution_reader(s.id)
             layers.append(
                 {
                     "scope_id": s.id,
@@ -589,12 +649,21 @@ def compose_perspective(
                         "condensed": self_summary["condensed"],
                         "context_contributions_absent": (
                             None
-                            if contribution_reader is None
+                            if accepted_context is None
                             else _context_contributions_absent(
-                                self_summary["context"], contribution_reader(s.id)
+                                self_summary["context"], accepted_context
                             )
                         ),
                     },
+                    # ADR 0017 P1b: the ids an agent can pass back as `acted_on`, each
+                    # with a short deterministic label — only for context still
+                    # PRESENT (never an id for material condensed away; see #202's own
+                    # presence test, reused verbatim by _present_context_items).
+                    "context_items": (
+                        None
+                        if accepted_context is None
+                        else _present_context_items(self_summary["context"], accepted_context)
+                    ),
                 }
             )
         else:
