@@ -369,28 +369,29 @@ JUDGE_TOOL: dict = {
     },
 }
 
-#: ADR 0017 P3: appended to :data:`JUDGE_TOOL`'s ``input_schema.properties`` ONLY for
-#: an ``acted_on`` contribution's single-contribution judge call (see
-#: :func:`_judge_tool_for`) — never unconditionally, per the M1/#212 lesson that a new
-#: field on EVERY call (schema, not just prompt text) measurably degrades general
-#: judging even when unused. An ordinary judge call's tool dict must stay byte-identical
-#: to what shipped before P3 (pinned against ``tests/fixtures/judge_tools_v1150/``).
-_OUTCOME_DISPOSITION_PROPERTY: dict = {
-    "type": ["string", "null"],
+#: ADR 0017 P3 rev 3 (ruling c′): the acted_on variant's ``decision`` property — the
+#: three ordinary values widened to the four dispositions themselves, never a sidecar
+#: field. qwen's measured behaviour (#209, M1) is to reach the right verdict and never
+#: fill an extra field the decision doesn't need — so c′ puts the choice on the ONE
+#: field the judge always fills. The exact phrasing for ``held`` is pinned (the
+#: philosopher's line, CEO rev-3 add): "held — an action that could have failed
+#: confirmed the item".
+_ACTED_ON_DECISION_PROPERTY: dict = {
+    "type": "string",
+    "enum": ["held", "failed_corrected", "failed_superseded", "decline"],
     "description": (
-        "ADR 0017 P3: REQUIRED, and ONLY meaningful, when the contribution "
-        "under judgment carries `acted_on` — an OUTCOME REPORT block will be "
-        "rendered above when that is so, and this field must then be exactly "
-        "one of: `held` (an action that could have failed CONFIRMED the item "
-        "— never merely that the claim reads as true), `failed_corrected` "
-        "(the claim was wrong; the report's own observation replaces it), "
-        "`failed_superseded` (the claim was right but the world moved on; "
-        "the report's own observation replaces it), or `decline` (the report "
-        "establishes neither a clean hold nor a clean failure — an echo, an "
-        "ambiguous result, or a pending one). `decision` must then read "
-        "`accept_as_context` for held/failed_corrected/failed_superseded, or "
-        "`decline` for `decline` — the two fields must agree. Null (omitted) "
-        "for every contribution that does NOT carry `acted_on`."
+        "ADR 0017 P3: this contribution carries `acted_on` — an OUTCOME REPORT block "
+        "is rendered above, and the verdict is exactly one of: "
+        "held — an action that could have failed confirmed the item (never merely "
+        "that the claim reads as true); "
+        "failed_corrected — the claim was wrong, and this report's own observation "
+        "replaces it; "
+        "failed_superseded — the claim was right but the world moved on, and this "
+        "report's own observation replaces it; "
+        "decline — the report establishes neither a clean hold nor a clean failure "
+        "(an echo, an ambiguous result, or a pending one). "
+        "held / failed_corrected / failed_superseded record as accept_as_context; "
+        "decline records as decline."
     ),
 }
 
@@ -398,7 +399,8 @@ _OUTCOME_DISPOSITION_PROPERTY: dict = {
 def _judge_tool_for(acted_on_target: ActedOnTarget | None) -> dict:
     """The single-contribution judge tool: :data:`JUDGE_TOOL` unchanged, unless this
     call judges an ``acted_on`` contribution, in which case a deep-copied variant
-    carrying ``outcome_disposition`` is returned instead (ADR 0017 P3).
+    whose ``decision`` enum is the four dispositions is returned instead (ADR 0017 P3
+    rev 3, ruling c′).
 
     Deliberately NOT a module-level constant: doing that once, unconditionally, is
     exactly the M1/#212 mistake this function exists to avoid.
@@ -406,9 +408,7 @@ def _judge_tool_for(acted_on_target: ActedOnTarget | None) -> dict:
     if acted_on_target is None:
         return JUDGE_TOOL
     tool = copy.deepcopy(JUDGE_TOOL)
-    tool["input_schema"]["properties"]["outcome_disposition"] = copy.deepcopy(
-        _OUTCOME_DISPOSITION_PROPERTY
-    )
+    tool["input_schema"]["properties"]["decision"] = copy.deepcopy(_ACTED_ON_DECISION_PROPERTY)
     return tool
 
 
@@ -1328,8 +1328,8 @@ _OUTCOME_ACCEPT_DISPOSITIONS = frozenset({"held", "failed_corrected", "failed_su
 
 
 class _MalformedDisposition(ValueError):
-    """An `acted_on` contribution's `outcome_disposition` is missing, not one of the
-    four values, or disagrees with `decision` (ADR 0017 P3, ruling line (b)).
+    """An `acted_on` contribution's `decision` is not one of the four dispositions
+    (ADR 0017 P3 rev 3, ruling c′).
 
     A ``ValueError`` subclass, exactly like its siblings — the one corrective re-ask
     fixes it the same way. It differs from every other protocol slip in what happens if
@@ -1340,36 +1340,25 @@ class _MalformedDisposition(ValueError):
     """
 
 
-def _validate_outcome_disposition(raw: dict, *, decision: str, acted_on: str | None) -> str | None:
-    """Return the validated `outcome_disposition`, or raise :class:`_MalformedDisposition`.
+def _resolve_acted_on_decision(raw_decision: object) -> tuple[str, str]:
+    """Resolve an `acted_on` call's raw `decision` into ``(record_decision,
+    outcome_disposition)``, or raise :class:`_MalformedDisposition`.
 
-    A no-op returning ``None`` when *acted_on* is ``None`` — every contribution that
-    does not carry it is completely unaffected, whatever stray value a payload might
-    (harmlessly) carry in this field.
-
-    When *acted_on* IS set, `outcome_disposition` must be exactly one of the four
-    values, AND must agree with `decision`: held/failed_corrected/failed_superseded
-    each require ``decision == "accept_as_context"``; `decline` requires
-    ``decision == "decline"``. A mismatch is exactly as malformed as a missing value —
-    it means the two fields disagree about what happened, which is a signal, not noise,
-    and must not be silently reconciled by trusting one field over the other.
+    ADR 0017 P3 rev 3 (ruling c′): there is no sidecar `outcome_disposition` field to
+    disagree with `decision` any more — for an `acted_on` contribution, `decision`
+    itself must be exactly one of the four dispositions (never one of the three
+    ordinary record values, and never anything else); this IS the disposition.
+    held/failed_corrected/failed_superseded map to the record decision
+    ``accept_as_context``; `decline` maps to ``decision="decline"``.
     """
-    if acted_on is None:
-        return None
-    disposition = raw.get("outcome_disposition")
-    if disposition not in _OUTCOME_DISPOSITIONS:
+    if raw_decision not in _OUTCOME_DISPOSITIONS:
         raise _MalformedDisposition(
-            "submit_judgment carries acted_on but `outcome_disposition` is missing or "
-            f"not one of held/failed_corrected/failed_superseded/decline (got {disposition!r})."
+            "submit_judgment carries acted_on, so `decision` must be exactly one of "
+            f"held/failed_corrected/failed_superseded/decline (got {raw_decision!r})."
         )
-    expected_decision = "decline" if disposition == "decline" else "accept_as_context"
-    if decision != expected_decision:
-        raise _MalformedDisposition(
-            f"submit_judgment's outcome_disposition={disposition!r} requires "
-            f"decision={expected_decision!r}, but decision={decision!r} was returned — "
-            "the two fields disagree."
-        )
-    return disposition
+    disposition = raw_decision
+    record_decision = "decline" if disposition == "decline" else "accept_as_context"
+    return record_decision, disposition
 
 
 def _parse_directive_ops(  # noqa: ANN001 — raw tool-call field
@@ -2873,8 +2862,9 @@ def _render_outcome_block(target: ActedOnTarget) -> str:
     )
     return (
         "OUTCOME REPORT — this contribution carries `acted_on`, reporting what "
-        "happened when the contributor acted on the item below. Judge them together "
-        "as ONE verdict: `outcome_disposition` plus `decision` (see the rule below).\n"
+        "happened when the contributor acted on the item below. Judge it with ONE "
+        "field: set `decision` to exactly one of the four values below (see the rule "
+        "below).\n"
         "\n"
         "ITEM ACTED ON (verbatim, as currently held):\n"
         f"- id: {c.id}\n"
@@ -2885,7 +2875,7 @@ def _render_outcome_block(target: ActedOnTarget) -> str:
         f"    {c.content}\n"
         f"{directive_caveat}"
         "\n"
-        "Set `outcome_disposition` to exactly one:\n"
+        "Set `decision` to exactly one:\n"
         "  - held: an ACTION THAT COULD HAVE FAILED CONFIRMED THE ITEM — never merely "
         'that the claim reads as true. An echo ("reviewed it and confirmed it") is '
         "NOT held: nothing was risked, so nothing was tested. Your reasoning must "
@@ -2907,8 +2897,9 @@ def _render_outcome_block(target: ActedOnTarget) -> str:
         "If you cannot tell failed_corrected from failed_superseded, choose "
         "failed_corrected: a needless notice costs attention; a missing one leaves "
         "readers acting on a falsehood.\n"
-        "`decision` must then read `accept_as_context` for held/failed_corrected/"
-        "failed_superseded, or `decline` for `decline` — the two fields must agree.\n"
+        "held / failed_corrected / failed_superseded record as accept_as_context; "
+        "decline records as decline — the engine derives this from `decision` itself, "
+        "there is no separate field to fill.\n"
         "\n"
     )
 
@@ -3525,12 +3516,12 @@ class ScopeManager:
             )
 
         def _parse_forced_decline(block) -> ScopeManagerJudgment:  # noqa: ANN001
-            """ADR 0017 P3, ruling line (b): still-unreadable outcome_disposition after
-            the one re-ask declines, marked as a judge failure — never as returned,
-            unlike #204's missing-reasoning fallback, because the engine genuinely
-            cannot tell held from failed from a bare echo; keeping whatever accept the
-            judge attempted would risk exactly the over-count the closure exists to
-            prevent."""
+            """ADR 0017 P3, ruling line (b): a `decision` still not one of the four
+            dispositions after the one re-ask declines, marked as a judge failure — never
+            as returned, unlike #204's missing-reasoning fallback, because the engine
+            genuinely cannot tell held from failed from a bare echo; keeping whatever
+            accept the judge attempted would risk exactly the over-count the closure
+            exists to prevent."""
             raw = getattr(block, "input", {}) or {}
             reasoning = _read_reasoning(raw, tool_name="submit_judgment", require=False) or (
                 "the judge did not return a readable outcome disposition"
@@ -3804,12 +3795,9 @@ class ScopeManager:
                 )
             if isinstance(error, _MalformedDisposition):
                 return (
-                    f"Your {tool_name} call carries `acted_on` but its `outcome_disposition` "
-                    f"was missing, not one of held/failed_corrected/failed_superseded/decline, "
-                    f"or disagreed with `decision`: {error} Call {tool_name} again with a "
-                    "readable `outcome_disposition` that agrees with `decision` "
-                    "(held/failed_corrected/failed_superseded -> accept_as_context; "
-                    "decline -> decline)."
+                    f"Your {tool_name} call carries `acted_on`, so `decision` must be "
+                    f"exactly one of held/failed_corrected/failed_superseded/decline: {error} "
+                    f"Call {tool_name} again with `decision` set to one of those four values."
                 )
             return (
                 f"Your {tool_name} call could not be parsed: {error} "
@@ -3826,7 +3814,7 @@ class ScopeManager:
             elif isinstance(error, _MissingReasoning):
                 slip = "the first response omitted `reasoning`"
             elif isinstance(error, _MalformedDisposition):
-                slip = "the first response's outcome_disposition was unreadable"
+                slip = "the first response's `decision` was not a readable disposition"
             else:
                 slip = "the first response did not parse"
             return f"Corrective re-ask: {slip}."
@@ -3899,8 +3887,8 @@ class ScopeManager:
                     raise
                 judgment = parse_forced_decline(tool_use_block)
                 protocol_notes.append(
-                    "Judge's outcome_disposition was still unreadable after the "
-                    "corrective re-ask; declined as a judge failure, not a "
+                    "Judge's `decision` was still not a readable disposition after "
+                    "the corrective re-ask; declined as a judge failure, not a "
                     "missing-ground decline."
                 )
             else:
@@ -4621,15 +4609,21 @@ class ScopeManager:
         """
         _check_mode(mode)
         raw: dict = tool_use_block.input
-        decision: str = raw["decision"]
         reasoning: str = _read_reasoning(
             raw, tool_name="submit_judgment", require=require_reasoning
         )
-        # ADR 0017 P3: a no-op unless new_contribution carries acted_on — every other
-        # contribution's decision/reasoning parse exactly as before, byte for byte.
-        outcome_disposition = _validate_outcome_disposition(
-            raw, decision=decision, acted_on=new_contribution.acted_on
-        )
+        # ADR 0017 P3 rev 3 (ruling c′): a no-op unless new_contribution carries
+        # acted_on — every other contribution's decision/reasoning parse exactly as
+        # before, byte for byte (raw["decision"], required by the tool schema). When it
+        # does, `decision` itself is one of the four dispositions — read leniently
+        # (raw.get, not raw[...]) so a missing key routes through the SAME malformed-
+        # disposition corrective as an empty or unrecognized one, rather than a bare
+        # KeyError.
+        if new_contribution.acted_on is not None:
+            decision, outcome_disposition = _resolve_acted_on_decision(raw.get("decision"))
+        else:
+            decision = raw["decision"]
+            outcome_disposition = None
 
         # Issue #201: an id-addressed op with no id reads it off the
         # contribution under judgment, whose record names what it replaces.

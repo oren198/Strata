@@ -85,22 +85,20 @@ def _resp(**payload) -> MagicMock:
 
 def _held(**extra) -> dict:
     return {
-        "decision": "accept_as_context",
+        "decision": "held",
         "reasoning": 'Confirmed by observation: "the service refused on 8443" never happened.',
         "directive_ops": [],
         "new_context": "The service listens on port 8443.",
-        "outcome_disposition": "held",
         **extra,
     }
 
 
 def _failed_corrected(**extra) -> dict:
     return {
-        "decision": "accept_as_context",
+        "decision": "failed_corrected",
         "reasoning": "Used port 8443, the service refused; the claim was wrong.",
         "directive_ops": [],
         "new_context": "The service listens on an unknown port; 8443 refused the connection.",
-        "outcome_disposition": "failed_corrected",
         **extra,
     }
 
@@ -111,7 +109,6 @@ def _decline(**extra) -> dict:
         "reasoning": "no outcome reported: the contribution only says it was reviewed.",
         "directive_ops": None,
         "new_context": None,
-        "outcome_disposition": "decline",
         **extra,
     }
 
@@ -153,15 +150,30 @@ def _followup_text(client: MagicMock, call: int = 1) -> str:
 # --- schema --------------------------------------------------------------------------
 
 
-def test_the_tool_carries_outcome_disposition_only_for_an_acted_on_target() -> None:
-    # ADR 0017 P3 rev2 (M1/#212 lesson): outcome_disposition is offered ONLY on the
-    # variant derived for an acted_on contribution — never on the base JUDGE_TOOL every
-    # ordinary judge call sees. See tests/test_p3_tool_schema_pins.py for the full pin.
-    assert "outcome_disposition" not in JUDGE_TOOL["input_schema"]["properties"]
+def test_the_tool_widens_decision_to_the_four_dispositions_only_for_an_acted_on_target() -> None:
+    # ADR 0017 P3 rev 3 (ruling c′; M1/#212 lesson): there is no sidecar field —
+    # `decision`'s own enum widens to the four dispositions, ONLY on the variant
+    # derived for an acted_on contribution, never on the base JUDGE_TOOL every ordinary
+    # judge call sees. See tests/test_p3_tool_schema_pins.py for the full pin.
+    assert JUDGE_TOOL["input_schema"]["properties"]["decision"]["enum"] == [
+        "accept_as_directive",
+        "accept_as_context",
+        "decline",
+    ]
 
     props = _judge_tool_for(CONTEXT_TARGET)["input_schema"]["properties"]
-    assert props["outcome_disposition"]["type"] == ["string", "null"]
-    assert "held" in props["outcome_disposition"]["description"]
+    assert props["decision"]["enum"] == [
+        "held",
+        "failed_corrected",
+        "failed_superseded",
+        "decline",
+    ]
+    # CEO rev-3 add: the philosopher's exact phrasing lives on the enum description
+    # itself, next to the value — the only place the judge sees it beside `decision`.
+    assert (
+        "held — an action that could have failed confirmed the item"
+        in props["decision"]["description"]
+    )
 
 
 def test_the_batch_tool_does_not_offer_outcome_disposition() -> None:
@@ -187,7 +199,7 @@ def test_failed_corrected_persists_as_accept_as_context() -> None:
 
 
 def test_failed_superseded_persists_as_accept_as_context() -> None:
-    j, _ = _judge(_failed_corrected(outcome_disposition="failed_superseded"))
+    j, _ = _judge(_failed_corrected(decision="failed_superseded"))
     assert j.decision == "accept_as_context"
     assert j.outcome_disposition == "failed_superseded"
 
@@ -199,31 +211,25 @@ def test_decline_persists_as_decline() -> None:
     assert j.new_summary is None
 
 
-# --- disposition/decision must agree ---------------------------------------------------
-
-
-def test_disposition_decision_mismatch_earns_the_one_reask() -> None:
-    j, client = _judge(
-        _held(decision="decline"),  # mismatch: held requires accept_as_context
-        _held(),
-    )
-    assert client.messages.create.call_count == 2
-    text = _followup_text(client)
-    assert "outcome_disposition" in text
-    assert j.outcome_disposition == "held"
-    assert j.decision == "accept_as_context"
-
-
-# --- missing/malformed/unknown/empty: four shapes, one re-ask, then fail-closed --------
+# --- missing/malformed/unknown/record-value: four shapes, one re-ask, then fail-closed --
 
 
 @pytest.mark.parametrize(
-    "bad_disposition",
-    [None, "", "definitely_not_a_real_value", "confirmed"],
-    ids=["missing", "empty", "unknown", "malformed"],
+    "bad_decision",
+    [None, "", "definitely_not_a_real_value", "accept_as_context"],
+    ids=["missing", "empty", "unknown", "record_value"],
 )
-def test_four_shapes_of_malformed_disposition_earn_one_reask(bad_disposition) -> None:
-    j, client = _judge(_held(outcome_disposition=bad_disposition), _held())
+def test_four_shapes_of_malformed_decision_earn_one_reask(bad_decision) -> None:
+    # ADR 0017 P3 rev 3: there is no separate outcome_disposition to disagree with
+    # decision any more — `decision` itself must be one of the four dispositions on an
+    # acted_on call, so a record-value like "accept_as_context" is now malformed HERE,
+    # not a mismatch between two fields.
+    payload = _held()
+    if bad_decision is None:
+        del payload["decision"]
+    else:
+        payload["decision"] = bad_decision
+    j, client = _judge(payload, _held())
     assert client.messages.create.call_count == 2
     assert j.outcome_disposition == "held"
     assert j.disposition_unreadable is False
@@ -231,8 +237,8 @@ def test_four_shapes_of_malformed_disposition_earn_one_reask(bad_disposition) ->
 
 def test_still_malformed_after_the_reask_declines_as_a_judge_failure() -> None:
     j, client = _judge(
-        _held(outcome_disposition="definitely_not_a_real_value"),
-        _held(outcome_disposition="still_not_real"),
+        _held(decision="definitely_not_a_real_value"),
+        _held(decision="still_not_real"),
     )
     assert client.messages.create.call_count == 2  # one re-ask, never a third call
     assert j.decision == "decline"
@@ -244,9 +250,7 @@ def test_still_malformed_after_the_reask_declines_as_a_judge_failure() -> None:
 
 
 def test_judge_failure_decline_is_distinguishable_from_a_missing_ground_decline() -> None:
-    judge_failure, _ = _judge(
-        _held(outcome_disposition="bogus"), _held(outcome_disposition="still bogus")
-    )
+    judge_failure, _ = _judge(_held(decision="bogus"), _held(decision="still bogus"))
     missing_ground, _ = _judge(_decline())
     assert "judge failure" in judge_failure.record_notes
     assert "judge failure" not in missing_ground.record_notes

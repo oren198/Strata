@@ -40,7 +40,11 @@ def test_judge_tool_for_with_no_acted_on_target_is_unchanged_from_pre_p3() -> No
     assert _judge_tool_for(None) == _load("JUDGE_TOOL")
 
 
-def test_judge_tool_for_with_acted_on_target_adds_outcome_disposition_only() -> None:
+def test_judge_tool_for_with_acted_on_target_widens_decision_only() -> None:
+    # ADR 0017 P3 rev 3 (ruling c′): no sidecar field — the acted_on variant differs
+    # from the base tool in exactly one property, `decision` (its enum widens to the
+    # four dispositions); every other property, and the tool's name/description/
+    # required list, stay byte-identical to the base.
     from strata.record_store import ContributorRef
     from strata.scope_manager import ActedOnTarget, Contribution
 
@@ -62,19 +66,24 @@ def test_judge_tool_for_with_acted_on_target_adds_outcome_disposition_only() -> 
     variant = _judge_tool_for(target)
     base = _load("JUDGE_TOOL")
 
-    assert set(variant["input_schema"]["properties"]) - set(base["input_schema"]["properties"]) == {
-        "outcome_disposition"
+    assert set(variant["input_schema"]["properties"]) == set(base["input_schema"]["properties"])
+    without_decision = {
+        k: v for k, v in variant["input_schema"]["properties"].items() if k != "decision"
     }
-    without_field = {
-        k: v for k, v in variant["input_schema"]["properties"].items() if k != "outcome_disposition"
+    base_without_decision = {
+        k: v for k, v in base["input_schema"]["properties"].items() if k != "decision"
     }
-    assert without_field == base["input_schema"]["properties"]
+    assert without_decision == base_without_decision
+    variant_decision = variant["input_schema"]["properties"]["decision"]
+    base_decision = base["input_schema"]["properties"]["decision"]
+    assert variant_decision != base_decision
+    assert variant_decision["enum"] == ["held", "failed_corrected", "failed_superseded", "decline"]
     assert variant["input_schema"]["required"] == base["input_schema"]["required"]
     assert variant["name"] == base["name"]
     assert variant["description"] == base["description"]
 
     # Deep-copied, not mutated in place: the shared JUDGE_TOOL constant is untouched.
-    assert "outcome_disposition" not in JUDGE_TOOL["input_schema"]["properties"]
+    assert base_decision["enum"] == ["accept_as_directive", "accept_as_context", "decline"]
 
 
 def test_judge_batch_tool_is_unchanged_from_pre_p3() -> None:
