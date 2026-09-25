@@ -110,6 +110,7 @@ from strata.perspective import ancestor_directives, compose_perspective
 from strata.project_config import StoragePaths, resolve_storage_paths
 from strata.publication import (
     apply_judged_withdrawals,
+    propagate_claim_correction,
     propagate_directive_removals,
     read_publication,
 )
@@ -740,6 +741,16 @@ def _judge_and_record(
                 if same_scope_correction
                 else (refresh_correction.after if refresh_correction is not None else None)
             ),
+            withdraw_corrected_claim_content=(
+                claim_event.before
+                if same_scope_correction
+                else (refresh_correction.before if refresh_correction is not None else None)
+            ),
+            withdraw_correcting_claim_id=(
+                claim_event.item_id
+                if same_scope_correction
+                else (refresh_correction.item_id if refresh_correction is not None else None)
+            ),
         )
         summary_updated = True
 
@@ -766,6 +777,8 @@ def _write_amendment(
     change_ids_override: Sequence[str] | None = None,
     withdraw_notice_kind: str = "withdrawn",
     withdraw_correcting_after: str | None = None,
+    withdraw_corrected_claim_content: str | None = None,
+    withdraw_correcting_claim_id: str | None = None,
 ) -> None:
     """Write an accepted amendment's summary and everything that follows from it.
 
@@ -788,7 +801,15 @@ def _write_amendment(
     ``failed_corrected`` case, where the amendment IS the holding scope's own
     judgment and must share the P3 audit row's change id, not mint its own.
     *withdraw_notice_kind*/*withdraw_correcting_after* thread straight to
-    :func:`~strata.publication.apply_judged_withdrawals`.
+    :func:`~strata.publication.apply_judged_withdrawals` for the JUDGE's own
+    ``withdraw_published``. *withdraw_corrected_claim_content* (the wrong claim's own
+    text) and *withdraw_correcting_claim_id* (its id) additionally drive the ENGINE's
+    own sweep (:func:`~strata.publication.propagate_claim_correction`, CEO decision A):
+    any of this scope's OWN published items still carrying that claim VERBATIM are
+    withdrawn mechanically, skipping whatever the judge already withdrew — a claim
+    left published is stale evidence for every reader of it, and a judge that omits
+    an optional field must not be the only thing standing between a corrected claim
+    and its readers.
     """
     assert judgment.new_summary is not None  # noqa: S101 — caller-checked invariant
     # ADR 0014 D4 — ONE originating act, one change id. An amendment that
@@ -865,6 +886,28 @@ def _write_amendment(
             hop=judgment.hop,
             notice_kind=withdraw_notice_kind,
             correcting_after=withdraw_correcting_after,
+            correcting_claim_id=withdraw_correcting_claim_id,
+        )
+
+    # 1b. ENGINE propagation (ADR 0017 P4, CEO decision A): a claim just found
+    #     WRONG must not stay published verbatim in this scope's OWN face,
+    #     whatever the judge did or omitted (qwen's own optional-field pattern —
+    #     #209/M1 — makes `withdraw_published` an unreliable sole signal). Skips
+    #     whatever the judge already withdrew above — one notice per reader
+    #     either way, and the record shows which path closed it.
+    if withdraw_corrected_claim_content is not None:
+        propagate_claim_correction(
+            scope.id,
+            claim_id=withdraw_correcting_claim_id or "",
+            corrected_claim_content=withdraw_corrected_claim_content,
+            correcting_content=withdraw_correcting_after or "",
+            trigger_id=judged_contribution_ids[0],
+            already_withdrawn=judgment.withdraw_published or [],
+            fleet=fleet,
+            record_store=record_store,
+            summaries_dir=str(summary_store.summaries_dir),
+            change_ids=change_ids,
+            hop=judgment.hop,
         )
 
     # 2. Mechanical propagation (D3): any published item anchored ONLY to
@@ -1180,6 +1223,12 @@ def _judge_batch_and_record(
             ),
             withdraw_correcting_after=(
                 batch_refresh_correction.after if batch_refresh_correction is not None else None
+            ),
+            withdraw_corrected_claim_content=(
+                batch_refresh_correction.before if batch_refresh_correction is not None else None
+            ),
+            withdraw_correcting_claim_id=(
+                batch_refresh_correction.item_id if batch_refresh_correction is not None else None
             ),
         )
         summary_updated = True

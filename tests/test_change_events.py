@@ -657,3 +657,33 @@ class TestEmit:
         assert holder_events[0].processed_at is None  # enqueued, an ordinary refresh
         assert holder_events[0].kind == "claim_corrected"
         assert "the corrected claim" in holder_events[0].after
+
+    def test_claim_corrected_notice_carries_the_claim_id_alongside_the_item(
+        self, fleet: FleetConfig, record_store: RecordStore
+    ) -> None:
+        """ADR 0017 P4 (CEO decision A, follow-up 2): a reader's refresh judge must
+        see, under the same change id: which of its OWN published items just went
+        stale (`item`), which upstream claim caused it (`claim_id`), and the
+        correcting content (`after`) — the new face alone is not enough."""
+        (change_id,) = emit(
+            fleet=fleet,
+            record_store=record_store,
+            item="pub_9",
+            kind="claim_corrected",
+            source_scope_id="g_funcA",
+            before="The service listens on port 8443.",
+            after="Used port 8443, the service refused; the right port is unknown.",
+            claim_id="c_target01",
+            by_owner=True,
+        )
+
+        for scope_id in ("g_teamX", "g_teamY", "g_funcB"):
+            events = record_store.list_change_events(scope_id=scope_id)
+            assert len(events) == 1
+            event = events[0]
+            assert event.change_id == change_id
+            notice = record_store.get_contribution(event.contribution_id)
+            assert notice is not None
+            assert "pub_9" in notice.content
+            assert "c_target01" in notice.content
+            assert "right port is unknown" in notice.content

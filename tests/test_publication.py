@@ -40,6 +40,7 @@ from strata.publication import (
     apply_judged_withdrawals,
     bootstrap_publication,
     list_scopes_with_publications,
+    propagate_claim_correction,
     propagate_directive_removals,
     propose_publish,
     propose_withdraw,
@@ -1478,6 +1479,157 @@ def test_judged_propagation_withdrawal_cascades_to_relayed_copy(
     )
     assert [i.id for i in withdrawn] == [origin_item.id]
     assert read_publication("g_func", summaries_dir=summaries_dir) == []
+
+
+# ---------------------------------------------------------------------------
+# ADR 0017 P4 (CEO decision A) — engine propagation (propagate_claim_correction)
+#
+# The engine's own sweep: a published item that still carries a claim its own
+# outcome judgment (or refresh) just found WRONG must not stay published,
+# whatever the judge did or omitted (qwen's optional-field pattern, #209/M1).
+# ---------------------------------------------------------------------------
+
+
+def test_engine_withdraws_a_published_item_that_still_carries_the_claim_verbatim(
+    fleet, record_store, summary_store, summaries_dir
+) -> None:
+    item = _seed_published_item(
+        record_store,
+        summaries_dir,
+        "g_exec",
+        content="The service listens on port 8443.",
+        subject="service-port",
+    )
+    withdrawn = propagate_claim_correction(
+        "g_exec",
+        claim_id="c_target01",
+        corrected_claim_content="The service listens on port 8443.",
+        correcting_content="Used port 8443, the service refused; the right port is unknown.",
+        trigger_id="c_outcome01",
+        already_withdrawn=[],
+        fleet=fleet,
+        record_store=record_store,
+        summaries_dir=summaries_dir,
+    )
+    assert [i.id for i in withdrawn] == [item.id]
+    assert read_publication("g_exec", summaries_dir=summaries_dir) == []
+
+
+def test_engine_mints_no_judgment_row_for_its_own_withdrawal(
+    fleet, record_store, summary_store, summaries_dir
+) -> None:
+    """Mechanical, like propagate_directive_removals — the record must never look
+    like the judge withdrew something it didn't (acceptance criterion 4): a judged
+    withdrawal gets a row in publication_judgments, an engine one does not."""
+    item = _seed_published_item(
+        record_store, summaries_dir, "g_exec", content="stale claim", subject="x"
+    )
+    propagate_claim_correction(
+        "g_exec",
+        claim_id="c_target01",
+        corrected_claim_content="stale claim",
+        correcting_content="the corrected observation",
+        trigger_id="c_outcome01",
+        already_withdrawn=[],
+        fleet=fleet,
+        record_store=record_store,
+        summaries_dir=summaries_dir,
+    )
+    acts = record_store.list_publication_acts(scope_id="g_exec")
+    withdraw_act = next(a for a in acts if a.act == "withdraw" and a.withdraws == item.id)
+    assert record_store.get_publication_judgment(withdraw_act.id) is None
+
+
+def test_engine_skips_an_item_the_judge_already_withdrew(
+    fleet, record_store, summary_store, summaries_dir
+) -> None:
+    """Acceptance criterion 3: one notice per reader either way — an item the judge
+    named in withdraw_published is never withdrawn (and so never emitted) twice."""
+    item = _seed_published_item(
+        record_store, summaries_dir, "g_exec", content="stale claim", subject="x"
+    )
+    apply_judged_withdrawals(
+        "g_exec",
+        [item.id],
+        judged_by="scope-manager",
+        reasoning="Corrected.",
+        fleet=fleet,
+        record_store=record_store,
+        summaries_dir=summaries_dir,
+        notice_kind="claim_corrected",
+        correcting_after="the corrected observation",
+        correcting_claim_id="c_target01",
+    )
+    withdrawn = propagate_claim_correction(
+        "g_exec",
+        claim_id="c_target01",
+        corrected_claim_content="stale claim",
+        correcting_content="the corrected observation",
+        trigger_id="c_outcome01",
+        already_withdrawn=[item.id],
+        fleet=fleet,
+        record_store=record_store,
+        summaries_dir=summaries_dir,
+    )
+    assert withdrawn == []
+
+
+def test_engine_does_not_catch_a_paraphrase(
+    fleet, record_store, summary_store, summaries_dir
+) -> None:
+    """KNOWN LIMIT, pinned rather than fixed (CEO decision A is explicit: the
+    engine catches the exact bytes; the judge is asked about everything else)."""
+    _seed_published_item(
+        record_store,
+        summaries_dir,
+        "g_exec",
+        content="Releases connect over port eighty-four forty-three.",
+        subject="service-port",
+    )
+    withdrawn = propagate_claim_correction(
+        "g_exec",
+        claim_id="c_target01",
+        corrected_claim_content="The service listens on port 8443.",
+        correcting_content="the corrected observation",
+        trigger_id="c_outcome01",
+        already_withdrawn=[],
+        fleet=fleet,
+        record_store=record_store,
+        summaries_dir=summaries_dir,
+    )
+    assert withdrawn == []
+    assert read_publication("g_exec", summaries_dir=summaries_dir) != []
+
+
+def test_engine_withdrawal_emits_claim_corrected_with_the_claim_id(
+    fleet, record_store, summary_store, summaries_dir
+) -> None:
+    item = _seed_published_item(
+        record_store,
+        summaries_dir,
+        "g_exec",
+        content="The service listens on port 8443.",
+        subject="service-port",
+    )
+    propagate_claim_correction(
+        "g_exec",
+        claim_id="c_target01",
+        corrected_claim_content="The service listens on port 8443.",
+        correcting_content="Used port 8443, the service refused; the right port is unknown.",
+        trigger_id="c_outcome01",
+        already_withdrawn=[],
+        fleet=fleet,
+        record_store=record_store,
+        summaries_dir=summaries_dir,
+    )
+    events = record_store.list_change_events(scope_id="g_func")
+    assert len(events) == 1
+    assert events[0].kind == "claim_corrected"
+    notice = record_store.get_contribution(events[0].contribution_id)
+    assert notice is not None
+    assert item.id in notice.content
+    assert "c_target01" in notice.content
+    assert "right port is unknown" in notice.content
 
 
 # ---------------------------------------------------------------------------

@@ -277,6 +277,7 @@ def _render_notice(
     before: str | None,
     after: str | None,
     note: str | None = None,
+    claim_id: str | None = None,
 ) -> str:
     """Render the change payload the affected scope's judge is shown (ADR 0014 D5).
 
@@ -285,6 +286,13 @@ def _render_notice(
     Every field D5 names is present and labelled, so a judge (and an
     operator reading the record years later) can tell what moved without a
     second lookup.
+
+    *claim_id* (ADR 0017 P4, claim_corrected only): the corrected claim's own id
+    (``acted_on``) — a DIFFERENT fact from *item*, which here is the withdrawn
+    PUBLISHED item's id. A reader needs both: which of ITS OWN published items just
+    went stale (*item*), and which upstream claim caused it, so an operator or a
+    later query can trace the two back to each other. ``None`` (every other kind)
+    renders nothing extra.
     """
     lines = [
         f"[Input change {change_id} — an input this scope's memory rests on has changed.]",
@@ -294,6 +302,8 @@ def _render_notice(
         f"- before: {before if before is not None else '(nothing — this is an addition)'}",
         f"- after: {after if after is not None else '(nothing — this input is gone)'}",
     ]
+    if claim_id is not None:
+        lines.append(f"- corrected claim: {claim_id}")
     if note is not None:
         lines.append(f"- note: {note}")
     return "\n".join(lines)
@@ -327,6 +337,7 @@ def emit(
     hop: int = 0,
     by_operator: bool = False,
     by_owner: bool = True,
+    claim_id: str | None = None,
 ) -> list[str]:
     """Notify every scope affected by a change to *item*, and return its change ids.
 
@@ -387,6 +398,12 @@ def emit(
         by_operator: The operator authored this change from outside the
             fleet, which widens a directive change's affected set to include
             the holding scope (see :func:`affected_scopes`).
+        by_owner: Threaded straight to :func:`affected_scopes` — see its own
+            docstring for what it means per kind.
+        claim_id: ADR 0017 P4, ``claim_corrected`` only — the corrected claim's
+            own id (``acted_on``), rendered as an extra line in the notice
+            alongside *item* (the withdrawn published item's id): a reader
+            needs both facts. ``None`` for every other kind.
 
     Returns:
         The change ids — minted or inherited, deduplicated and
@@ -463,6 +480,7 @@ def emit(
                     before=before,
                     after=after,
                     note=note,
+                    claim_id=claim_id,
                 ),
                 contributor=_notice_contributor(scope_id),
                 change_id=change_id,
@@ -509,6 +527,7 @@ def emit(
             before=before,
             after=after,
             hop=hop,
+            claim_id=claim_id,
         )
 
     return change_ids
@@ -524,6 +543,7 @@ def _emit_self_notice(
     before: str | None,
     after: str | None,
     hop: int,
+    claim_id: str | None = None,
 ) -> None:
     """Tell the retracting scope's own readers what it just took away (issue #197).
 
@@ -569,6 +589,7 @@ def _emit_self_notice(
                         "enqueued for a refresh: the scope's judge authored it "
                         "(ADR 0014 D1, as amended by issue #197)"
                     ),
+                    claim_id=claim_id,
                 ),
                 contributor=_notice_contributor(source_scope_id),
                 change_id=change_id,

@@ -1218,6 +1218,149 @@ def propagate_directive_removals(
     return to_withdraw
 
 
+def _carries_claim(published_content: str, claim_content: str) -> bool:
+    """Does *published_content* still assert *claim_content* VERBATIM (ADR 0017 P4)?
+
+    Mirrors :func:`strata.perspective._context_contributions_absent`'s exact
+    normalisation and substring test (also duplicated, for the same reason, in
+    :func:`strata.record_store._claim_content_absent`) — every one of the three
+    call sites needs the identical rule and none may import across the others'
+    module boundaries without a cycle. KNOWN LIMIT, same direction as #202's own:
+    a published item that PARAPHRASES the claim is not caught here — that is the
+    judge's job (the OUTCOME REPORT / INPUT CHANGES instruction), not the engine's;
+    the engine only closes the gap qwen's own optional-field pattern leaves open
+    for the exact bytes.
+    """
+    haystack = " ".join(published_content.split())
+    needle = " ".join(claim_content.split())
+    return bool(needle) and needle in haystack
+
+
+def propagate_claim_correction(
+    scope_id: str,
+    *,
+    claim_id: str,
+    corrected_claim_content: str,
+    correcting_content: str,
+    trigger_id: str,
+    already_withdrawn: Collection[str],
+    fleet: FleetConfig,
+    record_store: RecordStore,
+    summaries_dir: str,
+    change_ids: Sequence[str] = (),
+    hop: int = 0,
+) -> list[PublishedItem]:
+    """Mechanically withdraw *scope_id*'s OWN published items that still carry a
+    claim its own outcome judgment (same-scope) or refresh (cross-scope) just found
+    WRONG (ADR 0017 P4, CEO decision A: the engine enforces published-within-believed
+    for the exact bytes; the judge is asked about everything else — see the OUTCOME
+    REPORT and INPUT CHANGES instruction lines).
+
+    No LLM in the loop — the mechanical sibling of :func:`propagate_directive_removals`,
+    same shape: no judgment row (the correction was already judged; withdrawing a
+    published item that still asserts it is closing a contradiction the judgment
+    already settled, not a fresh judgment on the publication itself), a mechanical
+    ``proposer``, and the SAME wave id so a reader sees ONE correction, never two.
+
+    Skips *already_withdrawn* (the judge's own ``withdraw_published``, resolved to
+    published item ids by the caller) so an item the judge itself named is never
+    withdrawn — and so never emitted — a second time (acceptance criterion 3: one
+    notice per reader either way, whichever path found it).
+
+    The caller MUST already hold ``strata.locks.scope_lock(scope_id)`` — called from
+    :func:`strata.app._judge_and_record`, already inside it, after the judge's own
+    ``withdraw_published`` has been applied.
+
+    Args:
+        scope_id: The scope whose OWN publication is checked — never another
+            scope's (D6: a failed_superseded outcome, and a directive target, never
+            reach this function at all — the caller gates that).
+        claim_id: The corrected claim's own id (``acted_on``) — carried on the
+            notice alongside the withdrawn item's id (see :func:`emit`'s
+            ``claim_id``).
+        corrected_claim_content: The claim's own content, as it stood — what a
+            still-published item must carry verbatim to qualify.
+        correcting_content: The outcome's own observation — the notice's ``after``.
+        trigger_id: The record id of the triggering event (the outcome contribution,
+            same-scope; the refresh's own notice contribution, cross-scope) —
+            carried on each withdraw act, mirroring :func:`propagate_directive_removals`.
+        already_withdrawn: Published item ids the JUDGE already withdrew via
+            ``withdraw_published`` — skipped here (criterion 3).
+        change_ids: The change id(s) this correction is a consequence of (ADR 0014
+            D4) — the P3 audit row's own id (same-scope) or the refresh's own
+            ``wave_ids`` (cross-scope). Never a fresh id: a reader must see this
+            correction under the ONE id it already knows.
+        hop: Threaded through unchanged, matching every other propagation function.
+
+    Returns:
+        The published items actually withdrawn (empty if none carried the claim).
+    """
+    current_publication = read_publication(scope_id, summaries_dir=summaries_dir)
+    if not current_publication:
+        return []
+
+    skip = set(already_withdrawn)
+    to_withdraw = [
+        item
+        for item in current_publication
+        if item.id not in skip and _carries_claim(item.content, corrected_claim_content)
+    ]
+    if not to_withdraw:
+        return []
+
+    proposer = _mechanical_proposer(scope_id)
+    for item in to_withdraw:
+        record_store.append_publication_act(
+            scope_id=scope_id,
+            act="withdraw",
+            kind=None,
+            content=None,
+            subject=None,
+            anchors=None,
+            withdraws=item.id,
+            trigger=trigger_id,
+            proposer=proposer,
+        )
+        _logger.info(
+            "mechanically withdrew published item %s from scope %s: still carried "
+            "corrected claim %s verbatim (ADR 0017 P4)",
+            item.id,
+            scope_id,
+            claim_id,
+        )
+
+    withdrawn_ids = {item.id for item in to_withdraw}
+    remaining = [item for item in current_publication if item.id not in withdrawn_ids]
+    _write_publication(scope_id, remaining, summaries_dir=summaries_dir)
+
+    for item in to_withdraw:
+        item_change_ids = emit_change_event(
+            fleet=fleet,
+            record_store=record_store,
+            item=item.id,
+            kind="claim_corrected",
+            source_scope_id=scope_id,
+            before=item.content,
+            after=correcting_content,
+            wave_ids=change_ids,
+            hop=hop,
+            by_owner=True,
+            claim_id=claim_id,
+        )
+        _cascade_withdraw_relays(
+            scope_id,
+            item.id,
+            fleet=fleet,
+            record_store=record_store,
+            summaries_dir=summaries_dir,
+            held_scope_id=scope_id,
+            change_ids=item_change_ids,
+            hop=hop,
+        )
+
+    return to_withdraw
+
+
 def apply_judged_withdrawals(
     scope_id: str,
     item_ids: Sequence[str],
@@ -1231,6 +1374,7 @@ def apply_judged_withdrawals(
     hop: int = 0,
     notice_kind: str = "withdrawn",
     correcting_after: str | None = None,
+    correcting_claim_id: str | None = None,
 ) -> list[PublishedItem]:
     """Withdraw published items named by a contribution judgment's ``withdraw_published``.
 
@@ -1278,6 +1422,9 @@ def apply_judged_withdrawals(
             carry as ``after`` instead of the withdrawal's usual ``None``
             ("this input is gone"): a correction replaces, it does not merely
             remove (P3 ruling line (d)).
+        correcting_claim_id: ``claim_corrected`` only (ADR 0017 P4) — the
+            corrected claim's own id, carried on the notice alongside the
+            withdrawn item's id (see :func:`emit`'s ``claim_id``).
 
     Returns:
         The published items actually withdrawn.
@@ -1344,6 +1491,7 @@ def apply_judged_withdrawals(
             after=correcting_after if notice_kind == "claim_corrected" else None,
             wave_ids=change_ids,
             hop=hop,
+            claim_id=correcting_claim_id if notice_kind == "claim_corrected" else None,
         )
         _cascade_withdraw_relays(
             scope_id,
