@@ -263,6 +263,12 @@ Each item sits in a scope holding the item acted on. Goldens state decision
 **Hazard pin for P7 (next cycle).** A summary holding a restatement of an item
 and no `acted_on` outcome for it → when ratification is considered, the reason
 cites **no corroboration**. A restatement is never read as evidence.
+**Second P7 hazard (CEO, 2026-09-25): reasons that embellish evidence.** At the
+P3 gate (ol-007), the report "it didn't work, not sure why" was judged
+correctly, as failed_corrected. The reason, though, restated it as "the service
+refused on port 8443", which is more than the report said. Ratification reads
+these reasons, so P7's eval carries an item: the reason the ratification judge
+cites must not assert more than the outcome reports did.
 
 9. **Unprompted `acted_on`** — in the demo eval's write-back run, an agent that
    was not told to set the reference sets it at least once; or the report says
