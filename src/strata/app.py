@@ -110,6 +110,7 @@ from strata.perspective import ancestor_directives, compose_perspective
 from strata.project_config import StoragePaths, resolve_storage_paths
 from strata.publication import (
     apply_judged_withdrawals,
+    propagate_claim_correction,
     propagate_directive_removals,
     read_publication,
 )
@@ -117,6 +118,7 @@ from strata.record_store import (
     JUDGE_FAILED,
     RECENCY_WINDOW_SIZE,
     ChangeEvent,
+    ClaimEventInput,
     Contribution,
     ContributorRef,
     RecentContribution,
@@ -124,6 +126,7 @@ from strata.record_store import (
 )
 from strata.scope_manager import (
     WINDOW_VERBATIM_TAIL,
+    ActedOnTarget,
     JudgeMode,
     ScopeManager,
     ScopeManagerBatchJudgment,
@@ -325,6 +328,11 @@ class ContributeRequest(BaseModel):
     proposed_classification: Literal["directive", "context"]
     subject: str | None = None
     supersedes: str | None = None
+    acted_on: str | None = None
+    """ADR 0017 P1: the id of a prior contribution this one reports the outcome of
+    acting on. Mutually exclusive with ``supersedes``; validated the same way and with
+    the same messages as ``strata_contribute``'s ``acted_on`` (see
+    :func:`strata.app.validate_acted_on`)."""
     contributor: ContributorRefBody
 
 
@@ -553,6 +561,30 @@ def _judge_and_record(
         summary_store=summary_store,
         recency_window_size=recency_window_size,
     )
+    # ADR 0017 P3: resolve the item this contribution reports acting on, once, the
+    # same way P1's validate_acted_on already did at the write boundary — that
+    # validator guarantees the target exists and has an accepting judgment, so this
+    # never needs to handle "missing" itself.
+    acted_on_target: ActedOnTarget | None = None
+    if contribution.acted_on is not None:
+        entry = record_store.get_record_entry(contribution.acted_on)
+        assert entry is not None and entry.judgment is not None, (
+            "acted_on target unresolvable at judge time — P1's validate_acted_on "
+            "should have rejected this contribution at the write boundary"
+        )
+        acted_on_target = ActedOnTarget(
+            contribution=entry.contribution, decision=entry.judgment.decision
+        )
+    # ADR 0017 P3/P4: `acted_on_target` is passed ONLY when set — a call shape a
+    # judge with the pre-P3 signature (strata-evals' ScriptedJudge, the bench
+    # adapter, any out-of-repo judge) cannot be fixed for the way the 8 in-repo
+    # test doubles were. "An ordinary contribution's call shape is untouched"
+    # (the comment two lines below) means the KWARG never appears at all when
+    # there is nothing acted_on about this contribution — not that it appears
+    # as `None`. Any future P4+ addition to this call must pass the same test.
+    judge_kwargs: dict = {}
+    if acted_on_target is not None:
+        judge_kwargs["acted_on_target"] = acted_on_target
     try:
         judgment: ScopeManagerJudgment = scope_manager.judge(
             scope=scope,
@@ -575,6 +607,7 @@ def _judge_and_record(
             input_changes=input_changes,
             change_id=change_id,
             hop=hop,
+            **judge_kwargs,
         )
     except Exception as exc:
         # Record the failure as an event against the contribution — never as a
@@ -595,6 +628,31 @@ def _judge_and_record(
         )
         raise JudgeUnavailable(contribution.id, type(exc).__name__, str(exc)) from exc
 
+    # ADR 0017 P3: a failed outcome mints its linking event in the SAME transaction
+    # as the judgment (RecordStore.record_judgment's claim_event, atomic). Gated on
+    # the target being CONTEXT, not a directive — D6, checked here as well as
+    # upstream (scope_manager's #199 wiring): a directive is never replaced by an
+    # outcome, so no event is ever written against one, whatever the judge said.
+    claim_event = None
+    if (
+        judgment.outcome_disposition in ("failed_corrected", "failed_superseded")
+        and acted_on_target is not None
+        and acted_on_target.decision == "accept_as_context"
+    ):
+        claim_event = ClaimEventInput(
+            change_id=new_change_id(),
+            contribution_id=contribution.id,
+            scope_id=contribution.scope_id,
+            source_scope_id=acted_on_target.contribution.scope_id,
+            item_id=contribution.acted_on,
+            kind=(
+                "claim_corrected"
+                if judgment.outcome_disposition == "failed_corrected"
+                else "claim_superseded"
+            ),
+            before=acted_on_target.contribution.content,
+            after=contribution.content,
+        )
     record_store.record_judgment(
         contribution_id=contribution.id,
         decision=judgment.decision,
@@ -602,7 +660,57 @@ def _judge_and_record(
         # The judge's reasoning, plus the mechanical note for any amendment op
         # the engine dropped (ADR 0011 D1) — the record shows what applied.
         notes=judgment.record_notes,
+        claim_event=claim_event,
     )
+
+    # ADR 0017 P4: the correction's fan-out, split on who authored it.
+    #
+    # Same scope (the holding scope reported its own outcome): this judge call IS
+    # the holding scope's own act, so any withdrawal it makes below is tagged
+    # claim_corrected and shares the P3 row's change id (`change_ids_override`) —
+    # readers of this scope's publication get the correction under the ONE id, and
+    # this scope's own readers get the self-notice `emit()` triggers for it.
+    #
+    # Cross scope (a descendant reported on an ANCESTOR's item, P1's chain-only
+    # acted_on): this judge call is the DESCENDANT's own, and cannot touch the
+    # holding scope's publication at all (`current_publication` is always read for
+    # the JUDGED scope). The holding scope did nothing — it is told directly, as an
+    # ORDINARY unprocessed input change, so ITS OWN refresh judge decides whether to
+    # replace its context or withdraw its publication (never a self-notice: nobody
+    # there has acted yet).
+    same_scope_correction = (
+        claim_event is not None
+        and claim_event.kind == "claim_corrected"
+        and claim_event.source_scope_id == contribution.scope_id
+    )
+    if (
+        claim_event is not None
+        and claim_event.kind == "claim_corrected"
+        and claim_event.source_scope_id != contribution.scope_id
+    ):
+        emit_change_event(
+            fleet=fleet,
+            record_store=record_store,
+            item=claim_event.item_id,
+            kind="claim_corrected",
+            source_scope_id=claim_event.source_scope_id,
+            before=claim_event.before,
+            after=claim_event.after,
+            wave_ids=[claim_event.change_id],
+            by_owner=False,
+        )
+
+    # ADR 0017 P4: the HOLDING scope's own refresh, reacting to a claim_corrected
+    # notice a descendant's outcome sent it (above). Any pending claim_corrected
+    # event this drain carries means a withdrawal it makes below is the owner's own
+    # response to the correction, so it fans out as claim_corrected too, inheriting
+    # the SAME change id the notice arrived under (`judgment.wave_ids`, the default
+    # `_write_amendment` already uses — no override needed here).
+    refresh_correction: ChangeEvent | None = None
+    if mode == "input_change_refresh" and input_changes:
+        refresh_correction = next(
+            (event for event in input_changes if event.kind == "claim_corrected"), None
+        )
 
     summary_updated = False
     if judgment.decision != "decline" and judgment.new_summary is not None:
@@ -622,6 +730,27 @@ def _judge_and_record(
             removals=[(d, contribution.id) for d in judgment.removed_directive_ids],
             withdraw_reasoning=judgment.reasoning,
             judged_contribution_ids=[contribution.id],
+            change_ids_override=[claim_event.change_id] if same_scope_correction else None,
+            withdraw_notice_kind=(
+                "claim_corrected"
+                if same_scope_correction or refresh_correction is not None
+                else "withdrawn"
+            ),
+            withdraw_correcting_after=(
+                contribution.content
+                if same_scope_correction
+                else (refresh_correction.after if refresh_correction is not None else None)
+            ),
+            withdraw_corrected_claim_content=(
+                claim_event.before
+                if same_scope_correction
+                else (refresh_correction.before if refresh_correction is not None else None)
+            ),
+            withdraw_correcting_claim_id=(
+                claim_event.item_id
+                if same_scope_correction
+                else (refresh_correction.item_id if refresh_correction is not None else None)
+            ),
         )
         summary_updated = True
 
@@ -645,6 +774,11 @@ def _write_amendment(
     removals: Sequence[tuple[str, str]],
     withdraw_reasoning: str,
     judged_contribution_ids: Sequence[str],
+    change_ids_override: Sequence[str] | None = None,
+    withdraw_notice_kind: str = "withdrawn",
+    withdraw_correcting_after: str | None = None,
+    withdraw_corrected_claim_content: str | None = None,
+    withdraw_correcting_claim_id: str | None = None,
 ) -> None:
     """Write an accepted amendment's summary and everything that follows from it.
 
@@ -661,6 +795,21 @@ def _write_amendment(
     nothing is inferred — a ``Retirement`` row and a withdraw act are
     permanent, so a guessed owner would be a permanent misstatement of
     provenance.
+
+    ADR 0017 P4: *change_ids_override*, when given, replaces the change id this
+    write would otherwise mint or inherit — used for the same-scope
+    ``failed_corrected`` case, where the amendment IS the holding scope's own
+    judgment and must share the P3 audit row's change id, not mint its own.
+    *withdraw_notice_kind*/*withdraw_correcting_after* thread straight to
+    :func:`~strata.publication.apply_judged_withdrawals` for the JUDGE's own
+    ``withdraw_published``. *withdraw_corrected_claim_content* (the wrong claim's own
+    text) and *withdraw_correcting_claim_id* (its id) additionally drive the ENGINE's
+    own sweep (:func:`~strata.publication.propagate_claim_correction`, CEO decision A):
+    any of this scope's OWN published items still carrying that claim VERBATIM are
+    withdrawn mechanically, skipping whatever the judge already withdrew — a claim
+    left published is stale evidence for every reader of it, and a judge that omits
+    an optional field must not be the only thing standing between a corrected claim
+    and its readers.
     """
     assert judgment.new_summary is not None  # noqa: S101 — caller-checked invariant
     # ADR 0014 D4 — ONE originating act, one change id. An amendment that
@@ -678,7 +827,11 @@ def _write_amendment(
     # "fresh ids for derived changes"). `hop` travels for the same reason —
     # a backstop budget that restarts at zero on each derivation is not a
     # backstop.
-    change_ids = judgment.wave_ids or [new_change_id()]
+    change_ids = (
+        list(change_ids_override)
+        if change_ids_override is not None
+        else (judgment.wave_ids or [new_change_id()])
+    )
     # Issue #202: the condensation signal is stamped HERE, at the one site
     # that holds both halves of the comparison — the context this amendment
     # replaced and the context it writes. `SummaryStore.write` cannot derive
@@ -726,6 +879,30 @@ def _write_amendment(
             judgment.withdraw_published,
             judged_by="scope-manager",
             reasoning=withdraw_reasoning,
+            fleet=fleet,
+            record_store=record_store,
+            summaries_dir=str(summary_store.summaries_dir),
+            change_ids=change_ids,
+            hop=judgment.hop,
+            notice_kind=withdraw_notice_kind,
+            correcting_after=withdraw_correcting_after,
+            correcting_claim_id=withdraw_correcting_claim_id,
+        )
+
+    # 1b. ENGINE propagation (ADR 0017 P4, CEO decision A): a claim just found
+    #     WRONG must not stay published verbatim in this scope's OWN face,
+    #     whatever the judge did or omitted (qwen's own optional-field pattern —
+    #     #209/M1 — makes `withdraw_published` an unreliable sole signal). Skips
+    #     whatever the judge already withdrew above — one notice per reader
+    #     either way, and the record shows which path closed it.
+    if withdraw_corrected_claim_content is not None:
+        propagate_claim_correction(
+            scope.id,
+            claim_id=withdraw_correcting_claim_id or "",
+            corrected_claim_content=withdraw_corrected_claim_content,
+            correcting_content=withdraw_correcting_after or "",
+            trigger_id=judged_contribution_ids[0],
+            already_withdrawn=judgment.withdraw_published or [],
             fleet=fleet,
             record_store=record_store,
             summaries_dir=str(summary_store.summaries_dir),
@@ -1017,6 +1194,16 @@ def _judge_batch_and_record(
             (directive_id, contribution_id or "")
             for directive_id, contribution_id in batch.directive_removals()
         ]
+        # ADR 0017 P4: a coalesced drain is always the batch shape (D4's own note),
+        # so the holding scope's own refresh-driven correction fan-out (see
+        # _judge_and_record's matching comment) must be detected here too — a batch
+        # judgment never carries acted_on itself, only ever reacts to a pending
+        # claim_corrected event on a refresh.
+        batch_refresh_correction = (
+            next((event for event in input_changes if event.kind == "claim_corrected"), None)
+            if mode == "input_change_refresh" and input_changes
+            else None
+        )
         _write_amendment(
             batch,
             scope=scope,
@@ -1031,6 +1218,18 @@ def _judge_batch_and_record(
             # rather than a guess at which one meant it.
             withdraw_reasoning=batch.batch_reasoning,
             judged_contribution_ids=[v.contribution_id for v in batch.accepted_verdicts],
+            withdraw_notice_kind=(
+                "claim_corrected" if batch_refresh_correction is not None else "withdrawn"
+            ),
+            withdraw_correcting_after=(
+                batch_refresh_correction.after if batch_refresh_correction is not None else None
+            ),
+            withdraw_corrected_claim_content=(
+                batch_refresh_correction.before if batch_refresh_correction is not None else None
+            ),
+            withdraw_correcting_claim_id=(
+                batch_refresh_correction.item_id if batch_refresh_correction is not None else None
+            ),
         )
         summary_updated = True
 
@@ -1075,6 +1274,87 @@ def _fail_batch(
     return results
 
 
+#: Verdicts that count as "admitted into memory" for ADR 0017 P1's acted_on rule — a
+#: decline never entered it, and neither does an unjudged / judge-failed contribution
+#: (no verdict at all). Mirrors record_store's own accepted-decision set (kept separate:
+#: that one is private, and this check belongs to the write boundary, not the store).
+ACTED_ON_ADMITTED_DECISIONS = frozenset({"accept_as_directive", "accept_as_context"})
+
+
+def validate_acted_on(
+    fleet: FleetConfig,
+    record_store: RecordStore,
+    *,
+    acted_on: str | None,
+    supersedes: str | None,
+    agent_scope: str,
+) -> None:
+    """Enforce every ADR 0017 P1 rule on ``acted_on`` before a contribution is appended.
+
+    The single canonical check — both write surfaces (``strata_contribute`` in
+    :mod:`strata.mcp.server` and ``POST /contribute`` below) call this one function, so
+    a rule can never drift between them. *agent_scope* is the scope on whose behalf the
+    reference is made: the MCP tool's bound scope, or the HTTP body's own
+    ``contributor.scope_id`` — either way, "the scope this contribution is stamped as."
+
+    Rejected at the write boundary, each with a message naming which rule failed, in
+    this order:
+
+    1. ``acted_on`` together with ``supersedes`` — a correction is the judge's call
+       (P3), never the contributor's.
+    2. The referenced contribution must exist.
+    3. Its scope must be within *agent_scope*'s entitled READ surface — the same
+       chain-only check a by-id record lookup runs (``strata_read_contribution``):
+       you can act on what you may read by id.
+    4. It must have been ADMITTED (an accepting judgment) — a declined, pending, or
+       judge-failed contribution never entered memory, so nothing was there to act on
+       (CEO add).
+
+    A no-op when ``acted_on`` is ``None`` — every pre-P1 call site is unaffected.
+
+    Raises:
+        RuntimeError: any of the four rules above failed.
+    """
+    if acted_on is None:
+        return
+    if supersedes is not None:
+        raise RuntimeError(
+            "acted_on and supersedes cannot both be set: an outcome that shows the item "
+            "acted on was WRONG is a correction, which the judge decides from the outcome "
+            "you report — not something you assert yourself via supersedes. Submit the "
+            "outcome with acted_on alone and let the judge classify it."
+        )
+    entry = record_store.get_record_entry(acted_on)
+    if entry is None:
+        raise RuntimeError(f"acted_on={acted_on!r} does not reference an existing contribution.")
+    if fleet.get_scope(agent_scope) is None:
+        raise RuntimeError(
+            f"your bound scope {agent_scope!r} no longer exists in the fleet "
+            "config — fleet.yaml changed since this session started. Restore "
+            "the scope in fleet.yaml or relaunch with a valid binding."
+        )
+    ancestors = fleet.inter_stratum_ancestors(agent_scope)
+    entitled = {agent_scope, *(s.id for s in ancestors)}
+    if entry.contribution.scope_id not in entitled:
+        raise RuntimeError(
+            f"scope {entry.contribution.scope_id!r} is outside your entitled surface "
+            f"(your scope {agent_scope!r} plus its inter-stratum ancestors). "
+            "Records and perspective targets stay chain-only: a record "
+            "audits the authority that binds you, and a perspective is "
+            "composed for your own chain, not a peer's. A scope reachable "
+            "only through a reference edge informs you via "
+            "strata_read_scope_summary and as a non-binding peer_reference "
+            "layer inside your own perspective — never as its own record or "
+            "perspective target."
+        )
+    if entry.judgment is None or entry.judgment.decision not in ACTED_ON_ADMITTED_DECISIONS:
+        raise RuntimeError(
+            f"acted_on={acted_on!r} references a contribution that was never admitted "
+            "into memory (it was declined, or has no verdict yet) — you can only report "
+            "an outcome for an item that actually entered the scope's memory."
+        )
+
+
 def run_contribution(
     *,
     scope: Scope,
@@ -1093,6 +1373,7 @@ def run_contribution(
     recency_window_size: int = RECENCY_WINDOW_SIZE,
     batch_cap: int = BATCH_CAP,
     queue_timeout_s: float = QUEUE_WAIT_TIMEOUT_S,
+    acted_on: str | None = None,
 ) -> ContributionOutcome:
     """Append a contribution to the record and get it judged (ADR 0011 D3).
 
@@ -1116,9 +1397,19 @@ def run_contribution(
             it expired. The contribution and a judgment-attempt event are
             already in the record; retry via :func:`rejudge_contribution`,
             never a fresh contribute (which would duplicate the contribution).
-        sqlite3.IntegrityError: *supersedes* references a missing contribution
-            (a client-input error the caller maps to its surface's error shape).
+        sqlite3.IntegrityError: *supersedes* or *acted_on* references a missing
+            contribution (a client-input error the caller maps to its surface's
+            error shape).
+        ValueError: *acted_on* and *supersedes* were both given (ADR 0017 P1) —
+            a correction is the judge's call, from an outcome report, never
+            something the contributor asserts directly. Callers that accept
+            richer client input (e.g. :mod:`strata.mcp.server`) validate this
+            and every other ``acted_on`` rule earlier, with a friendlier
+            message; this is the backstop for every caller of this shared
+            choke point, not the primary check.
     """
+    if acted_on is not None and supersedes is not None:
+        raise ValueError("acted_on and supersedes cannot both be set on one contribution.")
     queue = _scope_queue(scope.id)
     with _scope_append_lock(scope.id):
         contribution = record_store.append_contribution(
@@ -1128,6 +1419,7 @@ def run_contribution(
             subject=subject,
             supersedes=supersedes,
             contributor=contributor,
+            acted_on=acted_on,
         )
         ticket = queue.enqueue(contribution.id, contribution)
 
@@ -1882,6 +2174,24 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
                 detail={"error": "scope_not_active", "scope_id": body.scope_id},
             )
 
+        # ADR 0017 P1: the same canonical check strata_contribute runs, stamped
+        # against this contribution's OWN scope (an HTTP caller has no bound agent
+        # scope the way an MCP session does — the scope it contributes as is the
+        # closest analogue to "the scope this reference is made on behalf of").
+        try:
+            validate_acted_on(
+                fleet,
+                record_store,
+                acted_on=body.acted_on,
+                supersedes=body.supersedes,
+                agent_scope=body.contributor.scope_id,
+            )
+        except RuntimeError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail={"error": "acted_on_invalid", "detail": str(exc)},
+            ) from exc
+
         # Resolve stratum from FleetConfig for scope-manager context.
         stratum = next(
             (s for s in fleet.strata if s.id == scope.stratum_id),
@@ -1915,6 +2225,7 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
                 proposed_classification=body.proposed_classification,
                 subject=body.subject,
                 supersedes=body.supersedes,
+                acted_on=body.acted_on,
                 contributor=contributor_ref,
                 fleet=fleet,
                 record_store=record_store,

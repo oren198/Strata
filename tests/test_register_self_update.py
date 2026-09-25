@@ -626,3 +626,78 @@ def test_unregister_after_self_update_removes_cleanly(tmp_path: Path, codex_home
     # unregister only ever strips the managed block, never deletes the file
     # — same "removed" outcome as the other artifacts, at block granularity.
     assert install.AGENTS_MD_MARKER not in agents_md.read_text(encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# v1.15 P1 (ADR 0017) — the acted_on line, and unregister still matches the
+# pre-P1 AGENTS.md block via the historical-hash table.
+# ---------------------------------------------------------------------------
+
+#: The exact AGENTS.md block v1.14.0 shipped (before P1's acted_on line), captured
+#: verbatim so this test never depends on git history or a live hash computation.
+_PRE_P1_AGENTS_MD_BLOCK = (
+    """<!-- strata:begin -->
+## Strata memory
+
+Strata is a shared memory layer this project's agents read from and write to
+across sessions.
+
+- **Read before working.** At the start of a session, pull your scope's
+  perspective before you act on anything.
+- **Contribute what the next agent needs.** A decision, a finding, a gap —
+  write it back. Nothing you don't contribute survives past this session.
+- **Expect the judge's verdict.** Every contribution is reviewed by that
+  scope's manager before it counts as memory — propose freely, but the
+  scope-manager decides what sticks.
+- **Never end silent.**
+  Before you finish, either contribute what you learned or call """
+    "`strata_session_closeout` with a reason — never end silent.\n"
+    """
+Memory access is only through the strata MCP tools `strata_read_perspective`,
+`strata_contribute`, and `strata_rejudge` (and their read-only siblings)
+exposed to this session — never run `strata start` or talk to its HTTP
+backend yourself; that process serves the human's Console UI only and is
+not part of your job.
+
+**Two hard rules:**
+- Never read or write files under `.strata/` directly (its database,
+  session files, or summaries) — that bypasses binding and judgment. All
+  memory access goes through the strata tools above.
+- If any strata tool returns the not-bound error, stop and ask the user
+  which scope to act as before completing your answer; an answer produced
+  without the project's memory is incomplete.
+
+Your scope and skill are bound when the session starts — from
+`STRATA_AGENT_SCOPE` and `STRATA_AGENT_SKILL` where they are set, or
+automatically when the fleet has a single scope — so do not hardcode them.
+The session id is derived per session by the server, so
+leave `STRATA_AGENT_SESSION_ID` blank (an id exported in your shell would reach
+the Stop hook but not the server, and split one session in two).
+<!-- strata:end -->
+"""
+)
+
+
+def test_shipped_agents_md_gained_the_acted_on_line() -> None:
+    block = _shipped_agents_block()
+    assert "If you acted on something from memory, say which item and how it went." in block
+
+
+def test_pre_p1_agents_md_block_hash_is_recorded_historical() -> None:
+    pre_p1_hash = hashlib.sha256(_PRE_P1_AGENTS_MD_BLOCK.encode("utf-8")).hexdigest()
+    assert pre_p1_hash in install._HISTORICAL_ARTIFACT_HASHES["agents-md"]["historical"]  # noqa: SLF001
+
+
+def test_a_pre_p1_agents_md_block_classifies_as_stale_not_edited() -> None:
+    """Round-4 unregister-fix guarantee, re-proven for this release: a project
+    registered under v1.14.0 must still classify as self-updatable, not user-edited."""
+    text = "# My project\n\n" + _PRE_P1_AGENTS_MD_BLOCK + "\n"
+    assert install.classify_agents_md_drift(text) == "stale"
+
+
+def test_unregister_removes_a_pre_p1_agents_md_block_cleanly(tmp_path: Path) -> None:
+    text = "# My project\n\n" + _PRE_P1_AGENTS_MD_BLOCK + "\nMy own notes.\n"
+    new_text, status = install.remove_agents_md(text)
+    assert status == "removed"
+    assert install.AGENTS_MD_MARKER not in new_text
+    assert "My own notes." in new_text

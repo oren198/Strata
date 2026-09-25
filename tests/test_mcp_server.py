@@ -3041,6 +3041,49 @@ async def test_nudge_rides_perspective_and_record_reads(tmp_path: Path) -> None:
     assert mod._session_store.read("sess_pr").reads == 3
 
 
+async def test_perspective_nudge_names_the_context_ids_it_showed(tmp_path: Path) -> None:
+    """ADR 0017 P1b — the nudge names the ids strata_read_perspective just showed the
+    agent, so it has something concrete to pass back as acted_on."""
+    from strata.record_store import ContributorRef
+
+    db_path = _make_db(tmp_path)
+    summaries_dir = str(tmp_path / "summaries")
+    fleet_path = _make_fleet_yaml(tmp_path)
+
+    mod = _load_mcp_module(db_path, summaries_dir, str(fleet_path))
+    SummaryStore(summaries_dir).write(
+        "g_backend", _make_summary("g_backend", "Release tags use the prefix rel-, never v.")
+    )
+    fleet = FleetConfig.load(fleet_path)
+    target = mod._record_store.append_contribution(
+        scope_id="g_backend",
+        content="Release tags use the prefix rel-, never v.",
+        proposed_classification="context",
+        subject=None,
+        supersedes=None,
+        contributor=ContributorRef(
+            scope_id="g_backend", skill="engineer", session_id="s0", ts="2026-01-01T00:00:00Z"
+        ),
+    )
+    mod._record_store.record_judgment(
+        contribution_id=target.id, decision="accept_as_context", judged_by="scope-manager"
+    )
+
+    scope_p, skill_p, session_p = _patch_agent_binding(
+        mod, scope="g_backend", session_id="sess_ctx"
+    )
+    with scope_p, skill_p, session_p, patch.object(mod, "_load_fleet", return_value=fleet):
+        result = await mod.strata_read_perspective("g_backend")
+
+    self_layer = next(layer for layer in result["layers"] if layer["relation"] == "self")
+    assert self_layer["context_items"] == [
+        {"id": target.id, "label": "Release tags use the prefix rel-, never v."}
+    ]
+    assert "nudge" in result
+    assert f"{target.id} (Release tags use the prefix rel-, never v.)" in result["nudge"]
+    assert "pass acted_on=<that id>" in result["nudge"]
+
+
 def test_instructions_declare_contribution_norm(tmp_path: Path) -> None:
     """The MCP server's initialize-handshake instructions carry the contribution norm."""
     db_path = _make_db(tmp_path)

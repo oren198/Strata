@@ -124,6 +124,7 @@ class _AccumulatingManager:
         change_id=None,
         hop=0,
         window_verbatim_tail=None,
+        acted_on_target=None,
     ):  # noqa: ANN001, ANN201, E501
         existing = list(current_summary.directives) if current_summary is not None else []
         time.sleep(self.delay)
@@ -174,6 +175,7 @@ class _SkillEchoManager:
         change_id=None,
         hop=0,
         window_verbatim_tail=None,
+        acted_on_target=None,
     ):  # noqa: ANN001, ANN201, E501
         directive = Directive(
             id=new_contribution.id,
@@ -537,6 +539,7 @@ class _CapturingManager:
         change_id=None,
         hop=0,
         window_verbatim_tail=None,
+        acted_on_target=None,
     ):  # noqa: ANN001, ANN201, E501
         self.received_operator_memory = operator_memory
         return ScopeManagerJudgment(
