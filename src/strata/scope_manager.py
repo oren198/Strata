@@ -2794,6 +2794,17 @@ def _render_input_changes(events: Sequence[_ChangeEventLike] | None) -> str:
             f"      before: {event.before or '(none)'}\n"
             f"      after:  {event.after or '(none)'}"
         )
+        if event.kind == "claim_corrected":
+            # ADR 0017 P4 (CEO decision A, philosopher's follow-up): the engine
+            # already withdraws THIS SCOPE'S PUBLICATION's own items that carry the
+            # corrected claim VERBATIM (#202's own presence test) — this instruction
+            # is for everything that test cannot catch. New text ONLY for this kind,
+            # so every other refresh kind's rendering stays byte-identical.
+            lines.append(
+                "      If THIS SCOPE'S PUBLICATION (below) carries this claim IN "
+                "OTHER WORDS — not the exact bytes — name that published item's id "
+                "in `withdraw_published`."
+            )
     return "\n".join(lines) + "\n\n"
 
 
@@ -2900,6 +2911,11 @@ def _render_outcome_block(target: ActedOnTarget) -> str:
         "held / failed_corrected / failed_superseded record as accept_as_context; "
         "decline records as decline — the engine derives this from `decision` itself, "
         "there is no separate field to fill.\n"
+        "If `decision` is failed_corrected and THIS SCOPE'S PUBLICATION (below) "
+        "carries the corrected claim IN OTHER WORDS — not the exact bytes, which the "
+        "engine already catches on its own — name that published item's id in "
+        "`withdraw_published`. A published face that still asserts a claim you just "
+        "found wrong is stale evidence for every reader of it.\n"
         "\n"
     )
 

@@ -110,6 +110,7 @@ from strata.perspective import ancestor_directives, compose_perspective
 from strata.project_config import StoragePaths, resolve_storage_paths
 from strata.publication import (
     apply_judged_withdrawals,
+    propagate_claim_correction,
     propagate_directive_removals,
     read_publication,
 )
@@ -574,6 +575,16 @@ def _judge_and_record(
         acted_on_target = ActedOnTarget(
             contribution=entry.contribution, decision=entry.judgment.decision
         )
+    # ADR 0017 P3/P4: `acted_on_target` is passed ONLY when set — a call shape a
+    # judge with the pre-P3 signature (strata-evals' ScriptedJudge, the bench
+    # adapter, any out-of-repo judge) cannot be fixed for the way the 8 in-repo
+    # test doubles were. "An ordinary contribution's call shape is untouched"
+    # (the comment two lines below) means the KWARG never appears at all when
+    # there is nothing acted_on about this contribution — not that it appears
+    # as `None`. Any future P4+ addition to this call must pass the same test.
+    judge_kwargs: dict = {}
+    if acted_on_target is not None:
+        judge_kwargs["acted_on_target"] = acted_on_target
     try:
         judgment: ScopeManagerJudgment = scope_manager.judge(
             scope=scope,
@@ -596,7 +607,7 @@ def _judge_and_record(
             input_changes=input_changes,
             change_id=change_id,
             hop=hop,
-            acted_on_target=acted_on_target,
+            **judge_kwargs,
         )
     except Exception as exc:
         # Record the failure as an event against the contribution — never as a
@@ -652,6 +663,55 @@ def _judge_and_record(
         claim_event=claim_event,
     )
 
+    # ADR 0017 P4: the correction's fan-out, split on who authored it.
+    #
+    # Same scope (the holding scope reported its own outcome): this judge call IS
+    # the holding scope's own act, so any withdrawal it makes below is tagged
+    # claim_corrected and shares the P3 row's change id (`change_ids_override`) —
+    # readers of this scope's publication get the correction under the ONE id, and
+    # this scope's own readers get the self-notice `emit()` triggers for it.
+    #
+    # Cross scope (a descendant reported on an ANCESTOR's item, P1's chain-only
+    # acted_on): this judge call is the DESCENDANT's own, and cannot touch the
+    # holding scope's publication at all (`current_publication` is always read for
+    # the JUDGED scope). The holding scope did nothing — it is told directly, as an
+    # ORDINARY unprocessed input change, so ITS OWN refresh judge decides whether to
+    # replace its context or withdraw its publication (never a self-notice: nobody
+    # there has acted yet).
+    same_scope_correction = (
+        claim_event is not None
+        and claim_event.kind == "claim_corrected"
+        and claim_event.source_scope_id == contribution.scope_id
+    )
+    if (
+        claim_event is not None
+        and claim_event.kind == "claim_corrected"
+        and claim_event.source_scope_id != contribution.scope_id
+    ):
+        emit_change_event(
+            fleet=fleet,
+            record_store=record_store,
+            item=claim_event.item_id,
+            kind="claim_corrected",
+            source_scope_id=claim_event.source_scope_id,
+            before=claim_event.before,
+            after=claim_event.after,
+            wave_ids=[claim_event.change_id],
+            by_owner=False,
+        )
+
+    # ADR 0017 P4: the HOLDING scope's own refresh, reacting to a claim_corrected
+    # notice a descendant's outcome sent it (above). Any pending claim_corrected
+    # event this drain carries means a withdrawal it makes below is the owner's own
+    # response to the correction, so it fans out as claim_corrected too, inheriting
+    # the SAME change id the notice arrived under (`judgment.wave_ids`, the default
+    # `_write_amendment` already uses — no override needed here).
+    refresh_correction: ChangeEvent | None = None
+    if mode == "input_change_refresh" and input_changes:
+        refresh_correction = next(
+            (event for event in input_changes if event.kind == "claim_corrected"), None
+        )
+
     summary_updated = False
     if judgment.decision != "decline" and judgment.new_summary is not None:
         # Single path: the one judged contribution owns the whole amendment —
@@ -670,6 +730,27 @@ def _judge_and_record(
             removals=[(d, contribution.id) for d in judgment.removed_directive_ids],
             withdraw_reasoning=judgment.reasoning,
             judged_contribution_ids=[contribution.id],
+            change_ids_override=[claim_event.change_id] if same_scope_correction else None,
+            withdraw_notice_kind=(
+                "claim_corrected"
+                if same_scope_correction or refresh_correction is not None
+                else "withdrawn"
+            ),
+            withdraw_correcting_after=(
+                contribution.content
+                if same_scope_correction
+                else (refresh_correction.after if refresh_correction is not None else None)
+            ),
+            withdraw_corrected_claim_content=(
+                claim_event.before
+                if same_scope_correction
+                else (refresh_correction.before if refresh_correction is not None else None)
+            ),
+            withdraw_correcting_claim_id=(
+                claim_event.item_id
+                if same_scope_correction
+                else (refresh_correction.item_id if refresh_correction is not None else None)
+            ),
         )
         summary_updated = True
 
@@ -693,6 +774,11 @@ def _write_amendment(
     removals: Sequence[tuple[str, str]],
     withdraw_reasoning: str,
     judged_contribution_ids: Sequence[str],
+    change_ids_override: Sequence[str] | None = None,
+    withdraw_notice_kind: str = "withdrawn",
+    withdraw_correcting_after: str | None = None,
+    withdraw_corrected_claim_content: str | None = None,
+    withdraw_correcting_claim_id: str | None = None,
 ) -> None:
     """Write an accepted amendment's summary and everything that follows from it.
 
@@ -709,6 +795,21 @@ def _write_amendment(
     nothing is inferred — a ``Retirement`` row and a withdraw act are
     permanent, so a guessed owner would be a permanent misstatement of
     provenance.
+
+    ADR 0017 P4: *change_ids_override*, when given, replaces the change id this
+    write would otherwise mint or inherit — used for the same-scope
+    ``failed_corrected`` case, where the amendment IS the holding scope's own
+    judgment and must share the P3 audit row's change id, not mint its own.
+    *withdraw_notice_kind*/*withdraw_correcting_after* thread straight to
+    :func:`~strata.publication.apply_judged_withdrawals` for the JUDGE's own
+    ``withdraw_published``. *withdraw_corrected_claim_content* (the wrong claim's own
+    text) and *withdraw_correcting_claim_id* (its id) additionally drive the ENGINE's
+    own sweep (:func:`~strata.publication.propagate_claim_correction`, CEO decision A):
+    any of this scope's OWN published items still carrying that claim VERBATIM are
+    withdrawn mechanically, skipping whatever the judge already withdrew — a claim
+    left published is stale evidence for every reader of it, and a judge that omits
+    an optional field must not be the only thing standing between a corrected claim
+    and its readers.
     """
     assert judgment.new_summary is not None  # noqa: S101 — caller-checked invariant
     # ADR 0014 D4 — ONE originating act, one change id. An amendment that
@@ -726,7 +827,11 @@ def _write_amendment(
     # "fresh ids for derived changes"). `hop` travels for the same reason —
     # a backstop budget that restarts at zero on each derivation is not a
     # backstop.
-    change_ids = judgment.wave_ids or [new_change_id()]
+    change_ids = (
+        list(change_ids_override)
+        if change_ids_override is not None
+        else (judgment.wave_ids or [new_change_id()])
+    )
     # Issue #202: the condensation signal is stamped HERE, at the one site
     # that holds both halves of the comparison — the context this amendment
     # replaced and the context it writes. `SummaryStore.write` cannot derive
@@ -774,6 +879,30 @@ def _write_amendment(
             judgment.withdraw_published,
             judged_by="scope-manager",
             reasoning=withdraw_reasoning,
+            fleet=fleet,
+            record_store=record_store,
+            summaries_dir=str(summary_store.summaries_dir),
+            change_ids=change_ids,
+            hop=judgment.hop,
+            notice_kind=withdraw_notice_kind,
+            correcting_after=withdraw_correcting_after,
+            correcting_claim_id=withdraw_correcting_claim_id,
+        )
+
+    # 1b. ENGINE propagation (ADR 0017 P4, CEO decision A): a claim just found
+    #     WRONG must not stay published verbatim in this scope's OWN face,
+    #     whatever the judge did or omitted (qwen's own optional-field pattern —
+    #     #209/M1 — makes `withdraw_published` an unreliable sole signal). Skips
+    #     whatever the judge already withdrew above — one notice per reader
+    #     either way, and the record shows which path closed it.
+    if withdraw_corrected_claim_content is not None:
+        propagate_claim_correction(
+            scope.id,
+            claim_id=withdraw_correcting_claim_id or "",
+            corrected_claim_content=withdraw_corrected_claim_content,
+            correcting_content=withdraw_correcting_after or "",
+            trigger_id=judged_contribution_ids[0],
+            already_withdrawn=judgment.withdraw_published or [],
             fleet=fleet,
             record_store=record_store,
             summaries_dir=str(summary_store.summaries_dir),
@@ -1065,6 +1194,16 @@ def _judge_batch_and_record(
             (directive_id, contribution_id or "")
             for directive_id, contribution_id in batch.directive_removals()
         ]
+        # ADR 0017 P4: a coalesced drain is always the batch shape (D4's own note),
+        # so the holding scope's own refresh-driven correction fan-out (see
+        # _judge_and_record's matching comment) must be detected here too — a batch
+        # judgment never carries acted_on itself, only ever reacts to a pending
+        # claim_corrected event on a refresh.
+        batch_refresh_correction = (
+            next((event for event in input_changes if event.kind == "claim_corrected"), None)
+            if mode == "input_change_refresh" and input_changes
+            else None
+        )
         _write_amendment(
             batch,
             scope=scope,
@@ -1079,6 +1218,18 @@ def _judge_batch_and_record(
             # rather than a guess at which one meant it.
             withdraw_reasoning=batch.batch_reasoning,
             judged_contribution_ids=[v.contribution_id for v in batch.accepted_verdicts],
+            withdraw_notice_kind=(
+                "claim_corrected" if batch_refresh_correction is not None else "withdrawn"
+            ),
+            withdraw_correcting_after=(
+                batch_refresh_correction.after if batch_refresh_correction is not None else None
+            ),
+            withdraw_corrected_claim_content=(
+                batch_refresh_correction.before if batch_refresh_correction is not None else None
+            ),
+            withdraw_correcting_claim_id=(
+                batch_refresh_correction.item_id if batch_refresh_correction is not None else None
+            ),
         )
         summary_updated = True
 

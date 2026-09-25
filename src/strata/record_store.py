@@ -66,6 +66,7 @@ from pathlib import Path
 from typing import Literal
 
 from strata.fleet_config import FleetConfig
+from strata.summary_store import SummaryStore
 
 # ---------------------------------------------------------------------------
 # ID helpers
@@ -2470,26 +2471,64 @@ class StandingEvidence:
     against the *current* fleet — re-checked, never assumed, and marking rather than
     silently dropping the evidence when it no longer holds (CEO add)."""
     replaced_kind: Literal["claim_corrected", "claim_superseded"] | None = None
-    """ADR 0017 P3: set when THIS outcome's own disposition was failed_corrected or
-    failed_superseded — read off the ``claim_corrected``/``claim_superseded`` change
-    event it minted as its source (:meth:`RecordStore.claim_event_for`), never
-    re-derived. ``None`` means this outcome held. Distinct from
-    :attr:`target_replaced`, which asks whether the TARGET was replaced by ANYTHING
-    (any accepted contribution's ``supersedes``) — an outcome can hold
-    (``replaced_kind is None``) even while its target was later replaced by a
-    different, later act (``target_replaced=True``)."""
+    """ADR 0017 P3/P4: set when THIS outcome's own disposition was failed_corrected or
+    failed_superseded **and** the holding scope's CURRENT summary no longer carries the
+    target's content verbatim — i.e. the correction actually took, not merely that the
+    judge said so (P4: the P3 row alone over-reported "replaced" in the cross-scope
+    case, and same-scope whenever #199's backstop had nothing to see). ``None`` means
+    either this outcome held, or its correction is still pending
+    (:attr:`correction_pending_kind`). Distinct from :attr:`target_replaced`, which
+    asks whether the TARGET was replaced by ANYTHING (any accepted contribution's
+    ``supersedes``) — an outcome can hold (``replaced_kind is None``) even while its
+    target was later replaced by a different, later act (``target_replaced=True``)."""
+    correction_pending_kind: Literal["claim_corrected", "claim_superseded"] | None = None
+    """ADR 0017 P4: set when this outcome minted a claim_corrected/claim_superseded
+    event but the holding scope's CURRENT summary still carries the target's content
+    verbatim — a correction reported, the owner not yet acted on it. Never counted as
+    :attr:`replaced_kind` until the owner's own summary drops the claim. Derived live,
+    the same verbatim substring test #202's condensation signal uses
+    (:func:`strata.perspective._context_contributions_absent`, mirrored here to avoid
+    a `perspective` -> `record_store` import cycle) — so it shares that test's
+    over-approximation: a PARAPHRASE the owner wrote before any correction reads as
+    "absent" too, which would read as :attr:`replaced_kind` here even though the owner
+    never acted on THIS correction. Not solved; the same direction #202 already
+    accepted (over-disclosure, never under)."""
 
 
-#: How one outcome contribution counts toward its target's standing (ADR 0017 P2/P3).
+#: How one outcome contribution counts toward its target's standing (ADR 0017 P2/P3/P4).
 _READING_EXCLUDED = "excluded"
 _READING_HELD = "held"
 _READING_REPLACED = "replaced"
+_READING_CORRECTION_PENDING = "correction_pending"
+
+
+def _claim_content_absent(holding_summary_context: str | None, content: str) -> bool:
+    """Is *content* no longer present verbatim in *holding_summary_context* (ADR 0017 P4)?
+
+    Mirrors :func:`strata.perspective._context_contributions_absent`'s exact
+    normalisation and substring test — duplicated rather than imported, since
+    ``perspective`` imports this module and importing back would cycle. Same
+    over-approximation, same direction (#202): a PARAPHRASE reads as absent too, so
+    this can say "gone" when the owner only paraphrased it before ever seeing this
+    correction. Never the reverse — it never says "gone" when the exact bytes are
+    still there.
+    """
+    if holding_summary_context is None:
+        return True
+    haystack = " ".join(holding_summary_context.split())
+    needle = " ".join(content.split())
+    return not needle or needle not in haystack
 
 
 def _outcome_reading(
-    judgment: Judgment | None, *, outcome_itself_superseded: bool, claim_event_kind: str | None
+    judgment: Judgment | None,
+    *,
+    outcome_itself_superseded: bool,
+    claim_event_kind: str | None,
+    claim_content_absent: bool,
 ) -> str:
-    """Classify one outcome contribution as excluded, held, or replaced (ADR 0017 P3).
+    """Classify one outcome contribution as excluded, held, replaced, or
+    correction_pending (ADR 0017 P3/P4).
 
     THE RULE (philosopher/CEO ruling, option c', 2026-09-24 — "Ruling on failed
     outcomes (final: option c')"): for an accepted contribution carrying ``acted_on``,
@@ -2499,8 +2538,14 @@ def _outcome_reading(
     judgment by :meth:`RecordStore.record_judgment`'s ``claim_event``).
 
     - No such event (*claim_event_kind* is ``None``) → ``held`` (corroboration).
-    - Such an event exists → ``replaced``; its KIND is read off the event by the
-      caller (:func:`standing_evidence`), never re-derived here.
+    - Such an event exists AND the target's content is gone from the holding scope's
+      CURRENT summary (*claim_content_absent*) → ``replaced``; its KIND is read off
+      the event by the caller (:func:`standing_evidence`), never re-derived here.
+    - Such an event exists but the content is STILL THERE (P4: the cross-scope case,
+      where the judge that produced the disposition cannot touch the holding scope at
+      all; or same-scope when #199's backstop had nothing in its window to catch) →
+      ``correction_pending`` — a correction was reported, the owner has not acted on
+      it yet. Never counted as ``replaced`` by assertion.
     - Declined (or pending, or judge-failed — no accepting judgment at all) →
       ``excluded``.
 
@@ -2519,11 +2564,13 @@ def _outcome_reading(
         return _READING_EXCLUDED
     if outcome_itself_superseded:
         return _READING_EXCLUDED
-    return _READING_REPLACED if claim_event_kind is not None else _READING_HELD
+    if claim_event_kind is None:
+        return _READING_HELD
+    return _READING_REPLACED if claim_content_absent else _READING_CORRECTION_PENDING
 
 
 def standing_evidence(
-    record_store: RecordStore, fleet: FleetConfig, item_id: str
+    record_store: RecordStore, fleet: FleetConfig, item_id: str, *, summary_store: SummaryStore
 ) -> list[StandingEvidence]:
     """Every outcome contribution's evidence toward *item_id*'s standing (ADR 0017 P2).
 
@@ -2552,7 +2599,12 @@ def standing_evidence(
       config still appears, marked ``reporter_entitlement_current=False`` (CEO add): P1
       checked entitlement once, at write time, and the record is never rewritten.
     - An outcome whose OWN disposition was failed_corrected/failed_superseded (P3) is
-      marked ``replaced_kind`` accordingly, read off its own ``claim_event_for`` row.
+      marked ``replaced_kind`` accordingly, read off its own ``claim_event_for`` row —
+      but ONLY once the holding scope's CURRENT summary (*summary_store*) no longer
+      carries the target's content verbatim (P4): until then it is marked
+      ``correction_pending_kind`` instead, never ``replaced_kind`` by assertion. See
+      :attr:`StandingEvidence.correction_pending_kind` for the known over-approximation
+      (a paraphrase reads as dropped too, same direction as #202).
 
     THE CLOSURE THIS RELIES ON (P3): "accepted + acted_on + disposition held means
     held" is true only because P3's judge instruction makes an ``acted_on``
@@ -2571,6 +2623,10 @@ def standing_evidence(
         return []
 
     target_replaced = record_store.is_superseded(item_id)
+    # ADR 0017 P4: the HOLDING scope's CURRENT summary — read once, outside the loop,
+    # since every outcome on this item shares the same target and the same owner.
+    holding_summary = summary_store.read(target.contribution.scope_id)
+    holding_context = holding_summary.context if holding_summary is not None else None
 
     evidence: list[StandingEvidence] = []
     for outcome in record_store.list_outcomes(acted_on=item_id):
@@ -2581,6 +2637,9 @@ def standing_evidence(
             judgment,
             outcome_itself_superseded=record_store.is_superseded(outcome.id),
             claim_event_kind=claim_kind,
+            claim_content_absent=_claim_content_absent(
+                holding_context, target.contribution.content
+            ),
         )
         if reading == _READING_EXCLUDED:
             continue
@@ -2600,6 +2659,9 @@ def standing_evidence(
                 target_replaced=target_replaced,
                 reporter_entitlement_current=entitled,
                 replaced_kind=claim_kind if reading == _READING_REPLACED else None,
+                correction_pending_kind=(
+                    claim_kind if reading == _READING_CORRECTION_PENDING else None
+                ),
             )
         )
     return evidence

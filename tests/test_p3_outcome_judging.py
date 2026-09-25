@@ -266,6 +266,17 @@ def test_prompt_instructs_default_to_failed_corrected_when_ambiguous() -> None:
     assert "cannot tell failed_corrected from failed_superseded, choose failed_corrected" in block
 
 
+def test_prompt_asks_the_judge_about_non_verbatim_published_carriers() -> None:
+    """ADR 0017 P4 (CEO decision A, philosopher's follow-up): the engine catches
+    published items that carry the corrected claim VERBATIM on its own; the judge
+    is asked about everything else — a paraphrase in THIS SCOPE'S PUBLICATION."""
+    from strata.scope_manager import _render_outcome_block
+
+    block = _render_outcome_block(CONTEXT_TARGET)
+    assert "IN OTHER WORDS" in block
+    assert "withdraw_published" in block
+
+
 # --- held quotes its observable ---------------------------------------------------------
 
 
