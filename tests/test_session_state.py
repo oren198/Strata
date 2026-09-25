@@ -1077,6 +1077,47 @@ def test_nudge_is_silent_once_a_contribute_call_was_made_whatever_the_verdict(
     assert compute_nudge(store.read("s1")) is None
 
 
+def test_nudge_names_context_ids_when_given(tmp_path: Path) -> None:
+    """ADR 0017 P1b — the nudge names the ids the perspective actually showed, not the
+    generic acted-on line, so an agent has something concrete to pass back."""
+    from strata.session_state import ACTED_ON_NUDGE_LINE, compute_nudge
+
+    store = SessionStateStore(tmp_path / "sessions")
+    store.record_read("s1", "g")
+    nudge = compute_nudge(
+        store.read("s1"),
+        context_items=[
+            {"id": "c_87a9", "label": "release tags use rel-"},
+            {"id": "c_ebab", "label": "tests need TZ=UTC"},
+        ],
+    )
+    assert nudge is not None
+    assert "c_87a9 (release tags use rel-) and c_ebab (tests need TZ=UTC)" in nudge
+    assert "if you acted on one, pass acted_on=<that id> and say what happened" in nudge
+    assert ACTED_ON_NUDGE_LINE not in nudge
+
+
+def test_nudge_falls_back_to_the_generic_line_without_context_items(tmp_path: Path) -> None:
+    from strata.session_state import ACTED_ON_NUDGE_LINE, compute_nudge
+
+    store = SessionStateStore(tmp_path / "sessions")
+    store.record_read("s1", "g")
+    assert ACTED_ON_NUDGE_LINE in compute_nudge(store.read("s1"))
+    assert ACTED_ON_NUDGE_LINE in compute_nudge(store.read("s1"), context_items=[])
+    assert ACTED_ON_NUDGE_LINE in compute_nudge(store.read("s1"), context_items=None)
+
+
+def test_render_context_items_clause_joins_by_count() -> None:
+    from strata.session_state import _render_context_items_clause
+
+    one = [{"id": "c_1", "label": "a"}]
+    two = [{"id": "c_1", "label": "a"}, {"id": "c_2", "label": "b"}]
+    three = two + [{"id": "c_3", "label": "c"}]
+    assert _render_context_items_clause(one) == "c_1 (a)"
+    assert _render_context_items_clause(two) == "c_1 (a) and c_2 (b)"
+    assert _render_context_items_clause(three) == "c_1 (a), c_2 (b) and c_3 (c)"
+
+
 def test_tool_calls_are_counted_and_a_block_snapshots_the_count(tmp_path: Path) -> None:
     store = SessionStateStore(tmp_path / "sessions")
     store.record_tool_call("s1")
