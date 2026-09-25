@@ -57,6 +57,7 @@ import json
 import logging
 import re
 from collections.abc import Callable, Collection, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Literal, Protocol, TypeVar
 
@@ -363,6 +364,24 @@ JUDGE_TOOL: dict = {
                     "item."
                 ),
             },
+            "outcome_disposition": {
+                "type": ["string", "null"],
+                "description": (
+                    "ADR 0017 P3: REQUIRED, and ONLY meaningful, when the contribution "
+                    "under judgment carries `acted_on` — an OUTCOME REPORT block will be "
+                    "rendered above when that is so, and this field must then be exactly "
+                    "one of: `held` (an action that could have failed CONFIRMED the item "
+                    "— never merely that the claim reads as true), `failed_corrected` "
+                    "(the claim was wrong; the report's own observation replaces it), "
+                    "`failed_superseded` (the claim was right but the world moved on; "
+                    "the report's own observation replaces it), or `decline` (the report "
+                    "establishes neither a clean hold nor a clean failure — an echo, an "
+                    "ambiguous result, or a pending one). `decision` must then read "
+                    "`accept_as_context` for held/failed_corrected/failed_superseded, or "
+                    "`decline` for `decline` — the two fields must agree. Null (omitted) "
+                    "for every contribution that does NOT carry `acted_on`."
+                ),
+            },
         },
         "required": ["decision", "reasoning", "directive_ops", "new_context"],
     },
@@ -402,6 +421,10 @@ def _build_batch_judge_tool() -> dict:
     schema = copy.deepcopy(JUDGE_TOOL["input_schema"])
     schema["properties"].pop("decision")
     schema["properties"].pop("reasoning")
+    # ADR 0017 P3: acted_on outcome judging is a single-contribution-only surface for
+    # now (same limit M1's directive attestation set for batches) — the field makes
+    # no sense per-batch-verdict yet, so it is not offered here.
+    schema["properties"].pop("outcome_disposition")
     schema["properties"]["directive_ops"] = op_schema
     schema["properties"]["verdicts"] = {
         "type": "array",
@@ -1270,6 +1293,60 @@ def _read_reasoning(raw: dict, *, tool_name: str, require: bool = True) -> str:
     return ""
 
 
+#: ADR 0017 P3: the judge's tool-level disposition for a contribution carrying
+#: `acted_on`. Never persisted as `judgments.decision` — see
+#: `ScopeManagerJudgment.outcome_disposition`'s docstring.
+_OUTCOME_DISPOSITIONS = frozenset({"held", "failed_corrected", "failed_superseded", "decline"})
+#: The three that admit the outcome (as accept_as_context); the fourth, "decline", maps
+#: to decision="decline" instead.
+_OUTCOME_ACCEPT_DISPOSITIONS = frozenset({"held", "failed_corrected", "failed_superseded"})
+
+
+class _MalformedDisposition(ValueError):
+    """An `acted_on` contribution's `outcome_disposition` is missing, not one of the
+    four values, or disagrees with `decision` (ADR 0017 P3, ruling line (b)).
+
+    A ``ValueError`` subclass, exactly like its siblings — the one corrective re-ask
+    fixes it the same way. It differs from every other protocol slip in what happens if
+    the re-ask ALSO comes back malformed: fail-closed, not silent — the contribution is
+    declined, marked :attr:`ScopeManagerJudgment.disposition_unreadable` so the record
+    shows the JUDGE failed, never stranding the contribution (the same discipline
+    :class:`_MissingReasoning` uses for #204).
+    """
+
+
+def _validate_outcome_disposition(raw: dict, *, decision: str, acted_on: str | None) -> str | None:
+    """Return the validated `outcome_disposition`, or raise :class:`_MalformedDisposition`.
+
+    A no-op returning ``None`` when *acted_on* is ``None`` — every contribution that
+    does not carry it is completely unaffected, whatever stray value a payload might
+    (harmlessly) carry in this field.
+
+    When *acted_on* IS set, `outcome_disposition` must be exactly one of the four
+    values, AND must agree with `decision`: held/failed_corrected/failed_superseded
+    each require ``decision == "accept_as_context"``; `decline` requires
+    ``decision == "decline"``. A mismatch is exactly as malformed as a missing value —
+    it means the two fields disagree about what happened, which is a signal, not noise,
+    and must not be silently reconciled by trusting one field over the other.
+    """
+    if acted_on is None:
+        return None
+    disposition = raw.get("outcome_disposition")
+    if disposition not in _OUTCOME_DISPOSITIONS:
+        raise _MalformedDisposition(
+            "submit_judgment carries acted_on but `outcome_disposition` is missing or "
+            f"not one of held/failed_corrected/failed_superseded/decline (got {disposition!r})."
+        )
+    expected_decision = "decline" if disposition == "decline" else "accept_as_context"
+    if decision != expected_decision:
+        raise _MalformedDisposition(
+            f"submit_judgment's outcome_disposition={disposition!r} requires "
+            f"decision={expected_decision!r}, but decision={decision!r} was returned — "
+            "the two fields disagree."
+        )
+    return disposition
+
+
 def _parse_directive_ops(  # noqa: ANN001 — raw tool-call field
     raw_ops,
     *,
@@ -1910,6 +1987,7 @@ def _superseded_claim_contents(
     contribution: Contribution,
     current_summary: ScopeSummary | None,
     recent_contributions: Sequence[RecentContribution],
+    acted_on_replaces: bool = False,
 ) -> dict[str, str]:
     """``{id: content}`` for every claim this amendment takes out of circulation.
 
@@ -1932,6 +2010,13 @@ def _superseded_claim_contents(
     targets = [*judgment.removed_directive_ids]
     if contribution.supersedes:
         targets.append(contribution.supersedes)
+    # ADR 0017 P3: a failed_corrected/failed_superseded outcome replaces `acted_on`
+    # exactly the way an ordinary `supersedes` reference replaces its target — P1
+    # forbids the contribution from naming this itself, so the caller (judge()'s
+    # _stale_claims closure) passes it in only when the disposition calls for it AND
+    # the target is not a directive (D6: a directive is never replaced by an outcome).
+    if acted_on_replaces and contribution.acted_on:
+        targets.append(contribution.acted_on)
 
     return {
         target: content
@@ -1948,6 +2033,7 @@ def _resurrected_superseded_claims(
     contribution: Contribution,
     current_summary: ScopeSummary | None,
     recent_contributions: Sequence[RecentContribution],
+    acted_on_replaces: bool = False,
 ) -> list[str]:
     """Ids whose superseded content the judge's ``new_context`` still carries (#199).
 
@@ -1993,6 +2079,7 @@ def _resurrected_superseded_claims(
             contribution=contribution,
             current_summary=current_summary,
             recent_contributions=recent_contributions,
+            acted_on_replaces=acted_on_replaces,
         ).items()
         if (collapsed := _collapse_whitespace(content)) in haystack and collapsed not in admitted
     ]
@@ -2014,6 +2101,27 @@ def _with_superseded_context_note(reasoning: str, dropped: bool) -> str:
         "retracted claim after one corrective re-ask — a replaced claim leaves "
         "the context entirely (#199).]"
     )
+
+
+#: ADR 0017 P3, ruling line (b): what the record says when a decline was the judge's
+#: own failure to produce a readable disposition, not a missing ground the contributor
+#: offered. A fixed marker so it is greppable, like every other mechanical note here.
+_DISPOSITION_UNREADABLE_NOTE = (
+    "judge failure: no readable disposition after the corrective re-ask "
+    "(not a missing-ground decline)"
+)
+
+
+def _with_disposition_unreadable_note(reasoning: str, disposition_unreadable: bool) -> str:
+    """Return *reasoning* plus the fixed judge-failure marker when it fired (ADR 0017 P3).
+
+    Sibling of :func:`_with_protocol_notes` — a distinct fact from every other note
+    here: this one says the record cannot trust the DECLINE's own stated ground,
+    because the judge never produced a readable one.
+    """
+    if not disposition_unreadable:
+        return reasoning
+    return f"{reasoning} [{_DISPOSITION_UNREADABLE_NOTE}]"
 
 
 def _with_protocol_notes(reasoning: str, protocol_notes: Sequence[str]) -> str:
@@ -2038,6 +2146,24 @@ def _with_dropped_note(reasoning: str, dropped_ops: Sequence[str]) -> str:
     return f"{reasoning} [Dropped amendment op(s), not applied: {dropped}.]"
 
 
+@dataclass(frozen=True)
+class ActedOnTarget:
+    """The item an ``acted_on`` contribution reports acting on (ADR 0017 P3).
+
+    :meth:`ScopeManager.judge` never reads the record itself — the caller
+    (:func:`strata.app.run_contribution`) resolves this once, the same way P1's
+    ``validate_acted_on`` already does, and hands it over: the target's contribution
+    (rendered verbatim in the OUTCOME REPORT block) and its OWN currently-recorded
+    decision, which is what tells the engine whether a failed_* disposition may
+    replace it at all (D6: a directive has no standing and is never replaced by an
+    outcome — see :data:`_SYSTEM_PROMPT` and the ``acted_on_replaces`` wiring in
+    :meth:`ScopeManager.judge`).
+    """
+
+    contribution: Contribution
+    decision: Literal["accept_as_directive", "accept_as_context"]
+
+
 class ScopeManagerJudgment(_AmendmentJudgment):
     """The scope-manager's structured verdict on a contribution.
 
@@ -2053,6 +2179,28 @@ class ScopeManagerJudgment(_AmendmentJudgment):
     reasoning: str
     """Brief explanation of the verdict — written to the judgment record."""
 
+    outcome_disposition: (
+        Literal["held", "failed_corrected", "failed_superseded", "decline"] | None
+    ) = None
+    """ADR 0017 P3: the judge's tool-level disposition for a contribution carrying
+    ``acted_on`` — ``None`` for every other contribution. This is NEVER what persists
+    as :attr:`decision` (the ``judgments.decision`` column stays CHECK-constrained to
+    its original three values — the ruling's own "implementation note"): held maps to
+    ``accept_as_context`` with no change event; failed_corrected/failed_superseded map
+    to ``accept_as_context`` plus a ``claim_corrected``/``claim_superseded`` change
+    event linking this contribution (the source) to ``acted_on`` (the target); decline
+    maps to ``decision="decline"``. Carried on the judgment object (not the DB row) so
+    :meth:`ScopeManager.judge`'s caller (:func:`strata.app.run_contribution`) knows
+    which change event, if any, to write in the same transaction as the judgment."""
+
+    disposition_unreadable: bool = False
+    """ADR 0017 P3, ruling line (b): fail-closed is not silent. Set when the
+    disposition was still malformed after the one corrective re-ask, so the
+    contribution is declined AS RETURNED (never stranded) with a marker in
+    :attr:`record_notes` that distinguishes a JUDGE failure from an ordinary
+    missing-ground decline — the same discipline as #204's missing-reasoning
+    backstop."""
+
     @property
     def record_notes(self) -> str:
         """The verdict text written to the judgment record.
@@ -2065,18 +2213,21 @@ class ScopeManagerJudgment(_AmendmentJudgment):
         rewrite still carried a superseded claim (#199), and one per protocol
         repair (issue #201).
         """
-        return _with_protocol_notes(
-            _with_superseded_context_note(
-                _with_dropped_context_note(
-                    _with_dropped_sources_note(
-                        _with_dropped_note(self.reasoning, self.dropped_ops),
-                        self.dropped_context_sources,
+        return _with_disposition_unreadable_note(
+            _with_protocol_notes(
+                _with_superseded_context_note(
+                    _with_dropped_context_note(
+                        _with_dropped_sources_note(
+                            _with_dropped_note(self.reasoning, self.dropped_ops),
+                            self.dropped_context_sources,
+                        ),
+                        self.dropped_new_context,
                     ),
-                    self.dropped_new_context,
+                    self.dropped_superseded_context,
                 ),
-                self.dropped_superseded_context,
+                self.protocol_notes,
             ),
-            self.protocol_notes,
+            self.disposition_unreadable,
         )
 
 
@@ -2675,6 +2826,68 @@ def _render_contribution_block(contribution: Contribution) -> str:
     )
 
 
+def _render_outcome_block(target: ActedOnTarget) -> str:
+    """The OUTCOME REPORT block (ADR 0017 P3) — added ONLY for a contribution that
+    carries ``acted_on``; see the call site in :func:`_build_user_message`.
+
+    Renders the target item verbatim, its provenance and its current state (the
+    judgment already on it), then the disposition instruction carrying the ruling's
+    four required lines and the closure. Kept as one block, composed once, so a
+    contribution WITHOUT ``acted_on`` never sees a byte of it — the same discipline
+    v1.14's M1 (#212) failed at and #212 fixed: a block added to every prompt degrades
+    general judging even when most prompts have nothing to do with it.
+    """
+    c = target.contribution
+    directive_caveat = (
+        "NOTE: this item is a DIRECTIVE. A directive has no standing and is never "
+        "replaced by an outcome (D6): failed_corrected/failed_superseded here still "
+        "admit the report as context, but the directive itself is left untouched — do "
+        "not attempt to retire, supersede, or otherwise change it.\n"
+        if target.decision == "accept_as_directive"
+        else ""
+    )
+    return (
+        "OUTCOME REPORT — this contribution carries `acted_on`, reporting what "
+        "happened when the contributor acted on the item below. Judge them together "
+        "as ONE verdict: `outcome_disposition` plus `decision` (see the rule below).\n"
+        "\n"
+        "ITEM ACTED ON (verbatim, as currently held):\n"
+        f"- id: {c.id}\n"
+        f"- subject: {c.subject or '(none)'}\n"
+        f"- current judgment: {target.decision}\n"
+        f"- contributor: {_render_contributor(c.contributor)}\n"
+        "- content:\n"
+        f"    {c.content}\n"
+        f"{directive_caveat}"
+        "\n"
+        "Set `outcome_disposition` to exactly one:\n"
+        "  - held: an ACTION THAT COULD HAVE FAILED CONFIRMED THE ITEM — never merely "
+        'that the claim reads as true. An echo ("reviewed it and confirmed it") is '
+        "NOT held: nothing was risked, so nothing was tested. Your reasoning must "
+        "QUOTE, in one clause, the observed result you relied on.\n"
+        "  - failed_corrected: the claim was WRONG. The report's own observation is "
+        'what now holds — a negative result counts as the replacement ("used port '
+        '8443, the service refused; the right port is unknown" contradicts and '
+        'supersedes "listens on 8443"). There is no known-wrong state and no '
+        "lowered standing: a failure either replaces the item or the report is "
+        "declined.\n"
+        "  - failed_superseded: the claim was RIGHT but the world moved on; the "
+        "report's own observation is what now holds.\n"
+        "  - decline: the report establishes neither a clean hold nor a clean "
+        'failure — an echo, an ambiguous result ("partially worked"), or a pending '
+        'one ("result unclear"). Your reasoning must name the MISSING GROUND '
+        'FIRST — begin "no outcome: the action could not have failed" or "no '
+        'outcome reported" — and only then, as guidance, say it may be resubmitted '
+        "WITHOUT `acted_on` if worth keeping as ordinary context.\n"
+        "If you cannot tell failed_corrected from failed_superseded, choose "
+        "failed_corrected: a needless notice costs attention; a missing one leaves "
+        "readers acting on a falsehood.\n"
+        "`decision` must then read `accept_as_context` for held/failed_corrected/"
+        "failed_superseded, or `decline` for `decline` — the two fields must agree.\n"
+        "\n"
+    )
+
+
 def _render_relevance(
     scope: Scope,
     current_summary: ScopeSummary | None,
@@ -2883,8 +3096,15 @@ def _build_user_message(
     input_changes: Sequence[_ChangeEventLike] | None = None,
     window_verbatim_tail: int = WINDOW_VERBATIM_TAIL,
     implied_purpose_min_words: int = IMPLIED_PURPOSE_MIN_WORDS,
+    acted_on_target: ActedOnTarget | None = None,
 ) -> str:
-    """Compose the (non-cached) per-call user message for a single contribution."""
+    """Compose the (non-cached) per-call user message for a single contribution.
+
+    *acted_on_target* (ADR 0017 P3): the item ``new_contribution.acted_on`` names,
+    resolved by the caller. Renders the OUTCOME REPORT block (see
+    :func:`_render_outcome_block`) ONLY when given — a contribution without
+    ``acted_on`` gets a message byte-identical to before P3 (a test pins this).
+    """
     preamble = _build_judge_preamble(
         scope=scope,
         stratum=stratum,
@@ -2903,8 +3123,10 @@ def _build_user_message(
         window_verbatim_tail=window_verbatim_tail,
         implied_purpose_min_words=implied_purpose_min_words,
     )
+    outcome_block = "" if acted_on_target is None else _render_outcome_block(acted_on_target)
     return (
         f"{preamble}"
+        f"{outcome_block}"
         "\n"
         "NEW CONTRIBUTION TO JUDGE:\n"
         f"{_render_contribution_block(new_contribution)}"
@@ -3027,8 +3249,15 @@ class ScopeManager:
         window_verbatim_tail: int = WINDOW_VERBATIM_TAIL,
         change_id: str | None = None,
         hop: int = 0,
+        acted_on_target: ActedOnTarget | None = None,
     ) -> ScopeManagerJudgment:
         """Judge a new contribution against the scope's current state.
+
+        *acted_on_target* (ADR 0017 P3): required (and only meaningful) when
+        *new_contribution* carries ``acted_on`` — the caller
+        (:func:`strata.app.run_contribution`) resolves the target the same way P1's
+        ``validate_acted_on`` already did and hands it over. Renders the OUTCOME
+        REPORT block; ``None`` for every other contribution renders nothing extra.
 
         Makes exactly one Anthropic API call using forced ``submit_judgment``
         tool use.  Validates the response, applies the judged amendment
@@ -3217,6 +3446,13 @@ class ScopeManager:
             input_changes=input_changes,
             window_verbatim_tail=window_verbatim_tail,
             implied_purpose_min_words=self._implied_purpose_min_words,
+            acted_on_target=acted_on_target,
+        )
+        # ADR 0017 P3: a failed_* disposition replaces `acted_on` through the #199
+        # path exactly like an ordinary `supersedes` reference does — but only when
+        # the target is not a directive (D6: an outcome never replaces a directive).
+        acted_on_replaces_ok = (
+            acted_on_target is not None and acted_on_target.decision == "accept_as_context"
         )
 
         # ADR 0014 D3: what a declared `context_sources` is audited against —
@@ -3261,6 +3497,27 @@ class ScopeManager:
                 hop=hop,
                 rendered_item_ids=rendered_item_ids,
                 require_reasoning=False,
+            )
+
+        def _parse_forced_decline(block) -> ScopeManagerJudgment:  # noqa: ANN001
+            """ADR 0017 P3, ruling line (b): still-unreadable outcome_disposition after
+            the one re-ask declines, marked as a judge failure — never as returned,
+            unlike #204's missing-reasoning fallback, because the engine genuinely
+            cannot tell held from failed from a bare echo; keeping whatever accept the
+            judge attempted would risk exactly the over-count the closure exists to
+            prevent."""
+            raw = getattr(block, "input", {}) or {}
+            reasoning = _read_reasoning(raw, tool_name="submit_judgment", require=False) or (
+                "the judge did not return a readable outcome disposition"
+            )
+            return ScopeManagerJudgment(
+                decision="decline",
+                reasoning=reasoning,
+                new_summary=None,
+                change_id=change_id,
+                hop=hop,
+                outcome_disposition="decline",
+                disposition_unreadable=True,
             )
 
         def _invalid_ops(judgment: ScopeManagerJudgment) -> list[DirectiveOp]:
@@ -3333,6 +3590,13 @@ class ScopeManager:
                 contribution=new_contribution,
                 current_summary=current_summary,
                 recent_contributions=recent_contributions,
+                # ADR 0017 P3: a failed_* disposition replaces acted_on, exactly like
+                # an ordinary supersedes reference — gated on the target not being a
+                # directive (D6).
+                acted_on_replaces=(
+                    acted_on_replaces_ok
+                    and judgment.outcome_disposition in ("failed_corrected", "failed_superseded")
+                ),
             )
 
         def _stale_claim_corrective(stale_ids: Sequence[str]) -> str:
@@ -3380,6 +3644,7 @@ class ScopeManager:
             stale_claim_corrective=_stale_claim_corrective,
             drop_stale_context=_drop_stale_context,
             parse_lenient=_parse_lenient,
+            parse_forced_decline=_parse_forced_decline,
         )
 
     def _call_with_correctives(
@@ -3403,6 +3668,7 @@ class ScopeManager:
         stale_claim_corrective: Callable[[Sequence[str]], str] | None = None,
         drop_stale_context: Callable[[_JudgmentT], _JudgmentT] | None = None,
         parse_lenient: Callable[[object], _JudgmentT] | None = None,
+        parse_forced_decline: Callable[[object], _JudgmentT] | None = None,
     ) -> _JudgmentT:
         """Run one judgment call and its correctives, one retry each.
 
@@ -3511,6 +3777,15 @@ class ScopeManager:
                     f"again with the SAME {verdict_noun}, this time including `reasoning` "
                     "— one or two sentences explaining it."
                 )
+            if isinstance(error, _MalformedDisposition):
+                return (
+                    f"Your {tool_name} call carries `acted_on` but its `outcome_disposition` "
+                    f"was missing, not one of held/failed_corrected/failed_superseded/decline, "
+                    f"or disagreed with `decision`: {error} Call {tool_name} again with a "
+                    "readable `outcome_disposition` that agrees with `decision` "
+                    "(held/failed_corrected/failed_superseded -> accept_as_context; "
+                    "decline -> decline)."
+                )
             return (
                 f"Your {tool_name} call could not be parsed: {error} "
                 f"Call {tool_name} again with the SAME {verdict_noun}, returning the "
@@ -3525,6 +3800,8 @@ class ScopeManager:
                 slip = "the first response declined while carrying an amendment"
             elif isinstance(error, _MissingReasoning):
                 slip = "the first response omitted `reasoning`"
+            elif isinstance(error, _MalformedDisposition):
+                slip = "the first response's outcome_disposition was unreadable"
             else:
                 slip = "the first response did not parse"
             return f"Corrective re-ask: {slip}."
@@ -3585,6 +3862,21 @@ class ScopeManager:
                 protocol_notes.append(
                     "Judge supplied no `reasoning` even after the corrective re-ask; "
                     "recorded with an empty reasoning."
+                )
+            except _MalformedDisposition:
+                # ADR 0017 P3, ruling line (b): fail-closed is NOT silent, but it is
+                # also not the #204 shape — a still-unreadable disposition means the
+                # engine cannot tell held from failed from a genuine echo, so unlike a
+                # missing reasoning it does NOT keep whatever accept the judge attempted.
+                # It declines, marked disposition_unreadable so the record shows the
+                # JUDGE failed, distinguishable from an ordinary missing-ground decline.
+                if parse_forced_decline is None:
+                    raise
+                judgment = parse_forced_decline(tool_use_block)
+                protocol_notes.append(
+                    "Judge's outcome_disposition was still unreadable after the "
+                    "corrective re-ask; declined as a judge failure, not a "
+                    "missing-ground decline."
                 )
             else:
                 protocol_notes.append(_protocol_note(parse_error))
@@ -4308,6 +4600,11 @@ class ScopeManager:
         reasoning: str = _read_reasoning(
             raw, tool_name="submit_judgment", require=require_reasoning
         )
+        # ADR 0017 P3: a no-op unless new_contribution carries acted_on — every other
+        # contribution's decision/reasoning parse exactly as before, byte for byte.
+        outcome_disposition = _validate_outcome_disposition(
+            raw, decision=decision, acted_on=new_contribution.acted_on
+        )
 
         # Issue #201: an id-addressed op with no id reads it off the
         # contribution under judgment, whose record names what it replaces.
@@ -4349,6 +4646,7 @@ class ScopeManager:
                 change_id=change_id,
                 hop=hop,
                 protocol_notes=protocol_notes,
+                outcome_disposition=outcome_disposition,
             )
 
         context_sources, dropped_sources = _validate_context_sources(
@@ -4397,6 +4695,7 @@ class ScopeManager:
             context_sources=context_sources,
             dropped_context_sources=dropped_sources,
             protocol_notes=protocol_notes,
+            outcome_disposition=outcome_disposition,
         )
 
     # ------------------------------------------------------------------

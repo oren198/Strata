@@ -117,6 +117,7 @@ from strata.record_store import (
     JUDGE_FAILED,
     RECENCY_WINDOW_SIZE,
     ChangeEvent,
+    ClaimEventInput,
     Contribution,
     ContributorRef,
     RecentContribution,
@@ -124,6 +125,7 @@ from strata.record_store import (
 )
 from strata.scope_manager import (
     WINDOW_VERBATIM_TAIL,
+    ActedOnTarget,
     JudgeMode,
     ScopeManager,
     ScopeManagerBatchJudgment,
@@ -558,6 +560,20 @@ def _judge_and_record(
         summary_store=summary_store,
         recency_window_size=recency_window_size,
     )
+    # ADR 0017 P3: resolve the item this contribution reports acting on, once, the
+    # same way P1's validate_acted_on already did at the write boundary — that
+    # validator guarantees the target exists and has an accepting judgment, so this
+    # never needs to handle "missing" itself.
+    acted_on_target: ActedOnTarget | None = None
+    if contribution.acted_on is not None:
+        entry = record_store.get_record_entry(contribution.acted_on)
+        assert entry is not None and entry.judgment is not None, (
+            "acted_on target unresolvable at judge time — P1's validate_acted_on "
+            "should have rejected this contribution at the write boundary"
+        )
+        acted_on_target = ActedOnTarget(
+            contribution=entry.contribution, decision=entry.judgment.decision
+        )
     try:
         judgment: ScopeManagerJudgment = scope_manager.judge(
             scope=scope,
@@ -580,6 +596,7 @@ def _judge_and_record(
             input_changes=input_changes,
             change_id=change_id,
             hop=hop,
+            acted_on_target=acted_on_target,
         )
     except Exception as exc:
         # Record the failure as an event against the contribution — never as a
@@ -600,6 +617,31 @@ def _judge_and_record(
         )
         raise JudgeUnavailable(contribution.id, type(exc).__name__, str(exc)) from exc
 
+    # ADR 0017 P3: a failed outcome mints its linking event in the SAME transaction
+    # as the judgment (RecordStore.record_judgment's claim_event, atomic). Gated on
+    # the target being CONTEXT, not a directive — D6, checked here as well as
+    # upstream (scope_manager's #199 wiring): a directive is never replaced by an
+    # outcome, so no event is ever written against one, whatever the judge said.
+    claim_event = None
+    if (
+        judgment.outcome_disposition in ("failed_corrected", "failed_superseded")
+        and acted_on_target is not None
+        and acted_on_target.decision == "accept_as_context"
+    ):
+        claim_event = ClaimEventInput(
+            change_id=new_change_id(),
+            contribution_id=contribution.id,
+            scope_id=contribution.scope_id,
+            source_scope_id=acted_on_target.contribution.scope_id,
+            item_id=contribution.acted_on,
+            kind=(
+                "claim_corrected"
+                if judgment.outcome_disposition == "failed_corrected"
+                else "claim_superseded"
+            ),
+            before=acted_on_target.contribution.content,
+            after=contribution.content,
+        )
     record_store.record_judgment(
         contribution_id=contribution.id,
         decision=judgment.decision,
@@ -607,6 +649,7 @@ def _judge_and_record(
         # The judge's reasoning, plus the mechanical note for any amendment op
         # the engine dropped (ADR 0011 D1) — the record shows what applied.
         notes=judgment.record_notes,
+        claim_event=claim_event,
     )
 
     summary_updated = False

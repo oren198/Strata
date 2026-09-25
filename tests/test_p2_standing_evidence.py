@@ -333,3 +333,111 @@ def test_multiple_outcomes_all_appear_in_record_order(store, fleet) -> None:
     second = _seed_outcome(store, target.id, scope_id="g_unrelated", session="s2")
     result = standing_evidence(store, fleet, target.id)
     assert [e.contribution_id for e in result] == [first.id, second.id]
+
+
+# ---------------------------------------------------------------------------
+# v1.15 P3 (ADR 0017) — the real disposition, read back through standing_evidence.
+# ---------------------------------------------------------------------------
+
+
+def _seed_outcome_with_disposition(
+    store: RecordStore,
+    *,
+    target_id: str,
+    decision: str,
+    outcome_disposition: str,
+    reporter_scope: str = "g_reporter",
+) -> str:
+    outcome = store.append_contribution(
+        scope_id=reporter_scope,
+        content="Used port 8443, the service refused; the right port is unknown.",
+        proposed_classification="context",
+        subject=None,
+        supersedes=None,
+        contributor=_contributor(reporter_scope),
+        acted_on=target_id,
+    )
+    claim_event = None
+    _kind_by_disposition = {
+        "failed_corrected": "claim_corrected",
+        "failed_superseded": "claim_superseded",
+    }
+    if outcome_disposition in _kind_by_disposition:
+        from strata.record_store import ClaimEventInput
+
+        claim_event = ClaimEventInput(
+            change_id=f"chg_{outcome.id}",
+            contribution_id=outcome.id,
+            scope_id=reporter_scope,
+            source_scope_id="g_source",
+            item_id=target_id,
+            kind=_kind_by_disposition[outcome_disposition],
+            before="The service listens on port 8443.",
+            after=outcome.content,
+        )
+    store.record_judgment(
+        contribution_id=outcome.id,
+        decision=decision,
+        judged_by="scope-manager",
+        claim_event=claim_event,
+    )
+    return outcome.id
+
+
+def test_held_reads_back_as_no_replaced_kind(store, fleet) -> None:
+    target = _seed_target(store)
+    outcome_id = _seed_outcome_with_disposition(
+        store, target_id=target.id, decision="accept_as_context", outcome_disposition="held"
+    )
+    result = standing_evidence(store, fleet, target.id)
+    assert len(result) == 1
+    assert result[0].contribution_id == outcome_id
+    assert result[0].replaced_kind is None
+
+
+def test_failed_corrected_reads_back_with_its_kind(store, fleet) -> None:
+    target = _seed_target(store)
+    outcome_id = _seed_outcome_with_disposition(
+        store,
+        target_id=target.id,
+        decision="accept_as_context",
+        outcome_disposition="failed_corrected",
+    )
+    result = standing_evidence(store, fleet, target.id)
+    assert len(result) == 1
+    assert result[0].contribution_id == outcome_id
+    assert result[0].replaced_kind == "claim_corrected"
+
+
+def test_failed_superseded_reads_back_with_its_kind(store, fleet) -> None:
+    target = _seed_target(store)
+    outcome_id = _seed_outcome_with_disposition(
+        store,
+        target_id=target.id,
+        decision="accept_as_context",
+        outcome_disposition="failed_superseded",
+    )
+    result = standing_evidence(store, fleet, target.id)
+    assert len(result) == 1
+    assert result[0].contribution_id == outcome_id
+    assert result[0].replaced_kind == "claim_superseded"
+
+
+def test_decline_reads_back_as_absent_entirely(store, fleet) -> None:
+    target = _seed_target(store)
+    _seed_outcome_with_disposition(
+        store, target_id=target.id, decision="decline", outcome_disposition="decline"
+    )
+    assert standing_evidence(store, fleet, target.id) == []
+
+
+def test_a_directive_target_never_gets_a_claim_event_and_standing_is_empty(store, fleet) -> None:
+    """CEO ruling: an outcome against a directive target persists as accept_as_context
+    with NO claim event (the engine never mints one for a directive) — and P2's
+    standing_evidence on a directive target is empty regardless, per D6, which gates
+    before any outcome is even read."""
+    target = _seed_target(store, decision="accept_as_directive")
+    _seed_outcome_with_disposition(
+        store, target_id=target.id, decision="accept_as_context", outcome_disposition="held"
+    )
+    assert standing_evidence(store, fleet, target.id) == []

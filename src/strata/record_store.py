@@ -623,6 +623,31 @@ class ChangeEvent:
     shown_at: str | None = None
 
 
+@dataclass(frozen=True)
+class ClaimEventInput:
+    """What :meth:`RecordStore.record_judgment` needs to write a failed outcome's
+    linking event, atomically with its judgment (ADR 0017 P3).
+
+    ``kind`` is ``'claim_corrected'`` or ``'claim_superseded'`` (migration 0017).
+    ``contribution_id`` is the OUTCOME (the source); ``item_id`` is ``acted_on`` (the
+    target); ``scope_id`` is the outcome's own scope; ``source_scope_id`` is the
+    target's scope (a different fact — an item id does not name its holder, exactly as
+    :meth:`RecordStore.append_change_event`'s own docstring says). ``before`` is the
+    target's content as it stood; ``after`` is the outcome's own content — the report's
+    observation that replaces it (ruling line (d): the correcting content is the
+    report's own observation, never anything invented).
+    """
+
+    change_id: str
+    contribution_id: str
+    scope_id: str
+    source_scope_id: str
+    item_id: str
+    kind: Literal["claim_corrected", "claim_superseded"]
+    before: str | None
+    after: str | None
+
+
 # ---------------------------------------------------------------------------
 # RecordStore
 # ---------------------------------------------------------------------------
@@ -895,6 +920,7 @@ class RecordStore:
         decision: Literal["accept_as_directive", "accept_as_context", "decline"],
         judged_by: str,
         notes: str | None = None,
+        claim_event: ClaimEventInput | None = None,
     ) -> Judgment:
         """Record the scope-manager's verdict on a contribution.
 
@@ -908,23 +934,48 @@ class RecordStore:
             judged_by:       Identifier of the scope-manager (agent session or
                              system component) issuing the judgment.
             notes:           Optional free-text rationale.
+            claim_event:     ADR 0017 P3. When given, a ``claim_corrected`` or
+                             ``claim_superseded`` change-event row is written in
+                             the SAME transaction as the judgment — a failed
+                             outcome's disposition and its record fact are one
+                             atomic write, never a judgment with no event or an
+                             event with no judgment. Stamped ``processed_at`` at
+                             birth (:meth:`append_change_event`'s ``processed``
+                             flag): P3 has nothing left to drain it for — P4
+                             defines the correction notice.
 
         Returns:
             The newly recorded :class:`Judgment`.
 
         Raises:
             sqlite3.IntegrityError: If *contribution_id* does not exist (FK)
-                or already has a judgment (UNIQUE).
+                or already has a judgment (UNIQUE); or, with *claim_event*, if
+                its own referenced contribution/item does not exist. Nothing
+                is written — the transaction rolls back, so a judgment never
+                survives without its event, or the reverse.
         """
         judgment_id = _new_judgment_id()
-        self._conn.execute(
-            """
-            INSERT INTO judgments (id, contribution_id, decision, judged_by, notes)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (judgment_id, contribution_id, decision, judged_by, notes),
-        )
-        self._conn.commit()
+        with self._conn:  # one transaction: the judgment, and the event if given
+            self._conn.execute(
+                """
+                INSERT INTO judgments (id, contribution_id, decision, judged_by, notes)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (judgment_id, contribution_id, decision, judged_by, notes),
+            )
+            if claim_event is not None:
+                self._insert_change_event(
+                    change_id=claim_event.change_id,
+                    contribution_id=claim_event.contribution_id,
+                    scope_id=claim_event.scope_id,
+                    source_scope_id=claim_event.source_scope_id,
+                    item_id=claim_event.item_id,
+                    kind=claim_event.kind,
+                    before=claim_event.before,
+                    after=claim_event.after,
+                    hop=0,
+                    processed=True,
+                )
         return self._fetch_judgment(judgment_id)
 
     def stamp_summary_version(self, contribution_ids: Sequence[str], *, version: int) -> None:
@@ -1370,6 +1421,24 @@ class RecordStore:
             (contribution_id, *_ACCEPTED_DECISIONS),
         ).fetchone()
         return row is not None
+
+    def claim_event_for(self, contribution_id: str) -> ChangeEvent | None:
+        """The ``claim_corrected``/``claim_superseded`` event this contribution minted
+        as its source, or ``None`` (ADR 0017 P3). At most one exists per outcome —
+        ``record_judgment``'s ``claim_event`` writes it once, atomically with the
+        judgment, and a contribution is judged exactly once.
+        """
+        row = self._conn.execute(
+            """
+            SELECT id, change_id, contribution_id, scope_id, source_scope_id, item_id, kind,
+                   before, after, hop, processed_at, created_at, self_notice, shown_at
+            FROM change_events
+            WHERE contribution_id = ? AND kind IN ('claim_corrected', 'claim_superseded')
+            LIMIT 1
+            """,
+            (contribution_id,),
+        ).fetchone()
+        return ChangeEvent(**dict(row)) if row is not None else None
 
     def _judgments_for(self, contribution_ids: list[str]) -> list[Judgment]:
         """Return the judgments on *contribution_ids*, oldest verdict first."""
@@ -2400,6 +2469,15 @@ class StandingEvidence:
     record is never rewritten when fleet.yaml changes later, so this is a live check
     against the *current* fleet — re-checked, never assumed, and marking rather than
     silently dropping the evidence when it no longer holds (CEO add)."""
+    replaced_kind: Literal["claim_corrected", "claim_superseded"] | None = None
+    """ADR 0017 P3: set when THIS outcome's own disposition was failed_corrected or
+    failed_superseded — read off the ``claim_corrected``/``claim_superseded`` change
+    event it minted as its source (:meth:`RecordStore.claim_event_for`), never
+    re-derived. ``None`` means this outcome held. Distinct from
+    :attr:`target_replaced`, which asks whether the TARGET was replaced by ANYTHING
+    (any accepted contribution's ``supersedes``) — an outcome can hold
+    (``replaced_kind is None``) even while its target was later replaced by a
+    different, later act (``target_replaced=True``)."""
 
 
 #: How one outcome contribution counts toward its target's standing (ADR 0017 P2/P3).
@@ -2408,47 +2486,40 @@ _READING_HELD = "held"
 _READING_REPLACED = "replaced"
 
 
-def _outcome_reading(judgment: Judgment | None, *, outcome_itself_superseded: bool) -> str:
-    """Classify one outcome contribution as excluded, held, or (once P4 exists) replaced.
+def _outcome_reading(
+    judgment: Judgment | None, *, outcome_itself_superseded: bool, claim_event_kind: str | None
+) -> str:
+    """Classify one outcome contribution as excluded, held, or replaced (ADR 0017 P3).
 
-    THE FINAL RULE (philosopher/CEO ruling, option c', 2026-09-24 — see the plan's
-    "Ruling on failed outcomes (final: option c')"): for an accepted contribution
-    carrying ``acted_on``, look for a change event linking IT to its target — a
-    ``claim_corrected`` event, or a supersession event, whose SOURCE is this
-    contribution and whose TARGET is ``acted_on``.
+    THE RULE (philosopher/CEO ruling, option c', 2026-09-24 — "Ruling on failed
+    outcomes (final: option c')"): for an accepted contribution carrying ``acted_on``,
+    look for a change event linking IT to its target — a ``claim_corrected`` event, or
+    a ``claim_superseded`` event, whose SOURCE is this contribution and whose TARGET is
+    ``acted_on`` (:meth:`RecordStore.claim_event_for`, written atomically with the
+    judgment by :meth:`RecordStore.record_judgment`'s ``claim_event``).
 
-    - No such event → ``held`` (corroboration).
-    - Such an event exists → ``replaced``, its KIND (correction or supersession) read
-      off the event itself, never re-derived here.
+    - No such event (*claim_event_kind* is ``None``) → ``held`` (corroboration).
+    - Such an event exists → ``replaced``; its KIND is read off the event by the
+      caller (:func:`standing_evidence`), never re-derived here.
     - Declined (or pending, or judge-failed — no accepting judgment at all) →
       ``excluded``.
 
-    P1's ``acted_on``+``supersedes`` exclusivity stands (an earlier reversal was
-    considered and withdrawn): a contribution cannot name its own replacement, so the
-    ENGINE mints the linking event once a future judge (P3) reads an outcome's content
-    as a correction or supersession and the engine records it (P4) — nothing here, or
-    at the contribution level, ever links an outcome to a replacement by id.
-
-    THAT MACHINERY DOES NOT EXIST YET (P3/P4). No claim_corrected or supersession event
-    naming an outcome as its source has ever been minted, so this function ALWAYS
-    RETURNS held for an accepted outcome TODAY — not because held is assumed, but
-    because there is nothing yet to find. That reading is sound only because of P3's
-    own closure (an outcome the judge cannot classify as a clean hold or a clean failure
-    is declined, never accepted ambiguously) — see the plan's P3 section. When P4 ships
-    the event, this is the one function that changes: replace the "no such event" branch
-    with a real lookup.
+    P1's ``acted_on``+``supersedes`` exclusivity stands: a contribution cannot name its
+    own replacement itself. The judge (P3) reads the outcome's content as a
+    corroboration, a correction, or a supersession, and the ENGINE (P3's
+    ``run_contribution`` wiring) mints the linking event when the disposition is
+    failed_corrected/failed_superseded — never a directive target (D6).
 
     Separately (rule 3, settled before the c/c' debate and unaffected by it): an
     outcome that was ITSELF later superseded or withdrawn drops out entirely —
     *outcome_itself_superseded* — a retracted report is not evidence of anything,
-    whether it once read as held or (once reachable) replaced.
+    whether it read as held or replaced.
     """
     if judgment is None or judgment.decision not in _ACCEPTED_DECISIONS:
         return _READING_EXCLUDED
     if outcome_itself_superseded:
         return _READING_EXCLUDED
-    # No claim_corrected / supersession event lookup exists yet (P4) — always held.
-    return _READING_HELD
+    return _READING_REPLACED if claim_event_kind is not None else _READING_HELD
 
 
 def standing_evidence(
@@ -2480,14 +2551,15 @@ def standing_evidence(
     - An outcome from a scope that can no longer read the item under the CURRENT fleet
       config still appears, marked ``reporter_entitlement_current=False`` (CEO add): P1
       checked entitlement once, at write time, and the record is never rewritten.
+    - An outcome whose OWN disposition was failed_corrected/failed_superseded (P3) is
+      marked ``replaced_kind`` accordingly, read off its own ``claim_event_for`` row.
 
-    THE CLOSURE THIS RELIES ON (P3, not yet built): "accepted + acted_on + not replaced
-    means held" is true only once P3's judge instruction makes an ``acted_on``
-    contribution DECLINE whenever it reports anything other than a clean hold or a clean
-    failure (an echo, an ambiguous report, a pending one) — see the plan's P3 section,
-    "the closure". Until then, an accepted outcome is read as held by construction
-    (:data:`_READING_HELD`), which is only as sound as that future judge behaviour makes
-    it; :func:`_outcome_reading` is the one place that reading changes when P3 lands.
+    THE CLOSURE THIS RELIES ON (P3): "accepted + acted_on + disposition held means
+    held" is true only because P3's judge instruction makes an ``acted_on``
+    contribution DECLINE whenever it reports anything other than a clean hold or a
+    clean failure (an echo, an ambiguous report, a pending one) — see the plan's P3
+    section, "the closure". :func:`_outcome_reading` is the one function that reads
+    the disposition off the record.
     """
     target = record_store.get_record_entry(item_id)
     if target is None or target.judgment is None:
@@ -2503,8 +2575,12 @@ def standing_evidence(
     evidence: list[StandingEvidence] = []
     for outcome in record_store.list_outcomes(acted_on=item_id):
         judgment = record_store.get_judgment(outcome.id)
+        claim_event = record_store.claim_event_for(outcome.id)
+        claim_kind = claim_event.kind if claim_event is not None else None
         reading = _outcome_reading(
-            judgment, outcome_itself_superseded=record_store.is_superseded(outcome.id)
+            judgment,
+            outcome_itself_superseded=record_store.is_superseded(outcome.id),
+            claim_event_kind=claim_kind,
         )
         if reading == _READING_EXCLUDED:
             continue
@@ -2523,6 +2599,7 @@ def standing_evidence(
                 ),
                 target_replaced=target_replaced,
                 reporter_entitlement_current=entitled,
+                replaced_kind=claim_kind if reading == _READING_REPLACED else None,
             )
         )
     return evidence

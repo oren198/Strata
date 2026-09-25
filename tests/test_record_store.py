@@ -1623,3 +1623,107 @@ def test_acted_on_rejects_a_missing_target_at_the_store_layer(tmp_path: Path) ->
             contributor=_CONTRIBUTOR,
             acted_on="c_does_not_exist",
         )
+
+
+# ---------------------------------------------------------------------------
+# v1.15 P3 (ADR 0017) — record_judgment's atomic claim_event write.
+# ---------------------------------------------------------------------------
+
+
+def _seed_two_contributions(store: RecordStore) -> tuple[str, str]:
+    target = store.append_contribution(
+        scope_id="g_source",
+        content="The service listens on port 8443.",
+        proposed_classification="context",
+        subject=None,
+        supersedes=None,
+        contributor=_CONTRIBUTOR,
+    )
+    store.record_judgment(
+        contribution_id=target.id, decision="accept_as_context", judged_by="scope-manager"
+    )
+    outcome = store.append_contribution(
+        scope_id="g_reporter",
+        content="Used port 8443, the service refused; the right port is unknown.",
+        proposed_classification="context",
+        subject=None,
+        supersedes=None,
+        contributor=_CONTRIBUTOR,
+        acted_on=target.id,
+    )
+    return target.id, outcome.id
+
+
+def test_record_judgment_writes_the_claim_event_atomically(tmp_path: Path) -> None:
+    from strata.record_store import ClaimEventInput
+
+    store = _open_store(str(tmp_path / "strata.db"))
+    target_id, outcome_id = _seed_two_contributions(store)
+
+    store.record_judgment(
+        contribution_id=outcome_id,
+        decision="accept_as_context",
+        judged_by="scope-manager",
+        claim_event=ClaimEventInput(
+            change_id="chg_test1",
+            contribution_id=outcome_id,
+            scope_id="g_reporter",
+            source_scope_id="g_source",
+            item_id=target_id,
+            kind="claim_corrected",
+            before="The service listens on port 8443.",
+            after="Used port 8443, the service refused; the right port is unknown.",
+        ),
+    )
+
+    events = store.list_change_events(scope_id="g_reporter")
+    assert len(events) == 1
+    event = events[0]
+    assert event.kind == "claim_corrected"
+    assert event.contribution_id == outcome_id
+    assert event.item_id == target_id
+    assert event.source_scope_id == "g_source"
+    assert event.processed_at is not None  # stamped processed at birth
+
+
+def test_record_judgment_without_claim_event_writes_no_event(tmp_path: Path) -> None:
+    store = _open_store(str(tmp_path / "strata.db"))
+    target_id, outcome_id = _seed_two_contributions(store)
+
+    store.record_judgment(
+        contribution_id=outcome_id, decision="accept_as_context", judged_by="scope-manager"
+    )
+
+    assert store.list_change_events(scope_id="g_reporter") == []
+    assert store.list_change_events(scope_id="g_source") == []
+
+
+def test_record_judgment_with_claim_event_rolls_back_both_on_a_bad_reference(
+    tmp_path: Path,
+) -> None:
+    """Atomicity: a claim_event referencing a nonexistent item_id must leave NEITHER
+    the judgment nor the event behind."""
+    from strata.record_store import ClaimEventInput
+
+    store = _open_store(str(tmp_path / "strata.db"))
+    _, outcome_id = _seed_two_contributions(store)
+
+    with pytest.raises(sqlite3.IntegrityError):
+        store.record_judgment(
+            contribution_id=outcome_id,
+            decision="accept_as_context",
+            judged_by="scope-manager",
+            claim_event=ClaimEventInput(
+                change_id="chg_test2",
+                contribution_id="c_does_not_exist",  # FK violation
+                scope_id="g_reporter",
+                source_scope_id="g_source",
+                item_id="whatever",
+                kind="claim_corrected",
+                before=None,
+                after=None,
+            ),
+        )
+
+    assert store.get_judgment(outcome_id) is None
+    assert store.list_change_events(scope_id="g_reporter") == []
