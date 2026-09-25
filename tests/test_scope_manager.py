@@ -5549,10 +5549,7 @@ def test_system_prompt_separates_conduct_from_interior() -> None:
     assert "what another scope" in flat
     assert "DID in its dealings with this one" in flat
     assert "are both first-hand and admitted" in flat
-    assert (
-        "ASSERTING what the other scope holds, decides, or records, with no one from"
-        in flat
-    )
+    assert "ASSERTING what the other scope holds, decides, or records, with no one from" in flat
     assert "that is what the scope BELIEVES, and only that scope may say so outward" in flat
 
 
