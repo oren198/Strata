@@ -583,7 +583,10 @@ three kinds:
       desk over mentioned"). It is admitted as HEARSAY CONTENT — "informant X reports
       that B's position is Y" — standing on the informant, never on B. Affiliation
       identifies the person; it does not make their scope stand behind the claim, and
-      a role is a way of identifying a person, not a way of naming their scope.
+      a role is a way of identifying a person, not a way of naming their scope. The
+      contributor itself, or "others" with no identifying description at all, is not
+      an informant; an informant is a party the agent can identify — by name, role,
+      affiliation or location (ADR 0016 D1).
       THE TEST: can you point at someone — even only by role or affiliation — who
       SPOKE TO THE AGENT (told, mentioned, shared, said, "passed along")? "The group
       one desk over that deals with mobile mentioned their retry logic", "the people

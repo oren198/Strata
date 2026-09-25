@@ -4,6 +4,11 @@ plus the philosopher's criterion as rule text: observed conduct and an inference
 it, offered on the contributor's own account, are first-hand; asserting what the other
 scope holds/decides/records with nobody standing behind it is not.
 
+FINAL REVISION (CEO): the live gate's leak (interior assertions via an invented
+informant — the contributor's own role, or unnamed "others") added one line to the
+INFORMANT item: neither the contributor itself nor an undescribed "others" is an
+informant; an informant is a party the agent can identify.
+
 The informant example (Priya) is untouched — it was measured harmless. Every other
 byte of the static system prompt is identical to the release/v1.16.0 base captured in
 tests/fixtures/judge_prompts_v1160/system_prompt.txt (own commit, before this change).
@@ -34,11 +39,30 @@ _NEW_ITEM = (
     "      that scope standing behind it.\n"
 )
 
+_OLD_INFORMANT_TAIL = (
+    "      identifies the person; it does not make their scope stand behind the claim, and\n"
+    "      a role is a way of identifying a person, not a way of naming their scope.\n"
+    "      THE TEST: can you point at someone"
+)
+_NEW_INFORMANT_TAIL = (
+    "      identifies the person; it does not make their scope stand behind the claim, and\n"
+    "      a role is a way of identifying a person, not a way of naming their scope. The\n"
+    '      contributor itself, or "others" with no identifying description at all, is not\n'
+    "      an informant; an informant is a party the agent can identify — by name, role,\n"
+    "      affiliation or location (ADR 0016 D1).\n"
+    "      THE TEST: can you point at someone"
+)
 
-def test_only_the_first_hand_item_changed() -> None:
+
+def test_only_the_first_hand_and_informant_items_changed() -> None:
     assert _OLD_ITEM in _GOLDEN
     assert _NEW_ITEM not in _GOLDEN
-    assert _GOLDEN.replace(_OLD_ITEM, _NEW_ITEM) == _SYSTEM_PROMPT
+    assert _OLD_INFORMANT_TAIL in _GOLDEN
+    assert _NEW_INFORMANT_TAIL not in _GOLDEN
+    rebuilt = _GOLDEN.replace(_OLD_ITEM, _NEW_ITEM).replace(
+        _OLD_INFORMANT_TAIL, _NEW_INFORMANT_TAIL
+    )
+    assert rebuilt == _SYSTEM_PROMPT
 
 
 def test_the_informant_example_is_byte_identical() -> None:
@@ -64,3 +88,17 @@ def test_the_criterion_names_the_manufactured_attribution_line() -> None:
         "ASSERTING what the other scope holds, decides, or records, with no one from"
         in _SYSTEM_PROMPT
     )
+
+
+def test_the_informant_item_excludes_the_contributor_and_undescribed_others() -> None:
+    """CEO's final revision: the live gate's leak was an INVENTED informant — the
+    contributor's own role, or unnamed 'others'. 'Unnamed' means no identifying
+    description at all: a role, affiliation or location still identifies a party."""
+    assert (
+        'contributor itself, or "others" with no identifying description at all, is not\n'
+        "      an informant; an informant is a party the agent can identify — by name, role,\n"
+        "      affiliation or location (ADR 0016 D1)."
+    ) in _SYSTEM_PROMPT
+    # A role/affiliation/location informant is still explicitly admitted elsewhere.
+    assert "one desk over" in _SYSTEM_PROMPT
+    assert "the vendor relationship shared some numbers with me" in _SYSTEM_PROMPT
