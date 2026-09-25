@@ -16,7 +16,9 @@ from strata.migrator import run_migrations
 _MIGRATIONS_DIR = Path(__file__).resolve().parent.parent / "src" / "strata" / "_migrations"
 
 #: P1's own applied-migrations list — exactly as pinned in tests/test_migrator.py
-#: (four call sites there all expect this same list). P2 adds none.
+#: (four call sites there all expect this same list, through 0016). P2 adds none of
+#: its own; a PREFIX check (not exact equality) is what "P2 adds none" actually means
+#: — a later cycle (P3, 0017) is free to extend the list without this file going stale.
 _P1_APPLIED_MIGRATIONS = [
     "0001_initial.sql",
     "0002_drop_fleet_tables.sql",
@@ -37,10 +39,11 @@ _P1_APPLIED_MIGRATIONS = [
 ]
 
 
-def test_shipped_migrations_are_exactly_p1s_list_plus_nothing_new(tmp_path: Path) -> None:
-    """P2 adds no migration: a fresh apply's list is unchanged from P1's own pin."""
+def test_shipped_migrations_include_p1s_list_unchanged_and_in_order(tmp_path: Path) -> None:
+    """P2 adds no migration: 0001-0016 are exactly P1's own pin, in order, a prefix of
+    whatever a later cycle (P3, 0017) legitimately adds on top."""
     applied = run_migrations(str(tmp_path / "strata.db"), migrations_dir=_MIGRATIONS_DIR)
-    assert applied == _P1_APPLIED_MIGRATIONS
+    assert applied[: len(_P1_APPLIED_MIGRATIONS)] == _P1_APPLIED_MIGRATIONS
 
 
 def _db_content_snapshot(db_path: str) -> dict[str, tuple[int, str]]:

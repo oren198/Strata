@@ -1,0 +1,66 @@
+{
+  "name": "submit_bootstrap_publication",
+  "description": "Submit an initial publication distilled from this scope's current summary, or decline if nothing is fit to publish yet.",
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "decision": {
+        "type": "string",
+        "enum": [
+          "accept",
+          "decline"
+        ]
+      },
+      "reasoning": {
+        "type": "string",
+        "description": "One or two sentences explaining the verdict."
+      },
+      "items": {
+        "type": [
+          "array",
+          "null"
+        ],
+        "description": "Required (may be empty) when accepting; null when declining.",
+        "items": {
+          "type": "object",
+          "properties": {
+            "content": {
+              "type": "string",
+              "description": "Outward wording, verbatim from this scope's memory."
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "directive",
+                "context"
+              ]
+            },
+            "subject": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "anchors": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "At least one anchor: a directive id currently in this scope's summary, or a subject string."
+            }
+          },
+          "required": [
+            "content",
+            "kind",
+            "anchors"
+          ]
+        }
+      }
+    },
+    "required": [
+      "decision",
+      "reasoning",
+      "items"
+    ]
+  }
+}
