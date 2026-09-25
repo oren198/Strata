@@ -11,6 +11,8 @@ links here.
 |---|---|
 | `judge-baseline-2026-09-20.md` | six judge models on the same suites: junk admission, J1 accuracy, J4 attack success, error rate, re-asks, latency, cost — plus the #210 gate and the #209 required-field check per model |
 | `m1-scope-purpose-gate-2026-09-20.md` | the scope-purpose relevance gate: the rehearsal office note across the three purpose paths, the 11-item workplace class, the 6 legitimate operational twins, and the J1 baseline diff |
+| `v1.15-p1-adoption-2026-09-24.md` | outcome-loop adoption BEFORE item ids were shown: fresh Claude Code and Codex sessions with `acted_on` available, neutral prompts — 0 of 6 set it (the 3 Codex sessions had no working sandbox, #218) |
+| `v1.15-p1b-adoption-2026-09-25.md` | the same protocol AFTER the perspective lists context item ids and the nudge names them (Claude Code only) — 6 of 6 set it; read with the P1 file as one before/after pair, caveats inside |
 
 A file here is a record of what was run, not a summary of what we wish it showed: failures,
 crashes and incidents stay in.
