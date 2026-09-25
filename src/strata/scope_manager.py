@@ -2892,9 +2892,9 @@ def _render_outcome_block(target: ActedOnTarget) -> str:
         "NOT held: nothing was risked, so nothing was tested. Your reasoning must "
         "QUOTE, in one clause, the observed result you relied on.\n"
         "  - failed_corrected: the claim was WRONG. The report's own observation is "
-        'what now holds — a negative result counts as the replacement ("used port '
-        '8443, the service refused; the right port is unknown" contradicts and '
-        'supersedes "listens on 8443"). There is no known-wrong state and no '
+        'what now holds — a negative result counts as the replacement ("<the action>; '
+        '<the observed negative result>" contradicts and supersedes the original '
+        "claim). There is no known-wrong state and no "
         "lowered standing: a failure either replaces the item or the report is "
         "declined.\n"
         "  - failed_superseded: the claim was RIGHT but the world moved on; the "

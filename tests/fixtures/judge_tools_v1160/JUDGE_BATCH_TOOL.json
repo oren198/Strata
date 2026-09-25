@@ -1,0 +1,136 @@
+{
+  "description": "Submit one verdict per new contribution in this batch, plus the single cumulative amendment to apply to the scope summary.",
+  "input_schema": {
+    "properties": {
+      "context_sources": {
+        "description": "ADR 0014 D3: list the published item ids your new_context rests on \u2014 ids exactly as rendered in THIS SCOPE'S PUBLICATION, REFERENCED PEER PUBLICATIONS or PARENT PUBLICATION. Record only: it changes nothing about your verdict and triggers nothing, it says what you actually used. Omit or null when the context rests on no published item.",
+        "items": {
+          "type": "string"
+        },
+        "type": [
+          "array",
+          "null"
+        ]
+      },
+      "directive_ops": {
+        "description": "ADR 0011 D1/D3: the ONE cumulative amendment for the whole batch \u2014 operations on the directives list, in the order you applied them. Existing directives are never re-emitted; a directive no op names is preserved by the engine byte for byte. Empty or null when the batch amends no directive.",
+        "items": {
+          "properties": {
+            "changed_circumstance": {
+              "description": "retire only: what changed that makes the directive no longer hold. Copy the contributor's stated changed circumstance verbatim (for 'X no longer exists, so remove Y', it is 'X no longer exists'). It must come from the contribution, never invented; a retirement with no stated changed circumstance is not a retirement. If the contribution only asks for the removal, state none: decline it instead. Recorded on the retirement so an operator can see why a rule went away.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "content": {
+              "description": "publish only: the directive text, in your words.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "contribution_id": {
+              "description": "REQUIRED on EVERY op in batch mode: the id of the contribution that motivated this op \u2014 the one an append or publish admits, and the one whose acceptance made a supersede or retire the right move. Exactly as listed in NEW CONTRIBUTIONS TO JUDGE, and one you accepted in `verdicts`.",
+              "type": "string"
+            },
+            "id": {
+              "description": "supersede / retire only: the id of the directive to remove, exactly as it appears in the CURRENT SUMMARY.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "op": {
+              "description": "append: admit this contribution as a directive in its own words (the engine builds the row from the contribution \u2014 write no text). publish: admit a directive in your words (requires content). supersede: remove the directive named by id, replaced by the directive this amendment admits (valid only alongside an append or a publish). retire: remove the directive named by id with no replacement, stating its changed_circumstance.",
+              "enum": [
+                "append",
+                "publish",
+                "supersede",
+                "retire"
+              ],
+              "type": "string"
+            },
+            "subject": {
+              "description": "publish only: subject tag. Omit to keep the contribution's own subject.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "supersedes": {
+              "description": "publish only: the id of the directive this published directive replaces, if any.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "op",
+            "contribution_id"
+          ],
+          "type": "object"
+        },
+        "type": [
+          "array",
+          "null"
+        ]
+      },
+      "new_context": {
+        "description": "ADR 0011 D1: the rewritten context section only \u2014 the whole digest, condensed. Null leaves the context exactly as it stands; must be null when declining.",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "verdicts": {
+        "description": "One verdict per contribution in NEW CONTRIBUTIONS TO JUDGE, in that same arrival order. Every contribution gets exactly one verdict; a decline on one says nothing about the others.",
+        "items": {
+          "properties": {
+            "contribution_id": {
+              "description": "The contribution this verdict judges, exactly as listed.",
+              "type": "string"
+            },
+            "decision": {
+              "enum": [
+                "accept_as_directive",
+                "accept_as_context",
+                "decline"
+              ],
+              "type": "string"
+            },
+            "reasoning": {
+              "description": "One or two sentences explaining THIS contribution's verdict. When any op is `publish`, this must state why the contribution's own bytes could not serve as the directive text.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "contribution_id",
+            "decision",
+            "reasoning"
+          ],
+          "type": "object"
+        },
+        "type": "array"
+      },
+      "withdraw_published": {
+        "description": "ADR 0007 D3/D5: published item ids (from THIS SCOPE'S PUBLICATION, when rendered) to withdraw because this amendment drops or contradicts the belief behind them. Omit or null when nothing needs withdrawing.",
+        "items": {
+          "type": "string"
+        },
+        "type": [
+          "array",
+          "null"
+        ]
+      }
+    },
+    "required": [
+      "verdicts",
+      "directive_ops",
+      "new_context"
+    ],
+    "type": "object"
+  },
+  "name": "submit_batch_judgment"
+}
