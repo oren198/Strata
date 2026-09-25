@@ -144,3 +144,12 @@ def test_outcome_loop_row_states_the_limits_as_measured() -> None:
         "an ambiguous failure was declined instead of treated as a correction in 1 of 3 runs (#220)"
     ) in row
     assert "sometimes declined" not in row
+
+
+# --- #225: interior assertions admitted via an invented informant (v1.16) ---------------------
+
+
+def test_the_invented_informant_limit_is_stated_with_its_numbers() -> None:
+    assert "tracked in #225" in _README
+    assert "a source nobody gave it" in _README
+    assert "22 admits" in _README

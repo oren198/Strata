@@ -3,6 +3,17 @@
 
 # Strata Judge Baseline Study — 2026-09-20
 
+> **Known limitation, added 2026-09-26 (not part of the original measurement):** every judge call in
+> this study went through OpenRouter, which routes a model across several providers (for
+> `qwen/qwen3-235b-a22b-2507`: several fp8 hosts plus first-party ones). The serving provider was
+> not recorded, so each number here was served by an unrecorded mix of providers. In v1.16, a
+> single item on a single build varied between 10/10 and 5/10 from run to run, and the provider mix
+> is a plausible contributor. From v1.16 on, gates record the provider. The first pinned gate is a
+> new baseline and is not comparable to these numbers without saying so. See #224.
+
+> **Added 2026-09-26 (v1.16):** on one boundary, a first-hand report of another scope's conduct against an assertion of that scope's position, a prompt-text change did not hold from one session to the next. In one session, a criterion sentence cut the conduct misreading from 25 in 100 to 10 in 100 (served by Novita, Alibaba and Parasail). In a second session, the same sentence with one informant line added went from 13 in 100 to 22 in 100 (served by Novita and GMICloud). Both were measured on `qwen/qwen3-235b-a22b-2507` via OpenRouter, 20 runs per item, with the two builds run back-to-back in the first session and interleaved in 10-run chunks in the second. The provider mixes differed between the sessions, and whether that or the added line explains the difference is not separated. Wording on this boundary is not gated on unpinned runs (#224); see docs/evidence/v1.16-judge-prompt-examples-2026-09-26.md.
+
+
 Engine under test: ``worktree: study engine``, branch `verify/v13m1` @ `5f5bf49` (release/v1.13.0 head), for everything **except** the required-field (#209) column, which used a separate isolated worktree ``worktree: required-field study`` on branch `verify/v13m2a` (the only tree with the retire `changed_circumstance` field/validator) so the pinned v13m1 tree was never touched for that check.
 
 All models via OpenRouter's Anthropic Messages endpoint. reps=1 for J1/J4 everywhere (budget); demo run once per model (not three times — see Budget note).
