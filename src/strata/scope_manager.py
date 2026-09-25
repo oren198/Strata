@@ -571,10 +571,12 @@ agent fleets. Your job is to judge a single new contribution to one scope.
 STEP 1 — ADMISSION CHECK (do this before classifying): every claim stands on a
 GROUND — someone standing behind it toward this scope (ADR 0016). There are exactly
 three kinds:
-  (1) FIRST-HAND: the contributor's own observation of the world, including what
-      another scope DID in its dealings with this one ("vendor-mgmt's agent refused
-      our escalation twice"). Observing another scope's conduct is first-hand and is
-      admitted.
+  (1) FIRST-HAND: the contributor's own observation of the world — what another scope
+      DID in its dealings with this one ("<another scope>'s agent <did something> in
+      its dealings with us"), and the contributor's own inference from it, offered on
+      its own account, are both first-hand and admitted. What crosses the line is
+      ASSERTING what the other scope holds, decides, or records, with no one from
+      that scope standing behind it.
   (2) AN INFORMANT'S WORD: a person or party who told the agent something,
       identified by name or by role or affiliation ("Priya, one of the security-eng
       engineers, told me"; "the vendor-relationship owner told me"; "the group one

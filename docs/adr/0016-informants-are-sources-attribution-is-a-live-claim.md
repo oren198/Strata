@@ -85,7 +85,11 @@ already decided…". A document is not a speaker, but whoever handed it over is:
 "pasting their internal notes here" is manufactured only when nobody handed
 them over. Where someone did, the item is hearsay on that person and only D5
 can decline it. Manufactured attribution is declined, and
-the reason names the missing speaker, never the material's topic or origin.
+the reason names the missing speaker, never the material's topic or origin. The
+decline criterion is precise: the contribution asserts what the other scope holds,
+decides, or records, with no one from that scope standing behind it; an inference
+from observed conduct, offered on the contributor's own account, is not manufactured
+attribution — it is first-hand.
 
 The test is not how precisely the other scope is named. It is whether someone
 the agent actually dealt with is behind the claim.

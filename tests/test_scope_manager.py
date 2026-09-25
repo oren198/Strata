@@ -5543,9 +5543,16 @@ def test_system_prompt_hearsay_is_never_a_directive_whatever_was_proposed() -> N
 
 
 def test_system_prompt_separates_conduct_from_interior() -> None:
+    """v1.16 1c: the worked example was dropped for a placeholder, and the
+    philosopher's criterion added as rule text — updated here to match."""
     flat = _flat_prompt()
-    assert "what another scope DID in its dealings with this one" in flat
-    assert "Observing another scope's conduct is first-hand and is admitted" in flat
+    assert "what another scope" in flat
+    assert "DID in its dealings with this one" in flat
+    assert "are both first-hand and admitted" in flat
+    assert (
+        "ASSERTING what the other scope holds, decides, or records, with no one from"
+        in flat
+    )
     assert "that is what the scope BELIEVES, and only that scope may say so outward" in flat
 
 
