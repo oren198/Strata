@@ -77,6 +77,7 @@ from __future__ import annotations
 import hashlib
 import importlib.resources
 import json
+import logging
 import os
 import pathlib
 import sqlite3
@@ -106,7 +107,11 @@ from strata.locks import scope_lock as _scope_lock
 from strata.locks import scope_queue as _scope_queue
 from strata.migrator import run_migrations
 from strata.operator import operator_memory_binding, read_operator_layer
-from strata.perspective import ancestor_directives, compose_perspective
+from strata.perspective import (
+    ancestor_directives,
+    compose_perspective,
+    dropped_context_contribution_ids,
+)
 from strata.project_config import StoragePaths, resolve_storage_paths
 from strata.publication import (
     apply_judged_withdrawals,
@@ -125,6 +130,7 @@ from strata.record_store import (
     RaisedContributionInput,
     RecentContribution,
     RecordStore,
+    standing_evidence,
 )
 from strata.scope_manager import (
     WINDOW_VERBATIM_TAIL,
@@ -142,6 +148,8 @@ from strata.session_state import (
 )
 from strata.settings import Settings, get_settings
 from strata.summary_store import Directive, ScopeSummary, SummaryStore, derive_condensed
+
+_logger = logging.getLogger(__name__)
 
 # Console UI static files bundled as package data (same vendoring pattern as
 # _skills/ / _migrations/ / _templates/), so the static mount works regardless
@@ -854,6 +862,7 @@ def _judge_and_record(
             fleet=fleet,
             record_store=record_store,
             summary_store=summary_store,
+            summary_max_words=summary_max_words,
             previous_summary=inputs.current_summary,
             retirements=[
                 (d, judgment.reasoning, judgment.retirement_circumstances().get(d))
@@ -898,6 +907,7 @@ def _write_amendment(
     fleet: FleetConfig,
     record_store: RecordStore,
     summary_store: SummaryStore,
+    summary_max_words: int,
     previous_summary: ScopeSummary | None,
     retirements: Sequence[tuple[str, str, str | None]],
     removals: Sequence[tuple[str, str]],
@@ -981,6 +991,71 @@ def _write_amendment(
     # one value on every accepted row, so a batch's N verdicts tie to their
     # one write without anyone counting rows against `version`.
     record_store.stamp_summary_version(judged_contribution_ids, version=written.version)
+
+    # ADR 0017 P6 part 1, issue #202: one condensation_drops row per accepted
+    # context contribution this amendment mechanically dropped — present
+    # verbatim in the OLD context, absent from the NEW one. NOT one SQL
+    # transaction with the summary write above (the summary is a markdown
+    # file, this is a DB row) — same `_scope_lock` ordering is the only
+    # atomicity available, so a crash between the two lines above and this
+    # one leaves a written summary with no drop rows for it, never the
+    # reverse. A failure writing the rows is logged loudly and swallowed —
+    # never silent, but never rolling back an already-committed summary
+    # write for a purely diagnostic side table.
+    try:
+        candidates = record_store.list_accepted_context_contributions(scope_id=scope.id)
+        dropped_ids = dropped_context_contribution_ids(
+            previous_summary.context if previous_summary is not None else None,
+            judgment.new_summary.context,
+            candidates,
+        )
+        # A claim THIS SAME amendment corrected (P3/P4) was REPLACED, not
+        # condensed — its own outcome already gets the record's claim_corrected/
+        # claim_superseded event; a second, condensation-flavoured row for the
+        # same fact would misname why it left the context.
+        corrected_targets = {
+            event.item_id
+            for jid in judged_contribution_ids
+            if (event := record_store.claim_event_for(jid)) is not None
+        }
+        dropped_ids = [d for d in dropped_ids if d not in corrected_targets]
+        if dropped_ids:
+            by_id = {c.id: c for c in candidates}
+            words_before = len((previous_summary.context if previous_summary else "").split())
+            words_after = len(judgment.new_summary.context.split())
+            drops: list[tuple[str, str, int, int]] = []
+            for dropped_id in dropped_ids:
+                evidence = standing_evidence(
+                    record_store, fleet, dropped_id, summary_store=summary_store
+                )
+                if any(
+                    e.replaced_kind is None and e.correction_pending_kind is None for e in evidence
+                ):
+                    state_at_drop = "corroborated"
+                elif record_store.claim_event_for(dropped_id) is not None:
+                    state_at_drop = "correcting"
+                # TODO(P6 part 2): the philosopher ruled a raised consequence's own
+                # acceptance at the issuer is EXAMINED (P5) — 'raised' below covers
+                # the dropped item itself being one; part 2 lists 'raised' among the
+                # examined states on the judge-input side too.
+                elif by_id[dropped_id].raised_from is not None:
+                    state_at_drop = "raised"
+                else:
+                    state_at_drop = "unexamined"
+                drops.append((dropped_id, state_at_drop, words_before, words_after))
+            record_store.append_condensation_drops(
+                scope_id=scope.id,
+                summary_version=written.version,
+                budget=summary_max_words,
+                drops=drops,
+            )
+    except Exception:
+        _logger.exception(
+            "condensation_drops write failed for scope %r at summary version %s "
+            "(summary already written; the drop rows are missing, not the amendment)",
+            scope.id,
+            written.version,
+        )
 
     # ADR 0011 D1: a `retire` op removes a directive with no replacement,
     # so no contribution row carries the explanation — the retirement
@@ -1343,6 +1418,7 @@ def _judge_batch_and_record(
             fleet=fleet,
             record_store=record_store,
             summary_store=summary_store,
+            summary_max_words=summary_max_words,
             previous_summary=inputs.current_summary,
             retirements=retirements,
             removals=removals,
@@ -2962,6 +3038,17 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
             # The derived per-contribution state (issue #118) so a client renders
             # "attempted, judge errored" without re-deriving the three-way join.
             "contribution_states": [asdict(s) for s in page.contribution_states],
+            # ADR 0017 P6 part 1, issue #202: every condensation-drop row for this
+            # scope (small, rare — "constitutional, not operational" like operator
+            # memory — never paginated the way contributions are), so a client can
+            # mark any contribution on this page found no longer verbatim in the
+            # summary at a later version — a live judge commonly REWORDS a
+            # still-standing claim rather than deleting it, and a verbatim-substring
+            # test cannot tell the two apart, so the client-facing wording must
+            # always be "condensed away or reworded", never "condensed away" alone.
+            "condensation_drops": [
+                asdict(d) for d in record_store.list_condensation_drops(scope_id=scope_id)
+            ],
             # next_before_id is None once the record is exhausted — the signal a
             # client pages until, rather than guessing from a short page.
             "page": {

@@ -3185,7 +3185,13 @@ async def strata_read_scope_record(
     Returns:
         ``contributions``, ``judgments``, ``judgment_attempts``, and
         ``contribution_states`` (lists) covering this page's contributions
-        only, newest first, plus a ``page`` block carrying ``limit``,
+        only, newest first; ``condensation_drops`` (ADR 0017 P6 part 1)
+        covering the WHOLE scope, never paginated — each row says a
+        contribution's text is no longer verbatim in the summary at a later
+        version ("condensed away or reworded"), never that it was condensed
+        away specifically: a live judge commonly rewords a still-standing
+        claim rather than deleting it, and a verbatim-substring test cannot
+        tell the two apart; plus a ``page`` block carrying ``limit``,
         ``total`` (the whole record's size), and ``next_before_id`` (null on
         the last page).
 
@@ -3224,6 +3230,11 @@ async def strata_read_scope_record(
             # Per-contribution state (issue #118): judged / judge_failed /
             # pending, so "the judge errored" never reads as "still in flight".
             "contribution_states": [asdict(s) for s in page.contribution_states],
+            # ADR 0017 P6 part 1, issue #202: every condensation-drop row for this
+            # scope — small, rare, never paginated the way contributions are.
+            "condensation_drops": [
+                asdict(d) for d in _record_store.list_condensation_drops(scope_id=scope_id)
+            ],
             # next_before_id is null once the record is exhausted — page until
             # then rather than inferring the end from a short page.
             "page": {

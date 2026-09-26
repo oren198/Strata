@@ -100,6 +100,10 @@ def _new_retirement_id() -> str:
     return f"ret_{secrets.token_hex(8)}"
 
 
+def _new_condensation_drop_id() -> str:
+    return f"cd_{secrets.token_hex(8)}"
+
+
 def _new_operator_evidence_id() -> str:
     return f"oev_{secrets.token_hex(8)}"
 
@@ -502,6 +506,35 @@ class Retirement:
     """The changed circumstance the scope-manager stated for a judged retirement (#209),
     in the contribution's own words; ``None`` for an operator retirement or a row that
     predates the column."""
+
+
+@dataclass(frozen=True)
+class CondensationDrop:
+    """One accepted context contribution the engine mechanically found condensed
+    away by a later amendment to the same scope (ADR 0017 P6 part 1, issue #202).
+
+    Written at the #202 stamping site (:func:`strata.app._write_amendment`),
+    alongside — not atomically with, see that function's own docstring — the
+    summary write it accompanies. ``state_at_drop`` is derived from the record
+    at that moment and never re-derived later, the same "true only when it was
+    written" discipline P2's :func:`standing_evidence` uses for its own live
+    reads: 'corroborated' (the item has at least one held outcome, any
+    reporter), 'correcting' (the item IS the correcting content of a failed
+    outcome), 'raised' (an accepted contribution with `raised_from` set — P5;
+    the philosopher's ruling is that this is EXAMINED, the order follows the
+    item's ground, not its location), or 'unexamined' (none of the above),
+    priority in that order.
+    """
+
+    id: str
+    scope_id: str
+    summary_version: int
+    contribution_id: str
+    state_at_drop: Literal["corroborated", "correcting", "raised", "unexamined"]
+    words_before: int
+    words_after: int
+    budget: int
+    created_at: str
 
 
 @dataclass(frozen=True)
@@ -2127,6 +2160,98 @@ class RecordStore:
                 """
             ).fetchall()
         return [Retirement(**dict(row)) for row in rows]
+
+    def append_condensation_drops(
+        self,
+        *,
+        scope_id: str,
+        summary_version: int,
+        budget: int,
+        drops: Sequence[
+            tuple[str, Literal["corroborated", "correcting", "raised", "unexamined"], int, int]
+        ],
+    ) -> list[CondensationDrop]:
+        """Append one row per dropped item from ONE amendment's condensation (ADR
+        0017 P6 part 1, issue #202).
+
+        *drops* is ``[(contribution_id, state_at_drop, words_before, words_after), ...]``
+        — every field the caller already derived; this call is a pure mechanical
+        write, deriving nothing. A no-op (returns ``[]``) when *drops* is empty, so
+        every amendment can call this unconditionally without a guard of its own.
+
+        Not atomic with the summary write that accompanies it (the summary is a
+        file, this is a DB row) — see :func:`strata.app._write_amendment`'s own
+        docstring for what a failure here does. All rows in one call DO share one
+        SQLite transaction with each other, so a batch's several drops from the
+        SAME amendment land together or not at all.
+        """
+        if not drops:
+            return []
+        rows_out: list[CondensationDrop] = []
+        with self._conn:
+            for contribution_id, state_at_drop, words_before, words_after in drops:
+                drop_id = _new_condensation_drop_id()
+                self._conn.execute(
+                    """
+                    INSERT INTO condensation_drops (
+                        id, scope_id, summary_version, contribution_id, state_at_drop,
+                        words_before, words_after, budget
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        drop_id,
+                        scope_id,
+                        summary_version,
+                        contribution_id,
+                        state_at_drop,
+                        words_before,
+                        words_after,
+                        budget,
+                    ),
+                )
+                row = self._conn.execute(
+                    """
+                    SELECT id, scope_id, summary_version, contribution_id, state_at_drop,
+                           words_before, words_after, budget, created_at
+                    FROM condensation_drops WHERE id = ?
+                    """,
+                    (drop_id,),
+                ).fetchone()
+                rows_out.append(CondensationDrop(**dict(row)))
+        return rows_out
+
+    def list_condensation_drops(
+        self, *, scope_id: str | None = None, contribution_id: str | None = None
+    ) -> list[CondensationDrop]:
+        """Return condensation-drop rows ordered by ``created_at`` ascending (ADR
+        0017 P6 part 1).
+
+        Args:
+            scope_id: When given, filter to this scope's own drops.
+            contribution_id: When given, filter to drops naming this one
+                contribution (a record-entry read: "was THIS item condensed
+                away, and when, and in what state").
+        """
+        clauses: list[str] = []
+        params: list[str] = []
+        if scope_id is not None:
+            clauses.append("scope_id = ?")
+            params.append(scope_id)
+        if contribution_id is not None:
+            clauses.append("contribution_id = ?")
+            params.append(contribution_id)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self._conn.execute(
+            f"""
+            SELECT id, scope_id, summary_version, contribution_id, state_at_drop,
+                   words_before, words_after, budget, created_at
+            FROM condensation_drops
+            {where}
+            ORDER BY created_at ASC, rowid ASC
+            """,
+            params,
+        ).fetchall()
+        return [CondensationDrop(**dict(row)) for row in rows]
 
     # ------------------------------------------------------------------
     # Publication acts + judgments (ADR 0007 D1/D2) — the publication

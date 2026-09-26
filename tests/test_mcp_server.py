@@ -1516,6 +1516,7 @@ async def test_entitled_no_argument_returns_bound_scope_data(tmp_path: Path) -> 
         "judgments": [],
         "judgment_attempts": [],
         "contribution_states": [],
+        "condensation_drops": [],
         # The record read is bounded by default (issue #130); an empty record
         # still reports its page, so "empty" and "first page of many" are
         # never confused.
@@ -1667,6 +1668,7 @@ async def test_entitled_own_empty_record_returns_empty_shape(tmp_path: Path) -> 
         "judgments": [],
         "judgment_attempts": [],
         "contribution_states": [],
+        "condensation_drops": [],
         # Bounded by default (issue #130) — the empty shape now names its page.
         "page": {"limit": mod._settings.record_page_size, "total": 0, "next_before_id": None},
     }
