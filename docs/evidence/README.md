@@ -15,6 +15,7 @@ links here.
 | `v1.15-p1b-adoption-2026-09-25.md` | the same protocol AFTER the perspective lists context item ids and the nudge names them (Claude Code only) — 6 of 6 set it; read with the P1 file as one before/after pair, caveats inside |
 | `v1.15-outcome-loop-gate-2026-09-25.md` | the v1.15 outcome-loop gate. P3: the judge's four dispositions on acted_on reports (echo hard stop 10/10, strict per-item scores, the input-identity no-regression proof with J1/J4 as noise context). P4: correction fan-out (exactly-once per reader, owner notified cross-scope, supersession silent, negative controls). Plus the found-and-fixed list and the two open limits (#219, #220) |
 | `v1.16-judge-prompt-examples-2026-09-26.md` | v1.16 items 1b/1c: the acted_on block's worked example leaking into reasons (fixed: fabricated quotes 3/70 → 0/70); the ADR 0016 conduct example and two failed wording fixes (reverted); findings: an unstable conduct/interior boundary, interior assertions admitted via an invented informant (#225), unpinned runs can't gate wording (#224) |
+| `v1.16-codex-adoption-2026-09-26.md` | Codex adoption of `acted_on`, before and after the item-id listing: 0 of 6 before; after, 1 of 1 completed session (5 not run: the account's usage limit). Also records that #218 is fixed in practice (CODEX_HOME under ~), Codex's refusal of `.git` writes, and the contribute-retry caveat |
 
 **Caveat for every unpinned before/after in v1.15–v1.16 (added 2026-09-26):** OpenRouter's
 routing appears to follow the prompt itself. Two builds that differed in one prompt line, run
