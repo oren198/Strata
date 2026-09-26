@@ -226,8 +226,10 @@ def test_a_failed_outcome_against_an_operator_directive_writes_unjudged_evidence
     assert len(evidence) == 1
     assert evidence[0].raised_from == outcome_id
     assert evidence[0].reporter_scope_id == "g_reporter"
-    assert f"Following {item.id} went wrong" in evidence[0].content
-    assert "Deployed on Friday; it broke within the hour." in evidence[0].content
+    assert evidence[0].content == (
+        f"evidence from g_reporter: following {item.id} went wrong: "
+        "Deployed on Friday; it broke within the hour."
+    )
     assert evidence[0].seen_at is None
 
     # Unjudged, per the plan: no synchronous second judge call for an operator raise.

@@ -710,7 +710,13 @@ def _judge_and_record(
         and acted_on_target is not None
         and acted_on_target.is_directive
     ):
-        raised_content = f"Following {acted_on_target.target_id} went wrong: {contribution.content}"
+        # ADR 0017 P5, philosopher's line 7: framed as evidence about the world
+        # from a NAMED scope — never a contrary rule the issuer's judge should
+        # weigh against its own directive.
+        raised_content = (
+            f"evidence from {contribution.scope_id}: following {acted_on_target.target_id} "
+            f"went wrong: {contribution.content}"
+        )
         if acted_on_target.operator_item is not None:
             raise_to_operator = OperatorEvidenceInput(
                 operator_item_id=acted_on_target.target_id,

@@ -157,8 +157,10 @@ def test_a_failed_directive_outcome_raises_to_the_issuing_scope(http_client) -> 
     assert raised_contribution.raised_from == outcome_id
     assert raised_contribution.acted_on == directive_id
     assert raised_contribution.contributor.scope_id == "g_reporter"
-    assert f"Following {directive_id} went wrong" in raised_contribution.content
-    assert "Tried TLS 1.3; the peer only supports 1.2." in raised_contribution.content
+    assert raised_contribution.content == (
+        f"evidence from g_reporter: following {directive_id} went wrong: "
+        "Tried TLS 1.3; the peer only supports 1.2."
+    )
 
     judgment = store.get_judgment(raised_contribution.id)
     assert judgment is not None
