@@ -3185,9 +3185,10 @@ async def strata_read_scope_record(
     Returns:
         ``contributions``, ``judgments``, ``judgment_attempts``, and
         ``contribution_states`` (lists) covering this page's contributions
-        only, newest first, plus a ``page`` block carrying ``limit``,
-        ``total`` (the whole record's size), and ``next_before_id`` (null on
-        the last page).
+        only, newest first; ``condensation_drops`` (ADR 0017 P6 part 1)
+        covering the WHOLE scope, never paginated; plus a ``page`` block
+        carrying ``limit``, ``total`` (the whole record's size), and
+        ``next_before_id`` (null on the last page).
 
     Raises:
         RuntimeError: If scope_id is outside this agent's entitled
@@ -3224,6 +3225,11 @@ async def strata_read_scope_record(
             # Per-contribution state (issue #118): judged / judge_failed /
             # pending, so "the judge errored" never reads as "still in flight".
             "contribution_states": [asdict(s) for s in page.contribution_states],
+            # ADR 0017 P6 part 1, issue #202: every condensation-drop row for this
+            # scope — small, rare, never paginated the way contributions are.
+            "condensation_drops": [
+                asdict(d) for d in _record_store.list_condensation_drops(scope_id=scope_id)
+            ],
             # next_before_id is null once the record is exhausted — page until
             # then rather than inferring the end from a short page.
             "page": {

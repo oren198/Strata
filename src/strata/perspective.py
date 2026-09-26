@@ -263,6 +263,36 @@ def _context_contributions_absent(context: str, contributions: Sequence[_Contrib
     )
 
 
+def dropped_context_contribution_ids(
+    previous_context: str | None,
+    new_context: str,
+    contributions: Sequence[_ContributionLike],
+) -> list[str]:
+    """Ids of *contributions* present verbatim in *previous_context* but absent from
+    *new_context* — the #202 condensation signal, per item rather than only counted
+    (ADR 0017 P6 part 1).
+
+    Same substring test and same over-approximation as
+    :func:`_context_contributions_absent` (a paraphrase reads as dropped too, the
+    safe direction): this is deliberately the identical test, applied twice — once
+    against the OLD context to find what was there to begin with, once against the
+    NEW to find what left. ``previous_context is None`` (no summary on disk yet)
+    returns ``[]``: a first write drops nothing, it admits (mirrors
+    :func:`~strata.summary_store.derive_condensed`'s own "None is not a
+    shortening").
+    """
+    if previous_context is None:
+        return []
+    before_haystack = _normalised(previous_context)
+    after_haystack = _normalised(new_context)
+    dropped: list[str] = []
+    for contribution in contributions:
+        needle = _normalised(contribution.content)
+        if needle and needle in before_haystack and needle not in after_haystack:
+            dropped.append(contribution.id)
+    return dropped
+
+
 def change_event_dict(event: _ChangeEventLike) -> dict:
     """Verbatim ``input_changes`` entry for one change event (ADR 0014 D5).
 

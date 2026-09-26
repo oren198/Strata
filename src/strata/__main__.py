@@ -728,6 +728,15 @@ def cmd_record(args: argparse.Namespace) -> int:
                 raised_evidence = stores.record_store.get_raised_operator_evidence(c.id)
                 if raised_evidence is not None:
                     print(f"      raised to the operator as {raised_evidence.id}")
+            # ADR 0017 P6 part 1, issue #202: this item was mechanically found
+            # condensed away by a later amendment — "unexamined", never "poorly
+            # standing" (the wording rule).
+            for drop in stores.record_store.list_condensation_drops(contribution_id=c.id):
+                print(
+                    f"      condensed away at v{drop.summary_version} "
+                    f"({drop.state_at_drop}, {drop.words_before}→{drop.words_after} words, "
+                    f"budget {drop.budget})"
+                )
             if state is not None and state.state == "judge_failed":
                 print(f"      judge failed at {state.failed_at}: {state.error_message}")
                 print("      re-judge with the strata_rejudge MCP tool")
