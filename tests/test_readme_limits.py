@@ -115,7 +115,7 @@ def test_the_demo_section_keeps_the_112_figure_and_adds_the_113_one() -> None:
 
 
 def _outcome_loop_row() -> str:
-    start = _README.index("| **Outcome loop** (1.15) |")
+    start = _README.index("| **Outcome loop** (1.15, 1.16) |")
     end = _README.index("| **Where the evidence lives** |", start)
     return _README[start:end]
 
@@ -124,9 +124,9 @@ def test_outcome_loop_row_states_the_direct_readers_and_the_relay_gap() -> None:
     row = _outcome_loop_row()
     assert (
         "a correction is sent once to every scope that reads the publication directly "
-        "(child scopes and scopes with a reference edge); copies re-published by a child "
-        "are not covered (#221)"
+        "(child scopes and scopes with a reference edge)"
     ) in row
+    assert "a relayed copy that paraphrases the claim is not (#221, #219)" in row
     assert "every scope that received it" not in row
 
 
@@ -134,13 +134,24 @@ def test_outcome_loop_row_states_adoption_with_its_harness_and_sample() -> None:
     row = _outcome_loop_row()
     assert "0 of 6 sessions set `acted_on` before the perspective listed item ids" in row
     assert "and 6 of 6 after (n=6;" in row
-    assert "Codex not measured." in row
+    assert "not yet a rate" in row
+    assert "Codex not measured." not in row
 
 
 def test_outcome_loop_row_states_the_limits_as_measured() -> None:
     row = _outcome_loop_row()
     assert "a published item that *paraphrases* a corrected claim stays up (#219)" in row
-    assert (
-        "an ambiguous failure was declined instead of treated as a correction in 1 of 3 runs (#220)"
-    ) in row
+    assert "did not recur on re-measure (20 of 20 correct) and is closed" in row
     assert "sometimes declined" not in row
+
+
+def test_outcome_loop_row_states_the_v116_additions() -> None:
+    row = _outcome_loop_row()
+    for phrase in (
+        "(1.15, 1.16)",
+        "not yet a rate",
+        "a correction kept 74% of its facts",
+        "condensed away or reworded",
+        "over-counts the same way (#227)",
+    ):
+        assert phrase in row
