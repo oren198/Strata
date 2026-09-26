@@ -395,12 +395,34 @@ _ACTED_ON_DECISION_PROPERTY: dict = {
     ),
 }
 
+_ACTED_ON_DIRECTIVE_DECISION_PROPERTY: dict = {
+    "type": "string",
+    "enum": ["held", "failed", "decline"],
+    "description": (
+        "ADR 0017 P5: this contribution reports acting on a DIRECTIVE — the acting "
+        "scope does not own this directive, so there is no claim of this scope's own "
+        "to correct or supersede here, only whether following it held or failed. "
+        "Exactly one of: "
+        "held — an action that could have failed confirmed the directive; "
+        "failed — following it went wrong, and this report's own observation is the "
+        "evidence (the engine raises this upward to whoever issued the directive; "
+        "it is never this scope's place to correct or supersede a directive it does "
+        "not own); "
+        "decline — the report establishes neither a clean hold nor a clean failure. "
+        "held / failed both record as accept_as_context, no claim event; "
+        "decline records as decline."
+    ),
+}
+
 
 def _judge_tool_for(acted_on_target: ActedOnTarget | None) -> dict:
     """The single-contribution judge tool: :data:`JUDGE_TOOL` unchanged, unless this
     call judges an ``acted_on`` contribution, in which case a deep-copied variant
-    whose ``decision`` enum is the four dispositions is returned instead (ADR 0017 P3
-    rev 3, ruling c′).
+    whose ``decision`` enum is narrowed instead — the four dispositions for a
+    context target (ADR 0017 P3 rev 3, ruling c′), or the three-way
+    held/failed/decline for a DIRECTIVE target of either origin, scope-held or
+    operator (ADR 0017 P5): the acting scope never owns a directive either way, so
+    it never corrects or supersedes one.
 
     Deliberately NOT a module-level constant: doing that once, unconditionally, is
     exactly the M1/#212 mistake this function exists to avoid.
@@ -408,7 +430,12 @@ def _judge_tool_for(acted_on_target: ActedOnTarget | None) -> dict:
     if acted_on_target is None:
         return JUDGE_TOOL
     tool = copy.deepcopy(JUDGE_TOOL)
-    tool["input_schema"]["properties"]["decision"] = copy.deepcopy(_ACTED_ON_DECISION_PROPERTY)
+    decision_property = (
+        _ACTED_ON_DIRECTIVE_DECISION_PROPERTY
+        if acted_on_target.is_directive
+        else _ACTED_ON_DECISION_PROPERTY
+    )
+    tool["input_schema"]["properties"]["decision"] = copy.deepcopy(decision_property)
     return tool
 
 
@@ -1322,6 +1349,7 @@ def _read_reasoning(raw: dict, *, tool_name: str, require: bool = True) -> str:
 #: `acted_on`. Never persisted as `judgments.decision` — see
 #: `ScopeManagerJudgment.outcome_disposition`'s docstring.
 _OUTCOME_DISPOSITIONS = frozenset({"held", "failed_corrected", "failed_superseded", "decline"})
+_DIRECTIVE_OUTCOME_DISPOSITIONS = frozenset({"held", "failed", "decline"})
 #: The three that admit the outcome (as accept_as_context); the fourth, "decline", maps
 #: to decision="decline" instead.
 _OUTCOME_ACCEPT_DISPOSITIONS = frozenset({"held", "failed_corrected", "failed_superseded"})
@@ -1340,7 +1368,24 @@ class _MalformedDisposition(ValueError):
     """
 
 
-def _resolve_acted_on_decision(raw_decision: object) -> tuple[str, str]:
+class _MalformedOrdinaryDecision(_MalformedDisposition):
+    """An ORDINARY (no acted_on) contribution's `decision` is not one of the three
+    record values (ADR 0017 P5 live-gate finding).
+
+    A defense-in-depth guard, not the primary fix: whichever gate decides a
+    contribution IS an acted_on outcome should already route it through
+    :func:`_resolve_acted_on_decision` instead of reaching here at all — but if that
+    gate and the judge ever disagree about which contribution this is (exactly what
+    happened live: a narrowed-tool answer like "failed"/"held" reaching the ordinary
+    branch), an out-of-vocabulary string must never reach ``record_judgment`` and
+    crash the request. A ``_MalformedDisposition`` subclass so it shares the SAME
+    one-retry-then-fail-closed-decline handling, not a parallel mechanism.
+    """
+
+
+def _resolve_acted_on_decision(
+    raw_decision: object, *, is_directive: bool = False
+) -> tuple[str, str]:
     """Resolve an `acted_on` call's raw `decision` into ``(record_decision,
     outcome_disposition)``, or raise :class:`_MalformedDisposition`.
 
@@ -1350,11 +1395,23 @@ def _resolve_acted_on_decision(raw_decision: object) -> tuple[str, str]:
     ordinary record values, and never anything else); this IS the disposition.
     held/failed_corrected/failed_superseded map to the record decision
     ``accept_as_context``; `decline` maps to ``decision="decline"``.
+
+    ADR 0017 P5: for a DIRECTIVE target, *is_directive* narrows the accepted set to
+    held/failed/decline (never the two failed_* names, and never four values) — the
+    acting scope does not own a directive, so there is no claim of its own to mark
+    corrected or superseded. A value outside the offered set fails closed exactly
+    like an unrecognized value always has, never silently coerced to a neighbor.
     """
-    if raw_decision not in _OUTCOME_DISPOSITIONS:
+    allowed = _DIRECTIVE_OUTCOME_DISPOSITIONS if is_directive else _OUTCOME_DISPOSITIONS
+    if raw_decision not in allowed:
+        wanted = (
+            "held/failed/decline"
+            if is_directive
+            else "held/failed_corrected/failed_superseded/decline"
+        )
         raise _MalformedDisposition(
-            "submit_judgment carries acted_on, so `decision` must be exactly one of "
-            f"held/failed_corrected/failed_superseded/decline (got {raw_decision!r})."
+            f"submit_judgment carries acted_on, so `decision` must be exactly one of "
+            f"{wanted} (got {raw_decision!r})."
         )
     disposition = raw_decision
     record_decision = "decline" if disposition == "decline" else "accept_as_context"
@@ -2162,7 +2219,7 @@ def _with_dropped_note(reasoning: str, dropped_ops: Sequence[str]) -> str:
 
 @dataclass(frozen=True)
 class ActedOnTarget:
-    """The item an ``acted_on`` contribution reports acting on (ADR 0017 P3).
+    """The item an ``acted_on`` contribution reports acting on (ADR 0017 P3/P5).
 
     :meth:`ScopeManager.judge` never reads the record itself — the caller
     (:func:`strata.app.run_contribution`) resolves this once, the same way P1's
@@ -2172,10 +2229,68 @@ class ActedOnTarget:
     replace it at all (D6: a directive has no standing and is never replaced by an
     outcome — see :data:`_SYSTEM_PROMPT` and the ``acted_on_replaces`` wiring in
     :meth:`ScopeManager.judge`).
+
+    ``operator_item`` (ADR 0017 P5, v1.16), when set instead of ``contribution``/
+    ``decision``, means the outcome reports acting on an OPERATOR directive —
+    operator directives never enter a scope's own record (ADR 0008 D4), so they
+    carry no judgment and no contributor. Exactly one of ``contribution`` or
+    ``operator_item`` is ever set.
     """
 
-    contribution: Contribution
-    decision: Literal["accept_as_directive", "accept_as_context"]
+    contribution: Contribution | None
+    decision: Literal["accept_as_directive", "accept_as_context"] | None
+    operator_item: OperatorItem | None = None
+
+    @property
+    def is_directive(self) -> bool:
+        """True for ANY directive target — scope-held or operator — never standing,
+        never replaced (D6). Drives the narrower {held, failed, decline} tool
+        contract (P5): the acting scope does not own a directive either way."""
+        return self.operator_item is not None or self.decision == "accept_as_directive"
+
+    @property
+    def target_id(self) -> str:
+        return self.operator_item.id if self.operator_item is not None else self.contribution.id
+
+    @property
+    def target_content(self) -> str:
+        return (
+            self.operator_item.content
+            if self.operator_item is not None
+            else self.contribution.content
+        )
+
+    @property
+    def target_subject(self) -> str | None:
+        return (
+            self.operator_item.subject
+            if self.operator_item is not None
+            else self.contribution.subject
+        )
+
+
+@dataclass(frozen=True)
+class ExaminedContextItem:
+    """One accepted context item this scope holds that an outcome has TESTED
+    (ADR 0017 P6 part 2): corroborated (held), correcting, or raised — the same
+    three examined states P6 part 1's ``state_at_drop`` derives, resolved here
+    against the CURRENT summary rather than at drop time.
+
+    Resolved once, by the caller (:func:`strata.app.run_contribution`/
+    :func:`strata.app.drain_scope`'s judge call sites), from data the record
+    already holds — never re-derived inside the judge, and never a new stored
+    fact. Only items VERBATIM-PRESENT in the current context are candidates:
+    an item already condensed away or reworded is not "in the context" for the
+    judge to weigh preserving.
+    """
+
+    contribution_id: str
+    content: str
+    kind: Literal["corroborated", "correcting", "raised"]
+    detail: str
+    """The one-line evidence a reader can check without re-deriving it:
+    ``"N held outcome(s)"`` (corroborated), ``"corrects <id>"`` (correcting), or
+    ``"evidence from <scope>"`` (raised) — a plain count or fact, never a score."""
 
 
 class ScopeManagerJudgment(_AmendmentJudgment):
@@ -2194,16 +2309,21 @@ class ScopeManagerJudgment(_AmendmentJudgment):
     """Brief explanation of the verdict — written to the judgment record."""
 
     outcome_disposition: (
-        Literal["held", "failed_corrected", "failed_superseded", "decline"] | None
+        Literal["held", "failed_corrected", "failed_superseded", "failed", "decline"] | None
     ) = None
-    """ADR 0017 P3: the judge's tool-level disposition for a contribution carrying
+    """ADR 0017 P3/P5: the judge's tool-level disposition for a contribution carrying
     ``acted_on`` — ``None`` for every other contribution. This is NEVER what persists
     as :attr:`decision` (the ``judgments.decision`` column stays CHECK-constrained to
     its original three values — the ruling's own "implementation note"): held maps to
     ``accept_as_context`` with no change event; failed_corrected/failed_superseded map
     to ``accept_as_context`` plus a ``claim_corrected``/``claim_superseded`` change
     event linking this contribution (the source) to ``acted_on`` (the target); decline
-    maps to ``decision="decline"``. Carried on the judgment object (not the DB row) so
+    maps to ``decision="decline"``. ``failed`` (P5, DIRECTIVE targets only — the
+    acting scope owns no claim of its own to correct or supersede) maps to
+    ``accept_as_context`` with no change event either, same as held — the engine's
+    own signal to act on is that this contribution's :attr:`acted_on` target is a
+    directive whose issuer differs from the reporting scope, not the disposition
+    name itself. Carried on the judgment object (not the DB row) so
     :meth:`ScopeManager.judge`'s caller (:func:`strata.app.run_contribution`) knows
     which change event, if any, to write in the same transaction as the judgment."""
 
@@ -2862,15 +2982,12 @@ def _render_outcome_block(target: ActedOnTarget) -> str:
     v1.14's M1 (#212) failed at and #212 fixed: a block added to every prompt degrades
     general judging even when most prompts have nothing to do with it.
     """
+    if target.is_directive:
+        return _render_directive_outcome_block(target)
+    # Reaching here means target.decision == "accept_as_context": is_directive
+    # above is the only gate for "accept_as_directive", so this path is a
+    # context target exclusively (ADR 0017 P5) — kept byte-identical to base.
     c = target.contribution
-    directive_caveat = (
-        "NOTE: this item is a DIRECTIVE. A directive has no standing and is never "
-        "replaced by an outcome (D6): failed_corrected/failed_superseded here still "
-        "admit the report as context, but the directive itself is left untouched — do "
-        "not attempt to retire, supersede, or otherwise change it.\n"
-        if target.decision == "accept_as_directive"
-        else ""
-    )
     return (
         "OUTCOME REPORT — this contribution carries `acted_on`, reporting what "
         "happened when the contributor acted on the item below. Judge it with ONE "
@@ -2884,7 +3001,6 @@ def _render_outcome_block(target: ActedOnTarget) -> str:
         f"- contributor: {_render_contributor(c.contributor)}\n"
         "- content:\n"
         f"    {c.content}\n"
-        f"{directive_caveat}"
         "\n"
         "Set `decision` to exactly one:\n"
         "  - held: an ACTION THAT COULD HAVE FAILED CONFIRMED THE ITEM — never merely "
@@ -2892,9 +3008,9 @@ def _render_outcome_block(target: ActedOnTarget) -> str:
         "NOT held: nothing was risked, so nothing was tested. Your reasoning must "
         "QUOTE, in one clause, the observed result you relied on.\n"
         "  - failed_corrected: the claim was WRONG. The report's own observation is "
-        'what now holds — a negative result counts as the replacement ("used port '
-        '8443, the service refused; the right port is unknown" contradicts and '
-        'supersedes "listens on 8443"). There is no known-wrong state and no '
+        'what now holds — a negative result counts as the replacement ("<the action>; '
+        '<the observed negative result>" contradicts and supersedes the original '
+        "claim). There is no known-wrong state and no "
         "lowered standing: a failure either replaces the item or the report is "
         "declined.\n"
         "  - failed_superseded: the claim was RIGHT but the world moved on; the "
@@ -2916,6 +3032,62 @@ def _render_outcome_block(target: ActedOnTarget) -> str:
         "engine already catches on its own — name that published item's id in "
         "`withdraw_published`. A published face that still asserts a claim you just "
         "found wrong is stale evidence for every reader of it.\n"
+        "\n"
+    )
+
+
+def _render_directive_outcome_block(target: ActedOnTarget) -> str:
+    """The OUTCOME REPORT block for a DIRECTIVE target — scope-held or operator
+    (ADR 0017 P5). Split out from :func:`_render_outcome_block` because the
+    disposition set genuinely narrows here, not merely gains a caveat line: the
+    acting scope never owns a directive either way, so there is no claim of
+    its own to correct or supersede, and no `withdraw_published` step. A
+    `failed` verdict is the engine's own signal to raise the outcome upward to
+    whoever issued the directive (:meth:`ScopeManager.judge`'s caller) — it is
+    never this scope's place to do that itself.
+    """
+    issuer = "operator" if target.operator_item is not None else target.contribution.scope_id
+    contributor_line = (
+        f"- contributor: {_render_contributor(target.contribution.contributor)}\n"
+        if target.contribution is not None
+        else ""
+    )
+    return (
+        "OUTCOME REPORT — this contribution carries `acted_on`, reporting what "
+        "happened when the contributor acted on the DIRECTIVE below. Judge it with "
+        "ONE field: set `decision` to exactly one of the three values below (see the "
+        "rule below).\n"
+        "\n"
+        "DIRECTIVE ACTED ON (verbatim, as currently held):\n"
+        f"- id: {target.target_id}\n"
+        f"- subject: {target.target_subject or '(none)'}\n"
+        f"- issuer: {issuer}\n"
+        f"{contributor_line}"
+        "- content:\n"
+        f"    {target.target_content}\n"
+        "NOTE: the acting scope does not own this directive. A directive has no "
+        "standing and is never replaced by an outcome (D6): whatever `decision` you "
+        "reach, the directive itself is left untouched — do not attempt to retire, "
+        "supersede, or otherwise change it.\n"
+        "\n"
+        "Set `decision` to exactly one:\n"
+        "  - held: an ACTION THAT COULD HAVE FAILED CONFIRMED THE DIRECTIVE — never "
+        'merely that it reads as sound. An echo ("followed it and it worked") is NOT '
+        "held: nothing was risked, so nothing was tested. Your reasoning must QUOTE, "
+        "in one clause, the observed result you relied on.\n"
+        "  - failed: FOLLOWING THE DIRECTIVE WENT WRONG. This report's own "
+        "observation is the evidence — it is not this scope's place to correct or "
+        "supersede the directive itself; the engine raises the failure upward to "
+        "whoever issued it.\n"
+        "  - decline: the report establishes neither a clean hold nor a clean "
+        'failure — an echo, an ambiguous result ("partially worked"), or a pending '
+        'one ("result unclear"). Your reasoning must name the MISSING GROUND '
+        'FIRST — begin "no outcome: the action could not have failed" or "no '
+        'outcome reported" — and only then, as guidance, say it may be resubmitted '
+        "WITHOUT `acted_on` if worth keeping as ordinary context.\n"
+        "held / failed record as accept_as_context; decline records as decline — "
+        "the engine derives this from `decision` itself, there is no separate field "
+        "to fill.\n"
         "\n"
     )
 
@@ -2972,6 +3144,31 @@ def _render_relevance(
     return ""
 
 
+def _render_examined_context(items: Sequence[ExaminedContextItem]) -> str:
+    """The EXAMINED CONTEXT block (ADR 0017 P6 part 2), or ``""`` with no examined
+    items — the same byte-identity discipline every optional block here follows
+    (a scope with nothing examined gets a message unchanged from before this
+    item).
+
+    "Examined" here means corroborated, correcting, or raised — the same three
+    states P6 part 1's ``state_at_drop`` derives, applied to what is CURRENTLY
+    verbatim in this scope's own context rather than at drop time. The
+    instruction is an ordering preference, never a rule the engine enforces —
+    unlike BUDGET, which the engine checks mechanically, nothing here is
+    validated: the judge may still drop an examined item, and the record (not
+    this prompt) is what later shows that it did.
+    """
+    if not items:
+        return ""
+    lines = [
+        "EXAMINED CONTEXT: items an outcome has tested. Under budget pressure, "
+        "drop unexamined context before examined context:"
+    ]
+    for item in items:
+        lines.append(f"- {item.content} ({item.kind}: {item.detail})")
+    return "\n".join(lines) + "\n\n"
+
+
 def _build_judge_preamble(
     *,
     scope: Scope,
@@ -2990,6 +3187,7 @@ def _build_judge_preamble(
     input_changes: Sequence[_ChangeEventLike] | None = None,
     window_verbatim_tail: int = WINDOW_VERBATIM_TAIL,
     implied_purpose_min_words: int = IMPLIED_PURPOSE_MIN_WORDS,
+    examined_context: Sequence[ExaminedContextItem] | None = None,
 ) -> str:
     """Compose everything in the user message ahead of the contributions to judge.
 
@@ -2997,6 +3195,10 @@ def _build_judge_preamble(
     and the batch message (:func:`_build_batch_user_message`, ADR 0011 D3) —
     the scope's rendered state is identical either way; only the block of
     contributions under judgment differs.
+
+    *examined_context* (ADR 0017 P6 part 2): renders the EXAMINED CONTEXT block
+    (see :func:`_render_examined_context`) ONLY when non-empty — a scope with
+    nothing examined gets a message byte-identical to before this item.
     """
     _check_mode(mode)
     if current_summary is not None:
@@ -3046,6 +3248,7 @@ def _build_judge_preamble(
         "BUDGET: once your amendment is applied, this summary must be at most "
         f"{summary_max_words} words (context plus every directive's content).\n\n"
     )
+    examined_context_block = _render_examined_context(examined_context or ())
 
     # There is one refresh instruction now (ADR 0015 D6): the splice's
     # MANAGER REFRESH block went with the splice, and a drain is always an
@@ -3091,6 +3294,7 @@ def _build_judge_preamble(
         "\n"
         f"{relevance_block}"
         f"{budget_line}"
+        f"{examined_context_block}"
         f"{refresh_block}"
         f"{input_changes_block}"
         f"{operator_block}"
@@ -3129,6 +3333,7 @@ def _build_user_message(
     window_verbatim_tail: int = WINDOW_VERBATIM_TAIL,
     implied_purpose_min_words: int = IMPLIED_PURPOSE_MIN_WORDS,
     acted_on_target: ActedOnTarget | None = None,
+    examined_context: Sequence[ExaminedContextItem] | None = None,
 ) -> str:
     """Compose the (non-cached) per-call user message for a single contribution.
 
@@ -3136,6 +3341,8 @@ def _build_user_message(
     resolved by the caller. Renders the OUTCOME REPORT block (see
     :func:`_render_outcome_block`) ONLY when given — a contribution without
     ``acted_on`` gets a message byte-identical to before P3 (a test pins this).
+
+    *examined_context* (ADR 0017 P6 part 2): see :func:`_build_judge_preamble`.
     """
     preamble = _build_judge_preamble(
         scope=scope,
@@ -3154,6 +3361,7 @@ def _build_user_message(
         input_changes=input_changes,
         window_verbatim_tail=window_verbatim_tail,
         implied_purpose_min_words=implied_purpose_min_words,
+        examined_context=examined_context,
     )
     outcome_block = "" if acted_on_target is None else _render_outcome_block(acted_on_target)
     return (
@@ -3185,12 +3393,15 @@ def _build_batch_user_message(
     input_changes: Sequence[_ChangeEventLike] | None = None,
     window_verbatim_tail: int = WINDOW_VERBATIM_TAIL,
     implied_purpose_min_words: int = IMPLIED_PURPOSE_MIN_WORDS,
+    examined_context: Sequence[ExaminedContextItem] | None = None,
 ) -> str:
     """Compose the per-call user message for a BATCH of contributions (ADR 0011 D3).
 
     The contributions render in arrival order and are numbered, so the order
     the judge must process them in is unmissable; everything above them is the
     same rendered scope state a single-contribution call gets.
+
+    *examined_context* (ADR 0017 P6 part 2): see :func:`_build_judge_preamble`.
     """
     preamble = _build_judge_preamble(
         scope=scope,
@@ -3209,6 +3420,7 @@ def _build_batch_user_message(
         input_changes=input_changes,
         window_verbatim_tail=window_verbatim_tail,
         implied_purpose_min_words=implied_purpose_min_words,
+        examined_context=examined_context,
     )
     blocks = "\n".join(
         f"CONTRIBUTION {position} OF {len(new_contributions)}:\n"
@@ -3282,6 +3494,7 @@ class ScopeManager:
         change_id: str | None = None,
         hop: int = 0,
         acted_on_target: ActedOnTarget | None = None,
+        examined_context: Sequence[ExaminedContextItem] | None = None,
     ) -> ScopeManagerJudgment:
         """Judge a new contribution against the scope's current state.
 
@@ -3290,6 +3503,12 @@ class ScopeManager:
         (:func:`strata.app.run_contribution`) resolves the target the same way P1's
         ``validate_acted_on`` already did and hands it over. Renders the OUTCOME
         REPORT block; ``None`` for every other contribution renders nothing extra.
+
+        *examined_context* (ADR 0017 P6 part 2): the caller's own resolution of
+        which of this scope's currently-present context items an outcome has
+        tested — renders the EXAMINED CONTEXT block (see
+        :func:`_render_examined_context`) ONLY when non-empty; empty or ``None``
+        renders nothing extra, byte-identical to before this item.
 
         Makes exactly one Anthropic API call using forced ``submit_judgment``
         tool use.  Validates the response, applies the judged amendment
@@ -3479,13 +3698,12 @@ class ScopeManager:
             window_verbatim_tail=window_verbatim_tail,
             implied_purpose_min_words=self._implied_purpose_min_words,
             acted_on_target=acted_on_target,
+            examined_context=examined_context,
         )
         # ADR 0017 P3: a failed_* disposition replaces `acted_on` through the #199
         # path exactly like an ordinary `supersedes` reference does — but only when
         # the target is not a directive (D6: an outcome never replaces a directive).
-        acted_on_replaces_ok = (
-            acted_on_target is not None and acted_on_target.decision == "accept_as_context"
-        )
+        acted_on_replaces_ok = acted_on_target is not None and not acted_on_target.is_directive
 
         # ADR 0014 D3: what a declared `context_sources` is audited against —
         # derived from the same arguments the message above was built from, so
@@ -3511,6 +3729,7 @@ class ScopeManager:
                 change_id=change_id,
                 hop=hop,
                 rendered_item_ids=rendered_item_ids,
+                acted_on_is_directive=acted_on_target is not None and acted_on_target.is_directive,
             )
 
         def _parse_lenient(block) -> ScopeManagerJudgment:  # noqa: ANN001 — tool_use block
@@ -3529,6 +3748,7 @@ class ScopeManager:
                 hop=hop,
                 rendered_item_ids=rendered_item_ids,
                 require_reasoning=False,
+                acted_on_is_directive=acted_on_target is not None and acted_on_target.is_directive,
             )
 
         def _parse_forced_decline(block) -> ScopeManagerJudgment:  # noqa: ANN001
@@ -3677,6 +3897,7 @@ class ScopeManager:
             drop_stale_context=_drop_stale_context,
             parse_lenient=_parse_lenient,
             parse_forced_decline=_parse_forced_decline,
+            acted_on_is_directive=acted_on_target is not None and acted_on_target.is_directive,
         )
 
     def _call_with_correctives(
@@ -3701,6 +3922,7 @@ class ScopeManager:
         drop_stale_context: Callable[[_JudgmentT], _JudgmentT] | None = None,
         parse_lenient: Callable[[object], _JudgmentT] | None = None,
         parse_forced_decline: Callable[[object], _JudgmentT] | None = None,
+        acted_on_is_directive: bool = False,
     ) -> _JudgmentT:
         """Run one judgment call and its correctives, one retry each.
 
@@ -3809,11 +4031,24 @@ class ScopeManager:
                     f"again with the SAME {verdict_noun}, this time including `reasoning` "
                     "— one or two sentences explaining it."
                 )
+            if isinstance(error, _MalformedOrdinaryDecision):
+                return (
+                    f"Your {tool_name} call's `decision` must be exactly one of "
+                    f"{', '.join(_BATCH_DECISIONS)}: {error} "
+                    f"Call {tool_name} again with `decision` set to one of those three values."
+                )
             if isinstance(error, _MalformedDisposition):
+                allowed_desc = (
+                    "held/failed/decline"
+                    if acted_on_is_directive
+                    else "held/failed_corrected/failed_superseded/decline"
+                )
+                count_desc = "three" if acted_on_is_directive else "four"
                 return (
                     f"Your {tool_name} call carries `acted_on`, so `decision` must be "
-                    f"exactly one of held/failed_corrected/failed_superseded/decline: {error} "
-                    f"Call {tool_name} again with `decision` set to one of those four values."
+                    f"exactly one of {allowed_desc}: {error} "
+                    f"Call {tool_name} again with `decision` set to one of those "
+                    f"{count_desc} values."
                 )
             return (
                 f"Your {tool_name} call could not be parsed: {error} "
@@ -3829,6 +4064,8 @@ class ScopeManager:
                 slip = "the first response declined while carrying an amendment"
             elif isinstance(error, _MissingReasoning):
                 slip = "the first response omitted `reasoning`"
+            elif isinstance(error, _MalformedOrdinaryDecision):
+                slip = "the first response's `decision` was not one of the three ordinary values"
             elif isinstance(error, _MalformedDisposition):
                 slip = "the first response's `decision` was not a readable disposition"
             else:
@@ -4111,6 +4348,7 @@ class ScopeManager:
         window_verbatim_tail: int = WINDOW_VERBATIM_TAIL,
         change_ids: Sequence[str] | None = None,
         hop: int = 0,
+        examined_context: Sequence[ExaminedContextItem] | None = None,
     ) -> ScopeManagerBatchJudgment:
         """Judge several new contributions, in arrival order, in ONE call (ADR 0011 D3).
 
@@ -4165,6 +4403,26 @@ class ScopeManager:
 
         if len(new_contributions) == 1:
             only = new_contributions[0]
+            # ADR 0017 P3/P5, #229 review fix: this internal shortcut calls
+            # `self.judge` with no `acted_on_target` — this method never had
+            # the caller's record_store/fleet to resolve one from, so it never
+            # could. `strata.app._judge_batch_and_record` now pulls any
+            # acted_on-carrying member (raised_from unset) out to the
+            # single-contribution path BEFORE ever reaching here — this is
+            # the last-resort guard for a caller that reaches this method
+            # directly, outside that split: fail loud rather than silently
+            # skip the P3 disposition/P4 claim event/P5 raise. A RAISED
+            # contribution (raised_from set) is exempt — it is judged as an
+            # ordinary consequence report, never through the acted_on path.
+            if (
+                only.acted_on is not None or only.acted_on_operator_item is not None
+            ) and only.raised_from is None:
+                raise ValueError(
+                    f"judge_batch called with a single member ({only.id!r}) carrying "
+                    "acted_on/acted_on_operator_item — the batch tool has no outcome-"
+                    "disposition field to judge it correctly. Route it through "
+                    "ScopeManager.judge (with its acted_on_target resolved) instead."
+                )
             judgment = self.judge(
                 scope=scope,
                 stratum=stratum,
@@ -4188,6 +4446,7 @@ class ScopeManager:
                 # way.
                 change_id=wave_ids[0] if len(wave_ids) == 1 else None,
                 hop=hop,
+                examined_context=examined_context,
             )
             return ScopeManagerBatchJudgment(
                 verdicts=[
@@ -4236,6 +4495,7 @@ class ScopeManager:
             input_changes=input_changes,
             window_verbatim_tail=window_verbatim_tail,
             implied_purpose_min_words=self._implied_purpose_min_words,
+            examined_context=examined_context,
         )
 
         rendered_item_ids = _rendered_publication_item_ids(
@@ -4608,6 +4868,7 @@ class ScopeManager:
         hop: int = 0,
         rendered_item_ids: Sequence[str] = (),
         require_reasoning: bool = True,
+        acted_on_is_directive: bool = False,
     ) -> ScopeManagerJudgment:
         """Validate a ``submit_judgment`` payload and apply its amendment.
 
@@ -4628,17 +4889,41 @@ class ScopeManager:
         reasoning: str = _read_reasoning(
             raw, tool_name="submit_judgment", require=require_reasoning
         )
-        # ADR 0017 P3 rev 3 (ruling c′): a no-op unless new_contribution carries
-        # acted_on — every other contribution's decision/reasoning parse exactly as
-        # before, byte for byte (raw["decision"], required by the tool schema). When it
-        # does, `decision` itself is one of the four dispositions — read leniently
-        # (raw.get, not raw[...]) so a missing key routes through the SAME malformed-
-        # disposition corrective as an empty or unrecognized one, rather than a bare
-        # KeyError.
-        if new_contribution.acted_on is not None:
-            decision, outcome_disposition = _resolve_acted_on_decision(raw.get("decision"))
+        # ADR 0017 P3 rev 3 (ruling c′) / P5: a no-op unless new_contribution carries
+        # acted_on OR acted_on_operator_item — every other contribution's
+        # decision/reasoning parse exactly as before, byte for byte (raw["decision"],
+        # required by the tool schema). When it does, `decision` itself is one of
+        # the dispositions — read leniently (raw.get, not raw[...]) so a missing key
+        # routes through the SAME malformed-disposition corrective as an empty or
+        # unrecognized one, rather than a bare KeyError.
+        #
+        # `raised_from` set excludes BOTH: a raised contribution is judged as an
+        # ORDINARY contribution at the issuing scope (app.py's own resolution
+        # already builds no `acted_on_target`/offers no narrowed tool for it — this
+        # gate must agree, or the issuer's genuine accept_as_context/
+        # accept_as_directive verdict gets forced through `_resolve_acted_on_decision`
+        # and rejected as malformed, wasting the one retry and forcing `decline`).
+        if (
+            new_contribution.acted_on is not None
+            or new_contribution.acted_on_operator_item is not None
+        ) and new_contribution.raised_from is None:
+            decision, outcome_disposition = _resolve_acted_on_decision(
+                raw.get("decision"), is_directive=acted_on_is_directive
+            )
         else:
-            decision = raw["decision"]
+            decision = raw.get("decision")
+            # ADR 0017 P5 live-gate finding: defense in depth. Whatever gate above
+            # decided this is NOT an acted_on outcome, an out-of-vocabulary decision
+            # (e.g. a narrowed acted_on tool's own "failed"/"held", reaching here
+            # because that gate and the offered tool schema disagreed) must never
+            # reach `record_judgment` and crash the request on the CHECK constraint
+            # — it fails closed through the SAME one-retry corrective this whole
+            # function already runs, never a bare exception.
+            if decision not in _BATCH_DECISIONS:
+                raise _MalformedOrdinaryDecision(
+                    "submit_judgment's `decision` must be exactly one of "
+                    f"{', '.join(_BATCH_DECISIONS)} (got {decision!r})."
+                )
             outcome_disposition = None
 
         # Issue #201: an id-addressed op with no id reads it off the

@@ -122,6 +122,18 @@ function RecordTrailView({ state, scopeId, onSelectScope }) {
     });
     return map;
   }, [data]);
+  // ADR 0017 P6 part 1, issue #202: condensation_drops covers the WHOLE
+  // scope (never paginated), so this map is built once from the full list
+  // the backend already returned, not re-fetched per page.
+  const condensationDropsById = React.useMemo(() => {
+    const map = new Map();
+    (data ? data.condensation_drops : []).forEach((d) => {
+      const list = map.get(d.contribution_id) || [];
+      list.push(d);
+      map.set(d.contribution_id, list);
+    });
+    return map;
+  }, [data]);
 
   return (
     <div style={{
@@ -176,6 +188,7 @@ function RecordTrailView({ state, scopeId, onSelectScope }) {
                     stateEntry={stateById.get(c.id)}
                     judgment={judgmentById.get(c.id)}
                     attempts={attemptsById.get(c.id) || []}
+                    condensationDrops={condensationDropsById.get(c.id) || []}
                     open={openId === c.id}
                     onToggle={() => setOpenId((prev) => (prev === c.id ? null : c.id))}
                     onOpen={setModalId}
@@ -204,7 +217,24 @@ function RecordTrailView({ state, scopeId, onSelectScope }) {
   );
 }
 
-function RecordEntryRow({ contribution, stateEntry, judgment, attempts, open, onToggle, onOpen }) {
+// "Unexamined", never "poorly standing" (P6 wording rule).
+const CONDENSATION_STATE_WORDS = {
+  corroborated: "corroborated",
+  correcting: "correcting",
+  raised: "raised",
+  unexamined: "unexamined",
+};
+
+function RecordEntryRow({
+  contribution,
+  stateEntry,
+  judgment,
+  attempts,
+  condensationDrops,
+  open,
+  onToggle,
+  onOpen,
+}) {
   const meta = stateWords(stateEntry, attempts, contribution.subject);
   return (
     <div className="activity-row">
@@ -263,6 +293,14 @@ function RecordEntryRow({ contribution, stateEntry, judgment, attempts, open, on
           {contribution.acted_on && (
             <div className="at-caption">Outcome for <code>{contribution.acted_on}</code></div>
           )}
+
+          {condensationDrops.length > 0 && condensationDrops.map((d) => (
+            <div className="at-caption" key={d.id}>
+              No longer verbatim in the summary at v{d.summary_version} (condensed away or reworded){" "}
+              — {CONDENSATION_STATE_WORDS[d.state_at_drop] || d.state_at_drop}
+              {" "}({d.words_before}→{d.words_after} words, budget {d.budget})
+            </div>
+          ))}
 
           <div style={{ fontFamily: "var(--font-mono)", fontSize: 11, color: "var(--at-muted)" }}>
             {contribution.id} · {contribution.contributor.session_id} · {absoluteTime(contribution.created_at)}

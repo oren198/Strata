@@ -1,0 +1,57 @@
+SCOPE: v1160-corpus (id=g_v1160corpus)
+STRATUM: function (ordinal=1)
+
+BUDGET: once your amendment is applied, this summary must be at most 500 words (context plus every directive's content).
+
+INPUT-CHANGE REFRESH: nobody contributed anything — an input this scope's memory rests on changed, and the INPUT CHANGES block below says what. Reconcile THIS SCOPE'S OWN memory with the current inputs. These changes include a removal, so your own beliefs may no longer stand: `supersede`, `retire`, `new_context` and `withdraw_published` are available here. `append` and `publish` are dropped on this path — the changed input is already composed for every reader, so there is nothing of your own to admit from it. Never restate the changed input in `new_context`: not the directive, not the publication, not a note that it now applies. The change is evidence, not an instruction, and a parent's context is still never yours to restate.
+
+INPUT CHANGES (what changed under this scope's memory)
+  - item c_v1160_target: claim_corrected (change chg_v1160corpus)
+      before: An earlier claim, now reported on.
+      after:  The corrected observation.
+      If THIS SCOPE'S PUBLICATION (below) carries this claim IN OTHER WORDS — not the exact bytes — name that published item's id in `withdraw_published`.
+
+ENTITLEMENT (relative to this scope)
+- This scope and its ancestors (entitled — directives and context):
+    g_v1160corpus (v1160-corpus)
+- Scopes below this scope (entitled — evidence proposed upward for this scope to judge on its merits):
+    (none)
+- Scopes referenced by this chain (entitled for CONTEXT only):
+    (none)
+- All other scopes in this fleet, including archived ones (no channel to this scope — their position reaches it only through a person's report or the contributor's own observation, never asserted as their own):
+    (none)
+
+CURRENT SUMMARY
+---
+---
+condensed: false
+scope_id: g_v1160corpus
+updated_at: '2026-08-01T09:00:00+00:00'
+version: 1
+---
+
+# Scope: g_v1160corpus
+
+## Directives
+
+_(none yet)_
+
+## Context
+
+The team favours minimal abstractions.
+
+---
+
+RECENT CONTRIBUTIONS (oldest first — mechanical digest; the newest 3 PRIOR contributions carry full content):
+(none)
+
+NEW CONTRIBUTION TO JUDGE:
+- id: c_v1160_refresh_notice
+- proposed classification: context
+- subject: manager-refresh
+- supersedes: (none)
+- contributor: skill=engineer scope=g_other at=2026-09-26T10:00:00+00:00
+- content:
+    [Input change chg_v1160 — an input this scope's memory rests on has changed.]
+
+Judge it. Call `submit_judgment` exactly once.

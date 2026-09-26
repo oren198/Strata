@@ -85,7 +85,13 @@ already decided…". A document is not a speaker, but whoever handed it over is:
 "pasting their internal notes here" is manufactured only when nobody handed
 them over. Where someone did, the item is hearsay on that person and only D5
 can decline it. Manufactured attribution is declined, and
-the reason names the missing speaker, never the material's topic or origin.
+the reason names the missing speaker, never the material's topic or origin. The
+decline criterion is precise: the contribution asserts what the other scope holds,
+decides, or records, with no one from that scope standing behind it; an inference
+from observed conduct, offered on the contributor's own account, is not manufactured
+attribution — it is first-hand.
+
+Measured on the shipped prompt (qwen3-235b-a22b-2507 via OpenRouter, served by Novita and GMICloud): the 21-item manufactured-attribution family was declined 63 of 63. Three items that assert another scope's rule or decision were not reliably declined: admitted 20 of 20, 2 of 20 and 0 of 20, and all 22 admits went through the hearsay path with an informant the judge made up. The judge rationalises the admit with a source nobody gave it. Whether this is the model or the provider route is not yet separated (#224). See #225 and docs/evidence/v1.16-judge-prompt-examples-2026-09-26.md.
 
 The test is not how precisely the other scope is named. It is whether someone
 the agent actually dealt with is behind the claim.

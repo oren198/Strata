@@ -247,7 +247,7 @@ function LayerBody({ layer }) {
     return <PublicationBody publication={layer.publication} />;
   }
   if (layer.operator_memory) {
-    return <OperatorMemoryBody operatorMemory={layer.operator_memory} />;
+    return <OperatorMemoryBody operatorMemory={layer.operator_memory} scopeId={layer.scope_id} />;
   }
   return null;
 }
@@ -294,9 +294,32 @@ function PublicationBody({ publication }) {
   );
 }
 
-function OperatorMemoryBody({ operatorMemory }) {
+function OperatorMemoryBody({ operatorMemory, scopeId }) {
   const directives = operatorMemory.directives || [];
   const context = operatorMemory.context || [];
+  // ADR 0017 P5: operator_evidence rows attached at this scope's own operator
+  // directives, shown WITH the directive each concerns. Fetched once per
+  // scope (unseen-only; "all" is the same data these rows already track via
+  // seen_at, and isn't needed for the inline marker/expansion below).
+  const [evidenceByItem, setEvidenceByItem] = React.useState({});
+  const [evidenceError, setEvidenceError] = React.useState(null);
+
+  const reloadEvidence = React.useCallback(() => {
+    if (!scopeId) return;
+    STRATA_STORE.fetchOperatorEvidence(scopeId, { all: true })
+      .then((body) => {
+        const grouped = {};
+        for (const row of body.evidence || []) {
+          (grouped[row.operator_item_id] = grouped[row.operator_item_id] || []).push(row);
+        }
+        setEvidenceByItem(grouped);
+        setEvidenceError(null);
+      })
+      .catch((err) => setEvidenceError(err.message || String(err)));
+  }, [scopeId]);
+
+  React.useEffect(() => { reloadEvidence(); }, [reloadEvidence]);
+
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
       {directives.length === 0 ? (
@@ -306,15 +329,83 @@ function OperatorMemoryBody({ operatorMemory }) {
           {directives.map((d, i) => (
             <li key={d.id || i} className="at-body-sm">
               {d.subject ? `${d.subject}: ${d.content}` : d.content}
+              {d.id && evidenceByItem[d.id] && evidenceByItem[d.id].length > 0 && (
+                <EvidenceMarker
+                  reports={evidenceByItem[d.id]}
+                  onMarkSeen={(evidenceId) => {
+                    STRATA_STORE.markOperatorEvidenceSeen(evidenceId).then(reloadEvidence);
+                  }}
+                />
+              )}
             </li>
           ))}
         </ul>
+      )}
+      {evidenceError && (
+        <div className="at-caption" style={{ color: "var(--at-bear)" }}>
+          Could not load evidence: {evidenceError}
+        </div>
       )}
       {context.length > 0 && (
         <ul style={{ listStyle: "none", padding: 0, margin: 0, display: "flex", flexDirection: "column", gap: 6 }}>
           {context.map((c, i) => (
             <li key={c.id || i} className="at-body-sm">
               {c.content}
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+// ADR 0017 P5: "N evidence reports (M unseen)" — expanding shows each report's
+// reporter identity, timestamp, and content verbatim. Opening or reading this
+// never sets seen_at; only the explicit "mark seen" button does.
+function EvidenceMarker({ reports, onMarkSeen }) {
+  const [open, setOpen] = React.useState(false);
+  const unseenCount = reports.filter((r) => !r.seen_at).length;
+
+  return (
+    <div style={{ marginTop: 4 }}>
+      <button
+        className="at-btn at-btn-secondary at-btn-sm"
+        onClick={() => setOpen((prev) => !prev)}
+        style={{ fontSize: 12 }}
+      >
+        {reports.length} evidence report{reports.length === 1 ? "" : "s"}
+        {unseenCount > 0 ? ` (${unseenCount} unseen)` : ""}
+      </button>
+      {open && (
+        <ul style={{
+          listStyle: "none", padding: 0, margin: "6px 0 0 0",
+          display: "flex", flexDirection: "column", gap: 6,
+        }}>
+          {reports.map((r) => (
+            <li key={r.id} style={{
+              background: "var(--at-bg)",
+              border: "1px solid var(--at-rule)",
+              borderRadius: 8, padding: "8px 10px",
+            }}>
+              <div className="at-caption" style={{ display: "flex", justifyContent: "space-between", gap: 8 }}>
+                <span>
+                  {r.reporter_skill ? `${r.reporter_skill}@${r.reporter_scope_id}` : r.reporter_scope_id}
+                  {" — "}{r.reporter_session_id}
+                  {" · "}{new Date(r.created_at).toLocaleString()}
+                  {r.seen_at ? " · seen" : ""}
+                </span>
+                {!r.seen_at && (
+                  <button
+                    className="at-btn at-btn-secondary at-btn-sm"
+                    onClick={() => onMarkSeen(r.id)}
+                  >
+                    Mark seen
+                  </button>
+                )}
+              </div>
+              <div className="at-body-sm" style={{ marginTop: 4, whiteSpace: "pre-wrap" }}>
+                {r.content}
+              </div>
             </li>
           ))}
         </ul>

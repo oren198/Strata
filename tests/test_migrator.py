@@ -99,6 +99,8 @@ def test_full_chain_drops_fleet_tables_and_preserves_record(tmp_path: Path) -> N
         "0015_retirement_circumstance.sql",
         "0016_acted_on.sql",
         "0017_claim_kinds.sql",
+        "0018_raised_from_operator_evidence.sql",
+        "0019_condensation_drops.sql",
     ]
 
     # Fleet tables gone.
@@ -278,10 +280,14 @@ def test_0007_adds_judge_failed_marker_and_leaves_existing_attempts_null(
     migrations_dir = Path(__file__).resolve().parent.parent / "src" / "strata" / "_migrations"
 
     # Apply 0001..0006 only — judgment_attempts has no outcome column there.
+    # (0018 recreates judgment_attempts from its own live shape, `outcome` column
+    # included, so this must stop strictly BEFORE 0007 adds it — not merely skip
+    # 0007 and keep everything after, which broke once a later migration started
+    # rebuilding this table.)
     through_0006 = tmp_path / "through_0006"
     through_0006.mkdir()
     for f in sorted(migrations_dir.glob("*.sql")):
-        if f.name.startswith("0007"):
+        if f.name >= "0007":
             continue
         (through_0006 / f.name).write_text(f.read_text())
     run_migrations(db_path, migrations_dir=through_0006)
@@ -306,7 +312,11 @@ def test_0007_adds_judge_failed_marker_and_leaves_existing_attempts_null(
         conn.close()
 
     applied = run_migrations(db_path, migrations_dir=migrations_dir)
-    assert applied == ["0007_failed_judgment_marker.sql"]
+    # Everything from 0007 onward is pending now (the setup above stops strictly
+    # before it) — this test cares that 0007 itself applied first and did its job,
+    # not that it was the ONLY thing pending, so a prefix check outlives later
+    # migrations being added.
+    assert applied[0] == "0007_failed_judgment_marker.sql"
 
     conn = sqlite3.connect(db_path)
     try:
@@ -356,6 +366,8 @@ def test_idempotent_reapply(tmp_path: Path) -> None:
         "0015_retirement_circumstance.sql",
         "0016_acted_on.sql",
         "0017_claim_kinds.sql",
+        "0018_raised_from_operator_evidence.sql",
+        "0019_condensation_drops.sql",
     ]
 
     second = run_migrations(db_path, migrations_dir=migrations_dir)
@@ -569,6 +581,8 @@ def test_crash_at_tracking_insert_rolls_back_script_too(
         "0015_retirement_circumstance.sql",
         "0016_acted_on.sql",
         "0017_claim_kinds.sql",
+        "0018_raised_from_operator_evidence.sql",
+        "0019_condensation_drops.sql",
     ]
 
 
@@ -938,6 +952,8 @@ def test_0011_preserves_change_events_written_before_it(tmp_path: Path) -> None:
         "0015_retirement_circumstance.sql",
         "0016_acted_on.sql",
         "0017_claim_kinds.sql",
+        "0018_raised_from_operator_evidence.sql",
+        "0019_condensation_drops.sql",
     ]
 
     conn = sqlite3.connect(db_path)
