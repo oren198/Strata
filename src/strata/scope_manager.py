@@ -395,12 +395,34 @@ _ACTED_ON_DECISION_PROPERTY: dict = {
     ),
 }
 
+_ACTED_ON_DIRECTIVE_DECISION_PROPERTY: dict = {
+    "type": "string",
+    "enum": ["held", "failed", "decline"],
+    "description": (
+        "ADR 0017 P5: this contribution reports acting on a DIRECTIVE — the acting "
+        "scope does not own this directive, so there is no claim of this scope's own "
+        "to correct or supersede here, only whether following it held or failed. "
+        "Exactly one of: "
+        "held — an action that could have failed confirmed the directive; "
+        "failed — following it went wrong, and this report's own observation is the "
+        "evidence (the engine raises this upward to whoever issued the directive; "
+        "it is never this scope's place to correct or supersede a directive it does "
+        "not own); "
+        "decline — the report establishes neither a clean hold nor a clean failure. "
+        "held / failed both record as accept_as_context, no claim event; "
+        "decline records as decline."
+    ),
+}
+
 
 def _judge_tool_for(acted_on_target: ActedOnTarget | None) -> dict:
     """The single-contribution judge tool: :data:`JUDGE_TOOL` unchanged, unless this
     call judges an ``acted_on`` contribution, in which case a deep-copied variant
-    whose ``decision`` enum is the four dispositions is returned instead (ADR 0017 P3
-    rev 3, ruling c′).
+    whose ``decision`` enum is narrowed instead — the four dispositions for a
+    context target (ADR 0017 P3 rev 3, ruling c′), or the three-way
+    held/failed/decline for a DIRECTIVE target of either origin, scope-held or
+    operator (ADR 0017 P5): the acting scope never owns a directive either way, so
+    it never corrects or supersedes one.
 
     Deliberately NOT a module-level constant: doing that once, unconditionally, is
     exactly the M1/#212 mistake this function exists to avoid.
@@ -408,7 +430,12 @@ def _judge_tool_for(acted_on_target: ActedOnTarget | None) -> dict:
     if acted_on_target is None:
         return JUDGE_TOOL
     tool = copy.deepcopy(JUDGE_TOOL)
-    tool["input_schema"]["properties"]["decision"] = copy.deepcopy(_ACTED_ON_DECISION_PROPERTY)
+    decision_property = (
+        _ACTED_ON_DIRECTIVE_DECISION_PROPERTY
+        if acted_on_target.is_directive
+        else _ACTED_ON_DECISION_PROPERTY
+    )
+    tool["input_schema"]["properties"]["decision"] = copy.deepcopy(decision_property)
     return tool
 
 
@@ -1322,6 +1349,7 @@ def _read_reasoning(raw: dict, *, tool_name: str, require: bool = True) -> str:
 #: `acted_on`. Never persisted as `judgments.decision` — see
 #: `ScopeManagerJudgment.outcome_disposition`'s docstring.
 _OUTCOME_DISPOSITIONS = frozenset({"held", "failed_corrected", "failed_superseded", "decline"})
+_DIRECTIVE_OUTCOME_DISPOSITIONS = frozenset({"held", "failed", "decline"})
 #: The three that admit the outcome (as accept_as_context); the fourth, "decline", maps
 #: to decision="decline" instead.
 _OUTCOME_ACCEPT_DISPOSITIONS = frozenset({"held", "failed_corrected", "failed_superseded"})
@@ -1340,7 +1368,9 @@ class _MalformedDisposition(ValueError):
     """
 
 
-def _resolve_acted_on_decision(raw_decision: object) -> tuple[str, str]:
+def _resolve_acted_on_decision(
+    raw_decision: object, *, is_directive: bool = False
+) -> tuple[str, str]:
     """Resolve an `acted_on` call's raw `decision` into ``(record_decision,
     outcome_disposition)``, or raise :class:`_MalformedDisposition`.
 
@@ -1350,11 +1380,23 @@ def _resolve_acted_on_decision(raw_decision: object) -> tuple[str, str]:
     ordinary record values, and never anything else); this IS the disposition.
     held/failed_corrected/failed_superseded map to the record decision
     ``accept_as_context``; `decline` maps to ``decision="decline"``.
+
+    ADR 0017 P5: for a DIRECTIVE target, *is_directive* narrows the accepted set to
+    held/failed/decline (never the two failed_* names, and never four values) — the
+    acting scope does not own a directive, so there is no claim of its own to mark
+    corrected or superseded. A value outside the offered set fails closed exactly
+    like an unrecognized value always has, never silently coerced to a neighbor.
     """
-    if raw_decision not in _OUTCOME_DISPOSITIONS:
+    allowed = _DIRECTIVE_OUTCOME_DISPOSITIONS if is_directive else _OUTCOME_DISPOSITIONS
+    if raw_decision not in allowed:
+        wanted = (
+            "held/failed/decline"
+            if is_directive
+            else "held/failed_corrected/failed_superseded/decline"
+        )
         raise _MalformedDisposition(
-            "submit_judgment carries acted_on, so `decision` must be exactly one of "
-            f"held/failed_corrected/failed_superseded/decline (got {raw_decision!r})."
+            f"submit_judgment carries acted_on, so `decision` must be exactly one of "
+            f"{wanted} (got {raw_decision!r})."
         )
     disposition = raw_decision
     record_decision = "decline" if disposition == "decline" else "accept_as_context"
@@ -2162,7 +2204,7 @@ def _with_dropped_note(reasoning: str, dropped_ops: Sequence[str]) -> str:
 
 @dataclass(frozen=True)
 class ActedOnTarget:
-    """The item an ``acted_on`` contribution reports acting on (ADR 0017 P3).
+    """The item an ``acted_on`` contribution reports acting on (ADR 0017 P3/P5).
 
     :meth:`ScopeManager.judge` never reads the record itself — the caller
     (:func:`strata.app.run_contribution`) resolves this once, the same way P1's
@@ -2172,10 +2214,44 @@ class ActedOnTarget:
     replace it at all (D6: a directive has no standing and is never replaced by an
     outcome — see :data:`_SYSTEM_PROMPT` and the ``acted_on_replaces`` wiring in
     :meth:`ScopeManager.judge`).
+
+    ``operator_item`` (ADR 0017 P5, v1.16), when set instead of ``contribution``/
+    ``decision``, means the outcome reports acting on an OPERATOR directive —
+    operator directives never enter a scope's own record (ADR 0008 D4), so they
+    carry no judgment and no contributor. Exactly one of ``contribution`` or
+    ``operator_item`` is ever set.
     """
 
-    contribution: Contribution
-    decision: Literal["accept_as_directive", "accept_as_context"]
+    contribution: Contribution | None
+    decision: Literal["accept_as_directive", "accept_as_context"] | None
+    operator_item: OperatorItem | None = None
+
+    @property
+    def is_directive(self) -> bool:
+        """True for ANY directive target — scope-held or operator — never standing,
+        never replaced (D6). Drives the narrower {held, failed, decline} tool
+        contract (P5): the acting scope does not own a directive either way."""
+        return self.operator_item is not None or self.decision == "accept_as_directive"
+
+    @property
+    def target_id(self) -> str:
+        return self.operator_item.id if self.operator_item is not None else self.contribution.id
+
+    @property
+    def target_content(self) -> str:
+        return (
+            self.operator_item.content
+            if self.operator_item is not None
+            else self.contribution.content
+        )
+
+    @property
+    def target_subject(self) -> str | None:
+        return (
+            self.operator_item.subject
+            if self.operator_item is not None
+            else self.contribution.subject
+        )
 
 
 class ScopeManagerJudgment(_AmendmentJudgment):
@@ -2194,16 +2270,21 @@ class ScopeManagerJudgment(_AmendmentJudgment):
     """Brief explanation of the verdict — written to the judgment record."""
 
     outcome_disposition: (
-        Literal["held", "failed_corrected", "failed_superseded", "decline"] | None
+        Literal["held", "failed_corrected", "failed_superseded", "failed", "decline"] | None
     ) = None
-    """ADR 0017 P3: the judge's tool-level disposition for a contribution carrying
+    """ADR 0017 P3/P5: the judge's tool-level disposition for a contribution carrying
     ``acted_on`` — ``None`` for every other contribution. This is NEVER what persists
     as :attr:`decision` (the ``judgments.decision`` column stays CHECK-constrained to
     its original three values — the ruling's own "implementation note"): held maps to
     ``accept_as_context`` with no change event; failed_corrected/failed_superseded map
     to ``accept_as_context`` plus a ``claim_corrected``/``claim_superseded`` change
     event linking this contribution (the source) to ``acted_on`` (the target); decline
-    maps to ``decision="decline"``. Carried on the judgment object (not the DB row) so
+    maps to ``decision="decline"``. ``failed`` (P5, DIRECTIVE targets only — the
+    acting scope owns no claim of its own to correct or supersede) maps to
+    ``accept_as_context`` with no change event either, same as held — the engine's
+    own signal to act on is that this contribution's :attr:`acted_on` target is a
+    directive whose issuer differs from the reporting scope, not the disposition
+    name itself. Carried on the judgment object (not the DB row) so
     :meth:`ScopeManager.judge`'s caller (:func:`strata.app.run_contribution`) knows
     which change event, if any, to write in the same transaction as the judgment."""
 
@@ -2862,15 +2943,12 @@ def _render_outcome_block(target: ActedOnTarget) -> str:
     v1.14's M1 (#212) failed at and #212 fixed: a block added to every prompt degrades
     general judging even when most prompts have nothing to do with it.
     """
+    if target.is_directive:
+        return _render_directive_outcome_block(target)
+    # Reaching here means target.decision == "accept_as_context": is_directive
+    # above is the only gate for "accept_as_directive", so this path is a
+    # context target exclusively (ADR 0017 P5) — kept byte-identical to base.
     c = target.contribution
-    directive_caveat = (
-        "NOTE: this item is a DIRECTIVE. A directive has no standing and is never "
-        "replaced by an outcome (D6): failed_corrected/failed_superseded here still "
-        "admit the report as context, but the directive itself is left untouched — do "
-        "not attempt to retire, supersede, or otherwise change it.\n"
-        if target.decision == "accept_as_directive"
-        else ""
-    )
     return (
         "OUTCOME REPORT — this contribution carries `acted_on`, reporting what "
         "happened when the contributor acted on the item below. Judge it with ONE "
@@ -2884,7 +2962,6 @@ def _render_outcome_block(target: ActedOnTarget) -> str:
         f"- contributor: {_render_contributor(c.contributor)}\n"
         "- content:\n"
         f"    {c.content}\n"
-        f"{directive_caveat}"
         "\n"
         "Set `decision` to exactly one:\n"
         "  - held: an ACTION THAT COULD HAVE FAILED CONFIRMED THE ITEM — never merely "
@@ -2916,6 +2993,62 @@ def _render_outcome_block(target: ActedOnTarget) -> str:
         "engine already catches on its own — name that published item's id in "
         "`withdraw_published`. A published face that still asserts a claim you just "
         "found wrong is stale evidence for every reader of it.\n"
+        "\n"
+    )
+
+
+def _render_directive_outcome_block(target: ActedOnTarget) -> str:
+    """The OUTCOME REPORT block for a DIRECTIVE target — scope-held or operator
+    (ADR 0017 P5). Split out from :func:`_render_outcome_block` because the
+    disposition set genuinely narrows here, not merely gains a caveat line: the
+    acting scope never owns a directive either way, so there is no claim of
+    its own to correct or supersede, and no `withdraw_published` step. A
+    `failed` verdict is the engine's own signal to raise the outcome upward to
+    whoever issued the directive (:meth:`ScopeManager.judge`'s caller) — it is
+    never this scope's place to do that itself.
+    """
+    issuer = "operator" if target.operator_item is not None else target.contribution.scope_id
+    contributor_line = (
+        f"- contributor: {_render_contributor(target.contribution.contributor)}\n"
+        if target.contribution is not None
+        else ""
+    )
+    return (
+        "OUTCOME REPORT — this contribution carries `acted_on`, reporting what "
+        "happened when the contributor acted on the DIRECTIVE below. Judge it with "
+        "ONE field: set `decision` to exactly one of the three values below (see the "
+        "rule below).\n"
+        "\n"
+        "DIRECTIVE ACTED ON (verbatim, as currently held):\n"
+        f"- id: {target.target_id}\n"
+        f"- subject: {target.target_subject or '(none)'}\n"
+        f"- issuer: {issuer}\n"
+        f"{contributor_line}"
+        "- content:\n"
+        f"    {target.target_content}\n"
+        "NOTE: the acting scope does not own this directive. A directive has no "
+        "standing and is never replaced by an outcome (D6): whatever `decision` you "
+        "reach, the directive itself is left untouched — do not attempt to retire, "
+        "supersede, or otherwise change it.\n"
+        "\n"
+        "Set `decision` to exactly one:\n"
+        "  - held: an ACTION THAT COULD HAVE FAILED CONFIRMED THE DIRECTIVE — never "
+        'merely that it reads as sound. An echo ("followed it and it worked") is NOT '
+        "held: nothing was risked, so nothing was tested. Your reasoning must QUOTE, "
+        "in one clause, the observed result you relied on.\n"
+        "  - failed: FOLLOWING THE DIRECTIVE WENT WRONG. This report's own "
+        "observation is the evidence — it is not this scope's place to correct or "
+        "supersede the directive itself; the engine raises the failure upward to "
+        "whoever issued it.\n"
+        "  - decline: the report establishes neither a clean hold nor a clean "
+        'failure — an echo, an ambiguous result ("partially worked"), or a pending '
+        'one ("result unclear"). Your reasoning must name the MISSING GROUND '
+        'FIRST — begin "no outcome: the action could not have failed" or "no '
+        'outcome reported" — and only then, as guidance, say it may be resubmitted '
+        "WITHOUT `acted_on` if worth keeping as ordinary context.\n"
+        "held / failed record as accept_as_context; decline records as decline — "
+        "the engine derives this from `decision` itself, there is no separate field "
+        "to fill.\n"
         "\n"
     )
 
@@ -3483,9 +3616,7 @@ class ScopeManager:
         # ADR 0017 P3: a failed_* disposition replaces `acted_on` through the #199
         # path exactly like an ordinary `supersedes` reference does — but only when
         # the target is not a directive (D6: an outcome never replaces a directive).
-        acted_on_replaces_ok = (
-            acted_on_target is not None and acted_on_target.decision == "accept_as_context"
-        )
+        acted_on_replaces_ok = acted_on_target is not None and not acted_on_target.is_directive
 
         # ADR 0014 D3: what a declared `context_sources` is audited against —
         # derived from the same arguments the message above was built from, so
@@ -3511,6 +3642,7 @@ class ScopeManager:
                 change_id=change_id,
                 hop=hop,
                 rendered_item_ids=rendered_item_ids,
+                acted_on_is_directive=acted_on_target is not None and acted_on_target.is_directive,
             )
 
         def _parse_lenient(block) -> ScopeManagerJudgment:  # noqa: ANN001 — tool_use block
@@ -3529,6 +3661,7 @@ class ScopeManager:
                 hop=hop,
                 rendered_item_ids=rendered_item_ids,
                 require_reasoning=False,
+                acted_on_is_directive=acted_on_target is not None and acted_on_target.is_directive,
             )
 
         def _parse_forced_decline(block) -> ScopeManagerJudgment:  # noqa: ANN001
@@ -3677,6 +3810,7 @@ class ScopeManager:
             drop_stale_context=_drop_stale_context,
             parse_lenient=_parse_lenient,
             parse_forced_decline=_parse_forced_decline,
+            acted_on_is_directive=acted_on_target is not None and acted_on_target.is_directive,
         )
 
     def _call_with_correctives(
@@ -3701,6 +3835,7 @@ class ScopeManager:
         drop_stale_context: Callable[[_JudgmentT], _JudgmentT] | None = None,
         parse_lenient: Callable[[object], _JudgmentT] | None = None,
         parse_forced_decline: Callable[[object], _JudgmentT] | None = None,
+        acted_on_is_directive: bool = False,
     ) -> _JudgmentT:
         """Run one judgment call and its correctives, one retry each.
 
@@ -3810,10 +3945,17 @@ class ScopeManager:
                     "— one or two sentences explaining it."
                 )
             if isinstance(error, _MalformedDisposition):
+                allowed_desc = (
+                    "held/failed/decline"
+                    if acted_on_is_directive
+                    else "held/failed_corrected/failed_superseded/decline"
+                )
+                count_desc = "three" if acted_on_is_directive else "four"
                 return (
                     f"Your {tool_name} call carries `acted_on`, so `decision` must be "
-                    f"exactly one of held/failed_corrected/failed_superseded/decline: {error} "
-                    f"Call {tool_name} again with `decision` set to one of those four values."
+                    f"exactly one of {allowed_desc}: {error} "
+                    f"Call {tool_name} again with `decision` set to one of those "
+                    f"{count_desc} values."
                 )
             return (
                 f"Your {tool_name} call could not be parsed: {error} "
@@ -4608,6 +4750,7 @@ class ScopeManager:
         hop: int = 0,
         rendered_item_ids: Sequence[str] = (),
         require_reasoning: bool = True,
+        acted_on_is_directive: bool = False,
     ) -> ScopeManagerJudgment:
         """Validate a ``submit_judgment`` payload and apply its amendment.
 
@@ -4636,7 +4779,9 @@ class ScopeManager:
         # disposition corrective as an empty or unrecognized one, rather than a bare
         # KeyError.
         if new_contribution.acted_on is not None:
-            decision, outcome_disposition = _resolve_acted_on_decision(raw.get("decision"))
+            decision, outcome_disposition = _resolve_acted_on_decision(
+                raw.get("decision"), is_directive=acted_on_is_directive
+            )
         else:
             decision = raw["decision"]
             outcome_disposition = None

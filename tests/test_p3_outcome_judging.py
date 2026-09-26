@@ -348,11 +348,19 @@ def test_held_never_triggers_the_199_backstop_against_its_own_target() -> None:
 
 
 def test_a_directive_target_is_never_replaced_by_a_failed_disposition() -> None:
-    """CEO ruling: failed_* against a directive target -> accept_as_context only, no
-    #199 replacement attempted (the directive isn't in `current_summary.context` to
-    begin with, so this also proves the backstop wasn't even consulted for it)."""
+    """ADR 0017 P5: a directive target's decision enum narrows to
+    held/failed/decline (never failed_corrected/failed_superseded — there is no
+    claim of the acting scope's own to correct or supersede for a directive it
+    does not own). `failed` -> accept_as_context only, no #199 replacement
+    attempted (the directive isn't in `current_summary.context` to begin with, so
+    this also proves the backstop wasn't even consulted for it)."""
     j, client = _judge(
-        _failed_corrected(new_context="Something else entirely, no TLS mention."),
+        {
+            "decision": "failed",
+            "reasoning": "Tried TLS 1.3; the peer only supports 1.2, so the directive failed.",
+            "directive_ops": [],
+            "new_context": "Something else entirely, no TLS mention.",
+        },
         target=DIRECTIVE_TARGET,
         contribution=Contribution(
             id="c_outcome02",
@@ -368,17 +376,21 @@ def test_a_directive_target_is_never_replaced_by_a_failed_disposition() -> None:
     )
     assert client.messages.create.call_count == 1  # no #199 re-ask fired
     assert j.decision == "accept_as_context"
-    assert j.outcome_disposition == "failed_corrected"
+    assert j.outcome_disposition == "failed"
 
 
 def test_prompt_tells_the_judge_the_target_is_a_directive() -> None:
+    """ADR 0017 P5: a directive target gets a wholly separate block (never
+    replaced by an outcome, and the acting scope does not own it) rather than the
+    P3 four-way block plus a caveat line."""
     from strata.scope_manager import _render_outcome_block
 
     block = _render_outcome_block(DIRECTIVE_TARGET)
-    assert "this item is a DIRECTIVE" in block
+    assert "DIRECTIVE" in block
+    assert "does not own this directive" in block
     assert "never replaced by an outcome" in block
     context_block = _render_outcome_block(CONTEXT_TARGET)
-    assert "this item is a DIRECTIVE" not in context_block
+    assert "does not own this directive" not in context_block
 
 
 # --- golden: the block appears only with acted_on_target, and never otherwise ---------
