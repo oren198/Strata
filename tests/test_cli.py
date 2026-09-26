@@ -816,6 +816,126 @@ def test_operator_publish_and_show(
     assert "Operator acts:" in show_all_out
 
 
+def test_operator_evidence_root_prints_help(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``strata operator evidence`` with no subcommand prints the group's help."""
+    _seed_fleet(tmp_path, monkeypatch)
+    rc = main(["operator", "evidence"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "list" in out
+    assert "seen" in out
+
+
+def test_operator_evidence_list_is_empty_by_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _seed_fleet(tmp_path, monkeypatch)
+    rc = main(["operator", "evidence", "list"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "(no unseen evidence)" in out
+
+
+def test_operator_evidence_list_shows_it_with_the_directive_and_marks_seen(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """ADR 0017 P5: an unjudged operator raise is shown grouped WITH the
+    directive it concerns, unseen by default, and stops appearing (unseen)
+    once explicitly marked seen — never by the list read itself."""
+    _seed_fleet(tmp_path, monkeypatch)
+    db_path = tmp_path / "test.db"
+
+    main(
+        [
+            "operator",
+            "publish",
+            "g_arch",
+            "--content",
+            "All services must use TLS 1.3.",
+            "--subject",
+            "tls",
+        ]
+    )
+    publish_out = capsys.readouterr().out
+    op_id = publish_out.split("[")[1].split("]")[0]
+
+    from strata.record_store import ContributorRef, OperatorEvidenceInput, RecordStore
+
+    with RecordStore(str(db_path)) as rs:
+        outcome_id = rs.append_contribution(
+            scope_id="g_arch",
+            content="Tried it; TLS 1.3 unsupported by peer.",
+            proposed_classification="context",
+            subject=None,
+            supersedes=None,
+            contributor=ContributorRef(
+                scope_id="g_arch", skill="engineer", session_id="s1", ts="2026-09-26T00:00:00Z"
+            ),
+        ).id
+        rs.record_judgment_and_raise(
+            contribution_id=outcome_id,
+            decision="accept_as_context",
+            judged_by="scope-manager",
+            raise_operator_evidence=OperatorEvidenceInput(
+                operator_item_id=op_id,
+                raised_from=outcome_id,
+                reporter=ContributorRef(
+                    scope_id="g_arch",
+                    skill="engineer",
+                    session_id="s1",
+                    ts="2026-09-26T00:00:00Z",
+                ),
+                content=f"evidence from g_arch: following {op_id} went wrong: unsupported peer.",
+            ),
+        )
+        evidence_rows = rs.list_operator_evidence(operator_item_id=op_id)
+    evidence_id = evidence_rows[0].id
+
+    # Shown in `strata operator show`, grouped with its directive.
+    rc = main(["operator", "show", "g_arch"])
+    assert rc == 0
+    show_out = capsys.readouterr().out
+    assert "unseen evidence" in show_out
+
+    # Shown in `strata operator evidence list`, grouped with its directive.
+    rc = main(["operator", "evidence", "list"])
+    assert rc == 0
+    list_out = capsys.readouterr().out
+    assert op_id in list_out
+    assert "All services must use TLS 1.3." in list_out
+    assert "UNSEEN" in list_out
+    assert "unsupported peer" in list_out
+
+    # Mark seen — an explicit operator act.
+    rc = main(["operator", "evidence", "seen", evidence_id])
+    assert rc == 0
+    seen_out = capsys.readouterr().out
+    assert evidence_id in seen_out
+
+    rc = main(["operator", "evidence", "list"])
+    assert rc == 0
+    after_out = capsys.readouterr().out
+    assert "(no unseen evidence)" in after_out
+
+    rc = main(["operator", "evidence", "list", "--all"])
+    assert rc == 0
+    all_out = capsys.readouterr().out
+    assert evidence_id in all_out
+    assert "UNSEEN" not in all_out
+
+
+def test_operator_evidence_seen_rejects_an_unknown_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _seed_fleet(tmp_path, monkeypatch)
+    rc = main(["operator", "evidence", "seen", "oev_doesnotexist"])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "Evidence not found" in err
+
+
 def test_operator_publish_configures_cross_process_lock_dir(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
