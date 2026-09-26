@@ -4771,14 +4771,24 @@ class ScopeManager:
         reasoning: str = _read_reasoning(
             raw, tool_name="submit_judgment", require=require_reasoning
         )
-        # ADR 0017 P3 rev 3 (ruling c′): a no-op unless new_contribution carries
-        # acted_on — every other contribution's decision/reasoning parse exactly as
-        # before, byte for byte (raw["decision"], required by the tool schema). When it
-        # does, `decision` itself is one of the four dispositions — read leniently
-        # (raw.get, not raw[...]) so a missing key routes through the SAME malformed-
-        # disposition corrective as an empty or unrecognized one, rather than a bare
-        # KeyError.
-        if new_contribution.acted_on is not None:
+        # ADR 0017 P3 rev 3 (ruling c′) / P5: a no-op unless new_contribution carries
+        # acted_on OR acted_on_operator_item — every other contribution's
+        # decision/reasoning parse exactly as before, byte for byte (raw["decision"],
+        # required by the tool schema). When it does, `decision` itself is one of
+        # the dispositions — read leniently (raw.get, not raw[...]) so a missing key
+        # routes through the SAME malformed-disposition corrective as an empty or
+        # unrecognized one, rather than a bare KeyError.
+        #
+        # `raised_from` set excludes BOTH: a raised contribution is judged as an
+        # ORDINARY contribution at the issuing scope (app.py's own resolution
+        # already builds no `acted_on_target`/offers no narrowed tool for it — this
+        # gate must agree, or the issuer's genuine accept_as_context/
+        # accept_as_directive verdict gets forced through `_resolve_acted_on_decision`
+        # and rejected as malformed, wasting the one retry and forcing `decline`).
+        if (
+            new_contribution.acted_on is not None
+            or new_contribution.acted_on_operator_item is not None
+        ) and new_contribution.raised_from is None:
             decision, outcome_disposition = _resolve_acted_on_decision(
                 raw.get("decision"), is_directive=acted_on_is_directive
             )
