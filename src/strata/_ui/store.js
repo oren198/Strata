@@ -209,6 +209,26 @@
     );
   }
 
+  // ADR 0017 P5: operator_evidence rows attached at a scope's own operator
+  // directives — unseen only by default, `all` includes already-seen rows.
+  async function fetchOperatorEvidence(scope_id, { all } = {}) {
+    const base = getApiBase();
+    const qs = all ? "?all=true" : "";
+    const resp = await fetch(
+      `${base}/scopes/${encodeURIComponent(scope_id)}/operator-evidence${qs}`,
+    );
+    if (!resp.ok) {
+      throw new Error(`GET /scopes/${scope_id}/operator-evidence returned ${resp.status}`);
+    }
+    return resp.json(); // { evidence: [...] }
+  }
+
+  // Mark one evidence row seen — an explicit operator act, never a bare read.
+  async function markOperatorEvidenceSeen(evidence_id) {
+    const base = getApiBase();
+    return _post(`${base}/operator-evidence/${encodeURIComponent(evidence_id)}/seen`, {});
+  }
+
   // Helpers used in graph layout.
   function stratumIndex(state, stratum_id) {
     return state.strata.findIndex((s) => s.id === stratum_id);
@@ -237,6 +257,8 @@
     fetchScopePublicationRecord,
     supersedeDirective,
     retireDirective,
+    fetchOperatorEvidence,
+    markOperatorEvidenceSeen,
     stratumIndex,
     edgeAllowed,
     loadPrefs,

@@ -2848,6 +2848,67 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
         return composed
 
     # -----------------------------------------------------------------------
+    # GET /scopes/{scope_id}/operator-evidence
+    # POST /operator-evidence/{evidence_id}/seen
+    # -----------------------------------------------------------------------
+
+    @application.get("/scopes/{scope_id}/operator-evidence")
+    def get_scope_operator_evidence(
+        scope_id: str,
+        request: Request,
+        all: bool = False,  # noqa: A002 — mirrors the CLI's own --all flag
+        record_store: RecordStore = Depends(get_record_store),
+        summary_store: SummaryStore = Depends(get_summary_store),
+    ) -> dict:
+        """Return operator_evidence rows for the operator directives attached AT
+        *scope_id* (ADR 0017 P5) — the Console surface for the same read
+        ``strata operator evidence`` gives the CLI. Unseen only by default;
+        ``?all=true`` includes already-seen rows too.
+
+        Grouped by ``operator_item_id`` client-side (the same "shown WITH the
+        directive it concerns" discipline as the CLI): this route returns a
+        flat ``evidence`` list, each row carrying its own ``operator_item_id``,
+        rather than pre-grouping server-side — the Console already has each
+        directive's own id from the perspective it just composed.
+
+        Same entitlement as the operator/perspective view: 404 only if the
+        scope itself is unknown, exactly like ``GET .../perspective``.
+        """
+        from dataclasses import asdict
+
+        from strata.operator import read_operator_layer
+
+        fleet: FleetConfig = request.app.state.fleet_reloader.get()
+        scope = fleet.get_scope(scope_id)
+        if scope is None:
+            raise HTTPException(status_code=404, detail=f"Scope not found: {scope_id!r}")
+
+        item_ids = {
+            item.id
+            for item in read_operator_layer(
+                scope_id, summaries_dir=str(summary_store.summaries_dir)
+            )
+        }
+        rows = record_store.list_operator_evidence(unseen_only=not all)
+        return {"evidence": [asdict(e) for e in rows if e.operator_item_id in item_ids]}
+
+    @application.post("/operator-evidence/{evidence_id}/seen")
+    def mark_operator_evidence_seen_route(
+        evidence_id: str,
+        record_store: RecordStore = Depends(get_record_store),
+    ) -> dict:
+        """Mark one operator_evidence row seen — the Console surface for
+        ``strata operator evidence seen`` (ADR 0017 P5): an explicit act, called
+        ONLY from a "mark seen" button, never from opening or reading a row.
+        """
+        if not any(e.id == evidence_id for e in record_store.list_operator_evidence()):
+            raise HTTPException(status_code=404, detail=f"Evidence not found: {evidence_id!r}")
+        record_store.mark_operator_evidence_seen(
+            evidence_id, seen_at=datetime.now(tz=UTC).isoformat()
+        )
+        return {"evidence_id": evidence_id, "seen": True}
+
+    # -----------------------------------------------------------------------
     # GET /scopes/{scope_id}/record
     # -----------------------------------------------------------------------
 
