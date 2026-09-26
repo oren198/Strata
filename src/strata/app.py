@@ -1122,10 +1122,10 @@ def _write_amendment(
                     state_at_drop = "corroborated"
                 elif record_store.claim_event_for(dropped_id) is not None:
                     state_at_drop = "correcting"
-                # TODO(P6 part 2): the philosopher ruled a raised consequence's own
-                # acceptance at the issuer is EXAMINED (P5) — 'raised' below covers
-                # the dropped item itself being one; part 2 lists 'raised' among the
-                # examined states on the judge-input side too.
+                # The philosopher ruled a raised consequence's own acceptance at the
+                # issuer is EXAMINED (P5) — part 2 (`_resolve_examined_context`)
+                # already lists 'raised' among the examined states on the
+                # judge-input side too, the same priority order as here.
                 elif by_id[dropped_id].raised_from is not None:
                     state_at_drop = "raised"
                 else:
@@ -1390,7 +1390,22 @@ def _judge_batch_and_record(
     Each verdict lands as its own judgment row against its own contribution id
     (the UNIQUE constraint is untouched), and a failed call writes one
     judgment-attempt row per member (issues #57/#118). The whole batch produces
-    exactly ONE summary write.
+    exactly ONE summary write — except when it contains an ``acted_on`` member
+    (see below), which splits it into more than one.
+
+    ADR 0017 P3/P5, #229 review fix: the batch tool offers no outcome-
+    disposition field at all, so a member carrying ``acted_on`` or
+    ``acted_on_operator_item`` (with ``raised_from`` unset — a RAISED
+    contribution is judged as an ORDINARY consequence report at the issuer,
+    never through the acted_on path, so it batches normally, by design) is
+    NEVER passed to :meth:`ScopeManager.judge_batch` — it would silently skip
+    the P3 disposition, the P4 claim event, and the P5 raise. Such a member is
+    pulled out and judged through :func:`_judge_and_record` instead, in
+    ARRIVAL ORDER, interleaved with the surrounding ordinary members (batched
+    among themselves in their own sub-groups) so every judgment still sees the
+    correctly-amended summary everything before it left behind — under the
+    SAME lock this whole function already requires. A batch with no acted_on
+    member takes the path below exactly as before.
 
     The caller MUST hold ``_scope_lock(scope.id)``.
     """
@@ -1424,6 +1439,78 @@ def _judge_batch_and_record(
             ]
         except JudgeUnavailable as exc:
             return [exc]
+
+    def _carries_acted_on(c: Contribution) -> bool:
+        return (
+            c.acted_on is not None or c.acted_on_operator_item is not None
+        ) and c.raised_from is None
+
+    if any(_carries_acted_on(c) for c in contributions):
+        results_by_id: dict[str, ContributionOutcome | JudgeUnavailable] = {}
+        pending_group: list[Contribution] = []
+
+        def _flush_ordinary_group() -> None:
+            if not pending_group:
+                return
+            # Recurses ONCE: `pending_group` has no acted_on member (they were
+            # all pulled out below), so this call takes the len==1 shortcut
+            # above or the ordinary batch path further down — never this
+            # branch again. Note: if this scope's queued batch mixes an
+            # acted_on member with a MULTI-WAVE refresh (change_ids has more
+            # than one id), the same `change_ids` are handed to every flushed
+            # sub-group rather than split among them — rare (a refresh notice
+            # never carries acted_on itself), and each sub-group's own
+            # amendment still records a real, correct wave attribution; it is
+            # just not exclusive across sub-groups.
+            for c, r in zip(
+                pending_group,
+                _judge_batch_and_record(
+                    contributions=list(pending_group),
+                    scope=scope,
+                    stratum=stratum,
+                    fleet=fleet,
+                    record_store=record_store,
+                    summary_store=summary_store,
+                    scope_manager=scope_manager,
+                    summary_max_words=summary_max_words,
+                    window_verbatim_tail=window_verbatim_tail,
+                    recency_window_size=recency_window_size,
+                    mode=mode,
+                    input_changes=input_changes,
+                    change_ids=change_ids,
+                    hop=hop,
+                ),
+                strict=True,
+            ):
+                results_by_id[c.id] = r
+            pending_group.clear()
+
+        for contribution in contributions:
+            if _carries_acted_on(contribution):
+                _flush_ordinary_group()
+                try:
+                    results_by_id[contribution.id] = _judge_and_record(
+                        contribution=contribution,
+                        scope=scope,
+                        stratum=stratum,
+                        fleet=fleet,
+                        record_store=record_store,
+                        summary_store=summary_store,
+                        scope_manager=scope_manager,
+                        summary_max_words=summary_max_words,
+                        window_verbatim_tail=window_verbatim_tail,
+                        recency_window_size=recency_window_size,
+                        mode=mode,
+                        input_changes=input_changes,
+                        change_id=wave_ids[0] if len(wave_ids) == 1 else None,
+                        hop=hop,
+                    )
+                except JudgeUnavailable as exc:
+                    results_by_id[contribution.id] = exc
+            else:
+                pending_group.append(contribution)
+        _flush_ordinary_group()
+        return [results_by_id[c.id] for c in contributions]
 
     inputs = _read_judge_inputs(
         scope=scope,

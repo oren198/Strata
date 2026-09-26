@@ -4403,6 +4403,26 @@ class ScopeManager:
 
         if len(new_contributions) == 1:
             only = new_contributions[0]
+            # ADR 0017 P3/P5, #229 review fix: this internal shortcut calls
+            # `self.judge` with no `acted_on_target` — this method never had
+            # the caller's record_store/fleet to resolve one from, so it never
+            # could. `strata.app._judge_batch_and_record` now pulls any
+            # acted_on-carrying member (raised_from unset) out to the
+            # single-contribution path BEFORE ever reaching here — this is
+            # the last-resort guard for a caller that reaches this method
+            # directly, outside that split: fail loud rather than silently
+            # skip the P3 disposition/P4 claim event/P5 raise. A RAISED
+            # contribution (raised_from set) is exempt — it is judged as an
+            # ordinary consequence report, never through the acted_on path.
+            if (
+                only.acted_on is not None or only.acted_on_operator_item is not None
+            ) and only.raised_from is None:
+                raise ValueError(
+                    f"judge_batch called with a single member ({only.id!r}) carrying "
+                    "acted_on/acted_on_operator_item — the batch tool has no outcome-"
+                    "disposition field to judge it correctly. Route it through "
+                    "ScopeManager.judge (with its acted_on_target resolved) instead."
+                )
             judgment = self.judge(
                 scope=scope,
                 stratum=stratum,
