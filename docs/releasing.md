@@ -42,3 +42,11 @@ has an owner. The operator's steps are approvals on GitHub; nobody uploads to Py
    strata-evals. It is the only check that calls the judge interface from outside this repo. In
    v1.15, P3 passed a new keyword to every `judge()` call; all in-repo fakes were updated, so the
    Strata suite passed, while every out-of-repo judge broke with a 500 on each `/contribute`.
+13. **Test the judge path with live-shape responses, not only fake judges.** For any branch that
+   changes what the judge returns or how it is parsed, at least one test replays a real captured
+   judge response (the raw `tool_use` input from a live call) through the real parse and contribute
+   path. In v1.16 P5, every fake-judge test passed, but live qwen output went down an unguarded
+   parse branch. The operator evidence was silently dropped, raised contributions were forced to
+   decline, and an out-of-vocabulary decision reached the database and returned a 500 on
+   `/contribute`. A contribute path must never 500 on a judge verdict: an unexpected decision fails
+   closed through the re-ask and the recorded unreadable-judgment decline.
