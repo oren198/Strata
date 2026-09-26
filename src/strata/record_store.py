@@ -1050,6 +1050,27 @@ class RecordStore:
         rows = self.list_operator_evidence()
         return next((e for e in rows if e.raised_from == outcome_contribution_id), None)
 
+    def count_raised_by_issuer(self) -> dict[str, int]:
+        """Count of engine-raised contributions per ISSUING scope (ADR 0017 P5,
+        the CEO stats add): "reported separately as system-raised", never
+        counted alongside a session's own write-back — see
+        :func:`strata.__main__.cmd_stats_writeback`'s own callers. Excludes
+        operator raises (:meth:`count_raised_operator_evidence`), which have no
+        scope to group by.
+        """
+        rows = self._conn.execute(
+            "SELECT scope_id, COUNT(*) AS n FROM contributions "
+            "WHERE raised_from IS NOT NULL GROUP BY scope_id"
+        ).fetchall()
+        return {row["scope_id"]: row["n"] for row in rows}
+
+    def count_raised_operator_evidence(self) -> int:
+        """Total operator_evidence rows (ADR 0017 P5) — the operator-issuer
+        counterpart to :meth:`count_raised_by_issuer`, which counts only
+        scope-issuer raises."""
+        row = self._conn.execute("SELECT COUNT(*) AS n FROM operator_evidence").fetchone()
+        return row["n"]
+
     # ------------------------------------------------------------------
     # Judgments
     # ------------------------------------------------------------------

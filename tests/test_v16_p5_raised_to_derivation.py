@@ -168,6 +168,52 @@ def test_get_raised_operator_evidence_finds_the_raise(tmp_path: Path) -> None:
     assert rs.get_raised_contribution(outcome_id) is None
 
 
+# --- system-raised counts (CEO stats add) ---------------------------------------------
+
+
+def test_count_raised_by_issuer_is_empty_when_nothing_was_raised(tmp_path: Path) -> None:
+    db_path, rs = _quick_db(tmp_path)
+    assert rs.count_raised_by_issuer() == {}
+    assert rs.count_raised_operator_evidence() == 0
+
+
+def test_count_raised_by_issuer_groups_by_the_issuing_scope(tmp_path: Path) -> None:
+    db_path, rs = _quick_db(tmp_path)
+    directive_id = _seed_directive(rs, "g_arch")
+    outcome_a, _ = _seed_outcome(db_path, "g_backend")
+    rs.record_judgment_and_raise(
+        contribution_id=outcome_a,
+        decision="accept_as_context",
+        judged_by="scope-manager",
+        raise_contribution=RaisedContributionInput(
+            scope_id="g_arch",
+            content=f"evidence from g_backend: following {directive_id} went wrong: it failed.",
+            subject=None,
+            contributor=_contributor("g_backend"),
+            acted_on=directive_id,
+            raised_from=outcome_a,
+        ),
+    )
+    outcome_b, _ = _seed_outcome(db_path, "g_backend")
+    rs.record_judgment_and_raise(
+        contribution_id=outcome_b,
+        decision="accept_as_context",
+        judged_by="scope-manager",
+        raise_contribution=RaisedContributionInput(
+            scope_id="g_arch",
+            content=(
+                f"evidence from g_backend: following {directive_id} went wrong: it failed again."
+            ),
+            subject=None,
+            contributor=_contributor("g_backend"),
+            acted_on=directive_id,
+            raised_from=outcome_b,
+        ),
+    )
+    assert rs.count_raised_by_issuer() == {"g_arch": 2}
+    assert rs.count_raised_operator_evidence() == 0
+
+
 # --- strata_read_contribution's raised_to ---------------------------------------------
 
 

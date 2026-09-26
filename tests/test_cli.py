@@ -423,6 +423,116 @@ def test_stats_writeback_prints_counts_beside_each_rate(
     assert "3" in next(line for line in out.splitlines() if line.strip().startswith("overall"))
 
 
+def test_stats_writeback_shows_no_system_raised_section_when_none_exist(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _seed_fleet(tmp_path, monkeypatch)
+    _seed_writeback_sessions(tmp_path)
+    rc = main(["stats", "writeback"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "System-raised" not in out
+
+
+def test_stats_writeback_reports_system_raised_separately_by_issuer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """ADR 0017 P5, CEO add: a raised contribution counts separately, never
+    folded into any session's own write-back row above."""
+    _seed_fleet(tmp_path, monkeypatch)
+    _seed_writeback_sessions(tmp_path)
+    db_path = tmp_path / "test.db"
+
+    from strata.fleet_config import FleetConfig
+    from strata.operator import operator_publish
+    from strata.record_store import (
+        ContributorRef,
+        OperatorEvidenceInput,
+        RaisedContributionInput,
+        RecordStore,
+    )
+
+    fleet = FleetConfig.load(tmp_path / "fleet.yaml")
+    with RecordStore(str(db_path)) as rs:
+        op_item = operator_publish(
+            "g_ceo",
+            "Never deploy on a Friday.",
+            None,
+            record_store=rs,
+            summaries_dir=str(tmp_path / "summaries"),
+            fleet=fleet,
+        )
+        directive_id = rs.append_contribution(
+            scope_id="g_ceo",
+            content="Use gRPC.",
+            proposed_classification="directive",
+            subject=None,
+            supersedes=None,
+            contributor=ContributorRef(
+                scope_id="g_ceo", skill="e", session_id="s1", ts="2026-09-26T00:00:00Z"
+            ),
+        ).id
+        rs.record_judgment(
+            contribution_id=directive_id, decision="accept_as_directive", judged_by="scope-manager"
+        )
+        outcome_id = rs.append_contribution(
+            scope_id="g_arch",
+            content="Tried it; failed.",
+            proposed_classification="context",
+            subject=None,
+            supersedes=None,
+            contributor=ContributorRef(
+                scope_id="g_arch", skill="e", session_id="s1", ts="2026-09-26T00:00:00Z"
+            ),
+        ).id
+        rs.record_judgment_and_raise(
+            contribution_id=outcome_id,
+            decision="accept_as_context",
+            judged_by="scope-manager",
+            raise_contribution=RaisedContributionInput(
+                scope_id="g_ceo",
+                content=f"evidence from g_arch: following {directive_id} went wrong: failed.",
+                subject=None,
+                contributor=ContributorRef(
+                    scope_id="g_arch", skill="e", session_id="s1", ts="2026-09-26T00:00:00Z"
+                ),
+                acted_on=directive_id,
+                raised_from=outcome_id,
+            ),
+        )
+
+        op_outcome_id = rs.append_contribution(
+            scope_id="g_arch",
+            content="Tried the op directive; failed too.",
+            proposed_classification="context",
+            subject=None,
+            supersedes=None,
+            contributor=ContributorRef(
+                scope_id="g_arch", skill="e", session_id="s1", ts="2026-09-26T00:00:00Z"
+            ),
+        ).id
+        rs.record_judgment_and_raise(
+            contribution_id=op_outcome_id,
+            decision="accept_as_context",
+            judged_by="scope-manager",
+            raise_operator_evidence=OperatorEvidenceInput(
+                operator_item_id=op_item.id,
+                raised_from=op_outcome_id,
+                reporter=ContributorRef(
+                    scope_id="g_arch", skill="e", session_id="s1", ts="2026-09-26T00:00:00Z"
+                ),
+                content=f"evidence from g_arch: following {op_item.id} went wrong: failed too.",
+            ),
+        )
+
+    rc = main(["stats", "writeback"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "System-raised (excluded above — not any session's own act): 2 total" in out
+    assert "to g_ceo: 1" in out
+    assert "to the operator: 1" in out
+
+
 def test_stats_writeback_shows_accounted_for_beside_the_rate_and_explains_both(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

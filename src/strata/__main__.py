@@ -852,6 +852,11 @@ def cmd_stats_writeback(args: argparse.Namespace) -> int:
         except ValueError as exc:
             print(str(exc), file=sys.stderr)
             return 1
+        # ADR 0017 P5, CEO add: a raised contribution is never a session's own
+        # second act (see the raise's own docstrings) — computed here, printed
+        # separately, never folded into any row above.
+        by_issuer = stores.record_store.count_raised_by_issuer()
+        operator_total = stores.record_store.count_raised_operator_evidence()
 
     note_out = sys.stderr if args.json else sys.stdout
     if export_rows is not None:
@@ -924,6 +929,18 @@ def cmd_stats_writeback(args: argparse.Namespace) -> int:
         print(f"Not counted: {report.unreadable_files} unreadable session file(s).")
     if report.denominator_note:
         print(f"Warning — {report.denominator_note}")
+
+    system_raised_total = sum(by_issuer.values()) + operator_total
+    if system_raised_total:
+        print()
+        print(
+            f"System-raised (excluded above — not any session's own act): "
+            f"{system_raised_total} total"
+        )
+        for scope_id, n in sorted(by_issuer.items()):
+            print(f"  to {scope_id}: {n}")
+        if operator_total:
+            print(f"  to the operator: {operator_total}")
     return 0
 
 
