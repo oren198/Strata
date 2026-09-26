@@ -82,7 +82,7 @@ import pathlib
 import sqlite3
 import tempfile
 from collections.abc import AsyncGenerator, Generator, Sequence
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Literal
@@ -121,6 +121,8 @@ from strata.record_store import (
     ClaimEventInput,
     Contribution,
     ContributorRef,
+    OperatorEvidenceInput,
+    RaisedContributionInput,
     RecentContribution,
     RecordStore,
 )
@@ -565,8 +567,15 @@ def _judge_and_record(
     # same way P1's validate_acted_on already did at the write boundary — that
     # validator guarantees the target exists and has an accepting judgment, so this
     # never needs to handle "missing" itself.
+    # ADR 0017 P5: a RAISED contribution carries `acted_on` too (the directive it
+    # was raised from — a record fact), but `raised_from` set means it is judged
+    # as an ORDINARY contribution at the issuing scope — plan decision: "an
+    # ordinary upward contribution... the issuer revises through the ordinary
+    # channel, or doesn't." No OUTCOME REPORT block, no narrowed enum: the
+    # issuer's own judge sees the standard accept_as_directive/accept_as_context/
+    # decline tool, same as if this had arrived as a fresh contribution.
     acted_on_target: ActedOnTarget | None = None
-    if contribution.acted_on is not None:
+    if contribution.acted_on is not None and contribution.raised_from is None:
         entry = record_store.get_record_entry(contribution.acted_on)
         assert entry is not None and entry.judgment is not None, (
             "acted_on target unresolvable at judge time — P1's validate_acted_on "
@@ -653,15 +662,96 @@ def _judge_and_record(
             before=acted_on_target.contribution.content,
             after=contribution.content,
         )
-    record_store.record_judgment(
-        contribution_id=contribution.id,
-        decision=judgment.decision,
-        judged_by="scope-manager",
-        # The judge's reasoning, plus the mechanical note for any amendment op
-        # the engine dropped (ADR 0011 D1) — the record shows what applied.
-        notes=judgment.record_notes,
-        claim_event=claim_event,
-    )
+    # ADR 0017 P5: "directive consequences go upward" — a `failed` outcome against
+    # a directive target, whose issuer differs from the reporter, is raised by the
+    # ENGINE (never a judge field) to whoever issued the directive. Bounds: `held`
+    # is never raised; issuer == reporter raises nothing (there is no "upward"
+    # from a scope to itself); a contribution already carrying `raised_from` can
+    # never trigger a further raise — guaranteed here not by an extra check but
+    # structurally, since such a contribution is judged with no `acted_on_target`
+    # at all (above), so it can never produce `outcome_disposition == "failed"`.
+    raise_to_scope: RaisedContributionInput | None = None
+    raise_to_operator: OperatorEvidenceInput | None = None
+    issuer_scope_id: str | None = None
+    if (
+        judgment.outcome_disposition == "failed"
+        and acted_on_target is not None
+        and acted_on_target.is_directive
+    ):
+        raised_content = f"Following {acted_on_target.target_id} went wrong: {contribution.content}"
+        if acted_on_target.operator_item is not None:
+            raise_to_operator = OperatorEvidenceInput(
+                operator_item_id=acted_on_target.target_id,
+                raised_from=contribution.id,
+                reporter=contribution.contributor,
+                content=raised_content,
+            )
+        else:
+            issuer_scope_id = acted_on_target.contribution.scope_id
+            if issuer_scope_id == contribution.scope_id:
+                issuer_scope_id = None  # nothing raised: issuer == reporter
+            else:
+                raise_to_scope = RaisedContributionInput(
+                    scope_id=issuer_scope_id,
+                    content=raised_content,
+                    subject=acted_on_target.target_subject,
+                    contributor=contribution.contributor,
+                    acted_on=acted_on_target.target_id,
+                    raised_from=contribution.id,
+                )
+
+    if raise_to_scope is not None or raise_to_operator is not None:
+        _judgment_row, raised_contribution = record_store.record_judgment_and_raise(
+            contribution_id=contribution.id,
+            decision=judgment.decision,
+            judged_by="scope-manager",
+            notes=judgment.record_notes,
+            raise_contribution=raise_to_scope,
+            raise_operator_evidence=raise_to_operator,
+        )
+        # The raised contribution is judged SYNCHRONOUSLY, in this same request,
+        # against its own issuing scope — never the reporter's. A failure here is
+        # the RAISED contribution's own JudgeUnavailable (its own id, its own
+        # JUDGE_FAILED marker via `_judge_and_record`'s usual handling): the
+        # reporter's own outcome is already durably judged above, so it is never
+        # let to fail this call — retry reaches it later through the ordinary
+        # strata_rejudge path, same as any other pending judgment.
+        if raised_contribution is not None:
+            issuer_scope = fleet.get_scope(issuer_scope_id)
+            issuer_stratum = (
+                next((s for s in fleet.strata if s.id == issuer_scope.stratum_id), None)
+                if issuer_scope is not None
+                else None
+            )
+            # A vanished issuer scope (fleet.yaml changed since the directive was
+            # issued) leaves the raise pending, exactly like any other unjudged
+            # contribution — retried later through strata_rejudge, which runs the
+            # same fleet lookup and raises its own clear RuntimeError if it is
+            # still missing then.
+            if issuer_scope is not None and issuer_stratum is not None:
+                with _scope_lock(issuer_scope.id), suppress(JudgeUnavailable):
+                    _judge_and_record(
+                        contribution=raised_contribution,
+                        scope=issuer_scope,
+                        stratum=issuer_stratum,
+                        fleet=fleet,
+                        record_store=record_store,
+                        summary_store=summary_store,
+                        scope_manager=scope_manager,
+                        summary_max_words=summary_max_words,
+                        window_verbatim_tail=window_verbatim_tail,
+                        recency_window_size=recency_window_size,
+                    )
+    else:
+        record_store.record_judgment(
+            contribution_id=contribution.id,
+            decision=judgment.decision,
+            judged_by="scope-manager",
+            # The judge's reasoning, plus the mechanical note for any amendment op
+            # the engine dropped (ADR 0011 D1) — the record shows what applied.
+            notes=judgment.record_notes,
+            claim_event=claim_event,
+        )
 
     # ADR 0017 P4: the correction's fan-out, split on who authored it.
     #
