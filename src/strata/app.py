@@ -82,7 +82,7 @@ import pathlib
 import sqlite3
 import tempfile
 from collections.abc import AsyncGenerator, Generator, Sequence
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Literal
@@ -121,6 +121,8 @@ from strata.record_store import (
     ClaimEventInput,
     Contribution,
     ContributorRef,
+    OperatorEvidenceInput,
+    RaisedContributionInput,
     RecentContribution,
     RecordStore,
 )
@@ -565,8 +567,15 @@ def _judge_and_record(
     # same way P1's validate_acted_on already did at the write boundary — that
     # validator guarantees the target exists and has an accepting judgment, so this
     # never needs to handle "missing" itself.
+    # ADR 0017 P5: a RAISED contribution carries `acted_on` too (the directive it
+    # was raised from — a record fact), but `raised_from` set means it is judged
+    # as an ORDINARY contribution at the issuing scope — plan decision: "an
+    # ordinary upward contribution... the issuer revises through the ordinary
+    # channel, or doesn't." No OUTCOME REPORT block, no narrowed enum: the
+    # issuer's own judge sees the standard accept_as_directive/accept_as_context/
+    # decline tool, same as if this had arrived as a fresh contribution.
     acted_on_target: ActedOnTarget | None = None
-    if contribution.acted_on is not None:
+    if contribution.acted_on is not None and contribution.raised_from is None:
         entry = record_store.get_record_entry(contribution.acted_on)
         assert entry is not None and entry.judgment is not None, (
             "acted_on target unresolvable at judge time — P1's validate_acted_on "
@@ -574,6 +583,38 @@ def _judge_and_record(
         )
         acted_on_target = ActedOnTarget(
             contribution=entry.contribution, decision=entry.judgment.decision
+        )
+    elif contribution.acted_on_operator_item is not None and contribution.raised_from is None:
+        # ADR 0017 P5: an OPERATOR directive target. validate_acted_on already
+        # guaranteed the act exists, is live, and its attachment scope is within
+        # the contributor's entitled surface — resolve the CURRENT item (an act id
+        # a contributor names may since have been superseded by a live one, though
+        # never past validate_acted_on's own is_operator_act_live gate at write
+        # time; this reads it fresh, at judge time, the same discipline as the
+        # scope-held branch above) from its attachment scope's own layer.
+        act = record_store.get_operator_act(contribution.acted_on_operator_item)
+        assert act is not None, (
+            "acted_on_operator_item unresolvable at judge time — P1's "
+            "validate_acted_on should have rejected this contribution at the "
+            "write boundary"
+        )
+        current_item = next(
+            (
+                item
+                for item in read_operator_layer(
+                    act.target_scope_id, summaries_dir=str(summary_store.summaries_dir)
+                )
+                if item.id == contribution.acted_on_operator_item
+            ),
+            None,
+        )
+        assert current_item is not None, (
+            "acted_on_operator_item no longer live at judge time — P1's "
+            "validate_acted_on should have rejected this contribution at the "
+            "write boundary"
+        )
+        acted_on_target = ActedOnTarget(
+            contribution=None, decision=None, operator_item=current_item
         )
     # ADR 0017 P3/P4: `acted_on_target` is passed ONLY when set — a call shape a
     # judge with the pre-P3 signature (strata-evals' ScriptedJudge, the bench
@@ -653,15 +694,102 @@ def _judge_and_record(
             before=acted_on_target.contribution.content,
             after=contribution.content,
         )
-    record_store.record_judgment(
-        contribution_id=contribution.id,
-        decision=judgment.decision,
-        judged_by="scope-manager",
-        # The judge's reasoning, plus the mechanical note for any amendment op
-        # the engine dropped (ADR 0011 D1) — the record shows what applied.
-        notes=judgment.record_notes,
-        claim_event=claim_event,
-    )
+    # ADR 0017 P5: "directive consequences go upward" — a `failed` outcome against
+    # a directive target, whose issuer differs from the reporter, is raised by the
+    # ENGINE (never a judge field) to whoever issued the directive. Bounds: `held`
+    # is never raised; issuer == reporter raises nothing (there is no "upward"
+    # from a scope to itself); a contribution already carrying `raised_from` can
+    # never trigger a further raise — guaranteed here not by an extra check but
+    # structurally, since such a contribution is judged with no `acted_on_target`
+    # at all (above), so it can never produce `outcome_disposition == "failed"`.
+    raise_to_scope: RaisedContributionInput | None = None
+    raise_to_operator: OperatorEvidenceInput | None = None
+    issuer_scope_id: str | None = None
+    if (
+        judgment.outcome_disposition == "failed"
+        and acted_on_target is not None
+        and acted_on_target.is_directive
+    ):
+        # ADR 0017 P5, philosopher's line 7: framed as evidence about the world
+        # from a NAMED scope — never a contrary rule the issuer's judge should
+        # weigh against its own directive.
+        raised_content = (
+            f"evidence from {contribution.scope_id}: following {acted_on_target.target_id} "
+            f"went wrong: {contribution.content}"
+        )
+        if acted_on_target.operator_item is not None:
+            raise_to_operator = OperatorEvidenceInput(
+                operator_item_id=acted_on_target.target_id,
+                raised_from=contribution.id,
+                reporter=contribution.contributor,
+                content=raised_content,
+            )
+        else:
+            issuer_scope_id = acted_on_target.contribution.scope_id
+            if issuer_scope_id == contribution.scope_id:
+                issuer_scope_id = None  # nothing raised: issuer == reporter
+            else:
+                raise_to_scope = RaisedContributionInput(
+                    scope_id=issuer_scope_id,
+                    content=raised_content,
+                    subject=acted_on_target.target_subject,
+                    contributor=contribution.contributor,
+                    acted_on=acted_on_target.target_id,
+                    raised_from=contribution.id,
+                )
+
+    if raise_to_scope is not None or raise_to_operator is not None:
+        _judgment_row, raised_contribution = record_store.record_judgment_and_raise(
+            contribution_id=contribution.id,
+            decision=judgment.decision,
+            judged_by="scope-manager",
+            notes=judgment.record_notes,
+            raise_contribution=raise_to_scope,
+            raise_operator_evidence=raise_to_operator,
+        )
+        # The raised contribution is judged SYNCHRONOUSLY, in this same request,
+        # against its own issuing scope — never the reporter's. A failure here is
+        # the RAISED contribution's own JudgeUnavailable (its own id, its own
+        # JUDGE_FAILED marker via `_judge_and_record`'s usual handling): the
+        # reporter's own outcome is already durably judged above, so it is never
+        # let to fail this call — retry reaches it later through the ordinary
+        # strata_rejudge path, same as any other pending judgment.
+        if raised_contribution is not None:
+            issuer_scope = fleet.get_scope(issuer_scope_id)
+            issuer_stratum = (
+                next((s for s in fleet.strata if s.id == issuer_scope.stratum_id), None)
+                if issuer_scope is not None
+                else None
+            )
+            # A vanished issuer scope (fleet.yaml changed since the directive was
+            # issued) leaves the raise pending, exactly like any other unjudged
+            # contribution — retried later through strata_rejudge, which runs the
+            # same fleet lookup and raises its own clear RuntimeError if it is
+            # still missing then.
+            if issuer_scope is not None and issuer_stratum is not None:
+                with _scope_lock(issuer_scope.id), suppress(JudgeUnavailable):
+                    _judge_and_record(
+                        contribution=raised_contribution,
+                        scope=issuer_scope,
+                        stratum=issuer_stratum,
+                        fleet=fleet,
+                        record_store=record_store,
+                        summary_store=summary_store,
+                        scope_manager=scope_manager,
+                        summary_max_words=summary_max_words,
+                        window_verbatim_tail=window_verbatim_tail,
+                        recency_window_size=recency_window_size,
+                    )
+    else:
+        record_store.record_judgment(
+            contribution_id=contribution.id,
+            decision=judgment.decision,
+            judged_by="scope-manager",
+            # The judge's reasoning, plus the mechanical note for any amendment op
+            # the engine dropped (ADR 0011 D1) — the record shows what applied.
+            notes=judgment.record_notes,
+            claim_event=claim_event,
+        )
 
     # ADR 0017 P4: the correction's fan-out, split on who authored it.
     #
@@ -1309,6 +1437,15 @@ def validate_acted_on(
        judge-failed contribution never entered memory, so nothing was there to act on
        (CEO add).
 
+    ADR 0017 P5: ``acted_on`` may instead name an OPERATOR act (``op_``-prefixed —
+    see :func:`run_contribution`'s own dispatch comment). Rules 2-4 above become:
+    the act must exist; its attachment scope (``target_scope_id``) must be within
+    *agent_scope*'s entitled surface (the operator layer is attached at or above a
+    scope, the same chain rule as an ordinary target's scope); and it must be
+    LIVE — not itself a ``retire`` act, and not since superseded — mirroring rule 4's
+    "the item that currently stands" exactly, since an operator act carries no
+    judgment to check instead.
+
     A no-op when ``acted_on`` is ``None`` — every pre-P1 call site is unaffected.
 
     Raises:
@@ -1323,6 +1460,34 @@ def validate_acted_on(
             "you report — not something you assert yourself via supersedes. Submit the "
             "outcome with acted_on alone and let the judge classify it."
         )
+    if acted_on.startswith("op_"):
+        act = record_store.get_operator_act(acted_on)
+        if act is None:
+            raise RuntimeError(
+                f"acted_on={acted_on!r} does not reference an existing operator item."
+            )
+        if fleet.get_scope(agent_scope) is None:
+            raise RuntimeError(
+                f"your bound scope {agent_scope!r} no longer exists in the fleet "
+                "config — fleet.yaml changed since this session started. Restore "
+                "the scope in fleet.yaml or relaunch with a valid binding."
+            )
+        ancestors = fleet.inter_stratum_ancestors(agent_scope)
+        entitled = {agent_scope, *(s.id for s in ancestors)}
+        if act.target_scope_id not in entitled:
+            raise RuntimeError(
+                f"operator item {acted_on!r} is attached at {act.target_scope_id!r}, outside "
+                f"your entitled surface (your scope {agent_scope!r} plus its inter-stratum "
+                "ancestors). The operator layer is attached at or above a scope, the same "
+                "chain-only rule as any other acted_on target."
+            )
+        if not record_store.is_operator_act_live(acted_on):
+            raise RuntimeError(
+                f"acted_on={acted_on!r} references an operator item that is no longer "
+                "current (superseded or retired) — you can only report an outcome for "
+                "the item that currently stands."
+            )
+        return
     entry = record_store.get_record_entry(acted_on)
     if entry is None:
         raise RuntimeError(f"acted_on={acted_on!r} does not reference an existing contribution.")
@@ -1409,6 +1574,12 @@ def run_contribution(
     """
     if acted_on is not None and supersedes is not None:
         raise ValueError("acted_on and supersedes cannot both be set on one contribution.")
+    # ADR 0017 P5: the API keeps ONE `acted_on` field; the app resolves which
+    # storage column the id belongs in. Ids are minted so this dispatch is
+    # unambiguous and never needs a lookup: contribution ids are `c_`-prefixed,
+    # operator act ids `op_`-prefixed (record_store's `_new_contribution_id`/
+    # `_new_operator_act_id`, by design — "never mistaken for" the other).
+    is_operator_target = acted_on is not None and acted_on.startswith("op_")
     queue = _scope_queue(scope.id)
     with _scope_append_lock(scope.id):
         contribution = record_store.append_contribution(
@@ -1418,7 +1589,8 @@ def run_contribution(
             subject=subject,
             supersedes=supersedes,
             contributor=contributor,
-            acted_on=acted_on,
+            acted_on=None if is_operator_target else acted_on,
+            acted_on_operator_item=acted_on if is_operator_target else None,
         )
         ticket = queue.enqueue(contribution.id, contribution)
 

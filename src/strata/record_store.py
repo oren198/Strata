@@ -100,6 +100,10 @@ def _new_retirement_id() -> str:
     return f"ret_{secrets.token_hex(8)}"
 
 
+def _new_operator_evidence_id() -> str:
+    return f"oev_{secrets.token_hex(8)}"
+
+
 def _new_publication_act_id() -> str:
     # ADR 0007 D1/D2: publication acts are prefixed pub_ — this id doubles as
     # a published item's own id once accepted (see strata.publication).
@@ -169,6 +173,22 @@ class Contribution:
     at the app boundary (`validate_acted_on`): a correction is the judge's call, not the
     contributor's. Defaults to None so every pre-P1 call site building a Contribution by
     hand (tests, fixtures) keeps working unchanged."""
+    acted_on_operator_item: str | None = None
+    """The OPERATOR directive this contribution reports acting on (ADR 0017 P5,
+    v1.16) — an FK to `operator_acts.id`, never `contributions.id`: operator
+    directives never enter a scope's own record (ADR 0008 D4), so they need their
+    own target column. Mutually exclusive with `acted_on` (enforced by a CHECK in
+    migration 0018, not only at the app boundary) — an outcome names exactly one
+    kind of directive. The write boundary (`validate_acted_on`) accepts a single
+    `acted_on` argument from the caller and resolves which column it belongs in."""
+    raised_from: str | None = None
+    """ADR 0017 P5, v1.16: set on a contribution the ENGINE minted (never an agent)
+    to raise a `failed` directive-outcome to the directive's issuing scope — the
+    id of the outcome contribution that caused the raise. A raised contribution is
+    never itself raised again (the mechanism stops at the issuer): callers check
+    this is None before raising further. Excluded from write-back/session stats
+    (it counts as the reporter's provenance for record purposes, but is not a
+    second act by the reporter) and reported separately as system-raised."""
 
 
 @dataclass(frozen=True)
@@ -430,6 +450,38 @@ class OperatorAct:
 
 
 @dataclass(frozen=True)
+class OperatorEvidence:
+    """The ENGINE's own raise of a `failed` outcome against an OPERATOR directive
+    (ADR 0017 P5, v1.16) — never judged, never an agent act.
+
+    A scope-issued directive's `failed` verdict is raised as an ordinary upward
+    contribution (`raised_from`); an operator directive has no scope record to
+    raise INTO, so this is the operator-stratum counterpart: shown with the
+    directive it concerns in the Console operator view, until the operator
+    explicitly marks it seen.
+    """
+
+    id: str
+    operator_item_id: str
+    """The operator directive (an ``operator_acts.id``) this evidence concerns."""
+    raised_from: str
+    """The outcome contribution (``contributions.id``) that caused the raise."""
+    reporter_scope_id: str
+    reporter_skill: str | None
+    reporter_session_id: str
+    reporter_ts: str
+    """The reporting agent's own provenance, carried verbatim — never the
+    operator's, since the operator did not report this."""
+    content: str
+    """Verbatim: "following <directive> went wrong" plus the report's own
+    observation — never rewritten, never summarised."""
+    created_at: str
+    seen_at: str | None = None
+    """Set ONLY by an explicit operator act (CLI/Console) — never by a read.
+    ``None`` means the operator has not yet acknowledged this evidence."""
+
+
+@dataclass(frozen=True)
 class Retirement:
     """A retirement event in a *scope's own* record (ADR 0008 D4 / CONTEXT.md § Retirement).
 
@@ -649,6 +701,41 @@ class ClaimEventInput:
     after: str | None
 
 
+@dataclass(frozen=True)
+class RaisedContributionInput:
+    """What :meth:`RecordStore.record_judgment_and_raise` needs to raise a `failed`
+    directive outcome to its issuing SCOPE, atomically with the outcome's own
+    judgment (ADR 0017 P5).
+
+    ``scope_id`` is the ISSUER (never the reporter) — the scope whose own
+    contribution the directive was published from. ``contributor`` carries the
+    REPORTER's own provenance verbatim (a CEO ruling: this is not a second act by
+    the reporter for write-back/session-stats purposes, since ``raised_from`` is
+    set — see :func:`strata.app.exclude_raised` and its callers). ``acted_on``
+    names the directive itself; ``raised_from`` names the outcome contribution
+    that caused this raise.
+    """
+
+    scope_id: str
+    content: str
+    subject: str | None
+    contributor: ContributorRef
+    acted_on: str
+    raised_from: str
+
+
+@dataclass(frozen=True)
+class OperatorEvidenceInput:
+    """What :meth:`RecordStore.record_judgment_and_raise` needs to raise a `failed`
+    outcome against an OPERATOR directive, atomically with the outcome's own
+    judgment (ADR 0017 P5)."""
+
+    operator_item_id: str
+    raised_from: str
+    reporter: ContributorRef
+    content: str
+
+
 # ---------------------------------------------------------------------------
 # RecordStore
 # ---------------------------------------------------------------------------
@@ -715,6 +802,8 @@ class RecordStore:
         supersedes: str | None,
         contributor: ContributorRef,
         acted_on: str | None = None,
+        acted_on_operator_item: str | None = None,
+        raised_from: str | None = None,
     ) -> Contribution:
         """Append a contribution to the scope's immutable record and return it.
 
@@ -742,13 +831,22 @@ class RecordStore:
                                      and every other `acted_on` rule before calling
                                      this (:func:`validate_acted_on`) — this layer
                                      only persists what it is given.
+            acted_on_operator_item:  Optional id of an operator directive this one
+                                     reports acting on (ADR 0017 P5) — mutually
+                                     exclusive with *acted_on*, enforced by the
+                                     schema's own CHECK (migration 0018) as well as
+                                     the app boundary.
+            raised_from:             ADR 0017 P5 — set only by the ENGINE, never an
+                                     agent, when this contribution is itself the
+                                     upward raise of a `failed` directive outcome.
 
         Returns:
             The newly appended :class:`Contribution`.
 
         Raises:
             sqlite3.IntegrityError: If *supersedes* or *acted_on* references a
-                non-existent contribution.
+                non-existent contribution, or both *acted_on* and
+                *acted_on_operator_item* are set.
         """
         contribution_id = self._insert_contribution(
             scope_id=scope_id,
@@ -758,6 +856,8 @@ class RecordStore:
             supersedes=supersedes,
             contributor=contributor,
             acted_on=acted_on,
+            acted_on_operator_item=acted_on_operator_item,
+            raised_from=raised_from,
         )
         self._conn.commit()
         return self._fetch_contribution(contribution_id)
@@ -772,6 +872,8 @@ class RecordStore:
         supersedes: str | None,
         contributor: ContributorRef,
         acted_on: str | None = None,
+        acted_on_operator_item: str | None = None,
+        raised_from: str | None = None,
     ) -> str:
         """INSERT one contribution row and return its id. Does NOT commit.
 
@@ -788,8 +890,8 @@ class RecordStore:
                 subject, supersedes,
                 contributor_scope_id, contributor_skill,
                 contributor_session_id, contributor_ts,
-                acted_on
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                acted_on, acted_on_operator_item, raised_from
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 contribution_id,
@@ -803,6 +905,8 @@ class RecordStore:
                 contributor.session_id,
                 contributor.ts,
                 acted_on,
+                acted_on_operator_item,
+                raised_from,
             ),
         )
         return contribution_id
@@ -826,7 +930,7 @@ class RecordStore:
         """
         base = """
             SELECT id, scope_id, content, proposed_classification,
-                   subject, supersedes, acted_on,
+                   subject, supersedes, acted_on, acted_on_operator_item, raised_from,
                    contributor_scope_id, contributor_skill,
                    contributor_session_id, contributor_ts,
                    created_at
@@ -868,7 +972,7 @@ class RecordStore:
         rows = self._conn.execute(
             """
             SELECT c.id, c.scope_id, c.content, c.proposed_classification,
-                   c.subject, c.supersedes, c.acted_on,
+                   c.subject, c.supersedes, c.acted_on, c.acted_on_operator_item, c.raised_from,
                    c.contributor_scope_id, c.contributor_skill,
                    c.contributor_session_id, c.contributor_ts,
                    c.created_at
@@ -898,7 +1002,7 @@ class RecordStore:
         row = self._conn.execute(
             """
             SELECT id, scope_id, content, proposed_classification,
-                   subject, supersedes, acted_on,
+                   subject, supersedes, acted_on, acted_on_operator_item, raised_from,
                    contributor_scope_id, contributor_skill,
                    contributor_session_id, contributor_ts,
                    created_at
@@ -909,6 +1013,63 @@ class RecordStore:
         if row is None:
             raise KeyError(f"Contribution not found: {contribution_id!r}")
         return _contribution_from_row(row)
+
+    def get_raised_contribution(self, outcome_contribution_id: str) -> Contribution | None:
+        """Return the contribution (at the issuing scope) raised FROM
+        *outcome_contribution_id*, or ``None`` if it raised nothing (ADR 0017 P5).
+
+        The reverse of ``raised_from``: the outcome contribution itself carries no
+        forward pointer, so a reader deriving "raised to <issuer> as <id>" (the
+        plan's own words) needs this lookup rather than a stored field — no new
+        column, exactly as approved. At most one contribution is ever raised from
+        a given outcome (the engine mints it once, atomically, in
+        :meth:`record_judgment_and_raise`); ``None`` also covers an OPERATOR raise,
+        which writes an :class:`OperatorEvidence` row instead of a contribution —
+        see :meth:`get_raised_operator_evidence`.
+        """
+        row = self._conn.execute(
+            """
+            SELECT id, scope_id, content, proposed_classification,
+                   subject, supersedes, acted_on, acted_on_operator_item, raised_from,
+                   contributor_scope_id, contributor_skill,
+                   contributor_session_id, contributor_ts,
+                   created_at
+            FROM contributions WHERE raised_from = ?
+            """,
+            (outcome_contribution_id,),
+        ).fetchone()
+        return _contribution_from_row(row) if row is not None else None
+
+    def get_raised_operator_evidence(self, outcome_contribution_id: str) -> OperatorEvidence | None:
+        """Return the :class:`OperatorEvidence` row raised FROM
+        *outcome_contribution_id*, or ``None`` (ADR 0017 P5). The operator-issuer
+        counterpart to :meth:`get_raised_contribution` — an operator raise writes
+        no contribution, so the reporter-side "raised to <issuer> as <id>"
+        derivation must check both.
+        """
+        rows = self.list_operator_evidence()
+        return next((e for e in rows if e.raised_from == outcome_contribution_id), None)
+
+    def count_raised_by_issuer(self) -> dict[str, int]:
+        """Count of engine-raised contributions per ISSUING scope (ADR 0017 P5,
+        the CEO stats add): "reported separately as system-raised", never
+        counted alongside a session's own write-back — see
+        :func:`strata.__main__.cmd_stats_writeback`'s own callers. Excludes
+        operator raises (:meth:`count_raised_operator_evidence`), which have no
+        scope to group by.
+        """
+        rows = self._conn.execute(
+            "SELECT scope_id, COUNT(*) AS n FROM contributions "
+            "WHERE raised_from IS NOT NULL GROUP BY scope_id"
+        ).fetchall()
+        return {row["scope_id"]: row["n"] for row in rows}
+
+    def count_raised_operator_evidence(self) -> int:
+        """Total operator_evidence rows (ADR 0017 P5) — the operator-issuer
+        counterpart to :meth:`count_raised_by_issuer`, which counts only
+        scope-issuer raises."""
+        row = self._conn.execute("SELECT COUNT(*) AS n FROM operator_evidence").fetchone()
+        return row["n"]
 
     # ------------------------------------------------------------------
     # Judgments
@@ -978,6 +1139,76 @@ class RecordStore:
                     processed=True,
                 )
         return self._fetch_judgment(judgment_id)
+
+    def record_judgment_and_raise(
+        self,
+        *,
+        contribution_id: str,
+        decision: Literal["accept_as_context", "decline"],
+        judged_by: str,
+        notes: str | None = None,
+        raise_contribution: RaisedContributionInput | None = None,
+        raise_operator_evidence: OperatorEvidenceInput | None = None,
+    ) -> tuple[Judgment, Contribution | None]:
+        """Record a directive-target outcome's judgment and, when its disposition is
+        `failed` and the issuer differs from the reporter, its engine-minted raise —
+        atomically (ADR 0017 P5): never a judgment recorded with no raise that was
+        due, or a raise with no judgment underneath it. A DEDICATED method rather
+        than new parameters on :meth:`record_judgment` — that one stays exactly as
+        every other caller already uses it.
+
+        At most one of *raise_contribution*/*raise_operator_evidence* may be given
+        — an outcome raises to exactly one kind of issuer (a scope, or the
+        operator). Neither is given for `held`/`decline`, or when issuer == reporter
+        (nothing to raise), or for a `failed` outcome the caller has already
+        confirmed was not raised (see the bound: never raise a contribution whose
+        own `raised_from` is set — checked by the caller, before this is called,
+        never re-derived here).
+
+        Returns:
+            ``(judgment, raised_contribution)`` — the second element is ``None``
+            unless *raise_contribution* was given (never set alongside
+            *raise_operator_evidence*, which writes no contribution at all).
+        """
+        if raise_contribution is not None and raise_operator_evidence is not None:
+            raise ValueError(
+                "at most one of raise_contribution/raise_operator_evidence may be given"
+            )
+        judgment_id = _new_judgment_id()
+        raised_contribution_id: str | None = None
+        with self._conn:  # one transaction: the judgment, and the raise if any
+            self._conn.execute(
+                """
+                INSERT INTO judgments (id, contribution_id, decision, judged_by, notes)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (judgment_id, contribution_id, decision, judged_by, notes),
+            )
+            if raise_contribution is not None:
+                raised_contribution_id = self._insert_contribution(
+                    scope_id=raise_contribution.scope_id,
+                    content=raise_contribution.content,
+                    proposed_classification="context",
+                    subject=raise_contribution.subject,
+                    supersedes=None,
+                    contributor=raise_contribution.contributor,
+                    acted_on=raise_contribution.acted_on,
+                    raised_from=raise_contribution.raised_from,
+                )
+            if raise_operator_evidence is not None:
+                self._insert_operator_evidence(
+                    operator_item_id=raise_operator_evidence.operator_item_id,
+                    raised_from=raise_operator_evidence.raised_from,
+                    reporter=raise_operator_evidence.reporter,
+                    content=raise_operator_evidence.content,
+                )
+        judgment = self._fetch_judgment(judgment_id)
+        raised = (
+            self._fetch_contribution(raised_contribution_id)
+            if raised_contribution_id is not None
+            else None
+        )
+        return judgment, raised
 
     def stamp_summary_version(self, contribution_ids: Sequence[str], *, version: int) -> None:
         """Record on each judgment row the summary version its amendment wrote.
@@ -1215,7 +1446,7 @@ class RecordStore:
 
         base = """
             SELECT id, scope_id, content, proposed_classification,
-                   subject, supersedes, acted_on,
+                   subject, supersedes, acted_on, acted_on_operator_item, raised_from,
                    contributor_scope_id, contributor_skill,
                    contributor_session_id, contributor_ts,
                    created_at
@@ -1314,7 +1545,7 @@ class RecordStore:
 
         base = """
             SELECT c.id, c.scope_id, c.content, c.proposed_classification,
-                   c.subject, c.supersedes, c.acted_on,
+                   c.subject, c.supersedes, c.acted_on, c.acted_on_operator_item, c.raised_from,
                    c.contributor_scope_id, c.contributor_skill,
                    c.contributor_session_id, c.contributor_ts,
                    c.created_at,
@@ -1391,7 +1622,7 @@ class RecordStore:
         rows = self._conn.execute(
             """
             SELECT id, scope_id, content, proposed_classification,
-                   subject, supersedes, acted_on,
+                   subject, supersedes, acted_on, acted_on_operator_item, raised_from,
                    contributor_scope_id, contributor_skill,
                    contributor_session_id, contributor_ts,
                    created_at
@@ -1504,7 +1735,7 @@ class RecordStore:
         rows = self._conn.execute(
             """
             SELECT c.id, c.scope_id, c.content, c.proposed_classification,
-                   c.subject, c.supersedes, c.acted_on,
+                   c.subject, c.supersedes, c.acted_on, c.acted_on_operator_item, c.raised_from,
                    c.contributor_scope_id, c.contributor_skill,
                    c.contributor_session_id, c.contributor_ts,
                    c.created_at,
@@ -1547,7 +1778,7 @@ class RecordStore:
         row = self._conn.execute(
             f"""
             SELECT c.id, c.scope_id, c.content, c.proposed_classification,
-                   c.subject, c.supersedes, c.acted_on,
+                   c.subject, c.supersedes, c.acted_on, c.acted_on_operator_item, c.raised_from,
                    c.contributor_scope_id, c.contributor_skill,
                    c.contributor_session_id, c.contributor_ts,
                    c.created_at
@@ -1661,6 +1892,157 @@ class RecordStore:
         if row is None:
             raise KeyError(f"Operator act not found: {act_id!r}")
         return OperatorAct(**dict(row))
+
+    def get_operator_act(self, act_id: str) -> OperatorAct | None:
+        """Return the operator act *act_id*, or ``None`` if it doesn't exist.
+
+        Public read (ADR 0017 P5) — unlike :meth:`_fetch_operator_act`, which only
+        ever looks up an id it just inserted, this is used at the write boundary
+        (:func:`strata.app.validate_acted_on`) for an id an AGENT supplied, which may
+        legitimately not exist.
+        """
+        row = self._conn.execute(
+            """
+            SELECT id, act, target_scope_id, kind, content, subject,
+                   supersedes, retires, created_at
+            FROM operator_acts WHERE id = ?
+            """,
+            (act_id,),
+        ).fetchone()
+        return OperatorAct(**dict(row)) if row is not None else None
+
+    def is_operator_act_live(self, act_id: str) -> bool:
+        """Is *act_id* still the CURRENT operator item — never superseded or retired,
+        and not itself a ``retire`` act (ADR 0017 P5)?
+
+        A pure record check, no file I/O: nothing else's ``supersedes``/``retires``
+        names *act_id*. Mirrors :meth:`is_superseded`'s own shape for contributions —
+        an outcome may only report acting on the item that currently stands, exactly
+        as :func:`strata.app.validate_acted_on` already requires for a contribution
+        target (an accepted, not-since-superseded judgment).
+        """
+        row = self._conn.execute("SELECT act FROM operator_acts WHERE id = ?", (act_id,)).fetchone()
+        if row is None or row["act"] == "retire":
+            return False
+        superseded_or_retired = self._conn.execute(
+            "SELECT 1 FROM operator_acts WHERE supersedes = ? OR retires = ? LIMIT 1",
+            (act_id, act_id),
+        ).fetchone()
+        return superseded_or_retired is None
+
+    # ------------------------------------------------------------------
+    # Operator evidence (ADR 0017 P5) — the engine's raise of a `failed`
+    # outcome against an operator directive. Never judged.
+    # ------------------------------------------------------------------
+
+    def append_operator_evidence(
+        self,
+        *,
+        operator_item_id: str,
+        raised_from: str,
+        reporter: ContributorRef,
+        content: str,
+    ) -> OperatorEvidence:
+        """Append one operator-evidence row and commit (ADR 0017 P5). Not judged,
+        not an agent act. For the atomic write alongside the outcome's own
+        judgment, see :meth:`record_judgment_and_raise` (which uses
+        :meth:`_insert_operator_evidence` directly, inside its own transaction).
+        """
+        evidence_id = self._insert_operator_evidence(
+            operator_item_id=operator_item_id,
+            raised_from=raised_from,
+            reporter=reporter,
+            content=content,
+        )
+        self._conn.commit()
+        return self._fetch_operator_evidence(evidence_id)
+
+    def _insert_operator_evidence(
+        self,
+        *,
+        operator_item_id: str,
+        raised_from: str,
+        reporter: ContributorRef,
+        content: str,
+    ) -> str:
+        """INSERT one operator-evidence row and return its id. Does NOT commit."""
+        evidence_id = _new_operator_evidence_id()
+        self._conn.execute(
+            """
+            INSERT INTO operator_evidence (
+                id, operator_item_id, raised_from,
+                reporter_scope_id, reporter_skill, reporter_session_id, reporter_ts,
+                content
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                evidence_id,
+                operator_item_id,
+                raised_from,
+                reporter.scope_id,
+                reporter.skill,
+                reporter.session_id,
+                reporter.ts,
+                content,
+            ),
+        )
+        return evidence_id
+
+    def _fetch_operator_evidence(self, evidence_id: str) -> OperatorEvidence:
+        row = self._conn.execute(
+            """
+            SELECT id, operator_item_id, raised_from,
+                   reporter_scope_id, reporter_skill, reporter_session_id, reporter_ts,
+                   content, created_at, seen_at
+            FROM operator_evidence WHERE id = ?
+            """,
+            (evidence_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"Operator evidence not found: {evidence_id!r}")
+        return OperatorEvidence(**dict(row))
+
+    def list_operator_evidence(
+        self, *, operator_item_id: str | None = None, unseen_only: bool = False
+    ) -> list[OperatorEvidence]:
+        """Return operator evidence rows, oldest first (ADR 0017 P5).
+
+        Args:
+            operator_item_id: When given, filter to evidence against this one
+                directive — the Console operator view shows evidence WITH the
+                directive it concerns, not only in a separate list.
+            unseen_only: When true, only rows with ``seen_at IS NULL`` —
+                ``strata operator evidence``'s default listing.
+        """
+        clauses: list[str] = []
+        params: list[str] = []
+        if operator_item_id is not None:
+            clauses.append("operator_item_id = ?")
+            params.append(operator_item_id)
+        if unseen_only:
+            clauses.append("seen_at IS NULL")
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self._conn.execute(
+            f"""
+            SELECT id, operator_item_id, raised_from,
+                   reporter_scope_id, reporter_skill, reporter_session_id, reporter_ts,
+                   content, created_at, seen_at
+            FROM operator_evidence
+            {where}
+            ORDER BY created_at ASC, rowid ASC
+            """,
+            params,
+        ).fetchall()
+        return [OperatorEvidence(**dict(row)) for row in rows]
+
+    def mark_operator_evidence_seen(self, evidence_id: str, *, seen_at: str) -> None:
+        """Stamp *evidence_id* seen (ADR 0017 P5) — an explicit operator act
+        (CLI/Console) only, never a side effect of reading it.
+        """
+        self._conn.execute(
+            "UPDATE operator_evidence SET seen_at = ? WHERE id = ?", (seen_at, evidence_id)
+        )
+        self._conn.commit()
 
     # ------------------------------------------------------------------
     # Retirements (retirement events in a SCOPE's own record — ADR 0008 D4)

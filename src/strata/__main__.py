@@ -718,6 +718,16 @@ def cmd_record(args: argparse.Namespace) -> int:
                 print(f"      subject: {c.subject}")
             if c.supersedes:
                 print(f"      supersedes: {c.supersedes}")
+            # ADR 0017 P5: derived at read time from `raised_from` — never a
+            # stored field on this contribution itself (the plan's own words:
+            # "the reporter's side shows 'raised to <issuer> as <id>'").
+            raised = stores.record_store.get_raised_contribution(c.id)
+            if raised is not None:
+                print(f"      raised to {raised.scope_id} as {raised.id}")
+            else:
+                raised_evidence = stores.record_store.get_raised_operator_evidence(c.id)
+                if raised_evidence is not None:
+                    print(f"      raised to the operator as {raised_evidence.id}")
             if state is not None and state.state == "judge_failed":
                 print(f"      judge failed at {state.failed_at}: {state.error_message}")
                 print("      re-judge with the strata_rejudge MCP tool")
@@ -842,6 +852,11 @@ def cmd_stats_writeback(args: argparse.Namespace) -> int:
         except ValueError as exc:
             print(str(exc), file=sys.stderr)
             return 1
+        # ADR 0017 P5, CEO add: a raised contribution is never a session's own
+        # second act (see the raise's own docstrings) — computed here, printed
+        # separately, never folded into any row above.
+        by_issuer = stores.record_store.count_raised_by_issuer()
+        operator_total = stores.record_store.count_raised_operator_evidence()
 
     note_out = sys.stderr if args.json else sys.stdout
     if export_rows is not None:
@@ -914,6 +929,18 @@ def cmd_stats_writeback(args: argparse.Namespace) -> int:
         print(f"Not counted: {report.unreadable_files} unreadable session file(s).")
     if report.denominator_note:
         print(f"Warning — {report.denominator_note}")
+
+    system_raised_total = sum(by_issuer.values()) + operator_total
+    if system_raised_total:
+        print()
+        print(
+            f"System-raised (excluded above — not any session's own act): "
+            f"{system_raised_total} total"
+        )
+        for scope_id, n in sorted(by_issuer.items()):
+            print(f"  to {scope_id}: {n}")
+        if operator_total:
+            print(f"  to the operator: {operator_total}")
     return 0
 
 
@@ -2113,6 +2140,14 @@ def cmd_operator_show(args: argparse.Namespace) -> int:
                 print(f"  [{item.id}] {item.kind}{subject_part}  (at {item.created_at})")
                 for line in item.content.splitlines():
                     print(f"      | {line}")
+                # ADR 0017 P5: shown WITH the directive it concerns.
+                unseen = [
+                    e
+                    for e in stores.record_store.list_operator_evidence(operator_item_id=item.id)
+                    if e.seen_at is None
+                ]
+                if unseen:
+                    print(f"      {len(unseen)} unseen evidence — see `strata operator evidence`")
             print()
             scope_health = health["per_scope"].get(args.scope_id, {"items": 0, "words": 0})
             print(f"Health: {scope_health['items']} item(s), {scope_health['words']} word(s).")
@@ -2136,6 +2171,103 @@ def cmd_operator_show(args: argparse.Namespace) -> int:
             "Doctrine (ADR 0008 D6): operator memory is constitutional, not operational — "
             "small, rare, and mostly stable."
         )
+    return 0
+
+
+_operator_evidence_parser: argparse.ArgumentParser | None = None
+
+
+def cmd_operator_evidence_root(args: argparse.Namespace) -> int:
+    """``strata operator evidence`` with no subcommand — print the group's help."""
+    if _operator_evidence_parser is not None:
+        _operator_evidence_parser.print_help()
+    return 0
+
+
+def cmd_operator_evidence(args: argparse.Namespace) -> int:
+    """``strata operator evidence list [scope_id]`` — list unseen operator_evidence rows.
+
+    ADR 0017 P5: a `failed` outcome against an operator directive raises as an
+    UNJUDGED evidence row, shown WITH the directive it concerns — never in a
+    separate list divorced from context. Unseen by default (``--all`` for the
+    full history); ``--scope`` narrows to one attachment scope's directives.
+    """
+    from strata.operator import read_operator_layer
+    from strata.stores import EmbeddedStoreError, open_embedded_stores
+
+    try:
+        stores = open_embedded_stores()
+    except EmbeddedStoreError as exc:
+        print(exc.message, file=sys.stderr)
+        return 1
+
+    with stores:
+        summaries_dir = stores.summary_store.summaries_dir
+        evidence_rows = stores.record_store.list_operator_evidence(unseen_only=not args.all)
+        if args.scope_id:
+            item_ids = {
+                item.id for item in read_operator_layer(args.scope_id, summaries_dir=summaries_dir)
+            }
+            evidence_rows = [e for e in evidence_rows if e.operator_item_id in item_ids]
+
+        if not evidence_rows:
+            print("(no unseen evidence)" if not args.all else "(no evidence)")
+            return 0
+
+        # Grouped by directive, per the spec: "shown WITH the directive it concerns".
+        by_item: dict[str, list] = {}
+        for e in evidence_rows:
+            by_item.setdefault(e.operator_item_id, []).append(e)
+
+        directives_by_id: dict[str, object] = {}
+        scopes = [args.scope_id] if args.scope_id else [s.id for s in stores.fleet_config.scopes]
+        for scope_id in scopes:
+            for item in read_operator_layer(scope_id, summaries_dir=summaries_dir):
+                directives_by_id[item.id] = item
+
+        for item_id, rows in by_item.items():
+            directive = directives_by_id.get(item_id)
+            if directive is not None:
+                subject_part = f" — {directive.subject}" if directive.subject else ""
+                print(f"[{item_id}]{subject_part}")
+                for line in directive.content.splitlines():
+                    print(f"    | {line}")
+            else:
+                print(f"[{item_id}] (directive no longer live)")
+            for e in rows:
+                seen_part = f"seen {e.seen_at}" if e.seen_at else "UNSEEN"
+                print(f"  - {e.id}  ({seen_part}, from {e.reporter_scope_id}, {e.created_at})")
+                for line in e.content.splitlines():
+                    print(f"      | {line}")
+            print()
+    return 0
+
+
+def cmd_operator_evidence_seen(args: argparse.Namespace) -> int:
+    """``strata operator evidence seen <evidence_id>`` — mark evidence seen.
+
+    An explicit operator act (ADR 0017 P5): ``seen_at`` is set only by this
+    call, never by ``strata operator evidence``'s own read.
+    """
+    from datetime import UTC, datetime
+
+    from strata.stores import EmbeddedStoreError, open_embedded_stores
+
+    try:
+        stores = open_embedded_stores()
+    except EmbeddedStoreError as exc:
+        print(exc.message, file=sys.stderr)
+        return 1
+
+    with stores:
+        rows = stores.record_store.list_operator_evidence()
+        if not any(e.id == args.evidence_id for e in rows):
+            print(f"Evidence not found: {args.evidence_id}", file=sys.stderr)
+            return 1
+        stores.record_store.mark_operator_evidence_seen(
+            args.evidence_id, seen_at=datetime.now(UTC).isoformat()
+        )
+        print(f"Marked seen: {args.evidence_id}")
     return 0
 
 
@@ -5082,6 +5214,37 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Attachment scope to show. Omit to show every attachment scope + totals.",
     )
     p_op_show.set_defaults(func=cmd_operator_show)
+
+    global _operator_evidence_parser
+    p_op_evidence = operator_sub.add_parser(
+        "evidence",
+        help="List operator_evidence rows, shown with the directive each concerns.",
+    )
+    _operator_evidence_parser = p_op_evidence
+    p_op_evidence.set_defaults(func=cmd_operator_evidence_root)
+    evidence_sub = p_op_evidence.add_subparsers(
+        dest="evidence_command", metavar="<evidence-command>"
+    )
+
+    p_op_evidence_list = evidence_sub.add_parser(
+        "list", help="List operator_evidence rows (default: unseen only)."
+    )
+    p_op_evidence_list.add_argument(
+        "scope_id",
+        nargs="?",
+        default=None,
+        help="Attachment scope to filter to. Omit to show every attachment scope.",
+    )
+    p_op_evidence_list.add_argument(
+        "--all", action="store_true", help="Include already-seen evidence, not just unseen."
+    )
+    p_op_evidence_list.set_defaults(func=cmd_operator_evidence)
+
+    p_op_evidence_seen = evidence_sub.add_parser(
+        "seen", help="Mark one evidence row seen — an explicit operator act, never a bare read."
+    )
+    p_op_evidence_seen.add_argument("evidence_id")
+    p_op_evidence_seen.set_defaults(func=cmd_operator_evidence_seen)
 
     # -------------------------------------------------------------------
     # strata publication — ADR 0007's local entry surface: show a scope's
