@@ -605,7 +605,10 @@ def compose_perspective(
         ``"condensation": {"condensed": bool, "context_contributions_absent":
         int | None}`` — the issue #202 disclosure that material may have been
         condensed away rather than never admitted; both halves are mechanical
-        and over-approximate — and ``"context_items": [{"id": str, "label":
+        and over-approximate, and over-counting is COMMON in practice, not
+        rare — live condensation is usually a REWORDING of a still-standing
+        claim, not a deletion, and a verbatim-substring test cannot tell the
+        two apart — and ``"context_items": [{"id": str, "label":
         str}] | None`` (ADR 0017 P1b): the accepted context contributions
         still findable, verbatim, in this layer's own ``context`` text, each
         with a deterministic (never LLM-generated) label truncated to at most

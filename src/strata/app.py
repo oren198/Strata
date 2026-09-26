@@ -3041,7 +3041,11 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
             # ADR 0017 P6 part 1, issue #202: every condensation-drop row for this
             # scope (small, rare — "constitutional, not operational" like operator
             # memory — never paginated the way contributions are), so a client can
-            # mark any contribution on this page that was later condensed away.
+            # mark any contribution on this page found no longer verbatim in the
+            # summary at a later version — a live judge commonly REWORDS a
+            # still-standing claim rather than deleting it, and a verbatim-substring
+            # test cannot tell the two apart, so the client-facing wording must
+            # always be "condensed away or reworded", never "condensed away" alone.
             "condensation_drops": [
                 asdict(d) for d in record_store.list_condensation_drops(scope_id=scope_id)
             ],

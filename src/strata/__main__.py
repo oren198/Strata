@@ -728,12 +728,16 @@ def cmd_record(args: argparse.Namespace) -> int:
                 raised_evidence = stores.record_store.get_raised_operator_evidence(c.id)
                 if raised_evidence is not None:
                     print(f"      raised to the operator as {raised_evidence.id}")
-            # ADR 0017 P6 part 1, issue #202: this item was mechanically found
-            # condensed away by a later amendment — "unexamined", never "poorly
-            # standing" (the wording rule).
+            # ADR 0017 P6 part 1, issue #202: this item's text was mechanically
+            # found gone at a later amendment. The wording says what the test
+            # actually measures, never asserts a cause: a verbatim-substring
+            # test cannot tell condensation from a live judge's common case,
+            # REWORDING a still-standing claim — "unexamined", never "poorly
+            # standing" (the separate wording rule for state_at_drop itself).
             for drop in stores.record_store.list_condensation_drops(contribution_id=c.id):
                 print(
-                    f"      condensed away at v{drop.summary_version} "
+                    f"      no longer verbatim in the summary at v{drop.summary_version} "
+                    f"(condensed away or reworded) "
                     f"({drop.state_at_drop}, {drop.words_before}→{drop.words_after} words, "
                     f"budget {drop.budget})"
                 )

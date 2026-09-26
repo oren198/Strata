@@ -296,8 +296,8 @@ function RecordEntryRow({
 
           {condensationDrops.length > 0 && condensationDrops.map((d) => (
             <div className="at-caption" key={d.id}>
-              Condensed away at summary v{d.summary_version} —{" "}
-              {CONDENSATION_STATE_WORDS[d.state_at_drop] || d.state_at_drop}
+              No longer verbatim in the summary at v{d.summary_version} (condensed away or reworded){" "}
+              — {CONDENSATION_STATE_WORDS[d.state_at_drop] || d.state_at_drop}
               {" "}({d.words_before}→{d.words_after} words, budget {d.budget})
             </div>
           ))}

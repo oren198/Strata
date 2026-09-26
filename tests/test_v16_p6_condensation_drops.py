@@ -380,5 +380,24 @@ def test_cli_record_prints_the_condensation_drop_line(
     rc = main(["record", "g_x"])
     assert rc == 0
     out = capsys.readouterr().out
-    assert "condensed away at v2 (corroborated, 10→4 words, budget 500)" in out
+    assert (
+        "no longer verbatim in the summary at v2 (condensed away or reworded) "
+        "(corroborated, 10→4 words, budget 500)"
+    ) in out
     get_settings.cache_clear()
+
+
+def test_console_record_trail_uses_the_no_longer_verbatim_wording() -> None:
+    """CEO wording fix: a live judge commonly REWORDS a still-standing claim
+    rather than deleting it, and a verbatim-substring test cannot tell the two
+    apart — so the Console must never assert "condensed away" alone. Pinned
+    against the component's own source, since this repo has no JS test
+    harness to render it through."""
+    import pathlib
+
+    source = (
+        pathlib.Path(__file__).parent.parent / "src" / "strata" / "_ui" / "record-trail.jsx"
+    ).read_text(encoding="utf-8")
+    assert "No longer verbatim in the summary at v" in source
+    assert "condensed away or reworded" in source
+    assert "Condensed away at summary v" not in source

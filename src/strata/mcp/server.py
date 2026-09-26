@@ -3186,9 +3186,14 @@ async def strata_read_scope_record(
         ``contributions``, ``judgments``, ``judgment_attempts``, and
         ``contribution_states`` (lists) covering this page's contributions
         only, newest first; ``condensation_drops`` (ADR 0017 P6 part 1)
-        covering the WHOLE scope, never paginated; plus a ``page`` block
-        carrying ``limit``, ``total`` (the whole record's size), and
-        ``next_before_id`` (null on the last page).
+        covering the WHOLE scope, never paginated — each row says a
+        contribution's text is no longer verbatim in the summary at a later
+        version ("condensed away or reworded"), never that it was condensed
+        away specifically: a live judge commonly rewords a still-standing
+        claim rather than deleting it, and a verbatim-substring test cannot
+        tell the two apart; plus a ``page`` block carrying ``limit``,
+        ``total`` (the whole record's size), and ``next_before_id`` (null on
+        the last page).
 
     Raises:
         RuntimeError: If scope_id is outside this agent's entitled
