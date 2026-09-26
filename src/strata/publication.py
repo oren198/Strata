@@ -948,6 +948,9 @@ def _cascade_withdraw_relays(
     held_scope_id: str,
     change_ids: Sequence[str],
     hop: int = 0,
+    notice_kind: str = "withdrawn",
+    correcting_after: str | None = None,
+    correcting_claim_id: str | None = None,
 ) -> None:
     """Mechanically withdraw every published item relayed from ``(scope_id, item_id)``.
 
@@ -981,6 +984,15 @@ def _cascade_withdraw_relays(
     ever held at a time; *held_scope_id* is therefore the only deadlock risk,
     and a relayed copy that loops back into it is withdrawn in place, under
     the lock the caller already holds, rather than skipped.
+
+    *notice_kind*/*correcting_after*/*correcting_claim_id* (ADR 0017 v1.16 #221):
+    when this cascade is propagating a CORRECTION (called from
+    :func:`propagate_claim_correction`) rather than an ordinary withdrawal, every
+    hop of the cascade — not only the first — must carry ``claim_corrected`` and
+    the correcting content, or a relay two or more hops downstream would silently
+    read as a bare "withdrawn" (a depth-2 relay's own reader losing the correction
+    entirely). Threaded through the recursion unchanged; ``"withdrawn"``/``None``
+    (the defaults) reproduce the exact original behaviour.
     """
     proposer = _mechanical_proposer(scope_id)
 
@@ -1044,11 +1056,13 @@ def _cascade_withdraw_relays(
                 fleet=fleet,
                 record_store=record_store,
                 item=item.id,
-                kind="withdrawn",
+                kind=notice_kind,
                 source_scope_id=other_scope_id,
                 before=item.content,
+                after=correcting_after if notice_kind == "claim_corrected" else None,
                 wave_ids=change_ids,
                 hop=hop + 1,
+                claim_id=correcting_claim_id if notice_kind == "claim_corrected" else None,
             )
             _cascade_withdraw_relays(
                 other_scope_id,
@@ -1059,6 +1073,9 @@ def _cascade_withdraw_relays(
                 held_scope_id=held_scope_id,
                 change_ids=change_ids,
                 hop=hop + 1,
+                notice_kind=notice_kind,
+                correcting_after=correcting_after,
+                correcting_claim_id=correcting_claim_id,
             )
 
 
@@ -1356,6 +1373,9 @@ def propagate_claim_correction(
             held_scope_id=scope_id,
             change_ids=item_change_ids,
             hop=hop,
+            notice_kind="claim_corrected",
+            correcting_after=correcting_content,
+            correcting_claim_id=claim_id,
         )
 
     return to_withdraw
@@ -1502,6 +1522,9 @@ def apply_judged_withdrawals(
             held_scope_id=scope_id,
             change_ids=item_change_ids,
             hop=hop,
+            notice_kind=notice_kind,
+            correcting_after=correcting_after,
+            correcting_claim_id=correcting_claim_id,
         )
 
     return withdrawn

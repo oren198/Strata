@@ -702,10 +702,14 @@ def _judge_and_record(
 
     # ADR 0017 P4: the HOLDING scope's own refresh, reacting to a claim_corrected
     # notice a descendant's outcome sent it (above). Any pending claim_corrected
-    # event this drain carries means a withdrawal it makes below is the owner's own
-    # response to the correction, so it fans out as claim_corrected too, inheriting
-    # the SAME change id the notice arrived under (`judgment.wave_ids`, the default
-    # `_write_amendment` already uses — no override needed here).
+    # event this drain carries means a withdrawal the JUDGE itself makes below is
+    # the owner's own response to the correction, so it fans out as claim_corrected
+    # too, inheriting the SAME change id the notice arrived under (`judgment.wave_ids`,
+    # the default `_write_amendment` already uses — no override needed here). The
+    # ENGINE's own sweep for this event no longer lives here (v1.16 #221) — it runs
+    # exactly once per drain, in `drain_scope`, AFTER the judge, regardless of what
+    # the judge did (including a refresh that declines or fails outright, neither of
+    # which ever reaches this function at all).
     refresh_correction: ChangeEvent | None = None
     if mode == "input_change_refresh" and input_changes:
         refresh_correction = next(
@@ -741,16 +745,13 @@ def _judge_and_record(
                 if same_scope_correction
                 else (refresh_correction.after if refresh_correction is not None else None)
             ),
+            # ADR 0017 v1.16 #221: the ENGINE sweep fires only for the same-scope
+            # acted_on judgment (this call site's own act) — a refresh's sweep is
+            # centralised in `drain_scope`, once per drain, regardless of verdict.
             withdraw_corrected_claim_content=(
-                claim_event.before
-                if same_scope_correction
-                else (refresh_correction.before if refresh_correction is not None else None)
+                claim_event.before if same_scope_correction else None
             ),
-            withdraw_correcting_claim_id=(
-                claim_event.item_id
-                if same_scope_correction
-                else (refresh_correction.item_id if refresh_correction is not None else None)
-            ),
+            withdraw_correcting_claim_id=(claim_event.item_id if same_scope_correction else None),
         )
         summary_updated = True
 
@@ -803,13 +804,16 @@ def _write_amendment(
     *withdraw_notice_kind*/*withdraw_correcting_after* thread straight to
     :func:`~strata.publication.apply_judged_withdrawals` for the JUDGE's own
     ``withdraw_published``. *withdraw_corrected_claim_content* (the wrong claim's own
-    text) and *withdraw_correcting_claim_id* (its id) additionally drive the ENGINE's
-    own sweep (:func:`~strata.publication.propagate_claim_correction`, CEO decision A):
-    any of this scope's OWN published items still carrying that claim VERBATIM are
-    withdrawn mechanically, skipping whatever the judge already withdrew — a claim
-    left published is stale evidence for every reader of it, and a judge that omits
-    an optional field must not be the only thing standing between a corrected claim
-    and its readers.
+    text) and *withdraw_correcting_claim_id* (its id), when given, additionally drive
+    the ENGINE's own sweep (:func:`~strata.publication.propagate_claim_correction`,
+    CEO decision A) for the SAME-SCOPE ``acted_on`` judgment only — a claim left
+    published is stale evidence for every reader of it, and a judge that omits an
+    optional field must not be the only thing standing between a corrected claim and
+    its readers. A REFRESH's own sweep for a drained ``claim_corrected`` event is
+    centralised in :func:`drain_scope` instead (v1.16 #221): it must run whatever the
+    judge does with the refresh, including a decline or an outright failure, neither
+    of which ever reaches this function — so these two params are never set from a
+    refresh's own drained event here.
     """
     assert judgment.new_summary is not None  # noqa: S101 — caller-checked invariant
     # ADR 0014 D4 — ONE originating act, one change id. An amendment that
@@ -1195,10 +1199,11 @@ def _judge_batch_and_record(
             for directive_id, contribution_id in batch.directive_removals()
         ]
         # ADR 0017 P4: a coalesced drain is always the batch shape (D4's own note),
-        # so the holding scope's own refresh-driven correction fan-out (see
-        # _judge_and_record's matching comment) must be detected here too — a batch
-        # judgment never carries acted_on itself, only ever reacts to a pending
-        # claim_corrected event on a refresh.
+        # so the JUDGE's own withdraw_published, if it makes one, must still be
+        # tagged claim_corrected rather than a bare "withdrawn" when this batch is
+        # reacting to a pending claim_corrected event. The ENGINE's own sweep for
+        # that event no longer runs here (v1.16 #221) — it runs exactly once per
+        # drain, in `drain_scope`, after the judge, whatever the judge did.
         batch_refresh_correction = (
             next((event for event in input_changes if event.kind == "claim_corrected"), None)
             if mode == "input_change_refresh" and input_changes
@@ -1223,12 +1228,6 @@ def _judge_batch_and_record(
             ),
             withdraw_correcting_after=(
                 batch_refresh_correction.after if batch_refresh_correction is not None else None
-            ),
-            withdraw_corrected_claim_content=(
-                batch_refresh_correction.before if batch_refresh_correction is not None else None
-            ),
-            withdraw_correcting_claim_id=(
-                batch_refresh_correction.item_id if batch_refresh_correction is not None else None
             ),
         )
         summary_updated = True
@@ -2020,6 +2019,11 @@ def drain_scope(
             )
 
         change_ids = list(dict.fromkeys(event.change_id for event in events))
+        # ADR 0014 D4's backstop budget: this refresh sits one hop beyond the
+        # furthest-travelled event it drained, and the judgment carries that so an
+        # emitter writing derived events inherits the distance instead of
+        # restarting the wave at zero.
+        refresh_hop = max(event.hop for event in events) + 1
 
         results = _judge_batch_and_record(
             contributions=to_judge,
@@ -2035,12 +2039,38 @@ def drain_scope(
             mode="input_change_refresh",
             input_changes=events,
             change_ids=change_ids,
-            # ADR 0014 D4's backstop budget: this refresh sits one hop beyond
-            # the furthest-travelled event it drained, and the judgment carries
-            # that so an emitter writing derived events inherits the distance
-            # instead of restarting the wave at zero.
-            hop=max(event.hop for event in events) + 1,
+            hop=refresh_hop,
         )
+
+        # ADR 0017 v1.16 #221: the engine's claim-correction sweep runs exactly
+        # once per drain, for every drained claim_corrected event, AFTER the judge —
+        # whatever it did: amended, accepted with no change, declined, or failed
+        # outright (none of those last two ever reach `_write_amendment`, which is
+        # why this cannot live there — see its own docstring). The invariant is
+        # mechanical (P4 decision A): a scope told a claim is wrong must not keep
+        # publishing it verbatim, regardless of what its own judge chose to do about
+        # it. Reads the CURRENT publication, so an item the judge's own
+        # withdraw_published already removed (inside `_write_amendment`, above, on
+        # the accept path) is already gone and skipped for free — no separate
+        # already-withdrawn bookkeeping needed, and a retried drain (this whole
+        # block re-run after a judge failure) cannot double-notify for the same
+        # reason: by the second attempt the item is no longer there to withdraw.
+        for event in events:
+            if event.kind != "claim_corrected":
+                continue
+            propagate_claim_correction(
+                scope.id,
+                claim_id=event.item_id,
+                corrected_claim_content=event.before or "",
+                correcting_content=event.after or "",
+                trigger_id=event.contribution_id,
+                already_withdrawn=[],
+                fleet=fleet,
+                record_store=record_store,
+                summaries_dir=str(summary_store.summaries_dir),
+                change_ids=[event.change_id],
+                hop=refresh_hop,
+            )
 
         failures = [r for r in results if isinstance(r, JudgeUnavailable)]
         if failures:
