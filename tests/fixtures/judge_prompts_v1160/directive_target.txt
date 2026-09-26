@@ -1,0 +1,69 @@
+SCOPE: v1165-p5-corpus (id=g_v1165p5corpus)
+STRATUM: function (ordinal=1)
+
+BUDGET: once your amendment is applied, this summary must be at most 500 words (context plus every directive's content).
+
+ENTITLEMENT (relative to this scope)
+- This scope and its ancestors (entitled — directives and context):
+    g_v1165p5corpus (v1165-p5-corpus)
+- Scopes below this scope (entitled — evidence proposed upward for this scope to judge on its merits):
+    (none)
+- Scopes referenced by this chain (entitled for CONTEXT only):
+    (none)
+- All other scopes in this fleet, including archived ones (no channel to this scope — their position reaches it only through a person's report or the contributor's own observation, never asserted as their own):
+    (none)
+
+CURRENT SUMMARY
+---
+---
+condensed: false
+scope_id: g_v1165p5corpus
+updated_at: '2026-08-01T09:00:00+00:00'
+version: 1
+---
+
+# Scope: g_v1165p5corpus
+
+## Directives
+
+_(none yet)_
+
+## Context
+
+The team favours minimal abstractions.
+
+---
+
+RECENT CONTRIBUTIONS (oldest first — mechanical digest; the newest 3 PRIOR contributions carry full content):
+(none)
+OUTCOME REPORT — this contribution carries `acted_on`, reporting what happened when the contributor acted on the item below. Judge it with ONE field: set `decision` to exactly one of the four values below (see the rule below).
+
+ITEM ACTED ON (verbatim, as currently held):
+- id: c_v1165p5_directive_target
+- subject: rollout
+- current judgment: accept_as_directive
+- contributor: skill=engineer scope=g_other at=2026-09-26T10:00:00+00:00
+- content:
+    Ship behind a feature flag.
+NOTE: this item is a DIRECTIVE. A directive has no standing and is never replaced by an outcome (D6): failed_corrected/failed_superseded here still admit the report as context, but the directive itself is left untouched — do not attempt to retire, supersede, or otherwise change it.
+
+Set `decision` to exactly one:
+  - held: an ACTION THAT COULD HAVE FAILED CONFIRMED THE ITEM — never merely that the claim reads as true. An echo ("reviewed it and confirmed it") is NOT held: nothing was risked, so nothing was tested. Your reasoning must QUOTE, in one clause, the observed result you relied on.
+  - failed_corrected: the claim was WRONG. The report's own observation is what now holds — a negative result counts as the replacement ("<the action>; <the observed negative result>" contradicts and supersedes the original claim). There is no known-wrong state and no lowered standing: a failure either replaces the item or the report is declined.
+  - failed_superseded: the claim was RIGHT but the world moved on; the report's own observation is what now holds.
+  - decline: the report establishes neither a clean hold nor a clean failure — an echo, an ambiguous result ("partially worked"), or a pending one ("result unclear"). Your reasoning must name the MISSING GROUND FIRST — begin "no outcome: the action could not have failed" or "no outcome reported" — and only then, as guidance, say it may be resubmitted WITHOUT `acted_on` if worth keeping as ordinary context.
+If you cannot tell failed_corrected from failed_superseded, choose failed_corrected: a needless notice costs attention; a missing one leaves readers acting on a falsehood.
+held / failed_corrected / failed_superseded record as accept_as_context; decline records as decline — the engine derives this from `decision` itself, there is no separate field to fill.
+If `decision` is failed_corrected and THIS SCOPE'S PUBLICATION (below) carries the corrected claim IN OTHER WORDS — not the exact bytes, which the engine already catches on its own — name that published item's id in `withdraw_published`. A published face that still asserts a claim you just found wrong is stale evidence for every reader of it.
+
+
+NEW CONTRIBUTION TO JUDGE:
+- id: c_v1165p5_directive_outcome
+- proposed classification: context
+- subject: (none)
+- supersedes: (none)
+- contributor: skill=engineer scope=g_other at=2026-09-26T10:00:00+00:00
+- content:
+    Followed the flag rollout; it broke on staging.
+
+Judge it. Call `submit_judgment` exactly once.
