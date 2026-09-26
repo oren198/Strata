@@ -77,12 +77,13 @@ from __future__ import annotations
 import hashlib
 import importlib.resources
 import json
+import logging
 import os
 import pathlib
 import sqlite3
 import tempfile
 from collections.abc import AsyncGenerator, Generator, Sequence
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Literal
@@ -106,7 +107,12 @@ from strata.locks import scope_lock as _scope_lock
 from strata.locks import scope_queue as _scope_queue
 from strata.migrator import run_migrations
 from strata.operator import operator_memory_binding, read_operator_layer
-from strata.perspective import ancestor_directives, compose_perspective
+from strata.perspective import (
+    ancestor_directives,
+    compose_perspective,
+    dropped_context_contribution_ids,
+    present_context_contributions,
+)
 from strata.project_config import StoragePaths, resolve_storage_paths
 from strata.publication import (
     apply_judged_withdrawals,
@@ -121,12 +127,16 @@ from strata.record_store import (
     ClaimEventInput,
     Contribution,
     ContributorRef,
+    OperatorEvidenceInput,
+    RaisedContributionInput,
     RecentContribution,
     RecordStore,
+    standing_evidence,
 )
 from strata.scope_manager import (
     WINDOW_VERBATIM_TAIL,
     ActedOnTarget,
+    ExaminedContextItem,
     JudgeMode,
     ScopeManager,
     ScopeManagerBatchJudgment,
@@ -140,6 +150,8 @@ from strata.session_state import (
 )
 from strata.settings import Settings, get_settings
 from strata.summary_store import Directive, ScopeSummary, SummaryStore, derive_condensed
+
+_logger = logging.getLogger(__name__)
 
 # Console UI static files bundled as package data (same vendoring pattern as
 # _skills/ / _migrations/ / _templates/), so the static mount works regardless
@@ -530,6 +542,77 @@ def _read_judge_inputs(
     )
 
 
+#: Aron's own number (P6 part 2): a naming instruction, not a budget the engine
+#: enforces, so a hard cap keeps the prompt itself bounded regardless of how many
+#: examined items a long-lived scope accumulates.
+_EXAMINED_CONTEXT_CAP = 10
+
+
+def _resolve_examined_context(
+    *,
+    scope_id: str,
+    current_summary: ScopeSummary | None,
+    fleet: FleetConfig,
+    record_store: RecordStore,
+    summary_store: SummaryStore,
+) -> list[ExaminedContextItem]:
+    """This scope's own accepted context items an outcome has TESTED (ADR 0017
+    P6 part 2) — corroborated, correcting, or raised, the same three examined
+    states P6 part 1's ``state_at_drop`` derives, applied live against what is
+    CURRENTLY verbatim in the scope's own context rather than at drop time.
+    Newest first, capped at :data:`_EXAMINED_CONTEXT_CAP`.
+
+    Priority corroborated > correcting > raised, same as part 1: an item that
+    is both corroborated and its own correcting content is named once, as the
+    stronger fact.
+    """
+    if current_summary is None or not current_summary.context.strip():
+        return []
+    candidates = record_store.list_accepted_context_contributions(scope_id=scope_id)
+    present = present_context_contributions(current_summary.context, candidates)
+    present = sorted(present, key=lambda c: c.created_at, reverse=True)
+
+    items: list[ExaminedContextItem] = []
+    for contribution in present:
+        if len(items) >= _EXAMINED_CONTEXT_CAP:
+            break
+        evidence = standing_evidence(
+            record_store, fleet, contribution.id, summary_store=summary_store
+        )
+        held_count = sum(
+            1 for e in evidence if e.replaced_kind is None and e.correction_pending_kind is None
+        )
+        correcting_event = record_store.claim_event_for(contribution.id)
+        if held_count > 0:
+            items.append(
+                ExaminedContextItem(
+                    contribution_id=contribution.id,
+                    content=contribution.content,
+                    kind="corroborated",
+                    detail=f"{held_count} held outcome{'s' if held_count != 1 else ''}",
+                )
+            )
+        elif correcting_event is not None:
+            items.append(
+                ExaminedContextItem(
+                    contribution_id=contribution.id,
+                    content=contribution.content,
+                    kind="correcting",
+                    detail=f"corrects {correcting_event.item_id}",
+                )
+            )
+        elif contribution.raised_from is not None:
+            items.append(
+                ExaminedContextItem(
+                    contribution_id=contribution.id,
+                    content=contribution.content,
+                    kind="raised",
+                    detail=f"evidence from {contribution.contributor.scope_id}",
+                )
+            )
+    return items
+
+
 def _judge_and_record(
     *,
     contribution: Contribution,
@@ -565,8 +648,15 @@ def _judge_and_record(
     # same way P1's validate_acted_on already did at the write boundary — that
     # validator guarantees the target exists and has an accepting judgment, so this
     # never needs to handle "missing" itself.
+    # ADR 0017 P5: a RAISED contribution carries `acted_on` too (the directive it
+    # was raised from — a record fact), but `raised_from` set means it is judged
+    # as an ORDINARY contribution at the issuing scope — plan decision: "an
+    # ordinary upward contribution... the issuer revises through the ordinary
+    # channel, or doesn't." No OUTCOME REPORT block, no narrowed enum: the
+    # issuer's own judge sees the standard accept_as_directive/accept_as_context/
+    # decline tool, same as if this had arrived as a fresh contribution.
     acted_on_target: ActedOnTarget | None = None
-    if contribution.acted_on is not None:
+    if contribution.acted_on is not None and contribution.raised_from is None:
         entry = record_store.get_record_entry(contribution.acted_on)
         assert entry is not None and entry.judgment is not None, (
             "acted_on target unresolvable at judge time — P1's validate_acted_on "
@@ -574,6 +664,38 @@ def _judge_and_record(
         )
         acted_on_target = ActedOnTarget(
             contribution=entry.contribution, decision=entry.judgment.decision
+        )
+    elif contribution.acted_on_operator_item is not None and contribution.raised_from is None:
+        # ADR 0017 P5: an OPERATOR directive target. validate_acted_on already
+        # guaranteed the act exists, is live, and its attachment scope is within
+        # the contributor's entitled surface — resolve the CURRENT item (an act id
+        # a contributor names may since have been superseded by a live one, though
+        # never past validate_acted_on's own is_operator_act_live gate at write
+        # time; this reads it fresh, at judge time, the same discipline as the
+        # scope-held branch above) from its attachment scope's own layer.
+        act = record_store.get_operator_act(contribution.acted_on_operator_item)
+        assert act is not None, (
+            "acted_on_operator_item unresolvable at judge time — P1's "
+            "validate_acted_on should have rejected this contribution at the "
+            "write boundary"
+        )
+        current_item = next(
+            (
+                item
+                for item in read_operator_layer(
+                    act.target_scope_id, summaries_dir=str(summary_store.summaries_dir)
+                )
+                if item.id == contribution.acted_on_operator_item
+            ),
+            None,
+        )
+        assert current_item is not None, (
+            "acted_on_operator_item no longer live at judge time — P1's "
+            "validate_acted_on should have rejected this contribution at the "
+            "write boundary"
+        )
+        acted_on_target = ActedOnTarget(
+            contribution=None, decision=None, operator_item=current_item
         )
     # ADR 0017 P3/P4: `acted_on_target` is passed ONLY when set — a call shape a
     # judge with the pre-P3 signature (strata-evals' ScriptedJudge, the bench
@@ -585,6 +707,21 @@ def _judge_and_record(
     judge_kwargs: dict = {}
     if acted_on_target is not None:
         judge_kwargs["acted_on_target"] = acted_on_target
+    # ADR 0017 P6 part 2: same discipline — the kwarg appears only when there is
+    # at least one examined item, so a scope with none gets the call shape it
+    # always had. Applies to a refresh judgment too (mode == "input_change_refresh"
+    # rewrites the summary the same way an ordinary accept does, per the CEO's
+    # own amendment to the brief) — never to publication or bootstrap judging,
+    # neither of which is called from here.
+    examined_context = _resolve_examined_context(
+        scope_id=scope.id,
+        current_summary=inputs.current_summary,
+        fleet=fleet,
+        record_store=record_store,
+        summary_store=summary_store,
+    )
+    if examined_context:
+        judge_kwargs["examined_context"] = examined_context
     try:
         judgment: ScopeManagerJudgment = scope_manager.judge(
             scope=scope,
@@ -653,15 +790,102 @@ def _judge_and_record(
             before=acted_on_target.contribution.content,
             after=contribution.content,
         )
-    record_store.record_judgment(
-        contribution_id=contribution.id,
-        decision=judgment.decision,
-        judged_by="scope-manager",
-        # The judge's reasoning, plus the mechanical note for any amendment op
-        # the engine dropped (ADR 0011 D1) — the record shows what applied.
-        notes=judgment.record_notes,
-        claim_event=claim_event,
-    )
+    # ADR 0017 P5: "directive consequences go upward" — a `failed` outcome against
+    # a directive target, whose issuer differs from the reporter, is raised by the
+    # ENGINE (never a judge field) to whoever issued the directive. Bounds: `held`
+    # is never raised; issuer == reporter raises nothing (there is no "upward"
+    # from a scope to itself); a contribution already carrying `raised_from` can
+    # never trigger a further raise — guaranteed here not by an extra check but
+    # structurally, since such a contribution is judged with no `acted_on_target`
+    # at all (above), so it can never produce `outcome_disposition == "failed"`.
+    raise_to_scope: RaisedContributionInput | None = None
+    raise_to_operator: OperatorEvidenceInput | None = None
+    issuer_scope_id: str | None = None
+    if (
+        judgment.outcome_disposition == "failed"
+        and acted_on_target is not None
+        and acted_on_target.is_directive
+    ):
+        # ADR 0017 P5, philosopher's line 7: framed as evidence about the world
+        # from a NAMED scope — never a contrary rule the issuer's judge should
+        # weigh against its own directive.
+        raised_content = (
+            f"evidence from {contribution.scope_id}: following {acted_on_target.target_id} "
+            f"went wrong: {contribution.content}"
+        )
+        if acted_on_target.operator_item is not None:
+            raise_to_operator = OperatorEvidenceInput(
+                operator_item_id=acted_on_target.target_id,
+                raised_from=contribution.id,
+                reporter=contribution.contributor,
+                content=raised_content,
+            )
+        else:
+            issuer_scope_id = acted_on_target.contribution.scope_id
+            if issuer_scope_id == contribution.scope_id:
+                issuer_scope_id = None  # nothing raised: issuer == reporter
+            else:
+                raise_to_scope = RaisedContributionInput(
+                    scope_id=issuer_scope_id,
+                    content=raised_content,
+                    subject=acted_on_target.target_subject,
+                    contributor=contribution.contributor,
+                    acted_on=acted_on_target.target_id,
+                    raised_from=contribution.id,
+                )
+
+    if raise_to_scope is not None or raise_to_operator is not None:
+        _judgment_row, raised_contribution = record_store.record_judgment_and_raise(
+            contribution_id=contribution.id,
+            decision=judgment.decision,
+            judged_by="scope-manager",
+            notes=judgment.record_notes,
+            raise_contribution=raise_to_scope,
+            raise_operator_evidence=raise_to_operator,
+        )
+        # The raised contribution is judged SYNCHRONOUSLY, in this same request,
+        # against its own issuing scope — never the reporter's. A failure here is
+        # the RAISED contribution's own JudgeUnavailable (its own id, its own
+        # JUDGE_FAILED marker via `_judge_and_record`'s usual handling): the
+        # reporter's own outcome is already durably judged above, so it is never
+        # let to fail this call — retry reaches it later through the ordinary
+        # strata_rejudge path, same as any other pending judgment.
+        if raised_contribution is not None:
+            issuer_scope = fleet.get_scope(issuer_scope_id)
+            issuer_stratum = (
+                next((s for s in fleet.strata if s.id == issuer_scope.stratum_id), None)
+                if issuer_scope is not None
+                else None
+            )
+            # A vanished issuer scope (fleet.yaml changed since the directive was
+            # issued) leaves the raise pending, exactly like any other unjudged
+            # contribution — retried later through strata_rejudge, which runs the
+            # same fleet lookup and raises its own clear RuntimeError if it is
+            # still missing then.
+            if issuer_scope is not None and issuer_stratum is not None:
+                with _scope_lock(issuer_scope.id), suppress(JudgeUnavailable):
+                    _judge_and_record(
+                        contribution=raised_contribution,
+                        scope=issuer_scope,
+                        stratum=issuer_stratum,
+                        fleet=fleet,
+                        record_store=record_store,
+                        summary_store=summary_store,
+                        scope_manager=scope_manager,
+                        summary_max_words=summary_max_words,
+                        window_verbatim_tail=window_verbatim_tail,
+                        recency_window_size=recency_window_size,
+                    )
+    else:
+        record_store.record_judgment(
+            contribution_id=contribution.id,
+            decision=judgment.decision,
+            judged_by="scope-manager",
+            # The judge's reasoning, plus the mechanical note for any amendment op
+            # the engine dropped (ADR 0011 D1) — the record shows what applied.
+            notes=judgment.record_notes,
+            claim_event=claim_event,
+        )
 
     # ADR 0017 P4: the correction's fan-out, split on who authored it.
     #
@@ -702,10 +926,14 @@ def _judge_and_record(
 
     # ADR 0017 P4: the HOLDING scope's own refresh, reacting to a claim_corrected
     # notice a descendant's outcome sent it (above). Any pending claim_corrected
-    # event this drain carries means a withdrawal it makes below is the owner's own
-    # response to the correction, so it fans out as claim_corrected too, inheriting
-    # the SAME change id the notice arrived under (`judgment.wave_ids`, the default
-    # `_write_amendment` already uses — no override needed here).
+    # event this drain carries means a withdrawal the JUDGE itself makes below is
+    # the owner's own response to the correction, so it fans out as claim_corrected
+    # too, inheriting the SAME change id the notice arrived under (`judgment.wave_ids`,
+    # the default `_write_amendment` already uses — no override needed here). The
+    # ENGINE's own sweep for this event no longer lives here (v1.16 #221) — it runs
+    # exactly once per drain, in `drain_scope`, AFTER the judge, regardless of what
+    # the judge did (including a refresh that declines or fails outright, neither of
+    # which ever reaches this function at all).
     refresh_correction: ChangeEvent | None = None
     if mode == "input_change_refresh" and input_changes:
         refresh_correction = next(
@@ -722,6 +950,7 @@ def _judge_and_record(
             fleet=fleet,
             record_store=record_store,
             summary_store=summary_store,
+            summary_max_words=summary_max_words,
             previous_summary=inputs.current_summary,
             retirements=[
                 (d, judgment.reasoning, judgment.retirement_circumstances().get(d))
@@ -741,16 +970,13 @@ def _judge_and_record(
                 if same_scope_correction
                 else (refresh_correction.after if refresh_correction is not None else None)
             ),
+            # ADR 0017 v1.16 #221: the ENGINE sweep fires only for the same-scope
+            # acted_on judgment (this call site's own act) — a refresh's sweep is
+            # centralised in `drain_scope`, once per drain, regardless of verdict.
             withdraw_corrected_claim_content=(
-                claim_event.before
-                if same_scope_correction
-                else (refresh_correction.before if refresh_correction is not None else None)
+                claim_event.before if same_scope_correction else None
             ),
-            withdraw_correcting_claim_id=(
-                claim_event.item_id
-                if same_scope_correction
-                else (refresh_correction.item_id if refresh_correction is not None else None)
-            ),
+            withdraw_correcting_claim_id=(claim_event.item_id if same_scope_correction else None),
         )
         summary_updated = True
 
@@ -769,6 +995,7 @@ def _write_amendment(
     fleet: FleetConfig,
     record_store: RecordStore,
     summary_store: SummaryStore,
+    summary_max_words: int,
     previous_summary: ScopeSummary | None,
     retirements: Sequence[tuple[str, str, str | None]],
     removals: Sequence[tuple[str, str]],
@@ -803,13 +1030,16 @@ def _write_amendment(
     *withdraw_notice_kind*/*withdraw_correcting_after* thread straight to
     :func:`~strata.publication.apply_judged_withdrawals` for the JUDGE's own
     ``withdraw_published``. *withdraw_corrected_claim_content* (the wrong claim's own
-    text) and *withdraw_correcting_claim_id* (its id) additionally drive the ENGINE's
-    own sweep (:func:`~strata.publication.propagate_claim_correction`, CEO decision A):
-    any of this scope's OWN published items still carrying that claim VERBATIM are
-    withdrawn mechanically, skipping whatever the judge already withdrew — a claim
-    left published is stale evidence for every reader of it, and a judge that omits
-    an optional field must not be the only thing standing between a corrected claim
-    and its readers.
+    text) and *withdraw_correcting_claim_id* (its id), when given, additionally drive
+    the ENGINE's own sweep (:func:`~strata.publication.propagate_claim_correction`,
+    CEO decision A) for the SAME-SCOPE ``acted_on`` judgment only — a claim left
+    published is stale evidence for every reader of it, and a judge that omits an
+    optional field must not be the only thing standing between a corrected claim and
+    its readers. A REFRESH's own sweep for a drained ``claim_corrected`` event is
+    centralised in :func:`drain_scope` instead (v1.16 #221): it must run whatever the
+    judge does with the refresh, including a decline or an outright failure, neither
+    of which ever reaches this function — so these two params are never set from a
+    refresh's own drained event here.
     """
     assert judgment.new_summary is not None  # noqa: S101 — caller-checked invariant
     # ADR 0014 D4 — ONE originating act, one change id. An amendment that
@@ -849,6 +1079,71 @@ def _write_amendment(
     # one value on every accepted row, so a batch's N verdicts tie to their
     # one write without anyone counting rows against `version`.
     record_store.stamp_summary_version(judged_contribution_ids, version=written.version)
+
+    # ADR 0017 P6 part 1, issue #202: one condensation_drops row per accepted
+    # context contribution this amendment mechanically dropped — present
+    # verbatim in the OLD context, absent from the NEW one. NOT one SQL
+    # transaction with the summary write above (the summary is a markdown
+    # file, this is a DB row) — same `_scope_lock` ordering is the only
+    # atomicity available, so a crash between the two lines above and this
+    # one leaves a written summary with no drop rows for it, never the
+    # reverse. A failure writing the rows is logged loudly and swallowed —
+    # never silent, but never rolling back an already-committed summary
+    # write for a purely diagnostic side table.
+    try:
+        candidates = record_store.list_accepted_context_contributions(scope_id=scope.id)
+        dropped_ids = dropped_context_contribution_ids(
+            previous_summary.context if previous_summary is not None else None,
+            judgment.new_summary.context,
+            candidates,
+        )
+        # A claim THIS SAME amendment corrected (P3/P4) was REPLACED, not
+        # condensed — its own outcome already gets the record's claim_corrected/
+        # claim_superseded event; a second, condensation-flavoured row for the
+        # same fact would misname why it left the context.
+        corrected_targets = {
+            event.item_id
+            for jid in judged_contribution_ids
+            if (event := record_store.claim_event_for(jid)) is not None
+        }
+        dropped_ids = [d for d in dropped_ids if d not in corrected_targets]
+        if dropped_ids:
+            by_id = {c.id: c for c in candidates}
+            words_before = len((previous_summary.context if previous_summary else "").split())
+            words_after = len(judgment.new_summary.context.split())
+            drops: list[tuple[str, str, int, int]] = []
+            for dropped_id in dropped_ids:
+                evidence = standing_evidence(
+                    record_store, fleet, dropped_id, summary_store=summary_store
+                )
+                if any(
+                    e.replaced_kind is None and e.correction_pending_kind is None for e in evidence
+                ):
+                    state_at_drop = "corroborated"
+                elif record_store.claim_event_for(dropped_id) is not None:
+                    state_at_drop = "correcting"
+                # TODO(P6 part 2): the philosopher ruled a raised consequence's own
+                # acceptance at the issuer is EXAMINED (P5) — 'raised' below covers
+                # the dropped item itself being one; part 2 lists 'raised' among the
+                # examined states on the judge-input side too.
+                elif by_id[dropped_id].raised_from is not None:
+                    state_at_drop = "raised"
+                else:
+                    state_at_drop = "unexamined"
+                drops.append((dropped_id, state_at_drop, words_before, words_after))
+            record_store.append_condensation_drops(
+                scope_id=scope.id,
+                summary_version=written.version,
+                budget=summary_max_words,
+                drops=drops,
+            )
+    except Exception:
+        _logger.exception(
+            "condensation_drops write failed for scope %r at summary version %s "
+            "(summary already written; the drop rows are missing, not the amendment)",
+            scope.id,
+            written.version,
+        )
 
     # ADR 0011 D1: a `retire` op removes a directive with no replacement,
     # so no contribution row carries the explanation — the retirement
@@ -1138,6 +1433,19 @@ def _judge_batch_and_record(
         recency_window_size=recency_window_size,
     )
 
+    # ADR 0017 P6 part 2: same discipline as the single path — the kwarg
+    # appears only when there is at least one examined item.
+    batch_judge_kwargs: dict = {}
+    examined_context = _resolve_examined_context(
+        scope_id=scope.id,
+        current_summary=inputs.current_summary,
+        fleet=fleet,
+        record_store=record_store,
+        summary_store=summary_store,
+    )
+    if examined_context:
+        batch_judge_kwargs["examined_context"] = examined_context
+
     try:
         batch: ScopeManagerBatchJudgment = scope_manager.judge_batch(
             scope=scope,
@@ -1157,6 +1465,7 @@ def _judge_batch_and_record(
             input_changes=input_changes,
             change_ids=wave_ids,
             hop=hop,
+            **batch_judge_kwargs,
         )
     except Exception as exc:  # noqa: BLE001 — every member needs its own error
         # One failed call strands the whole batch, so each member gets the
@@ -1195,10 +1504,11 @@ def _judge_batch_and_record(
             for directive_id, contribution_id in batch.directive_removals()
         ]
         # ADR 0017 P4: a coalesced drain is always the batch shape (D4's own note),
-        # so the holding scope's own refresh-driven correction fan-out (see
-        # _judge_and_record's matching comment) must be detected here too — a batch
-        # judgment never carries acted_on itself, only ever reacts to a pending
-        # claim_corrected event on a refresh.
+        # so the JUDGE's own withdraw_published, if it makes one, must still be
+        # tagged claim_corrected rather than a bare "withdrawn" when this batch is
+        # reacting to a pending claim_corrected event. The ENGINE's own sweep for
+        # that event no longer runs here (v1.16 #221) — it runs exactly once per
+        # drain, in `drain_scope`, after the judge, whatever the judge did.
         batch_refresh_correction = (
             next((event for event in input_changes if event.kind == "claim_corrected"), None)
             if mode == "input_change_refresh" and input_changes
@@ -1210,6 +1520,7 @@ def _judge_batch_and_record(
             fleet=fleet,
             record_store=record_store,
             summary_store=summary_store,
+            summary_max_words=summary_max_words,
             previous_summary=inputs.current_summary,
             retirements=retirements,
             removals=removals,
@@ -1223,12 +1534,6 @@ def _judge_batch_and_record(
             ),
             withdraw_correcting_after=(
                 batch_refresh_correction.after if batch_refresh_correction is not None else None
-            ),
-            withdraw_corrected_claim_content=(
-                batch_refresh_correction.before if batch_refresh_correction is not None else None
-            ),
-            withdraw_correcting_claim_id=(
-                batch_refresh_correction.item_id if batch_refresh_correction is not None else None
             ),
         )
         summary_updated = True
@@ -1310,6 +1615,15 @@ def validate_acted_on(
        judge-failed contribution never entered memory, so nothing was there to act on
        (CEO add).
 
+    ADR 0017 P5: ``acted_on`` may instead name an OPERATOR act (``op_``-prefixed —
+    see :func:`run_contribution`'s own dispatch comment). Rules 2-4 above become:
+    the act must exist; its attachment scope (``target_scope_id``) must be within
+    *agent_scope*'s entitled surface (the operator layer is attached at or above a
+    scope, the same chain rule as an ordinary target's scope); and it must be
+    LIVE — not itself a ``retire`` act, and not since superseded — mirroring rule 4's
+    "the item that currently stands" exactly, since an operator act carries no
+    judgment to check instead.
+
     A no-op when ``acted_on`` is ``None`` — every pre-P1 call site is unaffected.
 
     Raises:
@@ -1324,6 +1638,34 @@ def validate_acted_on(
             "you report — not something you assert yourself via supersedes. Submit the "
             "outcome with acted_on alone and let the judge classify it."
         )
+    if acted_on.startswith("op_"):
+        act = record_store.get_operator_act(acted_on)
+        if act is None:
+            raise RuntimeError(
+                f"acted_on={acted_on!r} does not reference an existing operator item."
+            )
+        if fleet.get_scope(agent_scope) is None:
+            raise RuntimeError(
+                f"your bound scope {agent_scope!r} no longer exists in the fleet "
+                "config — fleet.yaml changed since this session started. Restore "
+                "the scope in fleet.yaml or relaunch with a valid binding."
+            )
+        ancestors = fleet.inter_stratum_ancestors(agent_scope)
+        entitled = {agent_scope, *(s.id for s in ancestors)}
+        if act.target_scope_id not in entitled:
+            raise RuntimeError(
+                f"operator item {acted_on!r} is attached at {act.target_scope_id!r}, outside "
+                f"your entitled surface (your scope {agent_scope!r} plus its inter-stratum "
+                "ancestors). The operator layer is attached at or above a scope, the same "
+                "chain-only rule as any other acted_on target."
+            )
+        if not record_store.is_operator_act_live(acted_on):
+            raise RuntimeError(
+                f"acted_on={acted_on!r} references an operator item that is no longer "
+                "current (superseded or retired) — you can only report an outcome for "
+                "the item that currently stands."
+            )
+        return
     entry = record_store.get_record_entry(acted_on)
     if entry is None:
         raise RuntimeError(f"acted_on={acted_on!r} does not reference an existing contribution.")
@@ -1410,6 +1752,12 @@ def run_contribution(
     """
     if acted_on is not None and supersedes is not None:
         raise ValueError("acted_on and supersedes cannot both be set on one contribution.")
+    # ADR 0017 P5: the API keeps ONE `acted_on` field; the app resolves which
+    # storage column the id belongs in. Ids are minted so this dispatch is
+    # unambiguous and never needs a lookup: contribution ids are `c_`-prefixed,
+    # operator act ids `op_`-prefixed (record_store's `_new_contribution_id`/
+    # `_new_operator_act_id`, by design — "never mistaken for" the other).
+    is_operator_target = acted_on is not None and acted_on.startswith("op_")
     queue = _scope_queue(scope.id)
     with _scope_append_lock(scope.id):
         contribution = record_store.append_contribution(
@@ -1419,7 +1767,8 @@ def run_contribution(
             subject=subject,
             supersedes=supersedes,
             contributor=contributor,
-            acted_on=acted_on,
+            acted_on=None if is_operator_target else acted_on,
+            acted_on_operator_item=acted_on if is_operator_target else None,
         )
         ticket = queue.enqueue(contribution.id, contribution)
 
@@ -2020,6 +2369,11 @@ def drain_scope(
             )
 
         change_ids = list(dict.fromkeys(event.change_id for event in events))
+        # ADR 0014 D4's backstop budget: this refresh sits one hop beyond the
+        # furthest-travelled event it drained, and the judgment carries that so an
+        # emitter writing derived events inherits the distance instead of
+        # restarting the wave at zero.
+        refresh_hop = max(event.hop for event in events) + 1
 
         results = _judge_batch_and_record(
             contributions=to_judge,
@@ -2035,12 +2389,38 @@ def drain_scope(
             mode="input_change_refresh",
             input_changes=events,
             change_ids=change_ids,
-            # ADR 0014 D4's backstop budget: this refresh sits one hop beyond
-            # the furthest-travelled event it drained, and the judgment carries
-            # that so an emitter writing derived events inherits the distance
-            # instead of restarting the wave at zero.
-            hop=max(event.hop for event in events) + 1,
+            hop=refresh_hop,
         )
+
+        # ADR 0017 v1.16 #221: the engine's claim-correction sweep runs exactly
+        # once per drain, for every drained claim_corrected event, AFTER the judge —
+        # whatever it did: amended, accepted with no change, declined, or failed
+        # outright (none of those last two ever reach `_write_amendment`, which is
+        # why this cannot live there — see its own docstring). The invariant is
+        # mechanical (P4 decision A): a scope told a claim is wrong must not keep
+        # publishing it verbatim, regardless of what its own judge chose to do about
+        # it. Reads the CURRENT publication, so an item the judge's own
+        # withdraw_published already removed (inside `_write_amendment`, above, on
+        # the accept path) is already gone and skipped for free — no separate
+        # already-withdrawn bookkeeping needed, and a retried drain (this whole
+        # block re-run after a judge failure) cannot double-notify for the same
+        # reason: by the second attempt the item is no longer there to withdraw.
+        for event in events:
+            if event.kind != "claim_corrected":
+                continue
+            propagate_claim_correction(
+                scope.id,
+                claim_id=event.item_id,
+                corrected_claim_content=event.before or "",
+                correcting_content=event.after or "",
+                trigger_id=event.contribution_id,
+                already_withdrawn=[],
+                fleet=fleet,
+                record_store=record_store,
+                summaries_dir=str(summary_store.summaries_dir),
+                change_ids=[event.change_id],
+                hop=refresh_hop,
+            )
 
         failures = [r for r in results if isinstance(r, JudgeUnavailable)]
         if failures:
@@ -2646,6 +3026,67 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
         return composed
 
     # -----------------------------------------------------------------------
+    # GET /scopes/{scope_id}/operator-evidence
+    # POST /operator-evidence/{evidence_id}/seen
+    # -----------------------------------------------------------------------
+
+    @application.get("/scopes/{scope_id}/operator-evidence")
+    def get_scope_operator_evidence(
+        scope_id: str,
+        request: Request,
+        all: bool = False,  # noqa: A002 — mirrors the CLI's own --all flag
+        record_store: RecordStore = Depends(get_record_store),
+        summary_store: SummaryStore = Depends(get_summary_store),
+    ) -> dict:
+        """Return operator_evidence rows for the operator directives attached AT
+        *scope_id* (ADR 0017 P5) — the Console surface for the same read
+        ``strata operator evidence`` gives the CLI. Unseen only by default;
+        ``?all=true`` includes already-seen rows too.
+
+        Grouped by ``operator_item_id`` client-side (the same "shown WITH the
+        directive it concerns" discipline as the CLI): this route returns a
+        flat ``evidence`` list, each row carrying its own ``operator_item_id``,
+        rather than pre-grouping server-side — the Console already has each
+        directive's own id from the perspective it just composed.
+
+        Same entitlement as the operator/perspective view: 404 only if the
+        scope itself is unknown, exactly like ``GET .../perspective``.
+        """
+        from dataclasses import asdict
+
+        from strata.operator import read_operator_layer
+
+        fleet: FleetConfig = request.app.state.fleet_reloader.get()
+        scope = fleet.get_scope(scope_id)
+        if scope is None:
+            raise HTTPException(status_code=404, detail=f"Scope not found: {scope_id!r}")
+
+        item_ids = {
+            item.id
+            for item in read_operator_layer(
+                scope_id, summaries_dir=str(summary_store.summaries_dir)
+            )
+        }
+        rows = record_store.list_operator_evidence(unseen_only=not all)
+        return {"evidence": [asdict(e) for e in rows if e.operator_item_id in item_ids]}
+
+    @application.post("/operator-evidence/{evidence_id}/seen")
+    def mark_operator_evidence_seen_route(
+        evidence_id: str,
+        record_store: RecordStore = Depends(get_record_store),
+    ) -> dict:
+        """Mark one operator_evidence row seen — the Console surface for
+        ``strata operator evidence seen`` (ADR 0017 P5): an explicit act, called
+        ONLY from a "mark seen" button, never from opening or reading a row.
+        """
+        if not any(e.id == evidence_id for e in record_store.list_operator_evidence()):
+            raise HTTPException(status_code=404, detail=f"Evidence not found: {evidence_id!r}")
+        record_store.mark_operator_evidence_seen(
+            evidence_id, seen_at=datetime.now(tz=UTC).isoformat()
+        )
+        return {"evidence_id": evidence_id, "seen": True}
+
+    # -----------------------------------------------------------------------
     # GET /scopes/{scope_id}/record
     # -----------------------------------------------------------------------
 
@@ -2699,6 +3140,17 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
             # The derived per-contribution state (issue #118) so a client renders
             # "attempted, judge errored" without re-deriving the three-way join.
             "contribution_states": [asdict(s) for s in page.contribution_states],
+            # ADR 0017 P6 part 1, issue #202: every condensation-drop row for this
+            # scope (small, rare — "constitutional, not operational" like operator
+            # memory — never paginated the way contributions are), so a client can
+            # mark any contribution on this page found no longer verbatim in the
+            # summary at a later version — a live judge commonly REWORDS a
+            # still-standing claim rather than deleting it, and a verbatim-substring
+            # test cannot tell the two apart, so the client-facing wording must
+            # always be "condensed away or reworded", never "condensed away" alone.
+            "condensation_drops": [
+                asdict(d) for d in record_store.list_condensation_drops(scope_id=scope_id)
+            ],
             # next_before_id is None once the record is exhausted — the signal a
             # client pages until, rather than guessing from a short page.
             "page": {

@@ -75,7 +75,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
-from typing import Protocol
+from typing import Protocol, TypeVar
 
 from strata.fleet_config import FleetConfig
 from strata.summary_store import Directive, ScopeSummary, SummaryStore
@@ -240,6 +240,26 @@ def _present_context_items(context: str, contributions: Sequence[_ContributionLi
     return items
 
 
+_ContribT = TypeVar("_ContribT", bound=_ContributionLike)
+
+
+def present_context_contributions(
+    context: str, contributions: Sequence[_ContribT]
+) -> list[_ContribT]:
+    """The *contributions* still findable, verbatim, in *context* — the objects
+    themselves, not just ids/labels (ADR 0017 P6 part 2's own need: the caller
+    wants each one's full record, not only what :func:`_present_context_items`
+    exposes to a judge). Same substring test as :func:`_present_context_items`;
+    the same over-approximation applies in the OTHER direction here — a
+    contribution the judge paraphrased into the context reads as absent, not
+    present, so a paraphrased-but-kept item is under-selected as "examined"
+    rather than over-selected, the safe direction for a naming instruction
+    the engine never enforces.
+    """
+    haystack = _normalised(context)
+    return [c for c in contributions if (needle := _normalised(c.content)) and needle in haystack]
+
+
 def _context_contributions_absent(context: str, contributions: Sequence[_ContributionLike]) -> int:
     """Count *contributions* whose text no longer appears verbatim in *context* (issue #202).
 
@@ -261,6 +281,36 @@ def _context_contributions_absent(context: str, contributions: Sequence[_Contrib
         for contribution in contributions
         if (needle := _normalised(contribution.content)) and needle not in haystack
     )
+
+
+def dropped_context_contribution_ids(
+    previous_context: str | None,
+    new_context: str,
+    contributions: Sequence[_ContributionLike],
+) -> list[str]:
+    """Ids of *contributions* present verbatim in *previous_context* but absent from
+    *new_context* — the #202 condensation signal, per item rather than only counted
+    (ADR 0017 P6 part 1).
+
+    Same substring test and same over-approximation as
+    :func:`_context_contributions_absent` (a paraphrase reads as dropped too, the
+    safe direction): this is deliberately the identical test, applied twice — once
+    against the OLD context to find what was there to begin with, once against the
+    NEW to find what left. ``previous_context is None`` (no summary on disk yet)
+    returns ``[]``: a first write drops nothing, it admits (mirrors
+    :func:`~strata.summary_store.derive_condensed`'s own "None is not a
+    shortening").
+    """
+    if previous_context is None:
+        return []
+    before_haystack = _normalised(previous_context)
+    after_haystack = _normalised(new_context)
+    dropped: list[str] = []
+    for contribution in contributions:
+        needle = _normalised(contribution.content)
+        if needle and needle in before_haystack and needle not in after_haystack:
+            dropped.append(contribution.id)
+    return dropped
 
 
 def change_event_dict(event: _ChangeEventLike) -> dict:
@@ -575,7 +625,10 @@ def compose_perspective(
         ``"condensation": {"condensed": bool, "context_contributions_absent":
         int | None}`` — the issue #202 disclosure that material may have been
         condensed away rather than never admitted; both halves are mechanical
-        and over-approximate — and ``"context_items": [{"id": str, "label":
+        and over-approximate, and over-counting is COMMON in practice, not
+        rare — live condensation is usually a REWORDING of a still-standing
+        claim, not a deletion, and a verbatim-substring test cannot tell the
+        two apart — and ``"context_items": [{"id": str, "label":
         str}] | None`` (ADR 0017 P1b): the accepted context contributions
         still findable, verbatim, in this layer's own ``context`` text, each
         with a deterministic (never LLM-generated) label truncated to at most

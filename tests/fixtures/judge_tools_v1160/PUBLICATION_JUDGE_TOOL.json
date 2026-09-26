@@ -1,0 +1,24 @@
+{
+  "description": "Submit the scope-manager's verdict on a proposed publish or withdraw act.",
+  "input_schema": {
+    "properties": {
+      "decision": {
+        "enum": [
+          "accept",
+          "decline"
+        ],
+        "type": "string"
+      },
+      "reasoning": {
+        "description": "One or two sentences explaining the verdict.",
+        "type": "string"
+      }
+    },
+    "required": [
+      "decision",
+      "reasoning"
+    ],
+    "type": "object"
+  },
+  "name": "submit_publication_judgment"
+}
