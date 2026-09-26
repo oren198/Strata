@@ -1368,6 +1368,21 @@ class _MalformedDisposition(ValueError):
     """
 
 
+class _MalformedOrdinaryDecision(_MalformedDisposition):
+    """An ORDINARY (no acted_on) contribution's `decision` is not one of the three
+    record values (ADR 0017 P5 live-gate finding).
+
+    A defense-in-depth guard, not the primary fix: whichever gate decides a
+    contribution IS an acted_on outcome should already route it through
+    :func:`_resolve_acted_on_decision` instead of reaching here at all — but if that
+    gate and the judge ever disagree about which contribution this is (exactly what
+    happened live: a narrowed-tool answer like "failed"/"held" reaching the ordinary
+    branch), an out-of-vocabulary string must never reach ``record_judgment`` and
+    crash the request. A ``_MalformedDisposition`` subclass so it shares the SAME
+    one-retry-then-fail-closed-decline handling, not a parallel mechanism.
+    """
+
+
 def _resolve_acted_on_decision(
     raw_decision: object, *, is_directive: bool = False
 ) -> tuple[str, str]:
@@ -3944,6 +3959,12 @@ class ScopeManager:
                     f"again with the SAME {verdict_noun}, this time including `reasoning` "
                     "— one or two sentences explaining it."
                 )
+            if isinstance(error, _MalformedOrdinaryDecision):
+                return (
+                    f"Your {tool_name} call's `decision` must be exactly one of "
+                    f"{', '.join(_BATCH_DECISIONS)}: {error} "
+                    f"Call {tool_name} again with `decision` set to one of those three values."
+                )
             if isinstance(error, _MalformedDisposition):
                 allowed_desc = (
                     "held/failed/decline"
@@ -3971,6 +3992,8 @@ class ScopeManager:
                 slip = "the first response declined while carrying an amendment"
             elif isinstance(error, _MissingReasoning):
                 slip = "the first response omitted `reasoning`"
+            elif isinstance(error, _MalformedOrdinaryDecision):
+                slip = "the first response's `decision` was not one of the three ordinary values"
             elif isinstance(error, _MalformedDisposition):
                 slip = "the first response's `decision` was not a readable disposition"
             else:
@@ -4793,7 +4816,19 @@ class ScopeManager:
                 raw.get("decision"), is_directive=acted_on_is_directive
             )
         else:
-            decision = raw["decision"]
+            decision = raw.get("decision")
+            # ADR 0017 P5 live-gate finding: defense in depth. Whatever gate above
+            # decided this is NOT an acted_on outcome, an out-of-vocabulary decision
+            # (e.g. a narrowed acted_on tool's own "failed"/"held", reaching here
+            # because that gate and the offered tool schema disagreed) must never
+            # reach `record_judgment` and crash the request on the CHECK constraint
+            # — it fails closed through the SAME one-retry corrective this whole
+            # function already runs, never a bare exception.
+            if decision not in _BATCH_DECISIONS:
+                raise _MalformedOrdinaryDecision(
+                    "submit_judgment's `decision` must be exactly one of "
+                    f"{', '.join(_BATCH_DECISIONS)} (got {decision!r})."
+                )
             outcome_disposition = None
 
         # Issue #201: an id-addressed op with no id reads it off the

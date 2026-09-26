@@ -289,3 +289,50 @@ def test_a_raised_contributions_own_genuine_accept_is_not_forced_through_decline
         new_contribution=raised,
     )
     assert result.decision == "accept_as_context"
+
+
+def test_an_out_of_vocabulary_ordinary_decision_never_500s(client) -> None:
+    """The CEO's defense-in-depth ask: whatever GATE decided this is an ordinary
+    (non-acted_on) contribution, an out-of-vocabulary `decision` — here the live
+    shape's own narrowed-tool value "failed", reaching the ORDINARY branch as it
+    did live before the root-cause fix — must never reach `record_judgment` and
+    crash on the CHECK constraint. It fails closed through the SAME one-retry
+    corrective every other protocol slip uses: a recorded decline, marked as a
+    judge failure, never a 500. The contribution here carries no `acted_on` at
+    all, so this is independent of the root-cause fix in `_parse_judgment`'s gate."""
+    # Malformed on both the first try AND the one corrective retry, so the
+    # terminal fail-closed-decline path is exercised deterministically.
+    client.mock_anthropic.messages.create.side_effect = [
+        _tool_use_response(
+            decision="failed",
+            reasoning="matches the narrowed acted_on tool's own vocabulary, not this one's",
+            directive_ops=[],
+            new_context=None,
+        ),
+        _tool_use_response(
+            decision="failed",
+            reasoning="still not one of the three ordinary values",
+            directive_ops=[],
+            new_context=None,
+        ),
+    ]
+
+    resp = client.post(
+        "/contribute",
+        json={
+            "scope_id": "g_child",
+            "content": "The service listens on port 8443.",
+            "proposed_classification": "context",
+            "contributor": _CONTRIBUTOR_BODY,
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["judgment"]["decision"] == "decline"
+
+    # The judge-failure marker (never a missing-ground decline) is written to
+    # the DB record's notes, not the bare HTTP response reasoning.
+    store = RecordStore(client.db_path)
+    judgment_row = store.get_judgment(body["contribution_id"])
+    assert judgment_row is not None
+    assert "judge failure: no readable disposition" in (judgment_row.notes or "")
