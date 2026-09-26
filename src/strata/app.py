@@ -584,6 +584,38 @@ def _judge_and_record(
         acted_on_target = ActedOnTarget(
             contribution=entry.contribution, decision=entry.judgment.decision
         )
+    elif contribution.acted_on_operator_item is not None and contribution.raised_from is None:
+        # ADR 0017 P5: an OPERATOR directive target. validate_acted_on already
+        # guaranteed the act exists, is live, and its attachment scope is within
+        # the contributor's entitled surface — resolve the CURRENT item (an act id
+        # a contributor names may since have been superseded by a live one, though
+        # never past validate_acted_on's own is_operator_act_live gate at write
+        # time; this reads it fresh, at judge time, the same discipline as the
+        # scope-held branch above) from its attachment scope's own layer.
+        act = record_store.get_operator_act(contribution.acted_on_operator_item)
+        assert act is not None, (
+            "acted_on_operator_item unresolvable at judge time — P1's "
+            "validate_acted_on should have rejected this contribution at the "
+            "write boundary"
+        )
+        current_item = next(
+            (
+                item
+                for item in read_operator_layer(
+                    act.target_scope_id, summaries_dir=str(summary_store.summaries_dir)
+                )
+                if item.id == contribution.acted_on_operator_item
+            ),
+            None,
+        )
+        assert current_item is not None, (
+            "acted_on_operator_item no longer live at judge time — P1's "
+            "validate_acted_on should have rejected this contribution at the "
+            "write boundary"
+        )
+        acted_on_target = ActedOnTarget(
+            contribution=None, decision=None, operator_item=current_item
+        )
     # ADR 0017 P3/P4: `acted_on_target` is passed ONLY when set — a call shape a
     # judge with the pre-P3 signature (strata-evals' ScriptedJudge, the bench
     # adapter, any out-of-repo judge) cannot be fixed for the way the 8 in-repo
@@ -1399,6 +1431,15 @@ def validate_acted_on(
        judge-failed contribution never entered memory, so nothing was there to act on
        (CEO add).
 
+    ADR 0017 P5: ``acted_on`` may instead name an OPERATOR act (``op_``-prefixed —
+    see :func:`run_contribution`'s own dispatch comment). Rules 2-4 above become:
+    the act must exist; its attachment scope (``target_scope_id``) must be within
+    *agent_scope*'s entitled surface (the operator layer is attached at or above a
+    scope, the same chain rule as an ordinary target's scope); and it must be
+    LIVE — not itself a ``retire`` act, and not since superseded — mirroring rule 4's
+    "the item that currently stands" exactly, since an operator act carries no
+    judgment to check instead.
+
     A no-op when ``acted_on`` is ``None`` — every pre-P1 call site is unaffected.
 
     Raises:
@@ -1413,6 +1454,34 @@ def validate_acted_on(
             "you report — not something you assert yourself via supersedes. Submit the "
             "outcome with acted_on alone and let the judge classify it."
         )
+    if acted_on.startswith("op_"):
+        act = record_store.get_operator_act(acted_on)
+        if act is None:
+            raise RuntimeError(
+                f"acted_on={acted_on!r} does not reference an existing operator item."
+            )
+        if fleet.get_scope(agent_scope) is None:
+            raise RuntimeError(
+                f"your bound scope {agent_scope!r} no longer exists in the fleet "
+                "config — fleet.yaml changed since this session started. Restore "
+                "the scope in fleet.yaml or relaunch with a valid binding."
+            )
+        ancestors = fleet.inter_stratum_ancestors(agent_scope)
+        entitled = {agent_scope, *(s.id for s in ancestors)}
+        if act.target_scope_id not in entitled:
+            raise RuntimeError(
+                f"operator item {acted_on!r} is attached at {act.target_scope_id!r}, outside "
+                f"your entitled surface (your scope {agent_scope!r} plus its inter-stratum "
+                "ancestors). The operator layer is attached at or above a scope, the same "
+                "chain-only rule as any other acted_on target."
+            )
+        if not record_store.is_operator_act_live(acted_on):
+            raise RuntimeError(
+                f"acted_on={acted_on!r} references an operator item that is no longer "
+                "current (superseded or retired) — you can only report an outcome for "
+                "the item that currently stands."
+            )
+        return
     entry = record_store.get_record_entry(acted_on)
     if entry is None:
         raise RuntimeError(f"acted_on={acted_on!r} does not reference an existing contribution.")
@@ -1499,6 +1568,12 @@ def run_contribution(
     """
     if acted_on is not None and supersedes is not None:
         raise ValueError("acted_on and supersedes cannot both be set on one contribution.")
+    # ADR 0017 P5: the API keeps ONE `acted_on` field; the app resolves which
+    # storage column the id belongs in. Ids are minted so this dispatch is
+    # unambiguous and never needs a lookup: contribution ids are `c_`-prefixed,
+    # operator act ids `op_`-prefixed (record_store's `_new_contribution_id`/
+    # `_new_operator_act_id`, by design — "never mistaken for" the other).
+    is_operator_target = acted_on is not None and acted_on.startswith("op_")
     queue = _scope_queue(scope.id)
     with _scope_append_lock(scope.id):
         contribution = record_store.append_contribution(
@@ -1508,7 +1583,8 @@ def run_contribution(
             subject=subject,
             supersedes=supersedes,
             contributor=contributor,
-            acted_on=acted_on,
+            acted_on=None if is_operator_target else acted_on,
+            acted_on_operator_item=acted_on if is_operator_target else None,
         )
         ticket = queue.enqueue(contribution.id, contribution)
 
