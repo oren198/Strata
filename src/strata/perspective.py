@@ -75,7 +75,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
-from typing import Protocol
+from typing import Protocol, TypeVar
 
 from strata.fleet_config import FleetConfig
 from strata.summary_store import Directive, ScopeSummary, SummaryStore
@@ -238,6 +238,26 @@ def _present_context_items(context: str, contributions: Sequence[_ContributionLi
                 {"id": contribution.id, "label": _context_item_label(contribution.content)}
             )
     return items
+
+
+_ContribT = TypeVar("_ContribT", bound=_ContributionLike)
+
+
+def present_context_contributions(
+    context: str, contributions: Sequence[_ContribT]
+) -> list[_ContribT]:
+    """The *contributions* still findable, verbatim, in *context* — the objects
+    themselves, not just ids/labels (ADR 0017 P6 part 2's own need: the caller
+    wants each one's full record, not only what :func:`_present_context_items`
+    exposes to a judge). Same substring test as :func:`_present_context_items`;
+    the same over-approximation applies in the OTHER direction here — a
+    contribution the judge paraphrased into the context reads as absent, not
+    present, so a paraphrased-but-kept item is under-selected as "examined"
+    rather than over-selected, the safe direction for a naming instruction
+    the engine never enforces.
+    """
+    haystack = _normalised(context)
+    return [c for c in contributions if (needle := _normalised(c.content)) and needle in haystack]
 
 
 def _context_contributions_absent(context: str, contributions: Sequence[_ContributionLike]) -> int:

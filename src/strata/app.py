@@ -111,6 +111,7 @@ from strata.perspective import (
     ancestor_directives,
     compose_perspective,
     dropped_context_contribution_ids,
+    present_context_contributions,
 )
 from strata.project_config import StoragePaths, resolve_storage_paths
 from strata.publication import (
@@ -135,6 +136,7 @@ from strata.record_store import (
 from strata.scope_manager import (
     WINDOW_VERBATIM_TAIL,
     ActedOnTarget,
+    ExaminedContextItem,
     JudgeMode,
     ScopeManager,
     ScopeManagerBatchJudgment,
@@ -540,6 +542,77 @@ def _read_judge_inputs(
     )
 
 
+#: Aron's own number (P6 part 2): a naming instruction, not a budget the engine
+#: enforces, so a hard cap keeps the prompt itself bounded regardless of how many
+#: examined items a long-lived scope accumulates.
+_EXAMINED_CONTEXT_CAP = 10
+
+
+def _resolve_examined_context(
+    *,
+    scope_id: str,
+    current_summary: ScopeSummary | None,
+    fleet: FleetConfig,
+    record_store: RecordStore,
+    summary_store: SummaryStore,
+) -> list[ExaminedContextItem]:
+    """This scope's own accepted context items an outcome has TESTED (ADR 0017
+    P6 part 2) — corroborated, correcting, or raised, the same three examined
+    states P6 part 1's ``state_at_drop`` derives, applied live against what is
+    CURRENTLY verbatim in the scope's own context rather than at drop time.
+    Newest first, capped at :data:`_EXAMINED_CONTEXT_CAP`.
+
+    Priority corroborated > correcting > raised, same as part 1: an item that
+    is both corroborated and its own correcting content is named once, as the
+    stronger fact.
+    """
+    if current_summary is None or not current_summary.context.strip():
+        return []
+    candidates = record_store.list_accepted_context_contributions(scope_id=scope_id)
+    present = present_context_contributions(current_summary.context, candidates)
+    present = sorted(present, key=lambda c: c.created_at, reverse=True)
+
+    items: list[ExaminedContextItem] = []
+    for contribution in present:
+        if len(items) >= _EXAMINED_CONTEXT_CAP:
+            break
+        evidence = standing_evidence(
+            record_store, fleet, contribution.id, summary_store=summary_store
+        )
+        held_count = sum(
+            1 for e in evidence if e.replaced_kind is None and e.correction_pending_kind is None
+        )
+        correcting_event = record_store.claim_event_for(contribution.id)
+        if held_count > 0:
+            items.append(
+                ExaminedContextItem(
+                    contribution_id=contribution.id,
+                    content=contribution.content,
+                    kind="corroborated",
+                    detail=f"{held_count} held outcome{'s' if held_count != 1 else ''}",
+                )
+            )
+        elif correcting_event is not None:
+            items.append(
+                ExaminedContextItem(
+                    contribution_id=contribution.id,
+                    content=contribution.content,
+                    kind="correcting",
+                    detail=f"corrects {correcting_event.item_id}",
+                )
+            )
+        elif contribution.raised_from is not None:
+            items.append(
+                ExaminedContextItem(
+                    contribution_id=contribution.id,
+                    content=contribution.content,
+                    kind="raised",
+                    detail=f"evidence from {contribution.contributor.scope_id}",
+                )
+            )
+    return items
+
+
 def _judge_and_record(
     *,
     contribution: Contribution,
@@ -634,6 +707,21 @@ def _judge_and_record(
     judge_kwargs: dict = {}
     if acted_on_target is not None:
         judge_kwargs["acted_on_target"] = acted_on_target
+    # ADR 0017 P6 part 2: same discipline — the kwarg appears only when there is
+    # at least one examined item, so a scope with none gets the call shape it
+    # always had. Applies to a refresh judgment too (mode == "input_change_refresh"
+    # rewrites the summary the same way an ordinary accept does, per the CEO's
+    # own amendment to the brief) — never to publication or bootstrap judging,
+    # neither of which is called from here.
+    examined_context = _resolve_examined_context(
+        scope_id=scope.id,
+        current_summary=inputs.current_summary,
+        fleet=fleet,
+        record_store=record_store,
+        summary_store=summary_store,
+    )
+    if examined_context:
+        judge_kwargs["examined_context"] = examined_context
     try:
         judgment: ScopeManagerJudgment = scope_manager.judge(
             scope=scope,
@@ -1345,6 +1433,19 @@ def _judge_batch_and_record(
         recency_window_size=recency_window_size,
     )
 
+    # ADR 0017 P6 part 2: same discipline as the single path — the kwarg
+    # appears only when there is at least one examined item.
+    batch_judge_kwargs: dict = {}
+    examined_context = _resolve_examined_context(
+        scope_id=scope.id,
+        current_summary=inputs.current_summary,
+        fleet=fleet,
+        record_store=record_store,
+        summary_store=summary_store,
+    )
+    if examined_context:
+        batch_judge_kwargs["examined_context"] = examined_context
+
     try:
         batch: ScopeManagerBatchJudgment = scope_manager.judge_batch(
             scope=scope,
@@ -1364,6 +1465,7 @@ def _judge_batch_and_record(
             input_changes=input_changes,
             change_ids=wave_ids,
             hop=hop,
+            **batch_judge_kwargs,
         )
     except Exception as exc:  # noqa: BLE001 — every member needs its own error
         # One failed call strands the whole batch, so each member gets the
