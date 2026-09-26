@@ -3266,7 +3266,13 @@ async def strata_read_contribution(contribution_id: str) -> dict:
 
     Returns:
         ``contribution``, ``state`` (the derived state block), ``judgment``
-        (null unless the state is ``judged``), and ``judgment_attempts``.
+        (null unless the state is ``judged``), ``judgment_attempts``, and
+        ``raised_to`` (ADR 0017 P5) — non-null only when this contribution's own
+        outcome was raised: ``{"scope_id": ..., "contribution_id": ...}`` for a
+        scope issuer, or ``{"operator": True, "evidence_id": ...}`` for an
+        operator directive. ``null`` for every contribution that raised nothing
+        (the overwhelming majority) — derived at read time from ``raised_from``,
+        never a stored field on this contribution itself.
 
     Raises:
         RuntimeError: If the contribution is unknown, or its scope is outside
@@ -3281,6 +3287,18 @@ async def strata_read_contribution(contribution_id: str) -> dict:
         raise RuntimeError(f"Contribution not found: {contribution_id!r}")
     _check_entitled(fleet, _AGENT_SCOPE, entry.contribution.scope_id)
 
+    raised_to: dict | None = None
+    raised_contribution = _record_store.get_raised_contribution(contribution_id)
+    if raised_contribution is not None:
+        raised_to = {
+            "scope_id": raised_contribution.scope_id,
+            "contribution_id": raised_contribution.id,
+        }
+    else:
+        raised_evidence = _record_store.get_raised_operator_evidence(contribution_id)
+        if raised_evidence is not None:
+            raised_to = {"operator": True, "evidence_id": raised_evidence.id}
+
     # Forensic, like the scope record read: no read counter increment (#110),
     # but the nudge still rides along.
     return _attach_nudge(
@@ -3289,6 +3307,7 @@ async def strata_read_contribution(contribution_id: str) -> dict:
             "state": asdict(entry.state),
             "judgment": asdict(entry.judgment) if entry.judgment is not None else None,
             "judgment_attempts": [asdict(a) for a in entry.judgment_attempts],
+            "raised_to": raised_to,
         }
     )
 

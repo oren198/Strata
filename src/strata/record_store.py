@@ -1014,6 +1014,42 @@ class RecordStore:
             raise KeyError(f"Contribution not found: {contribution_id!r}")
         return _contribution_from_row(row)
 
+    def get_raised_contribution(self, outcome_contribution_id: str) -> Contribution | None:
+        """Return the contribution (at the issuing scope) raised FROM
+        *outcome_contribution_id*, or ``None`` if it raised nothing (ADR 0017 P5).
+
+        The reverse of ``raised_from``: the outcome contribution itself carries no
+        forward pointer, so a reader deriving "raised to <issuer> as <id>" (the
+        plan's own words) needs this lookup rather than a stored field — no new
+        column, exactly as approved. At most one contribution is ever raised from
+        a given outcome (the engine mints it once, atomically, in
+        :meth:`record_judgment_and_raise`); ``None`` also covers an OPERATOR raise,
+        which writes an :class:`OperatorEvidence` row instead of a contribution —
+        see :meth:`get_raised_operator_evidence`.
+        """
+        row = self._conn.execute(
+            """
+            SELECT id, scope_id, content, proposed_classification,
+                   subject, supersedes, acted_on, acted_on_operator_item, raised_from,
+                   contributor_scope_id, contributor_skill,
+                   contributor_session_id, contributor_ts,
+                   created_at
+            FROM contributions WHERE raised_from = ?
+            """,
+            (outcome_contribution_id,),
+        ).fetchone()
+        return _contribution_from_row(row) if row is not None else None
+
+    def get_raised_operator_evidence(self, outcome_contribution_id: str) -> OperatorEvidence | None:
+        """Return the :class:`OperatorEvidence` row raised FROM
+        *outcome_contribution_id*, or ``None`` (ADR 0017 P5). The operator-issuer
+        counterpart to :meth:`get_raised_contribution` — an operator raise writes
+        no contribution, so the reporter-side "raised to <issuer> as <id>"
+        derivation must check both.
+        """
+        rows = self.list_operator_evidence()
+        return next((e for e in rows if e.raised_from == outcome_contribution_id), None)
+
     # ------------------------------------------------------------------
     # Judgments
     # ------------------------------------------------------------------

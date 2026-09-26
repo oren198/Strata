@@ -718,6 +718,16 @@ def cmd_record(args: argparse.Namespace) -> int:
                 print(f"      subject: {c.subject}")
             if c.supersedes:
                 print(f"      supersedes: {c.supersedes}")
+            # ADR 0017 P5: derived at read time from `raised_from` — never a
+            # stored field on this contribution itself (the plan's own words:
+            # "the reporter's side shows 'raised to <issuer> as <id>'").
+            raised = stores.record_store.get_raised_contribution(c.id)
+            if raised is not None:
+                print(f"      raised to {raised.scope_id} as {raised.id}")
+            else:
+                raised_evidence = stores.record_store.get_raised_operator_evidence(c.id)
+                if raised_evidence is not None:
+                    print(f"      raised to the operator as {raised_evidence.id}")
             if state is not None and state.state == "judge_failed":
                 print(f"      judge failed at {state.failed_at}: {state.error_message}")
                 print("      re-judge with the strata_rejudge MCP tool")
