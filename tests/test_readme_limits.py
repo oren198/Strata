@@ -126,7 +126,9 @@ def test_outcome_loop_row_states_the_direct_readers_and_the_relay_gap() -> None:
         "a correction is sent once to every scope that reads the publication directly "
         "(child scopes and scopes with a reference edge)"
     ) in row
-    assert "a relayed copy that paraphrases the claim is not (#221, #219)" in row
+    assert "reaches the grandchild once when the relayed copy is verbatim (#221)" in row
+    assert "paraphrases the claim is not covered (#219)" in row
+    assert "(#221, #219)" not in row
     assert "every scope that received it" not in row
 
 
