@@ -1,0 +1,54 @@
+SCOPE: p6-corpus (id=g_p6corpus)
+STRATUM: function (ordinal=1)
+
+BUDGET: once your amendment is applied, this summary must be at most 500 words (context plus every directive's content).
+
+EXAMINED CONTEXT: items an outcome has tested. Under budget pressure, drop unexamined context before examined context:
+- The service listens on port 8443. (corroborated: 3 held outcomes)
+- It corrects an earlier claim. (correcting: corrects c_p6_target)
+- It was raised. (raised: evidence from g_child)
+
+ENTITLEMENT (relative to this scope)
+- This scope and its ancestors (entitled — directives and context):
+    g_p6corpus (p6-corpus)
+- Scopes below this scope (entitled — evidence proposed upward for this scope to judge on its merits):
+    (none)
+- Scopes referenced by this chain (entitled for CONTEXT only):
+    (none)
+- All other scopes in this fleet, including archived ones (no channel to this scope — their position reaches it only through a person's report or the contributor's own observation, never asserted as their own):
+    (none)
+
+CURRENT SUMMARY
+---
+---
+condensed: false
+scope_id: g_p6corpus
+updated_at: '2026-08-01T09:00:00+00:00'
+version: 1
+---
+
+# Scope: g_p6corpus
+
+## Directives
+
+_(none yet)_
+
+## Context
+
+The service listens on port 8443. It corrects an earlier claim. It was raised.
+
+---
+
+RECENT CONTRIBUTIONS (oldest first — mechanical digest; the newest 3 PRIOR contributions carry full content):
+[c_p6_recent] at=2026-08-15T08:00:00+00:00 subject=(none) state=judged decision=accept_as_context reasoning=Accepted as context. content='An earlier observation.'
+
+NEW CONTRIBUTION TO JUDGE:
+- id: c_p6_new
+- proposed classification: context
+- subject: (none)
+- supersedes: (none)
+- contributor: skill=engineer scope=g_other at=2026-09-26T10:00:00+00:00
+- content:
+    A fresh observation.
+
+Judge it. Call `submit_judgment` exactly once.

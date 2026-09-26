@@ -2269,6 +2269,30 @@ class ActedOnTarget:
         )
 
 
+@dataclass(frozen=True)
+class ExaminedContextItem:
+    """One accepted context item this scope holds that an outcome has TESTED
+    (ADR 0017 P6 part 2): corroborated (held), correcting, or raised — the same
+    three examined states P6 part 1's ``state_at_drop`` derives, resolved here
+    against the CURRENT summary rather than at drop time.
+
+    Resolved once, by the caller (:func:`strata.app.run_contribution`/
+    :func:`strata.app.drain_scope`'s judge call sites), from data the record
+    already holds — never re-derived inside the judge, and never a new stored
+    fact. Only items VERBATIM-PRESENT in the current context are candidates:
+    an item already condensed away or reworded is not "in the context" for the
+    judge to weigh preserving.
+    """
+
+    contribution_id: str
+    content: str
+    kind: Literal["corroborated", "correcting", "raised"]
+    detail: str
+    """The one-line evidence a reader can check without re-deriving it:
+    ``"N held outcome(s)"`` (corroborated), ``"corrects <id>"`` (correcting), or
+    ``"evidence from <scope>"`` (raised) — a plain count or fact, never a score."""
+
+
 class ScopeManagerJudgment(_AmendmentJudgment):
     """The scope-manager's structured verdict on a contribution.
 
@@ -3120,6 +3144,31 @@ def _render_relevance(
     return ""
 
 
+def _render_examined_context(items: Sequence[ExaminedContextItem]) -> str:
+    """The EXAMINED CONTEXT block (ADR 0017 P6 part 2), or ``""`` with no examined
+    items — the same byte-identity discipline every optional block here follows
+    (a scope with nothing examined gets a message unchanged from before this
+    item).
+
+    "Examined" here means corroborated, correcting, or raised — the same three
+    states P6 part 1's ``state_at_drop`` derives, applied to what is CURRENTLY
+    verbatim in this scope's own context rather than at drop time. The
+    instruction is an ordering preference, never a rule the engine enforces —
+    unlike BUDGET, which the engine checks mechanically, nothing here is
+    validated: the judge may still drop an examined item, and the record (not
+    this prompt) is what later shows that it did.
+    """
+    if not items:
+        return ""
+    lines = [
+        "EXAMINED CONTEXT: items an outcome has tested. Under budget pressure, "
+        "drop unexamined context before examined context:"
+    ]
+    for item in items:
+        lines.append(f"- {item.content} ({item.kind}: {item.detail})")
+    return "\n".join(lines) + "\n\n"
+
+
 def _build_judge_preamble(
     *,
     scope: Scope,
@@ -3138,6 +3187,7 @@ def _build_judge_preamble(
     input_changes: Sequence[_ChangeEventLike] | None = None,
     window_verbatim_tail: int = WINDOW_VERBATIM_TAIL,
     implied_purpose_min_words: int = IMPLIED_PURPOSE_MIN_WORDS,
+    examined_context: Sequence[ExaminedContextItem] | None = None,
 ) -> str:
     """Compose everything in the user message ahead of the contributions to judge.
 
@@ -3145,6 +3195,10 @@ def _build_judge_preamble(
     and the batch message (:func:`_build_batch_user_message`, ADR 0011 D3) —
     the scope's rendered state is identical either way; only the block of
     contributions under judgment differs.
+
+    *examined_context* (ADR 0017 P6 part 2): renders the EXAMINED CONTEXT block
+    (see :func:`_render_examined_context`) ONLY when non-empty — a scope with
+    nothing examined gets a message byte-identical to before this item.
     """
     _check_mode(mode)
     if current_summary is not None:
@@ -3194,6 +3248,7 @@ def _build_judge_preamble(
         "BUDGET: once your amendment is applied, this summary must be at most "
         f"{summary_max_words} words (context plus every directive's content).\n\n"
     )
+    examined_context_block = _render_examined_context(examined_context or ())
 
     # There is one refresh instruction now (ADR 0015 D6): the splice's
     # MANAGER REFRESH block went with the splice, and a drain is always an
@@ -3239,6 +3294,7 @@ def _build_judge_preamble(
         "\n"
         f"{relevance_block}"
         f"{budget_line}"
+        f"{examined_context_block}"
         f"{refresh_block}"
         f"{input_changes_block}"
         f"{operator_block}"
@@ -3277,6 +3333,7 @@ def _build_user_message(
     window_verbatim_tail: int = WINDOW_VERBATIM_TAIL,
     implied_purpose_min_words: int = IMPLIED_PURPOSE_MIN_WORDS,
     acted_on_target: ActedOnTarget | None = None,
+    examined_context: Sequence[ExaminedContextItem] | None = None,
 ) -> str:
     """Compose the (non-cached) per-call user message for a single contribution.
 
@@ -3284,6 +3341,8 @@ def _build_user_message(
     resolved by the caller. Renders the OUTCOME REPORT block (see
     :func:`_render_outcome_block`) ONLY when given — a contribution without
     ``acted_on`` gets a message byte-identical to before P3 (a test pins this).
+
+    *examined_context* (ADR 0017 P6 part 2): see :func:`_build_judge_preamble`.
     """
     preamble = _build_judge_preamble(
         scope=scope,
@@ -3302,6 +3361,7 @@ def _build_user_message(
         input_changes=input_changes,
         window_verbatim_tail=window_verbatim_tail,
         implied_purpose_min_words=implied_purpose_min_words,
+        examined_context=examined_context,
     )
     outcome_block = "" if acted_on_target is None else _render_outcome_block(acted_on_target)
     return (
@@ -3333,12 +3393,15 @@ def _build_batch_user_message(
     input_changes: Sequence[_ChangeEventLike] | None = None,
     window_verbatim_tail: int = WINDOW_VERBATIM_TAIL,
     implied_purpose_min_words: int = IMPLIED_PURPOSE_MIN_WORDS,
+    examined_context: Sequence[ExaminedContextItem] | None = None,
 ) -> str:
     """Compose the per-call user message for a BATCH of contributions (ADR 0011 D3).
 
     The contributions render in arrival order and are numbered, so the order
     the judge must process them in is unmissable; everything above them is the
     same rendered scope state a single-contribution call gets.
+
+    *examined_context* (ADR 0017 P6 part 2): see :func:`_build_judge_preamble`.
     """
     preamble = _build_judge_preamble(
         scope=scope,
@@ -3357,6 +3420,7 @@ def _build_batch_user_message(
         input_changes=input_changes,
         window_verbatim_tail=window_verbatim_tail,
         implied_purpose_min_words=implied_purpose_min_words,
+        examined_context=examined_context,
     )
     blocks = "\n".join(
         f"CONTRIBUTION {position} OF {len(new_contributions)}:\n"
@@ -3430,6 +3494,7 @@ class ScopeManager:
         change_id: str | None = None,
         hop: int = 0,
         acted_on_target: ActedOnTarget | None = None,
+        examined_context: Sequence[ExaminedContextItem] | None = None,
     ) -> ScopeManagerJudgment:
         """Judge a new contribution against the scope's current state.
 
@@ -3438,6 +3503,12 @@ class ScopeManager:
         (:func:`strata.app.run_contribution`) resolves the target the same way P1's
         ``validate_acted_on`` already did and hands it over. Renders the OUTCOME
         REPORT block; ``None`` for every other contribution renders nothing extra.
+
+        *examined_context* (ADR 0017 P6 part 2): the caller's own resolution of
+        which of this scope's currently-present context items an outcome has
+        tested — renders the EXAMINED CONTEXT block (see
+        :func:`_render_examined_context`) ONLY when non-empty; empty or ``None``
+        renders nothing extra, byte-identical to before this item.
 
         Makes exactly one Anthropic API call using forced ``submit_judgment``
         tool use.  Validates the response, applies the judged amendment
@@ -3627,6 +3698,7 @@ class ScopeManager:
             window_verbatim_tail=window_verbatim_tail,
             implied_purpose_min_words=self._implied_purpose_min_words,
             acted_on_target=acted_on_target,
+            examined_context=examined_context,
         )
         # ADR 0017 P3: a failed_* disposition replaces `acted_on` through the #199
         # path exactly like an ordinary `supersedes` reference does — but only when
@@ -4276,6 +4348,7 @@ class ScopeManager:
         window_verbatim_tail: int = WINDOW_VERBATIM_TAIL,
         change_ids: Sequence[str] | None = None,
         hop: int = 0,
+        examined_context: Sequence[ExaminedContextItem] | None = None,
     ) -> ScopeManagerBatchJudgment:
         """Judge several new contributions, in arrival order, in ONE call (ADR 0011 D3).
 
@@ -4353,6 +4426,7 @@ class ScopeManager:
                 # way.
                 change_id=wave_ids[0] if len(wave_ids) == 1 else None,
                 hop=hop,
+                examined_context=examined_context,
             )
             return ScopeManagerBatchJudgment(
                 verdicts=[
@@ -4401,6 +4475,7 @@ class ScopeManager:
             input_changes=input_changes,
             window_verbatim_tail=window_verbatim_tail,
             implied_purpose_min_words=self._implied_purpose_min_words,
+            examined_context=examined_context,
         )
 
         rendered_item_ids = _rendered_publication_item_ids(
