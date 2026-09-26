@@ -41,23 +41,43 @@ def _schema_snapshot(db_path: str) -> dict:
         conn.close()
 
 
-def _migrations_dir_without_0016(tmp_path: Path) -> Path:
-    scratch = tmp_path / "migrations_pre_0016"
+def _migrations_dir_up_to(tmp_path: Path, scratch_name: str, *, last_name: str | None) -> Path:
+    """A scratch migrations dir holding every file up to and including *last_name*
+    (or every file, when ``None``). Stopping at a NAME rather than merely skipping
+    one file matters once a LATER migration depends on what an earlier one added
+    (0018 recreates `contributions` and carries `acted_on` forward, so isolating
+    0016's own effect must not let 0017/0018 run without it, or run at all)."""
+    scratch = tmp_path / scratch_name
     scratch.mkdir()
     for f in sorted(_MIGRATIONS_DIR.glob("*.sql")):
-        if f.name != "0016_acted_on.sql":
-            shutil.copy(f, scratch / f.name)
+        if last_name is not None and f.name > last_name:
+            continue
+        shutil.copy(f, scratch / f.name)
     return scratch
 
 
 def test_0016_adds_exactly_one_nullable_column_and_one_fk(tmp_path: Path) -> None:
     before_path = str(tmp_path / "before.db")
-    run_migrations(before_path, migrations_dir=_migrations_dir_without_0016(tmp_path))
+    run_migrations(
+        before_path,
+        migrations_dir=_migrations_dir_up_to(
+            tmp_path, "migrations_pre_0016", last_name="0015_retirement_circumstance.sql"
+        ),
+    )
     before = _schema_snapshot(before_path)
 
     after_path = str(tmp_path / "after.db")
     shutil.copy(before_path, after_path)
-    run_migrations(after_path, migrations_dir=_MIGRATIONS_DIR)
+    # Through 0016 ONLY (not the full real dir): 0017/0018 make unrelated schema
+    # changes of their own (change_events' CHECK, then a full contributions
+    # rebuild) that would otherwise show up in this diff and defeat the
+    # isolation this test exists to prove.
+    run_migrations(
+        after_path,
+        migrations_dir=_migrations_dir_up_to(
+            tmp_path, "migrations_through_0016", last_name="0016_acted_on.sql"
+        ),
+    )
     after = _schema_snapshot(after_path)
 
     # No table, other than contributions' columns, changed at all.
