@@ -16,5 +16,10 @@ links here.
 | `v1.15-outcome-loop-gate-2026-09-25.md` | the v1.15 outcome-loop gate. P3: the judge's four dispositions on acted_on reports (echo hard stop 10/10, strict per-item scores, the input-identity no-regression proof with J1/J4 as noise context). P4: correction fan-out (exactly-once per reader, owner notified cross-scope, supersession silent, negative controls). Plus the found-and-fixed list and the two open limits (#219, #220) |
 | `v1.16-judge-prompt-examples-2026-09-26.md` | v1.16 items 1b/1c: the acted_on block's worked example leaking into reasons (fixed: fabricated quotes 3/70 → 0/70); the ADR 0016 conduct example and two failed wording fixes (reverted); findings: an unstable conduct/interior boundary, interior assertions admitted via an invented informant (#225), unpinned runs can't gate wording (#224) |
 
+**Caveat for every unpinned before/after in v1.15–v1.16 (added 2026-09-26):** OpenRouter's
+routing appears to follow the prompt itself. Two builds that differed in one prompt line, run
+interleaved in the same session, were served by very different provider mixes. Any two prompts
+compared without a pinned provider may therefore have been served by different providers (#224).
+
 A file here is a record of what was run, not a summary of what we wish it showed: failures,
 crashes and incidents stay in.
