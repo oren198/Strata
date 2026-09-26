@@ -167,6 +167,24 @@ def test_a_failed_directive_outcome_raises_to_the_issuing_scope(http_client) -> 
     # reporter's own judgment, then the synchronous raise judgment at the issuer.
     assert http_client.mock_manager.judge.call_count == 3
 
+    # Aron's ask: pin exactly what suppresses the acted_on path for the raised
+    # contribution, so a later edit can't silently re-enable the directive-target
+    # verdict set at the issuer (which would invite a re-raise). It's
+    # `raised_from` being set — NOT "no acted_on" (the raised contribution DOES
+    # carry acted_on = the directive as a record fact) — checked in
+    # `_judge_and_record` (strata/app.py) before `ActedOnTarget` is ever built:
+    # `if contribution.acted_on is not None and contribution.raised_from is None`.
+    # The third call (the synchronous raise judgment) is the one this contract
+    # is actually about.
+    raise_call_kwargs = http_client.mock_manager.judge.call_args_list[2].kwargs
+    assert "acted_on_target" not in raise_call_kwargs
+    # Contrast: the reporter's OWN outcome call (acted_on set, raised_from unset)
+    # DOES carry it — proving the suppression is specifically about raised_from,
+    # not "acted_on is somehow never passed through this call site at all".
+    reporter_call_kwargs = http_client.mock_manager.judge.call_args_list[1].kwargs
+    assert reporter_call_kwargs.get("acted_on_target") is not None
+    assert reporter_call_kwargs["acted_on_target"].is_directive
+
 
 def test_held_is_never_raised(http_client) -> None:
     directive_id = _post_directive(http_client, scope_id="g_source")
