@@ -1,10 +1,9 @@
 # Changelog
 
-This repository has not kept a changelog file before now; prior release
-notes live in each release's PR description (`dev` → `main`) and its GitHub
-Release body, per `docs/releasing.md`. This file starts with v1.17.0 and is
-meant to be folded into that PR's own notes at release time, not to replace
-them.
+This repository had no changelog file before v1.17.0. It is now the source
+the release PR (`dev` → `main`) and the GitHub Release body are built from
+(`docs/releasing.md`, step 3) — write entries here as work lands, and the
+"Unreleased" section is cleared once a release ships.
 
 ## Unreleased (v1.17.0)
 
@@ -34,13 +33,3 @@ them.
 
   See the README's J4 row and ADR 0016 D2's dated note (2026-10-02, #225) for
   the measured gate and the full rulings.
-
-- **A scope's own corrected claim is now checked for paraphrased carriers in
-  its own publication, not only verbatim ones (#219 C).** When a scope's
-  outcome judgment or refresh finds one of its own claims wrong
-  (`failed_corrected`), the engine already withdraws published items that
-  still carry the claim verbatim (#221). This adds one further owner-judge
-  call per correction, deciding `carries`/`does_not_carry` for the scope's
-  current published face beyond what the verbatim sweep already caught —
-  recorded either way (`claim_carrier_checks`), capped at 20 candidates per
-  correction with any overflow recorded, never silently dropped.
