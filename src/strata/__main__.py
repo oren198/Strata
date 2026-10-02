@@ -2378,6 +2378,7 @@ def cmd_publication_bootstrap(args: argparse.Namespace) -> int:
             client=settings.build_judge_client(),
             model=settings.manager_model,
             implied_purpose_min_words=settings.implied_purpose_min_words,
+            judge_provider=settings.judge_provider,
         )
 
         try:
@@ -2573,6 +2574,7 @@ def _refresh_stores(settings):  # noqa: ANN001, ANN201
         client=settings.build_judge_client(),
         model=settings.manager_model,
         implied_purpose_min_words=settings.implied_purpose_min_words,
+        judge_provider=settings.judge_provider,
     )
     return fleet_config, record_store, summary_store, manager
 
@@ -3081,16 +3083,34 @@ def _judge_line(resolved: object) -> str:
     head = f"{resolved.model} @ {_judge_endpoint_label(resolved.base_url)}"  # type: ignore[attr-defined]
     reason = resolved.reason  # type: ignore[attr-defined]
     if reason == JUDGE_REASON_DEFAULT:
-        return f"{head} (default, measured {_JUDGE_MEASURED_DATE})"
-    if reason == JUDGE_REASON_KEPT:
-        return (
-            f"{head} (kept: an Anthropic key is set and no JUDGE_MODEL/JUDGE_BASE_URL; measured "
+        tail = f"(default, measured {_JUDGE_MEASURED_DATE})"
+    elif reason == JUDGE_REASON_KEPT:
+        tail = (
+            "(kept: an Anthropic key is set and no JUDGE_MODEL/JUDGE_BASE_URL; measured "
             f'{_JUDGE_MEASURED_DATE} — see "Choosing a judge" in the README)'
         )
-    return (
-        f"{head} (configured via JUDGE_*; the README's measurements cover only the "
-        'judges in its "Choosing a judge" table)'
-    )
+    else:
+        tail = (
+            "(configured via JUDGE_*; the README's measurements cover only the "
+            'judges in its "Choosing a judge" table)'
+        )
+    return f"{head} {tail}{_judge_provider_suffix(resolved)}"
+
+
+def _judge_provider_suffix(resolved: object) -> str:
+    """#224: append the pin state to the doctor judge line, when a provider
+    is configured at all — pinned and taking effect, or configured but
+    ignored (never silent) on a non-OpenRouter endpoint, so a user who set
+    JUDGE_PROVIDER against a bare Anthropic endpoint sees why it does
+    nothing rather than wondering.
+    """
+    provider = getattr(resolved, "provider", None)
+    if provider is None:
+        return ""
+    base_url = getattr(resolved, "base_url", None) or ""
+    if "openrouter.ai" in base_url:
+        return f" [pinned to {provider}]"
+    return f" [JUDGE_PROVIDER={provider} configured, ignored: not an OpenRouter endpoint]"
 
 
 def _build_probe_client(resolved: object):  # -> anthropic.Anthropic
@@ -3108,18 +3128,39 @@ def _probe_judge_live(resolved: object) -> str | None:
 
     A ``messages.create(max_tokens=1)`` is the one call every Anthropic-Messages
     endpoint (a router, a gateway) is guaranteed to serve; a model listing is not.
+
+    Sends the SAME provider pin (#224, ``resolved.provider``) the real
+    judge calls would — via :func:`strata.settings.apply_provider_pin` —
+    so this probes the exact route a pinned run actually takes, never an
+    unpinned one a pin would never use. A ``NotFoundError`` against a
+    pinned probe is reported as the pinned provider rejecting the model,
+    not a generic endpoint finding, since that is the more useful
+    diagnosis once a provider is configured.
     """
     import anthropic  # noqa: PLC0415
 
+    from strata.settings import apply_provider_pin  # noqa: PLC0415
+
     model = resolved.model  # type: ignore[attr-defined]
+    provider = getattr(resolved, "provider", None)
     try:
         client = _build_probe_client(resolved)
         client.messages.create(
-            model=model, max_tokens=1, messages=[{"role": "user", "content": "ping"}]
+            **apply_provider_pin(
+                {
+                    "model": model,
+                    "max_tokens": 1,
+                    "messages": [{"role": "user", "content": "ping"}],
+                },
+                provider=provider,
+                client=client,
+            )
         )
     except anthropic.APIConnectionError as exc:
         return f"the endpoint is unreachable ({type(exc).__name__})"
     except anthropic.NotFoundError:
+        if provider is not None:
+            return f"the pinned provider ({provider}) does not serve model id '{model}'"
         return f"the endpoint does not serve model id '{model}'"
     except anthropic.AuthenticationError:
         return "the endpoint rejected the key (wrong provider, or revoked?)"

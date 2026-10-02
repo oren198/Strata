@@ -36,3 +36,16 @@ the release PR (`dev` → `main`) and the GitHub Release body are built from
 
   See the README's J4 row and ADR 0016 D2's dated note (2026-10-02, #225) for
   the measured gate and the full rulings.
+
+### Added
+
+- **Optional provider pinning for an OpenRouter judge, `JUDGE_PROVIDER` /
+  `STRATA_JUDGE_PROVIDER` (#224).** OpenRouter routes the default judge
+  across roughly ten backing providers; the same item on the same build
+  has measured anywhere from 10/10 to 5/10 across runs, plausibly from the
+  provider mix. Setting this pins every judge call to one named provider
+  (e.g. `Alibaba`) via `extra_body={"provider": {"order": [...],
+  "allow_fallbacks": false}}`, ignored entirely on a non-OpenRouter judge
+  endpoint. Not a behaviour change while unset (the default): every judge
+  call's request is byte-identical to today's. `strata doctor`'s judge line
+  now shows whether a configured provider is actually pinned or ignored.
