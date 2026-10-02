@@ -5875,7 +5875,7 @@ class ScopeManager:
             f"every one listed, by its exact item_id:\n{listed}"
         )
         try:
-            response = self._client.messages.create(
+            response = self._messages_create(
                 model=self._model,
                 max_tokens=1024,
                 system=[{"type": "text", "text": _CLAIM_CARRIER_SYSTEM_PROMPT}],
