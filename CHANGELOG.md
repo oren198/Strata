@@ -36,3 +36,16 @@ the release PR (`dev` → `main`) and the GitHub Release body are built from
 
   See the README's J4 row and ADR 0016 D2's dated note (2026-10-02, #225) for
   the measured gate and the full rulings.
+
+- **A scope's own corrected claim is now checked for paraphrased carriers in
+  its own publication, not only verbatim ones (#219 C).** When a scope's
+  outcome judgment or refresh finds one of its own claims wrong
+  (`failed_corrected`), the engine already withdraws published items that
+  still carry the claim verbatim (#221). This adds one further owner-judge
+  call per correction, deciding `carries`/`does_not_carry` for the scope's
+  current published face beyond what the verbatim sweep already caught —
+  recorded either way (`claim_carrier_checks`), capped at 20 candidates per
+  correction with any overflow recorded, never silently dropped. A
+  mechanical observed-value veto can additionally keep an item the judge
+  wrongly marked `carries` (recorded `kept_by_guard`) when it states what
+  was actually observed rather than the refuted claim.
