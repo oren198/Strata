@@ -1071,6 +1071,11 @@ see [`docs/console.md`](https://github.com/oren198/Strata/blob/main/docs/console
 The Console's backend also accepts contributions over HTTP (`POST /contribute`),
 with the same fields and checks as the MCP tool, including `acted_on`. The HTTP
 API trusts the caller's scope; `acted_on` entitlement is checked against it.
+A judge failure the engine cannot fail closed on by itself (a genuine API
+outage, auth failure, or a second malformed response surviving the
+corrective re-ask) returns `503` with `{"error": "scope_manager_failure",
+..., "retry": "strata_rejudge"}`, distinct from a `200` merits decline
+(#235, #236).
 
 **Stated limit: the position gate holds on the MCP path.** Only a session bound
 to a scope can create, replace or retire that scope's directives; a contribution
@@ -1162,6 +1167,20 @@ JUDGE_BASE_URL=https://your-gateway.example/api
 JUDGE_MODEL=<a model id that endpoint serves>
 ```
 
+**Pin the judge to one OpenRouter provider** — OpenRouter routes the same
+model id across roughly ten backing providers, and the same item on the
+same build has measured anywhere from 10/10 to 5/10 across runs,
+plausibly from the provider mix. `JUDGE_PROVIDER=Alibaba` (or
+`STRATA_JUDGE_PROVIDER`) pins every judge call to that one named
+provider via `extra_body={"provider": {"order": ["Alibaba"],
+"allow_fallbacks": false}}` — no silent fallback to a different
+provider if the pinned one is unavailable. It is OpenRouter-only:
+against any other endpoint (a bare Anthropic key, a self-hosted
+gateway) it is read but ignored, since a request-level OpenRouter
+provider preference means nothing elsewhere. `strata doctor` reports
+whether a configured provider is actually pinned or ignored for the
+endpoint you're running.
+
 ### Environment variables
 
 Most settings are env-var driven, prefixed `STRATA_` (the judge configuration
@@ -1181,6 +1200,7 @@ server (project config wins):
 | `JUDGE_BASE_URL` | `https://openrouter.ai/api` | Points the judge at a router/proxy/self-hosted gateway — the endpoint must speak the Anthropic Messages API. `STRATA_JUDGE_BASE_URL` also works. **Exception:** with only an Anthropic key set (see [Choosing a judge](#choosing-a-judge)) the default stays the Anthropic API. |
 | `JUDGE_MODEL` | `qwen/qwen3-235b-a22b-2507` | Model used by the judge (an id the endpoint serves). `STRATA_MANAGER_MODEL` is the original name and still works (wins if both are set). **Exception:** with only an Anthropic key set the default stays `claude-haiku-4-5`. |
 | `ANTHROPIC_API_KEY` / `STRATA_ANTHROPIC_API_KEY` | (unset) | **Deprecated**, kept as a working fallback: used only when `JUDGE_API_KEY` is unset. On its own it keeps `claude-haiku-4-5` on the Anthropic API. |
+| `JUDGE_PROVIDER` | (unset) | Pins every judge call to one named OpenRouter provider (e.g. `Alibaba`); ignored on a non-OpenRouter judge endpoint. `STRATA_JUDGE_PROVIDER` also works. See [Choosing a judge](#choosing-a-judge). |
 | `STRATA_FRESHNESS_STRICT` | (unset) | `1`/`0` forces the freshness `Stop`-hook strict (blocking) or background; unset defers to the project's `[freshness] strict`, default on ([details](#memory-freshness-stop-hook)) |
 | `STRATA_EVALUATOR_MODEL` | `claude-haiku-4-5-20251001` on the Anthropic API, otherwise the judge's model | Model the freshness evaluator drafts with (the judge is unaffected) |
 

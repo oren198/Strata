@@ -27,6 +27,17 @@ the release PR (`dev` → `main`) and the GitHub Release body are built from
   5 of 12 such items in our measurement; the operator path is the reliable
   remedy ([evidence](docs/evidence/v1.17-219c-restore-2026-10-03.md)).
 
+- **A judge failure on `/contribute` now returns HTTP 503, not 500 (#235,
+  #236).** A second protocol slip surviving the corrective re-ask — a
+  genuine judge-API outage, an auth failure, or a malformed response the
+  retry couldn't fix — now fails closed with a dedicated, engine-authored
+  decline reasoning instead of propagating the judge's own malformed text
+  or mis-tagging the contribution's outcome fields. The API layer maps
+  this to `503 {"error": "scope_manager_failure", ..., "retry":
+  "strata_rejudge"}`, distinct from a 200 merits decline. Covers both the
+  ordinary path (#235) and the batch path (#236), which had no
+  forced-decline fallback at all before this.
+
 - **Interior assertions naming a non-entitled scope now get one extra judge
   call, and can be declined where 1.16 admitted them (#225).** When an
   accepted contribution names a fleet scope the current scope is not
@@ -100,6 +111,9 @@ the release PR (`dev` → `main`) and the GitHub Release body are built from
   endpoint. Not a behaviour change while unset (the default): every judge
   call's request is byte-identical to today's. `strata doctor`'s judge line
   now shows whether a configured provider is actually pinned or ignored.
+  Covers the judge's own calls, the freshness Stop-hook evaluator's
+  drafter, and doctor's own live probe — the only three places the
+  engine ever calls the judge endpoint.
 
 - **A judged `restore` act undoes a published item a correction sweep wrongly
   withdrew, under its ORIGINAL id and bytes (companion to #219 C).** Only a
@@ -133,3 +147,45 @@ the release PR (`dev` → `main`) and the GitHub Release body are built from
     "keep withdrawn" acknowledge.
   - Not a behaviour change for anything already shipped: unused unless a
     withdrawal is actually restored.
+
+- **A running session learns when memory it already read has moved,
+  read signaling (#234).** A deterministic per-scope watermark (self +
+  ancestor summary versions, each chain scope's current operator item
+  ids, change-event count/newest id) is recorded alongside each read.
+  Every MCP tool result now carries `perspective_stale: [scope ids]`
+  when a scope this session read has since changed — including a scope
+  this session only reads, not just the one it writes to. The
+  Stop-hook's freshness evaluator gains an independent read-side clause
+  sharing its 2-block strict-mode budget with the existing write-side
+  reminder (write-side counted first); default mode surfaces it as a
+  non-blocking message, said at most once per session either way.
+
+- **A tolerant judge contract (#231).** `ScopeManager.judge`/`judge_batch`/
+  `judge_publication`/`judge_bootstrap_publication` each accept and
+  ignore a trailing `**_extra` — a new optional keyword the engine starts
+  passing in the future is a no-op at any judge implementation that
+  doesn't yet know it, never a `TypeError` (closing the class of incident
+  behind #202, the P5 parse/prompt-gate split, and #229 — three
+  kwarg-naming slips in two cycles). An AST-derived compatibility test
+  checks every real call-site keyword is still a named parameter (a typo
+  still surfaces as a missing argument) and that every in-repo test fake
+  standing in for `ScopeManager` itself tolerates an unknown keyword.
+
+- **MCP Registry housekeeping (docs-only).** `.github/SECURITY.md` now
+  describes the judge as any Anthropic-Messages-compatible endpoint
+  (OpenRouter by default), not only the Anthropic API, and names
+  `JUDGE_API_KEY` as the secret (with the deprecated `ANTHROPIC_API_KEY`
+  noted). `README.md` carries the registry's ownership-verification
+  marker (`<!-- mcp-name: io.github.oren198/strata -->`). A new
+  `server.json` at the repo root describes the package for the MCP
+  Registry.
+
+### Evals
+
+- **A live depth-2 relay item for `claim_corrected` (#230, in
+  `strata-evals`, follow-up from #221).** Covers owner → tracked-relay
+  child → chain-composed grandchild, plus a reference-edge reader of the
+  child, live rather than only pinned offline: the grandchild and the
+  reference-edge reader each get exactly one `claim_corrected`, under the
+  owner's original wave id, after the relaying child's own refresh is
+  judged — whatever that refresh decides.
