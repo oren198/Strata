@@ -104,6 +104,10 @@ def _new_condensation_drop_id() -> str:
     return f"cd_{secrets.token_hex(8)}"
 
 
+def _new_claim_carrier_check_id() -> str:
+    return f"ccc_{secrets.token_hex(8)}"
+
+
 def _new_operator_evidence_id() -> str:
     return f"oev_{secrets.token_hex(8)}"
 
@@ -534,6 +538,28 @@ class CondensationDrop:
     words_before: int
     words_after: int
     budget: int
+    created_at: str
+
+
+@dataclass(frozen=True)
+class ClaimCarrierCheck:
+    """One published item the owner-judge was asked to classify against a
+    just-corrected claim (issue #219 C, ADR 0017 P4 follow-up).
+
+    Written by :func:`strata.publication.check_claim_carriers`, at both
+    correction sites (same-scope outcome report, and #221's centralised
+    drain-scope sweep for a cross-scope notice) — never for a relay, which
+    rides down with its origin face item's own `carries` cascade instead of
+    getting its own row. See the migration's own docstring for what each
+    `outcome` value means.
+    """
+
+    id: str
+    change_id: str
+    scope_id: str
+    corrected_claim_id: str
+    item_id: str
+    outcome: Literal["carries", "does_not_carry", "unresolved_overflow", "unresolved_unreadable"]
     created_at: str
 
 
@@ -2252,6 +2278,88 @@ class RecordStore:
             params,
         ).fetchall()
         return [CondensationDrop(**dict(row)) for row in rows]
+
+    def append_claim_carrier_checks(
+        self,
+        *,
+        change_id: str,
+        scope_id: str,
+        corrected_claim_id: str,
+        checks: Sequence[
+            tuple[
+                str,
+                Literal[
+                    "carries", "does_not_carry", "unresolved_overflow", "unresolved_unreadable"
+                ],
+            ]
+        ],
+    ) -> list[ClaimCarrierCheck]:
+        """Append one row per candidate from ONE claim-carrier check (issue #219 C).
+
+        *checks* is ``[(item_id, outcome), ...]`` — every field the caller already
+        derived (ranking, the judge call's own decisions, or the overflow/unreadable
+        fallback); this call is a pure mechanical write, deriving nothing. A no-op
+        (returns ``[]``) when *checks* is empty, mirroring
+        :meth:`append_condensation_drops`.
+
+        All rows in one call share one SQLite transaction, so one correction's
+        several rows land together or not at all.
+        """
+        if not checks:
+            return []
+        rows_out: list[ClaimCarrierCheck] = []
+        with self._conn:
+            for item_id, outcome in checks:
+                check_id = _new_claim_carrier_check_id()
+                self._conn.execute(
+                    """
+                    INSERT INTO claim_carrier_checks (
+                        id, change_id, scope_id, corrected_claim_id, item_id, outcome
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (check_id, change_id, scope_id, corrected_claim_id, item_id, outcome),
+                )
+                row = self._conn.execute(
+                    """
+                    SELECT id, change_id, scope_id, corrected_claim_id, item_id, outcome,
+                           created_at
+                    FROM claim_carrier_checks WHERE id = ?
+                    """,
+                    (check_id,),
+                ).fetchone()
+                rows_out.append(ClaimCarrierCheck(**dict(row)))
+        return rows_out
+
+    def list_claim_carrier_checks(
+        self, *, scope_id: str | None = None, corrected_claim_id: str | None = None
+    ) -> list[ClaimCarrierCheck]:
+        """Return claim-carrier-check rows ordered by ``created_at`` ascending
+        (issue #219 C).
+
+        Args:
+            scope_id: When given, filter to this scope's own checks.
+            corrected_claim_id: When given, filter to checks against this one
+                corrected claim.
+        """
+        clauses: list[str] = []
+        params: list[str] = []
+        if scope_id is not None:
+            clauses.append("scope_id = ?")
+            params.append(scope_id)
+        if corrected_claim_id is not None:
+            clauses.append("corrected_claim_id = ?")
+            params.append(corrected_claim_id)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self._conn.execute(
+            f"""
+            SELECT id, change_id, scope_id, corrected_claim_id, item_id, outcome, created_at
+            FROM claim_carrier_checks
+            {where}
+            ORDER BY created_at ASC, rowid ASC
+            """,
+            params,
+        ).fetchall()
+        return [ClaimCarrierCheck(**dict(row)) for row in rows]
 
     # ------------------------------------------------------------------
     # Publication acts + judgments (ADR 0007 D1/D2) — the publication

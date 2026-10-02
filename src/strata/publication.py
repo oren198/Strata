@@ -1325,6 +1325,47 @@ def propagate_claim_correction(
     if not to_withdraw:
         return []
 
+    return _withdraw_and_cascade_carriers(
+        scope_id,
+        to_withdraw,
+        current_publication,
+        claim_id=claim_id,
+        correcting_content=correcting_content,
+        trigger_id=trigger_id,
+        reason="still carried corrected claim %s verbatim (ADR 0017 P4)",
+        fleet=fleet,
+        record_store=record_store,
+        summaries_dir=summaries_dir,
+        change_ids=change_ids,
+        hop=hop,
+    )
+
+
+def _withdraw_and_cascade_carriers(
+    scope_id: str,
+    to_withdraw: Sequence[PublishedItem],
+    current_publication: Sequence[PublishedItem],
+    *,
+    claim_id: str,
+    correcting_content: str,
+    trigger_id: str,
+    reason: str,
+    fleet: FleetConfig,
+    record_store: RecordStore,
+    summaries_dir: str,
+    change_ids: Sequence[str],
+    hop: int,
+) -> list[PublishedItem]:
+    """Shared tail of :func:`propagate_claim_correction` and
+    :func:`check_claim_carriers` (issue #219 C): given the items ALREADY
+    decided to carry a corrected claim — by verbatim match or by the
+    owner-judge's own ``carries`` decision — withdraw each, rewrite the
+    publication artifact, and cascade the withdrawal to every relay, exactly
+    once, under one wave id, however the carrier was found.
+
+    *reason* is a ``%``-style log template taking *claim_id* — the two
+    callers log a different cause for the same mechanical act.
+    """
     proposer = _mechanical_proposer(scope_id)
     for item in to_withdraw:
         record_store.append_publication_act(
@@ -1339,8 +1380,7 @@ def propagate_claim_correction(
             proposer=proposer,
         )
         _logger.info(
-            "mechanically withdrew published item %s from scope %s: still carried "
-            "corrected claim %s verbatim (ADR 0017 P4)",
+            "mechanically withdrew published item %s from scope %s: " + reason,
             item.id,
             scope_id,
             claim_id,
@@ -1378,7 +1418,201 @@ def propagate_claim_correction(
             correcting_claim_id=claim_id,
         )
 
-    return to_withdraw
+    return list(to_withdraw)
+
+
+_CARRIER_STOPWORDS = frozenset(
+    {
+        "a",
+        "an",
+        "the",
+        "is",
+        "are",
+        "was",
+        "were",
+        "be",
+        "been",
+        "being",
+        "of",
+        "to",
+        "in",
+        "on",
+        "at",
+        "by",
+        "for",
+        "with",
+        "as",
+        "and",
+        "or",
+        "but",
+        "it",
+        "its",
+        "this",
+        "that",
+        "these",
+        "those",
+        "from",
+        "into",
+        "about",
+        "than",
+        "then",
+        "so",
+        "not",
+        "no",
+    }
+)
+
+
+def _content_words(text: str) -> set[str]:
+    words = re.findall(r"[a-z0-9]+", text.casefold())
+    return {w for w in words if w not in _CARRIER_STOPWORDS}
+
+
+def _carrier_rank_score(claim_content: str, candidate_content: str) -> float:
+    """Issue #219 C: rank a published item against a corrected claim for
+    ORDERING ONLY, never as a gate — the offline measurement killed a
+    threshold outright, since one either misses paraphrases or admits
+    subject swaps. Key-token overlap (how many of the claim's own content
+    words the candidate shares) plus content-word coverage (what fraction of
+    the claim's content words that overlap is), so a short candidate that
+    restates the whole claim scores above a long one that shares only a
+    couple of words.
+
+    A tokenless claim (no content words survive stripping stopwords) scores
+    every candidate 0.0 — ties then fall back to the face's own stable
+    order, so every candidate still reaches the judge call rather than being
+    filtered out mechanically; see :func:`check_claim_carriers`.
+    """
+    claim_words = _content_words(claim_content)
+    if not claim_words:
+        return 0.0
+    candidate_words = _content_words(candidate_content)
+    overlap = claim_words & candidate_words
+    coverage = len(overlap) / len(claim_words)
+    return len(overlap) + coverage
+
+
+def check_claim_carriers(
+    scope_id: str,
+    *,
+    claim_id: str,
+    corrected_claim_content: str,
+    correcting_content: str,
+    trigger_id: str,
+    already_withdrawn: Collection[str],
+    scope_manager: ScopeManager,
+    fleet: FleetConfig,
+    record_store: RecordStore,
+    summaries_dir: str,
+    change_ids: Sequence[str] = (),
+    hop: int = 0,
+    cap: int = 20,
+) -> list[PublishedItem]:
+    """Issue #219 C: one owner-judge call per correction, deciding whether the
+    scope's own published face — beyond what the mechanical verbatim sweep
+    and the judge's own ``withdraw_published`` already caught — still carries
+    a claim this scope's own outcome or refresh just found wrong.
+
+    Called from BOTH correction sites, right after
+    :func:`propagate_claim_correction`, under the SAME wave id: the same-scope
+    ``failed_corrected`` outcome path (:func:`strata.app._write_amendment`),
+    and the cross-scope refresh's centralised sweep (:func:`strata.app.drain_scope`,
+    #221) — it runs unconditionally there too, whatever the refresh judgment did.
+
+    Candidates are the WHOLE current face minus *already_withdrawn* — never
+    relays: a relay is a copy of a face item, and a face item judged
+    ``carries`` takes its own relays down through the same
+    :func:`_cascade_withdraw_relays` cascade the verbatim path uses. Ranked by
+    :func:`_carrier_rank_score` (ordering only) and capped at *cap* (20):
+    anything past the cap is recorded ``unresolved_overflow``, never silently
+    dropped and never sent to the judge.
+
+    Every candidate the judge call does classify gets its own row — ``carries``
+    or ``does_not_carry`` is itself a judgment made, so the row exists either
+    way (Philis: "carries / does_not_carry are acts, not labels"); an id the
+    judge named with no readable decision, or never named at all, is recorded
+    ``unresolved_unreadable``. Nothing here is withdrawn except the items
+    actually decided ``carries``.
+
+    *scope_manager* is duck-typed, not required to be a real
+    :class:`~strata.scope_manager.ScopeManager`: one that predates this
+    method (a lighter test double elsewhere in the fleet) degrades every
+    candidate to ``unresolved_unreadable`` exactly as an unreadable response
+    would, rather than raising ``AttributeError`` into the write this
+    function runs inside.
+    """
+    current_publication = read_publication(scope_id, summaries_dir=summaries_dir)
+    if not current_publication:
+        return []
+
+    skip = set(already_withdrawn)
+    face = [item for item in current_publication if item.id not in skip]
+    if not face:
+        return []
+
+    ranked = sorted(
+        enumerate(face),
+        key=lambda pair: (
+            -_carrier_rank_score(corrected_claim_content, pair[1].content),
+            pair[0],
+        ),
+    )
+    candidates = [item for _, item in ranked[:cap]]
+    overflow = [item for _, item in ranked[cap:]]
+
+    rows: list[tuple[str, str]] = [(item.id, "unresolved_overflow") for item in overflow]
+
+    to_withdraw: list[PublishedItem] = []
+    if candidates:
+        # A scope-manager duck-type that predates this method (a lighter
+        # test double elsewhere in the fleet, or a future rolling deploy
+        # where the engine and the judge implementation are briefly out of
+        # step) degrades the same way an unreadable decision does — fails
+        # closed per candidate, never crashes the drain/write it runs
+        # inside.
+        check = getattr(scope_manager, "check_claim_carriers", None)
+        decisions = (
+            check(
+                corrected_claim_content=corrected_claim_content,
+                correcting_content=correcting_content,
+                candidates=[(item.id, item.content) for item in candidates],
+            )
+            if check is not None
+            else {}
+        )
+        for item in candidates:
+            outcome = decisions.get(item.id, "unresolved_unreadable")
+            if outcome not in ("carries", "does_not_carry", "unresolved_unreadable"):
+                outcome = "unresolved_unreadable"
+            rows.append((item.id, outcome))
+            if outcome == "carries":
+                to_withdraw.append(item)
+
+    if rows:
+        record_store.append_claim_carrier_checks(
+            change_id=change_ids[0] if change_ids else trigger_id,
+            scope_id=scope_id,
+            corrected_claim_id=claim_id,
+            checks=rows,
+        )
+
+    if not to_withdraw:
+        return []
+
+    return _withdraw_and_cascade_carriers(
+        scope_id,
+        to_withdraw,
+        current_publication,
+        claim_id=claim_id,
+        correcting_content=correcting_content,
+        trigger_id=trigger_id,
+        reason="the owner-judge said it carries corrected claim %s (issue #219 C)",
+        fleet=fleet,
+        record_store=record_store,
+        summaries_dir=summaries_dir,
+        change_ids=change_ids,
+        hop=hop,
+    )
 
 
 def apply_judged_withdrawals(

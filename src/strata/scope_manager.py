@@ -587,6 +587,53 @@ BOOTSTRAP_JUDGE_TOOL: dict = {
     },
 }
 
+CLAIM_CARRIER_TOOL: dict = {
+    "name": "classify_claim_carriers",
+    "description": (
+        "A claim this scope published has just been corrected. Decide, for "
+        "EVERY listed published item, whether it still asserts the corrected "
+        "claim (even paraphrased, reworded, or stated in different words) or "
+        "not. One decision per item id — every id listed must get one."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "decisions": {
+                "type": "array",
+                "description": "One entry per listed item id — all of them, no fewer.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "item_id": {
+                            "type": "string",
+                            "description": "One of the listed published item ids, verbatim.",
+                        },
+                        "decision": {
+                            "type": "string",
+                            "enum": ["carries", "does_not_carry"],
+                            "description": (
+                                "carries: this item still asserts the corrected claim, "
+                                "in any wording. does_not_carry: it does not — a "
+                                "different claim, even on a similar subject."
+                            ),
+                        },
+                    },
+                    "required": ["item_id", "decision"],
+                },
+            },
+        },
+        "required": ["decisions"],
+    },
+}
+
+_CLAIM_CARRIER_SYSTEM_PROMPT = """\
+You decide, for a scope whose own claim was just corrected, which of its \
+currently published items still carry that corrected claim — even paraphrased \
+or reworded — and which assert something else, including a different claim on \
+a similar subject (a subject swap is NOT a carrier). This is about CONTENT \
+equivalence only: does the item still assert the same thing the claim stated, \
+in substance, however the wording differs."""
+
 # ---------------------------------------------------------------------------
 # Interior-assertion re-ask tool (ADR 0016, issue #225 — static, eligible for
 # prompt caching). A SEPARATE tool from JUDGE_TOOL, never a `_judge_tool_for`
@@ -5724,6 +5771,76 @@ class ScopeManager:
                 ),
             }
         )
+
+    def check_claim_carriers(
+        self,
+        *,
+        corrected_claim_content: str,
+        correcting_content: str,
+        candidates: Sequence[tuple[str, str]],
+    ) -> dict[str, Literal["carries", "does_not_carry", "unresolved_unreadable"]]:
+        """Issue #219 C: one judge call, deciding per published item whether it
+        still carries a just-corrected claim.
+
+        A standalone call, never nested inside :meth:`judge`/:meth:`judge_batch`
+        — the caller (:func:`strata.publication.check_claim_carriers`) already
+        ran the mechanical verbatim sweep and the ordinary judgment's own
+        ``withdraw_published`` before gathering *candidates*, so every id here
+        is something both of those missed. *candidates* is ``[(item_id,
+        content), ...]``, already ranked and capped at 20 by the caller — this
+        method makes no ranking or cap decision of its own.
+
+        Fails closed per item, not per call: every candidate id defaults to
+        ``"unresolved_unreadable"``, overridden only by a valid, matching
+        entry in the model's own response. A missing id, an id naming no
+        candidate, a malformed decision, or the whole call raising (a network
+        error, a missing tool_use block) all collapse to that same default —
+        nothing here fabricates a verdict the model never gave.
+        """
+        result: dict[str, Literal["carries", "does_not_carry", "unresolved_unreadable"]] = {
+            item_id: "unresolved_unreadable" for item_id, _ in candidates
+        }
+        if not candidates:
+            return result
+
+        listed = "\n".join(f"- item_id {item_id!r}: {content}" for item_id, content in candidates)
+        user_text = (
+            "The corrected claim, as it stood before the correction:\n"
+            f"{corrected_claim_content}\n\n"
+            "The correction (the owner's own observation now):\n"
+            f"{correcting_content}\n\n"
+            "Published items to classify — decide carries/does_not_carry for "
+            f"every one listed, by its exact item_id:\n{listed}"
+        )
+        try:
+            response = self._client.messages.create(
+                model=self._model,
+                max_tokens=1024,
+                system=[{"type": "text", "text": _CLAIM_CARRIER_SYSTEM_PROMPT}],
+                tools=[CLAIM_CARRIER_TOOL],
+                tool_choice={
+                    "type": "tool",
+                    "name": CLAIM_CARRIER_TOOL["name"],
+                    "disable_parallel_tool_use": True,
+                },
+                messages=[{"role": "user", "content": user_text}],
+            )
+            block = self._extract_tool_use_block(response)
+            raw: dict = block.input or {}
+            decisions = raw.get("decisions")
+            if not isinstance(decisions, list):
+                raise ValueError("decisions is not a list")
+            candidate_ids = {item_id for item_id, _ in candidates}
+            for entry in decisions:
+                if not isinstance(entry, dict):
+                    continue
+                item_id = entry.get("item_id")
+                decision = entry.get("decision")
+                if item_id in candidate_ids and decision in ("carries", "does_not_carry"):
+                    result[item_id] = decision
+        except Exception:  # noqa: BLE001 — any slip here fails closed, per item
+            pass
+        return result
 
     @staticmethod
     def _extract_tool_use_block(response):

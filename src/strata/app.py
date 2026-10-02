@@ -117,6 +117,7 @@ from strata.perspective import (
 from strata.project_config import StoragePaths, resolve_storage_paths
 from strata.publication import (
     apply_judged_withdrawals,
+    check_claim_carriers,
     propagate_claim_correction,
     propagate_directive_removals,
     read_publication,
@@ -1005,6 +1006,7 @@ def _judge_and_record(
             removals=[(d, contribution.id) for d in judgment.removed_directive_ids],
             withdraw_reasoning=judgment.reasoning,
             judged_contribution_ids=[contribution.id],
+            scope_manager=scope_manager,
             change_ids_override=[claim_event.change_id] if same_scope_correction else None,
             withdraw_notice_kind=(
                 "claim_corrected"
@@ -1060,6 +1062,7 @@ def _write_amendment(
     withdraw_correcting_after: str | None = None,
     withdraw_corrected_claim_content: str | None = None,
     withdraw_correcting_claim_id: str | None = None,
+    scope_manager: ScopeManager | None = None,
 ) -> None:
     """Write an accepted amendment's summary and everything that follows from it.
 
@@ -1245,7 +1248,7 @@ def _write_amendment(
     #     whatever the judge already withdrew above — one notice per reader
     #     either way, and the record shows which path closed it.
     if withdraw_corrected_claim_content is not None:
-        propagate_claim_correction(
+        verbatim_withdrawn = propagate_claim_correction(
             scope.id,
             claim_id=withdraw_correcting_claim_id or "",
             corrected_claim_content=withdraw_corrected_claim_content,
@@ -1258,6 +1261,28 @@ def _write_amendment(
             change_ids=change_ids,
             hop=judgment.hop,
         )
+        # Issue #219 C: the owner-judge's own paraphrase check, over whatever
+        # the verbatim sweep (above) and the judge's own withdraw_published
+        # still left standing — same-scope `failed_corrected` only (the
+        # drain-path site is `drain_scope`'s own #221 sweep).
+        if scope_manager is not None:
+            check_claim_carriers(
+                scope.id,
+                claim_id=withdraw_correcting_claim_id or "",
+                corrected_claim_content=withdraw_corrected_claim_content,
+                correcting_content=withdraw_correcting_after or "",
+                trigger_id=judged_contribution_ids[0],
+                already_withdrawn=[
+                    *(judgment.withdraw_published or []),
+                    *(item.id for item in verbatim_withdrawn),
+                ],
+                scope_manager=scope_manager,
+                fleet=fleet,
+                record_store=record_store,
+                summaries_dir=str(summary_store.summaries_dir),
+                change_ids=change_ids,
+                hop=judgment.hop,
+            )
 
     # 2. Mechanical propagation (D3): any published item anchored ONLY to
     #    directives that just left the summary is withdrawn, no LLM in the
@@ -2569,13 +2594,31 @@ def drain_scope(
         for event in events:
             if event.kind != "claim_corrected":
                 continue
-            propagate_claim_correction(
+            verbatim_withdrawn = propagate_claim_correction(
                 scope.id,
                 claim_id=event.item_id,
                 corrected_claim_content=event.before or "",
                 correcting_content=event.after or "",
                 trigger_id=event.contribution_id,
                 already_withdrawn=[],
+                fleet=fleet,
+                record_store=record_store,
+                summaries_dir=str(summary_store.summaries_dir),
+                change_ids=[event.change_id],
+                hop=refresh_hop,
+            )
+            # Issue #219 C: the owner-judge's own paraphrase check, same
+            # unconditional shape as the sweep above — runs whatever the
+            # drained refresh judgment did, including a decline or a failure
+            # (neither of which ever reaches `_write_amendment`).
+            check_claim_carriers(
+                scope.id,
+                claim_id=event.item_id,
+                corrected_claim_content=event.before or "",
+                correcting_content=event.after or "",
+                trigger_id=event.contribution_id,
+                already_withdrawn=[item.id for item in verbatim_withdrawn],
+                scope_manager=scope_manager,
                 fleet=fleet,
                 record_store=record_store,
                 summaries_dir=str(summary_store.summaries_dir),

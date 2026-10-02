@@ -101,6 +101,7 @@ def test_full_chain_drops_fleet_tables_and_preserves_record(tmp_path: Path) -> N
         "0017_claim_kinds.sql",
         "0018_raised_from_operator_evidence.sql",
         "0019_condensation_drops.sql",
+        "0020_claim_carrier_checks.sql",
     ]
 
     # Fleet tables gone.
@@ -368,6 +369,7 @@ def test_idempotent_reapply(tmp_path: Path) -> None:
         "0017_claim_kinds.sql",
         "0018_raised_from_operator_evidence.sql",
         "0019_condensation_drops.sql",
+        "0020_claim_carrier_checks.sql",
     ]
 
     second = run_migrations(db_path, migrations_dir=migrations_dir)
@@ -583,6 +585,7 @@ def test_crash_at_tracking_insert_rolls_back_script_too(
         "0017_claim_kinds.sql",
         "0018_raised_from_operator_evidence.sql",
         "0019_condensation_drops.sql",
+        "0020_claim_carrier_checks.sql",
     ]
 
 
@@ -954,6 +957,7 @@ def test_0011_preserves_change_events_written_before_it(tmp_path: Path) -> None:
         "0017_claim_kinds.sql",
         "0018_raised_from_operator_evidence.sql",
         "0019_condensation_drops.sql",
+        "0020_claim_carrier_checks.sql",
     ]
 
     conn = sqlite3.connect(db_path)

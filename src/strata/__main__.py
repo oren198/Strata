@@ -741,6 +741,22 @@ def cmd_record(args: argparse.Namespace) -> int:
                     f"({drop.state_at_drop}, {drop.words_before}→{drop.words_after} words, "
                     f"budget {drop.budget})"
                 )
+            # Issue #219 C: a correction AGAINST this contribution (this
+            # claim was found wrong, same-scope or via a drained refresh) may
+            # have sent the scope's own published face through the
+            # owner-judge's paraphrase check. UNRESOLVED outcomes are surfaced
+            # explicitly — they are a judgment never made, not a clean verdict.
+            for check in stores.record_store.list_claim_carrier_checks(corrected_claim_id=c.id):
+                if check.outcome in ("unresolved_overflow", "unresolved_unreadable"):
+                    print(
+                        f"      claim-carrier check on published item {check.item_id}: "
+                        f"{check.outcome} — see strata_rejudge or operator review"
+                    )
+                else:
+                    print(
+                        f"      claim-carrier check on published item {check.item_id}: "
+                        f"{check.outcome}"
+                    )
             if state is not None and state.state == "judge_failed":
                 print(f"      judge failed at {state.failed_at}: {state.error_message}")
                 print("      re-judge with the strata_rejudge MCP tool")

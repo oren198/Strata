@@ -3373,9 +3373,12 @@ async def strata_read_scope_record(
         version ("condensed away or reworded"), never that it was condensed
         away specifically: a live judge commonly rewords a still-standing
         claim rather than deleting it, and a verbatim-substring test cannot
-        tell the two apart; plus a ``page`` block carrying ``limit``,
-        ``total`` (the whole record's size), and ``next_before_id`` (null on
-        the last page).
+        tell the two apart; ``claim_carrier_checks`` covering the WHOLE scope
+        the same way — one row per published item the owner-judge was asked
+        to classify against a corrected claim, outcome ``carries``/
+        ``does_not_carry``/``unresolved_overflow``/``unresolved_unreadable``;
+        plus a ``page`` block carrying ``limit``, ``total`` (the whole
+        record's size), and ``next_before_id`` (null on the last page).
 
     Raises:
         RuntimeError: If scope_id is outside this agent's entitled
@@ -3416,6 +3419,14 @@ async def strata_read_scope_record(
             # scope — small, rare, never paginated the way contributions are.
             "condensation_drops": [
                 asdict(d) for d in _record_store.list_condensation_drops(scope_id=scope_id)
+            ],
+            # Issue #219 C: every claim-carrier-check row for this scope — small,
+            # rare, never paginated, same shape as condensation_drops above. The
+            # UNRESOLVED outcomes (unresolved_overflow, unresolved_unreadable) are
+            # the ones an operator needs to see — a judgment that was never made,
+            # or never made to any item visible here.
+            "claim_carrier_checks": [
+                asdict(c) for c in _record_store.list_claim_carrier_checks(scope_id=scope_id)
             ],
             # next_before_id is null once the record is exhausted — page until
             # then rather than inferring the end from a short page.
