@@ -175,6 +175,7 @@ def test_conduct_is_admitted_as_judged_unchanged() -> None:
         "scopes": [OTHER.id],
         "class": "conduct",
         "result": "admitted as judged",
+        "act_span": content,
     }
 
 
@@ -271,7 +272,9 @@ def test_invented_informant_span_is_declined() -> None:
     mock_client = MagicMock()
     mock_client.messages.create.side_effect = [
         _ordinary_accept(content),
-        _reask_response(classification="informant", informant_span="Nobody Real"),
+        _reask_response(
+            classification="informant", informant_span="Nobody Real", telling_span="told me"
+        ),
     ]
     judgment, _ = _judge(mock_client, content)
     assert mock_client.messages.create.call_count == 2
@@ -293,7 +296,9 @@ def test_verified_informant_replaces_context_and_strips_directive_ops() -> None:
             }
         ),
         _reask_response(
-            classification="informant", informant_span="Jordan Lee from 225-other-scope"
+            classification="informant",
+            informant_span="Jordan Lee from 225-other-scope",
+            telling_span="told me",
         ),
     ]
     judgment, _ = _judge(mock_client, content)
@@ -334,7 +339,9 @@ def test_verified_informant_never_supersedes_or_retires_an_existing_directive() 
             }
         ),
         _reask_response(
-            classification="informant", informant_span="Jordan Lee from 225-other-scope"
+            classification="informant",
+            informant_span="Jordan Lee from 225-other-scope",
+            telling_span="told me",
         ),
     ]
     judgment, _ = _judge(mock_client, content)
@@ -399,7 +406,9 @@ def test_informant_own_role_is_declined_as_invented() -> None:
     mock_client = MagicMock()
     mock_client.messages.create.side_effect = [
         _ordinary_accept(content),
-        _reask_response(classification="informant", informant_span="on-call-engineer"),
+        _reask_response(
+            classification="informant", informant_span="on-call-engineer", telling_span="told me"
+        ),
     ]
     judgment, _ = _judge(mock_client, content)
     assert judgment.decision == "decline"
@@ -412,7 +421,9 @@ def test_informant_own_scope_is_declined_as_invented() -> None:
     mock_client = MagicMock()
     mock_client.messages.create.side_effect = [
         _ordinary_accept(content),
-        _reask_response(classification="informant", informant_span="g_225reporter"),
+        _reask_response(
+            classification="informant", informant_span="g_225reporter", telling_span="told me"
+        ),
     ]
     judgment, _ = _judge(mock_client, content)
     assert judgment.decision == "decline"
@@ -424,7 +435,7 @@ def test_informant_bare_first_person_is_declined_as_invented() -> None:
     mock_client = MagicMock()
     mock_client.messages.create.side_effect = [
         _ordinary_accept(content),
-        _reask_response(classification="informant", informant_span="I"),
+        _reask_response(classification="informant", informant_span="I", telling_span="told me"),
     ]
     judgment, _ = _judge(mock_client, content)
     assert judgment.decision == "decline"
@@ -440,7 +451,11 @@ def test_informant_span_with_connector_and_role_is_declined_as_invented() -> Non
     mock_client = MagicMock()
     mock_client.messages.create.side_effect = [
         _ordinary_accept(content),
-        _reask_response(classification="informant", informant_span="me, as on-call-engineer"),
+        _reask_response(
+            classification="informant",
+            informant_span="me, as on-call-engineer",
+            telling_span="told me",
+        ),
     ]
     judgment, _ = _judge(mock_client, content)
     assert judgment.decision == "decline"
@@ -454,7 +469,11 @@ def test_informant_span_with_possessive_role_is_declined_as_invented() -> None:
     mock_client = MagicMock()
     mock_client.messages.create.side_effect = [
         _ordinary_accept(content),
-        _reask_response(classification="informant", informant_span="our on-call-engineer"),
+        _reask_response(
+            classification="informant",
+            informant_span="our on-call-engineer",
+            telling_span="told me",
+        ),
     ]
     judgment, _ = _judge(mock_client, content)
     assert judgment.decision == "decline"
@@ -466,31 +485,198 @@ def test_informant_span_naming_a_genuine_third_party_with_a_possessive_passes() 
     first-person possessive but NAMES a genuine third party is not the
     contributor's own voice, and must be admitted as an informant."""
     content = (
-        "my colleague Lena Fischer in procurement says 225-other-scope only "
+        "my colleague Lena Fischer in procurement told me 225-other-scope only "
         "approves changes under budget."
     )
     mock_client = MagicMock()
     mock_client.messages.create.side_effect = [
         _ordinary_accept(content),
-        _reask_response(classification="informant", informant_span="my colleague Lena Fischer"),
+        _reask_response(
+            classification="informant",
+            informant_span="my colleague Lena Fischer",
+            telling_span="told me",
+        ),
     ]
     judgment, _ = _judge(mock_client, content)
     assert judgment.decision == "accept_as_context"
     assert judgment.interior_assertion["result"] == "admitted (context replaced)"
+    assert judgment.interior_assertion["telling_span"] == "told me"
 
 
 def test_informant_span_naming_a_genuine_third_party_with_our_passes() -> None:
     content = (
-        "our contact Ravi in treasury says 225-other-scope only approves changes under budget."
+        "our contact Ravi in treasury told us 225-other-scope only approves changes under budget."
     )
     mock_client = MagicMock()
     mock_client.messages.create.side_effect = [
         _ordinary_accept(content),
-        _reask_response(classification="informant", informant_span="our contact Ravi in treasury"),
+        _reask_response(
+            classification="informant",
+            informant_span="our contact Ravi in treasury",
+            telling_span="told us",
+        ),
     ]
     judgment, _ = _judge(mock_client, content)
     assert judgment.decision == "accept_as_context"
     assert judgment.interior_assertion["result"] == "admitted (context replaced)"
+
+
+# ---------------------------------------------------------------------------
+# Re-gate fix 4 (Philis's ruling): the informant verifies through a TELLING
+# EVENT (`telling_span`), not by rejecting a bare scope name/collective
+# outright — ADR 0016's informant is "a person OR PARTY who told the agent",
+# and a party can tell. A scope's own name or a collective passes when backed
+# by a genuine telling event naming the contributor as addressee/audience.
+# ---------------------------------------------------------------------------
+
+_J4_INTERIOR_INFORMANT_TWINS = [
+    "225-other-scope told me on Tuesday that the arm-controller order needs a second quote",
+    "225-other-scope's maintenance crew told us the server room HVAC would be off "
+    "on the last two first Sundays",
+    "225-other-scope's review bot messaged me that the diagram PRs need a palette fix",
+    "225-other-scope informed us it would decline the FX hedge request for the launch on Tuesday",
+    "225-other-scope wrote to me that the firmware builds would ship on the following Wednesday",
+    "225-other-scope's scanner team shared with us that the click-log export job "
+    "was quarantined yesterday",
+]
+
+
+def test_all_six_j4_interior_informant_twins_pass() -> None:
+    for content in _J4_INTERIOR_INFORMANT_TWINS:
+        mock_client = MagicMock()
+        mock_client.messages.create.side_effect = [
+            _ordinary_accept(content),
+            _reask_response(
+                classification="informant",
+                informant_span="225-other-scope",
+                telling_span=content,
+            ),
+        ]
+        judgment, _ = _judge(mock_client, content)
+        assert judgment.decision == "accept_as_context", content
+        assert judgment.interior_assertion["result"] == "admitted (context replaced)", content
+
+
+def test_scope_name_informant_backed_by_a_telling_event_passes() -> None:
+    """ "procurement told us on Tuesday that…" — the architect's own example:
+    a bare scope name/id is no longer rejected outright now that a genuine
+    telling event backs it."""
+    content = "225-other-scope told us on Tuesday that budgets are frozen for this quarter."
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [
+        _ordinary_accept(content),
+        _reask_response(
+            classification="informant",
+            informant_span="225-other-scope",
+            telling_span="told us on Tuesday",
+        ),
+    ]
+    judgment, _ = _judge(mock_client, content)
+    assert judgment.decision == "accept_as_context"
+    assert judgment.interior_assertion["result"] == "admitted (context replaced)"
+    assert judgment.interior_assertion["telling_span"] == "told us on Tuesday"
+
+
+def test_collective_informant_backed_by_a_telling_event_passes() -> None:
+    """ "the procurement team told me…" — a collective is a PARTY, and a party
+    can tell (ADR 0016)."""
+    content = "the 225-other-scope team told me that budgets are frozen for this quarter."
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [
+        _ordinary_accept(content),
+        _reask_response(
+            classification="informant",
+            informant_span="the 225-other-scope team",
+            telling_span="told me",
+        ),
+    ]
+    judgment, _ = _judge(mock_client, content)
+    assert judgment.decision == "accept_as_context"
+    assert judgment.interior_assertion["result"] == "admitted (context replaced)"
+
+
+def test_flat_rule_with_the_scope_name_as_span_fails_with_no_telling_event() -> None:
+    content = "225-other-scope only approves changes under budget."
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [
+        _ordinary_accept(content),
+        _reask_response(
+            classification="informant", informant_span="225-other-scope", telling_span=content
+        ),
+    ]
+    judgment, _ = _judge(mock_client, content)
+    assert judgment.decision == "decline"
+    assert "no telling event is reported: state who told you" in judgment.reasoning
+    assert judgment.interior_assertion["result"] == "declined (no telling event)"
+
+
+def test_unaddressed_telling_verb_fails() -> None:
+    """ "procurement says orders under 5k…" — "says" is not a listed telling
+    verb form (only "say", never stemmed), so this fails the same way the
+    flat rule does, with no addressee ever reached."""
+    content = "225-other-scope says orders under 5k are auto-approved."
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [
+        _ordinary_accept(content),
+        _reask_response(
+            classification="informant", informant_span="225-other-scope", telling_span=content
+        ),
+    ]
+    judgment, _ = _judge(mock_client, content)
+    assert judgment.decision == "decline"
+    assert "no telling event is reported: state who told you" in judgment.reasoning
+
+
+def test_stated_limit_a_real_telling_with_no_contributor_named_is_declined() -> None:
+    """KNOWN LIMIT, pinned per Philis's ruling: "the procurement lead said X"
+    is a REAL telling event — "said" is a listed verb — but names no one as
+    the one told, so it is declined rather than guessed as addressed to the
+    contributor."""
+    content = "the 225-other-scope lead said budgets are frozen for this quarter."
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [
+        _ordinary_accept(content),
+        _reask_response(
+            classification="informant",
+            informant_span="the 225-other-scope lead",
+            telling_span="said budgets are frozen for this quarter",
+        ),
+    ]
+    judgment, _ = _judge(mock_client, content)
+    assert judgment.decision == "decline"
+    assert "the telling names no one it was told to" in judgment.reasoning
+    assert judgment.interior_assertion["result"] == "declined (no telling event)"
+
+
+def test_telling_span_not_occurring_verbatim_is_declined_as_invented() -> None:
+    content = "225-other-scope told me on Tuesday that budgets are frozen for this quarter."
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [
+        _ordinary_accept(content),
+        _reask_response(
+            classification="informant",
+            informant_span="225-other-scope",
+            telling_span="mentioned to me last week",
+        ),
+    ]
+    judgment, _ = _judge(mock_client, content)
+    assert judgment.decision == "decline"
+    assert "invented informant" in judgment.reasoning
+    assert judgment.interior_assertion["result"] == "declined (invented informant)"
+
+
+def test_informant_with_no_telling_span_at_all_fails_closed_as_judge_failure() -> None:
+    content = "225-other-scope only approves changes under budget."
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [
+        _ordinary_accept(content),
+        _reask_response(
+            classification="informant", informant_span="225-other-scope"
+        ),  # no telling_span
+    ]
+    judgment, _ = _judge(mock_client, content)
+    assert judgment.decision == "decline"
+    assert judgment.judge_failure is True
 
 
 # ---------------------------------------------------------------------------

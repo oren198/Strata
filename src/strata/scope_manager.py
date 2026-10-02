@@ -622,8 +622,23 @@ INTERIOR_ASSERTION_TOOL: dict = {
                 "description": (
                     "Required when classification is informant: the EXACT verbatim "
                     "span of the contribution's own text naming who told the agent "
-                    "(e.g. 'Priya, one of the security-eng engineers'). Must occur in "
-                    "the contribution text."
+                    "(e.g. 'Priya, one of the security-eng engineers'). A scope's own "
+                    "name or a collective ('procurement', 'the procurement team') is "
+                    "allowed here — a party can tell, per ADR 0016. Must occur in the "
+                    "contribution text."
+                ),
+            },
+            "telling_span": {
+                "type": "string",
+                "description": (
+                    "Required when classification is informant: the EXACT verbatim "
+                    "span of the contribution's own text describing the TELLING "
+                    "EVENT itself — must contain a telling verb (told, tell, said, "
+                    "say, confirmed, informed, announced, mentioned, explained, "
+                    "warned, shared, sent, wrote, messaged, emailed, pinged, briefed) "
+                    "and name the contributor as the one told (me, us, our, we, my, "
+                    "I) — e.g. 'told me on Tuesday'. Must occur in the contribution "
+                    "text."
                 ),
             },
             "ref_id": {
@@ -2433,7 +2448,13 @@ class ScopeManagerJudgment(_AmendmentJudgment):
     classification was ever read). The SAME fact the fixed marker on
     :attr:`protocol_notes` already states in prose
     ("interior assertion: <scopes>, <result>") — this is its structured
-    twin, so an eval trace can read it without parsing prose."""
+    twin, so an eval trace can read it without parsing prose.
+
+    Re-gate follow-up: on an ADMITTED verdict only, carries the VERIFIED span
+    too — ``"span"`` (the informant span) for ``class == "informant"``, or
+    ``"act_span"`` for ``class == "conduct"`` — so the trace shows what was
+    actually accepted, not only that something was. Absent on every decline
+    and on every other classification."""
 
     @property
     def record_notes(self) -> str:
@@ -3606,6 +3627,40 @@ def _match_other_scopes(content: str, candidates: Sequence[Scope]) -> list[Scope
 #: frame (below). "our"/"ours" also catches "our order", not only "I"/"we".
 _FIRST_PERSON_RE = re.compile(r"\b(i|me|my|we|us|our|ours|myself|ourselves)\b", re.IGNORECASE)
 
+#: Philis's ruling (#225 re-gate, fix 4): the verb forms a `telling_span`
+#: must contain, word-bounded — exactly these listed forms, never stemmed
+#: ("say" does not match "says").
+_TELLING_VERBS = (
+    "told",
+    "tell",
+    "said",
+    "say",
+    "confirmed",
+    "informed",
+    "announced",
+    "mentioned",
+    "explained",
+    "warned",
+    "shared",
+    "sent",
+    "wrote",
+    "messaged",
+    "emailed",
+    "pinged",
+    "briefed",
+)
+_TELLING_VERB_RE = re.compile(r"\b(?:" + "|".join(_TELLING_VERBS) + r")\b", re.IGNORECASE)
+
+#: Articles stripped from a `telling_span` before the first-person-marker
+#: check only — narrower than `_OWN_ROLE_STRIP_WORDS` (no possessives, no
+#: "as"): a telling event's own addressee is what is being located here.
+_TELLING_ARTICLES = frozenset({"a", "an", "the"})
+
+#: The first-person markers a `telling_span` must contain, after stripping
+#: articles, for the contributor to be the telling's addressee or audience
+#: (Philis: "telling is conduct toward the contributor").
+_TELLING_FIRST_PERSON_WORDS = frozenset({"me", "us", "our", "we", "my", "i"})
+
 #: Philis's ruling: the verbs that introduce a claim ABOUT something rather
 #: than a dealing the contributor was PART OF — attestation ("I can tell you
 #: X") and perception ("I saw X") alike. Both frame a claim the speaker is
@@ -4089,20 +4144,38 @@ class ScopeManager:
             matched_ids = [s.id for s in matched]
 
             def _noted(
-                updated: ScopeManagerJudgment, classification: str | None, result: str
+                updated: ScopeManagerJudgment,
+                classification: str | None,
+                result: str,
+                *,
+                span: str | None = None,
+                telling_span: str | None = None,
+                act_span: str | None = None,
             ) -> ScopeManagerJudgment:
                 prose_class = classification if classification is not None else "unreadable"
+                interior_assertion: dict = {
+                    "scopes": matched_ids,
+                    "class": classification,
+                    "result": result,
+                }
+                # Architect's re-gate follow-up: the VERIFIED span(s), so the
+                # trace shows what was actually accepted — "span" (plus
+                # "telling_span", fix 4) for an admitted informant, "act_span"
+                # for admitted conduct. Never set on a decline: there is
+                # nothing verified to show.
+                if span is not None:
+                    interior_assertion["span"] = span
+                if telling_span is not None:
+                    interior_assertion["telling_span"] = telling_span
+                if act_span is not None:
+                    interior_assertion["act_span"] = act_span
                 return updated.model_copy(
                     update={
                         "protocol_notes": [
                             *updated.protocol_notes,
                             f"interior assertion: {names}, {prose_class}, {result}",
                         ],
-                        "interior_assertion": {
-                            "scopes": matched_ids,
-                            "class": classification,
-                            "result": result,
-                        },
+                        "interior_assertion": interior_assertion,
                     }
                 )
 
@@ -4125,7 +4198,23 @@ class ScopeManager:
                 return None
 
             _OWN_ROLE_STRIP_WORDS = {"my", "our", "a", "an", "the", "as"}
+            # CEO ruling (via the architect): a collective noun — "team",
+            # "group", "department", "folks", "people" — is HELD OUT of the
+            # strip set for now. ADR 0016's informant is "a person OR PARTY
+            # who told the agent", and "the procurement team told us in
+            # Tuesday's sync" may be a legitimate party informant — Philis is
+            # still ruling on it. Only the bare id/name half of fix 4 ships
+            # here; do not add these words without a further instruction.
             _OWN_ROLE_PRONOUNS = {"i", "me", "we", "us", "myself", "ourselves"}
+
+            def _remaining_tokens(span: str) -> list[str]:
+                """Normalise *span*, strip punctuation per token, and drop
+                :data:`_OWN_ROLE_STRIP_WORDS` — the first step of
+                :func:`_own_role_or_first_person`."""
+                normalized = " ".join(span.split()).casefold()
+                tokens = [re.sub(r"[^\w-]", "", t) for t in normalized.split()]
+                tokens = [t for t in tokens if t]
+                return [t for t in tokens if t not in _OWN_ROLE_STRIP_WORDS]
 
             def _own_role_or_first_person(span: str) -> str | None:
                 """#225, narrowed per the architect's follow-up review: the
@@ -4139,10 +4228,7 @@ class ScopeManager:
                 the reason to decline with, or ``None`` if the span names a
                 genuine third party.
                 """
-                normalized = " ".join(span.split()).casefold()
-                tokens = [re.sub(r"[^\w-]", "", t) for t in normalized.split()]
-                tokens = [t for t in tokens if t]
-                remaining = [t for t in tokens if t not in _OWN_ROLE_STRIP_WORDS]
+                remaining = _remaining_tokens(span)
                 if not remaining:
                     return None
 
@@ -4159,14 +4245,46 @@ class ScopeManager:
                     return "the contributor's own role is not an informant"
                 return None
 
+            def _telling_span_problem(telling_span: str) -> str | None:
+                """#225 re-gate fix 4, Philis's ruling: a span that is only a
+                scope's own name/id or a collective ("procurement", "the
+                procurement team") is NOT automatically invented — ADR 0016's
+                informant is "a person OR PARTY who told the agent", and a
+                party can tell. What must verify instead is the TELLING EVENT
+                itself: ``telling_span``, a verbatim quote containing (b) a
+                telling verb, word-bounded, any of the listed forms only
+                (never stemmed), and (c), after stripping articles, a
+                first-person marker — the contributor is addressee or
+                audience, the same witness-or-party test conduct's own
+                frame-strip applies, because telling IS conduct toward the
+                contributor. Returns the full decline reasoning (sans the
+                "Declined: " prefix) on failure, or ``None`` once verified.
+                """
+                haystack = " ".join(new_contribution.content.split()).casefold()
+                normalized = " ".join(telling_span.split())
+                if not normalized or normalized.casefold() not in haystack:
+                    return (
+                        f"invented informant — the telling event {telling_span!r} does "
+                        "not occur in the contribution's own text."
+                    )
+                if not _TELLING_VERB_RE.search(normalized):
+                    return "no telling event is reported: state who told you."
+                tokens = [re.sub(r"[^\w-]", "", t) for t in normalized.casefold().split()]
+                tokens = [t for t in tokens if t and t not in _TELLING_ARTICLES]
+                if not any(t in _TELLING_FIRST_PERSON_WORDS for t in tokens):
+                    return "the telling names no one it was told to — state who was told."
+                return None
+
             corrective_text = (
                 "Your accepted contribution names another fleet scope this scope "
                 f"is not entitled to: {names}. Call `classify_interior_assertion` "
                 "once, classifying what GROUNDS it per the admission check (ADR "
                 "0016): conduct (first-hand observation of that scope's CONDUCT), "
-                "informant (hearsay from an identifiable person who told the "
-                "agent — give the EXACT verbatim span naming them as "
-                "`informant_span`), publication or directive (grounded in that "
+                "informant (hearsay from an identifiable person or party who told "
+                "the agent — give the EXACT verbatim span naming them as "
+                "`informant_span`, and the EXACT verbatim span of the telling "
+                "event itself, naming the agent as the one told, as "
+                "`telling_span`), publication or directive (grounded in that "
                 "scope's own publication, or an ancestor directive/operator "
                 "memory item reaching this scope — give its id as `ref_id`), or "
                 "none (no ground at all)."
@@ -4206,12 +4324,17 @@ class ScopeManager:
                 ):
                     raise ValueError(f"unreadable classification {classification!r}")
                 informant_span = raw.get("informant_span")
+                telling_span = raw.get("telling_span")
                 ref_id = raw.get("ref_id")
                 act_span = raw.get("act_span")
                 if classification == "informant" and not (
                     isinstance(informant_span, str) and informant_span.strip()
                 ):
                     raise ValueError("informant classification with no informant_span")
+                if classification == "informant" and not (
+                    isinstance(telling_span, str) and telling_span.strip()
+                ):
+                    raise ValueError("informant classification with no telling_span")
                 if classification in ("publication", "directive") and not (
                     isinstance(ref_id, str) and ref_id.strip()
                 ):
@@ -4241,7 +4364,7 @@ class ScopeManager:
                 remainder = _strip_leading_frame(normalized_act_span)
                 first_person_ok = verbatim_ok and bool(_FIRST_PERSON_RE.search(remainder))
                 if verbatim_ok and first_person_ok:
-                    return _noted(judgment, classification, "admitted as judged")
+                    return _noted(judgment, classification, "admitted as judged", act_span=act_span)
                 return _noted(
                     judgment.model_copy(
                         update={
@@ -4335,6 +4458,25 @@ class ScopeManager:
                     classification,
                     "declined (invented informant)",
                 )
+            telling_problem = _telling_span_problem(telling_span)
+            if telling_problem is not None:
+                return _noted(
+                    judgment.model_copy(
+                        update={
+                            "decision": "decline",
+                            "new_summary": None,
+                            "directive_ops": [],
+                            "new_context": None,
+                            "reasoning": f"Declined: {telling_problem}",
+                        }
+                    ),
+                    classification,
+                    (
+                        "declined (invented informant)"
+                        if telling_problem.startswith("invented informant")
+                        else "declined (no telling event)"
+                    ),
+                )
             # Verified: ADR 0016 D1, hearsay from an identifiable informant.
             # Admit as CONTEXT ONLY (never a directive — an informant's word
             # is never a directive) and REPLACE the judge's own rewrite with
@@ -4385,7 +4527,13 @@ class ScopeManager:
                         ]
                     }
                 )
-            return _noted(updated, classification, "admitted (context replaced)")
+            return _noted(
+                updated,
+                classification,
+                "admitted (context replaced)",
+                span=informant_span,
+                telling_span=telling_span,
+            )
 
         def _invalid_ops(judgment: ScopeManagerJudgment) -> list[DirectiveOp]:
             _, invalid = _partition_ops(judgment.directive_ops, current_summary)
