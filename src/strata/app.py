@@ -2714,8 +2714,13 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
             # The contribution and a judgment-attempt-failed event are already
             # in the record (issue #57); carry the contribution id so a retry
             # routes to re-judge (strata_rejudge) instead of duplicating it.
+            # #235: 503, not 500 — this means the judge failed (a genuine API
+            # outage, auth failure, or a second protocol slip #235's own fix
+            # could not fail closed on, e.g. the batch path, which has no
+            # forced-decline fallback), never a bug in this request. A plain
+            # merits decline, by contrast, is a 200 with decision="decline".
             raise HTTPException(
-                status_code=500,
+                status_code=503,
                 detail={
                     "error": "scope_manager_failure",
                     "detail": str(exc),

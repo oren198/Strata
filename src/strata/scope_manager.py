@@ -4124,8 +4124,19 @@ class ScopeManager:
                 correction = _corrective_turn(response, tool_use_block, corrective_text)
             retry_messages = [*first_messages, *correction]
             response = _call(retry_messages)
-            tool_use_block = self._extract_tool_use_block(response)
+            # #235: unlike the first attempt, a bare block extract failure here
+            # (`_NoToolUseBlock`, a `ValueError` subclass) was previously
+            # UNGUARDED — it propagated out of this whole function rather than
+            # failing closed the way every other second-slip shape below does.
+            # `retry_tool_use_block` starts `None` and is set only if the
+            # extract below succeeds, so the broad `except ValueError` further
+            # down can tell "no block at all" from "a block whose content is
+            # still malformed" without reusing a stale block from the FIRST
+            # attempt.
+            retry_tool_use_block = None
             try:
+                retry_tool_use_block = self._extract_tool_use_block(response)
+                tool_use_block = retry_tool_use_block
                 judgment = parse(tool_use_block)
             except _MissingReasoning:
                 # #204: reasoning is never the thing being judged, so a SECOND miss —
@@ -4154,6 +4165,25 @@ class ScopeManager:
                     "Judge's `decision` was still not a readable disposition after "
                     "the corrective re-ask; declined as a judge failure, not a "
                     "missing-ground decline."
+                )
+            except ValueError as second_parse_error:
+                # #235: every OTHER second-slip shape (no tool_use block at all
+                # on the retry, a stringified/malformed `directive_ops`, an
+                # unpaired `supersede` — the same #201 shapes the FIRST attempt
+                # gets a corrective for, just surviving the one re-ask this
+                # time). The one-retry discipline above means there is no THIRD
+                # attempt to ask for: this fails closed exactly like the
+                # `_MalformedDisposition` case above — a recorded decline
+                # marked as a JUDGE failure, never an unhandled exception
+                # reaching the HTTP layer as a 500 (`parse_forced_decline`
+                # tolerates `retry_tool_use_block` being `None`: it only ever
+                # reads a block's `input` defensively for the reasoning text).
+                if parse_forced_decline is None:
+                    raise
+                judgment = parse_forced_decline(retry_tool_use_block)
+                protocol_notes.append(
+                    f"Second protocol slip on the corrective re-ask ({second_parse_error}); "
+                    "declined as a judge failure, not a missing-ground decline."
                 )
             else:
                 protocol_notes.append(_protocol_note(parse_error))
