@@ -587,6 +587,75 @@ BOOTSTRAP_JUDGE_TOOL: dict = {
     },
 }
 
+CLAIM_CARRIER_TOOL: dict = {
+    "name": "classify_claim_carriers",
+    "description": (
+        "A claim this scope published has just been found wrong (REFUTED). "
+        "Decide, for EVERY listed published item, whether it still asserts "
+        "the REFUTED claim (even paraphrased, reworded, or stated in "
+        "different words) or not. One decision per item id — every id "
+        "listed must get one."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "decisions": {
+                "type": "array",
+                "description": "One entry per listed item id — all of them, no fewer.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "item_id": {
+                            "type": "string",
+                            "description": "One of the listed published item ids, verbatim.",
+                        },
+                        "decision": {
+                            "type": "string",
+                            "enum": ["carries", "does_not_carry"],
+                            "description": (
+                                "carries = the item asserts the REFUTED claim itself: "
+                                "the same subject, action and value or timing, alone or "
+                                "among other claims. The SUBJECT must be the same thing, "
+                                "not a related one: a different item, place, group, kind "
+                                "or member of the same family is a different subject, "
+                                "even when the value, timing and wording match. Judge the "
+                                "subject first; if it differs, the item is does_not_carry "
+                                "before you look at the value. An item that asserts what "
+                                "was observed instead is does_not_carry: it agrees with "
+                                "the correction and must stay published. An item stating "
+                                "any other different value, subject, action, timing, or "
+                                "an exception to the claim is also does_not_carry. When in "
+                                "doubt, does_not_carry."
+                            ),
+                        },
+                    },
+                    "required": ["item_id", "decision"],
+                },
+            },
+        },
+        "required": ["decisions"],
+    },
+}
+
+_CLAIM_CARRIER_SYSTEM_PROMPT = """\
+You decide, for a scope whose own claim was just found wrong (REFUTED), which \
+of its currently published items still carry that REFUTED claim — even \
+paraphrased or reworded — and which assert something else, including a \
+different claim on a similar subject (a subject swap is NOT a carrier). This \
+is about CONTENT equivalence only: does the item still assert the same thing \
+the REFUTED claim stated, in substance, however the wording differs.
+
+carries = the item asserts the REFUTED claim itself: the same subject, \
+action and value or timing, alone or among other claims. The SUBJECT must \
+be the same thing, not a related one: a different item, place, group, kind \
+or member of the same family is a different subject, even when the value, \
+timing and wording match. Judge the subject first; if it differs, the item \
+is does_not_carry before you look at the value. An item that asserts what \
+was observed instead is does_not_carry: it agrees with the correction and \
+must stay published. An item stating any other different value, subject, \
+action, timing, or an exception to the claim is also does_not_carry. When \
+in doubt, does_not_carry."""
+
 # ---------------------------------------------------------------------------
 # Interior-assertion re-ask tool (ADR 0016, issue #225 — static, eligible for
 # prompt caching). A SEPARATE tool from JUDGE_TOOL, never a `_judge_tool_for`
@@ -5765,6 +5834,76 @@ class ScopeManager:
             }
         )
 
+    def check_claim_carriers(
+        self,
+        *,
+        refuted_claim_content: str,
+        correcting_content: str,
+        candidates: Sequence[tuple[str, str]],
+    ) -> dict[str, Literal["carries", "does_not_carry", "unresolved_unreadable"]]:
+        """Issue #219 C: one judge call, deciding per published item whether it
+        still carries a just-refuted claim.
+
+        A standalone call, never nested inside :meth:`judge`/:meth:`judge_batch`
+        — the caller (:func:`strata.publication.check_claim_carriers`) already
+        ran the mechanical verbatim sweep and the ordinary judgment's own
+        ``withdraw_published`` before gathering *candidates*, so every id here
+        is something both of those missed. *candidates* is ``[(item_id,
+        content), ...]``, already ranked and capped at 20 by the caller — this
+        method makes no ranking or cap decision of its own.
+
+        Fails closed per item, not per call: every candidate id defaults to
+        ``"unresolved_unreadable"``, overridden only by a valid, matching
+        entry in the model's own response. A missing id, an id naming no
+        candidate, a malformed decision, or the whole call raising (a network
+        error, a missing tool_use block) all collapse to that same default —
+        nothing here fabricates a verdict the model never gave.
+        """
+        result: dict[str, Literal["carries", "does_not_carry", "unresolved_unreadable"]] = {
+            item_id: "unresolved_unreadable" for item_id, _ in candidates
+        }
+        if not candidates:
+            return result
+
+        listed = "\n".join(f"- item_id {item_id!r}: {content}" for item_id, content in candidates)
+        user_text = (
+            "REFUTED claim (found to be wrong):\n"
+            f"{refuted_claim_content}\n\n"
+            "What was observed instead (the correction):\n"
+            f"{correcting_content}\n\n"
+            "Published items to classify — decide carries/does_not_carry for "
+            f"every one listed, by its exact item_id:\n{listed}"
+        )
+        try:
+            response = self._client.messages.create(
+                model=self._model,
+                max_tokens=1024,
+                system=[{"type": "text", "text": _CLAIM_CARRIER_SYSTEM_PROMPT}],
+                tools=[CLAIM_CARRIER_TOOL],
+                tool_choice={
+                    "type": "tool",
+                    "name": CLAIM_CARRIER_TOOL["name"],
+                    "disable_parallel_tool_use": True,
+                },
+                messages=[{"role": "user", "content": user_text}],
+            )
+            block = self._extract_tool_use_block(response)
+            raw: dict = block.input or {}
+            decisions = raw.get("decisions")
+            if not isinstance(decisions, list):
+                raise ValueError("decisions is not a list")
+            candidate_ids = {item_id for item_id, _ in candidates}
+            for entry in decisions:
+                if not isinstance(entry, dict):
+                    continue
+                item_id = entry.get("item_id")
+                decision = entry.get("decision")
+                if item_id in candidate_ids and decision in ("carries", "does_not_carry"):
+                    result[item_id] = decision
+        except Exception:  # noqa: BLE001 — any slip here fails closed, per item
+            pass
+        return result
+
     @staticmethod
     def _extract_tool_use_block(response):
         """Return the response's ``tool_use`` content block, or raise."""
@@ -5958,7 +6097,7 @@ class ScopeManager:
         self,
         *,
         scope: Scope,
-        act_kind: Literal["publish", "withdraw"],
+        act_kind: Literal["publish", "withdraw", "restore"],
         current_summary: ScopeSummary | None,
         current_publication: Sequence[_PublishedItemLike],
         content: str | None = None,
@@ -5966,13 +6105,16 @@ class ScopeManager:
         subject: str | None = None,
         anchors: Sequence[str] | None = None,
         withdraw_item: _PublishedItemLike | None = None,
+        restore_item: _PublishedItemLike | None = None,
+        corrected_claim_content: str | None = None,
+        correcting_content: str | None = None,
         operator_memory: list[tuple[str, list[OperatorItem]]] | None = None,
         relay_origin_scope_id: str | None = None,
         relay_via_scope_id: str | None = None,
         publication_max_words: int = PUBLICATION_MAX_WORDS,
         **_extra: object,
     ) -> PublicationJudgment:
-        """Judge a publish or withdraw proposal against the scope's current state.
+        """Judge a publish, withdraw, or restore proposal against the scope's current state.
 
         Makes exactly one Anthropic API call using forced
         ``submit_publication_judgment`` tool use — a separate call and a
@@ -5994,6 +6136,19 @@ class ScopeManager:
                 already-tagged anchor strings.
             withdraw_item: Required for ``act_kind='withdraw'`` — the
                 published item being proposed for removal.
+            restore_item: Required for ``act_kind='restore'`` (restore act
+                design) — the item being brought back, byte-identical, under
+                its original id.
+            corrected_claim_content: Required for ``act_kind='restore'`` —
+                the refuted claim's own wording, from
+                :class:`~strata.record_store.ClaimCorrection`.
+            correcting_content: Required for ``act_kind='restore'`` — the
+                correction's own observation that replaced it. Given to the
+                judge alongside *restore_item* and *corrected_claim_content*
+                (contract line 1: the structural test only — still believed,
+                does not re-assert the refuted claim — no extra ground, since
+                the restore's ground is the owning scope's own agent standing
+                behind the item, which the sweep never had).
             operator_memory: The operator memory binding *scope* — see
                 :func:`strata.operator.operator_memory_binding`. Rendered via
                 the same :func:`_render_operator_memory` the contribution
@@ -6078,12 +6233,37 @@ class ScopeManager:
                 "- content:\n"
                 f"    {content}\n"
             )
-        else:
+        elif act_kind == "withdraw":
             if withdraw_item is None:
                 raise ValueError("judge_publication(act_kind='withdraw') requires withdraw_item.")
             proposal_block = (
                 "PROPOSED ACT: withdraw\n"
                 f"- item to withdraw: {_render_published_item(withdraw_item)}\n"
+            )
+        else:
+            if (
+                restore_item is None
+                or corrected_claim_content is None
+                or correcting_content is None
+            ):
+                raise ValueError(
+                    "judge_publication(act_kind='restore') requires restore_item, "
+                    "corrected_claim_content, and correcting_content."
+                )
+            # Restore act design, contract line 1: the structural test
+            # only — still believed by this scope's CURRENT memory, and
+            # does not re-assert the refuted claim. No extra ground: the
+            # restore's ground is the owning scope's own agent standing
+            # behind the item, which the sweep that withdrew it never had.
+            proposal_block = (
+                "PROPOSED ACT: restore\n"
+                f"- item to restore (byte-identical if accepted): "
+                f"{_render_published_item(restore_item)}\n"
+                f"- the refuted claim this item was withdrawn over: {corrected_claim_content}\n"
+                f"- the correction that replaced it: {correcting_content}\n"
+                "Judge whether this item is still believed by the CURRENT summary below, "
+                "and whether it still asserts the refuted claim above. Accept only if it is "
+                "still believed and does not assert the refuted claim.\n"
             )
 
         operator_block = _render_operator_memory(operator_memory)

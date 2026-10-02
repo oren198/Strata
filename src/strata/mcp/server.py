@@ -91,7 +91,13 @@ from strata.project_config import (
     load_project_config,
     resolve_storage_paths,
 )
-from strata.publication import PublishedItem, propose_publish, propose_withdraw, read_publication
+from strata.publication import (
+    PublishedItem,
+    propose_publish,
+    propose_restore,
+    propose_withdraw,
+    read_publication,
+)
 from strata.record_store import ContributorRef, RecordStore
 from strata.session_state import (
     SessionState,
@@ -2951,6 +2957,92 @@ async def strata_withdraw(item_id: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Tool: strata_restore
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+@_with_read_signal
+async def strata_restore(item_id: str, reason: str | None = None) -> dict:
+    """Propose restoring a published item this scope's own correction sweep wrongly
+    withdrew — under its ORIGINAL id and bytes.
+
+    Only a withdrawal a correction sweep made — the verbatim sweep, or the
+    owner-judge's own paraphrase-carrier decision, at any hop of either
+    one's relay cascade — can be restored this way; a deliberate
+    ``strata_withdraw`` is re-published instead. Judged through the same
+    publication judge (ADR 0007 D2): the structural test only — still
+    believed by this scope's CURRENT memory, and does not re-assert the
+    refuted claim. A decline leaves the item withdrawn.
+
+    On accept: the item returns under its original id, with its original
+    bytes; every relay copy the withdrawal cascaded to comes back too,
+    unless the relaying scope's own judge has acted on the correction since
+    (then that scope gets the evidence instead, and decides for itself);
+    and exactly the readers who got the original false notice are told it
+    was wrong.
+
+    Args:
+        item_id: The ``pub_``-prefixed id of the withdrawn item to restore.
+        reason: Optional free-text note for the record.
+
+    Returns:
+        ``act_id`` and ``judgment`` (``decision``: ``"accept"``/``"decline"``,
+        ``reasoning``, ``artifact_updated``).
+
+    Raises:
+        RuntimeError: The bound scope is unknown; *item_id* has no withdraw
+            act on record in this scope; it was not withdrawn by a
+            correction sweep (a deliberate withdrawal — re-publish it
+            instead); or it was already restored.
+    """
+    await _require_bound_or_elicit()
+
+    agent_scope, agent_skill, agent_session_id = _AGENT_SCOPE, _AGENT_SKILL, _AGENT_SESSION_ID
+
+    fleet = _load_fleet()
+
+    scope = fleet.get_scope(agent_scope)
+    if scope is None:
+        raise RuntimeError(f"Your bound scope {agent_scope!r} was not found in the fleet config.")
+
+    ts = datetime.now(UTC).isoformat()
+    proposer = ContributorRef(
+        scope_id=agent_scope,
+        skill=agent_skill,
+        session_id=agent_session_id,
+        ts=ts,
+    )
+
+    manager = _build_scope_manager()
+
+    try:
+        outcome = propose_restore(
+            agent_scope,
+            item_id,
+            reason,
+            proposer,
+            fleet=fleet,
+            record_store=_record_store,
+            summary_store=_summary_store,
+            scope_manager=manager,
+        )
+    except (ValueError, KeyError) as exc:
+        raise RuntimeError(str(exc)) from exc
+
+    return _attach_fleet_notice(
+        {
+            "act_id": outcome.act_id,
+            "judgment": {
+                "decision": outcome.decision,
+                "reasoning": outcome.reasoning,
+                "artifact_updated": outcome.artifact_updated,
+            },
+        }
+    )
+
+
+# ---------------------------------------------------------------------------
 # Tool: strata_read_scope_summary
 # ---------------------------------------------------------------------------
 
@@ -3374,9 +3466,14 @@ async def strata_read_scope_record(
         version ("condensed away or reworded"), never that it was condensed
         away specifically: a live judge commonly rewords a still-standing
         claim rather than deleting it, and a verbatim-substring test cannot
-        tell the two apart; plus a ``page`` block carrying ``limit``,
-        ``total`` (the whole record's size), and ``next_before_id`` (null on
-        the last page).
+        tell the two apart; ``claim_carrier_checks`` covering the WHOLE scope
+        the same way — one row per published item the owner-judge was asked
+        to classify against a corrected claim, outcome ``carries``/
+        ``does_not_carry``/``unresolved_overflow``/``unresolved_unreadable``/
+        ``kept_by_guard`` (the judge said carries, but the mechanical
+        observed-value veto overrode it); plus a ``page`` block carrying
+        ``limit``, ``total`` (the whole record's size), and
+        ``next_before_id`` (null on the last page).
 
     Raises:
         RuntimeError: If scope_id is outside this agent's entitled
@@ -3417,6 +3514,14 @@ async def strata_read_scope_record(
             # scope — small, rare, never paginated the way contributions are.
             "condensation_drops": [
                 asdict(d) for d in _record_store.list_condensation_drops(scope_id=scope_id)
+            ],
+            # Issue #219 C: every claim-carrier-check row for this scope — small,
+            # rare, never paginated, same shape as condensation_drops above. The
+            # UNRESOLVED outcomes (unresolved_overflow, unresolved_unreadable) are
+            # the ones an operator needs to see — a judgment that was never made,
+            # or never made to any item visible here.
+            "claim_carrier_checks": [
+                asdict(c) for c in _record_store.list_claim_carrier_checks(scope_id=scope_id)
             ],
             # next_before_id is null once the record is exhausted — page until
             # then rather than inferring the end from a short page.

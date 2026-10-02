@@ -117,6 +117,7 @@ from strata.perspective import (
 from strata.project_config import StoragePaths, resolve_storage_paths
 from strata.publication import (
     apply_judged_withdrawals,
+    check_claim_carriers,
     propagate_claim_correction,
     propagate_directive_removals,
     read_publication,
@@ -399,6 +400,13 @@ class SupersedeDirectiveRequest(BaseModel):
 
 class RetireDirectiveRequest(BaseModel):
     """Operator retirement in person (ADR 0008 D4) — no replacement memory enters."""
+
+    reason: str | None = None
+
+
+class RestoreCorrectionWithdrawalRequest(BaseModel):
+    """Operator restore, in person — a published item a correction sweep wrongly
+    withdrew, back under its original id and bytes (the restore act design)."""
 
     reason: str | None = None
 
@@ -1006,6 +1014,7 @@ def _judge_and_record(
             removals=[(d, contribution.id) for d in judgment.removed_directive_ids],
             withdraw_reasoning=judgment.reasoning,
             judged_contribution_ids=[contribution.id],
+            scope_manager=scope_manager,
             change_ids_override=[claim_event.change_id] if same_scope_correction else None,
             withdraw_notice_kind=(
                 "claim_corrected"
@@ -1061,6 +1070,7 @@ def _write_amendment(
     withdraw_correcting_after: str | None = None,
     withdraw_corrected_claim_content: str | None = None,
     withdraw_correcting_claim_id: str | None = None,
+    scope_manager: ScopeManager | None = None,
 ) -> None:
     """Write an accepted amendment's summary and everything that follows from it.
 
@@ -1246,7 +1256,19 @@ def _write_amendment(
     #     whatever the judge already withdrew above — one notice per reader
     #     either way, and the record shows which path closed it.
     if withdraw_corrected_claim_content is not None:
-        propagate_claim_correction(
+        # Restore act design, point 2: the claim's own text and the
+        # correcting text, once per change id in this wave — never once per
+        # withdrawn item. Written inside the same lock the sweep itself
+        # runs under (this function's own caller already holds it).
+        for restore_change_id in change_ids:
+            record_store.record_claim_correction(
+                change_id=restore_change_id,
+                claim_id=withdraw_correcting_claim_id or "",
+                scope_id=scope.id,
+                corrected_claim_content=withdraw_corrected_claim_content,
+                correcting_content=withdraw_correcting_after or "",
+            )
+        verbatim_withdrawn = propagate_claim_correction(
             scope.id,
             claim_id=withdraw_correcting_claim_id or "",
             corrected_claim_content=withdraw_corrected_claim_content,
@@ -1259,6 +1281,28 @@ def _write_amendment(
             change_ids=change_ids,
             hop=judgment.hop,
         )
+        # Issue #219 C: the owner-judge's own paraphrase check, over whatever
+        # the verbatim sweep (above) and the judge's own withdraw_published
+        # still left standing — same-scope `failed_corrected` only (the
+        # drain-path site is `drain_scope`'s own #221 sweep).
+        if scope_manager is not None:
+            check_claim_carriers(
+                scope.id,
+                claim_id=withdraw_correcting_claim_id or "",
+                corrected_claim_content=withdraw_corrected_claim_content,
+                correcting_content=withdraw_correcting_after or "",
+                trigger_id=judged_contribution_ids[0],
+                already_withdrawn=[
+                    *(judgment.withdraw_published or []),
+                    *(item.id for item in verbatim_withdrawn),
+                ],
+                scope_manager=scope_manager,
+                fleet=fleet,
+                record_store=record_store,
+                summaries_dir=str(summary_store.summaries_dir),
+                change_ids=change_ids,
+                hop=judgment.hop,
+            )
 
     # 2. Mechanical propagation (D3): any published item anchored ONLY to
     #    directives that just left the summary is withdrawn, no LLM in the
@@ -2570,13 +2614,40 @@ def drain_scope(
         for event in events:
             if event.kind != "claim_corrected":
                 continue
-            propagate_claim_correction(
+            # Restore act design, point 2 — same write as the same-scope
+            # site above, once per (drained) change id.
+            record_store.record_claim_correction(
+                change_id=event.change_id,
+                claim_id=event.item_id,
+                scope_id=scope.id,
+                corrected_claim_content=event.before or "",
+                correcting_content=event.after or "",
+            )
+            verbatim_withdrawn = propagate_claim_correction(
                 scope.id,
                 claim_id=event.item_id,
                 corrected_claim_content=event.before or "",
                 correcting_content=event.after or "",
                 trigger_id=event.contribution_id,
                 already_withdrawn=[],
+                fleet=fleet,
+                record_store=record_store,
+                summaries_dir=str(summary_store.summaries_dir),
+                change_ids=[event.change_id],
+                hop=refresh_hop,
+            )
+            # Issue #219 C: the owner-judge's own paraphrase check, same
+            # unconditional shape as the sweep above — runs whatever the
+            # drained refresh judgment did, including a decline or a failure
+            # (neither of which ever reaches `_write_amendment`).
+            check_claim_carriers(
+                scope.id,
+                claim_id=event.item_id,
+                corrected_claim_content=event.before or "",
+                correcting_content=event.after or "",
+                trigger_id=event.contribution_id,
+                already_withdrawn=[item.id for item in verbatim_withdrawn],
+                scope_manager=scope_manager,
                 fleet=fleet,
                 record_store=record_store,
                 summaries_dir=str(summary_store.summaries_dir),
@@ -3656,6 +3727,130 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc.args[0])) from exc
         return {"scope_id": scope_id, "retirement": asdict(retirement)}
+
+    # -----------------------------------------------------------------------
+    # GET  /scopes/{scope_id}/correction-withdrawals
+    # POST /scopes/{scope_id}/correction-withdrawals/{item_id}/restore
+    # POST /scopes/{scope_id}/correction-withdrawals/{item_id}/acknowledge
+    #
+    # The detection surface the restore act design requires: every
+    # withdrawal a correction sweep made in a scope, side by side with its
+    # claim/correcting text, a Restore button (the operator path), and a
+    # "keep withdrawn" acknowledge — the same read function `strata record
+    # <scope> --swept` prints. UI-only surface (constraint G1): no engine
+    # flow calls any of these.
+    # -----------------------------------------------------------------------
+
+    @application.get("/scopes/{scope_id}/correction-withdrawals")
+    def get_correction_withdrawals(
+        scope_id: str,
+        request: Request,
+        all: bool = False,  # noqa: A002 — `all` is the query param name, mirrors operator-evidence
+        record_store: RecordStore = Depends(get_record_store),
+    ) -> dict:
+        """Every withdrawal a correction sweep made in *scope_id* — newest
+        first, each with its claim/correcting text and #219 C's own audit
+        row when judged — plus #219 C's own unresolved/overflow rows,
+        flagged separately.
+
+        ``all=true`` also returns a withdrawal already acknowledged
+        ("keep withdrawn"), hidden from the default "to review" view.
+
+        Returns 404 if the scope is not in the FleetConfig.
+        """
+        from dataclasses import asdict
+
+        from strata.publication import list_correction_withdrawals, list_unresolved_carrier_checks
+
+        fleet: FleetConfig = request.app.state.fleet_reloader.get()
+        scope = fleet.get_scope(scope_id)
+        if scope is None:
+            raise HTTPException(status_code=404, detail=f"Scope not found: {scope_id!r}")
+
+        rows = list_correction_withdrawals(
+            scope_id, record_store=record_store, include_acknowledged=all
+        )
+        unresolved = list_unresolved_carrier_checks(scope_id, record_store=record_store)
+        return {
+            "scope_id": scope_id,
+            "withdrawals": [
+                {
+                    "act": asdict(r.act),
+                    "correction": asdict(r.correction) if r.correction else None,
+                    "carrier_check": asdict(r.carrier_check) if r.carrier_check else None,
+                    "reader_count": r.reader_count,
+                    "method": r.method,
+                }
+                for r in rows
+            ],
+            "unresolved": [asdict(c) for c in unresolved],
+        }
+
+    @application.post("/scopes/{scope_id}/correction-withdrawals/{item_id}/restore")
+    def restore_correction_withdrawal(
+        scope_id: str,
+        item_id: str,
+        body: RestoreCorrectionWithdrawalRequest,
+        request: Request,
+        record_store: RecordStore = Depends(get_record_store),
+        summary_store: SummaryStore = Depends(get_summary_store),
+    ) -> dict:
+        """Operator restore, in person (the restore act design) — Console
+        surface for ``strata operator restore``.
+
+        Delegates straight to :func:`strata.publication.operator_restore`,
+        which takes :func:`strata.locks.scope_lock` itself — the SAME
+        cross-process per-scope lock the CLI takes. This route deliberately
+        takes NO lock of its own. UI-only surface (constraint G1): no engine
+        flow calls it.
+        """
+        from strata.publication import operator_restore
+
+        fleet: FleetConfig = request.app.state.fleet_reloader.get()
+        scope = fleet.get_scope(scope_id)
+        if scope is None:
+            raise HTTPException(status_code=404, detail=f"Scope not found: {scope_id!r}")
+        try:
+            outcome = operator_restore(
+                scope_id,
+                item_id,
+                body.reason,
+                fleet=fleet,
+                record_store=record_store,
+                summaries_dir=str(summary_store.summaries_dir),
+            )
+        except (ValueError, KeyError) as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return {
+            "scope_id": scope_id,
+            "item_id": item_id,
+            "act_id": outcome.act_id,
+            "decision": outcome.decision,
+        }
+
+    @application.post("/scopes/{scope_id}/correction-withdrawals/{item_id}/acknowledge")
+    def acknowledge_correction_withdrawal_route(
+        scope_id: str,
+        item_id: str,
+        request: Request,
+        record_store: RecordStore = Depends(get_record_store),
+    ) -> dict:
+        """The "keep withdrawn" action: mark the withdrawal acknowledged without
+        restoring it, hiding it from the default "to review" view.
+        """
+        from dataclasses import asdict
+
+        from strata.publication import acknowledge_correction_withdrawal
+
+        fleet: FleetConfig = request.app.state.fleet_reloader.get()
+        scope = fleet.get_scope(scope_id)
+        if scope is None:
+            raise HTTPException(status_code=404, detail=f"Scope not found: {scope_id!r}")
+        try:
+            act = acknowledge_correction_withdrawal(scope_id, item_id, record_store=record_store)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return {"scope_id": scope_id, "item_id": item_id, "act": asdict(act)}
 
     return application
 

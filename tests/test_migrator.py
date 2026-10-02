@@ -101,6 +101,8 @@ def test_full_chain_drops_fleet_tables_and_preserves_record(tmp_path: Path) -> N
         "0017_claim_kinds.sql",
         "0018_raised_from_operator_evidence.sql",
         "0019_condensation_drops.sql",
+        "0020_claim_carrier_checks.sql",
+        "0021_restore_act.sql",
     ]
 
     # Fleet tables gone.
@@ -368,6 +370,8 @@ def test_idempotent_reapply(tmp_path: Path) -> None:
         "0017_claim_kinds.sql",
         "0018_raised_from_operator_evidence.sql",
         "0019_condensation_drops.sql",
+        "0020_claim_carrier_checks.sql",
+        "0021_restore_act.sql",
     ]
 
     second = run_migrations(db_path, migrations_dir=migrations_dir)
@@ -583,6 +587,8 @@ def test_crash_at_tracking_insert_rolls_back_script_too(
         "0017_claim_kinds.sql",
         "0018_raised_from_operator_evidence.sql",
         "0019_condensation_drops.sql",
+        "0020_claim_carrier_checks.sql",
+        "0021_restore_act.sql",
     ]
 
 
@@ -758,9 +764,11 @@ def test_0010_adds_change_events_table(tmp_path: Path) -> None:
     try:
         conn.execute("PRAGMA foreign_keys = ON")
         # 0010's own columns, plus `source_scope_id`, which 0011 adds when it
-        # rewrites the table for the kind CHECK, and 0014's `self_notice` /
+        # rewrites the table for the kind CHECK, 0014's `self_notice` /
         # `shown_at` — what the one notice that owes a reader rather than a
-        # refresh IS, and whether it has been delivered.
+        # refresh IS, and whether it has been delivered — and 0021's
+        # `claim_id` (the restore act design's join key into
+        # `claim_corrections`).
         columns = {r[1] for r in conn.execute("PRAGMA table_info(change_events)").fetchall()}
         assert columns == {
             "id",
@@ -777,6 +785,7 @@ def test_0010_adds_change_events_table(tmp_path: Path) -> None:
             "created_at",
             "self_notice",
             "shown_at",
+            "claim_id",
         }
 
         conn.execute(
@@ -954,6 +963,8 @@ def test_0011_preserves_change_events_written_before_it(tmp_path: Path) -> None:
         "0017_claim_kinds.sql",
         "0018_raised_from_operator_evidence.sql",
         "0019_condensation_drops.sql",
+        "0020_claim_carrier_checks.sql",
+        "0021_restore_act.sql",
     ]
 
     conn = sqlite3.connect(db_path)

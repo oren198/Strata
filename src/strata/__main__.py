@@ -645,6 +645,40 @@ def cmd_summary(args: argparse.Namespace) -> int:
     return 0
 
 
+def _print_swept(scope_id: str, *, record_store: RecordStore) -> int:
+    """``strata record <scope> --swept`` — the Console's "Correction
+    withdrawals" view, printed as text: every withdrawal a correction sweep
+    made in *scope_id*, newest first, plus #219 C's own unresolved/overflow
+    rows, flagged."""
+    from strata.publication import list_correction_withdrawals, list_unresolved_carrier_checks
+
+    rows = list_correction_withdrawals(scope_id, record_store=record_store)
+    unresolved = list_unresolved_carrier_checks(scope_id, record_store=record_store)
+    print(f"Scope: {scope_id}")
+    print(f"Correction withdrawals: {len(rows)} (newest first; restored/acknowledged hidden)")
+    print()
+    if not rows:
+        print("  (none)")
+    for row in rows:
+        print(
+            f"  · {row.act.withdraws}  [{row.method}]  withdrawn {row.act.created_at}  "
+            f"readers notified: {row.reader_count}"
+        )
+        if row.correction is not None:
+            print(f"      refuted claim: {row.correction.corrected_claim_content}")
+            print(f"      correcting content: {row.correction.correcting_content}")
+        print(
+            f"      restore with: strata operator restore {scope_id} {row.act.withdraws} "
+            f"(withdraw act {row.act.id})"
+        )
+    if unresolved:
+        print()
+        print(f"UNRESOLVED (#219 C — never classified, flagged): {len(unresolved)}")
+        for check in unresolved:
+            print(f"  · {check.item_id}  [{check.outcome}]  {check.created_at}")
+    return 0
+
+
 def cmd_record(args: argparse.Namespace) -> int:
     """Print one page of a scope's record (contributions + judgments) — embedded read.
 
@@ -666,6 +700,9 @@ def cmd_record(args: argparse.Namespace) -> int:
         if scope is None:
             print(f"Scope not found: {args.scope_id}", file=sys.stderr)
             return 1
+
+        if getattr(args, "swept", False):
+            return _print_swept(args.scope_id, record_store=stores.record_store)
 
         limit = args.limit if args.limit is not None else get_settings().record_page_size
         try:
@@ -741,6 +778,28 @@ def cmd_record(args: argparse.Namespace) -> int:
                     f"({drop.state_at_drop}, {drop.words_before}→{drop.words_after} words, "
                     f"budget {drop.budget})"
                 )
+            # Issue #219 C: a correction AGAINST this contribution (this
+            # claim was found wrong, same-scope or via a drained refresh) may
+            # have sent the scope's own published face through the
+            # owner-judge's paraphrase check. UNRESOLVED outcomes are surfaced
+            # explicitly — they are a judgment never made, not a clean verdict.
+            for check in stores.record_store.list_claim_carrier_checks(corrected_claim_id=c.id):
+                if check.outcome in ("unresolved_overflow", "unresolved_unreadable"):
+                    print(
+                        f"      claim-carrier check on published item {check.item_id}: "
+                        f"{check.outcome} — see strata_rejudge or operator review"
+                    )
+                elif check.outcome == "kept_by_guard":
+                    print(
+                        f"      claim-carrier check on published item {check.item_id}: "
+                        "kept_by_guard — the judge said carries, but the item states "
+                        "the observed value, not the refuted one"
+                    )
+                else:
+                    print(
+                        f"      claim-carrier check on published item {check.item_id}: "
+                        f"{check.outcome}"
+                    )
             if state is not None and state.state == "judge_failed":
                 print(f"      judge failed at {state.failed_at}: {state.error_message}")
                 print("      re-judge with the strata_rejudge MCP tool")
@@ -2115,6 +2174,43 @@ def cmd_operator_retire(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 1
+    return 0
+
+
+def cmd_operator_restore(args: argparse.Namespace) -> int:
+    """``strata operator restore`` — restore a correction-withdrawn published
+    item in person, under its original id and bytes, no judgment row."""
+    from strata.publication import operator_restore
+    from strata.stores import EmbeddedStoreError, open_embedded_stores
+
+    try:
+        stores = open_embedded_stores()
+    except EmbeddedStoreError as exc:
+        print(exc.message, file=sys.stderr)
+        return 1
+
+    with stores:
+        scope = stores.fleet_config.get_scope(args.scope_id)
+        if scope is None:
+            print(f"Scope not found: {args.scope_id}", file=sys.stderr)
+            return 1
+
+        try:
+            outcome = operator_restore(
+                args.scope_id,
+                args.item_id,
+                args.reason,
+                fleet=stores.fleet_config,
+                record_store=stores.record_store,
+                summaries_dir=stores.summary_store.summaries_dir,
+            )
+        except (ValueError, KeyError) as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        print(
+            f"Restored item {args.item_id} in scope {args.scope_id!r} "
+            f"(act {outcome.act_id}, operator restore)."
+        )
     return 0
 
 
@@ -5147,6 +5243,15 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Cursor: show contributions older than this contribution id.",
     )
+    p_record.add_argument(
+        "--swept",
+        action="store_true",
+        help=(
+            "Print the scope's correction withdrawals instead (every withdrawal "
+            "a correction sweep made, newest first, with its claim/correcting "
+            "text, how it was withdrawn, and whether it's been restored)."
+        ),
+    )
     p_record.set_defaults(func=cmd_record)
 
     p_status = sub.add_parser(
@@ -5257,6 +5362,19 @@ def _build_parser() -> argparse.ArgumentParser:
     p_op_retire.add_argument("id", help="An 'op_...' operator item id or a 'c_...' directive id.")
     p_op_retire.add_argument("--reason", default=None, help="Optional free-text rationale.")
     p_op_retire.set_defaults(func=cmd_operator_retire)
+
+    p_op_restore = operator_sub.add_parser(
+        "restore",
+        help=(
+            "Restore a published item a correction sweep wrongly withdrew, "
+            "under its original id and bytes — unjudged: the operator decides; "
+            "the Console shows the refuted claim beside the item."
+        ),
+    )
+    p_op_restore.add_argument("scope_id")
+    p_op_restore.add_argument("item_id", help="The 'pub_...' id of the withdrawn item to restore.")
+    p_op_restore.add_argument("--reason", default=None, help="Optional free-text rationale.")
+    p_op_restore.set_defaults(func=cmd_operator_restore)
 
     p_op_show = operator_sub.add_parser(
         "show", help="Print operator memory verbatim, plus the health signal."

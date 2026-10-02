@@ -9,6 +9,24 @@ the release PR (`dev` → `main`) and the GitHub Release body are built from
 
 ### Behaviour change
 
+- **A scope's own corrected claim is now checked for paraphrased carriers in
+  its own publication, not only verbatim ones (#219 C).** When a scope's
+  outcome judgment or refresh finds one of its own claims wrong
+  (`failed_corrected`), the engine already withdraws published items that
+  still carry the claim verbatim (#221). This adds one further owner-judge
+  call per correction, deciding `carries`/`does_not_carry` for the scope's
+  current published face beyond what the verbatim sweep already caught —
+  recorded either way (`claim_carrier_checks`), capped at 20 candidates per
+  correction with any overflow recorded, never silently dropped. A
+  mechanical observed-value veto can additionally keep an item the judge
+  wrongly marked `carries` (recorded `kept_by_guard`) when it states what
+  was actually observed rather than the refuted claim. #219 C wrongly
+  withdraws about 2–7% of a scope's neighbouring items (measured). Each one
+  is listed in the Console's Correction withdrawals view and can be
+  restored there by the operator. The owner's own judged restore recovered
+  5 of 12 such items in our measurement; the operator path is the reliable
+  remedy ([evidence](docs/evidence/v1.17-219c-restore-2026-10-03.md)).
+
 - **Interior assertions naming a non-entitled scope now get one extra judge
   call, and can be declined where 1.16 admitted them (#225).** When an
   accepted contribution names a fleet scope the current scope is not
@@ -49,3 +67,36 @@ the release PR (`dev` → `main`) and the GitHub Release body are built from
   endpoint. Not a behaviour change while unset (the default): every judge
   call's request is byte-identical to today's. `strata doctor`'s judge line
   now shows whether a configured provider is actually pinned or ignored.
+
+- **A judged `restore` act undoes a published item a correction sweep wrongly
+  withdrew, under its ORIGINAL id and bytes (companion to #219 C).** Only a
+  sweep withdrawal — the verbatim P4 sweep, or #219 C's own owner-judge
+  `carries` decision, at any hop of either one's relay cascade — can be
+  restored this way; a deliberate withdrawal is re-published, as before.
+  - **Owner path, judged** (`strata_restore`/`propose_restore`): the owning
+    scope's own judge re-runs the structural test only — still believed by
+    its CURRENT memory, and does not re-assert the refuted claim — given the
+    refuted claim, the correcting content, and the item together. A decline
+    leaves the item withdrawn.
+  - **Operator path, in person** (`strata operator restore <scope> <item_id>`):
+    unjudged, operator provenance — the escape when the owner's judge
+    declines.
+  - **Relays come back mechanically** unless the relaying scope's own judge
+    has processed (drained) the correction notice for the item since the
+    withdrawal — then that scope gets the correction as evidence only, and
+    its own judge decides whether to relay again.
+  - **A new `claim_restored` notice** reaches EXACTLY the (reader scope,
+    item) pairs that got the original false notice, read from the recorded
+    change events by change id and item id — never recomputed from today's
+    topology, and never sent to a scope that started reading only after the
+    withdrawal. Evidence only: nothing is inserted into a reader's memory on
+    its behalf.
+  - **Detection surface:** `strata record <scope> --swept` and the Console's
+    new "Correction withdrawals" tab (under Publications) both list every
+    correction withdrawal in a scope (verbatim, judged `carries`, or relay),
+    with the refuted claim and correcting content side by side, how it was
+    withdrawn, the reader count, and #219 C's own unresolved/overflow rows,
+    flagged. The Console tab adds a Restore button (the operator path) and a
+    "keep withdrawn" acknowledge.
+  - Not a behaviour change for anything already shipped: unused unless a
+    withdrawal is actually restored.
