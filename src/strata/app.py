@@ -253,6 +253,7 @@ def get_scope_manager(
         client=client,
         model=settings.manager_model,
         implied_purpose_min_words=settings.implied_purpose_min_words,
+        judge_provider=settings.judge_provider,
     )
 
 

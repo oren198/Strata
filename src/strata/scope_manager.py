@@ -59,7 +59,7 @@ import re
 from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Literal, Protocol, TypeVar
+from typing import Any, Literal, Protocol, TypeVar
 
 import anthropic
 from pydantic import BaseModel, Field
@@ -3712,6 +3712,24 @@ def _strip_leading_frame(text: str) -> str:
     return _LEADING_FRAME_RE.sub("", text, count=1)
 
 
+def _is_openrouter_client(client: object) -> bool:
+    """#224: True only when *client*'s ``base_url`` host is ``openrouter.ai``.
+
+    A bare Anthropic endpoint, a local/bridge judge, or any other router
+    must never receive a provider pin — request-level OpenRouter provider
+    preference (``extra_body.provider``) is an OpenRouter-specific
+    extension and would be meaningless (at best ignored, at worst
+    rejected) elsewhere. Mirrors
+    ``strata_evals.judge_trace._is_openrouter_client`` exactly — evals
+    cannot be imported from here (the dependency only ever runs the other
+    direction), so this small, stable check is duplicated rather than
+    shared.
+    """
+    base_url = getattr(client, "base_url", None)
+    host = getattr(base_url, "host", None) if base_url is not None else None
+    return host == "openrouter.ai"
+
+
 # ---------------------------------------------------------------------------
 # ScopeManager
 # ---------------------------------------------------------------------------
@@ -3743,6 +3761,18 @@ class ScopeManager:
         implied_purpose_min_words: Words of existing memory a scope with no
                 description needs before that memory counts as its implied purpose
                 (#210); see :data:`IMPLIED_PURPOSE_MIN_WORDS`.
+        judge_provider: #224 — an OpenRouter provider name to pin every judge
+                call to (``extra_body={"provider": {"order": [name],
+                "allow_fallbacks": False}}``), or ``None`` (the default) for
+                unpinned — today's behaviour, byte-identical request shape.
+                Reaches :meth:`_messages_create`, the ONE place every call
+                site below routes its real API call through; see that
+                method's own docstring. A judge built by hand (evals'
+                ``LiveJudge``, a test) is unpinned unless it passes this
+                kwarg explicitly — evals' own separate pin
+                (``STRATA_EVALS_PIN_PROVIDER``) stays the only pin in a
+                normal eval run, so no double-pin arises in practice; see
+                ``judge_trace.py``'s own deferral when it does.
     """
 
     def __init__(
@@ -3751,10 +3781,44 @@ class ScopeManager:
         client: anthropic.Anthropic,
         model: str = "claude-haiku-4-5",
         implied_purpose_min_words: int = IMPLIED_PURPOSE_MIN_WORDS,
+        judge_provider: str | None = None,
     ) -> None:
         self._client = client
         self._model = model
         self._implied_purpose_min_words = implied_purpose_min_words
+        self._judge_provider = judge_provider
+
+    def _messages_create(self, **kwargs: Any) -> Any:
+        """The ONE place every judge call's real API request goes through
+        (#224). Every ``self._client.messages.create(...)`` call site in
+        this class calls this instead — never the client directly — so a
+        pinned provider (and anything this method does in the future)
+        reaches every judge call shape (ordinary, batch, publication,
+        bootstrap, and any targeted re-ask) automatically, with nothing
+        left to a call site remembering to opt in.
+
+        Mutates nothing when :attr:`_judge_provider` is ``None`` (the
+        default) — *kwargs* reach ``create`` completely unchanged, so an
+        unpinned judge's request is byte-identical to the call this method
+        replaces (input identity, #224's own constraint).
+
+        When a provider IS set, merges ``extra_body={"provider": {"order":
+        [provider], "allow_fallbacks": False}}`` — but ONLY when the client
+        is OpenRouter-shaped (``base_url`` host ``openrouter.ai``); a bare
+        Anthropic endpoint or any other router ignores the setting
+        entirely, since a request-level OpenRouter provider preference is
+        meaningless (at best ignored, at worst rejected) elsewhere. Any
+        other ``extra_body`` key a call site already set is preserved
+        untouched — only the ``"provider"`` key is written.
+        """
+        if self._judge_provider is not None and _is_openrouter_client(self._client):
+            extra_body = dict(kwargs.get("extra_body") or {})
+            extra_body["provider"] = {
+                "order": [self._judge_provider],
+                "allow_fallbacks": False,
+            }
+            kwargs["extra_body"] = extra_body
+        return self._client.messages.create(**kwargs)
 
     def judge(
         self,
@@ -4294,7 +4358,7 @@ class ScopeManager:
                 *_corrective_turn(response, tool_use_block, corrective_text),
             ]
             try:
-                reask_response = self._client.messages.create(
+                reask_response = self._messages_create(
                     model=self._model,
                     max_tokens=256,
                     system=[
@@ -4763,7 +4827,7 @@ class ScopeManager:
 
         def _call(messages: list[dict]):
             try:
-                return self._client.messages.create(
+                return self._messages_create(
                     model=self._model,
                     max_tokens=max_tokens,
                     system=system,
@@ -6077,7 +6141,7 @@ class ScopeManager:
         ]
         tools: list[dict] = [{**PUBLICATION_JUDGE_TOOL, "cache_control": {"type": "ephemeral"}}]
 
-        response = self._client.messages.create(
+        response = self._messages_create(
             model=self._model,
             max_tokens=1024,
             system=system,
@@ -6189,7 +6253,7 @@ class ScopeManager:
         ]
         tools: list[dict] = [{**BOOTSTRAP_JUDGE_TOOL, "cache_control": {"type": "ephemeral"}}]
 
-        response = self._client.messages.create(
+        response = self._messages_create(
             model=self._model,
             max_tokens=4096,
             system=system,

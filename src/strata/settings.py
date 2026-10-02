@@ -53,6 +53,12 @@ class ResolvedJudge:
     base_url: str | None
     api_key: str | None
     reason: str
+    #: #224: the configured provider pin (``JUDGE_PROVIDER``/
+    #: ``STRATA_JUDGE_PROVIDER``), carried through unresolved — whether it
+    #: actually applies depends on the endpoint (OpenRouter only), which
+    #: this dataclass does not itself decide; see
+    #: ``scope_manager._is_openrouter_client`` and ``__main__._judge_line``.
+    provider: str | None = None
 
 
 def resolve_judge(
@@ -61,13 +67,17 @@ def resolve_judge(
     base_url: str | None,
     judge_api_key: str | None,
     anthropic_api_key: str | None,
+    judge_provider: str | None = None,
 ) -> ResolvedJudge:
     """The single place that decides which judge model and endpoint are used.
 
     Inputs are the *explicit* settings only (None = not set): ``model`` is
     ``JUDGE_MODEL`` / ``STRATA_MANAGER_MODEL``; ``base_url`` is
     ``JUDGE_BASE_URL``; the two keys are ``JUDGE_API_KEY`` and the old
-    ``ANTHROPIC_API_KEY`` / ``STRATA_ANTHROPIC_API_KEY``.
+    ``ANTHROPIC_API_KEY`` / ``STRATA_ANTHROPIC_API_KEY``; ``judge_provider``
+    is ``JUDGE_PROVIDER`` / ``STRATA_JUDGE_PROVIDER`` (#224) — carried
+    straight through onto the result, never itself part of the
+    model/endpoint decision below.
 
     The rule (no silent switch — an upgrade must never change a judge, or post a
     user's Anthropic key to a third-party router):
@@ -95,14 +105,18 @@ def resolve_judge(
     if not base_url and key_is_anthropic:
         model = model or KEPT_JUDGE_MODEL
         reason = JUDGE_REASON_KEPT if model == KEPT_JUDGE_MODEL else JUDGE_REASON_OVERRIDE
-        return ResolvedJudge(model, None, key, reason)
+        return ResolvedJudge(model, None, key, reason, judge_provider)
     model = model or DEFAULT_JUDGE_MODEL
     base_url = base_url or DEFAULT_JUDGE_BASE_URL
     # Explicit lines that just restate the default (what `strata register` writes beside
     # a captured key) are still the default judge — "configured" only when they differ.
     is_default = model == DEFAULT_JUDGE_MODEL and base_url == DEFAULT_JUDGE_BASE_URL
     return ResolvedJudge(
-        model, base_url, key, JUDGE_REASON_DEFAULT if is_default else JUDGE_REASON_OVERRIDE
+        model,
+        base_url,
+        key,
+        JUDGE_REASON_DEFAULT if is_default else JUDGE_REASON_OVERRIDE,
+        judge_provider,
     )
 
 
@@ -115,6 +129,7 @@ def resolve_judge_from_env(env: Mapping[str, str]) -> ResolvedJudge:
         anthropic_api_key=env.get("STRATA_ANTHROPIC_API_KEY")
         or env.get("ANTHROPIC_API_KEY")
         or None,
+        judge_provider=env.get("STRATA_JUDGE_PROVIDER") or env.get("JUDGE_PROVIDER") or None,
     )
 
 
@@ -147,6 +162,16 @@ class Settings(BaseSettings):
     manager_model: str = Field(
         default=DEFAULT_JUDGE_MODEL,
         validation_alias=AliasChoices("STRATA_MANAGER_MODEL", "JUDGE_MODEL"),
+    )
+    # #224: an OpenRouter provider name to pin every judge call to (e.g.
+    # "Alibaba"), or unset for today's behaviour (unpinned). Same dual-alias
+    # shape as manager_model above, for the same reason (an explicit
+    # validation_alias suppresses the auto-generated STRATA_-prefixed one).
+    # Ignored entirely on a non-OpenRouter judge endpoint — see
+    # scope_manager._is_openrouter_client.
+    judge_provider: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("STRATA_JUDGE_PROVIDER", "JUDGE_PROVIDER"),
     )
     summary_max_words: int = Field(default=500, ge=1)
     # ADR 0013 D3: the word budget for a scope's PUBLISHED FACE (its own
@@ -242,6 +267,7 @@ class Settings(BaseSettings):
             base_url=self.judge_base_url if "judge_base_url" in given else None,
             judge_api_key=self.judge_api_key,
             anthropic_api_key=self.anthropic_api_key,
+            judge_provider=self.judge_provider,
         )
         self.manager_model = resolved.model
         self.judge_base_url = resolved.base_url

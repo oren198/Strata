@@ -701,6 +701,7 @@ def _build_scope_manager():
         client=_settings.build_judge_client(),
         model=_settings.manager_model,
         implied_purpose_min_words=_settings.implied_purpose_min_words,
+        judge_provider=_settings.judge_provider,
     )
 
 

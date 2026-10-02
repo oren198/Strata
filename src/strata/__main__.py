@@ -2378,6 +2378,7 @@ def cmd_publication_bootstrap(args: argparse.Namespace) -> int:
             client=settings.build_judge_client(),
             model=settings.manager_model,
             implied_purpose_min_words=settings.implied_purpose_min_words,
+            judge_provider=settings.judge_provider,
         )
 
         try:
@@ -2573,6 +2574,7 @@ def _refresh_stores(settings):  # noqa: ANN001, ANN201
         client=settings.build_judge_client(),
         model=settings.manager_model,
         implied_purpose_min_words=settings.implied_purpose_min_words,
+        judge_provider=settings.judge_provider,
     )
     return fleet_config, record_store, summary_store, manager
 
@@ -3081,16 +3083,34 @@ def _judge_line(resolved: object) -> str:
     head = f"{resolved.model} @ {_judge_endpoint_label(resolved.base_url)}"  # type: ignore[attr-defined]
     reason = resolved.reason  # type: ignore[attr-defined]
     if reason == JUDGE_REASON_DEFAULT:
-        return f"{head} (default, measured {_JUDGE_MEASURED_DATE})"
-    if reason == JUDGE_REASON_KEPT:
-        return (
-            f"{head} (kept: an Anthropic key is set and no JUDGE_MODEL/JUDGE_BASE_URL; measured "
+        tail = f"(default, measured {_JUDGE_MEASURED_DATE})"
+    elif reason == JUDGE_REASON_KEPT:
+        tail = (
+            "(kept: an Anthropic key is set and no JUDGE_MODEL/JUDGE_BASE_URL; measured "
             f'{_JUDGE_MEASURED_DATE} — see "Choosing a judge" in the README)'
         )
-    return (
-        f"{head} (configured via JUDGE_*; the README's measurements cover only the "
-        'judges in its "Choosing a judge" table)'
-    )
+    else:
+        tail = (
+            "(configured via JUDGE_*; the README's measurements cover only the "
+            'judges in its "Choosing a judge" table)'
+        )
+    return f"{head} {tail}{_judge_provider_suffix(resolved)}"
+
+
+def _judge_provider_suffix(resolved: object) -> str:
+    """#224: append the pin state to the doctor judge line, when a provider
+    is configured at all — pinned and taking effect, or configured but
+    ignored (never silent) on a non-OpenRouter endpoint, so a user who set
+    JUDGE_PROVIDER against a bare Anthropic endpoint sees why it does
+    nothing rather than wondering.
+    """
+    provider = getattr(resolved, "provider", None)
+    if provider is None:
+        return ""
+    base_url = getattr(resolved, "base_url", None) or ""
+    if "openrouter.ai" in base_url:
+        return f" [pinned to {provider}]"
+    return f" [JUDGE_PROVIDER={provider} configured, ignored: not an OpenRouter endpoint]"
 
 
 def _build_probe_client(resolved: object):  # -> anthropic.Anthropic
