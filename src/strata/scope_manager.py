@@ -2228,6 +2228,26 @@ class _AmendmentJudgment(BaseModel):
     refresh at all, this one is a context the engine could not let through
     because of what it still said."""
 
+    held_directive_changes: list[str] = Field(default_factory=list)
+    """Directive ids a contribution from outside this scope targeted, held (position gate).
+
+    A session bound to a scope carries that scope's authority over its own
+    directives; a contribution from any other position (an upward proposal from
+    a descendant, or an outcome raised from one) is a proposal, never a
+    decision. Its directive ops are held, it is admitted as context under an
+    engine-written attributed line, and the directive set stands byte for
+    byte. Noted in :attr:`record_notes`."""
+
+    held_ops: list[str] = Field(default_factory=list)
+    """The held ops, rendered for the record (position gate) — kept apart from
+    :attr:`dropped_ops`: those did not apply because they were invalid, these
+    were valid but the contributor is not bound to this scope."""
+
+    held_context: str | None = None
+    """The judge's own ``new_context`` for a held contribution (position gate), kept for
+    the record and for measurement. The summary carries an engine-written,
+    attributed report line instead — never this rewrite."""
+
     withdraw_published: list[str] = Field(default_factory=list)
     """Published item ids to withdraw (ADR 0007 D3/D5 judged propagation).
 
@@ -2785,21 +2805,28 @@ class ScopeManagerJudgment(_AmendmentJudgment):
         rewrite still carried a superseded claim (#199), and one per protocol
         repair (issue #201).
         """
-        return _with_disposition_unreadable_note(
-            _with_protocol_notes(
-                _with_superseded_context_note(
-                    _with_dropped_context_note(
-                        _with_dropped_sources_note(
-                            _with_dropped_note(self.reasoning, self.dropped_ops),
-                            self.dropped_context_sources,
+        return _with_held_note(
+            _with_disposition_unreadable_note(
+                _with_protocol_notes(
+                    _with_superseded_context_note(
+                        _with_dropped_context_note(
+                            _with_dropped_sources_note(
+                                _with_dropped_note(self.reasoning, self.dropped_ops),
+                                self.dropped_context_sources,
+                            ),
+                            self.dropped_new_context,
                         ),
-                        self.dropped_new_context,
+                        self.dropped_superseded_context,
                     ),
-                    self.dropped_superseded_context,
+                    self.protocol_notes,
                 ),
-                self.protocol_notes,
+                self.disposition_unreadable,
             ),
-            self.disposition_unreadable,
+            (
+                self.held_directive_changes
+                if (self.held_directive_changes or self.held_ops)
+                else None
+            ),
         )
 
 
@@ -2876,6 +2903,10 @@ class ScopeManagerBatchJudgment(_AmendmentJudgment):
     dropped_ops_by_contribution: dict[str, list[str]] = Field(default_factory=dict)
     """Dropped ops (rendered) keyed by the contribution whose record notes them."""
 
+    held_by_contribution: dict[str, list[str]] = Field(default_factory=dict)
+    """Held directive ids (position gate) keyed by the member whose change was held;
+    an empty list means a proposed NEW directive was held."""
+
     @property
     def accepted_verdicts(self) -> list[BatchVerdict]:
         """The batch's accept verdicts, in arrival order."""
@@ -2926,6 +2957,7 @@ class ScopeManagerBatchJudgment(_AmendmentJudgment):
         # Issue #201: a protocol repair is a fact about the CALL — one re-ask
         # obtained the whole payload, one op read its id off one member — so
         # it is noted on every row, declines included, like a dropped source.
+        notes = _with_held_note(notes, self.held_by_contribution.get(contribution_id))
         return _with_protocol_notes(notes, self.protocol_notes)
 
 
@@ -3249,6 +3281,51 @@ def _with_dropped_sources_note(reasoning: str, dropped_sources: Sequence[str]) -
         return reasoning
     dropped = ", ".join(dropped_sources)
     return f"{reasoning} [Declared context_sources not rendered to this judge: {dropped}.]"
+
+
+def _with_held_note(reasoning: str, held: Sequence[str] | None) -> str:
+    """Return *reasoning* plus the position gate's note, when a change was held.
+
+    *held* is ``None`` when nothing was held; an empty list means a proposed new
+    directive was held; otherwise the directive ids the contribution targeted.
+    """
+    if held is None:
+        return reasoning
+    what = (
+        f"would change directive {', '.join(held)}, which stands"
+        if held
+        else "proposed a new directive, not adopted"
+    )
+    return (
+        f"{reasoning} [Held: {what}. The contributor is not bound to this scope, so "
+        "this is admitted as an attributed proposal; a session bound to this scope "
+        "may adopt it.]"
+    )
+
+
+def _held_report_line(contribution: Contribution, directive_ids: Sequence[str]) -> str:
+    """The engine's attributed line for a contribution held by the position gate.
+
+    A contribution from outside the judged scope is a PROPOSAL, never a
+    decision: the line says who proposed what, verbatim, and that the
+    directive it targeted stands (or that it was proposed as a new one). Written
+    by the engine, never by the judge, so the claim cannot enter context as
+    unattributed fact.
+    """
+    who = contribution.contributor.skill or contribution.contributor.session_id
+    tail = (
+        f"directive {', '.join(directive_ids)} stands."
+        if directive_ids
+        else "proposed as a new directive; not adopted."
+    )
+    return (
+        f"[{contribution.id}] {who} ({contribution.contributor.scope_id}) proposes: "
+        f"{contribution.content.strip()} — {tail}"
+    )
+
+
+def _append_line(context: str, line: str) -> str:
+    return f"{context.rstrip()}\n{line}" if context.strip() else line
 
 
 def _with_dropped_context_note(reasoning: str, dropped_new_context: bool) -> str:
@@ -6360,7 +6437,7 @@ class ScopeManager:
                 new_contribution=new_contribution,
             )
 
-        return self._call_with_correctives(
+        judgment = self._call_with_correctives(
             user_message=user_message,
             system_prompt=_SYSTEM_PROMPT,
             tool=_judge_tool_for(acted_on_target),
@@ -6437,6 +6514,178 @@ class ScopeManager:
                 if acted_on_target is None and mode == "ordinary"
                 else None
             ),
+        )
+        return self._hold_directive_changes(
+            judgment,
+            scope=scope,
+            current_summary=current_summary,
+            new_contribution=new_contribution,
+            mode=mode,
+            input_changes=input_changes,
+        )
+
+    @staticmethod
+    def _hold_directive_changes(
+        judgment: ScopeManagerJudgment,
+        *,
+        scope: Scope,
+        current_summary: ScopeSummary | None,
+        new_contribution: Contribution,
+        mode: JudgeMode,
+        input_changes: Sequence[_ChangeEventLike] | None,
+    ) -> ScopeManagerJudgment:
+        """The position gate: only a session bound to *scope* changes its directives.
+
+        Mechanical and post-judgment — the judge's inputs are untouched. A
+        session bound to the judged scope carries that scope's authority: its
+        contributions apply exactly as judged. A contribution from any other
+        position (an upward proposal from a descendant, or an outcome the engine
+        raised from one) is a proposal, never a decision: every op that would
+        add, supersede or retire a directive is held, the contribution is
+        admitted as context under an engine-written attributed line, the
+        judge's own context rewrite is replaced by that line, and the directive
+        set stands byte for byte. A session bound to *scope* may adopt the
+        proposal by its own contribution. Refreshes, operator acts and
+        publication judgments never reach this method's gate.
+        """
+        del input_changes  # the gate is about position, not about refresh inputs
+        if judgment.decision == "decline" or mode != "ordinary":
+            return judgment
+        if new_contribution.contributor.scope_id == scope.id:
+            return judgment
+        directive_ids = (
+            {d.id for d in current_summary.directives} if current_summary is not None else set()
+        )
+        targeted = list(
+            dict.fromkeys(
+                target
+                for op in judgment.directive_ops
+                if (target := _op_target_id(op)) is not None and target in directive_ids
+            )
+        )
+        if (
+            new_contribution.supersedes in directive_ids
+            and new_contribution.supersedes not in targeted
+        ):
+            targeted.append(new_contribution.supersedes)
+        held = list(judgment.directive_ops)
+        if not held and not targeted and judgment.decision != "accept_as_directive":
+            return judgment
+        previous = current_summary.context if current_summary is not None else ""
+        context = _append_line(previous, _held_report_line(new_contribution, targeted))
+        return judgment.model_copy(
+            update={
+                "decision": "accept_as_context",
+                "directive_ops": [],
+                "new_context": context,
+                "held_directive_changes": targeted,
+                "held_ops": [op.describe() for op in held],
+                "held_context": judgment.new_context,
+                "new_summary": _apply_amendment(
+                    scope=scope,
+                    current_summary=current_summary,
+                    contribution=new_contribution,
+                    ops=[],
+                    new_context=context,
+                ),
+            }
+        )
+
+    @staticmethod
+    def _hold_batch_directive_changes(
+        judgment: ScopeManagerBatchJudgment,
+        *,
+        scope: Scope,
+        current_summary: ScopeSummary | None,
+        contributions: Mapping[str, Contribution],
+        mode: JudgeMode,
+        input_changes: Sequence[_ChangeEventLike] | None,
+    ) -> ScopeManagerBatchJudgment:
+        """:meth:`_hold_directive_changes`, carried to the batch.
+
+        A member bound to the judged scope keeps its ops as judged. A member from
+        any other position has every directive op it owns held and its verdict
+        becomes ``accept_as_context``, with the engine's attributed line. An op
+        whose owner cannot be read off its attribution or a member's
+        ``supersedes`` is held whenever any accepted member is foreign (the safe
+        direction: the directive stands). The batch's one context rewrite
+        belongs to every member, so it is kept and the lines are appended — a
+        known gap against the single path, where the rewrite is replaced.
+        """
+        del input_changes
+        if mode != "ordinary":
+            return judgment
+        accepted = {v.contribution_id for v in judgment.accepted_verdicts}
+        foreign = {cid for cid in accepted if contributions[cid].contributor.scope_id != scope.id}
+        if not foreign:
+            return judgment
+        directive_ids = (
+            {d.id for d in current_summary.directives} if current_summary is not None else set()
+        )
+        held_by: dict[str, list[str]] = {cid: [] for cid in foreign}
+        held_ops: list[DirectiveOp] = []
+        for op in judgment.directive_ops:
+            target = _op_target_id(op)
+            if op.contribution_id in accepted:
+                owners = [op.contribution_id]
+            else:
+                owners = [
+                    cid
+                    for cid in accepted
+                    if target is not None and contributions[cid].supersedes == target
+                ]
+            if (owners and any(o in foreign for o in owners)) or (not owners):
+                held_ops.append(op)
+                for o in owners or sorted(foreign):
+                    if o in held_by and target in directive_ids:
+                        held_by[o].append(target)
+        for cid in foreign:
+            sup = contributions[cid].supersedes
+            if sup in directive_ids and sup not in held_by[cid]:
+                held_by[cid].append(sup)
+        decided = {v.contribution_id: v.decision for v in judgment.verdicts}
+        changed = [
+            cid
+            for cid in foreign
+            if held_by[cid]
+            or decided.get(cid) == "accept_as_directive"
+            or any(op.contribution_id == cid for op in held_ops)
+        ]
+        if not changed and not held_ops:
+            return judgment
+        kept = [op for op in judgment.directive_ops if op not in held_ops]
+        context = (
+            judgment.new_context
+            if judgment.new_context is not None
+            else (current_summary.context if current_summary is not None else "")
+        )
+        for cid in sorted(set(changed)):
+            context = _append_line(context, _held_report_line(contributions[cid], held_by[cid]))
+        verdicts = [
+            v.model_copy(update={"decision": "accept_as_context"})
+            if v.contribution_id in changed
+            else v
+            for v in judgment.verdicts
+        ]
+        return judgment.model_copy(
+            update={
+                "verdicts": verdicts,
+                "directive_ops": kept,
+                "new_context": context,
+                "held_directive_changes": list(
+                    dict.fromkeys(t for ts in held_by.values() for t in ts)
+                ),
+                "held_ops": [op.describe() for op in held_ops],
+                "held_by_contribution": {cid: held_by[cid] for cid in changed},
+                "held_context": judgment.new_context,
+                "new_summary": _apply_batch_amendment(
+                    scope=scope,
+                    current_summary=current_summary,
+                    contributions=contributions,
+                    ops=kept,
+                    new_context=context,
+                ),
+            }
         )
 
     def _call_with_correctives(
@@ -7500,6 +7749,14 @@ class ScopeManager:
                 dropped_ops_by_contribution=(
                     {only.id: list(judgment.dropped_ops)} if judgment.dropped_ops else {}
                 ),
+                held_directive_changes=judgment.held_directive_changes,
+                held_ops=judgment.held_ops,
+                held_context=judgment.held_context,
+                held_by_contribution=(
+                    {only.id: list(judgment.held_directive_changes)}
+                    if judgment.held_directive_changes
+                    else {}
+                ),
                 withdraw_published=judgment.withdraw_published,
                 # The single path already validated these; rewrapping must not
                 # silently lose them (ADR 0014 D3/D4). `change_id` stays None
@@ -7633,7 +7890,7 @@ class ScopeManager:
                 hop=hop,
             )
 
-        return self._call_with_correctives(
+        batch_judgment = self._call_with_correctives(
             user_message=user_message,
             system_prompt=_BATCH_SYSTEM_PROMPT,
             tool=JUDGE_BATCH_TOOL,
@@ -7661,6 +7918,14 @@ class ScopeManager:
             # defaults to False here, so the generic branch is always what
             # a second slip reaches).
             parse_generic_decline=_generic_second_slip_batch_decline,
+        )
+        return self._hold_batch_directive_changes(
+            batch_judgment,
+            scope=scope,
+            current_summary=current_summary,
+            contributions=contributions,
+            mode=mode,
+            input_changes=input_changes,
         )
 
     @staticmethod

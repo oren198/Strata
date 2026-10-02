@@ -60,8 +60,11 @@ from strata.summary_store import Directive, ScopeSummary, _render_summary
 STRATUM = Stratum(id="L1", name="function", ordinal=1)
 SCOPE = Scope(id="g_abc123", name="architecture", stratum_id="L1")
 
+# Bound to the judged scope: an own-scope contributor carries the scope's
+# authority (the position gate), so directive ops apply as judged. Upward
+# proposals are covered in tests/test_position_gate.py.
 CONTRIBUTOR = ContributorRef(
-    scope_id="g_def456",
+    scope_id="g_abc123",
     skill="code-writer",
     session_id="sess_001",
     ts="2026-05-01T10:00:00+00:00",
@@ -162,7 +165,7 @@ def test_render_contributor_includes_skill_when_present() -> None:
     """A skill-bearing contributor keeps the ``skill=`` field (no regression)."""
     rendered = _render_contributor(CONTRIBUTOR)
     assert "skill=code-writer" in rendered
-    assert "scope=g_def456" in rendered
+    assert f"scope={CONTRIBUTOR.scope_id}" in rendered
 
 
 def test_digest_row_never_renders_a_none_placeholder() -> None:

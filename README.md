@@ -1072,6 +1072,14 @@ The Console's backend also accepts contributions over HTTP (`POST /contribute`),
 with the same fields and checks as the MCP tool, including `acted_on`. The HTTP
 API trusts the caller's scope; `acted_on` entitlement is checked against it.
 
+**Stated limit: the position gate holds on the MCP path.** Only a session bound
+to a scope can create, replace or retire that scope's directives; a contribution
+from any other position is admitted as an attributed proposal. On the MCP path
+the contributor's position comes from the session's binding. The HTTP API takes
+`contributor.scope_id` from the request body, so a caller on it can claim any
+position. That API is for local use and the Console (see SECURITY.md), not the
+agents' path; do not expose it.
+
 ## Configuration
 
 ### Per-project: `.strata/config.toml`
