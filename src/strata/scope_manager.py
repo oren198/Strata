@@ -2390,6 +2390,14 @@ class BatchVerdict(BaseModel):
     reasoning: str
     """Brief explanation of THIS contribution's verdict."""
 
+    judge_failure: bool = False
+    """#236, the batch-path twin of #235's `ScopeManagerJudgment.judge_failure`:
+    set on EVERY member's verdict when a second protocol slip survived the
+    one corrective re-ask on the batch retry — the batch tool has no per-
+    member outcome-disposition concept, so there is no P3-style distinction
+    to make here; every member just fails closed together. Distinct from an
+    ordinary merits decline for the same reason the single-path flag is."""
+
 
 class ScopeManagerBatchJudgment(_AmendmentJudgment):
     """The scope-manager's verdicts on a batch, plus its one amendment (ADR 0011 D3).
@@ -4682,6 +4690,34 @@ class ScopeManager:
                 contributions=contributions,
             )
 
+        def _generic_second_slip_batch_decline(error: Exception) -> ScopeManagerBatchJudgment:
+            """#236, the batch-path twin of #235's `_generic_second_slip_decline`:
+            a second protocol slip that survives the one corrective re-ask on
+            the batch retry declines EVERY member together, with the same
+            fixed, engine-authored reasoning (never the judge's own malformed
+            text) and `judge_failure=True` — the batch tool has no per-member
+            outcome-disposition field to narrow this to, so there is nothing
+            to salvage selectively; no amendment, no summary write."""
+            reasoning = (
+                "judge failure: the response was still malformed after the "
+                f"corrective re-ask ({type(error).__name__}); declined "
+                "without a verdict on the merits"
+            )
+            return ScopeManagerBatchJudgment(
+                verdicts=[
+                    BatchVerdict(
+                        contribution_id=cid,
+                        decision="decline",
+                        reasoning=reasoning,
+                        judge_failure=True,
+                    )
+                    for cid in batch_ids
+                ],
+                new_summary=None,
+                change_ids=wave_ids,
+                hop=hop,
+            )
+
         return self._call_with_correctives(
             user_message=user_message,
             system_prompt=_BATCH_SYSTEM_PROMPT,
@@ -4702,11 +4738,14 @@ class ScopeManager:
                 "string or null."
             ),
             parse_lenient=_parse_lenient,
-            # #235/#236: neither parse_forced_decline (no per-member outcome-
-            # disposition concept in the batch tool) nor parse_generic_decline
-            # is wired here — a second protocol slip on a BATCH retry still
-            # raises, a known, filed gap (oren198/Strata#236), not something
-            # this item silently papers over.
+            # #235: parse_forced_decline is never wired here — the batch tool
+            # has no per-member outcome-disposition concept, so the P3
+            # forced-decline semantics (disposition_unreadable etc.) have
+            # nothing to apply to. #236: parse_generic_decline IS wired,
+            # closing the batch-path gap #235 left open (is_outcome_report
+            # defaults to False here, so the generic branch is always what
+            # a second slip reaches).
+            parse_generic_decline=_generic_second_slip_batch_decline,
         )
 
     @staticmethod

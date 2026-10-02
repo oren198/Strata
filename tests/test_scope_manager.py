@@ -4085,15 +4085,25 @@ def test_missing_verdict_triggers_one_parse_reask() -> None:
 
 
 def test_second_parse_failure_propagates_never_a_second_retry() -> None:
-    """The #113 one-retry discipline holds in batch mode too."""
+    """The #113 one-retry discipline holds in batch mode too.
+
+    #236, the batch-path twin of #235: a second slip on the batch retry now
+    fails closed (every member declined together) rather than propagating.
+    """
     broken = _batch_input(verdicts=[])
     mock_client = MagicMock()
     mock_client.messages.create.side_effect = [_fake_response(broken), _fake_response(broken)]
 
-    with pytest.raises(ValueError, match="no verdict for"):
-        _judge_batch(mock_client)
+    judgment = _judge_batch(mock_client)
 
     assert mock_client.messages.create.call_count == 2
+    assert {v.contribution_id for v in judgment.verdicts} == {c.id for c in BATCH}
+    assert all(v.decision == "decline" for v in judgment.verdicts)
+    assert all(v.judge_failure is True for v in judgment.verdicts)
+    assert all(
+        "judge failure: the response was still malformed" in v.reasoning for v in judgment.verdicts
+    )
+    assert judgment.new_summary is None
 
 
 def test_op_admitting_a_declined_contribution_is_a_parse_failure() -> None:
@@ -4343,6 +4353,8 @@ def test_all_declined_batch_amends_nothing() -> None:
 
 
 def test_all_declined_batch_carrying_an_amendment_is_a_parse_failure() -> None:
+    """#236: the second identical attempt now fails closed (every member
+    declined together) rather than propagating."""
     contradictory = _batch_input(
         verdicts=[
             {"contribution_id": c.id, "decision": "decline", "reasoning": "no"} for c in BATCH
@@ -4356,8 +4368,11 @@ def test_all_declined_batch_carrying_an_amendment_is_a_parse_failure() -> None:
         _fake_response(contradictory),
     ]
 
-    with pytest.raises(ValueError, match="declined every contribution"):
-        _judge_batch(mock_client)
+    judgment = _judge_batch(mock_client)
+
+    assert all(v.decision == "decline" for v in judgment.verdicts)
+    assert all(v.judge_failure is True for v in judgment.verdicts)
+    assert judgment.new_summary is None
 
 
 def test_batch_verdicts_are_returned_in_arrival_order_however_they_came_back() -> None:
@@ -4801,7 +4816,8 @@ def test_batch_supersede_op_with_no_id_takes_it_from_its_member() -> None:
 
 
 def test_batch_supersede_op_with_no_id_and_no_supersedes_still_fails() -> None:
-    """A member naming no target leaves the op invalid, as today."""
+    """A member naming no target leaves the op invalid, as today — #236: the
+    second identical attempt now fails closed rather than propagating."""
     payload = _batch_input(
         directive_ops=[
             {"op": "supersede", "contribution_id": NEW_CONTRIBUTION.id},
@@ -4814,8 +4830,11 @@ def test_batch_supersede_op_with_no_id_and_no_supersedes_still_fails() -> None:
         _fake_response(payload),
     ]
 
-    with pytest.raises(ValueError, match="supersede op with no id"):
-        _judge_batch(mock_client)
+    judgment = _judge_batch(mock_client)
+
+    assert all(v.decision == "decline" for v in judgment.verdicts)
+    assert all(v.judge_failure is True for v in judgment.verdicts)
+    assert judgment.new_summary is None
 
 
 def test_no_tool_use_block_gets_one_corrective_reask() -> None:
