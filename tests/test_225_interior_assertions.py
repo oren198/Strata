@@ -416,7 +416,7 @@ def test_informant_own_scope_is_declined_as_invented() -> None:
     ]
     judgment, _ = _judge(mock_client, content)
     assert judgment.decision == "decline"
-    assert "own scope is not an informant" in judgment.reasoning
+    assert "own role is not an informant" in judgment.reasoning
 
 
 def test_informant_bare_first_person_is_declined_as_invented() -> None:
@@ -428,7 +428,69 @@ def test_informant_bare_first_person_is_declined_as_invented() -> None:
     ]
     judgment, _ = _judge(mock_client, content)
     assert judgment.decision == "decline"
-    assert "first-person reference is not an informant" in judgment.reasoning
+    assert "own role is not an informant" in judgment.reasoning
+
+
+def test_informant_span_with_connector_and_role_is_declined_as_invented() -> None:
+    """The architect's narrowing example: "me, as on-call-engineer" is still
+    entirely the contributor's own voice once "as" is dropped as a
+    connector, so it is rejected even though it is not a bare pronoun or a
+    bare skill alone."""
+    content = "me, as on-call-engineer -- 225-other-scope only approves changes under budget."
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [
+        _ordinary_accept(content),
+        _reask_response(classification="informant", informant_span="me, as on-call-engineer"),
+    ]
+    judgment, _ = _judge(mock_client, content)
+    assert judgment.decision == "decline"
+    assert "own role is not an informant" in judgment.reasoning
+
+
+def test_informant_span_with_possessive_role_is_declined_as_invented() -> None:
+    """ "our on-call-engineer" is still entirely the contributor's own voice
+    once the possessive determiner "our" is dropped."""
+    content = "our on-call-engineer says 225-other-scope only approves changes under budget."
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [
+        _ordinary_accept(content),
+        _reask_response(classification="informant", informant_span="our on-call-engineer"),
+    ]
+    judgment, _ = _judge(mock_client, content)
+    assert judgment.decision == "decline"
+    assert "own role is not an informant" in judgment.reasoning
+
+
+def test_informant_span_naming_a_genuine_third_party_with_a_possessive_passes() -> None:
+    """The narrowing's other direction: a span that merely MENTIONS a
+    first-person possessive but NAMES a genuine third party is not the
+    contributor's own voice, and must be admitted as an informant."""
+    content = (
+        "my colleague Lena Fischer in procurement says 225-other-scope only "
+        "approves changes under budget."
+    )
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [
+        _ordinary_accept(content),
+        _reask_response(classification="informant", informant_span="my colleague Lena Fischer"),
+    ]
+    judgment, _ = _judge(mock_client, content)
+    assert judgment.decision == "accept_as_context"
+    assert judgment.interior_assertion["result"] == "admitted (context replaced)"
+
+
+def test_informant_span_naming_a_genuine_third_party_with_our_passes() -> None:
+    content = (
+        "our contact Ravi in treasury says 225-other-scope only approves changes under budget."
+    )
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [
+        _ordinary_accept(content),
+        _reask_response(classification="informant", informant_span="our contact Ravi in treasury"),
+    ]
+    judgment, _ = _judge(mock_client, content)
+    assert judgment.decision == "accept_as_context"
+    assert judgment.interior_assertion["result"] == "admitted (context replaced)"
 
 
 # ---------------------------------------------------------------------------

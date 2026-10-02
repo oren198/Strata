@@ -4124,27 +4124,39 @@ class ScopeManager:
                                 return candidate.name
                 return None
 
+            _OWN_ROLE_STRIP_WORDS = {"my", "our", "a", "an", "the", "as"}
+            _OWN_ROLE_PRONOUNS = {"i", "me", "we", "us", "myself", "ourselves"}
+
             def _own_role_or_first_person(span: str) -> str | None:
-                """#225, the architect's live-gate review: an informant span
-                that is really the CONTRIBUTOR's own voice — their own
-                skill/role, their own scope, or a bare first-person
-                reference ("I", "we", ...) — is not an informant at all.
-                "As eng-lead I can tell you X" has "eng-lead" verbatim in
-                the text, so the plain occurrence check alone passes it;
-                this closes that hole. Returns the reason to decline with,
-                or ``None`` if the span is a genuine third party.
+                """#225, narrowed per the architect's follow-up review: the
+                span must BE the contributor, not merely MENTION them.
+                "my colleague Lena Fischer" mentions a first-person
+                possessive but names a genuine third party, so a plain
+                CONTAINS check over-declines it. Instead: normalise, drop
+                possessive determiners/articles/"as", and reject only if
+                EVERY remaining word is the contributor's own skill, their
+                own scope id/name, or a bare first-person pronoun. Returns
+                the reason to decline with, or ``None`` if the span names a
+                genuine third party.
                 """
                 normalized = " ".join(span.split()).casefold()
+                tokens = [re.sub(r"[^\w-]", "", t) for t in normalized.split()]
+                tokens = [t for t in tokens if t]
+                remaining = [t for t in tokens if t not in _OWN_ROLE_STRIP_WORDS]
+                if not remaining:
+                    return None
+
                 skill = (new_contribution.contributor.skill or "").strip().casefold()
-                if skill and skill in normalized:
-                    return "the contributor's own role is not an informant"
+                skill_tokens = set(skill.split())
                 contributor_scope_id = new_contribution.contributor.scope_id
                 contributor_scope_name = _scope_name_for(contributor_scope_id)
+                own_tokens: set[str] = set(skill_tokens)
                 for candidate in filter(None, (contributor_scope_id, contributor_scope_name)):
-                    if candidate.casefold() in normalized:
-                        return "the contributor's own scope is not an informant"
-                if _FIRST_PERSON_RE.search(normalized):
-                    return "a first-person reference is not an informant"
+                    own_tokens.update(candidate.casefold().split())
+                allowed = own_tokens | _OWN_ROLE_PRONOUNS
+
+                if all(t in allowed for t in remaining):
+                    return "the contributor's own role is not an informant"
                 return None
 
             corrective_text = (
