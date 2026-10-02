@@ -725,11 +725,13 @@ def test_a_tokenless_refuted_claim_never_vetoes() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Re-gate 2: an antonym-flip clause, independent of the correction text,
-# folded into observed_value_veto. An added-exception clause was tried and
-# dropped — the philosopher's ruling: it would keep refuted values
+# Re-gate 2: an antonym-flip clause was tried and dropped — 0 overrides in
+# the held-out run, no evidence it helps (the errors there were subject
+# swaps, which no antonym pair can see). An added-exception clause was also
+# tried and dropped — the philosopher's ruling: it would keep refuted values
 # published, the CEO's own named failure — so an exception-only item must
-# NOT be vetoed, left to the judge in both directions.
+# NOT be vetoed, left to the judge in both directions. The veto is
+# value-token only again.
 # ---------------------------------------------------------------------------
 
 
@@ -747,38 +749,7 @@ def test_an_added_exception_item_is_not_vetoed() -> None:
     )
 
 
-def test_the_timing_flip_is_vetoed() -> None:
-    """ "Security review happens after merge" against refuted "before
-    merge" — the antonym-flip clause, independent of the correction."""
-    assert observed_value_veto(
-        "Security review happens before merge.",
-        "The review actually happens after merge.",
-        "Security review happens after merge.",
-    )
-
-
-def test_the_double_negation_carrier_stays_not_vetoed() -> None:
-    """ "Logs never contain unredacted PII" is a TRUE carrier of "PII is
-    always redacted" (double negation) — always/never is deliberately
-    excluded from the antonym pairs, so this must NOT be vetoed."""
-    assert not observed_value_veto(
-        "PII is always redacted in logs.",
-        "This is not accurate.",
-        "Logs never contain unredacted PII.",
-    )
-
-
-def test_a_generic_correction_now_vetoes_on_the_flip_clause_only() -> None:
-    """The antonym-flip clause applies even to a generic correction with no
-    value tokens of its own — unlike the value-token clause, it never
-    consults the correction text at all."""
-    assert observed_value_veto(
-        "Security review happens before merge.",
-        "This is not accurate.",
-        "Security review happens after merge.",
-    )
-    # The value-token clause alone still declines to veto a generic
-    # correction when the antonym clause doesn't apply either.
+def test_a_generic_correction_with_no_value_tokens_never_vetoes() -> None:
     assert not observed_value_veto(
         "The limit is set to 15 items.",
         "This is not accurate.",

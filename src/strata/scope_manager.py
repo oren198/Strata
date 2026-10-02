@@ -615,11 +615,16 @@ CLAIM_CARRIER_TOOL: dict = {
                             "description": (
                                 "carries = the item asserts the REFUTED claim itself: "
                                 "the same subject, action and value or timing, alone or "
-                                "among other claims. An item that asserts what was "
-                                "observed instead is does_not_carry: it agrees with the "
-                                "correction and must stay published. An item stating any "
-                                "other different value, subject, action, timing, or an "
-                                "exception to the claim is also does_not_carry. When in "
+                                "among other claims. The SUBJECT must be the same thing, "
+                                "not a related one: a different item, place, group, kind "
+                                "or member of the same family is a different subject, "
+                                "even when the value, timing and wording match. Judge the "
+                                "subject first; if it differs, the item is does_not_carry "
+                                "before you look at the value. An item that asserts what "
+                                "was observed instead is does_not_carry: it agrees with "
+                                "the correction and must stay published. An item stating "
+                                "any other different value, subject, action, timing, or "
+                                "an exception to the claim is also does_not_carry. When in "
                                 "doubt, does_not_carry."
                             ),
                         },
@@ -641,11 +646,15 @@ is about CONTENT equivalence only: does the item still assert the same thing \
 the REFUTED claim stated, in substance, however the wording differs.
 
 carries = the item asserts the REFUTED claim itself: the same subject, \
-action and value or timing, alone or among other claims. An item that \
-asserts what was observed instead is does_not_carry: it agrees with the \
-correction and must stay published. An item stating any other different \
-value, subject, action, timing, or an exception to the claim is also \
-does_not_carry. When in doubt, does_not_carry."""
+action and value or timing, alone or among other claims. The SUBJECT must \
+be the same thing, not a related one: a different item, place, group, kind \
+or member of the same family is a different subject, even when the value, \
+timing and wording match. Judge the subject first; if it differs, the item \
+is does_not_carry before you look at the value. An item that asserts what \
+was observed instead is does_not_carry: it agrees with the correction and \
+must stay published. An item stating any other different value, subject, \
+action, timing, or an exception to the claim is also does_not_carry. When \
+in doubt, does_not_carry."""
 
 # ---------------------------------------------------------------------------
 # Interior-assertion re-ask tool (ADR 0016, issue #225 — static, eligible for

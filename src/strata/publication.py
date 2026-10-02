@@ -1603,89 +1603,43 @@ def _value_tokens(text: str) -> set[str]:
     return tokens
 
 
-#: Antonym pairs for :func:`_antonym_flip_veto` (#219 C re-gate 2): a FLIPPED
-#: TIMING/polarity error the value-token veto cannot catch, since it never
-#: looks at the correction (these fire on the refuted claim and the item
-#: alone). Deliberately EXCLUDES always/never: "logs never contain
-#: unredacted PII" is a TRUE carrier of "PII is always redacted" (double
-#: negation) — measured, including that pair vetoed 18 true-carrier cells.
-_ANTONYM_PAIRS = (
-    ("before", "after"),
-    ("on", "off"),
-    ("required", "optional"),
-    ("enabled", "disabled"),
-    ("open", "closed"),
-    ("allowed", "forbidden"),
-    ("allowed", "prohibited"),
-    ("include", "exclude"),
-    ("min", "max"),
-    ("above", "below"),
-    ("first", "last"),
-)
-
-
-def _words(text: str) -> set[str]:
-    return set(re.findall(r"[a-z]+", text.casefold()))
-
-
-def _antonym_flip_veto(refuted_claim: str, item_content: str) -> bool:
-    """#219 C re-gate 2: veto a FLIPPED TIMING/polarity error — "review after
-    merge" judged carries against refuted "review before merge". Fires when
-    the item contains one side of an :data:`_ANTONYM_PAIRS` pair, the
-    refuted claim contains the other side, and the item does NOT also
-    contain the refuted claim's own side (so an item stating both sides, or
-    neither, is left to the judge). Independent of the correction text —
-    applies to a generic correction too.
-    """
-    refuted_words = _words(refuted_claim)
-    item_words = _words(item_content)
-    for left, right in _ANTONYM_PAIRS:
-        if left in refuted_words and right in item_words and left not in item_words:
-            return True
-        if right in refuted_words and left in item_words and right not in item_words:
-            return True
-    return False
-
-
 def observed_value_veto(refuted_claim: str, correcting_content: str, item_content: str) -> bool:
     """#219 C live-gate addition (CEO, standing rule 1 — never trust prompt
     text alone): a mechanical veto that can only PREVENT a withdrawal, never
-    cause one. Two independent clauses, either of which vetoes:
+    cause one. VALUE-token only (:func:`_value_tokens` — never ordinary
+    content words; see that function's own docstring for why): the judge's
+    own ``carries`` answer is overridden when the item's values include at
+    least one value the correction states that the refuted claim does not
+    (``c_only``), and none of the values the item is being blocked on
+    (``block``: the refuted claim's own values the correction does NOT also
+    repeat — or, when the correction repeats every one of them, every one of
+    them, so a correction that merely adds detail never backs off the
+    block). A polarity word in the correction counts only when the refuted
+    claim itself has one too. A tokenless claim, or a correction with no
+    value the refuted claim lacks, never vetoes.
 
-    1. **Value tokens** (:func:`_value_tokens` — never ordinary content
-       words; see that function's own docstring for why): the judge's own
-       ``carries`` answer is overridden when the item's values include at
-       least one value the correction states that the refuted claim does
-       not (``c_only``), and none of the values the item is being blocked
-       on (``block``: the refuted claim's own values the correction does
-       NOT also repeat — or, when the correction repeats every one of
-       them, every one of them, so a correction that merely adds detail
-       never backs off the block). A polarity word in the correction counts
-       only when the refuted claim itself has one too. A tokenless claim,
-       or a correction with no value the refuted claim lacks, never vetoes
-       this clause.
-    2. **Antonym flip** (:func:`_antonym_flip_veto`, re-gate 2): a flipped
-       timing/polarity error, independent of the correction text.
-
-    An ADDED EXCEPTION ("PII is redacted in logs except in debug builds",
-    against refuted "PII is always redacted") is deliberately NOT a veto
-    clause — the philosopher's ruling: such a text carries the claim's VALUE
-    but not its SCOPE, and whether it should be withdrawn depends on what
-    the correction actually hit (if the correction changed the value, the
-    exception text is wrong too and must go; if the correction IS the
-    exception, it must stay) — a fact this function has no way to tell. A
-    mechanical veto that kept these would reintroduce the CEO's own named
-    failure (keeping a refuted value published), so this abstains on them
-    in both directions and leaves the judge's own answer standing.
+    Two further clauses were tried in re-gate 2 and both dropped:
+    - An ANTONYM FLIP (a closed before/after, on/off, etc. pair list,
+      independent of the correction text) measured 0 overrides in the
+      held-out run — the errors there were SUBJECT SWAPS ("fridges" for
+      "freezers"), which no antonym pair can see. No held-out evidence it
+      helps, so the CEO's rule drops it.
+    - An ADDED EXCEPTION ("PII is redacted in logs except in debug builds",
+      against refuted "PII is always redacted") is deliberately NOT a veto
+      clause — the philosopher's ruling: such a text carries the claim's
+      VALUE but not its SCOPE, and whether it should be withdrawn depends on
+      what the correction actually hit (a changed value means the exception
+      text is wrong too; the correction BEING the exception means it must
+      stay), a fact this function cannot tell from the text alone. A veto
+      that kept these would reintroduce the CEO's own named failure (keeping
+      a refuted value published), so this abstains on an exception-only
+      item in both directions and leaves the judge's own answer standing.
 
     Returns ``True`` when the item should be KEPT (the withdrawal is
     vetoed), ``False`` otherwise. The caller only ever consults this for an
     item the judge already marked ``carries`` — this never turns a
     ``does_not_carry`` into a ``carries``.
     """
-    if _antonym_flip_veto(refuted_claim, item_content):
-        return True
-
     refuted_values = _value_tokens(refuted_claim)
     correcting_values = _value_tokens(correcting_content)
     if not (refuted_values & _POL_WORDS):
