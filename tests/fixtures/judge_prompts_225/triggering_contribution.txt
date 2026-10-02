@@ -1,0 +1,49 @@
+SCOPE: 225-corpus (id=g_225corpus)
+STRATUM: function (ordinal=1)
+
+BUDGET: once your amendment is applied, this summary must be at most 500 words (context plus every directive's content).
+
+ENTITLEMENT (relative to this scope)
+- This scope and its ancestors (entitled — directives and context):
+    g_225corpus (225-corpus)
+- Scopes below this scope (entitled — evidence proposed upward for this scope to judge on its merits):
+    (none)
+- Scopes referenced by this chain (entitled for CONTEXT only):
+    (none)
+- All other scopes in this fleet, including archived ones (no channel to this scope — their position reaches it only through a person's report or the contributor's own observation, never asserted as their own):
+    g_other_225 (other-225-scope)
+
+CURRENT SUMMARY
+---
+---
+condensed: false
+scope_id: g_225corpus
+updated_at: '2026-08-01T09:00:00+00:00'
+version: 1
+---
+
+# Scope: g_225corpus
+
+## Directives
+
+_(none yet)_
+
+## Context
+
+The team favours minimal abstractions.
+
+---
+
+RECENT CONTRIBUTIONS (oldest first — mechanical digest; the newest 3 PRIOR contributions carry full content):
+[c_225_recent] at=2026-08-15T08:00:00+00:00 subject=(none) state=judged decision=accept_as_context reasoning=Accepted as context. content='An earlier observation.'
+
+NEW CONTRIBUTION TO JUDGE:
+- id: c_225_new
+- proposed classification: context
+- subject: (none)
+- supersedes: (none)
+- contributor: skill=engineer scope=g_225corpus at=2026-10-02T10:00:00+00:00
+- content:
+    other-225-scope only approves changes under 5,000 EUR without a second review.
+
+Judge it. Call `submit_judgment` exactly once.

@@ -10,8 +10,9 @@ has an owner. The operator's steps are approvals on GitHub; nobody uploads to Py
    the PR is opened, not after. v1.13.0 reached its release PR still reading 1.12.0, caught
    only because a verification printed `strata.__version__`; the suite does not check it.
 3. **PR `dev` → `main`.** Factual notes: what shipped, the evidence, the known
-   limits. The repository ruleset requires an approving review; the operator
-   approves, then the PR is merged.
+   limits. Built from `CHANGELOG.md`'s "Unreleased" section, which is cleared
+   once the release ships. The repository ruleset requires an approving
+   review; the operator approves, then the PR is merged.
 4. **Tag.** A lightweight tag `vX.Y.Z` on main's merge commit, then push it.
 5. **GitHub Release** for the tag, marked Latest, with the same factual notes.
    Link only to public pages.

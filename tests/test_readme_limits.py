@@ -164,5 +164,5 @@ def test_outcome_loop_row_states_the_v116_additions() -> None:
 
 def test_the_invented_informant_limit_is_stated_with_its_numbers() -> None:
     assert "tracked in #225" in _README
-    assert "a source nobody gave it" in _README
+    assert "hearsay from an informant the judge invented" in _README
     assert "22 admits" in _README

@@ -588,6 +588,87 @@ BOOTSTRAP_JUDGE_TOOL: dict = {
 }
 
 # ---------------------------------------------------------------------------
+# Interior-assertion re-ask tool (ADR 0016, issue #225 — static, eligible for
+# prompt caching). A SEPARATE tool from JUDGE_TOOL, never a `_judge_tool_for`
+# variant of it: this keeps the FIRST call's tool/prompt byte-identical
+# whether or not this re-ask ever fires (input identity).
+# ---------------------------------------------------------------------------
+
+INTERIOR_ASSERTION_TOOL: dict = {
+    "name": "classify_interior_assertion",
+    "description": (
+        "This accepted contribution names another fleet scope this scope is not "
+        "entitled to. Classify what GROUNDS it, per the admission check (ADR 0016) — "
+        "the same three grounds, plus the ungrounded case."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "classification": {
+                "type": "string",
+                "enum": ["conduct", "informant", "publication", "directive", "none"],
+                "description": (
+                    "conduct: first-hand observation of that scope's CONDUCT toward "
+                    "this one (what it DID), never its internal position. informant: "
+                    "hearsay from an identifiable person who told the agent something. "
+                    "publication: grounded in that scope's own publication reaching "
+                    "this scope. directive: grounded in an ancestor directive or "
+                    "operator memory item. none: no ground at all — manufactured "
+                    "attribution."
+                ),
+            },
+            "informant_span": {
+                "type": "string",
+                "description": (
+                    "Required when classification is informant: the EXACT verbatim "
+                    "span of the contribution's own text naming who told the agent "
+                    "(e.g. 'Priya, one of the security-eng engineers'). A scope's own "
+                    "name or a collective ('procurement', 'the procurement team') is "
+                    "allowed here — a party can tell, per ADR 0016. Must occur in the "
+                    "contribution text."
+                ),
+            },
+            "telling_span": {
+                "type": "string",
+                "description": (
+                    "Required when classification is informant: the EXACT verbatim "
+                    "span of the contribution's own text describing the TELLING "
+                    "EVENT itself — must contain a telling verb (told, tell, said, "
+                    "say, confirmed, informed, announced, mentioned, explained, "
+                    "warned, shared, sent, wrote, messaged, emailed, pinged, briefed) "
+                    "and name the contributor as the one told (me, us, our, we, my, "
+                    "I) — e.g. 'told me on Tuesday'. Must occur in the contribution "
+                    "text."
+                ),
+            },
+            "ref_id": {
+                "type": "string",
+                "description": (
+                    "Required when classification is publication or directive: the id "
+                    "of the published item, ancestor directive, or operator memory "
+                    "item this grounds on."
+                ),
+            },
+            "act_span": {
+                "type": "string",
+                "description": (
+                    "Required when classification is conduct: the EXACT verbatim span "
+                    "of the contribution's own text describing the observed act — a "
+                    "dealing the contributor was PART OF (e.g. 'their agent sent back "
+                    "our order twice'), never a claim merely attested or perceived "
+                    "about the other scope's general position."
+                ),
+            },
+            "reasoning": {
+                "type": "string",
+                "description": "One or two sentences explaining the classification.",
+            },
+        },
+        "required": ["classification", "reasoning"],
+    },
+}
+
+# ---------------------------------------------------------------------------
 # System prompt (static — eligible for prompt caching)
 # ---------------------------------------------------------------------------
 
@@ -2346,6 +2427,35 @@ class ScopeManagerJudgment(_AmendmentJudgment):
     ordinary merits decline, without needing to know which specific slip
     produced it."""
 
+    replaced_context: str | None = None
+    """#225 (ADR 0016): the judge's OWN ``new_context`` rewrite, kept here
+    for measurement ONLY when the interior-assertion re-ask verified an
+    INFORMANT ground and the engine therefore REPLACED it — the judge's
+    rewrite, read around a claim it does not own, states that claim as
+    unattributed fact in nearly every case (measured directly; an
+    attributed line placed beside it does not fix that), so the engine
+    substitutes its own attributed line instead (:attr:`new_context`
+    already carries the substitution — this field is what it would have
+    been). ``None`` whenever the re-ask never fires, or fires and verifies
+    anything other than informant."""
+
+    interior_assertion: dict | None = None
+    """#225 (ADR 0016), structured for measurement (the architect's live-gate
+    review): ``{"scopes": [id, ...], "class": <classification or None>,
+    "result": <result string>}`` whenever the interior-assertion re-ask
+    fired — ``None`` otherwise. ``class`` is ``None`` only for the "judge
+    failure" result (the re-ask's own answer was unreadable, so no
+    classification was ever read). The SAME fact the fixed marker on
+    :attr:`protocol_notes` already states in prose
+    ("interior assertion: <scopes>, <result>") — this is its structured
+    twin, so an eval trace can read it without parsing prose.
+
+    Re-gate follow-up: on an ADMITTED verdict only, carries the VERIFIED span
+    too — ``"span"`` (the informant span) for ``class == "informant"``, or
+    ``"act_span"`` for ``class == "conduct"`` — so the trace shows what was
+    actually accepted, not only that something was. Absent on every decline
+    and on every other classification."""
+
     @property
     def record_notes(self) -> str:
         """The verdict text written to the judgment record.
@@ -3458,6 +3568,150 @@ def _build_batch_user_message(
     )
 
 
+def _corrective_turn(previous_response, previous_block, text: str) -> list[dict]:  # noqa: ANN001
+    """Build the follow-up turn echoing the previous response plus *text*.
+
+    Pure and call-shape-agnostic (#225): used by every corrective re-ask
+    `_call_with_correctives` runs, AND by a `post_judgment` hook's own
+    follow-up call — hoisted to module level so a hook can build one without
+    reaching into `_call_with_correctives`'s own closure.
+    """
+    return [
+        {"role": "assistant", "content": previous_response.content},
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": previous_block.id,
+                    "content": "Received.",
+                },
+                {
+                    "type": "text",
+                    "text": text,
+                },
+            ],
+        },
+    ]
+
+
+def _match_other_scopes(content: str, candidates: Sequence[Scope]) -> list[Scope]:
+    """#225 (ADR 0016): every *candidate* scope whose id or name occurs in
+    *content* — word-bounded (``\\b``), case-insensitive, NO fuzzy or alias
+    matching (an explicit CEO condition: an alias like "the purchasing team"
+    for a scope named "procurement" does not match, by design — only a
+    literal occurrence of the id or name itself does).
+
+    Pure and reusable outside the judge call (the offline recall check runs
+    this directly against a dataset). *candidates* is the caller's own
+    `EntitlementView.others` — everything NOT already entitled (chain,
+    descendants, referenced peers); the caller never needs to separately
+    exclude this scope, its ancestors, or anything entitled, since those are
+    structurally absent from ``others`` already.
+    """
+    matched: list[Scope] = []
+    for candidate in candidates:
+        for needle in (candidate.id, candidate.name):
+            if not needle:
+                continue
+            if re.search(rf"\b{re.escape(needle)}\b", content, re.IGNORECASE):
+                matched.append(candidate)
+                break
+    return matched
+
+
+#: #225 (ADR 0016), the architect's live-gate review: a first-person marker,
+#: word-bounded, case-insensitive — what a genuine first-hand conduct
+#: observation or informant reference must still contain AFTER
+#: :func:`_strip_leading_frame` removes a leading attestation/perception
+#: frame (below). "our"/"ours" also catches "our order", not only "I"/"we".
+_FIRST_PERSON_RE = re.compile(r"\b(i|me|my|we|us|our|ours|myself|ourselves)\b", re.IGNORECASE)
+
+#: Philis's ruling (#225 re-gate, fix 4): the verb forms a `telling_span`
+#: must contain, word-bounded — exactly these listed forms, never stemmed
+#: ("say" does not match "says").
+_TELLING_VERBS = (
+    "told",
+    "tell",
+    "said",
+    "say",
+    "confirmed",
+    "informed",
+    "announced",
+    "mentioned",
+    "explained",
+    "warned",
+    "shared",
+    "sent",
+    "wrote",
+    "messaged",
+    "emailed",
+    "pinged",
+    "briefed",
+)
+_TELLING_VERB_RE = re.compile(r"\b(?:" + "|".join(_TELLING_VERBS) + r")\b", re.IGNORECASE)
+
+#: Articles stripped from a `telling_span` before the first-person-marker
+#: check only — narrower than `_OWN_ROLE_STRIP_WORDS` (no possessives, no
+#: "as"): a telling event's own addressee is what is being located here.
+_TELLING_ARTICLES = frozenset({"a", "an", "the"})
+
+#: The first-person markers a `telling_span` must contain, after stripping
+#: articles, for the contributor to be the telling's addressee or audience
+#: (Philis: "telling is conduct toward the contributor").
+_TELLING_FIRST_PERSON_WORDS = frozenset({"me", "us", "our", "we", "my", "i"})
+
+#: Philis's ruling: the verbs that introduce a claim ABOUT something rather
+#: than a dealing the contributor was PART OF — attestation ("I can tell you
+#: X") and perception ("I saw X") alike. Both frame a claim the speaker is
+#: merely RELAYING, which must not count as first-hand just because the
+#: frame itself happens to say "I" or "we" ("As eng-lead I can tell you
+#: procurement only approves..." — the "I" is the attestation, not a dealing;
+#: "I observed that procurement only approves..." — the "I" is the
+#: perception, not a dealing either).
+_FRAME_VERBS = (
+    "can tell you",
+    "know",
+    "knew",
+    "heard",
+    "hear",
+    "think",
+    "believe",
+    "guess",
+    "understand",
+    "was told",
+    "were told",
+    "saw",
+    "see",
+    "observed",
+    "observe",
+    "noticed",
+    "notice",
+    "watched",
+    "found",
+)
+
+#: A leading "fyi --"/"heads up --", then an optional "as <role>,", then a
+#: first-person subject ("I"/"we") plus one of :data:`_FRAME_VERBS`, then an
+#: optional "that" — stripped from the FRONT of a span only when the whole
+#: mandatory middle (subject + verb) actually matches; an ordinary sentence
+#: with no such frame is returned unchanged.
+_LEADING_FRAME_RE = re.compile(
+    r"^(?:fyi\s*--\s*|heads up\s*--\s*)?"
+    r"(?:as\s+[\w-]+,?\s*)?"
+    rf"(?:i|we)\s+(?:{'|'.join(re.escape(v) for v in _FRAME_VERBS)})\s*"
+    r"(?:that\s+)?",
+    re.IGNORECASE,
+)
+
+
+def _strip_leading_frame(text: str) -> str:
+    """#225: remove a leading attestation/perception frame from *text*, if
+    one is actually present — a no-op otherwise (the mandatory subject+verb
+    portion of :data:`_LEADING_FRAME_RE` never matches empty)."""
+    return _LEADING_FRAME_RE.sub("", text, count=1)
+
+
 # ---------------------------------------------------------------------------
 # ScopeManager
 # ---------------------------------------------------------------------------
@@ -3828,6 +4082,459 @@ class ScopeManager:
                 judge_failure=True,
             )
 
+        def _interior_assertion_failure_decline(detail: str) -> ScopeManagerJudgment:
+            """#225, #235's judge-failure pattern applied to this re-ask: a
+            missing or unreadable answer fails closed — never the judge's own
+            text, never a merits decline."""
+            return ScopeManagerJudgment(
+                decision="decline",
+                reasoning=(
+                    f"judge failure: the interior-assertion re-ask response was "
+                    f"unreadable ({detail}); declined without a verdict on the merits"
+                ),
+                new_summary=None,
+                change_id=change_id,
+                hop=hop,
+                judge_failure=True,
+            )
+
+        def _visible_ref_ids() -> set[str]:
+            """#225: every id a `publication`/`directive` classification may
+            cite — exactly what this call actually rendered to the judge, so
+            a cited id the judge was never shown cannot verify."""
+            ids: set[str] = set()
+            if current_summary is not None:
+                ids.update(d.id for d in current_summary.directives)
+            for _ancestor_id, directives in ancestor_directives or ():
+                ids.update(d.id for d in directives)
+            for _attachment_scope_id, items in operator_memory or ():
+                ids.update(item.id for item in items)
+            for items in (current_publication, *(p for _sid, p in peer_publications or ())):
+                if items:
+                    ids.update(item.id for item in items)
+            if parent_publication is not None:
+                ids.update(item.id for item in parent_publication[1])
+            return ids
+
+        def _check_interior_assertion(
+            judgment: ScopeManagerJudgment,
+            messages: list[dict],
+            response,  # noqa: ANN001 — Anthropic response
+            tool_use_block,  # noqa: ANN001 — Anthropic content block
+        ) -> ScopeManagerJudgment:
+            """#225 (ADR 0016): after an ORDINARY judgment ACCEPTS, verify any
+            fleet scope the contribution names that this scope is not
+            entitled to — one targeted re-ask, reusing the corrective
+            machinery's SHAPE (its own tool, the same system prompt) but
+            never its retry budget: one shot; an unreadable answer fails
+            closed (#235's pattern). A fixed marker note
+            ("interior assertion: <scopes>, <class>, <result>") is appended
+            to `protocol_notes` on every path below, so a trigger is always
+            countable in the record whatever it resolves to.
+            """
+            if judgment.decision not in ("accept_as_directive", "accept_as_context"):
+                return judgment
+            if entitlement is None:
+                return judgment
+            matched = _match_other_scopes(new_contribution.content, entitlement.others)
+            if not matched:
+                return judgment
+
+            names = ", ".join(f"{s.id} ({s.name})" for s in matched)
+            matched_ids = [s.id for s in matched]
+
+            def _noted(
+                updated: ScopeManagerJudgment,
+                classification: str | None,
+                result: str,
+                *,
+                span: str | None = None,
+                telling_span: str | None = None,
+                act_span: str | None = None,
+            ) -> ScopeManagerJudgment:
+                prose_class = classification if classification is not None else "unreadable"
+                interior_assertion: dict = {
+                    "scopes": matched_ids,
+                    "class": classification,
+                    "result": result,
+                }
+                # Architect's re-gate follow-up: the VERIFIED span(s), so the
+                # trace shows what was actually accepted — "span" (plus
+                # "telling_span", fix 4) for an admitted informant, "act_span"
+                # for admitted conduct. Never set on a decline: there is
+                # nothing verified to show.
+                if span is not None:
+                    interior_assertion["span"] = span
+                if telling_span is not None:
+                    interior_assertion["telling_span"] = telling_span
+                if act_span is not None:
+                    interior_assertion["act_span"] = act_span
+                return updated.model_copy(
+                    update={
+                        "protocol_notes": [
+                            *updated.protocol_notes,
+                            f"interior assertion: {names}, {prose_class}, {result}",
+                        ],
+                        "interior_assertion": interior_assertion,
+                    }
+                )
+
+            def _scope_name_for(scope_id: str) -> str | None:
+                """The best-effort name for *scope_id* from what this call
+                already has in hand — `scope` itself, or any group of
+                `entitlement` — never a fresh fleet lookup."""
+                if scope.id == scope_id:
+                    return scope.name
+                if entitlement is not None:
+                    for group in (
+                        entitlement.chain,
+                        entitlement.descendants,
+                        entitlement.referenced_peers,
+                        entitlement.others,
+                    ):
+                        for candidate in group:
+                            if candidate.id == scope_id:
+                                return candidate.name
+                return None
+
+            _OWN_ROLE_STRIP_WORDS = {"my", "our", "a", "an", "the", "as"}
+            # CEO ruling (via the architect): a collective noun — "team",
+            # "group", "department", "folks", "people" — is HELD OUT of the
+            # strip set for now. ADR 0016's informant is "a person OR PARTY
+            # who told the agent", and "the procurement team told us in
+            # Tuesday's sync" may be a legitimate party informant — Philis is
+            # still ruling on it. Only the bare id/name half of fix 4 ships
+            # here; do not add these words without a further instruction.
+            _OWN_ROLE_PRONOUNS = {"i", "me", "we", "us", "myself", "ourselves"}
+
+            def _remaining_tokens(span: str) -> list[str]:
+                """Normalise *span*, strip punctuation per token, and drop
+                :data:`_OWN_ROLE_STRIP_WORDS` — the first step of
+                :func:`_own_role_or_first_person`."""
+                normalized = " ".join(span.split()).casefold()
+                tokens = [re.sub(r"[^\w-]", "", t) for t in normalized.split()]
+                tokens = [t for t in tokens if t]
+                return [t for t in tokens if t not in _OWN_ROLE_STRIP_WORDS]
+
+            def _own_role_or_first_person(span: str) -> str | None:
+                """#225, narrowed per the architect's follow-up review: the
+                span must BE the contributor, not merely MENTION them.
+                "my colleague Lena Fischer" mentions a first-person
+                possessive but names a genuine third party, so a plain
+                CONTAINS check over-declines it. Instead: normalise, drop
+                possessive determiners/articles/"as", and reject only if
+                EVERY remaining word is the contributor's own skill, their
+                own scope id/name, or a bare first-person pronoun. Returns
+                the reason to decline with, or ``None`` if the span names a
+                genuine third party.
+                """
+                remaining = _remaining_tokens(span)
+                if not remaining:
+                    return None
+
+                skill = (new_contribution.contributor.skill or "").strip().casefold()
+                skill_tokens = set(skill.split())
+                contributor_scope_id = new_contribution.contributor.scope_id
+                contributor_scope_name = _scope_name_for(contributor_scope_id)
+                own_tokens: set[str] = set(skill_tokens)
+                for candidate in filter(None, (contributor_scope_id, contributor_scope_name)):
+                    own_tokens.update(candidate.casefold().split())
+                allowed = own_tokens | _OWN_ROLE_PRONOUNS
+
+                if all(t in allowed for t in remaining):
+                    return "the contributor's own role is not an informant"
+                return None
+
+            def _telling_span_problem(telling_span: str) -> str | None:
+                """#225 re-gate fix 4, Philis's ruling: a span that is only a
+                scope's own name/id or a collective ("procurement", "the
+                procurement team") is NOT automatically invented — ADR 0016's
+                informant is "a person OR PARTY who told the agent", and a
+                party can tell. What must verify instead is the TELLING EVENT
+                itself: ``telling_span``, a verbatim quote containing (b) a
+                telling verb, word-bounded, any of the listed forms only
+                (never stemmed), and (c), after stripping articles, a
+                first-person marker — the contributor is addressee or
+                audience, the same witness-or-party test conduct's own
+                frame-strip applies, because telling IS conduct toward the
+                contributor. Returns the full decline reasoning (sans the
+                "Declined: " prefix) on failure, or ``None`` once verified.
+                """
+                haystack = " ".join(new_contribution.content.split()).casefold()
+                normalized = " ".join(telling_span.split())
+                if not normalized or normalized.casefold() not in haystack:
+                    return (
+                        f"invented informant — the telling event {telling_span!r} does "
+                        "not occur in the contribution's own text."
+                    )
+                if not _TELLING_VERB_RE.search(normalized):
+                    return "no telling event is reported: state who told you."
+                tokens = [re.sub(r"[^\w-]", "", t) for t in normalized.casefold().split()]
+                tokens = [t for t in tokens if t and t not in _TELLING_ARTICLES]
+                if not any(t in _TELLING_FIRST_PERSON_WORDS for t in tokens):
+                    return "the telling names no one it was told to — state who was told."
+                return None
+
+            corrective_text = (
+                "Your accepted contribution names another fleet scope this scope "
+                f"is not entitled to: {names}. Call `classify_interior_assertion` "
+                "once, classifying what GROUNDS it per the admission check (ADR "
+                "0016): conduct (first-hand observation of that scope's CONDUCT), "
+                "informant (hearsay from an identifiable person or party who told "
+                "the agent — give the EXACT verbatim span naming them as "
+                "`informant_span`, and the EXACT verbatim span of the telling "
+                "event itself, naming the agent as the one told, as "
+                "`telling_span`), publication or directive (grounded in that "
+                "scope's own publication, or an ancestor directive/operator "
+                "memory item reaching this scope — give its id as `ref_id`), or "
+                "none (no ground at all)."
+            )
+            retry_messages = [
+                *messages,
+                *_corrective_turn(response, tool_use_block, corrective_text),
+            ]
+            try:
+                reask_response = self._client.messages.create(
+                    model=self._model,
+                    max_tokens=256,
+                    system=[
+                        {
+                            "type": "text",
+                            "text": _SYSTEM_PROMPT,
+                            "cache_control": {"type": "ephemeral"},
+                        }
+                    ],
+                    tools=[{**INTERIOR_ASSERTION_TOOL, "cache_control": {"type": "ephemeral"}}],
+                    tool_choice={
+                        "type": "tool",
+                        "name": INTERIOR_ASSERTION_TOOL["name"],
+                        "disable_parallel_tool_use": True,
+                    },
+                    messages=retry_messages,
+                )
+                reask_block = self._extract_tool_use_block(reask_response)
+                raw: dict = reask_block.input or {}
+                classification = raw.get("classification")
+                if classification not in (
+                    "conduct",
+                    "informant",
+                    "publication",
+                    "directive",
+                    "none",
+                ):
+                    raise ValueError(f"unreadable classification {classification!r}")
+                informant_span = raw.get("informant_span")
+                telling_span = raw.get("telling_span")
+                ref_id = raw.get("ref_id")
+                act_span = raw.get("act_span")
+                if classification == "informant" and not (
+                    isinstance(informant_span, str) and informant_span.strip()
+                ):
+                    raise ValueError("informant classification with no informant_span")
+                if classification == "informant" and not (
+                    isinstance(telling_span, str) and telling_span.strip()
+                ):
+                    raise ValueError("informant classification with no telling_span")
+                if classification in ("publication", "directive") and not (
+                    isinstance(ref_id, str) and ref_id.strip()
+                ):
+                    raise ValueError(f"{classification} classification with no ref_id")
+                if classification == "conduct" and not (
+                    isinstance(act_span, str) and act_span.strip()
+                ):
+                    raise ValueError("conduct classification with no act_span")
+            except Exception as exc:  # noqa: BLE001 — any slip here fails closed, #235's pattern
+                return _noted(
+                    _interior_assertion_failure_decline(f"{type(exc).__name__}: {exc}"),
+                    None,
+                    "judge failure",
+                )
+
+            if classification == "conduct":
+                # Philis's ruling: a witness or party, never a claim merely
+                # attested or perceived. The act_span must (a) occur in the
+                # contribution verbatim, and (b) AFTER stripping a leading
+                # attestation/perception frame, still contain a first-person
+                # marker — otherwise "As eng-lead I can tell you X" (or "I
+                # observed that X") would pass on the FRAME's own "I", never
+                # a dealing the contributor was part of.
+                haystack = " ".join(new_contribution.content.split()).casefold()
+                normalized_act_span = " ".join(act_span.split())
+                verbatim_ok = normalized_act_span.casefold() in haystack
+                remainder = _strip_leading_frame(normalized_act_span)
+                first_person_ok = verbatim_ok and bool(_FIRST_PERSON_RE.search(remainder))
+                if verbatim_ok and first_person_ok:
+                    return _noted(judgment, classification, "admitted as judged", act_span=act_span)
+                return _noted(
+                    judgment.model_copy(
+                        update={
+                            "decision": "decline",
+                            "new_summary": None,
+                            "directive_ops": [],
+                            "new_context": None,
+                            "reasoning": (
+                                "Declined: no observed act in the contributor's own "
+                                "dealings is stated."
+                            ),
+                        }
+                    ),
+                    classification,
+                    "declined (no observed act in own dealings)",
+                )
+
+            if classification == "none":
+                return _noted(
+                    judgment.model_copy(
+                        update={
+                            "decision": "decline",
+                            "new_summary": None,
+                            "directive_ops": [],
+                            "new_context": None,
+                            "reasoning": (
+                                "Manufactured attribution: no one spoke — no informant, "
+                                "not even one identified only by role, told the agent "
+                                "this, and no publication or directive here carries it."
+                            ),
+                        }
+                    ),
+                    classification,
+                    "declined (manufactured attribution)",
+                )
+
+            if classification in ("publication", "directive"):
+                if ref_id in _visible_ref_ids():
+                    return _noted(judgment, classification, "admitted as judged")
+                return _noted(
+                    judgment.model_copy(
+                        update={
+                            "decision": "decline",
+                            "new_summary": None,
+                            "directive_ops": [],
+                            "new_context": None,
+                            "reasoning": (
+                                f"Declined: the cited {classification} id {ref_id!r} is "
+                                "not visible to this scope — it names no publication, "
+                                "ancestor directive, or operator memory item this call "
+                                "actually rendered."
+                            ),
+                        }
+                    ),
+                    classification,
+                    "declined (ref not visible)",
+                )
+
+            # classification == "informant"
+            haystack = " ".join(new_contribution.content.split()).casefold()
+            needle = " ".join(informant_span.split()).casefold()
+            if not needle or needle not in haystack:
+                return _noted(
+                    judgment.model_copy(
+                        update={
+                            "decision": "decline",
+                            "new_summary": None,
+                            "directive_ops": [],
+                            "new_context": None,
+                            "reasoning": (
+                                f"Declined: invented informant — {informant_span!r} does "
+                                "not occur in the contribution's own text."
+                            ),
+                        }
+                    ),
+                    classification,
+                    "declined (invented informant)",
+                )
+            own_voice_reason = _own_role_or_first_person(informant_span)
+            if own_voice_reason is not None:
+                return _noted(
+                    judgment.model_copy(
+                        update={
+                            "decision": "decline",
+                            "new_summary": None,
+                            "directive_ops": [],
+                            "new_context": None,
+                            "reasoning": f"Declined: invented informant — {own_voice_reason}.",
+                        }
+                    ),
+                    classification,
+                    "declined (invented informant)",
+                )
+            telling_problem = _telling_span_problem(telling_span)
+            if telling_problem is not None:
+                return _noted(
+                    judgment.model_copy(
+                        update={
+                            "decision": "decline",
+                            "new_summary": None,
+                            "directive_ops": [],
+                            "new_context": None,
+                            "reasoning": f"Declined: {telling_problem}",
+                        }
+                    ),
+                    classification,
+                    (
+                        "declined (invented informant)"
+                        if telling_problem.startswith("invented informant")
+                        else "declined (no telling event)"
+                    ),
+                )
+            # Verified: ADR 0016 D1, hearsay from an identifiable informant.
+            # Admit as CONTEXT ONLY (never a directive — an informant's word
+            # is never a directive) and REPLACE the judge's own rewrite with
+            # the engine's attributed line: a judge's rewrite around a claim
+            # it does not own states that claim as unattributed fact in
+            # nearly every case, which an addition beside it does not fix.
+            previous_context = current_summary.context if current_summary is not None else ""
+            engine_line = (
+                f"{new_contribution.contributor.skill} ({new_contribution.contributor.scope_id}) "
+                f"reports that {informant_span} ({', '.join(s.id for s in matched)}) said: "
+                f"{new_contribution.content}"
+            )
+            replaced_context = (f"{previous_context}\n{engine_line}").strip()
+            # ADR 0016 D1: a directive changes only by its issuer's own act —
+            # an informant's word is never binding, so it may not admit
+            # (append/publish), remove (retire), or replace (supersede) one
+            # either. EVERY directive op this contribution motivated is
+            # dropped, not just the admitting ones: converting an orphaned
+            # `supersede` to a `retire` (an earlier version of this fix)
+            # still let an informant's hearsay remove a directive, which is
+            # the exact failure class this item closes elsewhere.
+            dropped_ops = list(judgment.directive_ops)
+            new_summary = _apply_amendment(
+                scope=scope,
+                current_summary=current_summary,
+                contribution=new_contribution,
+                ops=[],
+                new_context=replaced_context,
+            )
+            updated = judgment.model_copy(
+                update={
+                    "decision": "accept_as_context",
+                    "directive_ops": [],
+                    "new_context": replaced_context,
+                    "new_summary": new_summary,
+                    "replaced_context": judgment.new_context,
+                }
+            )
+            if dropped_ops:
+                updated = updated.model_copy(
+                    update={
+                        "protocol_notes": [
+                            *updated.protocol_notes,
+                            "Dropped directive op(s), an informant's word never "
+                            "binds a directive: "
+                            + ", ".join(op.describe() for op in dropped_ops)
+                            + ".",
+                        ]
+                    }
+                )
+            return _noted(
+                updated,
+                classification,
+                "admitted (context replaced)",
+                span=informant_span,
+                telling_span=telling_span,
+            )
+
         def _invalid_ops(judgment: ScopeManagerJudgment) -> list[DirectiveOp]:
             _, invalid = _partition_ops(judgment.directive_ops, current_summary)
             return invalid
@@ -3965,6 +4672,15 @@ class ScopeManager:
             parse_generic_decline=_generic_second_slip_decline,
             is_outcome_report=acted_on_target is not None,
             acted_on_is_directive=acted_on_target is not None and acted_on_target.is_directive,
+            # #225: ordinary contributions only — never an outcome report
+            # (its own narrowed tool/ground already covers that ground
+            # separately) and never a batch (single-path only this item;
+            # #236-shaped limit, stated in its own PR).
+            post_judgment=(
+                _check_interior_assertion
+                if acted_on_target is None and mode == "ordinary"
+                else None
+            ),
         )
 
     def _call_with_correctives(
@@ -3992,6 +4708,7 @@ class ScopeManager:
         parse_generic_decline: Callable[[Exception], _JudgmentT] | None = None,
         is_outcome_report: bool = False,
         acted_on_is_directive: bool = False,
+        post_judgment: Callable[[_JudgmentT, list[dict], object, object], _JudgmentT] | None = None,
     ) -> _JudgmentT:
         """Run one judgment call and its correctives, one retry each.
 
@@ -4014,6 +4731,18 @@ class ScopeManager:
         batch's several contributions each carry their own ``supersedes``,
         which the cumulative amendment's one ``new_context`` does not resolve
         to one target, so that path leaves them ``None``.
+
+        *post_judgment* (#225): run AFTER the overflow re-ask, before the
+        return — a caller's own, entirely separate follow-up exchange (its
+        own ``create`` call, its own tool), never threaded through this
+        function's own corrective machinery, so the FIRST call's tool/prompt
+        stay exactly what they were (input identity). Called with
+        ``(judgment, messages, response, tool_use_block)`` — the conversation
+        and the model's OWN latest turn, which already reflects the overflow
+        re-ask if that one fired — and returns the (possibly updated)
+        judgment. ``None`` (the default) skips this entirely, which is what
+        the batch path does (#225 is single-path only; #236-shaped limit,
+        stated in its own PR).
         """
         system: list[dict] = [
             {
@@ -4055,26 +4784,6 @@ class ScopeManager:
                     "The judge endpoint rejected the API key — check JUDGE_API_KEY "
                     "(or the deprecated ANTHROPIC_API_KEY / STRATA_ANTHROPIC_API_KEY)."
                 ) from exc
-
-        def _corrective_turn(previous_response, previous_block, text: str) -> list[dict]:  # noqa: ANN001
-            """Build the follow-up turn echoing the previous response plus *text*."""
-            return [
-                {"role": "assistant", "content": previous_response.content},
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": previous_block.id,
-                            "content": "Received.",
-                        },
-                        {
-                            "type": "text",
-                            "text": text,
-                        },
-                    ],
-                },
-            ]
 
         def _protocol_corrective(error: ValueError) -> str:
             """The correction text for one protocol slip (issue #201).
@@ -4149,6 +4858,12 @@ class ScopeManager:
 
         first_messages = [{"role": "user", "content": user_message}]
         response = _call(first_messages)
+        # #225: stays None whenever no attempt here ever produced a valid
+        # block to build a follow-up on (every path below that reaches a
+        # terminal judgment without one also returns a non-accepting
+        # judgment, so a post_judgment hook skips cleanly on a None here —
+        # see its own guard).
+        tool_use_block = None
         try:
             tool_use_block = self._extract_tool_use_block(response)
             judgment = parse(tool_use_block)
@@ -4437,6 +5152,12 @@ class ScopeManager:
                     second_judgment = None
                 if second_judgment is not None and second_judgment.new_summary is not None:
                     judgment = second_judgment
+                    # #225: so a post_judgment hook's own follow-up builds on
+                    # the model's ACTUAL latest turn, not the pre-overflow one
+                    # — replying to a stale tool_use id is invalid.
+                    first_messages = second_messages
+                    response = second_response
+                    tool_use_block = second_block
 
         if protocol_notes:
             # Issue #201: whichever judgment survived the correctives above
@@ -4445,6 +5166,9 @@ class ScopeManager:
             judgment = judgment.model_copy(
                 update={"protocol_notes": [*judgment.protocol_notes, *protocol_notes]}
             )
+
+        if post_judgment is not None:
+            judgment = post_judgment(judgment, first_messages, response, tool_use_block)
 
         return judgment
 
