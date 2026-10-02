@@ -126,6 +126,10 @@ def _new_publication_judgment_attempt_id() -> str:
     return f"pubja_{secrets.token_hex(8)}"
 
 
+def _new_claim_correction_id() -> str:
+    return f"cc_{secrets.token_hex(8)}"
+
+
 def _new_change_event_id() -> str:
     # ADR 0014 D5: the structured half of a `manager-refresh` contribution.
     # Distinct from the CHANGE ID it carries, which is minted by the writer of
@@ -566,6 +570,35 @@ class ClaimCarrierCheck:
 
 
 @dataclass(frozen=True)
+class ClaimCorrection:
+    """The claim and correcting text of ONE correction wave (restore act design).
+
+    Written once per correction — by :mod:`strata.app`, inside the same
+    :func:`strata.locks.scope_lock` the sweep itself runs under, right where
+    it already computes these two strings for
+    :func:`~strata.publication.propagate_claim_correction` /
+    :func:`~strata.publication.check_claim_carriers` — never once per
+    withdrawn item: one correction has one claim and one correcting text,
+    however many published items (and their relays) it withdraws under the
+    same ``change_id``/``claim_id``.
+
+    This is what a ``restore`` act's owner-path judge call is given
+    alongside the item itself (contract line 1), and what the Console's
+    "Correction withdrawals" view reads for its side-by-side row. Kept
+    independent of :class:`ClaimCarrierCheck`, which only ever gets rows for
+    #219 C's own judged classification — a verbatim-only correction has none.
+    """
+
+    id: str
+    change_id: str
+    claim_id: str
+    scope_id: str
+    corrected_claim_content: str
+    correcting_content: str
+    created_at: str
+
+
+@dataclass(frozen=True)
 class PublicationAct:
     """One act on a scope's publication — its curated outward face (ADR 0007 D1/D2).
 
@@ -596,11 +629,25 @@ class PublicationAct:
     including every act recorded before this migration (ADR 0013 D7 — no
     backfill; a pre-existing item reads as "not a relay", never invented
     history).
+
+    ``act == "restore"`` (migration 0021, the restore act) brings a
+    correction-withdrawn item back under its ORIGINAL id and bytes:
+    ``restores`` names the item id being restored (the withdraw act's own
+    ``withdraws`` target); ``trigger`` is that withdraw act's own id (the
+    reversed act, not an upstream item). ``restored_by``/``acknowledged``
+    live on the WITHDRAW act instead: ``restored_by`` is the id of the
+    ``restore`` act that reversed it, once one has (``None`` until then);
+    ``acknowledged`` is set when an operator reviews the withdrawal and
+    chooses to keep it (the Console's "keep withdrawn" action) without
+    restoring it. Both are on the withdraw act, not :class:`ClaimCarrierCheck`,
+    because a verbatim-sweep withdrawal never gets a row there at all — every
+    restorable withdrawal IS a withdraw act, so this is the one place both
+    methods (verbatim P4, #219 C ``carries``) can record it uniformly.
     """
 
     id: str
     scope_id: str
-    act: Literal["publish", "withdraw"]
+    act: Literal["publish", "withdraw", "restore"]
     kind: Literal["directive", "context"] | None
     content: str | None
     subject: str | None
@@ -612,6 +659,9 @@ class PublicationAct:
     origin_scope_id: str | None = None
     relay_scope_id: str | None = None
     relay_item_id: str | None = None
+    restores: str | None = None
+    restored_by: str | None = None
+    acknowledged: bool = False
 
 
 @dataclass(frozen=True)
@@ -719,6 +769,13 @@ class ChangeEvent:
     and stays composed into ``input_changes`` until a read delivers it. For
     every other event delivery and processing are the same moment, so the
     column is stamped at birth and decides nothing.
+
+    ``claim_id`` (migration 0021): the corrected claim's own id, for
+    ``kind in ("claim_corrected", "claim_restored")`` only — ``None`` for
+    every other kind, and for any row written before this migration (no
+    backfill). The join key a restore act uses to find the claim's own text
+    in :class:`ClaimCorrection`, and to identify a withdrawal as restorable
+    at all (see :func:`strata.publication.restorable_withdrawal`).
     """
 
     id: str
@@ -735,6 +792,7 @@ class ChangeEvent:
     created_at: str
     self_notice: int = 0
     shown_at: str | None = None
+    claim_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -2367,6 +2425,89 @@ class RecordStore:
         ).fetchall()
         return [ClaimCarrierCheck(**dict(row)) for row in rows]
 
+    def record_claim_correction(
+        self,
+        *,
+        change_id: str,
+        claim_id: str,
+        scope_id: str,
+        corrected_claim_content: str,
+        correcting_content: str,
+    ) -> ClaimCorrection:
+        """Record ONE correction wave's claim text and correcting text (restore act design).
+
+        Called once per correction — by :mod:`strata.app`, inside the same
+        :func:`strata.locks.scope_lock` the sweep itself runs under — never
+        once per withdrawn item (see :class:`ClaimCorrection`'s own
+        docstring for why). ``(change_id, claim_id)`` is not unique-enforced:
+        a caller that calls this twice for the same wave is a caller bug, not
+        a constraint this table polices, mirroring
+        :meth:`append_claim_carrier_checks`'s own stance.
+        """
+        row_id = _new_claim_correction_id()
+        self._conn.execute(
+            """
+            INSERT INTO claim_corrections (
+                id, change_id, claim_id, scope_id, corrected_claim_content, correcting_content
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (row_id, change_id, claim_id, scope_id, corrected_claim_content, correcting_content),
+        )
+        self._conn.commit()
+        row = self._conn.execute(
+            """
+            SELECT id, change_id, claim_id, scope_id, corrected_claim_content,
+                   correcting_content, created_at
+            FROM claim_corrections WHERE id = ?
+            """,
+            (row_id,),
+        ).fetchone()
+        return ClaimCorrection(**dict(row))
+
+    def get_claim_correction(self, *, claim_id: str, change_id: str) -> ClaimCorrection | None:
+        """Return the ``(claim_id, change_id)`` correction's claim/correcting text, or ``None``."""
+        row = self._conn.execute(
+            """
+            SELECT id, change_id, claim_id, scope_id, corrected_claim_content,
+                   correcting_content, created_at
+            FROM claim_corrections WHERE claim_id = ? AND change_id = ?
+            ORDER BY created_at ASC, rowid ASC LIMIT 1
+            """,
+            (claim_id, change_id),
+        ).fetchone()
+        return ClaimCorrection(**dict(row)) if row is not None else None
+
+    def list_change_events_by_change_id(
+        self, *, change_id: str, item_id: str | None = None, kind: str | None = None
+    ) -> list[ChangeEvent]:
+        """Return every scope's change-event row sharing *change_id*, across the fleet.
+
+        Unlike :meth:`list_change_events` (one scope's own events), this
+        reads ACROSS scopes — what a restore act needs to find exactly the
+        (reader scope, item) pairs that received a given correction's
+        ``claim_corrected`` notice, read from the original events rather than
+        recomputed from today's topology (restore act design, point 8).
+        """
+        clauses = ["change_id = ?"]
+        params: list[str] = [change_id]
+        if item_id is not None:
+            clauses.append("item_id = ?")
+            params.append(item_id)
+        if kind is not None:
+            clauses.append("kind = ?")
+            params.append(kind)
+        rows = self._conn.execute(
+            f"""
+            SELECT id, change_id, contribution_id, scope_id, source_scope_id, item_id, kind,
+                   before, after, hop, processed_at, created_at, self_notice, shown_at, claim_id
+            FROM change_events
+            WHERE {" AND ".join(clauses)}
+            ORDER BY created_at ASC, rowid ASC
+            """,
+            params,
+        ).fetchall()
+        return [ChangeEvent(**dict(row)) for row in rows]
+
     # ------------------------------------------------------------------
     # Publication acts + judgments (ADR 0007 D1/D2) — the publication
     # channel's own record, distinct from a scope's contribution record.
@@ -2376,7 +2517,7 @@ class RecordStore:
         self,
         *,
         scope_id: str,
-        act: Literal["publish", "withdraw"],
+        act: Literal["publish", "withdraw", "restore"],
         kind: Literal["directive", "context"] | None,
         content: str | None,
         subject: str | None,
@@ -2387,8 +2528,9 @@ class RecordStore:
         origin_scope_id: str | None = None,
         relay_scope_id: str | None = None,
         relay_item_id: str | None = None,
+        restores: str | None = None,
     ) -> PublicationAct:
-        """Append a publish or withdraw act to *scope_id*'s publication record.
+        """Append a publish, withdraw, or restore act to *scope_id*'s publication record.
 
         This is the raw record append — the caller judges (or, for
         mechanical propagation, mechanically decides) separately and records
@@ -2422,13 +2564,16 @@ class RecordStore:
             relay_item_id: ADR 0013 D4 — the ``pub_`` id, in
                        *relay_scope_id*'s publication, of the item this copy
                        relays. ``None`` unless *origin_scope_id* is also set.
+            restores:  For ``act == 'restore'`` (migration 0021): the ``pub_``
+                       id of the item being brought back — the withdraw act's
+                       own ``withdraws`` target. ``None`` otherwise.
 
         Returns:
             The newly appended :class:`PublicationAct`.
 
         Raises:
-            sqlite3.IntegrityError: If *withdraws* references a non-existent
-                publication act.
+            sqlite3.IntegrityError: If *withdraws*/*restores* references a
+                non-existent publication act.
         """
         act_id = _new_publication_act_id()
         anchors_json = json.dumps(anchors) if anchors is not None else None
@@ -2437,8 +2582,8 @@ class RecordStore:
             INSERT INTO publication_acts (
                 id, scope_id, act, kind, content, subject, anchors, withdraws, "trigger",
                 proposer_scope_id, proposer_skill, proposer_session_id, proposer_ts,
-                origin_scope_id, relay_scope_id, relay_item_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                origin_scope_id, relay_scope_id, relay_item_id, restores
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 act_id,
@@ -2457,6 +2602,7 @@ class RecordStore:
                 origin_scope_id,
                 relay_scope_id,
                 relay_item_id,
+                restores,
             ),
         )
         self._conn.commit()
@@ -2468,7 +2614,8 @@ class RecordStore:
             """
             SELECT id, scope_id, act, kind, content, subject, anchors, withdraws,
                    "trigger", proposer_scope_id, proposer_skill, proposer_session_id,
-                   proposer_ts, created_at, origin_scope_id, relay_scope_id, relay_item_id
+                   proposer_ts, created_at, origin_scope_id, relay_scope_id, relay_item_id,
+                   restores, restored_by, acknowledged
             FROM publication_acts
             WHERE scope_id = ?
             ORDER BY created_at ASC, rowid ASC
@@ -2489,7 +2636,8 @@ class RecordStore:
             """
             SELECT id, scope_id, act, kind, content, subject, anchors, withdraws,
                    "trigger", proposer_scope_id, proposer_skill, proposer_session_id,
-                   proposer_ts, created_at, origin_scope_id, relay_scope_id, relay_item_id
+                   proposer_ts, created_at, origin_scope_id, relay_scope_id, relay_item_id,
+                   restores, restored_by, acknowledged
             FROM publication_acts WHERE id = ?
             """,
             (act_id,),
@@ -2497,6 +2645,59 @@ class RecordStore:
         if row is None:
             raise KeyError(f"Publication act not found: {act_id!r}")
         return _publication_act_from_row(row)
+
+    def find_publication_acts_by_trigger(self, trigger_id: str) -> list[PublicationAct]:
+        """Return every publication act, in ANY scope, whose ``trigger`` is *trigger_id*.
+
+        Unlike :meth:`list_publication_acts` (one scope's own acts), this
+        reads ACROSS scopes — what a restore act's relay cascade needs to
+        find every relay withdrawal a given item's own withdrawal caused
+        (:func:`~strata.publication._cascade_withdraw_relays` sets ``trigger``
+        to the upstream item's own id at every hop), reconstructed from the
+        record rather than scanned from today's live publications, which no
+        longer hold what was withdrawn.
+        """
+        rows = self._conn.execute(
+            """
+            SELECT id, scope_id, act, kind, content, subject, anchors, withdraws,
+                   "trigger", proposer_scope_id, proposer_skill, proposer_session_id,
+                   proposer_ts, created_at, origin_scope_id, relay_scope_id, relay_item_id,
+                   restores, restored_by, acknowledged
+            FROM publication_acts
+            WHERE "trigger" = ?
+            ORDER BY created_at ASC, rowid ASC
+            """,
+            (trigger_id,),
+        ).fetchall()
+        return [_publication_act_from_row(row) for row in rows]
+
+    def mark_withdraw_restored(self, *, withdraw_act_id: str, restore_act_id: str) -> None:
+        """Stamp *withdraw_act_id* with the id of the ``restore`` act that reversed it.
+
+        Idempotent: an already-restored withdraw act (``restored_by`` already
+        set) is left unchanged rather than overwritten — a withdraw act is
+        restored at most once; a second restore attempt is a structural error
+        the caller checks before getting here, not papered over silently.
+        """
+        self._conn.execute(
+            """
+            UPDATE publication_acts
+            SET restored_by = ?
+            WHERE id = ? AND restored_by IS NULL
+            """,
+            (restore_act_id, withdraw_act_id),
+        )
+        self._conn.commit()
+
+    def acknowledge_withdraw(self, withdraw_act_id: str) -> None:
+        """Mark *withdraw_act_id* reviewed and kept withdrawn (the Console's
+        "keep withdrawn" action) — hides it from the "to review" filter
+        without restoring it. Idempotent."""
+        self._conn.execute(
+            "UPDATE publication_acts SET acknowledged = 1 WHERE id = ?",
+            (withdraw_act_id,),
+        )
+        self._conn.commit()
 
     def record_publication_judgment(
         self,
@@ -2694,6 +2895,7 @@ class RecordStore:
         before: str | None = None,
         after: str | None = None,
         hop: int = 0,
+        claim_id: str | None = None,
     ) -> ChangeEvent:
         """Append the structured half of an input-change notice (ADR 0014 D5).
 
@@ -2724,6 +2926,9 @@ class RecordStore:
                              withdrawal no after.
             hop:             Derived hops from the originating change, for ADR
                              0014 D4's backstop budget.
+            claim_id:        The corrected claim's own id (migration 0021),
+                             for ``kind in ("claim_corrected", "claim_restored")``
+                             only — ``None`` for every other kind.
 
         Returns:
             The newly appended :class:`ChangeEvent`, unprocessed.
@@ -2742,6 +2947,7 @@ class RecordStore:
             before=before,
             after=after,
             hop=hop,
+            claim_id=claim_id,
         )
         self._conn.commit()
         return self._fetch_change_event(event_id)
@@ -2760,6 +2966,7 @@ class RecordStore:
         hop: int,
         processed: bool = False,
         awaiting_show: bool = False,
+        claim_id: str | None = None,
     ) -> str:
         """INSERT one change-event row and return its id. Does NOT commit.
 
@@ -2779,11 +2986,12 @@ class RecordStore:
             """
             INSERT INTO change_events
             (id, change_id, contribution_id, scope_id, source_scope_id, item_id, kind,
-             before, after, hop, processed_at, self_notice, shown_at)
+             before, after, hop, processed_at, self_notice, shown_at, claim_id)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                     CASE WHEN ? THEN datetime('now') ELSE NULL END,
                     ?,
-                    CASE WHEN ? THEN NULL ELSE datetime('now') END)
+                    CASE WHEN ? THEN NULL ELSE datetime('now') END,
+                    ?)
             """,
             (
                 event_id,
@@ -2803,6 +3011,7 @@ class RecordStore:
                 processed,
                 awaiting_show,
                 awaiting_show,
+                claim_id,
             ),
         )
         return event_id
@@ -2822,6 +3031,7 @@ class RecordStore:
         hop: int = 0,
         processed: bool = False,
         awaiting_show: bool = False,
+        claim_id: str | None = None,
     ) -> tuple[Contribution, ChangeEvent]:
         """Append a change notice — both halves of one event — atomically.
 
@@ -2884,6 +3094,7 @@ class RecordStore:
                 hop=hop,
                 processed=processed,
                 awaiting_show=awaiting_show,
+                claim_id=claim_id,
             )
         return self._fetch_contribution(contribution_id), self._fetch_change_event(event_id)
 
@@ -2903,7 +3114,7 @@ class RecordStore:
         """
         sql = """
             SELECT id, change_id, contribution_id, scope_id, source_scope_id, item_id, kind,
-                   before, after, hop, processed_at, created_at, self_notice, shown_at
+                   before, after, hop, processed_at, created_at, self_notice, shown_at, claim_id
             FROM change_events
             WHERE scope_id = ?
         """
@@ -2967,7 +3178,7 @@ class RecordStore:
         row = self._conn.execute(
             """
             SELECT id, change_id, contribution_id, scope_id, source_scope_id, item_id, kind,
-                   before, after, hop, processed_at, created_at, self_notice, shown_at
+                   before, after, hop, processed_at, created_at, self_notice, shown_at, claim_id
             FROM change_events WHERE id = ?
             """,
             (event_id,),
@@ -3381,4 +3592,5 @@ def _publication_act_from_row(row: sqlite3.Row) -> PublicationAct:
     anchors_json = d.pop("anchors")
     anchors = json.loads(anchors_json) if anchors_json is not None else None
     trigger = d.pop("trigger")
+    d["acknowledged"] = bool(d.pop("acknowledged"))
     return PublicationAct(**d, anchors=anchors, trigger=trigger, proposer=proposer)

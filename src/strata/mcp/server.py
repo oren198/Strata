@@ -91,7 +91,13 @@ from strata.project_config import (
     load_project_config,
     resolve_storage_paths,
 )
-from strata.publication import PublishedItem, propose_publish, propose_withdraw, read_publication
+from strata.publication import (
+    PublishedItem,
+    propose_publish,
+    propose_restore,
+    propose_withdraw,
+    read_publication,
+)
 from strata.record_store import ContributorRef, RecordStore
 from strata.session_state import (
     SessionState,
@@ -2928,6 +2934,92 @@ async def strata_withdraw(item_id: str) -> dict:
         outcome = propose_withdraw(
             agent_scope,
             item_id,
+            proposer,
+            fleet=fleet,
+            record_store=_record_store,
+            summary_store=_summary_store,
+            scope_manager=manager,
+        )
+    except (ValueError, KeyError) as exc:
+        raise RuntimeError(str(exc)) from exc
+
+    return _attach_fleet_notice(
+        {
+            "act_id": outcome.act_id,
+            "judgment": {
+                "decision": outcome.decision,
+                "reasoning": outcome.reasoning,
+                "artifact_updated": outcome.artifact_updated,
+            },
+        }
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tool: strata_restore
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+@_with_read_signal
+async def strata_restore(item_id: str, reason: str | None = None) -> dict:
+    """Propose restoring a published item this scope's own correction sweep wrongly
+    withdrew — under its ORIGINAL id and bytes.
+
+    Only a withdrawal a correction sweep made — the verbatim sweep, or the
+    owner-judge's own paraphrase-carrier decision, at any hop of either
+    one's relay cascade — can be restored this way; a deliberate
+    ``strata_withdraw`` is re-published instead. Judged through the same
+    publication judge (ADR 0007 D2): the structural test only — still
+    believed by this scope's CURRENT memory, and does not re-assert the
+    refuted claim. A decline leaves the item withdrawn.
+
+    On accept: the item returns under its original id, with its original
+    bytes; every relay copy the withdrawal cascaded to comes back too,
+    unless the relaying scope's own judge has acted on the correction since
+    (then that scope gets the evidence instead, and decides for itself);
+    and exactly the readers who got the original false notice are told it
+    was wrong.
+
+    Args:
+        item_id: The ``pub_``-prefixed id of the withdrawn item to restore.
+        reason: Optional free-text note for the record.
+
+    Returns:
+        ``act_id`` and ``judgment`` (``decision``: ``"accept"``/``"decline"``,
+        ``reasoning``, ``artifact_updated``).
+
+    Raises:
+        RuntimeError: The bound scope is unknown; *item_id* has no withdraw
+            act on record in this scope; it was not withdrawn by a
+            correction sweep (a deliberate withdrawal — re-publish it
+            instead); or it was already restored.
+    """
+    await _require_bound_or_elicit()
+
+    agent_scope, agent_skill, agent_session_id = _AGENT_SCOPE, _AGENT_SKILL, _AGENT_SESSION_ID
+
+    fleet = _load_fleet()
+
+    scope = fleet.get_scope(agent_scope)
+    if scope is None:
+        raise RuntimeError(f"Your bound scope {agent_scope!r} was not found in the fleet config.")
+
+    ts = datetime.now(UTC).isoformat()
+    proposer = ContributorRef(
+        scope_id=agent_scope,
+        skill=agent_skill,
+        session_id=agent_session_id,
+        ts=ts,
+    )
+
+    manager = _build_scope_manager()
+
+    try:
+        outcome = propose_restore(
+            agent_scope,
+            item_id,
+            reason,
             proposer,
             fleet=fleet,
             record_store=_record_store,

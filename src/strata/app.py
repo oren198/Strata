@@ -1248,6 +1248,18 @@ def _write_amendment(
     #     whatever the judge already withdrew above — one notice per reader
     #     either way, and the record shows which path closed it.
     if withdraw_corrected_claim_content is not None:
+        # Restore act design, point 2: the claim's own text and the
+        # correcting text, once per change id in this wave — never once per
+        # withdrawn item. Written inside the same lock the sweep itself
+        # runs under (this function's own caller already holds it).
+        for restore_change_id in change_ids:
+            record_store.record_claim_correction(
+                change_id=restore_change_id,
+                claim_id=withdraw_correcting_claim_id or "",
+                scope_id=scope.id,
+                corrected_claim_content=withdraw_corrected_claim_content,
+                correcting_content=withdraw_correcting_after or "",
+            )
         verbatim_withdrawn = propagate_claim_correction(
             scope.id,
             claim_id=withdraw_correcting_claim_id or "",
@@ -2594,6 +2606,15 @@ def drain_scope(
         for event in events:
             if event.kind != "claim_corrected":
                 continue
+            # Restore act design, point 2 — same write as the same-scope
+            # site above, once per (drained) change id.
+            record_store.record_claim_correction(
+                change_id=event.change_id,
+                claim_id=event.item_id,
+                scope_id=scope.id,
+                corrected_claim_content=event.before or "",
+                correcting_content=event.after or "",
+            )
             verbatim_withdrawn = propagate_claim_correction(
                 scope.id,
                 claim_id=event.item_id,

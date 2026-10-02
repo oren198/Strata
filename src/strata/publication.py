@@ -96,9 +96,17 @@ from typing import TYPE_CHECKING, Literal
 
 import yaml
 
+from strata.change_events import CLAIM_CORRECTED, emit_restore_notice, new_change_id
 from strata.change_events import emit as emit_change_event
 from strata.locks import scope_lock
-from strata.record_store import JUDGE_FAILED, ContributorRef, RecordStore
+from strata.record_store import (
+    JUDGE_FAILED,
+    ClaimCarrierCheck,
+    ClaimCorrection,
+    ContributorRef,
+    PublicationAct,
+    RecordStore,
+)
 
 if TYPE_CHECKING:
     from strata.fleet_config import FleetConfig
@@ -149,7 +157,7 @@ class PublicationOutcome:
     """The result of proposing (and judging) a publish or withdraw act."""
 
     act_id: str
-    act: Literal["publish", "withdraw"]
+    act: Literal["publish", "withdraw", "restore"]
     decision: Literal["accept", "decline"]
     reasoning: str
     artifact_updated: bool
@@ -1077,6 +1085,539 @@ def _cascade_withdraw_relays(
                 correcting_after=correcting_after,
                 correcting_claim_id=correcting_claim_id,
             )
+
+
+# ---------------------------------------------------------------------------
+# The restore act (companion to #219 C) — undoes a published item wrongly
+# withdrawn by a correction sweep (verbatim P4, #219 C `carries`, or either
+# one's relay cascade), under its original id and bytes, telling exactly the
+# readers who got the false notice that it was false.
+# ---------------------------------------------------------------------------
+
+
+def restorable_withdrawal(
+    scope_id: str, item_id: str, *, record_store: RecordStore
+) -> tuple[str, list[str]] | None:
+    """Is *item_id*, as it stood in *scope_id*, restorable — i.e. withdrawn by a
+    correction sweep (verbatim P4 or #219 C ``carries``, at any hop of either
+    one's relay cascade)?
+
+    Detected mechanically from what #221/#219 C already write: a
+    ``claim_corrected`` SELF-notice (issue #197) always lands on the scope
+    that just lost the item, at every hop of the cascade — never for a
+    deliberate :func:`propose_withdraw` or a directive-removal propagation,
+    neither of which ever emits ``claim_corrected``. No new bookkeeping
+    needed to tell restorable from not.
+
+    Returns ``(claim_id, change_ids)`` — the corrected claim's own id, and
+    every distinct change id this item's correction was recorded under (a
+    coalesced refresh may have inherited several, ADR 0014 D4) — or ``None``
+    if *item_id* was never withdrawn by a correction at all.
+    """
+    events = [
+        e
+        for e in record_store.list_change_events(scope_id=scope_id)
+        if e.self_notice and e.kind == CLAIM_CORRECTED and e.item_id == item_id
+    ]
+    if not events:
+        return None
+    claim_id = events[0].claim_id or ""
+    change_ids = list(dict.fromkeys(e.change_id for e in events))
+    return claim_id, change_ids
+
+
+def _find_withdraw_act(
+    scope_id: str, item_id: str, *, record_store: RecordStore
+) -> PublicationAct | None:
+    """The withdraw act that removed *item_id* from *scope_id*'s publication, if any."""
+    for act in record_store.list_publication_acts(scope_id=scope_id):
+        if act.act == "withdraw" and act.withdraws == item_id:
+            return act
+    return None
+
+
+def _resolve_claim_correction(
+    claim_id: str, change_ids: Sequence[str], *, record_store: RecordStore
+) -> ClaimCorrection:
+    for change_id in change_ids:
+        correction = record_store.get_claim_correction(claim_id=claim_id, change_id=change_id)
+        if correction is not None:
+            return correction
+    raise KeyError(
+        f"No recorded claim correction found for claim {claim_id!r} under any of "
+        f"{change_ids!r} — restore act design point 2 should have written one at "
+        "correction time."
+    )
+
+
+def _published_item_from_act(act: PublicationAct) -> PublishedItem:
+    """Rebuild a :class:`PublishedItem` from the ORIGINAL ``publish`` act it came
+    from — this is what makes a restore's reinsertion byte-identical: the same
+    stored content, never a copy that could drift."""
+    return PublishedItem(
+        id=act.id,
+        kind=act.kind,  # type: ignore[arg-type]
+        content=act.content or "",
+        subject=act.subject,
+        anchors=act.anchors or [],
+        published_at=act.created_at,
+        origin_scope_id=act.origin_scope_id,
+        relay_scope_id=act.relay_scope_id,
+        relay_item_id=act.relay_item_id,
+    )
+
+
+def _relay_rejudged_since_withdrawal(
+    relay_scope_id: str,
+    origin_item_id: str,
+    change_ids: Sequence[str],
+    *,
+    record_store: RecordStore,
+) -> bool:
+    """Has *relay_scope_id*'s own judge PROCESSED (drained) the ``claim_corrected``
+    notice for *origin_item_id* under any of *change_ids* (contract line 4)?
+
+    A relaying scope is, by ADR 0013 D3 construction, a one-hop topological
+    reader of the scope it relayed from — the only way its judge could have
+    seen *origin_item_id* to relay it in the first place — so it receives an
+    ORDINARY (non-self-notice) ``claim_corrected`` event for *origin_item_id*
+    exactly as any other reader does, stamped ``processed_at`` only once its
+    own refresh actually drains it. That is the signal: not the self-notice
+    of the relay copy's OWN withdrawal, which is born processed at birth
+    (issue #197) and says nothing about whether this scope's judge acted.
+    """
+    for event in record_store.list_change_events(scope_id=relay_scope_id):
+        if (
+            not event.self_notice
+            and event.kind == CLAIM_CORRECTED
+            and event.item_id == origin_item_id
+            and event.change_id in change_ids
+            and event.processed_at is not None
+        ):
+            return True
+    return False
+
+
+def _restore_item_in_scope(
+    scope_id: str,
+    item: PublishedItem,
+    *,
+    withdraw_act_id: str,
+    fleet: FleetConfig,
+    record_store: RecordStore,
+    summaries_dir: str,
+    held_scope_id: str,
+) -> None:
+    """Re-insert *item* into *scope_id*'s live publication, record the ``restore``
+    act, and mark the withdraw act it reverses. Runs under *scope_id*'s own
+    lock unless it is *held_scope_id* (already locked by the outer caller —
+    mirrors :func:`_cascade_withdraw_relays`'s own re-entrancy rule)."""
+
+    def _do() -> None:
+        current = read_publication(scope_id, summaries_dir=summaries_dir)
+        if any(i.id == item.id for i in current):
+            return  # already present — a retried/duplicate cascade step, not an error
+        current.append(item)
+        _write_publication(scope_id, current, summaries_dir=summaries_dir)
+        restore_act = record_store.append_publication_act(
+            scope_id=scope_id,
+            act="restore",
+            kind=None,
+            content=None,
+            subject=None,
+            anchors=None,
+            withdraws=None,
+            trigger=withdraw_act_id,
+            proposer=_mechanical_proposer(scope_id),
+            restores=item.id,
+        )
+        record_store.mark_withdraw_restored(
+            withdraw_act_id=withdraw_act_id, restore_act_id=restore_act.id
+        )
+
+    if scope_id == held_scope_id:
+        _do()
+    else:
+        with scope_lock(scope_id):
+            _do()
+
+
+def _restore_relay_cascade(
+    item_id: str,
+    *,
+    claim_id: str,
+    change_ids: Sequence[str],
+    fleet: FleetConfig,
+    record_store: RecordStore,
+    summaries_dir: str,
+    held_scope_id: str,
+    notified_items: set[str],
+) -> None:
+    """Mirror of :func:`_cascade_withdraw_relays`, driven by the RECORD rather
+    than today's live publications (the relay copies are gone) — every
+    ``withdraw`` act anywhere whose own ``trigger`` is *item_id* is one relay
+    hop downstream of it.
+
+    Each hop restores mechanically unless
+    :func:`_relay_rejudged_since_withdrawal` says that relaying scope's
+    standing changed since (contract line 4) — in which case this branch
+    stops: no mechanical restore, no further descent (there is nothing to
+    cascade FROM if the relay was never recreated). Every item id this walk
+    reaches — restored or not — is queued in *notified_items* for a single
+    ``claim_restored`` emission per id at the end (point 8 handles the
+    "evidence either way" case uniformly: a scope that stopped the cascade
+    still gets the notice, exactly like a scope that only ever read the
+    correction and never itself relayed).
+    """
+    for withdraw_act in record_store.find_publication_acts_by_trigger(item_id):
+        if withdraw_act.act != "withdraw" or withdraw_act.withdraws is None:
+            continue
+        relay_scope_id = withdraw_act.scope_id
+        relay_item_id = withdraw_act.withdraws
+        notified_items.add(relay_item_id)
+        if _relay_rejudged_since_withdrawal(
+            relay_scope_id, item_id, change_ids, record_store=record_store
+        ):
+            continue
+        original_relay_act = record_store.get_publication_act(relay_item_id)
+        if original_relay_act is None:
+            continue
+        _restore_item_in_scope(
+            relay_scope_id,
+            _published_item_from_act(original_relay_act),
+            withdraw_act_id=withdraw_act.id,
+            fleet=fleet,
+            record_store=record_store,
+            summaries_dir=summaries_dir,
+            held_scope_id=held_scope_id,
+        )
+        _restore_relay_cascade(
+            relay_item_id,
+            claim_id=claim_id,
+            change_ids=change_ids,
+            fleet=fleet,
+            record_store=record_store,
+            summaries_dir=summaries_dir,
+            held_scope_id=held_scope_id,
+            notified_items=notified_items,
+        )
+
+
+def _render_restore_notice(item_id: str, reversed_change_id: str, content: str) -> str:
+    """Contract line 2: the owner's act, naming the earlier notice as wrong —
+    never the engine's confession, since the ``carries`` call that withdrew
+    it (if #219 C) was the owner's own judge's."""
+    return (
+        f"[Restore — item {item_id} is restored by its owner.]\n"
+        f"- the earlier notice ({reversed_change_id}) saying this item carried the "
+        "refuted claim was wrong.\n"
+        "- the correction of the refuted claim itself is unchanged and still stands.\n"
+        f"- restored content:\n    {content}\n"
+    )
+
+
+def _apply_restore(
+    origin_item_id: str,
+    origin_withdraw_act: PublicationAct,
+    restore_act_id: str,
+    original_item: PublishedItem,
+    *,
+    claim_id: str,
+    change_ids: Sequence[str],
+    fleet: FleetConfig,
+    record_store: RecordStore,
+    summaries_dir: str,
+    held_scope_id: str,
+) -> None:
+    """Everything an ACCEPTED restore (owner or operator path) does, after the
+    (optional) judgment is already recorded: reinsert the origin item,
+    cascade to its relays per contract line 4, then notify (contract lines
+    2/3/6) every item id the walk touched, mechanically restored or not.
+    """
+    current = read_publication(held_scope_id, summaries_dir=summaries_dir)
+    if not any(i.id == original_item.id for i in current):
+        current.append(original_item)
+        _write_publication(held_scope_id, current, summaries_dir=summaries_dir)
+    record_store.mark_withdraw_restored(
+        withdraw_act_id=origin_withdraw_act.id, restore_act_id=restore_act_id
+    )
+
+    notified_items: set[str] = {origin_item_id}
+    _restore_relay_cascade(
+        origin_item_id,
+        claim_id=claim_id,
+        change_ids=change_ids,
+        fleet=fleet,
+        record_store=record_store,
+        summaries_dir=summaries_dir,
+        held_scope_id=held_scope_id,
+        notified_items=notified_items,
+    )
+
+    restore_change_id = new_change_id()
+    content = _render_restore_notice(origin_item_id, change_ids[0], original_item.content)
+    for item_id in notified_items:
+        emit_restore_notice(
+            record_store=record_store,
+            item_id=item_id,
+            original_change_ids=change_ids,
+            restore_change_id=restore_change_id,
+            claim_id=claim_id,
+            content=content,
+        )
+
+
+def propose_restore(
+    scope_id: str,
+    item_id: str,
+    reason: str | None,
+    proposer: ContributorRef,
+    *,
+    fleet: FleetConfig,
+    record_store: RecordStore,
+    summary_store: SummaryStore,
+    scope_manager: ScopeManager,
+) -> PublicationOutcome:
+    """Propose restoring a correction-withdrawn published item (owner path, judged).
+
+    Same order-of-operations shape as :func:`propose_withdraw`: the act is
+    appended to the record BEFORE the scope-manager is invoked. Judged
+    through :meth:`~strata.scope_manager.ScopeManager.judge_publication`
+    (``act_kind='restore'``) — the structural test only (contract line 1):
+    still believed by *scope_id*'s CURRENT memory, and does not re-assert the
+    refuted claim. A decline leaves the item withdrawn; the operator path is
+    the escape (design point 2).
+
+    Raises:
+        ValueError: *scope_id* is not found in *fleet*; *item_id* was not
+            withdrawn by a correction sweep (restorable_withdrawal is
+            ``None`` — a deliberate withdrawal is re-published, not restored
+            this way); or it was already restored.
+        KeyError: no withdraw act is on record for *item_id*, or no
+            :class:`~strata.record_store.ClaimCorrection` row exists for its
+            claim (should always exist by design point 2 — a missing row is
+            a bug upstream, not a user error).
+    """
+    scope = fleet.get_scope(scope_id)
+    if scope is None:
+        raise ValueError(f"Scope not found: {scope_id!r}")
+
+    with scope_lock(scope_id):
+        withdraw_act = _find_withdraw_act(scope_id, item_id, record_store=record_store)
+        if withdraw_act is None:
+            raise KeyError(f"No withdraw act found for item {item_id!r} in scope {scope_id!r}.")
+        if withdraw_act.restored_by is not None:
+            raise ValueError(f"Item {item_id!r} has already been restored.")
+        restorable = restorable_withdrawal(scope_id, item_id, record_store=record_store)
+        if restorable is None:
+            raise ValueError(
+                f"Item {item_id!r} was not withdrawn by a correction sweep — only a "
+                "sweep withdrawal (verbatim or #219 C) can be restored this way. A "
+                "deliberate withdrawal is re-published instead."
+            )
+        claim_id, change_ids = restorable
+        correction = _resolve_claim_correction(claim_id, change_ids, record_store=record_store)
+        original_act = record_store.get_publication_act(withdraw_act.withdraws)  # type: ignore[arg-type]
+        if original_act is None:
+            raise KeyError(f"Original publish act {withdraw_act.withdraws!r} not found.")
+        restore_item = _published_item_from_act(original_act)
+
+        current_summary = summary_store.read(scope_id)
+        current_publication = read_publication(
+            scope_id, summaries_dir=str(summary_store.summaries_dir)
+        )
+
+        act = record_store.append_publication_act(
+            scope_id=scope_id,
+            act="restore",
+            kind=None,
+            content=None,
+            subject=None,
+            anchors=None,
+            withdraws=None,
+            trigger=withdraw_act.id,
+            proposer=proposer,
+            restores=item_id,
+        )
+
+        from strata.operator import operator_memory_binding
+
+        operator_memory = operator_memory_binding(
+            scope_id, fleet=fleet, summaries_dir=str(summary_store.summaries_dir)
+        )
+
+        try:
+            judgment = scope_manager.judge_publication(
+                scope=scope,
+                act_kind="restore",
+                current_summary=current_summary,
+                current_publication=current_publication,
+                restore_item=restore_item,
+                corrected_claim_content=correction.corrected_claim_content,
+                correcting_content=correction.correcting_content,
+                operator_memory=operator_memory,
+            )
+        except Exception as exc:
+            record_store.record_publication_judgment_attempt(
+                act_id=act.id,
+                error_class=type(exc).__name__,
+                message=str(exc),
+                outcome=JUDGE_FAILED,
+            )
+            raise
+
+        record_store.record_publication_judgment(
+            act_id=act.id,
+            decision=judgment.decision,
+            judged_by="scope-manager",
+            reasoning=judgment.reasoning,
+        )
+
+        artifact_updated = False
+        if judgment.decision == "accept":
+            _apply_restore(
+                item_id,
+                withdraw_act,
+                act.id,
+                restore_item,
+                claim_id=claim_id,
+                change_ids=change_ids,
+                fleet=fleet,
+                record_store=record_store,
+                summaries_dir=str(summary_store.summaries_dir),
+                held_scope_id=scope_id,
+            )
+            artifact_updated = True
+
+        return PublicationOutcome(
+            act_id=act.id,
+            act="restore",
+            decision=judgment.decision,
+            reasoning=judgment.reasoning,
+            artifact_updated=artifact_updated,
+        )
+
+
+def operator_restore(
+    scope_id: str,
+    item_id: str,
+    reason: str | None,
+    *,
+    fleet: FleetConfig,
+    record_store: RecordStore,
+    summaries_dir: str,
+) -> PublicationOutcome:
+    """Restore a correction-withdrawn published item in person (operator path, ADR
+    0008 D4) — no judgment row, operator provenance, the Console's Restore
+    button.
+
+    Same restorability check as :func:`propose_restore`; unlike that path,
+    accepts unconditionally (the operator's own review IS the ground —
+    design point 2's "the operator path is the escape" when the owner's
+    judge declines).
+
+    Raises:
+        ValueError: *scope_id* is not found in *fleet*, *item_id* was not
+            withdrawn by a correction sweep, or it was already restored.
+        KeyError: no withdraw act is on record for *item_id*, or no
+            :class:`~strata.record_store.ClaimCorrection` row exists for its
+            claim.
+    """
+    scope = fleet.get_scope(scope_id)
+    if scope is None:
+        raise ValueError(f"Scope not found: {scope_id!r}")
+
+    with scope_lock(scope_id):
+        withdraw_act = _find_withdraw_act(scope_id, item_id, record_store=record_store)
+        if withdraw_act is None:
+            raise KeyError(f"No withdraw act found for item {item_id!r} in scope {scope_id!r}.")
+        if withdraw_act.restored_by is not None:
+            raise ValueError(f"Item {item_id!r} has already been restored.")
+        restorable = restorable_withdrawal(scope_id, item_id, record_store=record_store)
+        if restorable is None:
+            raise ValueError(
+                f"Item {item_id!r} was not withdrawn by a correction sweep — only a "
+                "sweep withdrawal (verbatim or #219 C) can be restored this way."
+            )
+        claim_id, change_ids = restorable
+        original_act = record_store.get_publication_act(withdraw_act.withdraws)  # type: ignore[arg-type]
+        if original_act is None:
+            raise KeyError(f"Original publish act {withdraw_act.withdraws!r} not found.")
+        restore_item = _published_item_from_act(original_act)
+
+        proposer = ContributorRef(
+            scope_id="operator",
+            skill="operator",
+            session_id="operator",
+            ts=datetime.now(tz=UTC).isoformat(),
+        )
+        act = record_store.append_publication_act(
+            scope_id=scope_id,
+            act="restore",
+            kind=None,
+            content=None,
+            subject=None,
+            anchors=None,
+            withdraws=None,
+            trigger=withdraw_act.id,
+            proposer=proposer,
+            restores=item_id,
+        )
+        _apply_restore(
+            item_id,
+            withdraw_act,
+            act.id,
+            restore_item,
+            claim_id=claim_id,
+            change_ids=change_ids,
+            fleet=fleet,
+            record_store=record_store,
+            summaries_dir=summaries_dir,
+            held_scope_id=scope_id,
+        )
+        return PublicationOutcome(
+            act_id=act.id,
+            act="restore",
+            decision="accept",
+            reasoning=reason or "operator restore",
+            artifact_updated=True,
+        )
+
+
+def list_correction_withdrawals(
+    scope_id: str, *, record_store: RecordStore, include_acknowledged: bool = False
+) -> list[tuple[PublicationAct, ClaimCorrection | None, ClaimCarrierCheck | None]]:
+    """The Console's "Correction withdrawals" view / ``strata record --swept``:
+    every withdraw act in *scope_id* caused by a correction sweep, newest
+    first, each with its claim/correcting text (when found) and #219 C's own
+    audit row (when the method was a judged ``carries`` decision rather than
+    a verbatim match — absent otherwise).
+
+    *include_acknowledged*: by default, a withdrawal already marked
+    "keep withdrawn" is left out — the "to review" filter design point 10
+    describes. ``True`` returns every restorable withdrawal regardless.
+    """
+    acts = record_store.list_publication_acts(scope_id=scope_id)
+    carrier_checks = {
+        c.item_id: c for c in record_store.list_claim_carrier_checks(scope_id=scope_id)
+    }
+    out: list[tuple[PublicationAct, ClaimCorrection | None, ClaimCarrierCheck | None]] = []
+    for act in acts:
+        if act.act != "withdraw":
+            continue
+        if act.acknowledged and not include_acknowledged:
+            continue
+        restorable = restorable_withdrawal(scope_id, act.withdraws or "", record_store=record_store)
+        if restorable is None:
+            continue
+        claim_id, change_ids = restorable
+        try:
+            correction = _resolve_claim_correction(claim_id, change_ids, record_store=record_store)
+        except KeyError:
+            correction = None
+        out.append((act, correction, carrier_checks.get(act.withdraws or "")))
+    out.sort(key=lambda row: row[0].created_at, reverse=True)
+    return out
 
 
 # ---------------------------------------------------------------------------

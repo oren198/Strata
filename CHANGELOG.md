@@ -48,4 +48,36 @@ the release PR (`dev` → `main`) and the GitHub Release body are built from
   correction with any overflow recorded, never silently dropped. A
   mechanical observed-value veto can additionally keep an item the judge
   wrongly marked `carries` (recorded `kept_by_guard`) when it states what
-  was actually observed rather than the refuted claim.
+  was actually observed rather than the refuted claim. Measured, this
+  withdraws roughly 2–7% of a scope's neighbouring valid items alongside
+  genuine carriers — a known limit, addressed by the restore act below.
+
+- **A judged `restore` act undoes a published item a correction sweep wrongly
+  withdrew, under its ORIGINAL id and bytes (companion to #219 C).** Only a
+  sweep withdrawal — the verbatim P4 sweep, or #219 C's own owner-judge
+  `carries` decision, at any hop of either one's relay cascade — can be
+  restored this way; a deliberate withdrawal is re-published, as before.
+  - **Owner path, judged** (`strata_restore`/`propose_restore`): the owning
+    scope's own judge re-runs the structural test only — still believed by
+    its CURRENT memory, and does not re-assert the refuted claim — given the
+    refuted claim, the correcting content, and the item together. A decline
+    leaves the item withdrawn.
+  - **Operator path, in person** (`strata operator restore <scope> <item_id>`):
+    unjudged, operator provenance — the escape when the owner's judge
+    declines.
+  - **Relays come back mechanically** unless the relaying scope's own judge
+    has processed (drained) the correction notice for the item since the
+    withdrawal — then that scope gets the correction as evidence only, and
+    its own judge decides whether to relay again.
+  - **A new `claim_restored` notice** reaches EXACTLY the (reader scope,
+    item) pairs that got the original false notice, read from the recorded
+    change events by change id and item id — never recomputed from today's
+    topology, and never sent to a scope that started reading only after the
+    withdrawal. Evidence only: nothing is inserted into a reader's memory on
+    its behalf.
+  - **Detection surface:** `strata record <scope> --swept` lists every
+    correction withdrawal in a scope (verbatim, judged `carries`, or relay),
+    with the refuted claim and correcting content side by side, how it was
+    withdrawn, and a restore command to run.
+  - Not a behaviour change for anything already shipped: unused unless a
+    withdrawal is actually restored.

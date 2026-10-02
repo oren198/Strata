@@ -6057,7 +6057,7 @@ class ScopeManager:
         self,
         *,
         scope: Scope,
-        act_kind: Literal["publish", "withdraw"],
+        act_kind: Literal["publish", "withdraw", "restore"],
         current_summary: ScopeSummary | None,
         current_publication: Sequence[_PublishedItemLike],
         content: str | None = None,
@@ -6065,13 +6065,16 @@ class ScopeManager:
         subject: str | None = None,
         anchors: Sequence[str] | None = None,
         withdraw_item: _PublishedItemLike | None = None,
+        restore_item: _PublishedItemLike | None = None,
+        corrected_claim_content: str | None = None,
+        correcting_content: str | None = None,
         operator_memory: list[tuple[str, list[OperatorItem]]] | None = None,
         relay_origin_scope_id: str | None = None,
         relay_via_scope_id: str | None = None,
         publication_max_words: int = PUBLICATION_MAX_WORDS,
         **_extra: object,
     ) -> PublicationJudgment:
-        """Judge a publish or withdraw proposal against the scope's current state.
+        """Judge a publish, withdraw, or restore proposal against the scope's current state.
 
         Makes exactly one Anthropic API call using forced
         ``submit_publication_judgment`` tool use — a separate call and a
@@ -6093,6 +6096,19 @@ class ScopeManager:
                 already-tagged anchor strings.
             withdraw_item: Required for ``act_kind='withdraw'`` — the
                 published item being proposed for removal.
+            restore_item: Required for ``act_kind='restore'`` (restore act
+                design) — the item being brought back, byte-identical, under
+                its original id.
+            corrected_claim_content: Required for ``act_kind='restore'`` —
+                the refuted claim's own wording, from
+                :class:`~strata.record_store.ClaimCorrection`.
+            correcting_content: Required for ``act_kind='restore'`` — the
+                correction's own observation that replaced it. Given to the
+                judge alongside *restore_item* and *corrected_claim_content*
+                (contract line 1: the structural test only — still believed,
+                does not re-assert the refuted claim — no extra ground, since
+                the restore's ground is the owning scope's own agent standing
+                behind the item, which the sweep never had).
             operator_memory: The operator memory binding *scope* — see
                 :func:`strata.operator.operator_memory_binding`. Rendered via
                 the same :func:`_render_operator_memory` the contribution
@@ -6177,12 +6193,37 @@ class ScopeManager:
                 "- content:\n"
                 f"    {content}\n"
             )
-        else:
+        elif act_kind == "withdraw":
             if withdraw_item is None:
                 raise ValueError("judge_publication(act_kind='withdraw') requires withdraw_item.")
             proposal_block = (
                 "PROPOSED ACT: withdraw\n"
                 f"- item to withdraw: {_render_published_item(withdraw_item)}\n"
+            )
+        else:
+            if (
+                restore_item is None
+                or corrected_claim_content is None
+                or correcting_content is None
+            ):
+                raise ValueError(
+                    "judge_publication(act_kind='restore') requires restore_item, "
+                    "corrected_claim_content, and correcting_content."
+                )
+            # Restore act design, contract line 1: the structural test
+            # only — still believed by this scope's CURRENT memory, and
+            # does not re-assert the refuted claim. No extra ground: the
+            # restore's ground is the owning scope's own agent standing
+            # behind the item, which the sweep that withdrew it never had.
+            proposal_block = (
+                "PROPOSED ACT: restore\n"
+                f"- item to restore (byte-identical if accepted): "
+                f"{_render_published_item(restore_item)}\n"
+                f"- the refuted claim this item was withdrawn over: {corrected_claim_content}\n"
+                f"- the correction that replaced it: {correcting_content}\n"
+                "Judge whether this item is still believed by the CURRENT summary below, "
+                "and whether it still asserts the refuted claim above. Accept only if it is "
+                "still believed and does not assert the refuted claim.\n"
             )
 
         operator_block = _render_operator_memory(operator_memory)
