@@ -4154,37 +4154,44 @@ class ScopeManager:
                 f"{new_contribution.content}"
             )
             replaced_context = (f"{previous_context}\n{engine_line}").strip()
-            kept_ops = [op for op in judgment.directive_ops if op.op not in _ADMITTING_OPS]
-            # An unpaired supersede left behind by stripping its own append
-            # is a retirement wearing the wrong name (same rule
-            # `_parse_directive_ops` enforces) — convert rather than leave
-            # it invalid.
-            if any(op.op == "supersede" for op in kept_ops) and not any(
-                op.op in _ADMITTING_OPS for op in kept_ops
-            ):
-                kept_ops = [
-                    op.model_copy(update={"op": "retire"}) if op.op == "supersede" else op
-                    for op in kept_ops
-                ]
+            # ADR 0016 D1: a directive changes only by its issuer's own act —
+            # an informant's word is never binding, so it may not admit
+            # (append/publish), remove (retire), or replace (supersede) one
+            # either. EVERY directive op this contribution motivated is
+            # dropped, not just the admitting ones: converting an orphaned
+            # `supersede` to a `retire` (an earlier version of this fix)
+            # still let an informant's hearsay remove a directive, which is
+            # the exact failure class this item closes elsewhere.
+            dropped_ops = list(judgment.directive_ops)
             new_summary = _apply_amendment(
                 scope=scope,
                 current_summary=current_summary,
                 contribution=new_contribution,
-                ops=kept_ops,
+                ops=[],
                 new_context=replaced_context,
             )
-            return _noted(
-                judgment.model_copy(
-                    update={
-                        "decision": "accept_as_context",
-                        "directive_ops": kept_ops,
-                        "new_context": replaced_context,
-                        "new_summary": new_summary,
-                        "replaced_context": judgment.new_context,
-                    }
-                ),
-                "informant, admitted (context replaced)",
+            updated = judgment.model_copy(
+                update={
+                    "decision": "accept_as_context",
+                    "directive_ops": [],
+                    "new_context": replaced_context,
+                    "new_summary": new_summary,
+                    "replaced_context": judgment.new_context,
+                }
             )
+            if dropped_ops:
+                updated = updated.model_copy(
+                    update={
+                        "protocol_notes": [
+                            *updated.protocol_notes,
+                            "Dropped directive op(s), an informant's word never "
+                            "binds a directive: "
+                            + ", ".join(op.describe() for op in dropped_ops)
+                            + ".",
+                        ]
+                    }
+                )
+            return _noted(updated, "informant, admitted (context replaced)")
 
         def _invalid_ops(judgment: ScopeManagerJudgment) -> list[DirectiveOp]:
             _, invalid = _partition_ops(judgment.directive_ops, current_summary)

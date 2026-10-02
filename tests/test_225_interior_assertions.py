@@ -308,6 +308,42 @@ def test_verified_informant_replaces_context_and_strips_directive_ops() -> None:
     assert any("informant" in n and "context replaced" in n for n in judgment.protocol_notes)
 
 
+def test_verified_informant_never_supersedes_or_retires_an_existing_directive() -> None:
+    """ADR 0016 D1: a directive changes only by its issuer's own act. If the
+    FIRST judgment emitted a supersede+append against the existing
+    directive, the informant path must not let it through, even converted
+    to a retire — the directive must stay byte-identical, and the claim
+    enters only as the attributed context line."""
+    content = "Jordan Lee from 225-other-scope told me they only approve changes under budget."
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [
+        _fake_response(
+            {
+                "decision": "accept_as_directive",
+                "reasoning": "Superseding the old rule.",
+                "directive_ops": [
+                    {"op": "supersede", "id": EXISTING_DIRECTIVE.id},
+                    {"op": "append"},
+                ],
+                "new_context": None,
+            }
+        ),
+        _reask_response(
+            classification="informant", informant_span="Jordan Lee from 225-other-scope"
+        ),
+    ]
+    judgment, _ = _judge(mock_client, content)
+    assert judgment.decision == "accept_as_context"
+    assert judgment.directive_ops == []
+    # The directive is untouched — not removed, not replaced.
+    assert judgment.new_summary.directives == [EXISTING_DIRECTIVE]
+    assert content in judgment.new_context
+    assert any(
+        "Dropped directive op" in n and "informant's word never binds" in n
+        for n in judgment.protocol_notes
+    )
+
+
 def test_unreadable_reask_response_fails_closed_as_judge_failure() -> None:
     content = "225-other-scope only approves changes under budget."
     mock_client = MagicMock()
