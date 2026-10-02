@@ -3128,18 +3128,39 @@ def _probe_judge_live(resolved: object) -> str | None:
 
     A ``messages.create(max_tokens=1)`` is the one call every Anthropic-Messages
     endpoint (a router, a gateway) is guaranteed to serve; a model listing is not.
+
+    Sends the SAME provider pin (#224, ``resolved.provider``) the real
+    judge calls would — via :func:`strata.settings.apply_provider_pin` —
+    so this probes the exact route a pinned run actually takes, never an
+    unpinned one a pin would never use. A ``NotFoundError`` against a
+    pinned probe is reported as the pinned provider rejecting the model,
+    not a generic endpoint finding, since that is the more useful
+    diagnosis once a provider is configured.
     """
     import anthropic  # noqa: PLC0415
 
+    from strata.settings import apply_provider_pin  # noqa: PLC0415
+
     model = resolved.model  # type: ignore[attr-defined]
+    provider = getattr(resolved, "provider", None)
     try:
         client = _build_probe_client(resolved)
         client.messages.create(
-            model=model, max_tokens=1, messages=[{"role": "user", "content": "ping"}]
+            **apply_provider_pin(
+                {
+                    "model": model,
+                    "max_tokens": 1,
+                    "messages": [{"role": "user", "content": "ping"}],
+                },
+                provider=provider,
+                client=client,
+            )
         )
     except anthropic.APIConnectionError as exc:
         return f"the endpoint is unreachable ({type(exc).__name__})"
     except anthropic.NotFoundError:
+        if provider is not None:
+            return f"the pinned provider ({provider}) does not serve model id '{model}'"
         return f"the endpoint does not serve model id '{model}'"
     except anthropic.AuthenticationError:
         return "the endpoint rejected the key (wrong provider, or revoked?)"

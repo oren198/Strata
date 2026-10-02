@@ -3,12 +3,16 @@
 Covers:
 
 1. The choke point is ENFORCED, not conventional — an AST scan of every
-   ``.py`` file under ``src/strata/`` fails on any
-   ``<something>._client.messages.create(`` call outside
-   ``ScopeManager._messages_create`` itself. Whichever branch merges a new
-   judge call site second (#219 C's `check_claim_carriers`, at this
-   writing, still unmerged) must route through the method, and this test
-   makes skipping that impossible to miss.
+   ``.py`` file under ``src/strata/`` fails on any ``<something>.messages.create(``
+   call outside a short allowlist of functions
+   (``_messages_create``, ``_default_draft_fn``, ``_probe_judge_live``),
+   and a second scan asserts each of those allowlisted functions actually
+   calls ``apply_provider_pin`` somewhere in its own body — being exempt
+   from the raw-call violation is not enough; it must actually pin.
+   Whichever branch merges a new judge call site second (#219 C's
+   `check_claim_carriers`, at this writing, still unmerged) must route
+   through one of these, and this test makes skipping that impossible to
+   miss.
 2. Input identity: with no provider configured, the kwargs a mocked client
    receives are IDENTICAL to a pre-#224 call (no ``extra_body`` key at
    all) — on both an ordinary accept and a declined judgment. With a
@@ -31,8 +35,13 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from strata.scope_manager import ScopeManager, _is_openrouter_client
-from strata.settings import ResolvedJudge, resolve_judge, resolve_judge_from_env
+from strata.scope_manager import ScopeManager
+from strata.settings import (
+    ResolvedJudge,
+    _is_openrouter_client,
+    resolve_judge,
+    resolve_judge_from_env,
+)
 
 from .test_scope_manager import (
     CURRENT_SUMMARY,
@@ -54,10 +63,15 @@ _SRC = _REPO_ROOT / "src" / "strata"
 # ---------------------------------------------------------------------------
 
 
+_ALLOWLISTED_CALL_SITES = frozenset({"_messages_create", "_default_draft_fn", "_probe_judge_live"})
+
+
 def _raw_messages_create_calls(source: str, filename: str) -> list[tuple[str, int]]:
-    """Every ``<expr>._client.messages.create(`` call in *source*, as
-    ``(filename, lineno)``, EXCEPT inside a function literally named
-    ``_messages_create`` (the one place allowed to call the raw client)."""
+    """Every ``<expr>.messages.create(`` call in *source*, as
+    ``(filename, lineno)``, EXCEPT inside a function whose name is on
+    ``_ALLOWLISTED_CALL_SITES`` (the only places allowed to call the raw
+    client -- each of those is checked separately for actually calling
+    ``apply_provider_pin``, see ``test_allowlisted_call_sites_apply_the_pin``)."""
     tree = ast.parse(source, filename=filename)
     violations: list[tuple[str, int]] = []
 
@@ -79,9 +93,7 @@ def _raw_messages_create_calls(source: str, filename: str) -> list[tuple[str, in
                 and func.attr == "create"
                 and isinstance(func.value, ast.Attribute)
                 and func.value.attr == "messages"
-                and isinstance(func.value.value, ast.Attribute)
-                and func.value.value.attr == "_client"
-                and "_messages_create" not in self.func_stack
+                and not (set(self.func_stack) & _ALLOWLISTED_CALL_SITES)
             ):
                 violations.append((filename, node.lineno))
             self.generic_visit(node)
@@ -94,13 +106,54 @@ def test_every_messages_create_call_routes_through_the_choke_point() -> None:
     violations: list[tuple[str, int]] = []
     for path in _SRC.rglob("*.py"):
         source = path.read_text(encoding="utf-8")
-        if "_client.messages.create" not in source:
+        if "messages.create" not in source:
             continue
         violations.extend(_raw_messages_create_calls(source, str(path.relative_to(_REPO_ROOT))))
     assert violations == [], (
-        "every judge API call must go through ScopeManager._messages_create "
-        f"(#224) -- found raw self._client.messages.create(...) at: {violations}"
+        "every judge API call must go through one of "
+        f"{sorted(_ALLOWLISTED_CALL_SITES)} (#224) -- found a raw "
+        f"<client>.messages.create(...) call outside them at: {violations}"
     )
+
+
+def _function_source_calls_name(tree: ast.AST, func_name: str, call_name: str) -> bool:
+    """True if some function literally named *func_name* in *tree* contains,
+    anywhere in its own body, a call whose callee's final attribute/name is
+    *call_name*."""
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == func_name:
+            for inner in ast.walk(node):
+                if isinstance(inner, ast.Call):
+                    func = inner.func
+                    if isinstance(func, ast.Name) and func.id == call_name:
+                        return True
+                    if isinstance(func, ast.Attribute) and func.attr == call_name:
+                        return True
+    return False
+
+
+def test_allowlisted_call_sites_apply_the_pin() -> None:
+    """Being exempt from the raw-call scan is not enough on its own -- each
+    allowlisted function must actually call ``apply_provider_pin`` itself."""
+    found: dict[str, bool] = dict.fromkeys(_ALLOWLISTED_CALL_SITES, False)
+    defined: set[str] = set()
+    for path in _SRC.rglob("*.py"):
+        source = path.read_text(encoding="utf-8")
+        if not any(name in source for name in _ALLOWLISTED_CALL_SITES):
+            continue
+        tree = ast.parse(source, filename=str(path))
+        for func_name in _ALLOWLISTED_CALL_SITES:
+            if f"def {func_name}(" not in source:
+                continue
+            defined.add(func_name)
+            if _function_source_calls_name(tree, func_name, "apply_provider_pin"):
+                found[func_name] = True
+    assert defined == _ALLOWLISTED_CALL_SITES, (
+        f"expected to find definitions for all of {sorted(_ALLOWLISTED_CALL_SITES)}, "
+        f"only found {sorted(defined)} -- update the allowlist or the scan"
+    )
+    missing = [name for name, ok in found.items() if not ok]
+    assert missing == [], f"these allowlisted call sites never call apply_provider_pin: {missing}"
 
 
 # ---------------------------------------------------------------------------

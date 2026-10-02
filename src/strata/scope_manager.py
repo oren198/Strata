@@ -3712,24 +3712,6 @@ def _strip_leading_frame(text: str) -> str:
     return _LEADING_FRAME_RE.sub("", text, count=1)
 
 
-def _is_openrouter_client(client: object) -> bool:
-    """#224: True only when *client*'s ``base_url`` host is ``openrouter.ai``.
-
-    A bare Anthropic endpoint, a local/bridge judge, or any other router
-    must never receive a provider pin — request-level OpenRouter provider
-    preference (``extra_body.provider``) is an OpenRouter-specific
-    extension and would be meaningless (at best ignored, at worst
-    rejected) elsewhere. Mirrors
-    ``strata_evals.judge_trace._is_openrouter_client`` exactly — evals
-    cannot be imported from here (the dependency only ever runs the other
-    direction), so this small, stable check is duplicated rather than
-    shared.
-    """
-    base_url = getattr(client, "base_url", None)
-    host = getattr(base_url, "host", None) if base_url is not None else None
-    return host == "openrouter.ai"
-
-
 # ---------------------------------------------------------------------------
 # ScopeManager
 # ---------------------------------------------------------------------------
@@ -3802,22 +3784,16 @@ class ScopeManager:
         unpinned judge's request is byte-identical to the call this method
         replaces (input identity, #224's own constraint).
 
-        When a provider IS set, merges ``extra_body={"provider": {"order":
-        [provider], "allow_fallbacks": False}}`` — but ONLY when the client
-        is OpenRouter-shaped (``base_url`` host ``openrouter.ai``); a bare
-        Anthropic endpoint or any other router ignores the setting
-        entirely, since a request-level OpenRouter provider preference is
-        meaningless (at best ignored, at worst rejected) elsewhere. Any
-        other ``extra_body`` key a call site already set is preserved
-        untouched — only the ``"provider"`` key is written.
+        The actual merge decision — whether a provider is set, and whether
+        the client is OpenRouter-shaped — lives in
+        :func:`strata.settings.apply_provider_pin`, the ONE place that
+        decision is made across the whole engine (also used by the
+        freshness evaluator's drafter and ``strata doctor``'s live probe);
+        see that function's own docstring.
         """
-        if self._judge_provider is not None and _is_openrouter_client(self._client):
-            extra_body = dict(kwargs.get("extra_body") or {})
-            extra_body["provider"] = {
-                "order": [self._judge_provider],
-                "allow_fallbacks": False,
-            }
-            kwargs["extra_body"] = extra_body
+        from strata.settings import apply_provider_pin  # noqa: PLC0415
+
+        apply_provider_pin(kwargs, provider=self._judge_provider, client=self._client)
         return self._client.messages.create(**kwargs)
 
     def judge(

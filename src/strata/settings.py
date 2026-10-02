@@ -25,6 +25,7 @@ import functools
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass
+from typing import Any
 
 from pydantic import AliasChoices, Field, PrivateAttr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -319,6 +320,50 @@ def construct_judge_client(
     if base_url:
         kwargs["base_url"] = base_url
     return anthropic.Anthropic(**kwargs)
+
+
+def _is_openrouter_client(client: object) -> bool:
+    """#224: True only when *client*'s ``base_url`` host is ``openrouter.ai``.
+
+    A bare Anthropic endpoint, a local/bridge judge, or any other router
+    must never receive a provider pin — request-level OpenRouter provider
+    preference (``extra_body.provider``) is an OpenRouter-specific
+    extension and would be meaningless (at best ignored, at worst
+    rejected) elsewhere. Mirrors
+    ``strata_evals.judge_trace._is_openrouter_client`` exactly — evals
+    cannot be imported from here (the dependency only ever runs the other
+    direction), so this small, stable check is duplicated rather than
+    shared.
+    """
+    base_url = getattr(client, "base_url", None)
+    host = getattr(base_url, "host", None) if base_url is not None else None
+    return host == "openrouter.ai"
+
+
+def apply_provider_pin(
+    kwargs: dict[str, Any], *, provider: str | None, client: object
+) -> dict[str, Any]:
+    """#224: the ONE place an OpenRouter provider pin is decided and merged.
+
+    Mutates and returns *kwargs* in place. Every LLM call site in the
+    engine that can run against a configured ``JUDGE_PROVIDER`` —
+    :meth:`~strata.scope_manager.ScopeManager._messages_create`, the
+    freshness evaluator's drafter (``freshness._default_draft_fn``), and
+    ``strata doctor``'s live probe (``__main__._probe_judge_live``) — calls
+    this instead of merging ``extra_body`` itself, so there is exactly one
+    place deciding whether a pin applies.
+
+    A no-op when *provider* is ``None`` (unset — today's behaviour,
+    *kwargs* reach the real call completely unchanged) or *client* is not
+    OpenRouter-shaped (:func:`_is_openrouter_client`) — any other endpoint
+    ignores the setting entirely. Any other ``extra_body`` key already in
+    *kwargs* is preserved untouched; only ``"provider"`` is written.
+    """
+    if provider is not None and _is_openrouter_client(client):
+        extra_body = dict(kwargs.get("extra_body") or {})
+        extra_body["provider"] = {"order": [provider], "allow_fallbacks": False}
+        kwargs["extra_body"] = extra_body
+    return kwargs
 
 
 def resolve_judge_credentials(env: dict[str, str]) -> tuple[str | None, str | None]:

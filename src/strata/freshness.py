@@ -824,7 +824,13 @@ def _resolve_draft_fn(env: dict[str, str], draft_fn: DraftFn | None) -> DraftFn:
     default_model = DEFAULT_EVALUATOR_MODEL if resolved.base_url is None else resolved.model
     model = env.get(EVALUATOR_MODEL_ENV) or default_model
     api_key, base_url = resolve_judge_credentials(env)
-    return functools.partial(_default_draft_fn, api_key=api_key, base_url=base_url, model=model)
+    return functools.partial(
+        _default_draft_fn,
+        api_key=api_key,
+        base_url=base_url,
+        model=model,
+        provider=resolved.provider,
+    )
 
 
 def _submit_judged_contribution(
@@ -992,6 +998,7 @@ def _default_draft_fn(
     api_key: str | None,
     model: str,
     base_url: str | None = None,
+    provider: str | None = None,
 ) -> EvaluatorDraft | None:
     """Model-backed drafter: ask the evaluator model for a structured verdict.
 
@@ -999,25 +1006,38 @@ def _default_draft_fn(
     transcript) returns ``None``, which the caller turns into a mechanical
     decline. The evaluator never writes memory on its own; only a returned draft
     reaches the judged contribute path.
+
+    *provider* (#224): the same ``JUDGE_PROVIDER``/``STRATA_JUDGE_PROVIDER``
+    pin the judge itself uses, applied here via
+    :func:`strata.settings.apply_provider_pin` — this call speaks to the
+    SAME endpoint the judge does, so an unpinned drafter would otherwise
+    leak to a provider a user configured the pin specifically to avoid
+    (residency, compliance).
     """
     if not api_key or not transcript_tail.strip():
         return None
     try:
-        from strata.settings import construct_judge_client  # noqa: PLC0415
+        from strata.settings import apply_provider_pin, construct_judge_client  # noqa: PLC0415
 
         client = construct_judge_client(api_key=api_key, base_url=base_url)
         response = client.messages.create(
-            model=model,
-            max_tokens=1024,
-            system=_DRAFT_SYSTEM,
-            tools=[_DRAFT_TOOL],
-            tool_choice={"type": "tool", "name": "record_freshness_verdict"},
-            messages=[
+            **apply_provider_pin(
                 {
-                    "role": "user",
-                    "content": f"Session transcript tail:\n\n{transcript_tail}",
-                }
-            ],
+                    "model": model,
+                    "max_tokens": 1024,
+                    "system": _DRAFT_SYSTEM,
+                    "tools": [_DRAFT_TOOL],
+                    "tool_choice": {"type": "tool", "name": "record_freshness_verdict"},
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": f"Session transcript tail:\n\n{transcript_tail}",
+                        }
+                    ],
+                },
+                provider=provider,
+                client=client,
+            ),
         )
     except Exception as exc:  # noqa: BLE001 — drafting is best-effort
         _logger.debug("freshness evaluator draft call failed: %s", exc)
