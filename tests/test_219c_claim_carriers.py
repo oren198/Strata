@@ -650,10 +650,13 @@ def test_observed_value_veto_unit() -> None:
         "Feature flags default to on in production.",
         "Feature flags default to on, previously off, in production.",
     )
+    # A generic correction with no value tokens of its own never vetoes via
+    # the value-token clause specifically (the antonym-flip/added-exception
+    # clauses are independent of the correction text — see re-gate 2 below).
     assert not observed_value_veto(
-        "Feature flags default to off in production.",
+        "The limit is set to 15 items.",
         "This is not that.",
-        "Feature flags default to on in production.",
+        "The limit is set to 99 items.",
     )
 
 
@@ -718,6 +721,68 @@ def test_a_tokenless_refuted_claim_never_vetoes() -> None:
         "The team prefers minimal abstractions.",
         "The team actually prefers maximal abstractions.",
         "The team prefers maximal abstractions.",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Re-gate 2: an antonym-flip clause, independent of the correction text,
+# folded into observed_value_veto. An added-exception clause was tried and
+# dropped — the philosopher's ruling: it would keep refuted values
+# published, the CEO's own named failure — so an exception-only item must
+# NOT be vetoed, left to the judge in both directions.
+# ---------------------------------------------------------------------------
+
+
+def test_an_added_exception_item_is_not_vetoed() -> None:
+    """The philosopher's ruling: "PII is redacted in logs except in debug
+    builds" carries the refuted claim's VALUE but not its SCOPE — whether
+    it should be withdrawn depends on what the correction actually hit
+    (changed value vs. IS the exception), which this function cannot tell.
+    No veto clause fires on an added exception alone; the judge's own
+    carries answer stands, win or lose."""
+    assert not observed_value_veto(
+        "PII is always redacted in logs.",
+        "PII was found unredacted in debug build logs.",
+        "PII is redacted in logs except in debug builds.",
+    )
+
+
+def test_the_timing_flip_is_vetoed() -> None:
+    """ "Security review happens after merge" against refuted "before
+    merge" — the antonym-flip clause, independent of the correction."""
+    assert observed_value_veto(
+        "Security review happens before merge.",
+        "The review actually happens after merge.",
+        "Security review happens after merge.",
+    )
+
+
+def test_the_double_negation_carrier_stays_not_vetoed() -> None:
+    """ "Logs never contain unredacted PII" is a TRUE carrier of "PII is
+    always redacted" (double negation) — always/never is deliberately
+    excluded from the antonym pairs, so this must NOT be vetoed."""
+    assert not observed_value_veto(
+        "PII is always redacted in logs.",
+        "This is not accurate.",
+        "Logs never contain unredacted PII.",
+    )
+
+
+def test_a_generic_correction_now_vetoes_on_the_flip_clause_only() -> None:
+    """The antonym-flip clause applies even to a generic correction with no
+    value tokens of its own — unlike the value-token clause, it never
+    consults the correction text at all."""
+    assert observed_value_veto(
+        "Security review happens before merge.",
+        "This is not accurate.",
+        "Security review happens after merge.",
+    )
+    # The value-token clause alone still declines to veto a generic
+    # correction when the antonym clause doesn't apply either.
+    assert not observed_value_veto(
+        "The limit is set to 15 items.",
+        "This is not accurate.",
+        "The limit is set to 99 items.",
     )
 
 
