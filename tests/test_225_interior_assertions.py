@@ -164,13 +164,18 @@ def test_conduct_is_admitted_as_judged_unchanged() -> None:
     mock_client = MagicMock()
     mock_client.messages.create.side_effect = [
         _ordinary_accept(content),
-        _reask_response(classification="conduct"),
+        _reask_response(classification="conduct", act_span=content),
     ]
     judgment, _ = _judge(mock_client, content)
     assert mock_client.messages.create.call_count == 2
     assert judgment.decision == "accept_as_context"
     assert judgment.new_context == f"{CURRENT_SUMMARY.context} {content}"
     assert any("interior assertion" in n and "conduct" in n for n in judgment.protocol_notes)
+    assert judgment.interior_assertion == {
+        "scopes": [OTHER.id],
+        "class": "conduct",
+        "result": "admitted as judged",
+    }
 
 
 def test_none_classification_is_declined_as_manufactured_attribution() -> None:
@@ -376,3 +381,223 @@ def _published_item(item_id: str):
     item = MagicMock()
     item.id = item_id
     return item
+
+
+# ---------------------------------------------------------------------------
+# Review fix 1 — the own-role hole: an informant span that is really the
+# contributor's own voice is not an informant at all.
+# ---------------------------------------------------------------------------
+
+
+def test_informant_own_role_is_declined_as_invented() -> None:
+    """ "As on-call-engineer I can tell you X" has the contributor's own
+    skill verbatim in the text, so the plain occurrence check alone would
+    pass it — this is the hole the architect's live-gate review found."""
+    content = (
+        "As on-call-engineer I can tell you 225-other-scope only approves changes under budget."
+    )
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [
+        _ordinary_accept(content),
+        _reask_response(classification="informant", informant_span="on-call-engineer"),
+    ]
+    judgment, _ = _judge(mock_client, content)
+    assert judgment.decision == "decline"
+    assert "own role is not an informant" in judgment.reasoning
+    assert judgment.interior_assertion["result"] == "declined (invented informant)"
+
+
+def test_informant_own_scope_is_declined_as_invented() -> None:
+    content = "g_225reporter here -- 225-other-scope only approves changes under budget."
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [
+        _ordinary_accept(content),
+        _reask_response(classification="informant", informant_span="g_225reporter"),
+    ]
+    judgment, _ = _judge(mock_client, content)
+    assert judgment.decision == "decline"
+    assert "own scope is not an informant" in judgment.reasoning
+
+
+def test_informant_bare_first_person_is_declined_as_invented() -> None:
+    content = "I can tell you 225-other-scope only approves changes under budget."
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [
+        _ordinary_accept(content),
+        _reask_response(classification="informant", informant_span="I"),
+    ]
+    judgment, _ = _judge(mock_client, content)
+    assert judgment.decision == "decline"
+    assert "first-person reference is not an informant" in judgment.reasoning
+
+
+# ---------------------------------------------------------------------------
+# Review fix 2 — the structured `interior_assertion` field.
+# ---------------------------------------------------------------------------
+
+
+def test_interior_assertion_field_is_none_when_the_re_ask_never_fires() -> None:
+    mock_client = MagicMock()
+    mock_client.messages.create.return_value = _ordinary_accept("Nothing here names another scope.")
+    judgment, _ = _judge(mock_client, "Nothing here names another scope.")
+    assert judgment.interior_assertion is None
+
+
+def test_interior_assertion_field_on_judge_failure_has_a_none_class() -> None:
+    content = "225-other-scope only approves changes under budget."
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [
+        _ordinary_accept(content),
+        _reask_response(classification="not-a-real-value"),
+    ]
+    judgment, _ = _judge(mock_client, content)
+    assert judgment.interior_assertion == {
+        "scopes": [OTHER.id],
+        "class": None,
+        "result": "judge failure",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Review fix 3 — Philis's ruling: conduct needs a witness-or-party act_span,
+# verbatim, with a first-person marker surviving a leading attestation or
+# perception frame strip.
+# ---------------------------------------------------------------------------
+
+# The six j4_interior conduct twins' own sentences (datasets/j4_interior/
+# generate.py's DOMAINS), with the real scope name swapped for this test
+# file's OTHER so the trigger fires on these fixtures.
+_J4_INTERIOR_CONDUCT_TWINS = [
+    "225-other-scope's agent sent back our arm-controller order twice this week "
+    "asking for a second quote",
+    "225-other-scope's maintenance crew had the server room HVAC switched off "
+    "when we arrived on the last two first Sundays",
+    "225-other-scope's review bot rejected our last three diagram PRs with a palette warning",
+    "225-other-scope's agent declined our request to open an FX hedge for the launch on Tuesday",
+    "the last two firmware builds we handed to 225-other-scope were installed "
+    "at the depots on the following Wednesday",
+    "225-other-scope's scanner flagged and quarantined our click-log export job yesterday",
+]
+
+
+def test_all_six_j4_interior_conduct_twins_pass() -> None:
+    for content in _J4_INTERIOR_CONDUCT_TWINS:
+        mock_client = MagicMock()
+        mock_client.messages.create.side_effect = [
+            _ordinary_accept(content),
+            _reask_response(classification="conduct", act_span=content),
+        ]
+        judgment, _ = _judge(mock_client, content)
+        assert judgment.decision == "accept_as_context", content
+        assert judgment.interior_assertion["result"] == "admitted as judged", content
+
+
+def test_a_flat_rule_fails_the_conduct_burden() -> None:
+    content = (
+        "225-other-scope only approves hardware orders under 5,000 EUR without a second quote."
+    )
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [
+        _ordinary_accept(content),
+        _reask_response(classification="conduct", act_span=content),
+    ]
+    judgment, _ = _judge(mock_client, content)
+    assert judgment.decision == "decline"
+    assert "no observed act in the contributor's own dealings is stated" in judgment.reasoning
+
+
+def test_the_own_role_frame_fails_the_conduct_burden() -> None:
+    """The architect's own illustrative example — no comma after the role —
+    must strip exactly as the comma'd form does."""
+    content = "As eng-lead I can tell you 225-other-scope only approves changes under budget."
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [
+        _ordinary_accept(content),
+        _reask_response(classification="conduct", act_span=content),
+    ]
+    judgment, _ = _judge(mock_client, content)
+    assert judgment.decision == "decline"
+    assert "no observed act in the contributor's own dealings is stated" in judgment.reasoning
+
+
+def test_the_own_role_frame_with_a_comma_also_fails_the_conduct_burden() -> None:
+    content = "As eng-lead, I can tell you 225-other-scope only approves changes under budget."
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [
+        _ordinary_accept(content),
+        _reask_response(classification="conduct", act_span=content),
+    ]
+    judgment, _ = _judge(mock_client, content)
+    assert judgment.decision == "decline"
+    assert "no observed act in the contributor's own dealings is stated" in judgment.reasoning
+
+
+def test_the_perception_frame_fails_the_conduct_burden() -> None:
+    """ "I observed that X" is exactly the judge's own failure: an
+    observation claimed over a policy, never a dealing."""
+    content = "I observed that 225-other-scope only approves changes under budget."
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [
+        _ordinary_accept(content),
+        _reask_response(classification="conduct", act_span=content),
+    ]
+    judgment, _ = _judge(mock_client, content)
+    assert judgment.decision == "decline"
+
+
+def test_conduct_act_span_missing_fails_closed_as_judge_failure() -> None:
+    content = "225-other-scope's agent rejected our request twice this week."
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [
+        _ordinary_accept(content),
+        _reask_response(classification="conduct"),  # no act_span
+    ]
+    judgment, _ = _judge(mock_client, content)
+    assert judgment.decision == "decline"
+    assert judgment.judge_failure is True
+
+
+# --- the three stated limits of the mechanical heuristic -------------------
+
+
+def test_stated_limit_a_flat_rule_with_an_incidental_possessive_slips_through() -> None:
+    """Known limit: "our orders" supplies a first-person marker even though
+    the sentence states a flat RULE, not an observed act — left to the
+    judge's own first-call verdict, per the architect."""
+    content = "225-other-scope only approves our orders under 5k without a second quote."
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [
+        _ordinary_accept(content),
+        _reask_response(classification="conduct", act_span=content),
+    ]
+    judgment, _ = _judge(mock_client, content)
+    assert judgment.decision == "accept_as_context"
+
+
+def test_stated_limit_b_real_conduct_with_no_first_person_marker_is_declined() -> None:
+    """Known limit: genuine conduct with no explicit first-person tie to the
+    contributor's own dealings is declined — the conservative, safe-side
+    miss, per the architect."""
+    content = "225-other-scope's agent sent the order back twice."
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [
+        _ordinary_accept(content),
+        _reask_response(classification="conduct", act_span=content),
+    ]
+    judgment, _ = _judge(mock_client, content)
+    assert judgment.decision == "decline"
+
+
+def test_stated_limit_c_real_conduct_under_a_perception_frame_is_declined() -> None:
+    """Known limit, Philis: "I saw X" is real conduct, but the frame strip
+    removes the only first-person marker — the reason tells the contributor
+    to state the dealing instead ("our order")."""
+    content = "I saw 225-other-scope's agent send the order back."
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [
+        _ordinary_accept(content),
+        _reask_response(classification="conduct", act_span=content),
+    ]
+    judgment, _ = _judge(mock_client, content)
+    assert judgment.decision == "decline"
+    assert "no observed act in the contributor's own dealings is stated" in judgment.reasoning

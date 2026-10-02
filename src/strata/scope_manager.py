@@ -634,6 +634,16 @@ INTERIOR_ASSERTION_TOOL: dict = {
                     "item this grounds on."
                 ),
             },
+            "act_span": {
+                "type": "string",
+                "description": (
+                    "Required when classification is conduct: the EXACT verbatim span "
+                    "of the contribution's own text describing the observed act — a "
+                    "dealing the contributor was PART OF (e.g. 'their agent sent back "
+                    "our order twice'), never a claim merely attested or perceived "
+                    "about the other scope's general position."
+                ),
+            },
             "reasoning": {
                 "type": "string",
                 "description": "One or two sentences explaining the classification.",
@@ -2414,6 +2424,17 @@ class ScopeManagerJudgment(_AmendmentJudgment):
     been). ``None`` whenever the re-ask never fires, or fires and verifies
     anything other than informant."""
 
+    interior_assertion: dict | None = None
+    """#225 (ADR 0016), structured for measurement (the architect's live-gate
+    review): ``{"scopes": [id, ...], "class": <classification or None>,
+    "result": <result string>}`` whenever the interior-assertion re-ask
+    fired — ``None`` otherwise. ``class`` is ``None`` only for the "judge
+    failure" result (the re-ask's own answer was unreadable, so no
+    classification was ever read). The SAME fact the fixed marker on
+    :attr:`protocol_notes` already states in prose
+    ("interior assertion: <scopes>, <result>") — this is its structured
+    twin, so an eval trace can read it without parsing prose."""
+
     @property
     def record_notes(self) -> str:
         """The verdict text written to the judgment record.
@@ -3578,6 +3599,64 @@ def _match_other_scopes(content: str, candidates: Sequence[Scope]) -> list[Scope
     return matched
 
 
+#: #225 (ADR 0016), the architect's live-gate review: a first-person marker,
+#: word-bounded, case-insensitive — what a genuine first-hand conduct
+#: observation or informant reference must still contain AFTER
+#: :func:`_strip_leading_frame` removes a leading attestation/perception
+#: frame (below). "our"/"ours" also catches "our order", not only "I"/"we".
+_FIRST_PERSON_RE = re.compile(r"\b(i|me|my|we|us|our|ours|myself|ourselves)\b", re.IGNORECASE)
+
+#: Philis's ruling: the verbs that introduce a claim ABOUT something rather
+#: than a dealing the contributor was PART OF — attestation ("I can tell you
+#: X") and perception ("I saw X") alike. Both frame a claim the speaker is
+#: merely RELAYING, which must not count as first-hand just because the
+#: frame itself happens to say "I" or "we" ("As eng-lead I can tell you
+#: procurement only approves..." — the "I" is the attestation, not a dealing;
+#: "I observed that procurement only approves..." — the "I" is the
+#: perception, not a dealing either).
+_FRAME_VERBS = (
+    "can tell you",
+    "know",
+    "knew",
+    "heard",
+    "hear",
+    "think",
+    "believe",
+    "guess",
+    "understand",
+    "was told",
+    "were told",
+    "saw",
+    "see",
+    "observed",
+    "observe",
+    "noticed",
+    "notice",
+    "watched",
+    "found",
+)
+
+#: A leading "fyi --"/"heads up --", then an optional "as <role>,", then a
+#: first-person subject ("I"/"we") plus one of :data:`_FRAME_VERBS`, then an
+#: optional "that" — stripped from the FRONT of a span only when the whole
+#: mandatory middle (subject + verb) actually matches; an ordinary sentence
+#: with no such frame is returned unchanged.
+_LEADING_FRAME_RE = re.compile(
+    r"^(?:fyi\s*--\s*|heads up\s*--\s*)?"
+    r"(?:as\s+[\w-]+,?\s*)?"
+    rf"(?:i|we)\s+(?:{'|'.join(re.escape(v) for v in _FRAME_VERBS)})\s*"
+    r"(?:that\s+)?",
+    re.IGNORECASE,
+)
+
+
+def _strip_leading_frame(text: str) -> str:
+    """#225: remove a leading attestation/perception frame from *text*, if
+    one is actually present — a no-op otherwise (the mandatory subject+verb
+    portion of :data:`_LEADING_FRAME_RE` never matches empty)."""
+    return _LEADING_FRAME_RE.sub("", text, count=1)
+
+
 # ---------------------------------------------------------------------------
 # ScopeManager
 # ---------------------------------------------------------------------------
@@ -4007,16 +4086,66 @@ class ScopeManager:
                 return judgment
 
             names = ", ".join(f"{s.id} ({s.name})" for s in matched)
+            matched_ids = [s.id for s in matched]
 
-            def _noted(updated: ScopeManagerJudgment, result: str) -> ScopeManagerJudgment:
+            def _noted(
+                updated: ScopeManagerJudgment, classification: str | None, result: str
+            ) -> ScopeManagerJudgment:
+                prose_class = classification if classification is not None else "unreadable"
                 return updated.model_copy(
                     update={
                         "protocol_notes": [
                             *updated.protocol_notes,
-                            f"interior assertion: {names}, {result}",
-                        ]
+                            f"interior assertion: {names}, {prose_class}, {result}",
+                        ],
+                        "interior_assertion": {
+                            "scopes": matched_ids,
+                            "class": classification,
+                            "result": result,
+                        },
                     }
                 )
+
+            def _scope_name_for(scope_id: str) -> str | None:
+                """The best-effort name for *scope_id* from what this call
+                already has in hand — `scope` itself, or any group of
+                `entitlement` — never a fresh fleet lookup."""
+                if scope.id == scope_id:
+                    return scope.name
+                if entitlement is not None:
+                    for group in (
+                        entitlement.chain,
+                        entitlement.descendants,
+                        entitlement.referenced_peers,
+                        entitlement.others,
+                    ):
+                        for candidate in group:
+                            if candidate.id == scope_id:
+                                return candidate.name
+                return None
+
+            def _own_role_or_first_person(span: str) -> str | None:
+                """#225, the architect's live-gate review: an informant span
+                that is really the CONTRIBUTOR's own voice — their own
+                skill/role, their own scope, or a bare first-person
+                reference ("I", "we", ...) — is not an informant at all.
+                "As eng-lead I can tell you X" has "eng-lead" verbatim in
+                the text, so the plain occurrence check alone passes it;
+                this closes that hole. Returns the reason to decline with,
+                or ``None`` if the span is a genuine third party.
+                """
+                normalized = " ".join(span.split()).casefold()
+                skill = (new_contribution.contributor.skill or "").strip().casefold()
+                if skill and skill in normalized:
+                    return "the contributor's own role is not an informant"
+                contributor_scope_id = new_contribution.contributor.scope_id
+                contributor_scope_name = _scope_name_for(contributor_scope_id)
+                for candidate in filter(None, (contributor_scope_id, contributor_scope_name)):
+                    if candidate.casefold() in normalized:
+                        return "the contributor's own scope is not an informant"
+                if _FIRST_PERSON_RE.search(normalized):
+                    return "a first-person reference is not an informant"
+                return None
 
             corrective_text = (
                 "Your accepted contribution names another fleet scope this scope "
@@ -4066,6 +4195,7 @@ class ScopeManager:
                     raise ValueError(f"unreadable classification {classification!r}")
                 informant_span = raw.get("informant_span")
                 ref_id = raw.get("ref_id")
+                act_span = raw.get("act_span")
                 if classification == "informant" and not (
                     isinstance(informant_span, str) and informant_span.strip()
                 ):
@@ -4074,14 +4204,48 @@ class ScopeManager:
                     isinstance(ref_id, str) and ref_id.strip()
                 ):
                     raise ValueError(f"{classification} classification with no ref_id")
+                if classification == "conduct" and not (
+                    isinstance(act_span, str) and act_span.strip()
+                ):
+                    raise ValueError("conduct classification with no act_span")
             except Exception as exc:  # noqa: BLE001 — any slip here fails closed, #235's pattern
                 return _noted(
                     _interior_assertion_failure_decline(f"{type(exc).__name__}: {exc}"),
+                    None,
                     "judge failure",
                 )
 
             if classification == "conduct":
-                return _noted(judgment, "conduct, admitted as judged")
+                # Philis's ruling: a witness or party, never a claim merely
+                # attested or perceived. The act_span must (a) occur in the
+                # contribution verbatim, and (b) AFTER stripping a leading
+                # attestation/perception frame, still contain a first-person
+                # marker — otherwise "As eng-lead I can tell you X" (or "I
+                # observed that X") would pass on the FRAME's own "I", never
+                # a dealing the contributor was part of.
+                haystack = " ".join(new_contribution.content.split()).casefold()
+                normalized_act_span = " ".join(act_span.split())
+                verbatim_ok = normalized_act_span.casefold() in haystack
+                remainder = _strip_leading_frame(normalized_act_span)
+                first_person_ok = verbatim_ok and bool(_FIRST_PERSON_RE.search(remainder))
+                if verbatim_ok and first_person_ok:
+                    return _noted(judgment, classification, "admitted as judged")
+                return _noted(
+                    judgment.model_copy(
+                        update={
+                            "decision": "decline",
+                            "new_summary": None,
+                            "directive_ops": [],
+                            "new_context": None,
+                            "reasoning": (
+                                "Declined: no observed act in the contributor's own "
+                                "dealings is stated."
+                            ),
+                        }
+                    ),
+                    classification,
+                    "declined (no observed act in own dealings)",
+                )
 
             if classification == "none":
                 return _noted(
@@ -4098,12 +4262,13 @@ class ScopeManager:
                             ),
                         }
                     ),
-                    "none, declined (manufactured attribution)",
+                    classification,
+                    "declined (manufactured attribution)",
                 )
 
             if classification in ("publication", "directive"):
                 if ref_id in _visible_ref_ids():
-                    return _noted(judgment, f"{classification}, admitted as judged")
+                    return _noted(judgment, classification, "admitted as judged")
                 return _noted(
                     judgment.model_copy(
                         update={
@@ -4119,7 +4284,8 @@ class ScopeManager:
                             ),
                         }
                     ),
-                    f"{classification}, declined (ref not visible)",
+                    classification,
+                    "declined (ref not visible)",
                 )
 
             # classification == "informant"
@@ -4139,7 +4305,23 @@ class ScopeManager:
                             ),
                         }
                     ),
-                    "informant, declined (invented informant)",
+                    classification,
+                    "declined (invented informant)",
+                )
+            own_voice_reason = _own_role_or_first_person(informant_span)
+            if own_voice_reason is not None:
+                return _noted(
+                    judgment.model_copy(
+                        update={
+                            "decision": "decline",
+                            "new_summary": None,
+                            "directive_ops": [],
+                            "new_context": None,
+                            "reasoning": f"Declined: invented informant — {own_voice_reason}.",
+                        }
+                    ),
+                    classification,
+                    "declined (invented informant)",
                 )
             # Verified: ADR 0016 D1, hearsay from an identifiable informant.
             # Admit as CONTEXT ONLY (never a directive — an informant's word
@@ -4191,7 +4373,7 @@ class ScopeManager:
                         ]
                     }
                 )
-            return _noted(updated, "informant, admitted (context replaced)")
+            return _noted(updated, classification, "admitted (context replaced)")
 
         def _invalid_ops(judgment: ScopeManagerJudgment) -> list[DirectiveOp]:
             _, invalid = _partition_ops(judgment.directive_ops, current_summary)
