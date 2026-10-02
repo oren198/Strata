@@ -2335,6 +2335,17 @@ class ScopeManagerJudgment(_AmendmentJudgment):
     missing-ground decline — the same discipline as #204's missing-reasoning
     backstop."""
 
+    judge_failure: bool = False
+    """#235: a GENERIC marker, set on EVERY fail-closed decline this engine
+    produces after a second protocol slip survives the one corrective re-ask —
+    whether the slip was disposition-unreadable (:attr:`disposition_unreadable`,
+    ADR 0017 P3's own outcome-report case, also sets this) or any other parse
+    failure on an ORDINARY contribution (no :attr:`outcome_disposition` at all).
+    Distinct from :attr:`disposition_unreadable` specifically so a query can
+    count every judge-failure decline — of either kind — apart from an
+    ordinary merits decline, without needing to know which specific slip
+    produced it."""
+
     @property
     def record_notes(self) -> str:
         """The verdict text written to the judgment record.
@@ -3781,6 +3792,32 @@ class ScopeManager:
                 hop=hop,
                 outcome_disposition="decline",
                 disposition_unreadable=True,
+                judge_failure=True,
+            )
+
+        def _generic_second_slip_decline(error: Exception) -> ScopeManagerJudgment:
+            """#235: the fail-closed fallback for an ORDINARY contribution (no
+            `acted_on` — `_parse_forced_decline` above is reserved for the P3
+            outcome-report path; reusing it here would misrecord an ordinary
+            decline with a disposition it never had, `disposition_unreadable`
+            implying a disposition was even attempted, and — worse — the
+            judge's own malformed-response text as the stated reasoning,
+            which for a shape like an unpaired `supersede` is the judge's
+            ACCEPT reasoning, now sitting beside `decision="decline"`).
+            A FIXED engine-authored reasoning, never the judge's own text:
+            the response could not be trusted enough to read anything out of
+            it, including its reasoning."""
+            return ScopeManagerJudgment(
+                decision="decline",
+                reasoning=(
+                    "judge failure: the response was still malformed after the "
+                    f"corrective re-ask ({type(error).__name__}); declined "
+                    "without a verdict on the merits"
+                ),
+                new_summary=None,
+                change_id=change_id,
+                hop=hop,
+                judge_failure=True,
             )
 
         def _invalid_ops(judgment: ScopeManagerJudgment) -> list[DirectiveOp]:
@@ -3907,7 +3944,18 @@ class ScopeManager:
             stale_claim_corrective=_stale_claim_corrective,
             drop_stale_context=_drop_stale_context,
             parse_lenient=_parse_lenient,
+            # #202 defense-in-depth: `_parse_forced_decline` is wired
+            # UNCONDITIONALLY, same as before #235 — `_MalformedOrdinaryDecision`
+            # (an ORDINARY contribution's `decision` out of vocabulary, a
+            # `_MalformedDisposition` subclass) reaches the `except
+            # _MalformedDisposition` branch below regardless of `acted_on_target`,
+            # and has always used this same fallback. #235 only disambiguates
+            # the GENERIC second-slip branch (ValueError shapes that are not
+            # about `decision` at all, e.g. an unpaired `supersede`) via
+            # `is_outcome_report` below — never this wiring.
             parse_forced_decline=_parse_forced_decline,
+            parse_generic_decline=_generic_second_slip_decline,
+            is_outcome_report=acted_on_target is not None,
             acted_on_is_directive=acted_on_target is not None and acted_on_target.is_directive,
         )
 
@@ -3933,6 +3981,8 @@ class ScopeManager:
         drop_stale_context: Callable[[_JudgmentT], _JudgmentT] | None = None,
         parse_lenient: Callable[[object], _JudgmentT] | None = None,
         parse_forced_decline: Callable[[object], _JudgmentT] | None = None,
+        parse_generic_decline: Callable[[Exception], _JudgmentT] | None = None,
+        is_outcome_report: bool = False,
         acted_on_is_directive: bool = False,
     ) -> _JudgmentT:
         """Run one judgment call and its correctives, one retry each.
@@ -4124,8 +4174,19 @@ class ScopeManager:
                 correction = _corrective_turn(response, tool_use_block, corrective_text)
             retry_messages = [*first_messages, *correction]
             response = _call(retry_messages)
-            tool_use_block = self._extract_tool_use_block(response)
+            # #235: unlike the first attempt, a bare block extract failure here
+            # (`_NoToolUseBlock`, a `ValueError` subclass) was previously
+            # UNGUARDED — it propagated out of this whole function rather than
+            # failing closed the way every other second-slip shape below does.
+            # `retry_tool_use_block` starts `None` and is set only if the
+            # extract below succeeds, so the broad `except ValueError` further
+            # down can tell "no block at all" from "a block whose content is
+            # still malformed" without reusing a stale block from the FIRST
+            # attempt.
+            retry_tool_use_block = None
             try:
+                retry_tool_use_block = self._extract_tool_use_block(response)
+                tool_use_block = retry_tool_use_block
                 judgment = parse(tool_use_block)
             except _MissingReasoning:
                 # #204: reasoning is never the thing being judged, so a SECOND miss —
@@ -4155,6 +4216,47 @@ class ScopeManager:
                     "the corrective re-ask; declined as a judge failure, not a "
                     "missing-ground decline."
                 )
+            except ValueError as second_parse_error:
+                # #235: every OTHER second-slip shape (no tool_use block at all
+                # on the retry, a stringified/malformed `directive_ops`, an
+                # unpaired `supersede` — the same #201 shapes the FIRST attempt
+                # gets a corrective for, just surviving the one re-ask this
+                # time). The one-retry discipline above means there is no THIRD
+                # attempt to ask for: this fails closed, never an unhandled
+                # exception reaching the HTTP layer as a 500.
+                #
+                # An ACTED_ON outcome report (`is_outcome_report`) keeps the
+                # EXISTING P3 forced-decline semantics (`parse_forced_decline`)
+                # regardless of which ValueError subtype surfaced it — the
+                # outcome tool's whole contract is "decline on doubt," the
+                # same shape `_MalformedDisposition` already gets above (that
+                # branch, unlike this one, is reached by BOTH an outcome
+                # report's own malformed disposition AND an ORDINARY
+                # contribution's out-of-vocabulary `decision`
+                # (`_MalformedOrdinaryDecision`) — unconditional, unaffected by
+                # `is_outcome_report`, exactly as it was before #235: the P5
+                # defense-in-depth it implements is untouched here). An
+                # ORDINARY contribution hitting THIS branch has no disposition
+                # to be unreadable at all, so it gets the distinct generic
+                # fallback instead (`parse_generic_decline`) — never
+                # `parse_forced_decline`, which would misrecord
+                # `outcome_disposition`/`disposition_unreadable` on a
+                # contribution that was never an outcome.
+                if is_outcome_report and parse_forced_decline is not None:
+                    judgment = parse_forced_decline(retry_tool_use_block)
+                    protocol_notes.append(
+                        "Judge's `decision` was still not a readable disposition after "
+                        "the corrective re-ask; declined as a judge failure, not a "
+                        "missing-ground decline."
+                    )
+                elif parse_generic_decline is not None:
+                    judgment = parse_generic_decline(second_parse_error)
+                    protocol_notes.append(
+                        f"Second protocol slip on the corrective re-ask ({second_parse_error}); "
+                        "declined as a judge failure, not a missing-ground decline."
+                    )
+                else:
+                    raise
             else:
                 protocol_notes.append(_protocol_note(parse_error))
             # Chain the correctives below onto this turn: their follow-ups
@@ -4601,6 +4703,11 @@ class ScopeManager:
                 "string or null."
             ),
             parse_lenient=_parse_lenient,
+            # #235/#236: neither parse_forced_decline (no per-member outcome-
+            # disposition concept in the batch tool) nor parse_generic_decline
+            # is wired here — a second protocol slip on a BATCH retry still
+            # raises, a known, filed gap (oren198/Strata#236), not something
+            # this item silently papers over.
         )
 
     @staticmethod

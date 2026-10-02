@@ -667,7 +667,13 @@ def test_decline_returns_no_summary() -> None:
 
 
 def test_decline_with_new_context_raises() -> None:
-    """A declined contribution must not amend the summary (ADR 0011 D1)."""
+    """A declined contribution must not amend the summary (ADR 0011 D1).
+
+    #235: `return_value` replays the SAME inconsistent payload on the one
+    corrective re-ask too, so the second attempt now fails closed (a recorded
+    decline marked as a judge failure) rather than propagating — the
+    unhandled-exception shape #235 fixes.
+    """
     bad_input = {
         "decision": "decline",
         "reasoning": "Declining.",
@@ -676,18 +682,26 @@ def test_decline_with_new_context_raises() -> None:
     }
     manager, _ = _make_manager(bad_input)
 
-    with pytest.raises(ValueError, match="decline"):
-        manager.judge(
-            scope=SCOPE,
-            stratum=STRATUM,
-            current_summary=CURRENT_SUMMARY,
-            recent_contributions=[],
-            new_contribution=NEW_CONTRIBUTION,
-        )
+    judgment = manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+    )
+    assert judgment.decision == "decline"
+    assert judgment.disposition_unreadable is False
+    assert judgment.outcome_disposition is None
+    assert judgment.judge_failure is True
+    assert "judge failure: the response was still malformed" in judgment.reasoning
+    assert "declined without a verdict on the merits" in judgment.reasoning
 
 
 def test_decline_with_directive_ops_raises() -> None:
-    """The same inconsistency check covers directive ops, not just context."""
+    """The same inconsistency check covers directive ops, not just context.
+
+    #235: fails closed on the second (identical) attempt, same as above.
+    """
     bad_input = {
         "decision": "decline",
         "reasoning": "Declining.",
@@ -698,14 +712,19 @@ def test_decline_with_directive_ops_raises() -> None:
     }
     manager, _ = _make_manager(bad_input)
 
-    with pytest.raises(ValueError, match="decline"):
-        manager.judge(
-            scope=SCOPE,
-            stratum=STRATUM,
-            current_summary=CURRENT_SUMMARY,
-            recent_contributions=[],
-            new_contribution=NEW_CONTRIBUTION,
-        )
+    judgment = manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+    )
+    assert judgment.decision == "decline"
+    assert judgment.disposition_unreadable is False
+    assert judgment.outcome_disposition is None
+    assert judgment.judge_failure is True
+    assert "judge failure: the response was still malformed" in judgment.reasoning
+    assert "declined without a verdict on the merits" in judgment.reasoning
 
 
 # ---------------------------------------------------------------------------
@@ -759,14 +778,22 @@ def test_missing_tool_use_block_raises() -> None:
     mock_client.messages.create.return_value = response
     manager = ScopeManager(client=mock_client)
 
-    with pytest.raises(ValueError, match="tool_use"):
-        manager.judge(
-            scope=SCOPE,
-            stratum=STRATUM,
-            current_summary=CURRENT_SUMMARY,
-            recent_contributions=[],
-            new_contribution=NEW_CONTRIBUTION,
-        )
+    # #235: the SAME no-tool_use-block response answers the one corrective
+    # re-ask too, so this now fails closed (a recorded decline marked as a
+    # judge failure) rather than propagating.
+    judgment = manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+    )
+    assert judgment.decision == "decline"
+    assert judgment.disposition_unreadable is False
+    assert judgment.outcome_disposition is None
+    assert judgment.judge_failure is True
+    assert "judge failure: the response was still malformed" in judgment.reasoning
+    assert "declined without a verdict on the merits" in judgment.reasoning
 
     assert mock_client.messages.create.call_count == 2
 
@@ -1415,7 +1442,13 @@ def test_first_parse_failure_triggers_one_corrective_reask() -> None:
 
 
 def test_second_parse_failure_does_not_loop() -> None:
-    """Test (c): a second parse failure propagates — never more than one retry."""
+    """Test (c): a second parse failure never gets a third attempt.
+
+    #235: it used to propagate from here; it now fails closed instead (a
+    recorded decline marked as a judge failure) — but the one-retry
+    discipline itself is unchanged, so this still pins exactly one retry,
+    never a loop.
+    """
     garbage_input = {
         "decision": "accept_as_directive",
         "reasoning": "The contribution is a clear standard.",
@@ -1430,14 +1463,19 @@ def test_second_parse_failure_does_not_loop() -> None:
     ]
     manager = ScopeManager(client=mock_client)
 
-    with pytest.raises(ValueError, match="directive_ops as an unparseable string"):
-        manager.judge(
-            scope=SCOPE,
-            stratum=STRATUM,
-            current_summary=CURRENT_SUMMARY,
-            recent_contributions=[],
-            new_contribution=NEW_CONTRIBUTION,
-        )
+    judgment = manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+    )
+    assert judgment.decision == "decline"
+    assert judgment.disposition_unreadable is False
+    assert judgment.outcome_disposition is None
+    assert judgment.judge_failure is True
+    assert "judge failure: the response was still malformed" in judgment.reasoning
+    assert "declined without a verdict on the merits" in judgment.reasoning
 
     # Exactly one retry: two calls total, no third attempt.
     assert mock_client.messages.create.call_count == 2
@@ -2892,7 +2930,11 @@ def test_unpaired_supersede_is_rejected_at_parse() -> None:
 
 
 def test_unpaired_supersede_gets_the_parse_reask_then_propagates() -> None:
-    """The #113 one-retry discipline covers it: one corrective, then the error stands."""
+    """The #113 one-retry discipline covers it: one corrective, then — #235 —
+    it fails closed as a recorded judge-failure decline, not an unhandled
+    exception. This is the exact shape #235 fixes: the retry replaying the
+    same unpaired-supersede payload used to propagate out of judge() entirely,
+    which strata.app turned into a 500 on POST /contribute."""
     unpaired = {
         "decision": "accept_as_context",
         "reasoning": "dropping the old rule",
@@ -2906,14 +2948,19 @@ def test_unpaired_supersede_gets_the_parse_reask_then_propagates() -> None:
     ]
     manager = ScopeManager(client=mock_client)
 
-    with pytest.raises(ValueError, match="unpaired supersede"):
-        manager.judge(
-            scope=SCOPE,
-            stratum=STRATUM,
-            current_summary=CURRENT_SUMMARY,
-            recent_contributions=[],
-            new_contribution=NEW_CONTRIBUTION,
-        )
+    judgment = manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+    )
+    assert judgment.decision == "decline"
+    assert judgment.disposition_unreadable is False
+    assert judgment.outcome_disposition is None
+    assert judgment.judge_failure is True
+    assert "judge failure: the response was still malformed" in judgment.reasoning
+    assert "declined without a verdict on the merits" in judgment.reasoning
 
     assert mock_client.messages.create.call_count == 2
 
@@ -4700,7 +4747,9 @@ def test_supersede_op_with_no_id_takes_it_from_the_contribution() -> None:
 
 
 def test_retire_op_with_no_id_and_no_supersedes_still_fails() -> None:
-    """No target in the record leaves the op invalid exactly as before."""
+    """No target in the record leaves the op invalid exactly as before — #235:
+    the second identical attempt now fails closed as a recorded judge-failure
+    decline rather than propagating."""
     bad = {
         "decision": "accept_as_directive",
         "reasoning": "dropping the old rule",
@@ -4711,14 +4760,19 @@ def test_retire_op_with_no_id_and_no_supersedes_still_fails() -> None:
     mock_client.messages.create.side_effect = [_fake_response(bad), _fake_response(bad)]
     manager = ScopeManager(client=mock_client)
 
-    with pytest.raises(ValueError, match="retire op with no id"):
-        manager.judge(
-            scope=SCOPE,
-            stratum=STRATUM,
-            current_summary=CURRENT_SUMMARY,
-            recent_contributions=[],
-            new_contribution=NEW_CONTRIBUTION,
-        )
+    judgment = manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+    )
+    assert judgment.decision == "decline"
+    assert judgment.disposition_unreadable is False
+    assert judgment.outcome_disposition is None
+    assert judgment.judge_failure is True
+    assert "judge failure: the response was still malformed" in judgment.reasoning
+    assert "declined without a verdict on the merits" in judgment.reasoning
 
 
 def test_batch_supersede_op_with_no_id_takes_it_from_its_member() -> None:
@@ -4798,7 +4852,9 @@ def test_no_tool_use_block_gets_one_corrective_reask() -> None:
 
 
 def test_no_tool_use_block_twice_still_raises() -> None:
-    """One retry, never a loop: the second slip fails exactly as today."""
+    """One retry, never a loop: the second slip fails closed (#235), not a loop
+    or an unhandled exception. This is the `_extract_tool_use_block`-on-retry
+    shape #235 names directly: it used to be entirely unguarded."""
     mock_client = MagicMock()
     mock_client.messages.create.side_effect = [
         _fake_prose_response(),
@@ -4806,14 +4862,19 @@ def test_no_tool_use_block_twice_still_raises() -> None:
     ]
     manager = ScopeManager(client=mock_client)
 
-    with pytest.raises(ValueError, match="tool_use"):
-        manager.judge(
-            scope=SCOPE,
-            stratum=STRATUM,
-            current_summary=CURRENT_SUMMARY,
-            recent_contributions=[],
-            new_contribution=NEW_CONTRIBUTION,
-        )
+    judgment = manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+    )
+    assert judgment.decision == "decline"
+    assert judgment.disposition_unreadable is False
+    assert judgment.outcome_disposition is None
+    assert judgment.judge_failure is True
+    assert "judge failure: the response was still malformed" in judgment.reasoning
+    assert "declined without a verdict on the merits" in judgment.reasoning
 
     assert mock_client.messages.create.call_count == 2
 
