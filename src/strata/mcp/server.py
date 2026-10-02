@@ -3376,9 +3376,11 @@ async def strata_read_scope_record(
         tell the two apart; ``claim_carrier_checks`` covering the WHOLE scope
         the same way — one row per published item the owner-judge was asked
         to classify against a corrected claim, outcome ``carries``/
-        ``does_not_carry``/``unresolved_overflow``/``unresolved_unreadable``;
-        plus a ``page`` block carrying ``limit``, ``total`` (the whole
-        record's size), and ``next_before_id`` (null on the last page).
+        ``does_not_carry``/``unresolved_overflow``/``unresolved_unreadable``/
+        ``kept_by_guard`` (the judge said carries, but the mechanical
+        observed-value veto overrode it); plus a ``page`` block carrying
+        ``limit``, ``total`` (the whole record's size), and
+        ``next_before_id`` (null on the last page).
 
     Raises:
         RuntimeError: If scope_id is outside this agent's entitled

@@ -1492,6 +1492,104 @@ def _carrier_rank_score(claim_content: str, candidate_content: str) -> float:
     return len(overlap) + coverage
 
 
+_NUMBER_WORDS = {
+    "zero": "0",
+    "one": "1",
+    "two": "2",
+    "three": "3",
+    "four": "4",
+    "five": "5",
+    "six": "6",
+    "seven": "7",
+    "eight": "8",
+    "nine": "9",
+    "ten": "10",
+    "eleven": "11",
+    "twelve": "12",
+    "thirteen": "13",
+    "fourteen": "14",
+    "fifteen": "15",
+    "sixteen": "16",
+    "seventeen": "17",
+    "eighteen": "18",
+    "nineteen": "19",
+    "twenty": "20",
+    "thirty": "30",
+    "forty": "40",
+    "fifty": "50",
+    "sixty": "60",
+    "seventy": "70",
+    "eighty": "80",
+    "ninety": "90",
+    "hundred": "100",
+    "thousand": "1000",
+    "million": "1000000",
+}
+
+
+#: :func:`_key_tokens`'s own stopword set — :data:`_CARRIER_STOPWORDS` minus
+#: "on": a value word ("flags default to ON/OFF") the ranking stopword list
+#: correctly treats as noise for similarity scoring, but the veto's whole job
+#: is telling such a value apart from its opposite, so it must survive here.
+_KEY_TOKEN_STOPWORDS = frozenset(_CARRIER_STOPWORDS - {"on"})
+
+
+def _key_tokens(text: str) -> set[str]:
+    """Key tokens for :func:`observed_value_veto` (#219 C live-gate addition):
+    :data:`_KEY_TOKEN_STOPWORDS`-filtered content words, extended with
+    number/quote handling plain word-splitting loses — a number's grouping
+    commas and decimal point are kept together ("40,000" and "40000" are the
+    same token, never split into "40" and "000"), a quoted span is kept
+    whole rather than split into its own words, and a spelled-out number
+    word is normalised to its digit form ("forty" alongside "40000" lets
+    "forty thousand" match a candidate written "40,000").
+    """
+    words = re.findall(r"[a-z0-9]+", text.casefold())
+    tokens = {w for w in words if w not in _KEY_TOKEN_STOPWORDS}
+    for match in re.finditer(r'"([^"]+)"', text):
+        tokens.add(match.group(1).strip().casefold())
+    casefolded = text.casefold()
+    for match in re.finditer(r"\b\d[\d,]*(?:\.\d+)?\b", casefolded):
+        tokens.add(match.group(0).replace(",", ""))
+    for word in re.findall(r"[a-z]+", casefolded):
+        if word in _NUMBER_WORDS:
+            tokens.add(_NUMBER_WORDS[word])
+    return tokens
+
+
+def observed_value_veto(refuted_claim: str, correcting_content: str, item_content: str) -> bool:
+    """#219 C live-gate addition (CEO, standing rule 1 — never trust prompt
+    text alone): a mechanical veto that can only PREVENT a withdrawal, never
+    cause one.
+
+    The judge's own ``carries`` answer is overridden — the item is KEPT —
+    when its key tokens contain at least one token from what was actually
+    OBSERVED (``correcting_content``'s own key tokens, minus whatever it
+    shares with ``refuted_claim``) and none of what the refuted claim states
+    that the correction itself does NOT (the refuted claim's own key tokens,
+    minus whatever it shares with ``correcting_content``) — the two
+    claims' SHARED subject/action vocabulary is deliberately excluded from
+    both sides of this comparison, since a real carrier legitimately shares
+    it; only the part of each claim that actually DIFFERS from the other is
+    what the veto checks the item against. A generic correction (no key
+    tokens of its own beyond what it shares with the refuted claim, or no
+    key tokens at all) never vetoes.
+
+    Returns ``True`` when the item should be KEPT (the withdrawal is
+    vetoed), ``False`` otherwise. The caller only ever consults this for an
+    item the judge already marked ``carries`` — this never turns a
+    ``does_not_carry`` into a ``carries``.
+    """
+    refuted_keys = _key_tokens(refuted_claim)
+    correcting_keys = _key_tokens(correcting_content)
+    observed_keys = correcting_keys - refuted_keys
+    if not observed_keys:
+        return False
+    refuted_only = refuted_keys - correcting_keys
+    item_keys = _key_tokens(item_content)
+    return bool(item_keys & observed_keys) and not (item_keys & refuted_only)
+
+
 def check_claim_carriers(
     scope_id: str,
     *,
@@ -1529,10 +1627,15 @@ def check_claim_carriers(
 
     Every candidate the judge call does classify gets its own row — ``carries``
     or ``does_not_carry`` is itself a judgment made, so the row exists either
-    way (Philis: "carries / does_not_carry are acts, not labels"); an id the
-    judge named with no readable decision, or never named at all, is recorded
-    ``unresolved_unreadable``. Nothing here is withdrawn except the items
-    actually decided ``carries``.
+    way (the philosopher: "carries / does_not_carry are acts, not labels");
+    an id the judge named with no readable decision, or never named at all,
+    is recorded ``unresolved_unreadable``. A ``carries`` answer additionally
+    passes through :func:`observed_value_veto` (CEO, standing rule 1 — a
+    judge's own wording is never trusted alone): when the item's own key
+    tokens state what was actually OBSERVED rather than the refuted claim,
+    the withdrawal is vetoed and the row records ``kept_by_guard`` instead.
+    Nothing here is withdrawn except the items that end up decided
+    ``carries`` after that veto.
 
     *scope_manager* is duck-typed, not required to be a real
     :class:`~strata.scope_manager.ScopeManager`: one that predates this
@@ -1573,7 +1676,7 @@ def check_claim_carriers(
         check = getattr(scope_manager, "check_claim_carriers", None)
         decisions = (
             check(
-                corrected_claim_content=corrected_claim_content,
+                refuted_claim_content=corrected_claim_content,
                 correcting_content=correcting_content,
                 candidates=[(item.id, item.content) for item in candidates],
             )
@@ -1584,6 +1687,21 @@ def check_claim_carriers(
             outcome = decisions.get(item.id, "unresolved_unreadable")
             if outcome not in ("carries", "does_not_carry", "unresolved_unreadable"):
                 outcome = "unresolved_unreadable"
+            if outcome == "carries" and observed_value_veto(
+                corrected_claim_content, correcting_content, item.content
+            ):
+                # The mechanical veto (CEO, standing rule 1): the judge said
+                # carries, but the item's own key tokens state what was
+                # OBSERVED, not the refuted claim — never trust the prompt
+                # text alone. Can only PREVENT a withdrawal.
+                _logger.info(
+                    "claim-carrier guard kept published item %s in scope %s: judge said "
+                    "carries, but the item states the observed value, not the refuted "
+                    "one (issue #219 C)",
+                    item.id,
+                    scope_id,
+                )
+                outcome = "kept_by_guard"
             rows.append((item.id, outcome))
             if outcome == "carries":
                 to_withdraw.append(item)

@@ -590,10 +590,11 @@ BOOTSTRAP_JUDGE_TOOL: dict = {
 CLAIM_CARRIER_TOOL: dict = {
     "name": "classify_claim_carriers",
     "description": (
-        "A claim this scope published has just been corrected. Decide, for "
-        "EVERY listed published item, whether it still asserts the corrected "
-        "claim (even paraphrased, reworded, or stated in different words) or "
-        "not. One decision per item id — every id listed must get one."
+        "A claim this scope published has just been found wrong (REFUTED). "
+        "Decide, for EVERY listed published item, whether it still asserts "
+        "the REFUTED claim (even paraphrased, reworded, or stated in "
+        "different words) or not. One decision per item id — every id "
+        "listed must get one."
     ),
     "input_schema": {
         "type": "object",
@@ -612,14 +613,14 @@ CLAIM_CARRIER_TOOL: dict = {
                             "type": "string",
                             "enum": ["carries", "does_not_carry"],
                             "description": (
-                                "carries = the item asserts the corrected claim itself: "
-                                "the same subject, the same action and the same value or "
-                                "timing, alone or among other claims. An item that states "
-                                "a different value, a different subject, a different "
-                                "action, different timing, or an exception to the claim "
-                                "is does_not_carry, even if it is about the same matter. "
-                                "When in doubt, does_not_carry: a wrong 'carries' "
-                                "withdraws a valid publication."
+                                "carries = the item asserts the REFUTED claim itself: "
+                                "the same subject, action and value or timing, alone or "
+                                "among other claims. An item that asserts what was "
+                                "observed instead is does_not_carry: it agrees with the "
+                                "correction and must stay published. An item stating any "
+                                "other different value, subject, action, timing, or an "
+                                "exception to the claim is also does_not_carry. When in "
+                                "doubt, does_not_carry."
                             ),
                         },
                     },
@@ -632,19 +633,19 @@ CLAIM_CARRIER_TOOL: dict = {
 }
 
 _CLAIM_CARRIER_SYSTEM_PROMPT = """\
-You decide, for a scope whose own claim was just corrected, which of its \
-currently published items still carry that corrected claim — even paraphrased \
-or reworded — and which assert something else, including a different claim on \
-a similar subject (a subject swap is NOT a carrier). This is about CONTENT \
-equivalence only: does the item still assert the same thing the claim stated, \
-in substance, however the wording differs.
+You decide, for a scope whose own claim was just found wrong (REFUTED), which \
+of its currently published items still carry that REFUTED claim — even \
+paraphrased or reworded — and which assert something else, including a \
+different claim on a similar subject (a subject swap is NOT a carrier). This \
+is about CONTENT equivalence only: does the item still assert the same thing \
+the REFUTED claim stated, in substance, however the wording differs.
 
-carries = the item asserts the corrected claim itself: the same subject, the \
-same action and the same value or timing, alone or among other claims. An \
-item that states a different value, a different subject, a different \
-action, different timing, or an exception to the claim is does_not_carry, \
-even if it is about the same matter. When in doubt, does_not_carry: a wrong \
-"carries" withdraws a valid publication."""
+carries = the item asserts the REFUTED claim itself: the same subject, \
+action and value or timing, alone or among other claims. An item that \
+asserts what was observed instead is does_not_carry: it agrees with the \
+correction and must stay published. An item stating any other different \
+value, subject, action, timing, or an exception to the claim is also \
+does_not_carry. When in doubt, does_not_carry."""
 
 # ---------------------------------------------------------------------------
 # Interior-assertion re-ask tool (ADR 0016, issue #225 — static, eligible for
@@ -5787,12 +5788,12 @@ class ScopeManager:
     def check_claim_carriers(
         self,
         *,
-        corrected_claim_content: str,
+        refuted_claim_content: str,
         correcting_content: str,
         candidates: Sequence[tuple[str, str]],
     ) -> dict[str, Literal["carries", "does_not_carry", "unresolved_unreadable"]]:
         """Issue #219 C: one judge call, deciding per published item whether it
-        still carries a just-corrected claim.
+        still carries a just-refuted claim.
 
         A standalone call, never nested inside :meth:`judge`/:meth:`judge_batch`
         — the caller (:func:`strata.publication.check_claim_carriers`) already
@@ -5817,9 +5818,9 @@ class ScopeManager:
 
         listed = "\n".join(f"- item_id {item_id!r}: {content}" for item_id, content in candidates)
         user_text = (
-            "The corrected claim, as it stood before the correction:\n"
-            f"{corrected_claim_content}\n\n"
-            "The correction (the owner's own observation now):\n"
+            "REFUTED claim (found to be wrong):\n"
+            f"{refuted_claim_content}\n\n"
+            "What was observed instead (the correction):\n"
             f"{correcting_content}\n\n"
             "Published items to classify — decide carries/does_not_carry for "
             f"every one listed, by its exact item_id:\n{listed}"

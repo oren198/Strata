@@ -752,6 +752,12 @@ def cmd_record(args: argparse.Namespace) -> int:
                         f"      claim-carrier check on published item {check.item_id}: "
                         f"{check.outcome} — see strata_rejudge or operator review"
                     )
+                elif check.outcome == "kept_by_guard":
+                    print(
+                        f"      claim-carrier check on published item {check.item_id}: "
+                        "kept_by_guard — the judge said carries, but the item states "
+                        "the observed value, not the refuted one"
+                    )
                 else:
                     print(
                         f"      claim-carrier check on published item {check.item_id}: "

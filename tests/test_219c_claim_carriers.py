@@ -36,6 +36,7 @@ from strata.publication import (
     PublishedItem,
     _write_publication,
     check_claim_carriers,
+    observed_value_veto,
     propose_publish,
     read_publication,
 )
@@ -63,7 +64,7 @@ def test_decisions_applied_per_item_id() -> None:
     )
     manager = ScopeManager(client=mock_client, model="test-model")
     result = manager.check_claim_carriers(
-        corrected_claim_content="The service listens on port 8443.",
+        refuted_claim_content="The service listens on port 8443.",
         correcting_content="Used port 8443, the service refused.",
         candidates=[("pub_a", "Port: 8443"), ("pub_b", "The service is healthy.")],
     )
@@ -77,7 +78,7 @@ def test_a_missing_id_defaults_to_unresolved_unreadable() -> None:
     )
     manager = ScopeManager(client=mock_client, model="test-model")
     result = manager.check_claim_carriers(
-        corrected_claim_content="claim",
+        refuted_claim_content="claim",
         correcting_content="correction",
         candidates=[("pub_a", "x"), ("pub_b", "y")],
     )
@@ -91,7 +92,7 @@ def test_a_malformed_decision_value_defaults_to_unresolved_unreadable() -> None:
     )
     manager = ScopeManager(client=mock_client, model="test-model")
     result = manager.check_claim_carriers(
-        corrected_claim_content="claim",
+        refuted_claim_content="claim",
         correcting_content="correction",
         candidates=[("pub_a", "x")],
     )
@@ -105,7 +106,7 @@ def test_an_id_naming_no_candidate_is_ignored() -> None:
     )
     manager = ScopeManager(client=mock_client, model="test-model")
     result = manager.check_claim_carriers(
-        corrected_claim_content="claim",
+        refuted_claim_content="claim",
         correcting_content="correction",
         candidates=[("pub_a", "x")],
     )
@@ -117,7 +118,7 @@ def test_the_whole_call_raising_fails_closed_for_every_candidate() -> None:
     mock_client.messages.create.side_effect = RuntimeError("network error")
     manager = ScopeManager(client=mock_client, model="test-model")
     result = manager.check_claim_carriers(
-        corrected_claim_content="claim",
+        refuted_claim_content="claim",
         correcting_content="correction",
         candidates=[("pub_a", "x"), ("pub_b", "y")],
     )
@@ -128,7 +129,7 @@ def test_no_candidates_makes_no_call_at_all() -> None:
     mock_client = MagicMock()
     manager = ScopeManager(client=mock_client, model="test-model")
     result = manager.check_claim_carriers(
-        corrected_claim_content="claim", correcting_content="correction", candidates=[]
+        refuted_claim_content="claim", correcting_content="correction", candidates=[]
     )
     assert result == {}
     mock_client.messages.create.assert_not_called()
@@ -151,7 +152,7 @@ def test_the_ordinary_judge_tool_and_system_prompt_are_untouched() -> None:
     )
     manager = ScopeManager(client=mock_client, model="test-model")
     manager.check_claim_carriers(
-        corrected_claim_content="claim",
+        refuted_claim_content="claim",
         correcting_content="correction",
         candidates=[("pub_a", "x")],
     )
@@ -506,7 +507,152 @@ def test_already_withdrawn_items_never_become_candidates(
 
 
 # ---------------------------------------------------------------------------
-# 3. The drain-path site (strata.app.drain_scope, #221's centralised sweep).
+# 3. observed_value_veto — the mechanical guard (CEO, standing rule 1): can
+# only PREVENT a withdrawal the judge's own "carries" answer would otherwise
+# cause, never force one.
+# ---------------------------------------------------------------------------
+
+
+def test_the_inversion_pair_from_the_gate_is_kept_by_the_guard(
+    fleet, record_store, summaries_dir
+) -> None:
+    """The live-gate inversion: the judge reads "carries the corrected claim"
+    as "carries the correction" and marks the item stating the NEW value
+    carries. The item's own key tokens ("on") match the observed value, not
+    the refuted claim ("off"), so the guard keeps it published."""
+    item = _seed_published_item(
+        record_store,
+        summaries_dir,
+        "g_exec",
+        content="Feature flags default to on in production.",
+        subject="flags",
+    )
+    carrier_manager = _FakeCarrierManager({item.id: "carries"})
+    withdrawn = check_claim_carriers(
+        "g_exec",
+        claim_id="c_target08",
+        corrected_claim_content="Feature flags default to off in production.",
+        correcting_content="Feature flags default to on in production.",
+        trigger_id="c_outcome08",
+        already_withdrawn=[],
+        scope_manager=carrier_manager,
+        fleet=fleet,
+        record_store=record_store,
+        summaries_dir=summaries_dir,
+    )
+    assert withdrawn == []
+    assert [i.id for i in read_publication("g_exec", summaries_dir=summaries_dir)] == [item.id]
+    rows = record_store.list_claim_carrier_checks(scope_id="g_exec")
+    assert len(rows) == 1
+    assert rows[0].outcome == "kept_by_guard"
+
+
+def test_an_item_carrying_both_values_is_not_vetoed(fleet, record_store, summaries_dir) -> None:
+    """The item's own key tokens include the REFUTED claim's own value too
+    ("off"), so the guard does not fire — the judge's carries stands."""
+    item = _seed_published_item(
+        record_store,
+        summaries_dir,
+        "g_exec",
+        content="Feature flags default to on, previously off, in production.",
+        subject="flags",
+    )
+    carrier_manager = _FakeCarrierManager({item.id: "carries"})
+    withdrawn = check_claim_carriers(
+        "g_exec",
+        claim_id="c_target09",
+        corrected_claim_content="Feature flags default to off in production.",
+        correcting_content="Feature flags default to on in production.",
+        trigger_id="c_outcome09",
+        already_withdrawn=[],
+        scope_manager=carrier_manager,
+        fleet=fleet,
+        record_store=record_store,
+        summaries_dir=summaries_dir,
+    )
+    assert [i.id for i in withdrawn] == [item.id]
+    assert read_publication("g_exec", summaries_dir=summaries_dir) == []
+    rows = record_store.list_claim_carrier_checks(scope_id="g_exec")
+    assert rows[0].outcome == "carries"
+
+
+def test_a_generic_correction_never_vetoes(fleet, record_store, summaries_dir) -> None:
+    """A correction with no key tokens of its own (every word is a stopword)
+    gives the guard nothing to check against — it never fires, whatever the
+    judge said."""
+    item = _seed_published_item(
+        record_store,
+        summaries_dir,
+        "g_exec",
+        content="Feature flags default to off in production.",
+        subject="flags",
+    )
+    carrier_manager = _FakeCarrierManager({item.id: "carries"})
+    withdrawn = check_claim_carriers(
+        "g_exec",
+        claim_id="c_target10",
+        corrected_claim_content="Feature flags default to off in production.",
+        correcting_content="This is not that.",
+        trigger_id="c_outcome10",
+        already_withdrawn=[],
+        scope_manager=carrier_manager,
+        fleet=fleet,
+        record_store=record_store,
+        summaries_dir=summaries_dir,
+    )
+    assert [i.id for i in withdrawn] == [item.id]
+    rows = record_store.list_claim_carrier_checks(scope_id="g_exec")
+    assert rows[0].outcome == "carries"
+
+
+def test_the_guard_never_turns_does_not_carry_into_carries(
+    fleet, record_store, summaries_dir
+) -> None:
+    item = _seed_published_item(
+        record_store,
+        summaries_dir,
+        "g_exec",
+        content="Feature flags default to on in production.",
+        subject="flags",
+    )
+    carrier_manager = _FakeCarrierManager({item.id: "does_not_carry"})
+    withdrawn = check_claim_carriers(
+        "g_exec",
+        claim_id="c_target11",
+        corrected_claim_content="Feature flags default to off in production.",
+        correcting_content="Feature flags default to on in production.",
+        trigger_id="c_outcome11",
+        already_withdrawn=[],
+        scope_manager=carrier_manager,
+        fleet=fleet,
+        record_store=record_store,
+        summaries_dir=summaries_dir,
+    )
+    assert withdrawn == []
+    rows = record_store.list_claim_carrier_checks(scope_id="g_exec")
+    assert rows[0].outcome == "does_not_carry"
+
+
+def test_observed_value_veto_unit() -> None:
+    assert observed_value_veto(
+        "Feature flags default to off in production.",
+        "Feature flags default to on in production.",
+        "Feature flags default to on in production.",
+    )
+    assert not observed_value_veto(
+        "Feature flags default to off in production.",
+        "Feature flags default to on in production.",
+        "Feature flags default to on, previously off, in production.",
+    )
+    assert not observed_value_veto(
+        "Feature flags default to off in production.",
+        "This is not that.",
+        "Feature flags default to on in production.",
+    )
+
+
+# ---------------------------------------------------------------------------
+# 4. The drain-path site (strata.app.drain_scope, #221's centralised sweep).
 # ---------------------------------------------------------------------------
 
 _DRAIN_FLEET_YAML = """
@@ -611,7 +757,7 @@ def test_the_drain_path_site_runs_the_judge_call_too(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 4. Gating — an ordinary (non-correction) amendment never calls either site.
+# 5. Gating — an ordinary (non-correction) amendment never calls either site.
 # ---------------------------------------------------------------------------
 
 

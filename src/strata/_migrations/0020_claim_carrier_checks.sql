@@ -24,6 +24,12 @@
 --   'unresolved_unreadable'— the judge named this item but its decision
 --                            value did not parse, or named no decision for
 --                            it at all.
+--   'kept_by_guard'        — the judge said `carries`, but the mechanical
+--                            observed-value veto overrode it: the item's own
+--                            key tokens state what was actually OBSERVED (the
+--                            correction), not the refuted claim, so the
+--                            withdrawal was vetoed (CEO, standing rule 1 — a
+--                            judge's own wording is never trusted alone).
 --
 -- Relays are never rows here: a relay is a copy of a face item, carried down
 -- by the same cascade the verbatim path uses when its origin is judged
@@ -39,7 +45,8 @@ CREATE TABLE claim_carrier_checks (
                             'carries',
                             'does_not_carry',
                             'unresolved_overflow',
-                            'unresolved_unreadable'
+                            'unresolved_unreadable',
+                            'kept_by_guard'
                         )),
     created_at          TEXT NOT NULL DEFAULT (datetime('now'))
 );

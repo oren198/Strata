@@ -559,7 +559,9 @@ class ClaimCarrierCheck:
     scope_id: str
     corrected_claim_id: str
     item_id: str
-    outcome: Literal["carries", "does_not_carry", "unresolved_overflow", "unresolved_unreadable"]
+    outcome: Literal[
+        "carries", "does_not_carry", "unresolved_overflow", "unresolved_unreadable", "kept_by_guard"
+    ]
     created_at: str
 
 
@@ -2289,7 +2291,11 @@ class RecordStore:
             tuple[
                 str,
                 Literal[
-                    "carries", "does_not_carry", "unresolved_overflow", "unresolved_unreadable"
+                    "carries",
+                    "does_not_carry",
+                    "unresolved_overflow",
+                    "unresolved_unreadable",
+                    "kept_by_guard",
                 ],
             ]
         ],
