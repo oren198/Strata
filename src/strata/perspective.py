@@ -482,6 +482,102 @@ def ancestor_directives(
     ]
 
 
+def perspective_watermark(
+    scope_id: str,
+    *,
+    fleet: FleetConfig,
+    summary_store: SummaryStore,
+    operator_reader: OperatorReader | None = None,
+    change_event_reader: ChangeEventReader | None = None,
+) -> str:
+    """A short, deterministic string that changes whenever *scope_id*'s
+    composed perspective would read differently (issue #234, read signaling).
+
+    Covers every ADR 0014 input change plus a publication-affecting act, from
+    the SAME chain :func:`compose_perspective` composes, root-first:
+
+    - *scope_id*'s own summary ``version`` and each inter-stratum ancestor's
+      summary ``version`` — the directives-and-context half of what moved
+      (an own-scope write by another session, or any ancestor directive
+      change).
+    - When *operator_reader* is given: for each chain scope (ancestors +
+      self), its CURRENT operator item ids (ADR 0008 D2) — a `publish`,
+      `supersede`, or `retire` act always changes this set, since every act
+      mints a fresh id (``_new_operator_act_id``) even when it restates prior
+      content, and a `retire` empties it. No separate query against
+      ``operator_acts`` is needed: this is exactly what ``compose_perspective``
+      already loads via the same reader.
+    - When *change_event_reader* is given: *scope_id*'s own change-event
+      count and newest event id (ADR 0014's reactive re-judgement notices,
+      publications and claim events included) — called with ``scope_id``
+      only, matching :func:`compose_perspective`'s own call, and reading
+      EVERY event (processed or not — a processed event still means the
+      scope's input changed since this read).
+
+    Mechanical only (#234 §5): no judge is consulted, nothing here is stored
+    as memory, and this never gates or triggers a judgment — it only answers
+    "would composing *scope_id*'s perspective again read differently now."
+
+    Returns:
+        A string with no stability guarantee across engine versions — compare
+        it only against a watermark this same engine version produced
+        (:class:`~strata.session_state.ScopeReadReceipt`'s own compatibility
+        story already treats an absent/mismatched watermark as "no baseline,"
+        never a crash).
+    """
+    scope = fleet.get_scope(scope_id)
+    if scope is None:
+        raise ValueError(f"Scope not found: {scope_id!r}")
+    chain = [*fleet.inter_stratum_ancestors(scope_id), scope]
+    parts: list[str] = []
+    for s in chain:
+        summary = summary_store.read(s.id)
+        parts.append(f"{s.id}:v{summary.version if summary is not None else 0}")
+    if operator_reader is not None:
+        for s in chain:
+            items = operator_reader(s.id)
+            marker = ",".join(item.id for item in items) if items else "-"
+            parts.append(f"op:{s.id}:{marker}")
+    if change_event_reader is not None:
+        events = list(change_event_reader(scope_id))
+        marker = events[-1].id if events else "-"
+        parts.append(f"ce:{scope_id}:{len(events)}:{marker}")
+    return "|".join(parts)
+
+
+def perspective_changed_since(
+    watermark: str | None,
+    scope_id: str,
+    *,
+    fleet: FleetConfig,
+    summary_store: SummaryStore,
+    operator_reader: OperatorReader | None = None,
+    change_event_reader: ChangeEventReader | None = None,
+) -> bool:
+    """True if *scope_id*'s perspective would compose differently now than it
+    did when *watermark* was recorded (issue #234).
+
+    Cheap: the same small reads :func:`perspective_watermark` does, never the
+    full :func:`compose_perspective`. ``watermark`` is ``None`` for a read
+    recorded before #234 (an old state file, or a receipt this engine version
+    never stamped) — there is no baseline to compare, so this reports
+    ``False`` (not stale) rather than guessing; the NEXT read of this scope
+    records a real baseline.
+    """
+    if watermark is None:
+        return False
+    return (
+        perspective_watermark(
+            scope_id,
+            fleet=fleet,
+            summary_store=summary_store,
+            operator_reader=operator_reader,
+            change_event_reader=change_event_reader,
+        )
+        != watermark
+    )
+
+
 def compose_perspective(
     scope_id: str,
     *,
