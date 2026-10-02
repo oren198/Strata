@@ -247,9 +247,17 @@ class SessionState(BaseModel):
     """When the strict Stop hook last blocked this session's stop."""
 
     strict_blocks: int = 0
-    """How many times the strict Stop hook blocked this session (hard cap 2: the
-    first reminder, then one last reminder only if the agent made no strata call in
-    between). A pre-cap-2 file has only ``strict_blocked_at``; it counts as one."""
+    """How many times the strict Stop hook blocked this session — EITHER
+    clause (#234 §9: a shared cap of 2 across the write-side asymmetry
+    reminder and the read-side staleness notice, write-side counted first).
+    A pre-cap-2 file has only ``strict_blocked_at``; it counts as one."""
+
+    read_signal_notified: bool = False
+    """#234 §4b/§9: whether the Stop hook's read-side clause has already said
+    its one notice this session — strict (a block, sharing ``strict_blocks``'
+    budget) or default (a non-blocking ``systemMessage``) alike. Set once,
+    never re-fires: "memory you read has changed" is said at most once per
+    session, independent of the shared block budget's own cap."""
 
     tool_calls: int = 0
     """Strata tool calls this session has made (every ``tools/call`` the server
@@ -629,6 +637,17 @@ class SessionStateStore:
             state.strict_blocks = strict_blocks_so_far(state) + 1
             state.strict_blocked_at = ts
             state.tool_calls_at_last_block = state.tool_calls
+            self._write(state)
+        return state
+
+    def record_read_signal_notified(self, session_id: str) -> SessionState:
+        """#234 §4b/§9: record that the Stop hook's read-side clause has said
+        its one notice this session (strict block or default notify alike) —
+        idempotent after the first call, the same "at most once" guard
+        :attr:`SessionState.read_signal_notified` documents."""
+        with self._locked(session_id):
+            state = self.read(session_id) or SessionState(session_id=session_id)
+            state.read_signal_notified = True
             self._write(state)
         return state
 
