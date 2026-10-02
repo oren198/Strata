@@ -1584,9 +1584,39 @@ def operator_restore(
         )
 
 
+@dataclass(frozen=True)
+class CorrectionWithdrawalRow:
+    """One row of the "Correction withdrawals" detection surface (Console view
+    / ``strata record --swept`` / the backend endpoint) — a withdrawal made by
+    a correction sweep, with everything the row needs to show side by side."""
+
+    act: PublicationAct
+    """The withdraw act itself — ``act.withdraws`` is the withdrawn item's id,
+    ``act.acknowledged``/``act.restored_by`` its review state."""
+    correction: ClaimCorrection | None
+    """The refuted claim's text and the correcting text, when on record (should
+    always be, by design — see :class:`ClaimCorrection`'s own docstring)."""
+    carrier_check: ClaimCarrierCheck | None
+    """#219 C's own audit row, when the method was a judged ``carries``
+    decision — ``None`` for a verbatim match or a relay-cascade hop, neither
+    of which gets one."""
+    reader_count: int
+    """Distinct reader scopes notified of this item's withdrawal (every
+    ``claim_corrected`` event for this item under its own change ids,
+    excluding the owning scope's self-notice)."""
+
+    @property
+    def method(self) -> str:
+        if self.carrier_check is not None:
+            return f"judge {self.carrier_check.outcome}"
+        if (self.act.trigger or "").startswith("pub_"):
+            return "relay cascade"
+        return "verbatim"
+
+
 def list_correction_withdrawals(
     scope_id: str, *, record_store: RecordStore, include_acknowledged: bool = False
-) -> list[tuple[PublicationAct, ClaimCorrection | None, ClaimCarrierCheck | None]]:
+) -> list[CorrectionWithdrawalRow]:
     """The Console's "Correction withdrawals" view / ``strata record --swept``:
     every withdraw act in *scope_id* caused by a correction sweep, newest
     first, each with its claim/correcting text (when found) and #219 C's own
@@ -1594,18 +1624,19 @@ def list_correction_withdrawals(
     a verbatim match — absent otherwise).
 
     *include_acknowledged*: by default, a withdrawal already marked
-    "keep withdrawn" is left out — the "to review" filter design point 10
-    describes. ``True`` returns every restorable withdrawal regardless.
+    "keep withdrawn" OR already restored is left out — the "to review"
+    filter design point 10 describes (nothing left to review once either
+    has happened). ``True`` returns every restorable withdrawal regardless.
     """
     acts = record_store.list_publication_acts(scope_id=scope_id)
     carrier_checks = {
         c.item_id: c for c in record_store.list_claim_carrier_checks(scope_id=scope_id)
     }
-    out: list[tuple[PublicationAct, ClaimCorrection | None, ClaimCarrierCheck | None]] = []
+    out: list[CorrectionWithdrawalRow] = []
     for act in acts:
         if act.act != "withdraw":
             continue
-        if act.acknowledged and not include_acknowledged:
+        if (act.acknowledged or act.restored_by is not None) and not include_acknowledged:
             continue
         restorable = restorable_withdrawal(scope_id, act.withdraws or "", record_store=record_store)
         if restorable is None:
@@ -1615,9 +1646,59 @@ def list_correction_withdrawals(
             correction = _resolve_claim_correction(claim_id, change_ids, record_store=record_store)
         except KeyError:
             correction = None
-        out.append((act, correction, carrier_checks.get(act.withdraws or "")))
-    out.sort(key=lambda row: row[0].created_at, reverse=True)
+        reader_scopes: set[str] = set()
+        for change_id in change_ids:
+            for event in record_store.list_change_events_by_change_id(
+                change_id=change_id, item_id=act.withdraws, kind=CLAIM_CORRECTED
+            ):
+                reader_scopes.add(event.scope_id)
+        reader_scopes.discard(scope_id)
+        out.append(
+            CorrectionWithdrawalRow(
+                act=act,
+                correction=correction,
+                carrier_check=carrier_checks.get(act.withdraws or ""),
+                reader_count=len(reader_scopes),
+            )
+        )
+    out.sort(key=lambda row: row.act.created_at, reverse=True)
     return out
+
+
+def list_unresolved_carrier_checks(
+    scope_id: str, *, record_store: RecordStore
+) -> list[ClaimCarrierCheck]:
+    """#219 C's own unresolved/overflow rows for *scope_id*, newest first — flagged
+    in the same "Correction withdrawals" view (detection surface design point 1),
+    since by definition nothing was withdrawn for these: the item was never
+    classified (overflow) or the judge's decision could not be read (unreadable),
+    so there is no withdraw act to find them through."""
+    rows = [
+        c
+        for c in record_store.list_claim_carrier_checks(scope_id=scope_id)
+        if c.outcome in ("unresolved_overflow", "unresolved_unreadable")
+    ]
+    rows.sort(key=lambda c: c.created_at, reverse=True)
+    return rows
+
+
+def acknowledge_correction_withdrawal(
+    scope_id: str, item_id: str, *, record_store: RecordStore
+) -> PublicationAct:
+    """The Console's "keep withdrawn" action: mark the withdraw act for *item_id*
+    in *scope_id* acknowledged, hiding it from :func:`list_correction_withdrawals`'s
+    default "to review" filter without restoring it.
+
+    Raises:
+        KeyError: no withdraw act is on record for *item_id* in *scope_id*.
+    """
+    withdraw_act = _find_withdraw_act(scope_id, item_id, record_store=record_store)
+    if withdraw_act is None:
+        raise KeyError(f"No withdraw act found for item {item_id!r} in scope {scope_id!r}.")
+    record_store.acknowledge_withdraw(withdraw_act.id)
+    updated = record_store.get_publication_act(withdraw_act.id)
+    assert updated is not None  # noqa: S101 — just wrote it, must exist
+    return updated
 
 
 # ---------------------------------------------------------------------------

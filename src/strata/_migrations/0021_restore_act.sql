@@ -26,7 +26,18 @@
 --                     review" filter without restoring it. 0 by default.
 --    SQLite cannot widen a CHECK constraint in place, so this is the
 --    standard recreate-table rewrite (0006, 0011, 0012, 0017's shape):
---    new table, copy, drop, rename, recreate the index.
+--    new table, copy, drop, rename, recreate the index. Every connection
+--    runs PRAGMA foreign_keys = ON (the migrator sets it before opening
+--    this file's transaction), so DROP TABLE publication_acts performs an
+--    implicit DELETE of every row first, which the two tables that
+--    reference it (publication_judgments.act_id, migration 0005/0006;
+--    publication_judgment_attempts.act_id, migration 0008) would then
+--    violate on a real database with rows in them (0006's own header warns
+--    of exactly this). Both are backed up to a plain, FK-free temp table
+--    and dropped BEFORE publication_acts is rebuilt, then recreated and
+--    restored afterwards — the same shape 0006 already established for
+--    this exact table, extended here to publication_judgment_attempts,
+--    which did not exist yet when 0006 was written.
 --
 -- 2. `change_events` gains:
 --      claim_id    The corrected claim's own id (ADR 0017 P4/#219 C),
@@ -60,6 +71,12 @@
 --    reads for its side-by-side row. Keyed by (change_id, corrected_claim_id)
 --    rather than reusing `claim_carrier_checks`, which only exists for #219
 --    C's OWN judged rows — a verbatim-only correction has no row there.
+
+CREATE TABLE publication_judgments_backup AS SELECT * FROM publication_judgments;
+DROP TABLE publication_judgments;
+
+CREATE TABLE publication_judgment_attempts_backup AS SELECT * FROM publication_judgment_attempts;
+DROP TABLE publication_judgment_attempts;
 
 CREATE TABLE publication_acts_new (
     id                       TEXT PRIMARY KEY,
@@ -103,6 +120,38 @@ DROP TABLE publication_acts;
 ALTER TABLE publication_acts_new RENAME TO publication_acts;
 
 CREATE INDEX idx_publication_acts_scope ON publication_acts(scope_id);
+
+CREATE TABLE publication_judgments (
+    id          TEXT PRIMARY KEY,
+    act_id      TEXT NOT NULL UNIQUE REFERENCES publication_acts(id),
+    decision    TEXT NOT NULL CHECK (decision IN ('accept', 'decline')),
+    judged_by   TEXT NOT NULL,
+    reasoning   TEXT,
+    created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+INSERT INTO publication_judgments
+    SELECT id, act_id, decision, judged_by, reasoning, created_at
+    FROM publication_judgments_backup;
+
+DROP TABLE publication_judgments_backup;
+
+CREATE TABLE publication_judgment_attempts (
+    id           TEXT PRIMARY KEY,
+    act_id       TEXT NOT NULL REFERENCES publication_acts(id),
+    error_class  TEXT NOT NULL,
+    message      TEXT,
+    attempted_at TEXT NOT NULL DEFAULT (datetime('now')),
+    outcome      TEXT CHECK (outcome IS NULL OR outcome = 'judge_failed')
+);
+
+INSERT INTO publication_judgment_attempts
+    SELECT id, act_id, error_class, message, attempted_at, outcome
+    FROM publication_judgment_attempts_backup;
+
+DROP TABLE publication_judgment_attempts_backup;
+
+CREATE INDEX idx_publication_judgment_attempts_act ON publication_judgment_attempts(act_id);
 
 CREATE TABLE change_events_new (
     id              TEXT PRIMARY KEY,

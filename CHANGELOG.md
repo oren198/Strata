@@ -75,9 +75,12 @@ the release PR (`dev` → `main`) and the GitHub Release body are built from
     topology, and never sent to a scope that started reading only after the
     withdrawal. Evidence only: nothing is inserted into a reader's memory on
     its behalf.
-  - **Detection surface:** `strata record <scope> --swept` lists every
+  - **Detection surface:** `strata record <scope> --swept` and the Console's
+    new "Correction withdrawals" tab (under Publications) both list every
     correction withdrawal in a scope (verbatim, judged `carries`, or relay),
     with the refuted claim and correcting content side by side, how it was
-    withdrawn, and a restore command to run.
+    withdrawn, the reader count, and #219 C's own unresolved/overflow rows,
+    flagged. The Console tab adds a Restore button (the operator path) and a
+    "keep withdrawn" acknowledge.
   - Not a behaviour change for anything already shipped: unused unless a
     withdrawal is actually restored.

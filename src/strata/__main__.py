@@ -648,31 +648,34 @@ def cmd_summary(args: argparse.Namespace) -> int:
 def _print_swept(scope_id: str, *, record_store: RecordStore) -> int:
     """``strata record <scope> --swept`` — the Console's "Correction
     withdrawals" view, printed as text: every withdrawal a correction sweep
-    made in *scope_id*, newest first."""
-    from strata.publication import list_correction_withdrawals
+    made in *scope_id*, newest first, plus #219 C's own unresolved/overflow
+    rows, flagged."""
+    from strata.publication import list_correction_withdrawals, list_unresolved_carrier_checks
 
     rows = list_correction_withdrawals(scope_id, record_store=record_store)
+    unresolved = list_unresolved_carrier_checks(scope_id, record_store=record_store)
     print(f"Scope: {scope_id}")
     print(f"Correction withdrawals: {len(rows)} (newest first; restored/acknowledged hidden)")
     print()
     if not rows:
         print("  (none)")
-        return 0
-    for act, correction, carrier_check in rows:
-        if carrier_check is not None:
-            method = f"judge {carrier_check.outcome}"
-        elif act.trigger and act.trigger.startswith("pub_"):
-            method = "relay cascade"
-        else:
-            method = "verbatim"
-        print(f"  · {act.withdraws}  [{method}]  withdrawn {act.created_at}")
-        if correction is not None:
-            print(f"      refuted claim: {correction.corrected_claim_content}")
-            print(f"      correcting content: {correction.correcting_content}")
+    for row in rows:
         print(
-            f"      restore with: strata operator restore {scope_id} {act.withdraws} "
-            f"(withdraw act {act.id})"
+            f"  · {row.act.withdraws}  [{row.method}]  withdrawn {row.act.created_at}  "
+            f"readers notified: {row.reader_count}"
         )
+        if row.correction is not None:
+            print(f"      refuted claim: {row.correction.corrected_claim_content}")
+            print(f"      correcting content: {row.correction.correcting_content}")
+        print(
+            f"      restore with: strata operator restore {scope_id} {row.act.withdraws} "
+            f"(withdraw act {row.act.id})"
+        )
+    if unresolved:
+        print()
+        print(f"UNRESOLVED (#219 C — never classified, flagged): {len(unresolved)}")
+        for check in unresolved:
+            print(f"  · {check.item_id}  [{check.outcome}]  {check.created_at}")
     return 0
 
 

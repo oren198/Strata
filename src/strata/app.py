@@ -403,6 +403,13 @@ class RetireDirectiveRequest(BaseModel):
     reason: str | None = None
 
 
+class RestoreCorrectionWithdrawalRequest(BaseModel):
+    """Operator restore, in person — a published item a correction sweep wrongly
+    withdrew, back under its original id and bytes (the restore act design)."""
+
+    reason: str | None = None
+
+
 # ---------------------------------------------------------------------------
 # Contribute choke point (issues #38, #57)
 #
@@ -3719,6 +3726,130 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc.args[0])) from exc
         return {"scope_id": scope_id, "retirement": asdict(retirement)}
+
+    # -----------------------------------------------------------------------
+    # GET  /scopes/{scope_id}/correction-withdrawals
+    # POST /scopes/{scope_id}/correction-withdrawals/{item_id}/restore
+    # POST /scopes/{scope_id}/correction-withdrawals/{item_id}/acknowledge
+    #
+    # The detection surface the restore act design requires: every
+    # withdrawal a correction sweep made in a scope, side by side with its
+    # claim/correcting text, a Restore button (the operator path), and a
+    # "keep withdrawn" acknowledge — the same read function `strata record
+    # <scope> --swept` prints. UI-only surface (constraint G1): no engine
+    # flow calls any of these.
+    # -----------------------------------------------------------------------
+
+    @application.get("/scopes/{scope_id}/correction-withdrawals")
+    def get_correction_withdrawals(
+        scope_id: str,
+        request: Request,
+        all: bool = False,  # noqa: A002 — `all` is the query param name, mirrors operator-evidence
+        record_store: RecordStore = Depends(get_record_store),
+    ) -> dict:
+        """Every withdrawal a correction sweep made in *scope_id* — newest
+        first, each with its claim/correcting text and #219 C's own audit
+        row when judged — plus #219 C's own unresolved/overflow rows,
+        flagged separately.
+
+        ``all=true`` also returns a withdrawal already acknowledged
+        ("keep withdrawn"), hidden from the default "to review" view.
+
+        Returns 404 if the scope is not in the FleetConfig.
+        """
+        from dataclasses import asdict
+
+        from strata.publication import list_correction_withdrawals, list_unresolved_carrier_checks
+
+        fleet: FleetConfig = request.app.state.fleet_reloader.get()
+        scope = fleet.get_scope(scope_id)
+        if scope is None:
+            raise HTTPException(status_code=404, detail=f"Scope not found: {scope_id!r}")
+
+        rows = list_correction_withdrawals(
+            scope_id, record_store=record_store, include_acknowledged=all
+        )
+        unresolved = list_unresolved_carrier_checks(scope_id, record_store=record_store)
+        return {
+            "scope_id": scope_id,
+            "withdrawals": [
+                {
+                    "act": asdict(r.act),
+                    "correction": asdict(r.correction) if r.correction else None,
+                    "carrier_check": asdict(r.carrier_check) if r.carrier_check else None,
+                    "reader_count": r.reader_count,
+                    "method": r.method,
+                }
+                for r in rows
+            ],
+            "unresolved": [asdict(c) for c in unresolved],
+        }
+
+    @application.post("/scopes/{scope_id}/correction-withdrawals/{item_id}/restore")
+    def restore_correction_withdrawal(
+        scope_id: str,
+        item_id: str,
+        body: RestoreCorrectionWithdrawalRequest,
+        request: Request,
+        record_store: RecordStore = Depends(get_record_store),
+        summary_store: SummaryStore = Depends(get_summary_store),
+    ) -> dict:
+        """Operator restore, in person (the restore act design) — Console
+        surface for ``strata operator restore``.
+
+        Delegates straight to :func:`strata.publication.operator_restore`,
+        which takes :func:`strata.locks.scope_lock` itself — the SAME
+        cross-process per-scope lock the CLI takes. This route deliberately
+        takes NO lock of its own. UI-only surface (constraint G1): no engine
+        flow calls it.
+        """
+        from strata.publication import operator_restore
+
+        fleet: FleetConfig = request.app.state.fleet_reloader.get()
+        scope = fleet.get_scope(scope_id)
+        if scope is None:
+            raise HTTPException(status_code=404, detail=f"Scope not found: {scope_id!r}")
+        try:
+            outcome = operator_restore(
+                scope_id,
+                item_id,
+                body.reason,
+                fleet=fleet,
+                record_store=record_store,
+                summaries_dir=str(summary_store.summaries_dir),
+            )
+        except (ValueError, KeyError) as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return {
+            "scope_id": scope_id,
+            "item_id": item_id,
+            "act_id": outcome.act_id,
+            "decision": outcome.decision,
+        }
+
+    @application.post("/scopes/{scope_id}/correction-withdrawals/{item_id}/acknowledge")
+    def acknowledge_correction_withdrawal_route(
+        scope_id: str,
+        item_id: str,
+        request: Request,
+        record_store: RecordStore = Depends(get_record_store),
+    ) -> dict:
+        """The "keep withdrawn" action: mark the withdrawal acknowledged without
+        restoring it, hiding it from the default "to review" view.
+        """
+        from dataclasses import asdict
+
+        from strata.publication import acknowledge_correction_withdrawal
+
+        fleet: FleetConfig = request.app.state.fleet_reloader.get()
+        scope = fleet.get_scope(scope_id)
+        if scope is None:
+            raise HTTPException(status_code=404, detail=f"Scope not found: {scope_id!r}")
+        try:
+            act = acknowledge_correction_withdrawal(scope_id, item_id, record_store=record_store)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return {"scope_id": scope_id, "item_id": item_id, "act": asdict(act)}
 
     return application
 

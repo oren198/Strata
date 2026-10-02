@@ -2,9 +2,14 @@
 // Strata · Publications. The Console's surface for the sideways sharing
 // channel (CONTEXT.md § Publication, § Republication — ADR 0013): what a
 // scope currently publishes, the history of its publish/withdraw acts, and
-// what a given reader actually receives under the one-edge rule. Read-only
-// — this browser never publishes or withdraws (constraint G1); writing
-// still flows through `strata.publish` / `strata.withdraw`.
+// what a given reader actually receives under the one-edge rule.
+//
+// The first three subtabs are read-only — this browser never publishes or
+// withdraws (constraint G1); writing flows through `strata.publish` /
+// `strata.withdraw`. The fourth, "Correction withdrawals", is the ONE
+// exception: the restore act's operator path (ADR 0008 D4-shaped — in
+// person, unjudged) is a Console-only write, same precedent as
+// operator-actions.jsx's Supersede/Retire.
 //
 // Publication travels exactly one edge: a reader receives its chain
 // parent's publication and the publications of the scopes it itself
@@ -20,6 +25,7 @@ const PUB_SUBTABS = [
   { id: "current", label: "Publishes now" },
   { id: "history", label: "Act history" },
   { id: "reader", label: "As a reader" },
+  { id: "corrections", label: "Correction withdrawals" },
 ];
 
 function scopeName(state, scopeId) {
@@ -82,6 +88,7 @@ function PublicationsView({ state, scopeId, onSelectScope }) {
         {subtab === "current" && <PublishesNowPanel state={state} scopeId={scopeId} />}
         {subtab === "history" && <PublicationHistoryPanel state={state} scopeId={scopeId} />}
         {subtab === "reader" && <ReaderReceivesPanel state={state} defaultScopeId={scopeId} />}
+        {subtab === "corrections" && <CorrectionWithdrawalsPanel scopeId={scopeId} />}
       </div>
     </div>
   );
@@ -485,6 +492,171 @@ function ReaderSourceCard({ state, layer }) {
           </ul>
         )}
       </div>
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// View 4 — Correction withdrawals: the restore act's detection surface
+// (operator decision, verbatim). Every withdrawal a correction sweep made
+// in this scope — the refuted claim, the correcting content, and the
+// withdrawn item's text side by side, how it was withdrawn, the change id
+// and the reader count. A Restore button (the operator path, unjudged, in
+// person) and a "keep withdrawn" acknowledge that hides the row without
+// restoring it. #219 C's own unresolved/overflow rows appear below,
+// flagged — nothing was withdrawn for those, so there is nothing to
+// restore, only to notice.
+// ─────────────────────────────────────────────────────────────────────
+function CorrectionWithdrawalsPanel({ scopeId }) {
+  const [loading, setLoading] = React.useState(true);
+  const [error, setError] = React.useState(null);
+  const [data, setData] = React.useState(null);
+  const [busyId, setBusyId] = React.useState(null);
+  const [flash, setFlash] = React.useState(null);
+
+  const reload = React.useCallback(() => {
+    if (!scopeId) { setLoading(false); setData(null); return; }
+    setLoading(true);
+    setError(null);
+    return STRATA_STORE.fetchCorrectionWithdrawals(scopeId)
+      .then((body) => { setData(body); setLoading(false); })
+      .catch((err) => { setError(err.message || String(err)); setLoading(false); });
+  }, [scopeId]);
+
+  React.useEffect(() => { reload(); }, [reload]);
+
+  function handleRestore(itemId) {
+    setBusyId(itemId);
+    setFlash(null);
+    STRATA_STORE.restoreCorrectionWithdrawal(scopeId, itemId, {})
+      .then((body) => {
+        setFlash(
+          body.decision === "accept"
+            ? "Restored — item is back under its original id."
+            : "The owner's judge declined — item stays withdrawn.",
+        );
+        setBusyId(null);
+        reload();
+      })
+      .catch((err) => { setError(err.message || String(err)); setBusyId(null); });
+  }
+
+  function handleAcknowledge(itemId) {
+    setBusyId(itemId);
+    setFlash(null);
+    STRATA_STORE.acknowledgeCorrectionWithdrawal(scopeId, itemId)
+      .then(() => { setFlash("Kept withdrawn."); setBusyId(null); reload(); })
+      .catch((err) => { setError(err.message || String(err)); setBusyId(null); });
+  }
+
+  if (loading) return <div className="at-caption">Loading…</div>;
+  if (error) {
+    return (
+      <div>
+        <div className="at-caption">Could not load correction withdrawals.</div>
+        <div style={{ fontFamily: "var(--font-mono)", color: "var(--at-bear)", fontSize: 12, marginTop: 4 }}>
+          {error}
+        </div>
+      </div>
+    );
+  }
+  if (!data) return null;
+
+  const withdrawals = data.withdrawals || [];
+  const unresolved = data.unresolved || [];
+
+  return (
+    <div>
+      <div className="at-body-sm" style={{ marginBottom: 14, color: "var(--at-muted)" }}>
+        Every item a correction sweep withdrew from this scope — a wrong
+        withdrawal can be restored here, under its original id, or kept
+        withdrawn to stop it showing up again.
+      </div>
+
+      {flash && (
+        <div className="at-caption" style={{ color: "var(--at-ok)", marginBottom: 10 }}>
+          {flash}
+        </div>
+      )}
+
+      {withdrawals.length === 0 ? (
+        <div className="at-caption" style={{ fontStyle: "italic" }}>
+          Nothing to review — no withdrawal here was made by a correction sweep.
+        </div>
+      ) : (
+        <ul style={{ listStyle: "none", padding: 0, margin: 0, display: "flex", flexDirection: "column", gap: 10 }}>
+          {withdrawals.map((row) => {
+            const itemId = row.act.withdraws;
+            const busy = busyId === itemId;
+            return (
+              <li key={row.act.id} className="activity-row">
+                <div className="activity-row-detail" style={{ borderTop: "none", paddingTop: 12 }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+                    <Tag>{row.method}</Tag>
+                    <span className="at-caption">{row.reader_count} reader{row.reader_count === 1 ? "" : "s"} notified</span>
+                    <span style={{ flex: 1 }} />
+                    <time
+                      dateTime={row.act.created_at}
+                      title={absoluteTime(row.act.created_at)}
+                      style={{ fontSize: 12, color: "var(--at-muted)" }}
+                    >
+                      {humanAgo(row.act.created_at)}
+                    </time>
+                  </div>
+
+                  {row.correction && (
+                    <div style={{ display: "flex", flexDirection: "column", gap: 4, marginBottom: 8 }}>
+                      <div className="at-body-sm">
+                        <strong>Refuted claim:</strong> {row.correction.corrected_claim_content}
+                      </div>
+                      <div className="at-body-sm">
+                        <strong>Correcting content:</strong> {row.correction.correcting_content}
+                      </div>
+                    </div>
+                  )}
+
+                  <div style={{ fontFamily: "var(--font-mono)", fontSize: 11, color: "var(--at-muted)", marginBottom: 8 }}>
+                    {itemId} · change {row.correction ? row.correction.change_id : "—"}
+                  </div>
+
+                  <div style={{ display: "flex", gap: 8 }}>
+                    <button
+                      className="at-btn at-btn-sm"
+                      disabled={busy}
+                      onClick={() => handleRestore(itemId)}
+                      style={{ background: "var(--at-primary)", color: "#fff" }}
+                    >
+                      Restore
+                    </button>
+                    <button
+                      className="at-btn at-btn-secondary at-btn-sm"
+                      disabled={busy}
+                      onClick={() => handleAcknowledge(itemId)}
+                    >
+                      Keep withdrawn
+                    </button>
+                  </div>
+                </div>
+              </li>
+            );
+          })}
+        </ul>
+      )}
+
+      {unresolved.length > 0 && (
+        <div style={{ marginTop: 20 }}>
+          <div className="at-caption" style={{ color: "var(--at-warn)", marginBottom: 8 }}>
+            Unresolved — never classified by the owner-judge, flagged
+          </div>
+          <ul style={{ listStyle: "none", padding: 0, margin: 0, display: "flex", flexDirection: "column", gap: 6 }}>
+            {unresolved.map((check) => (
+              <li key={check.id} className="at-body-sm">
+                <Tag>{check.outcome}</Tag> {check.item_id}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
     </div>
   );
 }
