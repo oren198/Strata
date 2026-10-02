@@ -1,5 +1,7 @@
 # Strata
 
+<!-- mcp-name: io.github.oren198/strata -->
+
 Strata gives a fleet of AI coding agents shared memory. Agents working the
 same project write what they learn to a scope and read what other agents
 already wrote — and every write is checked by an LLM judge before it lands,

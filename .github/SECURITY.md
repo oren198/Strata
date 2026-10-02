@@ -22,12 +22,13 @@ public disclosure.
 
 ## Scope notes
 
-Strata runs **locally** and talks to the Anthropic API. A few things to keep in
-mind when assessing a report:
+Strata runs **locally**. The judge talks to any Anthropic-Messages-compatible
+endpoint — OpenRouter by default (`JUDGE_BASE_URL`), or Anthropic directly when
+configured. A few things to keep in mind when assessing a report:
 
-- Secrets (e.g. `ANTHROPIC_API_KEY`) are read from environment variables or a
-  local `.env` file and must never be committed. `.env` and `*.db`/`*.sqlite*`
-  files are git-ignored by design.
+- Secrets (e.g. `JUDGE_API_KEY`, or the deprecated `ANTHROPIC_API_KEY`) are read
+  from environment variables or a local `.env` file and must never be
+  committed. `.env` and `*.db`/`*.sqlite*` files are git-ignored by design.
 - The FastAPI surface and Console are intended for **local** use; exposing them
   on an untrusted network is out of the supported configuration.
 
