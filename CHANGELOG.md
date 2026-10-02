@@ -23,11 +23,14 @@ the release PR (`dev` → `main`) and the GitHub Release body are built from
     actually in, as addressee or audience ("told us", "mentioned to me") —
     not just a named teller. A scope's own name offered as its own informant,
     with no telling event, is declined.
-  - Three cases are declined **by design**, not promised fixed: a flat rule
-    stated as fact with no contributor in it; a real telling event that
+  - Three cases are declined **by design**, not promised fixed: an observed
+    act written without the contributor in it; a real telling event that
     names no addressee; and an overheard telling that names the scope
     (admissible in theory under ADR 0016 D2, declined here) — each decline
     reason tells the contributor what to say instead.
+  - A rule dressed with "our" passes the check and is left to the judge.
+  - Overheard tellings that name a scope: the 1.16 judge already declined
+    these on its first call (0/10 before and after), so this is unchanged.
   - Not covered by this change: the batch judgment path, and alias
     references to a scope (matching stays id/name only, word-bounded).
 

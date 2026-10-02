@@ -96,11 +96,11 @@ Measured on the shipped prompt (qwen3-235b-a22b-2507 via OpenRouter, served by N
 The test is not how precisely the other scope is named. It is whether someone
 the agent actually dealt with is behind the claim.
 
-**Note (2026-10-02, #225).** #224's measurement above is closed by a second,
+**Note (2026-10-02, #225).** The measurement above is addressed by a second,
 targeted judge call fired only when an accepted contribution names a scope
 the current one is not entitled to: classify the ground, then verify the
 answer against the contribution's own text rather than trust an optional
-field. Philis's rulings on what verifies:
+field. The philosopher's rulings on what verifies:
 
 - **Conduct** is a witness or party — a dealing the contributor was actually
   part of. An attestation frame ("I can tell you…") or a perception frame ("I
@@ -115,21 +115,24 @@ field. Philis's rulings on what verifies:
   is reported — "procurement told us on Tuesday" admits, matching D2's "an
   informant is a party, never a scope" only where NO ONE is reported as
   having spoken at all.
-- **Three stated limits**, declined by design, not promised fixed: an act
-  with no contributor in it (a flat rule, stated as fact, with nobody
-  party to it); a telling with no contributor in it (a real telling event
-  naming no addressee — "the procurement lead said X" is declined rather
-  than guessed as addressed to the contributor); and an **overheard**
-  telling that names the scope (D2's own "the group one desk over
-  mentioned…" shape, once a scope is named) — admissible in theory, declined
-  here, with the decline reason telling the contributor to say how they
-  heard it.
+- **Three stated limits**, declined by design, not promised fixed: an
+  observed act written without the contributor in it (declined; the reason
+  says to state the dealing); a telling with no contributor in it (a real
+  telling event naming no addressee — "the procurement lead said X" is
+  declined rather than guessed as addressed to the contributor); and an
+  **overheard** telling that names the scope (D2's own "the group one desk
+  over mentioned…" shape, once a scope is named) — admissible in theory,
+  declined here, with the decline reason telling the contributor to say how
+  they heard it.
+- A rule dressed with a first-person marker ("only approves our orders…")
+  passes the mechanical check and is left to the judge.
 - **Not covered**: the batch judgment path (this re-ask fires only on the
   single-contribution path); and alias references to a scope (the trigger
   matches by id/name only, word-bounded, no fuzzy or alias matching).
 
-See docs/evidence/v1.16-judge-prompt-examples-2026-09-26.md for the baseline
-this closes and the README's J4 row for the measured gate.
+Measured on 2026-10-02: see the README's J4 row and
+docs/evidence/v1.17-225-interior-gate-2026-10-02.md; the baseline this
+addresses is docs/evidence/v1.16-judge-prompt-examples-2026-09-26.md.
 
 ### D3 — Hearsay never corroborates
 
