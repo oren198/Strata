@@ -3453,6 +3453,16 @@ class ScopeManager:
     rewritten context section — which the engine applies mechanically
     (ADR 0011 D1).
 
+    Tolerant judge contract (#231): :meth:`judge`, :meth:`judge_batch`,
+    :meth:`judge_publication`, and :meth:`judge_bootstrap_publication` each
+    accept and ignore a trailing ``**_extra`` — this is where a FUTURE
+    optional keyword the engine starts passing lands until a given judge
+    implementation adopts it, rather than a ``TypeError`` (three kwarg-naming
+    incidents in two cycles: #202, P5's parse/prompt-gate split, #229).
+    A drop-in judge implementation (test fake or otherwise) MUST accept and
+    ignore ``**extra`` the same way, on every one of these four methods, or
+    the NEXT new keyword breaks it exactly as those did.
+
     Args:
         client: A configured :class:`anthropic.Anthropic` instance.
         model:  The model ID to use.  Defaults to ``"claude-haiku-4-5"`` to
@@ -3495,6 +3505,7 @@ class ScopeManager:
         hop: int = 0,
         acted_on_target: ActedOnTarget | None = None,
         examined_context: Sequence[ExaminedContextItem] | None = None,
+        **_extra: object,
     ) -> ScopeManagerJudgment:
         """Judge a new contribution against the scope's current state.
 
@@ -4349,6 +4360,7 @@ class ScopeManager:
         change_ids: Sequence[str] | None = None,
         hop: int = 0,
         examined_context: Sequence[ExaminedContextItem] | None = None,
+        **_extra: object,
     ) -> ScopeManagerBatchJudgment:
         """Judge several new contributions, in arrival order, in ONE call (ADR 0011 D3).
 
@@ -5049,6 +5061,7 @@ class ScopeManager:
         relay_origin_scope_id: str | None = None,
         relay_via_scope_id: str | None = None,
         publication_max_words: int = PUBLICATION_MAX_WORDS,
+        **_extra: object,
     ) -> PublicationJudgment:
         """Judge a publish or withdraw proposal against the scope's current state.
 
@@ -5227,6 +5240,7 @@ class ScopeManager:
         current_summary: ScopeSummary | None,
         publication_max_words: int = PUBLICATION_MAX_WORDS,
         current_publication: Sequence[_PublishedItemLike] = (),
+        **_extra: object,
     ) -> BootstrapJudgment:
         """Distill an initial publication for *scope* from its current summary.
 

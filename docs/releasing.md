@@ -50,3 +50,9 @@ has an owner. The operator's steps are approvals on GitHub; nobody uploads to Py
    decline, and an out-of-vocabulary decision reached the database and returned a 500 on
    `/contribute`. A contribute path must never 500 on a judge verdict: an unexpected decision fails
    closed through the re-ask and the recorded unreadable-judgment decline.
+14. **A new judge keyword gets an entry in the tolerant-judge-contract test** (#231,
+   `tests/test_v17_231_tolerant_judge_contract.py`). That test derives each judge method's
+   real call-site keywords from `strata.app`/`strata.publication` itself — nothing is
+   hand-typed — so a new keyword is caught there automatically; it exists as a checklist
+   line because the derivation only covers call sites in THIS repo, not an out-of-repo judge,
+   which item 12's evals-side sweep is what actually exercises.
