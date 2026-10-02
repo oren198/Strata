@@ -151,8 +151,16 @@ def test_a_double_unpaired_supersede_slip_fails_closed_never_500s(client) -> Non
     store = RecordStore(client.db_path)
     judgment_row = store.get_judgment(body["contribution_id"])
     assert judgment_row is not None
-    assert "judge failure" in (judgment_row.notes or "")
-    assert "second slip, still unpaired" in (judgment_row.notes or "")
+    # The FIXED engine reasoning, never the judge's own malformed text — an
+    # ordinary contribution has no disposition to be "unreadable," so this is
+    # the distinct generic judge-failure marker, not the P3 outcome-report one.
+    assert "judge failure: the response was still malformed" in (judgment_row.notes or "")
+    assert "declined without a verdict on the merits" in (judgment_row.notes or "")
+    assert "second slip, still unpaired" not in (judgment_row.notes or "")
+    # The protocol note (naming WHICH slip) is still there, alongside the
+    # fixed reasoning — that's the engine's own description of the detected
+    # problem, never the judge's text.
+    assert "Second protocol slip on the corrective re-ask" in (judgment_row.notes or "")
 
 
 def test_the_control_slip_then_valid_retry_still_gets_the_normal_verdict(client) -> None:
@@ -190,6 +198,65 @@ def test_the_control_slip_then_valid_retry_still_gets_the_normal_verdict(client)
     judgment_row = store.get_judgment(body["contribution_id"])
     assert judgment_row is not None
     assert "judge failure" not in (judgment_row.notes or "")
+
+
+def test_a_double_slip_on_an_acted_on_outcome_keeps_the_existing_p3_semantics(
+    client,
+) -> None:
+    """The architect's review: `_parse_forced_decline` (ADR 0017 P3's own
+    outcome-report fallback) must stay reserved for an ACTUAL outcome report —
+    an `acted_on` contribution keeps its EXISTING forced-decline semantics
+    (`outcome_disposition="decline"`, `disposition_unreadable=True`) even when
+    the SPECIFIC slip that triggers it is an unrelated unpaired-`supersede`,
+    never the ORDINARY contribution's generic fallback."""
+    directive_id = _seed_directive(client.db_path)
+    store = RecordStore(client.db_path)
+    context_id = store.append_contribution(
+        scope_id="g_active",
+        content="The primary pager has a 2-minute SLA.",
+        proposed_classification="context",
+        subject="paging",
+        supersedes=None,
+        contributor=ContributorRef(
+            scope_id="g_active", skill="eng-lead", session_id="s0", ts="2026-10-01T00:00:00Z"
+        ),
+    ).id
+    store.record_judgment(
+        contribution_id=context_id, decision="accept_as_context", judged_by="scope-manager"
+    )
+
+    # A valid disposition ("held") for a CONTEXT acted_on target, but the SAME
+    # unpaired-supersede shape in directive_ops — the disposition itself reads
+    # fine; the amendment around it doesn't. Replayed on both the first
+    # attempt and the one corrective retry.
+    outcome_response = _tool_use_response(
+        decision="held",
+        reasoning="Confirmed: the SLA held.",
+        directive_ops=[{"op": "supersede", "id": directive_id}],
+        new_context="The primary pager has a 2-minute SLA.",
+    )
+    client.mock_anthropic.messages.create.side_effect = [outcome_response, outcome_response]
+
+    resp = client.post(
+        "/contribute",
+        json={
+            "scope_id": "g_active",
+            "content": "Confirmed the SLA held during the last page.",
+            "proposed_classification": "context",
+            "contributor": _CONTRIBUTOR_BODY,
+            "acted_on": context_id,
+        },
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["judgment"]["decision"] == "decline"
+
+    judgment_row = store.get_judgment(body["contribution_id"])
+    assert judgment_row is not None
+    # The EXISTING P3 note, never the new generic one.
+    assert "no readable disposition after the corrective re-ask" in (judgment_row.notes or "")
+    assert "the response was still malformed" not in (judgment_row.notes or "")
 
 
 def test_judge_unavailable_maps_to_503_not_500(client) -> None:

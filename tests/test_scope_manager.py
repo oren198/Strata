@@ -690,7 +690,11 @@ def test_decline_with_new_context_raises() -> None:
         new_contribution=NEW_CONTRIBUTION,
     )
     assert judgment.decision == "decline"
-    assert judgment.disposition_unreadable is True
+    assert judgment.disposition_unreadable is False
+    assert judgment.outcome_disposition is None
+    assert judgment.judge_failure is True
+    assert "judge failure: the response was still malformed" in judgment.reasoning
+    assert "declined without a verdict on the merits" in judgment.reasoning
 
 
 def test_decline_with_directive_ops_raises() -> None:
@@ -716,7 +720,11 @@ def test_decline_with_directive_ops_raises() -> None:
         new_contribution=NEW_CONTRIBUTION,
     )
     assert judgment.decision == "decline"
-    assert judgment.disposition_unreadable is True
+    assert judgment.disposition_unreadable is False
+    assert judgment.outcome_disposition is None
+    assert judgment.judge_failure is True
+    assert "judge failure: the response was still malformed" in judgment.reasoning
+    assert "declined without a verdict on the merits" in judgment.reasoning
 
 
 # ---------------------------------------------------------------------------
@@ -781,7 +789,11 @@ def test_missing_tool_use_block_raises() -> None:
         new_contribution=NEW_CONTRIBUTION,
     )
     assert judgment.decision == "decline"
-    assert judgment.disposition_unreadable is True
+    assert judgment.disposition_unreadable is False
+    assert judgment.outcome_disposition is None
+    assert judgment.judge_failure is True
+    assert "judge failure: the response was still malformed" in judgment.reasoning
+    assert "declined without a verdict on the merits" in judgment.reasoning
 
     assert mock_client.messages.create.call_count == 2
 
@@ -1459,7 +1471,11 @@ def test_second_parse_failure_does_not_loop() -> None:
         new_contribution=NEW_CONTRIBUTION,
     )
     assert judgment.decision == "decline"
-    assert judgment.disposition_unreadable is True
+    assert judgment.disposition_unreadable is False
+    assert judgment.outcome_disposition is None
+    assert judgment.judge_failure is True
+    assert "judge failure: the response was still malformed" in judgment.reasoning
+    assert "declined without a verdict on the merits" in judgment.reasoning
 
     # Exactly one retry: two calls total, no third attempt.
     assert mock_client.messages.create.call_count == 2
@@ -2940,7 +2956,11 @@ def test_unpaired_supersede_gets_the_parse_reask_then_propagates() -> None:
         new_contribution=NEW_CONTRIBUTION,
     )
     assert judgment.decision == "decline"
-    assert judgment.disposition_unreadable is True
+    assert judgment.disposition_unreadable is False
+    assert judgment.outcome_disposition is None
+    assert judgment.judge_failure is True
+    assert "judge failure: the response was still malformed" in judgment.reasoning
+    assert "declined without a verdict on the merits" in judgment.reasoning
 
     assert mock_client.messages.create.call_count == 2
 
@@ -4748,7 +4768,11 @@ def test_retire_op_with_no_id_and_no_supersedes_still_fails() -> None:
         new_contribution=NEW_CONTRIBUTION,
     )
     assert judgment.decision == "decline"
-    assert judgment.disposition_unreadable is True
+    assert judgment.disposition_unreadable is False
+    assert judgment.outcome_disposition is None
+    assert judgment.judge_failure is True
+    assert "judge failure: the response was still malformed" in judgment.reasoning
+    assert "declined without a verdict on the merits" in judgment.reasoning
 
 
 def test_batch_supersede_op_with_no_id_takes_it_from_its_member() -> None:
@@ -4846,7 +4870,11 @@ def test_no_tool_use_block_twice_still_raises() -> None:
         new_contribution=NEW_CONTRIBUTION,
     )
     assert judgment.decision == "decline"
-    assert judgment.disposition_unreadable is True
+    assert judgment.disposition_unreadable is False
+    assert judgment.outcome_disposition is None
+    assert judgment.judge_failure is True
+    assert "judge failure: the response was still malformed" in judgment.reasoning
+    assert "declined without a verdict on the merits" in judgment.reasoning
 
     assert mock_client.messages.create.call_count == 2
 
