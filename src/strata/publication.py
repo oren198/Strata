@@ -1527,33 +1527,79 @@ _NUMBER_WORDS = {
 }
 
 
-#: :func:`_key_tokens`'s own stopword set — :data:`_CARRIER_STOPWORDS` minus
-#: "on": a value word ("flags default to ON/OFF") the ranking stopword list
-#: correctly treats as noise for similarity scoring, but the veto's whole job
-#: is telling such a value apart from its opposite, so it must survive here.
-_KEY_TOKEN_STOPWORDS = frozenset(_CARRIER_STOPWORDS - {"on"})
+#: :func:`_value_tokens`'s closed-class polarity words (#219 C live-gate
+#: measurement): words naming one of a pair of opposite states rather than a
+#: measurable quantity — content-word/key-token tokenisers both treat these
+#: as ordinary vocabulary, which is exactly why realistic corrections sharing
+#: subject/action wording with the refuted claim broke two earlier attempts
+#: at this veto (measured against 1,881 real judge answers from the re-gate:
+#: a content-word variant caught 20/21 inversions but vetoed 51 TRUE
+#: carriers). Restricting the veto to values alone — numbers, identifiers,
+#: quoted spans, and this closed list — measured 14/21 inversions vetoed,
+#: 0/198 true carriers vetoed.
+_POL_WORDS = frozenset(
+    {
+        "on",
+        "off",
+        "before",
+        "after",
+        "always",
+        "never",
+        "required",
+        "optional",
+        "enabled",
+        "disabled",
+        "open",
+        "closed",
+        "allowed",
+        "forbidden",
+        "prohibited",
+        "shared",
+        "private",
+        "include",
+        "exclude",
+        "min",
+        "max",
+        "above",
+        "below",
+        "first",
+        "last",
+    }
+)
 
 
-def _key_tokens(text: str) -> set[str]:
-    """Key tokens for :func:`observed_value_veto` (#219 C live-gate addition):
-    :data:`_KEY_TOKEN_STOPWORDS`-filtered content words, extended with
-    number/quote handling plain word-splitting loses — a number's grouping
-    commas and decimal point are kept together ("40,000" and "40000" are the
-    same token, never split into "40" and "000"), a quoted span is kept
-    whole rather than split into its own words, and a spelled-out number
-    word is normalised to its digit form ("forty" alongside "40000" lets
-    "forty thousand" match a candidate written "40,000").
+def _value_tokens(text: str) -> set[str]:
+    """VALUE tokens only, for :func:`observed_value_veto` (#219 C live-gate
+    measurement) — never ordinary content words, which is what made two
+    earlier attempts at this veto over-fire on realistic corrections that
+    share subject/action vocabulary with the refuted claim. Four kinds:
+
+    - numbers, with grouping commas collapsed ("40,000" and "40000" are the
+      same token) and spelled-out number words normalised to digits
+      ("forty" is also "40000"'s own partial match via the per-word pass);
+    - identifiers: a dot/slash/underscore-joined token ("pyproject.toml",
+      "a/b", "a_b") always counts; a HYPHENATED token counts only when it
+      contains a digit ("45-minute", "j4-822") — an ordinary hyphenated word
+      ("well-known") does not;
+    - a quoted span, kept whole rather than split into its own words;
+    - any word that is one of :data:`_POL_WORDS`.
     """
-    words = re.findall(r"[a-z0-9]+", text.casefold())
-    tokens = {w for w in words if w not in _KEY_TOKEN_STOPWORDS}
-    for match in re.finditer(r'"([^"]+)"', text):
-        tokens.add(match.group(1).strip().casefold())
     casefolded = text.casefold()
+    tokens: set[str] = set()
     for match in re.finditer(r"\b\d[\d,]*(?:\.\d+)?\b", casefolded):
         tokens.add(match.group(0).replace(",", ""))
     for word in re.findall(r"[a-z]+", casefolded):
         if word in _NUMBER_WORDS:
             tokens.add(_NUMBER_WORDS[word])
+    for match in re.finditer(r"[\w]+(?:[./_][\w]+)+", casefolded):
+        tokens.add(match.group(0))
+    for match in re.finditer(r"[\w]+(?:-[\w]+)+", casefolded):
+        token = match.group(0)
+        if any(c.isdigit() for c in token):
+            tokens.add(token)
+    for match in re.finditer(r'"([^"]+)"', text):
+        tokens.add(match.group(1).strip().casefold())
+    tokens |= set(re.findall(r"[a-z]+", casefolded)) & _POL_WORDS
     return tokens
 
 
@@ -1562,32 +1608,39 @@ def observed_value_veto(refuted_claim: str, correcting_content: str, item_conten
     text alone): a mechanical veto that can only PREVENT a withdrawal, never
     cause one.
 
+    Compares VALUE tokens only (:func:`_value_tokens`) — never ordinary
+    content words; see that function's own docstring for why. A polarity
+    word in the correction counts only when the refuted claim itself has
+    one too ("acting on…" has no bearing on an unrelated on/off claim) —
+    otherwise it is stripped from the correction's own values before
+    comparison.
+
     The judge's own ``carries`` answer is overridden — the item is KEPT —
-    when its key tokens contain at least one token from what was actually
-    OBSERVED (``correcting_content``'s own key tokens, minus whatever it
-    shares with ``refuted_claim``) and none of what the refuted claim states
-    that the correction itself does NOT (the refuted claim's own key tokens,
-    minus whatever it shares with ``correcting_content``) — the two
-    claims' SHARED subject/action vocabulary is deliberately excluded from
-    both sides of this comparison, since a real carrier legitimately shares
-    it; only the part of each claim that actually DIFFERS from the other is
-    what the veto checks the item against. A generic correction (no key
-    tokens of its own beyond what it shares with the refuted claim, or no
-    key tokens at all) never vetoes.
+    when its values include at least one value the correction states that
+    the refuted claim does not (``c_only``), and none of the values the
+    item is being blocked on (``block``: the refuted claim's own values
+    that the correction does NOT also repeat — or, when the correction
+    repeats every one of them, every one of them, so a correction that
+    merely adds detail without contradicting any of the refuted claim's own
+    values never backs off the block). A tokenless claim, or a correction
+    with no value the refuted claim lacks, never vetoes — the judge's
+    answer stands.
 
     Returns ``True`` when the item should be KEPT (the withdrawal is
     vetoed), ``False`` otherwise. The caller only ever consults this for an
     item the judge already marked ``carries`` — this never turns a
     ``does_not_carry`` into a ``carries``.
     """
-    refuted_keys = _key_tokens(refuted_claim)
-    correcting_keys = _key_tokens(correcting_content)
-    observed_keys = correcting_keys - refuted_keys
-    if not observed_keys:
+    refuted_values = _value_tokens(refuted_claim)
+    correcting_values = _value_tokens(correcting_content)
+    if not (refuted_values & _POL_WORDS):
+        correcting_values = correcting_values - _POL_WORDS
+    c_only = correcting_values - refuted_values
+    if not refuted_values or not c_only:
         return False
-    refuted_only = refuted_keys - correcting_keys
-    item_keys = _key_tokens(item_content)
-    return bool(item_keys & observed_keys) and not (item_keys & refuted_only)
+    block = (refuted_values - correcting_values) or refuted_values
+    item_values = _value_tokens(item_content)
+    return bool(item_values & c_only) and not (item_values & block)
 
 
 def check_claim_carriers(

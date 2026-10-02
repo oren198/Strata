@@ -509,7 +509,13 @@ def test_already_withdrawn_items_never_become_candidates(
 # ---------------------------------------------------------------------------
 # 3. observed_value_veto — the mechanical guard (CEO, standing rule 1): can
 # only PREVENT a withdrawal the judge's own "carries" answer would otherwise
-# cause, never force one.
+# cause, never force one. VALUE tokens only (numbers, identifiers, quoted
+# spans, and the closed POL word list) — measured against 1,881 real judge
+# answers from the re-gate after two content-word attempts both over-fired
+# on realistic corrections sharing subject/action vocabulary with the
+# refuted claim (one caught the canonical inversion 20/21 but vetoed 51 TRUE
+# carriers). The VALUE-only version measured 14/21 inversions vetoed, 0/198
+# true carriers vetoed.
 # ---------------------------------------------------------------------------
 
 
@@ -518,8 +524,8 @@ def test_the_inversion_pair_from_the_gate_is_kept_by_the_guard(
 ) -> None:
     """The live-gate inversion: the judge reads "carries the corrected claim"
     as "carries the correction" and marks the item stating the NEW value
-    carries. The item's own key tokens ("on") match the observed value, not
-    the refuted claim ("off"), so the guard keeps it published."""
+    carries. The item's own value tokens ("on") match the observed value,
+    not the refuted claim ("off"), so the guard keeps it published."""
     item = _seed_published_item(
         record_store,
         summaries_dir,
@@ -548,7 +554,7 @@ def test_the_inversion_pair_from_the_gate_is_kept_by_the_guard(
 
 
 def test_an_item_carrying_both_values_is_not_vetoed(fleet, record_store, summaries_dir) -> None:
-    """The item's own key tokens include the REFUTED claim's own value too
+    """The item's own value tokens include the REFUTED claim's own value too
     ("off"), so the guard does not fire — the judge's carries stands."""
     item = _seed_published_item(
         record_store,
@@ -577,9 +583,9 @@ def test_an_item_carrying_both_values_is_not_vetoed(fleet, record_store, summari
 
 
 def test_a_generic_correction_never_vetoes(fleet, record_store, summaries_dir) -> None:
-    """A correction with no key tokens of its own (every word is a stopword)
-    gives the guard nothing to check against — it never fires, whatever the
-    judge said."""
+    """A correction with no VALUE tokens of its own — no numbers,
+    identifiers, quoted spans, or POL words — gives the guard nothing to
+    check against; it never fires, whatever the judge said."""
     item = _seed_published_item(
         record_store,
         summaries_dir,
@@ -648,6 +654,70 @@ def test_observed_value_veto_unit() -> None:
         "Feature flags default to off in production.",
         "This is not that.",
         "Feature flags default to on in production.",
+    )
+
+
+def test_the_number_inversion_is_vetoed() -> None:
+    """Tokens 15 -> 60: "expire after 60 minutes"."""
+    assert observed_value_veto(
+        "Access tokens expire after 15 minutes.",
+        "Access tokens expire after 60 minutes.",
+        "Access tokens expire after 60 minutes.",
+    )
+
+
+def test_an_identifier_swap_is_vetoed_even_when_the_correction_mentions_both() -> None:
+    """pyproject.toml vs VERSION.txt, where the correction mentions both —
+    the "block = (VR - VC) or VR" fallback: since the correction repeats
+    the refuted claim's own identifier, the block falls back to the WHOLE
+    refuted value set, and the item carries none of it."""
+    assert observed_value_veto(
+        "The version lives only in pyproject.toml.",
+        "Ignoring pyproject.toml, the version lives in VERSION.txt.",
+        "The version lives only in VERSION.txt.",
+    )
+
+
+def test_a_flag_near_miss_stating_the_refuted_value_is_not_vetoed() -> None:
+    """ "In production, feature flags are off by default" — a real carrier of
+    the refuted claim, not the correction; must not be kept."""
+    assert not observed_value_veto(
+        "Feature flags default to off in production.",
+        "Feature flags default to on in production.",
+        "In production, feature flags are off by default.",
+    )
+
+
+def test_an_unrelated_number_near_miss_is_not_vetoed() -> None:
+    """ "Hygiene visits use 45-minute booking slots" — a near-miss on a
+    DIFFERENT number than what the correction actually states; shares no
+    value with the correction, so the guard gives the judge's carries no
+    reason to be overridden."""
+    assert not observed_value_veto(
+        "Appointment slots are capped at 30 minutes.",
+        "Appointment slots are capped at 20 minutes.",
+        "Hygiene visits use 45-minute booking slots.",
+    )
+
+
+def test_a_paraphrase_with_no_extractable_value_is_not_vetoed() -> None:
+    """ "Access tokens last a quarter of an hour" — a true paraphrase of the
+    refuted claim stated in words the value tokeniser cannot parse
+    numerically; shares no detectable value with the correction, so the
+    judge's carries stands — the veto is a narrow backstop, not the primary
+    paraphrase defence."""
+    assert not observed_value_veto(
+        "Access tokens expire after 15 minutes.",
+        "Access tokens expire after 60 minutes.",
+        "Access tokens last a quarter of an hour.",
+    )
+
+
+def test_a_tokenless_refuted_claim_never_vetoes() -> None:
+    assert not observed_value_veto(
+        "The team prefers minimal abstractions.",
+        "The team actually prefers maximal abstractions.",
+        "The team prefers maximal abstractions.",
     )
 
 
