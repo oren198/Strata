@@ -157,6 +157,93 @@ def test_record_read_increments_and_persists(tmp_path: Path) -> None:
     assert state.updated_at != ""
 
 
+def test_record_read_stores_and_updates_the_watermark(tmp_path: Path) -> None:
+    """#234: watermark stored on first read, overwritten on the next one;
+    omitting it (the old call shape) leaves it None, never an error."""
+    store = SessionStateStore(tmp_path / "sessions")
+    store.record_read("s1", "g_arch", watermark="w1")
+    state = store.read("s1")
+    assert state is not None
+    assert state.reads_by_scope["g_arch"].watermark == "w1"
+
+    store.record_read("s1", "g_arch", watermark="w2")
+    state = store.read("s1")
+    assert state is not None
+    assert state.reads_by_scope["g_arch"].watermark == "w2"
+
+    store.record_read("s1", "g_arch")
+    state = store.read("s1")
+    assert state is not None
+    assert state.reads_by_scope["g_arch"].watermark is None
+
+
+def test_an_old_state_file_without_watermark_still_loads(tmp_path: Path) -> None:
+    """#234 §6: a pre-#234 state file (no `watermark` key on its receipts) is
+    still valid — the field defaults to None rather than failing to parse."""
+    import json
+
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir(parents=True)
+    old_shape = {
+        "session_id": "s1",
+        "reads": 1,
+        "reads_by_scope": {"g_arch": {"count": 1, "last_read_at": "2026-01-01T00:00:00+00:00"}},
+    }
+    (sessions_dir / "s1.json").write_text(json.dumps(old_shape), encoding="utf-8")
+
+    store = SessionStateStore(sessions_dir)
+    state = store.read("s1")
+    assert state is not None
+    assert state.reads_by_scope["g_arch"].watermark is None
+
+
+def test_advance_watermark_if_matched_advances_on_a_match(tmp_path: Path) -> None:
+    store = SessionStateStore(tmp_path / "sessions")
+    store.record_read("s1", "g_arch", watermark="w1")
+
+    result = store.advance_watermark_if_matched(
+        "s1", "g_arch", expected_before="w1", new_after="w2"
+    )
+    assert result is not None
+    assert result.reads_by_scope["g_arch"].watermark == "w2"
+
+
+def test_advance_watermark_if_matched_is_a_no_op_on_a_mismatch(tmp_path: Path) -> None:
+    """Something else moved the scope first — the receipt is left as is."""
+    store = SessionStateStore(tmp_path / "sessions")
+    store.record_read("s1", "g_arch", watermark="w1")
+
+    result = store.advance_watermark_if_matched(
+        "s1", "g_arch", expected_before="w_stale", new_after="w2"
+    )
+    assert result is None
+    state = store.read("s1")
+    assert state is not None
+    assert state.reads_by_scope["g_arch"].watermark == "w1"
+
+
+def test_advance_watermark_if_matched_is_a_no_op_with_no_receipt(tmp_path: Path) -> None:
+    store = SessionStateStore(tmp_path / "sessions")
+    result = store.advance_watermark_if_matched(
+        "s1", "g_arch", expected_before="w1", new_after="w2"
+    )
+    assert result is None
+
+
+def test_advance_watermark_if_matched_is_a_no_op_with_no_expected_before(tmp_path: Path) -> None:
+    """expected_before=None means the watermark could not be computed at
+    write time — never a basis to advance anything."""
+    store = SessionStateStore(tmp_path / "sessions")
+    store.record_read("s1", "g_arch", watermark="w1")
+    result = store.advance_watermark_if_matched(
+        "s1", "g_arch", expected_before=None, new_after="w2"
+    )
+    assert result is None
+    state = store.read("s1")
+    assert state is not None
+    assert state.reads_by_scope["g_arch"].watermark == "w1"
+
+
 def test_record_contribution_and_decline(tmp_path: Path) -> None:
     store = SessionStateStore(tmp_path / "sessions")
     store.record_contribution("s1")

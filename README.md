@@ -564,6 +564,37 @@ the substrate (the read/contribute counters, `strata_session_stats`, the
 read-time nudge) still works, but the turn-boundary evaluator does not fire
 without a hook to trigger it.
 
+### Read signaling (issue #234)
+
+A session that read a scope's perspective can learn — mechanically, never
+judged, nothing stored as memory — that the scope has since changed.
+
+**How it works.** Every strata-tool result carries `perspective_stale: [scope
+ids]` when a scope this session previously read has moved since — appended
+only when the list is non-empty, so an up-to-date session's results are
+unchanged. A session's own accepted contribution to a scope may catch its own
+read receipt for that scope back up (the self-trigger): it does, UNLESS
+something else had already changed that scope first, in which case the
+session is correctly still told it's stale — there is foreign change it
+hasn't seen. The Memory-freshness Stop hook above gains a matching read-side
+clause: strict mode blocks on it (sharing that hook's existing two-block
+budget with the write-side reminder, write-side counted first), default mode
+only notifies (never blocks); either way it says so **at most once** per
+session.
+
+**Limits:**
+
+- The notice window is **between tool calls and turns** — it narrows, it
+  never closes. A session that calls no strata tool again, and whose turn
+  never ends (or ends with no Stop hook installed), is never told.
+- **Cross-scope facts arrive only through a composed edge.** A scope moving
+  is only ever noticed for a scope this session itself read directly — never
+  inferred for a scope only reachable through another scope's own ancestor
+  chain or publication.
+- A change this engine version cannot express as a watermark component (none
+  known at the time of writing) would go unnoticed; the watermark covers
+  every ADR 0014 input change plus every publication-affecting act.
+
 ### No Python 3.11+ globally? Use `--bootstrap-venv`
 
 If `pipx` can't find Python 3.11+ (locked-down corporate environment), use:

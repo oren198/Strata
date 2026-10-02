@@ -111,6 +111,7 @@ from strata.perspective import (
     ancestor_directives,
     compose_perspective,
     dropped_context_contribution_ids,
+    perspective_watermark,
     present_context_contributions,
 )
 from strata.project_config import StoragePaths, resolve_storage_paths
@@ -427,6 +428,44 @@ class ContributionOutcome:
     decision: Literal["accept_as_directive", "accept_as_context", "decline"]
     reasoning: str
     summary_updated: bool
+    watermark_before: str | None = None
+    """#234 §8, the self-trigger: the TARGET scope's own
+    :func:`~strata.perspective.perspective_watermark` immediately before this
+    judgment ran, read under the SAME ``_scope_lock`` the judgment itself
+    runs under (set inside :func:`_judge_and_record`/
+    :func:`_judge_batch_and_record`, never by a caller outside the lock) —
+    ``None`` if it could not be computed (best-effort, never load-bearing for
+    the judgment itself)."""
+
+    watermark_after: str | None = None
+    """#234 §8: the same scope's watermark immediately after, same lock. The
+    caller (the contributing session's own MCP layer) advances ITS OWN read
+    receipt to this value ONLY IF its receipt still matched
+    ``watermark_before`` at compare time — exact because both values were
+    read under the lock that serializes the write; if something ELSE had
+    already moved the scope before this write, the receipt is left as is and
+    the session is correctly told it is still stale."""
+
+
+def _scope_watermark(
+    scope_id: str, *, fleet: FleetConfig, record_store: RecordStore, summary_store: SummaryStore
+) -> str | None:
+    """#234 §8: best-effort :func:`~strata.perspective.perspective_watermark` for
+    *scope_id* — ``None`` on any failure (an unknown scope, a disk error), the
+    same discipline as the engine's other mechanical-measurement helpers:
+    never load-bearing for the judgment itself."""
+    try:
+        return perspective_watermark(
+            scope_id,
+            fleet=fleet,
+            summary_store=summary_store,
+            operator_reader=lambda s: read_operator_layer(
+                s, summaries_dir=str(summary_store.summaries_dir)
+            ),
+            change_event_reader=lambda s: record_store.list_change_events(scope_id=s),
+        )
+    except Exception:  # noqa: BLE001 — mechanical measurement, never load-bearing
+        return None
 
 
 class JudgeUnavailable(Exception):
@@ -637,6 +676,13 @@ def _judge_and_record(
     serialized unit. On judge failure it records a judgment-attempt-failed
     event and raises :class:`JudgeUnavailable`; no judgment row is written.
     """
+    # #234 §8: the PRE-write watermark, taken before anything below reads or
+    # writes — same lock as the write that follows, so this is the exact
+    # "nothing else had changed before this write" baseline the self-trigger
+    # compares against.
+    watermark_before = _scope_watermark(
+        scope.id, fleet=fleet, record_store=record_store, summary_store=summary_store
+    )
     inputs = _read_judge_inputs(
         scope=scope,
         fleet=fleet,
@@ -980,11 +1026,19 @@ def _judge_and_record(
         )
         summary_updated = True
 
+    # #234 §8: the POST-write watermark, same lock, whether or not this
+    # judgment actually wrote anything (a decline is itself "nothing else
+    # changed here," so before == after is the correct, common case).
+    watermark_after = _scope_watermark(
+        scope.id, fleet=fleet, record_store=record_store, summary_store=summary_store
+    )
     return ContributionOutcome(
         contribution_id=contribution.id,
         decision=judgment.decision,
         reasoning=judgment.reasoning,
         summary_updated=summary_updated,
+        watermark_before=watermark_before,
+        watermark_after=watermark_after,
     )
 
 
@@ -1512,6 +1566,12 @@ def _judge_batch_and_record(
         _flush_ordinary_group()
         return [results_by_id[c.id] for c in contributions]
 
+    # #234 §8: the PRE-write watermark, taken before any of this batch's
+    # reads or writes — same lock, same scope every member in this real
+    # batch shares (the queue batches within one scope only).
+    watermark_before = _scope_watermark(
+        scope.id, fleet=fleet, record_store=record_store, summary_store=summary_store
+    )
     inputs = _read_judge_inputs(
         scope=scope,
         fleet=fleet,
@@ -1625,6 +1685,18 @@ def _judge_batch_and_record(
         )
         summary_updated = True
 
+    # #234 §8: the POST-write watermark, same lock — one value for the
+    # whole batch, same as watermark_before, since every member here shares
+    # one scope and one summary write. Consequence, stated rather than left
+    # implicit: in a batch, watermark_after reflects every ACCEPTED member's
+    # contribution, not just whichever session's own member this result is
+    # handed back to — the design's own "the session caused this rewrite"
+    # reasoning (§8) extends to "a rewrite this session's own member was
+    # ONE PART of," which is still true, just not exclusively this session's
+    # doing when the batch coalesced with other sessions' contributions.
+    watermark_after = _scope_watermark(
+        scope.id, fleet=fleet, record_store=record_store, summary_store=summary_store
+    )
     return [
         ContributionOutcome(
             contribution_id=verdict.contribution_id,
@@ -1633,6 +1705,8 @@ def _judge_batch_and_record(
             # A declined member did not update the summary, whatever its
             # batch-mates did — the same thing a single decline reports.
             summary_updated=summary_updated and verdict.decision != "decline",
+            watermark_before=watermark_before,
+            watermark_after=watermark_after,
         )
         for verdict in batch.verdicts
     ]

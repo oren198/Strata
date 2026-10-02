@@ -196,6 +196,12 @@ class ScopeReadReceipt(BaseModel):
 
     count: int = 0
     last_read_at: str
+    watermark: str | None = None
+    """#234: `perspective_watermark` at the moment of this read — `None` for a
+    receipt an older engine version wrote, or a read this engine recorded
+    before #234 shipped. `perspective_changed_since` treats `None` as "no
+    baseline," never stale, rather than guessing (an old state file must
+    still load — #234 §6)."""
 
 
 class SessionState(BaseModel):
@@ -241,9 +247,17 @@ class SessionState(BaseModel):
     """When the strict Stop hook last blocked this session's stop."""
 
     strict_blocks: int = 0
-    """How many times the strict Stop hook blocked this session (hard cap 2: the
-    first reminder, then one last reminder only if the agent made no strata call in
-    between). A pre-cap-2 file has only ``strict_blocked_at``; it counts as one."""
+    """How many times the strict Stop hook blocked this session — EITHER
+    clause (#234 §9: a shared cap of 2 across the write-side asymmetry
+    reminder and the read-side staleness notice, write-side counted first).
+    A pre-cap-2 file has only ``strict_blocked_at``; it counts as one."""
+
+    read_signal_notified: bool = False
+    """#234 §4b/§9: whether the Stop hook's read-side clause has already said
+    its one notice this session — strict (a block, sharing ``strict_blocks``'
+    budget) or default (a non-blocking ``systemMessage``) alike. Set once,
+    never re-fires: "memory you read has changed" is said at most once per
+    session, independent of the shared block budget's own cap."""
 
     tool_calls: int = 0
     """Strata tool calls this session has made (every ``tools/call`` the server
@@ -460,10 +474,15 @@ class SessionStateStore:
         *,
         now: datetime | None = None,
         harness: str | None = None,
+        watermark: str | None = None,
     ) -> SessionState:
         """Record one perspective/summary read of *scope_id* by *session_id*.
 
         Increments the flat ``reads`` counter and the per-scope receipt.
+        *watermark* (#234) is :func:`strata.perspective.perspective_watermark`
+        at read time — a summary read stores it too (not only a perspective
+        read): either kind of read is "the session has now seen this scope's
+        current state," the thing the receipt exists to record.
         """
         ts = (now or datetime.now(UTC)).isoformat()
         with self._locked(session_id):
@@ -472,10 +491,57 @@ class SessionStateStore:
             state.reads += 1
             receipt = state.reads_by_scope.get(scope_id)
             if receipt is None:
-                state.reads_by_scope[scope_id] = ScopeReadReceipt(count=1, last_read_at=ts)
+                state.reads_by_scope[scope_id] = ScopeReadReceipt(
+                    count=1, last_read_at=ts, watermark=watermark
+                )
             else:
                 receipt.count += 1
                 receipt.last_read_at = ts
+                receipt.watermark = watermark
+            state.updated_at = ts
+            self._write(state)
+        return state
+
+    def advance_watermark_if_matched(
+        self,
+        session_id: str,
+        scope_id: str,
+        *,
+        expected_before: str | None,
+        new_after: str | None,
+        now: datetime | None = None,
+    ) -> SessionState | None:
+        """#234 §8, the self-trigger: on this session's OWN accepted
+        contribution to *scope_id*, advance its read receipt's watermark to
+        *new_after* ONLY IF the receipt's watermark still equals
+        *expected_before* (the scope's own watermark taken under the SAME
+        ``_scope_lock`` the write ran under, from
+        :class:`strata.app.ContributionOutcome`). If something ELSE had
+        already moved the scope before this write — the receipt reads
+        something other than *expected_before*, or there is no receipt at
+        all — the receipt is left exactly as it was: this session is
+        correctly still told it is stale, since there IS foreign change it
+        has not seen yet.
+
+        A blanket "this session just wrote here, so treat it as current" is
+        deliberately not done: it would hide a real foreign change that
+        landed between this session's last read and its own write.
+
+        Returns ``None`` (no-op, state untouched) when there is nothing to
+        advance — no session record, no receipt for *scope_id*, or a
+        mismatch — so a caller can tell "nothing changed" from "advanced."
+        """
+        if expected_before is None:
+            return None
+        ts = (now or datetime.now(UTC)).isoformat()
+        with self._locked(session_id):
+            state = self.read(session_id)
+            if state is None:
+                return None
+            receipt = state.reads_by_scope.get(scope_id)
+            if receipt is None or receipt.watermark != expected_before:
+                return None
+            receipt.watermark = new_after
             state.updated_at = ts
             self._write(state)
         return state
@@ -571,6 +637,17 @@ class SessionStateStore:
             state.strict_blocks = strict_blocks_so_far(state) + 1
             state.strict_blocked_at = ts
             state.tool_calls_at_last_block = state.tool_calls
+            self._write(state)
+        return state
+
+    def record_read_signal_notified(self, session_id: str) -> SessionState:
+        """#234 §4b/§9: record that the Stop hook's read-side clause has said
+        its one notice this session (strict block or default notify alike) —
+        idempotent after the first call, the same "at most once" guard
+        :attr:`SessionState.read_signal_notified` documents."""
+        with self._locked(session_id):
+            state = self.read(session_id) or SessionState(session_id=session_id)
+            state.read_signal_notified = True
             self._write(state)
         return state
 

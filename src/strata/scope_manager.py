@@ -4245,9 +4245,8 @@ class ScopeManager:
                 if is_outcome_report and parse_forced_decline is not None:
                     judgment = parse_forced_decline(retry_tool_use_block)
                     protocol_notes.append(
-                        "Judge's `decision` was still not a readable disposition after "
-                        "the corrective re-ask; declined as a judge failure, not a "
-                        "missing-ground decline."
+                        f"Second protocol slip on the corrective re-ask ({second_parse_error}); "
+                        "declined as a judge failure, not a missing-ground decline."
                     )
                 elif parse_generic_decline is not None:
                     judgment = parse_generic_decline(second_parse_error)

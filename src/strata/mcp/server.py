@@ -43,6 +43,7 @@ STRATA_AGENT_SESSION_ID
 
 from __future__ import annotations
 
+import functools
 import inspect
 import logging
 import os
@@ -78,7 +79,12 @@ from strata.fleet_reload import FleetReloader
 from strata.locks import configure_lock_dir
 from strata.migrator import run_migrations
 from strata.operator import read_operator_layer
-from strata.perspective import change_event_dict, compose_perspective
+from strata.perspective import (
+    change_event_dict,
+    compose_perspective,
+    perspective_changed_since,
+    perspective_watermark,
+)
 from strata.project_config import (
     ProjectConfigError,
     StoragePaths,
@@ -452,20 +458,154 @@ def _publish_connect_seam_problem() -> None:
         _logger.warning("failed to record the connect-seam marker: %s", exc)
 
 
-def _record_read(scope_id: str) -> None:
+def _watermark_operator_reader(scope_id: str) -> list:
+    """#234: the same current-operator-items read ``compose_perspective`` itself
+    uses — shared by :func:`_perspective_watermark_for` and
+    :func:`_stale_read_scopes` so both compute the identical watermark shape."""
+    return read_operator_layer(scope_id, summaries_dir=_summaries_dir)
+
+
+def _watermark_change_event_reader(scope_id: str) -> list:
+    """#234: sibling of :func:`_watermark_operator_reader`, for change events."""
+    if _record_store is None:
+        return []
+    return _record_store.list_change_events(scope_id=scope_id)
+
+
+def _perspective_watermark_for(scope_id: str, *, fleet: FleetConfig) -> str | None:
+    """#234: the watermark to stamp on this read's receipt — best-effort, same
+    discipline as :func:`_record_read` itself: a failure here must never break
+    the read the agent asked for, so it degrades to ``None`` (no baseline,
+    never a false "stale") rather than raising."""
+    if _record_store is None:
+        return None
+    try:
+        return perspective_watermark(
+            scope_id,
+            fleet=fleet,
+            summary_store=_summary_store,
+            operator_reader=_watermark_operator_reader,
+            change_event_reader=_watermark_change_event_reader,
+        )
+    except Exception as exc:  # noqa: BLE001 — mechanical measurement, never load-bearing
+        _logger.warning("failed to compute perspective watermark for %r: %s", scope_id, exc)
+        return None
+
+
+def _record_read(scope_id: str, *, fleet: FleetConfig | None = None) -> None:
     """Record one perspective/summary read for this session (best-effort, #110).
 
     The per-session asymmetry counters and per-scope read receipts are a
     mechanical measurement substrate: a failure to update them must never break
     the read the agent actually asked for, so any storage error is logged and
-    swallowed rather than raised.
+    swallowed rather than raised. *fleet* (#234), when given, is used to stamp
+    this read's :func:`~strata.perspective.perspective_watermark` on the
+    receipt; omitted (``None``) leaves the receipt's watermark untouched —
+    every caller of this function has a fleet in hand, so this is effectively
+    always supplied in practice, defaulted for callers that genuinely cannot
+    produce a baseline cheaply.
     """
     if _session_store is None:
         return
+    watermark = None if fleet is None else _perspective_watermark_for(scope_id, fleet=fleet)
     try:
-        _session_store.record_read(_AGENT_SESSION_ID, scope_id, harness=_client_harness())
+        _session_store.record_read(
+            _AGENT_SESSION_ID, scope_id, harness=_client_harness(), watermark=watermark
+        )
     except OSError as exc:  # pragma: no cover - defensive; disk failure only
         _logger.warning("failed to record read receipt for session %r: %s", _AGENT_SESSION_ID, exc)
+
+
+def _stale_read_scopes() -> list[str]:
+    """#234: scope ids this session read whose perspective has since moved.
+
+    Computed ONCE per tool result (:func:`_with_read_signal`), over the
+    session's own read receipts — never per scope read inside a tool. A
+    receipt with no watermark (an old read, or one this engine could not
+    stamp) is skipped, never counted stale: there is no baseline to compare.
+    Returns ``[]`` immediately when no receipt carries a watermark at all —
+    the common case once a session has done any writing of its own (its
+    receipts are then usually caught up by the self-trigger, #234 §8) — so
+    the cost of this check stays near zero on the common path.
+    """
+    if _session_store is None:
+        return []
+    state = _session_store.read(_AGENT_SESSION_ID)
+    if state is None:
+        return []
+    receipts = state.reads_by_scope
+    if not any(receipt.watermark is not None for receipt in receipts.values()):
+        return []
+    try:
+        fleet = _load_fleet()
+    except Exception:  # noqa: BLE001 — mechanical signal, never load-bearing
+        return []
+    stale: list[str] = []
+    for scope_id, receipt in receipts.items():
+        if receipt.watermark is None or fleet.get_scope(scope_id) is None:
+            continue
+        try:
+            if perspective_changed_since(
+                receipt.watermark,
+                scope_id,
+                fleet=fleet,
+                summary_store=_summary_store,
+                operator_reader=_watermark_operator_reader,
+                change_event_reader=_watermark_change_event_reader,
+            ):
+                stale.append(scope_id)
+        except Exception as exc:  # noqa: BLE001 — one scope's failure must not blank the rest
+            _logger.warning("failed to check staleness for %r: %s", scope_id, exc)
+    return sorted(stale)
+
+
+def _with_read_signal(fn):  # noqa: ANN001, ANN201
+    """Decorator: attach ``perspective_stale`` to a tool's result dict (#234).
+
+    Applied UNDER ``@mcp.tool()`` on every tool (``@mcp.tool()`` outermost,
+    this decorator next, the tool function innermost) — one point after every
+    tool's return, rather than threading the check through each tool's own
+    (sometimes several) return statements, and with no dependency on any
+    private MCP SDK seam. ``functools.wraps`` keeps the wrapped function's
+    name/signature/docstring, so FastMCP's schema introspection (``@mcp.tool()``
+    reads the ORIGINAL signature through this wrapper) is unaffected —
+    ``tests/test_234_read_signal.py`` pins the registered tool schemas
+    byte-identical to a pre-wrap snapshot.
+
+    A write tool is wrapped too: a contribute to scope S does not make every
+    OTHER scope this session has read current — only #234 §8's self-trigger
+    advances S's own receipt, on S's own write.
+
+    Handles both sync (``strata_list_scopes``) and async tool functions, and
+    marks the wrapper with ``_read_signal_wrapped = True`` so
+    ``test_234_read_signal.py`` can assert every registered tool carries it —
+    completeness enforced by a test, not by remembering to add the decorator.
+    """
+    if inspect.iscoroutinefunction(fn):
+
+        @functools.wraps(fn)
+        async def async_wrapper(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+            result = await fn(*args, **kwargs)
+            if isinstance(result, dict):
+                stale = _stale_read_scopes()
+                if stale:
+                    result["perspective_stale"] = stale
+            return result
+
+        async_wrapper._read_signal_wrapped = True  # noqa: SLF001
+        return async_wrapper
+
+    @functools.wraps(fn)
+    def sync_wrapper(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+        result = fn(*args, **kwargs)
+        if isinstance(result, dict):
+            stale = _stale_read_scopes()
+            if stale:
+                result["perspective_stale"] = stale
+        return result
+
+    sync_wrapper._read_signal_wrapped = True  # noqa: SLF001
+    return sync_wrapper
 
 
 def _record_accepted_contribution(decision: str) -> None:
@@ -1963,6 +2103,7 @@ _install_connect_hook(mcp)
 
 
 @mcp.tool()
+@_with_read_signal
 async def strata_bind(scope_id: str, skill: str | None = None, confirm: bool = False) -> dict:
     """Bind (or rebind) this session to a scope (and optionally skill), right now.
 
@@ -2272,6 +2413,7 @@ async def strata_bind(scope_id: str, skill: str | None = None, confirm: bool = F
 
 
 @mcp.tool()
+@_with_read_signal
 async def strata_contribute(
     scope_id: str,
     content: str,
@@ -2438,6 +2580,23 @@ async def strata_contribute(
     # (#110): only an accepted contribution resets the read/contribute gap.
     _record_submitted_contribution()
     _record_accepted_contribution(outcome.decision)
+    # #234 §8, the self-trigger: this session's own write to scope_id may
+    # catch its own receipt up — but only if nothing ELSE moved the scope
+    # first (the compare-and-set itself lives in session_state, against the
+    # exact pre/post watermarks ContributionOutcome carried from under the
+    # SAME scope lock the write ran under).
+    if _session_store is not None:
+        try:
+            _session_store.advance_watermark_if_matched(
+                _AGENT_SESSION_ID,
+                scope_id,
+                expected_before=outcome.watermark_before,
+                new_after=outcome.watermark_after,
+            )
+        except OSError as exc:  # pragma: no cover - defensive; disk failure only
+            _logger.warning(
+                "failed to advance read receipt for session %r: %s", _AGENT_SESSION_ID, exc
+            )
 
     return _attach_fleet_notice(
         {
@@ -2457,6 +2616,7 @@ async def strata_contribute(
 
 
 @mcp.tool()
+@_with_read_signal
 async def strata_rejudge(contribution_id: str) -> dict:
     """Re-judge a contribution whose scope-manager judgment previously failed.
 
@@ -2542,6 +2702,19 @@ async def strata_rejudge(contribution_id: str) -> dict:
     # first to record — the recovery of a previously-failed contribution.
     if not already_judged:
         _record_accepted_contribution(outcome.decision)
+    # #234 §8, the self-trigger — same mechanism as strata_contribute's.
+    if _session_store is not None:
+        try:
+            _session_store.advance_watermark_if_matched(
+                _AGENT_SESSION_ID,
+                contribution.scope_id,
+                expected_before=outcome.watermark_before,
+                new_after=outcome.watermark_after,
+            )
+        except OSError as exc:  # pragma: no cover - defensive; disk failure only
+            _logger.warning(
+                "failed to advance read receipt for session %r: %s", _AGENT_SESSION_ID, exc
+            )
 
     return _attach_fleet_notice(
         {
@@ -2568,6 +2741,7 @@ async def strata_rejudge(contribution_id: str) -> dict:
 
 
 @mcp.tool()
+@_with_read_signal
 async def strata_publish(
     content: str,
     kind: Literal["directive", "context"],
@@ -2704,6 +2878,7 @@ async def strata_publish(
 
 
 @mcp.tool()
+@_with_read_signal
 async def strata_withdraw(item_id: str) -> dict:
     """Propose withdrawing a published item from this agent's bound scope's publication.
 
@@ -2780,6 +2955,7 @@ async def strata_withdraw(item_id: str) -> dict:
 
 
 @mcp.tool()
+@_with_read_signal
 async def strata_read_scope_summary(scope_id: str | None = None) -> dict:
     """Return the scope summary for the given scope — or its directives, or its publication.
 
@@ -2848,7 +3024,7 @@ async def strata_read_scope_summary(scope_id: str | None = None) -> dict:
 
     # Read receipt (#110): a summary read consumes this scope's memory — count it
     # toward the session asymmetry counters and the per-scope staleness metric.
-    _record_read(scope_id)
+    _record_read(scope_id, fleet=fleet)
 
     # A chain-referenced scope (not the bound scope, not an ancestor) is
     # entitled for its OUTWARD FACE, never its internal summary.
@@ -2904,6 +3080,7 @@ async def strata_read_scope_summary(scope_id: str | None = None) -> dict:
 
 
 @mcp.tool()
+@_with_read_signal
 async def strata_read_perspective(scope_id: str | None = None) -> dict:
     """Return this agent's perspective on the fleet's long-term memory.
 
@@ -2990,7 +3167,10 @@ async def strata_read_perspective(scope_id: str | None = None) -> dict:
     # Read receipt (#110): a perspective read is attributed to its TARGET scope
     # (the scope whose perspective was requested), not fanned out to every
     # ancestor layer — "read this scope's perspective" is the metric's unit.
-    _record_read(scope_id)
+    # #234: stamped AFTER the drain above, so the watermark matches the
+    # POST-drain state this read actually composes and shows below — never a
+    # stale pre-drain baseline.
+    _record_read(scope_id, fleet=fleet)
 
     # Composition (ordering, relation labelling, the synthesized-empty-
     # summary fallback) lives in strata.perspective — the importable library
@@ -3075,6 +3255,7 @@ async def strata_read_perspective(scope_id: str | None = None) -> dict:
 
 
 @mcp.tool()
+@_with_read_signal
 def strata_list_scopes() -> dict:
     """Return the full fleet configuration: strata, scopes, and edges.
 
@@ -3127,6 +3308,7 @@ def strata_list_scopes() -> dict:
 
 
 @mcp.tool()
+@_with_read_signal
 async def strata_read_scope_record(
     scope_id: str | None = None,
     limit: int | None = None,
@@ -3252,6 +3434,7 @@ async def strata_read_scope_record(
 
 
 @mcp.tool()
+@_with_read_signal
 async def strata_read_contribution(contribution_id: str) -> dict:
     """Return one contribution with its state, verdict, and judgment attempts.
 
@@ -3329,6 +3512,7 @@ async def strata_read_contribution(contribution_id: str) -> dict:
 
 
 @mcp.tool()
+@_with_read_signal
 async def strata_session_stats() -> dict:
     """Return this session's mechanical read/contribute asymmetry counters.
 
@@ -3375,6 +3559,7 @@ async def strata_session_stats() -> dict:
 
 
 @mcp.tool()
+@_with_read_signal
 async def strata_session_closeout(reason: str) -> dict:
     """Record that this session has nothing to contribute — a MECHANICAL act.
 
