@@ -1516,6 +1516,14 @@ def operator_restore(
     design point 2's "the operator path is the escape" when the owner's
     judge declines).
 
+    Unjudged: the operator decides — the Console shows the refuted claim
+    beside the item (and the correcting content) precisely so that decision
+    is informed. By design, this WILL restore a genuine carrier of the
+    refuted claim if the operator chooses to (ADR 0008's in-person
+    authority) — there is no mechanical refusal here; the structural
+    "still believed, doesn't carry" test is the OWNER path's own judge, not
+    this one.
+
     Raises:
         ValueError: *scope_id* is not found in *fleet*, *item_id* was not
             withdrawn by a correction sweep, or it was already restored.

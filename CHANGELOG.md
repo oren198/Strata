@@ -48,9 +48,12 @@ the release PR (`dev` → `main`) and the GitHub Release body are built from
   correction with any overflow recorded, never silently dropped. A
   mechanical observed-value veto can additionally keep an item the judge
   wrongly marked `carries` (recorded `kept_by_guard`) when it states what
-  was actually observed rather than the refuted claim. Measured, this
-  withdraws roughly 2–7% of a scope's neighbouring valid items alongside
-  genuine carriers — a known limit, addressed by the restore act below.
+  was actually observed rather than the refuted claim. #219 C wrongly
+  withdraws about 2–7% of a scope's neighbouring items (measured). Each one
+  is listed in the Console's Correction withdrawals view and can be
+  restored there by the operator. The owner's own judged restore recovered
+  5 of 12 such items in our measurement; the operator path is the reliable
+  remedy ([evidence](docs/evidence/v1.17-219c-restore-2026-10-03.md)).
 
 - **A judged `restore` act undoes a published item a correction sweep wrongly
   withdrew, under its ORIGINAL id and bytes (companion to #219 C).** Only a

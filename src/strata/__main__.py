@@ -5326,7 +5326,8 @@ def _build_parser() -> argparse.ArgumentParser:
         "restore",
         help=(
             "Restore a published item a correction sweep wrongly withdrew, "
-            "under its original id and bytes — in person, no judgment."
+            "under its original id and bytes — unjudged: the operator decides; "
+            "the Console shows the refuted claim beside the item."
         ),
     )
     p_op_restore.add_argument("scope_id")
