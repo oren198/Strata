@@ -612,9 +612,14 @@ CLAIM_CARRIER_TOOL: dict = {
                             "type": "string",
                             "enum": ["carries", "does_not_carry"],
                             "description": (
-                                "carries: this item still asserts the corrected claim, "
-                                "in any wording. does_not_carry: it does not — a "
-                                "different claim, even on a similar subject."
+                                "carries = the item asserts the corrected claim itself: "
+                                "the same subject, the same action and the same value or "
+                                "timing, alone or among other claims. An item that states "
+                                "a different value, a different subject, a different "
+                                "action, different timing, or an exception to the claim "
+                                "is does_not_carry, even if it is about the same matter. "
+                                "When in doubt, does_not_carry: a wrong 'carries' "
+                                "withdraws a valid publication."
                             ),
                         },
                     },
@@ -632,7 +637,14 @@ currently published items still carry that corrected claim — even paraphrased 
 or reworded — and which assert something else, including a different claim on \
 a similar subject (a subject swap is NOT a carrier). This is about CONTENT \
 equivalence only: does the item still assert the same thing the claim stated, \
-in substance, however the wording differs."""
+in substance, however the wording differs.
+
+carries = the item asserts the corrected claim itself: the same subject, the \
+same action and the same value or timing, alone or among other claims. An \
+item that states a different value, a different subject, a different \
+action, different timing, or an exception to the claim is does_not_carry, \
+even if it is about the same matter. When in doubt, does_not_carry: a wrong \
+"carries" withdraws a valid publication."""
 
 # ---------------------------------------------------------------------------
 # Interior-assertion re-ask tool (ADR 0016, issue #225 — static, eligible for
