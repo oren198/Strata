@@ -2316,6 +2316,23 @@ _NEGATION_MARKERS: tuple[str, ...] = (
     "can't",
 )
 
+#: R5c (architect ruling, round 5): a CHANGE marker in the claim with none
+#: anywhere in the reference means the claim states a CHANGE from the
+#: reference's own value, not a restatement of it — "security findings can
+#: now be triaged within a week INSTEAD OF 48 hours" against a reference
+#: that only ever says "48 hours" is a flip, even with no antonym pair and
+#: no negation marker involved at all.
+_CHANGE_MARKERS: tuple[str, ...] = (
+    "instead of",
+    "rather than",
+    "no longer",
+    "anymore",
+    "except",
+    "exception",
+    "now can",
+    "can now",
+)
+
 
 def value_polarity_flip(
     claim_text: str,
@@ -2344,6 +2361,12 @@ def value_polarity_flip(
       a word in *claim_text* that *reference_text* also states UNNEGATED —
       "not waived" against a reference stating "waived" is a flip; "waived"
       against "waived" is not.
+    - **change-marker flip** (R5c): a :data:`_CHANGE_MARKERS` phrase
+      ("instead of", "rather than", "no longer", "anymore", "except",
+      "exception", "now can"/"can now") appears anywhere in *claim_text*
+      with NONE of them anywhere in *reference_text* — the claim states a
+      CHANGE from the reference's own value with no antonym pair or
+      negation marker necessarily involved at all.
 
     Pure and reusable: shared by v1.17 item 1's own
     ``directive_or_publication`` ground check and item 2's ``refines``/
@@ -2387,7 +2410,10 @@ def value_polarity_flip(
                 rf"\b(?:{negation_alternation})\s+{re.escape(word)}\b", ref_cf
             ):
                 return True
-    return False
+
+    return any(marker in claim_cf for marker in _CHANGE_MARKERS) and not any(
+        marker in ref_cf for marker in _CHANGE_MARKERS
+    )
 
 
 #: Hole B (architect review round 3, bridge attack on 1ffc4e4): an
