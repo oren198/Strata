@@ -3853,7 +3853,14 @@ _TELLING_VERB_RE = re.compile(r"\b(?:" + "|".join(_TELLING_VERBS) + r")\b", re.I
 #: ..." names no one and is not a telling event.
 _JOINT_EVENT_VERBS = ("discussed", "agreed", "decided", "met", "sync")
 _JOINT_EVENT_VERB_RE = re.compile(r"\b(?:" + "|".join(_JOINT_EVENT_VERBS) + r")\b", re.IGNORECASE)
-_JOINT_EVENT_PARTY_RE = re.compile(r"\bwith\s+\S", re.IGNORECASE)
+#: Fix (architect review round 3): the party must follow the JOINT verb
+#: within a word or two — an unanchored "with" anywhere in the span (e.g.
+#: "procurement only works with approved vendors" after a bare "as
+#: discussed, ...") is not a party object for the verb at all.
+_JOINT_EVENT_PARTY_RE = re.compile(
+    r"\b(?:discussed|agreed|decided|met)\s+(?:\w+\s+){0,2}with\s+\w|\bsync\s+with\s+\w",
+    re.IGNORECASE,
+)
 
 #: Articles stripped from a `telling_span` before the first-person-marker
 #: check only — narrower than `_OWN_ROLE_STRIP_WORDS` (no possessives, no

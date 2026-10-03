@@ -408,6 +408,51 @@ def test_joint_event_verbs_are_telling_events_with_a_party_object() -> None:
     assert "state who was told" in problem5
 
 
+def test_joint_event_party_must_follow_the_verb_within_a_word_or_two() -> None:
+    """Architect review round 3: the party must follow the JOINT verb
+    within a word or two — an unrelated "with" elsewhere in the span (a
+    bare "as discussed" plus some unrelated "with X" later on) is not a
+    party object for that verb."""
+    content1 = "As discussed, procurement only works with approved vendors."
+    problem1, kind1 = _telling_span_problem_for(
+        "As discussed, procurement only works with approved vendors", content=content1
+    )
+    assert problem1 is not None
+    assert kind1 is None
+    assert "state who was involved" in problem1
+
+    # The five addendum strings still pass.
+    for span, content in (
+        (
+            "As discussed with procurement in Tuesday's sync",
+            "As discussed with procurement in Tuesday's sync, procurement only approves orders.",
+        ),
+        (
+            "When we met with treasury in yesterday's handover",
+            "When we met with treasury in yesterday's handover, the limit changed.",
+        ),
+        (
+            "In our sync with field-support (Monday's stand-up)",
+            "In our sync with field-support (Monday's stand-up), the rota changed.",
+        ),
+        (
+            "As we agreed with data-governance",
+            "As we agreed with data-governance, retention changed.",
+        ),
+    ):
+        problem, kind = _telling_span_problem_for(span, content=content)
+        assert problem is None, span
+        assert kind == "joint", span
+
+    # "last week" is two words between the verb and "with": still passes.
+    content2 = "We agreed last week with procurement that the limit changed."
+    problem2, kind2 = _telling_span_problem_for(
+        "We agreed last week with procurement that the limit changed", content=content2
+    )
+    assert problem2 is None
+    assert kind2 == "joint"
+
+
 def test_first_hand_own_is_barred_when_a_non_entitled_scope_is_named() -> None:
     # j1-031 shape: the contributor's OWN proposal about its own scope.
     content = "we decided to only escalate to SEV-1 if error rate exceeds 5%."
