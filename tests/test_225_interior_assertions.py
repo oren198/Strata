@@ -138,13 +138,18 @@ def test_alias_text_does_not_trigger() -> None:
 
 
 def test_a_decline_never_triggers() -> None:
-    """Only an ACCEPT triggers — a decline has nothing to verify."""
+    """Only an ACCEPT triggers #225's own interior-assertion re-ask — a
+    decline has nothing to verify there. Reasoning deliberately avoids v1.17
+    item 1's own trigger phrases ("manufactured attribution", "no one
+    spoke", ...), which legitimately fire a DIFFERENT re-ask on a decline —
+    that the two never confuse each other is covered by that item's own
+    tests, not here."""
     mock_client = MagicMock()
     content = "225-other-scope only approves changes under budget."
     mock_client.messages.create.return_value = _fake_response(
         {
             "decision": "decline",
-            "reasoning": "Manufactured attribution.",
+            "reasoning": "Declined: contradicts a binding directive.",
             "directive_ops": [],
             "new_context": None,
         }
@@ -503,6 +508,28 @@ def test_informant_span_naming_a_genuine_third_party_with_a_possessive_passes() 
     assert judgment.interior_assertion["telling_span"] == "told me"
 
 
+def test_joint_event_verb_informant_is_attributed_in_discussion_with_form() -> None:
+    """Philis's ruling (architect review round 2, widening #225): a
+    JOINT-EVENT verb with a party ("discussed with X") is a telling event
+    too, and records at ITS OWN strength — "in discussion with X: ...",
+    never "X says"."""
+    content = "As discussed with 225-other-scope, they only approve changes under budget."
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [
+        _ordinary_accept(content),
+        _reask_response(
+            classification="informant",
+            informant_span="225-other-scope",
+            telling_span="discussed with 225-other-scope",
+        ),
+    ]
+    judgment, _ = _judge(mock_client, content)
+    assert judgment.decision == "accept_as_context"
+    assert judgment.new_context is not None
+    assert "In discussion with 225-other-scope:" in judgment.new_context
+    assert "says" not in judgment.new_context
+
+
 def test_informant_span_naming_a_genuine_third_party_with_our_passes() -> None:
     content = (
         "our contact Ravi in treasury told us 225-other-scope only approves changes under budget."
@@ -738,6 +765,40 @@ def test_all_six_j4_interior_conduct_twins_pass() -> None:
         judgment, _ = _judge(mock_client, content)
         assert judgment.decision == "accept_as_context", content
         assert judgment.interior_assertion["result"] == "admitted as judged", content
+
+
+def test_joint_event_verb_with_party_satisfies_the_conduct_burden() -> None:
+    """Addendum (bridge "after" run on j4_joint_verb, architect review
+    round 3): a joint-event verb WITH a party ("As discussed with X") is
+    conduct the contributor took part in too — the contributor is the
+    implied counterpart, same ruling as the telling-event check. No
+    separate first-person word is required; a bare "as discussed" with no
+    party still fails."""
+    content = (
+        "As discussed with 225-other-scope in Tuesday's sync, we'll get two quotes "
+        "before approving the purchase."
+    )
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [
+        _ordinary_accept(content),
+        _reask_response(
+            classification="conduct",
+            act_span="As discussed with 225-other-scope in Tuesday's sync",
+        ),
+    ]
+    judgment, _ = _judge(mock_client, content)
+    assert judgment.decision == "accept_as_context"
+    assert judgment.interior_assertion["result"] == "admitted as judged"
+
+    content_bad = "As discussed, 225-other-scope only approves changes under budget."
+    mock_client_bad = MagicMock()
+    mock_client_bad.messages.create.side_effect = [
+        _ordinary_accept(content_bad),
+        _reask_response(classification="conduct", act_span="As discussed"),
+    ]
+    judgment_bad, _ = _judge(mock_client_bad, content_bad)
+    assert judgment_bad.decision == "decline"
+    assert "no observed act in the contributor's own dealings is stated" in judgment_bad.reasoning
 
 
 def test_a_flat_rule_fails_the_conduct_burden() -> None:

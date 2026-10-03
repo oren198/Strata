@@ -2233,6 +2233,336 @@ def _value_tokens(text: str) -> set[str]:
     return tokens
 
 
+def _decomposed_value_tokens(text: str) -> set[str]:
+    """:func:`_value_tokens`, with one change: a hyphen- or slash-joined
+    compound CONTAINING a digit ("under-12", "j4-822") is decomposed into
+    its atoms — the digit atom normalised as a bare number — INSTEAD OF
+    kept whole, so a value spelled as a compound on one side compares
+    against the same value spelled as plain words on the other ("under-12"
+    vs "under 12") — v1.17 item 1's architect review of 10327f6's bridge
+    replay, round 2: adding the atom BESIDE the whole compound is not
+    enough, because the whole compound ("under-12") then never matches
+    anything on a side that spells it as two plain words, and a strict
+    subset check still fails on that leftover token. Number WORDS still
+    normalise via the same :data:`_NUMBER_WORDS` table :func:`_value_tokens`
+    already uses — nothing new there.
+
+    A SEPARATE function from :func:`_value_tokens`, not a change to it:
+    :func:`observed_value_veto`'s own #219 C gate relies on the whole
+    compound counting as one identifier-shaped token (``j4-822`` as a work
+    item id), and this function's own callers (the attribution and relation
+    re-checks' value-conflict comparisons) need the opposite — this is a
+    deliberate, reported fork, not a shared improvement to the original.
+    """
+    tokens = set(_value_tokens(text))
+    for match in re.finditer(r"[\w]+(?:[-/][\w]+)+", text.casefold()):
+        compound = match.group(0)
+        if not any(c.isdigit() for c in compound):
+            continue
+        tokens.discard(compound)
+        for atom in re.split(r"[-/]", compound):
+            if atom.isdigit():
+                tokens.add(atom)
+            elif atom in _NUMBER_WORDS:
+                tokens.add(_NUMBER_WORDS[atom])
+    return tokens
+
+
+#: #219's own closed POL_WORDS set, paired into antonyms — bidirectional.
+#: "forbidden" and "prohibited" are both treated as the antonym of
+#: "allowed" (near-synonyms of each other, not antonyms).
+_POL_ANTONYMS: dict[str, frozenset[str]] = {
+    "on": frozenset({"off"}),
+    "off": frozenset({"on"}),
+    "before": frozenset({"after"}),
+    "after": frozenset({"before"}),
+    "always": frozenset({"never"}),
+    "never": frozenset({"always"}),
+    "required": frozenset({"optional"}),
+    "optional": frozenset({"required"}),
+    "enabled": frozenset({"disabled"}),
+    "disabled": frozenset({"enabled"}),
+    "open": frozenset({"closed"}),
+    "closed": frozenset({"open"}),
+    "allowed": frozenset({"forbidden", "prohibited"}),
+    "forbidden": frozenset({"allowed"}),
+    "prohibited": frozenset({"allowed"}),
+    "shared": frozenset({"private"}),
+    "private": frozenset({"shared"}),
+    "include": frozenset({"exclude"}),
+    "exclude": frozenset({"include"}),
+    "min": frozenset({"max"}),
+    "max": frozenset({"min"}),
+    "above": frozenset({"below"}),
+    "below": frozenset({"above"}),
+    "first": frozenset({"last"}),
+    "last": frozenset({"first"}),
+}
+
+#: A span restating a claim under negation ("not waived", "no longer
+#: required") states the opposite of the unnegated claim — checked
+#: separately from :data:`_POL_ANTONYMS` because the negated word need not
+#: be one of :data:`_POL_WORDS` at all ("waived" is ordinary vocabulary).
+_NEGATION_MARKERS: tuple[str, ...] = (
+    "no longer",
+    "not",
+    "never",
+    "isn't",
+    "aren't",
+    "doesn't",
+    "don't",
+    "won't",
+    "cannot",
+    "can't",
+)
+
+#: R5c (architect ruling, round 5): a CHANGE marker in the claim with none
+#: anywhere in the reference means the claim states a CHANGE from the
+#: reference's own value, not a restatement of it — "security findings can
+#: now be triaged within a week INSTEAD OF 48 hours" against a reference
+#: that only ever says "48 hours" is a flip, even with no antonym pair and
+#: no negation marker involved at all.
+_CHANGE_MARKERS: tuple[str, ...] = (
+    "instead of",
+    "rather than",
+    "no longer",
+    "anymore",
+    "except",
+    "exception",
+    "now can",
+    "can now",
+)
+
+
+def value_polarity_flip(
+    claim_text: str,
+    reference_text: str,
+    extra_antonym_pairs: Sequence[tuple[str, str]] = (),
+) -> bool:
+    """#219's polarity guard, as a FLIP check — architect review round 2 of
+    10327f6's bridge replay: the PRIOR shape (every :data:`_POL_WORDS` word
+    in the claim must also appear in the reference) over-fires on ordinary
+    vocabulary that happens to be in the closed set ("the clinics directive
+    ON two-person counts" has no polarity assertion at all; "on" is common
+    word, not a claim about on/off state). A polarity word (or a negation)
+    appearing in *claim_text* with NO antonym anywhere in *reference_text*
+    is not a flip — it is simply not vetoed for being absent.
+
+    Two mechanisms, either one sufficient to report a flip:
+
+    - **antonym flip**: a :data:`_POL_ANTONYMS` word (or one of
+      *extra_antonym_pairs*, for a caller-specific antonym pair the closed
+      POL_WORDS set does not cover — v1.17 item 2's own relation antonyms,
+      e.g. "at or below"/"at or above", not in :data:`_POL_WORDS` at all)
+      appears in *claim_text*, its antonym appears in *reference_text*, and
+      *claim_text* itself does not ALSO contain that antonym (a claim that
+      restates both sides, e.g. quoting a change, is not penalised).
+    - **negation flip**: a :data:`_NEGATION_MARKERS` word directly precedes
+      a word in *claim_text* that *reference_text* also states UNNEGATED —
+      "not waived" against a reference stating "waived" is a flip; "waived"
+      against "waived" is not.
+    - **change-marker flip** (R5c): a :data:`_CHANGE_MARKERS` phrase
+      ("instead of", "rather than", "no longer", "anymore", "except",
+      "exception", "now can"/"can now") appears anywhere in *claim_text*
+      with NONE of them anywhere in *reference_text* — the claim states a
+      CHANGE from the reference's own value with no antonym pair or
+      negation marker necessarily involved at all.
+
+    Pure and reusable: shared by v1.17 item 1's own
+    ``directive_or_publication`` ground check and item 2's ``refines``/
+    ``tightens`` fact-mode polarity guard (its own relation antonyms are
+    supplied as *extra_antonym_pairs*) — ONE flip function, not two.
+    """
+    claim_cf = claim_text.casefold()
+    ref_cf = reference_text.casefold()
+
+    antonym_pairs = list(extra_antonym_pairs)
+    for word, antonyms in _POL_ANTONYMS.items():
+        antonym_pairs.extend((word, antonym) for antonym in antonyms)
+
+    for first, second in antonym_pairs:
+        # A bare `\b` lets a POL_WORD match inside an unrelated hyphenated
+        # compound ("on-call", "sign-off" both contain "on"/"off" as
+        # word-bounded substrings, with no on/off state assertion at all).
+        # Excluding a match directly adjacent to a hyphen on either side
+        # closes this without narrowing the real single-word case.
+        first_re = re.compile(rf"(?<!-)\b{re.escape(first)}\b(?!-)")
+        second_re = re.compile(rf"(?<!-)\b{re.escape(second)}\b(?!-)")
+        claim_has_first, claim_has_second = (
+            bool(first_re.search(claim_cf)),
+            bool(second_re.search(claim_cf)),
+        )
+        ref_has_first, ref_has_second = (
+            bool(first_re.search(ref_cf)),
+            bool(second_re.search(ref_cf)),
+        )
+        if claim_has_first and ref_has_second and not ref_has_first:
+            return True
+        if claim_has_second and ref_has_first and not ref_has_second:
+            return True
+
+    negation_alternation = "|".join(re.escape(marker) for marker in _NEGATION_MARKERS)
+    for marker in _NEGATION_MARKERS:
+        for match in re.finditer(rf"\b{re.escape(marker)}\s+(\w+)", claim_cf):
+            word = match.group(1)
+            word_re = re.compile(rf"\b{re.escape(word)}\b")
+            if word_re.search(ref_cf) and not re.search(
+                rf"\b(?:{negation_alternation})\s+{re.escape(word)}\b", ref_cf
+            ):
+                return True
+
+    return any(marker in claim_cf for marker in _CHANGE_MARKERS) and not any(
+        marker in ref_cf for marker in _CHANGE_MARKERS
+    )
+
+
+#: Hole B (architect review round 3, bridge attack on 1ffc4e4): an
+#: unrelated directive can be cited and still pass when the span's value
+#: tokens are vacuous (no number/id/quote at all, so the subset check holds
+#: trivially). Overlap is NECESSARY, never sufficient (the design note's
+#: own contract line) — these stay EXCLUDED from the count even though some
+#: are content-bearing words, because they recur in nearly every citation
+#: regardless of subject.
+_CONTENT_OVERLAP_STOPWORDS = frozenset(
+    {
+        "directive",
+        "policy",
+        "rule",
+        "says",
+        "already",
+        "according",
+        # Architect's bridge forced-gate fix (the j1a-025 coverage
+        # artefact): attribution-FRAME verbs recur in nearly every
+        # citation regardless of subject, the same reasoning as the
+        # original six words above.
+        "requires",
+        "require",
+        "required",
+        "states",
+        "stated",
+        "mandates",
+        "mandated",
+        "notes",
+        "following",
+        "under",
+        "per",
+        "quoted",
+        "ratified",
+    }
+)
+
+
+def _overlap_stem(word: str) -> str:
+    """A simple plural/-ed/-ing stem — just enough to match "products" to
+    "product" and "stickers" to "sticker" — never a real stemmer; this is a
+    necessary-overlap gate, not the value check itself."""
+    for suffix in ("ing", "ed", "es", "s"):
+        if word.endswith(suffix) and len(word) - len(suffix) >= 3:
+            return word[: -len(suffix)]
+    return word
+
+
+def _overlap_words(text: str) -> set[str]:
+    words: set[str] = set()
+    for word in re.findall(r"[a-z]+", text.casefold()):
+        if len(word) < 4 or word in _CONTENT_OVERLAP_STOPWORDS:
+            continue
+        words.add(_overlap_stem(word))
+    return words
+
+
+def _shared_six_word_sequence(a: str, b: str) -> bool:
+    a_tokens = re.findall(r"[a-z]+", a.casefold())
+    b_tokens = re.findall(r"[a-z]+", b.casefold())
+    if len(a_tokens) < 6 or len(b_tokens) < 6:
+        return False
+    b_sequences = {tuple(b_tokens[i : i + 6]) for i in range(len(b_tokens) - 5)}
+    return any(tuple(a_tokens[i : i + 6]) in b_sequences for i in range(len(a_tokens) - 5))
+
+
+#: F3 (architect review round 4, adversarial attack on 067183a: 12 passes
+#: through a weak "≥2 shared words" bar, including the whole j4-812 text).
+#: Splits the SPAN itself on coordinators, dashes and semicolons, so a
+#: requirement clause added beyond what the reference covers is caught
+#: even when the span's OVERALL coverage happens to clear the bar.
+_OVERLAP_CLAUSE_SPLIT_RE = re.compile(
+    r"\s*(?:--|;| and | AND | also | ALSO | plus | PLUS | as well as )\s*", re.IGNORECASE
+)
+
+
+def _coverage_ratio(subject_words: set[str], reference_words: set[str]) -> float:
+    if not subject_words:
+        return 0.0
+    return len(subject_words & reference_words) / len(subject_words)
+
+
+def content_overlap_required(
+    span: str,
+    reference_text: str,
+    exclude_words: Collection[str] = (),
+) -> bool:
+    """Hole B / F3's fix: at least 60% of *span*'s own content words
+    (casefolded, 4+ letters, simple plural/-ed/-ing stripping, excluding
+    :data:`_CONTENT_OVERLAP_STOPWORDS` and *exclude_words*) must appear in
+    *reference_text* — COVERAGE, not a flat "≥2 shared words" count (which
+    a long span could clear while adding whole unattributed clauses) — OR
+    a shared contiguous 6-word sequence.
+
+    *exclude_words* (architect's bridge forced-gate fix): raw words (e.g.
+    a scope's own id/name) the caller knows are NOT new information in
+    this span — a directive's own SOURCE scope, or any rendered ancestor
+    scope, named again in the span states nothing new ("the OBSERVATORY
+    directive..." citing the observatory's own rule), the same reasoning
+    as :data:`_CONTENT_OVERLAP_STOPWORDS`, just caller-specific rather
+    than universal. Stemmed and casefolded the same way as the span's own
+    words, so a plural or an inflected form still matches.
+
+    F3's own further rule: the span is ALSO split on coordinators, dashes
+    and semicolons, and every resulting clause that contains a REQUIREMENT
+    verb (:data:`_PARTIAL_GROUNDING_REQUIREMENT_RE`-shaped — imported
+    lazily from `strata.scope_manager` to avoid a circular import) must
+    ITSELF reach 60% coverage — this is what catches a span whose overall
+    coverage passes only because an earlier, genuinely-grounded clause
+    carries it (j4-812's own shape: "transactions over $500 require
+    step-up authentication AND transactions over $500 from newly-seen
+    devices must be blocked outright" shares "transactions", "500" with
+    the reference overall, but the SECOND clause's own value — "blocked
+    outright" — never appears there at all).
+
+    This is a NECESSARY gate, never a sufficient one on its own — the
+    value and polarity checks still apply on top.
+    """
+    from strata.scope_manager import (  # noqa: PLC0415 — avoids a circular import
+        _PARTIAL_GROUNDING_REQUIREMENT_RE,
+    )
+
+    excluded = _overlap_words(" ".join(exclude_words))
+    reference_words = _overlap_words(reference_text)
+    span_words = _overlap_words(span) - excluded
+    # Found while verifying F3 against the full adversarial attack: a span
+    # with only ONE surviving content word ("As the branches directive
+    # already says" — "directive"/"already"/"says" are all stopwords, only
+    # "branches" is left) can coincidentally match an UNRELATED reference
+    # that happens to share that one word, at 100% coverage. Coverage
+    # alone cannot distinguish "the whole span matches" from "the only
+    # word left happens to match" — at least 2 surviving words are
+    # required for the ratio to mean anything.
+    if len(span_words) < 2 and not _shared_six_word_sequence(span, reference_text):
+        return False
+    if _coverage_ratio(span_words, reference_words) < 0.6 and not _shared_six_word_sequence(
+        span, reference_text
+    ):
+        return False
+
+    for clause in _OVERLAP_CLAUSE_SPLIT_RE.split(span):
+        if not _PARTIAL_GROUNDING_REQUIREMENT_RE.search(clause):
+            continue
+        clause_words = _overlap_words(clause)
+        if _coverage_ratio(clause_words, reference_words) < 0.6:
+            return False
+    return True
+
+
 def observed_value_veto(refuted_claim: str, correcting_content: str, item_content: str) -> bool:
     """#219 C live-gate addition (CEO, standing rule 1 — never trust prompt
     text alone): a mechanical veto that can only PREVENT a withdrawal, never
