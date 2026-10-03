@@ -868,6 +868,101 @@ ATTRIBUTION_RECHECK_TOOL: dict = {
     },
 }
 
+RELATION_RECHECK_TOOL: dict = {
+    "name": "recheck_relation",
+    "description": (
+        "Your decline named an inherited (ancestor) directive as a contradiction. "
+        "Re-check ONLY that one ground: is the contribution actually a legitimate "
+        "refinement or tightening of that directive, rather than a genuine "
+        "contradiction or an exemption dressed as one? Every OTHER ground for the "
+        "original decline still applies — you must say so."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "relation": {
+                "type": "string",
+                "enum": ["contradicts", "exempts", "refines", "tightens"],
+                "description": (
+                    "contradicts: a genuine conflict with the parent directive — the "
+                    "decline stands. exempts: carves out an exception to the parent — "
+                    "the decline stands. refines: narrows to a specific, previously "
+                    "uncovered case, without contradicting any value the parent "
+                    "states. tightens: keeps every value the parent states, either "
+                    "unchanged or replaced by a strictly stricter one in the same "
+                    "direction."
+                ),
+            },
+            "other_grounds_clear": {
+                "type": "boolean",
+                "description": (
+                    "Required. True only if EVERY other ground for the original "
+                    "decline is also clear — relevance, no OTHER contradiction, "
+                    "nothing else restricts it. False means the decline stands "
+                    "regardless of relation."
+                ),
+            },
+            "parent_id": {
+                "type": "string",
+                "description": "Required: the id of the inherited directive this relates to.",
+            },
+            "classification": {
+                "type": "string",
+                "enum": ["directive", "context"],
+                "description": (
+                    "The contribution's ORIGINAL proposed classification, reinstated as "
+                    "the ground was always this, not 'directive' by default: a decision "
+                    "comes back as a directive, an observation as context. If omitted, "
+                    "the contributor's own original proposed classification is used."
+                ),
+            },
+            "subject_span": {
+                "type": "string",
+                "description": (
+                    "Required for relation 'refines': the EXACT verbatim span of the "
+                    "contribution's own text naming the specific case this is about."
+                ),
+            },
+            "kept_span": {
+                "type": "string",
+                "description": (
+                    "Required for relation 'tightens': the EXACT verbatim span of the "
+                    "contribution's own text showing the parent's value or fact is "
+                    "kept — unchanged, or replaced by a strictly stricter one in the "
+                    "same direction; for a fact, restated unchanged."
+                ),
+            },
+            "tighten_kind": {
+                "type": "string",
+                "enum": ["rule", "fact"],
+                "description": (
+                    "Required for relation 'tightens'. 'rule': the parent states a "
+                    'numeric threshold ("at or below X", "every N", "within T", '
+                    '"at least K") and kept_span restates it with the SAME pattern, '
+                    "unchanged or replaced by a strictly stricter value. 'fact': the "
+                    "parent states a plain fact or value with no such pattern, and "
+                    "kept_span restates it unchanged."
+                ),
+            },
+            "new_context": {
+                "type": "string",
+                "description": (
+                    "Required when relation is 'refines' or 'tightens' and "
+                    "other_grounds_clear is true: the full replacement context "
+                    "section, in the same shape an ordinary accept verdict would "
+                    "write — used only when the original verdict was context, not a "
+                    "directive."
+                ),
+            },
+            "reasoning": {
+                "type": "string",
+                "description": "One or two sentences explaining the re-check's verdict.",
+            },
+        },
+        "required": ["relation", "other_grounds_clear", "parent_id", "reasoning"],
+    },
+}
+
 # ---------------------------------------------------------------------------
 # System prompt (static — eligible for prompt caching)
 # ---------------------------------------------------------------------------
@@ -2666,6 +2761,17 @@ class ScopeManagerJudgment(_AmendmentJudgment):
     :attr:`interior_assertion`'s shape, the structured twin of the fixed
     marker this also appends to :attr:`protocol_notes`
     ("attribution recheck: <ground_kind>, <result>")."""
+
+    relation_recheck: dict | None = None
+    """v1.17 item 2 (#237 — refinement/tightening over-decline, in reverse
+    of #225's own shape): ``{"relation": <relation or None>, "parent_id":
+    <id or None>, "result": <result string>}`` whenever
+    :meth:`ScopeManager.recheck_relation_decline` fired — ``None``
+    otherwise. ``relation`` and ``parent_id`` are ``None`` only when the
+    re-ask's own response was unreadable or the re-ask call itself failed
+    (the result string then starts with "recheck failed"); the FIRST
+    decline stands unchanged in that case (see that method's own
+    docstring — a direct mirror of item 1's own Blocker 2 fix)."""
 
     @property
     def record_notes(self) -> str:
@@ -4665,6 +4771,498 @@ def verify_attribution_ground(
 
 
 # ---------------------------------------------------------------------------
+# v1.17 item 2 (#237) — relation/refinement over-decline re-check, pure
+# functions. Mirrors item 1's own three-layer shape (trigger / verifier /
+# injectable method), plus item 1's own review lessons: the re-ask renders
+# current context and never replaces it with engine text, a re-ask failure
+# leaves the first decline standing, and `reasoning` is a required field.
+# ---------------------------------------------------------------------------
+
+
+def relation_decline_trigger(
+    reasoning: str | None,
+    ancestor_directive_ids: Collection[str],
+) -> str | None:
+    """Does *reasoning* (an ordinary judgment's own decline text) name one
+    of *ancestor_directive_ids* as a literal, word-bounded substring — the
+    design note's own mechanical check that the declined-by directive is a
+    rendered ANCESTOR directive, not just any directive id.
+
+    Returns the matched ancestor directive id, not a bare bool (a
+    deliberate deviation from item 1's own `attribution_decline_trigger`
+    shape): the caller needs to know WHICH ancestor directive was named to
+    look up its text for the mechanical checks, and re-deriving that in the
+    caller would duplicate this same scan. Pure and judge-free: a harness
+    replays this over a corpus of recorded reasonings with no API call at
+    all, same as item 1's trigger.
+
+    ``None`` when *reasoning* is empty/``None`` or names no ancestor
+    directive id.
+    """
+    if not reasoning:
+        return None
+    for directive_id in ancestor_directive_ids:
+        if directive_id and re.search(rf"\b{re.escape(directive_id)}\b", reasoning):
+            return directive_id
+    return None
+
+
+#: The design note's own four recognised comparative patterns for `tightens`
+#: RULE mode, each paired with which direction is stricter — "smaller" means
+#: a smaller value in the contribution is the stricter one (at or below,
+#: every, within); "larger" means a larger value is stricter (at least).
+#: Tried against the PARENT's own text first; direction is read off whichever
+#: pattern matches there, never guessed.
+#: Item 2's own adversarial admit-check (architect ruling, round 1): a
+#: value can be a plain number OR a 24-hour clock time ("06:30") — "at or
+#: before"/"at or after" are the natural TIME-shaped twins of "at or
+#: below"/"at or above" ("watered at or before 07:00" vs "...before
+#: 06:30" is the same kind of threshold, just a clock value).
+_COMPARATOR_VALUE = r"(-?[\d:.,]+)"
+_COMPARATOR_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(rf"\bat or below\s+{_COMPARATOR_VALUE}", re.IGNORECASE), "smaller"),
+    (re.compile(rf"\bat or above\s+{_COMPARATOR_VALUE}", re.IGNORECASE), "larger"),
+    (re.compile(rf"\bat or before\s+{_COMPARATOR_VALUE}", re.IGNORECASE), "smaller"),
+    (re.compile(rf"\bat or after\s+{_COMPARATOR_VALUE}", re.IGNORECASE), "larger"),
+    (re.compile(rf"\bevery\s+{_COMPARATOR_VALUE}", re.IGNORECASE), "smaller"),
+    (re.compile(rf"\bwithin\s+{_COMPARATOR_VALUE}", re.IGNORECASE), "smaller"),
+    (re.compile(rf"\bat least\s+{_COMPARATOR_VALUE}", re.IGNORECASE), "larger"),
+)
+
+
+def _parse_comparable(value_str: str) -> float:
+    """A plain number ("500", "40,000") as a float, or a clock time
+    ("06:30", "21:55") as minutes since midnight — both compare correctly
+    with a bare ``<=``/``>=`` either way."""
+    if ":" in value_str:
+        parts = [int(p) for p in value_str.split(":")]
+        while len(parts) < 3:
+            parts.append(0)
+        hours, minutes, seconds = parts[:3]
+        return hours * 3600 + minutes * 60 + seconds
+    return float(value_str.replace(",", ""))
+
+
+def _comparator_rule_ok(parent_text: str, kept_span: str) -> tuple[bool | None, str | None]:
+    """``(True/False, matched_value)`` when the parent's value sits in one
+    of :data:`_COMPARATOR_PATTERNS` AND *kept_span* restates it in the SAME
+    pattern (the design note's own RULE mode: direction derived from the
+    parent's own pattern words) — *matched_value* is the parent's OWN
+    value string (comma-stripped), so the caller can exclude it from a
+    separate "every other key value is kept" check (it is legitimately
+    REPLACED by a stricter one, not kept unchanged). ``(None, None)`` when
+    the parent's value matches no recognised pattern, OR matches one but
+    *kept_span* does not restate it in that same pattern — either way, the
+    design note's own "otherwise the judge's answer stands, recorded":
+    the caller treats this as judge-only, not a mechanical fact-mode
+    fallback (architect review round 3 — the fallback case is NOT the
+    same as fact mode, which requires the value UNCHANGED).
+    """
+    for pattern, direction in _COMPARATOR_PATTERNS:
+        parent_match = pattern.search(parent_text)
+        if not parent_match:
+            continue
+        child_match = pattern.search(kept_span)
+        if not child_match:
+            return None, None
+        parent_value_str = parent_match.group(1).replace(",", "")
+        parent_value = _parse_comparable(parent_value_str)
+        child_value = _parse_comparable(child_match.group(1))
+        ok = child_value <= parent_value if direction == "smaller" else child_value >= parent_value
+        return ok, parent_value_str
+    return None, None
+
+
+#: Philosopher's adopted guard 1 (design note): a quantifier in the parent
+#: softened in the child is an exception dressed as a tightening, not a
+#: tightening — sends the whole check to judge-only (stays declined).
+_QUANTIFIER_WORDS: tuple[str, ...] = ("every", "all", "any", "whenever", "always")
+_SOFTENED_WORDS: tuple[str, ...] = (
+    "most",
+    "some",
+    "usually",
+    "typically",
+    "generally",
+    "where possible",
+    "only",
+)
+
+
+def _quantifier_softened(parent_text: str, child_span: str) -> bool:
+    parent_cf = parent_text.casefold()
+    child_cf = child_span.casefold()
+    has_quantifier = any(re.search(rf"\b{word}\b", parent_cf) for word in _QUANTIFIER_WORDS)
+    has_softening = any(re.search(rf"\b{re.escape(word)}\b", child_cf) for word in _SOFTENED_WORDS)
+    return has_quantifier and has_softening
+
+
+#: Item 2's own adversarial attack (architect ruling, round 1): an
+#: EXEMPT item is often phrased as a modal carve-out — "the blade MAY run
+#: past 40,000 cuts WHEN cutting only light card stock" — relaxing the
+#: parent's own limit under a condition, never a refinement or tightening.
+#: `_quantifier_softened` only catches a quantifier SPECIFICALLY softened;
+#: this catches the broader exemption-language shape, for both refines and
+#: tightens alike.
+_EXEMPTION_MARKERS = (
+    "unless",
+    "except",
+    "exempt",
+    "exemption",
+    "instead",
+    "waive",
+    "waived",
+    "optional",
+    "need not",
+    "run past",
+    "exceed",
+    "override",
+    "go beyond",
+    "surpass",
+    "take up to",
+    "allowed up to",
+)
+_EXEMPTION_MODAL_CONDITIONAL_RE = re.compile(
+    r"\bmay\b.{0,40}\b(?:when|during|unless|except|if)\b", re.IGNORECASE | re.DOTALL
+)
+
+
+def _exemption_marker_problem(span: str) -> bool:
+    span_cf = span.casefold()
+    if any(marker in span_cf for marker in _EXEMPTION_MARKERS):
+        return True
+    return bool(_EXEMPTION_MODAL_CONDITIONAL_RE.search(span_cf))
+
+
+#: Philosopher's adopted guard 2 (design note): relation antonyms for the
+#: polarity guard, on top of #219's own `_POL_WORDS` single-word set —
+#: "at or below"/"at or above" is a phrase, and "start"/"finish" and
+#: "opens"/"closes" are not in `_POL_WORDS` at all (which has "open"/"closed",
+#: a different inflection). Checked both directions.
+_RELATION_ANTONYM_PAIRS: tuple[tuple[str, str], ...] = (
+    ("before", "after"),
+    ("at or below", "at or above"),
+    ("open", "closed"),
+    ("on", "off"),
+    ("start", "finish"),
+    ("first", "last"),
+    ("opens", "closes"),
+)
+
+
+def _polarity_flip(
+    parent_text: str,
+    child_span: str,
+    pairs: tuple[tuple[str, str], ...] = _RELATION_ANTONYM_PAIRS,
+) -> bool:
+    """``True`` when *child_span* states the OPPOSITE polarity of what
+    *parent_text* states — item 1's own ``value_polarity_flip``
+    (#219's polarity guard, as a flip check), extended with *pairs*
+    (relation antonyms #219's own closed POL_WORDS set does not cover;
+    defaults to :data:`_RELATION_ANTONYM_PAIRS`). Note that
+    ``value_polarity_flip`` ALSO always adds its own built-in
+    ``_POL_ANTONYMS`` on top of whatever *pairs* says, which itself
+    includes ("first", "last") — passing a narrowed *pairs* here does NOT
+    exclude that pair; see ``refines``' own call site for how that
+    divergence is actually exempted (:func:`_names_a_different_instance`).
+    ONE flip function, not two (architect review round 2/3): item 1's own
+    ``directive_or_publication`` ground check and this function share the
+    same underlying implementation, so a fix to one (e.g. a missed antonym
+    pair) reaches both.
+    """
+    from strata.publication import value_polarity_flip  # noqa: PLC0415 — avoids a circular import
+
+    return value_polarity_flip(child_span, parent_text, extra_antonym_pairs=pairs)
+
+
+#: Item 2's own adversarial admit-check (architect ruling, round 1): ONLY
+#: "first"/"last" is exempted here, not the full :data:`_RELATION_ANTONYM_PAIRS`
+#: set — "the first ferry departs at 06:10" against a parent about the LAST
+#: ferry names a genuinely different, uncovered vehicle (a legitimate
+#: refine), but "opens before 09:00" against "opens after 09:00" (the SAME
+#: gate) is a real contradiction, not a different instance. Widening this
+#: to every antonym pair broke exactly that case.
+_DIFFERENT_INSTANCE_PAIRS: tuple[tuple[str, str], ...] = (("first", "last"),)
+
+
+def _names_a_different_instance(parent_text: str, content: str) -> bool:
+    """``True`` when *content* names the OPPOSITE member of a
+    :data:`_DIFFERENT_INSTANCE_PAIRS` pair from what *parent_text* names
+    ("the FIRST ferry" against a parent rule about the LAST ferry) — the
+    same divergence `_polarity_flip` itself would flag, used here as a
+    signal that *content* names a genuinely DIFFERENT specific instance,
+    not a restatement of the parent's own claim with a conflicting value.
+    """
+    parent_cf = parent_text.casefold()
+    content_cf = content.casefold()
+    for first, second in _DIFFERENT_INSTANCE_PAIRS:
+        first_re = re.compile(rf"\b{re.escape(first)}\b")
+        second_re = re.compile(rf"\b{re.escape(second)}\b")
+        if (
+            first_re.search(parent_cf)
+            and second_re.search(content_cf)
+            and not second_re.search(parent_cf)
+        ):
+            return True
+        if (
+            second_re.search(parent_cf)
+            and first_re.search(content_cf)
+            and not first_re.search(parent_cf)
+        ):
+            return True
+    return False
+
+
+def _leading_subject_words(text: str, count: int = 2) -> list[str]:
+    """The first *count* significant content words (same filtering as
+    `publication._overlap_words`, in TEXT ORDER — a set loses that) — a
+    cheap proxy for "what is this sentence ABOUT": the grammatical subject
+    almost always leads an English directive sentence ("Frozen pallets
+    must...", "Hygiene appointments are...")."""
+    from strata.publication import _CONTENT_OVERLAP_STOPWORDS, _overlap_stem  # noqa: PLC0415
+
+    words: list[str] = []
+    for word in re.findall(r"[a-z]+", text.casefold()):
+        if len(word) < 4 or word in _CONTENT_OVERLAP_STOPWORDS:
+            continue
+        words.append(_overlap_stem(word))
+        if len(words) >= count:
+            break
+    return words
+
+
+def _same_leading_subject(parent_text: str, content: str) -> bool:
+    """``True`` when EVERY one of *content*'s leading subject words
+    (:func:`_leading_subject_words`) matches SOME word in *parent_text*'s
+    own full content-word set — "matches" tolerates a shared 4+ character
+    prefix, since `_overlap_stem` is "never a real stemmer" (its own
+    docstring): "replace" (content, no suffix to strip) and "replaced"
+    (parent, stemmed to "replac") are the same word, just stemmed
+    inconsistently; this is NOT a real subject-noun match on its own,
+    since a paraphrased restatement ("Replace guillotine blade every
+    65,000 cuts" for "The guillotine blade must be replaced every 40,000
+    cuts") can lead with a VERB the original sentence doesn't lead with.
+    """
+    from strata.publication import _overlap_words  # noqa: PLC0415
+
+    parent_words = _overlap_words(parent_text)
+
+    def _matches(word: str) -> bool:
+        return any(
+            word == other or (len(word) >= 4 and (word.startswith(other) or other.startswith(word)))
+            for other in parent_words
+        )
+
+    leading = _leading_subject_words(content)
+    return bool(leading) and all(_matches(word) for word in leading)
+
+
+def _refines_value_conflict(parent_text: str, content: str) -> bool:
+    """Design note line 12: the contribution's key tokens (numbers, ids,
+    times, quoted values) "must NOT include a value that conflicts with the
+    parent's on the SAME token class". Checked per class
+    (:func:`strata.publication._classed_value_tokens`) rather than as one
+    flat set, so a number colliding with an unrelated id never passes for
+    the wrong reason — and ONLY when *content* leads with the SAME subject
+    as *parent_text* (:func:`_same_leading_subject`): "chilled pallets ...
+    4 °C" against a parent rule about FROZEN pallets leads with a
+    DIFFERENT subject ("chill" vs "frozen") despite otherwise sharing
+    nearly the entire sentence, and is a genuinely different, uncovered
+    subject, never a conflict — distinguishing that from a conflicting
+    restatement is exactly the design note's own stated judge-only limit,
+    which this mechanical proxy approximates rather than resolves.
+    """
+    from strata.publication import _classed_value_tokens  # noqa: PLC0415
+
+    if not _same_leading_subject(parent_text, content):
+        return False
+    parent_classes = _classed_value_tokens(parent_text)
+    content_classes = _classed_value_tokens(content)
+    return any(
+        parent_values and not (content_classes[token_class] <= parent_values)
+        for token_class, parent_values in parent_classes.items()
+    )
+
+
+def verify_relation_ground(
+    answer: dict,
+    parent_text: str,
+    content: str,
+    proposed_classification: Literal["directive", "context"],
+) -> tuple[bool, str, Literal["directive", "context"] | None, str | None]:
+    """The mechanical verifier, pure and judge-free: given the re-ask's own
+    raw answer (the ``recheck_relation`` tool's parsed input), the cited
+    ancestor (parent) directive's own text, the contribution's own text, and
+    its ORIGINAL proposed classification (the philosopher's adopted default
+    — the re-ask's own ``classification`` answer is used when it gives one,
+    this is the fallback), decide whether the cited relation actually holds.
+
+    Returns ``(ok, reason, classification, context_text)`` — a 4-tuple, a
+    deviation from item 1's own 3-tuple shape (reported as a decision,
+    mirroring item 1's OWN reported deviation from the architect's literal
+    2-tuple suggestion): the caller needs BOTH the classification to
+    reinstate (directive vs. context — item 2 has no fixed ceiling, unlike
+    item 1's `accept_as_context`) and the context payload when it resolves
+    to context. ``classification`` and ``context_text`` are both ``None`` on
+    failure.
+
+    Any missing/invalid field, or ``other_grounds_clear`` false, fails
+    closed — ``ok=False`` — per the general line: the decline stands.
+    """
+    relation = answer.get("relation")
+    if relation not in ("contradicts", "exempts", "refines", "tightens"):
+        return False, f"unreadable relation {relation!r}", None, None
+
+    other_grounds_clear = answer.get("other_grounds_clear")
+    if not isinstance(other_grounds_clear, bool):
+        return False, "other_grounds_clear is a required bool", None, None
+
+    parent_id = answer.get("parent_id")
+    if not (isinstance(parent_id, str) and parent_id.strip()):
+        return False, "declined (no parent_id)", None, None
+
+    if relation in ("contradicts", "exempts"):
+        return False, f"declined ({relation} stands)", None, None
+    if not other_grounds_clear:
+        return False, "declined (other grounds not clear)", None, None
+
+    def _verbatim(span: object) -> bool:
+        if not (isinstance(span, str) and span.strip()):
+            return False
+        haystack = " ".join(content.split()).casefold()
+        return " ".join(span.split()).casefold() in haystack
+
+    def _truncates_a_number(span: object) -> bool:
+        """Item 2's own adversarial attack, round 1: a verbatim span that
+        ends mid-number ("...every 65" where the real contribution text
+        continues ",000 cuts") passes the verbatim check (it IS a literal
+        substring) and can make a comparator value look stricter/looser
+        than it actually is. Declines whenever *content* has more digits
+        or a grouping comma immediately after where the span ends."""
+        if not isinstance(span, str):
+            return False
+        normalized_span = " ".join(span.split())
+        if not normalized_span or not normalized_span[-1].isdigit():
+            return False
+        haystack = " ".join(content.split()).casefold()
+        idx = haystack.find(normalized_span.casefold())
+        if idx == -1:
+            return False
+        end = idx + len(normalized_span)
+        if end >= len(haystack):
+            return False
+        if haystack[end].isdigit():
+            return True
+        # A GROUPING comma ("65,000") is followed immediately by more
+        # digits, no space — ordinary trailing punctuation ("06:30, same
+        # as before") is a comma followed by a space, never a truncation.
+        return haystack[end] == "," and end + 1 < len(haystack) and haystack[end + 1].isdigit()
+
+    classification = answer.get("classification")
+    if classification not in ("directive", "context"):
+        classification = proposed_classification
+
+    _ClsOrNone = Literal["directive", "context"] | None
+
+    def _context_or_fail(ok_reason: str) -> tuple[bool, str, _ClsOrNone, str | None]:
+        if classification != "context":
+            return True, ok_reason, classification, None
+        new_context = answer.get("new_context")
+        if not (isinstance(new_context, str) and new_context.strip()):
+            return False, "declined (no new_context)", None, None
+        return True, ok_reason, classification, new_context
+
+    from strata.publication import _POL_WORDS, _decomposed_value_tokens  # noqa: PLC0415
+
+    if relation == "refines":
+        subject_span = answer.get("subject_span")
+        if not _verbatim(subject_span):
+            return False, "declined (subject_span not verbatim)", None, None
+        # Item 2's own adversarial attack (architect ruling, round 1): an
+        # EXEMPT item ("the blade may run past 40,000 cuts when cutting
+        # only light card stock") passed as a "refinement" — a carve-out
+        # relaxing the parent's own limit under a condition is an
+        # exemption, never a refinement, the same class `_quantifier_softened`
+        # already guards for tightens.
+        if _exemption_marker_problem(subject_span):  # type: ignore[arg-type]
+            return False, "declined (exemption language, judge-only)", None, None
+        # Item 2's own adversarial attack, round 1: a child that narrows
+        # the parent's own quantifier ("every interval" -> "only at the
+        # end") is the same softened-exception shape as tightens', not a
+        # genuinely new, uncovered subject.
+        if _quantifier_softened(parent_text, subject_span):  # type: ignore[arg-type]
+            return False, "declined (quantifier softened — exception, judge-only)", None, None
+        # `value_polarity_flip` always adds #219's own built-in POL_ANTONYMS
+        # on top of whatever pairs are passed in, so "first"/"last" (one
+        # of those built-ins) still fires even with _REFINES_ANTONYM_PAIRS
+        # — exempted here instead, when the flip is explained by a
+        # different-instance divergence (the ferry REFINE admit: "the
+        # FIRST ferry departs at 06:10" against a parent about the LAST
+        # ferry is a new, uncovered subject, not a contradiction).
+        if _polarity_flip(parent_text, subject_span) and not _names_a_different_instance(  # type: ignore[arg-type]
+            parent_text,
+            subject_span,  # type: ignore[arg-type]
+        ):
+            return False, "declined (polarity flip against parent)", None, None
+        if _truncates_a_number(subject_span):  # type: ignore[arg-type]
+            return False, "declined (subject_span truncates a number)", None, None
+        if _refines_value_conflict(parent_text, content):
+            return False, "declined (value conflict with parent)", None, None
+        return _context_or_fail("admitted (rescued, refines parent)")
+
+    # relation == "tightens"
+    kept_span = answer.get("kept_span")
+    if not _verbatim(kept_span):
+        return False, "declined (kept_span not verbatim)", None, None
+    if _truncates_a_number(kept_span):
+        return False, "declined (kept_span truncates a number)", None, None
+    tighten_kind = answer.get("tighten_kind")
+    if tighten_kind not in ("rule", "fact"):
+        return False, "declined (tighten_kind is a required field)", None, None
+    if _quantifier_softened(parent_text, kept_span):  # type: ignore[arg-type]
+        return False, "declined (quantifier softened — exception, judge-only)", None, None
+    if _exemption_marker_problem(kept_span):  # type: ignore[arg-type]
+        return False, "declined (exemption language, judge-only)", None, None
+    if _polarity_flip(parent_text, kept_span):  # type: ignore[arg-type]
+        return False, "declined (polarity flip against parent)", None, None
+
+    if tighten_kind == "rule":
+        rule_ok, compared_value = _comparator_rule_ok(parent_text, kept_span)  # type: ignore[arg-type]
+        # Item 2's own adversarial attack, round 1: when the parent's value
+        # sits in no recognised comparative pattern, the design note's own
+        # "the judge's answer stands, recorded" assumes a REAL judge made
+        # that call — this pure verifier has no judge to defer to, and an
+        # unconditional admit here let EVERY RULE-mode attack through.
+        # Falls back to the FACT-mode value-subset check instead: the
+        # pattern distinction only ever supplied the DIRECTION check, never
+        # a free pass.
+        if rule_ok is False:
+            return False, "declined (not stricter in the same direction)", None, None
+        parent_values = _decomposed_value_tokens(parent_text) - _POL_WORDS
+        if rule_ok is True and compared_value is not None:
+            # The comparator already verified this ONE value is kept or
+            # replaced by a stricter one — don't also demand it unchanged.
+            # A clock time ("07:00") decomposes into separate digit tokens
+            # ("07", "00") in `_decomposed_value_tokens`, not one colon
+            # string, so the exclusion set must match that same shape.
+            parent_values = parent_values - _decomposed_value_tokens(compared_value)
+        kept_values = _decomposed_value_tokens(kept_span) - _POL_WORDS
+        if not parent_values <= kept_values:
+            reason = (
+                "declined (parent's other values not kept)"
+                if rule_ok is True
+                else "declined (parent's value not kept)"
+            )
+            return False, reason, None, None
+    else:  # tighten_kind == "fact"
+        parent_values = _decomposed_value_tokens(parent_text) - _POL_WORDS
+        kept_values = _decomposed_value_tokens(kept_span) - _POL_WORDS
+        if not parent_values <= kept_values:
+            return False, "declined (parent's value not kept)", None, None
+
+    return _context_or_fail("admitted (rescued, tightens parent)")
+
+
+# ---------------------------------------------------------------------------
 # ScopeManager
 # ---------------------------------------------------------------------------
 
@@ -5651,27 +6249,40 @@ class ScopeManager:
             parse_generic_decline=_generic_second_slip_decline,
             is_outcome_report=acted_on_target is not None,
             acted_on_is_directive=acted_on_target is not None and acted_on_target.is_directive,
-            # #225 / v1.17 item 1: ordinary contributions only — never an
-            # outcome report (its own narrowed tool/ground already covers
+            # #225 / v1.17 items 1 & 2: ordinary contributions only — never
+            # an outcome report (its own narrowed tool/ground already covers
             # that ground separately) and never a batch (single-path only
-            # either item; #236-shaped limit, stated in #225's own PR).
+            # any item; #236-shaped limit, stated in #225's own PR).
             # Composed in sequence: #225 only ever acts on an ACCEPT, the
-            # attribution re-check only ever acts on a DECLINE, so applying
-            # one after the other is safe regardless of order.
+            # attribution re-check and the relation re-check only ever act
+            # on a DECLINE (and never on the SAME decline as each other —
+            # each method's own guard checks the other's field is still
+            # ``None``), so applying all three in sequence is safe
+            # regardless of order.
             post_judgment=(
                 (
                     lambda judgment, messages, response, tool_use_block: (
-                        self.recheck_attribution_decline(
-                            _check_interior_assertion(judgment, messages, response, tool_use_block),
+                        self.recheck_relation_decline(
+                            self.recheck_attribution_decline(
+                                _check_interior_assertion(
+                                    judgment, messages, response, tool_use_block
+                                ),
+                                scope=scope,
+                                contribution=new_contribution,
+                                current_summary=current_summary,
+                                entitlement=entitlement,
+                                ancestor_directives=ancestor_directives,
+                                operator_memory=operator_memory,
+                                current_publication=current_publication,
+                                peer_publications=peer_publications,
+                                parent_publication=parent_publication,
+                                change_id=change_id,
+                                hop=hop,
+                            ),
                             scope=scope,
                             contribution=new_contribution,
                             current_summary=current_summary,
-                            entitlement=entitlement,
                             ancestor_directives=ancestor_directives,
-                            operator_memory=operator_memory,
-                            current_publication=current_publication,
-                            peer_publications=peer_publications,
-                            parent_publication=parent_publication,
                             change_id=change_id,
                             hop=hop,
                         )
@@ -6417,6 +7028,194 @@ class ScopeManager:
             }
         )
         return _noted(updated, ground_kind, other_grounds_clear, result)
+
+    def recheck_relation_decline(
+        self,
+        first: ScopeManagerJudgment,
+        *,
+        scope: Scope,
+        contribution: Contribution,
+        current_summary: ScopeSummary | None = None,
+        ancestor_directives: Sequence[tuple[str, Sequence[Directive]]] | None = None,
+        change_id: str | None = None,
+        hop: int = 0,
+    ) -> ScopeManagerJudgment:
+        """v1.17 item 2 (#237, #225's own shape in reverse): given a FIRST
+        judgment (real or forced), re-check a decline that names an
+        INHERITED (ancestor) directive as the conflict — often a legitimate
+        refinement or tightening, not a genuine contradiction.
+
+        Callable two ways, exactly like item 1's own
+        :meth:`recheck_attribution_decline`: :meth:`judge` calls this itself
+        right after its own first call, with *first* being that call's real
+        verdict — the ordinary path. A harness (the bridge gate) also calls
+        this directly with a GIVEN *first* — a recorded real decline
+        (replay) or a synthetic forced decline on every item (forced
+        re-ask) — with no live first call of its own. Either way, this
+        method is the only one that makes a (real) API call:
+        :func:`relation_decline_trigger` (the pure gate on whether to fire
+        at all) and :func:`verify_relation_ground` (the pure mechanical
+        check on the re-ask's own answer) are both plain functions a
+        harness can call with no judge at all.
+
+        Position concept (the philosopher's adopted answer 1): only fires
+        for an OWN-SCOPE contribution — the contributor is bound to
+        *scope*. A decline on behalf of some OTHER scope's contributor
+        names no directive this scope's own position can reinstate.
+
+        Never touches an ACCEPT. Never re-fires on a decline this SAME
+        method, or item 1's own attribution re-check, just produced
+        (``first.relation_recheck``/``first.attribution_recheck`` already
+        set) — item 1's own discovered collision class (an unrelated
+        feature's decline text can contain the same trigger phrase for a
+        different reason).
+        """
+        if first.decision != "decline" or first.relation_recheck is not None:
+            return first
+        if contribution.contributor.scope_id != scope.id:
+            return first
+        if first.attribution_recheck is not None:
+            return first
+
+        ancestor_map: dict[str, str] = {}
+        for _ancestor_scope_id, directives in ancestor_directives or ():
+            ancestor_map.update({d.id: d.content for d in directives})
+
+        matched_id = relation_decline_trigger(first.reasoning, ancestor_map.keys())
+        if matched_id is None:
+            return first
+        parent_text = ancestor_map[matched_id]
+
+        def _noted(
+            updated: ScopeManagerJudgment,
+            relation: str | None,
+            parent_id: str | None,
+            result: str,
+        ) -> ScopeManagerJudgment:
+            return updated.model_copy(
+                update={
+                    "protocol_notes": [
+                        *updated.protocol_notes,
+                        f"relation recheck: {relation}, {result}",
+                    ],
+                    "relation_recheck": {
+                        "relation": relation,
+                        "parent_id": parent_id,
+                        "result": result,
+                    },
+                }
+            )
+
+        previous_context = current_summary.context if current_summary is not None else ""
+        user_message = (
+            f"SCOPE: {scope.name} (id={scope.id})\n\n"
+            "This contribution was DECLINED citing a conflict with an inherited "
+            f"directive ({matched_id}):\n"
+            f'"{first.reasoning}"\n\n'
+            f"THE INHERITED DIRECTIVE ({matched_id}):\n{parent_text}\n\n"
+            f"CONTRIBUTION TEXT:\n{contribution.content}\n\n"
+            f"ORIGINAL PROPOSED CLASSIFICATION: {contribution.proposed_classification}\n\n"
+            f"CURRENT CONTEXT (rewrite it, keeping everything, adding this item):\n"
+            f"{previous_context or '(none)'}\n\n"
+            "Call `recheck_relation` exactly once."
+        )
+        try:
+            reask_response = self._messages_create(
+                model=self._model,
+                max_tokens=512,
+                system=[
+                    {
+                        "type": "text",
+                        "text": _SYSTEM_PROMPT,
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ],
+                tools=[{**RELATION_RECHECK_TOOL, "cache_control": {"type": "ephemeral"}}],
+                tool_choice={
+                    "type": "tool",
+                    "name": RELATION_RECHECK_TOOL["name"],
+                    "disable_parallel_tool_use": True,
+                },
+                messages=[{"role": "user", "content": user_message}],
+            )
+            reask_block = self._extract_tool_use_block(reask_response)
+            answer: dict = reask_block.input or {}
+        except Exception as exc:  # noqa: BLE001 — any slip here fails closed, #235's pattern
+            # Item 1's own Blocker 2 fix, applied from the start here: an
+            # unreadable re-ask leaves the FIRST decline standing, never a
+            # judge_failure verdict.
+            detail = f"{type(exc).__name__}: {exc}"
+            return _noted(
+                first.model_copy(
+                    update={"reasoning": f"{first.reasoning} (recheck failed: {detail})"}
+                ),
+                None,
+                None,
+                f"recheck failed: {detail}",
+            )
+
+        judge_reasoning = answer.get("reasoning")
+        judge_reasoning = judge_reasoning if isinstance(judge_reasoning, str) else ""
+
+        ok, result, classification, context_text = verify_relation_ground(
+            answer, parent_text, contribution.content, contribution.proposed_classification
+        )
+        relation = answer.get("relation")
+        parent_id = answer.get("parent_id")
+        if not ok:
+            prefix = f"{judge_reasoning} " if judge_reasoning else ""
+            reason_suffix = f" {prefix}[{result}]" if "declined" in result else ""
+            return _noted(
+                first.model_copy(update={"reasoning": f"{first.reasoning}{reason_suffix}"}),
+                relation if isinstance(relation, str) else None,
+                parent_id if isinstance(parent_id, str) else None,
+                result,
+            )
+
+        assert classification is not None  # noqa: S101 — ok=True always carries one
+        reasoning_text = (
+            f"{judge_reasoning} [Rescued: {result}]" if judge_reasoning else f"Rescued: {result}."
+        )
+
+        if classification == "directive":
+            # `append`: the engine builds the directive row from the
+            # contribution itself, in its own words — the philosopher's
+            # adopted answer 1 ("a decision comes back as a directive").
+            new_summary = _apply_amendment(
+                scope=scope,
+                current_summary=current_summary,
+                contribution=contribution,
+                ops=[DirectiveOp(op="append")],
+                new_context=None,
+            )
+            updated = first.model_copy(
+                update={
+                    "decision": "accept_as_directive",
+                    "directive_ops": [DirectiveOp(op="append")],
+                    "new_summary": new_summary,
+                    "reasoning": reasoning_text,
+                }
+            )
+            return _noted(updated, relation, parent_id, result)
+
+        assert context_text is not None  # noqa: S101 — classification "context" always carries one
+        new_summary = _apply_amendment(
+            scope=scope,
+            current_summary=current_summary,
+            contribution=contribution,
+            ops=[],
+            new_context=context_text,
+        )
+        updated = first.model_copy(
+            update={
+                "decision": "accept_as_context",
+                "directive_ops": [],
+                "new_context": context_text,
+                "new_summary": new_summary,
+                "reasoning": reasoning_text,
+            }
+        )
+        return _noted(updated, relation, parent_id, result)
 
     def judge_batch(
         self,
