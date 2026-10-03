@@ -2424,7 +2424,31 @@ def value_polarity_flip(
 #: are content-bearing words, because they recur in nearly every citation
 #: regardless of subject.
 _CONTENT_OVERLAP_STOPWORDS = frozenset(
-    {"directive", "policy", "rule", "says", "already", "according"}
+    {
+        "directive",
+        "policy",
+        "rule",
+        "says",
+        "already",
+        "according",
+        # Architect's bridge forced-gate fix (the j1a-025 coverage
+        # artefact): attribution-FRAME verbs recur in nearly every
+        # citation regardless of subject, the same reasoning as the
+        # original six words above.
+        "requires",
+        "require",
+        "required",
+        "states",
+        "stated",
+        "mandates",
+        "mandated",
+        "notes",
+        "following",
+        "under",
+        "per",
+        "quoted",
+        "ratified",
+    }
 )
 
 
@@ -2472,13 +2496,26 @@ def _coverage_ratio(subject_words: set[str], reference_words: set[str]) -> float
     return len(subject_words & reference_words) / len(subject_words)
 
 
-def content_overlap_required(span: str, reference_text: str) -> bool:
+def content_overlap_required(
+    span: str,
+    reference_text: str,
+    exclude_words: Collection[str] = (),
+) -> bool:
     """Hole B / F3's fix: at least 60% of *span*'s own content words
     (casefolded, 4+ letters, simple plural/-ed/-ing stripping, excluding
-    :data:`_CONTENT_OVERLAP_STOPWORDS`) must appear in *reference_text* —
-    COVERAGE, not a flat "≥2 shared words" count (which a long span could
-    clear while adding whole unattributed clauses) — OR a shared
-    contiguous 6-word sequence.
+    :data:`_CONTENT_OVERLAP_STOPWORDS` and *exclude_words*) must appear in
+    *reference_text* — COVERAGE, not a flat "≥2 shared words" count (which
+    a long span could clear while adding whole unattributed clauses) — OR
+    a shared contiguous 6-word sequence.
+
+    *exclude_words* (architect's bridge forced-gate fix): raw words (e.g.
+    a scope's own id/name) the caller knows are NOT new information in
+    this span — a directive's own SOURCE scope, or any rendered ancestor
+    scope, named again in the span states nothing new ("the OBSERVATORY
+    directive..." citing the observatory's own rule), the same reasoning
+    as :data:`_CONTENT_OVERLAP_STOPWORDS`, just caller-specific rather
+    than universal. Stemmed and casefolded the same way as the span's own
+    words, so a plural or an inflected form still matches.
 
     F3's own further rule: the span is ALSO split on coordinators, dashes
     and semicolons, and every resulting clause that contains a REQUIREMENT
@@ -2499,8 +2536,9 @@ def content_overlap_required(span: str, reference_text: str) -> bool:
         _PARTIAL_GROUNDING_REQUIREMENT_RE,
     )
 
+    excluded = _overlap_words(" ".join(exclude_words))
     reference_words = _overlap_words(reference_text)
-    span_words = _overlap_words(span)
+    span_words = _overlap_words(span) - excluded
     # Found while verifying F3 against the full adversarial attack: a span
     # with only ONE surviving content word ("As the branches directive
     # already says" — "directive"/"already"/"says" are all stopwords, only

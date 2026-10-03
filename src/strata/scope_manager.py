@@ -4127,6 +4127,31 @@ _ANY_TELLING_OR_JOINT_VERB_RE = re.compile(
 )
 
 
+def _teller_adjacent_to_telling(
+    content: str, teller_span: str, telling_span: str, *, window: int = 3
+) -> bool:
+    """``True`` when *teller_span* ends within *window* words BEFORE
+    *telling_span* starts, in *content* — architect ruling (bridge J4
+    replay on c702d80): the answerer can legitimately split a sentence
+    into an adjacent teller clause and a telling clause ("Fraud's
+    on-call engineer sent me their notes directly" as teller "Fraud's
+    on-call engineer" plus telling "sent me their notes directly"),
+    which :func:`verify_attribution_ground`'s own "teller_span inside
+    telling_span" check alone does not accept."""
+    content_cf = " ".join(content.split()).casefold()
+    teller_cf = " ".join(teller_span.split()).casefold()
+    telling_cf = " ".join(telling_span.split()).casefold()
+    teller_idx = content_cf.find(teller_cf)
+    telling_idx = content_cf.find(telling_cf)
+    if teller_idx == -1 or telling_idx == -1:
+        return False
+    teller_end = teller_idx + len(teller_cf)
+    if teller_end > telling_idx:
+        return False
+    gap = content_cf[teller_end:telling_idx]
+    return len(gap.split()) <= window
+
+
 def _teller_near_a_verb(telling_span: str, teller_span: str, *, window: int = 6) -> bool:
     """``True`` when *teller_span* sits within *window* words of a
     recognised telling/joint verb occurrence inside *telling_span* — found
@@ -4301,6 +4326,8 @@ def verify_attribution_ground(
     rendered_refs: Mapping[str, str],
     fleet: AttributionFleetContext,
     previous_context: str = "",
+    ref_source_scope_words: Mapping[str, frozenset[str]] | None = None,
+    ancestor_scope_words: frozenset[str] = frozenset(),
 ) -> tuple[bool, str, str | None]:
     """The mechanical verifier, pure and judge-free: given the re-ask's own
     raw answer (``answer`` — the ``recheck_attribution`` tool's parsed
@@ -4314,6 +4341,13 @@ def verify_attribution_ground(
     its own fixed line to ``previous_context`` directly, the same append
     pattern ADR 0016 D1's own informant-hearsay rewrite already uses, rather
     than replacing it), decide whether the cited ground actually holds.
+    *ref_source_scope_words* (``ref_id`` -> that item's own source scope's
+    id/name) and *ancestor_scope_words* (every rendered ancestor scope's
+    id/name, flattened) are excluded from ``directive_or_publication``'s
+    own content-overlap check — citing a directive by id already
+    establishes where it came from, so a span merely naming that scope
+    again states nothing new (architect's bridge forced-gate fix, the one
+    coverage-artefact miss on c702d80).
 
     Returns ``(ok, reason, context_text)``: ``ok`` is whether the ground
     verifies (and ``other_grounds_clear`` was true); ``reason`` is a short
@@ -4384,8 +4418,16 @@ def verify_attribution_ground(
         # vacuously, so an UNRELATED item can be cited with nothing to
         # catch it. Shared-token overlap is NECESSARY, never sufficient
         # (the design note's own contract line) — checked FIRST, before the
-        # value/polarity checks even run.
-        if not content_overlap_required(span, ref_text):  # type: ignore[arg-type]
+        # value/polarity checks even run. The referenced item's own source
+        # scope, and every rendered ancestor scope, are excluded from the
+        # span's own words first (bridge forced-gate fix): naming the
+        # scope a directive is ALREADY known to come from states nothing
+        # new ("the observatory directive..." citing the observatory's
+        # own rule).
+        exclude_words = set(ancestor_scope_words)
+        if ref_source_scope_words is not None:
+            exclude_words |= ref_source_scope_words.get(ref_id, frozenset())
+        if not content_overlap_required(span, ref_text, exclude_words=exclude_words):  # type: ignore[arg-type]
             return False, "declined (no shared content with the referenced item)", None
         # #219's gate, reused, round 2 (architect review of 10327f6's bridge
         # replay): split into a VALUE check (numbers/ids/quotes — a strict
@@ -4500,11 +4542,16 @@ def verify_attribution_ground(
         # genuine short name. A name is a short phrase.
         if len(teller_span.split()) > 8:  # type: ignore[union-attr]
             return False, "declined (teller_span is too long to be a name)", None
-        if (
+        teller_inside_telling = (
             " ".join(teller_span.split()).casefold()
-            not in " ".join(  # type: ignore[union-attr]
+            in " ".join(  # type: ignore[union-attr]
                 telling_span.split()
             ).casefold()
+        )
+        if not teller_inside_telling and not _teller_adjacent_to_telling(
+            content,
+            teller_span,
+            telling_span,  # type: ignore[arg-type]
         ):
             return False, "declined (teller_span is not inside telling_span)", None
         # Same review: a teller_span that is only part of the LEADING
@@ -4526,7 +4573,12 @@ def verify_attribution_ground(
         # qualify as teller_span merely by being INSIDE telling_span, with
         # no connection to the telling/joint verb at all. teller_span must
         # sit within 6 words of a recognised verb occurrence.
-        if not _teller_near_a_verb(telling_span, teller_span):  # type: ignore[arg-type]
+        # When teller_span is ADJACENT to (not inside) telling_span, the
+        # verb lives in telling_span but teller_span itself isn't a
+        # substring of it — check proximity against the two joined in
+        # their own content order instead.
+        verb_check_text = telling_span if teller_inside_telling else f"{teller_span} {telling_span}"
+        if not _teller_near_a_verb(verb_check_text, teller_span):  # type: ignore[arg-type]
             return False, "declined (teller_span is not near the telling verb)", None
         problem, _verb_kind = _telling_span_problem_for(telling_span, content=content)
         if problem is not None:
@@ -6169,14 +6221,19 @@ class ScopeManager:
         # not manufactured attribution).
         rendered_refs: dict[str, str] = {}
         ref_origins: dict[str, str] = {}
+        ref_source_scope_id: dict[str, str] = {}
+        ancestor_scope_ids: set[str] = set()
         if current_summary is not None:
             for d in current_summary.directives:
                 rendered_refs[d.id] = d.content
                 ref_origins[d.id] = "own directive"
+                ref_source_scope_id[d.id] = d.source_scope_id
         for ancestor_scope_id, directives in ancestor_directives or ():
+            ancestor_scope_ids.add(ancestor_scope_id)
             for d in directives:
                 rendered_refs[d.id] = d.content
                 ref_origins[d.id] = f"inherited directive ({ancestor_scope_id})"
+                ref_source_scope_id[d.id] = d.source_scope_id
         for _attachment_scope_id, items in operator_memory or ():
             for item in items:
                 rendered_refs[item.id] = item.content
@@ -6185,10 +6242,14 @@ class ScopeManager:
             for item in items or ():
                 rendered_refs[item.id] = item.content
                 ref_origins[item.id] = "publication"
+                if getattr(item, "origin_scope_id", None):
+                    ref_source_scope_id[item.id] = item.origin_scope_id
         if parent_publication is not None:
             for item in parent_publication[1]:
                 rendered_refs[item.id] = item.content
                 ref_origins[item.id] = "publication"
+                if getattr(item, "origin_scope_id", None):
+                    ref_source_scope_id[item.id] = item.origin_scope_id
 
         all_scopes: dict[str, Scope] = {scope.id: scope}
         non_entitled_scopes: Sequence[Scope] = ()
@@ -6208,6 +6269,26 @@ class ScopeManager:
             contributor_scope_id=contribution.contributor.scope_id,
             contributor_scope_name=all_scopes.get(contribution.contributor.scope_id, scope).name,
             contributor_skill=contribution.contributor.skill,
+        )
+
+        # Architect's tiny fix (bridge forced gate on c702d80, the one
+        # coverage-artefact miss): the referenced item's own SOURCE scope,
+        # and every rendered ANCESTOR scope, never count toward "shared
+        # content" — citing a directive by id already establishes where it
+        # came from, so a span that merely names that same scope again
+        # ("the OBSERVATORY directive...") states nothing new.
+        def _scope_words(scope_id: str) -> frozenset[str]:
+            candidate = all_scopes.get(scope_id)
+            words = {scope_id}
+            if candidate is not None and candidate.name:
+                words.add(candidate.name)
+            return frozenset(w for w in words if w)
+
+        ref_source_scope_words = {
+            rid: _scope_words(sid) for rid, sid in ref_source_scope_id.items()
+        }
+        ancestor_scope_words: frozenset[str] = frozenset().union(
+            *(_scope_words(sid) for sid in ancestor_scope_ids)
         )
 
         def _noted(
@@ -6292,7 +6373,13 @@ class ScopeManager:
         judge_reasoning = judge_reasoning if isinstance(judge_reasoning, str) else ""
 
         ok, result, context_text = verify_attribution_ground(
-            answer, contribution.content, rendered_refs, fleet, previous_context
+            answer,
+            contribution.content,
+            rendered_refs,
+            fleet,
+            previous_context,
+            ref_source_scope_words,
+            ancestor_scope_words,
         )
         ground_kind = answer.get("ground_kind")
         other_grounds_clear = answer.get("other_grounds_clear")

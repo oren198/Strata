@@ -1243,3 +1243,77 @@ def test_r5c_directive_or_publication_change_markers_flip_the_decline() -> None:
     assert ok is False
     assert ctx is None
     assert "declined" in result
+
+
+def test_directive_or_publication_excludes_the_refs_own_scope_from_overlap() -> None:
+    """Bridge forced-gate fix: a span naming the SAME scope the cited item
+    already comes from ("the observatory directive on closing at 40 km/h
+    wind requires") states nothing new — the attribution-frame verb
+    ("requires") and the source scope's own name ("observatory") are both
+    excluded from the coverage count."""
+    content = "As the observatory directive on closing at 40 km/h wind requires, we stay shut."
+    rendered_refs = {"c_ref1": "The dome must be closed whenever wind exceeds 40 km/h."}
+    answer = {
+        "ground_kind": "directive_or_publication",
+        "other_grounds_clear": True,
+        "span": "the observatory directive on closing at 40 km/h wind requires",
+        "ref_id": "c_ref1",
+        "new_context": "updated context",
+    }
+    ok, result, ctx = verify_attribution_ground(
+        answer,
+        content,
+        rendered_refs,
+        _fleet(),
+        "",
+        {"c_ref1": frozenset({"observatory"})},
+        frozenset(),
+    )
+    assert ok is True, result
+    assert ctx == "updated context"
+
+
+def test_telling_event_teller_span_can_be_adjacent_to_telling_span() -> None:
+    """Architect ruling (bridge J4 replay on c702d80): the answerer can
+    split a sentence into an adjacent teller clause and a telling clause
+    — teller_span need not be INSIDE telling_span, as long as it ends
+    within 3 words before telling_span starts. Tested both orders."""
+    content = "Fraud's on-call engineer sent me their notes directly about the change."
+    answer = {
+        "ground_kind": "telling_event",
+        "other_grounds_clear": True,
+        "telling_span": "sent me their notes directly",
+        "teller_span": "Fraud's on-call engineer",
+        "new_context": "updated context",
+    }
+    ok, _result, ctx = verify_attribution_ground(answer, content, {}, _fleet())
+    assert ok is True
+    assert ctx == "updated context"
+
+    content2 = "Lena Fischer, the procurement lead, told me orders under $500 are pre-approved."
+    answer2 = {
+        "ground_kind": "telling_event",
+        "other_grounds_clear": True,
+        "telling_span": "told me orders under $500 are pre-approved",
+        "teller_span": "Lena Fischer, the procurement lead,",
+        "new_context": "updated context",
+    }
+    ok2, _result2, ctx2 = verify_attribution_ground(answer2, content2, {}, _fleet())
+    assert ok2 is True
+    assert ctx2 == "updated context"
+
+
+def test_telling_event_adjacent_teller_still_fails_the_own_role_check() -> None:
+    """The adjacency fix widens WHERE teller_span can sit, never WHAT it
+    may say — a self-referential teller still fails."""
+    content = "I sent me their notes directly about the change."
+    answer = {
+        "ground_kind": "telling_event",
+        "other_grounds_clear": True,
+        "telling_span": "sent me their notes directly",
+        "teller_span": "I",
+        "new_context": "updated context",
+    }
+    ok, result, ctx = verify_attribution_ground(answer, content, {}, _fleet())
+    assert ok is False
+    assert ctx is None
