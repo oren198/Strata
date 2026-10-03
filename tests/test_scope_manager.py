@@ -96,6 +96,16 @@ EXISTING_DIRECTIVE = Directive(
     created_at="2026-04-01T09:00:00+00:00",
 )
 
+
+def _same_scope_line(op_list: str) -> str:
+    """The engine provenance line for :data:`CONTRIBUTOR` (bound to :data:`SCOPE`)."""
+    return (
+        f"[Engine: same-scope change by {CONTRIBUTOR.skill} (session {CONTRIBUTOR.session_id}), "
+        f"bound to {SCOPE.id}: {op_list}. This line, not the reasoning above, is the "
+        "record's account of who changed the directives.]"
+    )
+
+
 CURRENT_SUMMARY = ScopeSummary(
     scope_id=SCOPE.id,
     directives=[EXISTING_DIRECTIVE],
@@ -3061,7 +3071,8 @@ def test_invalid_id_triggers_one_corrective_listing_the_valid_ids() -> None:
     # The corrected amendment applies in full — nothing dropped.
     assert judgment.dropped_ops == []
     assert judgment.retired_directive_ids == [EXISTING_DIRECTIVE.id]
-    assert judgment.record_notes == judgment.reasoning
+    # Bound contributor, applied op: the engine provenance line is the only suffix.
+    assert judgment.record_notes == f"{judgment.reasoning} {_same_scope_line('retire c_old001')}"
 
 
 def test_invalid_id_twice_drops_the_op_and_notes_it_without_losing_the_verdict() -> None:
@@ -3997,7 +4008,9 @@ def test_batch_of_one_is_exactly_the_single_call() -> None:
     assert [(v.contribution_id, v.decision) for v in judgment.verdicts] == [
         (NEW_CONTRIBUTION.id, "accept_as_directive")
     ]
-    assert judgment.record_notes_for(NEW_CONTRIBUTION.id) == judgment.verdicts[0].reasoning
+    assert judgment.record_notes_for(NEW_CONTRIBUTION.id) == (
+        f"{judgment.verdicts[0].reasoning} {_same_scope_line('append c_001abc')}"
+    )
     assert [d.id for d in judgment.new_summary.directives] == [
         EXISTING_DIRECTIVE.id,
         NEW_CONTRIBUTION.id,
@@ -4311,7 +4324,9 @@ def test_invalid_directive_id_in_a_batch_is_dropped_and_noted_on_its_own_op() ->
     ]
     # The op named its member, so the note lands on that member's row alone.
     assert dropped in judgment.record_notes_for(SECOND_CONTRIBUTION.id)
-    assert judgment.record_notes_for(NEW_CONTRIBUTION.id) == "an enforceable standard"
+    assert judgment.record_notes_for(NEW_CONTRIBUTION.id) == (
+        f"an enforceable standard {_same_scope_line('append c_001abc')}"
+    )
 
 
 def test_batch_overflow_triggers_one_corrective_naming_the_batch_tool() -> None:
@@ -4985,7 +5000,8 @@ def test_a_clean_first_answer_makes_exactly_one_call_and_notes_nothing() -> None
 
     assert mock_client.messages.create.call_count == 1
     assert "re-ask" not in judgment.record_notes
-    assert judgment.record_notes == judgment.reasoning
+    # No protocol note; the bound contributor's applied op carries only the provenance line.
+    assert judgment.record_notes == f"{judgment.reasoning} {_same_scope_line('append c_001abc')}"
 
 
 def test_batch_no_tool_use_block_gets_one_corrective_reask() -> None:

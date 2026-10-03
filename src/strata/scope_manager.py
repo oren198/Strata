@@ -66,7 +66,7 @@ from pydantic import BaseModel, Field
 
 from strata.fleet_config import EntitlementView, Scope, Stratum
 from strata.operator import OperatorItem
-from strata.record_store import Contribution, RecentContribution
+from strata.record_store import Contribution, ContributorRef, RecentContribution
 from strata.summary_store import Directive, ScopeSummary, _render_summary, adopted_suffix
 
 _logger = logging.getLogger(__name__)
@@ -1338,7 +1338,10 @@ you detect the echo — which is why citations must survive every rewrite.
 
 You must call the `submit_judgment` tool exactly once and provide a
 one-or-two-sentence reasoning. When declining, submit no amendment:
-`directive_ops` empty or null, and `new_context` null.\
+`directive_ops` empty or null, and `new_context` null.
+Your stated reasoning may describe the contributor's position and what you
+actually checked; never state authority, verification or truth you could
+not establish from what is rendered here.\
 """
 
 #: Appended to :data:`_SYSTEM_PROMPT` for a batch call (ADR 0011 D3). The
@@ -2713,6 +2716,16 @@ class ScopeManagerJudgment(_AmendmentJudgment):
     note in :attr:`record_notes` keys off this flag, so every hold is recorded
     and the proposal stays adoptable."""
 
+    position_provenance: str | None = None
+    """The engine's provenance line for a same-scope directive change, or ``None``.
+
+    Set by :meth:`ScopeManager._hold_directive_changes` when an ordinary
+    contribution from a session bound to the judged scope is accepted with
+    directive ops. Rendered as the LAST suffix of :attr:`record_notes`, so the
+    record's account of who changed the directives is written by the engine and
+    never rests on the judge's reasoning. Never set on a held contribution: its
+    ops were held, so the held note stays the notes' final suffix."""
+
     outcome_disposition: (
         Literal["held", "failed_corrected", "failed_superseded", "failed", "decline"] | None
     ) = None
@@ -2814,24 +2827,27 @@ class ScopeManagerJudgment(_AmendmentJudgment):
         rewrite still carried a superseded claim (#199), and one per protocol
         repair (issue #201).
         """
-        return _with_held_note(
-            _with_disposition_unreadable_note(
-                _with_protocol_notes(
-                    _with_superseded_context_note(
-                        _with_dropped_context_note(
-                            _with_dropped_sources_note(
-                                _with_dropped_note(self.reasoning, self.dropped_ops),
-                                self.dropped_context_sources,
+        return _with_provenance_note(
+            _with_held_note(
+                _with_disposition_unreadable_note(
+                    _with_protocol_notes(
+                        _with_superseded_context_note(
+                            _with_dropped_context_note(
+                                _with_dropped_sources_note(
+                                    _with_dropped_note(self.reasoning, self.dropped_ops),
+                                    self.dropped_context_sources,
+                                ),
+                                self.dropped_new_context,
                             ),
-                            self.dropped_new_context,
+                            self.dropped_superseded_context,
                         ),
-                        self.dropped_superseded_context,
+                        self.protocol_notes,
                     ),
-                    self.protocol_notes,
+                    self.disposition_unreadable,
                 ),
-                self.disposition_unreadable,
+                self.held_directive_changes if self.position_held else None,
             ),
-            self.held_directive_changes if self.position_held else None,
+            self.position_provenance,
         )
 
 
@@ -2912,6 +2928,11 @@ class ScopeManagerBatchJudgment(_AmendmentJudgment):
     """Held directive ids (position gate) keyed by the member whose change was held;
     an empty list means a proposed NEW directive was held."""
 
+    provenance_by_contribution: dict[str, str] = Field(default_factory=dict)
+    """The engine's same-scope provenance line keyed by the bound member whose own
+    ops applied (see :func:`_batch_provenance`). Rendered as the last suffix of
+    that member's :meth:`record_notes_for`."""
+
     @property
     def accepted_verdicts(self) -> list[BatchVerdict]:
         """The batch's accept verdicts, in arrival order."""
@@ -2965,7 +2986,10 @@ class ScopeManagerBatchJudgment(_AmendmentJudgment):
         # The held note is appended LAST, as on the single path, so it is always
         # the notes' final suffix (`is_held_note` anchors on that).
         notes = _with_protocol_notes(notes, self.protocol_notes)
-        return _with_held_note(notes, self.held_by_contribution.get(contribution_id))
+        notes = _with_held_note(notes, self.held_by_contribution.get(contribution_id))
+        # A member is held or bound, never both, so the held note above and the
+        # provenance line below never share a row.
+        return _with_provenance_note(notes, self.provenance_by_contribution.get(contribution_id))
 
 
 class PublicationJudgment(BaseModel):
@@ -3344,6 +3368,92 @@ def is_held_note(notes: str | None) -> bool:
     similar words elsewhere does not count.
     """
     return notes is not None and _HELD_NOTE_RE.search(notes) is not None
+
+
+def _describe_provenance_ops(
+    ops: Sequence[DirectiveOp], admitted_id: Callable[[DirectiveOp], str | None]
+) -> str:
+    """Render applied directive *ops* for the provenance line, in applied order.
+
+    ``append c_x; publish c_x (supersedes c_y); supersede c_y→c_z; retire c_w``.
+    :meth:`DirectiveOp.describe` serves dropped/held accounting and does not name
+    the directive an admitting op mints, so this renders that id from
+    *admitted_id* (the triggering contribution on the single path, the op's own
+    member in a batch). A ``supersede`` points at the directive its owner admits
+    in the same amendment, when there is one.
+    """
+    admitted = {
+        owner for op in ops if op.op in _ADMITTING_OPS and (owner := admitted_id(op)) is not None
+    }
+    parts: list[str] = []
+    for op in ops:
+        owner = admitted_id(op)
+        if op.op in _ADMITTING_OPS:
+            text = f"{op.op} {owner}" if owner else op.op
+            if op.op == "publish" and op.supersedes:
+                text += f" (supersedes {op.supersedes})"
+        elif op.op == "supersede":
+            text = f"supersede {op.id}→{owner}" if owner in admitted else f"supersede {op.id}"
+        else:
+            text = f"{op.op} {op.id}"
+        parts.append(text)
+    return "; ".join(parts)
+
+
+def _provenance_line(contributor: ContributorRef, op_list: str) -> str:
+    """The engine-written provenance line for a same-scope directive change.
+
+    Built only from the contributor's bound identity and the ops that applied —
+    nothing the judge wrote — so the record's account of who changed the
+    directives does not rest on the judge's wording.
+    """
+    skill = contributor.skill or "(no skill)"
+    return (
+        f"[Engine: same-scope change by {skill} (session {contributor.session_id}), "
+        f"bound to {contributor.scope_id}: {op_list}. This line, not the reasoning "
+        "above, is the record's account of who changed the directives.]"
+    )
+
+
+def _with_provenance_note(notes: str, line: str | None) -> str:
+    """Return *notes* plus the provenance line, when there is one."""
+    return notes if line is None else f"{notes} {line}"
+
+
+def _batch_provenance(
+    judgment: ScopeManagerBatchJudgment,
+    *,
+    scope: Scope,
+    contributions: Mapping[str, Contribution],
+) -> ScopeManagerBatchJudgment:
+    """Give each accepted member bound to *scope* a provenance line for its own ops.
+
+    Reads the ops as finally applied (after held ops are removed). Each line names
+    only the ops attributed to that member. Stated limit: an op whose
+    ``contribution_id`` names no accepted member has no owner to read, so it is
+    on no member's line — attribution is never guessed. A judgment with no
+    bound member owning ops is returned unchanged.
+    """
+    accepted = {v.contribution_id for v in judgment.accepted_verdicts}
+    lines: dict[str, str] = {}
+    for verdict in judgment.accepted_verdicts:
+        cid = verdict.contribution_id
+        contributor = contributions[cid].contributor
+        if contributor.scope_id != scope.id:
+            continue
+        own = [op for op in judgment.directive_ops if op.contribution_id == cid]
+        if not own:
+            continue
+        lines[cid] = _provenance_line(
+            contributor,
+            _describe_provenance_ops(
+                own,
+                lambda op: op.contribution_id if op.contribution_id in accepted else None,
+            ),
+        )
+    if not lines:
+        return judgment
+    return judgment.model_copy(update={"provenance_by_contribution": lines})
 
 
 def _held_report_line(contribution: Contribution, directive_ids: Sequence[str]) -> str:
@@ -6624,7 +6734,18 @@ class ScopeManager:
         if judgment.decision == "decline" or mode != "ordinary":
             return judgment
         if new_contribution.contributor.scope_id == scope.id:
-            return judgment
+            if not judgment.directive_ops:
+                return judgment
+            return judgment.model_copy(
+                update={
+                    "position_provenance": _provenance_line(
+                        new_contribution.contributor,
+                        _describe_provenance_ops(
+                            judgment.directive_ops, lambda _op: new_contribution.id
+                        ),
+                    )
+                }
+            )
         directive_ids = (
             {d.id for d in current_summary.directives} if current_summary is not None else set()
         )
@@ -6691,7 +6812,7 @@ class ScopeManager:
         accepted = {v.contribution_id for v in judgment.accepted_verdicts}
         foreign = {cid for cid in accepted if contributions[cid].contributor.scope_id != scope.id}
         if not foreign:
-            return judgment
+            return _batch_provenance(judgment, scope=scope, contributions=contributions)
         directive_ids = (
             {d.id for d in current_summary.directives} if current_summary is not None else set()
         )
@@ -6725,7 +6846,7 @@ class ScopeManager:
             or any(op.contribution_id == cid for op in held_ops)
         ]
         if not changed and not held_ops:
-            return judgment
+            return _batch_provenance(judgment, scope=scope, contributions=contributions)
         kept = [op for op in judgment.directive_ops if op not in held_ops]
         context = (
             judgment.new_context
@@ -6740,7 +6861,7 @@ class ScopeManager:
             else v
             for v in judgment.verdicts
         ]
-        return judgment.model_copy(
+        held = judgment.model_copy(
             update={
                 "verdicts": verdicts,
                 "directive_ops": kept,
@@ -6760,6 +6881,7 @@ class ScopeManager:
                 ),
             }
         )
+        return _batch_provenance(held, scope=scope, contributions=contributions)
 
     def _call_with_correctives(
         self,
@@ -7830,6 +7952,11 @@ class ScopeManager:
                 held_by_contribution=(
                     {only.id: list(judgment.held_directive_changes)}
                     if judgment.position_held
+                    else {}
+                ),
+                provenance_by_contribution=(
+                    {only.id: judgment.position_provenance}
+                    if judgment.position_provenance is not None
                     else {}
                 ),
                 withdraw_published=judgment.withdraw_published,
