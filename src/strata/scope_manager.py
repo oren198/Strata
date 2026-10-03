@@ -2716,6 +2716,12 @@ class ScopeManagerJudgment(_AmendmentJudgment):
     note in :attr:`record_notes` keys off this flag, so every hold is recorded
     and the proposal stays adoptable."""
 
+    contribution_id: str | None = None
+    """The judged contribution's id, set by :meth:`ScopeManager.judge`. Names the
+    directive an ``append``/``publish`` mints in the decision prefix of
+    :attr:`record_notes`; ``None`` on a hand-built judgment, whose admitting ops
+    then render without an id."""
+
     position_provenance: str | None = None
     """The engine's provenance line for a same-scope directive change, or ``None``.
 
@@ -2826,8 +2832,19 @@ class ScopeManagerJudgment(_AmendmentJudgment):
         when the refresh locked the context (ADR 0014 D2), one more when the
         rewrite still carried a superseded claim (#199), and one per protocol
         repair (issue #201).
+
+        Opened by the engine's decision prefix (the decision as recorded and the
+        ops as applied), unless this is a judge failure.
         """
-        return _with_provenance_note(
+        prefix = (
+            ""
+            if self.judge_failure
+            else _decision_prefix(
+                self.decision,
+                _describe_provenance_ops(self.directive_ops, lambda _op: self.contribution_id),
+            )
+        )
+        return prefix + _with_provenance_note(
             _with_held_note(
                 _with_disposition_unreadable_note(
                     _with_protocol_notes(
@@ -2989,7 +3006,19 @@ class ScopeManagerBatchJudgment(_AmendmentJudgment):
         notes = _with_held_note(notes, self.held_by_contribution.get(contribution_id))
         # A member is held or bound, never both, so the held note above and the
         # provenance line below never share a row.
-        return _with_provenance_note(notes, self.provenance_by_contribution.get(contribution_id))
+        notes = _with_provenance_note(notes, self.provenance_by_contribution.get(contribution_id))
+        if verdict is None or verdict.judge_failure:
+            return notes
+        # The decision prefix lists only this member's own ops. A batch of one
+        # rewraps the single judgment, whose ops carry no attribution: there the
+        # binding is implicit, so they are the sole member's.
+        sole = self.verdicts[0].contribution_id if len(self.verdicts) == 1 else None
+
+        def _owner(op: DirectiveOp) -> str | None:
+            return op.contribution_id or sole
+
+        own = [op for op in self.directive_ops if _owner(op) == contribution_id]
+        return _decision_prefix(verdict.decision, _describe_provenance_ops(own, _owner)) + notes
 
 
 class PublicationJudgment(BaseModel):
@@ -3093,7 +3122,7 @@ def _render_digest_row(row: RecentContribution, *, verbatim: bool) -> str:
     return (
         f"[{c.id}] at={c.created_at} subject={c.subject or '(none)'} "
         f"state={row.state} decision={row.decision or '(none)'} "
-        f"reasoning={strip_provenance_note(row.judgment_notes or '') or '(none)'} "
+        f"reasoning={strip_record_only_notes(row.judgment_notes or '') or '(none)'} "
         f"content={content!r}"
     )
 
@@ -3437,6 +3466,34 @@ def _provenance_line(contributor: ContributorRef, op_list: str) -> str:
 def _with_provenance_note(notes: str, line: str | None) -> str:
     """Return *notes* plus the provenance line, when there is one."""
     return notes if line is None else f"{notes} {line}"
+
+
+#: The decision prefix opens every recorded verdict's notes: ``[decline] `` or
+#: ``[<decision>; <ops or "no ops">] ``. :func:`_decision_prefix` writes it and
+#: :func:`strip_record_only_notes` removes it, both from this shape.
+_DECISION_PREFIX_RE = re.compile(
+    r"\A(?:\[decline\] |\[(?:accept_as_directive|accept_as_context); [^\[\]]+\] )"
+)
+
+
+def _decision_prefix(decision: str, op_list: str) -> str:
+    """The engine's account of what the verdict actually did, written at the start
+    of the notes so the judge's reasoning cannot describe an act the decision did
+    not take without the record saying so. A decline carries no ops."""
+    if decision == "decline":
+        return "[decline] "
+    return f"[{decision}; {op_list or 'no ops'}] "
+
+
+def strip_record_only_notes(notes: str) -> str:
+    """Return recorded *notes* as a judge input: without the engine's record-only parts.
+
+    Removes the leading decision prefix and a trailing provenance line — both
+    exist for the audit record — so every render of recorded notes into a judge
+    call shows a later judge exactly what it saw before they existed. The held
+    note and every other note stay.
+    """
+    return strip_provenance_note(_DECISION_PREFIX_RE.sub("", notes, count=1))
 
 
 def strip_provenance_note(notes: str) -> str:
@@ -6735,7 +6792,7 @@ class ScopeManager:
             ),
         )
         return self._hold_directive_changes(
-            judgment,
+            judgment.model_copy(update={"contribution_id": new_contribution.id}),
             scope=scope,
             current_summary=current_summary,
             new_contribution=new_contribution,
@@ -7973,6 +8030,7 @@ class ScopeManager:
                         contribution_id=only.id,
                         decision=judgment.decision,
                         reasoning=judgment.reasoning,
+                        judge_failure=judgment.judge_failure,
                     )
                 ],
                 new_summary=judgment.new_summary,

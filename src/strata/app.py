@@ -850,6 +850,12 @@ def _judge_and_record(
         )
         raise JudgeUnavailable(contribution.id, type(exc).__name__, str(exc)) from exc
 
+    # The record's decision prefix names the directive an append mints by this
+    # contribution's id; a judge that did not set it (a stand-in or out-of-repo
+    # judge) still records the right id.
+    if isinstance(judgment, ScopeManagerJudgment) and judgment.contribution_id is None:
+        judgment = judgment.model_copy(update={"contribution_id": contribution.id})
+
     # ADR 0017 P3: a failed outcome mints its linking event in the SAME transaction
     # as the judgment (RecordStore.record_judgment's claim_event, atomic). Gated on
     # the target being CONTEXT, not a directive — D6, checked here as well as

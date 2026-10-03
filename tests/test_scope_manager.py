@@ -3072,7 +3072,10 @@ def test_invalid_id_triggers_one_corrective_listing_the_valid_ids() -> None:
     assert judgment.dropped_ops == []
     assert judgment.retired_directive_ids == [EXISTING_DIRECTIVE.id]
     # Bound contributor, applied op: the engine provenance line is the only suffix.
-    assert judgment.record_notes == f"{judgment.reasoning} {_same_scope_line('retire c_old001')}"
+    assert judgment.record_notes == (
+        f"[accept_as_context; retire c_old001] {judgment.reasoning} "
+        f"{_same_scope_line('retire c_old001')}"
+    )
 
 
 def test_invalid_id_twice_drops_the_op_and_notes_it_without_losing_the_verdict() -> None:
@@ -4009,7 +4012,8 @@ def test_batch_of_one_is_exactly_the_single_call() -> None:
         (NEW_CONTRIBUTION.id, "accept_as_directive")
     ]
     assert judgment.record_notes_for(NEW_CONTRIBUTION.id) == (
-        f"{judgment.verdicts[0].reasoning} {_same_scope_line('append c_001abc')}"
+        f"[accept_as_directive; append c_001abc] {judgment.verdicts[0].reasoning} "
+        f"{_same_scope_line('append c_001abc')}"
     )
     assert [d.id for d in judgment.new_summary.directives] == [
         EXISTING_DIRECTIVE.id,
@@ -4281,16 +4285,20 @@ def test_unknown_contribution_id_gets_one_corrective_then_drop_and_note() -> Non
     ]
     # The op named no member of this batch, so its note goes to every accepted
     # member rather than falsely naming one of them as its owner.
+    # Each row opens with the engine's decision prefix naming that member's own op.
     for contribution_id, reasoning in (
-        (NEW_CONTRIBUTION.id, "an enforceable standard"),
-        (SECOND_CONTRIBUTION.id, "also enforceable"),
+        (
+            NEW_CONTRIBUTION.id,
+            f"[accept_as_directive; append {NEW_CONTRIBUTION.id}] an enforceable standard",
+        ),
+        (SECOND_CONTRIBUTION.id, "[accept_as_directive; no ops] also enforceable"),
     ):
         notes = judgment.record_notes_for(contribution_id)
         assert notes.startswith(reasoning)
         assert "append(contribution=c_not_in_this_batch)" in notes
     # The declined member's row carries no amendment note at all.
     assert judgment.record_notes_for(THIRD_CONTRIBUTION.id) == (
-        "material originating outside this scope's entitlement"
+        "[decline] material originating outside this scope's entitlement"
     )
 
 
@@ -4325,7 +4333,8 @@ def test_invalid_directive_id_in_a_batch_is_dropped_and_noted_on_its_own_op() ->
     # The op named its member, so the note lands on that member's row alone.
     assert dropped in judgment.record_notes_for(SECOND_CONTRIBUTION.id)
     assert judgment.record_notes_for(NEW_CONTRIBUTION.id) == (
-        f"an enforceable standard {_same_scope_line('append c_001abc')}"
+        f"[accept_as_directive; append c_001abc] an enforceable standard "
+        f"{_same_scope_line('append c_001abc')}"
     )
 
 
@@ -5001,7 +5010,10 @@ def test_a_clean_first_answer_makes_exactly_one_call_and_notes_nothing() -> None
     assert mock_client.messages.create.call_count == 1
     assert "re-ask" not in judgment.record_notes
     # No protocol note; the bound contributor's applied op carries only the provenance line.
-    assert judgment.record_notes == f"{judgment.reasoning} {_same_scope_line('append c_001abc')}"
+    assert judgment.record_notes == (
+        f"[accept_as_directive; append c_001abc] {judgment.reasoning} "
+        f"{_same_scope_line('append c_001abc')}"
+    )
 
 
 def test_batch_no_tool_use_block_gets_one_corrective_reask() -> None:
@@ -5418,7 +5430,7 @@ def test_declining_an_observation_leaves_its_reasoning_as_the_only_record() -> N
 
     assert judgment.decision == "decline"
     assert judgment.new_summary is None
-    assert judgment.record_notes == reasoning
+    assert judgment.record_notes == f"[decline] {reasoning}"
 
 
 def test_budget_rewrite_may_not_resurrect_the_superseded_claim() -> None:

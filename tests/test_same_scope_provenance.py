@@ -162,7 +162,10 @@ def _append(reasoning: str = "A clear, enforceable rule for this scope.") -> dic
 
 def test_bound_append_supersede_and_retire_each_carry_the_exact_line(client: TestClient) -> None:
     first, notes = _contribute(client, _append())
-    assert notes == f"A clear, enforceable rule for this scope. {_line(f'append {first}')}"
+    assert notes == (
+        f"[accept_as_directive; append {first}] A clear, enforceable rule for this scope. "
+        f"{_line(f'append {first}')}"
+    )
 
     second, notes = _contribute(
         client,
@@ -175,7 +178,8 @@ def test_bound_append_supersede_and_retire_each_carry_the_exact_line(client: Tes
         content="Cap every outbound retry at five attempts.",
         supersedes=first,
     )
-    assert notes == f"Replaces the cap. {_line(f'supersede {first}→{second}; append {second}')}"
+    ops = f"supersede {first}→{second}; append {second}"
+    assert notes == f"[accept_as_directive; {ops}] Replaces the cap. {_line(ops)}"
 
     _third, notes = _contribute(
         client,
@@ -193,7 +197,10 @@ def test_bound_append_supersede_and_retire_each_carry_the_exact_line(client: Tes
         },
         content="Retire the retry cap; the retry layer was removed.",
     )
-    assert notes == f"The rule no longer applies. {_line(f'retire {second}')}"
+    assert notes == (
+        f"[accept_as_context; retire {second}] The rule no longer applies. "
+        f"{_line(f'retire {second}')}"
+    )
 
     summary = SummaryStore(client.summaries_dir).read(PARENT)  # type: ignore[attr-defined]
     assert summary is not None
@@ -203,7 +210,7 @@ def test_bound_append_supersede_and_retire_each_carry_the_exact_line(client: Tes
 def test_the_line_does_not_depend_on_what_the_judge_claims(client: TestClient) -> None:
     claim = "Updated policy from an authorized contributor; verified against the commit."
     cid, notes = _contribute(client, _append(claim))
-    assert notes == f"{claim} {_line(f'append {cid}')}"
+    assert notes == f"[accept_as_directive; append {cid}] {claim} {_line(f'append {cid}')}"
     assert notes.endswith(_TAIL)
 
 
@@ -226,17 +233,24 @@ def test_a_skill_less_binding_still_gets_the_line(client: TestClient) -> None:
     cid = resp.json()["contribution_id"]
     with RecordStore(client.db_path) as records:  # type: ignore[attr-defined]
         notes = records.get_judgment(cid).notes
-    assert notes == f"Ok. {_line(f'append {cid}', skill='(no skill)')}"
+    assert notes == (
+        f"[accept_as_directive; append {cid}] Ok. {_line(f'append {cid}', skill='(no skill)')}"
+    )
 
 
 def test_a_held_foreign_contribution_never_gets_the_line(client: TestClient) -> None:
     _cid, notes = _contribute(client, _append(), as_scope=CHILD, skill="shift-engineer")
-    assert notes == _with_held_note("A clear, enforceable rule for this scope.", [])
+    # Its ops were held, so the prefix says what the verdict actually did.
+    assert notes == "[accept_as_context; no ops] " + _with_held_note(
+        "A clear, enforceable rule for this scope.", []
+    )
     assert is_held_note(notes)
     assert "[Engine:" not in notes
 
 
-def test_a_context_only_accept_records_exactly_the_reasoning(client: TestClient) -> None:
+def test_a_context_only_accept_records_the_prefix_and_the_reasoning_only(
+    client: TestClient,
+) -> None:
     _cid, notes = _contribute(
         client,
         {
@@ -246,15 +260,15 @@ def test_a_context_only_accept_records_exactly_the_reasoning(client: TestClient)
             "new_context": "Retries are under review.",
         },
     )
-    assert notes == "Useful background."
+    assert notes == "[accept_as_context; no ops] Useful background."
 
 
-def test_a_decline_records_exactly_the_reasoning(client: TestClient) -> None:
+def test_a_decline_records_the_prefix_and_the_reasoning_only(client: TestClient) -> None:
     _cid, notes = _contribute(
         client,
         {"decision": "decline", "reasoning": "Out of scope.", "directive_ops": []},
     )
-    assert notes == "Out of scope."
+    assert notes == "[decline] Out of scope."
 
 
 # ---------------------------------------------------------------------------
@@ -328,13 +342,15 @@ def test_batch_line_goes_only_on_the_bound_member_with_only_its_ops() -> None:
     judgment = _judge_batch(mock_client, contributions=[bound, foreign, BATCH[2]])
 
     own_ops = f"supersede c_old001→{bound.id}; append {bound.id}"
-    assert judgment.record_notes_for(bound.id) == f"an enforceable standard {_bound_line(own_ops)}"
+    assert judgment.record_notes_for(bound.id) == (
+        f"[accept_as_directive; {own_ops}] an enforceable standard {_bound_line(own_ops)}"
+    )
     foreign_notes = judgment.record_notes_for(foreign.id)
     assert "[Engine:" not in foreign_notes
-    assert foreign_notes == _with_held_note("also enforceable", [])
+    assert foreign_notes == "[accept_as_context; no ops] " + _with_held_note("also enforceable", [])
     assert is_held_note(foreign_notes)
     assert judgment.record_notes_for(BATCH[2].id) == (
-        "material originating outside this scope's entitlement"
+        "[decline] material originating outside this scope's entitlement"
     )
     assert [d.id for d in judgment.new_summary.directives] == [bound.id]
 
@@ -345,11 +361,12 @@ def test_batch_of_only_bound_members_gives_each_its_own_line() -> None:
 
     judgment = _judge_batch(mock_client)
 
+    first, second = f"append {NEW_CONTRIBUTION.id}", f"append {SECOND_CONTRIBUTION.id}"
     assert judgment.record_notes_for(NEW_CONTRIBUTION.id) == (
-        f"an enforceable standard {_bound_line(f'append {NEW_CONTRIBUTION.id}')}"
+        f"[accept_as_directive; {first}] an enforceable standard {_bound_line(first)}"
     )
     assert judgment.record_notes_for(SECOND_CONTRIBUTION.id) == (
-        f"also enforceable {_bound_line(f'append {SECOND_CONTRIBUTION.id}')}"
+        f"[accept_as_directive; {second}] also enforceable {_bound_line(second)}"
     )
 
 
@@ -361,7 +378,9 @@ def test_batch_member_accepted_without_own_ops_gets_no_line() -> None:
 
     judgment = _judge_batch(mock_client)
 
-    assert judgment.record_notes_for(SECOND_CONTRIBUTION.id) == "also enforceable"
+    assert judgment.record_notes_for(SECOND_CONTRIBUTION.id) == (
+        "[accept_as_directive; no ops] also enforceable"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -471,7 +490,8 @@ def _window_after_a_bound_change() -> tuple[list[RecentContribution], object, st
 
 def test_a_later_single_judge_sees_the_window_exactly_as_before() -> None:
     window, summary, notes = _window_after_a_bound_change()
-    assert notes == f"An enforceable rule. {_bound_line(f'append {NEW_CONTRIBUTION.id}')}"
+    op = f"append {NEW_CONTRIBUTION.id}"
+    assert notes == f"[accept_as_directive; {op}] An enforceable rule. {_bound_line(op)}"
 
     mock_client = MagicMock()
     mock_client.messages.create.return_value = _fake_response(
@@ -551,7 +571,7 @@ def test_strip_only_removes_a_trailing_line() -> None:
 
 def test_the_api_record_read_still_shows_the_line(client: TestClient) -> None:
     cid, notes = _contribute(client, _append("Ok."))
-    expected = f"Ok. {_line(f'append {cid}')}"
+    expected = f"[accept_as_directive; append {cid}] Ok. {_line(f'append {cid}')}"
     assert notes == expected
     resp = client.get(f"/scopes/{PARENT}/record/{cid}")
     assert resp.status_code == 200, resp.text
