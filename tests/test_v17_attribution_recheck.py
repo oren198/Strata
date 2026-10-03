@@ -331,6 +331,83 @@ def test_first_hand_own_is_barred_when_a_non_entitled_scope_is_named() -> None:
     assert ctx3 == "updated context"
 
 
+def test_outside_party_appends_to_existing_context_rather_than_replacing_it() -> None:
+    """Blocker 1 (architect review of 10327f6): the engine writes this
+    line itself, never the judge's own text, so it must APPEND to the
+    scope's existing context rather than wipe it."""
+    content = "Global Pay published an advisory saying their API now requires 2FA."
+    answer = {
+        "ground_kind": "outside_party",
+        "other_grounds_clear": True,
+        "party_span": "Global Pay",
+        "act_span": "published an advisory",
+    }
+    ok, result, ctx = verify_attribution_ground(
+        answer, content, {}, _fleet(), previous_context="The team favours minimal abstractions."
+    )
+    assert ok is True
+    assert ctx == (
+        "The team favours minimal abstractions.\n"
+        "According to Global Pay's published an advisory: " + content
+    )
+    assert "rescued" in result
+
+
+def test_directive_or_publication_declines_a_scope_the_referenced_item_does_not_name() -> None:
+    """Fix 3 (same review): `_value_tokens` is a subset test, so a span
+    with no value tokens at all (no number, id, or quote) passes the
+    value/polarity check trivially. Such a span naming a non-entitled
+    scope the referenced item never mentions must still be barred."""
+    content = (
+        "As the branches directive says, attr-other-scope follows the "
+        "acquisitions-only ordering process."
+    )
+    rendered_refs = {
+        "c_ref1": "Acquisitions only orders new titles in the first week of each month."
+    }
+    span = "attr-other-scope follows the acquisitions-only ordering process"
+    answer = {
+        "ground_kind": "directive_or_publication",
+        "other_grounds_clear": True,
+        "span": span,
+        "ref_id": "c_ref1",
+        "new_context": "updated context",
+    }
+    ok, result, ctx = verify_attribution_ground(answer, content, rendered_refs, _fleet())
+    assert ok is False
+    assert ctx is None
+    assert "names a scope the referenced item does not" in result
+
+    # Same shape, but the referenced item DOES name that scope: a real
+    # directive naming a scope stays rescuable.
+    rendered_refs2 = {
+        "c_ref1": (
+            "Acquisitions only orders new titles in the first week of each month, "
+            "same as attr-other-scope's own process."
+        )
+    }
+    ok2, result2, ctx2 = verify_attribution_ground(answer, content, rendered_refs2, _fleet())
+    assert ok2 is True
+    assert ctx2 == "updated context"
+    assert "rescued" in result2
+
+
+def test_outside_party_is_barred_when_content_asserts_a_non_entitled_scopes_interior() -> None:
+    """Fix 3 (same review): an outside party can't carry another fleet
+    scope's interior — a stated limit, failing closed."""
+    content = "Global Pay published an advisory saying attr-other-scope's deploy policy changed."
+    answer = {
+        "ground_kind": "outside_party",
+        "other_grounds_clear": True,
+        "party_span": "Global Pay",
+        "act_span": "published an advisory",
+    }
+    ok, result, ctx = verify_attribution_ground(answer, content, {}, _fleet())
+    assert ok is False
+    assert ctx is None
+    assert "non-entitled scope's interior" in result
+
+
 def test_span_not_verbatim_fails_closed_for_every_ground_kind() -> None:
     for ground_kind, extra in (
         ("directive_or_publication", {"span": "not in the text", "ref_id": "x"}),
@@ -385,7 +462,12 @@ def test_decline_stands_when_ground_kind_is_none() -> None:
     assert judgment.attribution_recheck["ground_kind"] == "none"
 
 
-def test_judge_failure_on_unreadable_reask_fails_closed() -> None:
+def test_reask_failure_leaves_the_first_decline_standing() -> None:
+    """Blocker 2 (architect review of 10327f6): an unreadable re-ask must
+    NOT replace a valid first decline with a judge_failure verdict — that
+    carries pending/rejudge semantics the design's own "fails closed to
+    today's behaviour" line does not call for. The FIRST decline stands,
+    unchanged in kind, with a note appended."""
     mock_client = MagicMock()
     content = "procurement only approves orders under $500."
     mock_client.messages.create.side_effect = [
@@ -394,8 +476,29 @@ def test_judge_failure_on_unreadable_reask_fails_closed() -> None:
     ]
     judgment, _ = _judge(mock_client, content, "")
     assert judgment.decision == "decline"
-    assert judgment.judge_failure is True
+    assert judgment.judge_failure is False
+    assert "recheck failed" in judgment.reasoning
     assert judgment.attribution_recheck["ground_kind"] is None
+    assert "recheck failed" in judgment.attribution_recheck["result"]
+
+
+def test_reask_message_renders_the_current_context() -> None:
+    """Blocker 1 (architect review of 10327f6): the re-ask's own render
+    never showed the current context, so a judge's full-replacement
+    `new_context` had no way to keep it. The re-ask message must carry it."""
+    mock_client = MagicMock()
+    content = "we decided to only escalate to SEV-1 if error rate exceeds 5%."
+    mock_client.messages.create.side_effect = [
+        _ordinary_decline("Manufactured attribution: no one spoke, no publication, no directive."),
+        _reask_response(
+            ground_kind="first_hand_own",
+            span=content,
+            new_context=CURRENT_SUMMARY.context + " Also: " + content,
+        ),
+    ]
+    _judge(mock_client, content, "")
+    reask_message = mock_client.messages.create.call_args_list[1].kwargs["messages"][0]["content"]
+    assert CURRENT_SUMMARY.context in reask_message
 
 
 def test_a_non_attribution_decline_never_triggers() -> None:

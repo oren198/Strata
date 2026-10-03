@@ -4049,13 +4049,20 @@ def verify_attribution_ground(
     content: str,
     rendered_refs: Mapping[str, str],
     fleet: AttributionFleetContext,
+    previous_context: str = "",
 ) -> tuple[bool, str, str | None]:
     """The mechanical verifier, pure and judge-free: given the re-ask's own
     raw answer (``answer`` — the ``recheck_attribution`` tool's parsed
     input), the contribution's own text, a map of every id visible to this
     call to ITS OWN text (:func:`ScopeManager._visible_ref_ids`'s partner,
-    built by the caller), and the fleet/contributor context, decide whether
-    the cited ground actually holds.
+    built by the caller), the fleet/contributor context, and the scope's
+    CURRENT context (``previous_context`` — read by the architect's blocker
+    1 review: the re-ask's own prompt now shows this text so the judge's own
+    ``new_context`` can rewrite it keeping everything, but ``outside_party``
+    never goes through the judge's own rewrite at all — the engine appends
+    its own fixed line to ``previous_context`` directly, the same append
+    pattern ADR 0016 D1's own informant-hearsay rewrite already uses, rather
+    than replacing it), decide whether the cited ground actually holds.
 
     Returns ``(ok, reason, context_text)``: ``ok`` is whether the ground
     verifies (and ``other_grounds_clear`` was true); ``reason`` is a short
@@ -4106,7 +4113,8 @@ def verify_attribution_ground(
         from strata.publication import _value_tokens  # noqa: PLC0415 — avoids a circular import
 
         span_values = _value_tokens(span)  # type: ignore[arg-type]
-        ref_values = _value_tokens(rendered_refs[ref_id])
+        ref_text = rendered_refs[ref_id]
+        ref_values = _value_tokens(ref_text)
         # #219's gate, reused: every number/id/time/quoted value AND every
         # polarity word the attributed span states must also appear in the
         # referenced item's own text — tokenless overlap alone (a bare
@@ -4114,6 +4122,16 @@ def verify_attribution_ground(
         # line).
         if not span_values <= ref_values:
             return False, "declined (value/polarity mismatch)", None
+        # Fix 3 (architect review of 10327f6): a span with no value tokens
+        # at all passes the subset check trivially, so a span naming a
+        # non-entitled scope the referenced item never mentions would
+        # otherwise rescue on other_grounds_clear alone. Every non-entitled
+        # scope the SPAN names must also be named in the referenced item's
+        # own text; a real directive that genuinely names that scope stays
+        # rescuable.
+        span_scopes = _match_other_scopes(span, fleet.non_entitled_scopes)  # type: ignore[arg-type]
+        if span_scopes and not _match_other_scopes(ref_text, span_scopes):
+            return False, "declined (names a scope the referenced item does not)", None
         if not (isinstance(new_context, str) and new_context.strip()):
             return False, "declined (no new_context)", None
         return True, f"admitted (rescued, grounded in {ref_id})", new_context
@@ -4127,8 +4145,20 @@ def verify_attribution_ground(
             return False, "declined (party is a fleet scope)", None
         if not _OUTSIDE_PARTY_EVENT_VERB_RE.search(act_span):  # type: ignore[arg-type]
             return False, "declined (no event verb)", None
+        # Fix 3 (architect review of 10327f6): an outside party can never
+        # carry another fleet scope's interior — a stated limit, failing
+        # closed, since this ground admits whatever the party is reported
+        # to have said with no check on ITS content at all.
+        if fleet.non_entitled_scopes and _match_other_scopes(content, fleet.non_entitled_scopes):
+            return False, "declined (asserts a non-entitled scope's interior)", None
+        # Blocker 1 (same review): the engine writes this line itself — the
+        # judge's own text is never used here (contract line 3) — so it
+        # must APPEND to the scope's existing context, never replace it,
+        # the same append pattern ADR 0016 D1's own informant-hearsay
+        # rewrite already uses.
         engine_line = f"According to {party_span}'s {act_span}: {content}"
-        return True, "admitted (rescued, context replaced)", engine_line
+        appended_context = f"{previous_context}\n{engine_line}".strip()
+        return True, "admitted (rescued, context appended)", appended_context
 
     if ground_kind == "telling_event":
         telling_span = answer.get("telling_span")
@@ -5743,19 +5773,7 @@ class ScopeManager:
                 }
             )
 
-        def _failure_decline(detail: str) -> ScopeManagerJudgment:
-            return ScopeManagerJudgment(
-                decision="decline",
-                reasoning=(
-                    f"judge failure: the attribution re-check response was "
-                    f"unreadable ({detail}); declined without a verdict on the merits"
-                ),
-                new_summary=None,
-                change_id=change_id,
-                hop=hop,
-                judge_failure=True,
-            )
-
+        previous_context = current_summary.context if current_summary is not None else ""
         refs_block = (
             "\n".join(f"- {rid}: {text}" for rid, text in rendered_refs.items())
             if rendered_refs
@@ -5767,6 +5785,8 @@ class ScopeManager:
             f'"{first.reasoning}"\n\n'
             f"CONTRIBUTION TEXT:\n{contribution.content}\n\n"
             f"ITEMS VISIBLE TO THIS SCOPE (id: text):\n{refs_block}\n\n"
+            f"CURRENT CONTEXT (rewrite it, keeping everything, adding this item):\n"
+            f"{previous_context or '(none)'}\n\n"
             "Call `recheck_attribution` exactly once."
         )
         try:
@@ -5791,17 +5811,33 @@ class ScopeManager:
             reask_block = self._extract_tool_use_block(reask_response)
             answer: dict = reask_block.input or {}
         except Exception as exc:  # noqa: BLE001 — any slip here fails closed, #235's pattern
+            # Blocker 2 (architect review of 10327f6): an unreadable re-ask
+            # must leave the FIRST decline standing, not replace it with a
+            # judge_failure verdict (which carries pending/rejudge
+            # semantics a plain re-check failure does not).
+            detail = f"{type(exc).__name__}: {exc}"
             return _noted(
-                _failure_decline(f"{type(exc).__name__}: {exc}"), None, None, "judge failure"
+                first.model_copy(
+                    update={"reasoning": f"{first.reasoning} (recheck failed: {detail})"}
+                ),
+                None,
+                None,
+                f"recheck failed: {detail}",
             )
 
+        judge_reasoning = answer.get("reasoning")
+        judge_reasoning = judge_reasoning if isinstance(judge_reasoning, str) else ""
+
         ok, result, context_text = verify_attribution_ground(
-            answer, contribution.content, rendered_refs, fleet
+            answer, contribution.content, rendered_refs, fleet, previous_context
         )
         ground_kind = answer.get("ground_kind")
         other_grounds_clear = answer.get("other_grounds_clear")
         if not ok:
-            reason_suffix = f" {result}." if "declined" in result else ""
+            # Fix 4 (same review): keep the judge's own reasoning alongside
+            # the mechanical verdict, not just the latter.
+            prefix = f"{judge_reasoning} " if judge_reasoning else ""
+            reason_suffix = f" {prefix}[{result}]" if "declined" in result else ""
             return _noted(
                 first.model_copy(update={"reasoning": f"{first.reasoning}{reason_suffix}"}),
                 ground_kind if isinstance(ground_kind, str) else None,
@@ -5823,7 +5859,11 @@ class ScopeManager:
                 "directive_ops": [],
                 "new_context": context_text,
                 "new_summary": new_summary,
-                "reasoning": f"Rescued: {result}.",
+                "reasoning": (
+                    f"{judge_reasoning} [Rescued: {result}]"
+                    if judge_reasoning
+                    else f"Rescued: {result}."
+                ),
             }
         )
         return _noted(updated, ground_kind, other_grounds_clear, result)
