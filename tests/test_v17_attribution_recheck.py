@@ -20,6 +20,7 @@ from strata.record_store import Contribution, ContributorRef
 from strata.scope_manager import (
     AttributionFleetContext,
     ScopeManager,
+    _telling_span_problem_for,
     attribution_decline_trigger,
     verify_attribution_ground,
 )
@@ -208,7 +209,80 @@ def test_directive_or_publication_fails_on_value_mismatch() -> None:
     ok, result, ctx = verify_attribution_ground(answer, content, rendered_refs, _fleet())
     assert ok is False
     assert ctx is None
-    assert "value/polarity mismatch" in result
+    assert "value mismatch" in result
+
+
+def test_directive_or_publication_round_2_bridge_replay_cases() -> None:
+    """Architect review round 2 — the bridge replay's own real misses: a
+    hyphen-glued value compound ("under-12") must still compare as a plain
+    number against the referenced item's own plain-word value, and a
+    polarity word with no antonym in the referenced item (just ordinary
+    vocabulary, e.g. "directive ON two-person counts") must not be vetoed
+    for being merely absent — only an actual flip fails it."""
+    # "under-12" vs "under 12": the hyphen compound decomposes to the same
+    # number as the referenced item's own plain words.
+    content1 = "As the clinics directive says, fines are waived for under-12 patrons."
+    refs1 = {"c_ref1": "Overdue fines are waived for patrons under 12."}
+    answer1 = {
+        "ground_kind": "directive_or_publication",
+        "other_grounds_clear": True,
+        "span": "fines are waived for under-12 patrons",
+        "ref_id": "c_ref1",
+        "new_context": "updated context",
+    }
+    ok1, result1, ctx1 = verify_attribution_ground(answer1, content1, refs1, _fleet())
+    assert ok1 is True, result1
+    assert ctx1 == "updated context"
+
+    # "on" in "the clinics directive on two-person counts" asserts no
+    # on/off state at all — must not be vetoed for being absent from the
+    # referenced item.
+    content2 = "As the clinics directive on two-person counts says, we follow it at shift change."
+    refs2 = {"c_ref2": "Controlled drugs must be counted by two staff at every shift change."}
+    answer2 = {
+        "ground_kind": "directive_or_publication",
+        "other_grounds_clear": True,
+        "span": "the clinics directive on two-person counts says, we follow it at shift change",
+        "ref_id": "c_ref2",
+        "new_context": "updated context",
+    }
+    ok2, result2, ctx2 = verify_attribution_ground(answer2, content2, refs2, _fleet())
+    assert ok2 is True, result2
+    assert ctx2 == "updated context"
+
+    # Same shape with a real unit value: "40 km/h" matches on both sides.
+    content3 = "As the observatory directive on closing at 40 km/h wind says, we stay shut."
+    refs3 = {"c_ref3": "The dome stays closed whenever wind exceeds 40 km/h to protect the mirror."}
+    answer3 = {
+        "ground_kind": "directive_or_publication",
+        "other_grounds_clear": True,
+        "span": "the observatory directive on closing at 40 km/h wind says, we stay shut",
+        "ref_id": "c_ref3",
+        "new_context": "updated context",
+    }
+    ok3, result3, ctx3 = verify_attribution_ground(answer3, content3, refs3, _fleet())
+    assert ok3 is True, result3
+    assert ctx3 == "updated context"
+
+    # A genuinely DIFFERENT number (30 vs 40) still fails — the value check
+    # is still a real check, not disabled.
+    content4 = "As the observatory directive on closing at 30 km/h wind says, we stay shut."
+    answer4 = {
+        **answer3,
+        "span": "the observatory directive on closing at 30 km/h wind says, we stay shut",
+    }
+    ok4, result4, ctx4 = verify_attribution_ground(answer4, content4, refs3, _fleet())
+    assert ok4 is False
+    assert ctx4 is None
+    assert "value mismatch" in result4
+
+    # "not waived" against "waived": a genuine negation flip still fails.
+    content5 = "As the clinics directive says, fines are not waived for under-12 patrons."
+    answer5 = {**answer1, "span": "fines are not waived for under-12 patrons"}
+    ok5, result5, ctx5 = verify_attribution_ground(answer5, content5, refs1, _fleet())
+    assert ok5 is False
+    assert ctx5 is None
+    assert "polarity mismatch" in result5
 
 
 def test_directive_or_publication_fails_on_ref_not_rendered() -> None:
@@ -292,6 +366,48 @@ def test_telling_event_reuses_225s_own_check() -> None:
     assert "no telling event" in result2
 
 
+def test_joint_event_verbs_are_telling_events_with_a_party_object() -> None:
+    """Philis's ruling (architect review round 2 + the bridge addendum on
+    j4_joint_verb): discussed/agreed/decided/met/sync are telling events
+    too, PROVIDED they also name a party ("with <party>") — which is
+    ITSELF the contributor-present check for a joint verb, no separate
+    first-person marker required. A bare "as discussed"/"as agreed" with
+    no party still fails; told/said verbs keep their first-person
+    requirement unchanged."""
+    content1 = "As discussed with procurement in Tuesday's sync, procurement only approves orders."
+    problem1, kind1 = _telling_span_problem_for(
+        "As discussed with procurement in Tuesday's sync", content=content1
+    )
+    assert problem1 is None
+    assert kind1 == "joint"
+
+    content2 = "When we met with treasury in yesterday's handover, the limit changed."
+    problem2, kind2 = _telling_span_problem_for(
+        "When we met with treasury in yesterday's handover", content=content2
+    )
+    assert problem2 is None
+    assert kind2 == "joint"
+
+    content3 = "In our sync with field-support (Monday's stand-up), the rota changed."
+    problem3, kind3 = _telling_span_problem_for(
+        "In our sync with field-support (Monday's stand-up)", content=content3
+    )
+    assert problem3 is None
+    assert kind3 == "joint"
+
+    content4 = "As discussed, procurement only approves orders under $500."
+    problem4, kind4 = _telling_span_problem_for("As discussed", content=content4)
+    assert problem4 is not None
+    assert kind4 is None
+    assert "state who was involved" in problem4
+
+    content5 = "Procurement told the board the budget was cut."
+    problem5, kind5 = _telling_span_problem_for("told the board", content=content5)
+    assert problem5 is not None
+    assert kind5 is None
+    assert "state who was told" in problem5
+
+
 def test_first_hand_own_is_barred_when_a_non_entitled_scope_is_named() -> None:
     # j1-031 shape: the contributor's OWN proposal about its own scope.
     content = "we decided to only escalate to SEV-1 if error rate exceeds 5%."
@@ -329,6 +445,63 @@ def test_first_hand_own_is_barred_when_a_non_entitled_scope_is_named() -> None:
     )
     assert ok3 is True
     assert ctx3 == "updated context"
+
+
+def test_first_hand_own_round_2_bridge_replay_claim_itself_as_the_span() -> None:
+    """Architect review round 2, bridge replay (2/4 first_hand_own): the
+    answerer's span was the claim itself, with no first-person word at
+    all. Passes when the span names the contributor's own scope, or when
+    the surrounding content carries a first-person marker — fails for an
+    equivalent claim from a DIFFERENT scope."""
+    dome_fleet = _fleet(contributor_scope_id="g_dometwo", contributor_scope_name="Dome-two")
+
+    content1 = "Dome-two's filter wheel jammed twice this week."
+    ok1, _result1, ctx1 = verify_attribution_ground(
+        {
+            "ground_kind": "first_hand_own",
+            "other_grounds_clear": True,
+            "span": "Dome-two's filter wheel jammed twice this week",
+            "new_context": "updated context",
+        },
+        content1,
+        {},
+        dome_fleet,
+    )
+    assert ok1 is True
+    assert ctx1 == "updated context"
+
+    content2 = "Our queue backs up every term: it's been full by 08:15 all term."
+    ok2, _result2, ctx2 = verify_attribution_ground(
+        {
+            "ground_kind": "first_hand_own",
+            "other_grounds_clear": True,
+            "span": "it's been full by 08:15 all term",
+            "new_context": "updated context",
+        },
+        content2,
+        {},
+        dome_fleet,
+    )
+    assert ok2 is True
+    assert ctx2 == "updated context"
+
+    # The same claim shape, from a DIFFERENT scope, naming neither the
+    # contributor's own scope nor a first-person marker: fails.
+    content3b = "Acquisitions only orders on Mondays."
+    ok3b, result3b, ctx3b = verify_attribution_ground(
+        {
+            "ground_kind": "first_hand_own",
+            "other_grounds_clear": True,
+            "span": "Acquisitions only orders on Mondays",
+            "new_context": "updated context",
+        },
+        content3b,
+        {},
+        dome_fleet,
+    )
+    assert ok3b is False
+    assert ctx3b is None
+    assert "not first-hand" in result3b
 
 
 def test_outside_party_appends_to_existing_context_rather_than_replacing_it() -> None:
@@ -499,6 +672,42 @@ def test_reask_message_renders_the_current_context() -> None:
     _judge(mock_client, content, "")
     reask_message = mock_client.messages.create.call_args_list[1].kwargs["messages"][0]["content"]
     assert CURRENT_SUMMARY.context in reask_message
+
+
+def test_reask_message_labels_items_by_origin_and_states_the_own_rule_guidance() -> None:
+    """Fix 4 (architect review round 2, bridge replay miss j1-031): the
+    answerer counted a conflict with the scope's OWN directive as a decline
+    ground. The re-ask message must label each visible item by its ORIGIN
+    (own directive / inherited directive (scope) / operator / publication)
+    and state that only an INHERITED conflict is a ground."""
+    mock_client = MagicMock()
+    content = "whatever"
+    ancestor_directive = Directive(
+        id="c_attrancestor",
+        content="Deploys must go through the change board.",
+        subject="deploy-process",
+        source_scope_id=PARENT.id,
+        source_skill="architect",
+        created_at="2026-09-01T09:00:00+00:00",
+    )
+    mock_client.messages.create.side_effect = [
+        _ordinary_decline("Manufactured attribution: no one spoke."),
+        _reask_response(ground_kind="none"),
+    ]
+    manager = ScopeManager(client=mock_client)
+    manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        ancestor_directives=[(PARENT.id, [ancestor_directive])],
+        recent_contributions=[],
+        new_contribution=_contribution(content),
+        entitlement=ENTITLEMENT,
+    )
+    reask_message = mock_client.messages.create.call_args_list[1].kwargs["messages"][0]["content"]
+    assert f"{EXISTING_DIRECTIVE.id} [own directive]" in reask_message
+    assert f"{ancestor_directive.id} [inherited directive ({PARENT.id})]" in reask_message
+    assert "Conflicting with this scope's OWN directive is NOT" in reask_message
 
 
 def test_a_non_attribution_decline_never_triggers() -> None:

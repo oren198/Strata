@@ -508,6 +508,28 @@ def test_informant_span_naming_a_genuine_third_party_with_a_possessive_passes() 
     assert judgment.interior_assertion["telling_span"] == "told me"
 
 
+def test_joint_event_verb_informant_is_attributed_in_discussion_with_form() -> None:
+    """Philis's ruling (architect review round 2, widening #225): a
+    JOINT-EVENT verb with a party ("discussed with X") is a telling event
+    too, and records at ITS OWN strength — "in discussion with X: ...",
+    never "X says"."""
+    content = "As discussed with 225-other-scope, they only approve changes under budget."
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [
+        _ordinary_accept(content),
+        _reask_response(
+            classification="informant",
+            informant_span="225-other-scope",
+            telling_span="discussed with 225-other-scope",
+        ),
+    ]
+    judgment, _ = _judge(mock_client, content)
+    assert judgment.decision == "accept_as_context"
+    assert judgment.new_context is not None
+    assert "In discussion with 225-other-scope:" in judgment.new_context
+    assert "says" not in judgment.new_context
+
+
 def test_informant_span_naming_a_genuine_third_party_with_our_passes() -> None:
     content = (
         "our contact Ravi in treasury told us 225-other-scope only approves changes under budget."

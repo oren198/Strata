@@ -785,7 +785,12 @@ ATTRIBUTION_RECHECK_TOOL: dict = {
                     "Required. True only if EVERY other ground for the original "
                     "decline is also clear: no contradiction with a binding directive, "
                     "the material is relevant, and nothing restricts it. False means "
-                    "the decline stands regardless of ground_kind."
+                    "the decline stands regardless of ground_kind. Contradicting an "
+                    "INHERITED (ancestor or operator) directive is a decline ground. "
+                    "Conflicting with this scope's OWN directive is NOT: such a "
+                    "proposal is admissible as context. (A session that means to "
+                    "change its own scope's rule does that with an ordinary directive "
+                    "contribution, not through this re-check.)"
                 ),
             },
             "span": {
@@ -3815,7 +3820,7 @@ def _match_other_scopes(content: str, candidates: Sequence[Scope]) -> list[Scope
 #: observation or informant reference must still contain AFTER
 #: :func:`_strip_leading_frame` removes a leading attestation/perception
 #: frame (below). "our"/"ours" also catches "our order", not only "I"/"we".
-_FIRST_PERSON_RE = re.compile(r"\b(i|me|my|we|us|our|ours|myself|ourselves)\b", re.IGNORECASE)
+_FIRST_PERSON_RE = re.compile(r"\b(i|me|my|we|us|our|ours|myself|ourselves|let's)\b", re.IGNORECASE)
 
 #: Philis's ruling (#225 re-gate, fix 4): the verb forms a `telling_span`
 #: must contain, word-bounded — exactly these listed forms, never stemmed
@@ -3840,6 +3845,15 @@ _TELLING_VERBS = (
     "briefed",
 )
 _TELLING_VERB_RE = re.compile(r"\b(?:" + "|".join(_TELLING_VERBS) + r")\b", re.IGNORECASE)
+
+#: Philis's ruling (architect review round 2): JOINT-EVENT verbs are
+#: telling events too, in BOTH #225's own informant check and v1.17 item
+#: 1's own `telling_event` ground — one rule, shared. Each REQUIRES a
+#: party object ("with <party>"): a bare "as discussed, ..." or "as agreed,
+#: ..." names no one and is not a telling event.
+_JOINT_EVENT_VERBS = ("discussed", "agreed", "decided", "met", "sync")
+_JOINT_EVENT_VERB_RE = re.compile(r"\b(?:" + "|".join(_JOINT_EVENT_VERBS) + r")\b", re.IGNORECASE)
+_JOINT_EVENT_PARTY_RE = re.compile(r"\bwith\s+\S", re.IGNORECASE)
 
 #: Articles stripped from a `telling_span` before the first-person-marker
 #: check only — narrower than `_OWN_ROLE_STRIP_WORDS` (no possessives, no
@@ -3970,7 +3984,9 @@ _OUTSIDE_PARTY_EVENT_VERB_RE = re.compile(
 )
 
 
-def _telling_span_problem_for(telling_span: str, *, content: str) -> str | None:
+def _telling_span_problem_for(
+    telling_span: str, *, content: str
+) -> tuple[str | None, Literal["told", "joint"] | None]:
     """#225 re-gate fix 4, Philis's ruling (module-level, shared with issue
     #237 v1.17's attribution re-check): a span that is only a scope's own
     name/id or a collective ("procurement", "the procurement team") is NOT
@@ -3981,8 +3997,22 @@ def _telling_span_problem_for(telling_span: str, *, content: str) -> str | None:
     stemmed), and (c), after stripping articles, a first-person marker — the
     contributor is addressee or audience, the same witness-or-party test
     conduct's own frame-strip applies, because telling IS conduct toward the
-    contributor. Returns the full decline reasoning (sans the "Declined: "
-    prefix) on failure, or ``None`` once verified. *content* is the
+    contributor.
+
+    Architect review round 2, Philis's ruling: a JOINT-EVENT verb
+    (:data:`_JOINT_EVENT_VERBS` — discussed/agreed/decided/met/sync) is a
+    telling event too, PROVIDED it also names a party ("discussed WITH
+    X") — a bare "as discussed, ..." names no one and fails here, before
+    the first-person check even runs. The contributor-present first-person
+    check still applies either way.
+
+    Returns ``(problem, verb_kind)``: *problem* is the full decline
+    reasoning (sans the "Declined: " prefix) on failure, or ``None`` once
+    verified; *verb_kind* is ``"told"`` for one of :data:`_TELLING_VERBS` or
+    ``"joint"`` for one of :data:`_JOINT_EVENT_VERBS` — ``None`` whenever
+    *problem* is not ``None``. Record at the verb's strength: the caller
+    attributes a ``"joint"`` verdict as "in discussion with X: ...", never
+    "X says" — a ``"told"`` verdict keeps that form. *content* is the
     contribution's own text the span must occur in verbatim.
     """
     haystack = " ".join(content.split()).casefold()
@@ -3990,15 +4020,31 @@ def _telling_span_problem_for(telling_span: str, *, content: str) -> str | None:
     if not normalized or normalized.casefold() not in haystack:
         return (
             f"invented informant — the telling event {telling_span!r} does "
-            "not occur in the contribution's own text."
+            "not occur in the contribution's own text.",
+            None,
         )
-    if not _TELLING_VERB_RE.search(normalized):
-        return "no telling event is reported: state who told you."
+    is_joint = bool(_JOINT_EVENT_VERB_RE.search(normalized))
+    is_told = bool(_TELLING_VERB_RE.search(normalized))
+    if not (is_joint or is_told):
+        return "no telling event is reported: state who told you.", None
+    if is_joint:
+        # Addendum (bridge "before" run, j4_joint_verb): "discussed WITH X"
+        # is itself the contributor-present check for a joint verb — the
+        # contributor is the implied counterpart. No separate first-person
+        # marker is required; a bare "as discussed"/"as agreed" with no
+        # party still fails.
+        if not _JOINT_EVENT_PARTY_RE.search(normalized):
+            return (
+                'no telling event is reported: state who was involved ("with <party>").',
+                None,
+            )
+        return None, "joint"
+    # is_told: the first-person requirement is unchanged.
     tokens = [re.sub(r"[^\w-]", "", t) for t in normalized.casefold().split()]
     tokens = [t for t in tokens if t and t not in _TELLING_ARTICLES]
     if not any(t in _TELLING_FIRST_PERSON_WORDS for t in tokens):
-        return "the telling names no one it was told to — state who was told."
-    return None
+        return "the telling names no one it was told to — state who was told.", None
+    return None, "told"
 
 
 # ---------------------------------------------------------------------------
@@ -4110,18 +4156,27 @@ def verify_attribution_ground(
             return False, "declined (span not verbatim)", None
         if not (isinstance(ref_id, str) and ref_id in rendered_refs):
             return False, "declined (ref not visible)", None
-        from strata.publication import _value_tokens  # noqa: PLC0415 — avoids a circular import
+        from strata.publication import (  # noqa: PLC0415 — avoids a circular import
+            _POL_WORDS,
+            _decomposed_value_tokens,
+            value_polarity_flip,
+        )
 
-        span_values = _value_tokens(span)  # type: ignore[arg-type]
         ref_text = rendered_refs[ref_id]
-        ref_values = _value_tokens(ref_text)
-        # #219's gate, reused: every number/id/time/quoted value AND every
-        # polarity word the attributed span states must also appear in the
-        # referenced item's own text — tokenless overlap alone (a bare
-        # shared topic) is necessary, never sufficient (adopted contract
-        # line).
+        # #219's gate, reused, round 2 (architect review of 10327f6's bridge
+        # replay): split into a VALUE check (numbers/ids/quotes — a strict
+        # subset, decomposing a hyphen/slash digit compound like "under-12"
+        # into its atoms first, so it compares against "under 12") and a
+        # POLARITY check (a FLIP, never a presence requirement — "the
+        # directive ON two-person counts" asserts no on/off state at all,
+        # so it must not be vetoed just because "on" is absent from the
+        # referenced item's own text).
+        span_values = _decomposed_value_tokens(span) - _POL_WORDS  # type: ignore[arg-type]
+        ref_values = _decomposed_value_tokens(ref_text) - _POL_WORDS
         if not span_values <= ref_values:
-            return False, "declined (value/polarity mismatch)", None
+            return False, "declined (value mismatch)", None
+        if value_polarity_flip(span, ref_text):  # type: ignore[arg-type]
+            return False, "declined (polarity mismatch)", None
         # Fix 3 (architect review of 10327f6): a span with no value tokens
         # at all passes the subset check trivially, so a span naming a
         # non-entitled scope the referenced item never mentions would
@@ -4164,7 +4219,7 @@ def verify_attribution_ground(
         telling_span = answer.get("telling_span")
         if not (isinstance(telling_span, str) and telling_span.strip()):
             return False, "declined (no telling_span)", None
-        problem = _telling_span_problem_for(telling_span, content=content)
+        problem, _verb_kind = _telling_span_problem_for(telling_span, content=content)
         if problem is not None:
             return False, f"declined (no telling event): {problem}", None
         if not (isinstance(new_context, str) and new_context.strip()):
@@ -4182,7 +4237,26 @@ def verify_attribution_ground(
     if fleet.non_entitled_scopes and _match_other_scopes(content, fleet.non_entitled_scopes):
         return False, "declined (names a non-entitled scope)", None
     stripped = _strip_leading_frame(span)  # type: ignore[arg-type]
-    if not _FIRST_PERSON_RE.search(stripped):
+    # Fix 2 (architect review round 2, bridge replay 2/4): the answerer's
+    # own span can BE the claim itself with no first-person word at all
+    # ("Dome-two's filter wheel jammed twice this week") — the philosopher's
+    # test is that the claim is about the contributor's OWN scope or
+    # conduct, not that the span itself says "I"/"we". Pass when the
+    # SENTENCE containing the span (approximated here as the whole
+    # contribution text — a mechanical simplification, reported) or the
+    # span itself has a first-person marker, OR names the contributor's own
+    # scope by id or name. The non-entitled-scope bar above stays exactly
+    # as it was.
+    has_first_person = bool(_FIRST_PERSON_RE.search(stripped)) or bool(
+        _FIRST_PERSON_RE.search(content)
+    )
+    own_scope_needles = (fleet.contributor_scope_id, fleet.contributor_scope_name)
+    names_own_scope = any(
+        needle and re.search(rf"\b{re.escape(needle)}\b", haystack_text, re.IGNORECASE)
+        for haystack_text in (stripped, content)
+        for needle in own_scope_needles
+    )
+    if not (has_first_person or names_own_scope):
         return False, "declined (not first-hand)", None
     if not (isinstance(new_context, str) and new_context.strip()):
         return False, "declined (no new_context)", None
@@ -4754,7 +4828,9 @@ class ScopeManager:
                     contributor_scope_name=_scope_name_for(new_contribution.contributor.scope_id),
                 )
 
-            def _telling_span_problem(telling_span: str) -> str | None:
+            def _telling_span_problem(
+                telling_span: str,
+            ) -> tuple[str | None, Literal["told", "joint"] | None]:
                 """Thin wrapper over the module-level
                 :func:`_telling_span_problem_for`, filling in this call's
                 own contribution text."""
@@ -4943,7 +5019,7 @@ class ScopeManager:
                     classification,
                     "declined (invented informant)",
                 )
-            telling_problem = _telling_span_problem(telling_span)
+            telling_problem, telling_verb_kind = _telling_span_problem(telling_span)
             if telling_problem is not None:
                 return _noted(
                     judgment.model_copy(
@@ -4969,11 +5045,19 @@ class ScopeManager:
             # it does not own states that claim as unattributed fact in
             # nearly every case, which an addition beside it does not fix.
             previous_context = current_summary.context if current_summary is not None else ""
-            engine_line = (
-                f"{new_contribution.contributor.skill} ({new_contribution.contributor.scope_id}) "
-                f"reports that {informant_span} ({', '.join(s.id for s in matched)}) said: "
-                f"{new_contribution.content}"
-            )
+            # Philis's ruling (architect review round 2): record at the
+            # verb's strength — a JOINT-EVENT verb (discussed/agreed/
+            # decided/met/sync) reads "in discussion with X: ...", never
+            # "X says"; a told/said verb keeps today's form.
+            if telling_verb_kind == "joint":
+                engine_line = f"In discussion with {informant_span}: {new_contribution.content}"
+            else:
+                engine_line = (
+                    f"{new_contribution.contributor.skill} "
+                    f"({new_contribution.contributor.scope_id}) "
+                    f"reports that {informant_span} ({', '.join(s.id for s in matched)}) said: "
+                    f"{new_contribution.content}"
+                )
             replaced_context = (f"{previous_context}\n{engine_line}").strip()
             # ADR 0016 D1: a directive changes only by its issuer's own act —
             # an informant's word is never binding, so it may not admit
@@ -5719,19 +5803,34 @@ class ScopeManager:
         if not attribution_decline_trigger(first.reasoning):
             return first
 
+        # Fix 4 (architect review round 2, replay misses j1-031): each
+        # rendered item is labelled by its ORIGIN, so the re-ask can tell an
+        # INHERITED directive (a real decline ground) from this scope's OWN
+        # directive (never a ground — the contributor is bound to this
+        # scope's own rule, so a conflict with it is admissible as context,
+        # not manufactured attribution).
         rendered_refs: dict[str, str] = {}
+        ref_origins: dict[str, str] = {}
         if current_summary is not None:
-            rendered_refs.update({d.id: d.content for d in current_summary.directives})
-        for _ancestor_id, directives in ancestor_directives or ():
-            rendered_refs.update({d.id: d.content for d in directives})
+            for d in current_summary.directives:
+                rendered_refs[d.id] = d.content
+                ref_origins[d.id] = "own directive"
+        for ancestor_scope_id, directives in ancestor_directives or ():
+            for d in directives:
+                rendered_refs[d.id] = d.content
+                ref_origins[d.id] = f"inherited directive ({ancestor_scope_id})"
         for _attachment_scope_id, items in operator_memory or ():
-            rendered_refs.update({item.id: item.content for item in items})
+            for item in items:
+                rendered_refs[item.id] = item.content
+                ref_origins[item.id] = "operator"
         for items in (current_publication, *(p for _sid, p in peer_publications or ())):
             for item in items or ():
                 rendered_refs[item.id] = item.content
+                ref_origins[item.id] = "publication"
         if parent_publication is not None:
             for item in parent_publication[1]:
                 rendered_refs[item.id] = item.content
+                ref_origins[item.id] = "publication"
 
         all_scopes: dict[str, Scope] = {scope.id: scope}
         non_entitled_scopes: Sequence[Scope] = ()
@@ -5775,7 +5874,10 @@ class ScopeManager:
 
         previous_context = current_summary.context if current_summary is not None else ""
         refs_block = (
-            "\n".join(f"- {rid}: {text}" for rid, text in rendered_refs.items())
+            "\n".join(
+                f"- {rid} [{ref_origins.get(rid, 'unknown')}]: {text}"
+                for rid, text in rendered_refs.items()
+            )
             if rendered_refs
             else "(none rendered)"
         )
@@ -5784,7 +5886,10 @@ class ScopeManager:
             "This contribution was DECLINED citing manufactured attribution:\n"
             f'"{first.reasoning}"\n\n'
             f"CONTRIBUTION TEXT:\n{contribution.content}\n\n"
-            f"ITEMS VISIBLE TO THIS SCOPE (id: text):\n{refs_block}\n\n"
+            f"ITEMS VISIBLE TO THIS SCOPE (id [origin]: text):\n{refs_block}\n\n"
+            "Contradicting an INHERITED (ancestor or operator) directive is a "
+            "decline ground. Conflicting with this scope's OWN directive is NOT "
+            "— such a proposal is admissible as context.\n\n"
             f"CURRENT CONTEXT (rewrite it, keeping everything, adding this item):\n"
             f"{previous_context or '(none)'}\n\n"
             "Call `recheck_attribution` exactly once."

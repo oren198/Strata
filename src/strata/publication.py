@@ -2233,6 +2233,158 @@ def _value_tokens(text: str) -> set[str]:
     return tokens
 
 
+def _decomposed_value_tokens(text: str) -> set[str]:
+    """:func:`_value_tokens`, with one change: a hyphen- or slash-joined
+    compound CONTAINING a digit ("under-12", "j4-822") is decomposed into
+    its atoms — the digit atom normalised as a bare number — INSTEAD OF
+    kept whole, so a value spelled as a compound on one side compares
+    against the same value spelled as plain words on the other ("under-12"
+    vs "under 12") — v1.17 item 1's architect review of 10327f6's bridge
+    replay, round 2: adding the atom BESIDE the whole compound is not
+    enough, because the whole compound ("under-12") then never matches
+    anything on a side that spells it as two plain words, and a strict
+    subset check still fails on that leftover token. Number WORDS still
+    normalise via the same :data:`_NUMBER_WORDS` table :func:`_value_tokens`
+    already uses — nothing new there.
+
+    A SEPARATE function from :func:`_value_tokens`, not a change to it:
+    :func:`observed_value_veto`'s own #219 C gate relies on the whole
+    compound counting as one identifier-shaped token (``j4-822`` as a work
+    item id), and this function's own callers (the attribution and relation
+    re-checks' value-conflict comparisons) need the opposite — this is a
+    deliberate, reported fork, not a shared improvement to the original.
+    """
+    tokens = set(_value_tokens(text))
+    for match in re.finditer(r"[\w]+(?:[-/][\w]+)+", text.casefold()):
+        compound = match.group(0)
+        if not any(c.isdigit() for c in compound):
+            continue
+        tokens.discard(compound)
+        for atom in re.split(r"[-/]", compound):
+            if atom.isdigit():
+                tokens.add(atom)
+            elif atom in _NUMBER_WORDS:
+                tokens.add(_NUMBER_WORDS[atom])
+    return tokens
+
+
+#: #219's own closed POL_WORDS set, paired into antonyms — bidirectional.
+#: "forbidden" and "prohibited" are both treated as the antonym of
+#: "allowed" (near-synonyms of each other, not antonyms).
+_POL_ANTONYMS: dict[str, frozenset[str]] = {
+    "on": frozenset({"off"}),
+    "off": frozenset({"on"}),
+    "before": frozenset({"after"}),
+    "after": frozenset({"before"}),
+    "always": frozenset({"never"}),
+    "never": frozenset({"always"}),
+    "required": frozenset({"optional"}),
+    "optional": frozenset({"required"}),
+    "enabled": frozenset({"disabled"}),
+    "disabled": frozenset({"enabled"}),
+    "open": frozenset({"closed"}),
+    "closed": frozenset({"open"}),
+    "allowed": frozenset({"forbidden", "prohibited"}),
+    "forbidden": frozenset({"allowed"}),
+    "prohibited": frozenset({"allowed"}),
+    "shared": frozenset({"private"}),
+    "private": frozenset({"shared"}),
+    "include": frozenset({"exclude"}),
+    "exclude": frozenset({"include"}),
+    "min": frozenset({"max"}),
+    "max": frozenset({"min"}),
+    "above": frozenset({"below"}),
+    "below": frozenset({"above"}),
+    "first": frozenset({"last"}),
+    "last": frozenset({"first"}),
+}
+
+#: A span restating a claim under negation ("not waived", "no longer
+#: required") states the opposite of the unnegated claim — checked
+#: separately from :data:`_POL_ANTONYMS` because the negated word need not
+#: be one of :data:`_POL_WORDS` at all ("waived" is ordinary vocabulary).
+_NEGATION_MARKERS: tuple[str, ...] = (
+    "no longer",
+    "not",
+    "never",
+    "isn't",
+    "aren't",
+    "doesn't",
+    "don't",
+    "won't",
+    "cannot",
+    "can't",
+)
+
+
+def value_polarity_flip(
+    claim_text: str,
+    reference_text: str,
+    extra_antonym_pairs: Sequence[tuple[str, str]] = (),
+) -> bool:
+    """#219's polarity guard, as a FLIP check — architect review round 2 of
+    10327f6's bridge replay: the PRIOR shape (every :data:`_POL_WORDS` word
+    in the claim must also appear in the reference) over-fires on ordinary
+    vocabulary that happens to be in the closed set ("the clinics directive
+    ON two-person counts" has no polarity assertion at all; "on" is common
+    word, not a claim about on/off state). A polarity word (or a negation)
+    appearing in *claim_text* with NO antonym anywhere in *reference_text*
+    is not a flip — it is simply not vetoed for being absent.
+
+    Two mechanisms, either one sufficient to report a flip:
+
+    - **antonym flip**: a :data:`_POL_ANTONYMS` word (or one of
+      *extra_antonym_pairs*, for a caller-specific antonym pair the closed
+      POL_WORDS set does not cover — v1.17 item 2's own relation antonyms,
+      e.g. "at or below"/"at or above", not in :data:`_POL_WORDS` at all)
+      appears in *claim_text*, its antonym appears in *reference_text*, and
+      *claim_text* itself does not ALSO contain that antonym (a claim that
+      restates both sides, e.g. quoting a change, is not penalised).
+    - **negation flip**: a :data:`_NEGATION_MARKERS` word directly precedes
+      a word in *claim_text* that *reference_text* also states UNNEGATED —
+      "not waived" against a reference stating "waived" is a flip; "waived"
+      against "waived" is not.
+
+    Pure and reusable: shared by v1.17 item 1's own
+    ``directive_or_publication`` ground check and item 2's ``refines``/
+    ``tightens`` fact-mode polarity guard (its own relation antonyms are
+    supplied as *extra_antonym_pairs*) — ONE flip function, not two.
+    """
+    claim_cf = claim_text.casefold()
+    ref_cf = reference_text.casefold()
+
+    antonym_pairs = list(extra_antonym_pairs)
+    for word, antonyms in _POL_ANTONYMS.items():
+        antonym_pairs.extend((word, antonym) for antonym in antonyms)
+
+    for first, second in antonym_pairs:
+        first_re = re.compile(rf"\b{re.escape(first)}\b")
+        second_re = re.compile(rf"\b{re.escape(second)}\b")
+        claim_has_first, claim_has_second = (
+            bool(first_re.search(claim_cf)),
+            bool(second_re.search(claim_cf)),
+        )
+        ref_has_first, ref_has_second = (
+            bool(first_re.search(ref_cf)),
+            bool(second_re.search(ref_cf)),
+        )
+        if claim_has_first and ref_has_second and not ref_has_first:
+            return True
+        if claim_has_second and ref_has_first and not ref_has_second:
+            return True
+
+    negation_alternation = "|".join(re.escape(marker) for marker in _NEGATION_MARKERS)
+    for marker in _NEGATION_MARKERS:
+        for match in re.finditer(rf"\b{re.escape(marker)}\s+(\w+)", claim_cf):
+            word = match.group(1)
+            word_re = re.compile(rf"\b{re.escape(word)}\b")
+            if word_re.search(ref_cf) and not re.search(
+                rf"\b(?:{negation_alternation})\s+{re.escape(word)}\b", ref_cf
+            ):
+                return True
+    return False
+
+
 def observed_value_veto(refuted_claim: str, correcting_content: str, item_content: str) -> bool:
     """#219 C live-gate addition (CEO, standing rule 1 — never trust prompt
     text alone): a mechanical veto that can only PREVENT a withdrawal, never
