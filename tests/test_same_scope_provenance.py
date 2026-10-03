@@ -24,14 +24,17 @@ from fastapi.testclient import TestClient
 
 from strata.app import create_app, get_scope_manager
 from strata.migrator import run_migrations
-from strata.record_store import ContributorRef, RecordStore
+from strata.record_store import ContributorRef, RecentContribution, RecordStore
 from strata.scope_manager import (
     _BATCH_SYSTEM_PROMPT,
     _PUBLICATION_SYSTEM_PROMPT,
     _SYSTEM_PROMPT,
     ScopeManager,
+    _provenance_line,
     _with_held_note,
+    _with_provenance_note,
     is_held_note,
+    strip_provenance_note,
 )
 from strata.settings import Settings
 from strata.summary_store import SummaryStore
@@ -43,6 +46,7 @@ from tests.test_scope_manager import (
     SCOPE,
     SECOND_CONTRIBUTION,
     STRATUM,
+    THIRD_CONTRIBUTION,
     _batch_input,
     _fake_response,
     _judge_batch,
@@ -427,3 +431,128 @@ def test_batch_judge_call_inputs_are_unchanged_except_the_system_prompt() -> Non
     assert kwargs["system"][0]["text"] == _BATCH_SYSTEM_PROMPT
     assert _sha_json(kwargs["messages"]) == _BATCH_MESSAGES_SHA
     assert _sha_json(kwargs["tools"]) == _BATCH_TOOLS_SHA
+
+
+# ---------------------------------------------------------------------------
+# The line is for the record only: it never reaches a later judge's input
+# ---------------------------------------------------------------------------
+
+# sha256 of the `messages` sent for the window scenario below, captured at 3180f1f.
+_WINDOW_SINGLE_MESSAGES_SHA = "02de059d0240dd0a03b2933a5e87a399d7264a37fd79691cf0cbd45fd19d566c"
+_WINDOW_BATCH_MESSAGES_SHA = "7a68852d21313a113a31b389a238ee6fb67811e7810112c0448a1c7ecf402e42"
+
+
+def _window_after_a_bound_change() -> tuple[list[RecentContribution], object, str]:
+    """A bound append judged for real, then laid into the next call's recency window."""
+    mock_client = MagicMock()
+    mock_client.messages.create.return_value = _fake_response(
+        {
+            "decision": "accept_as_directive",
+            "reasoning": "An enforceable rule.",
+            "directive_ops": [{"op": "append"}],
+            "new_context": None,
+        }
+    )
+    first = ScopeManager(client=mock_client).judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=NEW_CONTRIBUTION,
+    )
+    notes = first.record_notes
+    window = [
+        RecentContribution(NEW_CONTRIBUTION, "judged", first.decision, notes),
+        RecentContribution(SECOND_CONTRIBUTION, "pending", None, None),
+    ]
+    summary = first.new_summary.model_copy(update={"updated_at": "2026-05-01T10:00:00+00:00"})
+    return window, summary, notes
+
+
+def test_a_later_single_judge_sees_the_window_exactly_as_before() -> None:
+    window, summary, notes = _window_after_a_bound_change()
+    assert notes == f"An enforceable rule. {_bound_line(f'append {NEW_CONTRIBUTION.id}')}"
+
+    mock_client = MagicMock()
+    mock_client.messages.create.return_value = _fake_response(
+        {"decision": "accept_as_context", "reasoning": "r", "directive_ops": [], "new_context": "x"}
+    )
+    ScopeManager(client=mock_client).judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=summary,
+        recent_contributions=window,
+        new_contribution=SECOND_CONTRIBUTION,
+    )
+    messages = mock_client.messages.create.call_args.kwargs["messages"]
+    rendered = json.dumps(messages)
+    assert "reasoning=An enforceable rule. content=" in rendered
+    assert "[Engine:" not in rendered
+    assert _sha_json(messages) == _WINDOW_SINGLE_MESSAGES_SHA
+
+
+def test_a_later_batch_judge_sees_the_window_exactly_as_before() -> None:
+    window, summary, _notes = _window_after_a_bound_change()
+    window = [*window, RecentContribution(THIRD_CONTRIBUTION, "pending", None, None)]
+    mock_client = MagicMock()
+    mock_client.messages.create.return_value = _fake_response(
+        _batch_input(
+            verdicts=[
+                {
+                    "contribution_id": SECOND_CONTRIBUTION.id,
+                    "decision": "accept_as_context",
+                    "reasoning": "a",
+                },
+                {"contribution_id": THIRD_CONTRIBUTION.id, "decision": "decline", "reasoning": "b"},
+            ],
+            directive_ops=[],
+        )
+    )
+    ScopeManager(client=mock_client).judge_batch(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=summary,
+        recent_contributions=window,
+        new_contributions=[SECOND_CONTRIBUTION, THIRD_CONTRIBUTION],
+    )
+    messages = mock_client.messages.create.call_args.kwargs["messages"]
+    assert "[Engine:" not in json.dumps(messages)
+    assert _sha_json(messages) == _WINDOW_BATCH_MESSAGES_SHA
+
+
+_LINE = _provenance_line(NEW_CONTRIBUTION.contributor, "supersede c_old001→c_new; append c_new")
+
+
+@pytest.mark.parametrize(
+    "notes",
+    [
+        "Plain reasoning.",
+        "",
+        "Reasoning. [Dropped amendment op(s), not applied: retire(c_x).]",
+        "Quotes [Engine: same-scope change by someone earlier.",
+    ],
+)
+def test_strip_round_trips_and_leaves_other_notes_alone(notes: str) -> None:
+    assert strip_provenance_note(_with_provenance_note(notes, _LINE)) == notes
+    assert strip_provenance_note(notes) == notes
+    assert strip_provenance_note(_with_provenance_note(notes, None)) == notes
+
+
+def test_strip_never_removes_the_held_note() -> None:
+    held = _with_held_note("Reasoning.", ["c_old001"])
+    assert strip_provenance_note(held) == held
+    assert is_held_note(strip_provenance_note(held))
+
+
+def test_strip_only_removes_a_trailing_line() -> None:
+    mid = f"Reasoning. {_LINE} trailing judge text."
+    assert strip_provenance_note(mid) == mid
+
+
+def test_the_api_record_read_still_shows_the_line(client: TestClient) -> None:
+    cid, notes = _contribute(client, _append("Ok."))
+    expected = f"Ok. {_line(f'append {cid}')}"
+    assert notes == expected
+    resp = client.get(f"/scopes/{PARENT}/record/{cid}")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["judgment"]["notes"] == expected

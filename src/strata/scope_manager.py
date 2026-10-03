@@ -3093,7 +3093,7 @@ def _render_digest_row(row: RecentContribution, *, verbatim: bool) -> str:
     return (
         f"[{c.id}] at={c.created_at} subject={c.subject or '(none)'} "
         f"state={row.state} decision={row.decision or '(none)'} "
-        f"reasoning={row.judgment_notes or '(none)'} "
+        f"reasoning={strip_provenance_note(row.judgment_notes or '') or '(none)'} "
         f"content={content!r}"
     )
 
@@ -3400,6 +3400,26 @@ def _describe_provenance_ops(
     return "; ".join(parts)
 
 
+#: The provenance line, in parts: ``_PROVENANCE_OPEN`` + who + ``_PROVENANCE_BOUND``
+#: + scope + ``": "`` + op list + ``_PROVENANCE_CLOSE``. :func:`_provenance_line`
+#: writes it and :func:`strip_provenance_note` removes it, both from these
+#: constants, so the two cannot drift.
+_PROVENANCE_OPEN = "[Engine: same-scope change by "
+_PROVENANCE_BOUND = "), bound to "
+_PROVENANCE_CLOSE = (
+    ". This line, not the reasoning above, is the record's account of who changed the directives.]"
+)
+_PROVENANCE_RE = re.compile(
+    " "
+    + re.escape(_PROVENANCE_OPEN)
+    + r".+? \(session .+?"
+    + re.escape(_PROVENANCE_BOUND)
+    + r"[^:]+: .+?"
+    + re.escape(_PROVENANCE_CLOSE),
+    re.DOTALL,
+)
+
+
 def _provenance_line(contributor: ContributorRef, op_list: str) -> str:
     """The engine-written provenance line for a same-scope directive change.
 
@@ -3409,15 +3429,32 @@ def _provenance_line(contributor: ContributorRef, op_list: str) -> str:
     """
     skill = contributor.skill or "(no skill)"
     return (
-        f"[Engine: same-scope change by {skill} (session {contributor.session_id}), "
-        f"bound to {contributor.scope_id}: {op_list}. This line, not the reasoning "
-        "above, is the record's account of who changed the directives.]"
+        f"{_PROVENANCE_OPEN}{skill} (session {contributor.session_id}"
+        f"{_PROVENANCE_BOUND}{contributor.scope_id}: {op_list}{_PROVENANCE_CLOSE}"
     )
 
 
 def _with_provenance_note(notes: str, line: str | None) -> str:
     """Return *notes* plus the provenance line, when there is one."""
     return notes if line is None else f"{notes} {line}"
+
+
+def strip_provenance_note(notes: str) -> str:
+    """Return *notes* without a trailing provenance line and its leading space.
+
+    The provenance line is for the audit record only; every render of recorded
+    notes into a judge call goes through here, so a later judge sees exactly
+    what it saw before the line existed. End-anchored and read from the LAST
+    opener, so the judge's own reasoning quoting similar words earlier in the
+    notes is never touched. Notes without the line come back unchanged; the
+    held note is never removed.
+    """
+    start = notes.rfind(f" {_PROVENANCE_OPEN}")
+    if start < 0 or not notes.endswith(_PROVENANCE_CLOSE):
+        return notes
+    if _PROVENANCE_RE.fullmatch(notes, start) is None:
+        return notes
+    return notes[:start]
 
 
 def _batch_provenance(
