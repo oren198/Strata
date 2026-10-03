@@ -55,6 +55,27 @@ the release PR (`dev` → `main`) and the GitHub Release body are built from
   See the README's J4 row and ADR 0016 D2's dated note (2026-10-02, #225) for
   the measured gate and the full rulings.
 
+- **"Discussed with X" now counts as a telling event (#225 widened).** "Discussed
+  with X", "agreed with X", "decided with X", "met with X" and "in our sync with
+  X", with the contributor present, are telling events in #225's informant and
+  conduct checks (the philosopher's ruling, 2026-10-03). A bare "as discussed,
+  …" names nobody and still fails. Hearsay from a joint verb is recorded at that
+  verb's strength ("In discussion with X: …"), never as "X says".
+
+- **A decline for "no one spoke" now gets one re-check, and can become context
+  (attribution over-decline).** When an ordinary judgment declines a
+  contribution for manufactured attribution, a second targeted judge call names
+  the contribution's actual ground: a rendered directive or publication it
+  quotes, a named outside party's publishing act, a telling event the
+  contributor was in, or the contributor's own first-hand claim. The engine
+  verifies that answer against the contribution's text. Only a verified ground
+  reverses the decline, and only ever to context, never to a directive. Every
+  other decline ground still stands, and any failure leaves the first decline
+  unchanged. A rescue must ground every claim the contribution attributes to its
+  source. Not covered: aliases ("the purchasing team"), the batch path, and a
+  conduct observation that names another scope
+  ([evidence](docs/evidence/v1.17-attribution-recheck-2026-10-03.md)).
+
 ### Added
 
 - **Optional provider pinning for an OpenRouter judge, `JUDGE_PROVIDER` /
