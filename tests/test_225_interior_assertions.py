@@ -138,13 +138,18 @@ def test_alias_text_does_not_trigger() -> None:
 
 
 def test_a_decline_never_triggers() -> None:
-    """Only an ACCEPT triggers — a decline has nothing to verify."""
+    """Only an ACCEPT triggers #225's own interior-assertion re-ask — a
+    decline has nothing to verify there. Reasoning deliberately avoids v1.17
+    item 1's own trigger phrases ("manufactured attribution", "no one
+    spoke", ...), which legitimately fire a DIFFERENT re-ask on a decline —
+    that the two never confuse each other is covered by that item's own
+    tests, not here."""
     mock_client = MagicMock()
     content = "225-other-scope only approves changes under budget."
     mock_client.messages.create.return_value = _fake_response(
         {
             "decision": "decline",
-            "reasoning": "Manufactured attribution.",
+            "reasoning": "Declined: contradicts a binding directive.",
             "directive_ops": [],
             "new_context": None,
         }

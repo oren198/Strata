@@ -738,6 +738,116 @@ INTERIOR_ASSERTION_TOOL: dict = {
 }
 
 # ---------------------------------------------------------------------------
+# Attribution re-check tool (v1.17 item 1 — #225 in reverse, a decline-only
+# re-ask). A SEPARATE tool, never a `_judge_tool_for` variant of the ordinary
+# one: the FIRST call's tool/prompt stays byte-identical whether or not this
+# re-ask ever fires (input identity) — the same discipline #225's own tool
+# keeps.
+# ---------------------------------------------------------------------------
+
+ATTRIBUTION_RECHECK_TOOL: dict = {
+    "name": "recheck_attribution",
+    "description": (
+        "Your decline cited manufactured attribution — no one spoke. Re-check ONLY "
+        "that one ground: does the contribution's own text actually attribute its "
+        "claim to something — a rendered directive or publication, a named outside "
+        "party's publishing act, a telling event the contributor was in, or the "
+        "contributor's own first-hand observation of its own scope? Every OTHER "
+        "ground for the original decline (contradiction with a binding directive, "
+        "relevance, directive-restricted material) still applies — you must say so."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "ground_kind": {
+                "type": "string",
+                "enum": [
+                    "directive_or_publication",
+                    "outside_party",
+                    "telling_event",
+                    "first_hand_own",
+                    "none",
+                ],
+                "description": (
+                    "directive_or_publication: grounded in a directive or publication "
+                    "item actually rendered to you. outside_party: a named party that "
+                    "is NOT a fleet scope did a publishing/telling act (published, "
+                    "announced, released, issued, posted). telling_event: a telling "
+                    "event the contributor was addressee or audience to. "
+                    "first_hand_own: the contributor's own first-hand observation or "
+                    "proposal about its OWN scope or conduct, naming no other fleet "
+                    "scope. none: the decline stands — still manufactured attribution."
+                ),
+            },
+            "other_grounds_clear": {
+                "type": "boolean",
+                "description": (
+                    "Required. True only if EVERY other ground for the original "
+                    "decline is also clear: no contradiction with a binding directive, "
+                    "the material is relevant, and nothing restricts it. False means "
+                    "the decline stands regardless of ground_kind."
+                ),
+            },
+            "span": {
+                "type": "string",
+                "description": (
+                    "Required for ground_kind directive_or_publication or "
+                    "first_hand_own: the EXACT verbatim span of the contribution's own "
+                    "text carrying the attributed claim (directive_or_publication) or "
+                    "the first-hand observation/proposal (first_hand_own)."
+                ),
+            },
+            "ref_id": {
+                "type": "string",
+                "description": (
+                    "Required for ground_kind directive_or_publication: the id of the "
+                    "directive or publication item actually rendered to you that "
+                    "`span` attributes the claim to."
+                ),
+            },
+            "party_span": {
+                "type": "string",
+                "description": (
+                    "Required for ground_kind outside_party: the EXACT verbatim span "
+                    "naming the outside party (not a fleet scope)."
+                ),
+            },
+            "act_span": {
+                "type": "string",
+                "description": (
+                    "Required for ground_kind outside_party: the EXACT verbatim span "
+                    "describing that party's publishing/telling EVENT (published, "
+                    "announced, released, issued, posted), not a standing position."
+                ),
+            },
+            "telling_span": {
+                "type": "string",
+                "description": (
+                    "Required for ground_kind telling_event: the EXACT verbatim span "
+                    "describing the telling event itself — a telling verb, and the "
+                    "contributor named as addressee or audience."
+                ),
+            },
+            "new_context": {
+                "type": "string",
+                "description": (
+                    "Required when ground_kind is not 'none' and other_grounds_clear is "
+                    "true, EXCEPT outside_party (the engine writes that attribution "
+                    "line itself): the full replacement context section, admitting this "
+                    "contribution's content as context, in the same shape an ordinary "
+                    "accept_as_context verdict would write."
+                ),
+            },
+            "reasoning": {
+                "type": "string",
+                "description": "One or two sentences explaining the re-check's verdict.",
+            },
+        },
+        "required": ["ground_kind", "other_grounds_clear", "reasoning"],
+    },
+}
+
+# ---------------------------------------------------------------------------
 # System prompt (static — eligible for prompt caching)
 # ---------------------------------------------------------------------------
 
@@ -2525,6 +2635,17 @@ class ScopeManagerJudgment(_AmendmentJudgment):
     actually accepted, not only that something was. Absent on every decline
     and on every other classification."""
 
+    attribution_recheck: dict | None = None
+    """v1.17 item 1 (#225 in reverse): ``{"ground_kind": <kind or None>,
+    "other_grounds_clear": <bool or None>, "result": <result string>}``
+    whenever the attribution re-check fired (an ordinary decline whose
+    reasoning cited manufactured attribution) — ``None`` otherwise.
+    ``ground_kind``/``other_grounds_clear`` are ``None`` only for the "judge
+    failure" result (the re-ask's own answer was unreadable). Mirrors
+    :attr:`interior_assertion`'s shape, the structured twin of the fixed
+    marker this also appends to :attr:`protocol_notes`
+    ("attribution recheck: <ground_kind>, <result>")."""
+
     @property
     def record_notes(self) -> str:
         """The verdict text written to the judgment record.
@@ -3781,6 +3902,263 @@ def _strip_leading_frame(text: str) -> str:
     return _LEADING_FRAME_RE.sub("", text, count=1)
 
 
+#: #225: possessive determiners/articles/"as" stripped from a span before
+#: :func:`_own_role_or_first_person_span`'s own-voice check — see that
+#: function's docstring for why ("my colleague Lena Fischer" must not
+#: over-decline on the possessive alone).
+_OWN_ROLE_STRIP_WORDS = frozenset({"my", "our", "a", "an", "the", "as"})
+#: CEO ruling (via the architect): a collective noun — "team", "group",
+#: "department", "folks", "people" — is HELD OUT of the strip set for now.
+#: ADR 0016's informant is "a person OR PARTY who told the agent", and "the
+#: procurement team told us in Tuesday's sync" may be a legitimate party
+#: informant — Philis is still ruling on it. Only the bare id/name half of
+#: fix 4 ships here; do not add these words without a further instruction.
+_OWN_ROLE_PRONOUNS = frozenset({"i", "me", "we", "us", "myself", "ourselves"})
+
+
+def _own_role_remaining_tokens(span: str) -> list[str]:
+    """Normalise *span*, strip punctuation per token, and drop
+    :data:`_OWN_ROLE_STRIP_WORDS` — the first step of
+    :func:`_own_role_or_first_person_span`."""
+    normalized = " ".join(span.split()).casefold()
+    tokens = [re.sub(r"[^\w-]", "", t) for t in normalized.split()]
+    tokens = [t for t in tokens if t]
+    return [t for t in tokens if t not in _OWN_ROLE_STRIP_WORDS]
+
+
+def _own_role_or_first_person_span(
+    span: str,
+    *,
+    skill: str | None,
+    contributor_scope_id: str,
+    contributor_scope_name: str | None,
+) -> str | None:
+    """#225, narrowed per the architect's follow-up review (module-level,
+    shared with issue #237 v1.17's attribution re-check): the span must BE
+    the contributor, not merely MENTION them. "my colleague Lena Fischer"
+    mentions a first-person possessive but names a genuine third party, so a
+    plain CONTAINS check over-declines it. Instead: normalise, drop
+    possessive determiners/articles/"as", and reject only if EVERY remaining
+    word is the contributor's own skill, their own scope id/name, or a bare
+    first-person pronoun. Returns the reason to decline with (#225) / the
+    reason the span fails as ground (attribution re-check), or ``None`` if
+    the span names a genuine third party / is genuinely the contributor's
+    own voice, depending on the caller's own question.
+    """
+    remaining = _own_role_remaining_tokens(span)
+    if not remaining:
+        return None
+
+    skill_tokens = set((skill or "").strip().casefold().split())
+    own_tokens: set[str] = set(skill_tokens)
+    for candidate in filter(None, (contributor_scope_id, contributor_scope_name)):
+        own_tokens.update(candidate.casefold().split())
+    allowed = own_tokens | _OWN_ROLE_PRONOUNS
+
+    if all(t in allowed for t in remaining):
+        return "the contributor's own role is not an informant"
+    return None
+
+
+#: v1.17 item 1, the philosopher's adopted contract line: "the act must be
+#: an EVENT ('published', 'announced', 'released', 'issued', 'posted'), not
+#: a standing 'says'" — word-bounded, never stemmed, same discipline as
+#: :data:`_TELLING_VERB_RE`.
+_OUTSIDE_PARTY_EVENT_VERBS = ("published", "announced", "released", "issued", "posted")
+_OUTSIDE_PARTY_EVENT_VERB_RE = re.compile(
+    r"\b(?:" + "|".join(_OUTSIDE_PARTY_EVENT_VERBS) + r")\b", re.IGNORECASE
+)
+
+
+def _telling_span_problem_for(telling_span: str, *, content: str) -> str | None:
+    """#225 re-gate fix 4, Philis's ruling (module-level, shared with issue
+    #237 v1.17's attribution re-check): a span that is only a scope's own
+    name/id or a collective ("procurement", "the procurement team") is NOT
+    automatically invented — ADR 0016's informant is "a person OR PARTY who
+    told the agent", and a party can tell. What must verify instead is the
+    TELLING EVENT itself: ``telling_span``, a verbatim quote containing (b)
+    a telling verb, word-bounded, any of the listed forms only (never
+    stemmed), and (c), after stripping articles, a first-person marker — the
+    contributor is addressee or audience, the same witness-or-party test
+    conduct's own frame-strip applies, because telling IS conduct toward the
+    contributor. Returns the full decline reasoning (sans the "Declined: "
+    prefix) on failure, or ``None`` once verified. *content* is the
+    contribution's own text the span must occur in verbatim.
+    """
+    haystack = " ".join(content.split()).casefold()
+    normalized = " ".join(telling_span.split())
+    if not normalized or normalized.casefold() not in haystack:
+        return (
+            f"invented informant — the telling event {telling_span!r} does "
+            "not occur in the contribution's own text."
+        )
+    if not _TELLING_VERB_RE.search(normalized):
+        return "no telling event is reported: state who told you."
+    tokens = [re.sub(r"[^\w-]", "", t) for t in normalized.casefold().split()]
+    tokens = [t for t in tokens if t and t not in _TELLING_ARTICLES]
+    if not any(t in _TELLING_FIRST_PERSON_WORDS for t in tokens):
+        return "the telling names no one it was told to — state who was told."
+    return None
+
+
+# ---------------------------------------------------------------------------
+# v1.17 item 1 — attribution over-decline re-check (#225 in reverse). Pure,
+# judge-free pieces, per the architect's build requirement (the bridge runs
+# gates by calling these directly, with recorded or forced declines — never
+# a live key): the trigger, and the mechanical ground verifier, are both
+# plain functions with no API call inside them. The one piece that DOES call
+# the judge (:meth:`ScopeManager.recheck_attribution_decline`) is a real
+# method, callable with a GIVEN first judgment — a harness supplies one,
+# real or forced, instead of this module ever minting it.
+# ---------------------------------------------------------------------------
+
+_ATTRIBUTION_DECLINE_MARKERS = (
+    "manufactured attribution",
+    "no one spoke",
+    "no informant",
+    "no speaker",
+)
+
+
+def attribution_decline_trigger(reasoning: str | None) -> bool:
+    """Does *reasoning* (an ordinary judgment's own decline text) cite
+    manufactured attribution — the fixed marker set the prompt's own decline
+    wording uses? Pure and judge-free: a harness replays this over a corpus
+    of recorded reasonings with no API call at all."""
+    reasoning_cf = (reasoning or "").casefold()
+    return any(marker in reasoning_cf for marker in _ATTRIBUTION_DECLINE_MARKERS)
+
+
+@dataclass(frozen=True)
+class AttributionFleetContext:
+    """Everything :func:`verify_attribution_ground` needs about the fleet and
+    the contributor to check ``outside_party`` (not a fleet scope) and
+    ``first_hand_own`` (names no non-entitled scope) — bundled so the
+    function's own signature stays ``(answer, content, rendered_refs,
+    fleet)``, matching the architect's own suggested shape."""
+
+    all_scopes: Sequence[Scope]
+    non_entitled_scopes: Sequence[Scope]
+    contributor_scope_id: str
+    contributor_scope_name: str | None
+    contributor_skill: str | None
+
+
+def verify_attribution_ground(
+    answer: dict,
+    content: str,
+    rendered_refs: Mapping[str, str],
+    fleet: AttributionFleetContext,
+) -> tuple[bool, str, str | None]:
+    """The mechanical verifier, pure and judge-free: given the re-ask's own
+    raw answer (``answer`` — the ``recheck_attribution`` tool's parsed
+    input), the contribution's own text, a map of every id visible to this
+    call to ITS OWN text (:func:`ScopeManager._visible_ref_ids`'s partner,
+    built by the caller), and the fleet/contributor context, decide whether
+    the cited ground actually holds.
+
+    Returns ``(ok, reason, context_text)``: ``ok`` is whether the ground
+    verifies (and ``other_grounds_clear`` was true); ``reason`` is a short
+    human-readable verdict, always present; ``context_text`` is the full
+    replacement context to accept with (``None`` on failure, or for
+    ``outside_party``, which the caller writes with its own fixed
+    "according to <party>'s <act>" line instead of the judge's own text —
+    see contract line 3).
+
+    Any missing/invalid field, or ``other_grounds_clear`` false, fails
+    closed — ``ok=False`` — per the general line: the decline stands.
+    """
+    ground_kind = answer.get("ground_kind")
+    if ground_kind not in (
+        "directive_or_publication",
+        "outside_party",
+        "telling_event",
+        "first_hand_own",
+        "none",
+    ):
+        return False, f"unreadable ground_kind {ground_kind!r}", None
+
+    other_grounds_clear = answer.get("other_grounds_clear")
+    if not isinstance(other_grounds_clear, bool):
+        return False, "other_grounds_clear is a required bool", None
+
+    if ground_kind == "none":
+        return False, "declined (manufactured attribution stands)", None
+    if not other_grounds_clear:
+        return False, "declined (other grounds not clear)", None
+
+    def _verbatim(span: object) -> bool:
+        if not (isinstance(span, str) and span.strip()):
+            return False
+        haystack = " ".join(content.split()).casefold()
+        normalized = " ".join(span.split())
+        return normalized.casefold() in haystack
+
+    new_context = answer.get("new_context")
+
+    if ground_kind == "directive_or_publication":
+        span = answer.get("span")
+        ref_id = answer.get("ref_id")
+        if not _verbatim(span):
+            return False, "declined (span not verbatim)", None
+        if not (isinstance(ref_id, str) and ref_id in rendered_refs):
+            return False, "declined (ref not visible)", None
+        from strata.publication import _value_tokens  # noqa: PLC0415 — avoids a circular import
+
+        span_values = _value_tokens(span)  # type: ignore[arg-type]
+        ref_values = _value_tokens(rendered_refs[ref_id])
+        # #219's gate, reused: every number/id/time/quoted value AND every
+        # polarity word the attributed span states must also appear in the
+        # referenced item's own text — tokenless overlap alone (a bare
+        # shared topic) is necessary, never sufficient (adopted contract
+        # line).
+        if not span_values <= ref_values:
+            return False, "declined (value/polarity mismatch)", None
+        if not (isinstance(new_context, str) and new_context.strip()):
+            return False, "declined (no new_context)", None
+        return True, f"admitted (rescued, grounded in {ref_id})", new_context
+
+    if ground_kind == "outside_party":
+        party_span = answer.get("party_span")
+        act_span = answer.get("act_span")
+        if not (_verbatim(party_span) and _verbatim(act_span)):
+            return False, "declined (span not verbatim)", None
+        if _match_other_scopes(party_span, fleet.all_scopes):  # type: ignore[arg-type]
+            return False, "declined (party is a fleet scope)", None
+        if not _OUTSIDE_PARTY_EVENT_VERB_RE.search(act_span):  # type: ignore[arg-type]
+            return False, "declined (no event verb)", None
+        engine_line = f"According to {party_span}'s {act_span}: {content}"
+        return True, "admitted (rescued, context replaced)", engine_line
+
+    if ground_kind == "telling_event":
+        telling_span = answer.get("telling_span")
+        if not (isinstance(telling_span, str) and telling_span.strip()):
+            return False, "declined (no telling_span)", None
+        problem = _telling_span_problem_for(telling_span, content=content)
+        if problem is not None:
+            return False, f"declined (no telling event): {problem}", None
+        if not (isinstance(new_context, str) and new_context.strip()):
+            return False, "declined (no new_context)", None
+        return True, "admitted (rescued)", new_context
+
+    # ground_kind == "first_hand_own"
+    span = answer.get("span")
+    if not _verbatim(span):
+        return False, "declined (span not verbatim)", None
+    # Barred mechanically when a non-entitled scope is named anywhere in
+    # the contribution — an interior assertion about another scope can
+    # never be rescued by this path (the general line's own stated reason
+    # this re-check cannot open #225's hole).
+    if fleet.non_entitled_scopes and _match_other_scopes(content, fleet.non_entitled_scopes):
+        return False, "declined (names a non-entitled scope)", None
+    stripped = _strip_leading_frame(span)  # type: ignore[arg-type]
+    if not _FIRST_PERSON_RE.search(stripped):
+        return False, "declined (not first-hand)", None
+    if not (isinstance(new_context, str) and new_context.strip()):
+        return False, "declined (no new_context)", None
+    return True, "admitted (rescued)", new_context
+
+
 # ---------------------------------------------------------------------------
 # ScopeManager
 # ---------------------------------------------------------------------------
@@ -4225,6 +4603,35 @@ class ScopeManager:
                 ids.update(item.id for item in parent_publication[1])
             return ids
 
+        def _referenced_item_text(ref_id: str) -> str | None:
+            """v1.17 item 1: the verbatim text of whatever :func:`_visible_ref_ids`
+            member *ref_id* names — a directive, operator memory item, or
+            published item — or ``None`` if it cannot be found among what this
+            call actually rendered. Every source :func:`_visible_ref_ids`
+            itself scans, in the same order, so an id visible there always
+            resolves here too."""
+            if current_summary is not None:
+                for d in current_summary.directives:
+                    if d.id == ref_id:
+                        return d.content
+            for _ancestor_id, directives in ancestor_directives or ():
+                for d in directives:
+                    if d.id == ref_id:
+                        return d.content
+            for _attachment_scope_id, items in operator_memory or ():
+                for item in items:
+                    if item.id == ref_id:
+                        return item.content
+            for items in (current_publication, *(p for _sid, p in peer_publications or ())):
+                for item in items or ():
+                    if item.id == ref_id:
+                        return item.content
+            if parent_publication is not None:
+                for item in parent_publication[1]:
+                    if item.id == ref_id:
+                        return item.content
+            return None
+
         def _check_interior_assertion(
             judgment: ScopeManagerJudgment,
             messages: list[dict],
@@ -4306,83 +4713,22 @@ class ScopeManager:
                                 return candidate.name
                 return None
 
-            _OWN_ROLE_STRIP_WORDS = {"my", "our", "a", "an", "the", "as"}
-            # CEO ruling (via the architect): a collective noun — "team",
-            # "group", "department", "folks", "people" — is HELD OUT of the
-            # strip set for now. ADR 0016's informant is "a person OR PARTY
-            # who told the agent", and "the procurement team told us in
-            # Tuesday's sync" may be a legitimate party informant — Philis is
-            # still ruling on it. Only the bare id/name half of fix 4 ships
-            # here; do not add these words without a further instruction.
-            _OWN_ROLE_PRONOUNS = {"i", "me", "we", "us", "myself", "ourselves"}
-
-            def _remaining_tokens(span: str) -> list[str]:
-                """Normalise *span*, strip punctuation per token, and drop
-                :data:`_OWN_ROLE_STRIP_WORDS` — the first step of
-                :func:`_own_role_or_first_person`."""
-                normalized = " ".join(span.split()).casefold()
-                tokens = [re.sub(r"[^\w-]", "", t) for t in normalized.split()]
-                tokens = [t for t in tokens if t]
-                return [t for t in tokens if t not in _OWN_ROLE_STRIP_WORDS]
-
             def _own_role_or_first_person(span: str) -> str | None:
-                """#225, narrowed per the architect's follow-up review: the
-                span must BE the contributor, not merely MENTION them.
-                "my colleague Lena Fischer" mentions a first-person
-                possessive but names a genuine third party, so a plain
-                CONTAINS check over-declines it. Instead: normalise, drop
-                possessive determiners/articles/"as", and reject only if
-                EVERY remaining word is the contributor's own skill, their
-                own scope id/name, or a bare first-person pronoun. Returns
-                the reason to decline with, or ``None`` if the span names a
-                genuine third party.
-                """
-                remaining = _remaining_tokens(span)
-                if not remaining:
-                    return None
-
-                skill = (new_contribution.contributor.skill or "").strip().casefold()
-                skill_tokens = set(skill.split())
-                contributor_scope_id = new_contribution.contributor.scope_id
-                contributor_scope_name = _scope_name_for(contributor_scope_id)
-                own_tokens: set[str] = set(skill_tokens)
-                for candidate in filter(None, (contributor_scope_id, contributor_scope_name)):
-                    own_tokens.update(candidate.casefold().split())
-                allowed = own_tokens | _OWN_ROLE_PRONOUNS
-
-                if all(t in allowed for t in remaining):
-                    return "the contributor's own role is not an informant"
-                return None
+                """Thin wrapper over the module-level
+                :func:`_own_role_or_first_person_span`, filling in this
+                call's own contributor identity."""
+                return _own_role_or_first_person_span(
+                    span,
+                    skill=new_contribution.contributor.skill,
+                    contributor_scope_id=new_contribution.contributor.scope_id,
+                    contributor_scope_name=_scope_name_for(new_contribution.contributor.scope_id),
+                )
 
             def _telling_span_problem(telling_span: str) -> str | None:
-                """#225 re-gate fix 4, Philis's ruling: a span that is only a
-                scope's own name/id or a collective ("procurement", "the
-                procurement team") is NOT automatically invented — ADR 0016's
-                informant is "a person OR PARTY who told the agent", and a
-                party can tell. What must verify instead is the TELLING EVENT
-                itself: ``telling_span``, a verbatim quote containing (b) a
-                telling verb, word-bounded, any of the listed forms only
-                (never stemmed), and (c), after stripping articles, a
-                first-person marker — the contributor is addressee or
-                audience, the same witness-or-party test conduct's own
-                frame-strip applies, because telling IS conduct toward the
-                contributor. Returns the full decline reasoning (sans the
-                "Declined: " prefix) on failure, or ``None`` once verified.
-                """
-                haystack = " ".join(new_contribution.content.split()).casefold()
-                normalized = " ".join(telling_span.split())
-                if not normalized or normalized.casefold() not in haystack:
-                    return (
-                        f"invented informant — the telling event {telling_span!r} does "
-                        "not occur in the contribution's own text."
-                    )
-                if not _TELLING_VERB_RE.search(normalized):
-                    return "no telling event is reported: state who told you."
-                tokens = [re.sub(r"[^\w-]", "", t) for t in normalized.casefold().split()]
-                tokens = [t for t in tokens if t and t not in _TELLING_ARTICLES]
-                if not any(t in _TELLING_FIRST_PERSON_WORDS for t in tokens):
-                    return "the telling names no one it was told to — state who was told."
-                return None
+                """Thin wrapper over the module-level
+                :func:`_telling_span_problem_for`, filling in this call's
+                own contribution text."""
+                return _telling_span_problem_for(telling_span, content=new_contribution.content)
 
             corrective_text = (
                 "Your accepted contribution names another fleet scope this scope "
@@ -4781,12 +5127,32 @@ class ScopeManager:
             parse_generic_decline=_generic_second_slip_decline,
             is_outcome_report=acted_on_target is not None,
             acted_on_is_directive=acted_on_target is not None and acted_on_target.is_directive,
-            # #225: ordinary contributions only — never an outcome report
-            # (its own narrowed tool/ground already covers that ground
-            # separately) and never a batch (single-path only this item;
-            # #236-shaped limit, stated in its own PR).
+            # #225 / v1.17 item 1: ordinary contributions only — never an
+            # outcome report (its own narrowed tool/ground already covers
+            # that ground separately) and never a batch (single-path only
+            # either item; #236-shaped limit, stated in #225's own PR).
+            # Composed in sequence: #225 only ever acts on an ACCEPT, the
+            # attribution re-check only ever acts on a DECLINE, so applying
+            # one after the other is safe regardless of order.
             post_judgment=(
-                _check_interior_assertion
+                (
+                    lambda judgment, messages, response, tool_use_block: (
+                        self.recheck_attribution_decline(
+                            _check_interior_assertion(judgment, messages, response, tool_use_block),
+                            scope=scope,
+                            contribution=new_contribution,
+                            current_summary=current_summary,
+                            entitlement=entitlement,
+                            ancestor_directives=ancestor_directives,
+                            operator_memory=operator_memory,
+                            current_publication=current_publication,
+                            peer_publications=peer_publications,
+                            parent_publication=parent_publication,
+                            change_id=change_id,
+                            hop=hop,
+                        )
+                    )
+                )
                 if acted_on_target is None and mode == "ordinary"
                 else None
             ),
@@ -5280,6 +5646,187 @@ class ScopeManager:
             judgment = post_judgment(judgment, first_messages, response, tool_use_block)
 
         return judgment
+
+    def recheck_attribution_decline(
+        self,
+        first: ScopeManagerJudgment,
+        *,
+        scope: Scope,
+        contribution: Contribution,
+        current_summary: ScopeSummary | None = None,
+        entitlement: EntitlementView | None = None,
+        ancestor_directives: Sequence[tuple[str, Sequence[Directive]]] | None = None,
+        operator_memory: list[tuple[str, list[OperatorItem]]] | None = None,
+        current_publication: Sequence[_PublishedItemLike] | None = None,
+        peer_publications: Sequence[tuple[str, Sequence[_PublishedItemLike]]] | None = None,
+        parent_publication: tuple[str, Sequence[_PublishedItemLike]] | None = None,
+        change_id: str | None = None,
+        hop: int = 0,
+    ) -> ScopeManagerJudgment:
+        """v1.17 item 1 (#225 in reverse): given a FIRST judgment (real or
+        forced), re-check a decline that cites manufactured attribution.
+
+        Callable two ways: :meth:`judge` calls this itself, right after its
+        own first call, with *first* being that call's real verdict — the
+        ordinary path. A harness (the bridge gate) also calls this directly
+        with a GIVEN *first* — either a recorded real decline (replay) or a
+        synthetic forced decline on every item (forced re-ask) — with no
+        live first call of its own. Either way, this method is the only one
+        that makes a (real) API call: :func:`attribution_decline_trigger`
+        (the pure gate on whether to fire at all) and
+        :func:`verify_attribution_ground` (the pure mechanical check on the
+        re-ask's own answer) are both plain functions a harness can call with
+        no judge at all, for a dataset-wide dry run before spending anything.
+
+        Never touches an ACCEPT, and never touches a decline
+        :meth:`judge`'s OWN #225 interior-assertion re-ask just produced
+        (``first.interior_assertion is not None``) — see
+        :data:`_ATTRIBUTION_DECLINE_MARKERS`'s own docstring for why that
+        guard exists (the SAME words, an unrelated concept).
+        """
+        if first.decision != "decline" or first.interior_assertion is not None:
+            return first
+        if not attribution_decline_trigger(first.reasoning):
+            return first
+
+        rendered_refs: dict[str, str] = {}
+        if current_summary is not None:
+            rendered_refs.update({d.id: d.content for d in current_summary.directives})
+        for _ancestor_id, directives in ancestor_directives or ():
+            rendered_refs.update({d.id: d.content for d in directives})
+        for _attachment_scope_id, items in operator_memory or ():
+            rendered_refs.update({item.id: item.content for item in items})
+        for items in (current_publication, *(p for _sid, p in peer_publications or ())):
+            for item in items or ():
+                rendered_refs[item.id] = item.content
+        if parent_publication is not None:
+            for item in parent_publication[1]:
+                rendered_refs[item.id] = item.content
+
+        all_scopes: dict[str, Scope] = {scope.id: scope}
+        non_entitled_scopes: Sequence[Scope] = ()
+        if entitlement is not None:
+            non_entitled_scopes = entitlement.others
+            for group in (
+                entitlement.chain,
+                entitlement.descendants,
+                entitlement.referenced_peers,
+                entitlement.others,
+            ):
+                for candidate in group:
+                    all_scopes.setdefault(candidate.id, candidate)
+        fleet = AttributionFleetContext(
+            all_scopes=list(all_scopes.values()),
+            non_entitled_scopes=non_entitled_scopes,
+            contributor_scope_id=contribution.contributor.scope_id,
+            contributor_scope_name=all_scopes.get(contribution.contributor.scope_id, scope).name,
+            contributor_skill=contribution.contributor.skill,
+        )
+
+        def _noted(
+            updated: ScopeManagerJudgment,
+            ground_kind: str | None,
+            other_grounds_clear: bool | None,
+            result: str,
+        ) -> ScopeManagerJudgment:
+            return updated.model_copy(
+                update={
+                    "protocol_notes": [
+                        *updated.protocol_notes,
+                        f"attribution recheck: {ground_kind}, {result}",
+                    ],
+                    "attribution_recheck": {
+                        "ground_kind": ground_kind,
+                        "other_grounds_clear": other_grounds_clear,
+                        "result": result,
+                    },
+                }
+            )
+
+        def _failure_decline(detail: str) -> ScopeManagerJudgment:
+            return ScopeManagerJudgment(
+                decision="decline",
+                reasoning=(
+                    f"judge failure: the attribution re-check response was "
+                    f"unreadable ({detail}); declined without a verdict on the merits"
+                ),
+                new_summary=None,
+                change_id=change_id,
+                hop=hop,
+                judge_failure=True,
+            )
+
+        refs_block = (
+            "\n".join(f"- {rid}: {text}" for rid, text in rendered_refs.items())
+            if rendered_refs
+            else "(none rendered)"
+        )
+        user_message = (
+            f"SCOPE: {scope.name} (id={scope.id})\n\n"
+            "This contribution was DECLINED citing manufactured attribution:\n"
+            f'"{first.reasoning}"\n\n'
+            f"CONTRIBUTION TEXT:\n{contribution.content}\n\n"
+            f"ITEMS VISIBLE TO THIS SCOPE (id: text):\n{refs_block}\n\n"
+            "Call `recheck_attribution` exactly once."
+        )
+        try:
+            reask_response = self._messages_create(
+                model=self._model,
+                max_tokens=512,
+                system=[
+                    {
+                        "type": "text",
+                        "text": _SYSTEM_PROMPT,
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ],
+                tools=[{**ATTRIBUTION_RECHECK_TOOL, "cache_control": {"type": "ephemeral"}}],
+                tool_choice={
+                    "type": "tool",
+                    "name": ATTRIBUTION_RECHECK_TOOL["name"],
+                    "disable_parallel_tool_use": True,
+                },
+                messages=[{"role": "user", "content": user_message}],
+            )
+            reask_block = self._extract_tool_use_block(reask_response)
+            answer: dict = reask_block.input or {}
+        except Exception as exc:  # noqa: BLE001 — any slip here fails closed, #235's pattern
+            return _noted(
+                _failure_decline(f"{type(exc).__name__}: {exc}"), None, None, "judge failure"
+            )
+
+        ok, result, context_text = verify_attribution_ground(
+            answer, contribution.content, rendered_refs, fleet
+        )
+        ground_kind = answer.get("ground_kind")
+        other_grounds_clear = answer.get("other_grounds_clear")
+        if not ok:
+            reason_suffix = f" {result}." if "declined" in result else ""
+            return _noted(
+                first.model_copy(update={"reasoning": f"{first.reasoning}{reason_suffix}"}),
+                ground_kind if isinstance(ground_kind, str) else None,
+                other_grounds_clear if isinstance(other_grounds_clear, bool) else None,
+                result,
+            )
+
+        assert context_text is not None  # noqa: S101 — ok=True always carries one
+        new_summary = _apply_amendment(
+            scope=scope,
+            current_summary=current_summary,
+            contribution=contribution,
+            ops=[],
+            new_context=context_text,
+        )
+        updated = first.model_copy(
+            update={
+                "decision": "accept_as_context",
+                "directive_ops": [],
+                "new_context": context_text,
+                "new_summary": new_summary,
+                "reasoning": f"Rescued: {result}.",
+            }
+        )
+        return _noted(updated, ground_kind, other_grounds_clear, result)
 
     def judge_batch(
         self,
