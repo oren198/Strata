@@ -2705,6 +2705,14 @@ class ScopeManagerJudgment(_AmendmentJudgment):
     reasoning: str
     """Brief explanation of the verdict — written to the judgment record."""
 
+    position_held: bool = False
+    """True whenever the position gate held this contribution (see
+    :meth:`ScopeManager._hold_directive_changes`) — including a directive
+    proposal that carried no ops and targeted nothing, which leaves
+    :attr:`held_directive_changes` and :attr:`held_ops` both empty. The held
+    note in :attr:`record_notes` keys off this flag, so every hold is recorded
+    and the proposal stays adoptable."""
+
     outcome_disposition: (
         Literal["held", "failed_corrected", "failed_superseded", "failed", "decline"] | None
     ) = None
@@ -2823,11 +2831,7 @@ class ScopeManagerJudgment(_AmendmentJudgment):
                 ),
                 self.disposition_unreadable,
             ),
-            (
-                self.held_directive_changes
-                if (self.held_directive_changes or self.held_ops)
-                else None
-            ),
+            self.held_directive_changes if self.position_held else None,
         )
 
 
@@ -6644,6 +6648,7 @@ class ScopeManager:
         return judgment.model_copy(
             update={
                 "decision": "accept_as_context",
+                "position_held": True,
                 "directive_ops": [],
                 "new_context": context,
                 "held_directive_changes": targeted,
@@ -7824,7 +7829,7 @@ class ScopeManager:
                 held_context=judgment.held_context,
                 held_by_contribution=(
                     {only.id: list(judgment.held_directive_changes)}
-                    if judgment.held_directive_changes or judgment.held_ops
+                    if judgment.position_held
                     else {}
                 ),
                 withdraw_published=judgment.withdraw_published,

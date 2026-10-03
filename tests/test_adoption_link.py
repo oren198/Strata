@@ -36,7 +36,15 @@ from strata.settings import Settings
 from strata.summary_store import Directive, ScopeSummary, SummaryStore, _parse_summary
 from strata.summary_store import _render_summary as _render_summary_markdown
 from tests.test_mcp_server import _load_mcp_module, _make_db, _make_fleet_yaml
-from tests.test_scope_manager import SCOPE, STRATUM, _fake_response
+from tests.test_scope_manager import (
+    NEW_CONTRIBUTION,
+    SCOPE,
+    SECOND_CONTRIBUTION,
+    STRATUM,
+    _batch_input,
+    _fake_response,
+    _judge_batch,
+)
 
 PARENT = "g_adopt_par"
 CHILD = "g_adopt_kid"
@@ -532,3 +540,109 @@ def test_a_batch_renders_the_adoption_under_the_adopting_member_only() -> None:
     assert message.count(line) == 1
     assert message.index("CONTRIBUTION 2 OF 2") < message.index(line)
     assert message.replace(line, "") == plain
+
+
+# ---------------------------------------------------------------------------
+# A directive proposal with no ops is still recorded as held (and adoptable)
+# ---------------------------------------------------------------------------
+
+_DIRECTIVE_NO_OPS = {
+    "decision": "accept_as_directive",
+    "reasoning": "A binding rule for this scope.",
+    "directive_ops": [],
+    "new_context": "Retries are bounded across the service.",
+}
+
+
+def test_a_foreign_directive_with_no_ops_is_held_with_the_note_and_adoptable(
+    client: TestClient,
+) -> None:
+    client.queued.append(_DIRECTIVE_NO_OPS)  # type: ignore[attr-defined]
+    resp = _post(client, as_scope=CHILD, content=_PROPOSAL_TEXT, skill="shift-engineer")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["judgment"]["decision"] == "accept_as_context"
+    proposal_id = resp.json()["contribution_id"]
+    with RecordStore(client.db_path) as records:  # type: ignore[attr-defined]
+        notes = records.get_judgment(proposal_id).notes
+    assert notes.endswith("[Held: proposed a new directive, not adopted" + _HELD_TAIL)
+    assert is_held_note(notes)
+
+    client.queued.append(_APPEND_DIRECTIVE)  # type: ignore[attr-defined]
+    resp = _post(client, as_scope=PARENT, content=_PROPOSAL_TEXT, adopted_from=proposal_id)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["judgment"]["decision"] == "accept_as_directive"
+
+
+def test_an_own_scope_directive_with_no_ops_has_no_held_note(client: TestClient) -> None:
+    client.queued.append(_DIRECTIVE_NO_OPS)  # type: ignore[attr-defined]
+    resp = _post(client, as_scope=PARENT, content=_PROPOSAL_TEXT)
+    assert resp.status_code == 200, resp.text
+    with RecordStore(client.db_path) as records:  # type: ignore[attr-defined]
+        notes = records.get_judgment(resp.json()["contribution_id"]).notes
+    assert "[Held:" not in notes
+    assert not is_held_note(notes)
+
+
+def test_a_batch_records_the_held_note_for_a_foreign_directive_with_no_ops(
+    tmp_path: Path,
+) -> None:
+    foreign = replace(
+        NEW_CONTRIBUTION,
+        contributor=ContributorRef(
+            scope_id="g_child01", skill="shift-engineer", session_id="s", ts="t"
+        ),
+    )
+    own = SECOND_CONTRIBUTION
+    mock_client = MagicMock()
+    mock_client.messages.create.return_value = _fake_response(
+        _batch_input(
+            verdicts=[
+                {
+                    "contribution_id": foreign.id,
+                    "decision": "accept_as_directive",
+                    "reasoning": "binding",
+                },
+                {
+                    "contribution_id": own.id,
+                    "decision": "accept_as_directive",
+                    "reasoning": "also binding",
+                },
+            ],
+            directive_ops=[],
+        )
+    )
+    judgment = _judge_batch(mock_client, contributions=[foreign, own])
+
+    assert judgment.held_by_contribution == {foreign.id: []}
+    foreign_notes = judgment.record_notes_for(foreign.id)
+    assert foreign_notes.endswith("[Held: proposed a new directive, not adopted" + _HELD_TAIL)
+    assert is_held_note(foreign_notes)
+    assert not is_held_note(judgment.record_notes_for(own.id))
+
+    # The recorded row makes the proposal adoptable by the scope's own session.
+    db_path = str(tmp_path / "strata.db")
+    run_migrations(db_path)
+    with RecordStore(db_path) as records:
+        cid = records.append_contribution(
+            scope_id=SCOPE.id,
+            content=foreign.content,
+            proposed_classification="directive",
+            subject=None,
+            supersedes=None,
+            contributor=foreign.contributor,
+        ).id
+        records.record_judgment(
+            contribution_id=cid,
+            decision="accept_as_context",
+            judged_by="scope-manager",
+            notes=foreign_notes,
+        )
+        validate_adopted_from(
+            records, adopted_from=cid, acted_on=None, scope_id=SCOPE.id, agent_scope=SCOPE.id
+        )
+
+
+_HELD_TAIL = (
+    ". The contributor is not bound to this scope, so this is admitted as an "
+    "attributed proposal; a session bound to this scope may adopt it.]"
+)
