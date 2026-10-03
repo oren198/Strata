@@ -181,12 +181,15 @@ def test_missing_other_grounds_clear_fails_closed() -> None:
 
 
 def test_directive_or_publication_verifies_value_and_polarity() -> None:
-    content = "As product-eng's parent directive already states, SEV-1 triggers at 500 ms p99."
+    content = (
+        "As product-eng's parent directive already states, alerting escalates to "
+        "SEV-1 triggers at 500 ms p99."
+    )
     rendered_refs = {"c_ref1": "Alerting escalates to SEV-1 only above 500 ms p99 latency."}
     answer = {
         "ground_kind": "directive_or_publication",
         "other_grounds_clear": True,
-        "span": "SEV-1 triggers at 500 ms p99",
+        "span": "alerting escalates to SEV-1 triggers at 500 ms p99",
         "ref_id": "c_ref1",
         "new_context": "updated context",
     }
@@ -197,12 +200,12 @@ def test_directive_or_publication_verifies_value_and_polarity() -> None:
 
 
 def test_directive_or_publication_fails_on_value_mismatch() -> None:
-    content = "As the parent directive says, SEV-1 triggers at 999 ms p99."
+    content = "As the parent directive says, alerting escalates to SEV-1 triggers at 999 ms p99."
     rendered_refs = {"c_ref1": "Alerting escalates to SEV-1 only above 500 ms p99 latency."}
     answer = {
         "ground_kind": "directive_or_publication",
         "other_grounds_clear": True,
-        "span": "SEV-1 triggers at 999 ms p99",
+        "span": "alerting escalates to SEV-1 triggers at 999 ms p99",
         "ref_id": "c_ref1",
         "new_context": "updated context",
     }
@@ -285,6 +288,122 @@ def test_directive_or_publication_round_2_bridge_replay_cases() -> None:
     assert "polarity mismatch" in result5
 
 
+def test_directive_or_publication_hole_b_requires_content_overlap() -> None:
+    """Hole B (architect review round 3, bridge attack on 1ffc4e4): a span
+    with no value tokens at all made the value-subset check pass
+    vacuously, so an UNRELATED item could be cited. Shared-token overlap
+    (or a shared 6-word run) is now required FIRST."""
+    content = (
+        "Following the bakeries directive on red allergen stickers for nut products, "
+        "we'll add the same labels to our own trays."
+    )
+    rendered_refs = {
+        "c_ref1": "All products containing nuts must be labelled with a red allergen sticker."
+    }
+    answer = {
+        "ground_kind": "directive_or_publication",
+        "other_grounds_clear": True,
+        "span": "Following the bakeries directive on red allergen stickers for nut products",
+        "ref_id": "c_ref1",
+        "new_context": "updated context",
+    }
+    ok, result, ctx = verify_attribution_ground(answer, content, rendered_refs, _fleet())
+    assert ok is True, result
+    assert ctx == "updated context"
+
+    content_bad = (
+        "Heads up -- the building team shuts the server room HVAC down for "
+        "maintenance every Friday night."
+    )
+    rendered_refs_bad = {"c_ref2": "Robots must stop within 1 metre of any person."}
+    answer_bad = {
+        "ground_kind": "directive_or_publication",
+        "other_grounds_clear": True,
+        "span": "the building team shuts the server room HVAC down for maintenance",
+        "ref_id": "c_ref2",
+        "new_context": "updated context",
+    }
+    ok2, result2, ctx2 = verify_attribution_ground(
+        answer_bad, content_bad, rendered_refs_bad, _fleet()
+    )
+    assert ok2 is False
+    assert ctx2 is None
+    assert "no shared content" in result2
+
+
+def test_directive_or_publication_item_d_requires_grounding_every_claim() -> None:
+    """Item D (architect review round 3, J4 j4-812): a rescue must ground
+    EVERY claim the contribution attributes to the source — a coordinator
+    outside the verified span joining a second requirement clause means
+    the decline stands."""
+    content = (
+        "Per fraud's publication, transactions over $500 require step-up "
+        "authentication AND transactions over $500 from newly-seen devices "
+        "must be blocked outright."
+    )
+    rendered_refs = {"c_ref1": "Transactions over $500 require step-up authentication."}
+    answer = {
+        "ground_kind": "directive_or_publication",
+        "other_grounds_clear": True,
+        "span": "transactions over $500 require step-up authentication",
+        "ref_id": "c_ref1",
+        "new_context": "updated context",
+    }
+    ok, result, ctx = verify_attribution_ground(answer, content, rendered_refs, _fleet())
+    assert ok is False
+    assert ctx is None
+    assert "attributes more than the source carries" in result
+    assert "blocked outright" in result
+
+    # The same content with no padding: passes.
+    content_clean = (
+        "Per fraud's publication, transactions over $500 require step-up authentication."
+    )
+    ok2, result2, ctx2 = verify_attribution_ground(answer, content_clean, rendered_refs, _fleet())
+    assert ok2 is True, result2
+    assert ctx2 == "updated context"
+
+    # The trailing clause is the contributor's OWN action, no coordinator
+    # plus requirement verb: passes.
+    content_own_action = (
+        "Per the clinics directive on two-person counts at shift change, "
+        "we've added a second signature line."
+    )
+    rendered_refs_own = {
+        "c_ref2": "Controlled drugs must be counted by two staff at every shift change."
+    }
+    answer_own = {
+        "ground_kind": "directive_or_publication",
+        "other_grounds_clear": True,
+        "span": "the clinics directive on two-person counts at shift change",
+        "ref_id": "c_ref2",
+        "new_context": "updated context",
+    }
+    ok3, result3, ctx3 = verify_attribution_ground(
+        answer_own, content_own_action, rendered_refs_own, _fleet()
+    )
+    assert ok3 is True, result3
+    assert ctx3 == "updated context"
+
+
+def test_outside_party_item_d_requires_grounding_every_claim() -> None:
+    content = (
+        "The weather service published a storm warning for Thursday and also said "
+        "all domes must close by 18:00."
+    )
+    answer = {
+        "ground_kind": "outside_party",
+        "other_grounds_clear": True,
+        "party_span": "The weather service",
+        "act_span": "published a storm warning for Thursday",
+        "span": "published a storm warning for Thursday",
+    }
+    ok, result, ctx = verify_attribution_ground(answer, content, {}, _fleet())
+    assert ok is False
+    assert ctx is None
+    assert "attributes more than the source carries" in result
+
+
 def test_directive_or_publication_fails_on_ref_not_rendered() -> None:
     content = "As the parent directive says, SEV-1 triggers at 500 ms p99."
     answer = {
@@ -346,6 +465,7 @@ def test_telling_event_reuses_225s_own_check() -> None:
         "ground_kind": "telling_event",
         "other_grounds_clear": True,
         "telling_span": "mentioned to me that we're",
+        "teller_span": "The platform-eng team",
         "new_context": "updated context",
     }
     ok, result, ctx = verify_attribution_ground(answer, content, {}, _fleet())
@@ -358,12 +478,43 @@ def test_telling_event_reuses_225s_own_check() -> None:
         "ground_kind": "telling_event",
         "other_grounds_clear": True,
         "telling_span": "the platform-eng team mentioned the queue",
+        "teller_span": "The platform-eng team",
         "new_context": "updated context",
     }
     ok2, result2, ctx2 = verify_attribution_ground(answer_bad, content, {}, _fleet())
     assert ok2 is False
     assert ctx2 is None
     assert "no telling event" in result2
+
+
+def test_telling_event_hole_a_bars_the_contributor_as_its_own_teller() -> None:
+    """Hole A (architect review round 3, bridge attack on 1ffc4e4): a
+    telling verb plus a first-person word is not enough — the TELLER must
+    be a genuine other party, never the contributor attesting to itself."""
+    content = "As eng-lead I can tell you procurement only approves orders under $500."
+    answer = {
+        "ground_kind": "telling_event",
+        "other_grounds_clear": True,
+        "telling_span": "I can tell you",
+        "teller_span": "I",
+        "new_context": "updated context",
+    }
+    ok, result, ctx = verify_attribution_ground(answer, content, {}, _fleet())
+    assert ok is False
+    assert ctx is None
+    assert "teller is the contributor" in result
+
+    content2 = "Lena Fischer, the procurement lead, told me orders under $500 are pre-approved."
+    answer2 = {
+        "ground_kind": "telling_event",
+        "other_grounds_clear": True,
+        "telling_span": "told me",
+        "teller_span": "Lena Fischer, the procurement lead,",
+        "new_context": "updated context",
+    }
+    ok2, _result2, ctx2 = verify_attribution_ground(answer2, content2, {}, _fleet())
+    assert ok2 is True
+    assert ctx2 == "updated context"
 
 
 def test_joint_event_verbs_are_telling_events_with_a_party_object() -> None:

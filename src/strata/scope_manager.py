@@ -799,7 +799,12 @@ ATTRIBUTION_RECHECK_TOOL: dict = {
                     "Required for ground_kind directive_or_publication or "
                     "first_hand_own: the EXACT verbatim span of the contribution's own "
                     "text carrying the attributed claim (directive_or_publication) or "
-                    "the first-hand observation/proposal (first_hand_own)."
+                    "the first-hand observation/proposal (first_hand_own). Optional for "
+                    "ground_kind outside_party: the EXACT verbatim span of the specific "
+                    "claim the party actually carries, if it is LESS than the whole "
+                    "contribution — any requirement clause outside this span, joined by "
+                    "'and'/'also'/'plus'/'as well as', is NOT grounded by this party and "
+                    "will decline."
                 ),
             },
             "ref_id": {
@@ -831,6 +836,17 @@ ATTRIBUTION_RECHECK_TOOL: dict = {
                     "Required for ground_kind telling_event: the EXACT verbatim span "
                     "describing the telling event itself — a telling verb, and the "
                     "contributor named as addressee or audience."
+                ),
+            },
+            "teller_span": {
+                "type": "string",
+                "description": (
+                    "Required for ground_kind telling_event: the EXACT verbatim span "
+                    "naming WHO told (the teller for a told/said verb, or the "
+                    "counterpart party for a joint-event verb). Must NOT be the "
+                    "contributor's own role, scope, or a bare first-person word — the "
+                    "teller must be a genuine OTHER party, never the contributor "
+                    "attesting to itself."
                 ),
             },
             "new_context": {
@@ -4097,6 +4113,48 @@ class AttributionFleetContext:
     contributor_skill: str | None
 
 
+#: Item D (architect review round 3, J4 j4-812): a rescue must ground
+#: EVERY claim the contribution attributes to the source, not just the one
+#: the judge happened to quote. A coordinator joining a SECOND requirement
+#: clause, outside the verified span, means the rest was padded in
+#: unattributed. The philosopher's own accepted proxy; "padding without a
+#: requirement verb slips this" is a stated limit, not fixed here —
+#: ``other_grounds_clear`` is the backstop.
+_PARTIAL_GROUNDING_COORDINATORS = ("and", "also", "plus", "as well as")
+_PARTIAL_GROUNDING_REQUIREMENT_RE = re.compile(
+    r"\b(?:must|requires?|required|block(?:ed)?|forbid(?:den)?|prohibit(?:ed)?"
+    r"|may not|cannot|only)\b",
+    re.IGNORECASE,
+)
+
+
+def _partial_grounding_problem(span: str, content: str) -> str | None:
+    """``None`` when *span* (the verbatim portion of *content* this ground
+    actually verifies) covers the whole claim; otherwise the trailing
+    clause (trimmed to 80 characters) the rest of *content* adds without
+    the source's own backing — a coordinator (and/also/plus/"as well as")
+    in the text OUTSIDE *span* followed by a requirement verb (must,
+    require(s/d), block(ed), forbid(den), prohibit(ed), "may not",
+    "cannot", "only").
+
+    Pure and judge-free, reused across every ground this applies to
+    (directive_or_publication, outside_party, telling_event) — the same
+    check regardless of WHY the span is grounded.
+    """
+    normalized_content = " ".join(content.split())
+    normalized_span = " ".join(span.split())
+    idx = normalized_content.casefold().find(normalized_span.casefold())
+    if idx == -1:
+        return None  # the caller's own verbatim check handles this
+    outside = normalized_content[:idx] + " " + normalized_content[idx + len(normalized_span) :]
+    for coordinator in _PARTIAL_GROUNDING_COORDINATORS:
+        for match in re.finditer(rf"\b{re.escape(coordinator)}\b", outside, re.IGNORECASE):
+            tail = outside[match.start() :].strip()
+            if _PARTIAL_GROUNDING_REQUIREMENT_RE.search(tail):
+                return tail if len(tail) <= 80 else tail[:80].rstrip() + "..."
+    return None
+
+
 def verify_attribution_ground(
     answer: dict,
     content: str,
@@ -4127,6 +4185,14 @@ def verify_attribution_ground(
 
     Any missing/invalid field, or ``other_grounds_clear`` false, fails
     closed — ``ok=False`` — per the general line: the decline stands.
+
+    Stated limit (LIMIT C, architect review round 3): ``first_hand_own``'s
+    non-entitled-scope bar matches a scope's own id or name, word-bounded —
+    an ALIAS for that scope ("the purchasing team" for a scope named
+    "procurement") is not matched, so a judge fooled into writing the alias
+    rather than the real name or id can still rescue past this bar. The
+    same limit #225 itself states, by the CEO's own condition (no fuzzy or
+    alias matching, by design); not fixed here.
     """
     ground_kind = answer.get("ground_kind")
     if ground_kind not in (
@@ -4166,10 +4232,19 @@ def verify_attribution_ground(
         from strata.publication import (  # noqa: PLC0415 — avoids a circular import
             _POL_WORDS,
             _decomposed_value_tokens,
+            content_overlap_required,
             value_polarity_flip,
         )
 
         ref_text = rendered_refs[ref_id]
+        # Hole B (architect review round 3, bridge attack on 1ffc4e4): a
+        # span with no value tokens at all passes the subset check below
+        # vacuously, so an UNRELATED item can be cited with nothing to
+        # catch it. Shared-token overlap is NECESSARY, never sufficient
+        # (the design note's own contract line) — checked FIRST, before the
+        # value/polarity checks even run.
+        if not content_overlap_required(span, ref_text):  # type: ignore[arg-type]
+            return False, "declined (no shared content with the referenced item)", None
         # #219's gate, reused, round 2 (architect review of 10327f6's bridge
         # replay): split into a VALUE check (numbers/ids/quotes — a strict
         # subset, decomposing a hyphen/slash digit compound like "under-12"
@@ -4194,6 +4269,13 @@ def verify_attribution_ground(
         span_scopes = _match_other_scopes(span, fleet.non_entitled_scopes)  # type: ignore[arg-type]
         if span_scopes and not _match_other_scopes(ref_text, span_scopes):
             return False, "declined (names a scope the referenced item does not)", None
+        # Item D (architect review round 3, J4 j4-812): a rescue must
+        # ground EVERY claim the contribution attributes to the source —
+        # a coordinator outside the span joining a second requirement
+        # clause means the rest was padded in unattributed.
+        partial = _partial_grounding_problem(span, content)  # type: ignore[arg-type]
+        if partial is not None:
+            return False, f"declined (attributes more than the source carries: {partial!r})", None
         if not (isinstance(new_context, str) and new_context.strip()):
             return False, "declined (no new_context)", None
         return True, f"admitted (rescued, grounded in {ref_id})", new_context
@@ -4213,6 +4295,21 @@ def verify_attribution_ground(
         # to have said with no check on ITS content at all.
         if fleet.non_entitled_scopes and _match_other_scopes(content, fleet.non_entitled_scopes):
             return False, "declined (asserts a non-entitled scope's interior)", None
+        # Item D (architect review round 3, J4 j4-812): when the re-ask
+        # names the specific claim actually grounded (`span`), it must not
+        # be padded with an unattributed second requirement clause. Absent
+        # `span`, the WHOLE content is treated as grounded, unchanged —
+        # today's established shape (outside_party has no other notion of
+        # a "grounded claim" distinct from the party/act spans).
+        padded_span = answer.get("span")
+        if isinstance(padded_span, str) and padded_span.strip() and _verbatim(padded_span):
+            partial = _partial_grounding_problem(padded_span, content)  # type: ignore[arg-type]
+            if partial is not None:
+                return (
+                    False,
+                    f"declined (attributes more than the source carries: {partial!r})",
+                    None,
+                )
         # Blocker 1 (same review): the engine writes this line itself — the
         # judge's own text is never used here (contract line 3) — so it
         # must APPEND to the scope's existing context, never replace it,
@@ -4223,12 +4320,38 @@ def verify_attribution_ground(
         return True, "admitted (rescued, context appended)", appended_context
 
     if ground_kind == "telling_event":
+        # Item D's own rule applies here too (architect review round 3),
+        # but today's shape attributes the WHOLE `content` to the teller
+        # (same as #225's own informant rewrite) — there is no separate
+        # "grounded claim" span to check padding against, so the check is
+        # structurally a no-op for this ground until/unless a future
+        # revision narrows what telling_event actually grounds.
         telling_span = answer.get("telling_span")
         if not (isinstance(telling_span, str) and telling_span.strip()):
             return False, "declined (no telling_span)", None
+        teller_span = answer.get("teller_span")
+        if not _verbatim(teller_span):
+            return False, "declined (no teller_span)", None
         problem, _verb_kind = _telling_span_problem_for(telling_span, content=content)
         if problem is not None:
             return False, f"declined (no telling event): {problem}", None
+        # Hole A (architect review round 3, bridge attack on 1ffc4e4): the
+        # TELLER must be a genuine other party, never the contributor
+        # attesting to itself ("As eng-lead I can tell you ..." is a
+        # telling verb plus a first-person word, but the teller IS the
+        # contributor). The SAME #225 own-role check covers a joint verb's
+        # own requirement too: the party after "with" must not be the
+        # contributor's own scope — `_own_role_or_first_person_span`'s own
+        # allowed set already includes the contributor's scope id/name, so
+        # one check serves both verb kinds.
+        own_role_reason = _own_role_or_first_person_span(
+            teller_span,  # type: ignore[arg-type]
+            skill=fleet.contributor_skill,
+            contributor_scope_id=fleet.contributor_scope_id,
+            contributor_scope_name=fleet.contributor_scope_name,
+        )
+        if own_role_reason is not None:
+            return False, f"declined (teller is the contributor: {own_role_reason})", None
         if not (isinstance(new_context, str) and new_context.strip()):
             return False, "declined (no new_context)", None
         return True, "admitted (rescued)", new_context
@@ -4926,12 +5049,21 @@ class ScopeManager:
                 # marker — otherwise "As eng-lead I can tell you X" (or "I
                 # observed that X") would pass on the FRAME's own "I", never
                 # a dealing the contributor was part of.
+                #
+                # Addendum (bridge "after" run, j4_joint_verb, architect
+                # review round 3): a JOINT-EVENT verb with a party ("As
+                # discussed with procurement ...") is conduct the
+                # contributor took part in too, by the SAME ruling that
+                # made it a telling event — the contributor is the implied
+                # counterpart, no separate first-person word needed. ONE
+                # regex (:data:`_JOINT_EVENT_PARTY_RE`), not forked.
                 haystack = " ".join(new_contribution.content.split()).casefold()
                 normalized_act_span = " ".join(act_span.split())
                 verbatim_ok = normalized_act_span.casefold() in haystack
                 remainder = _strip_leading_frame(normalized_act_span)
-                first_person_ok = verbatim_ok and bool(_FIRST_PERSON_RE.search(remainder))
-                if verbatim_ok and first_person_ok:
+                first_person_ok = bool(_FIRST_PERSON_RE.search(remainder))
+                joint_party_ok = bool(_JOINT_EVENT_PARTY_RE.search(remainder))
+                if verbatim_ok and (first_person_ok or joint_party_ok):
                     return _noted(judgment, classification, "admitted as judged", act_span=act_span)
                 return _noted(
                     judgment.model_copy(

@@ -767,6 +767,40 @@ def test_all_six_j4_interior_conduct_twins_pass() -> None:
         assert judgment.interior_assertion["result"] == "admitted as judged", content
 
 
+def test_joint_event_verb_with_party_satisfies_the_conduct_burden() -> None:
+    """Addendum (bridge "after" run on j4_joint_verb, architect review
+    round 3): a joint-event verb WITH a party ("As discussed with X") is
+    conduct the contributor took part in too — the contributor is the
+    implied counterpart, same ruling as the telling-event check. No
+    separate first-person word is required; a bare "as discussed" with no
+    party still fails."""
+    content = (
+        "As discussed with 225-other-scope in Tuesday's sync, we'll get two quotes "
+        "before approving the purchase."
+    )
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [
+        _ordinary_accept(content),
+        _reask_response(
+            classification="conduct",
+            act_span="As discussed with 225-other-scope in Tuesday's sync",
+        ),
+    ]
+    judgment, _ = _judge(mock_client, content)
+    assert judgment.decision == "accept_as_context"
+    assert judgment.interior_assertion["result"] == "admitted as judged"
+
+    content_bad = "As discussed, 225-other-scope only approves changes under budget."
+    mock_client_bad = MagicMock()
+    mock_client_bad.messages.create.side_effect = [
+        _ordinary_accept(content_bad),
+        _reask_response(classification="conduct", act_span="As discussed"),
+    ]
+    judgment_bad, _ = _judge(mock_client_bad, content_bad)
+    assert judgment_bad.decision == "decline"
+    assert "no observed act in the contributor's own dealings is stated" in judgment_bad.reasoning
+
+
 def test_a_flat_rule_fails_the_conduct_burden() -> None:
     content = (
         "225-other-scope only approves hardware orders under 5,000 EUR without a second quote."

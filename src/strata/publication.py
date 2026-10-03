@@ -2358,8 +2358,13 @@ def value_polarity_flip(
         antonym_pairs.extend((word, antonym) for antonym in antonyms)
 
     for first, second in antonym_pairs:
-        first_re = re.compile(rf"\b{re.escape(first)}\b")
-        second_re = re.compile(rf"\b{re.escape(second)}\b")
+        # A bare `\b` lets a POL_WORD match inside an unrelated hyphenated
+        # compound ("on-call", "sign-off" both contain "on"/"off" as
+        # word-bounded substrings, with no on/off state assertion at all).
+        # Excluding a match directly adjacent to a hyphen on either side
+        # closes this without narrowing the real single-word case.
+        first_re = re.compile(rf"(?<!-)\b{re.escape(first)}\b(?!-)")
+        second_re = re.compile(rf"(?<!-)\b{re.escape(second)}\b(?!-)")
         claim_has_first, claim_has_second = (
             bool(first_re.search(claim_cf)),
             bool(second_re.search(claim_cf)),
@@ -2383,6 +2388,61 @@ def value_polarity_flip(
             ):
                 return True
     return False
+
+
+#: Hole B (architect review round 3, bridge attack on 1ffc4e4): an
+#: unrelated directive can be cited and still pass when the span's value
+#: tokens are vacuous (no number/id/quote at all, so the subset check holds
+#: trivially). Overlap is NECESSARY, never sufficient (the design note's
+#: own contract line) — these stay EXCLUDED from the count even though some
+#: are content-bearing words, because they recur in nearly every citation
+#: regardless of subject.
+_CONTENT_OVERLAP_STOPWORDS = frozenset(
+    {"directive", "policy", "rule", "says", "already", "according"}
+)
+
+
+def _overlap_stem(word: str) -> str:
+    """A simple plural/-ed/-ing stem — just enough to match "products" to
+    "product" and "stickers" to "sticker" — never a real stemmer; this is a
+    necessary-overlap gate, not the value check itself."""
+    for suffix in ("ing", "ed", "es", "s"):
+        if word.endswith(suffix) and len(word) - len(suffix) >= 3:
+            return word[: -len(suffix)]
+    return word
+
+
+def _overlap_words(text: str) -> set[str]:
+    words: set[str] = set()
+    for word in re.findall(r"[a-z]+", text.casefold()):
+        if len(word) < 4 or word in _CONTENT_OVERLAP_STOPWORDS:
+            continue
+        words.add(_overlap_stem(word))
+    return words
+
+
+def _shared_six_word_sequence(a: str, b: str) -> bool:
+    a_tokens = re.findall(r"[a-z]+", a.casefold())
+    b_tokens = re.findall(r"[a-z]+", b.casefold())
+    if len(a_tokens) < 6 or len(b_tokens) < 6:
+        return False
+    b_sequences = {tuple(b_tokens[i : i + 6]) for i in range(len(b_tokens) - 5)}
+    return any(tuple(a_tokens[i : i + 6]) in b_sequences for i in range(len(a_tokens) - 5))
+
+
+def content_overlap_required(span: str, reference_text: str) -> bool:
+    """Hole B's fix: *span* must share at least two content words
+    (casefolded, 4+ letters, simple plural/-ed/-ing stripping, excluding
+    :data:`_CONTENT_OVERLAP_STOPWORDS`) with *reference_text*, OR a shared
+    contiguous 6-word sequence — otherwise an unrelated item can be cited
+    with no mechanical check catching it, whenever the span itself carries
+    no number/id/quote (the value-subset check then holds vacuously). This
+    is a NECESSARY gate, never a sufficient one on its own — the value and
+    polarity checks still apply on top.
+    """
+    if len(_overlap_words(span) & _overlap_words(reference_text)) >= 2:
+        return True
+    return _shared_six_word_sequence(span, reference_text)
 
 
 def observed_value_veto(refuted_claim: str, correcting_content: str, item_content: str) -> bool:
