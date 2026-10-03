@@ -201,6 +201,12 @@ class Contribution:
     this is None before raising further. Excluded from write-back/session stats
     (it counts as the reporter's provenance for record purposes, but is not a
     second act by the reporter) and reported separately as system-raised."""
+    adopted_from: str | None = None
+    """The held proposal this contribution adopts — an FK to another contribution's
+    id (migration 0022). Set only on an ordinary contribution from a session bound
+    to the target scope, naming a proposal that another position made to that
+    same scope (validated at the write boundary, `validate_adopted_from`). A
+    directive admitted from it carries the link as provenance."""
 
 
 @dataclass(frozen=True)
@@ -923,6 +929,7 @@ class RecordStore:
         acted_on: str | None = None,
         acted_on_operator_item: str | None = None,
         raised_from: str | None = None,
+        adopted_from: str | None = None,
     ) -> Contribution:
         """Append a contribution to the scope's immutable record and return it.
 
@@ -958,6 +965,10 @@ class RecordStore:
             raised_from:             ADR 0017 P5 — set only by the ENGINE, never an
                                      agent, when this contribution is itself the
                                      upward raise of a `failed` directive outcome.
+            adopted_from:            Optional id of the held proposal this one
+                                     adopts (migration 0022). Callers validate it
+                                     first (:func:`validate_adopted_from`) — this
+                                     layer only persists what it is given.
 
         Returns:
             The newly appended :class:`Contribution`.
@@ -977,6 +988,7 @@ class RecordStore:
             acted_on=acted_on,
             acted_on_operator_item=acted_on_operator_item,
             raised_from=raised_from,
+            adopted_from=adopted_from,
         )
         self._conn.commit()
         return self._fetch_contribution(contribution_id)
@@ -993,6 +1005,7 @@ class RecordStore:
         acted_on: str | None = None,
         acted_on_operator_item: str | None = None,
         raised_from: str | None = None,
+        adopted_from: str | None = None,
     ) -> str:
         """INSERT one contribution row and return its id. Does NOT commit.
 
@@ -1009,8 +1022,8 @@ class RecordStore:
                 subject, supersedes,
                 contributor_scope_id, contributor_skill,
                 contributor_session_id, contributor_ts,
-                acted_on, acted_on_operator_item, raised_from
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                acted_on, acted_on_operator_item, raised_from, adopted_from
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 contribution_id,
@@ -1026,6 +1039,7 @@ class RecordStore:
                 acted_on,
                 acted_on_operator_item,
                 raised_from,
+                adopted_from,
             ),
         )
         return contribution_id
@@ -1050,6 +1064,7 @@ class RecordStore:
         base = """
             SELECT id, scope_id, content, proposed_classification,
                    subject, supersedes, acted_on, acted_on_operator_item, raised_from,
+                   adopted_from,
                    contributor_scope_id, contributor_skill,
                    contributor_session_id, contributor_ts,
                    created_at
@@ -1092,6 +1107,7 @@ class RecordStore:
             """
             SELECT c.id, c.scope_id, c.content, c.proposed_classification,
                    c.subject, c.supersedes, c.acted_on, c.acted_on_operator_item, c.raised_from,
+                   c.adopted_from,
                    c.contributor_scope_id, c.contributor_skill,
                    c.contributor_session_id, c.contributor_ts,
                    c.created_at
@@ -1122,6 +1138,7 @@ class RecordStore:
             """
             SELECT id, scope_id, content, proposed_classification,
                    subject, supersedes, acted_on, acted_on_operator_item, raised_from,
+                   adopted_from,
                    contributor_scope_id, contributor_skill,
                    contributor_session_id, contributor_ts,
                    created_at
@@ -1150,6 +1167,7 @@ class RecordStore:
             """
             SELECT id, scope_id, content, proposed_classification,
                    subject, supersedes, acted_on, acted_on_operator_item, raised_from,
+                   adopted_from,
                    contributor_scope_id, contributor_skill,
                    contributor_session_id, contributor_ts,
                    created_at
@@ -1566,6 +1584,7 @@ class RecordStore:
         base = """
             SELECT id, scope_id, content, proposed_classification,
                    subject, supersedes, acted_on, acted_on_operator_item, raised_from,
+                   adopted_from,
                    contributor_scope_id, contributor_skill,
                    contributor_session_id, contributor_ts,
                    created_at
@@ -1665,6 +1684,7 @@ class RecordStore:
         base = """
             SELECT c.id, c.scope_id, c.content, c.proposed_classification,
                    c.subject, c.supersedes, c.acted_on, c.acted_on_operator_item, c.raised_from,
+                   c.adopted_from,
                    c.contributor_scope_id, c.contributor_skill,
                    c.contributor_session_id, c.contributor_ts,
                    c.created_at,
@@ -1742,6 +1762,7 @@ class RecordStore:
             """
             SELECT id, scope_id, content, proposed_classification,
                    subject, supersedes, acted_on, acted_on_operator_item, raised_from,
+                   adopted_from,
                    contributor_scope_id, contributor_skill,
                    contributor_session_id, contributor_ts,
                    created_at
@@ -1855,6 +1876,7 @@ class RecordStore:
             """
             SELECT c.id, c.scope_id, c.content, c.proposed_classification,
                    c.subject, c.supersedes, c.acted_on, c.acted_on_operator_item, c.raised_from,
+                   c.adopted_from,
                    c.contributor_scope_id, c.contributor_skill,
                    c.contributor_session_id, c.contributor_ts,
                    c.created_at,
@@ -1898,6 +1920,7 @@ class RecordStore:
             f"""
             SELECT c.id, c.scope_id, c.content, c.proposed_classification,
                    c.subject, c.supersedes, c.acted_on, c.acted_on_operator_item, c.raised_from,
+                   c.adopted_from,
                    c.contributor_scope_id, c.contributor_skill,
                    c.contributor_session_id, c.contributor_ts,
                    c.created_at

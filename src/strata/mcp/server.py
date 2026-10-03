@@ -2428,6 +2428,7 @@ async def strata_contribute(
     subject: str | None = None,
     supersedes: str | None = None,
     acted_on: str | None = None,
+    adopted_from: str | None = None,
 ) -> dict:
     """Submit a contribution to a scope's scope-manager for judgment.
 
@@ -2483,6 +2484,16 @@ async def strata_contribute(
             layer, ``context_items`` (ADR 0017 P1b): each entry there is
             ``{"id", "label"}`` for one piece of context you were actually
             shown, and its ``id`` is what you pass here.
+        adopted_from: Optional ID of a held proposal to ADOPT — a contribution
+            a session bound to another scope made to ``scope_id``, admitted
+            only as an attributed proposal ("... proposes: ... — directive
+            <id> stands" / "... not adopted"). Only a session bound to
+            ``scope_id`` itself can adopt: contribute the decision as you
+            would any other (with ``supersedes`` if it replaces a directive)
+            and pass the proposal's id here; the directive it admits records
+            where it came from. The proposal must exist, be a contribution to
+            ``scope_id``, and come from another scope's session. Cannot be
+            combined with ``acted_on``.
 
     Returns:
         ``contribution_id`` and ``judgment`` (decision, reasoning, summary_updated).
@@ -2490,7 +2501,8 @@ async def strata_contribute(
     Raises:
         RuntimeError: If the scope is not found, is archived, or is outside
             this agent's entitled write surface; or if ``acted_on`` fails any
-            of its own rules (see the ``acted_on`` argument above).
+            of its own rules (see the ``acted_on`` argument above); or if
+            ``adopted_from`` fails any of its own rules.
     """
     await _require_bound_or_elicit()
 
@@ -2515,8 +2527,15 @@ async def strata_contribute(
     # Imported lazily, like run_contribution below: keeps the import path light until a
     # contribution actually happens, and is the single canonical check both write
     # surfaces (this tool and POST /contribute) call — never a second copy to drift.
-    from strata.app import validate_acted_on  # noqa: PLC0415
+    from strata.app import validate_acted_on, validate_adopted_from  # noqa: PLC0415
 
+    validate_adopted_from(
+        _record_store,
+        adopted_from=adopted_from,
+        acted_on=acted_on,
+        scope_id=scope_id,
+        agent_scope=agent_scope,
+    )
     validate_acted_on(
         fleet,
         _record_store,
@@ -2558,6 +2577,7 @@ async def strata_contribute(
             subject=subject,
             supersedes=supersedes,
             acted_on=acted_on,
+            adopted_from=adopted_from,
             contributor=contributor,
             fleet=fleet,
             record_store=_record_store,

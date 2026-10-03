@@ -143,6 +143,7 @@ from strata.scope_manager import (
     ScopeManager,
     ScopeManagerBatchJudgment,
     ScopeManagerJudgment,
+    is_held_note,
 )
 from strata.session_state import (
     DEFAULT_STALENESS_WINDOW_DAYS,
@@ -348,6 +349,11 @@ class ContributeRequest(BaseModel):
     acting on. Mutually exclusive with ``supersedes``; validated the same way and with
     the same messages as ``strata_contribute``'s ``acted_on`` (see
     :func:`strata.app.validate_acted_on`)."""
+    adopted_from: str | None = None
+    """The id of a held proposal (a contribution another position made to this
+    scope) that this contribution adopts. Validated the same way and with the same
+    messages as ``strata_contribute``'s ``adopted_from`` (see
+    :func:`strata.app.validate_adopted_from`)."""
     contributor: ContributorRefBody
 
 
@@ -661,6 +667,25 @@ def _resolve_examined_context(
     return items
 
 
+def _resolve_adopted_proposal(
+    contribution: Contribution, *, record_store: RecordStore
+) -> Contribution | None:
+    """The held proposal *contribution* adopts, or ``None`` when it adopts none.
+
+    :func:`validate_adopted_from` already guaranteed the proposal exists at the
+    write boundary, and the record is append-only, so a set ``adopted_from``
+    always resolves.
+    """
+    if contribution.adopted_from is None:
+        return None
+    proposal = record_store.get_contribution(contribution.adopted_from)
+    assert proposal is not None, (
+        "adopted_from unresolvable at judge time — validate_adopted_from should have "
+        "rejected this contribution at the write boundary"
+    )
+    return proposal
+
+
 def _judge_and_record(
     *,
     contribution: Contribution,
@@ -777,6 +802,11 @@ def _judge_and_record(
     )
     if examined_context:
         judge_kwargs["examined_context"] = examined_context
+    # Adoption link: the held proposal this contribution adopts, so the judge sees
+    # what is adopted. Same discipline — the kwarg appears only when set.
+    adopted_proposal = _resolve_adopted_proposal(contribution, record_store=record_store)
+    if adopted_proposal is not None:
+        judge_kwargs["adopted_proposal"] = adopted_proposal
     try:
         judgment: ScopeManagerJudgment = scope_manager.judge(
             scope=scope,
@@ -1637,6 +1667,15 @@ def _judge_batch_and_record(
     )
     if examined_context:
         batch_judge_kwargs["examined_context"] = examined_context
+    # Adoption link: each member's adopted proposal, keyed by the member's id —
+    # the kwarg appears only when at least one member adopts.
+    adopted_proposals = {
+        c.id: proposal
+        for c in contributions
+        if (proposal := _resolve_adopted_proposal(c, record_store=record_store)) is not None
+    }
+    if adopted_proposals:
+        batch_judge_kwargs["adopted_proposals"] = adopted_proposals
 
     try:
         batch: ScopeManagerBatchJudgment = scope_manager.judge_batch(
@@ -1903,6 +1942,92 @@ def validate_acted_on(
         )
 
 
+def validate_adopted_from(
+    record_store: RecordStore,
+    *,
+    adopted_from: str | None,
+    acted_on: str | None,
+    scope_id: str,
+    agent_scope: str,
+) -> None:
+    """Enforce every rule on ``adopted_from`` before a contribution is appended.
+
+    A session bound to a scope adopts a held proposal — a contribution another
+    position made to that scope, admitted only as an attributed proposal by the
+    position gate — through an ordinary own-scope contribution naming it. The
+    single canonical check: both write surfaces (``strata_contribute`` and
+    ``POST /contribute``) call this one function. *scope_id* is the target scope;
+    *agent_scope* is the scope the new contribution is stamped as.
+
+    Rejected, each with a message naming which rule failed, in this order:
+
+    1. ``adopted_from`` together with ``acted_on`` — adopting a proposal is a
+       decision about this scope's directives, not an outcome report.
+    2. The referenced contribution must exist.
+    3. It must live in the target scope's own record (``scope_id`` matches).
+    4. It must have come from another position (its contributor is not bound to
+       the target scope) — an own-scope contribution needs no adoption.
+    5. The new contribution's contributor must be bound to the target scope:
+       only that scope's own position adopts into it.
+    6. The proposal must be one the position gate actually HELD: judged
+       ``accept_as_context`` with the gate's held note ending its judgment notes
+       (:func:`strata.scope_manager.is_held_note`). Unjudged, declined, or
+       admitted without a hold is rejected.
+
+    ``supersedes`` is allowed alongside: adopting a proposal may replace a
+    directive. A no-op when ``adopted_from`` is ``None``.
+
+    Raises:
+        RuntimeError: any of the rules above failed.
+    """
+    if adopted_from is None:
+        return
+    if acted_on is not None:
+        raise RuntimeError(
+            "adopted_from and acted_on cannot both be set: adopting a held proposal is "
+            "a decision about this scope's directives, not a report of acting on an item. "
+            "Submit the adoption and the outcome as separate contributions."
+        )
+    proposal = record_store.get_contribution(adopted_from)
+    if proposal is None:
+        raise RuntimeError(
+            f"adopted_from={adopted_from!r} does not reference an existing contribution."
+        )
+    if proposal.scope_id != scope_id:
+        raise RuntimeError(
+            f"adopted_from={adopted_from!r} is a contribution to {proposal.scope_id!r}, "
+            f"not to {scope_id!r} — you can only adopt a proposal made to the scope you "
+            "are contributing to."
+        )
+    if proposal.contributor.scope_id == scope_id:
+        raise RuntimeError(
+            f"adopted_from={adopted_from!r} came from a session bound to {scope_id!r} "
+            "itself — it is not a proposal from another position, so there is nothing to "
+            "adopt. Contribute the decision directly."
+        )
+    if agent_scope != scope_id:
+        raise RuntimeError(
+            f"only a session bound to {scope_id!r} can adopt a proposal into it; this "
+            f"contribution is made as {agent_scope!r}. Contributing upward is allowed, "
+            "but adoption is own-scope only."
+        )
+    judgment = record_store.get_judgment(adopted_from)
+    if judgment is None:
+        raise RuntimeError(
+            f"adopted_from={adopted_from!r} is not yet judged — only a proposal the "
+            "position gate held can be adopted. Wait for its verdict, then adopt it."
+        )
+    if judgment.decision == "decline":
+        raise RuntimeError(
+            f"adopted_from={adopted_from!r} was declined, so there is nothing held to adopt."
+        )
+    if judgment.decision != "accept_as_context" or not is_held_note(judgment.notes):
+        raise RuntimeError(
+            f"adopted_from={adopted_from!r} was not held as a proposal by the position "
+            "gate — only a held proposal can be adopted."
+        )
+
+
 def run_contribution(
     *,
     scope: Scope,
@@ -1922,6 +2047,7 @@ def run_contribution(
     batch_cap: int = BATCH_CAP,
     queue_timeout_s: float = QUEUE_WAIT_TIMEOUT_S,
     acted_on: str | None = None,
+    adopted_from: str | None = None,
 ) -> ContributionOutcome:
     """Append a contribution to the record and get it judged (ADR 0011 D3).
 
@@ -1958,6 +2084,8 @@ def run_contribution(
     """
     if acted_on is not None and supersedes is not None:
         raise ValueError("acted_on and supersedes cannot both be set on one contribution.")
+    if adopted_from is not None and acted_on is not None:
+        raise ValueError("adopted_from and acted_on cannot both be set on one contribution.")
     # ADR 0017 P5: the API keeps ONE `acted_on` field; the app resolves which
     # storage column the id belongs in. Ids are minted so this dispatch is
     # unambiguous and never needs a lookup: contribution ids are `c_`-prefixed,
@@ -1975,6 +2103,7 @@ def run_contribution(
             contributor=contributor,
             acted_on=None if is_operator_target else acted_on,
             acted_on_operator_item=acted_on if is_operator_target else None,
+            adopted_from=adopted_from,
         )
         ticket = queue.enqueue(contribution.id, contribution)
 
@@ -2787,6 +2916,21 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
                 detail={"error": "scope_not_active", "scope_id": body.scope_id},
             )
 
+        # Adoption link: the same canonical check strata_contribute runs, before
+        # acted_on's so the two-together rejection names the right rule.
+        try:
+            validate_adopted_from(
+                record_store,
+                adopted_from=body.adopted_from,
+                acted_on=body.acted_on,
+                scope_id=body.scope_id,
+                agent_scope=body.contributor.scope_id,
+            )
+        except RuntimeError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail={"error": "adopted_from_invalid", "detail": str(exc)},
+            ) from exc
         # ADR 0017 P1: the same canonical check strata_contribute runs, stamped
         # against this contribution's OWN scope (an HTTP caller has no bound agent
         # scope the way an MCP session does — the scope it contributes as is the
@@ -2839,6 +2983,7 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
                 subject=body.subject,
                 supersedes=body.supersedes,
                 acted_on=body.acted_on,
+                adopted_from=body.adopted_from,
                 contributor=contributor_ref,
                 fleet=fleet,
                 record_store=record_store,

@@ -67,7 +67,7 @@ from pydantic import BaseModel, Field
 from strata.fleet_config import EntitlementView, Scope, Stratum
 from strata.operator import OperatorItem
 from strata.record_store import Contribution, RecentContribution
-from strata.summary_store import Directive, ScopeSummary, _render_summary
+from strata.summary_store import Directive, ScopeSummary, _render_summary, adopted_suffix
 
 _logger = logging.getLogger(__name__)
 
@@ -2066,6 +2066,7 @@ def _mint_directive(op: DirectiveOp, contribution: Contribution) -> Directive:
         source_scope_id=contribution.contributor.scope_id,
         source_skill=contribution.contributor.skill,
         created_at=contribution.created_at,
+        adopted_from=contribution.adopted_from,
     )
 
 
@@ -2957,8 +2958,10 @@ class ScopeManagerBatchJudgment(_AmendmentJudgment):
         # Issue #201: a protocol repair is a fact about the CALL — one re-ask
         # obtained the whole payload, one op read its id off one member — so
         # it is noted on every row, declines included, like a dropped source.
-        notes = _with_held_note(notes, self.held_by_contribution.get(contribution_id))
-        return _with_protocol_notes(notes, self.protocol_notes)
+        # The held note is appended LAST, as on the single path, so it is always
+        # the notes' final suffix (`is_held_note` anchors on that).
+        notes = _with_protocol_notes(notes, self.protocol_notes)
+        return _with_held_note(notes, self.held_by_contribution.get(contribution_id))
 
 
 class PublicationJudgment(BaseModel):
@@ -3176,7 +3179,10 @@ def _render_directives_only(directives: Sequence[Directive]) -> str:
         lines.append(f"### [{directive.id}] {directive.content}")
         if directive.subject:
             lines.append(f"- subject: {directive.subject}")
-        lines.append(f"- source: scope={directive.source_scope_id} · at={directive.created_at}")
+        lines.append(
+            f"- source: scope={directive.source_scope_id} · at={directive.created_at}"
+            f"{adopted_suffix(directive)}"
+        )
         lines.append("")
     return "\n".join(lines).rstrip()
 
@@ -3283,6 +3289,33 @@ def _with_dropped_sources_note(reasoning: str, dropped_sources: Sequence[str]) -
     return f"{reasoning} [Declared context_sources not rendered to this judge: {dropped}.]"
 
 
+#: The position gate's held note, in parts: ``_HELD_NOTE_OPEN`` + what was held +
+#: ``_HELD_NOTE_CLOSE``, appended to the judgment's notes as the LAST suffix.
+#: :func:`_with_held_note` writes it and :func:`is_held_note` detects it, both
+#: from these constants, so the two cannot drift.
+_HELD_NOTE_OPEN = " [Held: "
+_HELD_NOTE_CLOSE = (
+    ". The contributor is not bound to this scope, so "
+    "this is admitted as an attributed proposal; a session bound to this scope "
+    "may adopt it.]"
+)
+_HELD_NOTE_TARGETED_PREFIX = "would change directive "
+_HELD_NOTE_TARGETED_SUFFIX = ", which stands"
+_HELD_NOTE_NEW_DIRECTIVE = "proposed a new directive, not adopted"
+_HELD_NOTE_RE = re.compile(
+    re.escape(_HELD_NOTE_OPEN)
+    + "(?:"
+    + re.escape(_HELD_NOTE_TARGETED_PREFIX)
+    + r"[^\[\]]+?"
+    + re.escape(_HELD_NOTE_TARGETED_SUFFIX)
+    + "|"
+    + re.escape(_HELD_NOTE_NEW_DIRECTIVE)
+    + ")"
+    + re.escape(_HELD_NOTE_CLOSE)
+    + r"\Z"
+)
+
+
 def _with_held_note(reasoning: str, held: Sequence[str] | None) -> str:
     """Return *reasoning* plus the position gate's note, when a change was held.
 
@@ -3292,15 +3325,21 @@ def _with_held_note(reasoning: str, held: Sequence[str] | None) -> str:
     if held is None:
         return reasoning
     what = (
-        f"would change directive {', '.join(held)}, which stands"
+        f"{_HELD_NOTE_TARGETED_PREFIX}{', '.join(held)}{_HELD_NOTE_TARGETED_SUFFIX}"
         if held
-        else "proposed a new directive, not adopted"
+        else _HELD_NOTE_NEW_DIRECTIVE
     )
-    return (
-        f"{reasoning} [Held: {what}. The contributor is not bound to this scope, so "
-        "this is admitted as an attributed proposal; a session bound to this scope "
-        "may adopt it.]"
-    )
+    return f"{reasoning}{_HELD_NOTE_OPEN}{what}{_HELD_NOTE_CLOSE}"
+
+
+def is_held_note(notes: str | None) -> bool:
+    """Whether judgment *notes* end with the position gate's held note.
+
+    Matches only the engine-appended suffix :func:`_with_held_note` writes,
+    anchored at the very end of the notes — the judge's own reasoning quoting
+    similar words elsewhere does not count.
+    """
+    return notes is not None and _HELD_NOTE_RE.search(notes) is not None
 
 
 def _held_report_line(contribution: Contribution, directive_ids: Sequence[str]) -> str:
@@ -3479,18 +3518,37 @@ def _render_parent_publication(
     return "\n".join(lines) + "\n\n"
 
 
-def _render_contribution_block(contribution: Contribution) -> str:
-    """Render one contribution's fields for the judge, id first."""
+def _render_contribution_block(
+    contribution: Contribution, adopted: Contribution | None = None
+) -> str:
+    """Render one contribution's fields for the judge, id first.
+
+    *adopted*: the held proposal *contribution* adopts (its ``adopted_from``),
+    rendered as one extra line so the judge sees what is adopted. Nothing is
+    rendered when it is ``None`` — the block is byte-identical to before.
+    """
     return (
         f"- id: {contribution.id}\n"
         f"- proposed classification: {contribution.proposed_classification}\n"
         f"- subject: {contribution.subject or '(none)'}\n"
         f"- supersedes: {contribution.supersedes or '(none)'}\n"
+        f"{_render_adoption_line(adopted)}"
         # Skill is optional (issue #121): show scope alone when absent so the
         # judge never sees a literal "None".
         f"- contributor: {_render_contributor(contribution.contributor)}\n"
         "- content:\n"
         f"    {contribution.content}\n"
+    )
+
+
+def _render_adoption_line(adopted: Contribution | None) -> str:
+    """The NEW-CONTRIBUTION line naming the proposal a contribution adopts, or ``""``."""
+    if adopted is None:
+        return ""
+    who = adopted.contributor.skill or adopted.contributor.session_id
+    return (
+        f"- adopts proposal {adopted.id} by {who} ({adopted.contributor.scope_id}): "
+        f"{adopted.content.strip()}\n"
     )
 
 
@@ -3857,6 +3915,7 @@ def _build_user_message(
     implied_purpose_min_words: int = IMPLIED_PURPOSE_MIN_WORDS,
     acted_on_target: ActedOnTarget | None = None,
     examined_context: Sequence[ExaminedContextItem] | None = None,
+    adopted_proposal: Contribution | None = None,
 ) -> str:
     """Compose the (non-cached) per-call user message for a single contribution.
 
@@ -3892,7 +3951,7 @@ def _build_user_message(
         f"{outcome_block}"
         "\n"
         "NEW CONTRIBUTION TO JUDGE:\n"
-        f"{_render_contribution_block(new_contribution)}"
+        f"{_render_contribution_block(new_contribution, adopted_proposal)}"
         "\n"
         "Judge it. Call `submit_judgment` exactly once."
     )
@@ -3917,6 +3976,7 @@ def _build_batch_user_message(
     window_verbatim_tail: int = WINDOW_VERBATIM_TAIL,
     implied_purpose_min_words: int = IMPLIED_PURPOSE_MIN_WORDS,
     examined_context: Sequence[ExaminedContextItem] | None = None,
+    adopted_proposals: Mapping[str, Contribution] | None = None,
 ) -> str:
     """Compose the per-call user message for a BATCH of contributions (ADR 0011 D3).
 
@@ -3945,9 +4005,10 @@ def _build_batch_user_message(
         implied_purpose_min_words=implied_purpose_min_words,
         examined_context=examined_context,
     )
+    adopted = adopted_proposals or {}
     blocks = "\n".join(
         f"CONTRIBUTION {position} OF {len(new_contributions)}:\n"
-        f"{_render_contribution_block(contribution)}"
+        f"{_render_contribution_block(contribution, adopted.get(contribution.id))}"
         for position, contribution in enumerate(new_contributions, start=1)
     )
     return (
@@ -5591,6 +5652,7 @@ class ScopeManager:
         hop: int = 0,
         acted_on_target: ActedOnTarget | None = None,
         examined_context: Sequence[ExaminedContextItem] | None = None,
+        adopted_proposal: Contribution | None = None,
         **_extra: object,
     ) -> ScopeManagerJudgment:
         """Judge a new contribution against the scope's current state.
@@ -5606,6 +5668,11 @@ class ScopeManager:
         tested — renders the EXAMINED CONTEXT block (see
         :func:`_render_examined_context`) ONLY when non-empty; empty or ``None``
         renders nothing extra, byte-identical to before this item.
+
+        *adopted_proposal*: the held proposal *new_contribution* adopts (its
+        ``adopted_from``), resolved by the caller — renders one "adopts proposal"
+        line in the NEW CONTRIBUTION block ONLY when given. ``judge_batch`` takes
+        the same as *adopted_proposals*, keyed by member id.
 
         Makes exactly one Anthropic API call using forced ``submit_judgment``
         tool use.  Validates the response, applies the judged amendment
@@ -5796,6 +5863,7 @@ class ScopeManager:
             implied_purpose_min_words=self._implied_purpose_min_words,
             acted_on_target=acted_on_target,
             examined_context=examined_context,
+            adopted_proposal=adopted_proposal,
         )
         # ADR 0017 P3: a failed_* disposition replaces `acted_on` through the #199
         # path exactly like an ordinary `supersedes` reference does — but only when
@@ -7633,6 +7701,7 @@ class ScopeManager:
         change_ids: Sequence[str] | None = None,
         hop: int = 0,
         examined_context: Sequence[ExaminedContextItem] | None = None,
+        adopted_proposals: Mapping[str, Contribution] | None = None,
         **_extra: object,
     ) -> ScopeManagerBatchJudgment:
         """Judge several new contributions, in arrival order, in ONE call (ADR 0011 D3).
@@ -7732,6 +7801,7 @@ class ScopeManager:
                 change_id=wave_ids[0] if len(wave_ids) == 1 else None,
                 hop=hop,
                 examined_context=examined_context,
+                adopted_proposal=(adopted_proposals or {}).get(only.id),
             )
             return ScopeManagerBatchJudgment(
                 verdicts=[
@@ -7754,7 +7824,7 @@ class ScopeManager:
                 held_context=judgment.held_context,
                 held_by_contribution=(
                     {only.id: list(judgment.held_directive_changes)}
-                    if judgment.held_directive_changes
+                    if judgment.held_directive_changes or judgment.held_ops
                     else {}
                 ),
                 withdraw_published=judgment.withdraw_published,
@@ -7789,6 +7859,7 @@ class ScopeManager:
             window_verbatim_tail=window_verbatim_tail,
             implied_purpose_min_words=self._implied_purpose_min_words,
             examined_context=examined_context,
+            adopted_proposals=adopted_proposals,
         )
 
         rendered_item_ids = _rendered_publication_item_ids(
