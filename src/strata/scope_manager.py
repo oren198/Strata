@@ -5012,75 +5012,154 @@ def _names_a_different_instance(parent_text: str, content: str) -> bool:
     return False
 
 
-def _leading_subject_words(text: str, count: int = 2) -> list[str]:
+#: Auxiliary/modal verbs that lead almost every directive sentence
+#: ("Cuttings ... MUST be misted", "Custard bases MUST be strained") —
+#: found while re-verifying P2 against the held-out admit set: "must"
+#: alone made two UNRELATED subjects ("cuttings" / "custard bases") read
+#: as covered. `_CONTENT_OVERLAP_STOPWORDS` is item 1's own shared set;
+#: this is item 2's own addition, local to the subject-phrase proxy only.
+_LEADING_PHRASE_STOPWORDS = frozenset({"must", "shall", "should", "will"})
+
+
+def _leading_phrase_words(text: str, count: int = 4) -> set[str]:
     """The first *count* significant content words (same filtering as
-    `publication._overlap_words`, in TEXT ORDER — a set loses that) — a
-    cheap proxy for "what is this sentence ABOUT": the grammatical subject
-    almost always leads an English directive sentence ("Frozen pallets
-    must...", "Hygiene appointments are...")."""
+    `publication._overlap_words`, plus :data:`_LEADING_PHRASE_STOPWORDS`)
+    — a cheap proxy for "what is this sentence's SUBJECT": the grammatical
+    subject almost always leads an English directive sentence ("Frozen
+    pallets must...", "Hygiene appointments are..."). Widened from a
+    2-word prefix (architect ruling, round 2): the covered-subject test
+    needs enough of the leading noun phrase to catch "small frozen
+    pallets" / "young seedlings" sharing a word with a 1-2-word parent
+    subject."""
     from strata.publication import _CONTENT_OVERLAP_STOPWORDS, _overlap_stem  # noqa: PLC0415
 
-    words: list[str] = []
+    words: set[str] = set()
     for word in re.findall(r"[a-z]+", text.casefold()):
-        if len(word) < 4 or word in _CONTENT_OVERLAP_STOPWORDS:
+        if len(word) < 4 or word in _CONTENT_OVERLAP_STOPWORDS or word in _LEADING_PHRASE_STOPWORDS:
             continue
-        words.append(_overlap_stem(word))
+        words.add(_overlap_stem(word))
         if len(words) >= count:
             break
     return words
 
 
-def _same_leading_subject(parent_text: str, content: str) -> bool:
-    """``True`` when EVERY one of *content*'s leading subject words
-    (:func:`_leading_subject_words`) matches SOME word in *parent_text*'s
-    own full content-word set — "matches" tolerates a shared 4+ character
-    prefix, since `_overlap_stem` is "never a real stemmer" (its own
-    docstring): "replace" (content, no suffix to strip) and "replaced"
-    (parent, stemmed to "replac") are the same word, just stemmed
-    inconsistently; this is NOT a real subject-noun match on its own,
-    since a paraphrased restatement ("Replace guillotine blade every
-    65,000 cuts" for "The guillotine blade must be replaced every 40,000
-    cuts") can lead with a VERB the original sentence doesn't lead with.
+def _is_covered_subject(parent_text: str, content: str) -> bool:
+    """P2 (architect ruling, round 2): the subject is COVERED when *content*'s
+    leading noun phrase shares ANY content word (prefix-tolerant, since
+    `_overlap_stem` is "never a real stemmer" — "replace"/"replaced" stem
+    inconsistently) with *parent_text*'s leading noun phrase — "seedling
+    trays", "young seedlings" and "small frozen pallets" are all covered by
+    a parent about "seedlings" or "frozen pallets". A covered subject can
+    never be a genuine `refines` (a refinement is for a subject the parent
+    never addressed at all); it is held to the TIGHTEN value test instead
+    (:func:`_tighten_value_check`), or the decline stands.
+
+    Stated limit: "chilled pallets ... 0-4 °C" against a parent about
+    FROZEN pallets at -18 °C shares "pallets" — held to the tighten test
+    and declined, even though chilled and frozen are arguably different
+    storage regimes. Fails closed, per the architect's own ruling.
     """
-    from strata.publication import _overlap_words  # noqa: PLC0415
 
-    parent_words = _overlap_words(parent_text)
+    def _matches(a: str, b: str) -> bool:
+        return a == b or (len(a) >= 4 and len(b) >= 4 and (a.startswith(b) or b.startswith(a)))
 
-    def _matches(word: str) -> bool:
-        return any(
-            word == other or (len(word) >= 4 and (word.startswith(other) or other.startswith(word)))
-            for other in parent_words
-        )
-
-    leading = _leading_subject_words(content)
-    return bool(leading) and all(_matches(word) for word in leading)
+    parent_words = _leading_phrase_words(parent_text)
+    content_words = _leading_phrase_words(content)
+    return any(_matches(cw, pw) for cw in content_words for pw in parent_words)
 
 
-def _refines_value_conflict(parent_text: str, content: str) -> bool:
-    """Design note line 12: the contribution's key tokens (numbers, ids,
-    times, quoted values) "must NOT include a value that conflicts with the
-    parent's on the SAME token class". Checked per class
-    (:func:`strata.publication._classed_value_tokens`) rather than as one
-    flat set, so a number colliding with an unrelated id never passes for
-    the wrong reason — and ONLY when *content* leads with the SAME subject
-    as *parent_text* (:func:`_same_leading_subject`): "chilled pallets ...
-    4 °C" against a parent rule about FROZEN pallets leads with a
-    DIFFERENT subject ("chill" vs "frozen") despite otherwise sharing
-    nearly the entire sentence, and is a genuinely different, uncovered
-    subject, never a conflict — distinguishing that from a conflicting
-    restatement is exactly the design note's own stated judge-only limit,
-    which this mechanical proxy approximates rather than resolves.
-    """
-    from strata.publication import _classed_value_tokens  # noqa: PLC0415
+#: P3 (architect ruling, round 2): a parent's own UNIVERSAL scope phrase
+#: ("every day", "always", "whenever", "at all times", "every <unit>", "all
+#: <noun>") must survive in a covered-subject contribution, or a stricter
+#: one in the same unit class — restricting WHEN or WHERE the rule applies
+#: ("on weekdays", "during the season", "in the morning") drops it, which
+#: is an exemption of the rest, not a refinement or a tightening.
+#:
+#: "every" immediately followed by a DIGIT ("every 40,000 cuts", "every 30
+#: minutes") is excluded — that is a comparator-style "every N" count
+#: `_COMPARATOR_PATTERNS` already recognises and verifies in its own right
+#: (smaller N is stricter); treating it as a bare universal-scope phrase
+#: too made a genuine stricter rewrite ("every 15 minutes" for "every 30
+#: minutes") fail here on a meaningless "every 30" vs "every 15" text
+#: mismatch.
+_UNIVERSAL_SCOPE_RE = re.compile(
+    r"\bevery\s+(?!\d)\w+\b|\balways\b|\bwhenever\b|\bat all times\b|\ball\s+(?!\d)\w+\b",
+    re.IGNORECASE,
+)
 
-    if not _same_leading_subject(parent_text, content):
+#: A coarse time-unit ordering so "every hour" reads as STRICTER than
+#: "every day" (a smaller, more frequent unit) — the same "smaller/more
+#: frequent is stricter" direction `_COMPARATOR_PATTERNS`'s own "every N"
+#: pattern already uses for a bare count.
+_TIME_UNIT_RANK = {
+    "second": 0,
+    "minute": 1,
+    "hour": 2,
+    "day": 3,
+    "week": 4,
+    "month": 5,
+    "year": 6,
+}
+
+
+def _stricter_universal_phrase_present(parent_phrase: str, content_cf: str) -> bool:
+    match = re.match(r"every\s+(\w+)", parent_phrase, re.IGNORECASE)
+    if not match:
         return False
-    parent_classes = _classed_value_tokens(parent_text)
-    content_classes = _classed_value_tokens(content)
-    return any(
-        parent_values and not (content_classes[token_class] <= parent_values)
-        for token_class, parent_values in parent_classes.items()
-    )
+    parent_rank = _TIME_UNIT_RANK.get(match.group(1).casefold().rstrip("s"))
+    if parent_rank is None:
+        return False
+    for candidate in re.finditer(r"every\s+(\w+)", content_cf, re.IGNORECASE):
+        content_rank = _TIME_UNIT_RANK.get(candidate.group(1).casefold().rstrip("s"))
+        if content_rank is not None and content_rank < parent_rank:
+            return True
+    return False
+
+
+def _universal_scope_preserved(parent_text: str, content: str) -> bool:
+    """``False`` when *parent_text* carries a universal scope phrase
+    (:data:`_UNIVERSAL_SCOPE_RE`) that *content* neither restates literally
+    nor replaces with a stricter same-unit-class phrase
+    (:func:`_stricter_universal_phrase_present`) — a partial-SCOPE
+    tightening ("In house 3, ... every day") still passes, since it KEEPS
+    "every day" (the philosopher's own ruling: subject narrowing to part of
+    the child's own scope is fine); dropping it entirely for a WHEN/WHERE
+    restriction does not.
+    """
+    content_cf = content.casefold()
+    for match in _UNIVERSAL_SCOPE_RE.finditer(parent_text.casefold()):
+        phrase = match.group(0)
+        if phrase in content_cf:
+            continue
+        if _stricter_universal_phrase_present(phrase, content_cf):
+            continue
+        return False
+    return True
+
+
+def _tighten_value_check(parent_text: str, content: str) -> tuple[bool, str]:
+    """The design note's own `tightens` value test (RULE mode when the
+    parent's value sits in a recognised comparator pattern, FACT-mode
+    value-subset otherwise), shared by the real `tightens` relation AND by
+    a covered-subject `refines` (P2 — a covered subject must pass this
+    test to be rescued at all). Operates on *content* directly, never a
+    (possibly truncated or cherry-picked) span — P1 (architect ruling,
+    round 2): every substantive guard runs on the whole contribution, the
+    span only proves WHERE the kept text sits, never narrows what counts.
+    """
+    from strata.publication import _POL_WORDS, _decomposed_value_tokens  # noqa: PLC0415
+
+    rule_ok, compared_value = _comparator_rule_ok(parent_text, content)
+    if rule_ok is False:
+        return False, "not stricter in the same direction"
+    parent_values = _decomposed_value_tokens(parent_text) - _POL_WORDS
+    if rule_ok is True and compared_value is not None:
+        parent_values = parent_values - _decomposed_value_tokens(compared_value)
+    content_values = _decomposed_value_tokens(content) - _POL_WORDS
+    if not parent_values <= content_values:
+        reason = "parent's other values not kept" if rule_ok is True else "parent's value not kept"
+        return False, reason
+    return True, "ok"
 
 
 def verify_relation_ground(
@@ -5171,25 +5250,20 @@ def verify_relation_ground(
             return False, "declined (no new_context)", None, None
         return True, ok_reason, classification, new_context
 
-    from strata.publication import _POL_WORDS, _decomposed_value_tokens  # noqa: PLC0415
-
     if relation == "refines":
         subject_span = answer.get("subject_span")
         if not _verbatim(subject_span):
             return False, "declined (subject_span not verbatim)", None, None
-        # Item 2's own adversarial attack (architect ruling, round 1): an
-        # EXEMPT item ("the blade may run past 40,000 cuts when cutting
-        # only light card stock") passed as a "refinement" — a carve-out
-        # relaxing the parent's own limit under a condition is an
-        # exemption, never a refinement, the same class `_quantifier_softened`
-        # already guards for tightens.
-        if _exemption_marker_problem(subject_span):  # type: ignore[arg-type]
+        if _truncates_a_number(subject_span):  # type: ignore[arg-type]
+            return False, "declined (subject_span truncates a number)", None, None
+        # P1 (architect ruling, round 2): every substantive guard runs on
+        # the WHOLE CONTENT, never only on the span — a forged span can
+        # quote only the clean half of a sentence ("Seedlings may be
+        # watered" for "Seedlings may be watered after 07:00 on rainy
+        # days"), and a span-only check never sees what was cut.
+        if _exemption_marker_problem(content):
             return False, "declined (exemption language, judge-only)", None, None
-        # Item 2's own adversarial attack, round 1: a child that narrows
-        # the parent's own quantifier ("every interval" -> "only at the
-        # end") is the same softened-exception shape as tightens', not a
-        # genuinely new, uncovered subject.
-        if _quantifier_softened(parent_text, subject_span):  # type: ignore[arg-type]
+        if _quantifier_softened(parent_text, content):
             return False, "declined (quantifier softened — exception, judge-only)", None, None
         # `value_polarity_flip` always adds #219's own built-in POL_ANTONYMS
         # on top of whatever pairs are passed in, so "first"/"last" (one
@@ -5198,15 +5272,23 @@ def verify_relation_ground(
         # different-instance divergence (the ferry REFINE admit: "the
         # FIRST ferry departs at 06:10" against a parent about the LAST
         # ferry is a new, uncovered subject, not a contradiction).
-        if _polarity_flip(parent_text, subject_span) and not _names_a_different_instance(  # type: ignore[arg-type]
-            parent_text,
-            subject_span,  # type: ignore[arg-type]
+        if _polarity_flip(parent_text, content) and not _names_a_different_instance(
+            parent_text, content
         ):
             return False, "declined (polarity flip against parent)", None, None
-        if _truncates_a_number(subject_span):  # type: ignore[arg-type]
-            return False, "declined (subject_span truncates a number)", None, None
-        if _refines_value_conflict(parent_text, content):
-            return False, "declined (value conflict with parent)", None, None
+        # P2 (same ruling): a COVERED subject (shares a word with the
+        # parent's own leading noun phrase) can never be a genuine
+        # refinement — it is held to the tighten value test instead, or
+        # the decline stands. P3: it must also keep the parent's own
+        # universal scope phrase, or a stricter one.
+        if _is_covered_subject(parent_text, content) and not _names_a_different_instance(
+            parent_text, content
+        ):
+            if not _universal_scope_preserved(parent_text, content):
+                return False, "declined (narrows when/where the rule applies)", None, None
+            tighten_ok, tighten_reason = _tighten_value_check(parent_text, content)
+            if not tighten_ok:
+                return False, f"declined (covered subject, {tighten_reason})", None, None
         return _context_or_fail("admitted (rescued, refines parent)")
 
     # relation == "tightens"
@@ -5218,46 +5300,19 @@ def verify_relation_ground(
     tighten_kind = answer.get("tighten_kind")
     if tighten_kind not in ("rule", "fact"):
         return False, "declined (tighten_kind is a required field)", None, None
-    if _quantifier_softened(parent_text, kept_span):  # type: ignore[arg-type]
+    # P1: same as refines — every guard below runs on the whole content.
+    if _quantifier_softened(parent_text, content):
         return False, "declined (quantifier softened — exception, judge-only)", None, None
-    if _exemption_marker_problem(kept_span):  # type: ignore[arg-type]
+    if _exemption_marker_problem(content):
         return False, "declined (exemption language, judge-only)", None, None
-    if _polarity_flip(parent_text, kept_span):  # type: ignore[arg-type]
+    if _polarity_flip(parent_text, content):
         return False, "declined (polarity flip against parent)", None, None
+    if not _universal_scope_preserved(parent_text, content):
+        return False, "declined (narrows when/where the rule applies)", None, None
 
-    if tighten_kind == "rule":
-        rule_ok, compared_value = _comparator_rule_ok(parent_text, kept_span)  # type: ignore[arg-type]
-        # Item 2's own adversarial attack, round 1: when the parent's value
-        # sits in no recognised comparative pattern, the design note's own
-        # "the judge's answer stands, recorded" assumes a REAL judge made
-        # that call — this pure verifier has no judge to defer to, and an
-        # unconditional admit here let EVERY RULE-mode attack through.
-        # Falls back to the FACT-mode value-subset check instead: the
-        # pattern distinction only ever supplied the DIRECTION check, never
-        # a free pass.
-        if rule_ok is False:
-            return False, "declined (not stricter in the same direction)", None, None
-        parent_values = _decomposed_value_tokens(parent_text) - _POL_WORDS
-        if rule_ok is True and compared_value is not None:
-            # The comparator already verified this ONE value is kept or
-            # replaced by a stricter one — don't also demand it unchanged.
-            # A clock time ("07:00") decomposes into separate digit tokens
-            # ("07", "00") in `_decomposed_value_tokens`, not one colon
-            # string, so the exclusion set must match that same shape.
-            parent_values = parent_values - _decomposed_value_tokens(compared_value)
-        kept_values = _decomposed_value_tokens(kept_span) - _POL_WORDS
-        if not parent_values <= kept_values:
-            reason = (
-                "declined (parent's other values not kept)"
-                if rule_ok is True
-                else "declined (parent's value not kept)"
-            )
-            return False, reason, None, None
-    else:  # tighten_kind == "fact"
-        parent_values = _decomposed_value_tokens(parent_text) - _POL_WORDS
-        kept_values = _decomposed_value_tokens(kept_span) - _POL_WORDS
-        if not parent_values <= kept_values:
-            return False, "declined (parent's value not kept)", None, None
+    tighten_ok, tighten_reason = _tighten_value_check(parent_text, content)
+    if not tighten_ok:
+        return False, f"declined ({tighten_reason})", None, None
 
     return _context_or_fail("admitted (rescued, tightens parent)")
 

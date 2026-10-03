@@ -689,8 +689,11 @@ def test_tightens_declines_a_kept_span_that_truncates_a_number() -> None:
 
 
 def test_refines_declines_a_same_subject_value_swap() -> None:
-    """A flat value swap on the SAME subject (near-identical sentence,
-    just the number changed) is a contradiction, not a refinement."""
+    """A flat value swap on the SAME (COVERED) subject (near-identical
+    sentence, just the number changed) is a contradiction, not a
+    refinement — P2 (architect ruling, round 2): a covered subject is held
+    to the tighten value test, which this fails (09:00 is looser than
+    07:00 for "at or before")."""
     parent_text = "Seedlings must be watered at or before 07:00 every day."
     content = "Seedlings must be watered at or before 09:00 every day."
     answer = {
@@ -702,13 +705,16 @@ def test_refines_declines_a_same_subject_value_swap() -> None:
     ok, result, _c, ctx = verify_relation_ground(answer, parent_text, content, "directive")
     assert ok is False
     assert ctx is None
-    assert "value conflict with parent" in result
+    assert "covered subject" in result
 
 
-def test_refines_admits_a_genuinely_different_subject_despite_shared_wording() -> None:
-    """The flip side of the above: a DIFFERENT subject that happens to
-    share most of the parent's sentence shape (different adjective, same
-    noun and structure) is a genuine refine, not a conflict."""
+def test_refines_declines_a_covered_subject_despite_shared_wording() -> None:
+    """P2's own stated limit (architect ruling, round 2): "chilled pallets"
+    shares "pallets" with a parent about FROZEN pallets, so the subject is
+    COVERED (not a genuinely different, uncovered one) — held to the
+    tighten value test, and 4 °C is not at or below -18 °C, so it stays
+    declined. Fails closed, by design; this is the accepted cost, not a
+    bug (a prior version of this test asserted the opposite, before P2)."""
     parent_text = "Frozen pallets must stay at or below -18 °C during dock transfer."
     content = "Chilled pallets must stay at or below 4 °C during dock transfer."
     answer = {
@@ -717,15 +723,17 @@ def test_refines_admits_a_genuinely_different_subject_despite_shared_wording() -
         "parent_id": "p",
         "subject_span": content,
     }
-    ok, _result, _c, ctx = verify_relation_ground(answer, parent_text, content, "directive")
-    assert ok is True
+    ok, result, _c, ctx = verify_relation_ground(answer, parent_text, content, "directive")
+    assert ok is False
     assert ctx is None
+    assert "covered subject" in result
 
 
-def test_refines_admits_a_paraphrased_restatement_of_the_same_subject() -> None:
+def test_refines_declines_a_paraphrased_value_swap_of_the_same_subject() -> None:
     """A compressed paraphrase ("Replace X every N" for "X must be
-    replaced every M") still correctly flags a value swap — the
-    subject-match proxy tolerates the paraphrase's own word order."""
+    replaced every M") is still a COVERED subject (P2) — held to the
+    tighten value test, which this fails (65,000 is not stricter than
+    40,000 for "every N cuts")."""
     parent_text = "The guillotine blade must be replaced every 40,000 cuts."
     content = "Replace guillotine blade every 65,000 cuts."
     answer = {
@@ -737,4 +745,4 @@ def test_refines_admits_a_paraphrased_restatement_of_the_same_subject() -> None:
     ok, result, _c, ctx = verify_relation_ground(answer, parent_text, content, "directive")
     assert ok is False
     assert ctx is None
-    assert "value conflict with parent" in result
+    assert "covered subject" in result

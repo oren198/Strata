@@ -2268,43 +2268,6 @@ def _decomposed_value_tokens(text: str) -> set[str]:
     return tokens
 
 
-def _classed_value_tokens(text: str) -> dict[str, set[str]]:
-    """:func:`_decomposed_value_tokens`'s own number/identifier/quote kinds,
-    kept SEPARATE rather than flattened into one set — v1.17 item 2's
-    ``refines`` ground needs to compare the contribution's own key tokens
-    against the parent directive's "on the same token class" (design note),
-    not against the parent's values as an undifferentiated bag (a number
-    colliding with an unrelated id would otherwise pass a flat subset check
-    for the wrong reason)."""
-    casefolded = text.casefold()
-    numbers: set[str] = set()
-    for match in re.finditer(r"\b\d[\d,]*(?:\.\d+)?\b", casefolded):
-        numbers.add(match.group(0).replace(",", ""))
-    for word in re.findall(r"[a-z]+", casefolded):
-        if word in _NUMBER_WORDS:
-            numbers.add(_NUMBER_WORDS[word])
-    identifiers: set[str] = set()
-    for match in re.finditer(r"[\w]+(?:[./_][\w]+)+", casefolded):
-        identifiers.add(match.group(0))
-    for match in re.finditer(r"[\w]+(?:[-/][\w]+)+", casefolded):
-        compound = match.group(0)
-        # An ordinary hyphenated word ("signed-off", "well-known") is NOT a
-        # value token at all — same discipline as `_value_tokens` — only a
-        # digit-containing compound counts, and it decomposes rather than
-        # staying whole (same as `_decomposed_value_tokens`).
-        if not any(c.isdigit() for c in compound):
-            continue
-        for atom in re.split(r"[-/]", compound):
-            if atom.isdigit():
-                numbers.add(atom)
-            elif atom in _NUMBER_WORDS:
-                numbers.add(_NUMBER_WORDS[atom])
-    quotes: set[str] = set()
-    for match in re.finditer(r'"([^"]+)"', text):
-        quotes.add(match.group(1).strip().casefold())
-    return {"number": numbers, "identifier": identifiers, "quote": quotes}
-
-
 #: #219's own closed POL_WORDS set, paired into antonyms — bidirectional.
 #: "forbidden" and "prohibited" are both treated as the antonym of
 #: "allowed" (near-synonyms of each other, not antonyms).
