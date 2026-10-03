@@ -4005,6 +4005,102 @@ _OUTSIDE_PARTY_EVENT_VERBS = ("published", "announced", "released", "issued", "p
 _OUTSIDE_PARTY_EVENT_VERB_RE = re.compile(
     r"\b(?:" + "|".join(_OUTSIDE_PARTY_EVENT_VERBS) + r")\b", re.IGNORECASE
 )
+_OUTSIDE_PARTY_EVENT_VERB_BY_RE = re.compile(
+    r"\b(?:" + "|".join(_OUTSIDE_PARTY_EVENT_VERBS) + r")\s+by\s+", re.IGNORECASE
+)
+
+#: F1 (architect review round 4, adversarial attack on 067183a):
+#: authority words a `first_hand_own` rescue can never ground, since they
+#: name fleet machinery or another scope's summary rather than the
+#: contributor's own conduct — even with no scope named by id/name.
+_FIRST_HAND_AUTHORITY_PHRASES = (
+    "operator",
+    "fleet config",
+    "fleet.yaml",
+    "entitlement",
+    "system note",
+    "summary says",
+    "summary already",
+)
+_FIRST_HAND_AUTHORITY_RE = re.compile(
+    r"\b(?:" + "|".join(re.escape(p) for p in _FIRST_HAND_AUTHORITY_PHRASES) + r")\b",
+    re.IGNORECASE,
+)
+
+#: F2/F4 (same review): a `party_span`/`teller_span` must contain a
+#: name-like token — not ONLY function words that happen to precede a
+#: name in real text ("Per Fraud's publication", "As eng-lead I can tell
+#: you"). Bare function words are never names on their own.
+_NAME_STOPWORDS = frozenset(
+    {
+        "per",
+        "both",
+        "stacked",
+        "as",
+        "the",
+        "our",
+        "their",
+        "this",
+        "that",
+        "here",
+        "it",
+        "you",
+        "i",
+        "we",
+        "me",
+        "us",
+    }
+)
+
+
+def _is_name_like(span: str) -> bool:
+    words = re.findall(r"[a-z]+", span.casefold())
+    return bool(words) and any(word not in _NAME_STOPWORDS for word in words)
+
+
+def _event_verb_near_party(content: str, party_span: str) -> bool:
+    """F2 (architect review round 4): the event verb must belong to
+    *party_span* — within 4 words AFTER it in *content*, or the passive
+    "<verb> by <party_span>" form — not merely present somewhere in the
+    content regardless of distance."""
+    normalized_content = " ".join(content.split())
+    normalized_party = " ".join(party_span.split())
+    idx = normalized_content.casefold().find(normalized_party.casefold())
+    if idx == -1:
+        return False
+    tail_words = normalized_content[idx + len(normalized_party) :].split()
+    window = " ".join(tail_words[:4])
+    if _OUTSIDE_PARTY_EVENT_VERB_RE.search(window):
+        return True
+    for match in _OUTSIDE_PARTY_EVENT_VERB_BY_RE.finditer(normalized_content):
+        if normalized_content[match.end() :].casefold().startswith(normalized_party.casefold()):
+            return True
+    return False
+
+
+_ANY_TELLING_OR_JOINT_VERB_RE = re.compile(
+    _TELLING_VERB_RE.pattern + "|" + _JOINT_EVENT_VERB_RE.pattern, re.IGNORECASE
+)
+
+
+def _teller_near_a_verb(telling_span: str, teller_span: str, *, window: int = 6) -> bool:
+    """``True`` when *teller_span* sits within *window* words of a
+    recognised telling/joint verb occurrence inside *telling_span* — found
+    while verifying F4 against the full adversarial attack: a forged
+    ``telling_span`` set to the WHOLE contribution otherwise lets an
+    unrelated capitalised word deep in the padding qualify as the teller
+    merely by being present somewhere inside it, with no connection to the
+    verb at all."""
+    span_cf = " ".join(telling_span.split()).casefold()
+    teller_cf = " ".join(teller_span.split()).casefold()
+    teller_idx = span_cf.find(teller_cf)
+    if teller_idx == -1:
+        return False
+    for verb_match in _ANY_TELLING_OR_JOINT_VERB_RE.finditer(span_cf):
+        lo, hi = sorted((teller_idx, verb_match.start()))
+        if len(span_cf[lo:hi].split()) <= window:
+            return True
+    return False
 
 
 def _telling_span_problem_for(
@@ -4287,14 +4383,26 @@ def verify_attribution_ground(
             return False, "declined (span not verbatim)", None
         if _match_other_scopes(party_span, fleet.all_scopes):  # type: ignore[arg-type]
             return False, "declined (party is a fleet scope)", None
-        if not _OUTSIDE_PARTY_EVENT_VERB_RE.search(act_span):  # type: ignore[arg-type]
+        # F2 (architect review round 4, adversarial attack on 067183a: 8
+        # passes with party_span a bare function word — "Per", "Both",
+        # "Stacked"). A party must be a NAME, not just a word that happens
+        # to precede one in real text.
+        if not _is_name_like(party_span):  # type: ignore[arg-type]
+            return False, "declined (party_span is not a name)", None
+        # Same review: an outside party can never carry fleet authority —
+        # not JUST another scope's interior (Fix 3), any fleet scope at
+        # all, or the operator.
+        if _match_other_scopes(content, fleet.all_scopes):
+            return False, "declined (names a fleet scope)", None
+        if re.search(r"\boperator\b", content, re.IGNORECASE):
+            return False, "declined (names the operator)", None
+        # Same review: the event verb must actually belong to THIS party —
+        # within 4 words after party_span, or "<verb> by <party_span>" —
+        # not merely present somewhere in act_span regardless of distance
+        # ("Per Fraud's own publication, ... since they already published
+        # it" — "published" is nowhere near "Per Fraud").
+        if not _event_verb_near_party(content, party_span):  # type: ignore[arg-type]
             return False, "declined (no event verb)", None
-        # Fix 3 (architect review of 10327f6): an outside party can never
-        # carry another fleet scope's interior — a stated limit, failing
-        # closed, since this ground admits whatever the party is reported
-        # to have said with no check on ITS content at all.
-        if fleet.non_entitled_scopes and _match_other_scopes(content, fleet.non_entitled_scopes):
-            return False, "declined (asserts a non-entitled scope's interior)", None
         # Item D (architect review round 3, J4 j4-812): when the re-ask
         # names the specific claim actually grounded (`span`), it must not
         # be padded with an unattributed second requirement clause. Absent
@@ -4332,6 +4440,48 @@ def verify_attribution_ground(
         teller_span = answer.get("teller_span")
         if not _verbatim(teller_span):
             return False, "declined (no teller_span)", None
+        # F4 (architect review round 4, adversarial attack on 067183a: the
+        # attack's teller_span was a bare "As"). The teller must be a NAME
+        # (same rule as F2), and must actually occur INSIDE telling_span —
+        # not merely be verbatim somewhere else in the contribution.
+        if not _is_name_like(teller_span):  # type: ignore[arg-type]
+            return False, "declined (teller_span is not a name)", None
+        # Found while verifying F4 against the full adversarial attack: a
+        # forged teller_span that simply EXTENDS the attestation frame
+        # ("As eng-lead I can tell you procurement only approves ...")
+        # starts at the same position as the frame itself, so a
+        # start-position-only proximity check cannot tell it apart from a
+        # genuine short name. A name is a short phrase.
+        if len(teller_span.split()) > 8:  # type: ignore[union-attr]
+            return False, "declined (teller_span is too long to be a name)", None
+        if (
+            " ".join(teller_span.split()).casefold()
+            not in " ".join(  # type: ignore[union-attr]
+                telling_span.split()
+            ).casefold()
+        ):
+            return False, "declined (teller_span is not inside telling_span)", None
+        # Same review: a teller_span that is only part of the LEADING
+        # attestation frame itself ("As eng-lead I can tell you ...") is
+        # not a name either, even when it is not one of the bare function
+        # words `_is_name_like` already screens — "eng-lead" passes
+        # that check on its own, but it is the FRAME's own role word, not
+        # a separate informant.
+        frame_match = _LEADING_FRAME_RE.match(telling_span)  # type: ignore[arg-type]
+        if (
+            frame_match is not None
+            and " ".join(teller_span.split()).casefold()
+            in " ".join(frame_match.group(0).split()).casefold()
+        ):
+            return False, "declined (teller_span is part of the attestation frame)", None
+        # Found while verifying F4 against the full adversarial attack: a
+        # forged telling_span set to the WHOLE contribution lets an
+        # unrelated capitalised word deep in the padding ("EUR", "HVAC")
+        # qualify as teller_span merely by being INSIDE telling_span, with
+        # no connection to the telling/joint verb at all. teller_span must
+        # sit within 6 words of a recognised verb occurrence.
+        if not _teller_near_a_verb(telling_span, teller_span):  # type: ignore[arg-type]
+            return False, "declined (teller_span is not near the telling verb)", None
         problem, _verb_kind = _telling_span_problem_for(telling_span, content=content)
         if problem is not None:
             return False, f"declined (no telling event): {problem}", None
@@ -4360,12 +4510,24 @@ def verify_attribution_ground(
     span = answer.get("span")
     if not _verbatim(span):
         return False, "declined (span not verbatim)", None
-    # Barred mechanically when a non-entitled scope is named anywhere in
-    # the contribution — an interior assertion about another scope can
-    # never be rescued by this path (the general line's own stated reason
-    # this re-check cannot open #225's hole).
-    if fleet.non_entitled_scopes and _match_other_scopes(content, fleet.non_entitled_scopes):
-        return False, "declined (names a non-entitled scope)", None
+    # F1 (architect review round 4, adversarial attack on 067183a: 40/57
+    # passing forgeries went through this path). Barred mechanically when
+    # the content names ANY fleet scope other than the contributor's OWN —
+    # not just a non-entitled one: a claim about an ENTITLED peer or
+    # ancestor ("Analytics-eng's summary already decided ...") is not
+    # first-hand about the contributor's own scope or conduct either.
+    # Legitimate conduct that names another scope is #225's own first-pass
+    # territory, never this rescue — accepted and stated, costs 2 of the
+    # j4_interior conduct twins their rescue path here.
+    other_scopes = [s for s in fleet.all_scopes if s.id != fleet.contributor_scope_id]
+    if other_scopes and _match_other_scopes(content, other_scopes):
+        return False, "declined (names a scope other than the contributor's own)", None
+    # Same review: an AUTHORITY word — the operator, the fleet's own
+    # config/entitlement machinery, or a paraphrase of another scope's
+    # summary ("summary says"/"summary already") — names something this
+    # rescue can never ground either, even with no scope named by id.
+    if _FIRST_HAND_AUTHORITY_RE.search(content):
+        return False, "declined (names fleet authority, not the contributor's own)", None
     stripped = _strip_leading_frame(span)  # type: ignore[arg-type]
     # Fix 2 (architect review round 2, bridge replay 2/4): the answerer's
     # own span can BE the claim itself with no first-person word at all

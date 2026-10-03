@@ -2430,19 +2430,73 @@ def _shared_six_word_sequence(a: str, b: str) -> bool:
     return any(tuple(a_tokens[i : i + 6]) in b_sequences for i in range(len(a_tokens) - 5))
 
 
+#: F3 (architect review round 4, adversarial attack on 067183a: 12 passes
+#: through a weak "≥2 shared words" bar, including the whole j4-812 text).
+#: Splits the SPAN itself on coordinators, dashes and semicolons, so a
+#: requirement clause added beyond what the reference covers is caught
+#: even when the span's OVERALL coverage happens to clear the bar.
+_OVERLAP_CLAUSE_SPLIT_RE = re.compile(
+    r"\s*(?:--|;| and | AND | also | ALSO | plus | PLUS | as well as )\s*", re.IGNORECASE
+)
+
+
+def _coverage_ratio(subject_words: set[str], reference_words: set[str]) -> float:
+    if not subject_words:
+        return 0.0
+    return len(subject_words & reference_words) / len(subject_words)
+
+
 def content_overlap_required(span: str, reference_text: str) -> bool:
-    """Hole B's fix: *span* must share at least two content words
+    """Hole B / F3's fix: at least 60% of *span*'s own content words
     (casefolded, 4+ letters, simple plural/-ed/-ing stripping, excluding
-    :data:`_CONTENT_OVERLAP_STOPWORDS`) with *reference_text*, OR a shared
-    contiguous 6-word sequence — otherwise an unrelated item can be cited
-    with no mechanical check catching it, whenever the span itself carries
-    no number/id/quote (the value-subset check then holds vacuously). This
-    is a NECESSARY gate, never a sufficient one on its own — the value and
-    polarity checks still apply on top.
+    :data:`_CONTENT_OVERLAP_STOPWORDS`) must appear in *reference_text* —
+    COVERAGE, not a flat "≥2 shared words" count (which a long span could
+    clear while adding whole unattributed clauses) — OR a shared
+    contiguous 6-word sequence.
+
+    F3's own further rule: the span is ALSO split on coordinators, dashes
+    and semicolons, and every resulting clause that contains a REQUIREMENT
+    verb (:data:`_PARTIAL_GROUNDING_REQUIREMENT_RE`-shaped — imported
+    lazily from `strata.scope_manager` to avoid a circular import) must
+    ITSELF reach 60% coverage — this is what catches a span whose overall
+    coverage passes only because an earlier, genuinely-grounded clause
+    carries it (j4-812's own shape: "transactions over $500 require
+    step-up authentication AND transactions over $500 from newly-seen
+    devices must be blocked outright" shares "transactions", "500" with
+    the reference overall, but the SECOND clause's own value — "blocked
+    outright" — never appears there at all).
+
+    This is a NECESSARY gate, never a sufficient one on its own — the
+    value and polarity checks still apply on top.
     """
-    if len(_overlap_words(span) & _overlap_words(reference_text)) >= 2:
-        return True
-    return _shared_six_word_sequence(span, reference_text)
+    from strata.scope_manager import (  # noqa: PLC0415 — avoids a circular import
+        _PARTIAL_GROUNDING_REQUIREMENT_RE,
+    )
+
+    reference_words = _overlap_words(reference_text)
+    span_words = _overlap_words(span)
+    # Found while verifying F3 against the full adversarial attack: a span
+    # with only ONE surviving content word ("As the branches directive
+    # already says" — "directive"/"already"/"says" are all stopwords, only
+    # "branches" is left) can coincidentally match an UNRELATED reference
+    # that happens to share that one word, at 100% coverage. Coverage
+    # alone cannot distinguish "the whole span matches" from "the only
+    # word left happens to match" — at least 2 surviving words are
+    # required for the ratio to mean anything.
+    if len(span_words) < 2 and not _shared_six_word_sequence(span, reference_text):
+        return False
+    if _coverage_ratio(span_words, reference_words) < 0.6 and not _shared_six_word_sequence(
+        span, reference_text
+    ):
+        return False
+
+    for clause in _OVERLAP_CLAUSE_SPLIT_RE.split(span):
+        if not _PARTIAL_GROUNDING_REQUIREMENT_RE.search(clause):
+            continue
+        clause_words = _overlap_words(clause)
+        if _coverage_ratio(clause_words, reference_words) < 0.6:
+            return False
+    return True
 
 
 def observed_value_veto(refuted_claim: str, correcting_content: str, item_content: str) -> bool:
