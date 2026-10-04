@@ -78,6 +78,18 @@ the release PR (`dev` → `main`) and the GitHub Release body are built from
 
 ### Added
 
+- **A child's own rule under an inherited one gets one re-check, and can be
+  reinstated (#237).** When a decline names an inherited directive as the
+  conflict, a second targeted judge call names the relation (contradicts,
+  exempts, refines or tightens), and the engine verifies it against both texts.
+  A verified refinement or tightening reinstates the judge's original
+  classification. Every guard reads the whole contribution, so an exemption,
+  a softened quantifier, a narrowed "every day", or a claim that the inherited
+  rule is outdated keeps the decline. Stated limits: a refinement whose subject
+  shares a word with the inherited rule's subject is held to the tightening
+  test, and the batch path is not covered
+  ([evidence](docs/evidence/v1.17-237-relation-recheck-2026-10-04.md)).
+
 - **Optional provider pinning for an OpenRouter judge, `JUDGE_PROVIDER` /
   `STRATA_JUDGE_PROVIDER` (#224).** OpenRouter routes the default judge
   across roughly ten backing providers; the same item on the same build

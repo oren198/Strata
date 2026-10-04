@@ -2531,6 +2531,11 @@ def content_overlap_required(
 
     This is a NECESSARY gate, never a sufficient one on its own — the
     value and polarity checks still apply on top.
+
+    v1.17 item 2 does not call this function: its own `refines` ground
+    needed a coarser "is this substantially about the same subject" gate
+    with no equivalent of F3's own partial-grounding shape, so it uses its
+    own `_same_leading_subject` proxy instead of forking this one.
     """
     from strata.scope_manager import (  # noqa: PLC0415 — avoids a circular import
         _PARTIAL_GROUNDING_REQUIREMENT_RE,
