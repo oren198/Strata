@@ -4933,6 +4933,36 @@ def _exemption_marker_problem(span: str) -> bool:
     return bool(_EXEMPTION_MODAL_CONDITIONAL_RE.search(span_cf))
 
 
+#: Architect ruling (bridge gate, the E-shape hole): a rescue REVERSES only
+#: one WRONG ground (the decline's own mistaken citation) — it never also
+#: lets the contribution assert that the INHERITED directive itself is
+#: outdated, retired, or replaced. A genuine tightening ("...stay at or
+#: below -20 °C...") plus a trailing claim that the PARENT's own rule is
+#: stale is a claim about the parent's authority the child can't make — the
+#: same shape item 1's own partial-grounding ruling exists for. Checked on
+#: the whole content (P1), same discipline as exemption/quantifier/polarity.
+_OUTDATING_MARKERS = (
+    "outdated",
+    "out of date",
+    "obsolete",
+    "superseded",
+    "supersedes",
+    "replaces",
+    "replaced by",
+    "no longer applies",
+    "no longer valid",
+    "changed in commit",
+    "earlier entry",
+    "previous entry",
+    "old rule",
+)
+
+
+def _outdating_marker_problem(content: str) -> bool:
+    content_cf = content.casefold()
+    return any(marker in content_cf for marker in _OUTDATING_MARKERS)
+
+
 #: Philosopher's adopted guard 2 (design note): relation antonyms for the
 #: polarity guard, on top of #219's own `_POL_WORDS` single-word set —
 #: "at or below"/"at or above" is a phrase, and "start"/"finish" and
@@ -5308,6 +5338,14 @@ def verify_relation_ground(
         # days"), and a span-only check never sees what was cut.
         if _exemption_marker_problem(content):
             return False, "declined (exemption language, judge-only)", None, None
+        if _outdating_marker_problem(content):
+            return (
+                False,
+                "declined (asserts the inherited directive is outdated; a child may "
+                "tighten but not retire it — resubmit the stricter rule alone)",
+                None,
+                None,
+            )
         if _quantifier_softened(parent_text, content):
             return False, "declined (quantifier softened — exception, judge-only)", None, None
         # `value_polarity_flip` always adds #219's own built-in POL_ANTONYMS
@@ -5350,6 +5388,14 @@ def verify_relation_ground(
         return False, "declined (quantifier softened — exception, judge-only)", None, None
     if _exemption_marker_problem(content):
         return False, "declined (exemption language, judge-only)", None, None
+    if _outdating_marker_problem(content):
+        return (
+            False,
+            "declined (asserts the inherited directive is outdated; a child may "
+            "tighten but not retire it — resubmit the stricter rule alone)",
+            None,
+            None,
+        )
     if _polarity_flip(parent_text, content):
         return False, "declined (polarity flip against parent)", None, None
     if not _universal_scope_preserved(parent_text, content):

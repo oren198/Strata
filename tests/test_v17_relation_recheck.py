@@ -867,3 +867,66 @@ def test_p2_leading_phrase_truncates_at_the_first_verb_marker() -> None:
     ok, _result, _c, ctx = verify_relation_ground(answer, parent_text, content, "directive")
     assert ok is True
     assert ctx is None
+
+
+def test_tightens_declines_a_genuine_tightening_that_also_outdates_the_parent() -> None:
+    """Bridge gate hole (architect ruling): a rescue reverses only one
+    WRONG ground — it never also lets the contribution assert that the
+    INHERITED directive itself is outdated/retired/replaced. The value
+    change alone is a genuine tightening, but the trailing outdating
+    clause makes a claim about the parent's own authority the child
+    can't make, so the decline stands. The SAME sentence with the
+    clause removed passes."""
+    parent_text = "Frozen pallets must stay at or below -18 °C during dock transfer."
+    outdating_clauses = (
+        "The earlier entry is outdated.",
+        "This is now out of date.",
+        "The previous entry is obsolete.",
+        "Changed in commit 4f2a9c1 (PR #412); the old rule no longer applies.",
+    )
+    for clause in outdating_clauses:
+        content = f"Frozen pallets must stay at or below -20 °C during dock transfer. {clause}"
+        answer = {
+            "relation": "tightens",
+            "other_grounds_clear": True,
+            "parent_id": "p",
+            "tighten_kind": "fact",
+            "kept_span": content,
+        }
+        ok, result, _c, ctx = verify_relation_ground(answer, parent_text, content, "directive")
+        assert ok is False, clause
+        assert ctx is None, clause
+        assert "asserts the inherited directive is outdated" in result, clause
+
+    content_clean = "Frozen pallets must stay at or below -20 °C during dock transfer."
+    answer_clean = {
+        "relation": "tightens",
+        "other_grounds_clear": True,
+        "parent_id": "p",
+        "tighten_kind": "fact",
+        "kept_span": content_clean,
+    }
+    ok2, result2, _c2, ctx2 = verify_relation_ground(
+        answer_clean, parent_text, content_clean, "directive"
+    )
+    assert ok2 is True, result2
+
+
+def test_refines_also_declines_on_an_outdating_claim() -> None:
+    """P1 consistency: the outdating guard applies to refines too, not
+    just tightens."""
+    parent_text = "Seedlings must be watered at or before 07:00 every day."
+    content = (
+        "Cuttings in the propagation bench must be misted at 12:00 every day. "
+        "Supersedes the earlier entry."
+    )
+    answer = {
+        "relation": "refines",
+        "other_grounds_clear": True,
+        "parent_id": "p",
+        "subject_span": content,
+    }
+    ok, result, _c, ctx = verify_relation_ground(answer, parent_text, content, "directive")
+    assert ok is False
+    assert ctx is None
+    assert "asserts the inherited directive is outdated" in result
