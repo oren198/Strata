@@ -451,6 +451,12 @@ def test_rejudge_judges_pending_then_is_idempotent(tmp_path: Path) -> None:
         )
     assert outcome2.decision == "accept_as_directive"
     assert outcome2.summary_updated is False
+    # The same reasoning as the first call: the record-only decision prefix
+    # on the stored notes is stripped from what the idempotent path returns.
+    assert outcome2.reasoning == outcome.reasoning
+    with RecordStore(db_path) as rs:
+        stored = rs.get_judgment(contribution_id).notes
+    assert stored == f"[accept_as_directive; no ops] {outcome.reasoning}"
 
     with RecordStore(db_path) as rs:
         assert len(rs.list_judgments(scope_id="g_root")) == 1

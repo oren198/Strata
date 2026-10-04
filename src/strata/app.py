@@ -144,6 +144,7 @@ from strata.scope_manager import (
     ScopeManagerBatchJudgment,
     ScopeManagerJudgment,
     is_held_note,
+    strip_record_only_notes,
 )
 from strata.session_state import (
     DEFAULT_STALENESS_WINDOW_DAYS,
@@ -2286,7 +2287,11 @@ def rejudge_contribution(
             return ContributionOutcome(
                 contribution_id=contribution_id,
                 decision=existing.decision,
-                reasoning=existing.notes or "",
+                # The record-only parts (the decision prefix and the same-scope
+                # provenance line) are the record's own account, not the judge's
+                # reasoning: an idempotent rejudge returns the same reasoning the
+                # first call did.
+                reasoning=strip_record_only_notes(existing.notes or ""),
                 summary_updated=False,
             )
         return _judge_and_record(
