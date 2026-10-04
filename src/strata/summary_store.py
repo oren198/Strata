@@ -56,6 +56,12 @@ class Directive(BaseModel):
     created_at: str
     """ISO 8601 timestamp of when the directive was created."""
 
+    adopted_from: str | None = None
+    """The id of the held proposal this directive was adopted from, when a session
+    bound to this scope admitted it by adopting another position's proposal;
+    ``None`` otherwise (and for every directive written before the field
+    existed). Rendered as a short suffix on the source line only when set."""
+
 
 class ScopeSummary(BaseModel):
     """The curated, condensed working view of a scope.
@@ -171,9 +177,21 @@ _SUBJECT_LINE_RE = re.compile(r"^-\s+subject:\s*(.*)")
 # Matches:  - source: scope=... · skill=... · at=...
 # The skill segment is optional (issue #121) — a skill-less directive renders
 # ``- source: scope=... · at=...`` and group(2) comes back None.
+# An adopted directive carries a trailing ``(adopted from proposal <id>)`` —
+# group(4), None when absent, so every older line parses exactly as before.
 _SOURCE_LINE_RE = re.compile(
-    r"^-\s+source:\s+scope=([^\s·]+)(?:\s+·\s+skill=([^\s·]+))?\s+·\s+at=(.+)"
+    r"^-\s+source:\s+scope=([^\s·]+)(?:\s+·\s+skill=([^\s·]+))?\s+·\s+at=(.+?)"
+    r"(?:\s+\(adopted from proposal ([^\s)]+)\))?$"
 )
+
+
+def adopted_suffix(directive: Directive) -> str:
+    """The provenance suffix for an adopted directive, or ``""`` when it is not one."""
+    if directive.adopted_from is None:
+        return ""
+    return f" (adopted from proposal {directive.adopted_from})"
+
+
 # Matches:  > blockquote body
 _BLOCKQUOTE_RE = re.compile(r"^>\s*(.*)")
 
@@ -223,11 +241,12 @@ def _render_summary(summary: ScopeSummary) -> str:
                 lines.append(
                     f"- source: scope={directive.source_scope_id}"
                     f" · skill={directive.source_skill}"
-                    f" · at={directive.created_at}"
+                    f" · at={directive.created_at}{adopted_suffix(directive)}"
                 )
             else:
                 lines.append(
                     f"- source: scope={directive.source_scope_id} · at={directive.created_at}"
+                    f"{adopted_suffix(directive)}"
                 )
             lines.append("")
             # Blockquote every line so multi-line directives round-trip
@@ -283,12 +302,14 @@ def _parse_summary(text: str) -> ScopeSummary:
     cur_source_scope: str | None = None
     cur_source_skill: str | None = None
     cur_created_at: str | None = None
+    cur_adopted_from: str | None = None
     cur_blockquote_lines: list[str] = []
 
     def _flush_directive() -> None:
         """Save the current in-progress directive to the list."""
         nonlocal cur_id, cur_content_from_heading, cur_subject
         nonlocal cur_source_scope, cur_source_skill, cur_created_at, cur_blockquote_lines
+        nonlocal cur_adopted_from
         if cur_id is None:
             return
         # Use blockquote as canonical content (as spec requires); the heading
@@ -307,6 +328,7 @@ def _parse_summary(text: str) -> ScopeSummary:
                 # value now (issue #121), distinct from an empty placeholder.
                 source_skill=cur_source_skill,
                 created_at=cur_created_at or "",
+                adopted_from=cur_adopted_from,
             )
         )
         cur_id = None
@@ -315,6 +337,7 @@ def _parse_summary(text: str) -> ScopeSummary:
         cur_source_scope = None
         cur_source_skill = None
         cur_created_at = None
+        cur_adopted_from = None
         cur_blockquote_lines = []
 
     for raw_line in body.splitlines():
@@ -361,6 +384,7 @@ def _parse_summary(text: str) -> ScopeSummary:
                 cur_source_scope = m_source.group(1)
                 cur_source_skill = m_source.group(2)
                 cur_created_at = m_source.group(3).strip()
+                cur_adopted_from = m_source.group(4)
                 continue
 
             m_bq = _BLOCKQUOTE_RE.match(line)

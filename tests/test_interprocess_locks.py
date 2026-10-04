@@ -97,7 +97,8 @@ class _MarkerManager:
         hop=0,
         window_verbatim_tail=None,
         acted_on_target=None,
-    ):  # noqa: ANN001, ANN201, E501
+        **_kwargs,
+    ):  # noqa: ANN001, ANN003, ANN201, E501
         existing = list(current_summary.directives) if current_summary is not None else []
         time.sleep(self.delay)
         new_directive = Directive(

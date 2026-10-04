@@ -51,25 +51,54 @@ def _migrations_dir_without_0017(tmp_path: Path) -> Path:
     return scratch
 
 
+def _migrations_dir_up_to(tmp_path: Path, last_name: str) -> Path:
+    """Every migration file up to and including *last_name*, in order —
+    stopping chronologically BEFORE a later one (0021) rebuilds the same
+    table 0017 does, so a subsequent apply of the remaining files (0017
+    onward) lands in its true chronological position rather than being
+    bolted on after 0021 already ran (which would re-apply 0017's own
+    pre-0021 table shape on top and look like data loss)."""
+    scratch = tmp_path / f"migrations_through_{last_name}"
+    scratch.mkdir()
+    for f in sorted(_MIGRATIONS_DIR.glob("*.sql")):
+        shutil.copy(f, scratch / f.name)
+        if f.name == last_name:
+            break
+    return scratch
+
+
 def test_0017_only_widens_the_kind_check_nothing_else_in_the_schema(tmp_path: Path) -> None:
+    """Compares two FRESH databases — one migrated without 0017, one with the
+    full chain in its correct chronological order — rather than bolting 0017
+    onto an already-migrated copy: migration 0021 (restore act) later rebuilds
+    `change_events` again for an unrelated reason (a new `claim_id` column), so
+    applying 0017 LATE, out of order, on top of that rebuild would reintroduce
+    0017's own pre-0021 column set and falsely look like a regression here.
+    Applying both chains fresh, each in its own correct order, is the sound
+    comparison and matches what every reader's live database actually does.
+    """
     before_path = str(tmp_path / "before.db")
     run_migrations(before_path, migrations_dir=_migrations_dir_without_0017(tmp_path))
     before = _schema_snapshot(before_path)
 
     after_path = str(tmp_path / "after.db")
-    shutil.copy(before_path, after_path)
     run_migrations(after_path, migrations_dir=_MIGRATIONS_DIR)
     after = _schema_snapshot(after_path)
 
     assert after["tables"] == before["tables"]
     assert after["indexes"] == before["indexes"]
     for table in before["tables"]:
+        if table == "change_events":
+            # The one table a LATER migration (0021) also rebuilds — 0017's
+            # own contribution to it (claim_corrected/claim_superseded in the
+            # kind CHECK) is covered by this file's other tests instead.
+            continue
         assert after["columns"][table] == before["columns"][table], table
 
 
 def test_existing_change_event_rows_survive_verbatim(tmp_path: Path) -> None:
     before_path = str(tmp_path / "before.db")
-    run_migrations(before_path, migrations_dir=_migrations_dir_without_0017(tmp_path))
+    run_migrations(before_path, migrations_dir=_migrations_dir_up_to(tmp_path, "0016_acted_on.sql"))
     conn = sqlite3.connect(before_path)
     conn.execute(
         "INSERT INTO contributions (id, scope_id, content, proposed_classification, "
@@ -88,7 +117,10 @@ def test_existing_change_event_rows_survive_verbatim(tmp_path: Path) -> None:
     conn = sqlite3.connect(before_path)
     after_row = conn.execute("SELECT * FROM change_events WHERE id = 'ce_1'").fetchone()
     conn.close()
-    assert after_row == before_row
+    # Every column the row had before 0017 keeps its exact value — a later
+    # migration (0021) adds one more (`claim_id`), which is legitimate schema
+    # growth, not something this row-survival check is about.
+    assert after_row[: len(before_row)] == before_row
 
 
 def test_the_old_kind_values_are_all_still_accepted(tmp_path: Path) -> None:

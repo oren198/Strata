@@ -125,6 +125,16 @@ STRICT_LAST_REMINDER_REASON = (
     "nothing is worth keeping. You will not be asked again."
 )
 
+#: #234 §4b/§9, the READ-side clause: memory this session read has since
+#: changed. Said ONCE per session, strict or not — strict mode blocks on it
+#: (only if a block remains in the shared budget, §9); default mode only
+#: notifies (`systemMessage`, non-blocking). The wording is the same either
+#: way, since it names the same fact.
+READ_SIDE_MESSAGE_TEMPLATE = (
+    "Memory you read has changed since you read it; re-read before acting. "
+    "Affected scope(s): {scopes}."
+)
+
 
 def strict_enabled(env: dict[str, str], project_root: Path | None) -> bool:
     """Whether strict (blocking) Stop-hook enforcement is on for this session.
@@ -210,6 +220,55 @@ def gate_open(state: SessionState | None) -> bool:
     if state.contributions > 0 or state.submitted > 0 or state.declines > 0:
         return False
     return state.reads >= NUDGE_MIN_READS
+
+
+def _read_side_stale_scopes(state: SessionState | None, env: dict[str, str]) -> list[str]:
+    """#234 §9, the read-side clause: scope ids this session read whose
+    perspective has since moved — ``[]`` on any failure or when there is
+    nothing to check (no state, no watermarked receipt, already notified
+    this session). Loads the fleet/record/summary stores only when a
+    watermark is actually present to compare, so the common no-op case (no
+    #234 receipts yet, or already notified) stays as cheap as every other
+    silent-degrade path in this hook.
+    """
+    if state is None or state.read_signal_notified:
+        return []
+    if not any(receipt.watermark is not None for receipt in state.reads_by_scope.values()):
+        return []
+    try:
+        from strata.fleet_config import FleetConfig  # noqa: PLC0415
+        from strata.operator import read_operator_layer  # noqa: PLC0415
+        from strata.perspective import perspective_changed_since  # noqa: PLC0415
+        from strata.project_config import resolve_storage_paths  # noqa: PLC0415
+        from strata.record_store import RecordStore  # noqa: PLC0415
+        from strata.summary_store import SummaryStore  # noqa: PLC0415
+
+        paths = resolve_storage_paths()
+        fleet = FleetConfig.load(Path(paths.fleet_yaml_path))
+        summary_store = SummaryStore(paths.summaries_dir)
+        with RecordStore(paths.db_path) as record_store:
+            stale: list[str] = []
+            for scope_id, receipt in state.reads_by_scope.items():
+                if receipt.watermark is None or fleet.get_scope(scope_id) is None:
+                    continue
+                try:
+                    if perspective_changed_since(
+                        receipt.watermark,
+                        scope_id,
+                        fleet=fleet,
+                        summary_store=summary_store,
+                        operator_reader=lambda s: read_operator_layer(
+                            s, summaries_dir=paths.summaries_dir
+                        ),
+                        change_event_reader=lambda s: record_store.list_change_events(scope_id=s),
+                    ):
+                        stale.append(scope_id)
+                except Exception:  # noqa: BLE001 — one scope's failure skips it, never raises
+                    continue
+            return sorted(stale)
+    except Exception as exc:  # noqa: BLE001 — hook must never raise
+        _logger.debug("freshness hook: cannot compute read-side staleness: %s", exc)
+        return []
 
 
 # ---------------------------------------------------------------------------
@@ -429,10 +488,18 @@ def run_stop_hook(
 ) -> int:
     """Run the turn-end Stop hook. Always returns ``0`` (never breaks a session).
 
-    Default mode: when the gate is open, spawn a detached background evaluator
-    and return immediately; otherwise do nothing. Strict mode
-    (``STRATA_FRESHNESS_STRICT=1``): when the gate is open and the stop was not
-    already blocked once, emit the block JSON on *out* and return; never spawn.
+    Two INDEPENDENT clauses, write-side and read-side (#234 §9), sharing one
+    block budget in strict mode (write-side counts first):
+
+    Write-side (unchanged by #234): default mode spawns a detached background
+    evaluator when the gate is open; strict mode blocks once, then at most
+    one "last reminder," never a third time.
+
+    Read-side (#234 §4b/§9): when a scope this session read has since moved,
+    it says so AT MOST ONCE per session, independent of the shared budget's
+    own cap — strict mode blocks on it only if a block remains in that
+    shared budget; default mode always just notifies (``systemMessage``,
+    never a block) when it fires.
 
     Every failure path — no project, no session state, no API key, a spawn
     error, a malformed payload — degrades to a silent ``return 0``.
@@ -471,33 +538,76 @@ def run_stop_hook(
         # The session record says which enforcement it ran under, so the
         # write-back rate can state it.
         store.record_strict(session_id, strict)
-    if not gate_open(state):
+
+    write_gate_open = gate_open(state)
+    # #234 §9: computed regardless of the write-side gate — an independent
+    # trigger. Degrades to [] fast (no fleet/store load) when there is
+    # nothing to check: no state, no watermarked receipt yet, or already
+    # notified this session.
+    stale_scopes = _read_side_stale_scopes(state, env)  # type: ignore[arg-type]
+
+    if not write_gate_open and not stale_scopes:
         return 0
 
     if strict:
-        # Strict mode blocks at most TWICE per session, never a third time. The
+        # Write-side: blocks at most TWICE per session, never a third time. The
         # session record enforces the cap (stop_hook_active only covers the
         # immediate continuation, and a later turn starts with it False again):
         # a first reminder, then one "last reminder" only if the agent made no
         # strata tool call at all since the first block.
         blocks = strict_blocks_so_far(state) if state is not None else 0
-        if blocks == 0:
-            # A stop another hook already blocked is not ours to pile onto.
+        reason: str | None = None
+        if write_gate_open:
+            if blocks == 0:
+                # A stop another hook already blocked is not ours to pile onto.
+                if hook_input.stop_hook_active:
+                    return 0
+                reason = STRICT_BLOCK_REASON
+            elif (
+                blocks == 1
+                and state is not None
+                and state.tool_calls == state.tool_calls_at_last_block
+            ):
+                reason = STRICT_LAST_REMINDER_REASON
+        if reason is not None:
+            store.record_strict_block(session_id)
+            out.write(json.dumps({"decision": "block", "reason": reason}))
+            return 0
+        # #234 §9: write-side had nothing to block on this turn (closed gate,
+        # or its own conditions above did not produce a reason) — read-side
+        # may still block, ONCE, if a block remains in the SHARED budget
+        # (write-side counted first, above).
+        if stale_scopes and blocks < 2:
             if hook_input.stop_hook_active:
                 return 0
-            reason = STRICT_BLOCK_REASON
-        elif (
-            blocks == 1 and state is not None and state.tool_calls == state.tool_calls_at_last_block
-        ):
-            reason = STRICT_LAST_REMINDER_REASON
-        else:
-            return 0
-        store.record_strict_block(session_id)
-        out.write(json.dumps({"decision": "block", "reason": reason}))
+            store.record_read_signal_notified(session_id)
+            store.record_strict_block(session_id)
+            out.write(
+                json.dumps(
+                    {
+                        "decision": "block",
+                        "reason": READ_SIDE_MESSAGE_TEMPLATE.format(scopes=", ".join(stale_scopes)),
+                    }
+                )
+            )
         return 0
 
-    # Default mode: never block. Spawn the detached evaluator behind the gate and
-    # the one-in-flight lock, and hand the user their prompt straight back.
+    # Default mode: never block. The read-side clause only ever notifies
+    # (#234 §4b) — independent of whatever the write-side evaluator below
+    # does or doesn't do.
+    if stale_scopes:
+        store.record_read_signal_notified(session_id)
+        out.write(
+            json.dumps(
+                {"systemMessage": READ_SIDE_MESSAGE_TEMPLATE.format(scopes=", ".join(stale_scopes))}
+            )
+        )
+
+    if not write_gate_open:
+        return 0
+
+    # Write-side: spawn the detached evaluator behind the gate and the
+    # one-in-flight lock, and hand the user their prompt straight back.
     if not _has_api_key(env):  # type: ignore[arg-type]
         # No key → the evaluator cannot draft. Stay silent rather than block.
         return 0
@@ -714,7 +824,13 @@ def _resolve_draft_fn(env: dict[str, str], draft_fn: DraftFn | None) -> DraftFn:
     default_model = DEFAULT_EVALUATOR_MODEL if resolved.base_url is None else resolved.model
     model = env.get(EVALUATOR_MODEL_ENV) or default_model
     api_key, base_url = resolve_judge_credentials(env)
-    return functools.partial(_default_draft_fn, api_key=api_key, base_url=base_url, model=model)
+    return functools.partial(
+        _default_draft_fn,
+        api_key=api_key,
+        base_url=base_url,
+        model=model,
+        provider=resolved.provider,
+    )
 
 
 def _submit_judged_contribution(
@@ -804,6 +920,7 @@ def _submit_judged_contribution(
         client=settings.build_judge_client(),
         model=settings.manager_model,
         implied_purpose_min_words=settings.implied_purpose_min_words,
+        judge_provider=settings.judge_provider,
     )
     with RecordStore(paths.db_path) as record_store:
         summary_store = SummaryStore(paths.summaries_dir)
@@ -881,6 +998,7 @@ def _default_draft_fn(
     api_key: str | None,
     model: str,
     base_url: str | None = None,
+    provider: str | None = None,
 ) -> EvaluatorDraft | None:
     """Model-backed drafter: ask the evaluator model for a structured verdict.
 
@@ -888,25 +1006,38 @@ def _default_draft_fn(
     transcript) returns ``None``, which the caller turns into a mechanical
     decline. The evaluator never writes memory on its own; only a returned draft
     reaches the judged contribute path.
+
+    *provider* (#224): the same ``JUDGE_PROVIDER``/``STRATA_JUDGE_PROVIDER``
+    pin the judge itself uses, applied here via
+    :func:`strata.settings.apply_provider_pin` — this call speaks to the
+    SAME endpoint the judge does, so an unpinned drafter would otherwise
+    leak to a provider a user configured the pin specifically to avoid
+    (residency, compliance).
     """
     if not api_key or not transcript_tail.strip():
         return None
     try:
-        from strata.settings import construct_judge_client  # noqa: PLC0415
+        from strata.settings import apply_provider_pin, construct_judge_client  # noqa: PLC0415
 
         client = construct_judge_client(api_key=api_key, base_url=base_url)
         response = client.messages.create(
-            model=model,
-            max_tokens=1024,
-            system=_DRAFT_SYSTEM,
-            tools=[_DRAFT_TOOL],
-            tool_choice={"type": "tool", "name": "record_freshness_verdict"},
-            messages=[
+            **apply_provider_pin(
                 {
-                    "role": "user",
-                    "content": f"Session transcript tail:\n\n{transcript_tail}",
-                }
-            ],
+                    "model": model,
+                    "max_tokens": 1024,
+                    "system": _DRAFT_SYSTEM,
+                    "tools": [_DRAFT_TOOL],
+                    "tool_choice": {"type": "tool", "name": "record_freshness_verdict"},
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": f"Session transcript tail:\n\n{transcript_tail}",
+                        }
+                    ],
+                },
+                provider=provider,
+                client=client,
+            ),
         )
     except Exception as exc:  # noqa: BLE001 — drafting is best-effort
         _logger.debug("freshness evaluator draft call failed: %s", exc)

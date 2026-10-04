@@ -959,3 +959,212 @@ def test_the_last_reminder_is_blunter_and_still_names_both_exits() -> None:
     assert "strata_contribute" in reason
     assert "strata_session_closeout(reason)" in reason
     assert reason != freshness.STRICT_BLOCK_REASON
+
+
+# ---------------------------------------------------------------------------
+# #234 §9 — the read-side clause, and its shared budget with the write-side
+# ---------------------------------------------------------------------------
+
+
+def _seed_watermarked_read(
+    paths: dict[str, str], *, session_id: str = _SESSION_ID, scope_id: str = "g_root"
+) -> None:
+    """Write g_root's initial summary and record a #234-watermarked read of it
+    for *session_id* — the baseline the read-side clause compares against.
+
+    Uses the SAME reader shape (operator_reader/change_event_reader) the real
+    hook's _read_side_stale_scopes wires — omitting them here would make this
+    helper's own baseline watermark differ from the hook's recomputed one for
+    reasons that have nothing to do with the scope actually moving."""
+    from strata.fleet_config import FleetConfig
+    from strata.operator import read_operator_layer
+    from strata.perspective import perspective_watermark
+    from strata.record_store import RecordStore
+    from strata.summary_store import SummaryStore
+
+    summary_store = SummaryStore(paths["summaries_dir"])
+    summary_store.write(
+        scope_id,
+        ScopeSummary(
+            scope_id=scope_id,
+            directives=[],
+            context="v1",
+            updated_at="2026-10-02T00:00:00+00:00",
+        ),
+    )
+    fleet = FleetConfig.load(Path(paths["fleet_yaml"]))
+    with RecordStore(paths["db"]) as record_store:
+        watermark = perspective_watermark(
+            scope_id,
+            fleet=fleet,
+            summary_store=summary_store,
+            operator_reader=lambda s: read_operator_layer(s, summaries_dir=paths["summaries_dir"]),
+            change_event_reader=lambda s: record_store.list_change_events(scope_id=s),
+        )
+    _session_store(paths).record_read(session_id, scope_id, watermark=watermark)
+
+
+def _move_scope(paths: dict[str, str], *, scope_id: str = "g_root") -> None:
+    from strata.summary_store import SummaryStore
+
+    summary_store = SummaryStore(paths["summaries_dir"])
+    current = summary_store.read(scope_id)
+    summary_store.write(scope_id, current.model_copy(update={"context": "v2"}))
+
+
+def test_read_side_notifies_in_default_mode_when_a_read_scope_moved(
+    tmp_path: Path, monkeypatch
+) -> None:
+    paths = _make_project(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    _seed_watermarked_read(paths)
+    _session_store(paths).record_decline(_SESSION_ID)  # close the write-side gate
+    _move_scope(paths)
+
+    spawns = _Spawns()
+    out = io.StringIO()
+    rc = freshness.run_stop_hook(
+        _hook_stdin(), env=_env(paths, strict=False), out=out, spawn_fn=spawns
+    )
+
+    assert rc == 0
+    payload = json.loads(out.getvalue())
+    assert "systemMessage" in payload
+    assert "g_root" in payload["systemMessage"]
+    assert "decision" not in payload  # never a block in default mode
+
+    state = _session_store(paths).read(_SESSION_ID)
+    assert state is not None
+    assert state.read_signal_notified is True
+
+
+def test_read_side_notifies_only_once_in_default_mode(tmp_path: Path, monkeypatch) -> None:
+    paths = _make_project(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    _seed_watermarked_read(paths)
+    _session_store(paths).record_decline(_SESSION_ID)  # close the write-side gate
+    _move_scope(paths)
+
+    out1 = io.StringIO()
+    freshness.run_stop_hook(_hook_stdin(), env=_env(paths, strict=False), out=out1)
+    assert "systemMessage" in json.loads(out1.getvalue())
+
+    out2 = io.StringIO()
+    freshness.run_stop_hook(_hook_stdin(), env=_env(paths, strict=False), out=out2)
+    assert out2.getvalue() == ""  # said once; never again, scope still stale or not
+
+
+def test_read_side_blocks_in_strict_mode_when_write_side_gate_is_closed(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Write-side gate closed (no reads at all toward that threshold) — the
+    read-side clause still fires, consuming the FIRST slot of the shared
+    2-block budget."""
+    paths = _make_project(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    _seed_watermarked_read(paths)
+    _session_store(paths).record_decline(_SESSION_ID)  # close the write-side gate
+    _move_scope(paths)
+
+    out = io.StringIO()
+    rc = freshness.run_stop_hook(_hook_stdin(), env=_env(paths, strict=True), out=out)
+
+    assert rc == 0
+    payload = json.loads(out.getvalue())
+    assert payload["decision"] == "block"
+    assert "g_root" in payload["reason"]
+
+    state = _session_store(paths).read(_SESSION_ID)
+    assert state is not None
+    assert state.read_signal_notified is True
+    assert state.strict_blocks == 1
+
+
+def test_read_side_never_blocks_once_write_side_has_used_both_blocks(
+    tmp_path: Path, monkeypatch
+) -> None:
+    paths = _make_project(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    _seed_reads(_session_store(paths), NUDGE_MIN_READS)
+
+    # First strict block (write-side).
+    out1 = io.StringIO()
+    freshness.run_stop_hook(_hook_stdin(), env=_env(paths, strict=True), out=out1)
+    assert json.loads(out1.getvalue())["decision"] == "block"
+
+    # Second strict block (write-side "last reminder" — no tool call since).
+    out2 = io.StringIO()
+    freshness.run_stop_hook(_hook_stdin(), env=_env(paths, strict=True), out=out2)
+    assert json.loads(out2.getvalue())["decision"] == "block"
+
+    state = _session_store(paths).read(_SESSION_ID)
+    assert state is not None
+    assert state.strict_blocks == 2
+
+    # Now a read-side staleness appears — the shared budget is exhausted.
+    _seed_watermarked_read(paths)
+    _move_scope(paths)
+    out3 = io.StringIO()
+    rc = freshness.run_stop_hook(_hook_stdin(), env=_env(paths, strict=True), out=out3)
+    assert rc == 0
+    assert out3.getvalue() == ""
+
+
+def test_read_side_can_block_once_after_write_side_blocked_once(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Write-side blocked once; the session then released the write-side gate
+    (a contribution) so write-side has nothing left to say — the read-side
+    clause may still take the SECOND, last slot in the shared budget."""
+    paths = _make_project(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    _seed_reads(_session_store(paths), NUDGE_MIN_READS)
+
+    out1 = io.StringIO()
+    freshness.run_stop_hook(_hook_stdin(), env=_env(paths, strict=True), out=out1)
+    assert json.loads(out1.getvalue())["decision"] == "block"
+
+    _session_store(paths).record_contribution(_SESSION_ID)  # closes the write-side gate
+    _seed_watermarked_read(paths)
+    _move_scope(paths)
+
+    out2 = io.StringIO()
+    rc = freshness.run_stop_hook(_hook_stdin(), env=_env(paths, strict=True), out=out2)
+    assert rc == 0
+    payload = json.loads(out2.getvalue())
+    assert payload["decision"] == "block"
+    assert "g_root" in payload["reason"]
+
+    state = _session_store(paths).read(_SESSION_ID)
+    assert state is not None
+    assert state.strict_blocks == 2
+
+
+def test_read_side_respects_stop_hook_active(tmp_path: Path, monkeypatch) -> None:
+    paths = _make_project(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    _seed_watermarked_read(paths)
+    _move_scope(paths)
+
+    out = io.StringIO()
+    rc = freshness.run_stop_hook(
+        _hook_stdin(stop_hook_active=True), env=_env(paths, strict=True), out=out
+    )
+
+    assert rc == 0
+    assert out.getvalue() == ""
+    state = _session_store(paths).read(_SESSION_ID)
+    assert state is None or state.read_signal_notified is False
+
+
+def test_read_side_does_not_fire_when_nothing_moved(tmp_path: Path, monkeypatch) -> None:
+    paths = _make_project(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    _seed_watermarked_read(paths)
+    # No _move_scope() call — the watermark still matches.
+
+    out = io.StringIO()
+    rc = freshness.run_stop_hook(_hook_stdin(), env=_env(paths, strict=False), out=out)
+
+    assert rc == 0
+    assert out.getvalue() == ""

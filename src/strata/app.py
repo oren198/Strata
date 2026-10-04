@@ -111,11 +111,13 @@ from strata.perspective import (
     ancestor_directives,
     compose_perspective,
     dropped_context_contribution_ids,
+    perspective_watermark,
     present_context_contributions,
 )
 from strata.project_config import StoragePaths, resolve_storage_paths
 from strata.publication import (
     apply_judged_withdrawals,
+    check_claim_carriers,
     propagate_claim_correction,
     propagate_directive_removals,
     read_publication,
@@ -141,6 +143,8 @@ from strata.scope_manager import (
     ScopeManager,
     ScopeManagerBatchJudgment,
     ScopeManagerJudgment,
+    is_held_note,
+    strip_record_only_notes,
 )
 from strata.session_state import (
     DEFAULT_STALENESS_WINDOW_DAYS,
@@ -252,6 +256,7 @@ def get_scope_manager(
         client=client,
         model=settings.manager_model,
         implied_purpose_min_words=settings.implied_purpose_min_words,
+        judge_provider=settings.judge_provider,
     )
 
 
@@ -345,6 +350,11 @@ class ContributeRequest(BaseModel):
     acting on. Mutually exclusive with ``supersedes``; validated the same way and with
     the same messages as ``strata_contribute``'s ``acted_on`` (see
     :func:`strata.app.validate_acted_on`)."""
+    adopted_from: str | None = None
+    """The id of a held proposal (a contribution another position made to this
+    scope) that this contribution adopts. Validated the same way and with the same
+    messages as ``strata_contribute``'s ``adopted_from`` (see
+    :func:`strata.app.validate_adopted_from`)."""
     contributor: ContributorRefBody
 
 
@@ -401,6 +411,13 @@ class RetireDirectiveRequest(BaseModel):
     reason: str | None = None
 
 
+class RestoreCorrectionWithdrawalRequest(BaseModel):
+    """Operator restore, in person — a published item a correction sweep wrongly
+    withdrew, back under its original id and bytes (the restore act design)."""
+
+    reason: str | None = None
+
+
 # ---------------------------------------------------------------------------
 # Contribute choke point (issues #38, #57)
 #
@@ -427,6 +444,44 @@ class ContributionOutcome:
     decision: Literal["accept_as_directive", "accept_as_context", "decline"]
     reasoning: str
     summary_updated: bool
+    watermark_before: str | None = None
+    """#234 §8, the self-trigger: the TARGET scope's own
+    :func:`~strata.perspective.perspective_watermark` immediately before this
+    judgment ran, read under the SAME ``_scope_lock`` the judgment itself
+    runs under (set inside :func:`_judge_and_record`/
+    :func:`_judge_batch_and_record`, never by a caller outside the lock) —
+    ``None`` if it could not be computed (best-effort, never load-bearing for
+    the judgment itself)."""
+
+    watermark_after: str | None = None
+    """#234 §8: the same scope's watermark immediately after, same lock. The
+    caller (the contributing session's own MCP layer) advances ITS OWN read
+    receipt to this value ONLY IF its receipt still matched
+    ``watermark_before`` at compare time — exact because both values were
+    read under the lock that serializes the write; if something ELSE had
+    already moved the scope before this write, the receipt is left as is and
+    the session is correctly told it is still stale."""
+
+
+def _scope_watermark(
+    scope_id: str, *, fleet: FleetConfig, record_store: RecordStore, summary_store: SummaryStore
+) -> str | None:
+    """#234 §8: best-effort :func:`~strata.perspective.perspective_watermark` for
+    *scope_id* — ``None`` on any failure (an unknown scope, a disk error), the
+    same discipline as the engine's other mechanical-measurement helpers:
+    never load-bearing for the judgment itself."""
+    try:
+        return perspective_watermark(
+            scope_id,
+            fleet=fleet,
+            summary_store=summary_store,
+            operator_reader=lambda s: read_operator_layer(
+                s, summaries_dir=str(summary_store.summaries_dir)
+            ),
+            change_event_reader=lambda s: record_store.list_change_events(scope_id=s),
+        )
+    except Exception:  # noqa: BLE001 — mechanical measurement, never load-bearing
+        return None
 
 
 class JudgeUnavailable(Exception):
@@ -613,6 +668,25 @@ def _resolve_examined_context(
     return items
 
 
+def _resolve_adopted_proposal(
+    contribution: Contribution, *, record_store: RecordStore
+) -> Contribution | None:
+    """The held proposal *contribution* adopts, or ``None`` when it adopts none.
+
+    :func:`validate_adopted_from` already guaranteed the proposal exists at the
+    write boundary, and the record is append-only, so a set ``adopted_from``
+    always resolves.
+    """
+    if contribution.adopted_from is None:
+        return None
+    proposal = record_store.get_contribution(contribution.adopted_from)
+    assert proposal is not None, (
+        "adopted_from unresolvable at judge time — validate_adopted_from should have "
+        "rejected this contribution at the write boundary"
+    )
+    return proposal
+
+
 def _judge_and_record(
     *,
     contribution: Contribution,
@@ -637,6 +711,13 @@ def _judge_and_record(
     serialized unit. On judge failure it records a judgment-attempt-failed
     event and raises :class:`JudgeUnavailable`; no judgment row is written.
     """
+    # #234 §8: the PRE-write watermark, taken before anything below reads or
+    # writes — same lock as the write that follows, so this is the exact
+    # "nothing else had changed before this write" baseline the self-trigger
+    # compares against.
+    watermark_before = _scope_watermark(
+        scope.id, fleet=fleet, record_store=record_store, summary_store=summary_store
+    )
     inputs = _read_judge_inputs(
         scope=scope,
         fleet=fleet,
@@ -722,6 +803,11 @@ def _judge_and_record(
     )
     if examined_context:
         judge_kwargs["examined_context"] = examined_context
+    # Adoption link: the held proposal this contribution adopts, so the judge sees
+    # what is adopted. Same discipline — the kwarg appears only when set.
+    adopted_proposal = _resolve_adopted_proposal(contribution, record_store=record_store)
+    if adopted_proposal is not None:
+        judge_kwargs["adopted_proposal"] = adopted_proposal
     try:
         judgment: ScopeManagerJudgment = scope_manager.judge(
             scope=scope,
@@ -764,6 +850,12 @@ def _judge_and_record(
             outcome=JUDGE_FAILED,
         )
         raise JudgeUnavailable(contribution.id, type(exc).__name__, str(exc)) from exc
+
+    # The record's decision prefix names the directive an append mints by this
+    # contribution's id; a judge that did not set it (a stand-in or out-of-repo
+    # judge) still records the right id.
+    if isinstance(judgment, ScopeManagerJudgment) and judgment.contribution_id is None:
+        judgment = judgment.model_copy(update={"contribution_id": contribution.id})
 
     # ADR 0017 P3: a failed outcome mints its linking event in the SAME transaction
     # as the judgment (RecordStore.record_judgment's claim_event, atomic). Gated on
@@ -959,6 +1051,7 @@ def _judge_and_record(
             removals=[(d, contribution.id) for d in judgment.removed_directive_ids],
             withdraw_reasoning=judgment.reasoning,
             judged_contribution_ids=[contribution.id],
+            scope_manager=scope_manager,
             change_ids_override=[claim_event.change_id] if same_scope_correction else None,
             withdraw_notice_kind=(
                 "claim_corrected"
@@ -980,11 +1073,19 @@ def _judge_and_record(
         )
         summary_updated = True
 
+    # #234 §8: the POST-write watermark, same lock, whether or not this
+    # judgment actually wrote anything (a decline is itself "nothing else
+    # changed here," so before == after is the correct, common case).
+    watermark_after = _scope_watermark(
+        scope.id, fleet=fleet, record_store=record_store, summary_store=summary_store
+    )
     return ContributionOutcome(
         contribution_id=contribution.id,
         decision=judgment.decision,
         reasoning=judgment.reasoning,
         summary_updated=summary_updated,
+        watermark_before=watermark_before,
+        watermark_after=watermark_after,
     )
 
 
@@ -1006,6 +1107,7 @@ def _write_amendment(
     withdraw_correcting_after: str | None = None,
     withdraw_corrected_claim_content: str | None = None,
     withdraw_correcting_claim_id: str | None = None,
+    scope_manager: ScopeManager | None = None,
 ) -> None:
     """Write an accepted amendment's summary and everything that follows from it.
 
@@ -1191,7 +1293,19 @@ def _write_amendment(
     #     whatever the judge already withdrew above — one notice per reader
     #     either way, and the record shows which path closed it.
     if withdraw_corrected_claim_content is not None:
-        propagate_claim_correction(
+        # Restore act design, point 2: the claim's own text and the
+        # correcting text, once per change id in this wave — never once per
+        # withdrawn item. Written inside the same lock the sweep itself
+        # runs under (this function's own caller already holds it).
+        for restore_change_id in change_ids:
+            record_store.record_claim_correction(
+                change_id=restore_change_id,
+                claim_id=withdraw_correcting_claim_id or "",
+                scope_id=scope.id,
+                corrected_claim_content=withdraw_corrected_claim_content,
+                correcting_content=withdraw_correcting_after or "",
+            )
+        verbatim_withdrawn = propagate_claim_correction(
             scope.id,
             claim_id=withdraw_correcting_claim_id or "",
             corrected_claim_content=withdraw_corrected_claim_content,
@@ -1204,6 +1318,28 @@ def _write_amendment(
             change_ids=change_ids,
             hop=judgment.hop,
         )
+        # Issue #219 C: the owner-judge's own paraphrase check, over whatever
+        # the verbatim sweep (above) and the judge's own withdraw_published
+        # still left standing — same-scope `failed_corrected` only (the
+        # drain-path site is `drain_scope`'s own #221 sweep).
+        if scope_manager is not None:
+            check_claim_carriers(
+                scope.id,
+                claim_id=withdraw_correcting_claim_id or "",
+                corrected_claim_content=withdraw_corrected_claim_content,
+                correcting_content=withdraw_correcting_after or "",
+                trigger_id=judged_contribution_ids[0],
+                already_withdrawn=[
+                    *(judgment.withdraw_published or []),
+                    *(item.id for item in verbatim_withdrawn),
+                ],
+                scope_manager=scope_manager,
+                fleet=fleet,
+                record_store=record_store,
+                summaries_dir=str(summary_store.summaries_dir),
+                change_ids=change_ids,
+                hop=judgment.hop,
+            )
 
     # 2. Mechanical propagation (D3): any published item anchored ONLY to
     #    directives that just left the summary is withdrawn, no LLM in the
@@ -1512,6 +1648,12 @@ def _judge_batch_and_record(
         _flush_ordinary_group()
         return [results_by_id[c.id] for c in contributions]
 
+    # #234 §8: the PRE-write watermark, taken before any of this batch's
+    # reads or writes — same lock, same scope every member in this real
+    # batch shares (the queue batches within one scope only).
+    watermark_before = _scope_watermark(
+        scope.id, fleet=fleet, record_store=record_store, summary_store=summary_store
+    )
     inputs = _read_judge_inputs(
         scope=scope,
         fleet=fleet,
@@ -1532,6 +1674,15 @@ def _judge_batch_and_record(
     )
     if examined_context:
         batch_judge_kwargs["examined_context"] = examined_context
+    # Adoption link: each member's adopted proposal, keyed by the member's id —
+    # the kwarg appears only when at least one member adopts.
+    adopted_proposals = {
+        c.id: proposal
+        for c in contributions
+        if (proposal := _resolve_adopted_proposal(c, record_store=record_store)) is not None
+    }
+    if adopted_proposals:
+        batch_judge_kwargs["adopted_proposals"] = adopted_proposals
 
     try:
         batch: ScopeManagerBatchJudgment = scope_manager.judge_batch(
@@ -1625,6 +1776,18 @@ def _judge_batch_and_record(
         )
         summary_updated = True
 
+    # #234 §8: the POST-write watermark, same lock — one value for the
+    # whole batch, same as watermark_before, since every member here shares
+    # one scope and one summary write. Consequence, stated rather than left
+    # implicit: in a batch, watermark_after reflects every ACCEPTED member's
+    # contribution, not just whichever session's own member this result is
+    # handed back to — the design's own "the session caused this rewrite"
+    # reasoning (§8) extends to "a rewrite this session's own member was
+    # ONE PART of," which is still true, just not exclusively this session's
+    # doing when the batch coalesced with other sessions' contributions.
+    watermark_after = _scope_watermark(
+        scope.id, fleet=fleet, record_store=record_store, summary_store=summary_store
+    )
     return [
         ContributionOutcome(
             contribution_id=verdict.contribution_id,
@@ -1633,6 +1796,8 @@ def _judge_batch_and_record(
             # A declined member did not update the summary, whatever its
             # batch-mates did — the same thing a single decline reports.
             summary_updated=summary_updated and verdict.decision != "decline",
+            watermark_before=watermark_before,
+            watermark_after=watermark_after,
         )
         for verdict in batch.verdicts
     ]
@@ -1784,6 +1949,92 @@ def validate_acted_on(
         )
 
 
+def validate_adopted_from(
+    record_store: RecordStore,
+    *,
+    adopted_from: str | None,
+    acted_on: str | None,
+    scope_id: str,
+    agent_scope: str,
+) -> None:
+    """Enforce every rule on ``adopted_from`` before a contribution is appended.
+
+    A session bound to a scope adopts a held proposal — a contribution another
+    position made to that scope, admitted only as an attributed proposal by the
+    position gate — through an ordinary own-scope contribution naming it. The
+    single canonical check: both write surfaces (``strata_contribute`` and
+    ``POST /contribute``) call this one function. *scope_id* is the target scope;
+    *agent_scope* is the scope the new contribution is stamped as.
+
+    Rejected, each with a message naming which rule failed, in this order:
+
+    1. ``adopted_from`` together with ``acted_on`` — adopting a proposal is a
+       decision about this scope's directives, not an outcome report.
+    2. The referenced contribution must exist.
+    3. It must live in the target scope's own record (``scope_id`` matches).
+    4. It must have come from another position (its contributor is not bound to
+       the target scope) — an own-scope contribution needs no adoption.
+    5. The new contribution's contributor must be bound to the target scope:
+       only that scope's own position adopts into it.
+    6. The proposal must be one the position gate actually HELD: judged
+       ``accept_as_context`` with the gate's held note ending its judgment notes
+       (:func:`strata.scope_manager.is_held_note`). Unjudged, declined, or
+       admitted without a hold is rejected.
+
+    ``supersedes`` is allowed alongside: adopting a proposal may replace a
+    directive. A no-op when ``adopted_from`` is ``None``.
+
+    Raises:
+        RuntimeError: any of the rules above failed.
+    """
+    if adopted_from is None:
+        return
+    if acted_on is not None:
+        raise RuntimeError(
+            "adopted_from and acted_on cannot both be set: adopting a held proposal is "
+            "a decision about this scope's directives, not a report of acting on an item. "
+            "Submit the adoption and the outcome as separate contributions."
+        )
+    proposal = record_store.get_contribution(adopted_from)
+    if proposal is None:
+        raise RuntimeError(
+            f"adopted_from={adopted_from!r} does not reference an existing contribution."
+        )
+    if proposal.scope_id != scope_id:
+        raise RuntimeError(
+            f"adopted_from={adopted_from!r} is a contribution to {proposal.scope_id!r}, "
+            f"not to {scope_id!r} — you can only adopt a proposal made to the scope you "
+            "are contributing to."
+        )
+    if proposal.contributor.scope_id == scope_id:
+        raise RuntimeError(
+            f"adopted_from={adopted_from!r} came from a session bound to {scope_id!r} "
+            "itself — it is not a proposal from another position, so there is nothing to "
+            "adopt. Contribute the decision directly."
+        )
+    if agent_scope != scope_id:
+        raise RuntimeError(
+            f"only a session bound to {scope_id!r} can adopt a proposal into it; this "
+            f"contribution is made as {agent_scope!r}. Contributing upward is allowed, "
+            "but adoption is own-scope only."
+        )
+    judgment = record_store.get_judgment(adopted_from)
+    if judgment is None:
+        raise RuntimeError(
+            f"adopted_from={adopted_from!r} is not yet judged — only a proposal the "
+            "position gate held can be adopted. Wait for its verdict, then adopt it."
+        )
+    if judgment.decision == "decline":
+        raise RuntimeError(
+            f"adopted_from={adopted_from!r} was declined, so there is nothing held to adopt."
+        )
+    if judgment.decision != "accept_as_context" or not is_held_note(judgment.notes):
+        raise RuntimeError(
+            f"adopted_from={adopted_from!r} was not held as a proposal by the position "
+            "gate — only a held proposal can be adopted."
+        )
+
+
 def run_contribution(
     *,
     scope: Scope,
@@ -1803,6 +2054,7 @@ def run_contribution(
     batch_cap: int = BATCH_CAP,
     queue_timeout_s: float = QUEUE_WAIT_TIMEOUT_S,
     acted_on: str | None = None,
+    adopted_from: str | None = None,
 ) -> ContributionOutcome:
     """Append a contribution to the record and get it judged (ADR 0011 D3).
 
@@ -1839,6 +2091,8 @@ def run_contribution(
     """
     if acted_on is not None and supersedes is not None:
         raise ValueError("acted_on and supersedes cannot both be set on one contribution.")
+    if adopted_from is not None and acted_on is not None:
+        raise ValueError("adopted_from and acted_on cannot both be set on one contribution.")
     # ADR 0017 P5: the API keeps ONE `acted_on` field; the app resolves which
     # storage column the id belongs in. Ids are minted so this dispatch is
     # unambiguous and never needs a lookup: contribution ids are `c_`-prefixed,
@@ -1856,6 +2110,7 @@ def run_contribution(
             contributor=contributor,
             acted_on=None if is_operator_target else acted_on,
             acted_on_operator_item=acted_on if is_operator_target else None,
+            adopted_from=adopted_from,
         )
         ticket = queue.enqueue(contribution.id, contribution)
 
@@ -2032,7 +2287,11 @@ def rejudge_contribution(
             return ContributionOutcome(
                 contribution_id=contribution_id,
                 decision=existing.decision,
-                reasoning=existing.notes or "",
+                # The record-only parts (the decision prefix and the same-scope
+                # provenance line) are the record's own account, not the judge's
+                # reasoning: an idempotent rejudge returns the same reasoning the
+                # first call did.
+                reasoning=strip_record_only_notes(existing.notes or ""),
                 summary_updated=False,
             )
         return _judge_and_record(
@@ -2495,13 +2754,40 @@ def drain_scope(
         for event in events:
             if event.kind != "claim_corrected":
                 continue
-            propagate_claim_correction(
+            # Restore act design, point 2 — same write as the same-scope
+            # site above, once per (drained) change id.
+            record_store.record_claim_correction(
+                change_id=event.change_id,
+                claim_id=event.item_id,
+                scope_id=scope.id,
+                corrected_claim_content=event.before or "",
+                correcting_content=event.after or "",
+            )
+            verbatim_withdrawn = propagate_claim_correction(
                 scope.id,
                 claim_id=event.item_id,
                 corrected_claim_content=event.before or "",
                 correcting_content=event.after or "",
                 trigger_id=event.contribution_id,
                 already_withdrawn=[],
+                fleet=fleet,
+                record_store=record_store,
+                summaries_dir=str(summary_store.summaries_dir),
+                change_ids=[event.change_id],
+                hop=refresh_hop,
+            )
+            # Issue #219 C: the owner-judge's own paraphrase check, same
+            # unconditional shape as the sweep above — runs whatever the
+            # drained refresh judgment did, including a decline or a failure
+            # (neither of which ever reaches `_write_amendment`).
+            check_claim_carriers(
+                scope.id,
+                claim_id=event.item_id,
+                corrected_claim_content=event.before or "",
+                correcting_content=event.after or "",
+                trigger_id=event.contribution_id,
+                already_withdrawn=[item.id for item in verbatim_withdrawn],
+                scope_manager=scope_manager,
                 fleet=fleet,
                 record_store=record_store,
                 summaries_dir=str(summary_store.summaries_dir),
@@ -2641,6 +2927,21 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
                 detail={"error": "scope_not_active", "scope_id": body.scope_id},
             )
 
+        # Adoption link: the same canonical check strata_contribute runs, before
+        # acted_on's so the two-together rejection names the right rule.
+        try:
+            validate_adopted_from(
+                record_store,
+                adopted_from=body.adopted_from,
+                acted_on=body.acted_on,
+                scope_id=body.scope_id,
+                agent_scope=body.contributor.scope_id,
+            )
+        except RuntimeError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail={"error": "adopted_from_invalid", "detail": str(exc)},
+            ) from exc
         # ADR 0017 P1: the same canonical check strata_contribute runs, stamped
         # against this contribution's OWN scope (an HTTP caller has no bound agent
         # scope the way an MCP session does — the scope it contributes as is the
@@ -2693,6 +2994,7 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
                 subject=body.subject,
                 supersedes=body.supersedes,
                 acted_on=body.acted_on,
+                adopted_from=body.adopted_from,
                 contributor=contributor_ref,
                 fleet=fleet,
                 record_store=record_store,
@@ -2714,8 +3016,13 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
             # The contribution and a judgment-attempt-failed event are already
             # in the record (issue #57); carry the contribution id so a retry
             # routes to re-judge (strata_rejudge) instead of duplicating it.
+            # #235: 503, not 500 — this means the judge failed (a genuine API
+            # outage, auth failure, or a second protocol slip #235's own fix
+            # could not fail closed on, e.g. the batch path, which has no
+            # forced-decline fallback), never a bug in this request. A plain
+            # merits decline, by contrast, is a 200 with decision="decline".
             raise HTTPException(
-                status_code=500,
+                status_code=503,
                 detail={
                     "error": "scope_manager_failure",
                     "detail": str(exc),
@@ -3576,6 +3883,130 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc.args[0])) from exc
         return {"scope_id": scope_id, "retirement": asdict(retirement)}
+
+    # -----------------------------------------------------------------------
+    # GET  /scopes/{scope_id}/correction-withdrawals
+    # POST /scopes/{scope_id}/correction-withdrawals/{item_id}/restore
+    # POST /scopes/{scope_id}/correction-withdrawals/{item_id}/acknowledge
+    #
+    # The detection surface the restore act design requires: every
+    # withdrawal a correction sweep made in a scope, side by side with its
+    # claim/correcting text, a Restore button (the operator path), and a
+    # "keep withdrawn" acknowledge — the same read function `strata record
+    # <scope> --swept` prints. UI-only surface (constraint G1): no engine
+    # flow calls any of these.
+    # -----------------------------------------------------------------------
+
+    @application.get("/scopes/{scope_id}/correction-withdrawals")
+    def get_correction_withdrawals(
+        scope_id: str,
+        request: Request,
+        all: bool = False,  # noqa: A002 — `all` is the query param name, mirrors operator-evidence
+        record_store: RecordStore = Depends(get_record_store),
+    ) -> dict:
+        """Every withdrawal a correction sweep made in *scope_id* — newest
+        first, each with its claim/correcting text and #219 C's own audit
+        row when judged — plus #219 C's own unresolved/overflow rows,
+        flagged separately.
+
+        ``all=true`` also returns a withdrawal already acknowledged
+        ("keep withdrawn"), hidden from the default "to review" view.
+
+        Returns 404 if the scope is not in the FleetConfig.
+        """
+        from dataclasses import asdict
+
+        from strata.publication import list_correction_withdrawals, list_unresolved_carrier_checks
+
+        fleet: FleetConfig = request.app.state.fleet_reloader.get()
+        scope = fleet.get_scope(scope_id)
+        if scope is None:
+            raise HTTPException(status_code=404, detail=f"Scope not found: {scope_id!r}")
+
+        rows = list_correction_withdrawals(
+            scope_id, record_store=record_store, include_acknowledged=all
+        )
+        unresolved = list_unresolved_carrier_checks(scope_id, record_store=record_store)
+        return {
+            "scope_id": scope_id,
+            "withdrawals": [
+                {
+                    "act": asdict(r.act),
+                    "correction": asdict(r.correction) if r.correction else None,
+                    "carrier_check": asdict(r.carrier_check) if r.carrier_check else None,
+                    "reader_count": r.reader_count,
+                    "method": r.method,
+                }
+                for r in rows
+            ],
+            "unresolved": [asdict(c) for c in unresolved],
+        }
+
+    @application.post("/scopes/{scope_id}/correction-withdrawals/{item_id}/restore")
+    def restore_correction_withdrawal(
+        scope_id: str,
+        item_id: str,
+        body: RestoreCorrectionWithdrawalRequest,
+        request: Request,
+        record_store: RecordStore = Depends(get_record_store),
+        summary_store: SummaryStore = Depends(get_summary_store),
+    ) -> dict:
+        """Operator restore, in person (the restore act design) — Console
+        surface for ``strata operator restore``.
+
+        Delegates straight to :func:`strata.publication.operator_restore`,
+        which takes :func:`strata.locks.scope_lock` itself — the SAME
+        cross-process per-scope lock the CLI takes. This route deliberately
+        takes NO lock of its own. UI-only surface (constraint G1): no engine
+        flow calls it.
+        """
+        from strata.publication import operator_restore
+
+        fleet: FleetConfig = request.app.state.fleet_reloader.get()
+        scope = fleet.get_scope(scope_id)
+        if scope is None:
+            raise HTTPException(status_code=404, detail=f"Scope not found: {scope_id!r}")
+        try:
+            outcome = operator_restore(
+                scope_id,
+                item_id,
+                body.reason,
+                fleet=fleet,
+                record_store=record_store,
+                summaries_dir=str(summary_store.summaries_dir),
+            )
+        except (ValueError, KeyError) as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return {
+            "scope_id": scope_id,
+            "item_id": item_id,
+            "act_id": outcome.act_id,
+            "decision": outcome.decision,
+        }
+
+    @application.post("/scopes/{scope_id}/correction-withdrawals/{item_id}/acknowledge")
+    def acknowledge_correction_withdrawal_route(
+        scope_id: str,
+        item_id: str,
+        request: Request,
+        record_store: RecordStore = Depends(get_record_store),
+    ) -> dict:
+        """The "keep withdrawn" action: mark the withdrawal acknowledged without
+        restoring it, hiding it from the default "to review" view.
+        """
+        from dataclasses import asdict
+
+        from strata.publication import acknowledge_correction_withdrawal
+
+        fleet: FleetConfig = request.app.state.fleet_reloader.get()
+        scope = fleet.get_scope(scope_id)
+        if scope is None:
+            raise HTTPException(status_code=404, detail=f"Scope not found: {scope_id!r}")
+        try:
+            act = acknowledge_correction_withdrawal(scope_id, item_id, record_store=record_store)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return {"scope_id": scope_id, "item_id": item_id, "act": asdict(act)}
 
     return application
 
