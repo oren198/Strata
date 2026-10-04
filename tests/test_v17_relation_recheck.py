@@ -607,8 +607,9 @@ def test_first_call_is_identical_whether_or_not_the_recheck_fires() -> None:
 # ---------------------------------------------------------------------------
 # 7. Round 1 (architect ruling) — item 2's own adversarial attack against
 #    verify_relation_ground, over every EXEMPT/CONTRADICT item in
-#    j1_refinement and the gup in_child set. Shapes reproduced here with
-#    self-authored fixtures (never copying the held-out sets' own text).
+#    j1_refinement and additional self-authored exemption/contradiction
+#    shapes. Shapes reproduced here with self-authored fixtures (never
+#    copying the held-out sets' own text).
 # ---------------------------------------------------------------------------
 
 
