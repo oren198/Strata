@@ -5021,20 +5021,65 @@ def _names_a_different_instance(parent_text: str, content: str) -> bool:
 _LEADING_PHRASE_STOPWORDS = frozenset({"must", "shall", "should", "will"})
 
 
+#: Architect ruling (round 2, second pass): the leading NOUN PHRASE ends
+#: at the first auxiliary, modal, or main-verb marker — without this, a
+#: 4-word cap runs PAST the subject into the predicate ("Runway lights ARE
+#: switched" / "Hangar apron floodlights ARE switched" both yield "switch",
+#: reading two unrelated subjects as covered; "Hygiene appointments ARE
+#: BOOKED" / "Orthodontic check-ups ARE BOOKED" share "book"). A verb-led
+#: imperative sentence ("Replace the guillotine blade ...") has no marker
+#: before its own content words, so it is unaffected — truncation only
+#: fires when a marker actually precedes them.
+_LEADING_PHRASE_VERB_MARKERS = (
+    "are",
+    "is",
+    "was",
+    "were",
+    "be",
+    "been",
+    "must",
+    "shall",
+    "should",
+    "will",
+    "would",
+    "may",
+    "might",
+    "can",
+    "cannot",
+    "could",
+    "need",
+    "needs",
+    "has",
+    "have",
+    "had",
+    "stay",
+    "stays",
+    "get",
+    "gets",
+)
+_LEADING_PHRASE_VERB_RE = re.compile(
+    r"\b(?:" + "|".join(_LEADING_PHRASE_VERB_MARKERS) + r")\b", re.IGNORECASE
+)
+
+
 def _leading_phrase_words(text: str, count: int = 4) -> set[str]:
     """The first *count* significant content words (same filtering as
     `publication._overlap_words`, plus :data:`_LEADING_PHRASE_STOPWORDS`)
-    — a cheap proxy for "what is this sentence's SUBJECT": the grammatical
+    found BEFORE the first :data:`_LEADING_PHRASE_VERB_RE` marker — a
+    cheap proxy for "what is this sentence's SUBJECT": the grammatical
     subject almost always leads an English directive sentence ("Frozen
-    pallets must...", "Hygiene appointments are..."). Widened from a
-    2-word prefix (architect ruling, round 2): the covered-subject test
-    needs enough of the leading noun phrase to catch "small frozen
-    pallets" / "young seedlings" sharing a word with a 1-2-word parent
-    subject."""
+    pallets must...", "Hygiene appointments are..."), and the predicate
+    starts at that marker. Widened from a 2-word prefix (architect ruling,
+    round 2): the covered-subject test needs enough of the leading noun
+    phrase to catch "small frozen pallets" / "young seedlings" sharing a
+    word with a 1-2-word parent subject."""
     from strata.publication import _CONTENT_OVERLAP_STOPWORDS, _overlap_stem  # noqa: PLC0415
 
+    marker = _LEADING_PHRASE_VERB_RE.search(text)
+    subject_text = text[: marker.start()] if marker is not None else text
+
     words: set[str] = set()
-    for word in re.findall(r"[a-z]+", text.casefold()):
+    for word in re.findall(r"[a-z]+", subject_text.casefold()):
         if len(word) < 4 or word in _CONTENT_OVERLAP_STOPWORDS or word in _LEADING_PHRASE_STOPWORDS:
             continue
         words.add(_overlap_stem(word))

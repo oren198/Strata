@@ -746,3 +746,123 @@ def test_refines_declines_a_paraphrased_value_swap_of_the_same_subject() -> None
     assert ok is False
     assert ctx is None
     assert "covered subject" in result
+
+
+# ---------------------------------------------------------------------------
+# 8. Round 2 (architect ruling) — P1 (guards on whole content), P2 (covered
+#    subject held to the tighten test), P3 (universal scope preserved).
+# ---------------------------------------------------------------------------
+
+
+def test_p1_guards_run_on_whole_content_not_just_the_span() -> None:
+    """A forged span can quote only the clean half of a sentence — every
+    substantive guard must see the WHOLE content, not just the span."""
+    parent_text = "Seedlings must be watered at or before 06:30 every day."
+    content = "Seedlings must be watered at or before 06:30 every day, except Sundays."
+    answer = {
+        "relation": "tightens",
+        "other_grounds_clear": True,
+        "parent_id": "p",
+        "tighten_kind": "rule",
+        "kept_span": "Seedlings must be watered at or before 06:30 every day",
+    }
+    ok, result, _c, ctx = verify_relation_ground(answer, parent_text, content, "directive")
+    assert ok is False
+    assert ctx is None
+    assert "exemption language" in result
+
+    content2 = "Seedlings may be watered after 07:00 on rainy days."
+    answer2 = {
+        "relation": "refines",
+        "other_grounds_clear": True,
+        "parent_id": "p",
+        "subject_span": "Seedlings may be watered",
+    }
+    ok2, result2, _c2, ctx2 = verify_relation_ground(answer2, parent_text, content2, "directive")
+    assert ok2 is False
+    assert ctx2 is None
+
+
+def test_p2_covered_subject_cannot_be_refines() -> None:
+    """A covered subject (shares a word with the parent's leading noun
+    phrase) is held to the TIGHTEN value test, not refines' looser one —
+    "on weekdays" drops the parent's own universal scope with no
+    recognised exemption word, and a looser value fails the value test."""
+    parent_text = "Seedlings must be watered at or before 07:00 every day."
+    content = "Seedlings must be watered at or before 07:00 on weekdays."
+    answer = {
+        "relation": "refines",
+        "other_grounds_clear": True,
+        "parent_id": "p",
+        "subject_span": content,
+    }
+    ok, result, _c, ctx = verify_relation_ground(answer, parent_text, content, "directive")
+    assert ok is False
+    assert ctx is None
+
+    content2 = "Small frozen pallets must stay at or below -12 °C during dock transfer."
+    answer2 = {
+        "relation": "refines",
+        "other_grounds_clear": True,
+        "parent_id": "p",
+        "subject_span": content2,
+    }
+    parent_text2 = "Frozen pallets must stay at or below -18 °C during dock transfer."
+    ok2, result2, _c2, ctx2 = verify_relation_ground(answer2, parent_text2, content2, "directive")
+    assert ok2 is False
+    assert ctx2 is None
+    assert "covered subject" in result2
+
+    # A covered subject that genuinely passes the tighten test: admitted.
+    content3 = "Small frozen pallets must stay at or below -20 °C during dock transfer."
+    answer3 = {
+        "relation": "refines",
+        "other_grounds_clear": True,
+        "parent_id": "p",
+        "subject_span": content3,
+    }
+    ok3, result3, _c3, ctx3 = verify_relation_ground(answer3, parent_text2, content3, "directive")
+    assert ok3 is True, result3
+
+
+def test_p3_universal_scope_must_survive_or_a_stricter_one() -> None:
+    """ "every hour" is stricter than "every day" in the same unit class;
+    dropping the universal phrase entirely for a day-of-week restriction
+    is not."""
+    parent_text = "Alarms must be tested every day."
+    content_stricter = "Alarms must be tested every hour."
+    answer = {
+        "relation": "tightens",
+        "other_grounds_clear": True,
+        "parent_id": "p",
+        "tighten_kind": "fact",
+        "kept_span": content_stricter,
+    }
+    ok, result, _c, ctx = verify_relation_ground(answer, parent_text, content_stricter, "directive")
+    assert ok is True, result
+
+    content_narrowed = "Alarms must be tested on Mondays."
+    answer2 = {**answer, "kept_span": content_narrowed}
+    ok2, result2, _c2, ctx2 = verify_relation_ground(
+        answer2, parent_text, content_narrowed, "directive"
+    )
+    assert ok2 is False
+    assert ctx2 is None
+    assert "narrows when/where" in result2
+
+
+def test_p2_leading_phrase_truncates_at_the_first_verb_marker() -> None:
+    """The leading noun phrase must stop at the first auxiliary/modal/verb
+    marker — otherwise a 4-word cap runs into the predicate and makes two
+    UNRELATED subjects read as covered just because they share a verb."""
+    parent_text = "Runway lights are switched on at sunset."
+    content = "Hangar apron floodlights are switched on at sunset."
+    answer = {
+        "relation": "refines",
+        "other_grounds_clear": True,
+        "parent_id": "p",
+        "subject_span": content,
+    }
+    ok, _result, _c, ctx = verify_relation_ground(answer, parent_text, content, "directive")
+    assert ok is True
+    assert ctx is None
