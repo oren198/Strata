@@ -5,7 +5,37 @@ the release PR (`dev` → `main`) and the GitHub Release body are built from
 (`docs/releasing.md`, step 3) — write entries here as work lands, and the
 "Unreleased" section is cleared once a release ships.
 
-## Unreleased (v1.17.0)
+## Unreleased (v1.17.1)
+
+### Fixed
+
+- **A child's own directive can no longer change an inherited one.** 1.17.0
+  left this to the judge alone, and a weaker judge admitted such directives as
+  "team-local practice". The engine now checks after judgment, with no extra
+  judge call and no change to what the judge is sent. For a directive admitted
+  from a session bound to the judged scope (append, publish or a supersede's
+  replacement), single or batch, each rendered inherited directive (ancestor
+  and operator) is compared. If the new text is about the same subject it must
+  tighten the rule: no exemption, no outdating claim, no softened "all", no
+  flipped polarity, no narrowing of when or where it applies, and a value no
+  looser. A conflict is admitted as context under the engine note "[Held:
+  conflicts with inherited directive <id> (<scope>); a child may tighten an
+  inherited rule, not change it.]", and the directive set is unchanged. A
+  different subject, a refinement, a tightening, or the rule restated with an
+  own constraint passes untouched. Stated limits: "same subject" is a
+  leading-noun-phrase match; a tightening the check can't read as stricter (a
+  spelled-out number, a "between" range) is held as context rather than
+  admitted; a parent with no value, polarity word or marker gives the check
+  nothing to compare, so such a contradiction still rests on the judge; in a
+  batch the judge's own context rewrite is kept and the held lines are
+  appended to it.
+  Measured without a key: 117 of 117 forged contradicting admits held; a
+  child changing where an inherited fact says a file lives, admitted by the
+  judge as a directive, held; held-out refinements and tightenings 24 of 24
+  correct; no legitimate admit from earlier pinned runs newly held
+  ([evidence](docs/evidence/v1.17.1-inherited-check-2026-10-05.md)).
+
+## 1.17.0 (2026-10-04)
 
 ### Security
 
