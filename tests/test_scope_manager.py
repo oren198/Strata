@@ -3453,7 +3453,10 @@ def test_appended_contribution_bytes_carrying_the_attribution_get_no_corrective(
     """An `append` admits the contribution's own bytes — those count as admitted text."""
     attributed_contribution = _contribution(
         "c_att1",
-        f"Services stay on TLS 1.3 or later, per operator directive {OPERATOR_DIRECTIVE.id}.",
+        # Keeps the operator rule's "All services" — an own-scope directive
+        # that drops the universal scope reads as narrowing it and is held by
+        # the 1.17.1 admit-side check, which this test is not about.
+        f"All services must use TLS 1.3 or later, per operator directive {OPERATOR_DIRECTIVE.id}.",
         subject="tls",
     )
     manager, mock_client = _make_manager(
