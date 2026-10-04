@@ -29,8 +29,13 @@ the release PR (`dev` → `main`) and the GitHub Release body are built from
   nothing to compare, so such a contradiction still rests on the judge; in a
   batch the judge's own context rewrite is kept and the held lines are
   appended to it.
+  Measured without a key: 117 of 117 forged contradicting admits held; a
+  child changing where an inherited fact says a file lives, admitted by the
+  judge as a directive, held; held-out refinements and tightenings 24 of 24
+  correct; no legitimate admit from earlier pinned runs newly held
+  ([evidence](docs/evidence/v1.17.1-inherited-check-2026-10-05.md)).
 
-## Unreleased (v1.17.0)
+## 1.17.0 (2026-10-04)
 
 ### Security
 
