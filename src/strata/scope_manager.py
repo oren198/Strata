@@ -5769,6 +5769,9 @@ def verify_relation_ground(
 # ---------------------------------------------------------------------------
 
 
+_CITED_ID = re.compile(r"\b(?:op|c|pub|d)_[0-9a-z]*\d[0-9a-z]*\b")
+
+
 def inherited_conflict(op_text: str, ancestor_text: str) -> str | None:
     """Why *op_text* (a directive a bound session wants admitted) conflicts
     with the inherited directive *ancestor_text*, or ``None`` when it does not.
@@ -5785,6 +5788,9 @@ def inherited_conflict(op_text: str, ancestor_text: str) -> str | None:
     gives the value test nothing to compare, so a contradiction phrased
     without any of them is not caught here (the judge's own ruling stands).
     """
+    # A cited directive id ("per operator directive op_tls123") is a
+    # reference, not a value; left in, its digits read as an unkept value.
+    op_text = _CITED_ID.sub("", op_text)
     if not _is_covered_subject(ancestor_text, op_text):
         return None
     if _names_a_different_instance(ancestor_text, op_text):
