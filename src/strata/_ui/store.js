@@ -229,6 +229,39 @@
     return _post(`${base}/operator-evidence/${encodeURIComponent(evidence_id)}/seen`, {});
   }
 
+  // The restore act's detection surface: every withdrawal a correction sweep
+  // made in a scope, plus #219 C's own unresolved/overflow rows.
+  async function fetchCorrectionWithdrawals(scope_id, { all } = {}) {
+    const base = getApiBase();
+    const qs = all ? "?all=true" : "";
+    const resp = await fetch(
+      `${base}/scopes/${encodeURIComponent(scope_id)}/correction-withdrawals${qs}`,
+    );
+    if (!resp.ok) {
+      throw new Error(`GET /scopes/${scope_id}/correction-withdrawals returned ${resp.status}`);
+    }
+    return resp.json();
+  }
+
+  // Operator restore, in person: bring a correction-withdrawn item back
+  // under its original id and bytes.
+  async function restoreCorrectionWithdrawal(scope_id, item_id, { reason } = {}) {
+    const base = getApiBase();
+    return _post(
+      `${base}/scopes/${encodeURIComponent(scope_id)}/correction-withdrawals/${encodeURIComponent(item_id)}/restore`,
+      { reason: reason || null },
+    );
+  }
+
+  // "Keep withdrawn": acknowledge the withdrawal without restoring it.
+  async function acknowledgeCorrectionWithdrawal(scope_id, item_id) {
+    const base = getApiBase();
+    return _post(
+      `${base}/scopes/${encodeURIComponent(scope_id)}/correction-withdrawals/${encodeURIComponent(item_id)}/acknowledge`,
+      {},
+    );
+  }
+
   // Helpers used in graph layout.
   function stratumIndex(state, stratum_id) {
     return state.strata.findIndex((s) => s.id === stratum_id);
@@ -259,6 +292,9 @@
     retireDirective,
     fetchOperatorEvidence,
     markOperatorEvidenceSeen,
+    fetchCorrectionWithdrawals,
+    restoreCorrectionWithdrawal,
+    acknowledgeCorrectionWithdrawal,
     stratumIndex,
     edgeAllowed,
     loadPrefs,

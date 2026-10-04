@@ -142,7 +142,10 @@ def test_outcome_loop_row_states_adoption_with_its_harness_and_sample() -> None:
 
 def test_outcome_loop_row_states_the_limits_as_measured() -> None:
     row = _outcome_loop_row()
-    assert "a published item that *paraphrases* a corrected claim stays up (#219)" in row
+    assert ("#219 C wrongly withdraws about 2–7% of a scope's neighbouring items (measured)") in row
+    assert "restored there by the operator" in row
+    assert "recovered 5 of 12 such items in our measurement" in row
+    assert "the operator path is the reliable remedy" in row
     assert "did not recur on re-measure (20 of 20 correct) and is closed" in row
     assert "sometimes declined" not in row
 
@@ -164,5 +167,5 @@ def test_outcome_loop_row_states_the_v116_additions() -> None:
 
 def test_the_invented_informant_limit_is_stated_with_its_numbers() -> None:
     assert "tracked in #225" in _README
-    assert "a source nobody gave it" in _README
+    assert "hearsay from an informant the judge invented" in _README
     assert "22 admits" in _README

@@ -645,6 +645,40 @@ def cmd_summary(args: argparse.Namespace) -> int:
     return 0
 
 
+def _print_swept(scope_id: str, *, record_store: RecordStore) -> int:
+    """``strata record <scope> --swept`` — the Console's "Correction
+    withdrawals" view, printed as text: every withdrawal a correction sweep
+    made in *scope_id*, newest first, plus #219 C's own unresolved/overflow
+    rows, flagged."""
+    from strata.publication import list_correction_withdrawals, list_unresolved_carrier_checks
+
+    rows = list_correction_withdrawals(scope_id, record_store=record_store)
+    unresolved = list_unresolved_carrier_checks(scope_id, record_store=record_store)
+    print(f"Scope: {scope_id}")
+    print(f"Correction withdrawals: {len(rows)} (newest first; restored/acknowledged hidden)")
+    print()
+    if not rows:
+        print("  (none)")
+    for row in rows:
+        print(
+            f"  · {row.act.withdraws}  [{row.method}]  withdrawn {row.act.created_at}  "
+            f"readers notified: {row.reader_count}"
+        )
+        if row.correction is not None:
+            print(f"      refuted claim: {row.correction.corrected_claim_content}")
+            print(f"      correcting content: {row.correction.correcting_content}")
+        print(
+            f"      restore with: strata operator restore {scope_id} {row.act.withdraws} "
+            f"(withdraw act {row.act.id})"
+        )
+    if unresolved:
+        print()
+        print(f"UNRESOLVED (#219 C — never classified, flagged): {len(unresolved)}")
+        for check in unresolved:
+            print(f"  · {check.item_id}  [{check.outcome}]  {check.created_at}")
+    return 0
+
+
 def cmd_record(args: argparse.Namespace) -> int:
     """Print one page of a scope's record (contributions + judgments) — embedded read.
 
@@ -666,6 +700,9 @@ def cmd_record(args: argparse.Namespace) -> int:
         if scope is None:
             print(f"Scope not found: {args.scope_id}", file=sys.stderr)
             return 1
+
+        if getattr(args, "swept", False):
+            return _print_swept(args.scope_id, record_store=stores.record_store)
 
         limit = args.limit if args.limit is not None else get_settings().record_page_size
         try:
@@ -741,6 +778,28 @@ def cmd_record(args: argparse.Namespace) -> int:
                     f"({drop.state_at_drop}, {drop.words_before}→{drop.words_after} words, "
                     f"budget {drop.budget})"
                 )
+            # Issue #219 C: a correction AGAINST this contribution (this
+            # claim was found wrong, same-scope or via a drained refresh) may
+            # have sent the scope's own published face through the
+            # owner-judge's paraphrase check. UNRESOLVED outcomes are surfaced
+            # explicitly — they are a judgment never made, not a clean verdict.
+            for check in stores.record_store.list_claim_carrier_checks(corrected_claim_id=c.id):
+                if check.outcome in ("unresolved_overflow", "unresolved_unreadable"):
+                    print(
+                        f"      claim-carrier check on published item {check.item_id}: "
+                        f"{check.outcome} — see strata_rejudge or operator review"
+                    )
+                elif check.outcome == "kept_by_guard":
+                    print(
+                        f"      claim-carrier check on published item {check.item_id}: "
+                        "kept_by_guard — the judge said carries, but the item states "
+                        "the observed value, not the refuted one"
+                    )
+                else:
+                    print(
+                        f"      claim-carrier check on published item {check.item_id}: "
+                        f"{check.outcome}"
+                    )
             if state is not None and state.state == "judge_failed":
                 print(f"      judge failed at {state.failed_at}: {state.error_message}")
                 print("      re-judge with the strata_rejudge MCP tool")
@@ -2118,6 +2177,43 @@ def cmd_operator_retire(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_operator_restore(args: argparse.Namespace) -> int:
+    """``strata operator restore`` — restore a correction-withdrawn published
+    item in person, under its original id and bytes, no judgment row."""
+    from strata.publication import operator_restore
+    from strata.stores import EmbeddedStoreError, open_embedded_stores
+
+    try:
+        stores = open_embedded_stores()
+    except EmbeddedStoreError as exc:
+        print(exc.message, file=sys.stderr)
+        return 1
+
+    with stores:
+        scope = stores.fleet_config.get_scope(args.scope_id)
+        if scope is None:
+            print(f"Scope not found: {args.scope_id}", file=sys.stderr)
+            return 1
+
+        try:
+            outcome = operator_restore(
+                args.scope_id,
+                args.item_id,
+                args.reason,
+                fleet=stores.fleet_config,
+                record_store=stores.record_store,
+                summaries_dir=stores.summary_store.summaries_dir,
+            )
+        except (ValueError, KeyError) as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        print(
+            f"Restored item {args.item_id} in scope {args.scope_id!r} "
+            f"(act {outcome.act_id}, operator restore)."
+        )
+    return 0
+
+
 def cmd_operator_show(args: argparse.Namespace) -> int:
     """``strata operator show`` — print operator layer(s) verbatim + the health signal.
 
@@ -2378,6 +2474,7 @@ def cmd_publication_bootstrap(args: argparse.Namespace) -> int:
             client=settings.build_judge_client(),
             model=settings.manager_model,
             implied_purpose_min_words=settings.implied_purpose_min_words,
+            judge_provider=settings.judge_provider,
         )
 
         try:
@@ -2573,6 +2670,7 @@ def _refresh_stores(settings):  # noqa: ANN001, ANN201
         client=settings.build_judge_client(),
         model=settings.manager_model,
         implied_purpose_min_words=settings.implied_purpose_min_words,
+        judge_provider=settings.judge_provider,
     )
     return fleet_config, record_store, summary_store, manager
 
@@ -3081,16 +3179,34 @@ def _judge_line(resolved: object) -> str:
     head = f"{resolved.model} @ {_judge_endpoint_label(resolved.base_url)}"  # type: ignore[attr-defined]
     reason = resolved.reason  # type: ignore[attr-defined]
     if reason == JUDGE_REASON_DEFAULT:
-        return f"{head} (default, measured {_JUDGE_MEASURED_DATE})"
-    if reason == JUDGE_REASON_KEPT:
-        return (
-            f"{head} (kept: an Anthropic key is set and no JUDGE_MODEL/JUDGE_BASE_URL; measured "
+        tail = f"(default, measured {_JUDGE_MEASURED_DATE})"
+    elif reason == JUDGE_REASON_KEPT:
+        tail = (
+            "(kept: an Anthropic key is set and no JUDGE_MODEL/JUDGE_BASE_URL; measured "
             f'{_JUDGE_MEASURED_DATE} — see "Choosing a judge" in the README)'
         )
-    return (
-        f"{head} (configured via JUDGE_*; the README's measurements cover only the "
-        'judges in its "Choosing a judge" table)'
-    )
+    else:
+        tail = (
+            "(configured via JUDGE_*; the README's measurements cover only the "
+            'judges in its "Choosing a judge" table)'
+        )
+    return f"{head} {tail}{_judge_provider_suffix(resolved)}"
+
+
+def _judge_provider_suffix(resolved: object) -> str:
+    """#224: append the pin state to the doctor judge line, when a provider
+    is configured at all — pinned and taking effect, or configured but
+    ignored (never silent) on a non-OpenRouter endpoint, so a user who set
+    JUDGE_PROVIDER against a bare Anthropic endpoint sees why it does
+    nothing rather than wondering.
+    """
+    provider = getattr(resolved, "provider", None)
+    if provider is None:
+        return ""
+    base_url = getattr(resolved, "base_url", None) or ""
+    if "openrouter.ai" in base_url:
+        return f" [pinned to {provider}]"
+    return f" [JUDGE_PROVIDER={provider} configured, ignored: not an OpenRouter endpoint]"
 
 
 def _build_probe_client(resolved: object):  # -> anthropic.Anthropic
@@ -3108,18 +3224,39 @@ def _probe_judge_live(resolved: object) -> str | None:
 
     A ``messages.create(max_tokens=1)`` is the one call every Anthropic-Messages
     endpoint (a router, a gateway) is guaranteed to serve; a model listing is not.
+
+    Sends the SAME provider pin (#224, ``resolved.provider``) the real
+    judge calls would — via :func:`strata.settings.apply_provider_pin` —
+    so this probes the exact route a pinned run actually takes, never an
+    unpinned one a pin would never use. A ``NotFoundError`` against a
+    pinned probe is reported as the pinned provider rejecting the model,
+    not a generic endpoint finding, since that is the more useful
+    diagnosis once a provider is configured.
     """
     import anthropic  # noqa: PLC0415
 
+    from strata.settings import apply_provider_pin  # noqa: PLC0415
+
     model = resolved.model  # type: ignore[attr-defined]
+    provider = getattr(resolved, "provider", None)
     try:
         client = _build_probe_client(resolved)
         client.messages.create(
-            model=model, max_tokens=1, messages=[{"role": "user", "content": "ping"}]
+            **apply_provider_pin(
+                {
+                    "model": model,
+                    "max_tokens": 1,
+                    "messages": [{"role": "user", "content": "ping"}],
+                },
+                provider=provider,
+                client=client,
+            )
         )
     except anthropic.APIConnectionError as exc:
         return f"the endpoint is unreachable ({type(exc).__name__})"
     except anthropic.NotFoundError:
+        if provider is not None:
+            return f"the pinned provider ({provider}) does not serve model id '{model}'"
         return f"the endpoint does not serve model id '{model}'"
     except anthropic.AuthenticationError:
         return "the endpoint rejected the key (wrong provider, or revoked?)"
@@ -5106,6 +5243,15 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Cursor: show contributions older than this contribution id.",
     )
+    p_record.add_argument(
+        "--swept",
+        action="store_true",
+        help=(
+            "Print the scope's correction withdrawals instead (every withdrawal "
+            "a correction sweep made, newest first, with its claim/correcting "
+            "text, how it was withdrawn, and whether it's been restored)."
+        ),
+    )
     p_record.set_defaults(func=cmd_record)
 
     p_status = sub.add_parser(
@@ -5216,6 +5362,19 @@ def _build_parser() -> argparse.ArgumentParser:
     p_op_retire.add_argument("id", help="An 'op_...' operator item id or a 'c_...' directive id.")
     p_op_retire.add_argument("--reason", default=None, help="Optional free-text rationale.")
     p_op_retire.set_defaults(func=cmd_operator_retire)
+
+    p_op_restore = operator_sub.add_parser(
+        "restore",
+        help=(
+            "Restore a published item a correction sweep wrongly withdrew, "
+            "under its original id and bytes — unjudged: the operator decides; "
+            "the Console shows the refuted claim beside the item."
+        ),
+    )
+    p_op_restore.add_argument("scope_id")
+    p_op_restore.add_argument("item_id", help="The 'pub_...' id of the withdrawn item to restore.")
+    p_op_restore.add_argument("--reason", default=None, help="Optional free-text rationale.")
+    p_op_restore.set_defaults(func=cmd_operator_restore)
 
     p_op_show = operator_sub.add_parser(
         "show", help="Print operator memory verbatim, plus the health signal."

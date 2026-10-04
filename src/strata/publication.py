@@ -96,9 +96,17 @@ from typing import TYPE_CHECKING, Literal
 
 import yaml
 
+from strata.change_events import CLAIM_CORRECTED, emit_restore_notice, new_change_id
 from strata.change_events import emit as emit_change_event
 from strata.locks import scope_lock
-from strata.record_store import JUDGE_FAILED, ContributorRef, RecordStore
+from strata.record_store import (
+    JUDGE_FAILED,
+    ClaimCarrierCheck,
+    ClaimCorrection,
+    ContributorRef,
+    PublicationAct,
+    RecordStore,
+)
 
 if TYPE_CHECKING:
     from strata.fleet_config import FleetConfig
@@ -149,7 +157,7 @@ class PublicationOutcome:
     """The result of proposing (and judging) a publish or withdraw act."""
 
     act_id: str
-    act: Literal["publish", "withdraw"]
+    act: Literal["publish", "withdraw", "restore"]
     decision: Literal["accept", "decline"]
     reasoning: str
     artifact_updated: bool
@@ -1080,6 +1088,628 @@ def _cascade_withdraw_relays(
 
 
 # ---------------------------------------------------------------------------
+# The restore act (companion to #219 C) — undoes a published item wrongly
+# withdrawn by a correction sweep (verbatim P4, #219 C `carries`, or either
+# one's relay cascade), under its original id and bytes, telling exactly the
+# readers who got the false notice that it was false.
+# ---------------------------------------------------------------------------
+
+
+def restorable_withdrawal(
+    scope_id: str, item_id: str, *, record_store: RecordStore
+) -> tuple[str, list[str]] | None:
+    """Is *item_id*, as it stood in *scope_id*, restorable — i.e. withdrawn by a
+    correction sweep (verbatim P4 or #219 C ``carries``, at any hop of either
+    one's relay cascade)?
+
+    Detected mechanically from what #221/#219 C already write: a
+    ``claim_corrected`` SELF-notice (issue #197) always lands on the scope
+    that just lost the item, at every hop of the cascade — never for a
+    deliberate :func:`propose_withdraw` or a directive-removal propagation,
+    neither of which ever emits ``claim_corrected``. No new bookkeeping
+    needed to tell restorable from not.
+
+    Returns ``(claim_id, change_ids)`` — the corrected claim's own id, and
+    every distinct change id this item's correction was recorded under (a
+    coalesced refresh may have inherited several, ADR 0014 D4) — or ``None``
+    if *item_id* was never withdrawn by a correction at all.
+    """
+    events = [
+        e
+        for e in record_store.list_change_events(scope_id=scope_id)
+        if e.self_notice and e.kind == CLAIM_CORRECTED and e.item_id == item_id
+    ]
+    if not events:
+        return None
+    claim_id = events[0].claim_id or ""
+    change_ids = list(dict.fromkeys(e.change_id for e in events))
+    return claim_id, change_ids
+
+
+def _find_withdraw_act(
+    scope_id: str, item_id: str, *, record_store: RecordStore
+) -> PublicationAct | None:
+    """The withdraw act that removed *item_id* from *scope_id*'s publication, if any."""
+    for act in record_store.list_publication_acts(scope_id=scope_id):
+        if act.act == "withdraw" and act.withdraws == item_id:
+            return act
+    return None
+
+
+def _resolve_claim_correction(
+    claim_id: str, change_ids: Sequence[str], *, record_store: RecordStore
+) -> ClaimCorrection:
+    for change_id in change_ids:
+        correction = record_store.get_claim_correction(claim_id=claim_id, change_id=change_id)
+        if correction is not None:
+            return correction
+    raise KeyError(
+        f"No recorded claim correction found for claim {claim_id!r} under any of "
+        f"{change_ids!r} — restore act design point 2 should have written one at "
+        "correction time."
+    )
+
+
+def _published_item_from_act(act: PublicationAct) -> PublishedItem:
+    """Rebuild a :class:`PublishedItem` from the ORIGINAL ``publish`` act it came
+    from — this is what makes a restore's reinsertion byte-identical: the same
+    stored content, never a copy that could drift."""
+    return PublishedItem(
+        id=act.id,
+        kind=act.kind,  # type: ignore[arg-type]
+        content=act.content or "",
+        subject=act.subject,
+        anchors=act.anchors or [],
+        published_at=act.created_at,
+        origin_scope_id=act.origin_scope_id,
+        relay_scope_id=act.relay_scope_id,
+        relay_item_id=act.relay_item_id,
+    )
+
+
+def _relay_rejudged_since_withdrawal(
+    relay_scope_id: str,
+    origin_item_id: str,
+    change_ids: Sequence[str],
+    *,
+    record_store: RecordStore,
+) -> bool:
+    """Has *relay_scope_id*'s own judge PROCESSED (drained) the ``claim_corrected``
+    notice for *origin_item_id* under any of *change_ids* (contract line 4)?
+
+    A relaying scope is, by ADR 0013 D3 construction, a one-hop topological
+    reader of the scope it relayed from — the only way its judge could have
+    seen *origin_item_id* to relay it in the first place — so it receives an
+    ORDINARY (non-self-notice) ``claim_corrected`` event for *origin_item_id*
+    exactly as any other reader does, stamped ``processed_at`` only once its
+    own refresh actually drains it. That is the signal: not the self-notice
+    of the relay copy's OWN withdrawal, which is born processed at birth
+    (issue #197) and says nothing about whether this scope's judge acted.
+    """
+    for event in record_store.list_change_events(scope_id=relay_scope_id):
+        if (
+            not event.self_notice
+            and event.kind == CLAIM_CORRECTED
+            and event.item_id == origin_item_id
+            and event.change_id in change_ids
+            and event.processed_at is not None
+        ):
+            return True
+    return False
+
+
+def _restore_item_in_scope(
+    scope_id: str,
+    item: PublishedItem,
+    *,
+    withdraw_act_id: str,
+    fleet: FleetConfig,
+    record_store: RecordStore,
+    summaries_dir: str,
+    held_scope_id: str,
+) -> None:
+    """Re-insert *item* into *scope_id*'s live publication, record the ``restore``
+    act, and mark the withdraw act it reverses. Runs under *scope_id*'s own
+    lock unless it is *held_scope_id* (already locked by the outer caller —
+    mirrors :func:`_cascade_withdraw_relays`'s own re-entrancy rule)."""
+
+    def _do() -> None:
+        current = read_publication(scope_id, summaries_dir=summaries_dir)
+        if any(i.id == item.id for i in current):
+            return  # already present — a retried/duplicate cascade step, not an error
+        current.append(item)
+        _write_publication(scope_id, current, summaries_dir=summaries_dir)
+        restore_act = record_store.append_publication_act(
+            scope_id=scope_id,
+            act="restore",
+            kind=None,
+            content=None,
+            subject=None,
+            anchors=None,
+            withdraws=None,
+            trigger=withdraw_act_id,
+            proposer=_mechanical_proposer(scope_id),
+            restores=item.id,
+        )
+        record_store.mark_withdraw_restored(
+            withdraw_act_id=withdraw_act_id, restore_act_id=restore_act.id
+        )
+
+    if scope_id == held_scope_id:
+        _do()
+    else:
+        with scope_lock(scope_id):
+            _do()
+
+
+def _restore_relay_cascade(
+    item_id: str,
+    *,
+    claim_id: str,
+    change_ids: Sequence[str],
+    fleet: FleetConfig,
+    record_store: RecordStore,
+    summaries_dir: str,
+    held_scope_id: str,
+    notified_items: set[str],
+) -> None:
+    """Mirror of :func:`_cascade_withdraw_relays`, driven by the RECORD rather
+    than today's live publications (the relay copies are gone) — every
+    ``withdraw`` act anywhere whose own ``trigger`` is *item_id* is one relay
+    hop downstream of it.
+
+    Each hop restores mechanically unless
+    :func:`_relay_rejudged_since_withdrawal` says that relaying scope's
+    standing changed since (contract line 4) — in which case this branch
+    stops: no mechanical restore, no further descent (there is nothing to
+    cascade FROM if the relay was never recreated). Every item id this walk
+    reaches — restored or not — is queued in *notified_items* for a single
+    ``claim_restored`` emission per id at the end (point 8 handles the
+    "evidence either way" case uniformly: a scope that stopped the cascade
+    still gets the notice, exactly like a scope that only ever read the
+    correction and never itself relayed).
+    """
+    for withdraw_act in record_store.find_publication_acts_by_trigger(item_id):
+        if withdraw_act.act != "withdraw" or withdraw_act.withdraws is None:
+            continue
+        relay_scope_id = withdraw_act.scope_id
+        relay_item_id = withdraw_act.withdraws
+        notified_items.add(relay_item_id)
+        if _relay_rejudged_since_withdrawal(
+            relay_scope_id, item_id, change_ids, record_store=record_store
+        ):
+            continue
+        original_relay_act = record_store.get_publication_act(relay_item_id)
+        if original_relay_act is None:
+            continue
+        _restore_item_in_scope(
+            relay_scope_id,
+            _published_item_from_act(original_relay_act),
+            withdraw_act_id=withdraw_act.id,
+            fleet=fleet,
+            record_store=record_store,
+            summaries_dir=summaries_dir,
+            held_scope_id=held_scope_id,
+        )
+        _restore_relay_cascade(
+            relay_item_id,
+            claim_id=claim_id,
+            change_ids=change_ids,
+            fleet=fleet,
+            record_store=record_store,
+            summaries_dir=summaries_dir,
+            held_scope_id=held_scope_id,
+            notified_items=notified_items,
+        )
+
+
+def _render_restore_notice(item_id: str, reversed_change_id: str, content: str) -> str:
+    """Contract line 2: the owner's act, naming the earlier notice as wrong —
+    never the engine's confession, since the ``carries`` call that withdrew
+    it (if #219 C) was the owner's own judge's."""
+    return (
+        f"[Restore — item {item_id} is restored by its owner.]\n"
+        f"- the earlier notice ({reversed_change_id}) saying this item carried the "
+        "refuted claim was wrong.\n"
+        "- the correction of the refuted claim itself is unchanged and still stands.\n"
+        f"- restored content:\n    {content}\n"
+    )
+
+
+def _apply_restore(
+    origin_item_id: str,
+    origin_withdraw_act: PublicationAct,
+    restore_act_id: str,
+    original_item: PublishedItem,
+    *,
+    claim_id: str,
+    change_ids: Sequence[str],
+    fleet: FleetConfig,
+    record_store: RecordStore,
+    summaries_dir: str,
+    held_scope_id: str,
+) -> None:
+    """Everything an ACCEPTED restore (owner or operator path) does, after the
+    (optional) judgment is already recorded: reinsert the origin item,
+    cascade to its relays per contract line 4, then notify (contract lines
+    2/3/6) every item id the walk touched, mechanically restored or not.
+    """
+    current = read_publication(held_scope_id, summaries_dir=summaries_dir)
+    if not any(i.id == original_item.id for i in current):
+        current.append(original_item)
+        _write_publication(held_scope_id, current, summaries_dir=summaries_dir)
+    record_store.mark_withdraw_restored(
+        withdraw_act_id=origin_withdraw_act.id, restore_act_id=restore_act_id
+    )
+
+    notified_items: set[str] = {origin_item_id}
+    _restore_relay_cascade(
+        origin_item_id,
+        claim_id=claim_id,
+        change_ids=change_ids,
+        fleet=fleet,
+        record_store=record_store,
+        summaries_dir=summaries_dir,
+        held_scope_id=held_scope_id,
+        notified_items=notified_items,
+    )
+
+    restore_change_id = new_change_id()
+    content = _render_restore_notice(origin_item_id, change_ids[0], original_item.content)
+    for item_id in notified_items:
+        emit_restore_notice(
+            record_store=record_store,
+            item_id=item_id,
+            original_change_ids=change_ids,
+            restore_change_id=restore_change_id,
+            claim_id=claim_id,
+            content=content,
+        )
+
+
+def propose_restore(
+    scope_id: str,
+    item_id: str,
+    reason: str | None,
+    proposer: ContributorRef,
+    *,
+    fleet: FleetConfig,
+    record_store: RecordStore,
+    summary_store: SummaryStore,
+    scope_manager: ScopeManager,
+) -> PublicationOutcome:
+    """Propose restoring a correction-withdrawn published item (owner path, judged).
+
+    Same order-of-operations shape as :func:`propose_withdraw`: the act is
+    appended to the record BEFORE the scope-manager is invoked. Judged
+    through :meth:`~strata.scope_manager.ScopeManager.judge_publication`
+    (``act_kind='restore'``) — the structural test only (contract line 1):
+    still believed by *scope_id*'s CURRENT memory, and does not re-assert the
+    refuted claim. A decline leaves the item withdrawn; the operator path is
+    the escape (design point 2).
+
+    Raises:
+        ValueError: *scope_id* is not found in *fleet*; *item_id* was not
+            withdrawn by a correction sweep (restorable_withdrawal is
+            ``None`` — a deliberate withdrawal is re-published, not restored
+            this way); or it was already restored.
+        KeyError: no withdraw act is on record for *item_id*, or no
+            :class:`~strata.record_store.ClaimCorrection` row exists for its
+            claim (should always exist by design point 2 — a missing row is
+            a bug upstream, not a user error).
+    """
+    scope = fleet.get_scope(scope_id)
+    if scope is None:
+        raise ValueError(f"Scope not found: {scope_id!r}")
+
+    with scope_lock(scope_id):
+        withdraw_act = _find_withdraw_act(scope_id, item_id, record_store=record_store)
+        if withdraw_act is None:
+            raise KeyError(f"No withdraw act found for item {item_id!r} in scope {scope_id!r}.")
+        if withdraw_act.restored_by is not None:
+            raise ValueError(f"Item {item_id!r} has already been restored.")
+        restorable = restorable_withdrawal(scope_id, item_id, record_store=record_store)
+        if restorable is None:
+            raise ValueError(
+                f"Item {item_id!r} was not withdrawn by a correction sweep — only a "
+                "sweep withdrawal (verbatim or #219 C) can be restored this way. A "
+                "deliberate withdrawal is re-published instead."
+            )
+        claim_id, change_ids = restorable
+        correction = _resolve_claim_correction(claim_id, change_ids, record_store=record_store)
+        original_act = record_store.get_publication_act(withdraw_act.withdraws)  # type: ignore[arg-type]
+        if original_act is None:
+            raise KeyError(f"Original publish act {withdraw_act.withdraws!r} not found.")
+        restore_item = _published_item_from_act(original_act)
+
+        current_summary = summary_store.read(scope_id)
+        current_publication = read_publication(
+            scope_id, summaries_dir=str(summary_store.summaries_dir)
+        )
+
+        act = record_store.append_publication_act(
+            scope_id=scope_id,
+            act="restore",
+            kind=None,
+            content=None,
+            subject=None,
+            anchors=None,
+            withdraws=None,
+            trigger=withdraw_act.id,
+            proposer=proposer,
+            restores=item_id,
+        )
+
+        from strata.operator import operator_memory_binding
+
+        operator_memory = operator_memory_binding(
+            scope_id, fleet=fleet, summaries_dir=str(summary_store.summaries_dir)
+        )
+
+        try:
+            judgment = scope_manager.judge_publication(
+                scope=scope,
+                act_kind="restore",
+                current_summary=current_summary,
+                current_publication=current_publication,
+                restore_item=restore_item,
+                corrected_claim_content=correction.corrected_claim_content,
+                correcting_content=correction.correcting_content,
+                operator_memory=operator_memory,
+            )
+        except Exception as exc:
+            record_store.record_publication_judgment_attempt(
+                act_id=act.id,
+                error_class=type(exc).__name__,
+                message=str(exc),
+                outcome=JUDGE_FAILED,
+            )
+            raise
+
+        record_store.record_publication_judgment(
+            act_id=act.id,
+            decision=judgment.decision,
+            judged_by="scope-manager",
+            reasoning=judgment.reasoning,
+        )
+
+        artifact_updated = False
+        if judgment.decision == "accept":
+            _apply_restore(
+                item_id,
+                withdraw_act,
+                act.id,
+                restore_item,
+                claim_id=claim_id,
+                change_ids=change_ids,
+                fleet=fleet,
+                record_store=record_store,
+                summaries_dir=str(summary_store.summaries_dir),
+                held_scope_id=scope_id,
+            )
+            artifact_updated = True
+
+        return PublicationOutcome(
+            act_id=act.id,
+            act="restore",
+            decision=judgment.decision,
+            reasoning=judgment.reasoning,
+            artifact_updated=artifact_updated,
+        )
+
+
+def operator_restore(
+    scope_id: str,
+    item_id: str,
+    reason: str | None,
+    *,
+    fleet: FleetConfig,
+    record_store: RecordStore,
+    summaries_dir: str,
+) -> PublicationOutcome:
+    """Restore a correction-withdrawn published item in person (operator path, ADR
+    0008 D4) — no judgment row, operator provenance, the Console's Restore
+    button.
+
+    Same restorability check as :func:`propose_restore`; unlike that path,
+    accepts unconditionally (the operator's own review IS the ground —
+    design point 2's "the operator path is the escape" when the owner's
+    judge declines).
+
+    Unjudged: the operator decides — the Console shows the refuted claim
+    beside the item (and the correcting content) precisely so that decision
+    is informed. By design, this WILL restore a genuine carrier of the
+    refuted claim if the operator chooses to (ADR 0008's in-person
+    authority) — there is no mechanical refusal here; the structural
+    "still believed, doesn't carry" test is the OWNER path's own judge, not
+    this one.
+
+    Raises:
+        ValueError: *scope_id* is not found in *fleet*, *item_id* was not
+            withdrawn by a correction sweep, or it was already restored.
+        KeyError: no withdraw act is on record for *item_id*, or no
+            :class:`~strata.record_store.ClaimCorrection` row exists for its
+            claim.
+    """
+    scope = fleet.get_scope(scope_id)
+    if scope is None:
+        raise ValueError(f"Scope not found: {scope_id!r}")
+
+    with scope_lock(scope_id):
+        withdraw_act = _find_withdraw_act(scope_id, item_id, record_store=record_store)
+        if withdraw_act is None:
+            raise KeyError(f"No withdraw act found for item {item_id!r} in scope {scope_id!r}.")
+        if withdraw_act.restored_by is not None:
+            raise ValueError(f"Item {item_id!r} has already been restored.")
+        restorable = restorable_withdrawal(scope_id, item_id, record_store=record_store)
+        if restorable is None:
+            raise ValueError(
+                f"Item {item_id!r} was not withdrawn by a correction sweep — only a "
+                "sweep withdrawal (verbatim or #219 C) can be restored this way."
+            )
+        claim_id, change_ids = restorable
+        original_act = record_store.get_publication_act(withdraw_act.withdraws)  # type: ignore[arg-type]
+        if original_act is None:
+            raise KeyError(f"Original publish act {withdraw_act.withdraws!r} not found.")
+        restore_item = _published_item_from_act(original_act)
+
+        proposer = ContributorRef(
+            scope_id="operator",
+            skill="operator",
+            session_id="operator",
+            ts=datetime.now(tz=UTC).isoformat(),
+        )
+        act = record_store.append_publication_act(
+            scope_id=scope_id,
+            act="restore",
+            kind=None,
+            content=None,
+            subject=None,
+            anchors=None,
+            withdraws=None,
+            trigger=withdraw_act.id,
+            proposer=proposer,
+            restores=item_id,
+        )
+        _apply_restore(
+            item_id,
+            withdraw_act,
+            act.id,
+            restore_item,
+            claim_id=claim_id,
+            change_ids=change_ids,
+            fleet=fleet,
+            record_store=record_store,
+            summaries_dir=summaries_dir,
+            held_scope_id=scope_id,
+        )
+        return PublicationOutcome(
+            act_id=act.id,
+            act="restore",
+            decision="accept",
+            reasoning=reason or "operator restore",
+            artifact_updated=True,
+        )
+
+
+@dataclass(frozen=True)
+class CorrectionWithdrawalRow:
+    """One row of the "Correction withdrawals" detection surface (Console view
+    / ``strata record --swept`` / the backend endpoint) — a withdrawal made by
+    a correction sweep, with everything the row needs to show side by side."""
+
+    act: PublicationAct
+    """The withdraw act itself — ``act.withdraws`` is the withdrawn item's id,
+    ``act.acknowledged``/``act.restored_by`` its review state."""
+    correction: ClaimCorrection | None
+    """The refuted claim's text and the correcting text, when on record (should
+    always be, by design — see :class:`ClaimCorrection`'s own docstring)."""
+    carrier_check: ClaimCarrierCheck | None
+    """#219 C's own audit row, when the method was a judged ``carries``
+    decision — ``None`` for a verbatim match or a relay-cascade hop, neither
+    of which gets one."""
+    reader_count: int
+    """Distinct reader scopes notified of this item's withdrawal (every
+    ``claim_corrected`` event for this item under its own change ids,
+    excluding the owning scope's self-notice)."""
+
+    @property
+    def method(self) -> str:
+        if self.carrier_check is not None:
+            return f"judge {self.carrier_check.outcome}"
+        if (self.act.trigger or "").startswith("pub_"):
+            return "relay cascade"
+        return "verbatim"
+
+
+def list_correction_withdrawals(
+    scope_id: str, *, record_store: RecordStore, include_acknowledged: bool = False
+) -> list[CorrectionWithdrawalRow]:
+    """The Console's "Correction withdrawals" view / ``strata record --swept``:
+    every withdraw act in *scope_id* caused by a correction sweep, newest
+    first, each with its claim/correcting text (when found) and #219 C's own
+    audit row (when the method was a judged ``carries`` decision rather than
+    a verbatim match — absent otherwise).
+
+    *include_acknowledged*: by default, a withdrawal already marked
+    "keep withdrawn" OR already restored is left out — the "to review"
+    filter design point 10 describes (nothing left to review once either
+    has happened). ``True`` returns every restorable withdrawal regardless.
+    """
+    acts = record_store.list_publication_acts(scope_id=scope_id)
+    carrier_checks = {
+        c.item_id: c for c in record_store.list_claim_carrier_checks(scope_id=scope_id)
+    }
+    out: list[CorrectionWithdrawalRow] = []
+    for act in acts:
+        if act.act != "withdraw":
+            continue
+        if (act.acknowledged or act.restored_by is not None) and not include_acknowledged:
+            continue
+        restorable = restorable_withdrawal(scope_id, act.withdraws or "", record_store=record_store)
+        if restorable is None:
+            continue
+        claim_id, change_ids = restorable
+        try:
+            correction = _resolve_claim_correction(claim_id, change_ids, record_store=record_store)
+        except KeyError:
+            correction = None
+        reader_scopes: set[str] = set()
+        for change_id in change_ids:
+            for event in record_store.list_change_events_by_change_id(
+                change_id=change_id, item_id=act.withdraws, kind=CLAIM_CORRECTED
+            ):
+                reader_scopes.add(event.scope_id)
+        reader_scopes.discard(scope_id)
+        out.append(
+            CorrectionWithdrawalRow(
+                act=act,
+                correction=correction,
+                carrier_check=carrier_checks.get(act.withdraws or ""),
+                reader_count=len(reader_scopes),
+            )
+        )
+    out.sort(key=lambda row: row.act.created_at, reverse=True)
+    return out
+
+
+def list_unresolved_carrier_checks(
+    scope_id: str, *, record_store: RecordStore
+) -> list[ClaimCarrierCheck]:
+    """#219 C's own unresolved/overflow rows for *scope_id*, newest first — flagged
+    in the same "Correction withdrawals" view (detection surface design point 1),
+    since by definition nothing was withdrawn for these: the item was never
+    classified (overflow) or the judge's decision could not be read (unreadable),
+    so there is no withdraw act to find them through."""
+    rows = [
+        c
+        for c in record_store.list_claim_carrier_checks(scope_id=scope_id)
+        if c.outcome in ("unresolved_overflow", "unresolved_unreadable")
+    ]
+    rows.sort(key=lambda c: c.created_at, reverse=True)
+    return rows
+
+
+def acknowledge_correction_withdrawal(
+    scope_id: str, item_id: str, *, record_store: RecordStore
+) -> PublicationAct:
+    """The Console's "keep withdrawn" action: mark the withdraw act for *item_id*
+    in *scope_id* acknowledged, hiding it from :func:`list_correction_withdrawals`'s
+    default "to review" filter without restoring it.
+
+    Raises:
+        KeyError: no withdraw act is on record for *item_id* in *scope_id*.
+    """
+    withdraw_act = _find_withdraw_act(scope_id, item_id, record_store=record_store)
+    if withdraw_act is None:
+        raise KeyError(f"No withdraw act found for item {item_id!r} in scope {scope_id!r}.")
+    record_store.acknowledge_withdraw(withdraw_act.id)
+    updated = record_store.get_publication_act(withdraw_act.id)
+    assert updated is not None  # noqa: S101 — just wrote it, must exist
+    return updated
+
+
+# ---------------------------------------------------------------------------
 # Staleness propagation (ADR 0007 D3) — two paths, by anchor type.
 # ---------------------------------------------------------------------------
 
@@ -1325,6 +1955,47 @@ def propagate_claim_correction(
     if not to_withdraw:
         return []
 
+    return _withdraw_and_cascade_carriers(
+        scope_id,
+        to_withdraw,
+        current_publication,
+        claim_id=claim_id,
+        correcting_content=correcting_content,
+        trigger_id=trigger_id,
+        reason="still carried corrected claim %s verbatim (ADR 0017 P4)",
+        fleet=fleet,
+        record_store=record_store,
+        summaries_dir=summaries_dir,
+        change_ids=change_ids,
+        hop=hop,
+    )
+
+
+def _withdraw_and_cascade_carriers(
+    scope_id: str,
+    to_withdraw: Sequence[PublishedItem],
+    current_publication: Sequence[PublishedItem],
+    *,
+    claim_id: str,
+    correcting_content: str,
+    trigger_id: str,
+    reason: str,
+    fleet: FleetConfig,
+    record_store: RecordStore,
+    summaries_dir: str,
+    change_ids: Sequence[str],
+    hop: int,
+) -> list[PublishedItem]:
+    """Shared tail of :func:`propagate_claim_correction` and
+    :func:`check_claim_carriers` (issue #219 C): given the items ALREADY
+    decided to carry a corrected claim — by verbatim match or by the
+    owner-judge's own ``carries`` decision — withdraw each, rewrite the
+    publication artifact, and cascade the withdrawal to every relay, exactly
+    once, under one wave id, however the carrier was found.
+
+    *reason* is a ``%``-style log template taking *claim_id* — the two
+    callers log a different cause for the same mechanical act.
+    """
     proposer = _mechanical_proposer(scope_id)
     for item in to_withdraw:
         record_store.append_publication_act(
@@ -1339,8 +2010,7 @@ def propagate_claim_correction(
             proposer=proposer,
         )
         _logger.info(
-            "mechanically withdrew published item %s from scope %s: still carried "
-            "corrected claim %s verbatim (ADR 0017 P4)",
+            "mechanically withdrew published item %s from scope %s: " + reason,
             item.id,
             scope_id,
             claim_id,
@@ -1378,7 +2048,716 @@ def propagate_claim_correction(
             correcting_claim_id=claim_id,
         )
 
-    return to_withdraw
+    return list(to_withdraw)
+
+
+_CARRIER_STOPWORDS = frozenset(
+    {
+        "a",
+        "an",
+        "the",
+        "is",
+        "are",
+        "was",
+        "were",
+        "be",
+        "been",
+        "being",
+        "of",
+        "to",
+        "in",
+        "on",
+        "at",
+        "by",
+        "for",
+        "with",
+        "as",
+        "and",
+        "or",
+        "but",
+        "it",
+        "its",
+        "this",
+        "that",
+        "these",
+        "those",
+        "from",
+        "into",
+        "about",
+        "than",
+        "then",
+        "so",
+        "not",
+        "no",
+    }
+)
+
+
+def _content_words(text: str) -> set[str]:
+    words = re.findall(r"[a-z0-9]+", text.casefold())
+    return {w for w in words if w not in _CARRIER_STOPWORDS}
+
+
+def _carrier_rank_score(claim_content: str, candidate_content: str) -> float:
+    """Issue #219 C: rank a published item against a corrected claim for
+    ORDERING ONLY, never as a gate — the offline measurement killed a
+    threshold outright, since one either misses paraphrases or admits
+    subject swaps. Key-token overlap (how many of the claim's own content
+    words the candidate shares) plus content-word coverage (what fraction of
+    the claim's content words that overlap is), so a short candidate that
+    restates the whole claim scores above a long one that shares only a
+    couple of words.
+
+    A tokenless claim (no content words survive stripping stopwords) scores
+    every candidate 0.0 — ties then fall back to the face's own stable
+    order, so every candidate still reaches the judge call rather than being
+    filtered out mechanically; see :func:`check_claim_carriers`.
+    """
+    claim_words = _content_words(claim_content)
+    if not claim_words:
+        return 0.0
+    candidate_words = _content_words(candidate_content)
+    overlap = claim_words & candidate_words
+    coverage = len(overlap) / len(claim_words)
+    return len(overlap) + coverage
+
+
+_NUMBER_WORDS = {
+    "zero": "0",
+    "one": "1",
+    "two": "2",
+    "three": "3",
+    "four": "4",
+    "five": "5",
+    "six": "6",
+    "seven": "7",
+    "eight": "8",
+    "nine": "9",
+    "ten": "10",
+    "eleven": "11",
+    "twelve": "12",
+    "thirteen": "13",
+    "fourteen": "14",
+    "fifteen": "15",
+    "sixteen": "16",
+    "seventeen": "17",
+    "eighteen": "18",
+    "nineteen": "19",
+    "twenty": "20",
+    "thirty": "30",
+    "forty": "40",
+    "fifty": "50",
+    "sixty": "60",
+    "seventy": "70",
+    "eighty": "80",
+    "ninety": "90",
+    "hundred": "100",
+    "thousand": "1000",
+    "million": "1000000",
+}
+
+
+#: :func:`_value_tokens`'s closed-class polarity words (#219 C live-gate
+#: measurement): words naming one of a pair of opposite states rather than a
+#: measurable quantity — content-word/key-token tokenisers both treat these
+#: as ordinary vocabulary, which is exactly why realistic corrections sharing
+#: subject/action wording with the refuted claim broke two earlier attempts
+#: at this veto (measured against 1,881 real judge answers from the re-gate:
+#: a content-word variant caught 20/21 inversions but vetoed 51 TRUE
+#: carriers). Restricting the veto to values alone — numbers, identifiers,
+#: quoted spans, and this closed list — measured 14/21 inversions vetoed,
+#: 0/198 true carriers vetoed.
+_POL_WORDS = frozenset(
+    {
+        "on",
+        "off",
+        "before",
+        "after",
+        "always",
+        "never",
+        "required",
+        "optional",
+        "enabled",
+        "disabled",
+        "open",
+        "closed",
+        "allowed",
+        "forbidden",
+        "prohibited",
+        "shared",
+        "private",
+        "include",
+        "exclude",
+        "min",
+        "max",
+        "above",
+        "below",
+        "first",
+        "last",
+    }
+)
+
+
+def _value_tokens(text: str) -> set[str]:
+    """VALUE tokens only, for :func:`observed_value_veto` (#219 C live-gate
+    measurement) — never ordinary content words, which is what made two
+    earlier attempts at this veto over-fire on realistic corrections that
+    share subject/action vocabulary with the refuted claim. Four kinds:
+
+    - numbers, with grouping commas collapsed ("40,000" and "40000" are the
+      same token) and spelled-out number words normalised to digits
+      ("forty" is also "40000"'s own partial match via the per-word pass);
+    - identifiers: a dot/slash/underscore-joined token ("pyproject.toml",
+      "a/b", "a_b") always counts; a HYPHENATED token counts only when it
+      contains a digit ("45-minute", "j4-822") — an ordinary hyphenated word
+      ("well-known") does not;
+    - a quoted span, kept whole rather than split into its own words;
+    - any word that is one of :data:`_POL_WORDS`.
+    """
+    casefolded = text.casefold()
+    tokens: set[str] = set()
+    for match in re.finditer(r"\b\d[\d,]*(?:\.\d+)?\b", casefolded):
+        tokens.add(match.group(0).replace(",", ""))
+    for word in re.findall(r"[a-z]+", casefolded):
+        if word in _NUMBER_WORDS:
+            tokens.add(_NUMBER_WORDS[word])
+    for match in re.finditer(r"[\w]+(?:[./_][\w]+)+", casefolded):
+        tokens.add(match.group(0))
+    for match in re.finditer(r"[\w]+(?:-[\w]+)+", casefolded):
+        token = match.group(0)
+        if any(c.isdigit() for c in token):
+            tokens.add(token)
+    for match in re.finditer(r'"([^"]+)"', text):
+        tokens.add(match.group(1).strip().casefold())
+    tokens |= set(re.findall(r"[a-z]+", casefolded)) & _POL_WORDS
+    return tokens
+
+
+def _decomposed_value_tokens(text: str) -> set[str]:
+    """:func:`_value_tokens`, with one change: a hyphen- or slash-joined
+    compound CONTAINING a digit ("under-12", "j4-822") is decomposed into
+    its atoms — the digit atom normalised as a bare number — INSTEAD OF
+    kept whole, so a value spelled as a compound on one side compares
+    against the same value spelled as plain words on the other ("under-12"
+    vs "under 12") — v1.17 item 1's architect review of 10327f6's bridge
+    replay, round 2: adding the atom BESIDE the whole compound is not
+    enough, because the whole compound ("under-12") then never matches
+    anything on a side that spells it as two plain words, and a strict
+    subset check still fails on that leftover token. Number WORDS still
+    normalise via the same :data:`_NUMBER_WORDS` table :func:`_value_tokens`
+    already uses — nothing new there.
+
+    A SEPARATE function from :func:`_value_tokens`, not a change to it:
+    :func:`observed_value_veto`'s own #219 C gate relies on the whole
+    compound counting as one identifier-shaped token (``j4-822`` as a work
+    item id), and this function's own callers (the attribution and relation
+    re-checks' value-conflict comparisons) need the opposite — this is a
+    deliberate, reported fork, not a shared improvement to the original.
+    """
+    tokens = set(_value_tokens(text))
+    for match in re.finditer(r"[\w]+(?:[-/][\w]+)+", text.casefold()):
+        compound = match.group(0)
+        if not any(c.isdigit() for c in compound):
+            continue
+        tokens.discard(compound)
+        for atom in re.split(r"[-/]", compound):
+            if atom.isdigit():
+                tokens.add(atom)
+            elif atom in _NUMBER_WORDS:
+                tokens.add(_NUMBER_WORDS[atom])
+    return tokens
+
+
+#: #219's own closed POL_WORDS set, paired into antonyms — bidirectional.
+#: "forbidden" and "prohibited" are both treated as the antonym of
+#: "allowed" (near-synonyms of each other, not antonyms).
+_POL_ANTONYMS: dict[str, frozenset[str]] = {
+    "on": frozenset({"off"}),
+    "off": frozenset({"on"}),
+    "before": frozenset({"after"}),
+    "after": frozenset({"before"}),
+    "always": frozenset({"never"}),
+    "never": frozenset({"always"}),
+    "required": frozenset({"optional"}),
+    "optional": frozenset({"required"}),
+    "enabled": frozenset({"disabled"}),
+    "disabled": frozenset({"enabled"}),
+    "open": frozenset({"closed"}),
+    "closed": frozenset({"open"}),
+    "allowed": frozenset({"forbidden", "prohibited"}),
+    "forbidden": frozenset({"allowed"}),
+    "prohibited": frozenset({"allowed"}),
+    "shared": frozenset({"private"}),
+    "private": frozenset({"shared"}),
+    "include": frozenset({"exclude"}),
+    "exclude": frozenset({"include"}),
+    "min": frozenset({"max"}),
+    "max": frozenset({"min"}),
+    "above": frozenset({"below"}),
+    "below": frozenset({"above"}),
+    "first": frozenset({"last"}),
+    "last": frozenset({"first"}),
+}
+
+#: A span restating a claim under negation ("not waived", "no longer
+#: required") states the opposite of the unnegated claim — checked
+#: separately from :data:`_POL_ANTONYMS` because the negated word need not
+#: be one of :data:`_POL_WORDS` at all ("waived" is ordinary vocabulary).
+_NEGATION_MARKERS: tuple[str, ...] = (
+    "no longer",
+    "not",
+    "never",
+    "isn't",
+    "aren't",
+    "doesn't",
+    "don't",
+    "won't",
+    "cannot",
+    "can't",
+)
+
+#: R5c (architect ruling, round 5): a CHANGE marker in the claim with none
+#: anywhere in the reference means the claim states a CHANGE from the
+#: reference's own value, not a restatement of it — "security findings can
+#: now be triaged within a week INSTEAD OF 48 hours" against a reference
+#: that only ever says "48 hours" is a flip, even with no antonym pair and
+#: no negation marker involved at all.
+_CHANGE_MARKERS: tuple[str, ...] = (
+    "instead of",
+    "rather than",
+    "no longer",
+    "anymore",
+    "except",
+    "exception",
+    "now can",
+    "can now",
+)
+
+
+def value_polarity_flip(
+    claim_text: str,
+    reference_text: str,
+    extra_antonym_pairs: Sequence[tuple[str, str]] = (),
+) -> bool:
+    """#219's polarity guard, as a FLIP check — architect review round 2 of
+    10327f6's bridge replay: the PRIOR shape (every :data:`_POL_WORDS` word
+    in the claim must also appear in the reference) over-fires on ordinary
+    vocabulary that happens to be in the closed set ("the clinics directive
+    ON two-person counts" has no polarity assertion at all; "on" is common
+    word, not a claim about on/off state). A polarity word (or a negation)
+    appearing in *claim_text* with NO antonym anywhere in *reference_text*
+    is not a flip — it is simply not vetoed for being absent.
+
+    Two mechanisms, either one sufficient to report a flip:
+
+    - **antonym flip**: a :data:`_POL_ANTONYMS` word (or one of
+      *extra_antonym_pairs*, for a caller-specific antonym pair the closed
+      POL_WORDS set does not cover — v1.17 item 2's own relation antonyms,
+      e.g. "at or below"/"at or above", not in :data:`_POL_WORDS` at all)
+      appears in *claim_text*, its antonym appears in *reference_text*, and
+      *claim_text* itself does not ALSO contain that antonym (a claim that
+      restates both sides, e.g. quoting a change, is not penalised).
+    - **negation flip**: a :data:`_NEGATION_MARKERS` word directly precedes
+      a word in *claim_text* that *reference_text* also states UNNEGATED —
+      "not waived" against a reference stating "waived" is a flip; "waived"
+      against "waived" is not.
+    - **change-marker flip** (R5c): a :data:`_CHANGE_MARKERS` phrase
+      ("instead of", "rather than", "no longer", "anymore", "except",
+      "exception", "now can"/"can now") appears anywhere in *claim_text*
+      with NONE of them anywhere in *reference_text* — the claim states a
+      CHANGE from the reference's own value with no antonym pair or
+      negation marker necessarily involved at all.
+
+    Pure and reusable: shared by v1.17 item 1's own
+    ``directive_or_publication`` ground check and item 2's ``refines``/
+    ``tightens`` fact-mode polarity guard (its own relation antonyms are
+    supplied as *extra_antonym_pairs*) — ONE flip function, not two.
+    """
+    claim_cf = claim_text.casefold()
+    ref_cf = reference_text.casefold()
+
+    antonym_pairs = list(extra_antonym_pairs)
+    for word, antonyms in _POL_ANTONYMS.items():
+        antonym_pairs.extend((word, antonym) for antonym in antonyms)
+
+    for first, second in antonym_pairs:
+        # A bare `\b` lets a POL_WORD match inside an unrelated hyphenated
+        # compound ("on-call", "sign-off" both contain "on"/"off" as
+        # word-bounded substrings, with no on/off state assertion at all).
+        # Excluding a match directly adjacent to a hyphen on either side
+        # closes this without narrowing the real single-word case.
+        first_re = re.compile(rf"(?<!-)\b{re.escape(first)}\b(?!-)")
+        second_re = re.compile(rf"(?<!-)\b{re.escape(second)}\b(?!-)")
+        claim_has_first, claim_has_second = (
+            bool(first_re.search(claim_cf)),
+            bool(second_re.search(claim_cf)),
+        )
+        ref_has_first, ref_has_second = (
+            bool(first_re.search(ref_cf)),
+            bool(second_re.search(ref_cf)),
+        )
+        if claim_has_first and ref_has_second and not ref_has_first:
+            return True
+        if claim_has_second and ref_has_first and not ref_has_second:
+            return True
+
+    negation_alternation = "|".join(re.escape(marker) for marker in _NEGATION_MARKERS)
+    for marker in _NEGATION_MARKERS:
+        for match in re.finditer(rf"\b{re.escape(marker)}\s+(\w+)", claim_cf):
+            word = match.group(1)
+            word_re = re.compile(rf"\b{re.escape(word)}\b")
+            if word_re.search(ref_cf) and not re.search(
+                rf"\b(?:{negation_alternation})\s+{re.escape(word)}\b", ref_cf
+            ):
+                return True
+
+    return any(marker in claim_cf for marker in _CHANGE_MARKERS) and not any(
+        marker in ref_cf for marker in _CHANGE_MARKERS
+    )
+
+
+#: Hole B (architect review round 3, bridge attack on 1ffc4e4): an
+#: unrelated directive can be cited and still pass when the span's value
+#: tokens are vacuous (no number/id/quote at all, so the subset check holds
+#: trivially). Overlap is NECESSARY, never sufficient (the design note's
+#: own contract line) — these stay EXCLUDED from the count even though some
+#: are content-bearing words, because they recur in nearly every citation
+#: regardless of subject.
+_CONTENT_OVERLAP_STOPWORDS = frozenset(
+    {
+        "directive",
+        "policy",
+        "rule",
+        "says",
+        "already",
+        "according",
+        # Architect's bridge forced-gate fix (the j1a-025 coverage
+        # artefact): attribution-FRAME verbs recur in nearly every
+        # citation regardless of subject, the same reasoning as the
+        # original six words above.
+        "requires",
+        "require",
+        "required",
+        "states",
+        "stated",
+        "mandates",
+        "mandated",
+        "notes",
+        "following",
+        "under",
+        "per",
+        "quoted",
+        "ratified",
+    }
+)
+
+
+def _overlap_stem(word: str) -> str:
+    """A simple plural/-ed/-ing stem — just enough to match "products" to
+    "product" and "stickers" to "sticker" — never a real stemmer; this is a
+    necessary-overlap gate, not the value check itself."""
+    for suffix in ("ing", "ed", "es", "s"):
+        if word.endswith(suffix) and len(word) - len(suffix) >= 3:
+            return word[: -len(suffix)]
+    return word
+
+
+def _overlap_words(text: str) -> set[str]:
+    words: set[str] = set()
+    for word in re.findall(r"[a-z]+", text.casefold()):
+        if len(word) < 4 or word in _CONTENT_OVERLAP_STOPWORDS:
+            continue
+        words.add(_overlap_stem(word))
+    return words
+
+
+def _shared_six_word_sequence(a: str, b: str) -> bool:
+    a_tokens = re.findall(r"[a-z]+", a.casefold())
+    b_tokens = re.findall(r"[a-z]+", b.casefold())
+    if len(a_tokens) < 6 or len(b_tokens) < 6:
+        return False
+    b_sequences = {tuple(b_tokens[i : i + 6]) for i in range(len(b_tokens) - 5)}
+    return any(tuple(a_tokens[i : i + 6]) in b_sequences for i in range(len(a_tokens) - 5))
+
+
+#: F3 (architect review round 4, adversarial attack on 067183a: 12 passes
+#: through a weak "≥2 shared words" bar, including the whole j4-812 text).
+#: Splits the SPAN itself on coordinators, dashes and semicolons, so a
+#: requirement clause added beyond what the reference covers is caught
+#: even when the span's OVERALL coverage happens to clear the bar.
+_OVERLAP_CLAUSE_SPLIT_RE = re.compile(
+    r"\s*(?:--|;| and | AND | also | ALSO | plus | PLUS | as well as )\s*", re.IGNORECASE
+)
+
+
+def _coverage_ratio(subject_words: set[str], reference_words: set[str]) -> float:
+    if not subject_words:
+        return 0.0
+    return len(subject_words & reference_words) / len(subject_words)
+
+
+def content_overlap_required(
+    span: str,
+    reference_text: str,
+    exclude_words: Collection[str] = (),
+) -> bool:
+    """Hole B / F3's fix: at least 60% of *span*'s own content words
+    (casefolded, 4+ letters, simple plural/-ed/-ing stripping, excluding
+    :data:`_CONTENT_OVERLAP_STOPWORDS` and *exclude_words*) must appear in
+    *reference_text* — COVERAGE, not a flat "≥2 shared words" count (which
+    a long span could clear while adding whole unattributed clauses) — OR
+    a shared contiguous 6-word sequence.
+
+    *exclude_words* (architect's bridge forced-gate fix): raw words (e.g.
+    a scope's own id/name) the caller knows are NOT new information in
+    this span — a directive's own SOURCE scope, or any rendered ancestor
+    scope, named again in the span states nothing new ("the OBSERVATORY
+    directive..." citing the observatory's own rule), the same reasoning
+    as :data:`_CONTENT_OVERLAP_STOPWORDS`, just caller-specific rather
+    than universal. Stemmed and casefolded the same way as the span's own
+    words, so a plural or an inflected form still matches.
+
+    F3's own further rule: the span is ALSO split on coordinators, dashes
+    and semicolons, and every resulting clause that contains a REQUIREMENT
+    verb (:data:`_PARTIAL_GROUNDING_REQUIREMENT_RE`-shaped — imported
+    lazily from `strata.scope_manager` to avoid a circular import) must
+    ITSELF reach 60% coverage — this is what catches a span whose overall
+    coverage passes only because an earlier, genuinely-grounded clause
+    carries it (j4-812's own shape: "transactions over $500 require
+    step-up authentication AND transactions over $500 from newly-seen
+    devices must be blocked outright" shares "transactions", "500" with
+    the reference overall, but the SECOND clause's own value — "blocked
+    outright" — never appears there at all).
+
+    This is a NECESSARY gate, never a sufficient one on its own — the
+    value and polarity checks still apply on top.
+
+    v1.17 item 2 does not call this function: its own `refines` ground
+    needed a coarser "is this substantially about the same subject" gate
+    with no equivalent of F3's own partial-grounding shape, so it uses its
+    own `_same_leading_subject` proxy instead of forking this one.
+    """
+    from strata.scope_manager import (  # noqa: PLC0415 — avoids a circular import
+        _PARTIAL_GROUNDING_REQUIREMENT_RE,
+    )
+
+    excluded = _overlap_words(" ".join(exclude_words))
+    reference_words = _overlap_words(reference_text)
+    span_words = _overlap_words(span) - excluded
+    # Found while verifying F3 against the full adversarial attack: a span
+    # with only ONE surviving content word ("As the branches directive
+    # already says" — "directive"/"already"/"says" are all stopwords, only
+    # "branches" is left) can coincidentally match an UNRELATED reference
+    # that happens to share that one word, at 100% coverage. Coverage
+    # alone cannot distinguish "the whole span matches" from "the only
+    # word left happens to match" — at least 2 surviving words are
+    # required for the ratio to mean anything.
+    if len(span_words) < 2 and not _shared_six_word_sequence(span, reference_text):
+        return False
+    if _coverage_ratio(span_words, reference_words) < 0.6 and not _shared_six_word_sequence(
+        span, reference_text
+    ):
+        return False
+
+    for clause in _OVERLAP_CLAUSE_SPLIT_RE.split(span):
+        if not _PARTIAL_GROUNDING_REQUIREMENT_RE.search(clause):
+            continue
+        clause_words = _overlap_words(clause)
+        if _coverage_ratio(clause_words, reference_words) < 0.6:
+            return False
+    return True
+
+
+def observed_value_veto(refuted_claim: str, correcting_content: str, item_content: str) -> bool:
+    """#219 C live-gate addition (CEO, standing rule 1 — never trust prompt
+    text alone): a mechanical veto that can only PREVENT a withdrawal, never
+    cause one. VALUE-token only (:func:`_value_tokens` — never ordinary
+    content words; see that function's own docstring for why): the judge's
+    own ``carries`` answer is overridden when the item's values include at
+    least one value the correction states that the refuted claim does not
+    (``c_only``), and none of the values the item is being blocked on
+    (``block``: the refuted claim's own values the correction does NOT also
+    repeat — or, when the correction repeats every one of them, every one of
+    them, so a correction that merely adds detail never backs off the
+    block). A polarity word in the correction counts only when the refuted
+    claim itself has one too. A tokenless claim, or a correction with no
+    value the refuted claim lacks, never vetoes.
+
+    Two further clauses were tried in re-gate 2 and both dropped:
+    - An ANTONYM FLIP (a closed before/after, on/off, etc. pair list,
+      independent of the correction text) measured 0 overrides in the
+      held-out run — the errors there were SUBJECT SWAPS ("fridges" for
+      "freezers"), which no antonym pair can see. No held-out evidence it
+      helps, so the CEO's rule drops it.
+    - An ADDED EXCEPTION ("PII is redacted in logs except in debug builds",
+      against refuted "PII is always redacted") is deliberately NOT a veto
+      clause — the philosopher's ruling: such a text carries the claim's
+      VALUE but not its SCOPE, and whether it should be withdrawn depends on
+      what the correction actually hit (a changed value means the exception
+      text is wrong too; the correction BEING the exception means it must
+      stay), a fact this function cannot tell from the text alone. A veto
+      that kept these would reintroduce the CEO's own named failure (keeping
+      a refuted value published), so this abstains on an exception-only
+      item in both directions and leaves the judge's own answer standing.
+
+    Returns ``True`` when the item should be KEPT (the withdrawal is
+    vetoed), ``False`` otherwise. The caller only ever consults this for an
+    item the judge already marked ``carries`` — this never turns a
+    ``does_not_carry`` into a ``carries``.
+    """
+    refuted_values = _value_tokens(refuted_claim)
+    correcting_values = _value_tokens(correcting_content)
+    if not (refuted_values & _POL_WORDS):
+        correcting_values = correcting_values - _POL_WORDS
+    c_only = correcting_values - refuted_values
+    if not refuted_values or not c_only:
+        return False
+    block = (refuted_values - correcting_values) or refuted_values
+    item_values = _value_tokens(item_content)
+    return bool(item_values & c_only) and not (item_values & block)
+
+
+def check_claim_carriers(
+    scope_id: str,
+    *,
+    claim_id: str,
+    corrected_claim_content: str,
+    correcting_content: str,
+    trigger_id: str,
+    already_withdrawn: Collection[str],
+    scope_manager: ScopeManager,
+    fleet: FleetConfig,
+    record_store: RecordStore,
+    summaries_dir: str,
+    change_ids: Sequence[str] = (),
+    hop: int = 0,
+    cap: int = 20,
+) -> list[PublishedItem]:
+    """Issue #219 C: one owner-judge call per correction, deciding whether the
+    scope's own published face — beyond what the mechanical verbatim sweep
+    and the judge's own ``withdraw_published`` already caught — still carries
+    a claim this scope's own outcome or refresh just found wrong.
+
+    Called from BOTH correction sites, right after
+    :func:`propagate_claim_correction`, under the SAME wave id: the same-scope
+    ``failed_corrected`` outcome path (:func:`strata.app._write_amendment`),
+    and the cross-scope refresh's centralised sweep (:func:`strata.app.drain_scope`,
+    #221) — it runs unconditionally there too, whatever the refresh judgment did.
+
+    Candidates are the WHOLE current face minus *already_withdrawn* — never
+    relays: a relay is a copy of a face item, and a face item judged
+    ``carries`` takes its own relays down through the same
+    :func:`_cascade_withdraw_relays` cascade the verbatim path uses. Ranked by
+    :func:`_carrier_rank_score` (ordering only) and capped at *cap* (20):
+    anything past the cap is recorded ``unresolved_overflow``, never silently
+    dropped and never sent to the judge.
+
+    Every candidate the judge call does classify gets its own row — ``carries``
+    or ``does_not_carry`` is itself a judgment made, so the row exists either
+    way (the philosopher: "carries / does_not_carry are acts, not labels");
+    an id the judge named with no readable decision, or never named at all,
+    is recorded ``unresolved_unreadable``. A ``carries`` answer additionally
+    passes through :func:`observed_value_veto` (CEO, standing rule 1 — a
+    judge's own wording is never trusted alone): when the item's own key
+    tokens state what was actually OBSERVED rather than the refuted claim,
+    the withdrawal is vetoed and the row records ``kept_by_guard`` instead.
+    Nothing here is withdrawn except the items that end up decided
+    ``carries`` after that veto.
+
+    *scope_manager* is duck-typed, not required to be a real
+    :class:`~strata.scope_manager.ScopeManager`: one that predates this
+    method (a lighter test double elsewhere in the fleet) degrades every
+    candidate to ``unresolved_unreadable`` exactly as an unreadable response
+    would, rather than raising ``AttributeError`` into the write this
+    function runs inside.
+    """
+    current_publication = read_publication(scope_id, summaries_dir=summaries_dir)
+    if not current_publication:
+        return []
+
+    skip = set(already_withdrawn)
+    face = [item for item in current_publication if item.id not in skip]
+    if not face:
+        return []
+
+    ranked = sorted(
+        enumerate(face),
+        key=lambda pair: (
+            -_carrier_rank_score(corrected_claim_content, pair[1].content),
+            pair[0],
+        ),
+    )
+    candidates = [item for _, item in ranked[:cap]]
+    overflow = [item for _, item in ranked[cap:]]
+
+    rows: list[tuple[str, str]] = [(item.id, "unresolved_overflow") for item in overflow]
+
+    to_withdraw: list[PublishedItem] = []
+    if candidates:
+        # A scope-manager duck-type that predates this method (a lighter
+        # test double elsewhere in the fleet, or a future rolling deploy
+        # where the engine and the judge implementation are briefly out of
+        # step) degrades the same way an unreadable decision does — fails
+        # closed per candidate, never crashes the drain/write it runs
+        # inside.
+        check = getattr(scope_manager, "check_claim_carriers", None)
+        decisions = (
+            check(
+                refuted_claim_content=corrected_claim_content,
+                correcting_content=correcting_content,
+                candidates=[(item.id, item.content) for item in candidates],
+            )
+            if check is not None
+            else {}
+        )
+        for item in candidates:
+            outcome = decisions.get(item.id, "unresolved_unreadable")
+            if outcome not in ("carries", "does_not_carry", "unresolved_unreadable"):
+                outcome = "unresolved_unreadable"
+            if outcome == "carries" and observed_value_veto(
+                corrected_claim_content, correcting_content, item.content
+            ):
+                # The mechanical veto (CEO, standing rule 1): the judge said
+                # carries, but the item's own key tokens state what was
+                # OBSERVED, not the refuted claim — never trust the prompt
+                # text alone. Can only PREVENT a withdrawal.
+                _logger.info(
+                    "claim-carrier guard kept published item %s in scope %s: judge said "
+                    "carries, but the item states the observed value, not the refuted "
+                    "one (issue #219 C)",
+                    item.id,
+                    scope_id,
+                )
+                outcome = "kept_by_guard"
+            rows.append((item.id, outcome))
+            if outcome == "carries":
+                to_withdraw.append(item)
+
+    if rows:
+        record_store.append_claim_carrier_checks(
+            change_id=change_ids[0] if change_ids else trigger_id,
+            scope_id=scope_id,
+            corrected_claim_id=claim_id,
+            checks=rows,
+        )
+
+    if not to_withdraw:
+        return []
+
+    return _withdraw_and_cascade_carriers(
+        scope_id,
+        to_withdraw,
+        current_publication,
+        claim_id=claim_id,
+        correcting_content=correcting_content,
+        trigger_id=trigger_id,
+        reason="the owner-judge said it carries corrected claim %s (issue #219 C)",
+        fleet=fleet,
+        record_store=record_store,
+        summaries_dir=summaries_dir,
+        change_ids=change_ids,
+        hop=hop,
+    )
 
 
 def apply_judged_withdrawals(

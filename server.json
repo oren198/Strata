@@ -1,0 +1,50 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.oren198/strata",
+  "description": "Shared memory for a fleet of AI coding agents, checked by an LLM judge before it lands.",
+  "version": "1.17.0",
+  "packages": [
+    {
+      "registryType": "pypi",
+      "registryBaseUrl": "https://pypi.org",
+      "identifier": "strata-mem",
+      "version": "1.17.0",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "JUDGE_API_KEY",
+          "description": "API key for the judge endpoint (OpenRouter by default, or an Anthropic-Messages-compatible endpoint set via JUDGE_BASE_URL).",
+          "isRequired": false,
+          "isSecret": true
+        },
+        {
+          "name": "JUDGE_BASE_URL",
+          "description": "Base URL of the Anthropic-Messages-compatible judge endpoint. Defaults to OpenRouter.",
+          "isRequired": false
+        },
+        {
+          "name": "JUDGE_MODEL",
+          "description": "Model id the judge calls at JUDGE_BASE_URL.",
+          "isRequired": false
+        },
+        {
+          "name": "STRATA_AGENT_SCOPE",
+          "description": "The scope this agent session is bound to.",
+          "isRequired": false
+        },
+        {
+          "name": "STRATA_AGENT_SKILL",
+          "description": "The skill identity this agent session acts as.",
+          "isRequired": false
+        },
+        {
+          "name": "STRATA_AGENT_SESSION_ID",
+          "description": "A stable id for this agent session.",
+          "isRequired": false
+        }
+      ]
+    }
+  ]
+}

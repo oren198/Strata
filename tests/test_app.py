@@ -558,8 +558,9 @@ class TestContribute:
         assert data["judgment"]["decision"] == "decline"
         assert data["judgment"]["summary_updated"] is False
 
-    def test_scope_manager_raises_returns_500(self, client):
-        """scope-manager raises — 500 with error key."""
+    def test_scope_manager_raises_returns_503(self, client):
+        """scope-manager raises — 503 with error key (#235: this means the judge
+        failed, never a bug in the request; a merits decline stays 200)."""
         scope_id = "g_active"
         client.mock_manager.judge.side_effect = ValueError("LLM unavailable")
 
@@ -572,7 +573,7 @@ class TestContribute:
                 "contributor": _CONTRIBUTOR_BODY,
             },
         )
-        assert resp.status_code == 500
+        assert resp.status_code == 503
         assert "scope_manager_failure" in str(resp.json())
 
 

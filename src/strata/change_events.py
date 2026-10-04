@@ -93,6 +93,14 @@ reaching every reader it did — never ``claim_superseded`` (recorded, no notice
 correction is a distinct fact from a publication change, even though its topological
 audience (see :func:`affected_scopes`) is computed the same way."""
 
+CLAIM_RESTORED = "claim_restored"
+"""Restore act design (companion to #219 C): a ``claim_corrected`` withdrawal was
+reversed by its owner. Deliberately NOT routed through :func:`emit`/:func:`affected_scopes`
+— its audience is read from the ORIGINAL ``claim_corrected`` events by change id and item
+id, never recomputed from today's topology (contract line 3) — see :func:`emit_restore_notice`.
+Evidence only: a reader's judge decides whether to re-admit or re-trust what it had
+doubted; nothing is inserted into its memory on its behalf (contract line 6)."""
+
 _SELF_NOTICING_KINDS = RETRACTION_KINDS | frozenset({CLAIM_CORRECTED})
 """Kinds whose SOURCE, when excluded from its own change's affected set, is still
 owed a self-notice (issue #197's rule, extended by ADR 0017 P4 to the claim owner's
@@ -491,6 +499,7 @@ def emit(
                 after=after,
                 hop=hop,
                 processed=processed,
+                claim_id=claim_id,
             )
         except Exception:  # noqa: BLE001 — one scope's notice, not the act
             _logger.exception(
@@ -601,6 +610,7 @@ def _emit_self_notice(
                 hop=hop,
                 processed=True,
                 awaiting_show=True,
+                claim_id=claim_id,
             )
         except Exception:  # noqa: BLE001 — one scope's notice, not the act
             _logger.exception(
@@ -716,3 +726,70 @@ def _record_emission_failure(
             change_id,
             source_scope_id,
         )
+
+
+def emit_restore_notice(
+    *,
+    record_store: RecordStore,
+    item_id: str,
+    original_change_ids: Sequence[str],
+    restore_change_id: str,
+    claim_id: str,
+    content: str,
+) -> None:
+    """Tell exactly the readers of a reversed ``claim_corrected`` notice that it was wrong.
+
+    Restore act design, point 8/contract lines 2-3: the audience is read
+    from the ORIGINAL ``claim_corrected`` events, by change id and item id —
+    never recomputed from today's topology (:func:`affected_scopes` answers
+    a different question and would include a reader added since the
+    withdrawal, which contract line 3 says gets no notice at all). For each
+    distinct ``(scope_id)`` that holds a ``claim_corrected`` row for *item_id*
+    under any id in *original_change_ids* (plural: a coalesced refresh may
+    have recorded the same correction under several inherited wave ids, ADR
+    0014 D4), one ``claim_restored`` row is written, inheriting
+    *restore_change_id* — the ONE new id this restore mints (contract line
+    3's "one new change id, inherited").
+
+    Evidence only (contract line 6): this writes change-event rows exactly
+    like :func:`emit` does, but is never enqueued for a refresh — the
+    reader's own judge decides what to do with the evidence, on its own next
+    ordinary act, exactly as a self-notice already works for retractions.
+    Every row is therefore stamped ``processed`` at birth, mirroring a
+    self-notice's own shape (``processed=True``).
+
+    *content* is the rendered notice (mechanical, no LLM — the caller
+    renders it once since it is the same for every reader).
+
+    Never raises — mirrors :func:`emit`'s own stance: a restore that
+    succeeded must not be undone because a notice could not be written.
+    """
+    seen_scopes: set[str] = set()
+    for original_change_id in dict.fromkeys(original_change_ids):
+        for event in record_store.list_change_events_by_change_id(
+            change_id=original_change_id, item_id=item_id, kind=CLAIM_CORRECTED
+        ):
+            if event.scope_id in seen_scopes:
+                continue
+            seen_scopes.add(event.scope_id)
+            try:
+                record_store.append_change_notice(
+                    scope_id=event.scope_id,
+                    content=content,
+                    contributor=_notice_contributor(event.scope_id),
+                    change_id=restore_change_id,
+                    source_scope_id=event.source_scope_id,
+                    item_id=item_id,
+                    kind=CLAIM_RESTORED,
+                    before=event.before,
+                    after=event.after,
+                    hop=event.hop,
+                    processed=True,
+                    claim_id=claim_id,
+                )
+            except Exception:  # noqa: BLE001 — one reader's notice, not the restore
+                _logger.exception(
+                    "failed to record the claim_restored notice for item %s in scope %s",
+                    item_id,
+                    event.scope_id,
+                )

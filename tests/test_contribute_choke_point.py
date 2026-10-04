@@ -125,7 +125,8 @@ class _AccumulatingManager:
         hop=0,
         window_verbatim_tail=None,
         acted_on_target=None,
-    ):  # noqa: ANN001, ANN201, E501
+        **_kwargs,
+    ):  # noqa: ANN001, ANN003, ANN201, E501
         existing = list(current_summary.directives) if current_summary is not None else []
         time.sleep(self.delay)
         new_directive = Directive(
@@ -176,7 +177,8 @@ class _SkillEchoManager:
         hop=0,
         window_verbatim_tail=None,
         acted_on_target=None,
-    ):  # noqa: ANN001, ANN201, E501
+        **_kwargs,
+    ):  # noqa: ANN001, ANN003, ANN201, E501
         directive = Directive(
             id=new_contribution.id,
             content=new_contribution.content,
@@ -449,6 +451,12 @@ def test_rejudge_judges_pending_then_is_idempotent(tmp_path: Path) -> None:
         )
     assert outcome2.decision == "accept_as_directive"
     assert outcome2.summary_updated is False
+    # The same reasoning as the first call: the record-only decision prefix
+    # on the stored notes is stripped from what the idempotent path returns.
+    assert outcome2.reasoning == outcome.reasoning
+    with RecordStore(db_path) as rs:
+        stored = rs.get_judgment(contribution_id).notes
+    assert stored == f"[accept_as_directive; no ops] {outcome.reasoning}"
 
     with RecordStore(db_path) as rs:
         assert len(rs.list_judgments(scope_id="g_root")) == 1
@@ -540,7 +548,8 @@ class _CapturingManager:
         hop=0,
         window_verbatim_tail=None,
         acted_on_target=None,
-    ):  # noqa: ANN001, ANN201, E501
+        **_kwargs,
+    ):  # noqa: ANN001, ANN003, ANN201, E501
         self.received_operator_memory = operator_memory
         return ScopeManagerJudgment(
             decision="accept_as_context",
@@ -1341,7 +1350,9 @@ def test_window_carries_state_and_notes_with_the_judged_row(tmp_path: Path) -> N
     assert [r.state for r in second_window] == ["judged", "pending"]
     assert second_window[0].contribution.content == "first observation"
     assert second_window[0].decision == "accept_as_context"
-    assert second_window[0].judgment_notes == "recorded"
+    # The window row is the raw record read, so it carries the engine's decision
+    # prefix; the judge-input render strips it (tests/test_same_scope_provenance.py).
+    assert second_window[0].judgment_notes == "[accept_as_context; no ops] recorded"
     assert second_window[1].contribution.content == "second observation"
     assert second_window[1].decision is None
 
@@ -1634,7 +1645,12 @@ def test_one_declined_member_does_not_poison_the_batch(tmp_path: Path) -> None:
     assert len(judgments) == 3
     for contribution, expected in zip(contributions, results, strict=True):
         assert judgments[contribution.id].decision == expected.decision
-        assert judgments[contribution.id].notes == expected.reasoning
+        prefix = (
+            "[decline] "
+            if expected.decision == "decline"
+            else f"[accept_as_directive; append {contribution.id}] "
+        )
+        assert judgments[contribution.id].notes == prefix + expected.reasoning
         assert judgments[contribution.id].judged_by == "scope-manager"
         assert states[contribution.id] == "judged"
 
@@ -1867,7 +1883,10 @@ def test_a_lone_contribution_still_takes_the_single_judgment_path(tmp_path: Path
     with RecordStore(db_path) as rs:
         (judgment,) = rs.list_judgments(scope_id="g_root")
     assert judgment.contribution_id == outcomes[0].contribution_id
-    assert judgment.notes == "accepted: only one"
+    assert (
+        judgment.notes
+        == f"[accept_as_directive; append {judgment.contribution_id}] accepted: only one"
+    )
     assert summary_store.read("g_root").version == 1
 
 

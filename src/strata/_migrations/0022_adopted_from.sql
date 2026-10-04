@@ -1,0 +1,15 @@
+-- Strata migration: a contribution may name the held proposal it adopts.
+--
+-- A contribution from a session bound to another scope cannot change this
+-- scope's directives (the position gate): it is admitted as an attributed
+-- proposal. A session bound to THIS scope adopts such a proposal through an
+-- ordinary own-scope contribution that carries `adopted_from` — the id of the
+-- held proposal, which lives in this scope's own record. Not a new act kind:
+-- the adopting contribution is judged like any other, and the directive it
+-- admits carries the link as provenance.
+--
+-- Nullable, nothing else stored. The app layer validates it at the write
+-- boundary (the proposal exists, lives in the target scope's record, came from
+-- another position, and the adopter is bound to the target scope) and rejects
+-- it together with `acted_on`. A plain ADD COLUMN, like 0016 — no rebuild.
+ALTER TABLE contributions ADD COLUMN adopted_from TEXT REFERENCES contributions(id);
