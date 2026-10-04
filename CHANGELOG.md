@@ -20,7 +20,10 @@ the release PR (`dev` → `main`) and the GitHub Release body are built from
   "<skill> (<scope>) proposes: … — directive <id> stands", and the directive
   set stays byte-identical. Examples are a child writing upward and an outcome
   raised from below. Own-scope authority is unchanged. A child's own
-  contribution that contradicts an inherited directive is still declined.
+  contribution that contradicts an inherited directive is declined by the
+  judge. That is judge-only: the engine doesn't yet check an admitted child
+  directive against the inherited ones (declined 48 of 48 on the default judge;
+  at least one other judge has admitted such a case).
   Measured with a pinned judge on child-to-parent attempts: the parent's
   directives changed in 41 of 84 attempts before and 0 of 84 after (qwen), and
   31 of 56 before and 0 of 56 after (Haiku)
