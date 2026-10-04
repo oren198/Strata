@@ -7,7 +7,48 @@ the release PR (`dev` → `main`) and the GitHub Release body are built from
 
 ## Unreleased (v1.17.0)
 
+### Security
+
+- Security: a child scope could change its parent's decisions by contributing upward. 1.17.0 enforces that only a session bound to a scope changes that scope's decisions; anything from below arrives as a proposal. Reported by Adam (@Adam13y). (GHSA-w7vh-r35h-8fvr)
+
 ### Behaviour change
+
+- **Only a session bound to a scope changes that scope's directives (the
+  position gate).** The engine enforces this after judgment; it doesn't rest on
+  the judge. A contribution from any other position that would add, replace or
+  retire a directive in a scope is admitted as an attributed proposal instead,
+  "<skill> (<scope>) proposes: … — directive <id> stands", and the directive
+  set stays byte-identical. Examples are a child writing upward and an outcome
+  raised from below. Own-scope authority is unchanged. A child's own
+  contribution that contradicts an inherited directive is still declined.
+  Measured with a pinned judge on child-to-parent attempts: the parent's
+  directives changed in 41 of 84 attempts before and 0 of 84 after (qwen), and
+  31 of 56 before and 0 of 56 after (Haiku)
+  ([evidence](docs/evidence/v1.17-position-gate-2026-10-04.md)). Stated limit:
+  this holds where the contributor's position comes from the session's binding
+  (the MCP path). The local HTTP API takes it from the request body and must
+  not be exposed.
+
+- **Every same-scope directive change carries an engine-written provenance
+  line in the record.** When a session bound to a scope changes its
+  directives, the engine appends "[Engine: same-scope change by <skill>
+  (session <id>), bound to <scope>: <ops>. …]" to the recorded notes. The
+  record's account of who changed the rules therefore never rests on the
+  judge's wording. On the release tree it was present on 21 of 21 such changes
+  and on no other judgment. The judge's prompt also gained one sentence: stated
+  reasoning may describe position and what was checked, never authority or
+  verification it couldn't establish. Its effect wasn't measurable on the
+  default judge (authority wording in 1 of 12 reasons before, 3 of 24 after,
+  all describing the scope's own position and none naming an approver). The
+  engine line is the guarantee. Judge inputs are otherwise byte-identical: the
+  line is stripped from the history later judges see.
+
+- **Recorded verdict notes open with the decision and the applied ops (#238).**
+  For example "[accept_as_context; no ops] …" or "[accept_as_directive;
+  supersede c_a→c_b; append c_b] …". The record then shows what actually
+  happened even when the reasoning describes a different act. The prefix is
+  stripped from every judge input; judge failures are recorded unchanged; an
+  idempotent rejudge returns the judge's reasoning without it.
 
 - **A scope's own corrected claim is now checked for paraphrased carriers in
   its own publication, not only verbatim ones (#219 C).** When a scope's
@@ -88,6 +129,16 @@ the release PR (`dev` → `main`) and the GitHub Release body are built from
   ([evidence](docs/evidence/v1.17-attribution-recheck-2026-10-03.md)).
 
 ### Added
+
+- **A session bound to a scope can adopt a proposal from below
+  (`adopted_from`).** It does so with an ordinary own-scope contribution that
+  names the held proposal (MCP `strata_contribute` and `POST /contribute`
+  parameter `adopted_from`; migration 0022). It is accepted only when:
+  - the proposal is in this scope's record, came from another position, and
+    was held by the position gate;
+  - the adopting session is bound to the scope.
+  The resulting directive records "adopted from proposal <id>". No notice goes
+  back to the proposer; the inherited rule is the notice.
 
 - **A child's own rule under an inherited one gets one re-check, and can be
   reinstated (#237).** When a decline names an inherited directive as the
