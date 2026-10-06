@@ -5955,6 +5955,237 @@ def _inherited_hold_note(directive_id: str, origin: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# v1.18 (#242): a child's CONTEXT that undercuts an inherited directive
+# ---------------------------------------------------------------------------
+
+CLASSIFY_INHERITED_RELATION_TOOL: dict = {
+    "name": "classify_inherited_relation",
+    "description": (
+        "A context item from a session bound to this scope touches the subject of an "
+        "inherited directive. Say how the item relates to that directive. A "
+        "consequence_report describes ONE specific, dated or countable occurrence of "
+        "FOLLOWING the directive and what happened. A departure_report describes ONE "
+        "specific, dated or countable occurrence of NOT following it and what happened, "
+        "asserting nothing about what may be done instead. An exception states, in "
+        "general, what may or does happen INSTEAD of the directive, normatively ('may', "
+        "'doesn't need') or as a standing practice ('we leave the pumps running until "
+        "22:00'). unrelated: none of these."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "kind": {
+                "type": "string",
+                "enum": ["consequence_report", "departure_report", "exception", "unrelated"],
+            },
+            "inherited_id": {
+                "type": "string",
+                "description": "Required: the id of the inherited directive this relates to.",
+            },
+            "reasoning": {"type": "string", "description": "Brief explanation."},
+            "occurrence_span": {
+                "type": "string",
+                "description": (
+                    "Required for consequence_report and departure_report: the specific "
+                    "occurrence, copied VERBATIM from the contribution text."
+                ),
+            },
+            "instead_span": {
+                "type": "string",
+                "description": (
+                    "Required for exception: the general 'may / does instead', copied "
+                    "VERBATIM from the contribution text."
+                ),
+            },
+        },
+        "required": ["kind", "inherited_id", "reasoning"],
+    },
+}
+
+_INHERITED_RELATION_SYSTEM_PROMPT = (
+    "You classify ONE context item against ONE inherited directive. Context is what a "
+    "scope observed; a directive is a rule. Context never overrides a directive.\n"
+    "- consequence_report: a specific occurrence (dated or countable, past tense) of "
+    "FOLLOWING the directive, and what happened. Evidence about the world; it asserts "
+    "nothing about what may be done instead.\n"
+    "- departure_report: a specific occurrence (dated or countable, past tense) of NOT "
+    "following the directive, and what happened. It must stay specific: a generalising "
+    "clause ('so hotfixes don't need it') makes it an exception.\n"
+    "- exception: states what may or does happen INSTEAD of the directive, in general. "
+    "Normative ('may', 'doesn't need', 'that is fine') or habitual ('we leave the pumps "
+    "running until 22:00', 'we skip QA now'). A standing practice contrary to the rule "
+    "is an exception even when phrased as a plain description.\n"
+    "- unrelated: none of these.\n"
+    "Copy the span your kind requires verbatim from the item. Call "
+    "`classify_inherited_relation` exactly once."
+)
+
+_NORMATIVE_EXCEPTION_RES: tuple[re.Pattern[str], ...] = tuple(
+    re.compile(p, re.IGNORECASE)
+    for p in (
+        r"\b(?:may|can)\b(?!['’])",
+        r"\ballowed to\b",
+        r"\bpermitted\b",
+        r"\b(?:don['’]?t|doesn['’]?t|do not|does not|need not|needn['’]?t)\s+(?:even\s+)?"
+        r"(?:need|have to)\b",
+        r"\bneedn['’]?t\b",
+        r"\bno need\b",
+        r"\bnobody (?:else )?(?:has|needs) to\b",
+        r"\b(?:is|are|that['’]?s|it['’]?s) (?:fine|ok|okay|acceptable)\b",
+        r"\bwaived?\b",
+        r"\bnot required\b",
+        r"\bexempt\b",
+        r"\bexception\b",
+        r"\boptional\b",
+    )
+)
+_HABITUAL_EXCEPTION_RES: tuple[re.Pattern[str], ...] = tuple(
+    re.compile(p, re.IGNORECASE)
+    for p in (
+        r"\bwe\s+(?:\w+\s+){0,2}?(?:leave|skip|let|hold|keep|go|put|run|ship|release|publish|"
+        r"merge|land|send|use|stop|drop|bypass|allow|start|test|check|inspect|review|do|just)\b",
+        r"\bnow\b",
+        r"\bgo(?:es)? straight\b",
+        r"\bstraight (?:back|out|away|through)\b",
+        r"\bwhenever\b",
+        r"\b(?:keeps|lets|leaves)\b",
+        r"\balone\b",
+        r"\bnobody\b",
+        r"\b(?:usually|normally|typically|generally|by default|as standard|as a rule)\b",
+        r"\bstanding practice\b",
+        # A "so / therefore / which means" clause that negates or permits
+        # generalises the occurrence into a rule: the whole item is an exception.
+        r"\b(?:so|therefore|hence|thus|which means|meaning(?: that)?)\b[^.;]*?"
+        r"(?:n['’]t\b|\bnot\b|\bno\b|\bnever\b)",
+    )
+)
+
+_MONTHS = r"(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*"
+_SPECIFICITY_ANCHOR_RE = re.compile(
+    rf"\b\d{{1,2}}(?:st|nd|rd|th)?\s+(?:of\s+)?{_MONTHS}\b"
+    rf"|\b{_MONTHS}\.?\s+\d{{1,2}}\b"
+    r"|\b\d{4}-\d{2}-\d{2}\b|\b\d{1,2}/\d{1,2}(?:/\d{2,4})?\b"
+    r"|\b(?:mon|tues|wednes|thurs|fri|satur|sun)day\b"
+    r"|\b\d+\.\d+\.\d+\b|\b(?:1[5-9]|20)\d{2}\b|\b\d{1,2}:\d{2}\b"
+    r"|\b(?:yesterday|last (?:night|week|month|shift)|this (?:morning|week)|earlier today)\b"
+    r"|\bthe night of\b|\b(?:once|twice|\d+ times|(?:two|three|four|five) times)\b",
+    re.IGNORECASE,
+)
+_PAST_TENSE_RE = re.compile(
+    r"\b(?:\w+ed|was|were|had|did|took|left|went|held|made|ran|got|came|found|lost|sent|"
+    r"broke|began|saw|gave|put|set|cut|hit|fell|stopped|spent|missed|drifted|shipped|"
+    r"overloaded|destroyed|reached|wasn['’]t|weren['’]t|didn['’]t)\b",
+    re.IGNORECASE,
+)
+_DEPARTURE_CUE_RE = re.compile(
+    r"\b(?:not done|weren['’]t|wasn['’]t|didn['’]t|did not|was not|were not|skipped|"
+    r"bypassed|omitted|ignored|left running|instead of|without (?:running|checking|"
+    r"inspecting|review|the))\b",
+    re.IGNORECASE,
+)
+
+
+def _norm_ws(text: str) -> str:
+    return " ".join(text.split())
+
+
+def _verbatim_span(answer: dict, key: str, content: str) -> str | None:
+    span = answer.get(key)
+    if not isinstance(span, str) or not span.strip():
+        return None
+    return span.strip() if _norm_ws(span) in _norm_ws(content) else None
+
+
+def _exception_marker(content: str, inherited_text: str) -> str | None:
+    """The first exception marker anywhere in *content* — normative, habitual,
+    or (for text that is not a specific past-tense report) the 1.17.2
+    inherited-conflict signal (a looser value, an exemption, a softened
+    "every/all" or an "only" narrowing on a covered subject) — else ``None``."""
+    for pattern in _NORMATIVE_EXCEPTION_RES:
+        match = pattern.search(content)
+        if match:
+            return f"normative marker '{match.group(0)}'"
+    for pattern in _HABITUAL_EXCEPTION_RES:
+        match = pattern.search(content)
+        if match:
+            return f"habitual marker '{match.group(0)}'"
+    specific_past = bool(_SPECIFICITY_ANCHOR_RE.search(content) and _PAST_TENSE_RE.search(content))
+    if not specific_past:
+        conflict = inherited_conflict(content, inherited_text)
+        if conflict is not None:
+            return f"undercuts the rule ({conflict})"
+    return None
+
+
+def _action_overlap(span: str, inherited_text: str) -> bool:
+    from strata.publication import _overlap_words  # noqa: PLC0415
+
+    if _overlap_words(span) & _overlap_words(inherited_text):
+        return True
+    numbers = set(re.findall(r"\d+(?:\.\d+)?", inherited_text))
+    return bool(numbers & set(re.findall(r"\d+(?:\.\d+)?", span)))
+
+
+def verify_inherited_relation(
+    answer: dict | None, content: str, inherited_text: str
+) -> tuple[str, str]:
+    """Engine verification of a ``classify_inherited_relation`` answer (#242).
+
+    Returns ``(verdict, reason)``; *verdict* is ``"decline"`` (the contribution
+    is an exception), ``"consequence_report"`` or ``"departure_report"``
+    (admitted, specific past-tense report), or ``"admit"`` (nothing verified
+    and no exception marker: the fail-open fallback, which callers count).
+    Fails toward the inherited rule: any failed check falls to the
+    whole-content marker scan, and a marker declines.
+    """
+    answer = answer if isinstance(answer, dict) else {}
+    kind = answer.get("kind")
+    marker = _exception_marker(content, inherited_text)
+
+    if kind == "exception":
+        span = _verbatim_span(answer, "instead_span", content)
+        if span is not None:
+            return "decline", "an exception: states what happens instead of the rule"
+        failure = "exception answer without a verbatim instead_span"
+    elif kind in ("consequence_report", "departure_report"):
+        span = _verbatim_span(answer, "occurrence_span", content)
+        if span is None:
+            failure = "no verbatim occurrence_span"
+        elif not _PAST_TENSE_RE.search(span):
+            failure = "occurrence not in the past tense"
+        elif not _SPECIFICITY_ANCHOR_RE.search(span):
+            failure = "occurrence carries no date, time, count or named instance"
+        elif not _action_overlap(span, inherited_text):
+            failure = "occurrence does not concern the rule's own action"
+        elif marker is not None:
+            return "decline", f"generalises beyond the occurrence ({marker})"
+        else:
+            verdict = "departure_report" if _DEPARTURE_CUE_RE.search(span) else kind
+            return verdict, "a specific past occurrence"
+    elif kind == "unrelated":
+        failure = "answered unrelated"
+    else:
+        failure = "unreadable answer"
+
+    if marker is not None:
+        return "decline", f"{failure}; exception marker present ({marker})"
+    return "admit", f"{failure}; no exception marker"
+
+
+def inherited_context_trigger(
+    content: str, inherited: Sequence[tuple[str, str, str]]
+) -> list[tuple[str, str, str]]:
+    """The inherited directives whose subject *content* covers (1.17.2's
+    covered-subject plus head-noun test). Empty means the judgment is left
+    untouched and no re-ask is made."""
+    return [
+        (directive_id, origin, text)
+        for directive_id, origin, text in inherited
+        if _is_covered_subject(text, content) and _head_nouns_compatible(text, content)
+    ]
+
+
+# ---------------------------------------------------------------------------
 # ScopeManager
 # ---------------------------------------------------------------------------
 
