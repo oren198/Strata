@@ -6034,7 +6034,11 @@ _INHERITED_RELATION_SYSTEM_PROMPT = (
 _NORMATIVE_EXCEPTION_RES: tuple[re.Pattern[str], ...] = tuple(
     re.compile(p, re.IGNORECASE)
     for p in (
-        r"\b(?:may|can)\b(?!['’])",
+        r"\bmay\b",
+        # "can" is common in plain facts ("bookings can only be made ..."); only
+        # its permission shapes count.
+        r"\bcan\s+(?:\w+\s+)?(?:keep|skip|leave|hold|go|run|ship|release|publish|merge|"
+        r"waive|ignore|bypass|use|stay|wait|just|be\s+(?:skipped|waived|ignored|left|held))\b",
         r"\ballowed to\b",
         r"\bpermitted\b",
         r"\b(?:don['’]?t|doesn['’]?t|do not|does not|need not|needn['’]?t)\s+(?:even\s+)?"
@@ -6055,7 +6059,7 @@ _HABITUAL_EXCEPTION_RES: tuple[re.Pattern[str], ...] = tuple(
     for p in (
         r"\bwe\s+(?:\w+\s+){0,2}?(?:leave|skip|let|hold|keep|go|put|run|ship|release|publish|"
         r"merge|land|send|use|stop|drop|bypass|allow|start|test|check|inspect|review|do|just)\b",
-        r"\bnow\b",
+        r"\bnow\s+(?:we|they)\b",
         r"\bgo(?:es)? straight\b",
         r"\bstraight (?:back|out|away|through)\b",
         r"\bwhenever\b",
@@ -6183,17 +6187,35 @@ def verify_inherited_relation(
     return "admit", f"{failure}; no exception marker"
 
 
-def inherited_context_trigger(
+_CONTEXT_REASK_DIRECTIVE_CHARS = 600
+_CONTEXT_REASK_BUDGET_CHARS = 2400
+
+
+def inherited_for_context(
     content: str, inherited: Sequence[tuple[str, str, str]]
 ) -> list[tuple[str, str, str]]:
-    """The inherited directives whose subject *content* covers (1.17.2's
-    covered-subject plus head-noun test). Empty means the judgment is left
-    untouched and no re-ask is made."""
-    return [
-        (directive_id, origin, text)
-        for directive_id, origin, text in inherited
-        if _is_covered_subject(text, content) and _head_nouns_compatible(text, content)
-    ]
+    """The inherited directives to show the #242 re-ask, most relevant first
+    (shared content words with *content*), within a character budget so the
+    re-ask stays compact. The trigger itself is NOT lexical: every ordinary
+    context admit by a session bound to the scope is classified when the scope
+    inherits anything (a lexical gate misses reworded exceptions, which is the
+    point of the check). Texts longer than the per-directive cap are cut for
+    display only; verification always uses the full text."""
+    from strata.publication import _overlap_words  # noqa: PLC0415
+
+    content_words = _overlap_words(content)
+    ranked = sorted(
+        inherited, key=lambda d: len(_overlap_words(d[2]) & content_words), reverse=True
+    )
+    shown: list[tuple[str, str, str]] = []
+    used = 0
+    for item in ranked:
+        cost = min(len(item[2]), _CONTEXT_REASK_DIRECTIVE_CHARS)
+        if shown and used + cost > _CONTEXT_REASK_BUDGET_CHARS:
+            break
+        shown.append(item)
+        used += cost
+    return shown
 
 
 def _inherited_relation_note(outcome: dict) -> str:
@@ -8559,7 +8581,7 @@ class ScopeManager:
     ) -> dict:
         """#242: the one targeted re-ask (``classify_inherited_relation``) and
         the engine's verification of its answer, for a context contribution
-        that covers the subject of *covered* inherited directives.
+        that the scope inherits directives for (*covered*, ranked and capped).
 
         Returns ``{"contribution_id", "kind", "verdict", "fallback",
         "inherited_id", "origin", "reason"}``. A failed or unreadable call is
@@ -8567,12 +8589,12 @@ class ScopeManager:
         scan then decides (a marker declines, otherwise the admit stands and
         ``fallback`` is True).
         """
-        shown = list(covered)[:3]
-        listing = "\n".join(f"- {d_id} ({origin}): {text}" for d_id, origin, text in shown)
+        shown = list(covered)
+        listing = "\n".join(
+            f"- {d_id}: {text[:_CONTEXT_REASK_DIRECTIVE_CHARS]}" for d_id, _origin, text in shown
+        )
         user_message = (
-            f"SCOPE: {scope.name} (id={scope.id})\n\n"
-            f"INHERITED DIRECTIVES THIS ITEM TOUCHES:\n{listing}\n\n"
-            f"CONTEXT ITEM:\n{contribution.content}\n\n"
+            f"INHERITED DIRECTIVES:\n{listing}\n\nCONTEXT ITEM:\n{contribution.content}\n\n"
             "Call `classify_inherited_relation` exactly once."
         )
         answer: dict = {}
@@ -8580,7 +8602,7 @@ class ScopeManager:
         try:
             response = self._messages_create(
                 model=self._model,
-                max_tokens=512,
+                max_tokens=300,
                 system=[
                     {
                         "type": "text",
@@ -8635,9 +8657,9 @@ class ScopeManager:
         """#242: a child's CONTEXT must not undercut an inherited directive.
 
         Fires only for an ordinary ``accept_as_context`` from a contributor
-        bound to *scope* whose text covers an inherited directive's subject
-        (:func:`inherited_context_trigger`); otherwise *first* is returned
-        untouched with no call. An exception is declined; a specific past
+        bound to *scope* when the scope inherits at least one directive
+        (ancestor or operator); otherwise *first* is returned untouched with
+        no call. An exception is declined; a specific past
         report stays admitted with a suffix naming it and suggesting
         ``acted_on``; an unreadable or unrelated answer declines only when an
         exception marker is present (the counted fail-open fallback).
@@ -8650,11 +8672,10 @@ class ScopeManager:
             or contribution.contributor.scope_id != scope.id
         ):
             return first
-        covered = inherited_context_trigger(
-            contribution.content, _inherited_directive_texts(ancestor_directives, operator_memory)
-        )
-        if not covered:
+        inherited = _inherited_directive_texts(ancestor_directives, operator_memory)
+        if not inherited:
             return first
+        covered = inherited_for_context(contribution.content, inherited)
         outcome = self._classify_inherited_relation(
             scope=scope, contribution=contribution, covered=covered
         )
@@ -8691,8 +8712,8 @@ class ScopeManager:
     ) -> ScopeManagerBatchJudgment:
         """:meth:`classify_inherited_context`, carried to the batch.
 
-        Each member that was admitted as context, is bound to *scope* and
-        covers an inherited subject gets its own re-ask. A declined member's
+        Each member that was admitted as context and is bound to *scope* gets
+        its own re-ask (when the scope inherits anything). A declined member's
         verdict becomes ``decline``. Stated limit: the batch has ONE context
         rewrite, which the judge wrote with the declined text in view; when
         any member is declined the rewrite is withheld and replaced by the
@@ -8716,11 +8737,11 @@ class ScopeManager:
                 or member.contributor.scope_id != scope.id
             ):
                 continue
-            covered = inherited_context_trigger(member.content, inherited)
-            if covered:
-                outcomes[cid] = self._classify_inherited_relation(
-                    scope=scope, contribution=member, covered=covered
-                )
+            outcomes[cid] = self._classify_inherited_relation(
+                scope=scope,
+                contribution=member,
+                covered=inherited_for_context(member.content, inherited),
+            )
         if not outcomes:
             return judgment
         declined = {cid for cid, o in outcomes.items() if o["verdict"] == "decline"}
