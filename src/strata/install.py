@@ -873,11 +873,13 @@ def _remove_hook_event(
 #   since v2.1.210), so one is not seeded. A ``Read`` deny also blocks Edit
 #   and Write on the same path (v2.1.208+ for edits, v2.1.228+ for writes).
 #   The ``Edit`` deny covers NotebookEdit, which a Read deny does not.
-# * Read and Edit deny rules apply to Claude Code's file tools and to the
-#   shell file commands it recognizes (``cat``, ``head``, ``tail``, ``sed``).
-#   They do not apply to an arbitrary subprocess (Python, Node) that opens
-#   the file itself. This is harness permission enforcement, not an OS
-#   boundary.
+# * Read and Edit deny rules apply to Claude Code's file tools, to the shell
+#   file commands it recognizes (``cat``, ``head``, ``tail``, ``sed``,
+#   ``tee``), and to Bash redirections (``> file``, ``< file``). They do not
+#   apply to a command that reads the files without naming them (``grep -r``
+#   from the store directory) or to an arbitrary subprocess (Python, Node)
+#   that opens the file itself. This is harness permission enforcement, not
+#   an OS boundary.
 #
 # The seeded layout keeps db, fleet, and summaries under ``.strata/``, and
 # those rules are :data:`CLAUDE_STRATA_DENY_RULES`. A project config can point
@@ -902,8 +904,10 @@ CLAUDE_STRATA_DENY_RULES: tuple[str, ...] = (
 #: so doctor, register, and the README describe one verified behavior.
 CLAUDE_STRATA_DENY_COVERAGE = (
     "blocks Claude Code's Read, Edit, and Write tools on the resolved store, "
-    "and the shell file commands Claude Code recognizes (cat, head, tail, sed); "
-    "does not block a Python or Node process that opens the files itself"
+    "the shell file commands it recognizes (cat, head, tail, sed, tee), and "
+    "Bash redirections onto those paths; does not block a command that reads "
+    "the files without naming them (grep -r from the store directory) or a "
+    "Python or Node process that opens the files itself"
 )
 
 #: Why ``strata register`` writes no Codex deny. See

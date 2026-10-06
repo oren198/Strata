@@ -27,10 +27,11 @@ so one agent's mistake never corrupts what the rest of the fleet reads.
 `/home/you/strata-fleet/`) is denied at that directory too, with a
 filesystem-absolute `//` pattern, and `.strata/` stays denied because the
 config lives there. Those rules cover Claude Code's Read, Edit, and Write
-tools and the shell file commands it recognizes (`cat`, `head`, `tail`,
-`sed`). They do not stop a Python or Node process that opens the files
-itself, and a `Write(path)` rule is not written because Claude Code never
-consults one. Codex's sandbox config cannot deny a path inside a writable
+tools, the shell file commands it recognizes (`cat`, `head`, `tail`, `sed`,
+`tee`), and Bash redirections onto those paths. They do not stop a command
+that reads the files without naming them (`grep -r` from the store
+directory) or a Python or Node process that opens the files itself, and a
+`Write(path)` rule is not written because Claude Code never consults one. Codex's sandbox config cannot deny a path inside a writable
 workspace, so register does not seed one there. Outside a harness that
 enforces the deny, scoping is discipline, not security.
 

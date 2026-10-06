@@ -62,9 +62,11 @@ the release PR (`dev` → `main`) and the GitHub Release body are built from
   beside any the user already has and left unchanged on a second register.
   `strata doctor` checks the resolved rules, not a hardcoded `.strata/`.
   A `Write(path)` rule is not seeded: Claude Code accepts it and never
-  consults it. The rules block Claude Code's file tools and the shell file
-  commands it recognizes (`cat`, `head`, `tail`, `sed`); they do not block
-  a Python or Node process that opens the files itself. Codex's sandbox
+  consults it. The rules block Claude Code's file tools, the shell file
+  commands it recognizes (`cat`, `head`, `tail`, `sed`, `tee`), and Bash
+  redirections onto those paths. They do not block a command that reads the
+  files without naming them (`grep -r` from the store directory) or a
+  Python or Node process that opens the files itself. Codex's sandbox
   config cannot deny a path inside a writable workspace, and its permission
   profiles do not apply while `sandbox_mode` is set, so register does not
   write a Codex deny. The Strata server still reads the store — it is a
