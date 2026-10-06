@@ -5,7 +5,21 @@ the release PR (`dev` → `main`) and the GitHub Release body are built from
 (`docs/releasing.md`, step 3) — write entries here as work lands, and the
 "Unreleased" section is cleared once a release ships.
 
-## Unreleased (v1.17.1)
+## Unreleased (v1.17.2)
+
+### Fixed
+
+- **The 1.17.1 inherited-directive check no longer holds legitimate child
+  directives as context.** Three false holds are fixed: a smaller value under
+  an upper bound ("a maximum of", "at most", "no more than", "up to",
+  "never above", "below") is now read as stricter, with the direction taken
+  from the parent's own words; an added own clause no longer reads as a
+  polarity flip when the parent's terms are all kept; and a shared modifier
+  with a different head noun ("fuel dock spill kit" under "fuel dock pumps")
+  is a different subject. A looser value, an exemption, a softened "all" and
+  a narrowing of when the rule applies are still held.
+
+## 1.17.1 (2026-10-05)
 
 ### Fixed
 
