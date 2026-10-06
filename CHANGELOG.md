@@ -52,18 +52,23 @@ the release PR (`dev` → `main`) and the GitHub Release body are built from
 
 ### Added
 
-- **`strata register` seeds Claude Code deny rules for `.strata/`** (#173,
-  ADR 0013 D6). `permissions.deny` in `.claude/settings.json` gains
-  `Read(/.strata/**)` and `Edit(/.strata/**)`, appended beside any rules
-  already there and left unchanged on a second register. `strata doctor`
-  reports whether they are present. A `Write(path)` rule is not seeded:
-  Claude Code accepts it and never consults it. The rules block Claude
-  Code's file tools and the shell file commands it recognizes (`cat`,
-  `head`, `tail`, `sed`); they do not block a Python or Node process that
-  opens the files itself. Codex's sandbox config cannot deny a path inside
-  a writable workspace, and its permission profiles do not apply while
-  `sandbox_mode` is set, so register does not write a Codex deny. The
-  Strata server still reads `.strata/` — it is a process, not a harness tool.
+- **`strata register` seeds Claude Code deny rules for the resolved store**
+  (#173, ADR 0013 D6). `permissions.deny` in `.claude/settings.json` gains
+  `Read` and `Edit` rules for the directories `.strata/config.toml` resolves
+  (`db`, `fleet_yaml`, `summaries_dir`, plus the sessions directory beside
+  the summaries and `.strata/` itself). The seeded layout is
+  `Read(/.strata/**)` and `Edit(/.strata/**)`. A store outside the project
+  is named with a filesystem-absolute `//` pattern. Rules are appended
+  beside any the user already has and left unchanged on a second register.
+  `strata doctor` checks the resolved rules, not a hardcoded `.strata/`.
+  A `Write(path)` rule is not seeded: Claude Code accepts it and never
+  consults it. The rules block Claude Code's file tools and the shell file
+  commands it recognizes (`cat`, `head`, `tail`, `sed`); they do not block
+  a Python or Node process that opens the files itself. Codex's sandbox
+  config cannot deny a path inside a writable workspace, and its permission
+  profiles do not apply while `sandbox_mode` is set, so register does not
+  write a Codex deny. The Strata server still reads the store — it is a
+  process, not a harness tool.
 
 ### Fixed
 

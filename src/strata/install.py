@@ -121,6 +121,7 @@ __all__ = [
     "CLAUDE_STRATA_DENY_COVERAGE",
     "CODEX_WORKSPACE_DENY_GAP",
     "codex_sandbox_can_deny_workspace_path",
+    "claude_store_deny_rules",
     "strata_deny_rules_present",
     "merge_strata_deny_rules",
     "remove_strata_deny_rules",
@@ -856,13 +857,17 @@ def _remove_hook_event(
 
 
 # ---------------------------------------------------------------------------
-# settings.json — additive permissions.deny for .strata/ (ADR 0013 D6, #173)
+# settings.json — additive permissions.deny for the resolved store
+# (ADR 0013 D6, #173)
 #
 # Verified 2026-10-06 against https://code.claude.com/docs/en/permissions :
 #
 # * Project ``.claude/settings.json`` honors ``permissions.deny``. A leading
 #   ``/`` anchors at the settings file's directory (the project root), so
-#   ``Read(/.strata/**)`` matches this project's store and not a nested copy.
+#   ``Read(/.strata/**)`` matches this project's ``.strata/`` and not a nested
+#   copy. A leading ``//`` is a filesystem-absolute path, which is how a store
+#   that lives outside the project (``db`` / ``fleet_yaml`` /
+#   ``summaries_dir`` in ``.strata/config.toml``) is named.
 # * Path rules are consulted only for ``Read(path)`` and ``Edit(path)``. A
 #   ``Write(path)`` rule is accepted and never consulted (startup warning
 #   since v2.1.210), so one is not seeded. A ``Read`` deny also blocks Edit
@@ -874,13 +879,20 @@ def _remove_hook_event(
 #   the file itself. This is harness permission enforcement, not an OS
 #   boundary.
 #
+# The seeded layout keeps db, fleet, and summaries under ``.strata/``, and
+# those rules are :data:`CLAUDE_STRATA_DENY_RULES`. A project config can point
+# the same three paths elsewhere (issue #184; ``resolve_storage_paths``).
+# Register denies the directories that config actually resolves, and still
+# denies ``.strata/`` itself because that directory holds the config.
+# Register never denies the project root.
+#
 # Codex: see :func:`codex_sandbox_can_deny_workspace_path`. Register does not
 # write a Codex deny, because the sandbox config cannot express one and the
 # newer permission profiles are ignored while ``sandbox_mode`` is set.
 # ---------------------------------------------------------------------------
 
-#: Deny rules ``strata register`` merges into Claude Code
-#: ``permissions.deny``. Order is the order they are appended when absent.
+#: Deny rules for the seeded store, which lives entirely under ``.strata/``.
+#: :func:`claude_store_deny_rules` returns this pair when that is still true.
 CLAUDE_STRATA_DENY_RULES: tuple[str, ...] = (
     "Read(/.strata/**)",
     "Edit(/.strata/**)",
@@ -889,9 +901,9 @@ CLAUDE_STRATA_DENY_RULES: tuple[str, ...] = (
 #: What those rules block, and what they leave open. Kept next to the rules
 #: so doctor, register, and the README describe one verified behavior.
 CLAUDE_STRATA_DENY_COVERAGE = (
-    "blocks Claude Code's Read, Edit, and Write tools on /.strata/**, and the "
-    "shell file commands Claude Code recognizes (cat, head, tail, sed); does "
-    "not block a Python or Node process that opens the files itself"
+    "blocks Claude Code's Read, Edit, and Write tools on the resolved store, "
+    "and the shell file commands Claude Code recognizes (cat, head, tail, sed); "
+    "does not block a Python or Node process that opens the files itself"
 )
 
 #: Why ``strata register`` writes no Codex deny. See
@@ -928,6 +940,180 @@ def codex_sandbox_can_deny_workspace_path() -> bool:
     return False
 
 
+def _posix_for_claude(path: Path) -> str:
+    """*path* in the POSIX form Claude Code's ``//`` patterns match.
+
+    ``/home/oren/fleet`` stays ``/home/oren/fleet``. A Windows path
+    ``C:\\Users\\oren\\fleet`` becomes ``/c/Users/oren/fleet`` (Claude Code
+    normalizes drive letters that way before matching).
+    """
+    posix = path.as_posix()
+    if len(posix) >= 2 and posix[1] == ":":
+        return "/" + posix[0].lower() + posix[2:]
+    return posix
+
+
+def _deny_spec(path: Path, project_root: Path, *, directory: bool) -> str:
+    """The pattern inside ``Read(...)`` / ``Edit(...)`` for *path*.
+
+    A directory inside the project is ``/<relative>/**``. A directory outside
+    it is ``//<absolute>/**``. A file omits the trailing ``/**``.
+    """
+    path = path.resolve()
+    root = project_root.resolve()
+    suffix = "/**" if directory else ""
+    try:
+        rel = path.relative_to(root)
+    except ValueError:
+        rel = None
+    if rel is not None:
+        rel_posix = rel.as_posix()
+        if rel_posix in ("", "."):
+            raise ValueError(f"refusing to deny the project root ({root})")
+        return f"/{rel_posix}{suffix}"
+    return f"/{_posix_for_claude(path)}{suffix}"
+
+
+def _collapse_directories(directories: list[Path]) -> list[Path]:
+    """Drop a directory that lives inside another directory in *directories*."""
+    unique: list[Path] = []
+    for directory in directories:
+        resolved = directory.resolve()
+        if resolved not in unique:
+            unique.append(resolved)
+    return [
+        directory
+        for directory in unique
+        if not any(directory != other and directory.is_relative_to(other) for other in unique)
+    ]
+
+
+def _covers_project(directory: Path, project_root: Path) -> bool:
+    """True when a directory deny of *directory* would also deny *project_root*."""
+    return directory == project_root or project_root.is_relative_to(directory)
+
+
+def _store_targets(
+    project_root: Path,
+    *,
+    db: Path,
+    fleet_yaml: Path,
+    summaries_dir: Path,
+) -> tuple[list[Path], list[Path]]:
+    """``(directories, files)`` the deny rules must cover.
+
+    A directory that is the project root, or that contains it, is not
+    returned — denying one of those would deny the whole project. A database
+    or fleet file in that situation is returned as a file instead (the
+    legacy layout keeps ``strata.db`` in the project root; a file sitting in
+    an ancestor of the project, such as ``/home/you/strata.db`` next to
+    ``/home/you/proj``, is the same case).
+    """
+    from strata.session_state import sessions_dir_for  # noqa: PLC0415
+
+    root = project_root.resolve()
+    db = Path(db).resolve()
+    fleet = Path(fleet_yaml).resolve()
+    summaries = Path(summaries_dir).resolve()
+    candidates = [
+        root / ".strata",
+        db.parent,
+        summaries,
+        sessions_dir_for(summaries),
+        fleet.parent,
+        db.parent / ".locks",
+    ]
+    directories: list[Path] = []
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        if _covers_project(resolved, root):
+            continue
+        directories.append(resolved)
+    files: list[Path] = []
+    if _covers_project(db.parent, root):
+        files.append(db)
+    if _covers_project(fleet.parent, root) and fleet != db:
+        files.append(fleet)
+    return _collapse_directories(directories), files
+
+
+def _rules_for_targets(
+    project_root: Path, directories: list[Path], files: list[Path]
+) -> tuple[str, ...]:
+    """Read+Edit rules for *directories* and *files*, project-relative first."""
+    specs: list[str] = []
+    for directory in directories:
+        specs.append(_deny_spec(directory, project_root, directory=True))
+    for file in files:
+        spec = _deny_spec(file, project_root, directory=False)
+        # SQLite also writes ``<db>-wal`` and ``<db>-shm`` beside the database.
+        if file.name.endswith(".db") or file.suffix == ".db":
+            spec += "*"
+        specs.append(spec)
+    rules: list[str] = []
+    for spec in sorted(set(specs), key=lambda item: (item.startswith("//"), item)):
+        rules.append(f"Read({spec})")
+        rules.append(f"Edit({spec})")
+    return tuple(rules)
+
+
+def claude_store_deny_rules(
+    project_root: Path,
+    *,
+    db: Path | None = None,
+    fleet_yaml: Path | None = None,
+    summaries_dir: Path | None = None,
+) -> tuple[str, ...]:
+    """Claude Code deny rules for the store *project_root* actually resolves.
+
+    Reads ``<project_root>/.strata/config.toml`` when that file is this
+    project's config (a parent project's config is ignored). Relative paths
+    in it are resolved the same way :func:`strata.project_config._parse_config`
+    resolves them. With no config, the seeded layout under ``.strata/`` is
+    used, and the result is :data:`CLAUDE_STRATA_DENY_RULES`.
+
+    Pass *db*, *fleet_yaml*, and *summaries_dir* together to name a store
+    that is not on disk yet — ``strata register --diff`` adopting an existing
+    store prints the rules it would write before it writes ``config.toml``.
+
+    The ``.strata/`` directory is always included: it holds the config, and
+    on the seeded layout it holds the store. An external fleet directory is
+    added beside it. The project root itself is never a deny target.
+    """
+    from strata.project_config import ProjectConfigError, _parse_config  # noqa: PLC0415
+
+    root = Path(project_root).resolve()
+    supplied = (db, fleet_yaml, summaries_dir)
+    if any(path is not None for path in supplied) and not all(
+        path is not None for path in supplied
+    ):
+        raise ValueError("db, fleet_yaml, and summaries_dir must be given together")
+    config_path = root / ".strata" / "config.toml"
+    if db is None and config_path.is_file():
+        try:
+            project = _parse_config(config_path, project_root=root)
+        except ProjectConfigError:
+            project = None
+        else:
+            db, fleet_yaml, summaries_dir = (
+                project.db,
+                project.fleet_yaml,
+                project.summaries_dir,
+            )
+    if db is None or fleet_yaml is None or summaries_dir is None:
+        db = root / ".strata" / "strata.db"
+        fleet_yaml = root / ".strata" / "fleet.yaml"
+        summaries_dir = root / ".strata" / "summaries"
+    directories, files = _store_targets(
+        root, db=db, fleet_yaml=fleet_yaml, summaries_dir=summaries_dir
+    )
+    return _rules_for_targets(root, directories, files)
+
+
+def _wanted_deny_rules(rules: tuple[str, ...] | None) -> tuple[str, ...]:
+    return CLAUDE_STRATA_DENY_RULES if rules is None else rules
+
+
 def _permissions_deny_list(settings_data: dict) -> list | None:
     """Return ``permissions.deny`` when it is a list, else ``None``.
 
@@ -948,27 +1134,31 @@ def _permissions_deny_list(settings_data: dict) -> list | None:
     return deny
 
 
-def strata_deny_rules_present(settings_data: dict) -> bool:
-    """Return whether every seeded Claude Code deny rule is already present.
+def strata_deny_rules_present(settings_data: dict, rules: tuple[str, ...] | None = None) -> bool:
+    """Return whether every deny rule in *rules* is already present.
 
-    A user's other deny rules do not count against this. A malformed
-    ``permissions`` / ``deny`` value counts as absent — doctor then asks for
-    ``strata register``, and register itself refuses to clobber that value.
+    *rules* defaults to :data:`CLAUDE_STRATA_DENY_RULES`. Pass
+    :func:`claude_store_deny_rules` when the store may not live under
+    ``.strata/``. A user's other deny rules do not count against this. A
+    malformed ``permissions`` / ``deny`` value counts as absent — doctor then
+    asks for ``strata register``, and register itself refuses to clobber
+    that value.
     """
     deny = _permissions_deny_list(settings_data)
     if deny is None:
         return False
-    return all(rule in deny for rule in CLAUDE_STRATA_DENY_RULES)
+    return all(rule in deny for rule in _wanted_deny_rules(rules))
 
 
-def merge_strata_deny_rules(settings_data: dict) -> bool:
-    """Append :data:`CLAUDE_STRATA_DENY_RULES` to ``permissions.deny``.
+def merge_strata_deny_rules(settings_data: dict, rules: tuple[str, ...] | None = None) -> bool:
+    """Append *rules* to ``permissions.deny``.
 
-    Strictly additive (ADR 0005 Decision 6): existing allow rules, existing
-    deny rules, and every other settings key are preserved. Each seeded rule
-    is appended only when that exact string is absent, so a second call
-    changes nothing. A non-dict ``permissions`` or a non-list ``deny`` is
-    left untouched and this returns ``False``.
+    *rules* defaults to :data:`CLAUDE_STRATA_DENY_RULES`. Strictly additive
+    (ADR 0005 Decision 6): existing allow rules, existing deny rules, and
+    every other settings key are preserved. Each seeded rule is appended only
+    when that exact string is absent, so a second call changes nothing. A
+    non-dict ``permissions`` or a non-list ``deny`` is left untouched and
+    this returns ``False``.
 
     Returns:
         ``True`` if at least one rule was appended.
@@ -976,7 +1166,8 @@ def merge_strata_deny_rules(settings_data: dict) -> bool:
     deny = _permissions_deny_list(settings_data)
     if deny is None:
         return False
-    missing = [rule for rule in CLAUDE_STRATA_DENY_RULES if rule not in deny]
+    wanted = _wanted_deny_rules(rules)
+    missing = [rule for rule in wanted if rule not in deny]
     if not missing:
         return False
     permissions = settings_data.get("permissions")
@@ -993,14 +1184,14 @@ def merge_strata_deny_rules(settings_data: dict) -> bool:
     return True
 
 
-def remove_strata_deny_rules(settings_data: dict) -> str:
+def remove_strata_deny_rules(settings_data: dict, rules: tuple[str, ...] | None = None) -> str:
     """Remove only the deny rules :func:`merge_strata_deny_rules` seeds.
 
-    The reverse of that merge. A user's own deny entries stay, in their
-    original order. An edited spelling of a seeded rule is not ours and is
-    left in place. Empty ``deny`` / ``permissions`` containers this function
-    empties are dropped so a project that had no permissions block before
-    register round-trips.
+    *rules* defaults to :data:`CLAUDE_STRATA_DENY_RULES`. The reverse of that
+    merge. A user's own deny entries stay, in their original order. An edited
+    spelling of a seeded rule is not ours and is left in place. Empty
+    ``deny`` / ``permissions`` containers this function empties are dropped so
+    a project that had no permissions block before register round-trips.
 
     Returns one of:
 
@@ -1008,11 +1199,12 @@ def remove_strata_deny_rules(settings_data: dict) -> str:
     - ``"absent"`` — none of the seeded rules were present (including a
       malformed ``permissions`` value, which is never rewritten).
     """
+    wanted = _wanted_deny_rules(rules)
     deny = _permissions_deny_list(settings_data)
-    if deny is None or not any(rule in deny for rule in CLAUDE_STRATA_DENY_RULES):
+    if deny is None or not any(rule in deny for rule in wanted):
         return "absent"
     permissions = settings_data["permissions"]
-    remaining = [rule for rule in deny if rule not in CLAUDE_STRATA_DENY_RULES]
+    remaining = [rule for rule in deny if rule not in wanted]
     if remaining:
         permissions["deny"] = remaining
     else:

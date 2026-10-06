@@ -1,9 +1,12 @@
-"""`strata register` seeds Claude Code deny rules for `.strata/` (#173, ADR 0013 D6).
+"""`strata register` seeds Claude Code deny rules for the resolved store (#173).
 
-Claude Code honors ``permissions.deny`` in ``.claude/settings.json``. Codex's
-sandbox config cannot deny a path inside a writable workspace, so register
-does not write one. The Strata server is a process: the deny rules bind the
-harness's tools, not the server.
+Claude Code honors ``permissions.deny`` in ``.claude/settings.json``. The
+seeded layout lives under ``.strata/``. A ``config.toml`` that points the
+store elsewhere (an external fleet directory, a split layout, a file in the
+project root) is denied at the path it resolves to. Codex's sandbox config
+cannot deny a path inside a writable workspace, so register does not write
+one. The Strata server is a process: the deny rules bind the harness's
+tools, not the server.
 """
 
 from __future__ import annotations
@@ -216,6 +219,292 @@ def test_doctor_fails_when_deny_rules_are_missing(
     assert "missing from .claude/settings.json permissions.deny" in output
     assert "strata register" in output
     assert "Codex sandbox config cannot deny" in output
+
+
+# ---------------------------------------------------------------------------
+# The store may not live under .strata/ (issue #184)
+# ---------------------------------------------------------------------------
+
+
+def _write_config(project: Path, body: str) -> None:
+    strata = project / ".strata"
+    strata.mkdir(parents=True, exist_ok=True)
+    (strata / "config.toml").write_text(body, encoding="utf-8")
+
+
+def _read_rule(path: Path, *, directory: bool) -> str:
+    """The ``Read(...)`` string register emits for an absolute *path*."""
+    suffix = "/**" if directory else ""
+    return f"Read(/{path.resolve().as_posix()}{suffix})"
+
+
+def test_no_config_resolves_to_the_seeded_dot_strata_rules(tmp_path: Path) -> None:
+    assert install.claude_store_deny_rules(tmp_path) == install.CLAUDE_STRATA_DENY_RULES
+
+
+def test_register_denies_an_external_fleet_directory(tmp_path: Path) -> None:
+    project = tmp_path / "proj"
+    fleet = tmp_path / "strata-fleet"
+    project.mkdir()
+    _init_project(project)
+    fleet.mkdir()
+    _write_config(
+        project,
+        "\n".join(
+            [
+                f'db = "{(fleet / "strata.db").as_posix()}"',
+                f'fleet_yaml = "{(fleet / "fleet.yaml").as_posix()}"',
+                f'summaries_dir = "{(fleet / "summaries").as_posix()}"',
+                "",
+            ]
+        ),
+    )
+    user_deny = "Bash(rm *)"
+    _write_settings(project, {"permissions": {"allow": ["Bash(npm test)"], "deny": [user_deny]}})
+
+    assert _register(project) == 0
+
+    external = f"/{fleet.resolve().as_posix()}/**"
+    data = _settings(project)
+    assert data["permissions"]["allow"] == ["Bash(npm test)"]
+    assert data["permissions"]["deny"] == [
+        user_deny,
+        "Read(/.strata/**)",
+        "Edit(/.strata/**)",
+        f"Read({external})",
+        f"Edit({external})",
+    ]
+    assert install.claude_store_deny_rules(project) == (
+        "Read(/.strata/**)",
+        "Edit(/.strata/**)",
+        f"Read({external})",
+        f"Edit({external})",
+    )
+    settings_path = project / ".claude" / "settings.json"
+    before = settings_path.read_bytes()
+    assert _register(project) == 0
+    assert settings_path.read_bytes() == before
+
+
+def test_doctor_checks_the_resolved_external_rules(
+    tmp_path: Path,
+    tmp_path_factory: pytest.TempPathFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    # The project has to be tmp_path itself. The suite pins config discovery
+    # at a guard directory inside tmp_path and walks upward, so a nested
+    # project directory is invisible to `strata doctor`.
+    fleet = tmp_path_factory.mktemp("strata-fleet")
+    db = fleet / "strata.db"
+    _init_project(tmp_path)
+    _write_config(
+        tmp_path,
+        "\n".join(
+            [
+                f'db = "{db.as_posix()}"',
+                f'fleet_yaml = "{(fleet / "fleet.yaml").as_posix()}"',
+                f'summaries_dir = "{(fleet / "summaries").as_posix()}"',
+                "",
+            ]
+        ),
+    )
+    assert _register(tmp_path) == 0
+    from strata.migrator import run_migrations
+
+    run_migrations(str(db))
+    monkeypatch.setenv("STRATA_AGENT_SCOPE", "g_root")
+    monkeypatch.setenv("STRATA_AGENT_SKILL", "strata-worker")
+    monkeypatch.setenv("STRATA_AGENT_SESSION_ID", "sess_test")
+    capsys.readouterr()
+
+    external = f"Read(/{fleet.resolve().as_posix()}/**)"
+    rc, output = _run_doctor(tmp_path, monkeypatch, capsys)
+    assert rc == 0
+    assert external in output
+    assert "Read(/.strata/**)" in output
+
+    data = _settings(tmp_path)
+    data["permissions"]["deny"] = list(install.CLAUDE_STRATA_DENY_RULES)
+    _write_settings(tmp_path, data)
+    capsys.readouterr()
+
+    rc, output = _run_doctor(tmp_path, monkeypatch, capsys)
+    assert rc == 1
+    assert "missing from .claude/settings.json permissions.deny" in output
+    assert external in output
+
+
+def test_unregister_removes_only_the_resolved_rules(tmp_path: Path) -> None:
+    project = tmp_path / "proj"
+    fleet = tmp_path / "strata-fleet"
+    project.mkdir()
+    _init_project(project)
+    fleet.mkdir()
+    _write_config(
+        project,
+        "\n".join(
+            [
+                f'db = "{(fleet / "strata.db").as_posix()}"',
+                f'fleet_yaml = "{(fleet / "fleet.yaml").as_posix()}"',
+                f'summaries_dir = "{(fleet / "summaries").as_posix()}"',
+                "",
+            ]
+        ),
+    )
+    _write_settings(project, {"theme": "dark", "permissions": {"deny": ["Bash(rm *)"]}})
+    assert _register(project) == 0
+
+    from strata.__main__ import cmd_unregister
+
+    assert (
+        cmd_unregister(argparse.Namespace(path=str(project), dry_run=False, purge_data=False)) == 0
+    )
+
+    data = _settings(project)
+    assert data["theme"] == "dark"
+    assert data["permissions"]["deny"] == ["Bash(rm *)"]
+
+
+def test_split_store_directories_are_each_denied(tmp_path: Path) -> None:
+    project = tmp_path / "proj"
+    project.mkdir()
+    db_dir = tmp_path / "db"
+    fleet_dir = tmp_path / "fleet"
+    mem = tmp_path / "mem"
+    _write_config(
+        project,
+        "\n".join(
+            [
+                f'db = "{(db_dir / "strata.db").as_posix()}"',
+                f'fleet_yaml = "{(fleet_dir / "fleet.yaml").as_posix()}"',
+                f'summaries_dir = "{(mem / "summaries").as_posix()}"',
+                "",
+            ]
+        ),
+    )
+
+    rules = install.claude_store_deny_rules(project)
+
+    expected_dirs = [db_dir, fleet_dir, mem / "summaries", mem / "sessions"]
+    for directory in expected_dirs:
+        assert _read_rule(directory, directory=True) in rules
+        assert _read_rule(directory, directory=True).replace("Read", "Edit", 1) in rules
+    assert "Read(/.strata/**)" in rules
+    assert "Edit(/.strata/**)" in rules
+    # The lock directory lives under the database directory, so it collapses.
+    assert _read_rule(db_dir / ".locks", directory=True) not in rules
+
+
+def test_legacy_root_layout_denies_files_not_the_project(tmp_path: Path) -> None:
+    _write_config(
+        tmp_path,
+        'db = "strata.db"\nfleet_yaml = "fleet.yaml"\nsummaries_dir = "summaries"\n',
+    )
+
+    rules = install.claude_store_deny_rules(tmp_path)
+
+    assert "Read(/**)" not in rules
+    assert "Edit(/**)" not in rules
+    assert "Read(/)" not in rules
+    assert "Edit(/)" not in rules
+    assert all(not rule.startswith(("Read(//", "Edit(//")) for rule in rules)
+    assert rules == (
+        "Read(/.locks/**)",
+        "Edit(/.locks/**)",
+        "Read(/.strata/**)",
+        "Edit(/.strata/**)",
+        "Read(/fleet.yaml)",
+        "Edit(/fleet.yaml)",
+        "Read(/sessions/**)",
+        "Edit(/sessions/**)",
+        "Read(/strata.db*)",
+        "Edit(/strata.db*)",
+        "Read(/summaries/**)",
+        "Edit(/summaries/**)",
+    )
+
+
+def test_file_in_an_ancestor_does_not_deny_that_ancestor(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    project = home / "proj"
+    project.mkdir(parents=True)
+    db = home / "strata.db"
+    _write_config(
+        project,
+        "\n".join(
+            [
+                f'db = "{db.as_posix()}"',
+                'fleet_yaml = ".strata/fleet.yaml"',
+                'summaries_dir = ".strata/summaries"',
+                "",
+            ]
+        ),
+    )
+
+    rules = install.claude_store_deny_rules(project)
+
+    assert _read_rule(home, directory=True) not in rules
+    assert f"Read(/{db.resolve().as_posix()}*)" in rules
+    assert f"Edit(/{db.resolve().as_posix()}*)" in rules
+    assert "Read(/.strata/**)" in rules
+    assert "Edit(/.strata/**)" in rules
+
+
+def test_malformed_config_falls_back_to_the_seeded_rules(tmp_path: Path) -> None:
+    _write_config(tmp_path, "this is not toml\n")
+    assert install.claude_store_deny_rules(tmp_path) == install.CLAUDE_STRATA_DENY_RULES
+
+
+def test_explicit_paths_name_a_store_that_is_not_on_disk_yet(tmp_path: Path) -> None:
+    fleet = tmp_path.parent / f"{tmp_path.name}-fleet"
+    rules = install.claude_store_deny_rules(
+        tmp_path,
+        db=fleet / "strata.db",
+        fleet_yaml=fleet / "fleet.yaml",
+        summaries_dir=fleet / "summaries",
+    )
+    external = f"/{fleet.resolve().as_posix()}/**"
+    assert rules == (
+        "Read(/.strata/**)",
+        "Edit(/.strata/**)",
+        f"Read({external})",
+        f"Edit({external})",
+    )
+
+
+def test_diff_preview_names_an_adopted_root_store(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    _init_project(tmp_path)
+    (tmp_path / "fleet.yaml").write_text(
+        "strata:\n  - id: L0\n    name: root\n    ordinal: 0\n"
+        "scopes:\n  - id: g_root\n    name: Root\n    stratum_id: L0\n"
+        "edges: []\n",
+        encoding="utf-8",
+    )
+    summaries = tmp_path / "summaries"
+    summaries.mkdir()
+    (summaries / "g_root.md").write_text("kept\n", encoding="utf-8")
+
+    rc = cmd_register(
+        argparse.Namespace(
+            path=str(tmp_path),
+            diff=True,
+            bootstrap_venv=False,
+            harness=["claude-code"],
+        )
+    )
+    captured = capsys.readouterr()
+    output = captured.out + captured.err
+
+    assert rc == 0
+    assert not (tmp_path / ".claude" / "settings.json").exists()
+    assert not (tmp_path / ".strata" / "config.toml").exists()
+    assert "Read(/strata.db*)" in output
+    assert "Read(/summaries/**)" in output
+    assert "Read(/.strata/**)" in output
+    assert "Read(/**)" not in output
 
 
 # ---------------------------------------------------------------------------

@@ -19,15 +19,20 @@ so one agent's mistake never corrupts what the rest of the fleet reads.
 - **Record** — the append-only audit trail of everything ever contributed
   and judged, per scope.
 
-`strata register` seeds Claude Code deny rules so that harness cannot open
-`.strata/` with its Read, Edit, or Write tools (`Read(/.strata/**)` and
-`Edit(/.strata/**)` in `.claude/settings.json`). Those rules also cover the
-shell file commands Claude Code recognizes (`cat`, `head`, `tail`, `sed`).
-They do not stop a Python or Node process that opens the files itself, and
-a `Write(path)` rule is not written because Claude Code never consults one.
-Codex's sandbox config cannot deny a path inside a writable workspace, so
-register does not seed one there. Outside a harness that enforces the deny,
-scoping is discipline, not security.
+`strata register` seeds Claude Code deny rules for the store
+`.strata/config.toml` actually resolves. The seeded layout lives under
+`.strata/`, and the rules are then `Read(/.strata/**)` and
+`Edit(/.strata/**)` in `.claude/settings.json`. A store kept elsewhere
+(for example `db`, `fleet_yaml`, and `summaries_dir` all under
+`/home/you/strata-fleet/`) is denied at that directory too, with a
+filesystem-absolute `//` pattern, and `.strata/` stays denied because the
+config lives there. Those rules cover Claude Code's Read, Edit, and Write
+tools and the shell file commands it recognizes (`cat`, `head`, `tail`,
+`sed`). They do not stop a Python or Node process that opens the files
+itself, and a `Write(path)` rule is not written because Claude Code never
+consults one. Codex's sandbox config cannot deny a path inside a writable
+workspace, so register does not seed one there. Outside a harness that
+enforces the deny, scoping is discipline, not security.
 
 For the full theory and vocabulary, see
 [`docs/philosophy.md`](https://github.com/oren198/Strata/blob/main/docs/philosophy.md) (why Strata exists, why naive

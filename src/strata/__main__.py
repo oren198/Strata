@@ -1187,9 +1187,11 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         the READ-side trigger, symmetric with check 5.
     6c. ``hooks.SessionStart`` entry present in ``.claude/settings.json`` —
         symmetric with check 6.
-    6d. Claude Code ``permissions.deny`` rules for ``/.strata/**`` (ADR 0013
-        D6). Codex's sandbox config cannot deny a workspace path; the check
-        says so instead of pretending a rule was seeded.
+    6d. Claude Code ``permissions.deny`` rules for the resolved store
+        (ADR 0013 D6). The seeded layout is ``/.strata/**``; a store
+        ``config.toml`` points at elsewhere is named too. Codex's sandbox
+        config cannot deny a workspace path; the check says so instead of
+        pretending a rule was seeded.
     7. Skills present in ``.claude/skills/``.
     8. Binding env vars (``STRATA_AGENT_SCOPE`` / ``_SKILL`` / ``_SESSION_ID``)
        set and valid against the fleet.
@@ -1689,11 +1691,14 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         )
 
     # -----------------------------------------------------------------------
-    # 6d. Claude Code deny rules for .strata/ (ADR 0013 D6, issue #173).
-    # The Strata server is a process: these rules bind the harness's tools,
-    # not the server. Codex cannot express the same deny — reported here,
-    # not seeded.
+    # 6d. Claude Code deny rules for the resolved store (ADR 0013 D6, #173).
+    # The rules name whatever db / fleet / summaries config.toml resolves,
+    # not a hardcoded `.strata/` when the store lives elsewhere. The Strata
+    # server is a process: these rules bind the harness's tools, not the
+    # server. Codex cannot express the same deny — reported here, not seeded.
     # -----------------------------------------------------------------------
+    store_deny_rules = install.claude_store_deny_rules(project_root)
+    store_deny_text = ", ".join(store_deny_rules)
     if settings_error is not None:
         checks.append(
             Check(
@@ -1702,20 +1707,19 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                 passed=False,
                 message=(
                     f".claude/settings.json is {settings_error} — fix the file, then "
-                    "run 'strata register' to add the .strata/ deny rules. "
+                    f"run 'strata register' to add the store deny rules ({store_deny_text}). "
                     f"{install.CODEX_WORKSPACE_DENY_GAP}."
                 ),
             )
         )
-    elif install.strata_deny_rules_present(settings_data):
-        rules = ", ".join(install.CLAUDE_STRATA_DENY_RULES)
+    elif install.strata_deny_rules_present(settings_data, store_deny_rules):
         checks.append(
             Check(
                 name="Store deny rules",
                 kind="hard",
                 passed=True,
                 message=(
-                    f"present in .claude/settings.json permissions.deny ({rules}). "
+                    f"present in .claude/settings.json permissions.deny ({store_deny_text}). "
                     f"{install.CLAUDE_STRATA_DENY_COVERAGE}. "
                     f"{install.CODEX_WORKSPACE_DENY_GAP}."
                 ),
@@ -1729,8 +1733,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                 passed=False,
                 message=(
                     "missing from .claude/settings.json permissions.deny — run "
-                    "'strata register' to add Read(/.strata/**) and "
-                    "Edit(/.strata/**). "
+                    f"'strata register' to add {store_deny_text}. "
                     f"{install.CODEX_WORKSPACE_DENY_GAP}."
                 ),
             )
@@ -4162,15 +4165,29 @@ def cmd_register(args: argparse.Namespace) -> int:
                 settings_changed = True
                 _act("merged SessionStart hook into", settings_json)
 
-        # Step 7d: additive permissions.deny for .strata/ (ADR 0013 D6, #173).
-        # A user's own allow/deny rules stay. A second register appends nothing.
-        # The server process is not subject to these rules — they bind Claude
-        # Code's tools. Codex is reported, not faked; see
+        # Step 7d: additive permissions.deny for the resolved store
+        # (ADR 0013 D6, #173). Config.toml is already written above, so the
+        # rules name the db / fleet / summaries this project actually uses.
+        # A user's own allow/deny rules stay. A second register appends
+        # nothing. The server process is not subject to these rules — they
+        # bind Claude Code's tools. Codex is reported, not faked; see
         # install.codex_sandbox_can_deny_workspace_path.
         if not settings_unreadable:
-            if install.strata_deny_rules_present(settings_data):
+            # An adopted store is not in config.toml yet on --diff (nothing
+            # is written). Name that store explicitly so the preview matches
+            # the rules a real register would persist.
+            if adopted_store is not None and not config_toml_already_registered:
+                store_deny_rules = install.claude_store_deny_rules(
+                    project_root,
+                    db=adopted_store.root / "strata.db",
+                    fleet_yaml=adopted_store.fleet_yaml,
+                    summaries_dir=adopted_store.root / "summaries",
+                )
+            else:
+                store_deny_rules = install.claude_store_deny_rules(project_root)
+            if install.strata_deny_rules_present(settings_data, store_deny_rules):
                 _act("skip store deny rules in", settings_json, skipped=True)
-            elif install.merge_strata_deny_rules(settings_data):
+            elif install.merge_strata_deny_rules(settings_data, store_deny_rules):
                 settings_changed = True
                 _act("merged store deny rules into", settings_json)
             else:
@@ -4181,7 +4198,8 @@ def cmd_register(args: argparse.Namespace) -> int:
                     file=sys.stderr,
                 )
             print(
-                f"    {install.CLAUDE_STRATA_DENY_COVERAGE}. "
+                f"    store deny rules: {', '.join(store_deny_rules)}. "
+                f"{install.CLAUDE_STRATA_DENY_COVERAGE}. "
                 f"{install.CODEX_WORKSPACE_DENY_GAP}. "
                 "Outside a harness that enforces the deny, scoping is discipline, "
                 "not security."
@@ -4901,9 +4919,11 @@ def cmd_unregister(args: argparse.Namespace) -> int:
                 else:  # absent
                     _ok(".claude/settings.json: nothing to do (no SessionStart hook)")
 
-                # Store deny rules (ADR 0013 D6) — only the exact strings
-                # register appended. A user's own deny entries stay.
-                deny_status = install.remove_strata_deny_rules(settings_data)
+                # Store deny rules (ADR 0013 D6) — only the exact strings the
+                # current config would seed. A user's own deny entries stay.
+                deny_status = install.remove_strata_deny_rules(
+                    settings_data, install.claude_store_deny_rules(project_root)
+                )
                 if deny_status == "removed":
                     settings_changed = True
                     _ok(f".claude/settings.json: {_would('remove', 'removed')} store deny rules")
