@@ -2708,6 +2708,13 @@ class ScopeManagerJudgment(_AmendmentJudgment):
     reasoning: str
     """Brief explanation of the verdict — written to the judgment record."""
 
+    inherited_relation: dict | None = None
+    """#242: ``{"contribution_id", "kind", "verdict", "fallback", "inherited_id",
+    "origin", "reason"}`` whenever the context re-ask fired (see
+    :meth:`ScopeManager.classify_inherited_context`) — ``None`` otherwise.
+    ``fallback`` is True when nothing was verified and no exception marker
+    stood in the way, so the admit stood: the counted fail-open door."""
+
     inherited_holds: list[dict] = Field(default_factory=list)
     """v1.17.1: ``{"contribution_id", "directive_id", "origin", "reason"}`` per
     contribution the inherited-conflict check held (see
@@ -2945,6 +2952,10 @@ class ScopeManagerBatchJudgment(_AmendmentJudgment):
 
     dropped_ops_by_contribution: dict[str, list[str]] = Field(default_factory=dict)
     """Dropped ops (rendered) keyed by the contribution whose record notes them."""
+
+    inherited_relations: list[dict] = Field(default_factory=list)
+    """#242: one outcome dict per member the context re-ask fired for (same
+    shape as :attr:`ScopeManagerJudgment.inherited_relation`)."""
 
     inherited_holds: list[dict] = Field(default_factory=list)
     """v1.17.1: the inherited-conflict check's holds, one dict per held member
@@ -6185,6 +6196,32 @@ def inherited_context_trigger(
     ]
 
 
+def _inherited_relation_note(outcome: dict) -> str:
+    """The engine-written suffix for a #242 outcome ("" when the admit stands
+    with nothing to say: the unverified fallback)."""
+    directive_id, origin = outcome["inherited_id"], outcome["origin"]
+    verdict = outcome["verdict"]
+    if verdict == "decline":
+        return (
+            f"[Declined: contrary to inherited directive {directive_id} ({origin}). A practice "
+            "that departs from an inherited rule can't be recorded as this scope's context. "
+            f"Report a specific occurrence of following the rule and what happened (admitted, "
+            f"and raised to {origin} with acted_on), or propose the exception to {origin}.]"
+        )
+    if verdict == "consequence_report":
+        return (
+            f"[A report of following {directive_id} ({origin}). To raise it to {origin}, "
+            f"resubmit with acted_on = {directive_id}.]"
+        )
+    if verdict == "departure_report":
+        return (
+            f"[A departure from {directive_id} ({origin}), not a licence: only {origin} decides "
+            f"whether the rule is slack. To raise it to {origin}, resubmit with "
+            f"acted_on = {directive_id}.]"
+        )
+    return ""
+
+
 # ---------------------------------------------------------------------------
 # ScopeManager
 # ---------------------------------------------------------------------------
@@ -7231,6 +7268,15 @@ class ScopeManager:
             ancestor_directives=ancestor_directives,
             operator_memory=operator_memory,
         )
+        if acted_on_target is None:
+            judgment = self.classify_inherited_context(
+                judgment,
+                scope=scope,
+                contribution=new_contribution,
+                ancestor_directives=ancestor_directives,
+                operator_memory=operator_memory,
+                mode=mode,
+            )
         return self._hold_directive_changes(
             judgment,
             scope=scope,
@@ -8504,6 +8550,219 @@ class ScopeManager:
         )
         return _noted(updated, relation, parent_id, result)
 
+    def _classify_inherited_relation(
+        self,
+        *,
+        scope: Scope,
+        contribution: Contribution,
+        covered: Sequence[tuple[str, str, str]],
+    ) -> dict:
+        """#242: the one targeted re-ask (``classify_inherited_relation``) and
+        the engine's verification of its answer, for a context contribution
+        that covers the subject of *covered* inherited directives.
+
+        Returns ``{"contribution_id", "kind", "verdict", "fallback",
+        "inherited_id", "origin", "reason"}``. A failed or unreadable call is
+        the unreadable-answer case, never an error: the verifier's marker
+        scan then decides (a marker declines, otherwise the admit stands and
+        ``fallback`` is True).
+        """
+        shown = list(covered)[:3]
+        listing = "\n".join(f"- {d_id} ({origin}): {text}" for d_id, origin, text in shown)
+        user_message = (
+            f"SCOPE: {scope.name} (id={scope.id})\n\n"
+            f"INHERITED DIRECTIVES THIS ITEM TOUCHES:\n{listing}\n\n"
+            f"CONTEXT ITEM:\n{contribution.content}\n\n"
+            "Call `classify_inherited_relation` exactly once."
+        )
+        answer: dict = {}
+        failure: str | None = None
+        try:
+            response = self._messages_create(
+                model=self._model,
+                max_tokens=512,
+                system=[
+                    {
+                        "type": "text",
+                        "text": _INHERITED_RELATION_SYSTEM_PROMPT,
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ],
+                tools=[
+                    {**CLASSIFY_INHERITED_RELATION_TOOL, "cache_control": {"type": "ephemeral"}}
+                ],
+                tool_choice={
+                    "type": "tool",
+                    "name": CLASSIFY_INHERITED_RELATION_TOOL["name"],
+                    "disable_parallel_tool_use": True,
+                },
+                messages=[{"role": "user", "content": user_message}],
+            )
+            block = self._extract_tool_use_block(response)
+            answer = block.input if isinstance(block.input, dict) else {}
+        except Exception as exc:  # noqa: BLE001 — any slip is the unreadable-answer case
+            failure = f"{type(exc).__name__}: {exc}"
+
+        named = answer.get("inherited_id")
+        chosen = next((d for d in shown if d[0] == named), None)
+        if chosen is None:
+            chosen = shown[0]
+            answer = {}  # an answer naming no shown directive is unreadable
+        verdict, reason = verify_inherited_relation(answer, contribution.content, chosen[2])
+        if failure is not None:
+            reason = f"re-ask failed ({failure}); {reason}"
+        kind = answer.get("kind")
+        return {
+            "contribution_id": contribution.id,
+            "kind": kind if isinstance(kind, str) else None,
+            "verdict": verdict,
+            "fallback": verdict == "admit",
+            "inherited_id": chosen[0],
+            "origin": chosen[1],
+            "reason": reason,
+        }
+
+    def classify_inherited_context(
+        self,
+        first: ScopeManagerJudgment,
+        *,
+        scope: Scope,
+        contribution: Contribution,
+        ancestor_directives: Sequence[tuple[str, Sequence[Directive]]] | None,
+        operator_memory: Sequence[tuple[str, Sequence[OperatorItem]]] | None,
+        mode: JudgeMode = "ordinary",
+    ) -> ScopeManagerJudgment:
+        """#242: a child's CONTEXT must not undercut an inherited directive.
+
+        Fires only for an ordinary ``accept_as_context`` from a contributor
+        bound to *scope* whose text covers an inherited directive's subject
+        (:func:`inherited_context_trigger`); otherwise *first* is returned
+        untouched with no call. An exception is declined; a specific past
+        report stays admitted with a suffix naming it and suggesting
+        ``acted_on``; an unreadable or unrelated answer declines only when an
+        exception marker is present (the counted fail-open fallback).
+        """
+        if (
+            mode != "ordinary"
+            or first.decision != "accept_as_context"
+            or first.inherited_holds
+            or first.inherited_relation is not None
+            or contribution.contributor.scope_id != scope.id
+        ):
+            return first
+        covered = inherited_context_trigger(
+            contribution.content, _inherited_directive_texts(ancestor_directives, operator_memory)
+        )
+        if not covered:
+            return first
+        outcome = self._classify_inherited_relation(
+            scope=scope, contribution=contribution, covered=covered
+        )
+        note = _inherited_relation_note(outcome)
+        update: dict = {
+            "inherited_relation": outcome,
+            "protocol_notes": [
+                *first.protocol_notes,
+                f"inherited relation: {outcome['verdict']}, {outcome['reason']}",
+            ],
+        }
+        if outcome["verdict"] == "decline":
+            update.update(
+                decision="decline",
+                directive_ops=[],
+                new_context=None,
+                new_summary=None,
+                reasoning=f"{first.reasoning} {note}",
+            )
+        elif note:
+            update["reasoning"] = f"{first.reasoning} {note}"
+        return first.model_copy(update=update)
+
+    def _classify_batch_inherited_context(
+        self,
+        judgment: ScopeManagerBatchJudgment,
+        *,
+        scope: Scope,
+        current_summary: ScopeSummary | None,
+        contributions: Mapping[str, Contribution],
+        mode: JudgeMode,
+        ancestor_directives: Sequence[tuple[str, Sequence[Directive]]] | None,
+        operator_memory: Sequence[tuple[str, Sequence[OperatorItem]]] | None,
+    ) -> ScopeManagerBatchJudgment:
+        """:meth:`classify_inherited_context`, carried to the batch.
+
+        Each member that was admitted as context, is bound to *scope* and
+        covers an inherited subject gets its own re-ask. A declined member's
+        verdict becomes ``decline``. Stated limit: the batch has ONE context
+        rewrite, which the judge wrote with the declined text in view; when
+        any member is declined the rewrite is withheld and replaced by the
+        previous context plus each remaining context-admitted member's own
+        text, verbatim, so a declined exception can never survive in it.
+        Held members are the inherited check's, not this one's.
+        """
+        if mode != "ordinary":
+            return judgment
+        inherited = _inherited_directive_texts(ancestor_directives, operator_memory)
+        if not inherited:
+            return judgment
+        held = {h["contribution_id"] for h in judgment.inherited_holds}
+        outcomes: dict[str, dict] = {}
+        for verdict in judgment.verdicts:
+            cid = verdict.contribution_id
+            member = contributions[cid]
+            if (
+                verdict.decision != "accept_as_context"
+                or cid in held
+                or member.contributor.scope_id != scope.id
+            ):
+                continue
+            covered = inherited_context_trigger(member.content, inherited)
+            if covered:
+                outcomes[cid] = self._classify_inherited_relation(
+                    scope=scope, contribution=member, covered=covered
+                )
+        if not outcomes:
+            return judgment
+        declined = {cid for cid, o in outcomes.items() if o["verdict"] == "decline"}
+        verdicts = []
+        for v in judgment.verdicts:
+            outcome = outcomes.get(v.contribution_id)
+            note = _inherited_relation_note(outcome) if outcome else ""
+            if outcome is None or not note:
+                verdicts.append(v)
+            elif v.contribution_id in declined:
+                verdicts.append(
+                    v.model_copy(
+                        update={"decision": "decline", "reasoning": f"{v.reasoning} {note}"}
+                    )
+                )
+            else:
+                verdicts.append(v.model_copy(update={"reasoning": f"{v.reasoning} {note}"}))
+        update: dict = {
+            "verdicts": verdicts,
+            "inherited_relations": list(outcomes.values()),
+        }
+        if declined:
+            context = current_summary.context if current_summary is not None else ""
+            for v in verdicts:
+                if v.decision == "accept_as_context" and v.contribution_id not in held:
+                    member = contributions[v.contribution_id]
+                    who = member.contributor.skill or member.contributor.session_id
+                    context = _append_line(
+                        context,
+                        f"[{member.id}] {who} ({member.contributor.scope_id}) "
+                        f"observed: {member.content.strip()}",
+                    )
+            update["new_context"] = context
+            update["new_summary"] = _apply_batch_amendment(
+                scope=scope,
+                current_summary=current_summary,
+                contributions=contributions,
+                ops=judgment.directive_ops,
+                new_context=context,
+            )
+        return judgment.model_copy(update=update)
+
     def judge_batch(
         self,
         *,
@@ -8645,6 +8904,9 @@ class ScopeManager:
                     {only.id: list(judgment.dropped_ops)} if judgment.dropped_ops else {}
                 ),
                 inherited_holds=judgment.inherited_holds,
+                inherited_relations=(
+                    [judgment.inherited_relation] if judgment.inherited_relation else []
+                ),
                 held_directive_changes=judgment.held_directive_changes,
                 held_ops=judgment.held_ops,
                 held_context=judgment.held_context,
@@ -8822,6 +9084,15 @@ class ScopeManager:
             parse_generic_decline=_generic_second_slip_batch_decline,
         )
         batch_judgment = self._hold_batch_inherited_conflicts(
+            batch_judgment,
+            scope=scope,
+            current_summary=current_summary,
+            contributions=contributions,
+            mode=mode,
+            ancestor_directives=ancestor_directives,
+            operator_memory=operator_memory,
+        )
+        batch_judgment = self._classify_batch_inherited_context(
             batch_judgment,
             scope=scope,
             current_summary=current_summary,
