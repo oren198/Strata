@@ -18,6 +18,11 @@ the release PR (`dev` → `main`) and the GitHub Release body are built from
   with a different head noun ("fuel dock spill kit" under "fuel dock pumps")
   is a different subject. A looser value, an exemption, a softened "all" and
   a narrowing of when the rule applies are still held.
+  Measured without a key on a new held-out set (48 items): with the same
+  recorded judge answers, the full path went from 44 to 48 correct; the
+  check's own catches are unchanged and 117 of 117 forged contradicting admits
+  are still held
+  ([evidence](docs/evidence/v1.17.2-inherited-false-holds-2026-10-06.md)).
 
 ## 1.17.1 (2026-10-05)
 
