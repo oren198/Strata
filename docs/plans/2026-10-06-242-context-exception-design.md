@@ -85,8 +85,12 @@ The fallback for an unreadable or unrelated answer with no exception marker lets
 
 If it is material, the fallback is revisited (e.g. decline when the covered-subject test is strong and the re-ask is unreadable).
 
-## Questions for the philosopher
+## The philosopher's answers (2026-10-06), adopted
 
-1. A report of *not* following the rule and what happened ("we skipped the suite on the 2.3.1 hotfix and it shipped fine"). Is it a consequence report, since it is evidence, or a confessed exception, since it records a departure? Draft: admit as context, as evidence of a departure, but never as license; the reason flags the departure. Or decline?
-2. Decline rather than hold-as-context-with-note: confirm.
-3. Should an admitted consequence report *without* `acted_on` still be raised to the issuer automatically, or only suggested? Draft: suggested only; auto-raise would be a new act.
+1. **A report of not following the rule** ("we skipped the suite on the 2.3.1 hotfix and it shipped fine") is **admitted as context**. A specific past departure and its outcome is first-hand observation; declining it would hide a violation, and accountability is the defence inside a scope. Conditions:
+   - **It must stay specific.** A generalising clause ("… so hotfixes don't need the suite") is an exception, and the whole contribution declines with that clause named. There is no fragment rescue.
+   - **It is never licence**, and never corroboration of an exception. Only the issuer decides whether the rule is slack.
+   - The engine reason names it as **a departure from <directive id>**, so no reader can mistake it for permission.
+   - Mechanically: the re-ask gains `kind = departure_report`, verified like `consequence_report` (specific, past tense, an anchor of specificity) but with an overlap with the *departure* rather than with following the rule. The generalising-clause check applies to both kinds: a coordinated or "so"/"therefore" clause carrying an exception marker declines.
+2. **Decline, not hold-with-note: confirmed.** A held note is still context asserting an exception; the theory has no half-binding state. The declined contribution stays in the record.
+3. **Consequence report without `acted_on`: suggest only.** The reason names the route plainly ("to raise this to <issuer>, resubmit with acted_on = <directive id>"); the same goes for departures. **Stated limit:** reports without `acted_on` reach the issuer only if the contributor follows the suggestion.
