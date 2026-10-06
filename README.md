@@ -19,10 +19,15 @@ so one agent's mistake never corrupts what the rest of the fleet reads.
 - **Record** — the append-only audit trail of everything ever contributed
   and judged, per scope.
 
-Scoping — which memory an agent binds to and reads/writes — is a
-discipline boundary for well-behaved agents, not a security boundary; a
-harness sandbox's own file-access rules are the enforcement layer against
-an adversarial agent.
+`strata register` seeds Claude Code deny rules so that harness cannot open
+`.strata/` with its Read, Edit, or Write tools (`Read(/.strata/**)` and
+`Edit(/.strata/**)` in `.claude/settings.json`). Those rules also cover the
+shell file commands Claude Code recognizes (`cat`, `head`, `tail`, `sed`).
+They do not stop a Python or Node process that opens the files itself, and
+a `Write(path)` rule is not written because Claude Code never consults one.
+Codex's sandbox config cannot deny a path inside a writable workspace, so
+register does not seed one there. Outside a harness that enforces the deny,
+scoping is discipline, not security.
 
 For the full theory and vocabulary, see
 [`docs/philosophy.md`](https://github.com/oren198/Strata/blob/main/docs/philosophy.md) (why Strata exists, why naive

@@ -9,7 +9,11 @@ operations Strata performs when it wires itself into a foreign project:
   has no ``mcpServers`` key in its schema) — an entry is added only when
   absent, user state is never overwritten,
 * skill copying into ``.claude/skills/`` (each skill is copied only when
-  absent), and
+  absent),
+* an additive ``permissions.deny`` merge into ``.claude/settings.json`` so
+  Claude Code cannot open ``.strata/`` with its file tools (ADR 0013 D6,
+  issue #173) — Codex's sandbox config cannot deny a workspace path, and
+  register does not invent one, and
 * ``--diff`` line rendering (the read-only "what would change" view).
 
 The rules live here, once. ``strata register`` (:mod:`strata.__main__`) is
@@ -113,6 +117,13 @@ __all__ = [
     "remove_agents_md",
     "gitignore_covers_dotenv",
     "write_env_judge_key",
+    "CLAUDE_STRATA_DENY_RULES",
+    "CLAUDE_STRATA_DENY_COVERAGE",
+    "CODEX_WORKSPACE_DENY_GAP",
+    "codex_sandbox_can_deny_workspace_path",
+    "strata_deny_rules_present",
+    "merge_strata_deny_rules",
+    "remove_strata_deny_rules",
 ]
 
 # ---------------------------------------------------------------------------
@@ -841,6 +852,173 @@ def _remove_hook_event(
         del hooks[event]
         if not hooks:
             del settings_data["hooks"]
+    return "removed"
+
+
+# ---------------------------------------------------------------------------
+# settings.json — additive permissions.deny for .strata/ (ADR 0013 D6, #173)
+#
+# Verified 2026-10-06 against https://code.claude.com/docs/en/permissions :
+#
+# * Project ``.claude/settings.json`` honors ``permissions.deny``. A leading
+#   ``/`` anchors at the settings file's directory (the project root), so
+#   ``Read(/.strata/**)`` matches this project's store and not a nested copy.
+# * Path rules are consulted only for ``Read(path)`` and ``Edit(path)``. A
+#   ``Write(path)`` rule is accepted and never consulted (startup warning
+#   since v2.1.210), so one is not seeded. A ``Read`` deny also blocks Edit
+#   and Write on the same path (v2.1.208+ for edits, v2.1.228+ for writes).
+#   The ``Edit`` deny covers NotebookEdit, which a Read deny does not.
+# * Read and Edit deny rules apply to Claude Code's file tools and to the
+#   shell file commands it recognizes (``cat``, ``head``, ``tail``, ``sed``).
+#   They do not apply to an arbitrary subprocess (Python, Node) that opens
+#   the file itself. This is harness permission enforcement, not an OS
+#   boundary.
+#
+# Codex: see :func:`codex_sandbox_can_deny_workspace_path`. Register does not
+# write a Codex deny, because the sandbox config cannot express one and the
+# newer permission profiles are ignored while ``sandbox_mode`` is set.
+# ---------------------------------------------------------------------------
+
+#: Deny rules ``strata register`` merges into Claude Code
+#: ``permissions.deny``. Order is the order they are appended when absent.
+CLAUDE_STRATA_DENY_RULES: tuple[str, ...] = (
+    "Read(/.strata/**)",
+    "Edit(/.strata/**)",
+)
+
+#: What those rules block, and what they leave open. Kept next to the rules
+#: so doctor, register, and the README describe one verified behavior.
+CLAUDE_STRATA_DENY_COVERAGE = (
+    "blocks Claude Code's Read, Edit, and Write tools on /.strata/**, and the "
+    "shell file commands Claude Code recognizes (cat, head, tail, sed); does "
+    "not block a Python or Node process that opens the files itself"
+)
+
+#: Why ``strata register`` writes no Codex deny. See
+#: :func:`codex_sandbox_can_deny_workspace_path`.
+CODEX_WORKSPACE_DENY_GAP = (
+    "Codex sandbox config cannot deny a path inside a writable workspace "
+    "(sandbox_workspace_write has no such key; permission profiles can deny "
+    "one but are ignored while sandbox_mode is set), so none is seeded"
+)
+
+
+def codex_sandbox_can_deny_workspace_path() -> bool:
+    """Whether Codex's sandbox config can deny a path inside the workspace.
+
+    Verified 2026-10-06 against OpenAI's sandbox and permissions docs:
+
+    * ``sandbox_mode`` / ``[sandbox_workspace_write]`` expose
+      ``writable_roots``, ``network_access``, ``exclude_tmpdir_env_var``, and
+      ``exclude_slash_tmp``. There is no key that denies an arbitrary
+      subdirectory of a writable root. ``.git``, ``.agents``, and ``.codex``
+      are hardcoded read-only carve-outs under a writable root; they are not
+      unreadable, and ``.strata`` is not one of them.
+    * Permission profiles can deny a workspace-relative path
+      (``[permissions.<profile>.filesystem.":workspace_roots"]`` with a
+      ``".strata/**" = "deny"`` entry). They do not compose with
+      ``sandbox_mode``: if ``sandbox_mode`` is set in any loaded config,
+      Codex ignores ``default_permissions``. Seeding a profile would either
+      do nothing or replace the user's sandbox posture, which is not an
+      additive deny.
+
+    Returns:
+        ``False``. One function so register, doctor, and tests share the answer.
+    """
+    return False
+
+
+def _permissions_deny_list(settings_data: dict) -> list | None:
+    """Return ``permissions.deny`` when it is a list, else ``None``.
+
+    A missing ``permissions`` or ``deny`` key is an empty list (register may
+    create it). A present value of the wrong type is ``None`` — the caller's
+    cue to leave the user's settings untouched.
+    """
+    if "permissions" not in settings_data:
+        return []
+    permissions = settings_data.get("permissions")
+    if not isinstance(permissions, dict):
+        return None
+    if "deny" not in permissions:
+        return []
+    deny = permissions.get("deny")
+    if not isinstance(deny, list):
+        return None
+    return deny
+
+
+def strata_deny_rules_present(settings_data: dict) -> bool:
+    """Return whether every seeded Claude Code deny rule is already present.
+
+    A user's other deny rules do not count against this. A malformed
+    ``permissions`` / ``deny`` value counts as absent — doctor then asks for
+    ``strata register``, and register itself refuses to clobber that value.
+    """
+    deny = _permissions_deny_list(settings_data)
+    if deny is None:
+        return False
+    return all(rule in deny for rule in CLAUDE_STRATA_DENY_RULES)
+
+
+def merge_strata_deny_rules(settings_data: dict) -> bool:
+    """Append :data:`CLAUDE_STRATA_DENY_RULES` to ``permissions.deny``.
+
+    Strictly additive (ADR 0005 Decision 6): existing allow rules, existing
+    deny rules, and every other settings key are preserved. Each seeded rule
+    is appended only when that exact string is absent, so a second call
+    changes nothing. A non-dict ``permissions`` or a non-list ``deny`` is
+    left untouched and this returns ``False``.
+
+    Returns:
+        ``True`` if at least one rule was appended.
+    """
+    deny = _permissions_deny_list(settings_data)
+    if deny is None:
+        return False
+    missing = [rule for rule in CLAUDE_STRATA_DENY_RULES if rule not in deny]
+    if not missing:
+        return False
+    permissions = settings_data.get("permissions")
+    if not isinstance(permissions, dict):
+        permissions = {}
+        settings_data["permissions"] = permissions
+    # Re-bind: the list from _permissions_deny_list may be a fresh [] that is
+    # not yet the object's list. Attach it before extending.
+    attached = permissions.get("deny")
+    if not isinstance(attached, list):
+        permissions["deny"] = deny
+        attached = deny
+    attached.extend(missing)
+    return True
+
+
+def remove_strata_deny_rules(settings_data: dict) -> str:
+    """Remove only the deny rules :func:`merge_strata_deny_rules` seeds.
+
+    The reverse of that merge. A user's own deny entries stay, in their
+    original order. An edited spelling of a seeded rule is not ours and is
+    left in place. Empty ``deny`` / ``permissions`` containers this function
+    empties are dropped so a project that had no permissions block before
+    register round-trips.
+
+    Returns one of:
+
+    - ``"removed"`` — at least one seeded rule was stripped.
+    - ``"absent"`` — none of the seeded rules were present (including a
+      malformed ``permissions`` value, which is never rewritten).
+    """
+    deny = _permissions_deny_list(settings_data)
+    if deny is None or not any(rule in deny for rule in CLAUDE_STRATA_DENY_RULES):
+        return "absent"
+    permissions = settings_data["permissions"]
+    remaining = [rule for rule in deny if rule not in CLAUDE_STRATA_DENY_RULES]
+    if remaining:
+        permissions["deny"] = remaining
+    else:
+        del permissions["deny"]
+        if not permissions:
+            del settings_data["permissions"]
     return "removed"
 
 

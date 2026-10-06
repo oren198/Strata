@@ -1187,6 +1187,9 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         the READ-side trigger, symmetric with check 5.
     6c. ``hooks.SessionStart`` entry present in ``.claude/settings.json`` —
         symmetric with check 6.
+    6d. Claude Code ``permissions.deny`` rules for ``/.strata/**`` (ADR 0013
+        D6). Codex's sandbox config cannot deny a workspace path; the check
+        says so instead of pretending a rule was seeded.
     7. Skills present in ``.claude/skills/``.
     8. Binding env vars (``STRATA_AGENT_SCOPE`` / ``_SKILL`` / ``_SESSION_ID``)
        set and valid against the fleet.
@@ -1681,6 +1684,54 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                 message=(
                     "missing from .claude/settings.json hooks.SessionStart — run "
                     "'strata register' to add it."
+                ),
+            )
+        )
+
+    # -----------------------------------------------------------------------
+    # 6d. Claude Code deny rules for .strata/ (ADR 0013 D6, issue #173).
+    # The Strata server is a process: these rules bind the harness's tools,
+    # not the server. Codex cannot express the same deny — reported here,
+    # not seeded.
+    # -----------------------------------------------------------------------
+    if settings_error is not None:
+        checks.append(
+            Check(
+                name="Store deny rules",
+                kind="hard",
+                passed=False,
+                message=(
+                    f".claude/settings.json is {settings_error} — fix the file, then "
+                    "run 'strata register' to add the .strata/ deny rules. "
+                    f"{install.CODEX_WORKSPACE_DENY_GAP}."
+                ),
+            )
+        )
+    elif install.strata_deny_rules_present(settings_data):
+        rules = ", ".join(install.CLAUDE_STRATA_DENY_RULES)
+        checks.append(
+            Check(
+                name="Store deny rules",
+                kind="hard",
+                passed=True,
+                message=(
+                    f"present in .claude/settings.json permissions.deny ({rules}). "
+                    f"{install.CLAUDE_STRATA_DENY_COVERAGE}. "
+                    f"{install.CODEX_WORKSPACE_DENY_GAP}."
+                ),
+            )
+        )
+    else:
+        checks.append(
+            Check(
+                name="Store deny rules",
+                kind="hard",
+                passed=False,
+                message=(
+                    "missing from .claude/settings.json permissions.deny — run "
+                    "'strata register' to add Read(/.strata/**) and "
+                    "Edit(/.strata/**). "
+                    f"{install.CODEX_WORKSPACE_DENY_GAP}."
                 ),
             )
         )
@@ -4111,9 +4162,34 @@ def cmd_register(args: argparse.Namespace) -> int:
                 settings_changed = True
                 _act("merged SessionStart hook into", settings_json)
 
-        # One write for the settings.json changes (legacy-entry removal and/or
-        # the Stop/SessionStart hook merges) — so bootstrap-venv (step 8) reads
-        # the up-to-date file back.
+        # Step 7d: additive permissions.deny for .strata/ (ADR 0013 D6, #173).
+        # A user's own allow/deny rules stay. A second register appends nothing.
+        # The server process is not subject to these rules — they bind Claude
+        # Code's tools. Codex is reported, not faked; see
+        # install.codex_sandbox_can_deny_workspace_path.
+        if not settings_unreadable:
+            if install.strata_deny_rules_present(settings_data):
+                _act("skip store deny rules in", settings_json, skipped=True)
+            elif install.merge_strata_deny_rules(settings_data):
+                settings_changed = True
+                _act("merged store deny rules into", settings_json)
+            else:
+                print(
+                    f"  {_glyph('warn')} .claude/settings.json permissions is not a "
+                    "mergeable object (or deny is not a list) — store deny rules "
+                    "left unmerged. Fix the value, then re-run `strata register`.",
+                    file=sys.stderr,
+                )
+            print(
+                f"    {install.CLAUDE_STRATA_DENY_COVERAGE}. "
+                f"{install.CODEX_WORKSPACE_DENY_GAP}. "
+                "Outside a harness that enforces the deny, scoping is discipline, "
+                "not security."
+            )
+
+        # One write for the settings.json changes (legacy-entry removal, the
+        # Stop/SessionStart hook merges, and the .strata/ deny rules) — so
+        # bootstrap-venv (step 8) reads the up-to-date file back.
         if settings_changed and not diff_mode:
             (project_root / ".claude").mkdir(parents=True, exist_ok=True)
             settings_json.write_text(json.dumps(settings_data, indent=2) + "\n", encoding="utf-8")
@@ -4166,6 +4242,16 @@ def cmd_register(args: argparse.Namespace) -> int:
         )
         if hook_already and not hook_added:
             print("    (a Strata Stop-hook block already exists in Codex's config — left as-is)")
+
+        # ADR 0013 D6: do not write a deny Codex's sandbox config cannot
+        # enforce. Permission profiles can deny a workspace subpath, but they
+        # are ignored while sandbox_mode is set, so a seeded profile would be
+        # either a no-op or a replacement of the user's sandbox posture.
+        if not install.codex_sandbox_can_deny_workspace_path():
+            print(
+                f"  {install.CODEX_WORKSPACE_DENY_GAP}. Outside a harness that "
+                "enforces a deny, scoping is discipline, not security."
+            )
 
         if not diff_mode and (mcp_added or hook_added):
             codex_config.parent.mkdir(parents=True, exist_ok=True)
@@ -4814,6 +4900,15 @@ def cmd_unregister(args: argparse.Namespace) -> int:
                     )
                 else:  # absent
                     _ok(".claude/settings.json: nothing to do (no SessionStart hook)")
+
+                # Store deny rules (ADR 0013 D6) — only the exact strings
+                # register appended. A user's own deny entries stay.
+                deny_status = install.remove_strata_deny_rules(settings_data)
+                if deny_status == "removed":
+                    settings_changed = True
+                    _ok(f".claude/settings.json: {_would('remove', 'removed')} store deny rules")
+                else:
+                    _ok(".claude/settings.json: nothing to do (no store deny rules)")
 
                 if settings_changed and not dry_run:
                     settings_json.write_text(

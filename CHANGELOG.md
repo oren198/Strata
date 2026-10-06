@@ -50,6 +50,21 @@ the release PR (`dev` → `main`) and the GitHub Release body are built from
 
 ## 1.17.2 (2026-10-06)
 
+### Added
+
+- **`strata register` seeds Claude Code deny rules for `.strata/`** (#173,
+  ADR 0013 D6). `permissions.deny` in `.claude/settings.json` gains
+  `Read(/.strata/**)` and `Edit(/.strata/**)`, appended beside any rules
+  already there and left unchanged on a second register. `strata doctor`
+  reports whether they are present. A `Write(path)` rule is not seeded:
+  Claude Code accepts it and never consults it. The rules block Claude
+  Code's file tools and the shell file commands it recognizes (`cat`,
+  `head`, `tail`, `sed`); they do not block a Python or Node process that
+  opens the files itself. Codex's sandbox config cannot deny a path inside
+  a writable workspace, and its permission profiles do not apply while
+  `sandbox_mode` is set, so register does not write a Codex deny. The
+  Strata server still reads `.strata/` — it is a process, not a harness tool.
+
 ### Fixed
 
 - **The 1.17.1 inherited-directive check no longer holds legitimate child
