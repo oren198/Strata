@@ -395,3 +395,111 @@ def test_a_batch_checks_operator_directives_too() -> None:
     )
     assert result.inherited_holds[0]["origin"] == "operator, g_exec"
     assert result.verdicts[0].reasoning == f"a {OP_NOTE}"
+
+
+# -- 1.17.2: three false holds the drift set found ---------------------------
+
+PUMPS = "Fuel dock pumps must be switched off at or before 20:00 every evening."
+VOLUMES = "Archive volumes may be borrowed for a maximum of 14 days."
+SAMPLES = "Cell samples must never be stored at a temperature above -70 °C."
+
+
+@pytest.mark.parametrize(
+    ("op_text", "parent"),
+    [
+        # (a) an upper bound: the smaller value is the stricter one
+        (
+            "In the map room, archive volumes may be borrowed for a maximum of 7 days "
+            "and are returned in a sealed case.",
+            VOLUMES,
+        ),
+        (
+            "In the cryo room, cell samples must never be stored above -80 °C, "
+            "and every freezer's temperature is logged twice a day.",
+            SAMPLES,
+        ),
+        # (b) an added own clause is not a polarity flip
+        (
+            "On night-shift, fuel dock pumps must be switched off at or before 19:30 "
+            "every evening and the nozzles locked.",
+            PUMPS,
+        ),
+        # (c) a shared modifier with a different head noun is a different subject
+        ("The fuel dock spill kit must be checked every Monday.", PUMPS),
+    ],
+)
+def test_the_four_drift_false_holds_pass(op_text: str, parent: str) -> None:
+    assert inherited_conflict(op_text, parent) is None
+
+
+@pytest.mark.parametrize(
+    ("op_text", "parent", "reason"),
+    [
+        (
+            "Archive volumes may be borrowed for a maximum of 21 days.",
+            VOLUMES,
+            "not stricter in the same direction",
+        ),
+        (
+            "Cell samples must never be stored above -60 °C.",
+            SAMPLES,
+            "not stricter in the same direction",
+        ),
+        (
+            "On night-shift, fuel dock pumps must be switched off at or before 20:30 "
+            "every evening and the nozzles locked.",
+            PUMPS,
+            "not stricter in the same direction",
+        ),
+        # The same head noun, narrowing when the rule applies, is still held.
+        (
+            "Fuel dock pumps must be switched off every Monday.",
+            PUMPS,
+            "narrows when/where the rule applies",
+        ),
+    ],
+)
+def test_the_violating_twins_are_still_held(op_text: str, parent: str, reason: str) -> None:
+    assert inherited_conflict(op_text, parent) == reason
+
+
+@pytest.mark.parametrize(
+    ("parent", "op_text", "held"),
+    [
+        ("Samples must stay below 8 °C.", "Samples must stay below 5 °C.", False),
+        ("Samples must stay below 8 °C.", "Samples must stay below 12 °C.", True),
+        ("Samples must be kept above 2 °C.", "Samples must be kept above 4 °C.", False),
+        ("Samples must be kept above 2 °C.", "Samples must be kept above 1 °C.", True),
+        (
+            "Samples must never be stored below -80 °C.",
+            "Samples must never be stored below -70 °C.",
+            False,
+        ),
+        (
+            "Samples must never be stored below -80 °C.",
+            "Samples must never be stored below -90 °C.",
+            True,
+        ),
+        ("Loans are for at most 14 days.", "Loans are for at most 10 days.", False),
+        ("Loans are for no more than 14 days.", "Loans are for no more than 30 days.", True),
+        ("Loans run for up to 14 days.", "Loans run for up to 7 days.", False),
+        ("Loans must be a minimum of 3 days.", "Loans must be a minimum of 2 days.", True),
+    ],
+)
+def test_the_direction_comes_from_the_parents_own_words(
+    parent: str, op_text: str, held: bool
+) -> None:
+    assert (inherited_conflict(op_text, parent) is not None) is held
+
+
+def test_a_restated_polarity_pair_is_held_only_when_the_parents_term_is_reversed() -> None:
+    assert inherited_conflict(
+        "Pumps must be switched on at 20:00.", "Pumps must be switched off at 20:00."
+    )
+    assert (
+        inherited_conflict(
+            "Pumps must be switched off at 20:00 and the valves closed.",
+            "Pumps must be switched off at 20:00.",
+        )
+        is None
+    )

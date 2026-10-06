@@ -5182,6 +5182,42 @@ _COMPARATOR_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(rf"\bevery\s+{_COMPARATOR_VALUE}", re.IGNORECASE), "smaller"),
     (re.compile(rf"\bwithin\s+{_COMPARATOR_VALUE}", re.IGNORECASE), "smaller"),
     (re.compile(rf"\bat least\s+{_COMPARATOR_VALUE}", re.IGNORECASE), "larger"),
+    # 1.17.2: upper- and lower-bound phrasings, direction read off the
+    # parent's own words. A NEGATED bound flips the bare word's direction
+    # ("never above -70" caps the value; "never below -70" floors it), so
+    # the negated forms are tried before the bare ones.
+    (
+        re.compile(
+            rf"\b(?:never|not|no)\b[^.,;]{{0,40}}?\b(?:above|over|exceed(?:s|ing)?)\s+{_COMPARATOR_VALUE}",
+            re.IGNORECASE,
+        ),
+        "smaller",
+    ),
+    (
+        re.compile(
+            rf"\b(?:never|not|no)\b[^.,;]{{0,40}}?\b(?:below|under)\s+{_COMPARATOR_VALUE}",
+            re.IGNORECASE,
+        ),
+        "larger",
+    ),
+    (
+        re.compile(
+            rf"\b(?:a\s+)?maximum(?:\s+of)?\s+{_COMPARATOR_VALUE}|\bat most\s+{_COMPARATOR_VALUE}"
+            rf"|\b(?:no|not)\s+more than\s+{_COMPARATOR_VALUE}|\bup to\s+{_COMPARATOR_VALUE}"
+            rf"|\bless than\s+{_COMPARATOR_VALUE}|\b(?:below|under)\s+{_COMPARATOR_VALUE}",
+            re.IGNORECASE,
+        ),
+        "smaller",
+    ),
+    (
+        re.compile(
+            rf"\b(?:a\s+)?minimum(?:\s+of)?\s+{_COMPARATOR_VALUE}"
+            rf"|\b(?:no|not)\s+less than\s+{_COMPARATOR_VALUE}"
+            rf"|\bmore than\s+{_COMPARATOR_VALUE}|\b(?:above|over)\s+{_COMPARATOR_VALUE}",
+            re.IGNORECASE,
+        ),
+        "larger",
+    ),
 )
 
 
@@ -5196,6 +5232,12 @@ def _parse_comparable(value_str: str) -> float:
         hours, minutes, seconds = parts[:3]
         return hours * 3600 + minutes * 60 + seconds
     return float(value_str.replace(",", ""))
+
+
+def _matched_value(match: re.Match[str]) -> str:
+    """The value a comparator pattern captured — whichever alternative of an
+    alternation matched — without a sentence-final "." or ","."""
+    return next(group for group in match.groups() if group).rstrip(".,:")
 
 
 def _comparator_rule_ok(parent_text: str, kept_span: str) -> tuple[bool | None, str | None]:
@@ -5220,9 +5262,9 @@ def _comparator_rule_ok(parent_text: str, kept_span: str) -> tuple[bool | None, 
         child_match = pattern.search(kept_span)
         if not child_match:
             return None, None
-        parent_value_str = parent_match.group(1).replace(",", "")
+        parent_value_str = _matched_value(parent_match).replace(",", "")
         parent_value = _parse_comparable(parent_value_str)
-        child_value = _parse_comparable(child_match.group(1))
+        child_value = _parse_comparable(_matched_value(child_match))
         ok = child_value <= parent_value if direction == "smaller" else child_value >= parent_value
         return ok, parent_value_str
     return None, None
@@ -5338,6 +5380,8 @@ def _polarity_flip(
     parent_text: str,
     child_span: str,
     pairs: tuple[tuple[str, str], ...] = _RELATION_ANTONYM_PAIRS,
+    *,
+    parent_term_kept_is_no_flip: bool = False,
 ) -> bool:
     """``True`` when *child_span* states the OPPOSITE polarity of what
     *parent_text* states — item 1's own ``value_polarity_flip``
@@ -5356,7 +5400,12 @@ def _polarity_flip(
     """
     from strata.publication import value_polarity_flip  # noqa: PLC0415 — avoids a circular import
 
-    return value_polarity_flip(child_span, parent_text, extra_antonym_pairs=pairs)
+    return value_polarity_flip(
+        child_span,
+        parent_text,
+        extra_antonym_pairs=pairs,
+        parent_term_kept_is_no_flip=parent_term_kept_is_no_flip,
+    )
 
 
 #: Item 2's own adversarial admit-check (architect ruling, round 1): ONLY
@@ -5769,6 +5818,63 @@ def verify_relation_ground(
 # ---------------------------------------------------------------------------
 
 
+_SCOPE_SETTING_PREFIX_RE = re.compile(
+    r"^\s*(?:in|on|at|during|for|within|when|if|after|before|under|across)\b[^,]*,\s*",
+    re.IGNORECASE,
+)
+_SUBJECT_CUT_RE = re.compile(
+    r"\b(?:in|on|at|for|of|during|from|with|within|across|per|to)\b", re.IGNORECASE
+)
+
+
+def _subject_head(text: str) -> tuple[str | None, set[str]]:
+    """The head noun of *text*'s subject (stemmed) and the stems of every
+    word in its leading noun phrase. A leading scope-setting clause ("On
+    night-shift, ...") is skipped and the phrase is cut at its first
+    preposition ("Hygiene appointments FOR children"). ``(None, set())``
+    when there is no verb marker to bound the phrase (an imperative), so
+    the caller treats the heads as compatible rather than guessing."""
+    from strata.publication import _overlap_stem  # noqa: PLC0415
+
+    body = _SCOPE_SETTING_PREFIX_RE.sub("", text, count=1)
+    marker = _LEADING_PHRASE_VERB_RE.search(body)
+    if marker is None:
+        return None, set()
+    phrase = body[: marker.start()]
+    cut = _SUBJECT_CUT_RE.search(phrase)
+    if cut is not None:
+        phrase = phrase[: cut.start()]
+    words = [
+        w
+        for w in re.findall(r"[a-z]+", phrase.casefold())
+        if w not in {"the", "a", "an", "all", "every", "each", "any"}
+    ]
+    stems = [_overlap_stem(w) if len(w) > 3 else w for w in words]
+    if not stems:
+        return None, set()
+    return stems[-1], set(stems)
+
+
+def _head_nouns_compatible(parent_text: str, op_text: str) -> bool:
+    """1.17.2: a shared modifier with a different head noun is a different
+    subject ("fuel dock SPILL KIT" under "fuel dock PUMPS"). The subjects
+    are the same when the heads match, or when either head appears inside
+    the other's leading phrase ("seedling TRAYS" under "SEEDLINGS"). When a
+    head can't be read, the subjects are treated as compatible: this only
+    ever narrows what the check holds where it can tell they differ."""
+    parent_head, parent_words = _subject_head(parent_text)
+    op_head, op_words = _subject_head(op_text)
+    if parent_head is None or op_head is None:
+        return True
+
+    def _same(a: str, b: str) -> bool:
+        return a == b or (len(a) >= 4 and len(b) >= 4 and (a.startswith(b) or b.startswith(a)))
+
+    return any(_same(parent_head, w) for w in op_words) or any(
+        _same(op_head, w) for w in parent_words
+    )
+
+
 _CITED_ID = re.compile(r"\b(?:op|c|pub|d)_[0-9a-z]*\d[0-9a-z]*\b")
 
 
@@ -5795,13 +5901,17 @@ def inherited_conflict(op_text: str, ancestor_text: str) -> str | None:
         return None
     if _names_a_different_instance(ancestor_text, op_text):
         return None
+    # Exemption and outdating language is about the parent rule itself, so it
+    # is held on any shared subject word, before the head-noun narrowing.
     if _exemption_marker_problem(op_text):
         return "exemption language"
     if _outdating_marker_problem(op_text):
         return "asserts the inherited directive is outdated"
+    if not _head_nouns_compatible(ancestor_text, op_text):
+        return None
     if _quantifier_softened(ancestor_text, op_text):
         return "quantifier softened"
-    if _polarity_flip(ancestor_text, op_text):
+    if _polarity_flip(ancestor_text, op_text, parent_term_kept_is_no_flip=True):
         return "polarity flip"
     if not _universal_scope_preserved(ancestor_text, op_text):
         return "narrows when/where the rule applies"
