@@ -6111,6 +6111,11 @@ def _verbatim_span(answer: dict, key: str, content: str) -> str | None:
     return span.strip() if _norm_ws(span) in _norm_ws(content) else None
 
 
+_CONTEXT_EXCEPTION_CONFLICTS = frozenset(
+    {"exemption language", "quantifier softened", "not stricter in the same direction"}
+)
+
+
 def _exception_marker(content: str, inherited_text: str) -> str | None:
     """The first exception marker anywhere in *content* — normative, habitual,
     or (for text that is not a specific past-tense report) the 1.17.2
@@ -6127,7 +6132,10 @@ def _exception_marker(content: str, inherited_text: str) -> str | None:
     specific_past = bool(_SPECIFICITY_ANCHOR_RE.search(content) and _PAST_TENSE_RE.search(content))
     if not specific_past:
         conflict = inherited_conflict(content, inherited_text)
-        if conflict is not None:
+        # Only the shapes that ARE an exception: a looser value, an exemption,
+        # a softened "every/all" or an "only" narrowing. A fact that merely
+        # doesn't restate the rule's value is not one.
+        if conflict in _CONTEXT_EXCEPTION_CONFLICTS:
             return f"undercuts the rule ({conflict})"
     return None
 
