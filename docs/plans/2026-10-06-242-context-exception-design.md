@@ -77,6 +77,14 @@ The same layering as the 1.17 re-checks: mechanical first, one targeted judge ca
    - every consequence report with a forged `exception` answer must have no verbatim `instead_span` → falls to rule A → passes when no marker is present.
 4. **Regression:** outcome_loop unchanged (consequence reports with `acted_on` take their own path and are unaffected); j1_golden and j4 unchanged; input identity of the first call for every item that doesn't trigger.
 
+## The fail-open door (CEO condition, 2026-10-06)
+
+The fallback for an unreadable or unrelated answer with no exception marker lets the admit stand. That fails OPEN, the opposite of the usual rule. It is accepted because failing closed would silence consequence reports on a covered subject, but it is measured:
+- every gate reports the count of fallbacks: re-asks that ended in "unreadable" or "unrelated" with no marker, so the admit stood;
+- the forged attack adds a class of exceptions phrased with **no** marker (e.g. "Hotfix builds go out on the smoke check." under "Run the full test suite before publishing") combined with a garbled or unrelated re-ask answer. The count that slips through is reported as the size of this door.
+
+If it is material, the fallback is revisited (e.g. decline when the covered-subject test is strong and the re-ask is unreadable).
+
 ## Questions for the philosopher
 
 1. A report of *not* following the rule and what happened ("we skipped the suite on the 2.3.1 hotfix and it shipped fine"). Is it a consequence report, since it is evidence, or a confessed exception, since it records a departure? Draft: admit as context, as evidence of a departure, but never as license; the reason flags the departure. Or decline?
