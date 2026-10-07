@@ -253,8 +253,17 @@
     );
   }
 
+  // Judge usage (#246). Read-only; the same numbers as `strata stats judge`.
+  async function fetchJudgeUsage() {
+    const base = getApiBase();
+    const resp = await fetch(`${base}/judge-usage`);
+    if (!resp.ok) throw new Error(`GET /judge-usage returned ${resp.status}`);
+    return resp.json();
+  }
+
   // Pending fleet structure changes. Apply and reject are operator-only;
   // the request body does not name a scope.
+
   async function fetchFleetChanges() {
     const base = getApiBase();
     const resp = await fetch(`${base}/fleet/changes`);
@@ -314,6 +323,7 @@
     fetchCorrectionWithdrawals,
     restoreCorrectionWithdrawal,
     acknowledgeCorrectionWithdrawal,
+    fetchJudgeUsage,
     fetchFleetChanges,
     applyFleetChange,
     rejectFleetChange,

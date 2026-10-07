@@ -39,6 +39,7 @@ _UI_FILES = [
     "format.jsx",
     "fleet-edit.jsx",
     "fleet-changes.jsx",
+    "judge-usage.jsx",
     "declines.jsx",
     "freshness.jsx",
     "record-trail.jsx",
