@@ -2708,6 +2708,11 @@ class ScopeManagerJudgment(_AmendmentJudgment):
     reasoning: str
     """Brief explanation of the verdict — written to the judgment record."""
 
+    inherited_holds: list[dict] = Field(default_factory=list)
+    """v1.17.1: ``{"contribution_id", "directive_id", "origin", "reason"}`` per
+    contribution the inherited-conflict check held (see
+    :meth:`ScopeManager._hold_inherited_conflicts`); empty when nothing was."""
+
     position_held: bool = False
     """True whenever the position gate held this contribution (see
     :meth:`ScopeManager._hold_directive_changes`) — including a directive
@@ -2940,6 +2945,10 @@ class ScopeManagerBatchJudgment(_AmendmentJudgment):
 
     dropped_ops_by_contribution: dict[str, list[str]] = Field(default_factory=dict)
     """Dropped ops (rendered) keyed by the contribution whose record notes them."""
+
+    inherited_holds: list[dict] = Field(default_factory=list)
+    """v1.17.1: the inherited-conflict check's holds, one dict per held member
+    (same shape as :attr:`ScopeManagerJudgment.inherited_holds`)."""
 
     held_by_contribution: dict[str, list[str]] = Field(default_factory=dict)
     """Held directive ids (position gate) keyed by the member whose change was held;
@@ -5173,6 +5182,42 @@ _COMPARATOR_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(rf"\bevery\s+{_COMPARATOR_VALUE}", re.IGNORECASE), "smaller"),
     (re.compile(rf"\bwithin\s+{_COMPARATOR_VALUE}", re.IGNORECASE), "smaller"),
     (re.compile(rf"\bat least\s+{_COMPARATOR_VALUE}", re.IGNORECASE), "larger"),
+    # 1.17.2: upper- and lower-bound phrasings, direction read off the
+    # parent's own words. A NEGATED bound flips the bare word's direction
+    # ("never above -70" caps the value; "never below -70" floors it), so
+    # the negated forms are tried before the bare ones.
+    (
+        re.compile(
+            rf"\b(?:never|not|no)\b[^.,;]{{0,40}}?\b(?:above|over|exceed(?:s|ing)?)\s+{_COMPARATOR_VALUE}",
+            re.IGNORECASE,
+        ),
+        "smaller",
+    ),
+    (
+        re.compile(
+            rf"\b(?:never|not|no)\b[^.,;]{{0,40}}?\b(?:below|under)\s+{_COMPARATOR_VALUE}",
+            re.IGNORECASE,
+        ),
+        "larger",
+    ),
+    (
+        re.compile(
+            rf"\b(?:a\s+)?maximum(?:\s+of)?\s+{_COMPARATOR_VALUE}|\bat most\s+{_COMPARATOR_VALUE}"
+            rf"|\b(?:no|not)\s+more than\s+{_COMPARATOR_VALUE}|\bup to\s+{_COMPARATOR_VALUE}"
+            rf"|\bless than\s+{_COMPARATOR_VALUE}|\b(?:below|under)\s+{_COMPARATOR_VALUE}",
+            re.IGNORECASE,
+        ),
+        "smaller",
+    ),
+    (
+        re.compile(
+            rf"\b(?:a\s+)?minimum(?:\s+of)?\s+{_COMPARATOR_VALUE}"
+            rf"|\b(?:no|not)\s+less than\s+{_COMPARATOR_VALUE}"
+            rf"|\bmore than\s+{_COMPARATOR_VALUE}|\b(?:above|over)\s+{_COMPARATOR_VALUE}",
+            re.IGNORECASE,
+        ),
+        "larger",
+    ),
 )
 
 
@@ -5187,6 +5232,12 @@ def _parse_comparable(value_str: str) -> float:
         hours, minutes, seconds = parts[:3]
         return hours * 3600 + minutes * 60 + seconds
     return float(value_str.replace(",", ""))
+
+
+def _matched_value(match: re.Match[str]) -> str:
+    """The value a comparator pattern captured — whichever alternative of an
+    alternation matched — without a sentence-final "." or ","."""
+    return next(group for group in match.groups() if group).rstrip(".,:")
 
 
 def _comparator_rule_ok(parent_text: str, kept_span: str) -> tuple[bool | None, str | None]:
@@ -5211,9 +5262,9 @@ def _comparator_rule_ok(parent_text: str, kept_span: str) -> tuple[bool | None, 
         child_match = pattern.search(kept_span)
         if not child_match:
             return None, None
-        parent_value_str = parent_match.group(1).replace(",", "")
+        parent_value_str = _matched_value(parent_match).replace(",", "")
         parent_value = _parse_comparable(parent_value_str)
-        child_value = _parse_comparable(child_match.group(1))
+        child_value = _parse_comparable(_matched_value(child_match))
         ok = child_value <= parent_value if direction == "smaller" else child_value >= parent_value
         return ok, parent_value_str
     return None, None
@@ -5329,6 +5380,8 @@ def _polarity_flip(
     parent_text: str,
     child_span: str,
     pairs: tuple[tuple[str, str], ...] = _RELATION_ANTONYM_PAIRS,
+    *,
+    parent_term_kept_is_no_flip: bool = False,
 ) -> bool:
     """``True`` when *child_span* states the OPPOSITE polarity of what
     *parent_text* states — item 1's own ``value_polarity_flip``
@@ -5347,7 +5400,12 @@ def _polarity_flip(
     """
     from strata.publication import value_polarity_flip  # noqa: PLC0415 — avoids a circular import
 
-    return value_polarity_flip(child_span, parent_text, extra_antonym_pairs=pairs)
+    return value_polarity_flip(
+        child_span,
+        parent_text,
+        extra_antonym_pairs=pairs,
+        parent_term_kept_is_no_flip=parent_term_kept_is_no_flip,
+    )
 
 
 #: Item 2's own adversarial admit-check (architect ruling, round 1): ONLY
@@ -5752,6 +5810,148 @@ def verify_relation_ground(
         return False, f"declined ({tighten_reason})", None, None
 
     return _context_or_fail("admitted (rescued, tightens parent)")
+
+
+# ---------------------------------------------------------------------------
+# v1.17.1 — admit-side check: a child directive that changes an inherited
+# value. Reuses #237's verifier pieces; mechanical only, no judge call.
+# ---------------------------------------------------------------------------
+
+
+_SCOPE_SETTING_PREFIX_RE = re.compile(
+    r"^\s*(?:in|on|at|during|for|within|when|if|after|before|under|across)\b[^,]*,\s*",
+    re.IGNORECASE,
+)
+_SUBJECT_CUT_RE = re.compile(
+    r"\b(?:in|on|at|for|of|during|from|with|within|across|per|to)\b", re.IGNORECASE
+)
+
+
+def _subject_head(text: str) -> tuple[str | None, set[str]]:
+    """The head noun of *text*'s subject (stemmed) and the stems of every
+    word in its leading noun phrase. A leading scope-setting clause ("On
+    night-shift, ...") is skipped and the phrase is cut at its first
+    preposition ("Hygiene appointments FOR children"). ``(None, set())``
+    when there is no verb marker to bound the phrase (an imperative), so
+    the caller treats the heads as compatible rather than guessing."""
+    from strata.publication import _overlap_stem  # noqa: PLC0415
+
+    body = _SCOPE_SETTING_PREFIX_RE.sub("", text, count=1)
+    marker = _LEADING_PHRASE_VERB_RE.search(body)
+    if marker is None:
+        return None, set()
+    phrase = body[: marker.start()]
+    cut = _SUBJECT_CUT_RE.search(phrase)
+    if cut is not None:
+        phrase = phrase[: cut.start()]
+    words = [
+        w
+        for w in re.findall(r"[a-z]+", phrase.casefold())
+        if w not in {"the", "a", "an", "all", "every", "each", "any"}
+    ]
+    stems = [_overlap_stem(w) if len(w) > 3 else w for w in words]
+    if not stems:
+        return None, set()
+    return stems[-1], set(stems)
+
+
+def _head_nouns_compatible(parent_text: str, op_text: str) -> bool:
+    """1.17.2: a shared modifier with a different head noun is a different
+    subject ("fuel dock SPILL KIT" under "fuel dock PUMPS"). The subjects
+    are the same when the heads match, or when either head appears inside
+    the other's leading phrase ("seedling TRAYS" under "SEEDLINGS"). When a
+    head can't be read, the subjects are treated as compatible: this only
+    ever narrows what the check holds where it can tell they differ."""
+    parent_head, parent_words = _subject_head(parent_text)
+    op_head, op_words = _subject_head(op_text)
+    if parent_head is None or op_head is None:
+        return True
+
+    def _same(a: str, b: str) -> bool:
+        return a == b or (len(a) >= 4 and len(b) >= 4 and (a.startswith(b) or b.startswith(a)))
+
+    return any(_same(parent_head, w) for w in op_words) or any(
+        _same(op_head, w) for w in parent_words
+    )
+
+
+_CITED_ID = re.compile(r"\b(?:op|c|pub|d)_[0-9a-z]*\d[0-9a-z]*\b")
+
+
+def inherited_conflict(op_text: str, ancestor_text: str) -> str | None:
+    """Why *op_text* (a directive a bound session wants admitted) conflicts
+    with the inherited directive *ancestor_text*, or ``None`` when it does not.
+
+    A child may TIGHTEN an inherited rule, never change it. An uncovered
+    subject passes untouched (a genuine refinement); a covered subject must
+    pass the same tighten test #237's verifier applies on the rescue path —
+    the value comparator, plus the whole-content exemption, outdating,
+    softening, polarity/change-marker and universal-scope guards. A
+    restatement of the fact unchanged plus an own constraint passes.
+
+    Pure and mechanical. Stated limits: "covered" is a leading-noun-phrase
+    proxy, and a parent with no comparable value, polarity word or marker
+    gives the value test nothing to compare, so a contradiction phrased
+    without any of them is not caught here (the judge's own ruling stands).
+    """
+    # A cited directive id ("per operator directive op_tls123") is a
+    # reference, not a value; left in, its digits read as an unkept value.
+    op_text = _CITED_ID.sub("", op_text)
+    if not _is_covered_subject(ancestor_text, op_text):
+        return None
+    if _names_a_different_instance(ancestor_text, op_text):
+        return None
+    # Exemption and outdating language is about the parent rule itself, so it
+    # is held on any shared subject word, before the head-noun narrowing.
+    if _exemption_marker_problem(op_text):
+        return "exemption language"
+    if _outdating_marker_problem(op_text):
+        return "asserts the inherited directive is outdated"
+    if not _head_nouns_compatible(ancestor_text, op_text):
+        return None
+    if _quantifier_softened(ancestor_text, op_text):
+        return "quantifier softened"
+    if _polarity_flip(ancestor_text, op_text, parent_term_kept_is_no_flip=True):
+        return "polarity flip"
+    if not _universal_scope_preserved(ancestor_text, op_text):
+        return "narrows when/where the rule applies"
+    ok, reason = _tighten_value_check(ancestor_text, op_text)
+    return None if ok else reason
+
+
+def _inherited_directive_texts(
+    ancestor_directives: Sequence[tuple[str, Sequence[Directive]]] | None,
+    operator_memory: Sequence[tuple[str, Sequence[OperatorItem]]] | None,
+) -> list[tuple[str, str, str]]:
+    """``(id, origin label, text)`` for every rendered inherited directive:
+    ancestor-scope directives and operator directives."""
+    out: list[tuple[str, str, str]] = []
+    for ancestor_scope_id, directives in ancestor_directives or ():
+        out.extend((d.id, ancestor_scope_id, d.content) for d in directives)
+    for attachment_scope_id, items in operator_memory or ():
+        out.extend(
+            (item.id, f"operator, {attachment_scope_id}", item.content)
+            for item in items
+            if item.kind == "directive"
+        )
+    return out
+
+
+def _first_inherited_conflict(
+    op_text: str, inherited: Sequence[tuple[str, str, str]]
+) -> tuple[str, str, str] | None:
+    for directive_id, origin, text in inherited:
+        reason = inherited_conflict(op_text, text)
+        if reason is not None:
+            return directive_id, origin, reason
+    return None
+
+
+def _inherited_hold_note(directive_id: str, origin: str) -> str:
+    return (
+        f"[Held: conflicts with inherited directive {directive_id} ({origin}); "
+        "a child may tighten an inherited rule, not change it.]"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -6791,13 +6991,185 @@ class ScopeManager:
                 else None
             ),
         )
-        return self._hold_directive_changes(
+        judgment = self._hold_inherited_conflicts(
             judgment.model_copy(update={"contribution_id": new_contribution.id}),
             scope=scope,
             current_summary=current_summary,
             new_contribution=new_contribution,
             mode=mode,
+            ancestor_directives=ancestor_directives,
+            operator_memory=operator_memory,
+        )
+        return self._hold_directive_changes(
+            judgment,
+            scope=scope,
+            current_summary=current_summary,
+            new_contribution=new_contribution,
+            mode=mode,
             input_changes=input_changes,
+        )
+
+    @staticmethod
+    def _hold_inherited_conflicts(
+        judgment: ScopeManagerJudgment,
+        *,
+        scope: Scope,
+        current_summary: ScopeSummary | None,
+        new_contribution: Contribution,
+        mode: JudgeMode,
+        ancestor_directives: Sequence[tuple[str, Sequence[Directive]]] | None,
+        operator_memory: Sequence[tuple[str, Sequence[OperatorItem]]] | None,
+    ) -> ScopeManagerJudgment:
+        """v1.17.1: a child may tighten an inherited rule, not change it.
+
+        Mechanical and post-judgment (no judge call, the judge's inputs are
+        untouched). For an admitted directive op owned by a contributor bound
+        to *scope*, checked against every rendered inherited directive
+        (ancestor and operator) with :func:`inherited_conflict`. A conflict
+        holds the contribution: admitted as context under an engine-written
+        line carrying the held note, every directive op dropped. Fails toward
+        context, never toward a contradicting directive. Contributions from
+        any other position are the position gate's.
+        """
+        if judgment.decision == "decline" or mode != "ordinary":
+            return judgment
+        if new_contribution.contributor.scope_id != scope.id:
+            return judgment
+        inherited = _inherited_directive_texts(ancestor_directives, operator_memory)
+        if not inherited:
+            return judgment
+        hit = None
+        for op in judgment.directive_ops:
+            if op.op in _ADMITTING_OPS:
+                hit = _first_inherited_conflict(op.content or new_contribution.content, inherited)
+                if hit is not None:
+                    break
+        if hit is None:
+            return judgment
+        directive_id, origin, reason = hit
+        note = _inherited_hold_note(directive_id, origin)
+        who = new_contribution.contributor.skill or new_contribution.contributor.session_id
+        line = (
+            f"[{new_contribution.id}] {who} ({new_contribution.contributor.scope_id}) "
+            f"proposed: {new_contribution.content.strip()} — {note}"
+        )
+        previous = current_summary.context if current_summary is not None else ""
+        context = _append_line(previous, line)
+        return judgment.model_copy(
+            update={
+                "decision": "accept_as_context",
+                "reasoning": f"{judgment.reasoning} {note}",
+                "directive_ops": [],
+                "new_context": context,
+                "new_summary": _apply_amendment(
+                    scope=scope,
+                    current_summary=current_summary,
+                    contribution=new_contribution,
+                    ops=[],
+                    new_context=context,
+                ),
+                "inherited_holds": [
+                    {
+                        "contribution_id": new_contribution.id,
+                        "directive_id": directive_id,
+                        "origin": origin,
+                        "reason": reason,
+                    }
+                ],
+            }
+        )
+
+    @staticmethod
+    def _hold_batch_inherited_conflicts(
+        judgment: ScopeManagerBatchJudgment,
+        *,
+        scope: Scope,
+        current_summary: ScopeSummary | None,
+        contributions: Mapping[str, Contribution],
+        mode: JudgeMode,
+        ancestor_directives: Sequence[tuple[str, Sequence[Directive]]] | None,
+        operator_memory: Sequence[tuple[str, Sequence[OperatorItem]]] | None,
+    ) -> ScopeManagerBatchJudgment:
+        """:meth:`_hold_inherited_conflicts`, carried to the batch.
+
+        A member bound to *scope* whose admitted op conflicts has every op it
+        owns dropped and its verdict becomes ``accept_as_context``. Known gap
+        against the single path (the same one the position gate states): the
+        batch's one context rewrite belongs to every member, so the judge's
+        own rewrite is kept and the engine's held lines are appended to it;
+        a rewrite that itself restates the held claim is not removed.
+        """
+        if mode != "ordinary":
+            return judgment
+        inherited = _inherited_directive_texts(ancestor_directives, operator_memory)
+        if not inherited:
+            return judgment
+        accepted = {v.contribution_id for v in judgment.accepted_verdicts}
+        hits: dict[str, tuple[str, str, str]] = {}
+        for op in judgment.directive_ops:
+            cid = op.contribution_id
+            if (
+                op.op in _ADMITTING_OPS
+                and cid in accepted
+                and cid not in hits
+                and contributions[cid].contributor.scope_id == scope.id
+            ):
+                hit = _first_inherited_conflict(op.content or contributions[cid].content, inherited)
+                if hit is not None:
+                    hits[cid] = hit
+        if not hits:
+            return judgment
+        kept = [op for op in judgment.directive_ops if op.contribution_id not in hits]
+        context = (
+            judgment.new_context
+            if judgment.new_context is not None
+            else (current_summary.context if current_summary is not None else "")
+        )
+        holds: list[dict] = []
+        notes: dict[str, str] = {}
+        for cid in sorted(hits):
+            directive_id, origin, reason = hits[cid]
+            note = _inherited_hold_note(directive_id, origin)
+            notes[cid] = note
+            who = contributions[cid].contributor.skill or contributions[cid].contributor.session_id
+            context = _append_line(
+                context,
+                f"[{cid}] {who} ({contributions[cid].contributor.scope_id}) "
+                f"proposed: {contributions[cid].content.strip()} — {note}",
+            )
+            holds.append(
+                {
+                    "contribution_id": cid,
+                    "directive_id": directive_id,
+                    "origin": origin,
+                    "reason": reason,
+                }
+            )
+        verdicts = [
+            v.model_copy(
+                update={
+                    "decision": "accept_as_context",
+                    "reasoning": f"{v.reasoning} {notes[v.contribution_id]}",
+                }
+            )
+            if v.contribution_id in hits
+            else v
+            for v in judgment.verdicts
+        ]
+        return judgment.model_copy(
+            update={
+                "verdicts": verdicts,
+                "directive_ops": kept,
+                "new_context": context,
+                "inherited_holds": holds,
+                "new_summary": _apply_batch_amendment(
+                    scope=scope,
+                    current_summary=current_summary,
+                    contributions=contributions,
+                    ops=kept,
+                    new_context=context,
+                ),
+            }
         )
 
     @staticmethod
@@ -8041,6 +8413,7 @@ class ScopeManager:
                 dropped_ops_by_contribution=(
                     {only.id: list(judgment.dropped_ops)} if judgment.dropped_ops else {}
                 ),
+                inherited_holds=judgment.inherited_holds,
                 held_directive_changes=judgment.held_directive_changes,
                 held_ops=judgment.held_ops,
                 held_context=judgment.held_context,
@@ -8216,6 +8589,15 @@ class ScopeManager:
             # defaults to False here, so the generic branch is always what
             # a second slip reaches).
             parse_generic_decline=_generic_second_slip_batch_decline,
+        )
+        batch_judgment = self._hold_batch_inherited_conflicts(
+            batch_judgment,
+            scope=scope,
+            current_summary=current_summary,
+            contributions=contributions,
+            mode=mode,
+            ancestor_directives=ancestor_directives,
+            operator_memory=operator_memory,
         )
         return self._hold_batch_directive_changes(
             batch_judgment,

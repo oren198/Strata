@@ -2,13 +2,13 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.oren198/strata",
   "description": "Shared memory for a fleet of AI coding agents, checked by an LLM judge before it lands.",
-  "version": "1.17.0",
+  "version": "1.17.2",
   "packages": [
     {
       "registryType": "pypi",
       "registryBaseUrl": "https://pypi.org",
       "identifier": "strata-mem",
-      "version": "1.17.0",
+      "version": "1.17.2",
       "transport": {
         "type": "stdio"
       },

@@ -5,8 +5,8 @@ __pycache__/
 dist/
 build/
 *.egg-info/
-.venv/
-venv/
+.venv
+venv
 .env
 *.db
 *.sqlite*
@@ -48,3 +48,6 @@ fleet.yaml
 /strata.db-wal
 /sessions/
 # fleet.yaml is intentionally NOT listed above — commit it (it is your team's org chart).
+
+# Local fleet work area (handoffs, reviews, scratch tooling, outside reports) — never committed or packaged
+.work/

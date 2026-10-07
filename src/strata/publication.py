@@ -2338,6 +2338,8 @@ def value_polarity_flip(
     claim_text: str,
     reference_text: str,
     extra_antonym_pairs: Sequence[tuple[str, str]] = (),
+    *,
+    parent_term_kept_is_no_flip: bool = False,
 ) -> bool:
     """#219's polarity guard, as a FLIP check — architect review round 2 of
     10327f6's bridge replay: the PRIOR shape (every :data:`_POL_WORDS` word
@@ -2368,6 +2370,11 @@ def value_polarity_flip(
       CHANGE from the reference's own value with no antonym pair or
       negation marker necessarily involved at all.
 
+    *parent_term_kept_is_no_flip* (1.17.2, the inherited-directive check
+    only): an antonym pair whose BOTH words the claim states is not a flip
+    by that pair — the claim keeps the reference's own term and adds a
+    clause around it. Off by default; every other caller is unchanged.
+
     Pure and reusable: shared by v1.17 item 1's own
     ``directive_or_publication`` ground check and item 2's ``refines``/
     ``tightens`` fact-mode polarity guard (its own relation antonyms are
@@ -2396,6 +2403,11 @@ def value_polarity_flip(
             bool(first_re.search(ref_cf)),
             bool(second_re.search(ref_cf)),
         )
+        if parent_term_kept_is_no_flip and claim_has_first and claim_has_second:
+            # 1.17.2: the claim keeps the reference's own term, so the
+            # other word of the pair is an added clause ("On night-shift,
+            # pumps are switched off ..."), not a reversal of it.
+            continue
         if claim_has_first and ref_has_second and not ref_has_first:
             return True
         if claim_has_second and ref_has_first and not ref_has_second:

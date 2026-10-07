@@ -58,8 +58,28 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Build wheel
-        run: pipx run build --wheel
+      # Build the sdist first and the wheel FROM it (the same path PyPI
+      # publishing takes), so a bad source archive fails here on the PR, not
+      # at release time — e.g. a tracked symlink to an absolute path made
+      # the 1.17.1 sdist unbuildable (tarfile.AbsoluteLinkError).
+      - name: Build sdist and wheel
+        run: pipx run build
+
+      - name: Source archive carries no symlinks and no virtualenv
+        run: |
+          set -eu
+          if tar -tvzf dist/*.tar.gz | grep -E '^l'; then
+            echo "sdist contains symlinks (above)"; exit 1
+          fi
+          if tar -tzf dist/*.tar.gz | grep -E '/(\.venv|venv)(/|$)'; then
+            echo "sdist contains a virtualenv (above)"; exit 1
+          fi
+
+      - name: Install the sdist into a clean venv
+        run: |
+          python -m venv /tmp/sdistenv
+          /tmp/sdistenv/bin/pip install --quiet dist/*.tar.gz
+          /tmp/sdistenv/bin/strata --help > /dev/null
 
       - name: Install wheel into a clean venv
         run: |
