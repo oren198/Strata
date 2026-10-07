@@ -122,6 +122,18 @@ is capped at the 50 most recent retirements for the scope — older ones stay
 in the record and are still retired, they just drop off this convenience
 list.
 
+## Fleet changes
+
+The "Fleet changes" tab lists structure changes that are waiting for the
+operator: a new scope, a re-parent, a reference edge, a removal, a
+description. Apply and Reject act as the operator. A request cannot name a
+scope to apply as. A change a scope already owned was applied when it was
+proposed and does not appear here.
+
+Removing a reference edge, removing a scope, or re-parenting prints the
+limit of what Strata does not yet re-check. Nothing on this tab is judged,
+and nothing here emits a change event.
+
 ## Editing the fleet
 
 The "Edit fleet" button in the graph tab's header opens a text editor over

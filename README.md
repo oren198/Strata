@@ -879,6 +879,19 @@ strata start --reload                           # uvicorn auto-reload (dev mode)
 strata start --port 8001                        # serve on a different port
 ```
 
+### Fleet structure changes
+
+`strata fleet pending` lists changes a scope proposed that it does not own.
+`strata fleet apply <id>` and `strata fleet reject <id>` decide them as the
+operator. `strata fleet add-scope`, `remove-scope`, `reparent`, `add-edge`,
+`remove-edge`, and `describe` apply immediately, also as the operator. A
+scope proposes the same changes with the MCP tools `strata_fleet_propose`,
+`strata_fleet_pending`, `strata_fleet_approve`, and `strata_fleet_reject`;
+the acting scope is the session's binding. The Console's Fleet changes tab
+is the same operator list. A change is recorded and not judged. Removing a
+reference, removing a scope, or re-parenting prints what is not re-checked
+automatically yet.
+
 ### `strata launch` — frictionless CC session binding (ADR 0003)
 
 `strata launch [scope_id]` validates the target scope against `fleet.yaml`

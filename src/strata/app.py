@@ -99,6 +99,17 @@ from strata import __version__
 from strata.bootstrap import load_fleet_config
 from strata.change_events import DIRECTIVE_UNSPLICED, new_change_id
 from strata.change_events import emit as emit_change_event
+from strata.fleet_changes import (
+    Actor,
+    FleetChangeError,
+    list_approvable,
+    names_an_actor,
+)
+from strata.fleet_changes import (
+    approve as approve_fleet_change,
+)
+from strata.fleet_changes import flag_phrases as fleet_flag_phrases
+from strata.fleet_changes import reject as reject_fleet_change
 from strata.fleet_config import FleetConfig, FleetConfigError, Scope, Stratum
 from strata.fleet_reload import FleetReloader
 from strata.locks import BATCH_CAP, QUEUE_WAIT_TIMEOUT_S, QueueTicket, configure_lock_dir
@@ -3191,6 +3202,123 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
                 "restart them to pick this up"
             ),
         }
+
+    # -----------------------------------------------------------------------
+    # Fleet structure changes (#247). Operator-only over HTTP: a request
+    # cannot propose or approve as a scope. There is no propose route.
+    # -----------------------------------------------------------------------
+
+    def _fleet_change_body(result) -> dict:
+        return {
+            "status": result.status,
+            "proposal_id": result.proposal_id,
+            "act_id": result.act_id,
+            "change_type": result.change_type,
+            "proposer_position": result.proposer_position,
+            "approver_position": result.approver_position,
+            "owner_scope_id": result.owner_scope_id,
+            "widens_proposer_reach": result.widens_proposer_reach,
+            "changes_proposer_binding": result.changes_proposer_binding,
+            "flags": fleet_flag_phrases(
+                widens=result.widens_proposer_reach,
+                binds=result.changes_proposer_binding,
+            ),
+            "notices": list(result.notices),
+            "backup": result.backup,
+        }
+
+    async def _refuse_scoped_fleet_actor(request: Request) -> None:
+        """400 when the request tries to act as a scope. The operator is the only actor."""
+        if names_an_actor(request.query_params.keys()):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Fleet apply is operator-only. A request cannot propose or approve as a scope."
+                ),
+            )
+        raw = await request.body()
+        if not raw.strip():
+            return
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise HTTPException(status_code=400, detail="Request body is not valid JSON.") from exc
+        if isinstance(data, dict) and names_an_actor(data.keys()):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Fleet apply is operator-only. A request cannot propose or approve as a scope."
+                ),
+            )
+
+    def _raise_fleet_change(exc: FleetChangeError) -> None:
+        status = 422
+        if exc.kind == "not_found":
+            status = 404
+        elif exc.kind == "not_pending":
+            status = 409
+        elif exc.kind == "not_authorized":
+            status = 403
+        raise HTTPException(status_code=status, detail=exc.message) from exc
+
+    @application.get("/fleet/changes")
+    def get_fleet_changes(
+        request: Request,
+        record_store: RecordStore = Depends(get_record_store),
+    ) -> dict:
+        """Pending fleet changes. The Console is the operator, so this is the full list."""
+        fleet: FleetConfig = request.app.state.fleet_reloader.get()
+        proposals = list_approvable(fleet, record_store, Actor(None))
+        return {
+            "changes": [
+                {
+                    "id": proposal.id,
+                    "change_type": proposal.change_type,
+                    "payload": proposal.payload,
+                    "proposer_position": proposal.proposer_position,
+                    "owner_scope_id": proposal.owner_scope_id,
+                    "widens_proposer_reach": proposal.widens_proposer_reach,
+                    "changes_proposer_binding": proposal.changes_proposer_binding,
+                    "flags": fleet_flag_phrases(
+                        widens=proposal.widens_proposer_reach,
+                        binds=proposal.changes_proposer_binding,
+                    ),
+                }
+                for proposal in proposals
+            ]
+        }
+
+    @application.post("/fleet/changes/{change_id}/apply")
+    async def apply_pending_fleet_change(
+        change_id: str,
+        request: Request,
+        record_store: RecordStore = Depends(get_record_store),
+    ) -> dict:
+        """Apply a pending change as the operator. A scope identity in the request is refused."""
+        await _refuse_scoped_fleet_actor(request)
+        fleet: FleetConfig = request.app.state.fleet_reloader.get()
+        try:
+            result = approve_fleet_change(fleet, record_store, change_id, approver=Actor(None))
+        except FleetChangeError as exc:
+            _raise_fleet_change(exc)
+        except FleetConfigError as exc:
+            raise HTTPException(status_code=422, detail=exc.message) from exc
+        return _fleet_change_body(result)
+
+    @application.post("/fleet/changes/{change_id}/reject")
+    async def reject_pending_fleet_change(
+        change_id: str,
+        request: Request,
+        record_store: RecordStore = Depends(get_record_store),
+    ) -> dict:
+        """Reject a pending change as the operator. A scope identity in the request is refused."""
+        await _refuse_scoped_fleet_actor(request)
+        fleet: FleetConfig = request.app.state.fleet_reloader.get()
+        try:
+            result = reject_fleet_change(fleet, record_store, change_id, approver=Actor(None))
+        except FleetChangeError as exc:
+            _raise_fleet_change(exc)
+        return _fleet_change_body(result)
 
     # -----------------------------------------------------------------------
     # GET /staleness

@@ -129,6 +129,15 @@ class FleetChangeResult:
     backup: str | None
 
 
+def names_an_actor(keys) -> bool:
+    """True when a request mapping tries to name who is proposing or approving.
+
+    The acting position is the MCP session binding, or the operator on the
+    local HTTP API. It is never a field of the request.
+    """
+    return bool(_ACTOR_KEYS & set(keys))
+
+
 def flag_phrases(*, widens: bool, binds: bool) -> list[str]:
     """The mechanical flag sentences, in a stable order."""
     phrases: list[str] = []

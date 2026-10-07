@@ -73,6 +73,14 @@ the release PR (`dev` → `main`) and the GitHub Release body are built from
   permission profiles do not apply while `sandbox_mode` is set, so
   register does not write a Codex deny. The Strata server still reads the
   store — it is a process, not a harness tool.
+- **Fleet structure changes go through Strata** (#247). A scope proposes
+  with `strata_fleet_propose`; the change applies immediately when that
+  scope owns it or sits above the owner, and otherwise waits for
+  `strata_fleet_approve`, `strata fleet apply`, or the Console's Fleet
+  changes tab. The acting scope is the MCP session's binding. Over HTTP
+  the operator is the only actor. Each applied change is recorded and
+  not judged. Removing a reference edge, removing a scope, or
+  re-parenting says what is not re-checked automatically yet.
 
 ## 1.17.2 (2026-10-06)
 

@@ -243,6 +243,10 @@ function App() {
           <SettingsScreen state={state} dispatch={dispatch} onFlash={flash} />
         )}
 
+        {tab === "fleet-changes" && (
+          <FleetChangesView onFlash={flash} />
+        )}
+
         {tab === "fleet-edit" && (
           <FleetEditView
             onDirtyChange={setFleetEditDirty}
@@ -362,6 +366,13 @@ function TopBar({ tab, onTab, dark, onToggleDark }) {
         >
           <Icon name="megaphone" size={13} style={{ marginRight: 6, verticalAlign: "-2px" }} />
           Publications
+        </button>
+        <button
+          className={"at-tab" + (tab === "fleet-changes" ? " active" : "")}
+          onClick={() => onTab("fleet-changes")}
+        >
+          <Icon name="git-pull-request" size={13} style={{ marginRight: 6, verticalAlign: "-2px" }} />
+          Fleet changes
         </button>
         <button
           className={"at-tab" + (tab === "settings" ? " active" : "")}
