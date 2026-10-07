@@ -818,6 +818,40 @@ def cmd_record(args: argparse.Namespace) -> int:
 _stats_parser: argparse.ArgumentParser | None = None
 
 
+def cmd_stats_judge(args: argparse.Namespace) -> int:
+    """``strata stats judge`` — tokens and cost per scope, call kind, and day.
+
+    Cost comes only from ``STRATA_JUDGE_PRICE_TABLE``. With no price for a
+    model, that row shows tokens and says so.
+    """
+    import json
+
+    from strata.judge_usage import (  # noqa: PLC0415
+        format_judge_usage_report,
+        judge_usage_report,
+    )
+    from strata.project_config import resolve_storage_paths  # noqa: PLC0415
+    from strata.stores import EmbeddedStoreError, open_embedded_stores  # noqa: PLC0415
+
+    since = args.since
+    if since is not None and not since.strip():
+        print("--since must be an ISO date or time.", file=sys.stderr)
+        return 1
+    try:
+        stores = open_embedded_stores()
+    except EmbeddedStoreError as exc:
+        print(exc.message, file=sys.stderr)
+        return 1
+    with stores:
+        db_path = resolve_storage_paths().db_path
+    report = judge_usage_report(db_path, since=since, scope_id=args.scope)
+    if args.json:
+        print(json.dumps(report, indent=2))
+    else:
+        print(format_judge_usage_report(report))
+    return 0
+
+
 def cmd_stats_root(args: argparse.Namespace) -> int:
     """``strata stats`` with no subcommand — print the group's help."""
     if _stats_parser is not None:
@@ -3289,32 +3323,33 @@ def _probe_judge_live(resolved: object) -> str | None:
     endpoint (a router, a gateway) is guaranteed to serve; a model listing is not.
 
     Sends the SAME provider pin (#224, ``resolved.provider``) the real
-    judge calls would — via :func:`strata.settings.apply_provider_pin` —
-    so this probes the exact route a pinned run actually takes, never an
-    unpinned one a pin would never use. A ``NotFoundError`` against a
+    judge calls would — via :func:`strata.judge_usage.metered_messages_create`,
+    which applies :func:`strata.settings.apply_provider_pin` — so this
+    probes the exact route a pinned run actually takes, never an unpinned
+    one a pin would never use. A ``NotFoundError`` against a
     pinned probe is reported as the pinned provider rejecting the model,
     not a generic endpoint finding, since that is the more useful
     diagnosis once a provider is configured.
     """
     import anthropic  # noqa: PLC0415
 
-    from strata.settings import apply_provider_pin  # noqa: PLC0415
+    from strata.judge_usage import JudgeDailyCapReached, metered_messages_create  # noqa: PLC0415
 
     model = resolved.model  # type: ignore[attr-defined]
     provider = getattr(resolved, "provider", None)
     try:
         client = _build_probe_client(resolved)
-        client.messages.create(
-            **apply_provider_pin(
-                {
-                    "model": model,
-                    "max_tokens": 1,
-                    "messages": [{"role": "user", "content": "ping"}],
-                },
-                provider=provider,
-                client=client,
-            )
+        metered_messages_create(
+            client,
+            {
+                "model": model,
+                "max_tokens": 1,
+                "messages": [{"role": "user", "content": "ping"}],
+            },
+            provider=provider,
         )
+    except JudgeDailyCapReached as exc:
+        return str(exc)
     except anthropic.APIConnectionError as exc:
         return f"the endpoint is unreachable ({type(exc).__name__})"
     except anthropic.NotFoundError:
@@ -3336,11 +3371,25 @@ def _probe_judge(resolved: object) -> str | None:
 
 
 def _check_judge(project_root: Path) -> Check:
-    """Doctor's judge line: what will judge, and (with a key) whether it answers."""
+    """Doctor's judge line: what will judge, and (with a key) whether it answers.
+
+    The line also names the daily token cap and today's recorded usage (#246).
+    """
+    from strata.judge_usage import cap_status_text  # noqa: PLC0415
+    from strata.project_config import resolve_storage_paths  # noqa: PLC0415
     from strata.settings import Settings  # noqa: PLC0415
 
-    resolved = Settings(_env_file=project_root / ".env").resolved_judge
-    line = _judge_line(resolved)
+    settings = Settings(_env_file=project_root / ".env")
+    resolved = settings.resolved_judge
+    try:
+        db_path = resolve_storage_paths(settings, start=project_root).db_path
+    except Exception:  # noqa: BLE001 — the cap line must not hide the judge check
+        db_path = None
+    line = (
+        _judge_line(resolved)
+        + "\n    "
+        + cap_status_text(db_path, cap=settings.judge_daily_token_cap)
+    )
     if not resolved.api_key:
         return Check(name="Judge", kind="soft", passed=True, message=line)
     failure = _probe_judge(resolved)
@@ -5438,6 +5487,25 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Write one JSON line per session ({session_id, harness, outcome, accepted_count}).",
     )
     p_stats_wb.set_defaults(func=cmd_stats_writeback)
+
+    p_stats_judge = stats_sub.add_parser(
+        "judge",
+        help="Judge calls, tokens, and cost by scope, call kind, and day.",
+    )
+    p_stats_judge.add_argument(
+        "--since",
+        default=None,
+        metavar="ISO",
+        help="Only calls at or after this ISO 8601 date or time.",
+    )
+    p_stats_judge.add_argument(
+        "--scope",
+        default=None,
+        metavar="SCOPE",
+        help="Only calls recorded for this scope id.",
+    )
+    p_stats_judge.add_argument("--json", action="store_true", help="Print the report as JSON.")
+    p_stats_judge.set_defaults(func=cmd_stats_judge)
 
     p_doctor = sub.add_parser(
         "doctor",

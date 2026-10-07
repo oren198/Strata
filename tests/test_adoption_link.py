@@ -404,6 +404,7 @@ def test_migration_0022_applies_on_a_populated_0021_database(tmp_path: Path) -> 
     assert run_migrations(db_path) == [
         "0022_adopted_from.sql",
         "0023_fleet_structure_act.sql",
+        "0024_judge_usage.sql",
     ]
 
     conn = sqlite3.connect(db_path)

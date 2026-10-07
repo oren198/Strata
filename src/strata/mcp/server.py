@@ -166,6 +166,9 @@ def _init_stores() -> None:
     """
     global _record_store, _summary_store, _session_store
     run_migrations(_db_path)
+    from strata.judge_usage import bind_usage_db  # noqa: PLC0415
+
+    bind_usage_db(_db_path)
     configure_lock_dir(Path(_db_path).parent / ".locks")
     _record_store = RecordStore(_db_path)
     _summary_store = SummaryStore(_summaries_dir)

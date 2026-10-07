@@ -2868,7 +2868,13 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
         # keeps serving the last good fleet — see get_fleet()/list_scopes_endpoint.
         fleet_path = pathlib.Path(paths.fleet_yaml_path)
         app.state.fleet_reloader = FleetReloader(fleet_path)
-        yield
+        from strata.judge_usage import bind_usage_db, unbind_usage_db  # noqa: PLC0415
+
+        previous_usage_db = bind_usage_db(paths.db_path)
+        try:
+            yield
+        finally:
+            unbind_usage_db(previous_usage_db)
 
     application = FastAPI(
         title="Strata",
@@ -3319,6 +3325,21 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
         except FleetChangeError as exc:
             _raise_fleet_change(exc)
         return _fleet_change_body(result)
+
+    # -----------------------------------------------------------------------
+    # GET /judge-usage — read-only (#246). Same numbers as `strata stats judge`.
+    # -----------------------------------------------------------------------
+
+    @application.get("/judge-usage")
+    def get_judge_usage(
+        since: str | None = None,
+        scope_id: str | None = None,
+        paths: StoragePaths = Depends(get_storage_paths),
+    ) -> dict:
+        """Judge calls, tokens, today's total, and the daily cap. Nothing here is written."""
+        from strata.judge_usage import judge_usage_report  # noqa: PLC0415
+
+        return judge_usage_report(paths.db_path, since=since, scope_id=scope_id)
 
     # -----------------------------------------------------------------------
     # GET /staleness

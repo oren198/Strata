@@ -1008,36 +1008,35 @@ def _default_draft_fn(
     reaches the judged contribute path.
 
     *provider* (#224): the same ``JUDGE_PROVIDER``/``STRATA_JUDGE_PROVIDER``
-    pin the judge itself uses, applied here via
-    :func:`strata.settings.apply_provider_pin` — this call speaks to the
-    SAME endpoint the judge does, so an unpinned drafter would otherwise
-    leak to a provider a user configured the pin specifically to avoid
-    (residency, compliance).
+    pin the judge itself uses, applied by
+    :func:`strata.judge_usage.metered_messages_create` — this call speaks
+    to the SAME endpoint the judge does, so an unpinned drafter would
+    otherwise leak to a provider a user configured the pin specifically to
+    avoid (residency, compliance). Usage for the call is recorded there too.
     """
     if not api_key or not transcript_tail.strip():
         return None
     try:
-        from strata.settings import apply_provider_pin, construct_judge_client  # noqa: PLC0415
+        from strata.judge_usage import metered_messages_create  # noqa: PLC0415
+        from strata.settings import construct_judge_client  # noqa: PLC0415
 
         client = construct_judge_client(api_key=api_key, base_url=base_url)
-        response = client.messages.create(
-            **apply_provider_pin(
-                {
-                    "model": model,
-                    "max_tokens": 1024,
-                    "system": _DRAFT_SYSTEM,
-                    "tools": [_DRAFT_TOOL],
-                    "tool_choice": {"type": "tool", "name": "record_freshness_verdict"},
-                    "messages": [
-                        {
-                            "role": "user",
-                            "content": f"Session transcript tail:\n\n{transcript_tail}",
-                        }
-                    ],
-                },
-                provider=provider,
-                client=client,
-            ),
+        response = metered_messages_create(
+            client,
+            {
+                "model": model,
+                "max_tokens": 1024,
+                "system": _DRAFT_SYSTEM,
+                "tools": [_DRAFT_TOOL],
+                "tool_choice": {"type": "tool", "name": "record_freshness_verdict"},
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": f"Session transcript tail:\n\n{transcript_tail}",
+                    }
+                ],
+            },
+            provider=provider,
         )
     except Exception as exc:  # noqa: BLE001 — drafting is best-effort
         _logger.debug("freshness evaluator draft call failed: %s", exc)

@@ -6498,11 +6498,15 @@ class ScopeManager:
         decision is made across the whole engine (also used by the
         freshness evaluator's drafter and ``strata doctor``'s live probe);
         see that function's own docstring.
-        """
-        from strata.settings import apply_provider_pin  # noqa: PLC0415
 
-        apply_provider_pin(kwargs, provider=self._judge_provider, client=self._client)
-        return self._client.messages.create(**kwargs)
+        Usage metering (#246) is recorded here too, via
+        :func:`strata.judge_usage.metered_messages_create`. That function
+        does not add a field to *kwargs*. The daily token cap, when set,
+        is applied there before a first or standalone call.
+        """
+        from strata.judge_usage import metered_messages_create  # noqa: PLC0415
+
+        return metered_messages_create(self._client, kwargs, provider=self._judge_provider)
 
     def judge(
         self,

@@ -27,9 +27,10 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from pydantic import AliasChoices, Field, PrivateAttr, model_validator
+from pydantic import AliasChoices, Field, PrivateAttr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from strata.judge_usage import parse_daily_token_cap
 from strata.session_state import DEFAULT_SESSION_IDLE_WINDOW_SECONDS
 
 #: The default judge (measured 2026-09-20; see the README's "Choosing a judge").
@@ -216,6 +217,15 @@ class Settings(BaseSettings):
     # more than a cap's worth of contributions at once. 1 disables coalescing
     # — every contribution is judged on its own, as before this ADR.
     judgment_batch_cap: int = Field(default=5, ge=1)
+    # #246: unset means no daily cap. A non-integer or a negative value is
+    # off, not zero — zero would refuse every judge call.
+    judge_daily_token_cap: int | None = Field(default=None)
+
+    @field_validator("judge_daily_token_cap", mode="before")
+    @classmethod
+    def _cap_off_when_unset(cls, value: object) -> int | None:
+        return parse_daily_token_cap(value)
+
     # An explicit validation_alias (rather than the auto-generated
     # STRATA_ANTHROPIC_API_KEY-only mapping) so the bare ANTHROPIC_API_KEY
     # spelling — the convention used by the Anthropic SDK and most tooling —
