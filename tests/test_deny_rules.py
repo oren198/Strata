@@ -232,10 +232,23 @@ def _write_config(project: Path, body: str) -> None:
     (strata / "config.toml").write_text(body, encoding="utf-8")
 
 
+def _spec(path: Path, suffix: str) -> str:
+    """A Claude pattern for an absolute *path* (``suffix`` is ``/**`` or ``*``)."""
+    return f"/{path.resolve().as_posix()}{suffix}"
+
+
 def _read_rule(path: Path, *, directory: bool) -> str:
     """The ``Read(...)`` string register emits for an absolute *path*."""
     suffix = "/**" if directory else ""
-    return f"Read(/{path.resolve().as_posix()}{suffix})"
+    return f"Read({_spec(path, suffix)})"
+
+
+def _rule_pairs(*specs: str) -> list[str]:
+    rules: list[str] = []
+    for spec in specs:
+        rules.append(f"Read({spec})")
+        rules.append(f"Edit({spec})")
+    return rules
 
 
 def test_no_config_resolves_to_the_seeded_dot_strata_rules(tmp_path: Path) -> None:
@@ -264,22 +277,23 @@ def test_register_denies_an_external_fleet_directory(tmp_path: Path) -> None:
 
     assert _register(project) == 0
 
-    external = f"/{fleet.resolve().as_posix()}/**"
+    # The fleet directory holds fleet.yaml next to the database. Deny the
+    # database file and Strata's own subdirectories, not the directory itself
+    # and not fleet.yaml.
+    fleet_root = fleet.resolve()
+    owned = _rule_pairs(
+        "/.strata/**",
+        _spec(fleet_root / ".locks", "/**"),
+        _spec(fleet_root / "sessions", "/**"),
+        _spec(fleet_root / "strata.db", "*"),
+        _spec(fleet_root / "summaries", "/**"),
+    )
     data = _settings(project)
     assert data["permissions"]["allow"] == ["Bash(npm test)"]
-    assert data["permissions"]["deny"] == [
-        user_deny,
-        "Read(/.strata/**)",
-        "Edit(/.strata/**)",
-        f"Read({external})",
-        f"Edit({external})",
-    ]
-    assert install.claude_store_deny_rules(project) == (
-        "Read(/.strata/**)",
-        "Edit(/.strata/**)",
-        f"Read({external})",
-        f"Edit({external})",
-    )
+    assert data["permissions"]["deny"] == [user_deny, *owned]
+    assert install.claude_store_deny_rules(project) == tuple(owned)
+    assert f"Read({_spec(fleet_root, '/**')})" not in data["permissions"]["deny"]
+    assert all("fleet.yaml" not in rule for rule in data["permissions"]["deny"])
     settings_path = project / ".claude" / "settings.json"
     before = settings_path.read_bytes()
     assert _register(project) == 0
@@ -318,10 +332,11 @@ def test_doctor_checks_the_resolved_external_rules(
     monkeypatch.setenv("STRATA_AGENT_SESSION_ID", "sess_test")
     capsys.readouterr()
 
-    external = f"Read(/{fleet.resolve().as_posix()}/**)"
+    external = f"Read({_spec(db, '*')})"
     rc, output = _run_doctor(tmp_path, monkeypatch, capsys)
     assert rc == 0
     assert external in output
+    assert f"Read({_spec(fleet, '/**')})" not in output
     assert "Read(/.strata/**)" in output
 
     data = _settings(tmp_path)
@@ -386,14 +401,16 @@ def test_split_store_directories_are_each_denied(tmp_path: Path) -> None:
 
     rules = install.claude_store_deny_rules(project)
 
-    expected_dirs = [db_dir, fleet_dir, mem / "summaries", mem / "sessions"]
-    for directory in expected_dirs:
-        assert _read_rule(directory, directory=True) in rules
-        assert _read_rule(directory, directory=True).replace("Read", "Edit", 1) in rules
+    assert f"Read({_spec(db_dir / 'strata.db', '*')})" in rules
+    assert _read_rule(db_dir / ".locks", directory=True) in rules
+    assert _read_rule(mem / "summaries", directory=True) in rules
+    assert _read_rule(mem / "sessions", directory=True) in rules
     assert "Read(/.strata/**)" in rules
     assert "Edit(/.strata/**)" in rules
-    # The lock directory lives under the database directory, so it collapses.
-    assert _read_rule(db_dir / ".locks", directory=True) not in rules
+    # The database's directory and the fleet file's directory stay open.
+    assert _read_rule(db_dir, directory=True) not in rules
+    assert _read_rule(fleet_dir, directory=True) not in rules
+    assert all("fleet.yaml" not in rule for rule in rules)
 
 
 def test_legacy_root_layout_denies_files_not_the_project(tmp_path: Path) -> None:
@@ -414,8 +431,6 @@ def test_legacy_root_layout_denies_files_not_the_project(tmp_path: Path) -> None
         "Edit(/.locks/**)",
         "Read(/.strata/**)",
         "Edit(/.strata/**)",
-        "Read(/fleet.yaml)",
-        "Edit(/fleet.yaml)",
         "Read(/sessions/**)",
         "Edit(/sessions/**)",
         "Read(/strata.db*)",
@@ -423,6 +438,7 @@ def test_legacy_root_layout_denies_files_not_the_project(tmp_path: Path) -> None
         "Read(/summaries/**)",
         "Edit(/summaries/**)",
     )
+    assert all("fleet.yaml" not in rule for rule in rules)
 
 
 def test_file_in_an_ancestor_does_not_deny_that_ancestor(tmp_path: Path) -> None:
@@ -464,13 +480,17 @@ def test_explicit_paths_name_a_store_that_is_not_on_disk_yet(tmp_path: Path) -> 
         fleet_yaml=fleet / "fleet.yaml",
         summaries_dir=fleet / "summaries",
     )
-    external = f"/{fleet.resolve().as_posix()}/**"
-    assert rules == (
-        "Read(/.strata/**)",
-        "Edit(/.strata/**)",
-        f"Read({external})",
-        f"Edit({external})",
+    fleet_root = fleet.resolve()
+    assert rules == tuple(
+        _rule_pairs(
+            "/.strata/**",
+            _spec(fleet_root / ".locks", "/**"),
+            _spec(fleet_root / "sessions", "/**"),
+            _spec(fleet_root / "strata.db", "*"),
+            _spec(fleet_root / "summaries", "/**"),
+        )
     )
+    assert f"Read({_spec(fleet_root, '/**')})" not in rules
 
 
 def test_diff_preview_names_an_adopted_root_store(
@@ -504,7 +524,238 @@ def test_diff_preview_names_an_adopted_root_store(
     assert "Read(/strata.db*)" in output
     assert "Read(/summaries/**)" in output
     assert "Read(/.strata/**)" in output
+    assert "Read(/fleet.yaml)" not in output
     assert "Read(/**)" not in output
+
+
+def _patch_home(monkeypatch: pytest.MonkeyPatch, home: Path) -> None:
+    monkeypatch.setattr(install, "_user_home", lambda: home.resolve())
+
+
+def test_coverage_names_python_node_and_sqlite3() -> None:
+    text = install.CLAUDE_STRATA_DENY_COVERAGE
+    assert "Python or Node" in text
+    assert "sqlite3" in text
+    assert "grep" not in text
+
+
+def test_shared_directory_does_not_deny_other_repos(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    dev = home / "dev"
+    project = dev / "repo-a"
+    other = dev / "repo-b"
+    project.mkdir(parents=True)
+    other.mkdir()
+    (other / "README").write_text("other repo\n", encoding="utf-8")
+    (dev / "Makefile").write_text("all:\n", encoding="utf-8")
+    _patch_home(monkeypatch, home)
+    db = dev / "strata.db"
+    _write_config(
+        project,
+        "\n".join(
+            [
+                f'db = "{db.as_posix()}"',
+                'fleet_yaml = ".strata/fleet.yaml"',
+                'summaries_dir = ".strata/summaries"',
+                "",
+            ]
+        ),
+    )
+
+    rules = install.claude_store_deny_rules(project)
+
+    assert f"Read({_spec(db, '*')})" in rules
+    assert f"Read({_spec(dev, '/**')})" not in rules
+    assert f"Read({_spec(other, '/**')})" not in rules
+    assert "Read(/.strata/**)" in rules
+    assert all("Makefile" not in rule and "repo-b" not in rule for rule in rules)
+    assert all("fleet.yaml" not in rule for rule in rules)
+
+
+def test_fleet_yaml_in_home_is_not_denied(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    home = tmp_path / "home"
+    project = home / "proj"
+    project.mkdir(parents=True)
+    (home / "notes.txt").write_text("personal\n", encoding="utf-8")
+    _patch_home(monkeypatch, home)
+    db = home / "strata.db"
+    _write_config(
+        project,
+        "\n".join(
+            [
+                f'db = "{db.as_posix()}"',
+                f'fleet_yaml = "{(home / "fleet.yaml").as_posix()}"',
+                'summaries_dir = ".strata/summaries"',
+                "",
+            ]
+        ),
+    )
+
+    rules = install.claude_store_deny_rules(project)
+
+    assert f"Read({_spec(home, '/**')})" not in rules
+    assert f"Read({_spec(db, '*')})" in rules
+    assert f"Read({_spec(home / '.locks', '/**')})" in rules
+    assert "Read(/.strata/**)" in rules
+    assert all("fleet.yaml" not in rule for rule in rules)
+
+
+def test_generic_home_directories_are_left_open_until_strata_creates_them(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    home = tmp_path / "home"
+    summaries = home / "summaries"
+    summaries.mkdir(parents=True)
+    (summaries / "notes.txt").write_text("mine\n", encoding="utf-8")
+    _patch_home(monkeypatch, home)
+    _init_project(tmp_path)
+    _write_config(
+        tmp_path,
+        "\n".join(
+            [
+                'db = ".strata/strata.db"',
+                'fleet_yaml = ".strata/fleet.yaml"',
+                f'summaries_dir = "{summaries.as_posix()}"',
+                "",
+            ]
+        ),
+    )
+
+    plan = install.claude_store_deny_plan(tmp_path)
+    sessions = home / "sessions"
+    assert f"Read({_spec(summaries, '/**')})" not in plan.rules
+    assert f"Read({_spec(sessions, '/**')})" not in plan.rules
+    assert any(
+        summaries.resolve().as_posix() in line and "home directory" in line for line in plan.skipped
+    )
+    assert any(
+        sessions.resolve().as_posix() in line and "home directory" in line for line in plan.skipped
+    )
+
+    assert _register(tmp_path) == 0
+    from strata.migrator import run_migrations
+
+    run_migrations(str(tmp_path / ".strata" / "strata.db"))
+    monkeypatch.setenv("STRATA_AGENT_SCOPE", "g_root")
+    monkeypatch.setenv("STRATA_AGENT_SKILL", "strata-worker")
+    monkeypatch.setenv("STRATA_AGENT_SESSION_ID", "sess_test")
+    capsys.readouterr()
+
+    rc, output = _run_doctor(tmp_path, monkeypatch, capsys)
+    assert rc == 0
+    assert "Not denied:" in output
+    assert summaries.resolve().as_posix() in output
+    assert "Strata did not create it" in output
+
+
+def test_generic_summaries_under_home_are_denied_when_strata_created_them(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    project = home / "proj"
+    summaries = home / "summaries"
+    summaries.mkdir(parents=True)
+    (summaries / "g_root.md").write_text(
+        "---\nscope_id: g_root\nversion: 1\n---\n# Scope: g_root\n",
+        encoding="utf-8",
+    )
+    _patch_home(monkeypatch, home)
+    project.mkdir()
+    _write_config(
+        project,
+        "\n".join(
+            [
+                'db = ".strata/strata.db"',
+                'fleet_yaml = ".strata/fleet.yaml"',
+                f'summaries_dir = "{summaries.as_posix()}"',
+                "",
+            ]
+        ),
+    )
+
+    rules = install.claude_store_deny_rules(project)
+
+    assert f"Read({_spec(summaries, '/**')})" in rules
+    assert f"Edit({_spec(summaries, '/**')})" in rules
+
+
+def test_generic_directory_under_a_project_ancestor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    dev = home / "dev"
+    project = dev / "repo"
+    summaries = dev / "summaries"
+    project.mkdir(parents=True)
+    summaries.mkdir()
+    (summaries / "notes.txt").write_text("not strata\n", encoding="utf-8")
+    _patch_home(monkeypatch, home)
+    _write_config(
+        project,
+        "\n".join(
+            [
+                'db = ".strata/strata.db"',
+                'fleet_yaml = ".strata/fleet.yaml"',
+                f'summaries_dir = "{summaries.as_posix()}"',
+                "",
+            ]
+        ),
+    )
+
+    plan = install.claude_store_deny_plan(project)
+    assert f"Read({_spec(summaries, '/**')})" not in plan.rules
+    assert any(
+        summaries.resolve().as_posix() in line and "ancestor of the project" in line
+        for line in plan.skipped
+    )
+
+    (summaries / "notes.txt").unlink()
+    (summaries / "g_root.md").write_text(
+        "---\nscope_id: g_root\n---\n# Scope: g_root\n",
+        encoding="utf-8",
+    )
+    created = install.claude_store_deny_plan(project)
+    assert f"Read({_spec(summaries, '/**')})" in created.rules
+
+
+def test_sessions_directory_above_home_is_not_denied(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # summaries_dir is the home directory, so the sessions sibling is
+    # <parent-of-home>/sessions — next to home, not inside it.
+    home = tmp_path / "users" / "me"
+    project = home / "proj"
+    project.mkdir(parents=True)
+    sessions = home.parent / "sessions"
+    sessions.mkdir()
+    (sessions / "sess.json").write_text(
+        '{"connected_at": "t", "tool_calls": 1, "strict_blocks": 0}\n',
+        encoding="utf-8",
+    )
+    _patch_home(monkeypatch, home)
+    _write_config(
+        project,
+        "\n".join(
+            [
+                'db = ".strata/strata.db"',
+                'fleet_yaml = ".strata/fleet.yaml"',
+                f'summaries_dir = "{home.as_posix()}"',
+                "",
+            ]
+        ),
+    )
+
+    plan = install.claude_store_deny_plan(project)
+
+    assert f"Read({_spec(sessions, '/**')})" not in plan.rules
+    assert f"Read({_spec(home, '/**')})" not in plan.rules
+    assert any(
+        sessions.resolve().as_posix() in line and "resolves above the home directory" in line
+        for line in plan.skipped
+    )
+    assert any("contains the project" in line for line in plan.skipped)
 
 
 # ---------------------------------------------------------------------------

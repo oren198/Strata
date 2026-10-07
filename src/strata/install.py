@@ -11,9 +11,9 @@ operations Strata performs when it wires itself into a foreign project:
 * skill copying into ``.claude/skills/`` (each skill is copied only when
   absent),
 * an additive ``permissions.deny`` merge into ``.claude/settings.json`` so
-  Claude Code cannot open ``.strata/`` with its file tools (ADR 0013 D6,
-  issue #173) — Codex's sandbox config cannot deny a workspace path, and
-  register does not invent one, and
+  Claude Code cannot open the resolved store with its file tools (ADR 0013
+  D6, issue #173) — Codex's sandbox config cannot deny a workspace path,
+  and register does not invent one, and
 * ``--diff`` line rendering (the read-only "what would change" view).
 
 The rules live here, once. ``strata register`` (:mod:`strata.__main__`) is
@@ -121,6 +121,8 @@ __all__ = [
     "CLAUDE_STRATA_DENY_COVERAGE",
     "CODEX_WORKSPACE_DENY_GAP",
     "codex_sandbox_can_deny_workspace_path",
+    "StoreDenyPlan",
+    "claude_store_deny_plan",
     "claude_store_deny_rules",
     "strata_deny_rules_present",
     "merge_strata_deny_rules",
@@ -876,17 +878,23 @@ def _remove_hook_event(
 # * Read and Edit deny rules apply to Claude Code's file tools, to the shell
 #   file commands it recognizes (``cat``, ``head``, ``tail``, ``sed``,
 #   ``tee``), and to Bash redirections (``> file``, ``< file``). They do not
-#   apply to a command that reads the files without naming them (``grep -r``
-#   from the store directory) or to an arbitrary subprocess (Python, Node)
-#   that opens the file itself. This is harness permission enforcement, not
-#   an OS boundary.
+#   apply to a Python or Node process, or the ``sqlite3`` shell, that opens
+#   the file itself. This is harness permission enforcement, not an OS
+#   boundary.
 #
 # The seeded layout keeps db, fleet, and summaries under ``.strata/``, and
 # those rules are :data:`CLAUDE_STRATA_DENY_RULES`. A project config can point
 # the same three paths elsewhere (issue #184; ``resolve_storage_paths``).
-# Register denies the directories that config actually resolves, and still
-# denies ``.strata/`` itself because that directory holds the config.
-# Register never denies the project root.
+# Register denies ``.strata/`` because that directory holds the config, the
+# database file (``<db>*``, which also covers ``-wal`` and ``-shm``), and the
+# summaries, sessions, and ``.locks`` directories when each one is Strata's
+# own. It does not deny a parent directory that merely holds the database or
+# ``fleet.yaml`` — a database in a shared checkout directory must not hide
+# the other repositories there. ``fleet.yaml`` itself is not denied.
+# A generic ``summaries`` or ``sessions`` directory directly under the home
+# directory, or under an ancestor of the project, is denied only when Strata
+# created it. A directory that resolves above the home directory is left
+# open. Register never denies the project root or the home directory.
 #
 # Codex: see :func:`codex_sandbox_can_deny_workspace_path`. Register does not
 # write a Codex deny, because the sandbox config cannot express one and the
@@ -905,9 +913,8 @@ CLAUDE_STRATA_DENY_RULES: tuple[str, ...] = (
 CLAUDE_STRATA_DENY_COVERAGE = (
     "blocks Claude Code's Read, Edit, and Write tools on the resolved store, "
     "the shell file commands it recognizes (cat, head, tail, sed, tee), and "
-    "Bash redirections onto those paths; does not block a command that reads "
-    "the files without naming them (grep -r from the store directory) or a "
-    "Python or Node process that opens the files itself"
+    "Bash redirections onto those paths; does not block a Python or Node "
+    "process, or the sqlite3 shell, that opens the files itself"
 )
 
 #: Why ``strata register`` writes no Codex deny. See
@@ -992,68 +999,186 @@ def _collapse_directories(directories: list[Path]) -> list[Path]:
     ]
 
 
-def _covers_project(directory: Path, project_root: Path) -> bool:
-    """True when a directory deny of *directory* would also deny *project_root*."""
-    return directory == project_root or project_root.is_relative_to(directory)
+@dataclass(frozen=True)
+class StoreDenyPlan:
+    """Deny rules for one project, and the store paths left open on purpose.
 
-
-def _store_targets(
-    project_root: Path,
-    *,
-    db: Path,
-    fleet_yaml: Path,
-    summaries_dir: Path,
-) -> tuple[list[Path], list[Path]]:
-    """``(directories, files)`` the deny rules must cover.
-
-    A directory that is the project root, or that contains it, is not
-    returned — denying one of those would deny the whole project. A database
-    or fleet file in that situation is returned as a file instead (the
-    legacy layout keeps ``strata.db`` in the project root; a file sitting in
-    an ancestor of the project, such as ``/home/you/strata.db`` next to
-    ``/home/you/proj``, is the same case).
+    ``skipped`` lines are what ``strata doctor`` prints. Each one is a path
+    Strata was asked about and did not deny: a shared parent of the database
+    or ``fleet.yaml``, the home directory, a directory above home, or a
+    generic ``summaries`` / ``sessions`` name Strata did not create.
     """
-    from strata.session_state import sessions_dir_for  # noqa: PLC0415
 
-    root = project_root.resolve()
-    db = Path(db).resolve()
-    fleet = Path(fleet_yaml).resolve()
-    summaries = Path(summaries_dir).resolve()
-    candidates = [
-        root / ".strata",
-        db.parent,
-        summaries,
-        sessions_dir_for(summaries),
-        fleet.parent,
-        db.parent / ".locks",
-    ]
-    directories: list[Path] = []
-    for candidate in candidates:
-        resolved = candidate.resolve()
-        if _covers_project(resolved, root):
-            continue
-        directories.append(resolved)
-    files: list[Path] = []
-    if _covers_project(db.parent, root):
-        files.append(db)
-    if _covers_project(fleet.parent, root) and fleet != db:
-        files.append(fleet)
-    return _collapse_directories(directories), files
+    rules: tuple[str, ...]
+    skipped: tuple[str, ...]
+
+
+#: Directory names that are ordinary words, not Strata's own. Directly under
+#: the home directory or an ancestor of the project they are denied only when
+#: the directory holds Strata's files and nothing else.
+_GENERIC_STORE_DIR_NAMES = frozenset({"summaries", "sessions"})
+
+
+def _text_head(path: Path, limit: int = 2048) -> str:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")[:limit]
+    except OSError:
+        return ""
+
+
+def _is_summary_artifact(child: Path) -> bool:
+    """True for a scope summary, a publication, or the operator layer."""
+    if child.is_dir():
+        return child.name == "operator"
+    if not child.is_file():
+        return False
+    if not (child.name.endswith(".md") or child.name.endswith(".md.tmp")):
+        return False
+    return "scope_id:" in _text_head(child)
+
+
+def _is_session_artifact(child: Path) -> bool:
+    """True for a session-state file or its lock, and nothing else."""
+    name = child.name
+    if name == ".connect-seam-unavailable":
+        return child.is_file()
+    if name.endswith((".json.eval.lock", ".json.lock", ".json.tmp")):
+        return child.is_file()
+    if name.endswith(".json") and child.is_file():
+        head = _text_head(child)
+        return any(key in head for key in ('"connected_at"', '"strict_blocks"', '"tool_calls"'))
+    return False
+
+
+def _strata_created_directory(directory: Path, kind: str) -> bool:
+    """True when *directory* exists and every entry is one of Strata's files.
+
+    A missing or empty directory is not evidence that Strata created it. A
+    foreign file means the directory was already somebody else's.
+    """
+    if not directory.is_dir():
+        return False
+    try:
+        children = list(directory.iterdir())
+    except OSError:
+        return False
+    if not children:
+        return False
+    check = _is_summary_artifact if kind == "summaries" else _is_session_artifact
+    return all(check(child) for child in children)
+
+
+def _resolves_above_home(directory: Path, home: Path, project_root: Path) -> bool:
+    """True when denying *directory* would reach outside *home*.
+
+    The sessions directory is the sibling ``sessions`` of the summaries
+    directory. When summaries sits on the home directory, that sibling is
+    ``<parent-of-home>/sessions`` — next to home, or higher, such as
+    ``/sessions``. Denying it would hide a path the user does not own.
+    A path inside the project (``.strata/``) is not above home, even when a
+    home directory happens to sit inside that project.
+    """
+    if directory != home and directory.is_relative_to(home):
+        return False
+    if directory == home or home.is_relative_to(directory):
+        return True
+    if directory.is_relative_to(project_root):
+        return False
+    parent = directory.parent
+    return parent == home or home.is_relative_to(parent)
+
+
+def _generic_shared_place(directory: Path, project_root: Path, home: Path) -> str | None:
+    """``"home"`` or ``"ancestor"`` when *directory* is a generic name there.
+
+    ``~/summaries`` and ``~/dev/sessions`` (with the project at
+    ``~/dev/repo``) are the cases. ``<project>/summaries`` is not: the
+    project itself is not an ancestor of the project.
+    """
+    if directory.name not in _GENERIC_STORE_DIR_NAMES:
+        return None
+    parent = directory.parent
+    if parent == home:
+        return "home"
+    current = project_root.parent
+    while True:
+        if parent == current:
+            return "ancestor"
+        nxt = current.parent
+        if nxt == current:
+            return None
+        current = nxt
+
+
+def _skip_line(path: Path, reason: str) -> str:
+    return f"{path.as_posix()}: {reason}"
+
+
+def _user_home() -> Path:
+    """The home directory deny rules must not reach outside of."""
+    return Path.home().resolve()
+
+
+def _append_store_directory(
+    directories: list[Path],
+    skipped: list[str],
+    directory: Path,
+    *,
+    project_root: Path,
+    home: Path,
+    db_parent: Path,
+    fleet_parent: Path,
+    kind: str,
+) -> None:
+    """Add *directory* when Strata owns it; otherwise record why it was left open."""
+    resolved = directory.resolve()
+    if resolved in (db_parent, fleet_parent):
+        skipped.append(
+            _skip_line(
+                resolved,
+                "is the database's or fleet file's parent directory, so it is not denied",
+            )
+        )
+        return
+    if resolved == project_root or project_root.is_relative_to(resolved):
+        skipped.append(_skip_line(resolved, "contains the project, so it is not denied"))
+        return
+    if resolved == home:
+        skipped.append(_skip_line(resolved, "is the home directory, so it is not denied"))
+        return
+    if _resolves_above_home(resolved, home, project_root):
+        skipped.append(
+            _skip_line(resolved, "resolves above the home directory, so it is not denied")
+        )
+        return
+    place = _generic_shared_place(resolved, project_root, home)
+    if place is not None and not _strata_created_directory(resolved, kind):
+        where = "the home directory" if place == "home" else "an ancestor of the project"
+        skipped.append(
+            _skip_line(
+                resolved,
+                "generic directory directly under "
+                f"{where}, and Strata did not create it, so it is not denied",
+            )
+        )
+        return
+    directories.append(resolved)
+
+
+def _inside_denied(path: Path, directories: list[Path]) -> bool:
+    return any(path == directory or path.is_relative_to(directory) for directory in directories)
 
 
 def _rules_for_targets(
     project_root: Path, directories: list[Path], files: list[Path]
 ) -> tuple[str, ...]:
-    """Read+Edit rules for *directories* and *files*, project-relative first."""
+    """Read+Edit rules for *directories* and database *files*, project-relative first."""
     specs: list[str] = []
     for directory in directories:
         specs.append(_deny_spec(directory, project_root, directory=True))
     for file in files:
-        spec = _deny_spec(file, project_root, directory=False)
-        # SQLite also writes ``<db>-wal`` and ``<db>-shm`` beside the database.
-        if file.name.endswith(".db") or file.suffix == ".db":
-            spec += "*"
-        specs.append(spec)
+        # ``<db>*`` also matches the ``-wal`` and ``-shm`` siblings.
+        specs.append(_deny_spec(file, project_root, directory=False) + "*")
     rules: list[str] = []
     for spec in sorted(set(specs), key=lambda item: (item.startswith("//"), item)):
         rules.append(f"Read({spec})")
@@ -1061,30 +1186,33 @@ def _rules_for_targets(
     return tuple(rules)
 
 
-def claude_store_deny_rules(
+def claude_store_deny_plan(
     project_root: Path,
     *,
     db: Path | None = None,
     fleet_yaml: Path | None = None,
     summaries_dir: Path | None = None,
-) -> tuple[str, ...]:
+) -> StoreDenyPlan:
     """Claude Code deny rules for the store *project_root* actually resolves.
 
     Reads ``<project_root>/.strata/config.toml`` when that file is this
     project's config (a parent project's config is ignored). Relative paths
     in it are resolved the same way :func:`strata.project_config._parse_config`
     resolves them. With no config, the seeded layout under ``.strata/`` is
-    used, and the result is :data:`CLAUDE_STRATA_DENY_RULES`.
+    used, and :attr:`StoreDenyPlan.rules` is :data:`CLAUDE_STRATA_DENY_RULES`.
 
     Pass *db*, *fleet_yaml*, and *summaries_dir* together to name a store
     that is not on disk yet — ``strata register --diff`` adopting an existing
     store prints the rules it would write before it writes ``config.toml``.
 
-    The ``.strata/`` directory is always included: it holds the config, and
-    on the seeded layout it holds the store. An external fleet directory is
-    added beside it. The project root itself is never a deny target.
+    ``.strata/`` is always included: it holds the config, and on the seeded
+    layout it holds the store. The database is a file rule. Summaries, the
+    sessions directory beside them, and ``.locks`` are directory rules only
+    when that directory is Strata's own. ``fleet.yaml`` is not a rule.
+    :attr:`StoreDenyPlan.skipped` names the paths left open, for doctor.
     """
     from strata.project_config import ProjectConfigError, _parse_config  # noqa: PLC0415
+    from strata.session_state import sessions_dir_for  # noqa: PLC0415
 
     root = Path(project_root).resolve()
     supplied = (db, fleet_yaml, summaries_dir)
@@ -1108,10 +1236,77 @@ def claude_store_deny_rules(
         db = root / ".strata" / "strata.db"
         fleet_yaml = root / ".strata" / "fleet.yaml"
         summaries_dir = root / ".strata" / "summaries"
-    directories, files = _store_targets(
-        root, db=db, fleet_yaml=fleet_yaml, summaries_dir=summaries_dir
+
+    home = _user_home()
+    db_path = Path(db).resolve()
+    fleet_path = Path(fleet_yaml).resolve()
+    summaries = Path(summaries_dir).resolve()
+    sessions = sessions_dir_for(summaries).resolve()
+    locks = (db_path.parent / ".locks").resolve()
+
+    directories: list[Path] = []
+    skipped: list[str] = []
+    strata_dir = (root / ".strata").resolve()
+    if (
+        strata_dir != root
+        and not root.is_relative_to(strata_dir)
+        and strata_dir != home
+        and not _resolves_above_home(strata_dir, home, root)
+    ):
+        directories.append(strata_dir)
+
+    for directory, kind in (
+        (summaries, "summaries"),
+        (sessions, "sessions"),
+        (locks, "locks"),
+    ):
+        _append_store_directory(
+            directories,
+            skipped,
+            directory,
+            project_root=root,
+            home=home,
+            db_parent=db_path.parent,
+            fleet_parent=fleet_path.parent,
+            kind=kind,
+        )
+    directories = _collapse_directories(directories)
+
+    files: list[Path] = []
+    if _inside_denied(db_path, directories):
+        pass
+    elif db_path in (root, home) or root.is_relative_to(db_path) or home.is_relative_to(db_path):
+        skipped.append(_skip_line(db_path, "contains the project or the home directory"))
+    else:
+        files.append(db_path)
+
+    unique_skipped: list[str] = []
+    for line in skipped:
+        if line in unique_skipped:
+            continue
+        # A path denied by a broader rule (``.strata/`` covers the seeded
+        # store) does not need a "left open" note.
+        covered = Path(line.split(": ", 1)[0])
+        if _inside_denied(covered, directories):
+            continue
+        unique_skipped.append(line)
+    return StoreDenyPlan(
+        rules=_rules_for_targets(root, directories, files),
+        skipped=tuple(unique_skipped),
     )
-    return _rules_for_targets(root, directories, files)
+
+
+def claude_store_deny_rules(
+    project_root: Path,
+    *,
+    db: Path | None = None,
+    fleet_yaml: Path | None = None,
+    summaries_dir: Path | None = None,
+) -> tuple[str, ...]:
+    """The deny rules from :func:`claude_store_deny_plan`, without the skip notes."""
+    return claude_store_deny_plan(
+        project_root, db=db, fleet_yaml=fleet_yaml, summaries_dir=summaries_dir
+    ).rules
 
 
 def _wanted_deny_rules(rules: tuple[str, ...] | None) -> tuple[str, ...]:

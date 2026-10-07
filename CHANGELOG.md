@@ -48,29 +48,33 @@ the release PR (`dev` → `main`) and the GitHub Release body are built from
   - A report reaches the issuer only if the contributor follows the `acted_on`
     suggestion.
 
-## 1.17.2 (2026-10-06)
-
 ### Added
 
 - **`strata register` seeds Claude Code deny rules for the resolved store**
   (#173, ADR 0013 D6). `permissions.deny` in `.claude/settings.json` gains
-  `Read` and `Edit` rules for the directories `.strata/config.toml` resolves
-  (`db`, `fleet_yaml`, `summaries_dir`, plus the sessions directory beside
-  the summaries and `.strata/` itself). The seeded layout is
-  `Read(/.strata/**)` and `Edit(/.strata/**)`. A store outside the project
-  is named with a filesystem-absolute `//` pattern. Rules are appended
-  beside any the user already has and left unchanged on a second register.
-  `strata doctor` checks the resolved rules, not a hardcoded `.strata/`.
-  A `Write(path)` rule is not seeded: Claude Code accepts it and never
+  `Read` and `Edit` rules for the store `.strata/config.toml` resolves.
+  The seeded layout is `Read(/.strata/**)` and `Edit(/.strata/**)`. A
+  database elsewhere is named per file (`<db>*`, which also covers the
+  `-wal` and `-shm` files), not by denying the directory that holds it.
+  Summaries, the sessions directory beside them, and `.locks` are denied
+  as directories only when that directory is Strata's own. `fleet.yaml`
+  is not denied. A generic `summaries` or `sessions` directory directly
+  under the home directory or an ancestor of the project is denied only
+  when Strata created it; otherwise `strata doctor` says it was left open.
+  A directory that resolves above the home directory is left open. Rules
+  are appended beside any the user already has and left unchanged on a
+  second register. `strata doctor` checks the resolved rules. A
+  `Write(path)` rule is not seeded: Claude Code accepts it and never
   consults it. The rules block Claude Code's file tools, the shell file
   commands it recognizes (`cat`, `head`, `tail`, `sed`, `tee`), and Bash
-  redirections onto those paths. They do not block a command that reads the
-  files without naming them (`grep -r` from the store directory) or a
-  Python or Node process that opens the files itself. Codex's sandbox
-  config cannot deny a path inside a writable workspace, and its permission
-  profiles do not apply while `sandbox_mode` is set, so register does not
-  write a Codex deny. The Strata server still reads the store — it is a
-  process, not a harness tool.
+  redirections onto those paths. They do not block a Python or Node
+  process, or the `sqlite3` shell, that opens the files itself. Codex's
+  sandbox config cannot deny a path inside a writable workspace, and its
+  permission profiles do not apply while `sandbox_mode` is set, so
+  register does not write a Codex deny. The Strata server still reads the
+  store — it is a process, not a harness tool.
+
+## 1.17.2 (2026-10-06)
 
 ### Fixed
 

@@ -22,18 +22,25 @@ so one agent's mistake never corrupts what the rest of the fleet reads.
 `strata register` seeds Claude Code deny rules for the store
 `.strata/config.toml` actually resolves. The seeded layout lives under
 `.strata/`, and the rules are then `Read(/.strata/**)` and
-`Edit(/.strata/**)` in `.claude/settings.json`. A store kept elsewhere
-(for example `db`, `fleet_yaml`, and `summaries_dir` all under
-`/home/you/strata-fleet/`) is denied at that directory too, with a
-filesystem-absolute `//` pattern, and `.strata/` stays denied because the
-config lives there. Those rules cover Claude Code's Read, Edit, and Write
-tools, the shell file commands it recognizes (`cat`, `head`, `tail`, `sed`,
-`tee`), and Bash redirections onto those paths. They do not stop a command
-that reads the files without naming them (`grep -r` from the store
-directory) or a Python or Node process that opens the files itself, and a
-`Write(path)` rule is not written because Claude Code never consults one. Codex's sandbox config cannot deny a path inside a writable
-workspace, so register does not seed one there. Outside a harness that
-enforces the deny, scoping is discipline, not security.
+`Edit(/.strata/**)` in `.claude/settings.json`. A database kept elsewhere
+is denied per file (`<db>*`, which also covers the `-wal` and `-shm`
+files), not by denying the directory that holds it — a database in a
+shared checkout directory must not hide the other repositories there.
+Summaries, the sessions directory beside them, and `.locks` are denied as
+directories only when that directory is Strata's own. `fleet.yaml` is not
+denied. A generic `summaries` or `sessions` directory directly under your
+home directory, or under an ancestor of the project, is denied only when
+Strata created it; otherwise `strata doctor` says it was left open. A
+directory that resolves above your home directory is left open too.
+`.strata/` stays denied because the config lives there. Those rules cover
+Claude Code's Read, Edit, and Write tools, the shell file commands it
+recognizes (`cat`, `head`, `tail`, `sed`, `tee`), and Bash redirections
+onto those paths. They do not stop a Python or Node process, or the
+`sqlite3` shell, that opens the files itself. A `Write(path)` rule is not
+written because Claude Code never consults one. Codex's sandbox config
+cannot deny a path inside a writable workspace, so register does not seed
+one there. Outside a harness that enforces the deny, scoping is discipline,
+not security.
 
 For the full theory and vocabulary, see
 [`docs/philosophy.md`](https://github.com/oren198/Strata/blob/main/docs/philosophy.md) (why Strata exists, why naive
