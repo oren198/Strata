@@ -12,6 +12,8 @@ change do not have a kind yet; apply reports that limit in prose instead.
 from __future__ import annotations
 
 import copy
+import json
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -21,6 +23,7 @@ from pydantic import ValidationError
 
 from strata.fleet_config import (
     FleetConfig,
+    FleetConfigError,
     _resolve_edges,
     _schema_error_to_fleet_config_error,
     _validate,
@@ -367,6 +370,30 @@ def approve(
     except Exception:
         record_store.reopen_fleet_change_proposal(proposal_id)
         raise
+
+
+def cli_fleet(args: object) -> int:
+    """Run one ``strata fleet`` subcommand. Prints notices and returns 0 or 1.
+
+    Direct subcommands (add-scope, remove-scope, reparent, add-edge,
+    remove-edge, describe) apply as the operator. ``apply`` and ``reject``
+    act on a pending id, also as the operator.
+    """
+    db = getattr(args, "db", None)
+    fleet_path = getattr(args, "fleet_path", None)
+    try:
+        fleet, store = _open_cli(db, fleet_path)
+    except (FleetChangeError, FleetConfigError, OSError) as exc:
+        message = exc.message if isinstance(exc, (FleetChangeError, FleetConfigError)) else str(exc)
+        print(message, file=sys.stderr)
+        return 1
+    try:
+        return _cli_dispatch(args, fleet, store)
+    except (FleetChangeError, FleetConfigError) as exc:
+        print(exc.message, file=sys.stderr)
+        return 1
+    finally:
+        store.close()
 
 
 def reject(
@@ -824,3 +851,97 @@ def _subtree_label(fleet: FleetConfig, scope_id: str) -> str:
 def _chain_label(fleet: FleetConfig, parent_id: str) -> str:
     ancestors = [scope.id for scope in fleet.inter_stratum_ancestors(parent_id)]
     return " → ".join([*ancestors, parent_id])
+
+
+def _open_cli(db: str | None, fleet_path: str | None) -> tuple[FleetConfig, RecordStore]:
+    from strata.migrator import run_migrations
+    from strata.project_config import resolve_storage_paths
+
+    paths = resolve_storage_paths()
+    db_path = db or paths.db_path
+    path = Path(fleet_path or paths.fleet_yaml_path)
+    if not path.is_file():
+        raise FleetChangeError("no_fleet", f"No fleet.yaml at {path}.")
+    run_migrations(db_path)
+    return FleetConfig.load(path), RecordStore(db_path)
+
+
+def _cli_dispatch(args: object, fleet: FleetConfig, store: RecordStore) -> int:
+    command = getattr(args, "fleet_command", None)
+    operator = Actor(None)
+    if command == "pending":
+        _print_pending(list_approvable(fleet, store, operator))
+        return 0
+    if command == "apply":
+        result = approve(fleet, store, args.change_id, approver=operator)
+        _print_result(result)
+        return 0
+    if command == "reject":
+        result = reject(fleet, store, args.change_id, approver=operator)
+        _print_result(result)
+        return 0
+    change = _change_from_cli(args, command)
+    result = apply_as_operator(fleet, store, change)
+    _print_result(result)
+    return 0
+
+
+def _change_from_cli(args: object, command: str | None) -> FleetChange:
+    if command == "add-scope":
+        return parse_change(
+            "add_scope",
+            {
+                "id": args.scope_id,
+                "name": args.name,
+                "stratum_id": args.stratum_id,
+                "parent_id": getattr(args, "parent_id", None),
+                "description": getattr(args, "description", None),
+                "references": list(getattr(args, "reference", None) or []),
+            },
+        )
+    if command == "remove-scope":
+        return parse_change("remove_scope", {"scope_id": args.scope_id})
+    if command == "reparent":
+        return parse_change(
+            "reparent",
+            {"scope_id": args.scope_id, "new_parent_id": args.new_parent_id},
+        )
+    if command == "add-edge":
+        return parse_change("add_edge", {"from": args.edge_from, "to": args.edge_to})
+    if command == "remove-edge":
+        return parse_change("remove_edge", {"from": args.edge_from, "to": args.edge_to})
+    if command == "describe":
+        return parse_change(
+            "describe",
+            {"scope_id": args.scope_id, "description": args.description},
+        )
+    raise FleetChangeError("invalid_change", f"Unknown fleet command {command!r}.")
+
+
+def _print_pending(proposals: list[FleetChangeProposal]) -> None:
+    if not proposals:
+        print("No pending fleet changes.")
+        return
+    for proposal in proposals:
+        owner = proposal.owner_scope_id or "operator"
+        phrases = flag_phrases(
+            widens=proposal.widens_proposer_reach,
+            binds=proposal.changes_proposer_binding,
+        )
+        flag_text = "; ".join(phrases) if phrases else "none"
+        print(
+            f"{proposal.id}  {proposal.change_type}  "
+            f"proposer {proposal.proposer_position}  owner {owner}"
+        )
+        print(f"  flags: {flag_text}")
+        print(f"  payload: {json.dumps(proposal.payload, sort_keys=True)}")
+
+
+def _print_result(result: FleetChangeResult) -> None:
+    label = result.proposal_id or result.change_type
+    act = result.act_id or "-"
+    print(f"{result.status} {label} act {act} approver {result.approver_position or '-'}")
+    for line in result.notices:
+        print(line)
+    if result.backup:
+        print(f"backup: {result.backup}")

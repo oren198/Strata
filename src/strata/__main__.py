@@ -5284,6 +5284,13 @@ def cmd_freshness_evaluator(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 
+def cmd_fleet(args: argparse.Namespace) -> int:
+    """``strata fleet`` — apply or review fleet structure changes as the operator."""
+    from strata.fleet_changes import cli_fleet
+
+    return cli_fleet(args)
+
+
 def cmd_session_start_hook(args: argparse.Namespace) -> int:
     """Print the SessionStart hook's read-side trigger instruction.
 
@@ -5861,6 +5868,78 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Project root directory (default: current working directory).",
     )
     p_set_default_harness.set_defaults(func=cmd_set_default_harness)
+
+    # -------------------------------------------------------------------
+    # fleet — structure changes (#247). The operator applies directly.
+    # A bound scope proposes through the MCP tools instead.
+    # -------------------------------------------------------------------
+    p_fleet = sub.add_parser(
+        "fleet",
+        help="Apply or review fleet structure changes (operator).",
+    )
+    p_fleet.add_argument("--db", default=None, help="Record-store database path.")
+    p_fleet.add_argument(
+        "--fleet",
+        dest="fleet_path",
+        default=None,
+        help="fleet.yaml path (default: the resolved project fleet).",
+    )
+    fleet_sub = p_fleet.add_subparsers(dest="fleet_command", required=True)
+
+    p_fleet_pending = fleet_sub.add_parser("pending", help="List changes waiting for approval.")
+    p_fleet_pending.set_defaults(func=cmd_fleet)
+
+    p_fleet_apply = fleet_sub.add_parser("apply", help="Apply a pending change as the operator.")
+    p_fleet_apply.add_argument("change_id")
+    p_fleet_apply.set_defaults(func=cmd_fleet)
+
+    p_fleet_reject = fleet_sub.add_parser("reject", help="Reject a pending change as the operator.")
+    p_fleet_reject.add_argument("change_id")
+    p_fleet_reject.set_defaults(func=cmd_fleet)
+
+    p_fleet_add = fleet_sub.add_parser("add-scope", help="Add a scope and its chain edge.")
+    p_fleet_add.add_argument("--id", dest="scope_id", required=True)
+    p_fleet_add.add_argument("--name", required=True)
+    p_fleet_add.add_argument("--stratum", dest="stratum_id", required=True)
+    p_fleet_add.add_argument("--parent", dest="parent_id", default=None)
+    p_fleet_add.add_argument("--description", default=None)
+    p_fleet_add.add_argument(
+        "--reference",
+        action="append",
+        default=None,
+        help="Published scope the new scope reads. Repeatable.",
+    )
+    p_fleet_add.set_defaults(func=cmd_fleet)
+
+    p_fleet_remove = fleet_sub.add_parser(
+        "remove-scope",
+        help="Remove a scope that has no children and no reference edges. Memory is kept.",
+    )
+    p_fleet_remove.add_argument("scope_id")
+    p_fleet_remove.set_defaults(func=cmd_fleet)
+
+    p_fleet_reparent = fleet_sub.add_parser("reparent", help="Give a scope a new chain parent.")
+    p_fleet_reparent.add_argument("scope_id")
+    p_fleet_reparent.add_argument("--parent", dest="new_parent_id", required=True)
+    p_fleet_reparent.set_defaults(func=cmd_fleet)
+
+    p_fleet_add_edge = fleet_sub.add_parser(
+        "add-edge",
+        help="Add a reference edge (FROM reads TO).",
+    )
+    p_fleet_add_edge.add_argument("edge_from")
+    p_fleet_add_edge.add_argument("edge_to")
+    p_fleet_add_edge.set_defaults(func=cmd_fleet)
+
+    p_fleet_remove_edge = fleet_sub.add_parser("remove-edge", help="Remove a reference edge.")
+    p_fleet_remove_edge.add_argument("edge_from")
+    p_fleet_remove_edge.add_argument("edge_to")
+    p_fleet_remove_edge.set_defaults(func=cmd_fleet)
+
+    p_fleet_describe = fleet_sub.add_parser("describe", help="Set a scope's description.")
+    p_fleet_describe.add_argument("scope_id")
+    p_fleet_describe.add_argument("--description", required=True)
+    p_fleet_describe.set_defaults(func=cmd_fleet)
 
     # -------------------------------------------------------------------
     # Hidden engine subcommands for the freshness Stop-hook (issue #112).
