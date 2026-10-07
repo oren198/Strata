@@ -132,7 +132,7 @@ def test_a_forged_report_answer_on_an_exception_still_declines(text: str) -> Non
     for span in (text, text.rstrip("."), "the pumps"):
         for kind in ("consequence_report", "departure_report"):
             verdict, _ = verify_inherited_relation(_answer(kind, occurrence_span=span), text, RULE)
-            assert verdict == "decline"
+            assert verdict.startswith("decline")
 
 
 def test_a_forged_exception_answer_without_a_verbatim_span_leaves_a_report_admitted() -> None:
@@ -144,19 +144,43 @@ def test_a_forged_exception_answer_without_a_verbatim_span_leaves_a_report_admit
         assert verdict == "admit"
 
 
-def test_the_fallback_declines_with_a_marker_and_admits_without() -> None:
-    for answer in (_answer("unrelated"), {"kind": "banana"}, None, {}):
+def test_an_unreadable_answer_declines_on_a_marker_and_admits_without() -> None:
+    for answer in ({"kind": "banana"}, None, {}):
         assert verify_inherited_relation(answer, EXCEPTION_HABITUAL, RULE)[0] == "decline"
         assert verify_inherited_relation(answer, PLAIN_FACT, RULE)[0] == "admit"
 
 
-def test_a_span_that_is_not_in_the_text_fails_the_check() -> None:
+def test_a_readable_unrelated_answer_declines_only_a_marked_text_that_covers_the_subject() -> None:
+    unrelated = _answer("unrelated")
+    # marker + covers the inherited subject -> decline
+    marked = "FYI, the fuel dock pumps run until 22:00 whenever the fleet is late."
+    assert verify_inherited_relation(unrelated, marked, RULE)[0] == "decline"
+    # a plain fact about the subject, no marker -> admit
+    assert verify_inherited_relation(unrelated, PLAIN_FACT, RULE)[0] == "admit"
+    # a marker in text about something else entirely -> the honest answer stands
+    elsewhere = "FYI, in the harbour cafe we leave the kettle running all day."
+    assert verify_inherited_relation(unrelated, elsewhere, RULE)[0] == "admit"
+
+
+def test_a_claimed_report_with_a_present_tense_or_undated_span_is_declined() -> None:
+    for text in (
+        "The pumps are switched off at 20:00 on the north quay.",  # present tense
+        "The pumps were switched off at the quay.",  # past tense, no anchor
+    ):
+        verdict, reason = verify_inherited_relation(
+            _answer("consequence_report", occurrence_span=text.rstrip(".")), text, RULE
+        )
+        assert verdict == "decline_unspecific", text
+        assert "past tense" in reason or "date" in reason
+
+
+def test_a_claimed_report_whose_span_is_not_verbatim_is_declined() -> None:
     verdict, reason = verify_inherited_relation(
         _answer("consequence_report", occurrence_span="something never said on 9 October"),
         CONSEQUENCE,
         RULE,
     )
-    assert verdict == "admit"
+    assert verdict == "decline_unspecific"
     assert "verbatim" in reason
 
 
@@ -295,9 +319,11 @@ def test_the_fallback_is_counted_both_ways() -> None:
     assert admitted.inherited_relation["fallback"] is True
     assert admitted.reasoning == "A note."  # nothing to say about an unverified admit
 
-    declined, _c = _judge(EXCEPTION_HABITUAL, _answer("unrelated"))
+    # an UNREADABLE answer declines on a marker anywhere in the text
+    declined, _c = _judge(EXCEPTION_HABITUAL, _answer("banana"))
     assert declined.decision == "decline"
     assert declined.inherited_relation["fallback"] is False
+    assert declined.inherited_relation["kind"] == "banana"
 
 
 def test_a_failed_reask_is_the_unreadable_case_not_an_error() -> None:
@@ -463,7 +489,7 @@ def test_a_batch_declines_the_exception_member_and_withholds_the_context_rewrite
         EXCEPTION_HABITUAL,
         CONSEQUENCE,
         [
-            _answer("unrelated"),
+            _answer("banana"),  # unreadable: a marker anywhere declines
             _answer("consequence_report", occurrence_span=CONSEQUENCE.rstrip(".")),
         ],
     )
@@ -556,3 +582,27 @@ def test_a_so_clause_that_says_enough_generalises_the_report() -> None:
     )
     assert verdict == "decline"
     assert "generalises" in reason
+
+
+NOTE_UNSPECIFIC = (
+    "[Declined: a report of following or departing from c_pump01 (g_arch) must name the specific "
+    "occurrence (when, which); resubmit with it, or propose the exception to g_arch.]"
+)
+
+
+def test_a_claimed_report_that_is_not_specific_is_declined_with_the_engine_reason() -> None:
+    text = "The pumps are switched off at 20:00 on the north quay."
+    judgment, _client = _judge(
+        text, _answer("consequence_report", occurrence_span=text.rstrip("."))
+    )
+    assert judgment.decision == "decline"
+    assert judgment.reasoning == f"A note. {NOTE_UNSPECIFIC}"
+    assert judgment.inherited_relation["verdict"] == "decline_unspecific"
+    assert judgment.inherited_relation["fallback"] is False
+
+
+def test_the_exposure_of_ordinary_contexts_is_small_under_an_honest_unrelated_answer() -> None:
+    marked_but_elsewhere = "We keep the visitor log by the gate and let guests sign it at the desk."
+    judgment, _client = _judge(marked_but_elsewhere, _answer("unrelated"))
+    assert judgment.decision == "accept_as_context"
+    assert judgment.inherited_relation["fallback"] is True

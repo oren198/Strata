@@ -6141,6 +6141,38 @@ def _exception_marker(content: str, inherited_text: str) -> str | None:
     return None
 
 
+_NOT_PAST_BEFORE_PARTICIPLE = frozenset(
+    {
+        "is",
+        "are",
+        "am",
+        "be",
+        "being",
+        "been",
+        "to",
+        "must",
+        "should",
+        "will",
+        "can",
+        "may",
+        "shall",
+    }
+)
+
+
+def _has_past_tense(span: str) -> bool:
+    """A past-tense verb in *span*. A bare "-ed" participle after a present
+    auxiliary ("are switched off") is a present passive, not a past occurrence."""
+    for match in _PAST_TENSE_RE.finditer(span):
+        word = match.group(0).casefold()
+        if word.endswith("ed") and word not in {"need", "did"}:
+            before = span[: match.start()].split()
+            if before and before[-1].casefold().strip(",;") in _NOT_PAST_BEFORE_PARTICIPLE:
+                continue
+        return True
+    return False
+
+
 def _action_overlap(span: str, inherited_text: str) -> bool:
     from strata.publication import _overlap_words  # noqa: PLC0415
 
@@ -6150,21 +6182,49 @@ def _action_overlap(span: str, inherited_text: str) -> bool:
     return bool(numbers & set(re.findall(r"\d+(?:\.\d+)?", span)))
 
 
+def _context_covers(inherited_text: str, content: str) -> bool:
+    """Whether context *content* is about an inherited directive's subject:
+    1.17.2's covered-subject plus head-noun test, OR at least two shared
+    content words anywhere (the leading-noun-phrase test alone is built for
+    directive sentences and misses most context prose)."""
+    from strata.publication import _overlap_words  # noqa: PLC0415
+
+    if _is_covered_subject(inherited_text, content) and _head_nouns_compatible(
+        inherited_text, content
+    ):
+        return True
+    return len(_overlap_words(inherited_text) & _overlap_words(content)) >= 2
+
+
 def verify_inherited_relation(
-    answer: dict | None, content: str, inherited_text: str
+    answer: dict | None,
+    content: str,
+    inherited_text: str,
+    other_texts: Sequence[str] = (),
 ) -> tuple[str, str]:
     """Engine verification of a ``classify_inherited_relation`` answer (#242).
 
     Returns ``(verdict, reason)``; *verdict* is ``"decline"`` (the contribution
-    is an exception), ``"consequence_report"`` or ``"departure_report"``
-    (admitted, specific past-tense report), or ``"admit"`` (nothing verified
-    and no exception marker: the fail-open fallback, which callers count).
-    Fails toward the inherited rule: any failed check falls to the
-    whole-content marker scan, and a marker declines.
+    is an exception), ``"decline_unspecific"`` (the answer CLAIMED a report but
+    the span is not a specific occurrence), ``"consequence_report"`` or
+    ``"departure_report"`` (admitted, specific past-tense report), or
+    ``"admit"`` (the fallback, which callers count).
+
+    Fails toward the inherited rule, by how readable the answer was:
+
+    - a claimed report whose span fails verbatim, tense or anchor declines;
+    - ``unrelated`` (a readable answer), or a report that is not about the
+      rule's own action, is admitted unless the text covers an inherited
+      subject (*inherited_text* or any of *other_texts*; see
+      :func:`_context_covers`) AND carries an exception marker or
+      the conflict signal;
+    - an unreadable answer, or an exception claim with no verbatim span,
+      declines on a marker anywhere in the text and is otherwise admitted.
     """
     answer = answer if isinstance(answer, dict) else {}
     kind = answer.get("kind")
     marker = _exception_marker(content, inherited_text)
+    readable_unrelated = False
 
     if kind == "exception":
         span = _verbatim_span(answer, "instead_span", content)
@@ -6173,14 +6233,18 @@ def verify_inherited_relation(
         failure = "exception answer without a verbatim instead_span"
     elif kind in ("consequence_report", "departure_report"):
         span = _verbatim_span(answer, "occurrence_span", content)
+        unspecific = None
         if span is None:
-            failure = "no verbatim occurrence_span"
-        elif not _PAST_TENSE_RE.search(span):
-            failure = "occurrence not in the past tense"
+            unspecific = "no verbatim occurrence_span"
+        elif not _has_past_tense(span):
+            unspecific = "occurrence not in the past tense"
         elif not _SPECIFICITY_ANCHOR_RE.search(span):
-            failure = "occurrence carries no date, time, count or named instance"
-        elif not _action_overlap(span, inherited_text):
+            unspecific = "occurrence carries no date, time, count or named instance"
+        if unspecific is not None:
+            return "decline_unspecific", unspecific
+        if not _action_overlap(span, inherited_text):
             failure = "occurrence does not concern the rule's own action"
+            readable_unrelated = True
         elif marker is not None:
             return "decline", f"generalises beyond the occurrence ({marker})"
         else:
@@ -6188,9 +6252,15 @@ def verify_inherited_relation(
             return verdict, "a specific past occurrence"
     elif kind == "unrelated":
         failure = "answered unrelated"
+        readable_unrelated = True
     else:
         failure = "unreadable answer"
 
+    if readable_unrelated:
+        covers = any(_context_covers(text, content) for text in (inherited_text, *other_texts))
+        if marker is not None and covers:
+            return "decline", f"{failure}; covers an inherited subject and ({marker})"
+        return "admit", f"{failure}; no covered exception"
     if marker is not None:
         return "decline", f"{failure}; exception marker present ({marker})"
     return "admit", f"{failure}; no exception marker"
@@ -6227,11 +6297,20 @@ def inherited_for_context(
     return shown
 
 
+_INHERITED_DECLINES = ("decline", "decline_unspecific")
+
+
 def _inherited_relation_note(outcome: dict) -> str:
     """The engine-written suffix for a #242 outcome ("" when the admit stands
     with nothing to say: the unverified fallback)."""
     directive_id, origin = outcome["inherited_id"], outcome["origin"]
     verdict = outcome["verdict"]
+    if verdict == "decline_unspecific":
+        return (
+            f"[Declined: a report of following or departing from {directive_id} ({origin}) "
+            "must name the specific occurrence (when, which); resubmit with it, or propose the "
+            f"exception to {origin}.]"
+        )
     if verdict == "decline":
         return (
             f"[Declined: contrary to inherited directive {directive_id} ({origin}). A practice "
@@ -8639,7 +8718,9 @@ class ScopeManager:
         if chosen is None:
             chosen = shown[0]
             answer = {}  # an answer naming no shown directive is unreadable
-        verdict, reason = verify_inherited_relation(answer, contribution.content, chosen[2])
+        verdict, reason = verify_inherited_relation(
+            answer, contribution.content, chosen[2], [d[2] for d in shown if d is not chosen]
+        )
         if failure is not None:
             reason = f"re-ask failed ({failure}); {reason}"
         kind = answer.get("kind")
@@ -8696,7 +8777,7 @@ class ScopeManager:
                 f"inherited relation: {outcome['verdict']}, {outcome['reason']}",
             ],
         }
-        if outcome["verdict"] == "decline":
+        if outcome["verdict"] in _INHERITED_DECLINES:
             update.update(
                 decision="decline",
                 directive_ops=[],
@@ -8753,7 +8834,7 @@ class ScopeManager:
             )
         if not outcomes:
             return judgment
-        declined = {cid for cid, o in outcomes.items() if o["verdict"] == "decline"}
+        declined = {cid for cid, o in outcomes.items() if o["verdict"] in _INHERITED_DECLINES}
         verdicts = []
         for v in judgment.verdicts:
             outcome = outcomes.get(v.contribution_id)

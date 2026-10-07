@@ -23,11 +23,14 @@ the release PR (`dev` → `main`) and the GitHub Release body are built from
   past-tense report of following the rule, or of departing from it, stays admitted;
   the record names a departure as a departure from the directive, never as
   permission, and suggests `acted_on`. A report that generalises ("... so we don't
-  need it") is an exception as a whole. When the answer is unreadable or says
-  unrelated, the note is declined only if it carries an exception marker; otherwise
-  it is admitted, and each such fallback is counted in the judgment's
-  `inherited_relation` trace. Stated limits: an exception phrased with no marker
-  and answered unreadably is admitted; a batch that declines a member replaces the
+  need it") is an exception as a whole, and a claimed report that doesn't name a
+  specific occurrence (when, which) is declined with a reason saying so. When the
+  answer says unrelated, the note is declined only if it also touches an inherited
+  directive's subject and carries an exception marker; when the answer is
+  unreadable, any exception marker declines. Otherwise the note is admitted, and
+  each such fallback is counted in the judgment's `inherited_relation` trace.
+  Stated limits: an exception phrased with no marker and answered unreadably or
+  unrelated is admitted; a batch that declines a member replaces the
   judge's single context rewrite with the previous context plus each remaining
   member's own text; a report reaches the issuer only if the contributor follows the
   `acted_on` suggestion.
