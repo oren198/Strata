@@ -27,7 +27,9 @@ from __future__ import annotations
 
 import os
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Literal
 
@@ -829,28 +831,34 @@ class FleetConfig(BaseModel):
     # Mutation API
     # ------------------------------------------------------------------
 
-    def _commit(self, raw: dict) -> None:
+    def _commit(self, raw: dict, *, backup: bool = False) -> Path | None:
         """Validate *raw*, canonicalize its edges, write it, and refresh in-memory state.
 
         The shared tail of every mutation: nothing touches disk until the
         candidate validates, the edges written out are canonical (ADR 0010 D3
         — chain edges oriented child→parent), and the in-memory mirror is
         rebuilt from what was actually written rather than from the candidate.
-        Callers hold ``self._lock``.
+        Callers hold ``self._lock``. *backup* copies the current file to a
+        timestamped sibling before the replace — fleet structure changes use
+        it; ordinary mutations keep the previous single-write behavior.
         """
         assert self._path is not None
+        path = self._path
+        lock = self._lock
         try:
             candidate = FleetConfig.model_validate(raw)
         except ValidationError as exc:
             raise _schema_error_to_fleet_config_error(exc, raw) from exc
         _validate(candidate)
         _canonicalize_raw_edges(candidate, raw["edges"])
-        _atomic_write(self._path, raw)
-        refreshed = FleetConfig.model_validate(
-            yaml.safe_load(self._path.read_text(encoding="utf-8"))
-        )
+        backup_path = _write_timestamped_backup(path) if backup else None
+        _atomic_write(path, raw)
+        refreshed = FleetConfig.model_validate(yaml.safe_load(path.read_text(encoding="utf-8")))
         _canonicalize(refreshed)
         self.__dict__.update(refreshed.__dict__)
+        object.__setattr__(self, "_path", path)
+        object.__setattr__(self, "_lock", lock)
+        return backup_path
 
     def add_stratum(self, *, id: str, name: str, ordinal: int) -> None:
         """Add a new stratum to the fleet config and persist to disk.
@@ -902,6 +910,47 @@ class FleetConfig(BaseModel):
                 entry["description"] = description.strip()
             raw["scopes"].append(entry)
             self._commit(raw)
+
+    def mutate(self, mutator: Callable[[dict], dict]) -> Path:
+        """Apply *mutator* to the on-disk document, then validate and replace it.
+
+        *mutator* receives the parsed YAML mapping and returns the mapping to
+        write. Nothing is written until that mapping passes the same checks
+        :meth:`load` runs. The previous file is copied to
+        ``fleet.yaml.bak.<timestamp>`` first, then replaced via a temp file
+        and ``os.replace``. Returns the backup path.
+        """
+        assert self._path is not None and self._lock is not None
+        with self._lock:
+            raw = yaml.safe_load(self._path.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict):
+                raise FleetConfigError(
+                    kind="invalid_schema",
+                    message="fleet.yaml must be a mapping.",
+                )
+            updated = mutator(raw)
+            if not isinstance(updated, dict):
+                raise FleetConfigError(
+                    kind="invalid_schema",
+                    message="fleet.yaml must be a mapping.",
+                )
+            backup = self._commit(updated, backup=True)
+            assert backup is not None
+            return backup
+
+    def reload_from_disk(self) -> None:
+        """Replace this object's fields from the file, keeping its path and lock.
+
+        Used when a structure change is rolled back after the file was already
+        replaced: the bytes are restored by the caller, then this re-reads them.
+        """
+        assert self._path is not None
+        path = self._path
+        lock = self._lock
+        refreshed = FleetConfig.load(path)
+        self.__dict__.update(refreshed.__dict__)
+        object.__setattr__(self, "_path", path)
+        object.__setattr__(self, "_lock", lock)
 
     def add_edge(
         self,
@@ -1161,3 +1210,15 @@ def _atomic_write(path: Path, data: object) -> None:
     tmp = Path(str(path) + ".tmp")
     tmp.write_text(yaml.dump(data, default_flow_style=False, allow_unicode=True), encoding="utf-8")
     os.replace(tmp, path)
+
+
+def _write_timestamped_backup(path: Path) -> Path:
+    """Copy *path* to ``<name>.bak.<utc timestamp>`` beside it and return that path."""
+    stamp = datetime.now(tz=UTC).strftime("%Y%m%dT%H%M%S%fZ")
+    backup = path.with_name(f"{path.name}.bak.{stamp}")
+    n = 0
+    while backup.exists():
+        n += 1
+        backup = path.with_name(f"{path.name}.bak.{stamp}.{n}")
+    backup.write_bytes(path.read_bytes())
+    return backup

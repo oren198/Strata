@@ -96,6 +96,14 @@ def _new_operator_act_id() -> str:
     return f"op_{secrets.token_hex(8)}"
 
 
+def _new_fleet_proposal_id() -> str:
+    return f"fcp_{secrets.token_hex(8)}"
+
+
+def _new_fleet_structure_act_id() -> str:
+    return f"fsa_{secrets.token_hex(8)}"
+
+
 def _new_retirement_id() -> str:
     return f"ret_{secrets.token_hex(8)}"
 
@@ -464,6 +472,53 @@ class OperatorAct:
     subject: str | None
     supersedes: str | None
     retires: str | None
+    created_at: str
+
+
+@dataclass(frozen=True)
+class FleetChangeProposal:
+    """One proposed fleet structure change, pending or already resolved.
+
+    ``proposer_position`` is the bound scope id, or ``"operator"`` when the
+    operator proposed it directly. ``owner_scope_id`` is the LCA that must
+    approve, or ``None`` when only the operator may.
+    """
+
+    id: str
+    change_type: str
+    payload: dict
+    proposer_position: str
+    owner_scope_id: str | None
+    widens_proposer_reach: bool
+    changes_proposer_binding: bool
+    status: Literal["pending", "applied", "rejected"]
+    created_at: str
+    resolved_at: str | None
+    resolved_by: str | None
+
+
+@dataclass(frozen=True)
+class FleetStructureAct:
+    """The operator-act record of one applied fleet structure change.
+
+    Authority, not memory: this row is never judged and never composed into
+    a perspective. ``approver_position`` is a bound scope id or
+    ``"operator"``. ``owner_scope_id`` is the LCA, or ``None`` when the
+    change has no common ancestor. Topology maps each touched scope id to
+    ``{"parent": id | None, "references": [id, ...]}``, or to ``None`` when
+    that scope is absent (not yet added, or already removed).
+    """
+
+    id: str
+    proposal_id: str | None
+    change_type: str
+    proposer_position: str
+    approver_position: str
+    widens_proposer_reach: bool
+    changes_proposer_binding: bool
+    owner_scope_id: str | None
+    before_topology: dict
+    after_topology: dict
     created_at: str
 
 
@@ -2073,6 +2128,206 @@ class RecordStore:
         return superseded_or_retired is None
 
     # ------------------------------------------------------------------
+    # Fleet structure acts (#247) — authority acts, not operator memory.
+    # Written beside append_operator_act; never a live directive.
+    # ------------------------------------------------------------------
+
+    def insert_fleet_change_proposal(
+        self,
+        *,
+        change_type: str,
+        payload: dict,
+        proposer_position: str,
+        owner_scope_id: str | None,
+        widens_proposer_reach: bool,
+        changes_proposer_binding: bool,
+        status: Literal["pending", "applied", "rejected"] = "pending",
+    ) -> FleetChangeProposal:
+        """Insert one fleet-change proposal and commit."""
+        proposal_id = _new_fleet_proposal_id()
+        self._conn.execute(
+            """
+            INSERT INTO fleet_change_proposals (
+                id, change_type, payload, proposer_position, owner_scope_id,
+                widens_proposer_reach, changes_proposer_binding, status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                proposal_id,
+                change_type,
+                json.dumps(payload, sort_keys=True),
+                proposer_position,
+                owner_scope_id,
+                int(widens_proposer_reach),
+                int(changes_proposer_binding),
+                status,
+            ),
+        )
+        self._conn.commit()
+        return self.get_fleet_change_proposal(proposal_id)
+
+    def get_fleet_change_proposal(self, proposal_id: str) -> FleetChangeProposal:
+        """Return the proposal *proposal_id*.
+
+        Raises:
+            KeyError: No such proposal.
+        """
+        row = self._conn.execute(
+            """
+            SELECT id, change_type, payload, proposer_position, owner_scope_id,
+                   widens_proposer_reach, changes_proposer_binding, status,
+                   created_at, resolved_at, resolved_by
+            FROM fleet_change_proposals WHERE id = ?
+            """,
+            (proposal_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"Fleet change proposal not found: {proposal_id!r}")
+        return _fleet_proposal_from_row(row)
+
+    def list_fleet_change_proposals(
+        self, *, status: Literal["pending", "applied", "rejected"] | None = "pending"
+    ) -> list[FleetChangeProposal]:
+        """Return proposals ordered by ``created_at`` ascending."""
+        if status is None:
+            rows = self._conn.execute(
+                """
+                SELECT id, change_type, payload, proposer_position, owner_scope_id,
+                       widens_proposer_reach, changes_proposer_binding, status,
+                       created_at, resolved_at, resolved_by
+                FROM fleet_change_proposals
+                ORDER BY created_at ASC, rowid ASC
+                """
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                """
+                SELECT id, change_type, payload, proposer_position, owner_scope_id,
+                       widens_proposer_reach, changes_proposer_binding, status,
+                       created_at, resolved_at, resolved_by
+                FROM fleet_change_proposals
+                WHERE status = ?
+                ORDER BY created_at ASC, rowid ASC
+                """,
+                (status,),
+            ).fetchall()
+        return [_fleet_proposal_from_row(row) for row in rows]
+
+    def claim_fleet_change_proposal(self, proposal_id: str, *, resolved_by: str) -> bool:
+        """Mark a pending proposal applied. False when it was not pending."""
+        cur = self._conn.execute(
+            """
+            UPDATE fleet_change_proposals
+            SET status = 'applied', resolved_by = ?, resolved_at = datetime('now')
+            WHERE id = ? AND status = 'pending'
+            """,
+            (resolved_by, proposal_id),
+        )
+        self._conn.commit()
+        return cur.rowcount == 1
+
+    def reject_fleet_change_proposal(self, proposal_id: str, *, resolved_by: str) -> bool:
+        """Mark a pending proposal rejected. False when it was not pending."""
+        cur = self._conn.execute(
+            """
+            UPDATE fleet_change_proposals
+            SET status = 'rejected', resolved_by = ?, resolved_at = datetime('now')
+            WHERE id = ? AND status = 'pending'
+            """,
+            (resolved_by, proposal_id),
+        )
+        self._conn.commit()
+        return cur.rowcount == 1
+
+    def reopen_fleet_change_proposal(self, proposal_id: str) -> None:
+        """Put a proposal back to pending after an apply failed mid-way."""
+        self._conn.execute(
+            """
+            UPDATE fleet_change_proposals
+            SET status = 'pending', resolved_by = NULL, resolved_at = NULL
+            WHERE id = ?
+            """,
+            (proposal_id,),
+        )
+        self._conn.commit()
+
+    def append_fleet_structure_act(
+        self,
+        *,
+        change_type: str,
+        proposer_position: str,
+        approver_position: str,
+        widens_proposer_reach: bool,
+        changes_proposer_binding: bool,
+        owner_scope_id: str | None,
+        before_topology: dict,
+        after_topology: dict,
+        proposal_id: str | None = None,
+    ) -> FleetStructureAct:
+        """Append the one operator-act record for an applied fleet change.
+
+        Not an ``operator_acts`` row: that table is operator memory. This
+        record is the structure-act sibling, written by
+        :func:`strata.operator.record_fleet_structure_act`.
+        """
+        act_id = _new_fleet_structure_act_id()
+        self._conn.execute(
+            """
+            INSERT INTO fleet_structure_acts (
+                id, proposal_id, change_type, proposer_position, approver_position,
+                widens_proposer_reach, changes_proposer_binding, owner_scope_id,
+                before_topology, after_topology
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                act_id,
+                proposal_id,
+                change_type,
+                proposer_position,
+                approver_position,
+                int(widens_proposer_reach),
+                int(changes_proposer_binding),
+                owner_scope_id,
+                json.dumps(before_topology, sort_keys=True),
+                json.dumps(after_topology, sort_keys=True),
+            ),
+        )
+        self._conn.commit()
+        return self.get_fleet_structure_act(act_id)
+
+    def get_fleet_structure_act(self, act_id: str) -> FleetStructureAct:
+        """Return the structure act *act_id*.
+
+        Raises:
+            KeyError: No such act.
+        """
+        row = self._conn.execute(
+            """
+            SELECT id, proposal_id, change_type, proposer_position, approver_position,
+                   widens_proposer_reach, changes_proposer_binding, owner_scope_id,
+                   before_topology, after_topology, created_at
+            FROM fleet_structure_acts WHERE id = ?
+            """,
+            (act_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"Fleet structure act not found: {act_id!r}")
+        return _fleet_structure_act_from_row(row)
+
+    def list_fleet_structure_acts(self) -> list[FleetStructureAct]:
+        """Return structure acts ordered by ``created_at`` ascending."""
+        rows = self._conn.execute(
+            """
+            SELECT id, proposal_id, change_type, proposer_position, approver_position,
+                   widens_proposer_reach, changes_proposer_binding, owner_scope_id,
+                   before_topology, after_topology, created_at
+            FROM fleet_structure_acts
+            ORDER BY created_at ASC, rowid ASC
+            """
+        ).fetchall()
+        return [_fleet_structure_act_from_row(row) for row in rows]
+
+    # ------------------------------------------------------------------
     # Operator evidence (ADR 0017 P5) — the engine's raise of a `failed`
     # outcome against an operator directive. Never judged.
     # ------------------------------------------------------------------
@@ -3536,6 +3791,23 @@ def _currently_entitled(fleet: FleetConfig, reporter_scope: str, item_scope: str
         return False
     ancestors = fleet.inter_stratum_ancestors(reporter_scope)
     return item_scope in {reporter_scope, *(s.id for s in ancestors)}
+
+
+def _fleet_proposal_from_row(row: sqlite3.Row) -> FleetChangeProposal:
+    data = dict(row)
+    data["payload"] = json.loads(data["payload"])
+    data["widens_proposer_reach"] = bool(data["widens_proposer_reach"])
+    data["changes_proposer_binding"] = bool(data["changes_proposer_binding"])
+    return FleetChangeProposal(**data)
+
+
+def _fleet_structure_act_from_row(row: sqlite3.Row) -> FleetStructureAct:
+    data = dict(row)
+    data["before_topology"] = json.loads(data["before_topology"])
+    data["after_topology"] = json.loads(data["after_topology"])
+    data["widens_proposer_reach"] = bool(data["widens_proposer_reach"])
+    data["changes_proposer_binding"] = bool(data["changes_proposer_binding"])
+    return FleetStructureAct(**data)
 
 
 def _contribution_from_row(row: sqlite3.Row) -> Contribution:
