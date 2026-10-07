@@ -6034,7 +6034,8 @@ _INHERITED_RELATION_SYSTEM_PROMPT = (
 _NORMATIVE_EXCEPTION_RES: tuple[re.Pattern[str], ...] = tuple(
     re.compile(p, re.IGNORECASE)
     for p in (
-        r"\bmay\b",
+        # lower-case only: "May" is the month ("on 12 May ...")
+        r"(?-i:\bmay\b)",
         # "can" is common in plain facts ("bookings can only be made ..."); only
         # its permission shapes count.
         r"\bcan\s+(?:\w+\s+)?(?:keep|skip|leave|hold|go|run|ship|release|publish|merge|"
@@ -6071,7 +6072,7 @@ _HABITUAL_EXCEPTION_RES: tuple[re.Pattern[str], ...] = tuple(
         # A "so / therefore / which means" clause that negates or permits
         # generalises the occurrence into a rule: the whole item is an exception.
         r"\b(?:so|therefore|hence|thus|which means|meaning(?: that)?)\b[^.;]*?"
-        r"(?:n['’]t\b|\bnot\b|\bno\b|\bnever\b)",
+        r"(?:n['’]t\b|\bnot\b|\bno\b|\bnever\b|\benough\b|\bsufficient\b|\bsuffices?\b)",
     )
 )
 

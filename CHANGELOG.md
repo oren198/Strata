@@ -5,6 +5,33 @@ the release PR (`dev` → `main`) and the GitHub Release body are built from
 (`docs/releasing.md`, step 3) — write entries here as work lands, and the
 "Unreleased" section is cleared once a release ships.
 
+## Unreleased (v1.18.0)
+
+### Behaviour change
+
+- **A child's own context can no longer undercut an inherited directive.** Until
+  now a context note such as "for hotfix builds we don't need the whole test
+  suite" rested on the judge alone, and the inherited rule and the contrary note
+  then sat side by side in the perspective. After judgment, when a session bound
+  to a scope has its context admitted and the scope inherits a directive (from an
+  ancestor or the operator), the engine makes one compact extra call that asks how
+  the note relates to the rule, then verifies the answer itself. A note that states
+  what may or does happen instead of the rule (permitted, or a standing practice) is
+  declined, with a reason naming the two legitimate routes: report a specific
+  occurrence of following the rule (admitted, raised to the issuer with `acted_on`),
+  or propose the exception to the scope that issued the rule. A specific, dated,
+  past-tense report of following the rule, or of departing from it, stays admitted;
+  the record names a departure as a departure from the directive, never as
+  permission, and suggests `acted_on`. A report that generalises ("... so we don't
+  need it") is an exception as a whole. When the answer is unreadable or says
+  unrelated, the note is declined only if it carries an exception marker; otherwise
+  it is admitted, and each such fallback is counted in the judgment's
+  `inherited_relation` trace. Stated limits: an exception phrased with no marker
+  and answered unreadably is admitted; a batch that declines a member replaces the
+  judge's single context rewrite with the previous context plus each remaining
+  member's own text; a report reaches the issuer only if the contributor follows the
+  `acted_on` suggestion.
+
 ## Unreleased (v1.17.2)
 
 ### Fixed

@@ -535,3 +535,24 @@ def test_a_batch_of_one_carries_the_single_path_trace() -> None:
     )
     assert result.verdicts[0].decision == "decline"
     assert result.inherited_relations[0]["verdict"] == "decline"
+
+
+def test_the_month_may_is_not_a_permission_marker() -> None:
+    text = "On 12 May the vendor invoices were paid at day 29 and the petty-cash float was emptied."
+    verdict, _ = verify_inherited_relation(
+        _answer("consequence_report", occurrence_span=text.rstrip(".")),
+        text,
+        "Invoices must be paid within 30 days.",
+    )
+    assert verdict == "consequence_report"
+
+
+def test_a_so_clause_that_says_enough_generalises_the_report() -> None:
+    text = "On 9 June the release shipped with one approval and nothing broke, so one is enough."
+    verdict, reason = verify_inherited_relation(
+        _answer("departure_report", occurrence_span=text.rstrip(".")),
+        text,
+        "Releases require two approvals.",
+    )
+    assert verdict == "decline"
+    assert "generalises" in reason

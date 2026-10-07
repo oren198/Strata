@@ -3289,6 +3289,18 @@ def test_overflow_retry_refusing_to_retire_keeps_the_over_budget_summary() -> No
 
 OPERATOR_MEMORY = [("g_exec", [OPERATOR_DIRECTIVE])]
 
+
+def _judge_calls(mock_client: MagicMock) -> list:
+    """The calls made to the judge itself: #242's compact context re-ask
+    (``classify_inherited_relation``), which now follows every ordinary context
+    admit in a scope that inherits a directive, is a separate call."""
+    return [
+        call
+        for call in mock_client.messages.create.call_args_list
+        if call.kwargs["tools"][0]["name"] != "classify_inherited_relation"
+    ]
+
+
 _CITING_REASONING = f"Consistent with operator directive {OPERATOR_DIRECTIVE.id}; recording it."
 
 ATTRIBUTED_CONTEXT = (
@@ -3340,7 +3352,7 @@ def test_unattributed_echo_triggers_one_corrective_naming_the_operator_directive
 
     judgment = _judge_with_operator_memory(mock_client)
 
-    assert mock_client.messages.create.call_count == 2
+    assert len(_judge_calls(mock_client)) == 2
     followup = mock_client.messages.create.call_args_list[1].kwargs["messages"][-1]
     text = [b for b in followup["content"] if b["type"] == "text"][0]["text"]
     assert OPERATOR_DIRECTIVE.id in text
@@ -3365,7 +3377,7 @@ def test_unattributed_echo_corrective_failure_keeps_the_first_judgment() -> None
 
     judgment = _judge_with_operator_memory(mock_client)
 
-    assert mock_client.messages.create.call_count == 2
+    assert len(_judge_calls(mock_client)) == 2
     assert judgment.decision == "accept_as_context"
     assert judgment.new_summary is not None
     assert judgment.new_summary.context == UNATTRIBUTED_CONTEXT
@@ -3381,7 +3393,7 @@ def test_unattributed_echo_corrective_may_not_flip_the_verdict() -> None:
 
     judgment = _judge_with_operator_memory(mock_client)
 
-    assert mock_client.messages.create.call_count == 2
+    assert len(_judge_calls(mock_client)) == 2
     assert judgment.decision == "accept_as_context"
     assert judgment.new_summary is not None
     assert judgment.new_summary.context == UNATTRIBUTED_CONTEXT
@@ -3400,7 +3412,7 @@ def test_attributed_echo_makes_exactly_one_call() -> None:
         operator_memory=OPERATOR_MEMORY,
     )
 
-    assert mock_client.messages.create.call_count == 1
+    assert len(_judge_calls(mock_client)) == 1
     assert judgment.new_summary is not None
     assert judgment.new_summary.context == ATTRIBUTED_CONTEXT
 
@@ -3427,7 +3439,7 @@ def test_decline_citing_an_operator_directive_gets_no_corrective() -> None:
         operator_memory=OPERATOR_MEMORY,
     )
 
-    assert mock_client.messages.create.call_count == 1
+    assert len(_judge_calls(mock_client)) == 1
     assert judgment.decision == "decline"
     assert judgment.new_summary is None
 
@@ -3444,7 +3456,7 @@ def test_no_operator_memory_rendered_gets_no_corrective() -> None:
         new_contribution=NEW_CONTRIBUTION,
     )
 
-    assert mock_client.messages.create.call_count == 1
+    assert len(_judge_calls(mock_client)) == 1
     assert judgment.new_summary is not None
     assert judgment.new_summary.context == UNATTRIBUTED_CONTEXT
 
@@ -3477,7 +3489,7 @@ def test_appended_contribution_bytes_carrying_the_attribution_get_no_corrective(
         operator_memory=OPERATOR_MEMORY,
     )
 
-    assert mock_client.messages.create.call_count == 1
+    assert len(_judge_calls(mock_client)) == 1
     assert judgment.new_summary is not None
     assert judgment.new_summary.directives[-1].content == attributed_contribution.content
 
@@ -3496,7 +3508,7 @@ def test_attribution_corrective_rewrite_is_still_budget_checked() -> None:
     # attribution rewrite does not.
     judgment = _judge_with_operator_memory(mock_client, summary_max_words=20)
 
-    assert mock_client.messages.create.call_count == 3
+    assert len(_judge_calls(mock_client)) == 3
     attribution_followup = mock_client.messages.create.call_args_list[1].kwargs["messages"][-1]
     attribution_text = [b for b in attribution_followup["content"] if b["type"] == "text"][0][
         "text"

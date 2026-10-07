@@ -306,7 +306,7 @@ def test_the_judge_inputs_are_byte_identical_with_inherited_directives_present()
             new_contribution=NEW_CONTRIBUTION,
             ancestor_directives=ancestors,
         )
-        calls.append(mock_client.messages.create.call_args.kwargs)
+        calls.append(mock_client.messages.create.call_args_list[0].kwargs)
     without, with_ancestors = calls
     # The no-ancestor scenario is the pre-1.17.1 pinned one.
     assert _sha_json(without["messages"]) == _SINGLE_MESSAGES_SHA
