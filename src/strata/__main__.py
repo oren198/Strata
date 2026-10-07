@@ -1190,12 +1190,13 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     6d. Claude Code ``permissions.deny`` rules for the resolved store
         (ADR 0013 D6). The seeded layout is ``/.strata/**``. A database
         elsewhere is a file rule; summaries, sessions, and ``.locks`` are
-        directory rules only when Strata owns that directory. Paths left
+        directory rules only when Strata owns that directory. ``fleet.yaml``
+        is an exact file rule when a denied directory does not already
+        cover it; the directory that holds the file stays open. Paths left
         open (a shared parent, a generic name Strata did not create, a
         directory above the home directory) are named in the check.
-        ``fleet.yaml`` is not a rule. Codex's sandbox config cannot deny a
-        workspace path; the check says so instead of pretending a rule was
-        seeded.
+        Codex's sandbox config cannot deny a workspace path; the check says
+        so instead of pretending a rule was seeded.
     7. Skills present in ``.claude/skills/``.
     8. Binding env vars (``STRATA_AGENT_SCOPE`` / ``_SKILL`` / ``_SESSION_ID``)
        set and valid against the fleet.

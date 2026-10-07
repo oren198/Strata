@@ -890,7 +890,9 @@ def _remove_hook_event(
 # summaries, sessions, and ``.locks`` directories when each one is Strata's
 # own. It does not deny a parent directory that merely holds the database or
 # ``fleet.yaml`` — a database in a shared checkout directory must not hide
-# the other repositories there. ``fleet.yaml`` itself is not denied.
+# the other repositories there. ``fleet.yaml`` is a file rule when that file
+# is not already inside a denied directory (``/.strata/**`` covers the seeded
+# ``.strata/fleet.yaml``). The rule names the file exactly, with no wildcard.
 # A generic ``summaries`` or ``sessions`` directory directly under the home
 # directory, or under an ancestor of the project, is denied only when Strata
 # created it. A directory that resolves above the home directory is left
@@ -1005,8 +1007,9 @@ class StoreDenyPlan:
 
     ``skipped`` lines are what ``strata doctor`` prints. Each one is a path
     Strata was asked about and did not deny: a shared parent of the database
-    or ``fleet.yaml``, the home directory, a directory above home, or a
-    generic ``summaries`` / ``sessions`` name Strata did not create.
+    or ``fleet.yaml`` (the fleet file itself is still denied), the home
+    directory, a directory above home, or a generic ``summaries`` /
+    ``sessions`` name Strata did not create.
     """
 
     rules: tuple[str, ...]
@@ -1170,15 +1173,24 @@ def _inside_denied(path: Path, directories: list[Path]) -> bool:
 
 
 def _rules_for_targets(
-    project_root: Path, directories: list[Path], files: list[Path]
+    project_root: Path,
+    directories: list[Path],
+    files: list[Path],
+    exact_files: list[Path] | None = None,
 ) -> tuple[str, ...]:
-    """Read+Edit rules for *directories* and database *files*, project-relative first."""
+    """Read+Edit rules for directories, database files, and exact files.
+
+    Database *files* gain a trailing ``*`` so the ``-wal`` and ``-shm``
+    siblings match. *exact_files* (``fleet.yaml``) do not: the rule is that
+    file and nothing beside it. Project-relative patterns sort first.
+    """
     specs: list[str] = []
     for directory in directories:
         specs.append(_deny_spec(directory, project_root, directory=True))
     for file in files:
-        # ``<db>*`` also matches the ``-wal`` and ``-shm`` siblings.
         specs.append(_deny_spec(file, project_root, directory=False) + "*")
+    for file in exact_files or []:
+        specs.append(_deny_spec(file, project_root, directory=False))
     rules: list[str] = []
     for spec in sorted(set(specs), key=lambda item: (item.startswith("//"), item)):
         rules.append(f"Read({spec})")
@@ -1208,7 +1220,8 @@ def claude_store_deny_plan(
     ``.strata/`` is always included: it holds the config, and on the seeded
     layout it holds the store. The database is a file rule. Summaries, the
     sessions directory beside them, and ``.locks`` are directory rules only
-    when that directory is Strata's own. ``fleet.yaml`` is not a rule.
+    when that directory is Strata's own. ``fleet.yaml`` is an exact file
+    rule unless a denied directory already covers it.
     :attr:`StoreDenyPlan.skipped` names the paths left open, for doctor.
     """
     from strata.project_config import ProjectConfigError, _parse_config  # noqa: PLC0415
@@ -1280,6 +1293,18 @@ def claude_store_deny_plan(
     else:
         files.append(db_path)
 
+    exact_files: list[Path] = []
+    if _inside_denied(fleet_path, directories):
+        pass
+    elif (
+        fleet_path in (root, home)
+        or root.is_relative_to(fleet_path)
+        or home.is_relative_to(fleet_path)
+    ):
+        skipped.append(_skip_line(fleet_path, "contains the project or the home directory"))
+    else:
+        exact_files.append(fleet_path)
+
     unique_skipped: list[str] = []
     for line in skipped:
         if line in unique_skipped:
@@ -1291,7 +1316,7 @@ def claude_store_deny_plan(
             continue
         unique_skipped.append(line)
     return StoreDenyPlan(
-        rules=_rules_for_targets(root, directories, files),
+        rules=_rules_for_targets(root, directories, files, exact_files),
         skipped=tuple(unique_skipped),
     )
 
