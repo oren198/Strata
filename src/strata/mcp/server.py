@@ -3736,6 +3736,165 @@ async def strata_session_closeout(reason: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Tools: fleet structure changes (#247)
+#
+# The acting scope is this session's binding. A request body cannot name it.
+# Structure changes are authority acts: recorded, never judged.
+# ---------------------------------------------------------------------------
+
+
+def _fleet_bound_actor():
+    """The session's bound scope. Never a value from a tool argument."""
+    from strata.fleet_changes import Actor
+
+    if not _AGENT_SCOPE:
+        raise RuntimeError("This session is not bound to a scope.")
+    return Actor(_AGENT_SCOPE)
+
+
+def _run_fleet_change(action):
+    """Run *action(fleet, record_store, actor)* and surface a refusal as an error."""
+    from strata.fleet_changes import FleetChangeError
+    from strata.fleet_config import FleetConfigError
+
+    if _record_store is None:
+        raise RuntimeError("Strata's record store is not initialised.")
+    try:
+        return action(_load_fleet(), _record_store, _fleet_bound_actor())
+    except (FleetChangeError, FleetConfigError) as exc:
+        raise RuntimeError(exc.message) from exc
+
+
+def _fleet_result_payload(result) -> dict:
+    from strata.fleet_changes import flag_phrases
+
+    return {
+        "status": result.status,
+        "proposal_id": result.proposal_id,
+        "act_id": result.act_id,
+        "change_type": result.change_type,
+        "proposer_position": result.proposer_position,
+        "approver_position": result.approver_position,
+        "owner_scope_id": result.owner_scope_id,
+        "widens_proposer_reach": result.widens_proposer_reach,
+        "changes_proposer_binding": result.changes_proposer_binding,
+        "flags": flag_phrases(
+            widens=result.widens_proposer_reach,
+            binds=result.changes_proposer_binding,
+        ),
+        "notices": list(result.notices),
+    }
+
+
+@mcp.tool()
+@_with_read_signal
+async def strata_fleet_propose(change_type: str, payload_json: str) -> dict:
+    """Propose a fleet structure change as this session's bound scope.
+
+    The acting scope is the session binding. It is not an argument, and a
+    field in ``payload_json`` that names a proposer or approver is refused.
+    The change is validated the same way ``fleet.yaml`` is validated on
+    load. It applies immediately when this scope owns it or sits above the
+    owner; otherwise it is stored pending.
+
+    Args:
+        change_type: ``add_scope``, ``remove_scope``, ``reparent``,
+            ``add_edge``, ``remove_edge``, or ``describe``.
+        payload_json: JSON object of the change itself. ``add_edge`` and
+            ``remove_edge`` are reference edges (``from`` reads ``to``).
+
+    Returns:
+        ``status`` ``applied`` or ``pending``, the ids, both flags, and any
+        stated-limit notices.
+    """
+    import json
+
+    from strata.fleet_changes import FleetChangeError, parse_change, propose
+
+    await _require_bound_or_elicit()
+    try:
+        payload = json.loads(payload_json)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"payload_json is not valid JSON: {exc}") from exc
+    try:
+        change = parse_change(change_type, payload)
+    except FleetChangeError as exc:
+        raise RuntimeError(exc.message) from exc
+    result = _run_fleet_change(
+        lambda fleet, store, actor: propose(fleet, store, change, proposer=actor)
+    )
+    return _fleet_result_payload(result)
+
+
+@mcp.tool()
+@_with_read_signal
+async def strata_fleet_pending() -> dict:
+    """List pending fleet changes this session's bound scope may approve.
+
+    The operator's own pending list is the ``strata fleet pending`` command
+    and the Console. This tool shows only the rows this binding may act on.
+    """
+    await _require_bound_or_elicit()
+
+    def _list(fleet, store, actor):
+        from strata.fleet_changes import flag_phrases
+        from strata.fleet_changes import list_approvable as _list_approvable
+
+        return [
+            {
+                "id": proposal.id,
+                "change_type": proposal.change_type,
+                "payload": proposal.payload,
+                "proposer_position": proposal.proposer_position,
+                "owner_scope_id": proposal.owner_scope_id,
+                "widens_proposer_reach": proposal.widens_proposer_reach,
+                "changes_proposer_binding": proposal.changes_proposer_binding,
+                "flags": flag_phrases(
+                    widens=proposal.widens_proposer_reach,
+                    binds=proposal.changes_proposer_binding,
+                ),
+            }
+            for proposal in _list_approvable(fleet, store, actor)
+        ]
+
+    return {"changes": _run_fleet_change(_list)}
+
+
+@mcp.tool()
+@_with_read_signal
+async def strata_fleet_approve(proposal_id: str) -> dict:
+    """Approve a pending fleet change as this session's bound scope.
+
+    Refused unless this scope is the owner or an ancestor of the owner.
+    The approver is the binding, never an argument.
+    """
+    from strata.fleet_changes import approve
+
+    await _require_bound_or_elicit()
+    result = _run_fleet_change(
+        lambda fleet, store, actor: approve(fleet, store, proposal_id, approver=actor)
+    )
+    return _fleet_result_payload(result)
+
+
+@mcp.tool()
+@_with_read_signal
+async def strata_fleet_reject(proposal_id: str) -> dict:
+    """Reject a pending fleet change as this session's bound scope.
+
+    The same authority rule as ``strata_fleet_approve``. Rejecting writes
+    no structure-act record and does not change ``fleet.yaml``.
+    """
+    from strata.fleet_changes import reject
+
+    await _require_bound_or_elicit()
+    result = _run_fleet_change(
+        lambda fleet, store, actor: reject(fleet, store, proposal_id, approver=actor)
+    )
+    return _fleet_result_payload(result)
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
