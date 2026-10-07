@@ -134,6 +134,14 @@ Removing a reference edge, removing a scope, or re-parenting prints the
 limit of what Strata does not yet re-check. Nothing on this tab is judged,
 and nothing here emits a change event.
 
+## Judge usage
+
+The "Judge usage" tab shows judge calls, tokens, and cost grouped by day,
+scope, and call kind — the same numbers as `strata stats judge`. It also
+shows the daily token cap and today's usage. Cost appears only when a
+price is configured for that model. Nothing on this tab writes, and
+nothing here calls the judge.
+
 ## Editing the fleet
 
 The "Edit fleet" button in the graph tab's header opens a text editor over

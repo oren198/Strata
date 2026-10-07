@@ -84,6 +84,19 @@ the release PR (`dev` → `main`) and the GitHub Release body are built from
   not judged. Removing a reference edge, removing a scope, or
   re-parenting says what is not re-checked automatically yet.
 
+- **Every judge call records its token usage** (#246). One row per call,
+  at the single choke point, with tokens taken from the response. `strata
+  stats judge` groups them by scope, call kind, and day (`--since`,
+  `--scope`). `STRATA_JUDGE_PRICE_TABLE` is a JSON file of per-model
+  prices per million tokens; with no price for a call the report stays
+  tokens-only. `STRATA_JUDGE_DAILY_TOKEN_CAP`, when set, is checked
+  before a judgment's first call and before a standalone call. A
+  judgment that has started always finishes. Over the cap, the
+  contribution takes the existing judge-unavailable path (503, the
+  attempt recorded, re-judge later). `strata doctor` shows the cap and
+  today's usage. The Console's Judge usage tab shows the same numbers
+  and does not write.
+
 ## 1.17.2 (2026-10-06)
 
 ### Fixed

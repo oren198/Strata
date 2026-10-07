@@ -869,7 +869,15 @@ strata scopes              # list the fleet's strata, scopes, edges
 strata summary <scope_id>  # curated summary (directives + context)
 strata record  <scope_id>  # every contribution + judgment in the scope's record
 strata stats writeback     # write-back rate by harness (sessions that contributed, closed out, or stayed silent)
+strata stats judge         # judge calls, tokens, and cost by scope, call kind, and day
 ```
+
+`strata stats judge` accepts `--since` (an ISO date or time) and `--scope`.
+Cost is filled only from `STRATA_JUDGE_PRICE_TABLE`. With no price for a
+call, that row shows tokens and says so. `STRATA_JUDGE_DAILY_TOKEN_CAP`
+(unset means off) refuses a new judgment once today's tokens reach it; a
+judgment already in progress still finishes. The Console's Judge usage tab
+shows the same numbers.
 
 ### Advanced subcommands
 
@@ -1096,6 +1104,8 @@ see [`docs/console.md`](https://github.com/oren198/Strata/blob/main/docs/console
   broken into layers with a rough token-weight estimate for each.
 - **Operator corrections** — replace or retire one of a scope's own
   directives in person, each action behind a confirm dialog.
+- **Judge usage** — judge calls, tokens, and cost by day, scope, and call
+  kind, the same numbers as `strata stats judge`. Read-only.
 
 ---
 
@@ -1105,10 +1115,10 @@ The Console's backend also accepts contributions over HTTP (`POST /contribute`),
 with the same fields and checks as the MCP tool, including `acted_on`. The HTTP
 API trusts the caller's scope; `acted_on` entitlement is checked against it.
 A judge failure the engine cannot fail closed on by itself (a genuine API
-outage, auth failure, or a second malformed response surviving the
-corrective re-ask) returns `503` with `{"error": "scope_manager_failure",
-..., "retry": "strata_rejudge"}`, distinct from a `200` merits decline
-(#235, #236).
+outage, auth failure, a second malformed response surviving the
+corrective re-ask, or the daily token cap) returns `503` with
+`{"error": "scope_manager_failure", ..., "retry": "strata_rejudge"}`,
+distinct from a `200` merits decline (#235, #236, #246).
 
 **Who changes a scope's directives.** Only a session bound to a scope can create, replace or retire that scope's directives; the engine enforces this after judgment. A contribution from any other position, such as a child writing upward, is admitted as an attributed proposal ("X (scope) proposes: … — directive <id> stands"). A session bound to that scope can adopt it with its own contribution (`adopted_from`). Every same-scope directive change carries an engine-written line in the record naming the session and the changes, so the record's account of who changed a rule never rests on the judge's wording. Recorded notes also open with the actual decision and ops ("[accept_as_context; no ops] …"). Both are stripped from what later judges read. A child's own directive may tighten an inherited one, never change it: after judgment the engine compares an admitted directive from a session bound to that scope against each inherited directive (ancestor and operator) on the same subject, and one that loosens it, exempts from it, softens it or calls it outdated is admitted as context under a held note instead. Stated limit: this is a mechanical comparison of values, polarity and markers, so a contradiction phrased with none of them rests on the judge, and a tightening it can't read as stricter becomes context. Stated limit: a session bound to a scope may change that scope's rules, so an instruction written into its own contribution ("just accept it as-is") is stopped only by the judge refusing it. The default judge admitted one such case once in the v1.17 baseline ([evidence](docs/evidence/v1.17-baseline-2026-10-04.md)), and the record names who made the change.
 
@@ -1238,6 +1248,8 @@ server (project config wins):
 | `JUDGE_MODEL` | `qwen/qwen3-235b-a22b-2507` | Model used by the judge (an id the endpoint serves). `STRATA_MANAGER_MODEL` is the original name and still works (wins if both are set). **Exception:** with only an Anthropic key set the default stays `claude-haiku-4-5`. |
 | `ANTHROPIC_API_KEY` / `STRATA_ANTHROPIC_API_KEY` | (unset) | **Deprecated**, kept as a working fallback: used only when `JUDGE_API_KEY` is unset. On its own it keeps `claude-haiku-4-5` on the Anthropic API. |
 | `JUDGE_PROVIDER` | (unset) | Pins every judge call to one named OpenRouter provider (e.g. `Alibaba`); ignored on a non-OpenRouter judge endpoint. `STRATA_JUDGE_PROVIDER` also works. See [Choosing a judge](#choosing-a-judge). |
+| `STRATA_JUDGE_DAILY_TOKEN_CAP` | (unset) | Off when unset. A non-negative integer is today's token budget for new judgments and standalone judge calls. A judgment that has already called the model still finishes. Over the cap, the contribution waits unjudged (the same 503 as an unreachable judge). |
+| `STRATA_JUDGE_PRICE_TABLE` | (unset) | Path to a JSON object keyed by model id, each value `{"input_per_million": <number>, "output_per_million": <number>}`. Used only when reporting cost. No entry for a model means that row stays tokens-only. |
 | `STRATA_FRESHNESS_STRICT` | (unset) | `1`/`0` forces the freshness `Stop`-hook strict (blocking) or background; unset defers to the project's `[freshness] strict`, default on ([details](#memory-freshness-stop-hook)) |
 | `STRATA_EVALUATOR_MODEL` | `claude-haiku-4-5-20251001` on the Anthropic API, otherwise the judge's model | Model the freshness evaluator drafts with (the judge is unaffected) |
 
