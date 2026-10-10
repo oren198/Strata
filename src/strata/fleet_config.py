@@ -26,6 +26,7 @@ reference edge, peer reference, fleet.
 from __future__ import annotations
 
 import os
+import tempfile
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -1206,10 +1207,32 @@ def _validate(config: FleetConfig) -> None:
 
 
 def _atomic_write(path: Path, data: object) -> None:
-    """Render *data* as YAML and write atomically to *path*."""
-    tmp = Path(str(path) + ".tmp")
-    tmp.write_text(yaml.dump(data, default_flow_style=False, allow_unicode=True), encoding="utf-8")
-    os.replace(tmp, path)
+    """Render *data* as YAML and replace *path* through a unique temp file."""
+    text = yaml.dump(data, default_flow_style=False, allow_unicode=True)
+    _atomic_replace(path, text.encode("utf-8"))
+
+
+def _atomic_replace(path: Path, data: bytes) -> None:
+    """Replace *path* with *data* via ``NamedTemporaryFile`` and ``os.replace``.
+
+    The temp file is created in *path*'s own directory under a unique name, so
+    two writers never share ``fleet.yaml.tmp``.
+    """
+    tmp_name: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as handle:
+            tmp_name = handle.name
+            handle.write(data)
+            handle.flush()
+    except BaseException:
+        if tmp_name is not None:
+            os.unlink(tmp_name)
+        raise
+    try:
+        os.replace(tmp_name, path)
+    except BaseException:
+        os.unlink(tmp_name)
+        raise
 
 
 def _write_timestamped_backup(path: Path) -> Path:

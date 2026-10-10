@@ -47,7 +47,7 @@ def test_cli_pending_flags_and_stated_limits(tmp_path: Path, capsys) -> None:
 
     assert main([*prefix, "remove-scope", "g_a1"]) == 0
     remove_out = capsys.readouterr().out
-    assert "Readers of g_a1's publication (none)" in remove_out
+    assert "remove_edge already gave notice" in remove_out
     assert "g_a1's memory is kept." in remove_out
     assert "not re-checked automatically (not built yet)" in remove_out
     assert FleetConfig.load(fleet._path).get_scope("g_a1") is None

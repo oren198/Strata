@@ -14,9 +14,17 @@ from __future__ import annotations
 import copy
 import json
 import sys
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover — Windows has no fcntl
+    # Same degrade as strata.locks: one process still serialises on the
+    # threading lock; two processes on Windows can still race the file.
+    fcntl = None  # type: ignore[assignment]
 
 import yaml
 from pydantic import ValidationError
@@ -24,6 +32,7 @@ from pydantic import ValidationError
 from strata.fleet_config import (
     FleetConfig,
     FleetConfigError,
+    _atomic_replace,
     _resolve_edges,
     _schema_error_to_fleet_config_error,
     _validate,
@@ -252,12 +261,9 @@ def limit_notices(fleet: FleetConfig, change: FleetChange) -> list[str]:
         ]
     if change.change_type == "remove_scope":
         scope_id = payload["scope_id"]
-        readers = [scope.id for scope in fleet.referenced_by(scope_id)]
-        listed = ", ".join(readers) if readers else "none"
         return [
-            f"Readers of {scope_id}'s publication ({listed}) lose that channel; their "
-            "attributed items are not re-checked automatically (not built yet). "
-            f"{scope_id}'s memory is kept."
+            f"{scope_id}'s memory is kept. remove_edge already gave notice to any reader; "
+            "attributed items are not re-checked automatically (not built yet)."
         ]
     if change.change_type == "reparent":
         scope_id = payload["scope_id"]
@@ -283,32 +289,39 @@ def propose(
     *proposer* is the session's bound scope, or the operator. It is never
     read from *change*. A proposer who is the owner, or an ancestor of the
     owner, applies immediately. Anyone else leaves a pending row.
+
+    The fleet file is re-read under the cross-process lock before the owner,
+    the flags, and the delegation refusal are computed.
     """
-    if proposer.scope_id is None:
-        raise FleetChangeError(
-            "operator_uses_apply",
-            "The operator applies a fleet change directly; propose is for a bound scope.",
-        )
-    preview = _preview(fleet, change, proposer)
-    if actor_qualifies(fleet, proposer, preview.owner):
-        return _apply(
-            fleet,
-            record_store,
-            change,
-            preview,
+
+    def _body() -> FleetChangeResult:
+        if proposer.scope_id is None:
+            raise FleetChangeError(
+                "operator_uses_apply",
+                "The operator applies a fleet change directly; propose is for a bound scope.",
+            )
+        preview = _preview(fleet, change, proposer)
+        if actor_qualifies(fleet, proposer, preview.owner):
+            return _apply(
+                fleet,
+                record_store,
+                change,
+                preview,
+                proposer_position=proposer.position,
+                approver_position=proposer.position,
+                proposal_id=None,
+            )
+        proposal = record_store.insert_fleet_change_proposal(
+            change_type=change.change_type,
+            payload=change.payload,
             proposer_position=proposer.position,
-            approver_position=proposer.position,
-            proposal_id=None,
+            owner_scope_id=preview.owner,
+            widens_proposer_reach=preview.widens,
+            changes_proposer_binding=preview.binds,
         )
-    proposal = record_store.insert_fleet_change_proposal(
-        change_type=change.change_type,
-        payload=change.payload,
-        proposer_position=proposer.position,
-        owner_scope_id=preview.owner,
-        widens_proposer_reach=preview.widens,
-        changes_proposer_binding=preview.binds,
-    )
-    return _pending_result(proposal)
+        return _pending_result(proposal)
+
+    return _under_fleet_lock(fleet, _body)
 
 
 def apply_as_operator(
@@ -317,17 +330,21 @@ def apply_as_operator(
     change: FleetChange,
 ) -> FleetChangeResult:
     """Apply *change* as the operator. The operator can apply anything valid."""
-    operator = Actor(None)
-    preview = _preview(fleet, change, operator)
-    return _apply(
-        fleet,
-        record_store,
-        change,
-        preview,
-        proposer_position="operator",
-        approver_position="operator",
-        proposal_id=None,
-    )
+
+    def _body() -> FleetChangeResult:
+        operator = Actor(None)
+        preview = _preview(fleet, change, operator)
+        return _apply(
+            fleet,
+            record_store,
+            change,
+            preview,
+            proposer_position="operator",
+            approver_position="operator",
+            proposal_id=None,
+        )
+
+    return _under_fleet_lock(fleet, _body)
 
 
 def list_approvable(
@@ -351,34 +368,44 @@ def approve(
     *,
     approver: Actor,
 ) -> FleetChangeResult:
-    """Apply a pending proposal. Refused unless *approver* owns it or is above it."""
-    proposal = _require_pending(record_store, proposal_id)
-    change = FleetChange(change_type=proposal.change_type, payload=proposal.payload)  # type: ignore[arg-type]
-    proposer_scope = (
-        None if proposal.proposer_position == "operator" else proposal.proposer_position
-    )
-    preview = _preview(fleet, change, Actor(proposer_scope))
-    if not actor_qualifies(fleet, approver, preview.owner):
-        raise FleetChangeError(
-            "not_authorized",
-            f"{approver.position} cannot approve {proposal_id}, owned by "
-            f"{preview.owner or 'the operator'}.",
+    """Apply a pending proposal. Refused unless *approver* owns it or is above it.
+
+    The claim, the fresh owner check, the write, and the act are one critical
+    section under the fleet file lock. The proposer cannot approve their own
+    proposal.
+    """
+
+    def _body() -> FleetChangeResult:
+        proposal = _require_pending(record_store, proposal_id)
+        _refuse_self_resolution(approver, proposal, verb="approve")
+        change = FleetChange(change_type=proposal.change_type, payload=proposal.payload)  # type: ignore[arg-type]
+        proposer_scope = (
+            None if proposal.proposer_position == "operator" else proposal.proposer_position
         )
-    if not record_store.claim_fleet_change_proposal(proposal_id, resolved_by=approver.position):
-        raise FleetChangeError("not_pending", f"{proposal_id} is not pending.")
-    try:
-        return _apply(
-            fleet,
-            record_store,
-            change,
-            preview,
-            proposer_position=proposal.proposer_position,
-            approver_position=approver.position,
-            proposal_id=proposal_id,
-        )
-    except Exception:
-        record_store.reopen_fleet_change_proposal(proposal_id)
-        raise
+        preview = _preview(fleet, change, Actor(proposer_scope))
+        if not actor_qualifies(fleet, approver, preview.owner):
+            raise FleetChangeError(
+                "not_authorized",
+                f"{approver.position} cannot approve {proposal_id}, owned by "
+                f"{preview.owner or 'the operator'}.",
+            )
+        if not record_store.claim_fleet_change_proposal(proposal_id, resolved_by=approver.position):
+            raise FleetChangeError("not_pending", f"{proposal_id} is not pending.")
+        try:
+            return _apply(
+                fleet,
+                record_store,
+                change,
+                preview,
+                proposer_position=proposal.proposer_position,
+                approver_position=approver.position,
+                proposal_id=proposal_id,
+            )
+        except Exception:
+            record_store.reopen_fleet_change_proposal(proposal_id)
+            raise
+
+    return _under_fleet_lock(fleet, _body)
 
 
 def cli_fleet(args: object) -> int:
@@ -412,29 +439,43 @@ def reject(
     *,
     approver: Actor,
 ) -> FleetChangeResult:
-    """Reject a pending proposal. Same authority rule as :func:`approve`."""
-    proposal = _require_pending(record_store, proposal_id)
-    if not actor_qualifies(fleet, approver, proposal.owner_scope_id):
-        raise FleetChangeError(
-            "not_authorized",
-            f"{approver.position} cannot reject {proposal_id}, owned by "
-            f"{proposal.owner_scope_id or 'the operator'}.",
+    """Reject a pending proposal. Same authority rule as :func:`approve`.
+
+    The owner is recomputed from the fleet file under the lock, not taken
+    from the stored ``owner_scope_id``. The proposer cannot reject their own
+    proposal.
+    """
+
+    def _body() -> FleetChangeResult:
+        proposal = _require_pending(record_store, proposal_id)
+        _refuse_self_resolution(approver, proposal, verb="reject")
+        change = FleetChange(change_type=proposal.change_type, payload=proposal.payload)  # type: ignore[arg-type]
+        owner = owner_scope(fleet, change)
+        if not actor_qualifies(fleet, approver, owner):
+            raise FleetChangeError(
+                "not_authorized",
+                f"{approver.position} cannot reject {proposal_id}, owned by "
+                f"{owner or 'the operator'}.",
+            )
+        if not record_store.reject_fleet_change_proposal(
+            proposal_id, resolved_by=approver.position
+        ):
+            raise FleetChangeError("not_pending", f"{proposal_id} is not pending.")
+        return FleetChangeResult(
+            status="rejected",
+            proposal_id=proposal_id,
+            act_id=None,
+            change_type=proposal.change_type,
+            proposer_position=proposal.proposer_position,
+            approver_position=approver.position,
+            owner_scope_id=owner,
+            widens_proposer_reach=proposal.widens_proposer_reach,
+            changes_proposer_binding=proposal.changes_proposer_binding,
+            notices=(),
+            backup=None,
         )
-    if not record_store.reject_fleet_change_proposal(proposal_id, resolved_by=approver.position):
-        raise FleetChangeError("not_pending", f"{proposal_id} is not pending.")
-    return FleetChangeResult(
-        status="rejected",
-        proposal_id=proposal_id,
-        act_id=None,
-        change_type=proposal.change_type,
-        proposer_position=proposal.proposer_position,
-        approver_position=approver.position,
-        owner_scope_id=proposal.owner_scope_id,
-        widens_proposer_reach=proposal.widens_proposer_reach,
-        changes_proposer_binding=proposal.changes_proposer_binding,
-        notices=(),
-        backup=None,
-    )
+
+    return _under_fleet_lock(fleet, _body)
 
 
 # ---------------------------------------------------------------------------
@@ -600,9 +641,97 @@ def _require_pending(record_store: RecordStore, proposal_id: str) -> FleetChange
 
 
 def _rollback(fleet: FleetConfig, backup: Path) -> None:
+    """Put the backup bytes back. Caller holds the fleet file lock."""
     assert fleet._path is not None
-    fleet._path.write_bytes(backup.read_bytes())
+    _atomic_replace(fleet._path, backup.read_bytes())
     fleet.reload_from_disk()
+
+
+def _refuse_self_resolution(approver: Actor, proposal: FleetChangeProposal, *, verb: str) -> None:
+    """The scope that proposed a change cannot be the one that decides it."""
+    if approver.position == proposal.proposer_position:
+        raise FleetChangeError(
+            "approver_is_proposer",
+            f"{approver.position} proposed {proposal.id} and cannot {verb} it.",
+        )
+
+
+class _FleetYamlLock:
+    """A threading lock plus a cross-process flock on a file beside ``fleet.yaml``.
+
+    Same order as :class:`strata.locks._ScopeFileLock`: the threading lock is
+    outermost, then ``fcntl.flock``. The same thread may enter again; only the
+    outermost entry takes the flock, so a write inside an apply does not
+    deadlock on the lock the apply already holds. Where ``fcntl`` is missing
+    the threading lock still serialises this process.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self._path = path
+        self._thread = threading.RLock()
+        self._fh: object | None = None
+        self._depth = 0
+
+    def __enter__(self) -> _FleetYamlLock:
+        self._thread.acquire()
+        try:
+            if self._depth == 0 and fcntl is not None:
+                handle = None
+                try:
+                    lock_path = self._path.with_name(self._path.name + ".lock")
+                    handle = lock_path.open("a", encoding="utf-8")
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                except BaseException:
+                    if handle is not None:
+                        handle.close()
+                    raise
+                self._fh = handle
+            self._depth += 1
+        except BaseException:
+            self._thread.release()
+            raise
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        try:
+            self._depth -= 1
+            if self._depth == 0 and self._fh is not None:
+                try:
+                    fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)  # type: ignore[attr-defined]
+                finally:
+                    self._fh.close()  # type: ignore[attr-defined]
+                    self._fh = None
+        finally:
+            self._thread.release()
+
+
+_fleet_yaml_locks: dict[str, _FleetYamlLock] = {}
+_fleet_yaml_locks_guard = threading.Lock()
+
+
+def _fleet_yaml_lock(path: Path) -> _FleetYamlLock:
+    key = str(Path(path).resolve())
+    with _fleet_yaml_locks_guard:
+        lock = _fleet_yaml_locks.get(key)
+        if lock is None:
+            lock = _FleetYamlLock(Path(key))
+            _fleet_yaml_locks[key] = lock
+        return lock
+
+
+def _under_fleet_lock(fleet: FleetConfig, body):  # noqa: ANN001, ANN202
+    """Re-read *fleet* and run *body* while holding the file lock.
+
+    *body* sees the file as it is now. Owner, flags, the delegation refusal,
+    the transform, the write, and the recorded act all happen before the lock
+    is released. Approve and reject claim the proposal inside the same hold.
+    """
+    path = fleet._path
+    if path is None:
+        raise FleetChangeError("no_fleet_file", "This fleet is not backed by a file.")
+    with _fleet_yaml_lock(path):
+        fleet.reload_from_disk()
+        return body()
 
 
 def _read_raw(fleet: FleetConfig) -> dict:

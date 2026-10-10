@@ -324,8 +324,8 @@ def test_remove_scope_refuses_children_and_edges_and_keeps_memory(tmp_path: Path
 
     result = apply_as_operator(fleet, store, _change("remove_scope", scope_id="g_a1"))
     assert result.notices == (
-        "Readers of g_a1's publication (none) lose that channel; their attributed items "
-        "are not re-checked automatically (not built yet). g_a1's memory is kept.",
+        "g_a1's memory is kept. remove_edge already gave notice to any reader; "
+        "attributed items are not re-checked automatically (not built yet).",
     )
     assert fleet.get_scope("g_a1") is None
     assert (summaries / "g_a1.md").read_text(encoding="utf-8") == "scope memory stays"
@@ -399,3 +399,120 @@ def test_migration_0023_applies_on_a_populated_database(tmp_path: Path) -> None:
     assert store.list_fleet_change_proposals(status=None) == []
     assert store.list_fleet_structure_acts() == []
     store.close()
+
+
+def _parallel_apply_edge(fleet_path: str, db_path: str, target: str) -> None:
+    """One process, one edge. Top-level so a spawned interpreter can import it."""
+    from strata.fleet_changes import apply_as_operator, parse_change
+    from strata.fleet_config import FleetConfig
+    from strata.record_store import RecordStore
+
+    fleet = FleetConfig.load(Path(fleet_path))
+    store = RecordStore(db_path)
+    try:
+        apply_as_operator(
+            fleet,
+            store,
+            parse_change("add_edge", {"from": "g_src", "to": target}),
+        )
+    finally:
+        store.close()
+
+
+def test_parallel_applies_keep_every_edge_and_act(tmp_path: Path) -> None:
+    import multiprocessing
+
+    n = 12
+    scopes = "\n".join(f"  - id: g_t{i}\n    name: T{i}\n    stratum_id: s0" for i in range(n))
+    fleet_path = tmp_path / "fleet.yaml"
+    fleet_path.write_text(
+        "strata:\n"
+        "  - id: s0\n"
+        "    name: Root\n"
+        "    ordinal: 0\n"
+        "scopes:\n"
+        "  - id: g_src\n"
+        "    name: Src\n"
+        "    stratum_id: s0\n"
+        f"{scopes}\n"
+        "edges: []\n",
+        encoding="utf-8",
+    )
+    db_path = str(tmp_path / "strata.db")
+    run_migrations(db_path)
+    ctx = multiprocessing.get_context("spawn")
+    procs = [
+        ctx.Process(target=_parallel_apply_edge, args=(str(fleet_path), db_path, f"g_t{i}"))
+        for i in range(n)
+    ]
+    for proc in procs:
+        proc.start()
+    for proc in procs:
+        proc.join(60)
+    codes = [proc.exitcode for proc in procs]
+    assert codes == [0] * n, codes
+    reloaded = FleetConfig.load(fleet_path)
+    edge_count = sum(1 for edge in reloaded.edges if edge.from_ == "g_src")
+    store = RecordStore(db_path)
+    try:
+        act_count = len(store.list_fleet_structure_acts())
+    finally:
+        store.close()
+    print(f"N={n} edges={edge_count} acts={act_count}")
+    assert edge_count == n
+    assert act_count == n
+    assert not (tmp_path / "fleet.yaml.tmp").exists()
+
+
+def test_failed_act_restores_the_fleet_file(tmp_path: Path, monkeypatch) -> None:
+    fleet, store = _world(tmp_path)
+    before = fleet._path.read_bytes()
+
+    def _boom(**_kwargs: object) -> None:
+        raise RuntimeError("act store down")
+
+    monkeypatch.setattr(fleet_changes, "record_fleet_structure_act", _boom)
+    with pytest.raises(RuntimeError, match="act store down"):
+        apply_as_operator(fleet, store, _change("describe", scope_id="g_a", description="nope"))
+    assert fleet._path.read_bytes() == before
+    assert fleet.get_scope("g_a").description is None
+    assert not (tmp_path / "fleet.yaml.tmp").exists()
+
+
+def test_proposer_cannot_approve_or_reject_their_own_proposal(tmp_path: Path) -> None:
+    fleet, store = _world(tmp_path)
+    proposal = store.insert_fleet_change_proposal(
+        change_type="describe",
+        payload={"scope_id": "g_a1", "description": "from its parent"},
+        proposer_position="g_a",
+        owner_scope_id="g_a",
+        widens_proposer_reach=False,
+        changes_proposer_binding=False,
+    )
+    with pytest.raises(FleetChangeError, match="cannot approve") as approve_error:
+        approve(fleet, store, proposal.id, approver=Actor("g_a"))
+    assert approve_error.value.kind == "approver_is_proposer"
+    with pytest.raises(FleetChangeError, match="cannot reject") as reject_error:
+        reject(fleet, store, proposal.id, approver=Actor("g_a"))
+    assert reject_error.value.kind == "approver_is_proposer"
+    assert store.get_fleet_change_proposal(proposal.id).status == "pending"
+    decided = approve(fleet, store, proposal.id, approver=Actor(None))
+    assert decided.status == "applied"
+
+
+def test_reject_recomputes_the_owner(tmp_path: Path) -> None:
+    fleet, store = _world(tmp_path)
+    proposal = store.insert_fleet_change_proposal(
+        change_type="describe",
+        payload={"scope_id": "g_a1", "description": "still pending"},
+        proposer_position="g_a1",
+        owner_scope_id="g_b",
+        widens_proposer_reach=False,
+        changes_proposer_binding=False,
+    )
+    with pytest.raises(FleetChangeError, match="owned by g_a") as stale:
+        reject(fleet, store, proposal.id, approver=Actor("g_b"))
+    assert stale.value.kind == "not_authorized"
+    rejected = reject(fleet, store, proposal.id, approver=Actor("g_a"))
+    assert rejected.status == "rejected"
+    assert rejected.owner_scope_id == "g_a"
