@@ -10,7 +10,7 @@ On the #244 drift set, with Claude answering on the bridge, the judge declined a
 
 ## The contract line (the philosopher, 2026-10-05)
 
-- **A consequence report** describes a specific occurrence of *following* the directive and what happened. It is dated or countable, in the past tense, about an action that could have failed and did. It is evidence about the world, and asserts nothing about what may be done instead.
+- **A consequence report** describes a specific occurrence of *following* the directive and what happened: one past act and its outcome. It is evidence about the world, and asserts nothing about what may be done instead. (Corrected 2026-10-10: the test is singular versus general, not "dated or countable"; see "Singular versus general" below.)
   - It is admitted as context.
   - Under the 2026-09-24 ruling it is raised to the issuer as evidence that following the directive went wrong.
   - The directive is untouched.
@@ -94,3 +94,25 @@ If it is material, the fallback is revisited (e.g. decline when the covered-subj
    - Mechanically: the re-ask gains `kind = departure_report`, verified like `consequence_report` (specific, past tense, an anchor of specificity) but with an overlap with the *departure* rather than with following the rule. The generalising-clause check applies to both kinds: a coordinated or "so"/"therefore" clause carrying an exception marker declines.
 2. **Decline, not hold-with-note: confirmed.** A held note is still context asserting an exception; the theory has no half-binding state. The declined contribution stays in the record.
 3. **Consequence report without `acted_on`: suggest only.** The reason names the route plainly ("to raise this to <issuer>, resubmit with acted_on = <directive id>"); the same goes for departures. **Stated limit:** reports without `acted_on` reach the issuer only if the contributor follows the suggestion.
+
+## Singular versus general (the philosopher, 2026-10-10), adopted
+
+The first build required an anchor of specificity: a date, a weekday plus a time, a count, or a named instance. It declined undated first-person reports such as "I paged the sev-1 through the primary rotation and it went wrong", including P5 reports carrying `acted_on`. That lost their raise to the issuer, which is the evidence route this line protects. The ruling corrects it:
+
+- **The test is singular versus general.** A date is one way to show singularity, not a requirement for it. A single past act, first-person or agentless ("I paged", "we ran", "used X as directed"), names one occurrence.
+- **General markers** on the act or its condition make it general, and it then declines:
+  - habitual or iterative adverbs: always, usually, every time, whenever, routinely, each …, used to;
+  - habitual "would";
+  - present or present-perfect forms ("we skip", "we've been skipping", "we don't");
+  - since, these days, lately, now;
+  - a generic bare plural or class as the object or condition ("QA on hotfixes", "for repeat jobs").
+
+  A singular with a determiner or a number is one instance ("the hotfix", "mould 17"). A plural naming *who* was acted on ("I paged the on-call engineers") stays singular.
+- **A generalising clause still declines the whole contribution.**
+- **`acted_on` removes only the anchor requirement, never the generality check.** "Acted on <rule>: we always skip it for hotfixes" declines.
+
+Built in 2cc8e60, which also adds a who-widening permission marker ("any/anyone … can/may …", plus "approve" and "sign off"). Gates are in the release evidence.
+
+## Stated limit: the fail-open door
+
+Measured on 2cc8e60, offline: 6 of 38 exceptions that carry no exception marker are admitted when the re-ask answer is garbled or "unrelated". In the live bridge runs, none of the 9 fallbacks (cx 6, j1 1, j4 2) hid an exception: all were plain facts or operator echoes. The door ships as a stated limit. #244's matching work is expected to shrink it, and re-measures it.
