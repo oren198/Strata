@@ -80,7 +80,8 @@ the release PR (`dev` → `main`) and the GitHub Release body are built from
   scope owns it or sits above the owner, and otherwise waits for
   `strata_fleet_approve`, `strata fleet apply`, or the Console's Fleet
   changes tab. The acting scope is the MCP session's binding. Over HTTP
-  the operator is the only actor. Each applied change is recorded and
+  the operator is the only actor: any local process that can reach the
+  Console port acts as the operator. Each applied change is recorded and
   not judged. Removing a reference edge, removing a scope, or
   re-parenting says what is not re-checked automatically yet.
 

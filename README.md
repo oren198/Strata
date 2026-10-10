@@ -898,7 +898,9 @@ operator. `strata fleet add-scope`, `remove-scope`, `reparent`, `add-edge`,
 scope proposes the same changes with the MCP tools `strata_fleet_propose`,
 `strata_fleet_pending`, `strata_fleet_approve`, and `strata_fleet_reject`;
 the acting scope is the session's binding. The Console's Fleet changes tab
-is the same operator list. A change is recorded and not judged. Removing a
+is the same operator list. Over HTTP the operator is the only actor, and
+any local process that can reach the Console port acts as the operator.
+A change is recorded and not judged. Removing a
 reference, removing a scope, or re-parenting prints what is not re-checked
 automatically yet.
 
