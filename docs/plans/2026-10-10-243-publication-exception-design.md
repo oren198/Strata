@@ -17,14 +17,11 @@ Facts from the code (release/v1.18.0):
 The same line as 1.17.1 and #242, applied to the outward face. **A scope may not publish what it may not hold.**
 - A published **directive** that loosens, exempts from, softens or calls outdated an inherited directive is refused. This is 1.17's inherited check.
 - A published **context** item that states what may or does happen instead of an inherited rule is refused. This is #242's exception line: singular versus general, generalising clauses, and who-widening.
-- A consequence report or a departure report may be published. Evidence travels, and readers may need it.
-
-**Question for the philosopher.** Should a *departure* report be publishable outward ("we skipped the suite on the 2.3.1 hotfix and it shipped fine")? Inside the scope, the record names it a departure, never licence. Outward, readers who never saw that record would get a published example of non-compliance, labelled only by the publication's own wording.
-- Option 1: publishable as is.
-- Option 2: publishable only with the engine's departure label prefixed ("Departure from <directive id> (<scope>): …").
-- Option 3: not publishable; consequence reports only.
-
-My lean is option 2, which keeps the evidence and makes the label travel with it.
+- A consequence report may be published. Evidence travels, and readers may need it.
+- A departure report may be published **only with the engine's label** (the philosopher, 2026-10-10, option 2). Its text is prefixed "Departure from <directive id> (<issuing scope>): …", and the publisher can't drop the label.
+  - Unlabelled publication (option 1) fails "published within believed". The scope holds the item *as* a departure, so publishing it bare would publish a precedent the scope never admitted. That is the laundering "attribution survives condensation" forbids.
+  - Refusing it (option 3) fails "evidence travels". An outcome that contradicts a directive is evidence to its issuer.
+  - The #242 singular-versus-general test runs before publishing. Only a singular past act publishes; a general or habitual clause refuses the whole item.
 
 ## Mechanism
 
@@ -34,20 +31,25 @@ The layering is the same as #242. Mechanical first, the judge only where needed,
 2. **Directive items.** `inherited_conflict(item_text, ancestor_text)` against every inherited directive, with the 1.17.2 comparator and covered-subject rules. A conflict refuses the publish. No judge call.
 3. **Context items.** The #242 re-ask (`classify_inherited_relation`) and `verify_inherited_relation`, unchanged, on the item's text against the inherited directives it covers. Verdicts map onto the publish decision:
    - `decline` or `decline_unspecific` → refuse;
-   - a report → accept; a departure report gets the treatment the philosopher rules;
+   - `consequence_report` → accept;
+   - `departure_report` → accept, with the engine's departure label prefixed to the published text;
    - the fallback → accept, counted.
 4. **The refusal** is recorded as the publication judgment's outcome, with an engine note:
    > [Refused: contrary to inherited directive <id> (<scope>). A scope can't publish an exception to a rule it inherits. Publish a specific report instead, or propose the exception to <scope>.]
 
    The artifact is untouched, exactly as for a decline today. The publish act and the judge's own verdict stay in the record, so the record shows the judge accepted and the engine refused.
-5. **Relays.** A relayed item (`relay_origin_scope_id`) is checked against the RELAYER's inherited directives. The relayer is the one putting the item on its face, and the origin's rules may differ.
+5. **Relays** (the philosopher, 2026-10-10). A relayed item (`relay_origin_scope_id`) keeps the origin's departure label verbatim, naming the origin scope.
+   - It is also checked against the RELAYER's inherited directives, but with the exception test only. A singular relayed report passes; a generalised one is refused.
+   - It is never re-labelled "Departure from <relayer's directive>": the relayer departed from nothing, so that label would be false.
+   - When the reported act conflicts with a directive that binds the relayer, the engine adds a separate note: "The reported act conflicts with <id>, which binds <relayer scope>."
+   - When the origin withdraws, the relay's label and claim go with it, because attribution is a live claim.
 6. **Bootstrap publication** (ADR 0007 D4, the one-shot initial distill) runs the same check per proposed item. A refused item is dropped from the initial set, with the note.
 
 **Why refuse rather than publish with a note.** It's the same reason as #242's decline: a published exception with a note is still an exception on the scope's face. A refusal leaves the face clean, and the act stays in the record.
 
 **What this does not do.** It never edits or withdraws an already-published item. Existing exceptions on a scope's face are left for D3's sweep and the scope's own agents. A one-off audit command that lists published items failing the check, with no change made, is cheap and could be added. That is the operator's call.
 
-## Gates (bridge only; no key)
+## Gates (offline where no judge is needed; otherwise targeted live runs on the pinned judge)
 
 1. **#244's publication chains.**
    - The drift set's "child publishes the exception" items must be refused at the publish step. This needs a publish-path harness: the drift items are contribution-shaped today, so add a `publish` act form with the publisher's ancestors.
@@ -59,6 +61,12 @@ The layering is the same as #242. Mechanical first, the judge only where needed,
    - the J-suite publication items;
    - the first call's input identity for every publish that doesn't trigger.
 4. **Fallback count and the door, reported.** The door is the same 6/38 class as #242, and #244's matching work shrinks both.
+5. **Departure label and relays, offline.**
+   - A departure report publishes with the label, and the label survives every edit path.
+   - A generalised departure is refused.
+   - A relayed departure keeps the origin's label and is never re-labelled.
+   - The relayer's conflict note appears only when a relayer directive conflicts.
+   - When the origin withdraws, the relay goes too.
 
 ## Cost
 
