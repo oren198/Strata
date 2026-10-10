@@ -6039,7 +6039,11 @@ _NORMATIVE_EXCEPTION_RES: tuple[re.Pattern[str], ...] = tuple(
         # "can" is common in plain facts ("bookings can only be made ..."); only
         # its permission shapes count.
         r"\bcan\s+(?:\w+\s+)?(?:keep|skip|leave|hold|go|run|ship|release|publish|merge|"
-        r"waive|ignore|bypass|use|stay|wait|just|be\s+(?:skipped|waived|ignored|left|held))\b",
+        r"waive|ignore|bypass|use|stay|wait|just|approve|sign\s+off|"
+        r"be\s+(?:skipped|waived|ignored|left|held))\b",
+        # who-widening: "any engineer can approve ...", "anyone may sign off ..."
+        r"\b(?:any|every|anyone|anybody|everyone|everybody)\b(?:\s+\w+)?\s+"
+        r"(?:can|may|is allowed to|are allowed to)\b",
         r"\ballowed to\b",
         r"\bpermitted\b",
         r"\b(?:don['’]?t|doesn['’]?t|do not|does not|need not|needn['’]?t)\s+(?:even\s+)?"
@@ -6099,6 +6103,68 @@ _DEPARTURE_CUE_RE = re.compile(
     r"inspecting|review|the))\b",
     re.IGNORECASE,
 )
+
+
+#: A report is SINGULAR (one act) or GENERAL (a practice); a date is one way to
+#: show singularity, never a requirement (the philosopher's ruling). Any of
+#: these on the act or its condition makes the text general.
+_GENERAL_MARKER_RES: tuple[re.Pattern[str], ...] = tuple(
+    re.compile(p, re.IGNORECASE)
+    for p in (
+        r"\b(?:always|usually|routinely|every time|whenever|used to|these days|lately|"
+        r"since|now)\b",
+        r"\beach\s+(?:time|day|night|week|month|morning|evening|shift|run|release|deploy)\b",
+        r"\b(?:we|i|they)\s+would\b",
+        r"\b(?:we|i|they)['’]ve\s+been\b|\bhave been\b|\bhas been\b",
+        r"\b(?:we|i|they)\s+(?:do not|don['’]?t)\b",
+    )
+)
+_GENERIC_PLURAL_PREPOSITIONS = frozenset(
+    {"on", "for", "during", "when", "if", "whenever", "across"}
+)
+_NOT_A_BARE_PLURAL = frozenset(
+    {"this", "was", "has", "does", "its", "his", "always", "perhaps", "sometimes", "less", "unless"}
+)
+_DETERMINERS = frozenset(
+    {"the", "a", "an", "this", "that", "these", "those", "my", "our", "your", "their", "its",
+     "his", "her", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine",
+     "ten", "both", "another", "any", "some", "no", "every"}
+)  # fmt: skip
+
+
+def _general_marker(text: str) -> str | None:
+    """The first marker that makes a report GENERAL rather than singular: a
+    habitual or iterative adverb, a habitual "would", a present-perfect or
+    negated-present form of the act, ``since / these days / lately / now``, or
+    a generic bare plural as the object or condition ("skipped QA on
+    hotfixes", "for repeat jobs"). A singular with a determiner or a number is
+    one instance ("the hotfix", "mould 17"), and a bare plural naming WHO was
+    acted on stays singular ("I paged the on-call engineers": determiner)."""
+    for pattern in _GENERAL_MARKER_RES:
+        match = pattern.search(text)
+        if match:
+            return f"general marker '{match.group(0)}'"
+    for sentence in re.split(r"[.;:,!?]", text):
+        tokens = re.findall(r"[A-Za-z0-9'’-]+", sentence)
+        for i, token in enumerate(tokens):
+            if token.casefold() not in _GENERIC_PLURAL_PREPOSITIONS:
+                continue
+            for k, word in enumerate(tokens[i + 1 : i + 4], start=i + 1):
+                low = word.casefold()
+                following = tokens[k + 1] if k + 1 < len(tokens) else ""
+                if low in _DETERMINERS or any(ch.isdigit() for ch in low):
+                    break
+                if low in _GENERIC_PLURAL_PREPOSITIONS:
+                    break
+                if (
+                    len(low) > 3
+                    and low.endswith("s")
+                    and not low.endswith(("ss", "us", "is"))
+                    and low not in _NOT_A_BARE_PLURAL
+                    and not any(ch.isdigit() for ch in following)  # "rows 4 to 6": named
+                ):
+                    return f"generic plural '{word}' after '{token}'"
+    return None
 
 
 def _norm_ws(text: str) -> str:
@@ -6193,7 +6259,23 @@ def _context_covers(inherited_text: str, content: str) -> bool:
         inherited_text, content
     ):
         return True
-    return len(_overlap_words(inherited_text) & _overlap_words(content)) >= 2
+    shared = {
+        mine
+        for mine in _overlap_words(inherited_text)
+        if any(
+            _shared_prefix(mine, other) >= 5 or mine == other for other in _overlap_words(content)
+        )
+    }
+    return len(shared) >= 2
+
+
+def _shared_prefix(a: str, b: str) -> int:
+    n = 0
+    for x, y in zip(a, b, strict=False):
+        if x != y:
+            break
+        n += 1
+    return n
 
 
 def verify_inherited_relation(
@@ -6238,15 +6320,21 @@ def verify_inherited_relation(
             unspecific = "no verbatim occurrence_span"
         elif not _has_past_tense(span):
             unspecific = "occurrence not in the past tense"
-        elif not _SPECIFICITY_ANCHOR_RE.search(span):
-            unspecific = "occurrence carries no date, time, count or named instance"
         if unspecific is not None:
             return "decline_unspecific", unspecific
         if not _action_overlap(span, inherited_text):
+            # The answer CLAIMED a report about the rule, so it is not an honest
+            # "unrelated": a marker anywhere declines (rule A), as does a habit.
             failure = "occurrence does not concern the rule's own action"
-            readable_unrelated = True
-        elif marker is not None:
-            return "decline", f"generalises beyond the occurrence ({marker})"
+            general = _general_marker(content)
+            if general is not None:
+                # a claimed report that is also a habit is not an honest "unrelated"
+                return "decline", f"{failure}; generalises ({general})"
+        elif marker is not None or (general := _general_marker(content)) is not None:
+            # The generality check runs on EVERY report, including one that
+            # an `acted_on` points at the rule: `acted_on` never waives it
+            # ("acted on <rule>: we always skip it for hotfixes" declines).
+            return "decline", f"generalises beyond the occurrence ({marker or general})"
         else:
             verdict = "departure_report" if _DEPARTURE_CUE_RE.search(span) else kind
             return verdict, "a specific past occurrence"

@@ -162,16 +162,13 @@ def test_a_readable_unrelated_answer_declines_only_a_marked_text_that_covers_the
     assert verify_inherited_relation(unrelated, elsewhere, RULE)[0] == "admit"
 
 
-def test_a_claimed_report_with_a_present_tense_or_undated_span_is_declined() -> None:
-    for text in (
-        "The pumps are switched off at 20:00 on the north quay.",  # present tense
-        "The pumps were switched off at the quay.",  # past tense, no anchor
-    ):
-        verdict, reason = verify_inherited_relation(
-            _answer("consequence_report", occurrence_span=text.rstrip(".")), text, RULE
-        )
-        assert verdict == "decline_unspecific", text
-        assert "past tense" in reason or "date" in reason
+def test_a_claimed_report_in_the_present_tense_is_declined() -> None:
+    text = "The pumps are switched off at 20:00 on the north quay."
+    verdict, reason = verify_inherited_relation(
+        _answer("consequence_report", occurrence_span=text.rstrip(".")), text, RULE
+    )
+    assert verdict == "decline_unspecific"
+    assert "past tense" in reason
 
 
 def test_a_claimed_report_whose_span_is_not_verbatim_is_declined() -> None:
@@ -606,3 +603,137 @@ def test_the_exposure_of_ordinary_contexts_is_small_under_an_honest_unrelated_an
     judgment, _client = _judge(marked_but_elsewhere, _answer("unrelated"))
     assert judgment.decision == "accept_as_context"
     assert judgment.inherited_relation["fallback"] is True
+
+
+# -- singular versus general (the philosopher's ruling) ----------------------
+
+PAGE_RULE = (
+    "Page the sev-1 on-call rotation through the primary pager, never the secondary rotation "
+    "directly."
+)
+API_PORT_RULE = "Use port 8443 for the internal API."
+WATER_RULE = "Water zone 3 at 6am daily."
+
+#: outcome_loop and P5 goldens labelled admit: an undated first-person report of one act
+UNDATED_REPORTS = [
+    (
+        "I paged the sev-1 through the primary rotation and it went wrong: the page never "
+        "reached anyone, and the incident sat unacknowledged for 40 minutes.",
+        PAGE_RULE,
+    ),
+    (
+        "I paged the sev-1 through the primary rotation before rolling back and it went wrong: "
+        "the page never reached anyone.",
+        PAGE_RULE,
+    ),
+    (
+        "I paged the sev-1 through the primary rotation and it went wrong: the page never "
+        "reached anyone.",
+        PAGE_RULE,
+    ),
+    (
+        "I paged the sev-1 through the primary rotation and the on-call engineer picked up the "
+        "page and acknowledged within two minutes.",
+        PAGE_RULE,
+    ),
+    ("Used 8443 as directed; the service refused connections.", API_PORT_RULE),
+    (
+        "I used the documented port 8443 and the service refused connections; it listens on 9443.",
+        API_PORT_RULE,
+    ),
+    ("Watered at 6am as directed; zone 3 got no water.", WATER_RULE),
+    (
+        "I used the documented 6am schedule and zone 3 got no water; it actually waters at 5am.",
+        WATER_RULE,
+    ),
+]
+
+
+@pytest.mark.parametrize(("text", "rule"), UNDATED_REPORTS)
+def test_an_undated_first_person_report_of_one_act_is_admitted(text: str, rule: str) -> None:
+    for span in (text.rstrip("."), text.split(":")[0].split(";")[0]):
+        verdict, _ = verify_inherited_relation(
+            _answer("consequence_report", occurrence_span=span), text, rule
+        )
+        assert verdict == "consequence_report", (span, verdict)
+
+
+@pytest.mark.parametrize(
+    ("text", "rule"),
+    [
+        ("Every time I paged through the primary it went wrong", PAGE_RULE),
+        ("We skipped QA on hotfixes and it was fine", "Hotfixes must go through QA."),
+        ("We would deploy at night", "Deploys must happen in business hours."),
+        ("We have been skipping QA for hotfixes", "Hotfixes must go through QA."),
+        ("We don't page the primary rotation these days", PAGE_RULE),
+        (
+            "I paged the sev-1 through the primary rotation and it went wrong, and it does "
+            "whenever the primary is busy",
+            PAGE_RULE,
+        ),
+        ("We skipped QA for repeat jobs and the hotfix shipped", "Hotfixes must go through QA."),
+    ],
+)
+def test_a_habitual_or_generic_report_is_declined_as_general(text: str, rule: str) -> None:
+    verdict, _ = verify_inherited_relation(
+        _answer("consequence_report", occurrence_span=text), text, rule
+    )
+    assert verdict.startswith("decline"), verdict
+
+
+def test_acted_on_removes_no_generality_check() -> None:
+    text = "Acted on the sev-1 paging rule: we always skip the primary rotation for hotfixes."
+    for kind in ("consequence_report", "departure_report"):
+        verdict, reason = verify_inherited_relation(
+            _answer(kind, occurrence_span=text.rstrip(".")), text, PAGE_RULE
+        )
+        assert verdict == "decline"
+        assert "generalises" in reason
+
+
+@pytest.mark.parametrize(
+    ("text", "rule"),
+    [
+        ("I paged the on-call engineers", PAGE_RULE),
+        ("We skipped QA on the 2.3.1 hotfix", "Hotfixes must go through QA."),
+        ("I paged the sev-1 at mould 17", PAGE_RULE),
+    ],
+)
+def test_a_singular_with_a_determiner_or_a_name_is_one_instance(text: str, rule: str) -> None:
+    verdict, _ = verify_inherited_relation(
+        _answer("consequence_report", occurrence_span=text), text, rule
+    )
+    assert verdict in ("consequence_report", "departure_report")
+
+
+# -- the who-widening marker -------------------------------------------------
+
+MIGRATION_RULE = "Migrations require DBA approval."
+SIGNOFF_RULE = "Releases require sign-off from two reviewers."
+
+
+@pytest.mark.parametrize(
+    ("text", "rule"),
+    [
+        ("any engineer can approve migrations", MIGRATION_RULE),
+        (
+            "Our platform lead said in standup that any engineer can approve a migration now.",
+            MIGRATION_RULE,
+        ),
+        ("anyone may sign off on the release", SIGNOFF_RULE),
+    ],
+)
+def test_a_who_widening_permission_declines_on_every_answer_kind(text: str, rule: str) -> None:
+    answers = [
+        _answer("unrelated"),
+        {"kind": "banana"},
+        _answer("exception", instead_span=text),
+        _answer("consequence_report", occurrence_span=text),
+    ]
+    for answer in answers:
+        assert verify_inherited_relation(answer, text, rule)[0].startswith("decline"), answer
+
+
+def test_a_who_widening_text_about_something_else_and_a_plain_fact_stay_admitted() -> None:
+    for text in ("any engineer can read the runbook", "bookings can only be made by phone"):
+        assert verify_inherited_relation(_answer("unrelated"), text, MIGRATION_RULE)[0] == "admit"
