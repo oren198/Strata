@@ -19,23 +19,36 @@ the release PR (`dev` → `main`) and the GitHub Release body are built from
   what may or does happen instead of the rule (permitted, or a standing practice) is
   declined, with a reason naming the two legitimate routes: report a specific
   occurrence of following the rule (admitted, raised to the issuer with `acted_on`),
-  or propose the exception to the scope that issued the rule. A specific, dated,
-  past-tense report of following the rule, or of departing from it, stays admitted;
-  the record names a departure as a departure from the directive, never as
-  permission, and suggests `acted_on`. A report that generalises ("... so we don't
-  need it") is an exception as a whole, and a claimed report that doesn't name a
-  specific occurrence (when, which) is declined with a reason saying so. When the
-  answer says unrelated, the note is declined only if it also touches an inherited
-  directive's subject and carries an exception marker; when the answer is
-  unreadable, any exception marker declines. Otherwise the note is admitted, and
-  each such fallback is counted in the judgment's `inherited_relation` trace.
-  Stated limits: an exception phrased with no marker and answered unreadably or
-  unrelated is admitted; a batch that declines a member replaces the
-  judge's single context rewrite with the previous context plus each remaining
-  member's own text; a report reaches the issuer only if the contributor follows the
-  `acted_on` suggestion.
+  or propose the exception to the scope that issued the rule. A report of one
+  past act of following the rule, or of departing from it, stays admitted, dated
+  or not ("I paged the sev-1 through the primary rotation and it went wrong"); the
+  record names a departure as a departure from the directive, never as
+  permission, and suggests `acted_on`. A report becomes general, and is declined,
+  when its act or condition carries a habitual marker ("every time", "whenever",
+  "we would", "we skip", "these days") or a generic class ("on hotfixes", "for
+  repeat jobs"), or when it adds a generalising clause ("... so we don't need
+  it"); `acted_on` never waives that check. A permission widened to "any" or
+  "anyone" ("any engineer can approve migrations") is an exception marker. When
+  the answer says unrelated, the note is declined only if it also touches an
+  inherited directive's subject and carries an exception marker; when the answer
+  is unreadable, any exception marker declines. Otherwise the note is admitted,
+  and each such fallback is counted in the judgment's `inherited_relation` trace.
+  Measured without a key: the three-level drift set 48 of 48, a new held-out set
+  of 36 context items 36 of 36, J1 and J4 unchanged or better, and 228 of 228
+  forged report answers on exceptions declined
+  ([evidence](docs/evidence/v1.18-242-context-exception-2026-10-10.md)).
+  Stated limits:
+  - An exception phrased with no exception marker is admitted when the extra
+    call's answer is unreadable or says unrelated: 6 of the 38 exceptions in the
+    held-out measurement. In the live runs no fallback hid an exception (9 of 9
+    were plain facts or operator echoes). Better subject matching (#244) is
+    expected to shrink this.
+  - A batch that declines a member replaces the judge's single context rewrite
+    with the previous context plus each remaining member's own text.
+  - A report reaches the issuer only if the contributor follows the `acted_on`
+    suggestion.
 
-## Unreleased (v1.17.2)
+## 1.17.2 (2026-10-06)
 
 ### Fixed
 
@@ -148,7 +161,7 @@ the release PR (`dev` → `main`) and the GitHub Release body are built from
   is listed in the Console's Correction withdrawals view and can be
   restored there by the operator. The owner's own judged restore recovered
   5 of 12 such items in our measurement; the operator path is the reliable
-  remedy ([evidence](docs/evidence/v1.17-219c-restore-2026-10-03.md)).
+  remedy ([evidence](docs/evidence/v1.17.219c-restore-2026-10-03.md)).
 
 - **A judge failure on `/contribute` now returns HTTP 503, not 500 (#235,
   #236).** A second protocol slip surviving the corrective re-ask — a
@@ -232,7 +245,7 @@ the release PR (`dev` → `main`) and the GitHub Release body are built from
   rule is outdated keeps the decline. Stated limits: a refinement whose subject
   shares a word with the inherited rule's subject is held to the tightening
   test, and the batch path is not covered
-  ([evidence](docs/evidence/v1.17-237-relation-recheck-2026-10-04.md)).
+  ([evidence](docs/evidence/v1.17.237-relation-recheck-2026-10-04.md)).
 
 - **Optional provider pinning for an OpenRouter judge, `JUDGE_PROVIDER` /
   `STRATA_JUDGE_PROVIDER` (#224).** OpenRouter routes the default judge
