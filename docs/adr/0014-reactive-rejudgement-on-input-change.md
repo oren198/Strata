@@ -259,6 +259,122 @@ with nothing to backfill.
 > directive id is a contribution id, and a contribution belongs to exactly one
 > scope's record), idempotent, and named in the record.
 
+### D8 — A fleet structure change is an input change: `channel_removed` and `chain_changed`
+
+> **Added 2026-10-10 (v1.18, #247 core half). Draft for the philosopher's check.**
+
+`fleet.yaml` is now changed through Strata (#247): a bound scope proposes, the
+owner (the lowest common ancestor of what the change touches) or the operator
+applies, and each applied change is recorded once in `fleet_structure_acts`,
+never judged. Until this decision the apply emitted nothing and printed a
+stated-limit line instead, because the settled vocabulary (D1) had no faithful
+kind for "a channel this scope read from is gone" or "the chain above this
+scope moved". Reusing `withdrawn` or `directive_retired` would be false
+notice: nothing was withdrawn and no directive was retired; the reader simply
+stopped composing it.
+
+**What a structure change owes** (the philosopher, 2026-10-07): notice exactly
+where the change alters what binds a scope, or cuts a channel a live
+attribution depends on; everywhere else the next read is the notice.
+
+| Change | Event | Affected | Refresh |
+|---|---|---|---|
+| Reference edge added | none | — | — (the next read composes it; D1's addition rule) |
+| Reference edge removed | `channel_removed` | the reader (`from`) | yes: removal-class |
+| Scope removed | none of its own | — | — (see below) |
+| Chain edge changed (re-parent) | `chain_changed` | the moved scope and every chain descendant | yes: removal-class, own-directive ops held |
+| Description changed | none | — | — (relevance is judged against it from then on) |
+
+**Scope removed.** #247 refuses to remove a scope that still has chain
+children or reference edges. Every reader has therefore already received
+`channel_removed` from the edge removal that had to come first, and no
+descendant exists to lose a binding. A removed leaf's chain parent never
+composed the leaf. The act owes nothing further, and the scope's memory is
+kept. If the refusal is ever relaxed, the removal emits `channel_removed` to
+each reader and `chain_changed` to each descendant, exactly as the edge
+removals and re-parents it would replace.
+
+**`channel_removed`.** The payload carries the act id, the reader, the source,
+and the source's publication item ids as they stood when the edge was removed
+(read from the source's current publication at apply time). The reader's
+refresh is removal-class (D2's #198 third form), so `new_context` stays. The
+judge is told the source is no longer composed: any context resting on it
+(its `context_sources`, or attribution "according to <source>") can no longer
+be kept live from that channel, and the judge re-grounds it on what is still
+rendered or lets it fade. Nothing is corrected: the source's claims were not
+found wrong, and `claim_corrected` stays reserved for that. `supersede`/
+`retire` of the reader's own directives are allowed on this refresh as on any
+removal refresh (D2).
+
+**`chain_changed`.** The payload carries the act id, the moved scope, the
+chain before and after (root-first ids), and, for the receiving scope, the
+inherited directives it gained and lost (ids and text, computed from the
+before/after topology the act records). Then:
+
+1. **Every affected scope refreshes** against its new composed inputs. The
+   refresh is removal-class, since some inherited directives and a parent
+   publication stopped binding or being composed. The authority's act of
+   moving the scope is a legitimate refresh input.
+2. **The scope's own directives are never retired or superseded by this
+   refresh.** The refresh runs on the scope manager's authority, but this
+   change was made by an authority above the scope, and the position gate
+   (1.17) says only a session bound to the scope changes its directives.
+   `supersede`/`retire` ops on a refresh whose pending events include
+   `chain_changed` are dropped mechanically, and the drop is noted in the
+   judgment record.
+3. **Conflicts are surfaced, mechanically.** At emit time the engine runs the
+   1.17 inherited check (`inherited_conflict`) on each own directive of each
+   affected scope against each newly inherited directive. Every conflict is
+   written into that scope's notice:
+
+   > Own directive <id> conflicts with newly inherited <id> (<scope>): <reason>. It still stands; a session bound to <scope> decides.
+
+   `input_changes` carries it to every reader of the scope. The operator sees
+   the same list in the Console with the act.
+   - The check's stated limits apply. A conflict phrased with no value,
+     polarity or marker is not surfaced, and the refresh's judge may still
+     notice it in prose.
+   - The newly inherited directive binds from the moment of the move,
+     whatever the own directive says. That is composition, unchanged.
+
+**Emission is the engine's operation, not the peripheral's.** `strata.change_events`
+gains one whole operation, `emit_structure_change(act_id)`. It reads the act's
+recorded before/after topology, never today's fleet, so a later structure
+change can't redirect the notice. It computes the affected set by the table
+above and emits through the existing `emit` machinery (change ids, D4 once per
+scope, D5 notice row, the hop budget). The apply path in `fleet_changes` calls
+it once, after the act row is committed and under the same cross-process
+fleet lock. Its source-scan test changes from "never calls emit" to "calls
+only `emit_structure_change`".
+
+An emission failure is recorded the way `_record_emission_failure` records one
+today. The applied change stands: the file and the act are the truth.
+- `emit_structure_change` is idempotent per act. Change events carry the act
+  id, and an act that already has events emits nothing.
+- `strata doctor` lists acts with no events.
+- The operator re-runs the emission for one act from the CLI.
+
+**Vocabulary and schema.**
+- `channel_removed` and `chain_changed` join the settled kinds in
+  `change_events.py` and the `change_events.kind` CHECK. The CHECK is rebuilt in
+  one migration, the next free number after the v1.18 peripheral migrations,
+  the same recreate-table pattern as 0011, 0012 and 0021.
+- Both join `_REFRESH_REMOVAL_KINDS`, so `new_context` is never dropped on
+  their refresh.
+- Neither is in `RETRACTION_KINDS`. Nothing the source owned was taken back;
+  the reader's composition changed, and the reader is the one told.
+
+**Rejected:**
+- Reusing `withdrawn` for a cut channel: it states a withdrawal that never
+  happened, and a reader would doubt a claim nobody retracted.
+- Reusing `directive_retired` for a re-parent: same falsehood, and it would
+  invite the refresh to treat the old parent's directives as wrong.
+- Auto-retiring an own directive that conflicts after a move: an authority
+  above the scope would change the scope's own rules through the back door,
+  which is exactly what the position gate forbids.
+- Emitting from today's topology at drain time: a second move before the
+  drain would rewrite whom the first move notified.
+
 ## Known gap — transitive staleness under read-time drain
 
 Documented and left open. With D6, C reads B, B reads A, A changes: C's drain
