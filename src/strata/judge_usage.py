@@ -26,17 +26,18 @@ _logger = logging.getLogger(__name__)
 
 _OVERFLOW_MARK = "over the BUDGET"
 
-# Follow-ups of a judgment that already called the model. The cap does not
-# apply to these: a judgment that has started always finishes.
-_UNGATED_KINDS = frozenset(
+# The cap applies only to these. Every other kind is ungated, including a
+# tool name this module does not know: a judgment that has started always
+# finishes, and a new re-ask cannot be stranded on the cap by being unmapped.
+_GATED_KINDS = frozenset(
     {
-        "corrective_reask",
-        "batch_corrective_reask",
-        "condensation",
-        "batch_condensation",
-        "targeted_reask",
-        "attribution_recheck",
-        "relation_recheck",
+        "judgment",
+        "batch_judgment",
+        "carrier_check",
+        "publication",
+        "bootstrap",
+        "drafter",
+        "doctor_probe",
     }
 )
 
@@ -46,6 +47,7 @@ _FIRST_KIND = {
     "classify_interior_assertion": "targeted_reask",
     "recheck_attribution": "attribution_recheck",
     "recheck_relation": "relation_recheck",
+    "classify_inherited_relation": "inherited_relation_recheck",
     "classify_claim_carriers": "carrier_check",
     "submit_publication_judgment": "publication",
     "submit_bootstrap_publication": "bootstrap",
@@ -145,8 +147,13 @@ def current_usage_db() -> str | None:
 
 
 def kind_is_gated(kind: str) -> bool:
-    """True when this call is checked against the daily cap."""
-    return kind not in _UNGATED_KINDS
+    """True when this call is checked against the daily cap.
+
+    Only a judgment's first call and the known standalone calls are gated.
+    A follow-up, a targeted re-ask, and any tool name that is not mapped are
+    not: a judgment that has started always finishes.
+    """
+    return kind in _GATED_KINDS
 
 
 def call_kind_from_request(kwargs: dict[str, Any]) -> str:

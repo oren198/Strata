@@ -6480,8 +6480,8 @@ class ScopeManager:
 
     def _messages_create(self, **kwargs: Any) -> Any:
         """The ONE place every judge call's real API request goes through
-        (#224). Every ``self._client.messages.create(...)`` call site in
-        this class calls this instead — never the client directly — so a
+        (#224). Every judge call in this class goes through this method
+        instead of the client, so a
         pinned provider (and anything this method does in the future)
         reaches every judge call shape (ordinary, batch, publication,
         bootstrap, and any targeted re-ask) automatically, with nothing

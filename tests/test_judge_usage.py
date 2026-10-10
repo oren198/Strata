@@ -155,8 +155,73 @@ def test_call_kind_comes_from_the_request() -> None:
     assert kind_is_gated("drafter") is True
     assert kind_is_gated("doctor_probe") is True
     assert kind_is_gated("targeted_reask") is False
+    inherited = {
+        "tool_choice": {"type": "tool", "name": "classify_inherited_relation"},
+        "messages": [{"role": "user", "content": "SCOPE: A (id=g_a)\n"}],
+    }
+    assert call_kind_from_request(inherited) == "inherited_relation_recheck"
+    assert kind_is_gated("inherited_relation_recheck") is False
+    unknown = {
+        "tool_choice": {"type": "tool", "name": "some_new_reask"},
+        "messages": [{"role": "user", "content": "SCOPE: A (id=g_a)\n"}],
+    }
+    assert call_kind_from_request(unknown) == "some_new_reask"
+    assert kind_is_gated("some_new_reask") is False
     source = Path(scope_manager.__file__).read_text(encoding="utf-8")
     assert "over the BUDGET" in source
+
+
+def test_every_scope_manager_tool_is_mapped() -> None:
+    """A tool constant the meter does not know would be ungated, and this fails."""
+    tools = [
+        scope_manager.JUDGE_TOOL,
+        scope_manager.JUDGE_BATCH_TOOL,
+        scope_manager.PUBLICATION_JUDGE_TOOL,
+        scope_manager.BOOTSTRAP_JUDGE_TOOL,
+        scope_manager.CLAIM_CARRIER_TOOL,
+        scope_manager.INTERIOR_ASSERTION_TOOL,
+        scope_manager.ATTRIBUTION_RECHECK_TOOL,
+        scope_manager.RELATION_RECHECK_TOOL,
+        scope_manager.CLASSIFY_INHERITED_RELATION_TOOL,
+    ]
+    expected = {
+        "submit_judgment": "judgment",
+        "submit_batch_judgment": "batch_judgment",
+        "submit_publication_judgment": "publication",
+        "submit_bootstrap_publication": "bootstrap",
+        "classify_claim_carriers": "carrier_check",
+        "classify_interior_assertion": "targeted_reask",
+        "recheck_attribution": "attribution_recheck",
+        "recheck_relation": "relation_recheck",
+        "classify_inherited_relation": "inherited_relation_recheck",
+    }
+    seen: set[str] = set()
+    for tool in tools:
+        name = tool["name"]
+        seen.add(name)
+        kind = call_kind_from_request(
+            {
+                "tool_choice": {"type": "tool", "name": name},
+                "messages": [{"role": "user", "content": "ping"}],
+            }
+        )
+        assert kind == expected[name]
+        assert kind != name
+        if name == "classify_inherited_relation":
+            assert kind_is_gated(kind) is False
+    assert seen == set(expected)
+
+
+def test_messages_create_text_lives_only_in_judge_usage() -> None:
+    root = Path(judge_usage.__file__).resolve().parent
+    needle = ".messages.create("
+    hits = [
+        str(path.relative_to(root))
+        for path in sorted(root.rglob("*.py"))
+        if path.name != "judge_usage.py" and needle in path.read_text(encoding="utf-8")
+    ]
+    assert hits == []
+    assert needle in (root / "judge_usage.py").read_text(encoding="utf-8")
 
 
 def test_one_row_uses_response_tokens_not_an_estimate(tmp_path: Path, monkeypatch) -> None:
