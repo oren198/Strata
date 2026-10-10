@@ -261,7 +261,7 @@ with nothing to backfill.
 
 ### D8 — A fleet structure change is an input change: `channel_removed` and `chain_changed`
 
-> **Added 2026-10-10 (v1.18, #247 core half). Draft for the philosopher's check.**
+> **Added 2026-10-10 (v1.18, #247 core half). Checked by the philosopher 2026-10-10; (a) and (b) below are her rulings.**
 
 `fleet.yaml` is now changed through Strata (#247): a bound scope proposes, the
 owner (the lowest common ancestor of what the change touches) or the operator
@@ -280,7 +280,7 @@ attribution depends on; everywhere else the next read is the notice.
 | Change | Event | Affected | Refresh |
 |---|---|---|---|
 | Reference edge added | none | — | — (the next read composes it; D1's addition rule) |
-| Reference edge removed | `channel_removed` | the reader (`from`) | yes: removal-class |
+| Reference edge removed | `channel_removed` | the reader (`from`) | yes: removal-class, own-directive ops held |
 | Scope removed | none of its own | — | — (see below) |
 | Chain edge changed (re-parent) | `chain_changed` | the moved scope and every chain descendant | yes: removal-class, own-directive ops held |
 | Description changed | none | — | — (relevance is judged against it from then on) |
@@ -302,9 +302,19 @@ judge is told the source is no longer composed: any context resting on it
 (its `context_sources`, or attribution "according to <source>") can no longer
 be kept live from that channel, and the judge re-grounds it on what is still
 rendered or lets it fade. Nothing is corrected: the source's claims were not
-found wrong, and `claim_corrected` stays reserved for that. `supersede`/
-`retire` of the reader's own directives are allowed on this refresh as on any
-removal refresh (D2).
+found wrong, and `claim_corrected` stays reserved for that.
+
+**(b) The reader's own directives are not touched.** `supersede`/`retire` ops on
+a refresh whose pending events include `channel_removed` are dropped
+mechanically, and the drop is noted. Nothing about any directive's ground
+changed: the source withdrew nothing, and a directive the scope adopted from
+that publication was adopted by the scope's own act and stands on it. The
+refresh is the judge acting, and under the position concept the judge is not
+the scope's authority over its own directives. An own directive whose record
+cites the cut source's publication (its `context_sources`, or an anchor to a
+source item) is surfaced in the notice instead:
+
+> Own directive <id> was adopted from <source>'s publication, which <scope> no longer reads. It still binds. A session bound to <scope> decides whether to keep it on its own account.
 
 **`chain_changed`.** The payload carries the act id, the moved scope, the
 chain before and after (root-first ids), and, for the receiving scope, the
@@ -327,15 +337,25 @@ before/after topology the act records). Then:
    affected scope against each newly inherited directive. Every conflict is
    written into that scope's notice:
 
-   > Own directive <id> conflicts with newly inherited <id> (<scope>): <reason>. It still stands; a session bound to <scope> decides.
+   > Own directive <id> conflicts with newly inherited <id> (<scope>): <reason>. Where they conflict, the inherited directive governs. <id> remains in <scope>'s memory until a session bound to <scope> revises or retires it.
+
+   **(a) Precedence resolves the conflict; nothing is rewritten** (the
+   philosopher, Concept 5). Broader authority wins. The theory has no state
+   where two contradicting directives both bind, so the own directive is not
+   retired (the position gate) but does not govern where it contradicts.
+   "Where they conflict" also covers the check's false positives: with no real
+   conflict, nothing yields. The perspective's self layer carries the same line
+   on that own directive, an engine annotation, for as long as both stand. So a
+   reader never sees the own directive bare beside the inherited one.
 
    `input_changes` carries it to every reader of the scope. The operator sees
    the same list in the Console with the act.
    - The check's stated limits apply. A conflict phrased with no value,
      polarity or marker is not surfaced, and the refresh's judge may still
      notice it in prose.
-   - The newly inherited directive binds from the moment of the move,
-     whatever the own directive says. That is composition, unchanged.
+   - The newly inherited directive binds from the moment of the move. That is
+     composition, unchanged; the annotation only makes the precedence
+     visible.
 
 **Emission is the engine's operation, not the peripheral's.** `strata.change_events`
 gains one whole operation, `emit_structure_change(act_id)`. It reads the act's
@@ -369,6 +389,10 @@ today. The applied change stands: the file and the act are the truth.
   happened, and a reader would doubt a claim nobody retracted.
 - Reusing `directive_retired` for a re-parent: same falsehood, and it would
   invite the refresh to treat the old parent's directives as wrong.
+- "It still stands" as the conflict notice: it tells readers they may follow
+  either directive, which is the contested state by another route.
+- Letting a `channel_removed` refresh retire the reader's own directives, as
+  other removal refreshes do: the cut changed no directive's ground.
 - Auto-retiring an own directive that conflicts after a move: an authority
   above the scope would change the scope's own rules through the back door,
   which is exactly what the position gate forbids.
