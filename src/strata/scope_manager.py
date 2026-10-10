@@ -2708,6 +2708,13 @@ class ScopeManagerJudgment(_AmendmentJudgment):
     reasoning: str
     """Brief explanation of the verdict — written to the judgment record."""
 
+    inherited_relation: dict | None = None
+    """#242: ``{"contribution_id", "kind", "verdict", "fallback", "inherited_id",
+    "origin", "reason"}`` whenever the context re-ask fired (see
+    :meth:`ScopeManager.classify_inherited_context`) — ``None`` otherwise.
+    ``fallback`` is True when nothing was verified and no exception marker
+    stood in the way, so the admit stood: the counted fail-open door."""
+
     inherited_holds: list[dict] = Field(default_factory=list)
     """v1.17.1: ``{"contribution_id", "directive_id", "origin", "reason"}`` per
     contribution the inherited-conflict check held (see
@@ -2945,6 +2952,10 @@ class ScopeManagerBatchJudgment(_AmendmentJudgment):
 
     dropped_ops_by_contribution: dict[str, list[str]] = Field(default_factory=dict)
     """Dropped ops (rendered) keyed by the contribution whose record notes them."""
+
+    inherited_relations: list[dict] = Field(default_factory=list)
+    """#242: one outcome dict per member the context re-ask fired for (same
+    shape as :attr:`ScopeManagerJudgment.inherited_relation`)."""
 
     inherited_holds: list[dict] = Field(default_factory=list)
     """v1.17.1: the inherited-conflict check's holds, one dict per held member
@@ -5955,6 +5966,461 @@ def _inherited_hold_note(directive_id: str, origin: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# v1.18 (#242): a child's CONTEXT that undercuts an inherited directive
+# ---------------------------------------------------------------------------
+
+CLASSIFY_INHERITED_RELATION_TOOL: dict = {
+    "name": "classify_inherited_relation",
+    "description": (
+        "A context item from a session bound to this scope touches the subject of an "
+        "inherited directive. Say how the item relates to that directive. A "
+        "consequence_report describes ONE specific, dated or countable occurrence of "
+        "FOLLOWING the directive and what happened. A departure_report describes ONE "
+        "specific, dated or countable occurrence of NOT following it and what happened, "
+        "asserting nothing about what may be done instead. An exception states, in "
+        "general, what may or does happen INSTEAD of the directive, normatively ('may', "
+        "'doesn't need') or as a standing practice ('we leave the pumps running until "
+        "22:00'). unrelated: none of these."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "kind": {
+                "type": "string",
+                "enum": ["consequence_report", "departure_report", "exception", "unrelated"],
+            },
+            "inherited_id": {
+                "type": "string",
+                "description": "Required: the id of the inherited directive this relates to.",
+            },
+            "reasoning": {"type": "string", "description": "Brief explanation."},
+            "occurrence_span": {
+                "type": "string",
+                "description": (
+                    "Required for consequence_report and departure_report: the specific "
+                    "occurrence, copied VERBATIM from the contribution text."
+                ),
+            },
+            "instead_span": {
+                "type": "string",
+                "description": (
+                    "Required for exception: the general 'may / does instead', copied "
+                    "VERBATIM from the contribution text."
+                ),
+            },
+        },
+        "required": ["kind", "inherited_id", "reasoning"],
+    },
+}
+
+_INHERITED_RELATION_SYSTEM_PROMPT = (
+    "You classify ONE context item against ONE inherited directive. Context is what a "
+    "scope observed; a directive is a rule. Context never overrides a directive.\n"
+    "- consequence_report: a specific occurrence (dated or countable, past tense) of "
+    "FOLLOWING the directive, and what happened. Evidence about the world; it asserts "
+    "nothing about what may be done instead.\n"
+    "- departure_report: a specific occurrence (dated or countable, past tense) of NOT "
+    "following the directive, and what happened. It must stay specific: a generalising "
+    "clause ('so hotfixes don't need it') makes it an exception.\n"
+    "- exception: states what may or does happen INSTEAD of the directive, in general. "
+    "Normative ('may', 'doesn't need', 'that is fine') or habitual ('we leave the pumps "
+    "running until 22:00', 'we skip QA now'). A standing practice contrary to the rule "
+    "is an exception even when phrased as a plain description.\n"
+    "- unrelated: none of these.\n"
+    "Copy the span your kind requires verbatim from the item. Call "
+    "`classify_inherited_relation` exactly once."
+)
+
+_NORMATIVE_EXCEPTION_RES: tuple[re.Pattern[str], ...] = tuple(
+    re.compile(p, re.IGNORECASE)
+    for p in (
+        # lower-case only: "May" is the month ("on 12 May ...")
+        r"(?-i:\bmay\b)",
+        # "can" is common in plain facts ("bookings can only be made ..."); only
+        # its permission shapes count.
+        r"\bcan\s+(?:\w+\s+)?(?:keep|skip|leave|hold|go|run|ship|release|publish|merge|"
+        r"waive|ignore|bypass|use|stay|wait|just|approve|sign\s+off|"
+        r"be\s+(?:skipped|waived|ignored|left|held))\b",
+        # who-widening: "any engineer can approve ...", "anyone may sign off ..."
+        r"\b(?:any|every|anyone|anybody|everyone|everybody)\b(?:\s+\w+)?\s+"
+        r"(?:can|may|is allowed to|are allowed to)\b",
+        r"\ballowed to\b",
+        r"\bpermitted\b",
+        r"\b(?:don['’]?t|doesn['’]?t|do not|does not|need not|needn['’]?t)\s+(?:even\s+)?"
+        r"(?:need|have to)\b",
+        r"\bneedn['’]?t\b",
+        r"\bno need\b",
+        r"\bnobody (?:else )?(?:has|needs) to\b",
+        r"\b(?:is|are|that['’]?s|it['’]?s) (?:fine|ok|okay|acceptable)\b",
+        r"\bwaived?\b",
+        r"\bnot required\b",
+        r"\bexempt\b",
+        r"\bexception\b",
+        r"\boptional\b",
+    )
+)
+_HABITUAL_EXCEPTION_RES: tuple[re.Pattern[str], ...] = tuple(
+    re.compile(p, re.IGNORECASE)
+    for p in (
+        r"\bwe\s+(?:\w+\s+){0,2}?(?:leave|skip|let|hold|keep|go|put|run|ship|release|publish|"
+        r"merge|land|send|use|stop|drop|bypass|allow|start|test|check|inspect|review|do|just)\b",
+        r"\bnow\s+(?:we|they)\b",
+        r"\bgo(?:es)? straight\b",
+        r"\bstraight (?:back|out|away|through)\b",
+        r"\bwhenever\b",
+        r"\b(?:keeps|lets|leaves)\b",
+        r"\balone\b",
+        r"\bnobody\b",
+        r"\b(?:usually|normally|typically|generally|by default|as standard|as a rule)\b",
+        r"\bstanding practice\b",
+        # A "so / therefore / which means" clause that negates or permits
+        # generalises the occurrence into a rule: the whole item is an exception.
+        r"\b(?:so|therefore|hence|thus|which means|meaning(?: that)?)\b[^.;]*?"
+        r"(?:n['’]t\b|\bnot\b|\bno\b|\bnever\b|\benough\b|\bsufficient\b|\bsuffices?\b)",
+    )
+)
+
+_MONTHS = r"(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*"
+_SPECIFICITY_ANCHOR_RE = re.compile(
+    rf"\b\d{{1,2}}(?:st|nd|rd|th)?\s+(?:of\s+)?{_MONTHS}\b"
+    rf"|\b{_MONTHS}\.?\s+\d{{1,2}}\b"
+    r"|\b\d{4}-\d{2}-\d{2}\b|\b\d{1,2}/\d{1,2}(?:/\d{2,4})?\b"
+    r"|\b(?:mon|tues|wednes|thurs|fri|satur|sun)day\b"
+    r"|\b\d+\.\d+\.\d+\b|\b(?:1[5-9]|20)\d{2}\b|\b\d{1,2}:\d{2}\b"
+    r"|\b(?:yesterday|last (?:night|week|month|shift)|this (?:morning|week)|earlier today)\b"
+    r"|\bthe night of\b|\b(?:once|twice|\d+ times|(?:two|three|four|five) times)\b",
+    re.IGNORECASE,
+)
+_PAST_TENSE_RE = re.compile(
+    r"\b(?:\w+ed|was|were|had|did|took|left|went|held|made|ran|got|came|found|lost|sent|"
+    r"broke|began|saw|gave|put|set|cut|hit|fell|stopped|spent|missed|drifted|shipped|"
+    r"overloaded|destroyed|reached|wasn['’]t|weren['’]t|didn['’]t)\b",
+    re.IGNORECASE,
+)
+_DEPARTURE_CUE_RE = re.compile(
+    r"\b(?:not done|weren['’]t|wasn['’]t|didn['’]t|did not|was not|were not|skipped|"
+    r"bypassed|omitted|ignored|left running|instead of|without (?:running|checking|"
+    r"inspecting|review|the))\b",
+    re.IGNORECASE,
+)
+
+
+#: A report is SINGULAR (one act) or GENERAL (a practice); a date is one way to
+#: show singularity, never a requirement (the philosopher's ruling). Any of
+#: these on the act or its condition makes the text general.
+_GENERAL_MARKER_RES: tuple[re.Pattern[str], ...] = tuple(
+    re.compile(p, re.IGNORECASE)
+    for p in (
+        r"\b(?:always|usually|routinely|every time|whenever|used to|these days|lately|"
+        r"since|now)\b",
+        r"\beach\s+(?:time|day|night|week|month|morning|evening|shift|run|release|deploy)\b",
+        r"\b(?:we|i|they)\s+would\b",
+        r"\b(?:we|i|they)['’]ve\s+been\b|\bhave been\b|\bhas been\b",
+        r"\b(?:we|i|they)\s+(?:do not|don['’]?t)\b",
+    )
+)
+_GENERIC_PLURAL_PREPOSITIONS = frozenset(
+    {"on", "for", "during", "when", "if", "whenever", "across"}
+)
+_NOT_A_BARE_PLURAL = frozenset(
+    {"this", "was", "has", "does", "its", "his", "always", "perhaps", "sometimes", "less", "unless"}
+)
+_DETERMINERS = frozenset(
+    {"the", "a", "an", "this", "that", "these", "those", "my", "our", "your", "their", "its",
+     "his", "her", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine",
+     "ten", "both", "another", "any", "some", "no", "every"}
+)  # fmt: skip
+
+
+def _general_marker(text: str) -> str | None:
+    """The first marker that makes a report GENERAL rather than singular: a
+    habitual or iterative adverb, a habitual "would", a present-perfect or
+    negated-present form of the act, ``since / these days / lately / now``, or
+    a generic bare plural as the object or condition ("skipped QA on
+    hotfixes", "for repeat jobs"). A singular with a determiner or a number is
+    one instance ("the hotfix", "mould 17"), and a bare plural naming WHO was
+    acted on stays singular ("I paged the on-call engineers": determiner)."""
+    for pattern in _GENERAL_MARKER_RES:
+        match = pattern.search(text)
+        if match:
+            return f"general marker '{match.group(0)}'"
+    for sentence in re.split(r"[.;:,!?]", text):
+        tokens = re.findall(r"[A-Za-z0-9'’-]+", sentence)
+        for i, token in enumerate(tokens):
+            if token.casefold() not in _GENERIC_PLURAL_PREPOSITIONS:
+                continue
+            for k, word in enumerate(tokens[i + 1 : i + 4], start=i + 1):
+                low = word.casefold()
+                following = tokens[k + 1] if k + 1 < len(tokens) else ""
+                if low in _DETERMINERS or any(ch.isdigit() for ch in low):
+                    break
+                if low in _GENERIC_PLURAL_PREPOSITIONS:
+                    break
+                if (
+                    len(low) > 3
+                    and low.endswith("s")
+                    and not low.endswith(("ss", "us", "is"))
+                    and low not in _NOT_A_BARE_PLURAL
+                    and not any(ch.isdigit() for ch in following)  # "rows 4 to 6": named
+                ):
+                    return f"generic plural '{word}' after '{token}'"
+    return None
+
+
+def _norm_ws(text: str) -> str:
+    return " ".join(text.split())
+
+
+def _verbatim_span(answer: dict, key: str, content: str) -> str | None:
+    span = answer.get(key)
+    if not isinstance(span, str) or not span.strip():
+        return None
+    return span.strip() if _norm_ws(span) in _norm_ws(content) else None
+
+
+_CONTEXT_EXCEPTION_CONFLICTS = frozenset(
+    {"exemption language", "quantifier softened", "not stricter in the same direction"}
+)
+
+
+def _exception_marker(content: str, inherited_text: str) -> str | None:
+    """The first exception marker anywhere in *content* — normative, habitual,
+    or (for text that is not a specific past-tense report) the 1.17.2
+    inherited-conflict signal (a looser value, an exemption, a softened
+    "every/all" or an "only" narrowing on a covered subject) — else ``None``."""
+    for pattern in _NORMATIVE_EXCEPTION_RES:
+        match = pattern.search(content)
+        if match:
+            return f"normative marker '{match.group(0)}'"
+    for pattern in _HABITUAL_EXCEPTION_RES:
+        match = pattern.search(content)
+        if match:
+            return f"habitual marker '{match.group(0)}'"
+    specific_past = bool(_SPECIFICITY_ANCHOR_RE.search(content) and _PAST_TENSE_RE.search(content))
+    if not specific_past:
+        conflict = inherited_conflict(content, inherited_text)
+        # Only the shapes that ARE an exception: a looser value, an exemption,
+        # a softened "every/all" or an "only" narrowing. A fact that merely
+        # doesn't restate the rule's value is not one.
+        if conflict in _CONTEXT_EXCEPTION_CONFLICTS:
+            return f"undercuts the rule ({conflict})"
+    return None
+
+
+_NOT_PAST_BEFORE_PARTICIPLE = frozenset(
+    {
+        "is",
+        "are",
+        "am",
+        "be",
+        "being",
+        "been",
+        "to",
+        "must",
+        "should",
+        "will",
+        "can",
+        "may",
+        "shall",
+    }
+)
+
+
+def _has_past_tense(span: str) -> bool:
+    """A past-tense verb in *span*. A bare "-ed" participle after a present
+    auxiliary ("are switched off") is a present passive, not a past occurrence."""
+    for match in _PAST_TENSE_RE.finditer(span):
+        word = match.group(0).casefold()
+        if word.endswith("ed") and word not in {"need", "did"}:
+            before = span[: match.start()].split()
+            if before and before[-1].casefold().strip(",;") in _NOT_PAST_BEFORE_PARTICIPLE:
+                continue
+        return True
+    return False
+
+
+def _action_overlap(span: str, inherited_text: str) -> bool:
+    from strata.publication import _overlap_words  # noqa: PLC0415
+
+    if _overlap_words(span) & _overlap_words(inherited_text):
+        return True
+    numbers = set(re.findall(r"\d+(?:\.\d+)?", inherited_text))
+    return bool(numbers & set(re.findall(r"\d+(?:\.\d+)?", span)))
+
+
+def _context_covers(inherited_text: str, content: str) -> bool:
+    """Whether context *content* is about an inherited directive's subject:
+    1.17.2's covered-subject plus head-noun test, OR at least two shared
+    content words anywhere (the leading-noun-phrase test alone is built for
+    directive sentences and misses most context prose)."""
+    from strata.publication import _overlap_words  # noqa: PLC0415
+
+    if _is_covered_subject(inherited_text, content) and _head_nouns_compatible(
+        inherited_text, content
+    ):
+        return True
+    shared = {
+        mine
+        for mine in _overlap_words(inherited_text)
+        if any(
+            _shared_prefix(mine, other) >= 5 or mine == other for other in _overlap_words(content)
+        )
+    }
+    return len(shared) >= 2
+
+
+def _shared_prefix(a: str, b: str) -> int:
+    n = 0
+    for x, y in zip(a, b, strict=False):
+        if x != y:
+            break
+        n += 1
+    return n
+
+
+def verify_inherited_relation(
+    answer: dict | None,
+    content: str,
+    inherited_text: str,
+    other_texts: Sequence[str] = (),
+) -> tuple[str, str]:
+    """Engine verification of a ``classify_inherited_relation`` answer (#242).
+
+    Returns ``(verdict, reason)``; *verdict* is ``"decline"`` (the contribution
+    is an exception), ``"decline_unspecific"`` (the answer CLAIMED a report but
+    the span is not a specific occurrence), ``"consequence_report"`` or
+    ``"departure_report"`` (admitted, specific past-tense report), or
+    ``"admit"`` (the fallback, which callers count).
+
+    Fails toward the inherited rule, by how readable the answer was:
+
+    - a claimed report whose span fails verbatim, tense or anchor declines;
+    - ``unrelated`` (a readable answer), or a report that is not about the
+      rule's own action, is admitted unless the text covers an inherited
+      subject (*inherited_text* or any of *other_texts*; see
+      :func:`_context_covers`) AND carries an exception marker or
+      the conflict signal;
+    - an unreadable answer, or an exception claim with no verbatim span,
+      declines on a marker anywhere in the text and is otherwise admitted.
+    """
+    answer = answer if isinstance(answer, dict) else {}
+    kind = answer.get("kind")
+    marker = _exception_marker(content, inherited_text)
+    readable_unrelated = False
+
+    if kind == "exception":
+        span = _verbatim_span(answer, "instead_span", content)
+        if span is not None:
+            return "decline", "an exception: states what happens instead of the rule"
+        failure = "exception answer without a verbatim instead_span"
+    elif kind in ("consequence_report", "departure_report"):
+        span = _verbatim_span(answer, "occurrence_span", content)
+        unspecific = None
+        if span is None:
+            unspecific = "no verbatim occurrence_span"
+        elif not _has_past_tense(span):
+            unspecific = "occurrence not in the past tense"
+        if unspecific is not None:
+            return "decline_unspecific", unspecific
+        if not _action_overlap(span, inherited_text):
+            # The answer CLAIMED a report about the rule, so it is not an honest
+            # "unrelated": a marker anywhere declines (rule A), as does a habit.
+            failure = "occurrence does not concern the rule's own action"
+            general = _general_marker(content)
+            if general is not None:
+                # a claimed report that is also a habit is not an honest "unrelated"
+                return "decline", f"{failure}; generalises ({general})"
+        elif marker is not None or (general := _general_marker(content)) is not None:
+            # The generality check runs on EVERY report, including one that
+            # an `acted_on` points at the rule: `acted_on` never waives it
+            # ("acted on <rule>: we always skip it for hotfixes" declines).
+            return "decline", f"generalises beyond the occurrence ({marker or general})"
+        else:
+            verdict = "departure_report" if _DEPARTURE_CUE_RE.search(span) else kind
+            return verdict, "a specific past occurrence"
+    elif kind == "unrelated":
+        failure = "answered unrelated"
+        readable_unrelated = True
+    else:
+        failure = "unreadable answer"
+
+    if readable_unrelated:
+        covers = any(_context_covers(text, content) for text in (inherited_text, *other_texts))
+        if marker is not None and covers:
+            return "decline", f"{failure}; covers an inherited subject and ({marker})"
+        return "admit", f"{failure}; no covered exception"
+    if marker is not None:
+        return "decline", f"{failure}; exception marker present ({marker})"
+    return "admit", f"{failure}; no exception marker"
+
+
+_CONTEXT_REASK_DIRECTIVE_CHARS = 600
+_CONTEXT_REASK_BUDGET_CHARS = 2400
+
+
+def inherited_for_context(
+    content: str, inherited: Sequence[tuple[str, str, str]]
+) -> list[tuple[str, str, str]]:
+    """The inherited directives to show the #242 re-ask, most relevant first
+    (shared content words with *content*), within a character budget so the
+    re-ask stays compact. The trigger itself is NOT lexical: every ordinary
+    context admit by a session bound to the scope is classified when the scope
+    inherits anything (a lexical gate misses reworded exceptions, which is the
+    point of the check). Texts longer than the per-directive cap are cut for
+    display only; verification always uses the full text."""
+    from strata.publication import _overlap_words  # noqa: PLC0415
+
+    content_words = _overlap_words(content)
+    ranked = sorted(
+        inherited, key=lambda d: len(_overlap_words(d[2]) & content_words), reverse=True
+    )
+    shown: list[tuple[str, str, str]] = []
+    used = 0
+    for item in ranked:
+        cost = min(len(item[2]), _CONTEXT_REASK_DIRECTIVE_CHARS)
+        if shown and used + cost > _CONTEXT_REASK_BUDGET_CHARS:
+            break
+        shown.append(item)
+        used += cost
+    return shown
+
+
+_INHERITED_DECLINES = ("decline", "decline_unspecific")
+
+
+def _inherited_relation_note(outcome: dict) -> str:
+    """The engine-written suffix for a #242 outcome ("" when the admit stands
+    with nothing to say: the unverified fallback)."""
+    directive_id, origin = outcome["inherited_id"], outcome["origin"]
+    verdict = outcome["verdict"]
+    if verdict == "decline_unspecific":
+        return (
+            f"[Declined: a report of following or departing from {directive_id} ({origin}) "
+            "must name the specific occurrence (when, which); resubmit with it, or propose the "
+            f"exception to {origin}.]"
+        )
+    if verdict == "decline":
+        return (
+            f"[Declined: contrary to inherited directive {directive_id} ({origin}). A practice "
+            "that departs from an inherited rule can't be recorded as this scope's context. "
+            f"Report a specific occurrence of following the rule and what happened (admitted, "
+            f"and raised to {origin} with acted_on), or propose the exception to {origin}.]"
+        )
+    if verdict == "consequence_report":
+        return (
+            f"[A report of following {directive_id} ({origin}). To raise it to {origin}, "
+            f"resubmit with acted_on = {directive_id}.]"
+        )
+    if verdict == "departure_report":
+        return (
+            f"[A departure from {directive_id} ({origin}), not a licence: only {origin} decides "
+            f"whether the rule is slack. To raise it to {origin}, resubmit with "
+            f"acted_on = {directive_id}.]"
+        )
+    return ""
+
+
+# ---------------------------------------------------------------------------
 # ScopeManager
 # ---------------------------------------------------------------------------
 
@@ -7000,6 +7466,15 @@ class ScopeManager:
             ancestor_directives=ancestor_directives,
             operator_memory=operator_memory,
         )
+        if acted_on_target is None:
+            judgment = self.classify_inherited_context(
+                judgment,
+                scope=scope,
+                contribution=new_contribution,
+                ancestor_directives=ancestor_directives,
+                operator_memory=operator_memory,
+                mode=mode,
+            )
         return self._hold_directive_changes(
             judgment,
             scope=scope,
@@ -8273,6 +8748,220 @@ class ScopeManager:
         )
         return _noted(updated, relation, parent_id, result)
 
+    def _classify_inherited_relation(
+        self,
+        *,
+        scope: Scope,
+        contribution: Contribution,
+        covered: Sequence[tuple[str, str, str]],
+    ) -> dict:
+        """#242: the one targeted re-ask (``classify_inherited_relation``) and
+        the engine's verification of its answer, for a context contribution
+        that the scope inherits directives for (*covered*, ranked and capped).
+
+        Returns ``{"contribution_id", "kind", "verdict", "fallback",
+        "inherited_id", "origin", "reason"}``. A failed or unreadable call is
+        the unreadable-answer case, never an error: the verifier's marker
+        scan then decides (a marker declines, otherwise the admit stands and
+        ``fallback`` is True).
+        """
+        shown = list(covered)
+        listing = "\n".join(
+            f"- {d_id}: {text[:_CONTEXT_REASK_DIRECTIVE_CHARS]}" for d_id, _origin, text in shown
+        )
+        user_message = (
+            f"INHERITED DIRECTIVES:\n{listing}\n\nCONTEXT ITEM:\n{contribution.content}\n\n"
+            "Call `classify_inherited_relation` exactly once."
+        )
+        answer: dict = {}
+        failure: str | None = None
+        try:
+            response = self._messages_create(
+                model=self._model,
+                max_tokens=300,
+                system=[
+                    {
+                        "type": "text",
+                        "text": _INHERITED_RELATION_SYSTEM_PROMPT,
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ],
+                tools=[
+                    {**CLASSIFY_INHERITED_RELATION_TOOL, "cache_control": {"type": "ephemeral"}}
+                ],
+                tool_choice={
+                    "type": "tool",
+                    "name": CLASSIFY_INHERITED_RELATION_TOOL["name"],
+                    "disable_parallel_tool_use": True,
+                },
+                messages=[{"role": "user", "content": user_message}],
+            )
+            block = self._extract_tool_use_block(response)
+            answer = block.input if isinstance(block.input, dict) else {}
+        except Exception as exc:  # noqa: BLE001 — any slip is the unreadable-answer case
+            failure = f"{type(exc).__name__}: {exc}"
+
+        named = answer.get("inherited_id")
+        chosen = next((d for d in shown if d[0] == named), None)
+        if chosen is None:
+            chosen = shown[0]
+            answer = {}  # an answer naming no shown directive is unreadable
+        verdict, reason = verify_inherited_relation(
+            answer, contribution.content, chosen[2], [d[2] for d in shown if d is not chosen]
+        )
+        if failure is not None:
+            reason = f"re-ask failed ({failure}); {reason}"
+        kind = answer.get("kind")
+        return {
+            "contribution_id": contribution.id,
+            "kind": kind if isinstance(kind, str) else None,
+            "verdict": verdict,
+            "fallback": verdict == "admit",
+            "inherited_id": chosen[0],
+            "origin": chosen[1],
+            "reason": reason,
+        }
+
+    def classify_inherited_context(
+        self,
+        first: ScopeManagerJudgment,
+        *,
+        scope: Scope,
+        contribution: Contribution,
+        ancestor_directives: Sequence[tuple[str, Sequence[Directive]]] | None,
+        operator_memory: Sequence[tuple[str, Sequence[OperatorItem]]] | None,
+        mode: JudgeMode = "ordinary",
+    ) -> ScopeManagerJudgment:
+        """#242: a child's CONTEXT must not undercut an inherited directive.
+
+        Fires only for an ordinary ``accept_as_context`` from a contributor
+        bound to *scope* when the scope inherits at least one directive
+        (ancestor or operator); otherwise *first* is returned untouched with
+        no call. An exception is declined; a specific past
+        report stays admitted with a suffix naming it and suggesting
+        ``acted_on``; an unreadable or unrelated answer declines only when an
+        exception marker is present (the counted fail-open fallback).
+        """
+        if (
+            mode != "ordinary"
+            or first.decision != "accept_as_context"
+            or first.inherited_holds
+            or first.inherited_relation is not None
+            or contribution.contributor.scope_id != scope.id
+        ):
+            return first
+        inherited = _inherited_directive_texts(ancestor_directives, operator_memory)
+        if not inherited:
+            return first
+        covered = inherited_for_context(contribution.content, inherited)
+        outcome = self._classify_inherited_relation(
+            scope=scope, contribution=contribution, covered=covered
+        )
+        note = _inherited_relation_note(outcome)
+        update: dict = {
+            "inherited_relation": outcome,
+            "protocol_notes": [
+                *first.protocol_notes,
+                f"inherited relation: {outcome['verdict']}, {outcome['reason']}",
+            ],
+        }
+        if outcome["verdict"] in _INHERITED_DECLINES:
+            update.update(
+                decision="decline",
+                directive_ops=[],
+                new_context=None,
+                new_summary=None,
+                reasoning=f"{first.reasoning} {note}",
+            )
+        elif note:
+            update["reasoning"] = f"{first.reasoning} {note}"
+        return first.model_copy(update=update)
+
+    def _classify_batch_inherited_context(
+        self,
+        judgment: ScopeManagerBatchJudgment,
+        *,
+        scope: Scope,
+        current_summary: ScopeSummary | None,
+        contributions: Mapping[str, Contribution],
+        mode: JudgeMode,
+        ancestor_directives: Sequence[tuple[str, Sequence[Directive]]] | None,
+        operator_memory: Sequence[tuple[str, Sequence[OperatorItem]]] | None,
+    ) -> ScopeManagerBatchJudgment:
+        """:meth:`classify_inherited_context`, carried to the batch.
+
+        Each member that was admitted as context and is bound to *scope* gets
+        its own re-ask (when the scope inherits anything). A declined member's
+        verdict becomes ``decline``. Stated limit: the batch has ONE context
+        rewrite, which the judge wrote with the declined text in view; when
+        any member is declined the rewrite is withheld and replaced by the
+        previous context plus each remaining context-admitted member's own
+        text, verbatim, so a declined exception can never survive in it.
+        Held members are the inherited check's, not this one's.
+        """
+        if mode != "ordinary":
+            return judgment
+        inherited = _inherited_directive_texts(ancestor_directives, operator_memory)
+        if not inherited:
+            return judgment
+        held = {h["contribution_id"] for h in judgment.inherited_holds}
+        outcomes: dict[str, dict] = {}
+        for verdict in judgment.verdicts:
+            cid = verdict.contribution_id
+            member = contributions[cid]
+            if (
+                verdict.decision != "accept_as_context"
+                or cid in held
+                or member.contributor.scope_id != scope.id
+            ):
+                continue
+            outcomes[cid] = self._classify_inherited_relation(
+                scope=scope,
+                contribution=member,
+                covered=inherited_for_context(member.content, inherited),
+            )
+        if not outcomes:
+            return judgment
+        declined = {cid for cid, o in outcomes.items() if o["verdict"] in _INHERITED_DECLINES}
+        verdicts = []
+        for v in judgment.verdicts:
+            outcome = outcomes.get(v.contribution_id)
+            note = _inherited_relation_note(outcome) if outcome else ""
+            if outcome is None or not note:
+                verdicts.append(v)
+            elif v.contribution_id in declined:
+                verdicts.append(
+                    v.model_copy(
+                        update={"decision": "decline", "reasoning": f"{v.reasoning} {note}"}
+                    )
+                )
+            else:
+                verdicts.append(v.model_copy(update={"reasoning": f"{v.reasoning} {note}"}))
+        update: dict = {
+            "verdicts": verdicts,
+            "inherited_relations": list(outcomes.values()),
+        }
+        if declined:
+            context = current_summary.context if current_summary is not None else ""
+            for v in verdicts:
+                if v.decision == "accept_as_context" and v.contribution_id not in held:
+                    member = contributions[v.contribution_id]
+                    who = member.contributor.skill or member.contributor.session_id
+                    context = _append_line(
+                        context,
+                        f"[{member.id}] {who} ({member.contributor.scope_id}) "
+                        f"observed: {member.content.strip()}",
+                    )
+            update["new_context"] = context
+            update["new_summary"] = _apply_batch_amendment(
+                scope=scope,
+                current_summary=current_summary,
+                contributions=contributions,
+                ops=judgment.directive_ops,
+                new_context=context,
+            )
+        return judgment.model_copy(update=update)
+
     def judge_batch(
         self,
         *,
@@ -8414,6 +9103,9 @@ class ScopeManager:
                     {only.id: list(judgment.dropped_ops)} if judgment.dropped_ops else {}
                 ),
                 inherited_holds=judgment.inherited_holds,
+                inherited_relations=(
+                    [judgment.inherited_relation] if judgment.inherited_relation else []
+                ),
                 held_directive_changes=judgment.held_directive_changes,
                 held_ops=judgment.held_ops,
                 held_context=judgment.held_context,
@@ -8591,6 +9283,15 @@ class ScopeManager:
             parse_generic_decline=_generic_second_slip_batch_decline,
         )
         batch_judgment = self._hold_batch_inherited_conflicts(
+            batch_judgment,
+            scope=scope,
+            current_summary=current_summary,
+            contributions=contributions,
+            mode=mode,
+            ancestor_directives=ancestor_directives,
+            operator_memory=operator_memory,
+        )
+        batch_judgment = self._classify_batch_inherited_context(
             batch_judgment,
             scope=scope,
             current_summary=current_summary,
