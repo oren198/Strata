@@ -1246,9 +1246,11 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     10. Refresh queue depth and oldest pending event (ADR 0014 D6, pin 4) —
         soft, purely informational: an unprocessed ``change_events`` row is
         an input change awaiting its refresh, never a judge outage.
-    11. Structure emission (ADR 0014 D8) — soft. Lists every
-        ``fleet_structure_acts`` row of type ``remove_edge`` or ``reparent``
-        that has no change event carrying its act id.
+    11. Structure emission (ADR 0014 D8) — soft. While
+        ``change_events.events_for_act`` is absent, one line: structure
+        emission is not built yet and acts are not checked. When it exists,
+        lists every ``remove_edge`` or ``reparent`` act that function
+        returns no rows for.
     """
     from strata.bootstrap import load_fleet_config
     from strata.fleet_config import FleetConfigError
@@ -5370,7 +5372,19 @@ def cmd_freshness_evaluator(args: argparse.Namespace) -> int:
 
 
 def _check_structure_emission(paths: object) -> Check:
-    """List remove_edge and reparent acts that have no change events yet."""
+    """Report structure acts the core has not emitted for yet.
+
+    While ``events_for_act`` is absent, one line and no act is inspected.
+    """
+    import strata.change_events as change_events
+
+    if not hasattr(change_events, "events_for_act"):
+        return Check(
+            name="Structure emission",
+            kind="soft",
+            passed=True,
+            message="Structure emission is not built yet; acts are not checked",
+        )
     if paths is None:
         return Check(
             name="Structure emission",
@@ -5386,19 +5400,19 @@ def _check_structure_emission(paths: object) -> Check:
             passed=True,
             message="skipped — see the Database check above.",
         )
-    conn: sqlite3.Connection | None = None
+    from strata.fleet_changes import unemitted_structure_acts  # noqa: PLC0415
+    from strata.record_store import RecordStore  # noqa: PLC0415
+
+    store: RecordStore | None = None
     missing: list[tuple[str, str]] | None = None
     try:
-        conn = sqlite3.connect(f"file:{db_file}?mode=ro", uri=True)
-        conn.row_factory = sqlite3.Row
-        from strata.fleet_changes import unemitted_structure_acts  # noqa: PLC0415
-
-        missing = unemitted_structure_acts(conn)
+        store = RecordStore(str(db_file))
+        missing = unemitted_structure_acts(store)
     except sqlite3.Error:
         missing = None
     finally:
-        if conn is not None:
-            conn.close()
+        if store is not None:
+            store.close()
     if missing is None:
         return Check(
             name="Structure emission",

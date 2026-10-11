@@ -244,7 +244,7 @@ function LayerBody({ layer }) {
     return (
       <SummaryBody
         summary={layer.summary}
-        ownDirectiveConflicts={layer.relation === "self" ? layer.own_directive_conflicts : null}
+        showAnnotation={layer.relation === "self"}
       />
     );
   }
@@ -257,29 +257,25 @@ function LayerBody({ layer }) {
   return null;
 }
 
-function SummaryBody({ summary, ownDirectiveConflicts }) {
+function SummaryBody({ summary, showAnnotation }) {
   if (!summary.exists) {
     return <div className="at-caption" style={{ fontStyle: "italic" }}>This scope has no summary yet.</div>;
   }
   const directives = summary.directives || [];
-  const conflicts = ownDirectiveConflicts || {};
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
       {directives.length === 0 ? (
         <div className="at-caption" style={{ fontStyle: "italic" }}>No directives.</div>
       ) : (
         <ul style={{ listStyle: "none", padding: 0, margin: 0, display: "flex", flexDirection: "column", gap: 6 }}>
-          {directives.map((d, i) => {
-            const notes = conflicts[d.id] || [];
-            return (
-              <li key={d.id || i} className="at-body-sm">
-                {d.subject ? `${d.subject}: ${d.content}` : d.content}
-                {notes.map((line) => (
-                  <div key={line} className="at-caption" style={{ marginTop: 4 }}>{line}</div>
-                ))}
-              </li>
-            );
-          })}
+          {directives.map((d, i) => (
+            <li key={d.id || i} className="at-body-sm">
+              {d.subject ? `${d.subject}: ${d.content}` : d.content}
+              {showAnnotation && d.annotation ? (
+                <div className="at-caption" style={{ marginTop: 4 }}>{d.annotation}</div>
+              ) : null}
+            </li>
+          ))}
         </ul>
       )}
       <p className="at-body-sm" style={{ margin: 0, whiteSpace: "pre-wrap" }}>

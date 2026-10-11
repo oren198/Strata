@@ -133,13 +133,14 @@ proposed and does not appear here.
 Removing a reference edge, removing a scope, or re-parenting prints the
 limit of what Strata does not yet re-check, until structure emission is
 part of the engine. Below the pending list, each applied act is shown
-read-only with the change events that carry it and every conflict line
-("Own directive … governs …"). Nothing on this tab is judged, and nothing
-here emits a change event. The operator re-runs emission with
+read-only. Its events and conflict lines are the ones
+`events_for_act` and `structure_conflict_lines` report. While those
+operations are absent, the lists are empty. Nothing on this tab is judged,
+and nothing here emits a change event. The operator re-runs emission with
 `strata fleet reemit`.
 
-The perspective view ("View as") shows that same conflict line on the
-self layer, beside the own directive it names.
+The perspective view ("View as") shows the `annotation` the engine put on
+an own directive in the self layer. The Console does not derive that line.
 
 ## Judge usage
 

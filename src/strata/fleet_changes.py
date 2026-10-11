@@ -18,8 +18,6 @@ from __future__ import annotations
 import copy
 import json
 import logging
-import re
-import sqlite3
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -43,11 +41,6 @@ from strata.operator import record_fleet_structure_act
 from strata.record_store import FleetChangeProposal, FleetStructureAct, RecordStore
 
 _logger = logging.getLogger("strata.fleet_changes")
-
-# Conflict lines the engine writes into a structure-change notice (ADR 0014 D8).
-# The console shows every line of this shape; it does not invent them.
-_CONFLICT_MARK = "Own directive "
-_CONFLICT_GOVERNS = "governs"
 
 ChangeType = Literal[
     "add_scope",
@@ -629,7 +622,6 @@ def _apply(
     # lines limit_notices still returns while the operation is absent.
     notices = preview.notices
     if hasattr(change_events, "emit_structure_change"):
-        notices = ()
         try:
             change_events.emit_structure_change(act.id)
         except Exception:
@@ -638,6 +630,9 @@ def _apply(
                 act.id,
                 exc_info=True,
             )
+            notices = (_emission_failed_notice(act.id),)
+        else:
+            notices = ()
     return FleetChangeResult(
         status="applied",
         proposal_id=proposal_id,
@@ -1089,14 +1084,14 @@ def _reemit(fleet: FleetConfig, store: RecordStore, act_id: str) -> int:
     except KeyError:
         print(f"No fleet structure act {act_id}.", file=sys.stderr)
         return 1
-    if events_carrying_act(store._conn, act_id):
+    if _events_for_act(store, act_id):
         print("already emitted")
         return 0
     if hasattr(change_events, "emit_structure_change"):
         try:
             emitted = change_events.emit_structure_change(act_id)
-        except Exception as exc:
-            print(f"Emission failed for {act_id}: {exc}", file=sys.stderr)
+        except Exception:
+            print(_emission_failed_notice(act_id), file=sys.stderr)
             return 1
         _print_emitted(emitted)
         return 0
@@ -1148,156 +1143,59 @@ def _change_from_recorded_act(act: FleetStructureAct) -> FleetChange | None:
     return None
 
 
-def _row_value(row: sqlite3.Row | tuple, key: str, index: int):
-    if isinstance(row, sqlite3.Row):
-        return row[key]
-    return row[index]
+def _emission_failed_notice(act_id: str) -> str:
+    return f"Structure emission failed for {act_id}; run `strata fleet reemit {act_id}`."
 
 
-def _change_event_columns(conn: sqlite3.Connection) -> set[str]:
-    try:
-        return {row[1] for row in conn.execute("PRAGMA table_info(change_events)")}
-    except sqlite3.Error:
-        return set()
+def _events_for_act(record_store: RecordStore, act_id: str) -> list[dict]:
+    """Rows from the core's ``events_for_act``. Empty while that operation is absent.
 
-
-def events_carrying_act(conn: sqlite3.Connection, act_id: str) -> list[dict]:
-    """Change-event rows that carry *act_id*.
-
-    The core's migration may add an ``act_id`` column. Until then the payload
-    (``before`` / ``after``) carries the act id. Either match counts.
+    Nothing here looks at event text or contribution text.
     """
-    columns = _change_event_columns(conn)
-    if not columns:
+    finder = getattr(change_events, "events_for_act", None)
+    if finder is None:
         return []
-    clauses = [
-        "instr(ifnull(before, ''), ?) > 0",
-        "instr(ifnull(after, ''), ?) > 0",
-    ]
-    params: list[str] = [act_id, act_id]
-    if "act_id" in columns:
-        clauses.append("act_id = ?")
-        params.append(act_id)
-    wanted = [
-        "id",
-        "change_id",
-        "contribution_id",
-        "scope_id",
-        "kind",
-        "before",
-        "after",
-        "created_at",
-    ]
-    present = [name for name in wanted if name in columns]
-    if not present:
-        return []
-    sql = (
-        f"SELECT {', '.join(present)} FROM change_events "
-        f"WHERE {' OR '.join(clauses)} ORDER BY created_at ASC, rowid ASC"
-    )
-    try:
-        cursor = conn.execute(sql, params)
-        names = [item[0] for item in cursor.description]
-        return [dict(zip(names, row, strict=True)) for row in cursor]
-    except sqlite3.Error:
-        return []
+    return list(finder(record_store, act_id) or [])
 
 
-def unemitted_structure_acts(conn: sqlite3.Connection) -> list[tuple[str, str]]:
-    """``remove_edge`` and ``reparent`` acts with no change event carrying the act id."""
-    try:
-        rows = conn.execute(
-            """
-            SELECT id, change_type FROM fleet_structure_acts
-            WHERE change_type IN ('remove_edge', 'reparent')
-            ORDER BY created_at ASC, rowid ASC
-            """
-        ).fetchall()
-    except sqlite3.Error:
-        return []
-    missing: list[tuple[str, str]] = []
-    for row in rows:
-        act_id = _row_value(row, "id", 0)
-        change_type = _row_value(row, "change_type", 1)
-        if not events_carrying_act(conn, act_id):
-            missing.append((act_id, change_type))
-    return missing
-
-
-def _is_conflict_line(line: str) -> bool:
-    return line.startswith(_CONFLICT_MARK) and _CONFLICT_GOVERNS in line
-
-
-def conflict_lines_in_text(text: str | None) -> list[str]:
-    """Every ``Own directive … governs …`` line in *text*, including JSON lists."""
-    if not text:
+def _conflict_lines_from_core(events: list[dict]) -> list[str]:
+    """Lines from ``structure_conflict_lines`` only. Empty while it is absent."""
+    reader = getattr(change_events, "structure_conflict_lines", None)
+    if reader is None:
         return []
     found: list[str] = []
     seen: set[str] = set()
-
-    def _add(line: str) -> None:
-        stripped = line.strip()
-        if stripped and _is_conflict_line(stripped) and stripped not in seen:
-            seen.add(stripped)
-            found.append(stripped)
-
-    stripped = text.strip()
-    if stripped.startswith("{"):
-        try:
-            data = json.loads(stripped)
-        except json.JSONDecodeError:
-            data = None
-        if isinstance(data, dict):
-            for key in ("conflicts", "conflict_lines", "lines", "notices"):
-                value = data.get(key)
-                if isinstance(value, str):
-                    _add(value)
-                elif isinstance(value, list):
-                    for item in value:
-                        if isinstance(item, str):
-                            _add(item)
-    for line in text.splitlines():
-        _add(line)
-    return found
-
-
-def conflict_lines_for_events(conn: sqlite3.Connection, events: list[dict]) -> list[str]:
-    found: list[str] = []
-    seen: set[str] = set()
-    contribution_ids: list[str] = []
     for event in events:
-        for key in ("before", "after"):
-            for line in conflict_lines_in_text(event.get(key)):
-                if line not in seen:
-                    seen.add(line)
-                    found.append(line)
-        contribution_id = event.get("contribution_id")
-        if contribution_id:
-            contribution_ids.append(contribution_id)
-    if not contribution_ids:
-        return found
-    placeholders = ", ".join("?" * len(contribution_ids))
-    try:
-        rows = conn.execute(
-            f"SELECT content FROM contributions WHERE id IN ({placeholders})",
-            contribution_ids,
-        ).fetchall()
-    except sqlite3.Error:
-        return found
-    for row in rows:
-        content = _row_value(row, "content", 0)
-        for line in conflict_lines_in_text(content):
-            if line not in seen:
+        for line in reader(event) or []:
+            if isinstance(line, str) and line not in seen:
                 seen.add(line)
                 found.append(line)
     return found
 
 
+def unemitted_structure_acts(record_store: RecordStore) -> list[tuple[str, str]]:
+    """``remove_edge`` and ``reparent`` acts ``events_for_act`` does not return.
+
+    Caller has already checked that ``events_for_act`` exists.
+    """
+    missing: list[tuple[str, str]] = []
+    for act in record_store.list_fleet_structure_acts():
+        if act.change_type not in ("remove_edge", "reparent"):
+            continue
+        if not _events_for_act(record_store, act.id):
+            missing.append((act.id, act.change_type))
+    return missing
+
+
 def structure_act_views(record_store: RecordStore) -> list[dict]:
-    """Applied acts with the events and conflict lines already recorded. Read-only."""
+    """Applied acts with the events and conflict lines the core reports. Read-only.
+
+    While ``events_for_act`` or ``structure_conflict_lines`` is absent, the
+    corresponding list is empty. This does not read event or contribution text.
+    """
     views: list[dict] = []
     for act in record_store.list_fleet_structure_acts():
-        events = events_carrying_act(record_store._conn, act.id)
+        events = _events_for_act(record_store, act.id)
         views.append(
             {
                 "id": act.id,
@@ -1311,73 +1209,11 @@ def structure_act_views(record_store: RecordStore) -> list[dict]:
                         "id": event.get("id"),
                         "kind": event.get("kind"),
                         "scope_id": event.get("scope_id"),
-                        "before": event.get("before"),
-                        "after": event.get("after"),
                         "created_at": event.get("created_at"),
                     }
                     for event in events
                 ],
-                "conflict_lines": conflict_lines_for_events(record_store._conn, events),
+                "conflict_lines": _conflict_lines_from_core(events),
             }
         )
     return views
-
-
-def own_directive_conflicts(record_store: RecordStore, scope_id: str) -> dict[str, list[str]]:
-    """Conflict lines for *scope_id*'s own directives, keyed by directive id.
-
-    The same sentence the act view shows, attached to the directive it names.
-    Empty when no recorded notice says that directive conflicts.
-    """
-    conn = record_store._conn
-    try:
-        rows = conn.execute(
-            """
-            SELECT before, after, contribution_id FROM change_events
-            WHERE ifnull(before, '') LIKE '%governs%'
-               OR ifnull(after, '') LIKE '%governs%'
-               OR contribution_id IN (
-                    SELECT id FROM contributions WHERE ifnull(content, '') LIKE '%governs%'
-               )
-            """
-        ).fetchall()
-    except sqlite3.Error:
-        return {}
-    texts: list[str | None] = []
-    contribution_ids: list[str] = []
-    for row in rows:
-        texts.append(_row_value(row, "before", 0))
-        texts.append(_row_value(row, "after", 1))
-        contribution_id = _row_value(row, "contribution_id", 2)
-        if contribution_id:
-            contribution_ids.append(contribution_id)
-    if contribution_ids:
-        placeholders = ", ".join("?" * len(contribution_ids))
-        try:
-            contents = conn.execute(
-                f"SELECT content FROM contributions WHERE id IN ({placeholders})",
-                contribution_ids,
-            ).fetchall()
-        except sqlite3.Error:
-            contents = []
-        texts.extend(_row_value(row, "content", 0) for row in contents)
-    grouped: dict[str, list[str]] = {}
-    for text in texts:
-        for line in conflict_lines_in_text(text):
-            directive_id, line_scope = _conflict_target(line)
-            if directive_id is None or line_scope != scope_id:
-                continue
-            bucket = grouped.setdefault(directive_id, [])
-            if line not in bucket:
-                bucket.append(line)
-    return grouped
-
-
-def _conflict_target(line: str) -> tuple[str | None, str | None]:
-    """``(own directive id, scope whose memory keeps it)`` from one conflict line."""
-    own = re.search(r"Own directive (\S+) ", line)
-    scope = re.search(r"remains in (\S+)'s memory", line)
-    return (
-        own.group(1) if own else None,
-        scope.group(1) if scope else None,
-    )

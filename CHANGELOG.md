@@ -56,15 +56,18 @@ the release PR (`dev` → `main`) and the GitHub Release body are built from
   (its chain subtree ids at apply time). Other change types are unchanged.
   While `emit_structure_change` is absent, apply still prints the stated-limit
   line and does not emit. When that operation is present, apply calls it
-  once after the act row is committed, under the same fleet lock, and an
-  emission failure leaves the file and the act in place. `strata doctor`
-  lists every `remove_edge` or `reparent` act that has no change event
-  carrying its id. `strata fleet reemit <act_id>` emits for one act, prints
-  what was emitted, and prints `already emitted` when the act already has
-  events. The Console act list shows those events and every conflict line,
-  and the perspective's self layer shows the same line on the own directive.
-  All of that is read-only. The kinds, the migration, and
-  `emit_structure_change` itself are not in this change.
+  once after the act row is committed, under the same fleet lock. If the
+  call raises, the apply stands and the notice is "Structure emission failed
+  for <act_id>; run `strata fleet reemit <act_id>`." `strata doctor` says
+  "Structure emission is not built yet; acts are not checked" until
+  `events_for_act` exists, and then lists every `remove_edge` or `reparent`
+  act that function returns no rows for. `strata fleet reemit <act_id>`
+  emits for one act, prints what was emitted, and prints `already emitted`
+  only when `events_for_act` returns rows. The Console act list shows those
+  rows and the lines `structure_conflict_lines` returns. The perspective
+  shows the `annotation` the engine put on a self-layer directive. Neither
+  surface reads event or contribution text. The kinds, the migration, and
+  the core operations themselves are not in this change.
 
 - **`strata register` seeds Claude Code deny rules for the resolved store**
   (#173, ADR 0013 D6). `permissions.deny` in `.claude/settings.json` gains

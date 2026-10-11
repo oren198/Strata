@@ -106,7 +106,6 @@ from strata.fleet_changes import (
     FleetChangeError,
     list_approvable,
     names_an_actor,
-    own_directive_conflicts,
     structure_act_views,
 )
 from strata.fleet_changes import (
@@ -3593,17 +3592,8 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
 
         composed["token_estimate_total"] = total
         composed["token_estimate_method"] = "characters divided by 4 — an estimate, not a tokenizer"
-        # Console-only. The engine writes the conflict sentence into the
-        # notice; this attaches that same sentence to the self layer so the
-        # perspective view can show it on the own directive. It is not part
-        # of what an agent is shown — compose_perspective does not carry it,
-        # and the token estimate above was taken before this key existed.
-        conflicts = own_directive_conflicts(record_store, scope_id)
-        if conflicts:
-            for layer in composed["layers"]:
-                if layer.get("relation") == "self":
-                    layer["own_directive_conflicts"] = conflicts
-                    break
+        # A conflicting own directive's ``annotation`` is written by the core
+        # onto the self layer (perspective.py). This route does not compute one.
         return composed
 
     # -----------------------------------------------------------------------
