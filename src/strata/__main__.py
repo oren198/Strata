@@ -3562,9 +3562,11 @@ def cmd_register(args: argparse.Namespace) -> int:
     Walks the registration steps in order:
     1. Detect project root (require a project marker).
     2. Create .strata/ directory.
-    3. Write .strata/config.toml (skip if exists).
-    4. Update .gitignore (idempotent block with # Strata marker).
-    5. Seed .strata/fleet.yaml from templates/minimal.yaml (skip if exists).
+    3. Seed fleet.yaml (skip if it exists). A refusal here is said before
+       .strata/config.toml is written, and a directory this run created is
+       removed so a re-run is not blocked.
+    4. Write .strata/config.toml (skip if exists).
+    5. Update .gitignore (idempotent block with # Strata marker).
     6. Copy strata skills to .claude/skills/ (skip each if exists).
     7. Merge strata into .mcp.json mcpServers (skip if exists; migrates a
        legacy .claude/settings.json mcpServers.strata entry if found).
@@ -3773,16 +3775,102 @@ def cmd_register(args: argparse.Namespace) -> int:
     # Step 2: Create .strata/ directory.
     # -----------------------------------------------------------------------
     strata_dir = project_root / ".strata"
-    if not strata_dir.exists():
+    strata_existed = strata_dir.exists()
+    if not strata_existed:
         if not diff_mode:
             strata_dir.mkdir(parents=True)
         _act("created", strata_dir)
 
     # -----------------------------------------------------------------------
-    # Step 3: Write .strata/config.toml.
+    # Step 3: Seed fleet.yaml before config.toml exists.
+    #
+    # config.toml is the registration marker. A refusal while seeding must
+    # be said before that file is written. If this run created .strata/ and
+    # then could not seed, remove that directory: step 1b would otherwise
+    # refuse the re-run ("no config.toml") and the project would stay stuck.
+    # A config.toml that was already there is left in place; the re-run
+    # seeds the missing fleet and finishes.
     # -----------------------------------------------------------------------
     config_toml = strata_dir / "config.toml"
     config_toml_already_registered = config_toml.exists()
+    if adopted_store is not None:
+        fleet_yaml = adopted_store.fleet_yaml
+    elif config_toml_already_registered:
+        from strata.project_config import (  # noqa: PLC0415
+            ProjectConfigError,
+            load_project_config,
+        )
+
+        try:
+            existing_project_config = load_project_config(project_root)
+        except ProjectConfigError:
+            # Malformed config.toml — not this step's problem to diagnose
+            # (doctor covers that). Fall back to the default layout so
+            # register can still finish the rest of its work.
+            existing_project_config = None
+        fleet_yaml = (
+            existing_project_config.fleet_yaml
+            if existing_project_config is not None
+            else strata_dir / "fleet.yaml"
+        )
+    else:
+        fleet_yaml = strata_dir / "fleet.yaml"
+    minimal_template = _TEMPLATES_DIR / "minimal.yaml"
+    try:
+        if fleet_yaml.exists():
+            _act("skip", fleet_yaml, skipped=True)
+        else:
+            # The first scope's description (#210): the flag, else ask when a person is
+            # there to answer. Only ever for a fleet this run seeds; never in --diff.
+            scope_description: str | None = None
+            if not diff_mode:
+                flagged = getattr(args, "description", None)
+                scope_description = (
+                    flagged.strip() or None
+                    if flagged is not None
+                    else _ask_scope_description(allowed=not getattr(args, "yes", False))
+                )
+            if not diff_mode:
+                # The configured fleet path can point anywhere (issue #184),
+                # including a directory that no longer exists — e.g. the
+                # recovery path `strata start` documents ("fleet.yaml missing
+                # ... Re-run `strata register` ... to re-seed it") must actually
+                # work even when the parent directory was removed too.
+                fleet_yaml.parent.mkdir(parents=True, exist_ok=True)
+                from strata.fleet_config import create_fleet_file
+
+                if minimal_template.exists():
+                    seeded = minimal_template.read_bytes()
+                else:
+                    # Fallback: write a minimal inline template.
+                    seeded = (
+                        b"# TODO: replace with your team's structure\n"
+                        b"strata:\n  - id: L0\n    name: root\n    ordinal: 0\n"
+                        b"scopes:\n  - id: g_root\n    name: Root\n    stratum_id: L0\n"
+                        b"edges: []\n"
+                    )
+                if scope_description:
+                    seeded = install.seed_scope_description(
+                        seeded.decode("utf-8"), scope_description
+                    ).encode("utf-8")
+                # Exclusive create, no flock. A file that landed first is left alone.
+                if create_fleet_file(fleet_yaml, seeded):
+                    _act("seeded", fleet_yaml)
+                else:
+                    _act("skip", fleet_yaml, skipped=True)
+            else:
+                _act("seeded", fleet_yaml)
+    except Exception as exc:
+        print(f"Refusing to register: {exc}", file=sys.stderr)
+        if not strata_existed and strata_dir.exists() and not config_toml.exists():
+            import shutil
+
+            shutil.rmtree(strata_dir)
+        return 1
+
+    # -----------------------------------------------------------------------
+    # Step 4: Write .strata/config.toml.
+    # -----------------------------------------------------------------------
     if config_toml_already_registered:
         _act("skip", config_toml, skipped=True)
     else:
@@ -3836,7 +3924,7 @@ def cmd_register(args: argparse.Namespace) -> int:
             _act(f"recorded the registering install ({registering[1]}) in", config_toml)
 
     # -----------------------------------------------------------------------
-    # Step 4: Update .gitignore.
+    # Step 5: Update .gitignore.
     # -----------------------------------------------------------------------
     gitignore = project_root / ".gitignore"
     existing_gitignore = gitignore.read_text(encoding="utf-8") if gitignore.exists() else ""
@@ -3850,83 +3938,6 @@ def cmd_register(args: argparse.Namespace) -> int:
                 f.write("\n")
                 f.write(_GITIGNORE_BLOCK)
         _act("appended Strata block to", gitignore)
-
-    # -----------------------------------------------------------------------
-    # Step 5: Seed .strata/fleet.yaml from templates/minimal.yaml.
-    #
-    # A project already carrying a config.toml is already registered — its
-    # config.toml is the source of truth for where the fleet lives, and may
-    # point anywhere (issue #184: seen pointing at an absolute path outside
-    # the project tree). Seeding must ask the resolver, not assume the
-    # default `.strata/fleet.yaml` layout, or it plants a second, misleading
-    # fleet file nothing reads while the project's real one goes untouched.
-    # -----------------------------------------------------------------------
-    if adopted_store is not None:
-        fleet_yaml = adopted_store.fleet_yaml
-    elif config_toml_already_registered:
-        from strata.project_config import (  # noqa: PLC0415
-            ProjectConfigError,
-            load_project_config,
-        )
-
-        try:
-            existing_project_config = load_project_config(project_root)
-        except ProjectConfigError:
-            # Malformed config.toml — not this step's problem to diagnose
-            # (doctor covers that). Fall back to the default layout so
-            # register can still finish the rest of its work.
-            existing_project_config = None
-        fleet_yaml = (
-            existing_project_config.fleet_yaml
-            if existing_project_config is not None
-            else strata_dir / "fleet.yaml"
-        )
-    else:
-        fleet_yaml = strata_dir / "fleet.yaml"
-    minimal_template = _TEMPLATES_DIR / "minimal.yaml"
-    if fleet_yaml.exists():
-        _act("skip", fleet_yaml, skipped=True)
-    else:
-        # The first scope's description (#210): the flag, else ask when a person is
-        # there to answer. Only ever for a fleet this run seeds; never in --diff.
-        scope_description: str | None = None
-        if not diff_mode:
-            flagged = getattr(args, "description", None)
-            scope_description = (
-                flagged.strip() or None
-                if flagged is not None
-                else _ask_scope_description(allowed=not getattr(args, "yes", False))
-            )
-        if not diff_mode:
-            # The configured fleet path can point anywhere (issue #184),
-            # including a directory that no longer exists — e.g. the
-            # recovery path `strata start` documents ("fleet.yaml missing
-            # ... Re-run `strata register` ... to re-seed it") must actually
-            # work even when the parent directory was removed too.
-            fleet_yaml.parent.mkdir(parents=True, exist_ok=True)
-            from strata.fleet_config import create_fleet_file
-
-            if minimal_template.exists():
-                seeded = minimal_template.read_bytes()
-            else:
-                # Fallback: write a minimal inline template.
-                seeded = (
-                    b"# TODO: replace with your team's structure\n"
-                    b"strata:\n  - id: L0\n    name: root\n    ordinal: 0\n"
-                    b"scopes:\n  - id: g_root\n    name: Root\n    stratum_id: L0\n"
-                    b"edges: []\n"
-                )
-            if scope_description:
-                seeded = install.seed_scope_description(
-                    seeded.decode("utf-8"), scope_description
-                ).encode("utf-8")
-            # Exclusive create, no flock. A file that landed first is left alone.
-            if create_fleet_file(fleet_yaml, seeded):
-                _act("seeded", fleet_yaml)
-            else:
-                _act("skip", fleet_yaml, skipped=True)
-        else:
-            _act("seeded", fleet_yaml)
 
     def _seeded_binding_hint() -> tuple[bool, str]:
         """Return ``(single_scope, first_scope_id)`` for *fleet_yaml*.

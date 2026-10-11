@@ -121,6 +121,56 @@ def test_start_seeds_fleet_when_fcntl_is_missing(
     assert FLEET_FILE_LOCK_UNAVAILABLE not in captured.err
 
 
+def test_register_seed_refusal_does_not_leave_a_half_registered_project(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A seed refusal is said before config.toml, and a re-run then finishes.
+
+    The first register fails while reading the seed template. It must exit 1
+    with that reason and no traceback, and it must not leave ``.strata/config.toml``.
+    The second register, with the refusal gone, exits 0 and writes both files.
+    """
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+    monkeypatch.setattr("sys.stdout.isatty", lambda: False)
+    monkeypatch.setattr("getpass.getpass", lambda prompt="": "")
+    (tmp_path / ".git").mkdir()
+
+    real_read_bytes = Path.read_bytes
+    armed = True
+
+    def _read_bytes(self: Path) -> bytes:
+        nonlocal armed
+        if armed and self.name == "minimal.yaml":
+            armed = False
+            raise OSError("simulated seed refusal")
+        return real_read_bytes(self)
+
+    monkeypatch.setattr(Path, "read_bytes", _read_bytes)
+
+    from strata.__main__ import main
+
+    rc = main(["register", str(tmp_path), "--yes"])
+    captured = capsys.readouterr()
+
+    assert rc == 1
+    assert "Refusing to register: simulated seed refusal" in captured.err
+    assert "Traceback" not in captured.err
+    assert "Traceback" not in captured.out
+    assert not (tmp_path / ".strata" / "config.toml").exists()
+
+    rc = main(["register", str(tmp_path), "--yes"])
+    captured = capsys.readouterr()
+
+    assert rc == 0
+    fleet = tmp_path / ".strata" / "fleet.yaml"
+    assert fleet.is_file()
+    assert fleet.stat().st_size > 0
+    assert (tmp_path / ".strata" / "config.toml").is_file()
+    assert "Traceback" not in captured.err
+    assert "Traceback" not in captured.out
+    assert "Refusing to register" not in captured.err
+
+
 def test_export_fleet_existing_file_refuses_without_fcntl(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

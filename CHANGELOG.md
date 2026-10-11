@@ -120,7 +120,10 @@ the release PR (`dev` → `main`) and the GitHub Release body are built from
   (`O_CREAT|O_EXCL`) and does not take the lock, so a fresh register where
   `fcntl` is missing no longer stops after writing `config.toml`. An
   existing file is left alone. `strata export-fleet` onto an existing file
-  still refuses, printing that message and exiting 1.
+  still refuses, printing that message and exiting 1. If seeding itself
+  refuses, `strata register` says so before it writes `.strata/config.toml`
+  and removes a `.strata/` directory that this run created, so a re-run
+  finishes instead of leaving a half-registered project.
 
 ## 1.17.2 (2026-10-06)
 
