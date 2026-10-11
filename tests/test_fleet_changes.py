@@ -508,6 +508,14 @@ _FLEET_PUBLISHERS = {
     "__main__.py",
 }
 _FLEET_DEST_NAMES = {"fleet_yaml", "fleet_path"}
+# The only fleet.yaml write allowed outside replace_fleet_bytes: an exclusive
+# create of a file that does not exist yet. Callers are the register seed and
+# the env-driven start seed. The os.open(O_CREAT|O_EXCL) that implements it
+# lives only in create_fleet_file.
+_EXCLUSIVE_CREATE_CALLERS = {
+    ("__main__.py", "cmd_register"),
+    ("__main__.py", "cmd_start"),
+}
 
 
 def _callee_name(node: ast.Call) -> str | None:
@@ -527,6 +535,22 @@ def _is_os_replace(node: ast.Call) -> bool:
         and isinstance(func.value, ast.Name)
         and func.value.id == "os"
     )
+
+
+def _is_os_open(node: ast.Call) -> bool:
+    func = node.func
+    return (
+        isinstance(func, ast.Attribute)
+        and func.attr == "open"
+        and isinstance(func.value, ast.Name)
+        and func.value.id == "os"
+    )
+
+
+def _os_open_flag_names(node: ast.Call) -> set[str]:
+    if len(node.args) < 2:
+        return set()
+    return {child.attr for child in ast.walk(node.args[1]) if isinstance(child, ast.Attribute)}
 
 
 def _is_byte_publish(node: ast.Call) -> bool:
@@ -562,7 +586,14 @@ class _PublishVisitor(ast.NodeVisitor):
 
 
 def test_fleet_yaml_writes_go_through_replace_fleet_bytes() -> None:
-    """A fleet.yaml publish cannot come back outside replace_fleet_bytes."""
+    """Fleet.yaml bytes are published only by replace_fleet_bytes.
+
+    The one exception is create_fleet_file: an O_CREAT|O_EXCL create of a
+    file that does not exist yet, and it takes no flock. Only cmd_register
+    and cmd_start may call it. The os.open that implements that create lives
+    only inside create_fleet_file. Every replacement of an existing file
+    still goes through replace_fleet_bytes.
+    """
     import strata.fleet_config as fleet_config
 
     root = Path(fleet_config.__file__).resolve().parent
@@ -577,7 +608,16 @@ def test_fleet_yaml_writes_go_through_replace_fleet_bytes() -> None:
         visitor = _PublishVisitor()
         visitor.visit(ast.parse(source))
         for func_name, call in visitor.calls:
-            if _callee_name(call) == "replace_fleet_bytes":
+            callee = _callee_name(call)
+            if callee == "replace_fleet_bytes":
+                continue
+            if callee == "create_fleet_file":
+                if (path.name, func_name) not in _EXCLUSIVE_CREATE_CALLERS:
+                    offenders.append(
+                        f"{rel}:{call.lineno}: create_fleet_file is only the "
+                        "missing-file seed in cmd_register and cmd_start "
+                        "(the only exception to replace_fleet_bytes)"
+                    )
                 continue
             if (
                 path.name in _FLEET_PUBLISHERS
@@ -585,6 +625,20 @@ def test_fleet_yaml_writes_go_through_replace_fleet_bytes() -> None:
                 and func_name != "replace_fleet_bytes"
             ):
                 offenders.append(f"{rel}:{call.lineno}: os.replace outside replace_fleet_bytes")
+            if path.name in _FLEET_PUBLISHERS and _is_os_open(call):
+                flags = _os_open_flag_names(call)
+                exclusive = "O_CREAT" in flags and "O_EXCL" in flags
+                if (
+                    exclusive
+                    and func_name == "create_fleet_file"
+                    and path.name == "fleet_config.py"
+                ):
+                    continue
+                if exclusive or (_name_ids(call) & _FLEET_DEST_NAMES):
+                    offenders.append(
+                        f"{rel}:{call.lineno}: os.open of a fleet file outside "
+                        "create_fleet_file (the only exception to replace_fleet_bytes)"
+                    )
             if _is_byte_publish(call) and (_name_ids(call) & _FLEET_DEST_NAMES):
                 offenders.append(
                     f"{rel}:{call.lineno}: fleet file write outside replace_fleet_bytes"

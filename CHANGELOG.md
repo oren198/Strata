@@ -115,7 +115,12 @@ the release PR (`dev` → `main`) and the GitHub Release body are built from
   given that mode before it is renamed into place. The caller's etag is
   compared, inside the lock, with the bytes just re-read; a tag fetched
   before a fleet change is `409 fleet_changed` and the file stays as the
-  change wrote it.
+  change wrote it. Seeding a `fleet.yaml` that does not exist yet (`strata
+  register`, and the env-driven `strata start` seed) is an exclusive create
+  (`O_CREAT|O_EXCL`) and does not take the lock, so a fresh register where
+  `fcntl` is missing no longer stops after writing `config.toml`. An
+  existing file is left alone. `strata export-fleet` onto an existing file
+  still refuses, printing that message and exiting 1.
 
 ## 1.17.2 (2026-10-06)
 

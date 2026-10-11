@@ -906,7 +906,11 @@ an exclusive `fcntl.flock` on `fleet.yaml.lock` beside the file, then a
 unique temporary file renamed into place. Where `fcntl` is unavailable
 (Windows), that write is refused with: "Refusing to write fleet.yaml:
 fcntl.flock is not available on this platform, and Strata will not update
-the file without that lock."
+the file without that lock." `strata register` and the env-driven `strata
+start` seed create a missing `fleet.yaml` exclusively (`O_CREAT|O_EXCL`)
+and do not take that lock; an existing file is left alone. Replacing an
+existing file, including `strata export-fleet --force`, still refuses with
+that message.
 A change is recorded and not judged. Removing a
 reference, removing a scope, or re-parenting prints what is not re-checked
 automatically yet.

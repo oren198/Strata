@@ -5,8 +5,10 @@ ADR 0002. It loads, validates, and mutates fleet configuration, ensuring
 ``fleet.yaml`` is always the source of truth.
 
 - :class:`FleetConfig` is the top-level model and public API.
-- All mutations take the cross-process fleet file lock, then an in-process
-  lock, and publish through :func:`replace_fleet_bytes`.
+- Replacing an existing fleet file takes the cross-process fleet file lock,
+  then an in-process lock, and publishes through :func:`replace_fleet_bytes`.
+- Seeding a fleet file that does not exist yet is :func:`create_fleet_file`:
+  an exclusive create, no lock. That is the only exception.
 - Validation raises :class:`FleetConfigError` on the first failure; the
   ``kind`` attribute identifies which invariant was violated.
 
@@ -30,7 +32,7 @@ import stat
 import tempfile
 import threading
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -1315,13 +1317,45 @@ def fleet_file_lock(path: Path) -> _FleetYamlLock:
     return _fleet_yaml_lock(path)
 
 
+def create_fleet_file(path: Path, data: bytes) -> bool:
+    """Create *path* only when it does not exist. No fleet lock.
+
+    This is the only fleet-file write that does not go through
+    :func:`replace_fleet_bytes`. It seeds a missing ``fleet.yaml`` (``strata
+    register``, and the env-driven ``strata start`` seed). The create is
+    exclusive (``O_CREAT|O_EXCL``): a file that already exists is left
+    untouched and this returns ``False``. Replacing an existing file still
+    takes :func:`fleet_file_lock` and still refuses where ``fcntl.flock`` is
+    unavailable.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+    except FileExistsError:
+        return False
+    try:
+        remaining = memoryview(data)
+        while remaining:
+            written = os.write(fd, remaining)
+            remaining = remaining[written:]
+        os.close(fd)
+    except BaseException:
+        with suppress(OSError):
+            os.close(fd)
+        with suppress(OSError):
+            os.unlink(path)
+        raise
+    return True
+
+
 def replace_fleet_bytes(path: Path, data: bytes) -> None:
     """Publish *data* as *path*. The only function that replaces a fleet file.
 
     Takes :func:`fleet_file_lock` (reentrant for a caller that already holds
     it) and writes a uniquely named temp file in *path*'s directory, then
     ``os.replace``. A missing ``fcntl`` raises :class:`FleetFileLockUnavailable`
-    before any byte of *path* changes.
+    before any byte of *path* changes. Creating a file that does not exist yet
+    is :func:`create_fleet_file`, not this function.
     """
     with fleet_file_lock(path):
         # The temp file is created mode 0o600. Copy the live file's mode onto

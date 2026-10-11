@@ -536,10 +536,12 @@ def cmd_start(args: argparse.Namespace) -> int:
             )
             return 1
         if _DEFAULT_TEMPLATE.exists():
-            from strata.fleet_config import replace_fleet_bytes
+            from strata.fleet_config import create_fleet_file
 
-            replace_fleet_bytes(fleet_path, _DEFAULT_TEMPLATE.read_bytes())
-            print("seeded fleet.yaml from the default template; edit to suit")
+            # A file that is not there yet needs no flock. Exclusive create
+            # leaves an existing file alone if one appears first.
+            if create_fleet_file(fleet_path, _DEFAULT_TEMPLATE.read_bytes()):
+                print("seeded fleet.yaml from the default template; edit to suit")
 
     # 5. Serve.
     import uvicorn
@@ -2613,7 +2615,7 @@ def cmd_export_fleet(args: argparse.Namespace) -> int:
     migrations, converts to the V1.2 schema, and writes a ``fleet.yaml`` that
     round-trips through :class:`FleetConfig.load`.
     """
-    from strata.fleet_config import FleetConfigError
+    from strata.fleet_config import FleetConfigError, FleetFileLockUnavailable
     from strata.fleet_export import ExportResult, TablesAbsentError, export_fleet
 
     db_path = args.db or _db_path_default()
@@ -2638,6 +2640,11 @@ def cmd_export_fleet(args: argparse.Namespace) -> int:
             "different path with --out.",
             file=sys.stderr,
         )
+        return 1
+    except FleetFileLockUnavailable as exc:
+        # Subclass of FleetConfigError. Print the lock refusal itself, not
+        # the validation wrapper, and never a traceback.
+        print(exc.message, file=sys.stderr)
         return 1
     except FleetConfigError as exc:
         print(
@@ -3897,7 +3904,7 @@ def cmd_register(args: argparse.Namespace) -> int:
             # ... Re-run `strata register` ... to re-seed it") must actually
             # work even when the parent directory was removed too.
             fleet_yaml.parent.mkdir(parents=True, exist_ok=True)
-            from strata.fleet_config import replace_fleet_bytes
+            from strata.fleet_config import create_fleet_file
 
             if minimal_template.exists():
                 seeded = minimal_template.read_bytes()
@@ -3913,8 +3920,13 @@ def cmd_register(args: argparse.Namespace) -> int:
                 seeded = install.seed_scope_description(
                     seeded.decode("utf-8"), scope_description
                 ).encode("utf-8")
-            replace_fleet_bytes(fleet_yaml, seeded)
-        _act("seeded", fleet_yaml)
+            # Exclusive create, no flock. A file that landed first is left alone.
+            if create_fleet_file(fleet_yaml, seeded):
+                _act("seeded", fleet_yaml)
+            else:
+                _act("skip", fleet_yaml, skipped=True)
+        else:
+            _act("seeded", fleet_yaml)
 
     def _seeded_binding_hint() -> tuple[bool, str]:
         """Return ``(single_scope, first_scope_id)`` for *fleet_yaml*.
