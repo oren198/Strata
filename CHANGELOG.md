@@ -98,6 +98,18 @@ the release PR (`dev` → `main`) and the GitHub Release body are built from
   today's usage. The Console's Judge usage tab shows the same numbers
   and does not write.
 
+### Fixed
+
+- **The Console's raw fleet save takes the same lock as a fleet change**
+  (#247). `PUT /fleet` and every other write of `fleet.yaml` go through one
+  helper: an exclusive `fcntl.flock` on `fleet.yaml.lock` beside the file,
+  then a unique temporary file and `os.replace`. The save re-checks the
+  caller's etag while that lock is held, so a fleet change that landed
+  first is left in place (409). Where `fcntl` is unavailable (Windows), the
+  write is refused with "Refusing to write fleet.yaml: fcntl.flock is not
+  available on this platform, and Strata will not update the file without
+  that lock." The file is left unchanged.
+
 ## 1.17.2 (2026-10-06)
 
 ### Fixed

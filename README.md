@@ -900,6 +900,12 @@ scope proposes the same changes with the MCP tools `strata_fleet_propose`,
 the acting scope is the session's binding. The Console's Fleet changes tab
 is the same operator list. Over HTTP the operator is the only actor, and
 any local process that can reach the Console port acts as the operator.
+`PUT /fleet` and every fleet change publish `fleet.yaml` through one helper:
+an exclusive `fcntl.flock` on `fleet.yaml.lock` beside the file, then a
+unique temporary file renamed into place. Where `fcntl` is unavailable
+(Windows), that write is refused with: "Refusing to write fleet.yaml:
+fcntl.flock is not available on this platform, and Strata will not update
+the file without that lock."
 A change is recorded and not judged. Removing a
 reference, removing a scope, or re-parenting prints what is not re-checked
 automatically yet.

@@ -14,17 +14,9 @@ from __future__ import annotations
 import copy
 import json
 import sys
-import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
-
-try:
-    import fcntl
-except ImportError:  # pragma: no cover — Windows has no fcntl
-    # Same degrade as strata.locks: one process still serialises on the
-    # threading lock; two processes on Windows can still race the file.
-    fcntl = None  # type: ignore[assignment]
 
 import yaml
 from pydantic import ValidationError
@@ -32,10 +24,11 @@ from pydantic import ValidationError
 from strata.fleet_config import (
     FleetConfig,
     FleetConfigError,
-    _atomic_replace,
     _resolve_edges,
     _schema_error_to_fleet_config_error,
     _validate,
+    fleet_file_lock,
+    replace_fleet_bytes,
 )
 from strata.operator import record_fleet_structure_act
 from strata.record_store import FleetChangeProposal, RecordStore
@@ -643,7 +636,7 @@ def _require_pending(record_store: RecordStore, proposal_id: str) -> FleetChange
 def _rollback(fleet: FleetConfig, backup: Path) -> None:
     """Put the backup bytes back. Caller holds the fleet file lock."""
     assert fleet._path is not None
-    _atomic_replace(fleet._path, backup.read_bytes())
+    replace_fleet_bytes(fleet._path, backup.read_bytes())
     fleet.reload_from_disk()
 
 
@@ -656,80 +649,19 @@ def _refuse_self_resolution(approver: Actor, proposal: FleetChangeProposal, *, v
         )
 
 
-class _FleetYamlLock:
-    """A threading lock plus a cross-process flock on a file beside ``fleet.yaml``.
-
-    Same order as :class:`strata.locks._ScopeFileLock`: the threading lock is
-    outermost, then ``fcntl.flock``. The same thread may enter again; only the
-    outermost entry takes the flock, so a write inside an apply does not
-    deadlock on the lock the apply already holds. Where ``fcntl`` is missing
-    the threading lock still serialises this process.
-    """
-
-    def __init__(self, path: Path) -> None:
-        self._path = path
-        self._thread = threading.RLock()
-        self._fh: object | None = None
-        self._depth = 0
-
-    def __enter__(self) -> _FleetYamlLock:
-        self._thread.acquire()
-        try:
-            if self._depth == 0 and fcntl is not None:
-                handle = None
-                try:
-                    lock_path = self._path.with_name(self._path.name + ".lock")
-                    handle = lock_path.open("a", encoding="utf-8")
-                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-                except BaseException:
-                    if handle is not None:
-                        handle.close()
-                    raise
-                self._fh = handle
-            self._depth += 1
-        except BaseException:
-            self._thread.release()
-            raise
-        return self
-
-    def __exit__(self, *_exc: object) -> None:
-        try:
-            self._depth -= 1
-            if self._depth == 0 and self._fh is not None:
-                try:
-                    fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)  # type: ignore[attr-defined]
-                finally:
-                    self._fh.close()  # type: ignore[attr-defined]
-                    self._fh = None
-        finally:
-            self._thread.release()
-
-
-_fleet_yaml_locks: dict[str, _FleetYamlLock] = {}
-_fleet_yaml_locks_guard = threading.Lock()
-
-
-def _fleet_yaml_lock(path: Path) -> _FleetYamlLock:
-    key = str(Path(path).resolve())
-    with _fleet_yaml_locks_guard:
-        lock = _fleet_yaml_locks.get(key)
-        if lock is None:
-            lock = _FleetYamlLock(Path(key))
-            _fleet_yaml_locks[key] = lock
-        return lock
-
-
 def _under_fleet_lock(fleet: FleetConfig, body):  # noqa: ANN001, ANN202
     """Re-read *fleet* and run *body* while holding the file lock.
 
     *body* sees the file as it is now. Owner, flags, the delegation refusal,
     the transform, the write, and the recorded act all happen before the lock
     is released. Approve and reject claim the proposal inside the same hold.
+    The lock is the same one :func:`strata.fleet_config.replace_fleet_bytes`
+    takes, so a Console save cannot land in the middle of this section.
     """
     path = fleet._path
     if path is None:
         raise FleetChangeError("no_fleet_file", "This fleet is not backed by a file.")
-    with _fleet_yaml_lock(path):
+    with fleet_file_lock(path):
         fleet.reload_from_disk()
         return body()
 

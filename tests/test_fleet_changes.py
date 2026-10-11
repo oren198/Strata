@@ -500,6 +500,291 @@ def test_proposer_cannot_approve_or_reject_their_own_proposal(tmp_path: Path) ->
     assert decided.status == "applied"
 
 
+_FLEET_PUBLISHERS = {
+    "app.py",
+    "fleet_changes.py",
+    "fleet_config.py",
+    "fleet_export.py",
+    "__main__.py",
+}
+_FLEET_DEST_NAMES = {"fleet_yaml", "fleet_path"}
+
+
+def _callee_name(node: ast.Call) -> str | None:
+    func = node.func
+    if isinstance(func, ast.Name):
+        return func.id
+    if isinstance(func, ast.Attribute):
+        return func.attr
+    return None
+
+
+def _is_os_replace(node: ast.Call) -> bool:
+    func = node.func
+    return (
+        isinstance(func, ast.Attribute)
+        and func.attr == "replace"
+        and isinstance(func.value, ast.Name)
+        and func.value.id == "os"
+    )
+
+
+def _is_byte_publish(node: ast.Call) -> bool:
+    func = node.func
+    if isinstance(func, ast.Attribute) and func.attr in {"write_text", "write_bytes"}:
+        return True
+    if _is_os_replace(node):
+        return True
+    if isinstance(func, ast.Attribute) and func.attr in {"copy", "copyfile", "copy2"}:
+        return isinstance(func.value, ast.Name) and func.value.id == "shutil"
+    return isinstance(func, ast.Name) and func.id in {"copy", "copyfile", "copy2"}
+
+
+def _name_ids(node: ast.AST) -> set[str]:
+    return {child.id for child in ast.walk(node) if isinstance(child, ast.Name)}
+
+
+class _PublishVisitor(ast.NodeVisitor):
+    def __init__(self) -> None:
+        self.stack: list[str] = []
+        self.calls: list[tuple[str | None, ast.Call]] = []
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        self.stack.append(node.name)
+        self.generic_visit(node)
+        self.stack.pop()
+
+    visit_AsyncFunctionDef = visit_FunctionDef  # type: ignore[assignment]
+
+    def visit_Call(self, node: ast.Call) -> None:
+        self.calls.append((self.stack[-1] if self.stack else None, node))
+        self.generic_visit(node)
+
+
+def test_fleet_yaml_writes_go_through_replace_fleet_bytes() -> None:
+    """A fleet.yaml publish cannot come back outside replace_fleet_bytes."""
+    import strata.fleet_config as fleet_config
+
+    root = Path(fleet_config.__file__).resolve().parent
+    offenders: list[str] = []
+    for path in sorted(root.rglob("*.py")):
+        source = path.read_text(encoding="utf-8")
+        rel = str(path.relative_to(root))
+        if "fleet.yaml.tmp" in source:
+            offenders.append(f"{rel}: contains fleet.yaml.tmp")
+        if path.name in _FLEET_PUBLISHERS and '+ ".tmp"' in source:
+            offenders.append(f"{rel}: fixed .tmp suffix")
+        visitor = _PublishVisitor()
+        visitor.visit(ast.parse(source))
+        for func_name, call in visitor.calls:
+            if _callee_name(call) == "replace_fleet_bytes":
+                continue
+            if (
+                path.name in _FLEET_PUBLISHERS
+                and _is_os_replace(call)
+                and func_name != "replace_fleet_bytes"
+            ):
+                offenders.append(f"{rel}:{call.lineno}: os.replace outside replace_fleet_bytes")
+            if _is_byte_publish(call) and (_name_ids(call) & _FLEET_DEST_NAMES):
+                offenders.append(
+                    f"{rel}:{call.lineno}: fleet file write outside replace_fleet_bytes"
+                )
+    assert offenders == []
+
+
+def _parallel_put_fleet(fleet_path: str, db_path: str, yaml_text: str, result_path: str) -> None:
+    """PUT /fleet until it lands. Top-level so a spawned interpreter can import it."""
+    from fastapi.testclient import TestClient
+
+    from strata.app import create_app
+    from strata.settings import Settings
+
+    settings = Settings(
+        db_path=db_path,
+        summaries_dir=str(Path(fleet_path).parent / "summaries"),
+        fleet_yaml_path=fleet_path,
+        manager_model="claude-haiku-4-5",
+        anthropic_api_key="test-key",
+    )
+    application = create_app(settings=settings)
+    try:
+        with TestClient(application) as client:
+            # Applies wait on this file, so they run during the save loop.
+            Path(result_path).with_name("put-ready").write_text("ready", encoding="utf-8")
+            for _ in range(100):
+                etag = client.get("/fleet").json()["etag"]
+                resp = client.put("/fleet", json={"yaml": yaml_text, "etag": etag})
+                if resp.status_code == 200:
+                    Path(result_path).write_text("ok", encoding="utf-8")
+                    return
+                if resp.status_code != 409:
+                    Path(result_path).write_text(
+                        f"status={resp.status_code} body={resp.text}",
+                        encoding="utf-8",
+                    )
+                    return
+        Path(result_path).write_text("exhausted", encoding="utf-8")
+    except Exception as exc:
+        Path(result_path).write_text(f"error={type(exc).__name__}: {exc}", encoding="utf-8")
+        raise
+
+
+def _parallel_apply_edge_when_ready(
+    fleet_path: str, db_path: str, target: str, ready_path: str, after_path: str
+) -> None:
+    """Apply one edge once PUT /fleet is in its save loop.
+
+    *after_path*, when set, waits until that file exists, so those applies
+    run only after the PUT has returned.
+    """
+    import time
+
+    deadline = time.monotonic() + 30
+    while not Path(ready_path).exists():
+        if time.monotonic() > deadline:
+            raise TimeoutError("PUT /fleet did not become ready")
+        time.sleep(0.01)
+    if after_path:
+        while not Path(after_path).exists():
+            if time.monotonic() > deadline:
+                raise TimeoutError("PUT /fleet did not finish")
+            time.sleep(0.01)
+    _parallel_apply_edge(fleet_path, db_path, target)
+
+
+def _put_document(n: int) -> str:
+    scopes = "\n".join(
+        ["  - id: g_src\n    name: Src\n    stratum_id: s0"]
+        + [f"  - id: g_t{i}\n    name: T{i}\n    stratum_id: s0" for i in range(n)]
+        + ["  - id: g_from_put\n    name: FromPut\n    stratum_id: s0"]
+    )
+    return f"strata:\n  - id: s0\n    name: Root\n    ordinal: 0\nscopes:\n{scopes}\nedges: []\n"
+
+
+def test_put_fleet_beside_parallel_applies_loses_nothing(tmp_path: Path) -> None:
+    """PUT /fleet races N applies. Every act is kept or superseded, in order.
+
+    The applies and the PUT take one flock, so they run in one order. Each
+    apply records its act under that lock, after its write, so SQLite rowid
+    is that order. The PUT body has every scope the applies need, a marker
+    scope ``g_from_put``, and no reference edges. Applies that ran before
+    the PUT had their edges replaced by that body. Applies that ran after
+    it re-read that body and added their edge on top. The edges left in the
+    file are therefore a suffix of the act order, and the superseded edges
+    are the prefix. A hole in that suffix would be an edge a later writer
+    dropped. A missing marker would be the PUT's bytes overwritten by a
+    stale apply. ``FleetConfig.load`` succeeding means the file was not torn.
+
+    Eight applies start while the PUT is looping. Four more
+    (``g_t8`` .. ``g_t11``) start only after the PUT returns, so the kept
+    suffix cannot be empty.
+    """
+    import json
+    import multiprocessing
+    import sqlite3
+
+    n = 12
+    scopes = "\n".join(f"  - id: g_t{i}\n    name: T{i}\n    stratum_id: s0" for i in range(n))
+    fleet_path = tmp_path / "fleet.yaml"
+    fleet_path.write_text(
+        "strata:\n"
+        "  - id: s0\n"
+        "    name: Root\n"
+        "    ordinal: 0\n"
+        "scopes:\n"
+        "  - id: g_src\n"
+        "    name: Src\n"
+        "    stratum_id: s0\n"
+        f"{scopes}\n"
+        "edges: []\n",
+        encoding="utf-8",
+    )
+    db_path = str(tmp_path / "strata.db")
+    run_migrations(db_path)
+    result_path = tmp_path / "put-result.txt"
+    ready_path = tmp_path / "put-ready"
+    ctx = multiprocessing.get_context("spawn")
+    put = ctx.Process(
+        target=_parallel_put_fleet,
+        args=(str(fleet_path), db_path, _put_document(n), str(result_path)),
+    )
+    late = {f"g_t{i}" for i in range(8, n)}
+    procs = [
+        ctx.Process(
+            target=_parallel_apply_edge_when_ready,
+            args=(
+                str(fleet_path),
+                db_path,
+                f"g_t{i}",
+                str(ready_path),
+                str(result_path) if f"g_t{i}" in late else "",
+            ),
+        )
+        for i in range(n)
+    ]
+    put.start()
+    for proc in procs:
+        proc.start()
+    put.join(60)
+    for proc in procs:
+        proc.join(60)
+    codes = [proc.exitcode for proc in procs]
+    put_detail = result_path.read_text(encoding="utf-8") if result_path.exists() else codes
+    assert put.exitcode == 0, put_detail
+    assert codes == [0] * n, codes
+    put_status = result_path.read_text(encoding="utf-8")
+    assert put_status == "ok"
+    reloaded = FleetConfig.load(fleet_path)
+    marker = any(scope.id == "g_from_put" for scope in reloaded.scopes)
+    present = {edge.to for edge in reloaded.edges if edge.from_ == "g_src"}
+    connection = sqlite3.connect(db_path)
+    try:
+        rows = connection.execute(
+            "SELECT before_topology, after_topology FROM fleet_structure_acts ORDER BY rowid ASC"
+        ).fetchall()
+    finally:
+        connection.close()
+    targets: list[str] = []
+    for before_raw, after_raw in rows:
+        before = set(json.loads(before_raw)["g_src"]["references"])
+        after = json.loads(after_raw)["g_src"]["references"]
+        added = [item for item in after if item not in before]
+        assert len(added) == 1, added
+        targets.append(added[0])
+    cut = 0
+    while cut < len(targets) and targets[cut] not in present:
+        cut += 1
+    kept = targets[cut:]
+    superseded = targets[:cut]
+    print(
+        f"N={n} put={put_status} marker={marker} cut={cut} "
+        f"kept={len(kept)} superseded={len(superseded)} acts={len(targets)} edges={len(present)}"
+    )
+    assert marker is True
+    assert len(targets) == n
+    assert present == set(kept)
+    assert late <= present
+    assert not (tmp_path / "fleet.yaml.tmp").exists()
+
+
+def test_missing_fcntl_refuses_the_fleet_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No flock means no write. The file stays as it was."""
+    import strata.fleet_config as fleet_config
+    from strata.fleet_config import FLEET_FILE_LOCK_UNAVAILABLE, FleetFileLockUnavailable
+
+    monkeypatch.setattr(fleet_config, "fcntl", None)
+    fleet, store = _world(tmp_path)
+    before = fleet._path.read_bytes()
+    with pytest.raises(FleetFileLockUnavailable) as raised:
+        apply_as_operator(fleet, store, _change("describe", scope_id="g_a", description="nope"))
+    assert str(raised.value) == FLEET_FILE_LOCK_UNAVAILABLE
+    assert raised.value.kind == "fleet_lock_unavailable"
+    assert fleet._path.read_bytes() == before
+    assert fleet.get_scope("g_a").description is None
+
+
 def test_reject_recomputes_the_owner(tmp_path: Path) -> None:
     fleet, store = _world(tmp_path)
     proposal = store.insert_fleet_change_proposal(

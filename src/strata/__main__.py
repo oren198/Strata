@@ -536,7 +536,9 @@ def cmd_start(args: argparse.Namespace) -> int:
             )
             return 1
         if _DEFAULT_TEMPLATE.exists():
-            shutil.copy(_DEFAULT_TEMPLATE, fleet_path)
+            from strata.fleet_config import replace_fleet_bytes
+
+            replace_fleet_bytes(fleet_path, _DEFAULT_TEMPLATE.read_bytes())
             print("seeded fleet.yaml from the default template; edit to suit")
 
     # 5. Serve.
@@ -3894,24 +3896,23 @@ def cmd_register(args: argparse.Namespace) -> int:
             # ... Re-run `strata register` ... to re-seed it") must actually
             # work even when the parent directory was removed too.
             fleet_yaml.parent.mkdir(parents=True, exist_ok=True)
+            from strata.fleet_config import replace_fleet_bytes
+
             if minimal_template.exists():
-                shutil.copy(minimal_template, fleet_yaml)
+                seeded = minimal_template.read_bytes()
             else:
                 # Fallback: write a minimal inline template.
-                fleet_yaml.write_text(
-                    "# TODO: replace with your team's structure\n"
-                    "strata:\n  - id: L0\n    name: root\n    ordinal: 0\n"
-                    "scopes:\n  - id: g_root\n    name: Root\n    stratum_id: L0\n"
-                    "edges: []\n",
-                    encoding="utf-8",
+                seeded = (
+                    b"# TODO: replace with your team's structure\n"
+                    b"strata:\n  - id: L0\n    name: root\n    ordinal: 0\n"
+                    b"scopes:\n  - id: g_root\n    name: Root\n    stratum_id: L0\n"
+                    b"edges: []\n"
                 )
             if scope_description:
-                fleet_yaml.write_text(
-                    install.seed_scope_description(
-                        fleet_yaml.read_text(encoding="utf-8"), scope_description
-                    ),
-                    encoding="utf-8",
-                )
+                seeded = install.seed_scope_description(
+                    seeded.decode("utf-8"), scope_description
+                ).encode("utf-8")
+            replace_fleet_bytes(fleet_yaml, seeded)
         _act("seeded", fleet_yaml)
 
     def _seeded_binding_hint() -> tuple[bool, str]:

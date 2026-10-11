@@ -39,8 +39,10 @@ POST /fleet/validate
     path. Never writes.
 
 PUT /fleet
-    Save fleet.yaml: validate, back up, atomic write, hot-swap the in-memory
-    FleetConfig. 409 on a stale etag (D4); UI-only, no engine flow calls it.
+    Save fleet.yaml: validate, then under the fleet file lock re-check the
+    etag, back up, and publish the submitted bytes. 409 on a stale etag
+    (D4); 503 when ``fcntl.flock`` is unavailable. UI-only, no engine flow
+    calls it.
 
 GET /scopes/{scope_id}/summary
     Return the scope summary.  200 with a synthesized empty summary
@@ -110,7 +112,15 @@ from strata.fleet_changes import (
 )
 from strata.fleet_changes import flag_phrases as fleet_flag_phrases
 from strata.fleet_changes import reject as reject_fleet_change
-from strata.fleet_config import FleetConfig, FleetConfigError, Scope, Stratum
+from strata.fleet_config import (
+    FleetConfig,
+    FleetConfigError,
+    FleetFileLockUnavailable,
+    Scope,
+    Stratum,
+    fleet_file_lock,
+    replace_fleet_bytes,
+)
 from strata.fleet_reload import FleetReloader
 from strata.locks import BATCH_CAP, QUEUE_WAIT_TIMEOUT_S, QueueTicket, configure_lock_dir
 from strata.locks import scope_append_lock as _scope_append_lock
@@ -3153,15 +3163,15 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
 
     @application.put("/fleet")
     def save_fleet(body: FleetSaveBody, request: Request) -> dict:
-        """Save fleet.yaml: validate -> etag check -> back up -> atomic write -> hot swap.
+        """Save fleet.yaml: validate, then under the file lock etag, backup, publish.
 
-        In that order (D2, D4, D5): nothing is written unless the submitted
-        text loads cleanly AND the file on disk still matches the etag the
-        caller last read. Every fleet-reading route reads through
+        Nothing is written unless the submitted text loads cleanly. The etag
+        is checked again while ``fleet.yaml.lock`` is held, so a fleet change
+        that landed after the caller read the file returns 409 and leaves
+        that change in place. The bytes written are the submitted text, via
+        :func:`replace_fleet_bytes`. Every fleet-reading route reads through
         ``app.state.fleet_reloader``, which stats fleet.yaml before serving
-        (ADR 0002 addendum) — so the ``os.replace`` below is itself the hot
-        swap: the very next fleet-reading call sees the new mtime/size and
-        reloads, with no extra state to keep in sync by hand.
+        (ADR 0002 addendum) — the publish is itself the hot swap.
         """
         reloader: FleetReloader = request.app.state.fleet_reloader
         fleet_path = reloader.path
@@ -3175,26 +3185,30 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
             ) from exc
 
         try:
-            current_bytes = fleet_path.read_bytes()
-        except OSError:
-            current_bytes = b""
-        if body.etag != _fleet_etag(current_bytes):
+            with fleet_file_lock(fleet_path):
+                try:
+                    current_bytes = fleet_path.read_bytes()
+                except OSError:
+                    current_bytes = b""
+                if body.etag != _fleet_etag(current_bytes):
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "error": "fleet_changed",
+                            "detail": (
+                                "the fleet file changed since you loaded it — "
+                                "reload and reapply your edit"
+                            ),
+                        },
+                    )
+                backup_path = fleet_path.with_name(fleet_path.name + ".bak")
+                backup_path.write_bytes(current_bytes)
+                replace_fleet_bytes(fleet_path, body.yaml.encode("utf-8"))
+        except FleetFileLockUnavailable as exc:
             raise HTTPException(
-                status_code=409,
-                detail={
-                    "error": "fleet_changed",
-                    "detail": (
-                        "the fleet file changed since you loaded it — reload and reapply your edit"
-                    ),
-                },
-            )
-
-        backup_path = fleet_path.with_name(fleet_path.name + ".bak")
-        backup_path.write_bytes(current_bytes)
-
-        tmp_path = fleet_path.with_name(fleet_path.name + ".tmp")
-        tmp_path.write_bytes(body.yaml.encode("utf-8"))
-        os.replace(tmp_path, fleet_path)
+                status_code=503,
+                detail={"error": exc.kind, "detail": exc.message},
+            ) from exc
 
         fresh_fleet = reloader.get()
 
