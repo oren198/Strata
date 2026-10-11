@@ -104,30 +104,46 @@ def test_judge_message_builders_are_byte_identical() -> None:
     assert "fleet_changes" not in inspect.getsource(scope_manager)
 
 
-def test_fleet_change_code_never_emits_change_events() -> None:
-    """Source scan: structure changes do not call the change-event machinery."""
-    sources = [
-        Path(fleet_changes.__file__).read_text(encoding="utf-8"),
-        inspect.getsource(operator.record_fleet_structure_act),
-    ]
-    for source in sources:
-        _assert_no_change_event_calls(source)
+def test_fleet_change_code_calls_only_emit_structure_change() -> None:
+    """Source scan: fleet_changes calls only emit_structure_change.
+
+    ``record_fleet_structure_act`` still does not touch the change-event
+    machinery. HTTP, MCP, and the Console stay on the never-emit scan.
+    """
+    source = Path(fleet_changes.__file__).read_text(encoding="utf-8")
+    names = _change_event_call_names(source)
+    assert names, "fleet_changes does not call emit_structure_change"
+    assert set(names) == {"emit_structure_change"}
+    _assert_no_change_event_calls(inspect.getsource(operator.record_fleet_structure_act))
 
 
-def _assert_no_change_event_calls(source: str) -> None:
-    banned = {"emit", "affected_scopes", "emit_restore_notice", "drain_scope"}
+def _change_event_call_names(source: str) -> list[str]:
+    watched = {
+        "emit",
+        "emit_structure_change",
+        "affected_scopes",
+        "emit_restore_notice",
+        "drain_scope",
+    }
     tree = ast.parse(source)
+    found: list[str] = []
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom):
             module = node.module or ""
             assert "change_events" not in module
-            assert all(alias.name not in banned for alias in node.names)
+            assert all(alias.name not in watched for alias in node.names)
         if isinstance(node, ast.Call):
             func = node.func
             name = func.id if isinstance(func, ast.Name) else None
             if isinstance(func, ast.Attribute):
                 name = func.attr
-            assert name not in banned
+            if name in watched:
+                found.append(name)
+    return found
+
+
+def _assert_no_change_event_calls(source: str) -> None:
+    assert _change_event_call_names(source) == []
 
 
 def test_owner_rules_and_separate_roots(tmp_path: Path) -> None:

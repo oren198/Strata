@@ -131,8 +131,15 @@ scope to apply as. A change a scope already owned was applied when it was
 proposed and does not appear here.
 
 Removing a reference edge, removing a scope, or re-parenting prints the
-limit of what Strata does not yet re-check. Nothing on this tab is judged,
-and nothing here emits a change event.
+limit of what Strata does not yet re-check, until structure emission is
+part of the engine. Below the pending list, each applied act is shown
+read-only with the change events that carry it and every conflict line
+("Own directive … governs …"). Nothing on this tab is judged, and nothing
+here emits a change event. The operator re-runs emission with
+`strata fleet reemit`.
+
+The perspective view ("View as") shows that same conflict line on the
+self layer, beside the own directive it names.
 
 ## Judge usage
 

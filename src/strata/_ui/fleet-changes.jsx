@@ -1,10 +1,11 @@
-// Fleet changes — pending structure changes the operator can apply or reject.
+// Fleet changes — pending structure changes the operator can apply or reject,
+// and a read-only list of applied acts with the events already recorded.
 // Apply and reject are operator-only. The request does not name a scope.
-// A channel removal or a chain move prints its stated limit; nothing here
-// emits a change event.
+// Nothing in this view emits a change event. Re-emission is `strata fleet reemit`.
 
 function FleetChangesView({ onFlash }) {
   const [rows, setRows] = React.useState(null);
+  const [acts, setActs] = React.useState([]);
   const [error, setError] = React.useState(null);
   const [busyId, setBusyId] = React.useState(null);
   const [notices, setNotices] = React.useState({});
@@ -12,7 +13,9 @@ function FleetChangesView({ onFlash }) {
   async function load() {
     try {
       const data = await STRATA_STORE.fetchFleetChanges();
+      const recorded = await STRATA_STORE.fetchFleetActs();
       setRows(data.changes || []);
+      setActs(recorded.acts || []);
       setError(null);
     } catch (err) {
       setError(err.message);
@@ -99,6 +102,60 @@ function FleetChangesView({ onFlash }) {
             </div>
           </div>
           {(notices[row.id] || []).map((line) => (
+            <div key={line} style={{ fontSize: 12, marginTop: 8 }}>{line}</div>
+          ))}
+        </div>
+      ))}
+      <AppliedActs acts={acts} />
+    </div>
+  );
+}
+
+// Read-only. Each act shows the change events that carry it and every
+// conflict line ("Own directive … governs …") those events recorded.
+function AppliedActs({ acts }) {
+  const list = acts || [];
+  return (
+    <div style={{ marginTop: 28 }}>
+      <h2 className="at-h2" style={{ marginBottom: 4 }}>Applied acts</h2>
+      <div style={{ color: "var(--at-muted)", fontSize: 13, marginBottom: 16 }}>
+        Read-only. Emitted events and conflict lines for each applied act.
+      </div>
+      {list.length === 0 && (
+        <div style={{ color: "var(--at-muted)", fontSize: 14 }}>No applied acts.</div>
+      )}
+      {list.map((act) => (
+        <div
+          key={act.id}
+          style={{
+            border: "1px solid var(--at-rule)",
+            borderRadius: 8,
+            padding: "12px 14px",
+            marginBottom: 10,
+          }}
+        >
+          <div style={{ fontFamily: "var(--font-mono)", fontSize: 13 }}>
+            {act.change_type} · {act.id}
+          </div>
+          <div style={{ color: "var(--at-muted)", fontSize: 12, marginTop: 4 }}>
+            approver {act.approver_position || "—"}
+          </div>
+          <div style={{ fontSize: 12, fontWeight: 600, marginTop: 10 }}>Emitted events</div>
+          {(act.events || []).length === 0 ? (
+            <div style={{ color: "var(--at-muted)", fontSize: 12, marginTop: 4 }}>
+              No change events for this act.
+            </div>
+          ) : (
+            (act.events || []).map((event) => (
+              <div
+                key={event.id}
+                style={{ fontFamily: "var(--font-mono)", fontSize: 11, marginTop: 4 }}
+              >
+                {event.created_at} — {event.kind} — {event.scope_id}
+              </div>
+            ))
+          )}
+          {(act.conflict_lines || []).map((line) => (
             <div key={line} style={{ fontSize: 12, marginTop: 8 }}>{line}</div>
           ))}
         </div>

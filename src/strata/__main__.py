@@ -1246,6 +1246,9 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     10. Refresh queue depth and oldest pending event (ADR 0014 D6, pin 4) —
         soft, purely informational: an unprocessed ``change_events`` row is
         an input change awaiting its refresh, never a judge outage.
+    11. Structure emission (ADR 0014 D8) — soft. Lists every
+        ``fleet_structure_acts`` row of type ``remove_edge`` or ``reparent``
+        that has no change event carrying its act id.
     """
     from strata.bootstrap import load_fleet_config
     from strata.fleet_config import FleetConfigError
@@ -2096,6 +2099,13 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         finally:
             if conn is not None:
                 conn.close()
+
+    # -----------------------------------------------------------------------
+    # 11. Structure emission (ADR 0014 D8). Soft: an act with no change
+    # events is waiting on emission, not a broken install. Read-only, like
+    # the refresh queue — doctor never writes the events it is listing.
+    # -----------------------------------------------------------------------
+    checks.append(_check_structure_emission(paths))
 
     return _run_preflight(checks)
 
@@ -5359,6 +5369,62 @@ def cmd_freshness_evaluator(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 
+def _check_structure_emission(paths: object) -> Check:
+    """List remove_edge and reparent acts that have no change events yet."""
+    if paths is None:
+        return Check(
+            name="Structure emission",
+            kind="soft",
+            passed=True,
+            message="skipped — fix the project config check above first.",
+        )
+    db_file = Path(paths.db_path)
+    if not db_file.exists():
+        return Check(
+            name="Structure emission",
+            kind="soft",
+            passed=True,
+            message="skipped — see the Database check above.",
+        )
+    conn: sqlite3.Connection | None = None
+    missing: list[tuple[str, str]] | None = None
+    try:
+        conn = sqlite3.connect(f"file:{db_file}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+        from strata.fleet_changes import unemitted_structure_acts  # noqa: PLC0415
+
+        missing = unemitted_structure_acts(conn)
+    except sqlite3.Error:
+        missing = None
+    finally:
+        if conn is not None:
+            conn.close()
+    if missing is None:
+        return Check(
+            name="Structure emission",
+            kind="soft",
+            passed=True,
+            message="skipped — see the Database check above.",
+        )
+    if not missing:
+        return Check(
+            name="Structure emission",
+            kind="soft",
+            passed=True,
+            message="no remove_edge or reparent act is missing its change events.",
+        )
+    listed = ", ".join(f"{act_id} ({change_type})" for act_id, change_type in missing)
+    return Check(
+        name="Structure emission",
+        kind="soft",
+        passed=False,
+        message=(
+            f"{listed} — no change event carries this act. "
+            "`strata fleet reemit <act_id>` emits for one act."
+        ),
+    )
+
+
 def cmd_fleet(args: argparse.Namespace) -> int:
     """``strata fleet`` — apply or review fleet structure changes as the operator."""
     from strata.fleet_changes import cli_fleet
@@ -6034,6 +6100,13 @@ def _build_parser() -> argparse.ArgumentParser:
     p_fleet_describe.add_argument("scope_id")
     p_fleet_describe.add_argument("--description", required=True)
     p_fleet_describe.set_defaults(func=cmd_fleet)
+
+    p_fleet_reemit = fleet_sub.add_parser(
+        "reemit",
+        help="Emit change events for one applied structure act (operator). Idempotent.",
+    )
+    p_fleet_reemit.add_argument("act_id")
+    p_fleet_reemit.set_defaults(func=cmd_fleet)
 
     # -------------------------------------------------------------------
     # Hidden engine subcommands for the freshness Stop-hook (issue #112).

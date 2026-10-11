@@ -271,6 +271,14 @@
     return resp.json();
   }
 
+  // Applied structure acts. Read-only: events and conflict lines already recorded.
+  async function fetchFleetActs() {
+    const base = getApiBase();
+    const resp = await fetch(`${base}/fleet/acts`);
+    if (!resp.ok) throw new Error(`GET /fleet/acts returned ${resp.status}`);
+    return resp.json();
+  }
+
   async function applyFleetChange(change_id) {
     const base = getApiBase();
     return _post(`${base}/fleet/changes/${encodeURIComponent(change_id)}/apply`, {});
@@ -325,6 +333,7 @@
     acknowledgeCorrectionWithdrawal,
     fetchJudgeUsage,
     fetchFleetChanges,
+    fetchFleetActs,
     applyFleetChange,
     rejectFleetChange,
     stratumIndex,

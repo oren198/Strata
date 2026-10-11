@@ -506,7 +506,8 @@ class FleetStructureAct:
     ``"operator"``. ``owner_scope_id`` is the LCA, or ``None`` when the
     change has no common ancestor. Topology maps each touched scope id to
     ``{"parent": id | None, "references": [id, ...]}``, or to ``None`` when
-    that scope is absent (not yet added, or already removed).
+    that scope is absent (not yet added, or already removed). A ``reparent``
+    snapshot also records ``chain`` and ``descendants`` on the moved scope.
     """
 
     id: str
@@ -2268,7 +2269,9 @@ class RecordStore:
 
         Not an ``operator_acts`` row: that table is operator memory. This
         record is the structure-act sibling, written by
-        :func:`strata.operator.record_fleet_structure_act`.
+        :func:`strata.operator.record_fleet_structure_act`. A ``reparent``
+        snapshot also carries ``chain`` (ancestors, root-first) and
+        ``descendants`` (chain subtree ids) on the moved scope.
         """
         act_id = _new_fleet_structure_act_id()
         self._conn.execute(

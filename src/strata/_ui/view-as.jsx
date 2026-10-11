@@ -241,7 +241,12 @@ function LayerCard({ layer, total, state }) {
 
 function LayerBody({ layer }) {
   if (layer.summary) {
-    return <SummaryBody summary={layer.summary} />;
+    return (
+      <SummaryBody
+        summary={layer.summary}
+        ownDirectiveConflicts={layer.relation === "self" ? layer.own_directive_conflicts : null}
+      />
+    );
   }
   if (layer.publication) {
     return <PublicationBody publication={layer.publication} />;
@@ -252,22 +257,29 @@ function LayerBody({ layer }) {
   return null;
 }
 
-function SummaryBody({ summary }) {
+function SummaryBody({ summary, ownDirectiveConflicts }) {
   if (!summary.exists) {
     return <div className="at-caption" style={{ fontStyle: "italic" }}>This scope has no summary yet.</div>;
   }
   const directives = summary.directives || [];
+  const conflicts = ownDirectiveConflicts || {};
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
       {directives.length === 0 ? (
         <div className="at-caption" style={{ fontStyle: "italic" }}>No directives.</div>
       ) : (
         <ul style={{ listStyle: "none", padding: 0, margin: 0, display: "flex", flexDirection: "column", gap: 6 }}>
-          {directives.map((d, i) => (
-            <li key={d.id || i} className="at-body-sm">
-              {d.subject ? `${d.subject}: ${d.content}` : d.content}
-            </li>
-          ))}
+          {directives.map((d, i) => {
+            const notes = conflicts[d.id] || [];
+            return (
+              <li key={d.id || i} className="at-body-sm">
+                {d.subject ? `${d.subject}: ${d.content}` : d.content}
+                {notes.map((line) => (
+                  <div key={line} className="at-caption" style={{ marginTop: 4 }}>{line}</div>
+                ))}
+              </li>
+            );
+          })}
         </ul>
       )}
       <p className="at-body-sm" style={{ margin: 0, whiteSpace: "pre-wrap" }}>

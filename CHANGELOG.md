@@ -50,6 +50,22 @@ the release PR (`dev` → `main`) and the GitHub Release body are built from
 
 ### Added
 
+- **A re-parent records the chain and the subtree the emission will need**
+  (ADR 0014 D8). The act's before and after topology for a `reparent` also
+  carry `chain` (the moved scope's ancestors, root-first) and `descendants`
+  (its chain subtree ids at apply time). Other change types are unchanged.
+  While `emit_structure_change` is absent, apply still prints the stated-limit
+  line and does not emit. When that operation is present, apply calls it
+  once after the act row is committed, under the same fleet lock, and an
+  emission failure leaves the file and the act in place. `strata doctor`
+  lists every `remove_edge` or `reparent` act that has no change event
+  carrying its id. `strata fleet reemit <act_id>` emits for one act, prints
+  what was emitted, and prints `already emitted` when the act already has
+  events. The Console act list shows those events and every conflict line,
+  and the perspective's self layer shows the same line on the own directive.
+  All of that is read-only. The kinds, the migration, and
+  `emit_structure_change` itself are not in this change.
+
 - **`strata register` seeds Claude Code deny rules for the resolved store**
   (#173, ADR 0013 D6). `permissions.deny` in `.claude/settings.json` gains
   `Read` and `Edit` rules for the store `.strata/config.toml` resolves.

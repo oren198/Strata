@@ -106,6 +106,8 @@ from strata.fleet_changes import (
     FleetChangeError,
     list_approvable,
     names_an_actor,
+    own_directive_conflicts,
+    structure_act_views,
 )
 from strata.fleet_changes import (
     approve as approve_fleet_change,
@@ -3340,6 +3342,17 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
             _raise_fleet_change(exc)
         return _fleet_change_body(result)
 
+    @application.get("/fleet/acts")
+    def get_fleet_acts(
+        record_store: RecordStore = Depends(get_record_store),
+    ) -> dict:
+        """Applied structure acts, with the events and conflict lines already recorded.
+
+        Read-only. Nothing here emits. The operator re-runs emission with
+        ``strata fleet reemit``.
+        """
+        return {"acts": structure_act_views(record_store)}
+
     # -----------------------------------------------------------------------
     # GET /judge-usage — read-only (#246). Same numbers as `strata stats judge`.
     # -----------------------------------------------------------------------
@@ -3580,6 +3593,17 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
 
         composed["token_estimate_total"] = total
         composed["token_estimate_method"] = "characters divided by 4 — an estimate, not a tokenizer"
+        # Console-only. The engine writes the conflict sentence into the
+        # notice; this attaches that same sentence to the self layer so the
+        # perspective view can show it on the own directive. It is not part
+        # of what an agent is shown — compose_perspective does not carry it,
+        # and the token estimate above was taken before this key existed.
+        conflicts = own_directive_conflicts(record_store, scope_id)
+        if conflicts:
+            for layer in composed["layers"]:
+                if layer.get("relation") == "self":
+                    layer["own_directive_conflicts"] = conflicts
+                    break
         return composed
 
     # -----------------------------------------------------------------------
