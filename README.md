@@ -29,8 +29,9 @@ shared checkout directory must not hide the other repositories there.
 Summaries, the sessions directory beside them, and `.locks` are denied as
 directories only when that directory is Strata's own. `fleet.yaml` is
 denied as that file (`Read` and `Edit`, no wildcard) when a denied
-directory does not already cover it; the directory holding the file is
-not denied. A generic `summaries` or `sessions` directory directly under your
+directory does not already cover it, and the backups beside it are denied
+as `Read(<file>.bak*)` and `Edit(<file>.bak*)` (`fleet.yaml.bak` and
+`fleet.yaml.bak.<utc>`). The directory holding the file is not denied. A generic `summaries` or `sessions` directory directly under your
 home directory, or under an ancestor of the project, is denied only when
 Strata created it; otherwise `strata doctor` says it was left open. A
 directory that resolves above your home directory is left open too.

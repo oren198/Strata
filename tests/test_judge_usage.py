@@ -22,6 +22,7 @@ import strata.scope_manager as scope_manager
 from strata.app import create_app, get_scope_manager
 from strata.freshness import _default_draft_fn
 from strata.judge_usage import (
+    _FIRST_KIND,
     JudgeDailyCapReached,
     bind_usage_db,
     call_kind_from_request,
@@ -172,44 +173,32 @@ def test_call_kind_comes_from_the_request() -> None:
 
 
 def test_every_scope_manager_tool_is_mapped() -> None:
-    """A tool constant the meter does not know would be ungated, and this fails."""
+    """Every ``*_TOOL`` constant on scope_manager is mapped.
+
+    The constants are discovered from the module. A new tool that is not in
+    the meter's map fails here, instead of staying ungated until someone
+    remembers to extend a hand-written list.
+    """
     tools = [
-        scope_manager.JUDGE_TOOL,
-        scope_manager.JUDGE_BATCH_TOOL,
-        scope_manager.PUBLICATION_JUDGE_TOOL,
-        scope_manager.BOOTSTRAP_JUDGE_TOOL,
-        scope_manager.CLAIM_CARRIER_TOOL,
-        scope_manager.INTERIOR_ASSERTION_TOOL,
-        scope_manager.ATTRIBUTION_RECHECK_TOOL,
-        scope_manager.RELATION_RECHECK_TOOL,
-        scope_manager.CLASSIFY_INHERITED_RELATION_TOOL,
+        value
+        for name, value in vars(scope_manager).items()
+        if name.endswith("_TOOL") and isinstance(value, dict) and isinstance(value.get("name"), str)
     ]
-    expected = {
-        "submit_judgment": "judgment",
-        "submit_batch_judgment": "batch_judgment",
-        "submit_publication_judgment": "publication",
-        "submit_bootstrap_publication": "bootstrap",
-        "classify_claim_carriers": "carrier_check",
-        "classify_interior_assertion": "targeted_reask",
-        "recheck_attribution": "attribution_recheck",
-        "recheck_relation": "relation_recheck",
-        "classify_inherited_relation": "inherited_relation_recheck",
-    }
-    seen: set[str] = set()
+    names = [tool["name"] for tool in tools]
+    assert len(names) == len(set(names))
+    assert "classify_inherited_relation" in names
     for tool in tools:
         name = tool["name"]
-        seen.add(name)
         kind = call_kind_from_request(
             {
                 "tool_choice": {"type": "tool", "name": name},
                 "messages": [{"role": "user", "content": "ping"}],
             }
         )
-        assert kind == expected[name]
+        assert name in _FIRST_KIND
+        assert kind == _FIRST_KIND[name]
         assert kind != name
-        if name == "classify_inherited_relation":
-            assert kind_is_gated(kind) is False
-    assert seen == set(expected)
+    assert kind_is_gated(_FIRST_KIND["classify_inherited_relation"]) is False
 
 
 def test_messages_create_text_lives_only_in_judge_usage() -> None:

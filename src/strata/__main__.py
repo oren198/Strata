@@ -1228,7 +1228,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         elsewhere is a file rule; summaries, sessions, and ``.locks`` are
         directory rules only when Strata owns that directory. ``fleet.yaml``
         is an exact file rule when a denied directory does not already
-        cover it; the directory that holds the file stays open. Paths left
+        cover it, plus ``<file>.bak*`` for the backups beside it; the
+        directory that holds the file stays open. Paths left
         open (a shared parent, a generic name Strata did not create, a
         directory above the home directory) are named in the check.
         Codex's sandbox config cannot deny a workspace path; the check says

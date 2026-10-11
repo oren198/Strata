@@ -59,8 +59,10 @@ the release PR (`dev` → `main`) and the GitHub Release body are built from
   Summaries, the sessions directory beside them, and `.locks` are denied
   as directories only when that directory is Strata's own. `fleet.yaml`
   is denied as that file (`Read` and `Edit`, no wildcard) when a denied
-  directory does not already cover it; the directory holding the file is
-  not denied. A generic `summaries` or `sessions` directory directly
+  directory does not already cover it. The backups beside that file are
+  denied as `Read(<file>.bak*)` and `Edit(<file>.bak*)`, which covers
+  `fleet.yaml.bak` and the timestamped `fleet.yaml.bak.<utc>` copies. The
+  directory holding the file is not denied. A generic `summaries` or `sessions` directory directly
   under the home directory or an ancestor of the project is denied only
   when Strata created it; otherwise `strata doctor` says it was left open.
   A directory that resolves above the home directory is left open. Rules
@@ -108,7 +110,12 @@ the release PR (`dev` → `main`) and the GitHub Release body are built from
   first is left in place (409). Where `fcntl` is unavailable (Windows), the
   write is refused with "Refusing to write fleet.yaml: fcntl.flock is not
   available on this platform, and Strata will not update the file without
-  that lock." The file is left unchanged.
+  that lock." The file is left unchanged. The replace keeps the mode
+  `fleet.yaml` already had: the temporary file is created `0o600`, then
+  given that mode before it is renamed into place. The caller's etag is
+  compared, inside the lock, with the bytes just re-read; a tag fetched
+  before a fleet change is `409 fleet_changed` and the file stays as the
+  change wrote it.
 
 ## 1.17.2 (2026-10-06)
 

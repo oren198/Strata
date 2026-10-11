@@ -892,7 +892,9 @@ def _remove_hook_event(
 # ``fleet.yaml`` — a database in a shared checkout directory must not hide
 # the other repositories there. ``fleet.yaml`` is a file rule when that file
 # is not already inside a denied directory (``/.strata/**`` covers the seeded
-# ``.strata/fleet.yaml``). The rule names the file exactly, with no wildcard.
+# ``.strata/fleet.yaml`` and the backups beside it). The file rule names that
+# file exactly, with no wildcard, and a second rule ``<file>.bak*`` denies
+# ``fleet.yaml.bak`` and ``fleet.yaml.bak.<utc>``.
 # A generic ``summaries`` or ``sessions`` directory directly under the home
 # directory, or under an ancestor of the project, is denied only when Strata
 # created it. A directory that resolves above the home directory is left
@@ -1181,8 +1183,10 @@ def _rules_for_targets(
     """Read+Edit rules for directories, database files, and exact files.
 
     Database *files* gain a trailing ``*`` so the ``-wal`` and ``-shm``
-    siblings match. *exact_files* (``fleet.yaml``) do not: the rule is that
-    file and nothing beside it. Project-relative patterns sort first.
+    siblings match. *exact_files* (``fleet.yaml``) stay exact, and gain a
+    second rule ``<file>.bak*`` so ``fleet.yaml.bak`` and the timestamped
+    ``fleet.yaml.bak.<utc>`` copies are denied too. Project-relative
+    patterns sort first.
     """
     specs: list[str] = []
     for directory in directories:
@@ -1190,7 +1194,11 @@ def _rules_for_targets(
     for file in files:
         specs.append(_deny_spec(file, project_root, directory=False) + "*")
     for file in exact_files or []:
-        specs.append(_deny_spec(file, project_root, directory=False))
+        spec = _deny_spec(file, project_root, directory=False)
+        specs.append(spec)
+        # ``fleet.yaml.bak`` and ``fleet.yaml.bak.<utc>`` sit beside the file.
+        # The exact rule does not cover them; ``<file>.bak*`` does.
+        specs.append(f"{spec}.bak*")
     rules: list[str] = []
     for spec in sorted(set(specs), key=lambda item: (item.startswith("//"), item)):
         rules.append(f"Read({spec})")
@@ -1221,7 +1229,8 @@ def claude_store_deny_plan(
     layout it holds the store. The database is a file rule. Summaries, the
     sessions directory beside them, and ``.locks`` are directory rules only
     when that directory is Strata's own. ``fleet.yaml`` is an exact file
-    rule unless a denied directory already covers it.
+    rule unless a denied directory already covers it, plus ``<file>.bak*``
+    for the backups beside that file.
     :attr:`StoreDenyPlan.skipped` names the paths left open, for doctor.
     """
     from strata.project_config import ProjectConfigError, _parse_config  # noqa: PLC0415

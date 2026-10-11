@@ -592,64 +592,79 @@ def test_fleet_yaml_writes_go_through_replace_fleet_bytes() -> None:
     assert offenders == []
 
 
-def _parallel_put_fleet(fleet_path: str, db_path: str, yaml_text: str, result_path: str) -> None:
-    """PUT /fleet until it lands. Top-level so a spawned interpreter can import it."""
-    from fastapi.testclient import TestClient
-
-    from strata.app import create_app
+def _console_settings(fleet_path: str, db_path: str):
     from strata.settings import Settings
 
-    settings = Settings(
+    return Settings(
         db_path=db_path,
         summaries_dir=str(Path(fleet_path).parent / "summaries"),
         fleet_yaml_path=fleet_path,
         manager_model="claude-haiku-4-5",
         anthropic_api_key="test-key",
     )
-    application = create_app(settings=settings)
-    try:
-        with TestClient(application) as client:
-            # Applies wait on this file, so they run during the save loop.
-            Path(result_path).with_name("put-ready").write_text("ready", encoding="utf-8")
-            for _ in range(100):
-                etag = client.get("/fleet").json()["etag"]
-                resp = client.put("/fleet", json={"yaml": yaml_text, "etag": etag})
-                if resp.status_code == 200:
-                    Path(result_path).write_text("ok", encoding="utf-8")
-                    return
-                if resp.status_code != 409:
-                    Path(result_path).write_text(
-                        f"status={resp.status_code} body={resp.text}",
-                        encoding="utf-8",
-                    )
-                    return
-        Path(result_path).write_text("exhausted", encoding="utf-8")
-    except Exception as exc:
-        Path(result_path).write_text(f"error={type(exc).__name__}: {exc}", encoding="utf-8")
-        raise
 
 
-def _parallel_apply_edge_when_ready(
-    fleet_path: str, db_path: str, target: str, ready_path: str, after_path: str
-) -> None:
-    """Apply one edge once PUT /fleet is in its save loop.
-
-    *after_path*, when set, waits until that file exists, so those applies
-    run only after the PUT has returned.
-    """
+def _apply_hold_lock(fleet_path: str, db_path: str, held_path: str, release_path: str) -> None:
+    """Apply one describe while holding the fleet lock at the test hook."""
     import time
 
-    deadline = time.monotonic() + 30
-    while not Path(ready_path).exists():
-        if time.monotonic() > deadline:
-            raise TimeoutError("PUT /fleet did not become ready")
-        time.sleep(0.01)
-    if after_path:
-        while not Path(after_path).exists():
+    import strata.fleet_changes as fleet_changes
+    from strata.fleet_changes import apply_as_operator, parse_change
+    from strata.fleet_config import FleetConfig
+    from strata.record_store import RecordStore
+
+    def _hook() -> None:
+        Path(held_path).write_text("held", encoding="utf-8")
+        deadline = time.monotonic() + 30
+        while not Path(release_path).exists():
             if time.monotonic() > deadline:
-                raise TimeoutError("PUT /fleet did not finish")
+                raise TimeoutError("lock release did not arrive")
             time.sleep(0.01)
-    _parallel_apply_edge(fleet_path, db_path, target)
+
+    fleet_changes._apply_lock_hook = _hook
+    fleet = FleetConfig.load(Path(fleet_path))
+    store = RecordStore(db_path)
+    try:
+        apply_as_operator(
+            fleet,
+            store,
+            parse_change("describe", {"scope_id": "g_a", "description": "held under the lock"}),
+        )
+    finally:
+        store.close()
+
+
+def _put_once(
+    fleet_path: str,
+    db_path: str,
+    yaml_text: str,
+    etag: str,
+    requesting_path: str,
+    response_path: str,
+) -> None:
+    """One PUT /fleet. Writes *requesting_path* immediately before the call."""
+    from fastapi.testclient import TestClient
+
+    from strata.app import create_app
+
+    application = create_app(settings=_console_settings(fleet_path, db_path))
+    try:
+        with TestClient(application) as client:
+            Path(requesting_path).write_text("requesting", encoding="utf-8")
+            resp = client.put("/fleet", json={"yaml": yaml_text, "etag": etag})
+            error = ""
+            if resp.status_code != 200:
+                error = resp.json()["detail"]["error"]
+            Path(response_path).write_text(
+                f"status={resp.status_code} error={error}",
+                encoding="utf-8",
+            )
+    except Exception as exc:
+        Path(response_path).write_text(
+            f"error={type(exc).__name__}: {exc}",
+            encoding="utf-8",
+        )
+        raise
 
 
 def _put_document(n: int) -> str:
@@ -661,29 +676,20 @@ def _put_document(n: int) -> str:
     return f"strata:\n  - id: s0\n    name: Root\n    ordinal: 0\nscopes:\n{scopes}\nedges: []\n"
 
 
-def test_put_fleet_beside_parallel_applies_loses_nothing(tmp_path: Path) -> None:
-    """PUT /fleet races N applies. Every act is kept or superseded, in order.
+_PUT_BODY = (
+    "strata:\n"
+    "  - id: s0\n"
+    "    name: Root\n"
+    "    ordinal: 0\n"
+    "scopes:\n"
+    "  - id: g_from_put\n"
+    "    name: FromPut\n"
+    "    stratum_id: s0\n"
+    "edges: []\n"
+)
 
-    The applies and the PUT take one flock, so they run in one order. Each
-    apply records its act under that lock, after its write, so SQLite rowid
-    is that order. The PUT body has every scope the applies need, a marker
-    scope ``g_from_put``, and no reference edges. Applies that ran before
-    the PUT had their edges replaced by that body. Applies that ran after
-    it re-read that body and added their edge on top. The edges left in the
-    file are therefore a suffix of the act order, and the superseded edges
-    are the prefix. A hole in that suffix would be an edge a later writer
-    dropped. A missing marker would be the PUT's bytes overwritten by a
-    stale apply. ``FleetConfig.load`` succeeding means the file was not torn.
 
-    Eight applies start while the PUT is looping. Four more
-    (``g_t8`` .. ``g_t11``) start only after the PUT returns, so the kept
-    suffix cannot be empty.
-    """
-    import json
-    import multiprocessing
-    import sqlite3
-
-    n = 12
+def _edge_fleet(tmp_path: Path, n: int = 12) -> tuple[Path, str]:
     scopes = "\n".join(f"  - id: g_t{i}\n    name: T{i}\n    stratum_id: s0" for i in range(n))
     fleet_path = tmp_path / "fleet.yaml"
     fleet_path.write_text(
@@ -701,70 +707,167 @@ def test_put_fleet_beside_parallel_applies_loses_nothing(tmp_path: Path) -> None
     )
     db_path = str(tmp_path / "strata.db")
     run_migrations(db_path)
-    result_path = tmp_path / "put-result.txt"
-    ready_path = tmp_path / "put-ready"
+    return fleet_path, db_path
+
+
+def _run_parallel_edges(fleet_path: Path, db_path: str, n: int) -> None:
+    import multiprocessing
+
     ctx = multiprocessing.get_context("spawn")
-    put = ctx.Process(
-        target=_parallel_put_fleet,
-        args=(str(fleet_path), db_path, _put_document(n), str(result_path)),
-    )
-    late = {f"g_t{i}" for i in range(8, n)}
     procs = [
-        ctx.Process(
-            target=_parallel_apply_edge_when_ready,
-            args=(
-                str(fleet_path),
-                db_path,
-                f"g_t{i}",
-                str(ready_path),
-                str(result_path) if f"g_t{i}" in late else "",
-            ),
-        )
+        ctx.Process(target=_parallel_apply_edge, args=(str(fleet_path), db_path, f"g_t{i}"))
         for i in range(n)
     ]
-    put.start()
     for proc in procs:
         proc.start()
-    put.join(60)
     for proc in procs:
         proc.join(60)
     codes = [proc.exitcode for proc in procs]
-    put_detail = result_path.read_text(encoding="utf-8") if result_path.exists() else codes
-    assert put.exitcode == 0, put_detail
     assert codes == [0] * n, codes
-    put_status = result_path.read_text(encoding="utf-8")
-    assert put_status == "ok"
+
+
+def _edge_and_act_counts(fleet_path: Path, db_path: str) -> tuple[int, int]:
     reloaded = FleetConfig.load(fleet_path)
-    marker = any(scope.id == "g_from_put" for scope in reloaded.scopes)
-    present = {edge.to for edge in reloaded.edges if edge.from_ == "g_src"}
-    connection = sqlite3.connect(db_path)
+    edges = sum(1 for edge in reloaded.edges if edge.from_ == "g_src")
+    store = RecordStore(db_path)
     try:
-        rows = connection.execute(
-            "SELECT before_topology, after_topology FROM fleet_structure_acts ORDER BY rowid ASC"
-        ).fetchall()
+        acts = len(store.list_fleet_structure_acts())
     finally:
-        connection.close()
-    targets: list[str] = []
-    for before_raw, after_raw in rows:
-        before = set(json.loads(before_raw)["g_src"]["references"])
-        after = json.loads(after_raw)["g_src"]["references"]
-        added = [item for item in after if item not in before]
-        assert len(added) == 1, added
-        targets.append(added[0])
-    cut = 0
-    while cut < len(targets) and targets[cut] not in present:
-        cut += 1
-    kept = targets[cut:]
-    superseded = targets[:cut]
-    print(
-        f"N={n} put={put_status} marker={marker} cut={cut} "
-        f"kept={len(kept)} superseded={len(superseded)} acts={len(targets)} edges={len(present)}"
+        store.close()
+    return edges, acts
+
+
+def test_put_blocks_while_an_apply_holds_the_lock_then_gets_409(tmp_path: Path) -> None:
+    """The PUT is fired while an apply still holds the fleet lock.
+
+    The apply writes the file, then the test hook waits. The PUT process
+    announces that it is inside ``client.put`` and does not return until the
+    hook is released. The tag was taken before the apply, so the compare
+    inside the lock answers 409 and the apply's bytes stay.
+    """
+    import hashlib
+    import multiprocessing
+    import time
+
+    fleet_path = tmp_path / "fleet.yaml"
+    fleet_path.write_text(_FLEET, encoding="utf-8")
+    db_path = str(tmp_path / "strata.db")
+    run_migrations(db_path)
+    etag = hashlib.sha256(fleet_path.read_bytes()).hexdigest()
+    held_path = tmp_path / "apply-held"
+    release_path = tmp_path / "apply-release"
+    requesting_path = tmp_path / "put-requesting"
+    response_path = tmp_path / "put-response"
+    ctx = multiprocessing.get_context("spawn")
+    apply_proc = ctx.Process(
+        target=_apply_hold_lock,
+        args=(str(fleet_path), db_path, str(held_path), str(release_path)),
     )
-    assert marker is True
-    assert len(targets) == n
-    assert present == set(kept)
-    assert late <= present
-    assert not (tmp_path / "fleet.yaml.tmp").exists()
+    apply_proc.start()
+    deadline = time.monotonic() + 30
+    while not held_path.exists():
+        assert apply_proc.is_alive(), "apply exited before it held the lock"
+        assert time.monotonic() < deadline, "apply never held the lock"
+        time.sleep(0.01)
+    post_apply = fleet_path.read_bytes()
+    put_proc = ctx.Process(
+        target=_put_once,
+        args=(
+            str(fleet_path),
+            db_path,
+            _PUT_BODY,
+            etag,
+            str(requesting_path),
+            str(response_path),
+        ),
+    )
+    put_proc.start()
+    while not requesting_path.exists():
+        detail = response_path.read_text(encoding="utf-8") if response_path.exists() else "put died"
+        assert put_proc.is_alive(), detail
+        assert time.monotonic() < deadline, "PUT never reached client.put"
+        time.sleep(0.01)
+    time.sleep(0.5)
+    assert not response_path.exists(), response_path.read_text(encoding="utf-8")
+    release_path.write_text("go", encoding="utf-8")
+    apply_proc.join(60)
+    put_proc.join(60)
+    assert apply_proc.exitcode == 0
+    assert put_proc.exitcode == 0, response_path.read_text(encoding="utf-8")
+    outcome = response_path.read_text(encoding="utf-8")
+    print(f"overlap blocked_until_release=True {outcome} bytes_unchanged=True")
+    assert outcome == "status=409 error=fleet_changed"
+    assert fleet_path.read_bytes() == post_apply
+    assert b"held under the lock" in post_apply
+    assert b"g_from_put" not in fleet_path.read_bytes()
+
+
+def test_stale_etag_fetched_before_applies_changes_nothing(tmp_path: Path) -> None:
+    """A tag taken before the applies is stale, and the PUT must not land.
+
+    The tag is hashed from the file before any apply starts. After all 12
+    applies, the PUT carries that same tag. The compare inside the lock
+    re-reads the post-apply bytes, returns 409, and leaves them in place:
+    12 acts, 12 edges, nothing superseded.
+    """
+    import hashlib
+
+    from fastapi.testclient import TestClient
+
+    from strata.app import create_app
+
+    n = 12
+    fleet_path, db_path = _edge_fleet(tmp_path, n)
+    etag = hashlib.sha256(fleet_path.read_bytes()).hexdigest()
+    _run_parallel_edges(fleet_path, db_path, n)
+    post_apply = fleet_path.read_bytes()
+    edges, acts = _edge_and_act_counts(fleet_path, db_path)
+    superseded = n - edges
+    with TestClient(create_app(settings=_console_settings(str(fleet_path), db_path))) as client:
+        resp = client.put("/fleet", json={"yaml": _PUT_BODY, "etag": etag})
+    error = resp.json()["detail"]["error"]
+    print(
+        f"stale_etag status={resp.status_code} error={error} "
+        f"acts={acts} edges={edges} superseded={superseded}"
+    )
+    assert resp.status_code == 409
+    assert error == "fleet_changed"
+    assert acts == n
+    assert edges == n
+    assert superseded == 0
+    assert fleet_path.read_bytes() == post_apply
+    assert b"g_from_put" not in fleet_path.read_bytes()
+
+
+def test_fresh_etag_after_applies_saves(tmp_path: Path) -> None:
+    """A tag read after the applies matches the file, so the PUT lands."""
+    from fastapi.testclient import TestClient
+
+    from strata.app import create_app
+
+    n = 12
+    fleet_path, db_path = _edge_fleet(tmp_path, n)
+    _run_parallel_edges(fleet_path, db_path, n)
+    with TestClient(create_app(settings=_console_settings(str(fleet_path), db_path))) as client:
+        etag = client.get("/fleet").json()["etag"]
+        resp = client.put("/fleet", json={"yaml": _put_document(n), "etag": etag})
+    print(f"fresh_etag status={resp.status_code} saved={resp.json().get('saved')}")
+    assert resp.status_code == 200
+    assert resp.json()["saved"] is True
+    assert fleet_path.read_bytes() == _put_document(n).encode("utf-8")
+    assert b"g_from_put" in fleet_path.read_bytes()
+
+
+def test_fleet_yaml_keeps_its_file_mode_across_the_replace(tmp_path: Path) -> None:
+    """The rename must not replace a 0o644 fleet.yaml with the temp file's 0o600."""
+    import stat
+
+    fleet, store = _world(tmp_path)
+    assert fleet._path is not None
+    fleet._path.chmod(0o640)
+    apply_as_operator(fleet, store, _change("describe", scope_id="g_a", description="mode stays"))
+    assert stat.S_IMODE(fleet._path.stat().st_mode) == 0o640
+    assert fleet.get_scope("g_a").description == "mode stays"
 
 
 def test_missing_fcntl_refuses_the_fleet_write(

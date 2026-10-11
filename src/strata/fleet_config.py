@@ -26,6 +26,7 @@ reference edge, peer reference, fleet.
 from __future__ import annotations
 
 import os
+import stat
 import tempfile
 import threading
 from collections.abc import Callable, Iterator
@@ -1323,12 +1324,18 @@ def replace_fleet_bytes(path: Path, data: bytes) -> None:
     before any byte of *path* changes.
     """
     with fleet_file_lock(path):
+        # The temp file is created mode 0o600. Copy the live file's mode onto
+        # it before the rename, or the replace would drop a 0o644 fleet.yaml
+        # down to the temp file's mode.
+        kept_mode = stat.S_IMODE(path.stat().st_mode) if path.exists() else None
         tmp_name: str | None = None
         try:
             with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as handle:
                 tmp_name = handle.name
                 handle.write(data)
                 handle.flush()
+                if kept_mode is not None:
+                    os.chmod(handle.fileno(), kept_mode)
         except BaseException:
             if tmp_name is not None:
                 os.unlink(tmp_name)

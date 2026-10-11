@@ -14,6 +14,7 @@ from __future__ import annotations
 import copy
 import json
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -562,6 +563,12 @@ def _preview(fleet: FleetConfig, change: FleetChange, proposer: Actor) -> _Previ
     )
 
 
+# Tests set this to pause inside an apply while the fleet file lock is held,
+# after the file has been replaced and before the act is recorded. Production
+# leaves it unset.
+_apply_lock_hook: Callable[[], None] | None = None
+
+
 def _apply(
     fleet: FleetConfig,
     record_store: RecordStore,
@@ -576,6 +583,9 @@ def _apply(
     before = _topology(fleet, touched)
     backup = fleet.mutate(lambda raw: _transform(raw, change))
     after = _topology(fleet, touched)
+    hook = _apply_lock_hook
+    if hook is not None:
+        hook()
     try:
         act = record_fleet_structure_act(
             record_store=record_store,

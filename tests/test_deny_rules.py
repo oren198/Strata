@@ -286,6 +286,7 @@ def test_register_denies_an_external_fleet_directory(tmp_path: Path) -> None:
         "/.strata/**",
         _spec(fleet_root / ".locks", "/**"),
         fleet_file,
+        _spec(fleet_root / "fleet.yaml", ".bak*"),
         _spec(fleet_root / "sessions", "/**"),
         _spec(fleet_root / "strata.db", "*"),
         _spec(fleet_root / "summaries", "/**"),
@@ -416,13 +417,46 @@ def test_split_store_directories_are_each_denied(tmp_path: Path) -> None:
     assert "Read(/.strata/**)" in rules
     assert "Edit(/.strata/**)" in rules
     # The database's directory and the fleet file's directory stay open.
-    # The fleet file itself is denied, with no wildcard.
+    # The fleet file itself is denied, with no wildcard. Its backups are
+    # denied as ``<file>.bak*``.
     fleet_file = _read_rule(fleet_dir / "fleet.yaml", directory=False)
     assert fleet_file in rules
     assert fleet_file.replace("Read(", "Edit(", 1) in rules
     assert fleet_file[:-1] + "*)" not in rules
+    backup_rule = fleet_file[:-1] + ".bak*)"
+    assert backup_rule in rules
+    assert backup_rule.replace("Read(", "Edit(", 1) in rules
     assert _read_rule(db_dir, directory=True) not in rules
     assert _read_rule(fleet_dir, directory=True) not in rules
+
+
+def test_timestamped_fleet_backups_are_denied(tmp_path: Path) -> None:
+    """``Read(<fleet>.bak*)`` covers ``fleet.yaml.bak`` and ``fleet.yaml.bak.<utc>``."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    fleet_dir = tmp_path / "fleet"
+    mem = tmp_path / "mem"
+    _write_config(
+        project,
+        "\n".join(
+            [
+                f'db = "{(tmp_path / "db" / "strata.db").as_posix()}"',
+                f'fleet_yaml = "{(fleet_dir / "fleet.yaml").as_posix()}"',
+                f'summaries_dir = "{(mem / "summaries").as_posix()}"',
+                "",
+            ]
+        ),
+    )
+
+    rules = install.claude_store_deny_rules(project)
+    fleet = fleet_dir / "fleet.yaml"
+
+    assert f"Read({_spec(fleet, '.bak*')})" in rules
+    assert f"Edit({_spec(fleet, '.bak*')})" in rules
+    assert f"Read({_spec(fleet, '*')})" not in rules
+    # A fleet inside the denied ``.strata/`` directory is covered by that
+    # directory rule, which already matches the backup names.
+    assert install.claude_store_deny_rules(tmp_path) == install.CLAUDE_STRATA_DENY_RULES
 
 
 def test_legacy_root_layout_denies_files_not_the_project(tmp_path: Path) -> None:
@@ -445,6 +479,8 @@ def test_legacy_root_layout_denies_files_not_the_project(tmp_path: Path) -> None
         "Edit(/.strata/**)",
         "Read(/fleet.yaml)",
         "Edit(/fleet.yaml)",
+        "Read(/fleet.yaml.bak*)",
+        "Edit(/fleet.yaml.bak*)",
         "Read(/sessions/**)",
         "Edit(/sessions/**)",
         "Read(/strata.db*)",
@@ -501,6 +537,7 @@ def test_explicit_paths_name_a_store_that_is_not_on_disk_yet(tmp_path: Path) -> 
             "/.strata/**",
             _spec(fleet_root / ".locks", "/**"),
             _spec(fleet_root / "fleet.yaml", ""),
+            _spec(fleet_root / "fleet.yaml", ".bak*"),
             _spec(fleet_root / "sessions", "/**"),
             _spec(fleet_root / "strata.db", "*"),
             _spec(fleet_root / "summaries", "/**"),
@@ -542,6 +579,8 @@ def test_diff_preview_names_an_adopted_root_store(
     assert "Read(/.strata/**)" in output
     assert "Read(/fleet.yaml)" in output
     assert "Edit(/fleet.yaml)" in output
+    assert "Read(/fleet.yaml.bak*)" in output
+    assert "Edit(/fleet.yaml.bak*)" in output
     assert "Read(/fleet.yaml*)" not in output
     assert "Read(/**)" not in output
 
