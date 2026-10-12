@@ -5872,20 +5872,31 @@ def _restates_the_requirement_of(phrase: str, parent_text: str, content: str) ->
     and restates most of the parent's requirement is an enforcement of the rule, not a
     change to when it applies: the parent still binds every case the child does not name.
     Only the "all <noun>" quantifier; "every day", "always" and the like are about WHEN."""
-    quantified = re.fullmatch(r"all\s+(\w+)", phrase)
-    if quantified is None or _relaxation_marker(content, [parent_text]) is not None:
+    if not phrase.startswith("all ") or _relaxation_marker(content, [parent_text]) is not None:
         return False
-    noun = _subject_stems(quantified.group(1))
+    parent_head, _parent_leading = _subject_head(parent_text)
+    if parent_head is None:
+        # An imperative-shaped or "require"-verbed parent: the head is the last word of
+        # the quantified phrase before its verb ("all production deploys require ...").
+        spoken = re.search(
+            re.escape(phrase) + r"((?:\s+[\w-]+){0,3}?)\s+"
+            r"(?:require|must|shall|need|should|are|is|have|has|run|use)\b",
+            parent_text.casefold(),
+        )
+        words = (phrase.split()[1:] + (spoken.group(1).split() if spoken else []))[-1:]
+        stems = _subject_stems(" ".join(words))
+        parent_head = next(iter(stems), None)
+    child_head, _child_leading = _subject_head(content)
     child = _subject_stems(content)
-    # The child's own subject must be a DIFFERENT thing that carries the noun as a
-    # modifier ("deploy TICKETS"). The same noun restated without "all" ("Services
-    # stay on ..." under "All services ...") is the narrowing the check exists for.
-    head, _leading = _subject_head(content)
-    if head is None or any(head == n or _shared_prefix(head, n) >= 4 for n in noun):
+    # The child's own subject must be a DIFFERENT thing that carries the parent's subject
+    # noun as a modifier ("deploy TICKETS" under "all deploys"). The same noun restated
+    # without "all" ("Services stay on ..." under "All services ...") is the narrowing the
+    # check exists for.
+    if parent_head is None or child_head is None:
         return False
-    if not noun or not any(
-        n in child or any(_shared_prefix(n, c) >= 4 for c in child) for n in noun
-    ):
+    if parent_head == child_head or _shared_prefix(parent_head, child_head) >= 4:
+        return False
+    if not (parent_head in child or any(_shared_prefix(parent_head, c) >= 4 for c in child)):
         return False
     parent_stems = _subject_stems(parent_text)
     if not parent_stems:
@@ -6860,11 +6871,12 @@ _SYNONYM_FAMILIES: tuple[tuple[re.Pattern[str], str], ...] = (
         "approval",
     ),
     (
-        re.compile(
-            r"\bwalk-?rounds?\b|\binspect\w*|\bsecond pair of eyes\b|\bpeer review\w*",
-            re.IGNORECASE,
-        ),
+        re.compile(r"\bwalk-?rounds?\b|\binspect\w*", re.IGNORECASE),
         "inspection",
+    ),
+    (
+        re.compile(r"\bsecond pair of eyes\b|\bpeer review\w*", re.IGNORECASE),
+        "second review",
     ),
 )
 

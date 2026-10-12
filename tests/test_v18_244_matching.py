@@ -727,3 +727,19 @@ def test_sign_off_and_approval_are_one_subject(text: str) -> None:
 
 def test_an_unrelated_sentence_does_not_gain_a_subject_from_the_synonyms() -> None:
     assert not _context_covers(_TWO_APPROVALS, "The cafeteria opens at 08:00 on weekdays.")
+
+
+def test_an_additive_tightening_of_a_narrower_subject_is_not_a_narrowing() -> None:
+    parent = "All production deploys require an approved change ticket."
+    child = (
+        "For payments-service deploys specifically, the change ticket must additionally include a "
+        "rollback plan reviewed by a second engineer, on top of the usual approved-ticket "
+        "requirement."
+    )
+    assert inherited_conflict(child, parent) is None
+    # the same shape that drops the requirement or relaxes it is still caught
+    assert inherited_conflict("Payments-service deploys need a ticket.", parent) is not None
+    assert (
+        inherited_conflict("For payments-service deploys the change ticket may be skipped.", parent)
+        is not None
+    )
