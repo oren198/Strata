@@ -6071,9 +6071,13 @@ def _first_inherited_conflict(
 
 
 def _inherited_hold_note(directive_id: str, origin: str) -> str:
+    """#244 step 1 (the philosopher's ruling A, c_6894f2b1d28a11ea): the engine's reason when a
+    child's directive changes an inherited one. The exception belongs to the scope that owns
+    the rule, so the contribution is declined and pointed there."""
+    owner = "the operator" if origin.startswith("operator") else origin
     return (
-        f"[Held: conflicts with inherited directive {directive_id} ({origin}); "
-        "a child may tighten an inherited rule, not change it.]"
+        f"Contradicts inherited {directive_id} ({origin}). "
+        f"An exception to it is {owner}'s to make; propose it there."
     )
 
 
@@ -7617,10 +7621,11 @@ class ScopeManager:
         untouched). For an admitted directive op owned by a contributor bound
         to *scope*, checked against every rendered inherited directive
         (ancestor and operator) with :func:`inherited_conflict`. A conflict
-        holds the contribution: admitted as context under an engine-written
-        line carrying the held note, every directive op dropped. Fails toward
-        context, never toward a contradicting directive. Contributions from
-        any other position are the position gate's.
+        declines the contribution (#244 step 1, the philosopher's ruling A):
+        every directive op is dropped, no context line is written, and the
+        engine's reason points the contributor at the owning scope. Fails
+        toward the rule. Contributions from any other position are the
+        position gate's.
         """
         if judgment.decision == "decline" or mode != "ordinary":
             return judgment
@@ -7639,26 +7644,15 @@ class ScopeManager:
             return judgment
         directive_id, origin, reason = hit
         note = _inherited_hold_note(directive_id, origin)
-        who = new_contribution.contributor.skill or new_contribution.contributor.session_id
-        line = (
-            f"[{new_contribution.id}] {who} ({new_contribution.contributor.scope_id}) "
-            f"proposed: {new_contribution.content.strip()} — {note}"
-        )
-        previous = current_summary.context if current_summary is not None else ""
-        context = _append_line(previous, line)
         return judgment.model_copy(
             update={
-                "decision": "accept_as_context",
-                "reasoning": f"{judgment.reasoning} {note}",
+                "decision": "decline",
+                "reasoning": note,
                 "directive_ops": [],
-                "new_context": context,
-                "new_summary": _apply_amendment(
-                    scope=scope,
-                    current_summary=current_summary,
-                    contribution=new_contribution,
-                    ops=[],
-                    new_context=context,
-                ),
+                "new_context": None,
+                "new_summary": None,
+                "withdraw_published": [],
+                "context_sources": [],
                 "inherited_holds": [
                     {
                         "contribution_id": new_contribution.id,
@@ -7684,11 +7678,10 @@ class ScopeManager:
         """:meth:`_hold_inherited_conflicts`, carried to the batch.
 
         A member bound to *scope* whose admitted op conflicts has every op it
-        owns dropped and its verdict becomes ``accept_as_context``. Known gap
-        against the single path (the same one the position gate states): the
-        batch's one context rewrite belongs to every member, so the judge's
-        own rewrite is kept and the engine's held lines are appended to it;
-        a rewrite that itself restates the held claim is not removed.
+        owns dropped and its verdict becomes ``decline`` (#244 step 1). The
+        batch's one context rewrite belongs to every member, so it is withheld
+        and rebuilt from the previous context plus each remaining
+        context-admitted member's verbatim text.
         """
         if mode != "ordinary":
             return judgment
@@ -7711,23 +7704,11 @@ class ScopeManager:
         if not hits:
             return judgment
         kept = [op for op in judgment.directive_ops if op.contribution_id not in hits]
-        context = (
-            judgment.new_context
-            if judgment.new_context is not None
-            else (current_summary.context if current_summary is not None else "")
-        )
         holds: list[dict] = []
         notes: dict[str, str] = {}
         for cid in sorted(hits):
             directive_id, origin, reason = hits[cid]
-            note = _inherited_hold_note(directive_id, origin)
-            notes[cid] = note
-            who = contributions[cid].contributor.skill or contributions[cid].contributor.session_id
-            context = _append_line(
-                context,
-                f"[{cid}] {who} ({contributions[cid].contributor.scope_id}) "
-                f"proposed: {contributions[cid].content.strip()} — {note}",
-            )
+            notes[cid] = _inherited_hold_note(directive_id, origin)
             holds.append(
                 {
                     "contribution_id": cid,
@@ -7737,28 +7718,43 @@ class ScopeManager:
                 }
             )
         verdicts = [
-            v.model_copy(
-                update={
-                    "decision": "accept_as_context",
-                    "reasoning": f"{v.reasoning} {notes[v.contribution_id]}",
-                }
-            )
+            v.model_copy(update={"decision": "decline", "reasoning": notes[v.contribution_id]})
             if v.contribution_id in hits
             else v
             for v in judgment.verdicts
         ]
+        # Stated limit, as on #242's batch: the batch has ONE context rewrite,
+        # which the judge wrote with the declined text in view. It is withheld
+        # and replaced by the previous context plus each remaining
+        # context-admitted member's own text, verbatim, so a declined
+        # contribution can never survive in it.
+        context = current_summary.context if current_summary is not None else ""
+        for v in verdicts:
+            if v.decision == "accept_as_context":
+                member = contributions[v.contribution_id]
+                who = member.contributor.skill or member.contributor.session_id
+                context = _append_line(
+                    context,
+                    f"[{member.id}] {who} ({member.contributor.scope_id}) "
+                    f"observed: {member.content.strip()}",
+                )
+        any_accepted = any(v.decision != "decline" for v in verdicts)
         return judgment.model_copy(
             update={
                 "verdicts": verdicts,
                 "directive_ops": kept,
-                "new_context": context,
+                "new_context": context if any_accepted else None,
                 "inherited_holds": holds,
-                "new_summary": _apply_batch_amendment(
-                    scope=scope,
-                    current_summary=current_summary,
-                    contributions=contributions,
-                    ops=kept,
-                    new_context=context,
+                "new_summary": (
+                    _apply_batch_amendment(
+                        scope=scope,
+                        current_summary=current_summary,
+                        contributions=contributions,
+                        ops=kept,
+                        new_context=context,
+                    )
+                    if any_accepted
+                    else None
                 ),
             }
         )
