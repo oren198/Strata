@@ -5173,6 +5173,36 @@ def relation_decline_trigger(
     return None
 
 
+def relation_decline_scope_trigger(
+    reasoning: str | None,
+    content: str,
+    ancestor_directives: Sequence[tuple[str, Sequence[Directive]]] | None,
+) -> str | None:
+    """#244 fix 3: the ancestor directive a decline points at WITHOUT citing its id.
+
+    A decline that says "the ancestor scope g_org has already established that ..."
+    names the scope, not the directive. When *reasoning* names an ancestor scope id
+    (word-bounded) and *content* shares a content word with at least one of that
+    scope's directives, the directive sharing the most words is returned (ties go
+    to the first). ``None`` when no ancestor scope is named or nothing overlaps.
+    Pure and judge-free; a wrong pick only means the re-ask fails toward the rule.
+    """
+    from strata.publication import _overlap_words  # noqa: PLC0415
+
+    if not reasoning:
+        return None
+    content_words = _overlap_words(content)
+    best: tuple[int, str] | None = None
+    for ancestor_scope_id, directives in ancestor_directives or ():
+        if not re.search(rf"(?<![\w-]){re.escape(ancestor_scope_id)}(?![\w-])", reasoning):
+            continue
+        for directive in directives:
+            overlap = len(_overlap_words(directive.content) & content_words)
+            if overlap and (best is None or overlap > best[0]):
+                best = (overlap, directive.id)
+    return best[1] if best else None
+
+
 #: The design note's own four recognised comparative patterns for `tightens`
 #: RULE mode, each paired with which direction is stricter — "smaller" means
 #: a smaller value in the contribution is the stricter one (at or below,
@@ -5858,10 +5888,21 @@ def verify_relation_ground(
 
     # relation == "tightens"
     kept_span = answer.get("kept_span")
-    if not _verbatim(kept_span):
-        return False, "declined (kept_span not verbatim)", None, None
-    if _truncates_a_number(kept_span):
-        return False, "declined (kept_span truncates a number)", None, None
+    located_by_engine = False
+    if _verbatim(kept_span):
+        if _truncates_a_number(kept_span):
+            return False, "declined (kept_span truncates a number)", None, None
+    else:
+        # #244 fix 2: the model's span is a hint. Models quote the PARENT or
+        # paraphrase it, which a verbatim test refuses even when the
+        # contribution plainly carries a tighter value. The engine finds the
+        # value itself: the comparator must read a value in the contribution
+        # and find it inside the parent's bound. No such value fails toward
+        # the rule, as before.
+        located_ok, _located_value = _comparator_rule_ok(parent_text, content)
+        if located_ok is not True:
+            return False, "declined (kept_span not verbatim)", None, None
+        located_by_engine = True
     tighten_kind = answer.get("tighten_kind")
     if tighten_kind not in ("rule", "fact"):
         return False, "declined (tighten_kind is a required field)", None, None
@@ -5887,7 +5928,11 @@ def verify_relation_ground(
     if not tighten_ok:
         return False, f"declined ({tighten_reason})", None, None
 
-    return _context_or_fail("admitted (rescued, tightens parent)")
+    return _context_or_fail(
+        "admitted (rescued, tightens parent; kept value located by the engine)"
+        if located_by_engine
+        else "admitted (rescued, tightens parent)"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -8684,6 +8729,10 @@ class ScopeManager:
             ancestor_map.update({d.id: d.content for d in directives})
 
         matched_id = relation_decline_trigger(first.reasoning, ancestor_map.keys())
+        if matched_id is None:
+            matched_id = relation_decline_scope_trigger(
+                first.reasoning, contribution.content, ancestor_directives
+            )
         if matched_id is None:
             return first
         parent_text = ancestor_map[matched_id]
