@@ -5288,7 +5288,12 @@ def relation_decline_scope_trigger(
 #: before"/"at or after" are the natural TIME-shaped twins of "at or
 #: below"/"at or above" ("watered at or before 07:00" vs "...before
 #: 06:30" is the same kind of threshold, just a clock value).
-_COMPARATOR_VALUE = r"(-?[\d:.,]+)"
+_NUMBER_WORD_ALT = (
+    "zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|"
+    "fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty|sixty|seventy|"
+    "eighty|ninety|hundred"
+)
+_COMPARATOR_VALUE = rf"(-?[\d:.,]+|(?:{_NUMBER_WORD_ALT})\b)"
 _COMPARATOR_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(rf"\bat or below\s+{_COMPARATOR_VALUE}", re.IGNORECASE), "smaller"),
     (re.compile(rf"\bat or above\s+{_COMPARATOR_VALUE}", re.IGNORECASE), "larger"),
@@ -5297,6 +5302,11 @@ _COMPARATOR_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(rf"\bevery\s+{_COMPARATOR_VALUE}", re.IGNORECASE), "smaller"),
     (re.compile(rf"\bwithin\s+{_COMPARATOR_VALUE}", re.IGNORECASE), "smaller"),
     (re.compile(rf"\bat least\s+{_COMPARATOR_VALUE}", re.IGNORECASE), "larger"),
+    # #244b class A: other surface forms of a bound. "by"/"before" count only
+    # for a clock time (the bare words are everywhere: "before publishing").
+    (re.compile(r"\b(?:not|no) later than\s+(-?[\d:.,]+)", re.IGNORECASE), "smaller"),
+    (re.compile(r"\b(?:not|no) earlier than\s+(-?[\d:.,]+)", re.IGNORECASE), "larger"),
+    (re.compile(r"\b(?:by|before)\s+(\d{1,2}:\d{2})", re.IGNORECASE), "smaller"),
     # 1.17.2: upper- and lower-bound phrasings, direction read off the
     # parent's own words. A NEGATED bound flips the bare word's direction
     # ("never above -70" caps the value; "never below -70" floors it), so
@@ -5336,10 +5346,23 @@ _COMPARATOR_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
 )
 
 
+_WORD_VALUES = {
+    w: n
+    for w, n in zip(
+        _NUMBER_WORD_ALT.split("|"),
+        [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 30, 40, 50]
+        + [60, 70, 80, 90, 100],
+        strict=True,
+    )
+}
+
+
 def _parse_comparable(value_str: str) -> float:
     """A plain number ("500", "40,000") as a float, or a clock time
     ("06:30", "21:55") as minutes since midnight — both compare correctly
     with a bare ``<=``/``>=`` either way."""
+    if value_str.casefold() in _WORD_VALUES:
+        return float(_WORD_VALUES[value_str.casefold()])
     if ":" in value_str:
         parts = [int(p) for p in value_str.split(":")]
         while len(parts) < 3:
@@ -5479,6 +5502,137 @@ def _bare_child_value(parent_text: str, parent_match: re.Match[str], content: st
     return next(iter(values))
 
 
+_FREQ_UNITS = {
+    "second": 1,
+    "minute": 60,
+    "hour": 3600,
+    "day": 86400,
+    "night": 86400,
+    "week": 604800,
+    "fortnight": 1209600,
+    "month": 2592000,
+    "year": 31536000,
+}
+_FREQ_COUNT = {"once": 1, "twice": 2, "thrice": 3}
+_UNCERTAIN = "?uncertain"
+"""Second element of ``_comparator_rule_ok``'s ``(None, ...)`` when the child states the
+bound in a form that cannot be compared (units that do not convert): no conflict is
+claimed, the judge and the extra check decide."""
+
+
+def _every_phrase(seconds: float) -> str:
+    """ "every N <unit>" for a period, in the largest unit that divides it evenly."""
+    for name, size in (("week", 604800), ("day", 86400), ("hour", 3600), ("minute", 60)):
+        if seconds >= size and seconds % size == 0:
+            return f"every {int(seconds // size)} {name}{'s' if seconds // size != 1 else ''}"
+    if seconds >= 1:
+        return f"every {int(round(seconds))} seconds"
+    return f"every {seconds:g} seconds"
+
+
+def _normalise_quantities(text: str) -> str:
+    """#244b class A: the same bound in another surface form, written in one.
+
+    - clock times: "7 pm", "7:30 pm" -> "19:00", "19:30"; "noon" -> "12:00";
+      "midnight" -> "24:00";
+    - frequencies: "twice an hour", "four times a day", "hourly", "half-hourly", "daily",
+      "every hour", "every other day", "every fortnight" -> "every N <unit>".
+
+    Only used to compare values, never to rewrite anything shown or stored.
+    """
+
+    def clock(m: re.Match[str]) -> str:
+        hour, minute = int(m.group(1)), int(m.group(2) or 0)
+        meridiem = m.group(3).replace(".", "").casefold()
+        if meridiem == "pm" and hour < 12:
+            hour += 12
+        if meridiem == "am" and hour == 12:
+            hour = 0
+        return f"{hour:02d}:{minute:02d}"
+
+    text = re.sub(r"\b(\d{1,2})(?::(\d{2}))?\s*([ap]\.?m\.?)(?!\w)", clock, text, flags=re.I)
+    text = re.sub(r"\bnoon\b", "12:00", text, flags=re.I)
+    text = re.sub(r"\bmidnight\b", "24:00", text, flags=re.I)
+
+    unit_alt = "|".join(_FREQ_UNITS)
+
+    def times_per(m: re.Match[str]) -> str:
+        word = m.group("count").casefold()
+        count = _FREQ_COUNT.get(word) or _WORD_VALUES.get(word) or int(word)
+        if count <= 0:
+            return m.group(0)
+        return _every_phrase(_FREQ_UNITS[m.group("unit").casefold()] / count)
+
+    text = re.sub(
+        rf"(?<![\d:.])\b(?P<count>once|twice|thrice|\d+|{_NUMBER_WORD_ALT})(?: times)?\s+"
+        rf"(?:a|an|per|each|every)\s+(?P<unit>{unit_alt})\b",
+        times_per,
+        text,
+        flags=re.I,
+    )
+    text = re.sub(
+        r"\bevery\s+(?:half an? hour|half[- ]hour)\b", "every 30 minutes", text, flags=re.I
+    )
+    # "checked no more than 60 minutes apart" is a frequency: every 60 minutes at most
+    text = re.sub(
+        rf"\b(?:no more than|not more than|at most|up to|within)\s+(\d+|{_NUMBER_WORD_ALT})\s+"
+        rf"({unit_alt})s?\s+(?:apart|between|in between)\b",
+        lambda m: f"every {m.group(1)} {m.group(2)}s",
+        text,
+        flags=re.I,
+    )
+    # "no later than 90 minutes before departure": a larger lead time is stricter
+    text = re.sub(
+        rf"\b(?:no|not) later than\s+(\d+|{_NUMBER_WORD_ALT})\s+({unit_alt})s?\s+"
+        r"(?:before|prior to|ahead of)\b",
+        lambda m: f"at least {m.group(1)} {m.group(2)}s before",
+        text,
+        flags=re.I,
+    )
+    text = re.sub(
+        rf"\bevery\s+(?:second|other)\s+({unit_alt})\b",
+        lambda m: _every_phrase(2 * _FREQ_UNITS[m.group(1).casefold()]),
+        text,
+        flags=re.I,
+    )
+    text = re.sub(
+        rf"\bevery\s+third\s+({unit_alt})\b",
+        lambda m: _every_phrase(3 * _FREQ_UNITS[m.group(1).casefold()]),
+        text,
+        flags=re.I,
+    )
+    text = re.sub(r"\bhalf[- ]hourly\b", "every 30 minutes", text, flags=re.I)
+    text = re.sub(r"\bquarter[- ]hourly\b", "every 15 minutes", text, flags=re.I)
+    text = re.sub(
+        r"\bevery other (day|week|month)\b",
+        lambda m: _every_phrase(2 * _FREQ_UNITS[m.group(1).casefold()]),
+        text,
+        flags=re.I,
+    )
+    for adverb, unit in (
+        ("hourly", "hour"),
+        ("daily", "day"),
+        ("nightly", "night"),
+        ("weekly", "week"),
+        ("fortnightly", "fortnight"),
+        ("monthly", "month"),
+    ):
+        text = re.sub(rf"\b{adverb}\b", _every_phrase(_FREQ_UNITS[unit]), text, flags=re.I)
+    return text
+
+
+def _bound_family(pattern: re.Pattern[str]) -> str:
+    """What kind of bound a comparator pattern states: a frequency ("every N"), a time of day
+    ("at or before", "by", "no later than") or a quantity. A child's bound only stands in for
+    the parent's when both are the same kind."""
+    source = pattern.pattern
+    if "every" in source:
+        return "frequency"
+    if any(word in source for word in ("before", "after", "later than", "earlier than", "by|")):
+        return "time"
+    return "quantity"
+
+
 def _comparator_rule_ok(parent_text: str, kept_span: str) -> tuple[bool | None, str | None]:
     """``(True/False, matched_value)`` when the parent's value sits in one
     of :data:`_COMPARATOR_PATTERNS` AND *kept_span* restates it in the SAME
@@ -5494,11 +5648,25 @@ def _comparator_rule_ok(parent_text: str, kept_span: str) -> tuple[bool | None, 
     fallback (architect review round 3 — the fallback case is NOT the
     same as fact mode, which requires the value UNCHANGED).
     """
+    parent_text = _normalise_quantities(parent_text)
+    kept_span = _normalise_quantities(kept_span)
     for pattern, direction in _COMPARATOR_PATTERNS:
         parent_match = pattern.search(parent_text)
         if not parent_match:
             continue
         child_match = pattern.search(kept_span)
+        if child_match is None:
+            # the child may state the SAME kind of bound in another word ("by 7 pm" under
+            # "at or before 20:00"): any pattern of the parent's direction reads it
+            for other, other_direction in _COMPARATOR_PATTERNS:
+                if (
+                    other_direction == direction
+                    and other is not pattern
+                    and _bound_family(other) == _bound_family(pattern)
+                ):
+                    child_match = other.search(kept_span)
+                    if child_match is not None:
+                        break
         parent_value_str = _matched_value(parent_match).replace(",", "")
         parent_value = _parse_comparable(parent_value_str)
         if not child_match:
@@ -5509,10 +5677,24 @@ def _comparator_rule_ok(parent_text: str, kept_span: str) -> tuple[bool | None, 
             # comparator of any direction governs it.
             bare = _bare_child_value(parent_text, parent_match, kept_span)
             if bare is None:
-                return None, None
+                # the child says nothing comparable about THIS bound; a parent with
+                # several bounds ("at most 15 minutes ... rotated every 30 days") may
+                # have one the child does restate
+                continue
             ok = bare <= parent_value if direction == "smaller" else bare >= parent_value
             return ok, parent_value_str
         child_value = _parse_comparable(_matched_value(child_match))
+        parent_unit = _value_unit(parent_text, parent_match)
+        child_unit = _value_unit(kept_span, child_match)
+        parent_key = _duration_key(parent_unit) if parent_unit else None
+        child_key = _duration_key(child_unit) if child_unit else None
+        if parent_key and child_key:
+            # the same bound in another duration unit ("within 90 minutes" under "within 2 hours")
+            parent_value *= _DURATION_SECONDS[parent_key]
+            child_value *= _DURATION_SECONDS[child_key]
+        elif parent_unit and child_unit and parent_unit[:3] != child_unit[:3]:
+            # units that do not convert: claim no conflict, the judge decides
+            return None, _UNCERTAIN
         ok = child_value <= parent_value if direction == "smaller" else child_value >= parent_value
         return ok, parent_value_str
     return None, None
@@ -5535,7 +5717,8 @@ _SOFTENED_WORDS: tuple[str, ...] = (
 
 def _quantifier_softened(parent_text: str, child_span: str) -> bool:
     parent_cf = parent_text.casefold()
-    child_cf = child_span.casefold()
+    # "at most 10 minutes" is a bound, not the softening quantifier "most"
+    child_cf = re.sub(r"\bat most\b", " ", child_span.casefold())
     has_quantifier = any(re.search(rf"\b{word}\b", parent_cf) for word in _QUANTIFIER_WORDS)
     has_softening = any(re.search(rf"\b{re.escape(word)}\b", child_cf) for word in _SOFTENED_WORDS)
     return has_quantifier and has_softening
@@ -5922,6 +6105,8 @@ def _tighten_value_check(parent_text: str, content: str) -> tuple[bool, str]:
     from strata.publication import _POL_WORDS, _decomposed_value_tokens  # noqa: PLC0415
 
     rule_ok, compared_value = _comparator_rule_ok(parent_text, content)
+    if rule_ok is None and compared_value == _UNCERTAIN:
+        return True, "ok (bound in a form that cannot be compared)"
     if rule_ok is False:
         return False, "not stricter in the same direction"
     parent_values = _decomposed_value_tokens(parent_text) - _POL_WORDS
@@ -5929,9 +6114,59 @@ def _tighten_value_check(parent_text: str, content: str) -> tuple[bool, str]:
         parent_values = parent_values - _decomposed_value_tokens(compared_value)
     content_values = _decomposed_value_tokens(content) - _POL_WORDS
     if not parent_values <= content_values:
-        reason = "parent's other values not kept" if rule_ok is True else "parent's value not kept"
-        return False, reason
+        multi_valued = len({n for n, _keys in _value_slots(parent_text)}) >= 2
+        if rule_ok is not True and not multi_valued:
+            return False, "parent's value not kept"
+        # #244b class B: the child restates only part of the parent (it tightened one
+        # value, or added one). An absent value stays bound by the parent; only a DIFFERENT
+        # value for the same slot (the same unit or the same word before it) contradicts it.
+        if _slot_contradicted(parent_text, content, parent_values - content_values):
+            return False, "parent's other values not kept" if rule_ok else "parent's value not kept"
     return True, "ok"
+
+
+_SLOT_STOP = frozenset(
+    {
+        "or", "and", "to", "at", "of", "in", "on", "for", "the", "a", "an", "than", "by",
+        "before", "after", "until", "least", "most", "later", "earlier", "within", "every",
+        "each", "per", "about", "around", "over", "under", "below", "above", "is", "are",
+    }
+)  # fmt: skip
+
+
+def _value_slots(text: str) -> list[tuple[str, set[str]]]:
+    """``(number, slot keys)`` for each number in *text*: the stem of the unit after it and of
+    the word before it ("30 days" -> {"day"}; "TLS 1.3 or later" -> {"tls"})."""
+    from strata.publication import _NUMBER_WORDS  # noqa: PLC0415
+
+    found: list[tuple[str, set[str]]] = []
+    for m in re.finditer(
+        rf"(?:(?P<prev>[A-Za-z][A-Za-z_]*)(?:\s+|-))?(?P<num>\d{{1,2}}:\d{{2}}(?::\d{{2}})?|-?\d[\d,]*(?:\.\d+)?|{_NUMBER_WORD_ALT})"
+        r"(?:\s*(?P<unit>[A-Za-z°%]+))?",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        number = _NUMBER_WORDS.get(m.group("num").casefold(), m.group("num")).replace(",", "")
+        keys = {
+            word.casefold()[:3]
+            for word in (m.group("prev"), m.group("unit"))
+            if word and word.casefold() not in _SLOT_STOP
+        }
+        found.append((number, keys))
+    return found
+
+
+def _slot_contradicted(parent_text: str, content: str, missing: set[str]) -> bool:
+    """Is any value in *missing* (parent values the child did not restate) replaced in
+    the child by a different value in the same slot?"""
+    child = _value_slots(content)
+    for number, keys in _value_slots(parent_text):
+        if number not in missing or not keys:
+            continue
+        child_numbers = {n for n, k in child if k & keys}
+        if child_numbers and number not in child_numbers:
+            return True
+    return False
 
 
 def verify_relation_ground(
@@ -6806,6 +7041,9 @@ _DIRECTIVE_RELAXATION_EXTRA_RES: tuple[re.Pattern[str], ...] = tuple(
         r"\bno\s+(?:\w+\s+){0,3}?(?:required|needed|necessary)\b",
         r"\b(?:can|could|may)\b[^.;]{0,40}\bwithout\b",
         r"\bexcept\b",
+        r"\bin place of\b|\binstead of\b|\brather than\b|\bno longer\b",
+        r"\bdrop(?:s|ped|ping)?\b|\breplac(?:e|es|ed|ing)\b",
+        r"\bevery\s+(?:other|second|third)\s+\w+",
         r"\balone\b",
         r"\bgo(?:es)?\s+(?:straight|directly)\b",
         r"\b(?:straight|directly)\s+(?:back|out|away|through)\b",
