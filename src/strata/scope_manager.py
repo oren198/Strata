@@ -6549,12 +6549,12 @@ def _context_covers(inherited_text: str, content: str) -> bool:
         inherited_text, content
     ):
         return True
+    inherited_words = _overlap_words(_normalise_synonyms(inherited_text))
+    content_words = _overlap_words(_normalise_synonyms(content))
     shared = {
         mine
-        for mine in _overlap_words(inherited_text)
-        if any(
-            _shared_prefix(mine, other) >= 5 or mine == other for other in _overlap_words(content)
-        )
+        for mine in inherited_words
+        if any(_shared_prefix(mine, other) >= 5 or mine == other for other in content_words)
     }
     return len(shared) >= 2
 
@@ -6846,6 +6846,35 @@ def _relaxation_marker(content: str, inherited_texts: Sequence[str] = ()) -> str
     return None
 
 
+#: #244 (the synonym gap): a few word families that name the same act in rules and in
+#: restatements of them, collapsed to one token before subject words are compared.
+#: "Anyone may sign off on a release" is about the same thing as "Releases require two
+#: approvals" and shares no stem with it. Kept small and domain-neutral on purpose.
+_SYNONYM_FAMILIES: tuple[tuple[re.Pattern[str], str], ...] = (
+    (
+        re.compile(
+            r"\bsign(?:s|ed|ing)?[- ]?offs?\b|\bsign(?:s|ed|ing)? off\b|\bapprov\w*|"
+            r"\bauthori[sz]\w*|\bcountersign\w*",
+            re.IGNORECASE,
+        ),
+        "approval",
+    ),
+    (
+        re.compile(
+            r"\bwalk-?rounds?\b|\binspect\w*|\bsecond pair of eyes\b|\bpeer review\w*",
+            re.IGNORECASE,
+        ),
+        "inspection",
+    ),
+)
+
+
+def _normalise_synonyms(text: str) -> str:
+    for pattern, token in _SYNONYM_FAMILIES:
+        text = pattern.sub(token, text)
+    return text
+
+
 def _subject_stems(text: str) -> set[str]:
     """Content-word stems of *text*, three letters and up ("van", "QA"-free), minus the
     overlap stopwords: the loosened subject test of #244 step 3."""
@@ -6853,7 +6882,7 @@ def _subject_stems(text: str) -> set[str]:
 
     return {
         _overlap_stem(word)
-        for word in re.findall(r"[a-z]{3,}", text.casefold())
+        for word in re.findall(r"[a-z]{3,}", _normalise_synonyms(text).casefold())
         if word not in _CONTENT_OVERLAP_STOPWORDS and word not in _LOOSE_STOPWORDS
     }
 

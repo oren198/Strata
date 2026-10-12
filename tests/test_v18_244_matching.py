@@ -698,3 +698,32 @@ def test_j1_050_is_admitted_end_to_end_when_the_reask_calls_it_a_tightening() ->
     assert judgment.decision == "accept_as_directive"
     assert judgment.inherited_holds == []
     assert judgment.directive_relation["verdict"] == "admit"
+
+
+# ---------------------------------------------------------------------------
+# The synonym gap: "sign off" and "approvals" are the same act
+# ---------------------------------------------------------------------------
+
+from strata.scope_manager import _context_covers, verify_inherited_relation  # noqa: E402
+
+_TWO_APPROVALS = "Releases require two approvals."
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Anyone may sign off on a release.",
+        "Any engineer can approve a release.",
+        "Ops can authorize a release alone.",
+    ],
+)
+def test_sign_off_and_approval_are_one_subject(text: str) -> None:
+    assert _context_covers(_TWO_APPROVALS, text)
+    verdict, _reason = verify_inherited_relation(
+        {"kind": "unrelated", "inherited_id": "p"}, text, _TWO_APPROVALS
+    )
+    assert verdict == "decline"
+
+
+def test_an_unrelated_sentence_does_not_gain_a_subject_from_the_synonyms() -> None:
+    assert not _context_covers(_TWO_APPROVALS, "The cafeteria opens at 08:00 on weekdays.")
