@@ -6045,8 +6045,58 @@ def _universal_scope_preserved(parent_text: str, content: str) -> bool:
             continue
         if _restates_the_requirement_of(phrase, parent_text, content):
             continue
+        if _adds_a_requirement(parent_text, content):
+            continue
         return False
     return True
+
+
+_RESTRICTION_RE = re.compile(
+    r"\b(?:only|just|solely|exclusively)\s+(?:on|for|in|during|when|if|at|between)\b"
+    r"|\bexcept\b|\boutside (?:of )?\b|\bunless\b"
+    r"|\b(?:on|during|in|between|from)\s+(?:the\s+)?(?:weekdays?|weekends?|mornings?|"
+    r"evenings?|nights?|seasons?|summer|winter|holidays?|mondays?|tuesdays?|wednesdays?|"
+    r"thursdays?|fridays?|saturdays?|sundays?)\b",
+    re.IGNORECASE,
+)
+_REQUIREMENT_MODAL_RE = re.compile(
+    r"\b(?:must|shall|should|need(?:s)? to|needs?|require[sd]?|has to|have to|is required)\b",
+    re.IGNORECASE,
+)
+
+
+_ADDITIVE_CUE_RE = re.compile(
+    r"\badditionally\b|\bon top of\b|\bin addition\b|\bas well as\b|\balso must\b"
+    r"|\bmust also\b|\bplus\b|\bfurthermore\b",
+    re.IGNORECASE,
+)
+
+
+def _adds_a_requirement(parent_text: str, content: str) -> bool:
+    """#244b class C: a child for a sub-case that ADDS a requirement is an addition, not a
+    narrowing of the parent's universal phrase: the parent still binds every case the
+    child does not name. It qualifies only when it states a requirement, brings at least
+    two content words the parent does not have, carries no relaxation marker and no
+    restriction of when or where the parent's own requirement applies ("only on",
+    "except", "outside of", "on weekdays")."""
+    if _REQUIREMENT_MODAL_RE.search(content) is None:
+        return False
+    if _RESTRICTION_RE.search(content) or _relaxation_marker(content, [parent_text]):
+        return False
+    parent_stems = _subject_stems(parent_text)
+    child_stems = _subject_stems(content)
+    if len(child_stems - parent_stems) < 2:
+        return False
+    if _ADDITIVE_CUE_RE.search(content):
+        return True
+    # without an explicit "additionally / on top of", it must visibly keep the parent's
+    # requirement: most of the parent's words come back
+    kept = {
+        stem
+        for stem in parent_stems
+        if stem in child_stems or any(_shared_prefix(stem, c) >= 5 for c in child_stems)
+    }
+    return bool(parent_stems) and len(kept) / len(parent_stems) >= 0.5
 
 
 def _restates_the_requirement_of(phrase: str, parent_text: str, content: str) -> bool:
@@ -7044,6 +7094,7 @@ _DIRECTIVE_RELAXATION_EXTRA_RES: tuple[re.Pattern[str], ...] = tuple(
         r"\bin place of\b|\binstead of\b|\brather than\b|\bno longer\b",
         r"\bdrop(?:s|ped|ping)?\b|\breplac(?:e|es|ed|ing)\b",
         r"\bevery\s+(?:other|second|third)\s+\w+",
+        r"\b(?:only|just|merely)\s+(?:need|needs|have to|has to|require|requires)\b",
         r"\balone\b",
         r"\bgo(?:es)?\s+(?:straight|directly)\b",
         r"\b(?:straight|directly)\s+(?:back|out|away|through)\b",

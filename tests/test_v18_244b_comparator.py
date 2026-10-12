@@ -148,3 +148,59 @@ def test_a_replacement_or_a_dropped_check_is_caught_by_the_directive_verifier() 
         )[0]
         == "decline"
     )
+
+
+# ---------------------------------------------------------------------------
+# C: a sub-case that adds a requirement is an addition, not a narrowing
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("parent", "child"),
+    [
+        (
+            "Nurses must check the ward every shift.",
+            "Night nurses must additionally log vital signs every hour.",
+        ),
+        (
+            "Every delivery van is inspected before it leaves the depot.",
+            "Refrigerated vans must also have the compressor logged before they leave.",
+        ),
+        (
+            "All production deploys require an approved change ticket.",
+            "For payments-service deploys the change ticket must additionally name a second "
+            "reviewer, on top of the usual approved-ticket requirement.",
+        ),
+    ],
+)
+def test_a_sub_case_that_adds_a_requirement_does_not_narrow_the_universal_phrase(
+    parent: str, child: str
+) -> None:
+    assert inherited_conflict(child, parent) is None
+
+
+@pytest.mark.parametrize(
+    ("parent", "child"),
+    [
+        (
+            "Seedlings must be watered at or before 07:00 every day.",
+            "Seedlings in house 3 must be watered at or before 06:00 on weekdays.",
+        ),
+        (
+            "All production deploys require an approved change ticket.",
+            "Deploys outside of office hours require a ticket.",
+        ),
+        (
+            "All deploys require a rollback plan documented in the deploy ticket.",
+            "Staging deploys need a plan.",
+        ),
+        (
+            "All production deploys require an approved change ticket.",
+            "Payments-service deploys need a ticket.",
+        ),
+    ],
+)
+def test_a_restriction_or_a_weaker_requirement_is_still_a_narrowing(
+    parent: str, child: str
+) -> None:
+    assert inherited_conflict(child, parent) is not None
