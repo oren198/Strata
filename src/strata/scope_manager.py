@@ -5251,6 +5251,64 @@ def _matched_value(match: re.Match[str]) -> str:
     return next(group for group in match.groups() if group).rstrip(".,:")
 
 
+def _value_unit(text: str, match: re.Match[str]) -> str | None:
+    """The unit word right after the value a comparator pattern captured ("minutes" in
+    "at most 15 minutes"); ``""`` for a clock time, ``None`` when the value has no unit."""
+    end = next((m_end for (m_start, m_end) in match.regs[1:] if m_start != -1), None)
+    if end is None:
+        return None
+    value = _matched_value(match)
+    if ":" in value:
+        return ""
+    after = re.match(r"\s*([A-Za-z]+)", text[end:])
+    return after.group(1).casefold() if after else None
+
+
+def _bare_child_value(parent_text: str, parent_match: re.Match[str], content: str) -> float | None:
+    """The one value in *content* that has the parent value's unit and no comparator
+    governing it (#244 fix 1), or ``None`` when there is not exactly one such value.
+
+    A value a comparator pattern of any direction captured is not bare: "at least 10
+    minutes" under "at most 15 minutes" floors the value, it does not tighten it.
+    """
+    from strata.publication import _NUMBER_WORDS  # noqa: PLC0415
+
+    unit = _value_unit(parent_text, parent_match)
+    if unit is None:
+        return None
+    governed: set[float] = set()
+    for pattern, _direction in _COMPARATOR_PATTERNS:
+        for found in pattern.finditer(content):
+            try:
+                governed.add(_parse_comparable(_matched_value(found).replace(",", "")))
+            except ValueError:
+                continue
+    word_alt = "|".join(sorted(_NUMBER_WORDS, key=len, reverse=True))
+    if unit == "":
+        candidates = re.finditer(r"(?<![\d:])(\d{1,2}:\d{2}(?::\d{2})?)(?![\d:])", content)
+        pairs = [(m.group(1), "") for m in candidates]
+    else:
+        stem = unit[:3]
+        candidates = re.finditer(
+            rf"\b(-?\d[\d,]*(?:\.\d+)?|{word_alt})\s+({re.escape(stem)}[A-Za-z]*)\b",
+            content,
+            re.IGNORECASE,
+        )
+        pairs = [(m.group(1), m.group(2)) for m in candidates]
+    values: set[float] = set()
+    for raw, _unit in pairs:
+        key = raw.casefold()
+        raw_number = _NUMBER_WORDS.get(key, raw).replace(",", "")
+        try:
+            values.add(_parse_comparable(raw_number))
+        except ValueError:
+            continue
+    values -= governed
+    if len(values) != 1 or (governed and not values):
+        return None
+    return next(iter(values))
+
+
 def _comparator_rule_ok(parent_text: str, kept_span: str) -> tuple[bool | None, str | None]:
     """``(True/False, matched_value)`` when the parent's value sits in one
     of :data:`_COMPARATOR_PATTERNS` AND *kept_span* restates it in the SAME
@@ -5271,10 +5329,19 @@ def _comparator_rule_ok(parent_text: str, kept_span: str) -> tuple[bool | None, 
         if not parent_match:
             continue
         child_match = pattern.search(kept_span)
-        if not child_match:
-            return None, None
         parent_value_str = _matched_value(parent_match).replace(",", "")
         parent_value = _parse_comparable(parent_value_str)
+        if not child_match:
+            # #244 fix 1: a bare value with no comparator of its own ("expire
+            # after 10 minutes" under "at most 15 minutes") is a value, and
+            # inside an upper bound a smaller value is a tightening. Read it
+            # only when it is the one value of the parent's unit and no
+            # comparator of any direction governs it.
+            bare = _bare_child_value(parent_text, parent_match, kept_span)
+            if bare is None:
+                return None, None
+            ok = bare <= parent_value if direction == "smaller" else bare >= parent_value
+            return ok, parent_value_str
         child_value = _parse_comparable(_matched_value(child_match))
         ok = child_value <= parent_value if direction == "smaller" else child_value >= parent_value
         return ok, parent_value_str
