@@ -623,7 +623,7 @@ def _apply(
     notices = preview.notices
     if hasattr(change_events, "emit_structure_change"):
         try:
-            change_events.emit_structure_change(act.id)
+            change_events.emit_structure_change(act.id, record_store=record_store)
         except Exception:
             _logger.warning(
                 "structure emission failed for %s; the applied change stands",
@@ -1089,7 +1089,7 @@ def _reemit(fleet: FleetConfig, store: RecordStore, act_id: str) -> int:
         return 0
     if hasattr(change_events, "emit_structure_change"):
         try:
-            emitted = change_events.emit_structure_change(act_id)
+            emitted = change_events.emit_structure_change(act_id, record_store=store)
         except Exception:
             print(_emission_failed_notice(act_id), file=sys.stderr)
             return 1
