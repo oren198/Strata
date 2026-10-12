@@ -1006,6 +1006,12 @@ as a child sharing the console, and forwards its exit code. Ctrl-C reaches the
 `claude` session in both cases, and the child's exit code becomes the exit code
 of `strata launch`.
 
+**Windows.** From 1.18.0, CI on `windows-latest` covers `strata register`,
+an MCP stdio round trip (`strata_read_perspective`, one `strata_contribute`,
+`strata_read_scope_record`), a fleet-structure-change refusal, and an
+`export-fleet` refusal onto an existing file. We still can't claim that
+Strata runs as an MCP server on Windows; that round trip is what CI covers.
+
 ### Upgrading from V1.1 to V1.2
 
 V1.2 moves fleet configuration (strata, scopes, edges) out of SQLite and into a

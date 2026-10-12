@@ -50,6 +50,16 @@ the release PR (`dev` → `main`) and the GitHub Release body are built from
 
 ### Added
 
+- **Windows CI runs the MCP round trip** (#232).
+  `scripts/ci_mcp_roundtrip.py` registers a temp project, then over stdio
+  calls `strata_read_perspective`, one `strata_contribute` with no judge key
+  (the contribution stays unjudged), and `strata_read_scope_record`. Where
+  `fcntl` is missing, a fleet structure change is refused before any write
+  and `export-fleet` onto an existing file is refused with no traceback; on
+  POSIX the fleet change is applied. The script runs on the existing
+  `windows-launch` job and on the Linux wheel-smoke leg. No judge key is
+  placed in CI.
+
 - **A re-parent records the chain and the subtree the emission will need**
   (ADR 0014 D8). The act's before and after topology for a `reparent` also
   carry `chain` (the moved scope's ancestors, root-first) and `descendants`

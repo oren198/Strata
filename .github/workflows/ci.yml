@@ -225,6 +225,13 @@ jobs:
           curl -fsS -o /dev/null http://127.0.0.1:8971/ui/atlas.css
           curl -fsS -o /dev/null http://127.0.0.1:8971/scopes
 
+      # Issue #232, same script as windows-launch. The wheel's interpreter
+      # has strata, strata-mcp, and the mcp client; the checkout has the script.
+      - name: MCP round trip (register, stdio, fleet change, export-fleet)
+        run: |
+          export PATH="/tmp/wheelenv/bin:$PATH"
+          python scripts/ci_mcp_roundtrip.py
+
   # Windows is the real target for `strata launch` (issue #20): POSIX uses
   # execvp, Windows spawns a console-sharing child and propagates its exit
   # code. A dedicated lane keeps this from regressing without ballooning the
@@ -274,6 +281,12 @@ jobs:
       # is caught here, not just on Linux.
       - name: Windows portability suite (issue #66 / PR #84)
         run: python -m pytest tests/test_packaging.py tests/test_project_config.py -q
+
+      # Issue #232: register, MCP stdio round trip, fleet-change refusal,
+      # and export-fleet refusal. Same script as the Linux wheel-smoke leg.
+      # No judge key. POSIX vs Windows is fcntl, not the runner label.
+      - name: MCP round trip (register, stdio, fleet change, export-fleet)
+        run: python scripts/ci_mcp_roundtrip.py
 
   # Single, stable status-check context required by the branch ruleset.
   # Succeeds only if every matrix leg of `test` succeeded.
