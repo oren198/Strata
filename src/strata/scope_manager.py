@@ -5860,8 +5860,42 @@ def _universal_scope_preserved(parent_text: str, content: str) -> bool:
             continue
         if _stricter_universal_phrase_present(phrase, content_cf):
             continue
+        if _restates_the_requirement_of(phrase, parent_text, content):
+            continue
         return False
     return True
+
+
+def _restates_the_requirement_of(phrase: str, parent_text: str, content: str) -> bool:
+    """#244 (j1-050): an "all <noun>" parent narrowed to a subject that carries the noun
+    ("all deploys" -> "Deploy tickets must include a rollback-plan section before merge")
+    and restates most of the parent's requirement is an enforcement of the rule, not a
+    change to when it applies: the parent still binds every case the child does not name.
+    Only the "all <noun>" quantifier; "every day", "always" and the like are about WHEN."""
+    quantified = re.fullmatch(r"all\s+(\w+)", phrase)
+    if quantified is None or _relaxation_marker(content, [parent_text]) is not None:
+        return False
+    noun = _subject_stems(quantified.group(1))
+    child = _subject_stems(content)
+    # The child's own subject must be a DIFFERENT thing that carries the noun as a
+    # modifier ("deploy TICKETS"). The same noun restated without "all" ("Services
+    # stay on ..." under "All services ...") is the narrowing the check exists for.
+    head, _leading = _subject_head(content)
+    if head is None or any(head == n or _shared_prefix(head, n) >= 4 for n in noun):
+        return False
+    if not noun or not any(
+        n in child or any(_shared_prefix(n, c) >= 4 for c in child) for n in noun
+    ):
+        return False
+    parent_stems = _subject_stems(parent_text)
+    if not parent_stems:
+        return False
+    kept = {
+        stem
+        for stem in parent_stems
+        if stem in child or any(_shared_prefix(stem, c) >= 5 for c in child)
+    }
+    return len(kept) / len(parent_stems) >= 0.6
 
 
 def _tighten_value_check(parent_text: str, content: str) -> tuple[bool, str]:

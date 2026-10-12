@@ -628,3 +628,73 @@ def test_a_batch_declines_the_exception_member_and_keeps_the_other() -> None:
     assert len(result.directive_relations) == 2
     assert result.new_summary is not None
     assert [d.content for d in result.new_summary.directives] == [second.content]
+
+
+# ---------------------------------------------------------------------------
+# j1-050: an enforcement of the rule is not a narrowing of it
+# ---------------------------------------------------------------------------
+
+_DEPLOY_RULE = "All deploys require a rollback plan documented in the deploy ticket."
+
+
+def test_an_enforcement_point_for_an_all_noun_rule_is_not_a_narrowing() -> None:
+    enforcing = (
+        "Deploy tickets must include a filled-out rollback-plan section before merge is allowed."
+    )
+    assert inherited_conflict(enforcing, _DEPLOY_RULE) is None
+
+
+def test_a_narrowing_that_relaxes_or_drops_the_requirement_is_still_a_conflict() -> None:
+    assert (
+        inherited_conflict(
+            "Deploys of the billing service may skip the rollback plan.", _DEPLOY_RULE
+        )
+        is not None
+    )
+    assert inherited_conflict("Staging deploys need a plan.", _DEPLOY_RULE) is not None
+    # the same noun restated for a part of it is still read as a narrowing
+    assert (
+        inherited_conflict(
+            "Hotfix deploys require a rollback plan documented in the deploy ticket.", _DEPLOY_RULE
+        )
+        is not None
+    )
+
+
+def test_j1_050_is_admitted_end_to_end_when_the_reask_calls_it_a_tightening() -> None:
+    parent = Directive(
+        id="c_pe102",
+        content=_DEPLOY_RULE,
+        source_scope_id="s_platform_eng",
+        created_at="2026-05-11T09:00:00+00:00",
+    )
+    text = "Deploy tickets must include a filled-out rollback-plan section before merge is allowed."
+    client = MagicMock()
+    client.messages.create.side_effect = [
+        _fake_response(
+            {
+                "decision": "accept_as_directive",
+                "reasoning": "Enforces the parent rule locally.",
+                "directive_ops": [{"op": "publish", "content": text}],
+                "new_context": None,
+            }
+        ),
+        _fake_response(
+            {
+                "relation": "tightens",
+                "parent_id": "c_pe102",
+                "reasoning": "adds an enforcement point",
+            }
+        ),
+    ]
+    judgment = ScopeManager(client=client).judge(
+        scope=_SCOPE,
+        stratum=_STRATUM,
+        current_summary=_SUMMARY,
+        recent_contributions=[],
+        new_contribution=replace(_CONTRIBUTION, content=text),
+        ancestor_directives=[("s_platform_eng", [parent])],
+    )
+    assert judgment.decision == "accept_as_directive"
+    assert judgment.inherited_holds == []
+    assert judgment.directive_relation["verdict"] == "admit"
