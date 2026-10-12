@@ -77,6 +77,7 @@ from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from typing import Protocol, TypeVar
 
+from strata.change_events import structure_conflicts
 from strata.fleet_config import FleetConfig
 from strata.summary_store import Directive, ScopeSummary, SummaryStore
 
@@ -425,6 +426,30 @@ def _operator_layer(attachment_scope_id: str, directives: list[dict]) -> dict:
     }
 
 
+def _annotate_conflicts(
+    summary: dict, events: Sequence[_ChangeEventLike], inherited_ids: set[str]
+) -> None:
+    """ADR 0014 D8 (a): put ``annotation`` on each own directive with an open conflict.
+
+    Derived at read time, no stored flag. A conflict is open while the own
+    directive is in *summary* and the inherited one is still among what binds
+    the scope (*inherited_ids*), so retiring or superseding either removes it.
+    The conflicts come from ``chain_changed`` events' structured payload only
+    (:func:`strata.change_events.structure_conflicts`); no text is parsed.
+    """
+    own_ids = {d["id"] for d in summary.get("directives", [])}
+    lines: dict[str, list[str]] = {}
+    for event in events:
+        for conflict in structure_conflicts(event):
+            if conflict["own_id"] in own_ids and conflict["inherited_id"] in inherited_ids:
+                bucket = lines.setdefault(conflict["own_id"], [])
+                if conflict["line"] not in bucket:
+                    bucket.append(conflict["line"])
+    for directive in summary.get("directives", []):
+        if directive["id"] in lines:
+            directive["annotation"] = " ".join(lines[directive["id"]])
+
+
 def summary_for_scope(scope_id: str, *, summary_store: SummaryStore) -> dict:
     """Return a scope's summary as a plain dict, synthesizing an empty one if none exists on disk.
 
@@ -766,10 +791,17 @@ def compose_perspective(
     # re-derive what binds a scope.
     inherited = dict(ancestor_directives(scope_id, fleet=fleet, summary_store=summary_store))
 
+    # ADR 0014 D8: every event the reader holds for this scope, read once —
+    # the structure annotation below needs the processed ones too, and the
+    # `input_changes` filter further down needs the same list.
+    scope_events = list(change_event_reader(scope_id)) if change_event_reader is not None else []
+    inherited_ids: set[str] = {d.id for ds in inherited.values() for d in ds}
+
     layers = []
     for s in chain:
         if operator_reader is not None:
             directives = _operator_directives(operator_reader(s.id))
+            inherited_ids.update(d["id"] for d in directives)
             if directives:
                 # ADR 0008 D2: the operator layer sits immediately above its
                 # attachment scope's own layer — inserted here, before the
@@ -781,6 +813,7 @@ def compose_perspective(
             # Self: unaffected by ADR 0013 — full summary, directives and
             # context alike, still feeds this scope's own judgments.
             self_summary = summary_for_scope(s.id, summary_store=summary_store)
+            _annotate_conflicts(self_summary, scope_events, inherited_ids)
             # One call, shared by the condensation count and the context-ids list below
             # (ADR 0017 P1b) — both read the same accepted-context contributions.
             accepted_context = None if contribution_reader is None else contribution_reader(s.id)
@@ -880,11 +913,7 @@ def compose_perspective(
     # filter or forgot to order).
     input_changes: list[dict] = []
     if change_event_reader is not None or just_processed:
-        events = [
-            e
-            for e in (change_event_reader(scope_id) if change_event_reader is not None else [])
-            if _composes_as_input_change(e, scope_id=scope_id)
-        ]
+        events = [e for e in scope_events if _composes_as_input_change(e, scope_id=scope_id)]
         # The events this read's own drain consumed (issue #203). Deduplicated
         # by event id, since a caller may hand over both an unfiltered reader
         # and the drain's own list.

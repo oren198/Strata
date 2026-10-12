@@ -48,6 +48,7 @@ directive, change event.
 
 from __future__ import annotations
 
+import json
 import logging
 import secrets
 from collections.abc import Sequence
@@ -121,6 +122,21 @@ OPERATOR_DIRECTIVE_CHANGED = "operator_directive_changed"
 one kind whose affected set includes the attachment scope ITSELF: the
 operator's layer composes ABOVE that scope and binds it, so the scope is a
 reader of the change, not its author."""
+
+CHANNEL_REMOVED = "channel_removed"
+"""ADR 0014 D8: a reference edge a scope read through was removed. Sent to the
+reader. Not in :data:`RETRACTION_KINDS`, :data:`PUBLICATION_KINDS` or
+:data:`DIRECTIVE_KINDS`: nothing was withdrawn and no directive was retired."""
+
+CHAIN_CHANGED = "chain_changed"
+"""ADR 0014 D8: the chain above a scope moved (a re-parent). Sent to the moved
+scope and every chain descendant. In none of the three sets above, for the
+reason :data:`CHANNEL_REMOVED` gives."""
+
+STRUCTURE_KINDS = frozenset({CHANNEL_REMOVED, CHAIN_CHANGED})
+"""The kinds a fleet structure change writes. Each stores a JSON object in
+``after`` carrying ``act_id`` (and its conflict lines or notices) — the read
+contract of :func:`events_for_act` and :func:`structure_conflict_lines`."""
 
 HOP_BUDGET = 8
 """ADR 0014 D4's backstop, not its termination mechanism — that is the
@@ -793,3 +809,141 @@ def emit_restore_notice(
                     item_id,
                     event.scope_id,
                 )
+
+
+def _structure_payload(after: str | None) -> dict:
+    """The parsed ``after`` of a structure event; ``{}`` when it is not a JSON object."""
+    try:
+        payload = json.loads(after or "")
+    except (TypeError, ValueError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def events_for_act(record_store: RecordStore, act_id: str) -> list[dict]:
+    """Every structure event written for fleet structure act *act_id*.
+
+    ADR 0014 D8's read contract. Matches only :data:`STRUCTURE_KINDS` rows
+    whose JSON ``after`` has ``act_id`` equal to *act_id*; free text (a notice,
+    a publication quoting an act id) is never read. Ordered by ``created_at``
+    then ``rowid``. Each dict has ``id``, ``change_id``, ``scope_id``, ``kind``,
+    ``created_at`` and ``payload`` (the parsed ``after``).
+    """
+    rows = record_store.list_events_by_act(act_id=act_id, kinds=sorted(STRUCTURE_KINDS))
+    return [
+        {
+            "id": row.id,
+            "change_id": row.change_id,
+            "scope_id": row.scope_id,
+            "kind": row.kind,
+            "created_at": row.created_at,
+            "payload": _structure_payload(row.after),
+        }
+        for row in rows
+    ]
+
+
+def structure_conflict_lines(event_row: dict) -> list[str]:
+    """The conflict lines a structure event stored, as the core wrote them.
+
+    ``payload["conflict_lines"]`` for ``chain_changed``, ``payload["notices"]``
+    for ``channel_removed``; ``[]`` for any other kind. Nothing is re-derived
+    from text.
+    """
+    kind = event_row.get("kind")
+    key = {CHAIN_CHANGED: "conflict_lines", CHANNEL_REMOVED: "notices"}.get(kind)
+    if key is None:
+        return []
+    lines = (event_row.get("payload") or {}).get(key)
+    return [line for line in lines if isinstance(line, str)] if isinstance(lines, list) else []
+
+
+# ---------------------------------------------------------------------------
+# ADR 0014 D8: the notice texts (verbatim from the ADR), and the conflicts
+# the engine finds when a chain moves.
+# ---------------------------------------------------------------------------
+
+
+def chain_conflict_line(
+    *, own_id: str, inherited_id: str, inherited_scope: str, scope_id: str, reason: str
+) -> str:
+    """The ``chain_changed`` conflict line for one own directive (ADR 0014 D8 (a))."""
+    return (
+        f"Own directive {own_id} conflicts with newly inherited {inherited_id} "
+        f"({inherited_scope}): {reason}. Where they conflict, the inherited directive "
+        f"governs. {own_id} remains in {scope_id}'s memory until a session bound to "
+        f"{scope_id} revises or retires it."
+    )
+
+
+def channel_removed_notice(*, own_id: str, source_scope: str, scope_id: str) -> str:
+    """The ``channel_removed`` notice for one own directive adopted from the cut source."""
+    return (
+        f"Own directive {own_id} was adopted from {source_scope}'s publication, which "
+        f"{scope_id} no longer reads. It still binds. A session bound to {scope_id} "
+        "decides whether to keep it on its own account."
+    )
+
+
+def find_chain_conflicts(
+    *,
+    scope_id: str,
+    own: Sequence[tuple[str, str]],
+    gained: Sequence[tuple[str, str, str]],
+) -> list[dict]:
+    """Run the 1.17 inherited check on each own directive against each newly inherited one.
+
+    Args:
+        scope_id: The receiving scope.
+        own:      ``(id, text)`` of each of its own directives.
+        gained:   ``(id, scope label, text)`` of each directive it newly inherits.
+
+    Returns one ``{"own_id", "inherited_id", "line"}`` per conflict, own
+    directives first-to-last, each against the gained directives in order. The
+    check's stated limits apply: a conflict phrased with no value, polarity or
+    marker is not found.
+    """
+    from strata.scope_manager import inherited_conflict  # lazy: heavy, one-way dependency
+
+    found: list[dict] = []
+    for own_id, own_text in own:
+        for inherited_id, inherited_scope, inherited_text in gained:
+            reason = inherited_conflict(own_text, inherited_text)
+            if reason is None:
+                continue
+            found.append(
+                {
+                    "own_id": own_id,
+                    "inherited_id": inherited_id,
+                    "line": chain_conflict_line(
+                        own_id=own_id,
+                        inherited_id=inherited_id,
+                        inherited_scope=inherited_scope,
+                        scope_id=scope_id,
+                        reason=reason,
+                    ),
+                }
+            )
+    return found
+
+
+def structure_conflicts(event) -> list[dict]:  # noqa: ANN001 — any object with kind/after
+    """The structured conflicts a ``chain_changed`` event stored.
+
+    Each is ``{"own_id", "inherited_id", "line"}``.
+
+    Read from ``payload["conflicts"]`` only. ``[]`` for any other kind, or a
+    payload that is not the engine's own JSON. This is what the self-layer
+    annotation reads, so no free text is ever parsed to find a conflict.
+    """
+    if getattr(event, "kind", None) != CHAIN_CHANGED:
+        return []
+    raw = _structure_payload(getattr(event, "after", None)).get("conflicts")
+    if not isinstance(raw, list):
+        return []
+    return [
+        c
+        for c in raw
+        if isinstance(c, dict)
+        and all(isinstance(c.get(k), str) for k in ("own_id", "inherited_id", "line"))
+    ]

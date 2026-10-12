@@ -410,6 +410,7 @@ def test_the_two_kind_sets_partition_the_settled_vocabulary():
         DIRECTIVE_UNSPLICED,
         OPERATOR_DIRECTIVE_CHANGED,
         PUBLICATION_KINDS,
+        STRUCTURE_KINDS,
     )
     from strata.scope_manager import (
         _REFRESH_ADDITION_KINDS,
@@ -420,7 +421,10 @@ def test_the_two_kind_sets_partition_the_settled_vocabulary():
     assert not _REFRESH_ADDITION_KINDS & _REFRESH_REMOVAL_KINDS
     assert _REFRESH_NEUTRAL_KIND == DIRECTIVE_UNSPLICED
     assert _REFRESH_ADDITION_KINDS | _REFRESH_REMOVAL_KINDS | {_REFRESH_NEUTRAL_KIND} == (
-        PUBLICATION_KINDS | DIRECTIVE_KINDS | {OPERATOR_DIRECTIVE_CHANGED, DIRECTIVE_UNSPLICED}
+        PUBLICATION_KINDS
+        | DIRECTIVE_KINDS
+        | STRUCTURE_KINDS
+        | {OPERATOR_DIRECTIVE_CHANGED, DIRECTIVE_UNSPLICED}
     )
 
 

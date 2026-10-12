@@ -436,7 +436,9 @@ _NOT_BUILT = "Structure emission is not built yet; acts are not checked"
 def test_doctor_without_core_says_acts_are_not_checked(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    assert not hasattr(change_events, "events_for_act")
+    # The core now ships `events_for_act`; this test is the no-core state, so it
+    # removes the operation rather than relying on its absence.
+    monkeypatch.delattr(change_events, "events_for_act")
     fleet, store = _world(tmp_path)
     reparented = apply_as_operator(
         fleet,
