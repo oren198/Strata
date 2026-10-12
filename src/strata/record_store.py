@@ -2789,6 +2789,29 @@ class RecordStore:
         ).fetchall()
         return [ChangeEvent(**dict(row)) for row in rows]
 
+    def list_events_by_act(self, *, act_id: str, kinds: Sequence[str]) -> list[ChangeEvent]:
+        """Return the change-event rows of *kinds* whose JSON ``after`` names *act_id*.
+
+        ADR 0014 D8: a structure event stores ``{"act_id": ...}`` as its
+        ``after``. The match is on that structured key alone, never on the
+        text of a notice or a publication.
+        """
+        if not kinds:
+            return []
+        marks = ", ".join("?" for _ in kinds)
+        rows = self._conn.execute(
+            f"""
+            SELECT id, change_id, contribution_id, scope_id, source_scope_id, item_id, kind,
+                   before, after, hop, processed_at, created_at, self_notice, shown_at, claim_id
+            FROM change_events
+            WHERE kind IN ({marks})
+              AND CASE WHEN json_valid(after) THEN json_extract(after, '$.act_id') END = ?
+            ORDER BY created_at ASC, rowid ASC
+            """,
+            [*kinds, act_id],
+        ).fetchall()
+        return [ChangeEvent(**dict(row)) for row in rows]
+
     # ------------------------------------------------------------------
     # Publication acts + judgments (ADR 0007 D1/D2) — the publication
     # channel's own record, distinct from a scope's contribution record.

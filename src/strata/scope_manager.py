@@ -164,8 +164,65 @@ _REFRESH_ADDITION_KINDS: frozenset[str] = frozenset({"published", "amended", "di
 #: genuinely no longer stand — it may be asserting something its inputs no
 #: longer support — so `new_context` stays available.
 _REFRESH_REMOVAL_KINDS: frozenset[str] = frozenset(
-    {"withdrawn", "directive_retired", "directive_superseded", "operator_directive_changed"}
+    {
+        "withdrawn",
+        "directive_retired",
+        "directive_superseded",
+        "operator_directive_changed",
+        "channel_removed",
+        "chain_changed",
+    }
 )
+
+#: ADR 0014 D8: the kinds that record a fleet structure change. Spelled here
+#: rather than imported, as :data:`_REFRESH_NEUTRAL_KIND` is.
+_STRUCTURE_KINDS: frozenset[str] = frozenset({"channel_removed", "chain_changed"})
+
+#: The ops a structure refresh may never apply: the judge is not the scope's
+#: authority over its own directives (ADR 0014 D8 (b), the position gate).
+_STRUCTURE_DROPPED_OPS: tuple[str, ...] = ("supersede", "retire")
+
+
+def _structure_event(events: Sequence[_ChangeEventLike] | None) -> tuple[str, str] | None:
+    """The first structure event among a refresh's pending events: (kind, act id).
+
+    The act id is read from the event's structured JSON ``after`` payload,
+    never from free text; an unreadable payload yields an empty id.
+    """
+    for event in events or ():
+        if event.kind not in _STRUCTURE_KINDS:
+            continue
+        act_id = ""
+        try:
+            payload = json.loads(event.after or "")
+            if isinstance(payload, dict) and isinstance(payload.get("act_id"), str):
+                act_id = payload["act_id"]
+        except (TypeError, ValueError):
+            pass
+        return event.kind, act_id
+    return None
+
+
+def _drop_structure_ops(
+    ops: list[DirectiveOp],
+    structure: tuple[str, str] | None,
+) -> tuple[list[DirectiveOp], list[str]]:
+    """Drop supersede/retire ops on a structure refresh; return (kept ops, notes)."""
+    if structure is None:
+        return ops, []
+    kind, act_id = structure
+    kept: list[DirectiveOp] = []
+    notes: list[str] = []
+    for op in ops:
+        if op.op in _STRUCTURE_DROPPED_OPS:
+            notes.append(
+                f"Dropped {op.op} on {op.id}: a structure change ({kind}, act "
+                f"{act_id}) never retires or supersedes a scope's own directives."
+            )
+        else:
+            kept.append(op)
+    return kept, notes
+
 
 #: ADR 0015 D5's unsplice, spelled here rather than imported: this module does
 #: not depend on :mod:`strata.change_events` (see :class:`_ChangeEventLike`).
@@ -6769,6 +6826,9 @@ class ScopeManager:
                     mode == "input_change_refresh"
                     and _refresh_events_are_all_additions(input_changes)
                 ),
+                structure=(
+                    _structure_event(input_changes) if mode == "input_change_refresh" else None
+                ),
                 change_id=change_id,
                 hop=hop,
                 rendered_item_ids=rendered_item_ids,
@@ -6786,6 +6846,9 @@ class ScopeManager:
                 context_locked=(
                     mode == "input_change_refresh"
                     and _refresh_events_are_all_additions(input_changes)
+                ),
+                structure=(
+                    _structure_event(input_changes) if mode == "input_change_refresh" else None
                 ),
                 change_id=change_id,
                 hop=hop,
@@ -9174,6 +9237,9 @@ class ScopeManager:
                     mode == "input_change_refresh"
                     and _refresh_events_are_all_additions(input_changes)
                 ),
+                structure=(
+                    _structure_event(input_changes) if mode == "input_change_refresh" else None
+                ),
                 change_ids=wave_ids,
                 hop=hop,
                 rendered_item_ids=rendered_item_ids,
@@ -9190,6 +9256,9 @@ class ScopeManager:
                 context_locked=(
                     mode == "input_change_refresh"
                     and _refresh_events_are_all_additions(input_changes)
+                ),
+                structure=(
+                    _structure_event(input_changes) if mode == "input_change_refresh" else None
                 ),
                 change_ids=wave_ids,
                 hop=hop,
@@ -9322,6 +9391,7 @@ class ScopeManager:
         contributions: Mapping[str, Contribution],
         mode: JudgeMode = "ordinary",
         context_locked: bool = False,
+        structure: tuple[str, str] | None = None,
         change_ids: Sequence[str] = (),
         hop: int = 0,
         rendered_item_ids: Sequence[str] = (),
@@ -9417,6 +9487,10 @@ class ScopeManager:
                     f"contribution {op.contribution_id}, which this batch declined. A "
                     "declined contribution amends nothing, so no op belongs to it."
                 )
+
+        # ADR 0014 D8, exactly as on the single path.
+        ops, structure_notes = _drop_structure_ops(ops, structure)
+        protocol_notes = [*protocol_notes, *structure_notes]
 
         # ADR 0014 D2 (amended 2026-09-08, #198 third form), exactly as on the
         # single path: a refresh on additions alone has nothing of this
@@ -9656,6 +9730,7 @@ class ScopeManager:
         new_contribution: Contribution,
         mode: JudgeMode = "ordinary",
         context_locked: bool = False,
+        structure: tuple[str, str] | None = None,
         change_id: str | None = None,
         hop: int = 0,
         rendered_item_ids: Sequence[str] = (),
@@ -9776,6 +9851,11 @@ class ScopeManager:
             if admitting:
                 ops = [op for op in ops if op.op not in to_drop]
                 dropped = [op.describe() for op in admitting]
+
+        # ADR 0014 D8: a structure change never retires or supersedes the
+        # scope's own directives; mechanical, and named in the record.
+        ops, structure_notes = _drop_structure_ops(ops, structure)
+        protocol_notes = [*protocol_notes, *structure_notes]
 
         # ADR 0014 D2 (amended 2026-09-08, #198 third form): on a refresh whose
         # events are all additions the context is locked. A prompt obligation
