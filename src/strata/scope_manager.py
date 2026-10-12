@@ -1234,6 +1234,12 @@ ancestor scope, broadest first):
   names one is dropped as an invalid target, since it is not in this scope's
   CURRENT SUMMARY.
 - They bind this scope: nothing you admit may contradict or override them.
+- An EXCEPTION is not a refinement. A contribution that lets some case skip,
+  waive, defer or do less than an inherited directive requires ("may ...
+  without", "no need to", "can skip", "doesn't need", "except when", "is
+  fine to") EXEMPTS that case and contradicts the directive: DECLINE it, in
+  either classification. A refinement only adds detail or tightens; it never
+  removes a case from the directive's reach.
 - You are shown each ancestor's directives and nothing else of that
   ancestor's. Its own working notes are not yours to see, restate, or write
   into `new_context`.

@@ -393,6 +393,17 @@ _PROMPT_LINE = (
     "not establish from what is rendered here."
 )
 
+# v1.18 #244 step 2: one rule in the ANCESTOR DIRECTIVES list of the system prompt.
+# Stripping it must give back the prompt the pin below was captured from.
+_EXCEPTION_RULE = (
+    "- An EXCEPTION is not a refinement. A contribution that lets some case skip,\n"
+    "  waive, defer or do less than an inherited directive requires (\"may ...\n"
+    "  without\", \"no need to\", \"can skip\", \"doesn't need\", \"except when\", \"is\n"
+    "  fine to\") EXEMPTS that case and contradicts the directive: DECLINE it, in\n"
+    "  either classification. A refinement only adds detail or tightens; it never\n"
+    "  removes a case from the directive's reach.\n"
+)
+
 # sha256 of the judge inputs captured at 3180f1f, before this change, for the
 # same fixed scenarios built below.
 _OLD_SYSTEM_PROMPT_SHA = "d3fe4f63e224c647ec14668271a3ad32cc8e3f9b611938652c9875256da445a4"
@@ -414,12 +425,16 @@ def _sha_json(value: object) -> str:
 def test_system_prompt_is_the_previous_one_plus_exactly_one_sentence() -> None:
     assert _SYSTEM_PROMPT.count(_PROMPT_LINE) == 1
     assert _SYSTEM_PROMPT.endswith(f"\n{_PROMPT_LINE}")
-    assert _sha(_SYSTEM_PROMPT.replace(f"\n{_PROMPT_LINE}", "")) == _OLD_SYSTEM_PROMPT_SHA
+    assert _SYSTEM_PROMPT.count(_EXCEPTION_RULE) == 1
+    stripped = _SYSTEM_PROMPT.replace(_EXCEPTION_RULE, "").replace(f"\n{_PROMPT_LINE}", "")
+    assert _sha(stripped) == _OLD_SYSTEM_PROMPT_SHA
     # The batch prompt is built from the single one, so the sentence lands there too.
     assert _BATCH_SYSTEM_PROMPT.count(_PROMPT_LINE) == 1
-    assert (
-        _sha(_BATCH_SYSTEM_PROMPT.replace(f"\n{_PROMPT_LINE}", "")) == _OLD_BATCH_SYSTEM_PROMPT_SHA
+    assert _BATCH_SYSTEM_PROMPT.count(_EXCEPTION_RULE) == 1
+    batch_stripped = _BATCH_SYSTEM_PROMPT.replace(_EXCEPTION_RULE, "").replace(
+        f"\n{_PROMPT_LINE}", ""
     )
+    assert _sha(batch_stripped) == _OLD_BATCH_SYSTEM_PROMPT_SHA
     # The publication judge has its own prompt and does not share the text.
     assert _PROMPT_LINE not in _PUBLICATION_SYSTEM_PROMPT
 
