@@ -355,7 +355,10 @@ def test_a_batch_declines_only_the_conflicting_member() -> None:
             "Logging pipelines must retain entries for 30 days.",
         )
     )
-    assert mock_client.messages.create.call_count == 1
+    names = [c.kwargs["tools"][0]["name"] for c in mock_client.messages.create.call_args_list]
+    # the judge call, then one directive re-ask for the member that was not declined
+    assert names.count("submit_batch_judgment") == 1
+    assert names.count("classify_directive_relation") == 1
     decisions = {v.contribution_id: v.decision for v in result.verdicts}
     assert decisions == {first.id: "decline", second.id: "accept_as_directive"}
     assert [op.contribution_id for op in result.directive_ops] == [second.id]

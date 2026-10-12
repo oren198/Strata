@@ -2721,6 +2721,13 @@ class ScopeManagerJudgment(_AmendmentJudgment):
     ``fallback`` is True when nothing was verified and no exception marker
     stood in the way, so the admit stood: the counted fail-open door."""
 
+    directive_relation: dict | None = None
+    """#244 step 3: ``{"contribution_id", "relation", "verdict", "fallback",
+    "inherited_id", "origin", "reason"}`` whenever the directive re-ask fired (see
+    :meth:`ScopeManager.classify_inherited_directive`) — ``None`` otherwise.
+    ``fallback`` is True when the admit rests on an unreadable, unrelated or
+    unverified answer with no relaxation marker in the way: the counted door."""
+
     inherited_holds: list[dict] = Field(default_factory=list)
     """v1.17.1: ``{"contribution_id", "directive_id", "origin", "reason"}`` per
     contribution the inherited-conflict check held (see
@@ -2962,6 +2969,10 @@ class ScopeManagerBatchJudgment(_AmendmentJudgment):
     inherited_relations: list[dict] = Field(default_factory=list)
     """#242: one outcome dict per member the context re-ask fired for (same
     shape as :attr:`ScopeManagerJudgment.inherited_relation`)."""
+
+    directive_relations: list[dict] = Field(default_factory=list)
+    """#244 step 3: one outcome dict per member the directive re-ask fired for (same
+    shape as :attr:`ScopeManagerJudgment.directive_relation`)."""
 
     inherited_holds: list[dict] = Field(default_factory=list)
     """v1.17.1: the inherited-conflict check's holds, one dict per held member
@@ -5300,12 +5311,51 @@ def _value_unit(text: str, match: re.Match[str]) -> str | None:
     return after.group(1).casefold() if after else None
 
 
+#: #244 step 4: duration units in seconds, so "two months" is read against "14 days". A month is
+#: 30 days and a year 365: the comparison needs an order of magnitude, not a calendar.
+_DURATION_SECONDS: dict[str, int] = {
+    "sec": 1,
+    "min": 60,
+    "hou": 3600,
+    "day": 86400,
+    "wee": 604800,
+    "for": 1209600,  # fortnight
+    "mon": 2592000,
+    "yea": 31536000,
+}
+_DURATION_WORD_RE = (
+    r"(?:seconds?|minutes?|mins?|hours?|hrs?|days?|weeks?|fortnights?|months?|years?|yrs?)"
+)
+_DURATION_PREFIX = {
+    "sec": "sec",
+    "min": "min",
+    "hou": "hou",
+    "hrs": "hou",
+    "day": "day",
+    "wee": "wee",
+    "for": "for",
+    "mon": "mon",
+    "yea": "yea",
+    "yrs": "yea",
+}
+
+
+def _duration_key(word: str) -> str | None:
+    return _DURATION_PREFIX.get(word.casefold()[:3])
+
+
 def _bare_child_value(parent_text: str, parent_match: re.Match[str], content: str) -> float | None:
     """The one value in *content* that has the parent value's unit and no comparator
     governing it (#244 fix 1), or ``None`` when there is not exactly one such value.
 
     A value a comparator pattern of any direction captured is not bare: "at least 10
     minutes" under "at most 15 minutes" floors the value, it does not tighten it.
+
+    Step 4 reach: a duration is read in the parent's unit whatever unit it is written in
+    ("two months" against "14 days"; "a fortnight" is 14 days), and against a clock-time
+    parent a bare hour word after until/till/at/by/to ("until ten") is the 24-hour time
+    that falls after noon when the parent's time does: ten is 22:00 under "at or before
+    20:00", and 10:00 under "at or before 09:00".
     """
     from strata.publication import _NUMBER_WORDS  # noqa: PLC0415
 
@@ -5320,27 +5370,54 @@ def _bare_child_value(parent_text: str, parent_match: re.Match[str], content: st
             except ValueError:
                 continue
     word_alt = "|".join(sorted(_NUMBER_WORDS, key=len, reverse=True))
+    values: set[float] = set()
+
+    def _number(raw: str) -> float | None:
+        key = raw.casefold()
+        if key in ("a", "an"):
+            return 1.0
+        raw_number = _NUMBER_WORDS.get(key, raw).replace(",", "")
+        try:
+            return float(raw_number)
+        except ValueError:
+            return None
+
+    parent_duration = _duration_key(unit) if unit else None
     if unit == "":
-        candidates = re.finditer(r"(?<![\d:])(\d{1,2}:\d{2}(?::\d{2})?)(?![\d:])", content)
-        pairs = [(m.group(1), "") for m in candidates]
+        for m in re.finditer(r"(?<![\d:])(\d{1,2}:\d{2}(?::\d{2})?)(?![\d:])", content):
+            values.add(_parse_comparable(m.group(1)))
+        parent_clock = _parse_comparable(_matched_value(parent_match))
+        for m in re.finditer(
+            rf"\b(?:until|till|at|by|to)\s+({word_alt}|\d{{1,2}})\b(?!\s*(?::|{_DURATION_WORD_RE}))",
+            content,
+            re.IGNORECASE,
+        ):
+            hour = _number(m.group(1))
+            if hour is not None and 1 <= hour <= 12:
+                pm = parent_clock >= 12 * 3600 and hour < 12
+                values.add((hour + (12 if pm else 0)) * 3600)
+    elif parent_duration is not None:
+        scale = _DURATION_SECONDS[parent_duration]
+        for m in re.finditer(
+            rf"\b(-?\d[\d,]*(?:\.\d+)?|{word_alt}|an?)\s+({_DURATION_WORD_RE})\b",
+            content,
+            re.IGNORECASE,
+        ):
+            amount, key = _number(m.group(1)), _duration_key(m.group(2))
+            if amount is not None and key is not None:
+                values.add(amount * _DURATION_SECONDS[key] / scale)
     else:
         stem = unit[:3]
-        candidates = re.finditer(
+        for m in re.finditer(
             rf"\b(-?\d[\d,]*(?:\.\d+)?|{word_alt})\s+({re.escape(stem)}[A-Za-z]*)\b",
             content,
             re.IGNORECASE,
-        )
-        pairs = [(m.group(1), m.group(2)) for m in candidates]
-    values: set[float] = set()
-    for raw, _unit in pairs:
-        key = raw.casefold()
-        raw_number = _NUMBER_WORDS.get(key, raw).replace(",", "")
-        try:
-            values.add(_parse_comparable(raw_number))
-        except ValueError:
-            continue
+        ):
+            amount = _number(m.group(1))
+            if amount is not None:
+                values.add(amount)
     values -= governed
-    if len(values) != 1 or (governed and not values):
+    if len(values) != 1:
         return None
     return next(iter(values))
 
@@ -6543,6 +6620,327 @@ def _inherited_relation_note(outcome: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
+# v1.18 (#244 step 3): a child's DIRECTIVE that relaxes an inherited directive
+# ---------------------------------------------------------------------------
+
+CLASSIFY_DIRECTIVE_RELATION_TOOL: dict = {
+    "name": "classify_directive_relation",
+    "description": (
+        "A directive from a session bound to this scope is about to be admitted, and this "
+        "scope inherits directives. Say how the new directive relates to the inherited one "
+        "it is closest to. exempts: it lets some case skip, waive, defer or do less than the "
+        "inherited directive requires. contradicts: it states the opposite of it. refines: it "
+        "adds detail for a case the inherited directive does not cover and removes no case "
+        "from its reach. tightens: it keeps what the inherited directive requires and asks "
+        "for strictly more. unrelated: none of these."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "relation": {
+                "type": "string",
+                "enum": ["contradicts", "exempts", "refines", "tightens", "unrelated"],
+            },
+            "parent_id": {
+                "type": "string",
+                "description": "Required: the id of the inherited directive this relates to.",
+            },
+            "reasoning": {"type": "string", "description": "Brief explanation."},
+            "exempted_case_span": {
+                "type": "string",
+                "description": (
+                    "Required for exempts and contradicts: the words that skip, waive, defer "
+                    "or reverse the inherited requirement, copied VERBATIM from the directive."
+                ),
+            },
+            "uncovered_case_span": {
+                "type": "string",
+                "description": (
+                    "Required for refines: the case the inherited directive does not cover, "
+                    "copied VERBATIM from the directive."
+                ),
+            },
+            "kept_requirement": {
+                "type": "string",
+                "description": (
+                    "Required for refines: the inherited requirement that stays fully in force."
+                ),
+            },
+        },
+        "required": ["relation", "parent_id", "reasoning"],
+    },
+}
+
+_DIRECTIVE_RELATION_SYSTEM_PROMPT = (
+    "You classify ONE new directive against the inherited directives of the scope it is "
+    "being added to. Inherited directives bind this scope; a new directive may add to them "
+    "but never take a case out of their reach.\n"
+    "- exempts: lets some case skip, waive, defer or do less than an inherited directive "
+    "requires ('hotfix builds may be published without the full suite', 'the author's "
+    "sign-off alone is enough', 'vans do not need to be inspected', 'keep the pumps on until "
+    "22:00' under 'off by 20:00'). Judge what the words DO, not what they are called: an "
+    "exception phrased as a plain rule is still an exception.\n"
+    "- contradicts: states the opposite of an inherited directive.\n"
+    "- refines: adds detail for a case the inherited directive does not cover, and removes "
+    "no case from its reach.\n"
+    "- tightens: keeps everything the inherited directive requires and asks for strictly "
+    "more or a stricter value.\n"
+    "- unrelated: about something else.\n"
+    "Copy the span your relation requires verbatim from the directive. Call "
+    "`classify_directive_relation` exactly once."
+)
+
+#: Directive-only additions to the shared marker list. Context may legitimately REPORT a
+#: skipped step in the past tense ("the suite was skipped on 12 May"), so these live
+#: apart from :data:`_NORMATIVE_EXCEPTION_RES`, which #242 also applies; a directive
+#: is a standing rule, so the same words are relaxation wherever they occur.
+_DIRECTIVE_RELAXATION_EXTRA_RES: tuple[re.Pattern[str], ...] = tuple(
+    re.compile(p, re.IGNORECASE)
+    for p in (
+        r"\bskip(?:s|ped|ping)?\b",
+        r"\b(?:is|are)\s+enough\b",
+        r"\bsuffices?\b",
+        r"\bsufficient\b",
+        r"\bno\s+(?:\w+\s+){0,3}?(?:required|needed|necessary)\b",
+        r"\b(?:can|could|may)\b[^.;]{0,40}\bwithout\b",
+        r"\bexcept\b",
+        r"\balone\b",
+        r"\bgo(?:es)?\s+(?:straight|directly)\b",
+        r"\b(?:straight|directly)\s+(?:back|out|away|through)\b",
+        r"\bwith(?:out)?\s+no\s+\w+",
+        r"\bno\s+(?:walk-?round|review|check|inspection|test(?:s|ing)?|qa|approval|"
+        r"sign-?off|audit|verification|validation|confirmation)\b",
+    )
+)
+_NEGATOR_BEFORE_RE = re.compile(
+    r"\b(?:never|not|no|cannot|can['’]?t|mustn['’]?t|must not|without)\b", re.IGNORECASE
+)
+_SELF_NEGATED_STARTS = (
+    "no ",
+    "not ",
+    "don",
+    "doesn",
+    "do not",
+    "does not",
+    "need not",
+    "needn",
+    "nobody",
+    "without",
+    "with no",
+)
+
+
+def _relaxation_marker(content: str, inherited_texts: Sequence[str] = ()) -> str | None:
+    """The first relaxation marker in a directive's text, else ``None``.
+
+    The shared normative list (#242) plus :data:`_DIRECTIVE_RELAXATION_EXTRA_RES`. A word
+    that is itself negated by an earlier "never / not / no" in the same clause ("never
+    skip the review", "no exceptions") tightens the rule instead of relaxing it and is
+    ignored; markers that are negations themselves ("no need", "don't need") are not. A
+    marker the inherited text carries in the same words ("archive volumes MAY be borrowed
+    ...") is the rule's own phrasing restated, not a relaxation, and is ignored too.
+    """
+    own_words = " ".join(inherited_texts).casefold()
+    for pattern in (*_NORMATIVE_EXCEPTION_RES, *_DIRECTIVE_RELAXATION_EXTRA_RES):
+        for match in pattern.finditer(content):
+            found = match.group(0)
+            if found.casefold() in own_words:
+                continue
+            if not found.casefold().startswith(_SELF_NEGATED_STARTS):
+                window = content[max(0, match.start() - 30) : match.start()]
+                clause = re.split(r"[.;:,]", window)[-1]
+                if _NEGATOR_BEFORE_RE.search(clause):
+                    continue
+            return f"relaxation marker '{found}'"
+    return None
+
+
+def _subject_stems(text: str) -> set[str]:
+    """Content-word stems of *text*, three letters and up ("van", "QA"-free), minus the
+    overlap stopwords: the loosened subject test of #244 step 3."""
+    from strata.publication import _CONTENT_OVERLAP_STOPWORDS, _overlap_stem  # noqa: PLC0415
+
+    return {
+        _overlap_stem(word)
+        for word in re.findall(r"[a-z]{3,}", text.casefold())
+        if word not in _CONTENT_OVERLAP_STOPWORDS and word not in _LOOSE_STOPWORDS
+    }
+
+
+def _shares_content_word(a: str, b: str) -> bool:
+    """A shared content word (stem), or a 5-letter shared prefix ("approve"/"approval")."""
+    other = _subject_stems(b)
+    return any(
+        mine in other or any(_shared_prefix(mine, w) >= 5 for w in other)
+        for mine in _subject_stems(a)
+    )
+
+
+#: Words that carry no subject: modals, quantifiers, connectives and time words. Two directives
+#: sharing only these ("must ... every day") are not about the same thing.
+_LOOSE_STOPWORDS = frozenset(
+    {
+        "must", "should", "shall", "will", "would", "could", "never", "always", "every", "each",
+        "only", "also", "other", "when", "with", "that", "this", "these", "those", "from", "have",
+        "been", "being", "before", "after", "until", "than", "then", "into", "onto", "over",
+        "under", "within", "without", "least", "most", "more", "less", "same", "such", "any",
+        "all", "day", "days", "week", "weeks", "time", "times", "per", "are", "and", "the",
+        "for", "not", "can", "may", "its", "their", "they", "them", "who", "has", "had",
+        "was", "were", "but", "out", "one", "two", "our", "you", "your", "his", "her", "off",
+        "run", "get", "use", "set", "put", "new", "old",
+    }
+)  # fmt: skip
+
+#: Opposite states whose reversal is a relaxation on its own ("switched OFF by 20:00" vs
+#: "keeps the pumps ON").
+_LOOSE_POLARITY_PAIRS: tuple[tuple[str, str], ...] = (
+    ("off", "on"),
+    ("closed", "open"),
+    ("stopped", "running"),
+    ("disabled", "enabled"),
+)
+
+
+def _loose_covers(inherited_text: str, content: str) -> bool:
+    """Covered by the strict test, or at least two shared SUBJECT stems (not modals,
+    quantifiers or time words) anywhere: the shared subject may be an object."""
+    if _is_covered_subject(inherited_text, content) and _head_nouns_compatible(
+        inherited_text, content
+    ):
+        return True
+    mine = _subject_stems(inherited_text) - _LOOSE_STOPWORDS
+    other = _subject_stems(content) - _LOOSE_STOPWORDS
+    shared = {m for m in mine if m in other or any(_shared_prefix(m, w) >= 5 for w in other)}
+    return len(shared) >= 2
+
+
+def _loose_polarity(inherited_text: str, content: str) -> bool:
+    parent_words = set(re.findall(r"[a-z]+", inherited_text.casefold()))
+    child_words = set(re.findall(r"[a-z]+", content.casefold()))
+    for one, other in _LOOSE_POLARITY_PAIRS:
+        for kept, flipped in ((one, other), (other, one)):
+            if kept in parent_words and flipped in child_words and kept not in child_words:
+                return True
+    return False
+
+
+def _loose_conflict(content: str, inherited_text: str) -> str | None:
+    """#244 step 4: a conflict signal for a directive whose subject the narrow 1.17 test calls
+    uncovered because the shared subject is the OBJECT of its sentence ("night-shift keeps
+    the fuel dock pumps on until 22:00"). Under the loosened subject test only the strict
+    signals count: a reversed on/off-style state, or a value outside the parent's bound in
+    its own direction."""
+    if not _loose_covers(inherited_text, content):
+        return None
+    if _names_a_different_instance(inherited_text, content):
+        return None
+    if _loose_polarity(inherited_text, content):
+        return "polarity flip"
+    ok, reason = _tighten_value_check(inherited_text, content)
+    if not ok and reason == "not stricter in the same direction":
+        return reason
+    return None
+
+
+def verify_directive_relation(
+    answer: dict | None,
+    content: str,
+    inherited: Sequence[tuple[str, str, str]],
+) -> tuple[str, str, tuple[str, str] | None, bool]:
+    """Engine verification of a ``classify_directive_relation`` answer (#244 step 3).
+
+    Returns ``(verdict, reason, target, fallback)``: *verdict* is ``"decline"`` or
+    ``"admit"``; *target* is the ``(id, origin)`` of the inherited directive the decline
+    names (``None`` on an admit); *fallback* is True when the admit rests on an
+    unreadable, unrelated or unverified answer with no relaxation marker in the way,
+    which callers count (the directive path's door).
+
+    Fails toward the inherited rule:
+
+    - ``exempts`` or ``contradicts`` with a verbatim ``exempted_case_span`` declines;
+    - ``refines`` is admitted only with a verbatim ``uncovered_case_span``, a stated
+      kept requirement, and no relaxation marker; ``tightens`` only if the 1.17.2
+      comparator agrees and no marker is present;
+    - anything else (unrelated, unreadable, a claim that fails its own check) declines
+      when a relaxation marker is present and the text shares a content word with an
+      inherited directive or the answer names one; otherwise the admit stands, counted.
+    """
+    answer = answer if isinstance(answer, dict) else {}
+    relation = answer.get("relation")
+    named = answer.get("parent_id")
+    chosen = next((d for d in inherited if d[0] == named), None)
+    marker = _relaxation_marker(content, [d[2] for d in inherited])
+
+    def _target(default: tuple[str, str, str] | None = None) -> tuple[str, str] | None:
+        pick = chosen or default
+        return (pick[0], pick[1]) if pick is not None else None
+
+    def _best_overlap() -> tuple[str, str, str] | None:
+        return next((d for d in inherited if _shares_content_word(d[2], content)), None)
+
+    failure = "unreadable answer"
+    if relation in ("exempts", "contradicts"):
+        if _verbatim_span(answer, "exempted_case_span", content) is not None:
+            return (
+                "decline",
+                f"{relation}: states an exception to the rule",
+                _target(_best_overlap() or (inherited[0] if inherited else None)),
+                False,
+            )
+        failure = f"{relation} without a verbatim exempted_case_span"
+    elif relation == "refines":
+        kept = answer.get("kept_requirement")
+        if (
+            _verbatim_span(answer, "uncovered_case_span", content) is not None
+            and isinstance(kept, str)
+            and kept.strip()
+            and marker is None
+            and not any(_loose_conflict(content, d[2]) for d in inherited)
+        ):
+            return "admit", "verified refinement", None, False
+        failure = "refines claim not verified"
+    elif relation == "tightens":
+        if (
+            chosen is not None
+            and marker is None
+            and inherited_conflict(content, chosen[2]) is None
+            and _tighten_value_check(chosen[2], content)[0]
+            and not any(_loose_conflict(content, d[2]) for d in inherited)
+        ):
+            return "admit", "verified tightening", None, False
+        failure = "tightens claim not verified"
+    elif relation == "unrelated":
+        failure = "answered unrelated"
+
+    for candidate in inherited:
+        loose = _loose_conflict(content, candidate[2])
+        if loose is not None:
+            return (
+                "decline",
+                f"{failure}; {loose} on an inherited subject",
+                _target(candidate),
+                False,
+            )
+    if marker is not None:
+        covering = chosen if chosen is not None else _best_overlap()
+        if covering is None:
+            covering = next((d for d in inherited if _shares_content_word(d[2], content)), None)
+        if covering is not None:
+            return (
+                "decline",
+                f"{failure}; {marker} on an inherited subject",
+                _target(covering),
+                False,
+            )
+    return "admit", f"{failure}; no relaxation marker on an inherited subject", None, True
+
+
+def _directive_relation_note(outcome: dict) -> str:
+    """The engine reason for a declined directive: #244 step 1's, verbatim."""
+    return _inherited_hold_note(outcome["inherited_id"], outcome["origin"])
+
+
+# ---------------------------------------------------------------------------
 # ScopeManager
 # ---------------------------------------------------------------------------
 
@@ -7594,6 +7992,14 @@ class ScopeManager:
         )
         if acted_on_target is None:
             judgment = self.classify_inherited_context(
+                judgment,
+                scope=scope,
+                contribution=new_contribution,
+                ancestor_directives=ancestor_directives,
+                operator_memory=operator_memory,
+                mode=mode,
+            )
+            judgment = self.classify_inherited_directive(
                 judgment,
                 scope=scope,
                 contribution=new_contribution,
@@ -8999,6 +9405,219 @@ class ScopeManager:
             update["reasoning"] = f"{first.reasoning} {note}"
         return first.model_copy(update=update)
 
+    def _classify_directive_relation(
+        self,
+        *,
+        contribution: Contribution,
+        text: str,
+        covered: Sequence[tuple[str, str, str]],
+    ) -> dict:
+        """#244 step 3: the one targeted re-ask (``classify_directive_relation``) for a
+        directive about to be admitted, and the engine's verification of its answer.
+
+        Returns ``{"contribution_id", "relation", "verdict", "fallback", "inherited_id",
+        "origin", "reason"}``. A failed or unreadable call is the unreadable-answer case,
+        never an error: the verifier's marker scan then decides.
+        """
+        listing = "\n".join(
+            f"- {d_id}: {t[:_CONTEXT_REASK_DIRECTIVE_CHARS]}" for d_id, _origin, t in covered
+        )
+        user_message = (
+            f"INHERITED DIRECTIVES:\n{listing}\n\nNEW DIRECTIVE:\n{text}\n\n"
+            "Call `classify_directive_relation` exactly once."
+        )
+        answer: dict = {}
+        failure: str | None = None
+        try:
+            response = self._messages_create(
+                model=self._model,
+                max_tokens=400,
+                system=[
+                    {
+                        "type": "text",
+                        "text": _DIRECTIVE_RELATION_SYSTEM_PROMPT,
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ],
+                tools=[
+                    {**CLASSIFY_DIRECTIVE_RELATION_TOOL, "cache_control": {"type": "ephemeral"}}
+                ],
+                tool_choice={
+                    "type": "tool",
+                    "name": CLASSIFY_DIRECTIVE_RELATION_TOOL["name"],
+                    "disable_parallel_tool_use": True,
+                },
+                messages=[{"role": "user", "content": user_message}],
+            )
+            block = self._extract_tool_use_block(response)
+            answer = block.input if isinstance(block.input, dict) else {}
+        except Exception as exc:  # noqa: BLE001 — any slip is the unreadable-answer case
+            failure = f"{type(exc).__name__}: {exc}"
+
+        verdict, reason, target, fallback = verify_directive_relation(answer, text, covered)
+        if failure is not None:
+            reason = f"re-ask failed ({failure}); {reason}"
+        shown = target or (covered[0][0], covered[0][1])
+        relation = answer.get("relation")
+        return {
+            "contribution_id": contribution.id,
+            "relation": relation if isinstance(relation, str) else None,
+            "verdict": verdict,
+            "fallback": fallback,
+            "inherited_id": shown[0],
+            "origin": shown[1],
+            "reason": reason,
+        }
+
+    def classify_inherited_directive(
+        self,
+        first: ScopeManagerJudgment,
+        *,
+        scope: Scope,
+        contribution: Contribution,
+        ancestor_directives: Sequence[tuple[str, Sequence[Directive]]] | None,
+        operator_memory: Sequence[tuple[str, Sequence[OperatorItem]]] | None,
+        mode: JudgeMode = "ordinary",
+    ) -> ScopeManagerJudgment:
+        """#244 step 3: a child's DIRECTIVE must not relax an inherited directive.
+
+        Fires only for an ordinary judgment that admits a directive op for a contributor
+        bound to *scope*, when the scope inherits at least one directive and nothing has
+        already ruled on this contribution (a hold, or a #237 rescue that was verified
+        mechanically); otherwise *first* is returned untouched with no call. The trigger
+        is the engine's, with no lexical gate: the misses share no words with the rule.
+        A declined directive keeps nothing: no ops, no context line, the engine's reason.
+        """
+        if (
+            mode != "ordinary"
+            or first.decision == "decline"
+            or first.inherited_holds
+            or first.relation_recheck is not None
+            or first.directive_relation is not None
+            or contribution.contributor.scope_id != scope.id
+        ):
+            return first
+        texts = [
+            op.content or contribution.content
+            for op in first.directive_ops
+            if op.op in _ADMITTING_OPS
+        ]
+        inherited = _inherited_directive_texts(ancestor_directives, operator_memory)
+        if not texts or not inherited:
+            return first
+        outcome: dict | None = None
+        for text in texts:
+            result = self._classify_directive_relation(
+                contribution=contribution,
+                text=text,
+                covered=inherited_for_context(text, inherited),
+            )
+            if outcome is None or result["verdict"] == "decline":
+                outcome = result
+            if result["verdict"] == "decline":
+                break
+        assert outcome is not None  # noqa: S101 — texts is non-empty
+        update: dict = {
+            "directive_relation": outcome,
+            "protocol_notes": [
+                *first.protocol_notes,
+                f"directive relation: {outcome['verdict']}, {outcome['reason']}",
+            ],
+        }
+        if outcome["verdict"] == "decline":
+            update.update(
+                decision="decline",
+                directive_ops=[],
+                new_context=None,
+                new_summary=None,
+                withdraw_published=[],
+                context_sources=[],
+                reasoning=_directive_relation_note(outcome),
+            )
+        return first.model_copy(update=update)
+
+    def _classify_batch_inherited_directive(
+        self,
+        judgment: ScopeManagerBatchJudgment,
+        *,
+        scope: Scope,
+        current_summary: ScopeSummary | None,
+        contributions: Mapping[str, Contribution],
+        mode: JudgeMode,
+        ancestor_directives: Sequence[tuple[str, Sequence[Directive]]] | None,
+        operator_memory: Sequence[tuple[str, Sequence[OperatorItem]]] | None,
+    ) -> ScopeManagerBatchJudgment:
+        """:meth:`classify_inherited_directive`, carried to the batch: each accepted
+        member bound to *scope* with an admitting op gets its own re-ask. A declined
+        member loses its ops and its verdict becomes ``decline``; the judge's single
+        context rewrite is then withheld and rebuilt from the previous context plus
+        each remaining context-admitted member's own text, as on the hold path."""
+        if mode != "ordinary":
+            return judgment
+        inherited = _inherited_directive_texts(ancestor_directives, operator_memory)
+        if not inherited:
+            return judgment
+        held = {h["contribution_id"] for h in judgment.inherited_holds}
+        accepted = {v.contribution_id for v in judgment.accepted_verdicts}
+        outcomes: dict[str, dict] = {}
+        for op in judgment.directive_ops:
+            cid = op.contribution_id
+            if (
+                op.op not in _ADMITTING_OPS
+                or cid not in accepted
+                or cid in held
+                or cid in outcomes
+                or contributions[cid].contributor.scope_id != scope.id
+            ):
+                continue
+            member = contributions[cid]
+            text = op.content or member.content
+            outcomes[cid] = self._classify_directive_relation(
+                contribution=member, text=text, covered=inherited_for_context(text, inherited)
+            )
+        if not outcomes:
+            return judgment
+        declined = {cid for cid, o in outcomes.items() if o["verdict"] == "decline"}
+        verdicts = [
+            v.model_copy(
+                update={
+                    "decision": "decline",
+                    "reasoning": _directive_relation_note(outcomes[v.contribution_id]),
+                }
+            )
+            if v.contribution_id in declined
+            else v
+            for v in judgment.verdicts
+        ]
+        update: dict = {"verdicts": verdicts, "directive_relations": list(outcomes.values())}
+        if declined:
+            kept = [op for op in judgment.directive_ops if op.contribution_id not in declined]
+            context = current_summary.context if current_summary is not None else ""
+            for v in verdicts:
+                if v.decision == "accept_as_context":
+                    member = contributions[v.contribution_id]
+                    who = member.contributor.skill or member.contributor.session_id
+                    context = _append_line(
+                        context,
+                        f"[{member.id}] {who} ({member.contributor.scope_id}) "
+                        f"observed: {member.content.strip()}",
+                    )
+            any_accepted = any(v.decision != "decline" for v in verdicts)
+            update["directive_ops"] = kept
+            update["new_context"] = context if any_accepted else None
+            update["new_summary"] = (
+                _apply_batch_amendment(
+                    scope=scope,
+                    current_summary=current_summary,
+                    contributions=contributions,
+                    ops=kept,
+                    new_context=context,
+                )
+                if any_accepted
+                else None
+            )
+        return judgment.model_copy(update=update)
+
     def _classify_batch_inherited_context(
         self,
         judgment: ScopeManagerBatchJudgment,
@@ -9405,6 +10024,15 @@ class ScopeManager:
             parse_generic_decline=_generic_second_slip_batch_decline,
         )
         batch_judgment = self._hold_batch_inherited_conflicts(
+            batch_judgment,
+            scope=scope,
+            current_summary=current_summary,
+            contributions=contributions,
+            mode=mode,
+            ancestor_directives=ancestor_directives,
+            operator_memory=operator_memory,
+        )
+        batch_judgment = self._classify_batch_inherited_directive(
             batch_judgment,
             scope=scope,
             current_summary=current_summary,

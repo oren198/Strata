@@ -391,7 +391,9 @@ def test_no_extra_call_for_a_decline_a_directive_admit_or_no_inherited_directive
         (FIRST_CONTEXT, None),
     ):
         judgment, client = _judge(EXCEPTION_HABITUAL, None, first=first, ancestors=ancestors)
-        assert client.messages.create.call_count == 1
+        # A directive admit gets #244's own re-ask, never #242's context one.
+        names = [c.kwargs["tools"][0]["name"] for c in client.messages.create.call_args_list]
+        assert "classify_inherited_relation" not in names
         assert judgment.inherited_relation is None
 
 
