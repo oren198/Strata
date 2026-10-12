@@ -47,7 +47,7 @@ from .test_scope_manager import (
     _fake_response,
 )
 
-_JUDGE_BUILDER_SHA256 = "b703d4582bfd827cf8ba2a9ca6e90a8279ee771d24034b47be771a66d70c7a7e"
+_JUDGE_BUILDER_SHA256 = "ee9320c0685518f5f1794633c5100bad06bb2b5562a0cb176150078b84e5c7cb"
 
 _FLEET = """\
 strata:

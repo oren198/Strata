@@ -6,6 +6,11 @@ The corpus and its "before" render are captured once, at 4523634, in
 tests/_judge_prompt_corpus.py and tests/fixtures/judge_prompts_v1150/ — this test
 re-renders the SAME corpus now and diffs, so a change here can only mean the render
 itself moved, never a re-baselined expectation (the #205 mistake in a new shape).
+
+One deliberate exception, v1.18 #244 step 2: a scope that inherits directives now gets the
+exception rule after its ANCESTOR DIRECTIVES blocks, so the two goldens that carry ancestors
+(`ancestor_directives`, `batch_of_3`) were regenerated for that rule and nothing else; the
+other four, which have no ancestors, are untouched.
 """
 
 from __future__ import annotations

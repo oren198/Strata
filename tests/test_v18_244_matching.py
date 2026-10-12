@@ -743,3 +743,96 @@ def test_an_additive_tightening_of_a_narrower_subject_is_not_a_narrowing() -> No
         inherited_conflict("For payments-service deploys the change ticket may be skipped.", parent)
         is not None
     )
+
+
+# ---------------------------------------------------------------------------
+# Step 2 placement and the j1-050 attribution path
+# ---------------------------------------------------------------------------
+
+
+def test_the_exception_rule_rides_the_ancestor_block_not_the_system_prompt() -> None:
+    from strata.scope_manager import _EXCEPTION_RULE_TEXT, _SYSTEM_PROMPT  # noqa: PLC0415
+
+    assert "An EXCEPTION is not a refinement" not in _SYSTEM_PROMPT
+    client = MagicMock()
+    client.messages.create.side_effect = [_fake_response(_ADMIT), _fake_response({})]
+    ScopeManager(client=client).judge(
+        scope=_SCOPE,
+        stratum=_STRATUM,
+        current_summary=_SUMMARY,
+        recent_contributions=[],
+        new_contribution=_CONTRIBUTION,
+        ancestor_directives=_ANCESTORS,
+    )
+    message = client.messages.create.call_args_list[0].kwargs["messages"][0]["content"]
+    assert _EXCEPTION_RULE_TEXT in message
+    assert message.index("ANCESTOR DIRECTIVES") < message.index(_EXCEPTION_RULE_TEXT)
+
+    bare = MagicMock()
+    bare.messages.create.side_effect = [_fake_response(_ADMIT)]
+    ScopeManager(client=bare).judge(
+        scope=_SCOPE,
+        stratum=_STRATUM,
+        current_summary=_SUMMARY,
+        recent_contributions=[],
+        new_contribution=_CONTRIBUTION,
+    )
+    assert (
+        _EXCEPTION_RULE_TEXT not in bare.messages.create.call_args.kwargs["messages"][0]["content"]
+    )
+
+
+def test_an_attribution_phrase_span_is_grounded_by_the_whole_contributions_subject() -> None:
+    from strata.scope_manager import (  # noqa: PLC0415
+        AttributionFleetContext,
+        verify_attribution_ground,
+    )
+
+    ref = "All deploys require a rollback plan documented in the deploy ticket."
+    content = (
+        "Per platform-eng's own directive (already binding on this chain), all deploys require "
+        "a documented rollback plan -- adding a local directive to actually enforce it here: "
+        "'Deploy tickets must include a filled-out rollback-plan section before merge is allowed.'"
+    )
+    fleet = AttributionFleetContext(
+        all_scopes=[("s_platform_eng", "platform-eng"), ("s_deploy_tooling", "deploy-tooling")],
+        non_entitled_scopes=[],
+        contributor_scope_id="s_deploy_tooling",
+        contributor_scope_name="deploy-tooling",
+        contributor_skill="engineer",
+    )
+    answer = {
+        "ground_kind": "directive_or_publication",
+        "ref_id": "c-pe-102",
+        "span": "Per platform-eng's own directive",
+        "other_grounds_clear": True,
+        "new_context": "ctx",
+    }
+    ok, why, _ctx = verify_attribution_ground(
+        answer,
+        content,
+        {"c-pe-102": ref},
+        fleet,
+        "",
+        None,
+        frozenset({"platform", "eng", "platform-eng"}),
+        frozenset({"c-pe-102"}),
+    )
+    assert ok, why
+    # without the directive marking, the span alone still decides
+    ok, why, _ctx = verify_attribution_ground(
+        answer, content, {"c-pe-102": ref}, fleet, "", None, frozenset({"platform", "eng"})
+    )
+    assert not ok and "no shared content" in why
+    # a contribution that shares nothing with the cited rule is not grounded by it
+    ok, why, _ctx = verify_attribution_ground(
+        answer,
+        "Per platform-eng's own directive, the cafeteria opens at 08:00 on weekdays.",
+        {"c-pe-102": ref},
+        fleet,
+        "",
+        None,
+        frozenset({"platform", "eng", "platform-eng"}),
+        frozenset({"c-pe-102"}),
+    )
+    assert not ok

@@ -1291,12 +1291,6 @@ ancestor scope, broadest first):
   names one is dropped as an invalid target, since it is not in this scope's
   CURRENT SUMMARY.
 - They bind this scope: nothing you admit may contradict or override them.
-- An EXCEPTION is not a refinement. A contribution that lets some case skip,
-  waive, defer or do less than an inherited directive requires ("may ...
-  without", "no need to", "can skip", "doesn't need", "except when", "is
-  fine to") EXEMPTS that case and contradicts the directive: DECLINE it, in
-  either classification. A refinement only adds detail or tightens; it never
-  removes a case from the directive's reach.
 - You are shown each ancestor's directives and nothing else of that
   ancestor's. Its own working notes are not yours to see, restate, or write
   into `new_context`.
@@ -3307,6 +3301,18 @@ def _render_entitlement(entitlement: EntitlementView) -> str:
     )
 
 
+#: #244 step 2, placed with the rule it qualifies: it is in the user message after the ANCESTOR
+#: DIRECTIVES blocks, so it reaches only scopes that inherit directives and leaves every other
+#: judgment's input (and the system prompt) as it was.
+_EXCEPTION_RULE_TEXT = (
+    "An EXCEPTION is not a refinement. A contribution that lets some case skip, waive, defer "
+    'or do less than an inherited directive requires ("may ... without", "no need to", "can '
+    'skip", "doesn\'t need", "except when", "is fine to") EXEMPTS that case and contradicts '
+    "the directive: DECLINE it, in either classification. A refinement only adds detail or "
+    "tightens; it never removes a case from the directive's reach.\n\n"
+)
+
+
 def _render_directives_only(directives: Sequence[Directive]) -> str:
     """Render an ancestor's directives, without its context (ADR 0013 D1, #187).
 
@@ -4118,6 +4124,8 @@ def _build_judge_preamble(
         # so is noise in every descendant's prompt, forever.
         if directives
     )
+    if ancestor_block:
+        ancestor_block += _EXCEPTION_RULE_TEXT
 
     entitlement_block = ""
     if entitlement is not None:
@@ -4866,6 +4874,22 @@ def _partial_grounding_problem(span: str, content: str) -> str | None:
     return None
 
 
+def _shares_subject_words(
+    content: str, ref_text: str, exclude_words: Collection[str], *, minimum: int
+) -> bool:
+    """At least *minimum* content-word stems of *ref_text* occur in *content*, scope words
+    excluded. Coverage of a long contribution cannot be required (the attribution is most of
+    its words); what is required is that the cited rule's own subject is in it."""
+    from strata.publication import _overlap_stem, _overlap_words  # noqa: PLC0415
+
+    excluded = {_overlap_stem(w.casefold()) for w in exclude_words} | {
+        w.casefold() for w in exclude_words
+    }
+    ref = _overlap_words(ref_text) - excluded
+    mine = _overlap_words(content) - excluded
+    return len(ref & mine) >= minimum
+
+
 def verify_attribution_ground(
     answer: dict,
     content: str,
@@ -4874,6 +4898,7 @@ def verify_attribution_ground(
     previous_context: str = "",
     ref_source_scope_words: Mapping[str, frozenset[str]] | None = None,
     ancestor_scope_words: frozenset[str] = frozenset(),
+    directive_ref_ids: frozenset[str] = frozenset(),
 ) -> tuple[bool, str, str | None]:
     """The mechanical verifier, pure and judge-free: given the re-ask's own
     raw answer (``answer`` — the ``recheck_attribution`` tool's parsed
@@ -4973,7 +4998,19 @@ def verify_attribution_ground(
         exclude_words = set(ancestor_scope_words)
         if ref_source_scope_words is not None:
             exclude_words |= ref_source_scope_words.get(ref_id, frozenset())
-        if not content_overlap_required(span, ref_text, exclude_words=exclude_words):  # type: ignore[arg-type]
+        # #244 (j1-050): the model's span for an attribution is often just the attribution
+        # phrase ("Per platform-eng's own directive"), which shares nothing with the directive
+        # once scope words are excluded. For a rendered directive the whole contribution is
+        # checked instead; the span must still be verbatim and the ref visible, and every
+        # check below still runs on the span.
+        if not content_overlap_required(
+            span,  # type: ignore[arg-type]
+            ref_text,
+            exclude_words=exclude_words,
+        ) and not (
+            ref_id in directive_ref_ids
+            and _shares_subject_words(content, ref_text, exclude_words, minimum=3)
+        ):
             return False, "declined (no shared content with the referenced item)", None
         # #219's gate, reused, round 2 (architect review of 10327f6's bridge
         # replay): split into a VALUE check (numbers/ids/quotes — a strict
@@ -9473,6 +9510,7 @@ class ScopeManager:
             previous_context,
             ref_source_scope_words,
             ancestor_scope_words,
+            frozenset(rid for rid, origin in ref_origins.items() if "directive" in origin),
         )
         ground_kind = answer.get("ground_kind")
         other_grounds_clear = answer.get("other_grounds_clear")
