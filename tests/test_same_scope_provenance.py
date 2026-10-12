@@ -397,9 +397,9 @@ _PROMPT_LINE = (
 # Stripping it must give back the prompt the pin below was captured from.
 _EXCEPTION_RULE = (
     "- An EXCEPTION is not a refinement. A contribution that lets some case skip,\n"
-    "  waive, defer or do less than an inherited directive requires (\"may ...\n"
-    "  without\", \"no need to\", \"can skip\", \"doesn't need\", \"except when\", \"is\n"
-    "  fine to\") EXEMPTS that case and contradicts the directive: DECLINE it, in\n"
+    '  waive, defer or do less than an inherited directive requires ("may ...\n'
+    '  without", "no need to", "can skip", "doesn\'t need", "except when", "is\n'
+    '  fine to") EXEMPTS that case and contradicts the directive: DECLINE it, in\n'
     "  either classification. A refinement only adds detail or tightens; it never\n"
     "  removes a case from the directive's reach.\n"
 )
