@@ -130,13 +130,10 @@ description. Apply and Reject act as the operator. A request cannot name a
 scope to apply as. A change a scope already owned was applied when it was
 proposed and does not appear here.
 
-Removing a reference edge, removing a scope, or re-parenting prints the
-limit of what Strata does not yet re-check, until structure emission is
-part of the engine. Below the pending list, each applied act is shown
-read-only. Its events and conflict lines are the ones
-`events_for_act` and `structure_conflict_lines` report. While those
-operations are absent, the lists are empty. Nothing on this tab is judged,
-and nothing here emits a change event. The operator re-runs emission with
+Below the pending list, each applied act is shown read-only. Its events
+and conflict lines are the ones `events_for_act` and
+`structure_conflict_lines` report. Nothing on this tab is judged, and
+nothing here emits a change event. The operator re-runs emission with
 `strata fleet reemit`.
 
 The perspective view ("View as") shows the `annotation` the engine put on

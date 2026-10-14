@@ -10,9 +10,7 @@ from strata.fleet_config import FleetConfig
 from tests.test_fleet_changes import _world
 
 
-def test_cli_pending_flags_and_stated_limits(tmp_path: Path, capsys, monkeypatch) -> None:
-    # The stated-limit lines are the no-core state; the core now emits instead.
-    monkeypatch.delattr("strata.change_events.emit_structure_change")
+def test_cli_pending_flags_and_apply(tmp_path: Path, capsys) -> None:
     fleet, store = _world(tmp_path)
     pending = propose(
         fleet,
@@ -34,22 +32,16 @@ def test_cli_pending_flags_and_stated_limits(tmp_path: Path, capsys, monkeypatch
 
     assert main([*prefix, "apply", pending.proposal_id]) == 0
     applied_out = capsys.readouterr().out
-    assert "g_a1 now inherits from g_root → g_b" in applied_out
-    assert "not re-checked against the new inherited rules automatically (not built yet)" in (
-        applied_out
-    )
+    assert "applied" in applied_out
+    assert "not built yet" not in applied_out
     assert FleetConfig.load(fleet._path).inter_stratum_parent("g_a1").id == "g_b"
 
     assert main([*prefix, "remove-edge", "g_a", "g_b"]) == 0
     edge_out = capsys.readouterr().out
-    assert (
-        "g_a no longer reads g_b's publication. Items in g_a's memory attributed to g_b "
-        "are not re-checked automatically (not built yet)."
-    ) in edge_out
+    assert "not built yet" not in edge_out
+    assert FleetConfig.load(fleet._path).references_from("g_a") == []
 
     assert main([*prefix, "remove-scope", "g_a1"]) == 0
     remove_out = capsys.readouterr().out
-    assert "remove_edge already gave notice" in remove_out
-    assert "g_a1's memory is kept." in remove_out
-    assert "not re-checked automatically (not built yet)" in remove_out
+    assert "not built yet" not in remove_out
     assert FleetConfig.load(fleet._path).get_scope("g_a1") is None

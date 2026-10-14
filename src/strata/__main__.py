@@ -1246,11 +1246,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     10. Refresh queue depth and oldest pending event (ADR 0014 D6, pin 4) —
         soft, purely informational: an unprocessed ``change_events`` row is
         an input change awaiting its refresh, never a judge outage.
-    11. Structure emission (ADR 0014 D8) — soft. While
-        ``change_events.events_for_act`` is absent, one line: structure
-        emission is not built yet and acts are not checked. When it exists,
-        lists every ``remove_edge`` or ``reparent`` act that function
-        returns no rows for.
+    11. Structure emission (ADR 0014 D8) — soft. Lists every ``remove_edge``
+        or ``reparent`` act for which ``unemitted_receivers`` is not ``[]``.
     """
     from strata.bootstrap import load_fleet_config
     from strata.fleet_config import FleetConfigError
@@ -5372,19 +5369,10 @@ def cmd_freshness_evaluator(args: argparse.Namespace) -> int:
 
 
 def _check_structure_emission(paths: object) -> Check:
-    """Report structure acts the core has not emitted for yet.
+    """Report ``remove_edge`` and ``reparent`` acts that still owe a receiver.
 
-    While ``events_for_act`` is absent, one line and no act is inspected.
+    An act is emitted when ``unemitted_receivers`` returns ``[]``.
     """
-    import strata.change_events as change_events
-
-    if not hasattr(change_events, "events_for_act"):
-        return Check(
-            name="Structure emission",
-            kind="soft",
-            passed=True,
-            message="Structure emission is not built yet; acts are not checked",
-        )
     if paths is None:
         return Check(
             name="Structure emission",

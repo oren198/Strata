@@ -24,7 +24,6 @@ from strata.fleet_changes import (
     apply_as_operator,
     approve,
     change_flags,
-    limit_notices,
     owner_scope,
     parse_change,
     propose,
@@ -255,11 +254,7 @@ def test_removing_ones_own_scope_is_owned_above(tmp_path: Path) -> None:
         approve(fleet, store, result.proposal_id, approver=Actor("g_a1"))
 
 
-def test_reparent_limit_and_binding_flag_round_trip(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # The stated-limit lines belong to the no-core state; the core now emits instead.
-    monkeypatch.delattr(fleet_changes.change_events, "emit_structure_change")
+def test_reparent_limit_and_binding_flag_round_trip(tmp_path: Path) -> None:
     fleet, store = _world(tmp_path)
     change = _change("reparent", scope_id="g_a1", new_parent_id="g_b")
     pending = propose(fleet, store, change, proposer=Actor("g_a1"))
@@ -269,11 +264,7 @@ def test_reparent_limit_and_binding_flag_round_trip(
     with pytest.raises(FleetChangeError, match="cannot approve"):
         approve(fleet, store, pending.proposal_id, approver=Actor("g_a1"))
     applied = approve(fleet, store, pending.proposal_id, approver=Actor("g_root"))
-    assert applied.notices == (
-        "g_a1 now inherits from g_root → g_b. Its own directives are not re-checked "
-        "against the new inherited rules automatically (not built yet). Review them; "
-        "the 1.17 inherited check applies to new writes only.",
-    )
+    assert applied.notices == ()
     assert fleet.inter_stratum_parent("g_a1").id == "g_b"
     act = store.get_fleet_structure_act(applied.act_id)
     assert act.changes_proposer_binding is True
@@ -285,11 +276,7 @@ def test_reparent_limit_and_binding_flag_round_trip(
     assert act.owner_scope_id == "g_root"
 
 
-def test_reference_edge_notices_and_widen_flag(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # The stated-limit lines belong to the no-core state; the core now emits instead.
-    monkeypatch.delattr(fleet_changes.change_events, "emit_structure_change")
+def test_reference_edge_notices_and_widen_flag(tmp_path: Path) -> None:
     fleet, store = _world(tmp_path)
     added = _change("add_edge", **{"from": "g_a", "to": "g_other"})
     pending = propose(fleet, store, added, proposer=Actor("g_a"))
@@ -310,22 +297,12 @@ def test_reference_edge_notices_and_widen_flag(
     assert "g_other" in act.after_topology["g_a"]["references"]
 
     removed = _change("remove_edge", **{"from": "g_a", "to": "g_b"})
-    assert limit_notices(fleet, removed) == [
-        "g_a no longer reads g_b's publication. Items in g_a's memory attributed to g_b "
-        "are not re-checked automatically (not built yet)."
-    ]
     result = apply_as_operator(fleet, store, removed)
-    assert result.notices[0] == (
-        "g_a no longer reads g_b's publication. Items in g_a's memory attributed to g_b "
-        "are not re-checked automatically (not built yet)."
-    )
+    assert result.notices == ()
+    assert [scope.id for scope in fleet.references_from("g_a")] == ["g_other"]
 
 
-def test_remove_scope_refuses_children_and_edges_and_keeps_memory(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # The stated-limit lines belong to the no-core state; the core now emits instead.
-    monkeypatch.delattr(fleet_changes.change_events, "emit_structure_change")
+def test_remove_scope_refuses_children_and_edges_and_keeps_memory(tmp_path: Path) -> None:
     fleet, store = _world(tmp_path)
     summaries = tmp_path / "summaries"
     summaries.mkdir()
@@ -351,10 +328,7 @@ def test_remove_scope_refuses_children_and_edges_and_keeps_memory(
     assert edges.value.kind == "scope_has_edges"
 
     result = apply_as_operator(fleet, store, _change("remove_scope", scope_id="g_a1"))
-    assert result.notices == (
-        "g_a1's memory is kept. remove_edge already gave notice to any reader; "
-        "attributed items are not re-checked automatically (not built yet).",
-    )
+    assert result.notices == ()
     assert fleet.get_scope("g_a1") is None
     assert (summaries / "g_a1.md").read_text(encoding="utf-8") == "scope memory stays"
     assert store.get_contribution(contribution.id).content == "kept"
