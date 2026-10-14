@@ -636,6 +636,10 @@ def _apply_exception_check(
         relay_origin_scope_id=relay_origin_scope_id,
         relay_label=relay_label,
     )
+    from strata.scope_manager import PublicationExceptionCheck  # noqa: PLC0415
+
+    if not isinstance(check, PublicationExceptionCheck):  # a stand-in scope-manager
+        return None, judgment
     if check.decision == "refuse":
         reasoning = f"{judgment.reasoning} (the judge accepted) {check.note}"
         return check, judgment.model_copy(update={"decision": "decline", "reasoning": reasoning})
