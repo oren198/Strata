@@ -89,7 +89,7 @@ import logging
 import os
 import re
 from collections.abc import Collection, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
@@ -161,6 +161,10 @@ class PublicationOutcome:
     decision: Literal["accept", "decline"]
     reasoning: str
     artifact_updated: bool
+    exception_check: dict | None = None
+    """#243: ``{"decision", "label", "fallback", "inherited_relation", "note"}`` when the
+    inherited-exception check ran for this act; ``None`` when it did not (no inherited
+    directive, or a withdraw). ``fallback`` is the counted fail-open path."""
 
 
 @dataclass(frozen=True)
@@ -551,6 +555,113 @@ def _bootstrap_proposer(scope_id: str) -> ContributorRef:
 # ---------------------------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class _BootstrapVerdict:
+    """The two fields :func:`_apply_exception_check` needs from a judgment, for the bootstrap
+    path where there is one batch verdict rather than a per-item PublicationJudgment."""
+
+    decision: str
+    reasoning: str
+
+    def model_copy(self, *, update: dict) -> _BootstrapVerdict:
+        return replace(self, **update)
+
+
+def _exception_check_dict(check) -> dict | None:  # noqa: ANN001
+    if check is None:
+        return None
+    return {
+        "decision": check.decision,
+        "label": check.label,
+        "fallback": check.fallback,
+        "inherited_relation": check.inherited_relation,
+        "note": check.note,
+    }
+
+
+def _origin_label(
+    relay_source_scope_id: str | None,
+    relay_source_item_id: str | None,
+    *,
+    summary_store: SummaryStore,
+) -> str | None:
+    """The departure label the relayed source item carries, verbatim, if any."""
+    if relay_source_scope_id is None or relay_source_item_id is None:
+        return None
+    from strata.scope_manager import split_departure_label  # noqa: PLC0415
+
+    for item in read_publication(
+        relay_source_scope_id, summaries_dir=str(summary_store.summaries_dir)
+    ):
+        if item.id == relay_source_item_id:
+            return split_departure_label(item.content)[0]
+    return None
+
+
+def _apply_exception_check(
+    judgment,  # noqa: ANN001 — a PublicationJudgment
+    *,
+    scope,  # noqa: ANN001
+    content: str,
+    kind: str,
+    scope_id: str,
+    fleet: FleetConfig,
+    summary_store: SummaryStore,
+    scope_manager: ScopeManager,
+    operator_memory,  # noqa: ANN001
+    relay_origin_scope_id: str | None,
+    relay_label: str | None,
+):  # noqa: ANN202
+    """Run #243's check on an accepted item. Returns ``(check or None, judgment)``: the judgment
+    is unchanged on accept (plus the label marker and the relay's conflict note) and becomes a
+    ``decline`` carrying the engine's note when refused, so the record shows the judge's own
+    verdict beside the engine's refusal."""
+    from strata.perspective import ancestor_directives as _ancestors  # noqa: PLC0415
+    from strata.scope_manager import departure_marker  # noqa: PLC0415
+
+    inherited = _ancestors(scope_id, fleet=fleet, summary_store=summary_store)
+    if not any(directives for _scope, directives in inherited) and not any(
+        item.kind == "directive" for _scope, items in (operator_memory or ()) for item in items
+    ):
+        return None, judgment
+    # A security check: called directly on the scope-manager, never behind a feature test.
+    # A scope-manager (or wrapper) that does not provide it raises here, and the item is
+    # not published; there is no skip, noted or silent.
+    check = scope_manager.check_publication_exception(
+        scope=scope,
+        content=content,
+        kind=kind,  # type: ignore[arg-type]
+        ancestor_directives=inherited,
+        operator_memory=operator_memory,
+        relay_origin_scope_id=relay_origin_scope_id,
+        relay_label=relay_label,
+    )
+    from strata.scope_manager import PublicationExceptionCheck  # noqa: PLC0415
+
+    if not isinstance(check, PublicationExceptionCheck):
+        raise TypeError(
+            "check_publication_exception returned "
+            f"{type(check).__name__}, not a PublicationExceptionCheck; the item is not published."
+        )
+    if check.decision == "refuse":
+        reasoning = f"{judgment.reasoning} (the judge accepted) {check.note}"
+        return check, judgment.model_copy(update={"decision": "decline", "reasoning": reasoning})
+    extras: list[str] = []
+    if check.label is not None:
+        from strata.scope_manager import _DEPARTURE_LABEL_RE  # noqa: PLC0415
+
+        match = _DEPARTURE_LABEL_RE.match(check.label)
+        if match:
+            extras.append(departure_marker(match.group(1), match.group(2)))
+    if check.conflict_note:
+        extras.append(check.conflict_note)
+    if extras:
+        judgment = judgment.model_copy(
+            update={"reasoning": f"{judgment.reasoning} {' '.join(extras)}"}
+        )
+    return check, judgment
+
+
 def propose_publish(
     scope_id: str,
     content: str,
@@ -752,6 +863,38 @@ def propose_publish(
             )
             raise
 
+        # #243: a scope may not publish what it may not hold. Only an item the judge
+        # accepted, and only for a scope that inherits a directive; no extra call otherwise.
+        exception_check = None
+        published_content = content
+        if judgment.decision == "accept":
+            try:
+                exception_check, judgment = _apply_exception_check(
+                    judgment,
+                    scope=scope,
+                    content=content,
+                    kind=kind,
+                    scope_id=scope_id,
+                    fleet=fleet,
+                    summary_store=summary_store,
+                    scope_manager=scope_manager,
+                    operator_memory=operator_memory,
+                    relay_origin_scope_id=origin_scope_id,
+                    relay_label=_origin_label(
+                        relay_source_scope_id, relay_source_item_id, summary_store=summary_store
+                    ),
+                )
+            except Exception as exc:
+                record_store.record_publication_judgment_attempt(
+                    act_id=act.id,
+                    error_class=type(exc).__name__,
+                    message=str(exc),
+                    outcome=JUDGE_FAILED,
+                )
+                raise
+            if exception_check is not None and exception_check.decision == "accept":
+                published_content = exception_check.content
+
         record_store.record_publication_judgment(
             act_id=act.id,
             decision=judgment.decision,
@@ -764,7 +907,7 @@ def propose_publish(
             item = PublishedItem(
                 id=act.id,
                 kind=kind,
-                content=content,
+                content=published_content,
                 subject=subject,
                 anchors=tagged_anchors,
                 published_at=act.created_at,
@@ -790,7 +933,7 @@ def propose_publish(
                 item=item.id,
                 kind="published",
                 source_scope_id=scope_id,
-                after=content,
+                after=published_content,
             )
 
         return PublicationOutcome(
@@ -799,6 +942,7 @@ def propose_publish(
             decision=judgment.decision,
             reasoning=judgment.reasoning,
             artifact_updated=artifact_updated,
+            exception_check=_exception_check_dict(exception_check),
         )
 
 
@@ -1150,14 +1294,30 @@ def _resolve_claim_correction(
     )
 
 
-def _published_item_from_act(act: PublicationAct) -> PublishedItem:
+def _published_item_from_act(
+    act: PublicationAct, record_store: RecordStore | None = None
+) -> PublishedItem:
     """Rebuild a :class:`PublishedItem` from the ORIGINAL ``publish`` act it came
     from — this is what makes a restore's reinsertion byte-identical: the same
-    stored content, never a copy that could drift."""
+    stored content, never a copy that could drift.
+
+    #243: the act records the text as PROPOSED, and the engine's departure label was
+    prefixed to what was published. With *record_store*, the label the original judgment
+    recorded is re-applied, so a restored item never comes back bare."""
+    content = act.content or ""
+    if record_store is not None:
+        from strata.scope_manager import (  # noqa: PLC0415
+            departure_label_from_reasoning,
+            with_departure_label,
+        )
+
+        judgment = record_store.get_publication_judgment(act.id)
+        label = departure_label_from_reasoning(judgment.reasoning if judgment else None)
+        content = with_departure_label(content, label)
     return PublishedItem(
         id=act.id,
         kind=act.kind,  # type: ignore[arg-type]
-        content=act.content or "",
+        content=content,
         subject=act.subject,
         anchors=act.anchors or [],
         published_at=act.created_at,
@@ -1284,7 +1444,7 @@ def _restore_relay_cascade(
             continue
         _restore_item_in_scope(
             relay_scope_id,
-            _published_item_from_act(original_relay_act),
+            _published_item_from_act(original_relay_act, record_store),
             withdraw_act_id=withdraw_act.id,
             fleet=fleet,
             record_store=record_store,
@@ -1420,7 +1580,7 @@ def propose_restore(
         original_act = record_store.get_publication_act(withdraw_act.withdraws)  # type: ignore[arg-type]
         if original_act is None:
             raise KeyError(f"Original publish act {withdraw_act.withdraws!r} not found.")
-        restore_item = _published_item_from_act(original_act)
+        restore_item = _published_item_from_act(original_act, record_store)
 
         current_summary = summary_store.read(scope_id)
         current_publication = read_publication(
@@ -1466,6 +1626,35 @@ def propose_restore(
             )
             raise
 
+        # #243: a restore re-publishes the original bytes, but inherited directives may have
+        # changed since; the same check runs on the item as it would be published now.
+        exception_check = None
+        if judgment.decision == "accept":
+            try:
+                exception_check, judgment = _apply_exception_check(
+                    judgment,
+                    scope=scope,
+                    content=restore_item.content,
+                    kind=restore_item.kind,
+                    scope_id=scope_id,
+                    fleet=fleet,
+                    summary_store=summary_store,
+                    scope_manager=scope_manager,
+                    operator_memory=operator_memory,
+                    relay_origin_scope_id=restore_item.origin_scope_id,
+                    relay_label=None,
+                )
+            except Exception as exc:
+                record_store.record_publication_judgment_attempt(
+                    act_id=act.id,
+                    error_class=type(exc).__name__,
+                    message=str(exc),
+                    outcome=JUDGE_FAILED,
+                )
+                raise
+            if exception_check is not None and exception_check.decision == "accept":
+                restore_item = replace(restore_item, content=exception_check.content)
+
         record_store.record_publication_judgment(
             act_id=act.id,
             decision=judgment.decision,
@@ -1495,6 +1684,7 @@ def propose_restore(
             decision=judgment.decision,
             reasoning=judgment.reasoning,
             artifact_updated=artifact_updated,
+            exception_check=_exception_check_dict(exception_check),
         )
 
 
@@ -1551,7 +1741,7 @@ def operator_restore(
         original_act = record_store.get_publication_act(withdraw_act.withdraws)  # type: ignore[arg-type]
         if original_act is None:
             raise KeyError(f"Original publish act {withdraw_act.withdraws!r} not found.")
-        restore_item = _published_item_from_act(original_act)
+        restore_item = _published_item_from_act(original_act, record_store)
 
         proposer = ContributorRef(
             scope_id="operator",
@@ -3047,7 +3237,14 @@ def bootstrap_publication(
 
         proposer = _bootstrap_proposer(scope_id)
         recorded: list[PublishedItem] = []
+        refused_notes: list[str] = []
 
+        # #243: the same check, per proposed item; a refused item is dropped with its note.
+        from strata.operator import operator_memory_binding  # noqa: PLC0415
+
+        boot_operator_memory = operator_memory_binding(
+            scope_id, fleet=fleet, summaries_dir=str(summary_store.summaries_dir)
+        )
         binding_ids = _binding_directive_ids(scope_id, fleet=fleet, summary_store=summary_store)
         for candidate in judgment.items:
             tagged_anchors = [
@@ -3074,17 +3271,53 @@ def bootstrap_publication(
                 trigger=None,
                 proposer=proposer,
             )
+            item_content = candidate.content
+            item_reasoning = judgment.reasoning
+            try:
+                boot_check, boot_verdict = _apply_exception_check(
+                    _BootstrapVerdict("accept", judgment.reasoning),
+                    scope=scope,
+                    content=candidate.content,
+                    kind=candidate.kind,
+                    scope_id=scope_id,
+                    fleet=fleet,
+                    summary_store=summary_store,
+                    scope_manager=scope_manager,
+                    operator_memory=boot_operator_memory,
+                    relay_origin_scope_id=None,
+                    relay_label=None,
+                )
+            except Exception as exc:
+                record_store.record_publication_judgment_attempt(
+                    act_id=act.id,
+                    error_class=type(exc).__name__,
+                    message=str(exc),
+                    outcome=JUDGE_FAILED,
+                )
+                raise
+            if boot_check is not None and boot_check.decision == "refuse":
+                record_store.record_publication_judgment(
+                    act_id=act.id,
+                    decision="decline",
+                    judged_by="scope-manager",
+                    reasoning=boot_verdict.reasoning,
+                )
+                refused_notes.append(f"Dropped one proposed item. {boot_check.note}")
+                continue
+            if boot_check is not None:
+                item_content = boot_check.content
+                item_reasoning = boot_verdict.reasoning
             record_store.record_publication_judgment(
                 act_id=act.id,
                 decision="accept",
                 judged_by="scope-manager",
-                reasoning=judgment.reasoning,
+                reasoning=item_reasoning,
             )
             recorded.append(
                 PublishedItem(
                     id=act.id,
                     kind=candidate.kind,
-                    content=candidate.content,
+                    content=item_content,
                     subject=candidate.subject,
                     anchors=tagged_anchors,
                     published_at=act.created_at,
@@ -3112,7 +3345,7 @@ def bootstrap_publication(
         decision: Literal["accept", "decline"] = "accept" if recorded else "decline"
         return BootstrapOutcome(
             decision=decision,
-            reasoning=judgment.reasoning,
+            reasoning=" ".join([judgment.reasoning, *refused_notes]),
             items=recorded,
             trimmed=judgment.trimmed,
         )

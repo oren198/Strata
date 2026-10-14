@@ -3313,6 +3313,16 @@ _EXCEPTION_RULE_TEXT = (
 )
 
 
+def _summary_markers(summary_block: str) -> str:
+    """The publication and bootstrap judges' CURRENT SUMMARY block, with unambiguous markers.
+
+    The summary file begins with a "---" YAML frontmatter line, so a block fenced by "---"
+    rendered as "---\\n---" and read as EMPTY: the judge refused legitimate publications as
+    "not in the current summary". Explicit open and close markers keep the frontmatter
+    inside the block. (The ordinary judgment's renderer is separate and unchanged.)"""
+    return f"CURRENT SUMMARY (between the markers)\n<<<SUMMARY\n{summary_block}\nSUMMARY>>>\n"
+
+
 def _render_directives_only(directives: Sequence[Directive]) -> str:
     """Render an ancestor's directives, without its context (ADR 0013 D1, #187).
 
@@ -6816,7 +6826,9 @@ _SPECIFICITY_ANCHOR_RE = re.compile(
 _PAST_TENSE_RE = re.compile(
     r"\b(?:\w+ed|was|were|had|did|took|left|went|held|made|ran|got|came|found|lost|sent|"
     r"broke|began|saw|gave|put|set|cut|hit|fell|stopped|spent|missed|drifted|shipped|"
-    r"overloaded|destroyed|reached|wasn['’]t|weren['’]t|didn['’]t)\b",
+    r"overloaded|destroyed|reached|wasn['’]t|weren['’]t|didn['’]t|"
+    r"caught|kept|built|wrote|told|paid|chose|threw|knew|grew|drove|rose|woke|froze|"
+    r"stood|understood|met|led|slept|sold|bought|brought|thought|taught|won)\b",
     re.IGNORECASE,
 )
 _DEPARTURE_CUE_RE = re.compile(
@@ -7143,6 +7155,74 @@ def _inherited_relation_note(outcome: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
+# v1.18 (#243): a publication that carries an exception down
+# ---------------------------------------------------------------------------
+
+_DEPARTURE_LABEL_RE = re.compile(r"\ADeparture from (\S+) \(([^)]*)\): ")
+_DEPARTURE_MARKER_RE = re.compile(r"\[Published as a departure from (\S+) \(([^)]*)\)\.\]")
+
+
+def departure_label(directive_id: str, origin: str) -> str:
+    """The engine's prefix for a published departure report (#243, ruling option 2)."""
+    return f"Departure from {directive_id} ({origin}): "
+
+
+def split_departure_label(text: str) -> tuple[str | None, str]:
+    """``(label or None, body)``: the leading departure label, verbatim, and the rest."""
+    match = _DEPARTURE_LABEL_RE.match(text)
+    if match is None:
+        return None, text
+    return match.group(0), text[match.end() :]
+
+
+def departure_marker(directive_id: str, origin: str) -> str:
+    """The structured line written into the publication judgment's reasoning when an item is
+    published with a departure label, so a restore re-applies the same label."""
+    return f"[Published as a departure from {directive_id} ({origin}).]"
+
+
+def departure_label_from_reasoning(reasoning: str | None) -> str | None:
+    """The label :func:`departure_marker` recorded in a judgment's reasoning, if any."""
+    match = _DEPARTURE_MARKER_RE.search(reasoning or "")
+    return departure_label(match.group(1), match.group(2)) if match else None
+
+
+def with_departure_label(text: str, label: str | None) -> str:
+    """*text* with *label* as its prefix. Idempotent: an item that already carries a departure
+    label keeps it (never doubled, never replaced), and no label leaves *text* alone."""
+    if label is None or _DEPARTURE_LABEL_RE.match(text):
+        return text
+    return f"{label}{text}"
+
+
+@dataclass(frozen=True)
+class PublicationExceptionCheck:
+    """The engine's ruling on a publication that was accepted by the judge (#243).
+
+    ``decision`` is ``accept`` or ``refuse``. ``content`` is what to publish: the proposed
+    text, with the departure label prefixed when the item reports a departure (or when a
+    relay carries one). ``note`` is the engine's refusal note, or the relay's separate
+    conflict note on an accept. ``inherited_relation`` is the #242 outcome dict when the
+    re-ask ran; ``fallback`` is True when the admit rests on the counted fail-open path.
+    """
+
+    decision: Literal["accept", "refuse"]
+    content: str
+    note: str | None = None
+    label: str | None = None
+    inherited_relation: dict | None = None
+    fallback: bool = False
+    conflict_note: str | None = None
+
+
+def _publication_refusal_note(directive_id: str, origin: str) -> str:
+    return (
+        f"[Refused: contrary to inherited directive {directive_id} ({origin}). A scope can't "
+        f"publish an exception to a rule it inherits. Publish a specific report instead, or "
+        f"propose the exception to {origin}.]"
+    )
+
+
 # v1.18 (#244 step 3): a child's DIRECTIVE that relaxes an inherited directive
 # ---------------------------------------------------------------------------
 
@@ -10014,6 +10094,127 @@ class ScopeManager:
             update["reasoning"] = f"{first.reasoning} {note}"
         return first.model_copy(update=update)
 
+    def check_publication_exception(
+        self,
+        *,
+        scope: Scope,
+        content: str,
+        kind: Literal["directive", "context"],
+        ancestor_directives: Sequence[tuple[str, Sequence[Directive]]] | None,
+        operator_memory: Sequence[tuple[str, Sequence[OperatorItem]]] | None,
+        relay_origin_scope_id: str | None = None,
+        relay_label: str | None = None,
+    ) -> PublicationExceptionCheck:
+        """#243: a scope may not publish what it may not hold.
+
+        Called for an item the publication judge ACCEPTED (publish or restore) by a scope that
+        inherits at least one directive; without one, nothing is checked and no call is made.
+
+        - a ``directive`` item: :func:`inherited_conflict` against every inherited directive,
+          no judge call; a conflict refuses;
+        - a ``context`` item: #242's re-ask and verifier, unchanged. An exception refuses;
+          a consequence report publishes; a departure report publishes with the engine's
+          label prefixed; the fail-open fallback publishes and is counted.
+        - a relay (*relay_origin_scope_id*): the origin's label is kept verbatim (re-applied
+          from *relay_label* if the relayer dropped it) and never replaced; the relayer's
+          directives get the exception test only (a singular report passes, a general one is
+          refused); a reported act that conflicts with a relayer directive adds a separate
+          note.
+        """
+        inherited = _inherited_directive_texts(ancestor_directives, operator_memory)
+        existing_label, body = split_departure_label(content)
+        if not inherited:
+            return PublicationExceptionCheck("accept", content, label=existing_label)
+
+        if relay_origin_scope_id is None and existing_label is not None:
+            # a label typed by the publisher is never trusted: the engine writes it
+            content = body
+
+        if relay_origin_scope_id is not None:
+            keep = existing_label or relay_label
+            if kind == "directive":
+                refusal = self._directive_item_refusal(body, inherited)
+                if refusal is not None:
+                    return PublicationExceptionCheck("refuse", content, note=refusal)
+            outcome: dict | None = None
+            if kind == "context":
+                outcome = self._classify_publication_text(scope, body, inherited)
+                if outcome["verdict"] in _INHERITED_DECLINES:
+                    return PublicationExceptionCheck(
+                        "refuse",
+                        content,
+                        note=_publication_refusal_note(outcome["inherited_id"], outcome["origin"]),
+                        inherited_relation=outcome,
+                    )
+            conflict = _first_inherited_conflict(body, inherited)
+            conflict_note = (
+                f"The reported act conflicts with {conflict[0]}, which binds {scope.id}."
+                if conflict is not None
+                else None
+            )
+            return PublicationExceptionCheck(
+                "accept",
+                with_departure_label(content, keep),
+                label=keep,
+                inherited_relation=outcome,
+                fallback=bool(outcome and outcome["fallback"]),
+                conflict_note=conflict_note,
+            )
+
+        if kind == "directive":
+            refusal = self._directive_item_refusal(body, inherited)
+            if refusal is not None:
+                return PublicationExceptionCheck("refuse", content, note=refusal)
+            return PublicationExceptionCheck("accept", body)
+
+        outcome = self._classify_publication_text(scope, body, inherited)
+        verdict = outcome["verdict"]
+        if verdict in _INHERITED_DECLINES:
+            return PublicationExceptionCheck(
+                "refuse",
+                content,
+                note=_publication_refusal_note(outcome["inherited_id"], outcome["origin"]),
+                inherited_relation=outcome,
+            )
+        if verdict == "departure_report":
+            label = departure_label(outcome["inherited_id"], outcome["origin"])
+            return PublicationExceptionCheck(
+                "accept",
+                with_departure_label(body, label),
+                label=label,
+                inherited_relation=outcome,
+            )
+        return PublicationExceptionCheck(
+            "accept", body, inherited_relation=outcome, fallback=bool(outcome["fallback"])
+        )
+
+    @staticmethod
+    def _directive_item_refusal(body: str, inherited: Sequence[tuple[str, str, str]]) -> str | None:
+        """The refusal note for a published DIRECTIVE item that changes or relaxes an
+        inherited directive, or ``None``. No judge call: the 1.17 inherited check, then the
+        #244 verifier read with no answer (a relaxation marker on an inherited subject, or a
+        reversed state or out-of-bound value on a shared object subject)."""
+        hit = _first_inherited_conflict(body, inherited)
+        if hit is not None:
+            return _publication_refusal_note(hit[0], hit[1])
+        verdict, _reason, target, _fallback = verify_directive_relation({}, body, inherited)
+        if verdict == "decline" and target is not None:
+            return _publication_refusal_note(target[0], target[1])
+        return None
+
+    def _classify_publication_text(
+        self, scope: Scope, text: str, inherited: Sequence[tuple[str, str, str]]
+    ) -> dict:
+        """The #242 re-ask for a published context item's text (a stand-in contribution)."""
+        from types import SimpleNamespace  # noqa: PLC0415
+
+        stand_in = SimpleNamespace(id="publication-item", content=text)
+        return self._classify_inherited_relation(
+            scope=scope,
+            contribution=stand_in,  # type: ignore[arg-type]
+            covered=inherited_for_context(text, inherited),
+        )
+
     def _classify_directive_relation(
         self,
         *,
@@ -11445,10 +11646,7 @@ class ScopeManager:
             f"{operator_block}"
             f"{publication_block}"
             f"{relay_block}"
-            "CURRENT SUMMARY\n"
-            "---\n"
-            f"{summary_block}\n"
-            "---\n\n"
+            f"{_summary_markers(summary_block)}\n"
             f"{proposal_block}\n"
             "Judge it. Call `submit_publication_judgment` exactly once."
         )
@@ -11557,10 +11755,7 @@ class ScopeManager:
         user_message = (
             f"SCOPE: {scope.name} (id={scope.id})\n\n"
             f"{budget_block}"
-            "CURRENT SUMMARY\n"
-            "---\n"
-            f"{summary_block}\n"
-            "---\n\n"
+            f"{_summary_markers(summary_block)}\n"
             "Propose this scope's initial publication (or decline). Call "
             "`submit_bootstrap_publication` exactly once."
         )

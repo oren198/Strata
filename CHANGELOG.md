@@ -77,6 +77,28 @@ the release PR (`dev` → `main`) and the GitHub Release body are built from
   declined. A directive admitted by the #237 rescue goes through the same engine checks
   before it counts. "may not", "may only" and "may never" are restrictions, not the
   permissive "may".
+- **A scope can't publish an exception to a rule it inherits.** After the publication
+  judge accepts a publish or restore by a scope that inherits a directive (from an
+  ancestor or the operator), the engine checks the item. A directive item that changes,
+  loosens or exempts from an inherited directive is refused with no extra call. A context
+  item goes through the same check as #242's context note: an exception is refused; a
+  report of one specific past act of following the rule is published; a report of one
+  specific act of departing from it is published only with the engine's label, prefixed to
+  the text, "Departure from <directive id> (<issuing scope>): ", which the publisher can't
+  drop, and which a restore puts back. A general or habitual clause is an exception and is
+  refused whole. A refusal is recorded beside the judge's own verdict and leaves the
+  published face untouched; the note names the two routes ("publish a specific report
+  instead, or propose the exception to <scope>"). A relayed item keeps its origin's label
+  verbatim and is never re-labelled as a departure from the relayer's own directive; the
+  relayer's directives get the exception test only, and a separate note says when the
+  reported act conflicts with one of them. A relay goes when its origin is withdrawn. The
+  one-shot initial publication runs the check per proposed item and drops refused ones.
+  No new judge tool; a published context item costs one extra call in a scope that
+  inherits directives. Stated limit: an exception already on a scope's face is not
+  withdrawn by this. Also fixed on the same path: the publication and bootstrap judges saw
+  the scope's summary as an empty block (its frontmatter "---" ran into the "---" fence),
+  and refused legitimate publications as not in the summary; the block now has explicit
+  markers.
 
 
 ### Added
