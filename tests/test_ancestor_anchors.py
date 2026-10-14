@@ -122,10 +122,17 @@ def _proposer() -> ContributorRef:
 
 
 def _accepting_manager() -> MagicMock:
+    from strata.scope_manager import ScopeManager
+
     manager = MagicMock()
     manager.judge_publication.return_value = PublicationJudgment(
         decision="accept", reasoning="Rests on what binds this scope."
     )
+    # #243: the engine's publication check is called on the scope-manager, never skipped, so
+    # a stand-in provides it. These items are plain facts and directives: the real check.
+    manager.check_publication_exception.side_effect = ScopeManager(
+        client=MagicMock()
+    ).check_publication_exception
     return manager
 
 

@@ -553,3 +553,38 @@ def test_the_bootstrap_judges_summary_block_uses_the_same_markers(world) -> None
     assert "CURRENT SUMMARY (between the markers)\n<<<SUMMARY\n" in message
     assert "\nSUMMARY>>>\n" in message
     assert "---\n---" not in message
+
+
+# -- a manager that cannot run the check can never publish -------------------
+
+
+class _NoCheck:
+    """A stand-in (or wrapper) that provides judge_publication but not the check."""
+
+    def judge_publication(self, **_kwargs):  # noqa: ANN003, ANN201
+        return PublicationJudgment(decision="accept", reasoning="Believed.")
+
+
+def test_a_scope_manager_without_the_check_cannot_publish(world) -> None:  # noqa: ANN001
+    fleet, store, summaries = world
+    with pytest.raises(AttributeError, match="check_publication_exception"):
+        _publish(world, _EXCEPTION, "directive", _client(), manager=_NoCheck())
+    assert _face(world) == []  # nothing reached the face
+    # the act stays in the record with a failed-attempt marker, never an accepted verdict
+    acts = store.list_publication_acts(scope_id="g_web")
+    assert acts
+    assert store.get_publication_judgment(acts[-1].id) is None
+    attempts = store.list_publication_judgment_attempts(act_id=acts[-1].id)
+    assert attempts and attempts[-1].error_class == "AttributeError"
+
+
+def test_a_scope_with_nothing_inherited_needs_no_check_from_the_manager(world) -> None:  # noqa: ANN001
+    outcome, _ = _publish(
+        world,
+        "Releases are tagged in git.",
+        "context",
+        _client(),
+        scope_id="g_org",
+        manager=_NoCheck(),
+    )
+    assert outcome.decision == "accept"

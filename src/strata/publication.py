@@ -619,15 +619,15 @@ def _apply_exception_check(
     from strata.perspective import ancestor_directives as _ancestors  # noqa: PLC0415
     from strata.scope_manager import departure_marker  # noqa: PLC0415
 
-    checker = getattr(scope_manager, "check_publication_exception", None)
-    if checker is None:  # a scope-manager stand-in without the check: nothing to run
-        return None, judgment
     inherited = _ancestors(scope_id, fleet=fleet, summary_store=summary_store)
     if not any(directives for _scope, directives in inherited) and not any(
         item.kind == "directive" for _scope, items in (operator_memory or ()) for item in items
     ):
         return None, judgment
-    check = checker(
+    # A security check: called directly on the scope-manager, never behind a feature test.
+    # A scope-manager (or wrapper) that does not provide it raises here, and the item is
+    # not published; there is no skip, noted or silent.
+    check = scope_manager.check_publication_exception(
         scope=scope,
         content=content,
         kind=kind,  # type: ignore[arg-type]
@@ -638,8 +638,11 @@ def _apply_exception_check(
     )
     from strata.scope_manager import PublicationExceptionCheck  # noqa: PLC0415
 
-    if not isinstance(check, PublicationExceptionCheck):  # a stand-in scope-manager
-        return None, judgment
+    if not isinstance(check, PublicationExceptionCheck):
+        raise TypeError(
+            "check_publication_exception returned "
+            f"{type(check).__name__}, not a PublicationExceptionCheck; the item is not published."
+        )
     if check.decision == "refuse":
         reasoning = f"{judgment.reasoning} (the judge accepted) {check.note}"
         return check, judgment.model_copy(update={"decision": "decline", "reasoning": reasoning})
@@ -865,21 +868,30 @@ def propose_publish(
         exception_check = None
         published_content = content
         if judgment.decision == "accept":
-            exception_check, judgment = _apply_exception_check(
-                judgment,
-                scope=scope,
-                content=content,
-                kind=kind,
-                scope_id=scope_id,
-                fleet=fleet,
-                summary_store=summary_store,
-                scope_manager=scope_manager,
-                operator_memory=operator_memory,
-                relay_origin_scope_id=origin_scope_id,
-                relay_label=_origin_label(
-                    relay_source_scope_id, relay_source_item_id, summary_store=summary_store
-                ),
-            )
+            try:
+                exception_check, judgment = _apply_exception_check(
+                    judgment,
+                    scope=scope,
+                    content=content,
+                    kind=kind,
+                    scope_id=scope_id,
+                    fleet=fleet,
+                    summary_store=summary_store,
+                    scope_manager=scope_manager,
+                    operator_memory=operator_memory,
+                    relay_origin_scope_id=origin_scope_id,
+                    relay_label=_origin_label(
+                        relay_source_scope_id, relay_source_item_id, summary_store=summary_store
+                    ),
+                )
+            except Exception as exc:
+                record_store.record_publication_judgment_attempt(
+                    act_id=act.id,
+                    error_class=type(exc).__name__,
+                    message=str(exc),
+                    outcome=JUDGE_FAILED,
+                )
+                raise
             if exception_check is not None and exception_check.decision == "accept":
                 published_content = exception_check.content
 
@@ -1618,19 +1630,28 @@ def propose_restore(
         # changed since; the same check runs on the item as it would be published now.
         exception_check = None
         if judgment.decision == "accept":
-            exception_check, judgment = _apply_exception_check(
-                judgment,
-                scope=scope,
-                content=restore_item.content,
-                kind=restore_item.kind,
-                scope_id=scope_id,
-                fleet=fleet,
-                summary_store=summary_store,
-                scope_manager=scope_manager,
-                operator_memory=operator_memory,
-                relay_origin_scope_id=restore_item.origin_scope_id,
-                relay_label=None,
-            )
+            try:
+                exception_check, judgment = _apply_exception_check(
+                    judgment,
+                    scope=scope,
+                    content=restore_item.content,
+                    kind=restore_item.kind,
+                    scope_id=scope_id,
+                    fleet=fleet,
+                    summary_store=summary_store,
+                    scope_manager=scope_manager,
+                    operator_memory=operator_memory,
+                    relay_origin_scope_id=restore_item.origin_scope_id,
+                    relay_label=None,
+                )
+            except Exception as exc:
+                record_store.record_publication_judgment_attempt(
+                    act_id=act.id,
+                    error_class=type(exc).__name__,
+                    message=str(exc),
+                    outcome=JUDGE_FAILED,
+                )
+                raise
             if exception_check is not None and exception_check.decision == "accept":
                 restore_item = replace(restore_item, content=exception_check.content)
 
@@ -3252,19 +3273,28 @@ def bootstrap_publication(
             )
             item_content = candidate.content
             item_reasoning = judgment.reasoning
-            boot_check, boot_verdict = _apply_exception_check(
-                _BootstrapVerdict("accept", judgment.reasoning),
-                scope=scope,
-                content=candidate.content,
-                kind=candidate.kind,
-                scope_id=scope_id,
-                fleet=fleet,
-                summary_store=summary_store,
-                scope_manager=scope_manager,
-                operator_memory=boot_operator_memory,
-                relay_origin_scope_id=None,
-                relay_label=None,
-            )
+            try:
+                boot_check, boot_verdict = _apply_exception_check(
+                    _BootstrapVerdict("accept", judgment.reasoning),
+                    scope=scope,
+                    content=candidate.content,
+                    kind=candidate.kind,
+                    scope_id=scope_id,
+                    fleet=fleet,
+                    summary_store=summary_store,
+                    scope_manager=scope_manager,
+                    operator_memory=boot_operator_memory,
+                    relay_origin_scope_id=None,
+                    relay_label=None,
+                )
+            except Exception as exc:
+                record_store.record_publication_judgment_attempt(
+                    act_id=act.id,
+                    error_class=type(exc).__name__,
+                    message=str(exc),
+                    outcome=JUDGE_FAILED,
+                )
+                raise
             if boot_check is not None and boot_check.decision == "refuse":
                 record_store.record_publication_judgment(
                     act_id=act.id,
