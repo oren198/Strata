@@ -408,3 +408,120 @@ def test_the_switch_on_wires_the_check_and_off_makes_no_extra_call(
     hearsay = MagicMock()
     hearsay.messages.create.side_effect = [_accept("Hearsay: this is a first-hand report.")]
     assert _judge_plain(hearsay, _NO_CEO).reasoning == "Hearsay: this is a first-hand report."
+
+
+# -- the closed vocabulary of parties the engine knows --------------------------------------
+
+from strata.fleet_config import EntitlementView  # noqa: E402
+from strata.scope_manager import _party_vocabulary, _vocabulary_informants_missing  # noqa: E402
+
+_CEO = Scope(id="g_ceo", name="CEO", stratum_id="L0")
+_ARCH = Scope(id="g_arch", name="Architect", stratum_id="L1")
+_ENT = EntitlementView(chain=[_CEO, _SCOPE], descendants=[], referenced_peers=[], others=[_ARCH])
+_PARTIES, _OWN = _party_vocabulary(_SCOPE, _ENT, ["g_ceo"], [(_SCOPE.id, "marketing")])
+
+_TEXT_3 = (
+    "2026-10-12: Operator ordered a README Judge-models section for v1.18. Marketing drafted "
+    "it from the facts file; the drift numbers carry refresh markers."
+)
+_FAILING = (
+    "Hearsay: the agent's own observation of the world includes drafting the section, which is "
+    "first-hand. The content reports decisions relayed by the CEO, grounded in a telling event "
+    "by a named party (g_ceo session), satisfying the admission rule."
+)
+
+
+def test_the_failing_reasoning_names_the_ceo_and_the_text_does_not() -> None:
+    missing = _vocabulary_informants_missing(_FAILING, _TEXT_3, _PARTIES, _OWN)
+    assert len(missing) == 1 and missing[0] in {"ceo", "g_ceo"}  # one party, by either label
+
+
+def test_a_source_citation_is_not_an_informant() -> None:
+    reasoning = "Contradicts inherited c-pharmacy-r1 (g_ceo). An exception is g_ceo's to make."
+    assert _vocabulary_informants_missing(reasoning, _TEXT_3, _PARTIES, _OWN) == []
+    published = "Per the ancestor directive from the CEO, this is already binding."
+    assert _vocabulary_informants_missing(published, _TEXT_3, _PARTIES, _OWN) == []
+
+
+def test_the_same_party_by_id_or_label_in_the_text_satisfies_the_reasoning() -> None:
+    reasoning = "Hearsay: the CEO told me the README is mine to draft."
+    for text in (
+        "The CEO (g_ceo session) told me the README is mine.",
+        "g_ceo told me the README is mine.",
+        "the ceo told me",
+    ):
+        assert _vocabulary_informants_missing(reasoning, text, _PARTIES, _OWN) == [], text
+    assert len(_vocabulary_informants_missing(reasoning, _TEXT_3, _PARTIES, _OWN)) == 1
+
+
+def test_the_contributors_own_scope_name_and_skill_are_never_informants() -> None:
+    for reasoning in (
+        "Hearsay: informant 'marketing' told the agent this.",
+        "The informant lead told the agent the shift ends at six.",
+    ):
+        parties, own = _party_vocabulary(_SCOPE, _ENT, [], [(_SCOPE.id, "lead")])
+        assert _vocabulary_informants_missing(reasoning, "Shift ends at six.", parties, own) == []
+
+
+def test_the_failing_reasoning_gets_one_reask_then_the_engine_reason_through_judge() -> None:
+    client = MagicMock()
+    client.messages.create.side_effect = [_accept(_FAILING), _accept(_FAILING)]
+    judgment = ScopeManager(client=client).judge(
+        scope=_SCOPE,
+        stratum=_STRATUM,
+        current_summary=_SUMMARY,
+        recent_contributions=[],
+        new_contribution=_contribution(_TEXT_3),
+        entitlement=_ENT,
+        ancestor_directives=[("g_ceo", [])],
+    )
+    assert client.messages.create.call_count == 2
+    assert judgment.reasoning.startswith("Reason withdrawn:")
+    assert "ceo" in judgment.reasoning
+    assert judgment.decision == "accept_as_context"
+
+
+def test_a_vocabulary_informant_present_in_the_text_makes_no_reask() -> None:
+    client = MagicMock()
+    client.messages.create.side_effect = [
+        _accept("Hearsay: the CEO told me the README is mine to draft.")
+    ]
+    ScopeManager(client=client).judge(
+        scope=_SCOPE,
+        stratum=_STRATUM,
+        current_summary=_SUMMARY,
+        recent_contributions=[],
+        new_contribution=_contribution("The CEO (g_ceo session) told me the README is mine."),
+        entitlement=_ENT,
+        ancestor_directives=[("g_ceo", [])],
+    )
+    assert client.messages.create.call_count == 1
+
+
+def test_the_contributors_own_skill_or_scope_never_triggers_the_reask() -> None:
+    from strata.scope_manager import _drop_own_names  # noqa: PLC0415
+
+    _parties, own = _party_vocabulary(_SCOPE, _ENT, [], [(_SCOPE.id, "lead")])
+    names = ["lead", "skill lead", "lead scope s_van_pool", "g_mkt", "night crew"]
+    assert _drop_own_names(["lead", "skill lead", "g_mkt"], own) == []
+    assert _drop_own_names(names, own) == ["night crew"]
+
+    client = MagicMock()
+    client.messages.create.side_effect = [
+        _accept("Hearsay: informant 'lead' (role in this scope) told the agent this.")
+    ]
+    contribution = replace(
+        _contribution("The oven is cleaned on Sundays."),
+        contributor=ContributorRef(
+            scope_id="g_mkt", skill="lead", session_id="s", ts="2026-10-12T10:00:00+00:00"
+        ),
+    )
+    ScopeManager(client=client).judge(
+        scope=_SCOPE,
+        stratum=_STRATUM,
+        current_summary=_SUMMARY,
+        recent_contributions=[],
+        new_contribution=contribution,
+        entitlement=_ENT,
+    )
+    assert client.messages.create.call_count == 1

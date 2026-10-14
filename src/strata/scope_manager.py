@@ -4790,6 +4790,114 @@ def _informants_missing_from(reasoning: str | None, content: str) -> list[str]:
     return missing
 
 
+# --- the closed vocabulary of parties the engine knows (reason honesty, CEO/architect) ---
+
+_TELLING_CUE_RE = re.compile(
+    r"\b(?:told|tells|relayed|relays|reported by|conveyed|passed on|said|says|informant|"
+    r"named party|telling event|hearsay|according to)\b",
+    re.IGNORECASE,
+)
+#: A sentence that cites a party as the SOURCE of a rule or publication is not naming an
+#: informant: "Contradicts inherited c-x (s_y)", "per the ancestor directive ...".
+_SOURCE_CITATION_RE = re.compile(
+    r"\b(?:directive|inherited|ancestor|publication|published|operator memory)\b"
+    r"|\b(?:c|pub|op)[_-][\w-]+",
+    re.IGNORECASE,
+)
+_PARTY_GENERIC_WORDS = frozenset(
+    {"team", "scope", "group", "org", "the", "and", "for", "lead", "agent", "session"}
+)
+
+
+def _party_aliases(scope_id: str, name: str | None) -> frozenset[str]:
+    """Casefolded ways a text can name one scope: its id, the id without its prefix, its name
+    and each distinctive word of its name. "g_ceo", "ceo" and "CEO" are one party."""
+    aliases = {scope_id.casefold()}
+    if "_" in scope_id:
+        aliases.add(scope_id.split("_", 1)[1].casefold())
+    if name:
+        aliases.add(" ".join(name.split()).casefold())
+        aliases.update(
+            w for w in re.findall(r"[\w-]{3,}", name.casefold()) if w not in _PARTY_GENERIC_WORDS
+        )
+    return frozenset(a for a in aliases if a and a not in _PARTY_GENERIC_WORDS)
+
+
+def _party_vocabulary(
+    scope: object,
+    entitlement: object | None,
+    ancestor_ids: Sequence[str],
+    contributors: Sequence[tuple[str, str | None]],
+) -> tuple[list[frozenset[str]], frozenset[str]]:
+    """``(parties, own_aliases)``: every scope the engine knows as a party (alias sets), and the
+    aliases of the contributors' own scope(s) and skill(s), which are never "informants"."""
+    seen: dict[str, str | None] = {getattr(scope, "id", ""): getattr(scope, "name", None)}
+    for group in ("chain", "descendants", "referenced_peers", "others"):
+        for item in getattr(entitlement, group, ()) or ():
+            seen.setdefault(item.id, getattr(item, "name", None))
+    for ancestor_id in ancestor_ids:
+        seen.setdefault(ancestor_id, None)
+    seen.setdefault("operator", "operator")
+    parties = [_party_aliases(i, n) for i, n in seen.items() if i]
+    own: set[str] = set()
+    own.update(_party_aliases(getattr(scope, "id", ""), getattr(scope, "name", None)))
+    for contributor_scope_id, skill in contributors:
+        own.update(_party_aliases(contributor_scope_id, seen.get(contributor_scope_id)))
+        if skill:
+            own.add(skill.casefold())
+    return parties, frozenset(own)
+
+
+def _drop_own_names(names: Sequence[str], own_aliases: frozenset[str]) -> list[str]:
+    """Names the contributor's own scope, scope name or skill account for are not informants
+    ("informant 'lead' told the agent", "lead scope=s_van_pool"): the contributor speaking
+    in their own voice is the first-hand case, not an absent party."""
+    kept: list[str] = []
+    for name in names:
+        words = set(re.findall(r"[\w-]+", name.casefold()))
+        if name.casefold() in own_aliases or words & own_aliases:
+            continue
+        kept.append(name)
+    return kept
+
+
+def _text_names(text: str, alias: str) -> bool:
+    return re.search(rf"(?<![\w-]){re.escape(alias)}(?![\w-])", text, re.IGNORECASE) is not None
+
+
+def _vocabulary_informants_missing(
+    reasoning: str | None,
+    content: str,
+    parties: Sequence[frozenset[str]],
+    own_aliases: frozenset[str],
+) -> list[str]:
+    """Known parties the reasoning names AS AN INFORMANT that the contribution does not name.
+
+    A party counts as named when it occurs, on a word boundary, in a sentence of the
+    reasoning that carries a telling cue (told, relayed, reported by, conveyed, passed on,
+    said, informant, named party, telling event, hearsay, according to) and does NOT cite a
+    rule or publication (directive, inherited, ancestor, publication, published, c_/pub_ ids).
+    The contributor's own scope, name and skill are excluded. It is missing when none of its
+    aliases (id, id without prefix, name words) occurs in *content*."""
+    missing: list[str] = []
+    sentences = re.split(r"(?<=[.!?;])\s+|\n+", reasoning or "")
+    for sentence in sentences:
+        if not _TELLING_CUE_RE.search(sentence) or _SOURCE_CITATION_RE.search(sentence):
+            continue
+        for aliases in parties:
+            if aliases & own_aliases:
+                continue
+            hits = [a for a in aliases if _text_names(sentence, a)]
+            if not hits:
+                continue
+            if any(_text_names(content, a) for a in aliases):
+                continue
+            label = sorted(hits, key=len)[-1]
+            if label not in missing:
+                missing.append(label)
+    return missing
+
+
 def _drop_false_hearsay(reasoning: str) -> str:
     """ "Hearsay:" on a reasoning that itself says first-hand is a wrong label: dropped."""
     for match in re.finditer(r"\bfirst[- ]hand\b", reasoning, re.IGNORECASE):
@@ -7643,8 +7751,24 @@ class ScopeManager:
                 new_contribution=new_contribution,
             )
 
+        _parties, _own_aliases = _party_vocabulary(
+            scope,
+            entitlement,
+            [ancestor_scope_id for ancestor_scope_id, _d in (ancestor_directives or ())],
+            [(new_contribution.contributor.scope_id, new_contribution.contributor.skill)],
+        )
+
         def _reasoning_gaps(judgment: ScopeManagerJudgment) -> list[str]:
-            return _informants_missing_from(judgment.reasoning, new_contribution.content)
+            names = _drop_own_names(
+                _informants_missing_from(judgment.reasoning, new_contribution.content),
+                _own_aliases,
+            )
+            for name in _vocabulary_informants_missing(
+                judgment.reasoning, new_contribution.content, _parties, _own_aliases
+            ):
+                if name not in names:
+                    names.append(name)
+            return names
 
         def _reasoning_adopt(
             judgment: ScopeManagerJudgment, retry: ScopeManagerJudgment
@@ -9598,13 +9722,29 @@ class ScopeManager:
                 hop=hop,
             )
 
+        _batch_parties, _batch_own = _party_vocabulary(
+            scope,
+            entitlement,
+            [ancestor_scope_id for ancestor_scope_id, _d in (ancestor_directives or ())],
+            [(c.contributor.scope_id, c.contributor.skill) for c in contributions.values()],
+        )
+
+        def _missing_for(reasoning: str, content: str) -> list[str]:
+            names = _drop_own_names(_informants_missing_from(reasoning, content), _batch_own)
+            for name in _vocabulary_informants_missing(
+                reasoning, content, _batch_parties, _batch_own
+            ):
+                if name not in names:
+                    names.append(name)
+            return names
+
         def _batch_reasoning_gaps(judgment: ScopeManagerBatchJudgment) -> list[str]:
             names: list[str] = []
             for verdict in judgment.verdicts:
                 member = contributions.get(verdict.contribution_id)
                 if member is None:
                     continue
-                for name in _informants_missing_from(verdict.reasoning, member.content):
+                for name in _missing_for(verdict.reasoning, member.content):
                     if name not in names:
                         names.append(name)
             return names
@@ -9630,9 +9770,7 @@ class ScopeManager:
             verdicts = []
             for verdict in judgment.verdicts:
                 member = contributions.get(verdict.contribution_id)
-                missing = (
-                    _informants_missing_from(verdict.reasoning, member.content) if member else []
-                )
+                missing = _missing_for(verdict.reasoning, member.content) if member else []
                 if missing:
                     verdict = verdict.model_copy(
                         update={"reasoning": _withdrawn_reason(missing, verdict.decision)}
