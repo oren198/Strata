@@ -67,6 +67,17 @@ the release PR (`dev` → `main`) and the GitHub Release body are built from
   names an ancestor scope (rather than a directive id) now triggers the same
   extra check when the contribution shares a subject word with that scope's
   directives.
+- **A directive the judge only CLAIMS is an exception is held as context, not declined.**
+  When the extra check on an admitted directive rests on the judge's own reading ("this
+  exempts a case") and the engine finds no conflict of its own (no relaxation marker on an
+  inherited subject, no reversed state or out-of-bound value), the text is kept as context
+  with the note "Held as context: the judge reads this as an exception to <id> (<scope>);
+  the engine could not confirm a conflict. Context never binds." and no directive is
+  written. A directive that carries a marker or a conflict the engine can see is still
+  declined. A directive admitted by the #237 rescue goes through the same engine checks
+  before it counts. "may not", "may only" and "may never" are restrictions, not the
+  permissive "may".
+
 
 ### Added
 

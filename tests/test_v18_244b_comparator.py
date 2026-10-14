@@ -341,3 +341,272 @@ def test_a_state_word_on_another_object_is_not_a_polarity_flip() -> None:
         is None
     )
     assert inherited_conflict("Night-shift fuel dock pumps are kept on until 22:00.", parent)
+
+
+# ---------------------------------------------------------------------------
+# Iteration 3: compound-rule triggers, the rescue's polarity check, rescue evidence,
+# hold-not-decline on the judge's claim alone, "may not"
+# ---------------------------------------------------------------------------
+
+from strata.scope_manager import (  # noqa: E402
+    _comparator_rule_ok,
+    _relaxation_marker,
+    verify_relation_ground,
+)
+
+_COMPOUND = (
+    "Chlorine residual must stay at or above 0.5 mg/L; if it falls below 0.5 mg/L for more "
+    "than 4 hours, the batch is discarded."
+)
+
+
+def test_a_compound_rule_tightened_on_both_bounds_is_a_tightening() -> None:
+    child = (
+        "Chlorine residual must stay at or above 0.8 mg/L; if it falls below 0.8 mg/L for more "
+        "than 2 hours, the batch is discarded."
+    )
+    assert inherited_conflict(child, _COMPOUND) is None
+    ok, _ = _comparator_rule_ok(_COMPOUND, child)
+    assert ok is True
+    answer = {
+        "relation": "tightens",
+        "other_grounds_clear": True,
+        "parent_id": "p",
+        "tighten_kind": "rule",
+        "kept_span": "the parent's words, not verbatim",
+    }
+    verified, result, _cls, _ctx = verify_relation_ground(answer, _COMPOUND, child, "directive")
+    assert verified is True, result
+
+
+@pytest.mark.parametrize(
+    "child",
+    [
+        # the trigger got LONGER: looser
+        "Chlorine residual must stay at or above 0.8 mg/L; if it falls below 0.8 mg/L for "
+        "more than 8 hours, the batch is discarded.",
+        # the floor dropped: looser
+        "Chlorine residual must stay at or above 0.3 mg/L; if it falls below 0.3 mg/L for "
+        "more than 2 hours, the batch is discarded.",
+    ],
+)
+def test_a_compound_rule_loosened_on_either_bound_still_conflicts(child: str) -> None:
+    assert inherited_conflict(child, _COMPOUND) is not None
+
+
+def test_the_rescue_verifier_does_not_misread_a_state_word_on_another_object() -> None:
+    parent = "Fuel dock pumps must be switched off at or before 20:00 every evening."
+    child = (
+        "On night-shift, fuel dock pumps must be switched off at or before 19:30 every "
+        "evening and the nozzles locked."
+    )
+    answer = {
+        "relation": "refines",
+        "other_grounds_clear": True,
+        "parent_id": "p",
+        "subject_span": "On night-shift, fuel dock pumps",
+    }
+    ok, result, _cls, _ctx = verify_relation_ground(answer, parent, child, "directive")
+    assert "polarity flip" not in result
+    # the same verifier still catches a real reversal of the parent's own state
+    flipped = "On night-shift, fuel dock pumps are kept on until 22:00 every evening."
+    answer2 = {**answer, "subject_span": "On night-shift, fuel dock pumps"}
+    ok2, result2, _c, _x = verify_relation_ground(answer2, parent, flipped, "directive")
+    assert ok2 is False
+
+
+def _flow_with(first_decline: str, answers: list[dict], content: str, parents: list):  # noqa: ANN001, ANN202
+    from unittest.mock import MagicMock  # noqa: PLC0415
+
+    from strata.fleet_config import Scope, Stratum  # noqa: PLC0415
+    from strata.record_store import Contribution, ContributorRef  # noqa: PLC0415
+    from strata.scope_manager import ScopeManager  # noqa: PLC0415
+    from strata.summary_store import ScopeSummary  # noqa: PLC0415
+
+    from .test_scope_manager import _fake_response  # noqa: PLC0415
+
+    stamp = "2026-10-01T00:00:00+00:00"
+    client = MagicMock()
+    steps = []
+    if first_decline:
+        steps.append(
+            _fake_response(
+                {
+                    "decision": "decline",
+                    "reasoning": first_decline,
+                    "directive_ops": [],
+                    "new_context": None,
+                }
+            )
+        )
+    else:
+        steps.append(
+            _fake_response(
+                {
+                    "decision": "accept_as_directive",
+                    "reasoning": "A rule.",
+                    "directive_ops": [{"op": "append"}],
+                    "new_context": None,
+                }
+            )
+        )
+    steps.extend(_fake_response(a) for a in answers)
+    client.messages.create.side_effect = steps
+    judgment = ScopeManager(client=client).judge(
+        scope=Scope(id="g_squad", name="Squad", stratum_id="L2"),
+        stratum=Stratum(id="L2", name="squad", ordinal=2),
+        current_summary=ScopeSummary(
+            scope_id="g_squad", directives=[], context="", updated_at=stamp
+        ),
+        recent_contributions=[],
+        new_contribution=Contribution(
+            id="c_new",
+            scope_id="g_squad",
+            content=content,
+            proposed_classification="directive",
+            subject=None,
+            supersedes=None,
+            contributor=ContributorRef(scope_id="g_squad", skill=None, session_id="s", ts=stamp),
+            created_at=stamp,
+        ),
+        ancestor_directives=[("g_org", parents)],
+    )
+    return judgment, client
+
+
+def _parent(directive_id: str, content: str):  # noqa: ANN202
+    from strata.summary_store import Directive  # noqa: PLC0415
+
+    return Directive(
+        id=directive_id,
+        content=content,
+        source_scope_id="g_org",
+        created_at="2026-10-01T00:00:00+00:00",
+    )
+
+
+def test_a_rescued_exception_with_a_relaxation_marker_does_not_become_a_directive() -> None:
+    parent = _parent("c_hot", "Hot-held food must be kept at or above 63 C.")
+    text = (
+        "Rice trays on the buffet line are kept at or above 63 C and can be left out for two hours."
+    )
+    judgment, _client = _flow_with(
+        "Contradicts inherited directive c_hot.",
+        [
+            {
+                "relation": "refines",
+                "other_grounds_clear": True,
+                "parent_id": "c_hot",
+                "subject_span": "Rice trays on the buffet line",
+                "reasoning": "a specific case",
+            }
+        ],
+        text,
+        [parent],
+    )
+    assert judgment.directive_ops == []
+    assert judgment.decision != "accept_as_directive"
+    assert judgment.directive_relation["relation"] == "rescued"
+
+
+def test_a_rescued_clean_refinement_is_still_a_directive() -> None:
+    parent = _parent("c_hot", "Hot-held food must be kept at or above 63 C.")
+    text = "Rice trays on the buffet line must have a probe reading logged every hour."
+    judgment, _client = _flow_with(
+        "Contradicts inherited directive c_hot.",
+        [
+            {
+                "relation": "refines",
+                "other_grounds_clear": True,
+                "parent_id": "c_hot",
+                "subject_span": "Rice trays on the buffet line",
+                "reasoning": "a specific case",
+            }
+        ],
+        text,
+        [parent],
+    )
+    assert judgment.decision == "accept_as_directive", judgment.reasoning
+
+
+def test_the_judges_exception_claim_alone_is_held_as_context_never_a_directive() -> None:
+    parent = _parent("c_suite", "Run the full test suite before publishing a release.")
+    text = "Release candidates are tagged in git before the suite runs."
+    judgment, _client = _flow_with(
+        "",
+        [
+            {
+                "relation": "exempts",
+                "parent_id": "c_suite",
+                "exempted_case_span": "tagged in git",
+                "reasoning": "reads like an exemption",
+            }
+        ],
+        text,
+        [parent],
+    )
+    assert judgment.decision == "accept_as_context"
+    assert judgment.directive_ops == []
+    assert judgment.new_summary.directives == []
+    assert text in judgment.new_context
+    assert "Held as context" in judgment.reasoning
+    assert "Context never binds." in judgment.reasoning
+
+
+@pytest.mark.parametrize("relation", ["exempts", "contradicts"])
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Release candidates are tagged in git before the suite runs.",
+        "The group holds its daily standup at 09:30 CET.",
+        "Hotfix builds may be published without the full test suite.",
+        "Checkout hotfixes skip QA; a green smoke check is enough.",
+    ],
+)
+def test_no_exempts_or_contradicts_answer_ever_yields_a_directive(relation: str, text: str) -> None:
+    parent = _parent("c_suite", "Run the full test suite before publishing a release.")
+    span = text.split(";")[0].split(" before ")[0]
+    judgment, _client = _flow_with(
+        "",
+        [
+            {
+                "relation": relation,
+                "parent_id": "c_suite",
+                "exempted_case_span": span,
+                "reasoning": "forged",
+            }
+        ],
+        text,
+        [parent],
+    )
+    assert judgment.decision != "accept_as_directive"
+    assert judgment.directive_ops == []
+
+
+def test_a_declined_claim_with_engine_evidence_stays_a_decline() -> None:
+    parent = _parent("c_suite", "Run the full test suite before publishing a release.")
+    judgment, _client = _flow_with(
+        "",
+        [
+            {
+                "relation": "exempts",
+                "parent_id": "c_suite",
+                "exempted_case_span": "without the full test suite",
+                "reasoning": "skips the suite",
+            }
+        ],
+        "Hotfix builds may be published without the full test suite.",
+        [parent],
+    )
+    assert judgment.decision == "decline"
+    assert judgment.reasoning.startswith("Contradicts inherited c_suite")
+
+
+def test_may_not_is_a_restriction_not_the_permissive_marker() -> None:
+    assert _relaxation_marker("Issued tokens may not be re-issued.") is None
+    assert _relaxation_marker("Approvals may only be given by the owner.") is None
+    assert _relaxation_marker("Keys may never leave the vault.") is None
+    assert _relaxation_marker("Staff may skip the check.") is not None
+    assert _relaxation_marker("Hotfixes may be published without the suite.") is not None
+    child = "Platform tokens expire after 10 minutes and may not be re-issued."
+    assert verify_directive_relation({}, child, [("c_t", "g_org", _TOKEN_LIFE)])[0] == "admit"

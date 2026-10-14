@@ -5332,6 +5332,26 @@ _NUMBER_WORD_ALT = (
 )
 _COMPARATOR_VALUE = rf"(-?[\d:.,]+|(?:{_NUMBER_WORD_ALT})\b)"
 _COMPARATOR_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    # #244b iteration 3: the threshold of a trigger ("if it falls below A ..."): the higher
+    # the trigger level, the more cases it catches, the stricter the rule.
+    (
+        re.compile(
+            rf"\b(?:falls?|fell|drops?|dips?|goes?|go|sinks?)\s+(?:to\s+)?(?:below|under)\s+"
+            rf"{_COMPARATOR_VALUE}",
+            re.IGNORECASE,
+        ),
+        "larger",
+    ),
+    # #244b iteration 3: a trigger duration ("if below A for MORE THAN T, discard"): the
+    # shorter the trigger, the stricter the rule. First, so the plain "more than" (a
+    # floor) never claims the same value.
+    (
+        re.compile(
+            rf"\bfor\s+(?:more than|over|longer than|in excess of)\s+{_COMPARATOR_VALUE}",
+            re.IGNORECASE,
+        ),
+        "smaller",
+    ),
     (re.compile(rf"\bat or below\s+{_COMPARATOR_VALUE}", re.IGNORECASE), "smaller"),
     (re.compile(rf"\bat or above\s+{_COMPARATOR_VALUE}", re.IGNORECASE), "larger"),
     (re.compile(rf"\bat or before\s+{_COMPARATOR_VALUE}", re.IGNORECASE), "smaller"),
@@ -6453,9 +6473,9 @@ def verify_relation_ground(
         # different-instance divergence (the ferry REFINE admit: "the
         # FIRST ferry departs at 06:10" against a parent about the LAST
         # ferry is a new, uncovered subject, not a contradiction).
-        if _polarity_flip(parent_text, content) and not _names_a_different_instance(
-            parent_text, content
-        ):
+        if _polarity_flip(
+            parent_text, content, parent_term_kept_is_no_flip=True
+        ) and not _names_a_different_instance(parent_text, content):
             return False, "declined (polarity flip against parent)", None, None
         # P2 (same ruling): a COVERED subject (shares a word with the
         # parent's own leading noun phrase) can never be a genuine
@@ -6505,7 +6525,7 @@ def verify_relation_ground(
             None,
             None,
         )
-    if _polarity_flip(parent_text, content):
+    if _polarity_flip(parent_text, content, parent_term_kept_is_no_flip=True):
         return False, "declined (polarity flip against parent)", None, None
     if not _universal_scope_preserved(parent_text, content):
         return False, "declined (narrows when/where the rule applies)", None, None
@@ -6737,7 +6757,7 @@ _NORMATIVE_EXCEPTION_RES: tuple[re.Pattern[str], ...] = tuple(
     re.compile(p, re.IGNORECASE)
     for p in (
         # lower-case only: "May" is the month ("on 12 May ...")
-        r"(?-i:\bmay\b)",
+        r"(?-i:\bmay\b(?!\s+(?:not|only|never)\b))",
         # "can" is common in plain facts ("bookings can only be made ..."); only
         # its permission shapes count.
         r"\bcan\s+(?:\w+\s+)?(?:keep|skip|leave|hold|go|run|ship|release|publish|merge|"
@@ -7397,15 +7417,18 @@ def verify_directive_relation(
 ) -> tuple[str, str, tuple[str, str] | None, bool]:
     """Engine verification of a ``classify_directive_relation`` answer (#244 step 3).
 
-    Returns ``(verdict, reason, target, fallback)``: *verdict* is ``"decline"`` or
-    ``"admit"``; *target* is the ``(id, origin)`` of the inherited directive the decline
-    names (``None`` on an admit); *fallback* is True when the admit rests on an
+    Returns ``(verdict, reason, target, fallback)``: *verdict* is ``"decline"``, ``"hold"``
+    or ``"admit"``; *target* is the ``(id, origin)`` of the inherited directive the
+    decline or hold names (``None`` on an admit); *fallback* is True when the admit rests on an
     unreadable, unrelated or unverified answer with no relaxation marker in the way,
     which callers count (the directive path's door).
 
     Fails toward the inherited rule:
 
-    - ``exempts`` or ``contradicts`` with a verbatim ``exempted_case_span`` declines;
+    - ``exempts`` or ``contradicts`` with a verbatim ``exempted_case_span`` is the MODEL's
+      claim; the span only proves the quote exists. It declines when the engine has evidence
+      of its own (a relaxation marker on an inherited subject, or a loose conflict), and is
+      otherwise a ``"hold"``: the contribution is kept as context and never binds;
     - ``refines`` is admitted only with a verbatim ``uncovered_case_span``, a stated
       kept requirement, and no relaxation marker; ``tightens`` only if the 1.17.2
       comparator agrees and no marker is present;
@@ -7429,10 +7452,34 @@ def verify_directive_relation(
     failure = "unreadable answer"
     if relation in ("exempts", "contradicts"):
         if _verbatim_span(answer, "exempted_case_span", content) is not None:
+            pick = chosen or _best_overlap() or (inherited[0] if inherited else None)
+            evidence = next(
+                (
+                    (d, loose)
+                    for d in inherited
+                    if (loose := _loose_conflict(content, d[2])) is not None
+                ),
+                None,
+            )
+            if evidence is not None:
+                return (
+                    "decline",
+                    f"{relation}: {evidence[1]} on an inherited subject",
+                    _target(evidence[0]),
+                    False,
+                )
+            if marker is not None and pick is not None and _shares_content_word(pick[2], content):
+                return (
+                    "decline",
+                    f"{relation}: {marker} on an inherited subject",
+                    _target(pick),
+                    False,
+                )
+            # the model's claim alone: held as context, never a directive
             return (
-                "decline",
-                f"{relation}: states an exception to the rule",
-                _target(_best_overlap() or (inherited[0] if inherited else None)),
+                "hold",
+                f"{relation} claimed by the judge; the engine found no conflict of its own",
+                _target(pick),
                 False,
             )
         failure = f"{relation} without a verbatim exempted_case_span"
@@ -7484,7 +7531,13 @@ def verify_directive_relation(
 
 
 def _directive_relation_note(outcome: dict) -> str:
-    """The engine reason for a declined directive: #244 step 1's, verbatim."""
+    """The engine reason for a declined directive: #244 step 1's, verbatim; or, for a
+    ``hold`` (the judge's claim alone), the note that the text is kept as context."""
+    if outcome["verdict"] == "hold":
+        return (
+            f"Held as context: the judge reads this as an exception to {outcome['inherited_id']} "
+            f"({outcome['origin']}); the engine could not confirm a conflict. Context never binds."
+        )
     return _inherited_hold_note(outcome["inherited_id"], outcome["origin"])
 
 
@@ -8560,6 +8613,7 @@ class ScopeManager:
                 ancestor_directives=ancestor_directives,
                 operator_memory=operator_memory,
                 mode=mode,
+                current_summary=current_summary,
             )
         return self._hold_directive_changes(
             judgment,
@@ -10033,6 +10087,7 @@ class ScopeManager:
         ancestor_directives: Sequence[tuple[str, Sequence[Directive]]] | None,
         operator_memory: Sequence[tuple[str, Sequence[OperatorItem]]] | None,
         mode: JudgeMode = "ordinary",
+        current_summary: ScopeSummary | None = None,
     ) -> ScopeManagerJudgment:
         """#244 step 3: a child's DIRECTIVE must not relax an inherited directive.
 
@@ -10047,7 +10102,6 @@ class ScopeManager:
             mode != "ordinary"
             or first.decision == "decline"
             or first.inherited_holds
-            or first.relation_recheck is not None
             or first.directive_relation is not None
             or contribution.contributor.scope_id != scope.id
         ):
@@ -10061,16 +10115,36 @@ class ScopeManager:
         if not texts or not inherited:
             return first
         outcome: dict | None = None
-        for text in texts:
-            result = self._classify_directive_relation(
-                contribution=contribution,
-                text=text,
-                covered=inherited_for_context(text, inherited),
-            )
-            if outcome is None or result["verdict"] == "decline":
-                outcome = result
-            if result["verdict"] == "decline":
-                break
+        if first.relation_recheck is not None:
+            # A #237 rescue ran: its verifier never looked for a relaxation marker or a
+            # loose conflict. Those engine checks run here, with no judge call; evidence
+            # of either means it does not become a directive.
+            for text in texts:
+                verdict, reason, target, _fallback = verify_directive_relation({}, text, inherited)
+                if verdict == "decline" and target is not None:
+                    outcome = {
+                        "contribution_id": contribution.id,
+                        "relation": "rescued",
+                        "verdict": "decline",
+                        "fallback": False,
+                        "inherited_id": target[0],
+                        "origin": target[1],
+                        "reason": f"rescued directive: {reason}",
+                    }
+                    break
+            if outcome is None:
+                return first
+        else:
+            for text in texts:
+                result = self._classify_directive_relation(
+                    contribution=contribution,
+                    text=text,
+                    covered=inherited_for_context(text, inherited),
+                )
+                if outcome is None or result["verdict"] in ("decline", "hold"):
+                    outcome = result
+                if result["verdict"] == "decline":
+                    break
         assert outcome is not None  # noqa: S101 — texts is non-empty
         update: dict = {
             "directive_relation": outcome,
@@ -10088,6 +10162,30 @@ class ScopeManager:
                 withdraw_published=[],
                 context_sources=[],
                 reasoning=_directive_relation_note(outcome),
+            )
+        elif outcome["verdict"] == "hold":
+            # The judge's claim of an exception, with no engine evidence: the text is
+            # kept as context under an attributed line, the directive ops are removed.
+            note = _directive_relation_note(outcome)
+            who = contribution.contributor.skill or contribution.contributor.session_id
+            previous = current_summary.context if current_summary is not None else ""
+            context = _append_line(
+                previous,
+                f"[{contribution.id}] {who} ({contribution.contributor.scope_id}) "
+                f"proposed: {contribution.content.strip()} — {note}",
+            )
+            update.update(
+                decision="accept_as_context",
+                directive_ops=[],
+                new_context=context,
+                new_summary=_apply_amendment(
+                    scope=scope,
+                    current_summary=current_summary,
+                    contribution=contribution,
+                    ops=[],
+                    new_context=context,
+                ),
+                reasoning=f"{first.reasoning} {note}",
             )
         return first.model_copy(update=update)
 
@@ -10133,30 +10231,47 @@ class ScopeManager:
         if not outcomes:
             return judgment
         declined = {cid for cid, o in outcomes.items() if o["verdict"] == "decline"}
-        verdicts = [
-            v.model_copy(
-                update={
-                    "decision": "decline",
-                    "reasoning": _directive_relation_note(outcomes[v.contribution_id]),
-                }
-            )
-            if v.contribution_id in declined
-            else v
-            for v in judgment.verdicts
-        ]
+        held_out = {cid for cid, o in outcomes.items() if o["verdict"] == "hold"}
+        verdicts = []
+        for v in judgment.verdicts:
+            if v.contribution_id in declined:
+                v = v.model_copy(
+                    update={
+                        "decision": "decline",
+                        "reasoning": _directive_relation_note(outcomes[v.contribution_id]),
+                    }
+                )
+            elif v.contribution_id in held_out:
+                # the judge's claim of an exception with no engine evidence: held as context
+                v = v.model_copy(
+                    update={
+                        "decision": "accept_as_context",
+                        "reasoning": _directive_relation_note(outcomes[v.contribution_id]),
+                    }
+                )
+            verdicts.append(v)
         update: dict = {"verdicts": verdicts, "directive_relations": list(outcomes.values())}
-        if declined:
-            kept = [op for op in judgment.directive_ops if op.contribution_id not in declined]
+        if declined or held_out:
+            kept = [
+                op for op in judgment.directive_ops if op.contribution_id not in declined | held_out
+            ]
             context = current_summary.context if current_summary is not None else ""
             for v in verdicts:
                 if v.decision == "accept_as_context":
                     member = contributions[v.contribution_id]
                     who = member.contributor.skill or member.contributor.session_id
-                    context = _append_line(
-                        context,
-                        f"[{member.id}] {who} ({member.contributor.scope_id}) "
-                        f"observed: {member.content.strip()}",
-                    )
+                    if v.contribution_id in held_out:
+                        context = _append_line(
+                            context,
+                            f"[{member.id}] {who} ({member.contributor.scope_id}) "
+                            f"proposed: {member.content.strip()} — {v.reasoning}",
+                        )
+                    else:
+                        context = _append_line(
+                            context,
+                            f"[{member.id}] {who} ({member.contributor.scope_id}) "
+                            f"observed: {member.content.strip()}",
+                        )
             any_accepted = any(v.decision != "decline" for v in verdicts)
             update["directive_ops"] = kept
             update["new_context"] = context if any_accepted else None
