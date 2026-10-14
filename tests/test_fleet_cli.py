@@ -10,7 +10,9 @@ from strata.fleet_config import FleetConfig
 from tests.test_fleet_changes import _world
 
 
-def test_cli_pending_flags_and_stated_limits(tmp_path: Path, capsys) -> None:
+def test_cli_pending_flags_and_stated_limits(tmp_path: Path, capsys, monkeypatch) -> None:
+    # The stated-limit lines are the no-core state; the core now emits instead.
+    monkeypatch.delattr("strata.change_events.emit_structure_change")
     fleet, store = _world(tmp_path)
     pending = propose(
         fleet,

@@ -99,6 +99,28 @@ the release PR (`dev` → `main`) and the GitHub Release body are built from
   surface reads event or contribution text. The kinds, the migration, and
   the core operations themselves are not in this change.
 
+- **A fleet structure change now tells the scopes it affects** (ADR 0014 D8, core).
+  Two new change-event kinds, `channel_removed` (a reference edge a scope read
+  through was removed) and `chain_changed` (the chain above a scope moved), come
+  with migration 0025. `emit_structure_change(act_id)` reads the act's recorded
+  topology, never today's fleet: a removed edge tells the reader, with the
+  source's publication item ids and a notice for each own directive that cites
+  one of those items by id; a re-parent tells the moved scope and every scope in
+  its recorded subtree, with the directives gained and lost and, for each own
+  directive that conflicts with a newly inherited one under the 1.17 check, a
+  conflict line ("... Where they conflict, the inherited directive governs. ...").
+  It runs once per receiver (a call after a partial failure tells only the
+  receivers still owed), goes through the ordinary notice machinery, and on
+  failure records it and raises `StructureEmissionError`, which the apply turns
+  into the "run `strata fleet reemit`" notice without rolling anything back. A refresh that carries either kind drops any `retire` or
+  `supersede` the judge returns on the scope's own directives, and notes the drop:
+  a structure change is not the scope's own decision. The perspective's self layer
+  shows the conflict line as `annotation` on the own directive while both
+  directives stand. Stated limits: a conflict phrased with no value, polarity or
+  marker is not found; a directive that rests on the removed source only through
+  the judge's declared `context_sources` is not named in the notice, since that
+  declaration is not stored on the directive's record.
+
 - **`strata register` seeds Claude Code deny rules for the resolved store**
   (#173, ADR 0013 D6). `permissions.deny` in `.claude/settings.json` gains
   `Read` and `Edit` rules for the store `.strata/config.toml` resolves.

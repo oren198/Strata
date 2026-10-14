@@ -197,8 +197,11 @@ def test_non_reparent_topology_omits_chain_and_descendants(tmp_path: Path) -> No
     store.close()
 
 
-def test_apply_without_core_keeps_stated_limit_and_succeeds(tmp_path: Path) -> None:
-    assert not hasattr(change_events, "emit_structure_change")
+def test_apply_without_core_keeps_stated_limit_and_succeeds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The core ships emit_structure_change; this is the no-core state.
+    monkeypatch.delattr(change_events, "emit_structure_change")
     fleet, store = _world(tmp_path)
     result = apply_as_operator(
         fleet,
@@ -222,7 +225,7 @@ def test_apply_with_core_emits_once_after_commit_under_the_lock(
     fleet, store = _world(tmp_path)
     seen: dict = {}
 
-    def emit(act_id: str) -> dict:
+    def emit(act_id: str, **_kwargs: object) -> dict:
         seen["calls"] = seen.get("calls", []) + [act_id]
         seen["committed"] = store.get_fleet_structure_act(act_id).id
         seen["depth"] = fleet_file_lock(fleet._path)._depth
@@ -256,7 +259,7 @@ def test_raising_emit_does_not_roll_back_the_apply(
         proposer=Actor("g_a1"),
     )
 
-    def emit(act_id: str) -> None:
+    def emit(act_id: str, **_kwargs: object) -> None:
         raise RuntimeError(f"emission failed for {act_id}")
 
     monkeypatch.setattr(change_events, "emit_structure_change", emit, raising=False)
@@ -275,6 +278,9 @@ def test_reemit_calls_emit_and_prints_what_was_emitted(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     fleet, store = _world(tmp_path)
+    monkeypatch.setattr(
+        change_events, "emit_structure_change", lambda *a, **k: {}, raising=False
+    )  # apply first, emit in the test
     result = apply_as_operator(
         fleet,
         store,
@@ -283,7 +289,7 @@ def test_reemit_calls_emit_and_prints_what_was_emitted(
     store.close()
     calls: list[str] = []
 
-    def emit(act_id: str) -> dict:
+    def emit(act_id: str, **_kwargs: object) -> dict:
         calls.append(act_id)
         return {"kind": "chain_changed", "act_id": act_id}
 
@@ -308,6 +314,9 @@ def test_reemit_prints_already_emitted_and_does_not_call_again(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     fleet, store = _world(tmp_path)
+    monkeypatch.setattr(
+        change_events, "emit_structure_change", lambda *a, **k: {}, raising=False
+    )  # apply first, emit in the test
     result = apply_as_operator(
         fleet,
         store,
@@ -333,7 +342,7 @@ def test_reemit_prints_already_emitted_and_does_not_call_again(
     monkeypatch.setattr(
         change_events,
         "emit_structure_change",
-        lambda act_id: calls.append(act_id),
+        lambda act_id, **_kwargs: calls.append(act_id),
         raising=False,
     )
     code = main(
@@ -357,6 +366,9 @@ def test_reemit_says_when_emission_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     fleet, store = _world(tmp_path)
+    monkeypatch.setattr(
+        change_events, "emit_structure_change", lambda *a, **k: {}, raising=False
+    )  # apply first, emit in the test
     result = apply_as_operator(
         fleet,
         store,
@@ -364,7 +376,7 @@ def test_reemit_says_when_emission_fails(
     )
     store.close()
 
-    def emit(act_id: str) -> None:
+    def emit(act_id: str, **_kwargs: object) -> None:
         raise RuntimeError(f"emission failed for {act_id}")
 
     monkeypatch.setattr(change_events, "emit_structure_change", emit, raising=False)
@@ -384,9 +396,9 @@ def test_reemit_says_when_emission_fails(
 
 
 def test_reemit_without_core_prints_the_stated_limit(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    assert not hasattr(change_events, "emit_structure_change")
+    monkeypatch.delattr(change_events, "emit_structure_change")
     fleet, store = _world(tmp_path)
     result = apply_as_operator(
         fleet,
@@ -463,6 +475,9 @@ def test_doctor_lists_only_acts_events_for_act_misses(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     fleet, store = _world(tmp_path)
+    monkeypatch.setattr(
+        change_events, "emit_structure_change", lambda *a, **k: {}, raising=False
+    )  # apply first, emit in the test
     reparented = apply_as_operator(
         fleet,
         store,
@@ -543,6 +558,9 @@ def test_act_view_lists_events_and_lines_from_the_core(
     from fastapi.testclient import TestClient
 
     fleet, store = _world(tmp_path)
+    monkeypatch.setattr(
+        change_events, "emit_structure_change", lambda *a, **k: {}, raising=False
+    )  # apply first, emit in the test
     result = apply_as_operator(
         fleet,
         store,
@@ -666,7 +684,7 @@ def test_forged_publication_is_not_an_emission_or_an_annotation(
     monkeypatch.setattr(
         change_events,
         "emit_structure_change",
-        lambda act_id: calls.append(act_id),
+        lambda act_id, **_kwargs: calls.append(act_id),
         raising=False,
     )
     code = main(

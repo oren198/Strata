@@ -256,7 +256,11 @@ def test_removing_ones_own_scope_is_owned_above(tmp_path: Path) -> None:
         approve(fleet, store, result.proposal_id, approver=Actor("g_a1"))
 
 
-def test_reparent_limit_and_binding_flag_round_trip(tmp_path: Path) -> None:
+def test_reparent_limit_and_binding_flag_round_trip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The stated-limit lines belong to the no-core state; the core now emits instead.
+    monkeypatch.delattr(fleet_changes.change_events, "emit_structure_change")
     fleet, store = _world(tmp_path)
     change = _change("reparent", scope_id="g_a1", new_parent_id="g_b")
     pending = propose(fleet, store, change, proposer=Actor("g_a1"))
@@ -282,7 +286,11 @@ def test_reparent_limit_and_binding_flag_round_trip(tmp_path: Path) -> None:
     assert act.owner_scope_id == "g_root"
 
 
-def test_reference_edge_notices_and_widen_flag(tmp_path: Path) -> None:
+def test_reference_edge_notices_and_widen_flag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The stated-limit lines belong to the no-core state; the core now emits instead.
+    monkeypatch.delattr(fleet_changes.change_events, "emit_structure_change")
     fleet, store = _world(tmp_path)
     added = _change("add_edge", **{"from": "g_a", "to": "g_other"})
     pending = propose(fleet, store, added, proposer=Actor("g_a"))
@@ -314,7 +322,11 @@ def test_reference_edge_notices_and_widen_flag(tmp_path: Path) -> None:
     )
 
 
-def test_remove_scope_refuses_children_and_edges_and_keeps_memory(tmp_path: Path) -> None:
+def test_remove_scope_refuses_children_and_edges_and_keeps_memory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The stated-limit lines belong to the no-core state; the core now emits instead.
+    monkeypatch.delattr(fleet_changes.change_events, "emit_structure_change")
     fleet, store = _world(tmp_path)
     summaries = tmp_path / "summaries"
     summaries.mkdir()

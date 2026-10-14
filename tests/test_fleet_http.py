@@ -86,7 +86,9 @@ def _pending_reparent(db_path: Path, fleet_path: Path) -> str:
     return result.proposal_id
 
 
-def test_http_cannot_propose_or_approve_as_a_scope(tmp_path: Path) -> None:
+def test_http_cannot_propose_or_approve_as_a_scope(tmp_path: Path, monkeypatch) -> None:
+    # The stated-limit lines are the no-core state; the core now emits instead.
+    monkeypatch.delattr("strata.change_events.emit_structure_change")
     client, db_path, fleet_path = _client(tmp_path)
     with client:
         proposal_id = _pending_reparent(db_path, fleet_path)
