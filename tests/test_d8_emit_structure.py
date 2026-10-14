@@ -8,7 +8,13 @@ from pathlib import Path
 import pytest
 
 import strata.change_events as change_events
-from strata.change_events import emit_structure_change, events_for_act, structure_conflict_lines
+from strata.change_events import (
+    StructureEmissionError,
+    emit_structure_change,
+    events_for_act,
+    structure_conflict_lines,
+    unemitted_receivers,
+)
 from strata.fleet_changes import apply_as_operator, parse_change
 from strata.perspective import compose_perspective
 from strata.record_store import ContributorRef
@@ -252,7 +258,7 @@ def test_the_audience_is_the_recorded_one_not_todays_fleet(tmp_path: Path) -> No
     store.close()
 
 
-def test_a_failure_is_returned_and_recorded_never_raised(
+def test_a_failure_is_recorded_then_raised_and_the_apply_stands(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     fleet, store = _world(tmp_path)
@@ -261,12 +267,117 @@ def test_a_failure_is_returned_and_recorded_never_raised(
         raise RuntimeError("store unavailable")
 
     monkeypatch.setattr(change_events, "emit", boom)
-    result = _reparent(fleet, store)  # apply stands even though emission fails
+    result = _reparent(fleet, store)  # apply stands; the failure notice names the act
     assert result.status == "applied"
+    assert result.notices == (
+        f"Structure emission failed for {result.act_id}; "
+        f"run `strata fleet reemit {result.act_id}`.",
+    )
+    assert fleet.inter_stratum_parent("g_a1").id == "g_b"
+    with pytest.raises(StructureEmissionError) as raised:
+        emit_structure_change(result.act_id, record_store=store)
+    assert raised.value.act_id == result.act_id
+    assert "store unavailable" in str(raised.value)
+    # the failure was recorded in the record before it was raised
+    notes = [
+        c
+        for c in store.list_contributions(scope_id="g_a1")
+        if c.subject == "change-emission-failed"
+    ]
+    assert notes
+    store.close()
+
+
+def test_a_remove_edge_failure_raises_too(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    fleet, store = _world(tmp_path)
+
+    def boom(*_a: object, **_k: object) -> list[str]:
+        raise RuntimeError("publication unreadable")
+
+    monkeypatch.setattr("strata.publication.read_publication", boom)
+    result = apply_as_operator(
+        fleet, store, parse_change("remove_edge", {"from": "g_a", "to": "g_b"})
+    )
+    assert result.notices and "Structure emission failed" in result.notices[0]
+    with pytest.raises(StructureEmissionError):
+        emit_structure_change(result.act_id, record_store=store)
+    store.close()
+
+
+def test_an_unknown_act_and_a_missing_store_raise(tmp_path: Path) -> None:
+    fleet, store = _world(tmp_path)
+    with pytest.raises(StructureEmissionError):
+        emit_structure_change("fsa_missing", record_store=store)
+    with pytest.raises(StructureEmissionError, match="record_store"):
+        emit_structure_change("fsa_missing")
+    store.close()
+
+
+_THREE = """\
+strata:
+  - {id: s0, name: Root, ordinal: 0}
+  - {id: s1, name: Mid, ordinal: 1}
+  - {id: s2, name: Leaf, ordinal: 2}
+scopes:
+  - {id: g_root, name: Root, stratum_id: s0}
+  - {id: g_other, name: Other, stratum_id: s0}
+  - {id: g_a, name: A, stratum_id: s1}
+  - {id: g_a1, name: A1, stratum_id: s2}
+  - {id: g_a2, name: A2, stratum_id: s2}
+edges:
+  - {from: g_a, to: g_root, kind: chain}
+  - {from: g_a1, to: g_a, kind: chain}
+  - {from: g_a2, to: g_a, kind: chain}
+"""
+
+
+def test_emission_resumes_for_the_receivers_still_owed_without_duplicates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from strata.fleet_config import FleetConfig  # noqa: PLC0415
+    from strata.migrator import run_migrations  # noqa: PLC0415
+    from strata.record_store import RecordStore  # noqa: PLC0415
+
+    (tmp_path / "fleet.yaml").write_text(_THREE, encoding="utf-8")
+    run_migrations(str(tmp_path / "strata.db"))
+    fleet = FleetConfig.load(tmp_path / "fleet.yaml")
+    store = RecordStore(str(tmp_path / "strata.db"))
+    real_emit = change_events.emit
+    calls = {"n": 0}
+
+    def flaky(**kwargs: object) -> list[str]:
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise RuntimeError("second receiver failed")
+        return real_emit(**kwargs)
+
+    monkeypatch.setattr(change_events, "emit", flaky)
+    result = apply_as_operator(
+        fleet, store, parse_change("reparent", {"scope_id": "g_a", "new_parent_id": "g_other"})
+    )
+    assert "Structure emission failed" in result.notices[0]
+    told = [r["scope_id"] for r in _events(store, result.act_id)]
+    assert told == ["g_a"]
+    assert unemitted_receivers(store, result.act_id) == ["g_a1", "g_a2"]
+
+    monkeypatch.setattr(change_events, "emit", real_emit)
     again = emit_structure_change(result.act_id, record_store=store)
-    assert "store unavailable" in again["error"]
-    assert emit_structure_change("fsa_missing", record_store=store)["error"]
-    assert "record_store" in emit_structure_change(result.act_id)["error"]
+    assert sorted(e["scope_id"] for e in again["events"]) == ["g_a1", "g_a2"]
+    assert again["already_emitted"] is False
+    assert sorted(r["scope_id"] for r in _events(store, result.act_id)) == ["g_a", "g_a1", "g_a2"]
+    assert len(store.list_change_events(scope_id="g_a")) == 1  # no duplicate
+    assert unemitted_receivers(store, result.act_id) == []
+    final = emit_structure_change(result.act_id, record_store=store)
+    assert final["already_emitted"] is True and final["events"] == []
+    store.close()
+
+
+def test_unemitted_receivers_is_empty_for_other_change_types(tmp_path: Path) -> None:
+    fleet, store = _world(tmp_path)
+    added = apply_as_operator(
+        fleet, store, parse_change("add_edge", {"from": "g_a", "to": "g_other"})
+    )
+    assert unemitted_receivers(store, added.act_id) == []
     store.close()
 
 

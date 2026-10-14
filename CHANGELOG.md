@@ -89,8 +89,10 @@ the release PR (`dev` → `main`) and the GitHub Release body are built from
   its recorded subtree, with the directives gained and lost and, for each own
   directive that conflicts with a newly inherited one under the 1.17 check, a
   conflict line ("... Where they conflict, the inherited directive governs. ...").
-  It runs once per act, goes through the ordinary notice machinery, and never
-  raises into the apply. A refresh that carries either kind drops any `retire` or
+  It runs once per receiver (a call after a partial failure tells only the
+  receivers still owed), goes through the ordinary notice machinery, and on
+  failure records it and raises `StructureEmissionError`, which the apply turns
+  into the "run `strata fleet reemit`" notice without rolling anything back. A refresh that carries either kind drops any `retire` or
   `supersede` the judge returns on the scope's own directives, and notes the drop:
   a structure change is not the scope's own decision. The perspective's self layer
   shows the conflict line as `annotation` on the own directive while both
