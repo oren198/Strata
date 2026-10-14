@@ -493,3 +493,63 @@ def test_a_forged_exception_answer_without_a_verbatim_span_leaves_a_report_publi
     client = _client(_reask(kind="exception", instead_span="not in the text at all"))
     outcome, _ = _publish(world, text, "context", client)
     assert outcome.decision == "accept", outcome.reasoning
+
+
+# -- the judge's CURRENT SUMMARY block --------------------------------------
+
+
+def _capture_publication_message(world, **kwargs) -> str:  # noqa: ANN001, ANN003
+    """The user message the real publication judge is sent for a scope whose summary file
+    starts with YAML frontmatter ("---")."""
+    from strata.summary_store import ScopeSummary  # noqa: PLC0415
+
+    fleet, store, summaries = world
+    client = MagicMock()
+    client.messages.create.return_value = _fake_response({"decision": "accept", "reasoning": "ok"})
+    ScopeManager(client=client).judge_publication(
+        scope=fleet.get_scope("g_web"),
+        act_kind="publish",
+        content="Releases are tagged in git.",
+        kind="context",
+        subject=None,
+        anchors=["release process"],
+        current_summary=summaries.read("g_web"),
+        current_publication=[],
+        **kwargs,
+    )
+    assert isinstance(summaries.read("g_web"), ScopeSummary)
+    return client.messages.create.call_args.kwargs["messages"][0]["content"]
+
+
+def test_the_publication_judges_summary_block_is_never_empty_or_ambiguous(world) -> None:  # noqa: ANN001
+    import re  # noqa: PLC0415
+
+    message = _capture_publication_message(world)
+    head, _, rest = message.partition("CURRENT SUMMARY (between the markers)\n")
+    assert rest, "the CURRENT SUMMARY header with markers is missing"
+    assert rest.startswith("<<<SUMMARY\n")
+    # no empty or ambiguous fence between the header and the content, in any spacing
+    assert not re.search(r"CURRENT SUMMARY[^\n]*\n\s*---\s*\n\s*---", message)
+    block = rest.split("SUMMARY>>>", 1)[0]
+    # the frontmatter lines sit INSIDE the markers, and the summary's content after them
+    assert block.startswith("<<<SUMMARY\n---\n")
+    assert "\nscope_id: g_web\n" in block
+    assert "Releases are tagged in git." in block
+
+
+def test_the_bootstrap_judges_summary_block_uses_the_same_markers(world) -> None:  # noqa: ANN001
+    fleet, store, summaries = world
+    client = MagicMock()
+    client.messages.create.return_value = _fake_response(
+        {"decision": "decline", "reasoning": "nothing yet", "items": []}
+    )
+    ScopeManager(client=client).judge_bootstrap_publication(
+        scope=fleet.get_scope("g_web"),
+        current_summary=summaries.read("g_web"),
+        publication_max_words=200,
+        current_publication=[],
+    )
+    message = client.messages.create.call_args.kwargs["messages"][0]["content"]
+    assert "CURRENT SUMMARY (between the markers)\n<<<SUMMARY\n" in message
+    assert "\nSUMMARY>>>\n" in message
+    assert "---\n---" not in message

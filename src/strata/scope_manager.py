@@ -3313,6 +3313,16 @@ _EXCEPTION_RULE_TEXT = (
 )
 
 
+def _summary_markers(summary_block: str) -> str:
+    """The publication and bootstrap judges' CURRENT SUMMARY block, with unambiguous markers.
+
+    The summary file begins with a "---" YAML frontmatter line, so a block fenced by "---"
+    rendered as "---\\n---" and read as EMPTY: the judge refused legitimate publications as
+    "not in the current summary". Explicit open and close markers keep the frontmatter
+    inside the block. (The ordinary judgment's renderer is separate and unchanged.)"""
+    return f"CURRENT SUMMARY (between the markers)\n<<<SUMMARY\n{summary_block}\nSUMMARY>>>\n"
+
+
 def _render_directives_only(directives: Sequence[Directive]) -> str:
     """Render an ancestor's directives, without its context (ADR 0013 D1, #187).
 
@@ -11521,10 +11531,7 @@ class ScopeManager:
             f"{operator_block}"
             f"{publication_block}"
             f"{relay_block}"
-            "CURRENT SUMMARY\n"
-            "---\n"
-            f"{summary_block}\n"
-            "---\n\n"
+            f"{_summary_markers(summary_block)}\n"
             f"{proposal_block}\n"
             "Judge it. Call `submit_publication_judgment` exactly once."
         )
@@ -11633,10 +11640,7 @@ class ScopeManager:
         user_message = (
             f"SCOPE: {scope.name} (id={scope.id})\n\n"
             f"{budget_block}"
-            "CURRENT SUMMARY\n"
-            "---\n"
-            f"{summary_block}\n"
-            "---\n\n"
+            f"{_summary_markers(summary_block)}\n"
             "Propose this scope's initial publication (or decline). Call "
             "`submit_bootstrap_publication` exactly once."
         )
