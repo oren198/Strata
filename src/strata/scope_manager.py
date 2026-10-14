@@ -5527,7 +5527,51 @@ _NUMBER_WORD_ALT = (
     "eighty|ninety|hundred"
 )
 _COMPARATOR_VALUE = rf"(-?[\d:.,]+|(?:{_NUMBER_WORD_ALT})\b)"
+_TRIGGER_DURATION_AHEAD = (
+    r"(?=\s*[A-Za-z°%]{0,4}\s*,?\s*for\s+(?:more than|over|longer than|in excess of)\b)"
+)
 _COMPARATOR_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    # #244b a2: the level of a trigger whose duration follows it, whatever the verb or none
+    # ("any batch found below 60C for more than 2 hours", "kept above 5C for more than 4
+    # hours", "if it rises above 5C for more than 4 hours"): below a floor, a HIGHER floor is
+    # stricter; above a ceiling, a LOWER ceiling is stricter.
+    (
+        re.compile(rf"\b(?:below|under)\s+{_COMPARATOR_VALUE}{_TRIGGER_DURATION_AHEAD}", re.I),
+        "larger",
+    ),
+    (
+        re.compile(
+            rf"\b(?:above|over|exceeds?|exceeding)\s+{_COMPARATOR_VALUE}{_TRIGGER_DURATION_AHEAD}",
+            re.I,
+        ),
+        "smaller",
+    ),
+    # the mirrored motion verbs: "rises above A", "climbs / goes / exceeds"
+    (
+        re.compile(
+            rf"\b(?:rises?|rose|climbs?|goes?|go|creeps?|exceeds?)\s+(?:to\s+)?(?:above|over)\s+"
+            rf"{_COMPARATOR_VALUE}",
+            re.I,
+        ),
+        "smaller",
+    ),
+    # value-first limits: "60C or above", "5C or below" (any spelling of "or more / less")
+    (
+        re.compile(
+            rf"(?<![\w-]){_COMPARATOR_VALUE}\s*(?!(?:at|is|be|to|or|in|on)\b)[A-Za-z°%]{{0,4}}"
+            rf"\s+or\s+(?:above|more|higher|greater|over)\b",
+            re.I,
+        ),
+        "larger",
+    ),
+    (
+        re.compile(
+            rf"(?<![\w-]){_COMPARATOR_VALUE}\s*(?!(?:at|is|be|to|or|in|on)\b)[A-Za-z°%]{{0,4}}"
+            rf"\s+or\s+(?:below|less|lower|fewer|under)\b",
+            re.I,
+        ),
+        "smaller",
+    ),
     # #244b iteration 3: the threshold of a trigger ("if it falls below A ..."): the higher
     # the trigger level, the more cases it catches, the stricter the rule.
     (
