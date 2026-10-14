@@ -3,9 +3,10 @@
 After an ordinary judgment admits a directive owned by a session bound to the
 judged scope, the engine checks the admitted text against every rendered
 inherited directive (ancestor and operator). A covered subject must pass the
-same tighten test the relation re-check uses; a conflict holds the
-contribution as context under an engine-written note. Mechanical: no judge
-call, no judge-input change.
+same tighten test the relation re-check uses. A conflict DECLINES the
+contribution (v1.18 #244: it was a hold as context in 1.17.1) with the
+engine's reason pointing at the owning scope. Mechanical: no judge call, no
+judge-input change.
 """
 
 from __future__ import annotations
@@ -57,12 +58,12 @@ OPERATOR = OperatorItem(
 OPERATOR_MEMORY = [("g_exec", [OPERATOR])]
 
 NOTE = (
-    "[Held: conflicts with inherited directive c_par001 (g_arch); "
-    "a child may tighten an inherited rule, not change it.]"
+    "Contradicts inherited c_par001 (g_arch). "
+    "An exception to it is g_arch's to make; propose it there."
 )
 OP_NOTE = (
-    "[Held: conflicts with inherited directive op_tls123 (operator, g_exec); "
-    "a child may tighten an inherited rule, not change it.]"
+    "Contradicts inherited op_tls123 (operator, g_exec). "
+    "An exception to it is the operator's to make; propose it there."
 )
 
 # -- the pure function ------------------------------------------------------
@@ -145,20 +146,17 @@ def _judge(
     return judgment, mock_client, contribution
 
 
-def test_a_looser_value_is_held_as_context_with_the_engine_note() -> None:
+def test_a_looser_value_is_declined_with_the_engine_reason() -> None:
     content = "All services must use TLS 1.2 or later."
     judgment, mock_client, contribution = _judge(content)
 
     assert mock_client.messages.create.call_count == 1  # no extra judge call
-    assert judgment.decision == "accept_as_context"
+    assert judgment.decision == "decline"
     assert judgment.directive_ops == []
-    assert judgment.reasoning == f"An enforceable rule. {NOTE}"
-    assert judgment.new_summary is not None
-    assert judgment.new_summary.directives == CURRENT_SUMMARY.directives
-    assert judgment.new_summary.context == (
-        f"{CURRENT_SUMMARY.context}\n[{contribution.id}] code-writer (g_abc123) "
-        f"proposed: {content} — {NOTE}"
-    )
+    assert judgment.reasoning == NOTE
+    # Nothing is admitted: no summary change, no context line.
+    assert judgment.new_summary is None
+    assert judgment.new_context is None
     assert judgment.inherited_holds == [
         {
             "contribution_id": contribution.id,
@@ -177,9 +175,11 @@ def test_a_looser_value_is_held_as_context_with_the_engine_note() -> None:
         "Most services must use TLS 1.3 or later.",
     ],
 )
-def test_an_exemption_an_outdating_claim_and_a_softened_universal_are_held(content: str) -> None:
+def test_an_exemption_an_outdating_claim_and_a_softened_universal_are_declined(
+    content: str,
+) -> None:
     judgment, _client, _c = _judge(content)
-    assert judgment.decision == "accept_as_context"
+    assert judgment.decision == "decline"
     assert judgment.directive_ops == []
     assert len(judgment.inherited_holds) == 1
 
@@ -215,8 +215,8 @@ def test_an_operator_directive_is_an_inherited_source_too() -> None:
     judgment, _c, _x = _judge(
         "All services must use TLS 1.2 or later.", ancestors=None, operator_memory=OPERATOR_MEMORY
     )
-    assert judgment.decision == "accept_as_context"
-    assert judgment.reasoning == f"An enforceable rule. {OP_NOTE}"
+    assert judgment.decision == "decline"
+    assert judgment.reasoning == OP_NOTE
     assert judgment.inherited_holds[0]["origin"] == "operator, g_exec"
 
 
@@ -235,7 +235,7 @@ def test_a_publish_op_is_checked_on_its_own_words() -> None:
         "Agreed.",
         ops=[{"op": "publish", "content": "All services must use TLS 1.2 or later."}],
     )
-    assert judgment.decision == "accept_as_context"
+    assert judgment.decision == "decline"
     assert judgment.inherited_holds
 
 
@@ -244,10 +244,9 @@ def test_a_supersede_riding_a_conflicting_append_is_dropped_with_it() -> None:
         "All services must use TLS 1.2 or later.",
         ops=[{"op": "append"}, {"op": "supersede", "id": "c_old001"}],
     )
-    assert judgment.decision == "accept_as_context"
+    assert judgment.decision == "decline"
     assert judgment.directive_ops == []
-    assert judgment.new_summary is not None
-    assert judgment.new_summary.directives == CURRENT_SUMMARY.directives
+    assert judgment.new_summary is None
 
 
 def test_only_a_session_bound_to_the_judged_scope_is_checked() -> None:
@@ -349,22 +348,24 @@ def _batch(contents: tuple[str, str], *, ancestors=ANCESTORS, operator_memory=No
     return result, first, second, mock_client
 
 
-def test_a_batch_holds_only_the_conflicting_member() -> None:
+def test_a_batch_declines_only_the_conflicting_member() -> None:
     result, first, second, mock_client = _batch(
         (
             "All services must use TLS 1.2 or later.",
             "Logging pipelines must retain entries for 30 days.",
         )
     )
-    assert mock_client.messages.create.call_count == 1
+    names = [c.kwargs["tools"][0]["name"] for c in mock_client.messages.create.call_args_list]
+    # the judge call, then one directive re-ask for the member that was not declined
+    assert names.count("submit_batch_judgment") == 1
+    assert names.count("classify_directive_relation") == 1
     decisions = {v.contribution_id: v.decision for v in result.verdicts}
-    assert decisions == {first.id: "accept_as_context", second.id: "accept_as_directive"}
+    assert decisions == {first.id: "decline", second.id: "accept_as_directive"}
     assert [op.contribution_id for op in result.directive_ops] == [second.id]
-    assert result.verdicts[0].reasoning == f"a {NOTE}"
+    assert result.verdicts[0].reasoning == NOTE
     assert result.verdicts[1].reasoning == "b"
-    assert result.new_context == (
-        f"Judge's context.\n[{first.id}] code-writer (g_abc123) proposed: {first.content} — {NOTE}"
-    )
+    # The declined text is nowhere in the context; the judge's one rewrite is withheld.
+    assert first.content not in (result.new_context or "")
     assert result.inherited_holds == [
         {
             "contribution_id": first.id,
@@ -394,7 +395,7 @@ def test_a_batch_checks_operator_directives_too() -> None:
         operator_memory=OPERATOR_MEMORY,
     )
     assert result.inherited_holds[0]["origin"] == "operator, g_exec"
-    assert result.verdicts[0].reasoning == f"a {OP_NOTE}"
+    assert result.verdicts[0].reasoning == OP_NOTE
 
 
 # -- 1.17.2: three false holds the drift set found ---------------------------
@@ -503,3 +504,22 @@ def test_a_restated_polarity_pair_is_held_only_when_the_parents_term_is_reversed
         )
         is None
     )
+
+
+def test_a_batch_where_every_member_conflicts_declines_all_and_amends_nothing() -> None:
+    result, first, second, _c = _batch(
+        (
+            "All services must use TLS 1.2 or later.",
+            "All services must use TLS 1.1 or later.",
+        )
+    )
+    assert {v.decision for v in result.verdicts} == {"decline"}
+    assert result.directive_ops == []
+    assert result.new_summary is None
+    assert result.new_context is None
+
+
+def test_a_declined_conflict_carries_no_publication_withdrawal_or_sources() -> None:
+    judgment, _client, _c = _judge("All services must use TLS 1.2 or later.")
+    assert judgment.withdraw_published == []
+    assert judgment.context_sources == []

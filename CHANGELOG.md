@@ -48,6 +48,26 @@ the release PR (`dev` → `main`) and the GitHub Release body are built from
   - A report reaches the issuer only if the contributor follows the `acted_on`
     suggestion.
 
+- **A child directive that changes an inherited one is now declined, not held.**
+  Since 1.17.1 a directive from a session bound to a scope that loosened,
+  exempted or outdated an inherited directive was admitted as context under a
+  "Held" line. It is now declined, with no context line written, and the reason
+  names where the change belongs: "Contradicts inherited <id> (<scope>). An
+  exception to it is <scope>'s to make; propose it there." The declined
+  proposal stays in the record. A directive that only tightens the inherited
+  rule, or touches a subject the rule does not cover, is admitted as before. In
+  a batch, the judge's single context rewrite is replaced by the previous context
+  plus each remaining context member's own text.
+- **A bare value inside an inherited bound is a tightening.** "Tokens expire
+  after 10 minutes" under "at most 15 minutes", or a clock time earlier than an
+  "at or before" bound, no longer reads as the parent's value not kept; the
+  comparator reads the one value of the parent's unit that no comparator governs.
+  The engine also finds the kept value in the contribution itself when the
+  judge's quoted span is the parent's words or a paraphrase, and a decline that
+  names an ancestor scope (rather than a directive id) now triggers the same
+  extra check when the contribution shares a subject word with that scope's
+  directives.
+
 ### Added
 
 - **Windows CI runs the MCP round trip** (#232).

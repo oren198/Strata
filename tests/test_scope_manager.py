@@ -954,7 +954,7 @@ def test_ancestor_directives_render_under_the_inherited_header() -> None:
         new_contribution=NEW_CONTRIBUTION,
     )
 
-    call_kwargs = mock_client.messages.create.call_args
+    call_kwargs = mock_client.messages.create.call_args_list[0]
     messages = call_kwargs.kwargs["messages"]
     user_message_content = messages[0]["content"]
 
@@ -1713,7 +1713,7 @@ def test_operator_memory_block_present_with_verbatim_items() -> None:
         operator_memory=[("g_exec", [OPERATOR_DIRECTIVE, OPERATOR_CONTEXT])],
     )
 
-    call_kwargs = mock_client.messages.create.call_args
+    call_kwargs = mock_client.messages.create.call_args_list[0]
     content = call_kwargs.kwargs["messages"][0]["content"]
 
     assert "OPERATOR MEMORY (binding this scope" in content
@@ -1763,7 +1763,7 @@ def test_operator_memory_block_precedes_the_ancestor_directives_block() -> None:
         new_contribution=NEW_CONTRIBUTION,
         operator_memory=[("g_exec", [OPERATOR_DIRECTIVE])],
     )
-    content = mock_client.messages.create.call_args.kwargs["messages"][0]["content"]
+    content = mock_client.messages.create.call_args_list[0].kwargs["messages"][0]["content"]
     operator_idx = content.index("OPERATOR MEMORY")
     parent_idx = content.index("ANCESTOR DIRECTIVES — g_exec (inherited, binding)")
     assert operator_idx < parent_idx
@@ -3297,7 +3297,8 @@ def _judge_calls(mock_client: MagicMock) -> list:
     return [
         call
         for call in mock_client.messages.create.call_args_list
-        if call.kwargs["tools"][0]["name"] != "classify_inherited_relation"
+        if call.kwargs["tools"][0]["name"]
+        not in ("classify_inherited_relation", "classify_directive_relation")
     ]
 
 

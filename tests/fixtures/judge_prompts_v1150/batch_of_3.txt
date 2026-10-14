@@ -13,6 +13,8 @@ ANCESTOR DIRECTIVES — g_p1parent (inherited, binding)
 - source: scope=g_p1parent · at=2026-01-01T00:00:00+00:00
 ---
 
+An EXCEPTION is not a refinement. A contribution that lets some case skip, waive, defer or do less than an inherited directive requires ("may ... without", "no need to", "can skip", "doesn't need", "except when", "is fine to") EXEMPTS that case and contradicts the directive: DECLINE it, in either classification. A refinement only adds detail or tightens; it never removes a case from the directive's reach.
+
 ENTITLEMENT (relative to this scope)
 - This scope and its ancestors (entitled — directives and context):
     g_p1corpus (p1-corpus)
