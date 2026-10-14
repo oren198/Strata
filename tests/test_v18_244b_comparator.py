@@ -610,3 +610,57 @@ def test_may_not_is_a_restriction_not_the_permissive_marker() -> None:
     assert _relaxation_marker("Hotfixes may be published without the suite.") is not None
     child = "Platform tokens expire after 10 minutes and may not be re-issued."
     assert verify_directive_relation({}, child, [("c_t", "g_org", _TOKEN_LIFE)])[0] == "admit"
+
+
+# ---------------------------------------------------------------------------
+# a2: a trigger with no motion verb, and the mirrored upper bound
+# ---------------------------------------------------------------------------
+
+_FLOOR = (
+    "Water must stay at 60C or above; any batch found below 60C for more than 2 hours is discarded."
+)
+_CEILING = (
+    "Chilled stock must stay at or below 5C; if it rises above 5C for more than 4 hours it "
+    "is discarded."
+)
+
+
+def _floor(level: str, trigger: str, duration: str, *, extra: str = "") -> str:
+    return (
+        f"Water must stay at {level}{extra}; any batch {trigger} below {level.split()[0]} for "
+        f"more than {duration} is discarded."
+    )
+
+
+def _ceiling(level: str, trigger: str, duration: str) -> str:
+    return (
+        f"Chilled stock must stay at {level}; {trigger} above {level.split()[-1]} for more "
+        f"than {duration} it is discarded."
+    )
+
+
+_COMPOUND_CASES = [
+    # floor, trigger with no verb ("found below")
+    (_FLOOR, _floor("65C or above", "found", "1 hour"), True),
+    (_FLOOR, _floor("65C or above", "kept", "1 hour"), True),
+    (_FLOOR, _floor("65C or above", "found", "3 hours"), False),
+    (_FLOOR, _floor("55C or above", "found", "1 hour"), False),
+    (_FLOOR, _floor("65C or above", "held", "1 hour", extra=", probed every 30 minutes"), True),
+    (_FLOOR, _floor("65C or above", "left", "90 minutes"), True),
+    (_FLOOR, _floor("65C or above", "stored", "90 minutes"), True),
+    # ceiling, "above A for more than T"
+    (_CEILING, _ceiling("or below 3C", "if it rises", "2 hours"), True),
+    (_CEILING, _ceiling("or below 3C", "if it rises", "6 hours"), False),
+    (_CEILING, _ceiling("or below 8C", "if it rises", "2 hours"), False),
+    (_CEILING, _ceiling("3C or below", "any item found", "2 hours").replace("it is", "is"), True),
+    (_CEILING, _ceiling("or below 3C", "anything kept", "90 minutes").replace("it is", "is"), True),
+]
+
+
+@pytest.mark.parametrize(("parent", "child", "legit"), _COMPOUND_CASES)
+def test_compound_rules_with_a_trigger_tighten_on_both_bounds_or_conflict(
+    parent: str, child: str, legit: bool
+) -> None:
+    assert (inherited_conflict(child, parent) is None) is legit, child
+    ok, _ = _comparator_rule_ok(parent, child)
+    assert (ok is True) is legit, child
