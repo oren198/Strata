@@ -4701,9 +4701,134 @@ def _teller_near_a_verb(telling_span: str, teller_span: str, *, window: int = 6)
     return False
 
 
+# ---------------------------------------------------------------------------
+# #reason-honesty: an informant the reasoning names must occur in the contribution
+# ---------------------------------------------------------------------------
+
+_REASONING_INFORMANT_RES: tuple[re.Pattern[str], ...] = (
+    re.compile(
+        r"\bHearsay:[^.;\n]*?\b(?:told|relayed|reported)\s+by\s+(?P<x>[^,.;:()\n]+)", re.IGNORECASE
+    ),
+    re.compile(r"\breports?\s+being\s+told\s+by\s+(?P<x>[^,.;:()\n]+)", re.IGNORECASE),
+    re.compile(r"(?P<x>[^,.;:()\n]+?)\s*\(a named informant\)", re.IGNORECASE),
+    re.compile(r"\binformant\s+(?P<x>[^,.;:()\n]+)", re.IGNORECASE),
+)
+_INFORMANT_CLAUSE_CUT_RE = re.compile(
+    r"\s+(?:that|who|which|and|but|to|about|on|in|for|because|since|so|as|when|while|"
+    r"saying|said|stating|regarding|relayed|via|from|with)\b"
+)
+_INFORMANT_ARTICLES = frozenset({"a", "an", "the", "their", "his", "her", "its", "our", "my"})
+_INFORMANT_ROLE_WORDS = frozenset(
+    {"informant", "named", "person", "party", "contributor", "source", "scope", "agent"}
+)
+
+
+def _informant_names(reasoning: str | None) -> list[str]:
+    """The informants *reasoning* names, articles and role words stripped, casefolded.
+
+    Patterns: "Hearsay: ... told by X", "reports being told by X", "X (a named informant)"
+    and "informant X". Pure; a reasoning that names no informant gives ``[]``."""
+    found: list[str] = []
+    for pattern in _REASONING_INFORMANT_RES:
+        for match in pattern.finditer(reasoning or ""):
+            phrase = _INFORMANT_CLAUSE_CUT_RE.split(match.group("x").casefold(), maxsplit=1)[0]
+            words = re.findall(r"[\w'’.-]+", phrase)[:5]
+            while words and words[0] in _INFORMANT_ARTICLES | _INFORMANT_ROLE_WORDS:
+                words.pop(0)
+            while words and words[-1] in _INFORMANT_ROLE_WORDS:
+                words.pop()
+            name = " ".join(words).strip(" .'’-")
+            if name and name not in found:
+                found.append(name)
+    return found
+
+
+def _informants_missing_from(reasoning: str | None, content: str) -> list[str]:
+    """Informants the reasoning names that do not occur in *content* (word-bounded)."""
+    text = " ".join(content.split()).casefold()
+    missing: list[str] = []
+    for name in _informant_names(reasoning):
+        if not re.search(rf"(?<![\w-]){re.escape(name)}(?![\w-])", text):
+            missing.append(name)
+    return missing
+
+
+def _drop_false_hearsay(reasoning: str) -> str:
+    """ "Hearsay:" on a reasoning that itself says first-hand is a wrong label: dropped."""
+    if re.search(r"\bfirst[- ]hand\b", reasoning, re.IGNORECASE):
+        return re.sub(r"^\s*Hearsay:\s*", "", reasoning, count=1, flags=re.IGNORECASE)
+    return reasoning
+
+
+def _decisions_of(judgment: object) -> object:
+    """The verdict(s) a judgment carries: one decision, or a batch's per-member tuple."""
+    verdicts = getattr(judgment, "verdicts", None)
+    if verdicts is not None:
+        return tuple((v.contribution_id, v.decision) for v in verdicts)
+    return getattr(judgment, "decision", None)
+
+
+def _withdrawn_reason(names: Sequence[str], decision: str) -> str:
+    return (
+        "Reason withdrawn: the judge described content that is not in this contribution "
+        f"({', '.join(names)}). Verdict: {decision}."
+    )
+
+
+#: #2b (the philosopher, c_9b1d2a2b136c4d96): reading an artifact is a telling event. A document
+#: is its author telling its readers in writing; the reader's first-person reading act IS the
+#: telling event. The accepted form has three parts, all verbatim in the contribution:
+#: (1) a first-person reading act, (2) the artifact attributed to its source, (3) a locator
+#: that belongs to THAT artifact and follows it.
+_READING_ACT_RE = re.compile(
+    r"\bI\s+(?:read|opened|reviewed|checked|consulted|worked from|"
+    r"(?:drafted|wrote|built|compiled|prepared)\b(?:(?!\.\s)[^;]){0,160}?\bfrom)\b",
+    re.IGNORECASE,
+)
+_ARTIFACT_NOUNS = r"(?:file|document|page|note|notes|report|spec|ADR|doc|memo|brief)"
+_ARTIFACT_OF_SOURCE_RE = re.compile(
+    rf"(?:\b[\w][\w'’.-]*(?:\s+[\w][\w'’.-]*){{0,3}}?['’]s\s+(?:[\w-]+\s+){{0,3}}?{_ARTIFACT_NOUNS}\b"
+    rf"|\b{_ARTIFACT_NOUNS}\s+(?:by|from)\s+[\w][\w'’.-]*(?:\s+[\w][\w'’.-]*){{0,2}})",
+    re.IGNORECASE,
+)
+_LOCATOR_RE = re.compile(
+    r"(?:https?://\S+|[\w.~-]*/[\w./~-]+|[\w-]+\.(?:md|txt|rst|json|ya?ml|py|pdf|html?)\b"
+    r"|\bpub_[0-9a-z]+|\b[a-z]_[0-9a-f]{6,}|[\"“][^\"”]{3,}[\"”])",
+    re.IGNORECASE,
+)
+
+
+def _document_telling_problem(telling_span: str, content: str) -> str | None:
+    """``None`` when *telling_span* is a first-hand reading of an artifact in the accepted
+    form, else the reason it is not. The span is already known to be verbatim in *content*."""
+    if not _READING_ACT_RE.search(telling_span):
+        return 'no first-person reading act ("I read / opened / reviewed / drafted ... from")'
+    artifact = None
+    for match in _ARTIFACT_OF_SOURCE_RE.finditer(telling_span):
+        artifact = match  # the last attribution in the span is the one a locator must follow
+    if artifact is None:
+        return 'no artifact attributed to its source ("<source>\'s file", "<file> by <source>")'
+    # The locator must belong to the attributed artifact: it follows that artifact's text in
+    # the contribution, in the next parenthesis or clause. A path elsewhere in the span, or
+    # before the artifact, does not count.
+    haystack = " ".join(content.split())
+    span = " ".join(telling_span.split())
+    start = haystack.casefold().find(span.casefold())
+    artifact_text = " ".join(artifact.group(0).split())
+    offset = span.casefold().rfind(artifact_text.casefold())
+    if start == -1 or offset == -1:
+        return "the attributed artifact could not be located in the contribution"
+    after = haystack[start + offset + len(artifact_text) :]
+    following = re.match(r"\s*(?:\(([^)]{0,200})\)|(?:at|in|:|—|-|,)\s*(\S+))", after)
+    candidate = (following.group(1) or following.group(2)) if following else None
+    if not candidate or not _LOCATOR_RE.search(candidate):
+        return "no locator (path, URL, publication id or title) follows the attributed artifact"
+    return None
+
+
 def _telling_span_problem_for(
-    telling_span: str, *, content: str
-) -> tuple[str | None, Literal["told", "joint"] | None]:
+    telling_span: str, *, content: str, informant_span: str | None = None
+) -> tuple[str | None, Literal["told", "joint", "document"] | None]:
     """#225 re-gate fix 4, Philis's ruling (module-level, shared with issue
     #237 v1.17's attribution re-check): a span that is only a scope's own
     name/id or a collective ("procurement", "the procurement team") is NOT
@@ -4723,27 +4848,41 @@ def _telling_span_problem_for(
     the first-person check even runs. The contributor-present first-person
     check still applies either way.
 
+    Philosopher c_9b1d2a2b136c4d96 (v1.18): a first-person READING of an artifact is a
+    third kind, ``"document"`` — see :func:`_document_telling_problem` for the accepted form.
+
     Returns ``(problem, verb_kind)``: *problem* is the full decline
     reasoning (sans the "Declined: " prefix) on failure, or ``None`` once
-    verified; *verb_kind* is ``"told"`` for one of :data:`_TELLING_VERBS` or
-    ``"joint"`` for one of :data:`_JOINT_EVENT_VERBS` — ``None`` whenever
-    *problem* is not ``None``. Record at the verb's strength: the caller
-    attributes a ``"joint"`` verdict as "in discussion with X: ...", never
-    "X says" — a ``"told"`` verdict keeps that form. *content* is the
-    contribution's own text the span must occur in verbatim.
+    verified; *verb_kind* is ``"told"`` for one of :data:`_TELLING_VERBS`,
+    ``"joint"`` for one of :data:`_JOINT_EVENT_VERBS` or ``"document"`` — ``None``
+    whenever *problem* is not ``None``. Record at the verb's strength: the caller
+    attributes a ``"joint"`` verdict as "in discussion with X: ...", never "X says" — a
+    ``"told"`` verdict keeps that form. *content* is the contribution's own text the span
+    must occur in verbatim. *informant_span* is the claim's attributed informant; when given,
+    every reason names it, so the reader can tell WHICH claim the decline is about.
     """
+    about = f"the claim attributed to {informant_span!r}" if informant_span else "the claim"
     haystack = " ".join(content.split()).casefold()
     normalized = " ".join(telling_span.split())
     if not normalized or normalized.casefold() not in haystack:
         return (
-            f"invented informant — the telling event {telling_span!r} does "
+            f"invented informant — {about}: the telling event {telling_span!r} does "
             "not occur in the contribution's own text.",
             None,
         )
     is_joint = bool(_JOINT_EVENT_VERB_RE.search(normalized))
     is_told = bool(_TELLING_VERB_RE.search(normalized))
     if not (is_joint or is_told):
-        return "no telling event is reported: state who told you.", None
+        document_problem = _document_telling_problem(normalized, content)
+        if document_problem is None:
+            return None, "document"
+        return (
+            f"{about} has no telling event ({telling_span!r}): state who told you, or report "
+            f"what you read and where. Reading an artifact counts when you say so in the first "
+            f"person, name whose it is, and give its path, URL or id right after it "
+            f"({document_problem}).",
+            None,
+        )
     if is_joint:
         # Addendum (bridge "before" run, j4_joint_verb): "discussed WITH X"
         # is itself the contributor-present check for a joint verb — the
@@ -4752,7 +4891,8 @@ def _telling_span_problem_for(
         # party still fails.
         if not _JOINT_EVENT_PARTY_RE.search(normalized):
             return (
-                'no telling event is reported: state who was involved ("with <party>").',
+                f"{about} has no telling event ({telling_span!r}): state who was involved "
+                '("with <party>").',
                 None,
             )
         return None, "joint"
@@ -4760,7 +4900,11 @@ def _telling_span_problem_for(
     tokens = [re.sub(r"[^\w-]", "", t) for t in normalized.casefold().split()]
     tokens = [t for t in tokens if t and t not in _TELLING_ARTICLES]
     if not any(t in _TELLING_FIRST_PERSON_WORDS for t in tokens):
-        return "the telling names no one it was told to — state who was told.", None
+        return (
+            f"the telling for {about} ({telling_span!r}) names no one it was told to — "
+            "state who was told.",
+            None,
+        )
     return None, "told"
 
 
@@ -5109,7 +5253,9 @@ def verify_attribution_ground(
         verb_check_text = telling_span if teller_inside_telling else f"{teller_span} {telling_span}"
         if not _teller_near_a_verb(verb_check_text, teller_span):  # type: ignore[arg-type]
             return False, "declined (teller_span is not near the telling verb)", None
-        problem, _verb_kind = _telling_span_problem_for(telling_span, content=content)
+        problem, _verb_kind = _telling_span_problem_for(
+            telling_span, content=content, informant_span=teller_span
+        )
         if problem is not None:
             return False, f"declined (no telling event): {problem}", None
         # Hole A (architect review round 3, bridge attack on 1ffc4e4): the
@@ -7060,12 +7206,14 @@ class ScopeManager:
                 )
 
             def _telling_span_problem(
-                telling_span: str,
-            ) -> tuple[str | None, Literal["told", "joint"] | None]:
+                telling_span: str, informant_span: str | None = None
+            ) -> tuple[str | None, Literal["told", "joint", "document"] | None]:
                 """Thin wrapper over the module-level
                 :func:`_telling_span_problem_for`, filling in this call's
                 own contribution text."""
-                return _telling_span_problem_for(telling_span, content=new_contribution.content)
+                return _telling_span_problem_for(
+                    telling_span, content=new_contribution.content, informant_span=informant_span
+                )
 
             corrective_text = (
                 "Your accepted contribution names another fleet scope this scope "
@@ -7259,7 +7407,7 @@ class ScopeManager:
                     classification,
                     "declined (invented informant)",
                 )
-            telling_problem, telling_verb_kind = _telling_span_problem(telling_span)
+            telling_problem, telling_verb_kind = _telling_span_problem(telling_span, informant_span)
             if telling_problem is not None:
                 return _noted(
                     judgment.model_copy(
@@ -7291,6 +7439,15 @@ class ScopeManager:
             # "X says"; a told/said verb keeps today's form.
             if telling_verb_kind == "joint":
                 engine_line = f"In discussion with {informant_span}: {new_contribution.content}"
+            elif telling_verb_kind == "document":
+                # c_9b1d2a2b136c4d96: the author's word as of the reading, never
+                # "<scope> holds/decided". Context only, like every informant claim.
+                engine_line = (
+                    f"{new_contribution.contributor.skill} "
+                    f"({new_contribution.contributor.scope_id}) reports reading {informant_span}'s "
+                    f"document ({telling_span.strip()}); as of that reading it says: "
+                    f"{new_contribution.content}"
+                )
             else:
                 engine_line = (
                     f"{new_contribution.contributor.skill} "
@@ -7446,10 +7603,22 @@ class ScopeManager:
                 new_contribution=new_contribution,
             )
 
+        def _reasoning_gaps(judgment: ScopeManagerJudgment) -> list[str]:
+            return _informants_missing_from(judgment.reasoning, new_contribution.content)
+
+        def _reasoning_withdraw(
+            judgment: ScopeManagerJudgment, names: Sequence[str]
+        ) -> ScopeManagerJudgment:
+            return judgment.model_copy(
+                update={"reasoning": _withdrawn_reason(names, judgment.decision)}
+            )
+
         judgment = self._call_with_correctives(
             user_message=user_message,
             system_prompt=_SYSTEM_PROMPT,
             tool=_judge_tool_for(acted_on_target),
+            reasoning_gaps=_reasoning_gaps,
+            reasoning_withdraw=_reasoning_withdraw,
             max_tokens=JUDGE_MAX_TOKENS,
             summary_max_words=summary_max_words,
             parse=_parse,
@@ -7523,6 +7692,10 @@ class ScopeManager:
                 if acted_on_target is None and mode == "ordinary"
                 else None
             ),
+        )
+        # A "Hearsay:" label on a reasoning that itself says first-hand is a wrong label.
+        judgment = judgment.model_copy(
+            update={"reasoning": _drop_false_hearsay(judgment.reasoning)}
         )
         judgment = self._hold_inherited_conflicts(
             judgment.model_copy(update={"contribution_id": new_contribution.id}),
@@ -7914,6 +8087,8 @@ class ScopeManager:
         parse_lenient: Callable[[object], _JudgmentT] | None = None,
         parse_forced_decline: Callable[[object], _JudgmentT] | None = None,
         parse_generic_decline: Callable[[Exception], _JudgmentT] | None = None,
+        reasoning_gaps: Callable[[_JudgmentT], list[str]] | None = None,
+        reasoning_withdraw: Callable[[_JudgmentT, Sequence[str]], _JudgmentT] | None = None,
         is_outcome_report: bool = False,
         acted_on_is_directive: bool = False,
         post_judgment: Callable[[_JudgmentT, list[dict], object, object], _JudgmentT] | None = None,
@@ -8307,6 +8482,53 @@ class ScopeManager:
                 # replaced item, stay.
                 if drop_stale_context is not None and stale_claims(judgment):
                     judgment = drop_stale_context(judgment)
+
+        # Reason honesty: the reasoning names an informant that does not occur in the
+        # contribution (the judge described content from another contribution in its window).
+        # Exactly ONE re-ask with the same tool; the verdict is never changed by it. If the
+        # name is still there, the engine withdraws the reasoning and says so.
+        if reasoning_gaps is not None and reasoning_withdraw is not None:
+            missing = reasoning_gaps(judgment)
+            if missing:
+                retry_messages = [
+                    *first_messages,
+                    *_corrective_turn(
+                        response,
+                        tool_use_block,
+                        f"Your reasoning names {', '.join(missing)} as an informant; that does "
+                        "not appear in the NEW CONTRIBUTION. Describe only the new "
+                        f"contribution. Call {tool_name} again with the SAME {verdict_noun} "
+                        f"and the SAME {decision_noun}, and `reasoning` that describes only "
+                        "what the NEW CONTRIBUTION says.",
+                    ),
+                ]
+                try:
+                    retry_response = _call(retry_messages)
+                    retry_block = self._extract_tool_use_block(retry_response)
+                    retry_judgment = parse(retry_block)
+                except Exception:  # noqa: BLE001 — deliberate: retry is best-effort
+                    retry_judgment = None
+                if retry_judgment is not None and _decisions_of(retry_judgment) == _decisions_of(
+                    judgment
+                ):
+                    if invalid_ops(retry_judgment):
+                        retry_judgment = drop_invalid(retry_judgment)
+                    judgment = retry_judgment
+                    response = retry_response
+                    tool_use_block = retry_block
+                    first_messages = retry_messages
+                still = reasoning_gaps(judgment)
+                protocol_notes.append(
+                    "Corrective re-ask: the reasoning named an informant that does not occur "
+                    f"in the contribution ({', '.join(missing)})"
+                    + (
+                        "; the second answer still did."
+                        if still
+                        else "; the second answer fixed it."
+                    )
+                )
+                if still:
+                    judgment = reasoning_withdraw(judgment, still)
 
         # Overflow re-ask (issue #63): the LLM was told the BUDGET but nothing
         # enforced it.  Give it exactly one corrective follow-up call if the
@@ -9326,10 +9548,39 @@ class ScopeManager:
                 hop=hop,
             )
 
+        def _batch_reasoning_gaps(judgment: ScopeManagerBatchJudgment) -> list[str]:
+            names: list[str] = []
+            for verdict in judgment.verdicts:
+                member = contributions.get(verdict.contribution_id)
+                if member is None:
+                    continue
+                for name in _informants_missing_from(verdict.reasoning, member.content):
+                    if name not in names:
+                        names.append(name)
+            return names
+
+        def _batch_reasoning_withdraw(
+            judgment: ScopeManagerBatchJudgment, _names: Sequence[str]
+        ) -> ScopeManagerBatchJudgment:
+            verdicts = []
+            for verdict in judgment.verdicts:
+                member = contributions.get(verdict.contribution_id)
+                missing = (
+                    _informants_missing_from(verdict.reasoning, member.content) if member else []
+                )
+                if missing:
+                    verdict = verdict.model_copy(
+                        update={"reasoning": _withdrawn_reason(missing, verdict.decision)}
+                    )
+                verdicts.append(verdict)
+            return judgment.model_copy(update={"verdicts": verdicts})
+
         batch_judgment = self._call_with_correctives(
             user_message=user_message,
             system_prompt=_BATCH_SYSTEM_PROMPT,
             tool=JUDGE_BATCH_TOOL,
+            reasoning_gaps=_batch_reasoning_gaps,
+            reasoning_withdraw=_batch_reasoning_withdraw,
             max_tokens=_batch_max_tokens(len(new_contributions)),
             summary_max_words=summary_max_words,
             parse=_parse,
@@ -9354,6 +9605,14 @@ class ScopeManager:
             # defaults to False here, so the generic branch is always what
             # a second slip reaches).
             parse_generic_decline=_generic_second_slip_batch_decline,
+        )
+        batch_judgment = batch_judgment.model_copy(
+            update={
+                "verdicts": [
+                    v.model_copy(update={"reasoning": _drop_false_hearsay(v.reasoning)})
+                    for v in batch_judgment.verdicts
+                ]
+            }
         )
         batch_judgment = self._hold_batch_inherited_conflicts(
             batch_judgment,
