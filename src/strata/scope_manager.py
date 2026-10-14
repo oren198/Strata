@@ -6717,7 +6717,9 @@ _SPECIFICITY_ANCHOR_RE = re.compile(
 _PAST_TENSE_RE = re.compile(
     r"\b(?:\w+ed|was|were|had|did|took|left|went|held|made|ran|got|came|found|lost|sent|"
     r"broke|began|saw|gave|put|set|cut|hit|fell|stopped|spent|missed|drifted|shipped|"
-    r"overloaded|destroyed|reached|wasn['’]t|weren['’]t|didn['’]t)\b",
+    r"overloaded|destroyed|reached|wasn['’]t|weren['’]t|didn['’]t|"
+    r"caught|kept|built|wrote|told|paid|chose|threw|knew|grew|drove|rose|woke|froze|"
+    r"stood|understood|met|led|slept|sold|bought|brought|thought|taught|won)\b",
     re.IGNORECASE,
 )
 _DEPARTURE_CUE_RE = re.compile(
@@ -9976,11 +9978,10 @@ class ScopeManager:
 
         if relay_origin_scope_id is not None:
             keep = existing_label or relay_label
-            hit = _first_inherited_conflict(body, inherited) if kind == "directive" else None
-            if kind == "directive" and hit is not None:
-                return PublicationExceptionCheck(
-                    "refuse", content, note=_publication_refusal_note(hit[0], hit[1])
-                )
+            if kind == "directive":
+                refusal = self._directive_item_refusal(body, inherited)
+                if refusal is not None:
+                    return PublicationExceptionCheck("refuse", content, note=refusal)
             outcome: dict | None = None
             if kind == "context":
                 outcome = self._classify_publication_text(scope, body, inherited)
@@ -10007,11 +10008,9 @@ class ScopeManager:
             )
 
         if kind == "directive":
-            hit = _first_inherited_conflict(body, inherited)
-            if hit is not None:
-                return PublicationExceptionCheck(
-                    "refuse", content, note=_publication_refusal_note(hit[0], hit[1])
-                )
+            refusal = self._directive_item_refusal(body, inherited)
+            if refusal is not None:
+                return PublicationExceptionCheck("refuse", content, note=refusal)
             return PublicationExceptionCheck("accept", body)
 
         outcome = self._classify_publication_text(scope, body, inherited)
@@ -10034,6 +10033,20 @@ class ScopeManager:
         return PublicationExceptionCheck(
             "accept", body, inherited_relation=outcome, fallback=bool(outcome["fallback"])
         )
+
+    @staticmethod
+    def _directive_item_refusal(body: str, inherited: Sequence[tuple[str, str, str]]) -> str | None:
+        """The refusal note for a published DIRECTIVE item that changes or relaxes an
+        inherited directive, or ``None``. No judge call: the 1.17 inherited check, then the
+        #244 verifier read with no answer (a relaxation marker on an inherited subject, or a
+        reversed state or out-of-bound value on a shared object subject)."""
+        hit = _first_inherited_conflict(body, inherited)
+        if hit is not None:
+            return _publication_refusal_note(hit[0], hit[1])
+        verdict, _reason, target, _fallback = verify_directive_relation({}, body, inherited)
+        if verdict == "decline" and target is not None:
+            return _publication_refusal_note(target[0], target[1])
+        return None
 
     def _classify_publication_text(
         self, scope: Scope, text: str, inherited: Sequence[tuple[str, str, str]]

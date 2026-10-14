@@ -102,7 +102,13 @@ def world(tmp_path: Path):  # noqa: ANN201
         ScopeSummary(
             scope_id="g_org",
             directives=[
-                Directive(id="c_suite", content=_RULE, source_scope_id="g_org", created_at=stamp)
+                Directive(id="c_suite", content=_RULE, source_scope_id="g_org", created_at=stamp),
+                Directive(
+                    id="c_tokens",
+                    content="Access tokens expire after at most 15 minutes.",
+                    source_scope_id="g_org",
+                    created_at=stamp,
+                ),
             ],
             context="",
             updated_at=stamp,
@@ -385,6 +391,25 @@ def test_the_relayers_conflict_note_appears_only_when_its_directive_conflicts(wo
     outcome, _ = _publish(world, text, "context", quiet, relay=("g_api", origin))
     assert outcome.decision == "accept"
     assert "The reported act conflicts with" not in outcome.reasoning
+
+
+def test_a_reported_act_that_conflicts_with_a_relayer_directive_adds_the_separate_note(
+    world,  # noqa: ANN001
+) -> None:
+    text = "On 3 June the access tokens were set to expire after 60 minutes for the batch run."
+    origin = _origin_item(world, f"{_ORIGIN_LABEL}{text}")
+    client = _client(
+        _reask(
+            kind="consequence_report",
+            inherited_id="c_tokens",
+            occurrence_span="On 3 June the access tokens were set to expire after 60 minutes",
+        )
+    )
+    outcome, _ = _publish(world, text, "context", client, relay=("g_api", origin))
+    assert outcome.decision == "accept"
+    assert "The reported act conflicts with c_tokens, which binds g_web." in outcome.reasoning
+    (item,) = _face(world)
+    assert item.content.startswith(_ORIGIN_LABEL)
 
 
 def test_when_the_origin_withdraws_the_relay_goes_with_it(world) -> None:  # noqa: ANN001
