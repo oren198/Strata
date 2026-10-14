@@ -64,20 +64,17 @@ the release PR (`dev` → `main`) and the GitHub Release body are built from
   (ADR 0014 D8). The act's before and after topology for a `reparent` also
   carry `chain` (the moved scope's ancestors, root-first) and `descendants`
   (its chain subtree ids at apply time). Other change types are unchanged.
-  While `emit_structure_change` is absent, apply still prints the stated-limit
-  line and does not emit. When that operation is present, apply calls it
-  once after the act row is committed, under the same fleet lock. If the
-  call raises, the apply stands and the notice is "Structure emission failed
-  for <act_id>; run `strata fleet reemit <act_id>`." `strata doctor` says
-  "Structure emission is not built yet; acts are not checked" until
-  `events_for_act` exists, and then lists every `remove_edge` or `reparent`
-  act that function returns no rows for. `strata fleet reemit <act_id>`
-  emits for one act, prints what was emitted, and prints `already emitted`
-  only when `events_for_act` returns rows. The Console act list shows those
-  rows and the lines `structure_conflict_lines` returns. The perspective
-  shows the `annotation` the engine put on a self-layer directive. Neither
-  surface reads event or contribution text. The kinds, the migration, and
-  the core operations themselves are not in this change.
+  Apply calls `emit_structure_change` once after the act row is committed,
+  under the same fleet lock. If that call raises `StructureEmissionError`,
+  the apply stands and the notice is "Structure emission failed
+  for <act_id>; run `strata fleet reemit <act_id>`." `strata doctor` lists
+  every `remove_edge` or `reparent` act for which `unemitted_receivers` is
+  not `[]`. `strata fleet reemit <act_id>` emits for the receivers still
+  owed, prints what was emitted, and prints `already emitted` only when
+  `unemitted_receivers` returns `[]`. The Console act list shows the rows
+  `events_for_act` returns and the lines `structure_conflict_lines` returns.
+  The perspective shows the `annotation` the engine put on a self-layer
+  directive. Neither surface reads event or contribution text.
 
 - **A fleet structure change now tells the scopes it affects** (ADR 0014 D8, core).
   Two new change-event kinds, `channel_removed` (a reference edge a scope read

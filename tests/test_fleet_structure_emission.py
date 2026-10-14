@@ -1,10 +1,9 @@
 """ADR 0014 D8, peripheral half.
 
-The core's ``emit_structure_change``, ``events_for_act``, and
-``structure_conflict_lines`` have not landed, and ``perspective.py`` does
-not yet write ``annotation``. These tests cover the guard path (those
-operations absent) and stubs standing in for the read contract. Nothing
-here treats event text or contribution text as an act id or a conflict.
+Apply, doctor, reemit, and the Console call the core operations directly.
+``already emitted`` and a clean doctor both mean ``unemitted_receivers``
+returned ``[]``. Nothing here treats event text or contribution text as an
+act id or a conflict.
 """
 
 from __future__ import annotations
@@ -197,28 +196,6 @@ def test_non_reparent_topology_omits_chain_and_descendants(tmp_path: Path) -> No
     store.close()
 
 
-def test_apply_without_core_keeps_stated_limit_and_succeeds(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # The core ships emit_structure_change; this is the no-core state.
-    monkeypatch.delattr(change_events, "emit_structure_change")
-    fleet, store = _world(tmp_path)
-    result = apply_as_operator(
-        fleet,
-        store,
-        parse_change("reparent", {"scope_id": "g_a1", "new_parent_id": "g_b"}),
-    )
-    assert result.status == "applied"
-    assert result.notices == (
-        "g_a1 now inherits from g_root → g_b. Its own directives are not re-checked "
-        "against the new inherited rules automatically (not built yet). Review them; "
-        "the 1.17 inherited check applies to new writes only.",
-    )
-    assert fleet.inter_stratum_parent("g_a1").id == "g_b"
-    assert store.get_fleet_structure_act(result.act_id).after_topology["g_a1"]["parent"] == "g_b"
-    store.close()
-
-
 def test_apply_with_core_emits_once_after_commit_under_the_lock(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -259,10 +236,10 @@ def test_raising_emit_does_not_roll_back_the_apply(
         proposer=Actor("g_a1"),
     )
 
-    def emit(act_id: str, **_kwargs: object) -> None:
-        raise RuntimeError(f"emission failed for {act_id}")
+    def boom(**_kwargs: object) -> list[str]:
+        raise RuntimeError("store unavailable")
 
-    monkeypatch.setattr(change_events, "emit_structure_change", emit, raising=False)
+    monkeypatch.setattr(change_events, "emit", boom)
     applied = approve(fleet, store, pending.proposal_id, approver=Actor("g_root"))
     assert applied.status == "applied"
     assert applied.notices == (_failed_notice(applied.act_id),)
@@ -271,6 +248,11 @@ def test_raising_emit_does_not_roll_back_the_apply(
     act = store.get_fleet_structure_act(applied.act_id)
     assert act.after_topology["g_a1"]["parent"] == "g_b"
     assert store.get_fleet_change_proposal(pending.proposal_id).status == "applied"
+    with pytest.raises(change_events.StructureEmissionError) as raised:
+        change_events.emit_structure_change(applied.act_id, record_store=store)
+    assert type(raised.value) is change_events.StructureEmissionError
+    assert raised.value.act_id == applied.act_id
+    assert "store unavailable" in str(raised.value.cause)
     store.close()
 
 
@@ -366,20 +348,22 @@ def test_reemit_says_when_emission_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     fleet, store = _world(tmp_path)
-    monkeypatch.setattr(
-        change_events, "emit_structure_change", lambda *a, **k: {}, raising=False
-    )  # apply first, emit in the test
+
+    def boom(**_kwargs: object) -> list[str]:
+        raise RuntimeError("store unavailable")
+
+    monkeypatch.setattr(change_events, "emit", boom)
     result = apply_as_operator(
         fleet,
         store,
         parse_change("remove_edge", {"from": "g_a", "to": "g_b"}),
     )
+    assert result.notices == (_failed_notice(result.act_id),)
+    with pytest.raises(change_events.StructureEmissionError) as raised:
+        change_events.emit_structure_change(result.act_id, record_store=store)
+    assert type(raised.value) is change_events.StructureEmissionError
+    assert raised.value.act_id == result.act_id
     store.close()
-
-    def emit(act_id: str, **_kwargs: object) -> None:
-        raise RuntimeError(f"emission failed for {act_id}")
-
-    monkeypatch.setattr(change_events, "emit_structure_change", emit, raising=False)
     code = main(
         [
             "fleet",
@@ -395,18 +379,38 @@ def test_reemit_says_when_emission_fails(
     assert _failed_notice(result.act_id) in capsys.readouterr().err
 
 
-def test_reemit_without_core_prints_the_stated_limit(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.delattr(change_events, "emit_structure_change")
-    fleet, store = _world(tmp_path)
-    result = apply_as_operator(
-        fleet,
-        store,
-        parse_change("reparent", {"scope_id": "g_a1", "new_parent_id": "g_b"}),
-    )
-    store.close()
-    code = main(
+_THREE = """\
+strata:
+  - {id: s0, name: Root, ordinal: 0}
+  - {id: s1, name: Mid, ordinal: 1}
+  - {id: s2, name: Leaf, ordinal: 2}
+scopes:
+  - {id: g_root, name: Root, stratum_id: s0}
+  - {id: g_other, name: Other, stratum_id: s0}
+  - {id: g_a, name: A, stratum_id: s1}
+  - {id: g_a1, name: A1, stratum_id: s2}
+  - {id: g_a2, name: A2, stratum_id: s2}
+edges:
+  - {from: g_a, to: g_root, kind: chain}
+  - {from: g_a1, to: g_a, kind: chain}
+  - {from: g_a2, to: g_a, kind: chain}
+"""
+
+_CLEAN = "no remove_edge or reparent act is missing its change events."
+
+
+def _three(tmp_path: Path) -> tuple[FleetConfig, RecordStore]:
+    fleet_path = tmp_path / "fleet.yaml"
+    fleet_path.write_text(_THREE, encoding="utf-8")
+    from strata.migrator import run_migrations
+
+    db_path = str(tmp_path / "strata.db")
+    run_migrations(db_path)
+    return FleetConfig.load(fleet_path), RecordStore(db_path)
+
+
+def _reemit(tmp_path: Path, fleet: FleetConfig, act_id: str) -> int:
+    return main(
         [
             "fleet",
             "--db",
@@ -414,14 +418,99 @@ def test_reemit_without_core_prints_the_stated_limit(
             "--fleet",
             str(fleet._path),
             "reemit",
-            result.act_id,
+            act_id,
         ]
     )
-    out = capsys.readouterr().out
+
+
+def test_partial_emission_is_listed_by_doctor_and_completed_by_reemit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """One receiver missing: doctor lists the act, reemit finishes it, then both are clean."""
+    from strata.change_events import events_for_act, unemitted_receivers
+
+    fleet, store = _three(tmp_path)
+    real_emit = change_events.emit
+    calls = {"n": 0}
+
+    def flaky(**kwargs: object) -> list[str]:
+        calls["n"] += 1
+        if calls["n"] == 3:
+            raise RuntimeError("third receiver failed")
+        return real_emit(**kwargs)
+
+    monkeypatch.setattr(change_events, "emit", flaky)
+    result = apply_as_operator(
+        fleet,
+        store,
+        parse_change("reparent", {"scope_id": "g_a", "new_parent_id": "g_other"}),
+    )
+    assert result.notices == (_failed_notice(result.act_id),)
+    missing = unemitted_receivers(store, result.act_id)
+    assert missing == ["g_a2"]
+    told = sorted(row["scope_id"] for row in events_for_act(store, result.act_id))
+    assert told == ["g_a", "g_a1"]
+    monkeypatch.setattr(change_events, "emit", real_emit)
+    store.close()
+
+    _use_project(tmp_path, fleet, monkeypatch)
+    capsys.readouterr()
+    listed = _doctor_line(capsys)
+    assert result.act_id in listed
+    assert "reparent" in listed
+    assert _CLEAN not in listed
+
+    code = _reemit(tmp_path, fleet, result.act_id)
+    first_out = capsys.readouterr().out
     assert code == 0
-    assert "g_a1 now inherits from g_root → g_b" in out
-    assert "not re-checked against the new inherited rules automatically (not built yet)" in out
-    assert "already emitted" not in out
+    assert "already emitted" not in first_out
+    emitted = json.loads(first_out)
+    assert "error" not in emitted
+    assert emitted["already_emitted"] is False
+    assert "g_a2" in first_out
+
+    check = RecordStore(str(tmp_path / "strata.db"))
+    try:
+        assert unemitted_receivers(check, result.act_id) == []
+        assert sorted(row["scope_id"] for row in events_for_act(check, result.act_id)) == [
+            "g_a",
+            "g_a1",
+            "g_a2",
+        ]
+    finally:
+        check.close()
+
+    clean = _doctor_line(capsys)
+    assert _CLEAN in clean
+    assert result.act_id not in clean
+
+    code = _reemit(tmp_path, fleet, result.act_id)
+    assert code == 0
+    assert capsys.readouterr().out.strip() == "already emitted"
+    check = RecordStore(str(tmp_path / "strata.db"))
+    try:
+        assert sorted(row["scope_id"] for row in events_for_act(check, result.act_id)) == [
+            "g_a",
+            "g_a1",
+            "g_a2",
+        ]
+    finally:
+        check.close()
+
+
+def test_reemit_of_a_change_that_owes_nothing_prints_already_emitted(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fleet, store = _world(tmp_path)
+    result = apply_as_operator(
+        fleet,
+        store,
+        parse_change("describe", {"scope_id": "g_a", "description": "purpose"}),
+    )
+    store.close()
+    code = _reemit(tmp_path, fleet, result.act_id)
+    assert code == 0
+    assert capsys.readouterr().out.strip() == "already emitted"
 
 
 def test_reemit_unknown_act_exits_1(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -440,35 +529,6 @@ def test_reemit_unknown_act_exits_1(tmp_path: Path, capsys: pytest.CaptureFixtur
     )
     assert code == 1
     assert "No fleet structure act fsa_missing." in capsys.readouterr().err
-
-
-_NOT_BUILT = "Structure emission is not built yet; acts are not checked"
-
-
-def test_doctor_without_core_says_acts_are_not_checked(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    # The core now ships `events_for_act`; this test is the no-core state, so it
-    # removes the operation rather than relying on its absence.
-    monkeypatch.delattr(change_events, "events_for_act")
-    fleet, store = _world(tmp_path)
-    reparented = apply_as_operator(
-        fleet,
-        store,
-        parse_change("reparent", {"scope_id": "g_a1", "new_parent_id": "g_b"}),
-    )
-    removed = apply_as_operator(
-        fleet,
-        store,
-        parse_change("remove_edge", {"from": "g_a", "to": "g_b"}),
-    )
-    store.close()
-    _use_project(tmp_path, fleet, monkeypatch)
-    capsys.readouterr()
-    line = _doctor_line(capsys)
-    assert _NOT_BUILT in line
-    assert reparented.act_id not in line
-    assert removed.act_id not in line
 
 
 def test_doctor_lists_only_acts_events_for_act_misses(
@@ -523,7 +583,7 @@ def test_doctor_lists_only_acts_events_for_act_misses(
     assert "reparent" in line
     assert removed.act_id not in line
     assert described.act_id not in line
-    assert _NOT_BUILT not in line
+    assert "not built yet" not in line
 
 
 def _structure_rows(act_id: str) -> list[dict]:
@@ -737,6 +797,22 @@ def test_console_act_and_perspective_views_are_read_only() -> None:
     assert 'layer.relation === "self"' in perspective
     assert "fetchFleetActs" in store
     assert "emit(" not in store
+
+
+def test_peripherals_call_core_operations_without_absence_guards() -> None:
+    root = Path(change_events.__file__).parent
+    fleet = (root / "fleet_changes.py").read_text(encoding="utf-8")
+    doctor = (root / "__main__.py").read_text(encoding="utf-8")
+    for text in (fleet, doctor):
+        assert "hasattr(change_events" not in text
+        assert "getattr(change_events" not in text
+        assert "not built yet" not in text
+    assert "change_events.emit_structure_change(" in fleet
+    assert "change_events.events_for_act(" in fleet
+    assert "change_events.structure_conflict_lines(" in fleet
+    assert "change_events.unemitted_receivers(" in fleet
+    assert "unemitted_receivers(record_store, act_id) == []" in fleet
+    assert "unemitted_structure_acts" in doctor
 
 
 def test_peripherals_do_not_scan_event_text() -> None:
