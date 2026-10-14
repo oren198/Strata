@@ -324,3 +324,87 @@ def test_the_batch_path_checks_each_members_reasoning_against_its_own_text() -> 
     assert by_id["c_a"].reasoning == "Hearsay: told by the CEO."
     assert by_id["c_b"].reasoning.startswith("Reason withdrawn:")
     assert {v.decision for v in result.verdicts} == {"accept_as_context"}
+
+
+# -- review fixes: extraction, the re-ask adopts only the reasoning, negation, the switch --
+
+
+@pytest.mark.parametrize(
+    ("reasoning", "expected"),
+    [
+        ("No informant is named in this contribution.", []),
+        ("No informant from another team is cited.", []),
+        ("The text names no informant or operator directive.", []),
+        ("Not an informant claim; this is not applicable.", []),
+        ("Any informant would be unnamed here.", []),
+        ("Informant is not applicable: this is a plain fact.", []),
+        ("The informant 'night crew' told the agent the shift ends at six.", ["night crew"]),
+        ("Informant Tom told the agent he would check.", ["tom"]),
+        ("Hearsay: the contributor reports being told by two people.", ["two people"]),
+    ],
+)
+def test_informant_extraction_has_no_false_names(reasoning: str, expected: list[str]) -> None:
+    assert _informant_names(reasoning) == expected
+
+
+def test_a_true_informant_in_the_text_is_never_withdrawn() -> None:
+    for reasoning, text in (
+        ("The informant 'night crew' told the agent the shift ends at six.", "night crew said six"),
+        ("Informant Tom told the agent he would check.", "Tom told me he would check the rota."),
+        (
+            "Hearsay: the contributor reports being told by two people.",
+            "Two people told me the lift is out.",
+        ),
+    ):
+        assert _informants_missing_from(reasoning, text) == [], reasoning
+
+
+def test_the_reask_takes_only_the_reasoning_from_the_retry() -> None:
+    client = MagicMock()
+    first = _accept("Hearsay: told by the CEO.", new_context="first context")
+    retry = _fake_response(
+        {
+            "decision": "accept_as_context",
+            "reasoning": "Marketing plans to ship a README section.",
+            "directive_ops": [{"op": "append"}],  # a retry that tries to add a directive
+            "new_context": "retry context",
+        }
+    )
+    client.messages.create.side_effect = [first, retry]
+    judgment = _judge_plain(client, _NO_CEO)
+    assert judgment.reasoning == "Marketing plans to ship a README section."
+    assert judgment.directive_ops == []
+    assert judgment.new_context == "first context"
+    assert [d.id for d in judgment.new_summary.directives] == []
+
+
+def test_not_first_hand_keeps_its_hearsay_label() -> None:
+    text = "Hearsay: not first-hand; told by the CEO."
+    assert _drop_false_hearsay(text) == text
+    assert _drop_false_hearsay("Hearsay: no first-hand report, told by Dana.").startswith(
+        "Hearsay:"
+    )
+
+
+def test_the_switch_on_wires_the_check_and_off_makes_no_extra_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import strata.scope_manager as sm  # noqa: PLC0415
+
+    ceo = "Hearsay: the contributor reports being told by the CEO that this is approved."
+    monkeypatch.setattr(sm, "_REASON_INFORMANT_CHECK", True)
+    on = MagicMock()
+    on.messages.create.side_effect = [_accept(ceo), _accept(ceo)]
+    on_judgment = _judge_plain(on, _NO_CEO)
+    assert on.messages.create.call_count == 2
+    assert on_judgment.reasoning.startswith("Reason withdrawn:")
+
+    monkeypatch.setattr(sm, "_REASON_INFORMANT_CHECK", False)
+    off = MagicMock()
+    off.messages.create.side_effect = [_accept(ceo)]
+    off_judgment = _judge_plain(off, _NO_CEO)
+    assert off.messages.create.call_count == 1
+    assert off_judgment.reasoning == ceo  # untouched
+    hearsay = MagicMock()
+    hearsay.messages.create.side_effect = [_accept("Hearsay: this is a first-hand report.")]
+    assert _judge_plain(hearsay, _NO_CEO).reasoning == "Hearsay: this is a first-hand report."

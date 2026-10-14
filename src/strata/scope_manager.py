@@ -4705,6 +4705,11 @@ def _teller_near_a_verb(telling_span: str, teller_span: str, *, window: int = 6)
 # #reason-honesty: an informant the reasoning names must occur in the contribution
 # ---------------------------------------------------------------------------
 
+#: One internal switch for the whole "reason honesty" §2 (the informant check, its re-ask and
+#: withdrawal, and the dropped "Hearsay:" label). With it False no reasoning callable is wired
+#: into the judgment call and no extra call is ever made: a one-line way to turn it off.
+_REASON_INFORMANT_CHECK = True
+
 _REASONING_INFORMANT_RES: tuple[re.Pattern[str], ...] = (
     re.compile(
         r"\bHearsay:[^.;\n]*?\b(?:told|relayed|reported)\s+by\s+(?P<x>[^,.;:()\n]+)", re.IGNORECASE
@@ -4715,28 +4720,60 @@ _REASONING_INFORMANT_RES: tuple[re.Pattern[str], ...] = (
 )
 _INFORMANT_CLAUSE_CUT_RE = re.compile(
     r"\s+(?:that|who|which|and|but|to|about|on|in|for|because|since|so|as|when|while|"
-    r"saying|said|stating|regarding|relayed|via|from|with)\b"
+    r"saying|said|says|stating|regarding|relayed|via|from|with|told|tells|reported|reports|"
+    r"is|was|are|were|cited|named|has|had|claims?|claimed)\b"
 )
+_INFORMANT_QUOTES = "'\"‘’“”`"
 _INFORMANT_ARTICLES = frozenset({"a", "an", "the", "their", "his", "her", "its", "our", "my"})
 _INFORMANT_ROLE_WORDS = frozenset(
     {"informant", "named", "person", "party", "contributor", "source", "scope", "agent"}
 )
+#: A captured "name" that starts with one of these is a clause, not an informant.
+_INFORMANT_NOT_A_NAME = frozenset(
+    {
+        "is", "was", "are", "were", "from", "or", "and", "not", "no", "none", "nobody",
+        "applicable", "any", "another", "other", "this", "that", "there", "it", "one",
+        "unknown", "unnamed", "identified", "identifiable", "named", "present", "stated",
+        "mentioned", "given", "available", "cited", "reported", "relevant",
+    }
+)  # fmt: skip
+_INFORMANT_NEGATED_BEFORE_RE = re.compile(
+    r"\b(?:no|not|any|an|without|neither|nor|zero)\s+(?:\w+\s+){0,2}$", re.IGNORECASE
+)
 
 
 def _informant_names(reasoning: str | None) -> list[str]:
-    """The informants *reasoning* names, articles and role words stripped, casefolded.
+    """The informants *reasoning* names, articles, quotes and role words stripped, casefolded.
 
     Patterns: "Hearsay: ... told by X", "reports being told by X", "X (a named informant)"
-    and "informant X". Pure; a reasoning that names no informant gives ``[]``."""
+    and "informant X". A capture ends at the first clause word (told, is, from, ...) or at a
+    closing quote; a capture that is a negation or function word ("no informant is named")
+    names no one. Pure; a reasoning that names no informant gives ``[]``."""
+    text = reasoning or ""
     found: list[str] = []
     for pattern in _REASONING_INFORMANT_RES:
-        for match in pattern.finditer(reasoning or ""):
-            phrase = _INFORMANT_CLAUSE_CUT_RE.split(match.group("x").casefold(), maxsplit=1)[0]
+        for match in pattern.finditer(text):
+            if pattern.pattern.startswith(r"\binformant") and _INFORMANT_NEGATED_BEFORE_RE.search(
+                text[: match.start()]
+            ):
+                continue  # "no informant", "not an informant", "any informant"
+            raw = match.group("x").strip()
+            if raw and raw[0] in _INFORMANT_QUOTES:
+                inner = raw[1:]
+                end = next((i for i, c in enumerate(inner) if c in _INFORMANT_QUOTES), len(inner))
+                phrase = inner[:end]
+            else:
+                phrase = raw
+                for quote in _INFORMANT_QUOTES:
+                    phrase = phrase.split(quote, 1)[0]
+            phrase = _INFORMANT_CLAUSE_CUT_RE.split(phrase.casefold(), maxsplit=1)[0]
             words = re.findall(r"[\w'’.-]+", phrase)[:5]
             while words and words[0] in _INFORMANT_ARTICLES | _INFORMANT_ROLE_WORDS:
                 words.pop(0)
             while words and words[-1] in _INFORMANT_ROLE_WORDS:
                 words.pop()
+            if not words or words[0] in _INFORMANT_NOT_A_NAME:
+                continue
             name = " ".join(words).strip(" .'’-")
             if name and name not in found:
                 found.append(name)
@@ -4755,7 +4792,10 @@ def _informants_missing_from(reasoning: str | None, content: str) -> list[str]:
 
 def _drop_false_hearsay(reasoning: str) -> str:
     """ "Hearsay:" on a reasoning that itself says first-hand is a wrong label: dropped."""
-    if re.search(r"\bfirst[- ]hand\b", reasoning, re.IGNORECASE):
+    for match in re.finditer(r"\bfirst[- ]hand\b", reasoning, re.IGNORECASE):
+        before = " ".join(reasoning[: match.start()].split()[-3:])
+        if re.search(r"\b(?:not|no|never|isn['’]t|wasn['’]t|neither|nor|without)\b", before, re.I):
+            continue  # "not first-hand" keeps its "Hearsay:" label
         return re.sub(r"^\s*Hearsay:\s*", "", reasoning, count=1, flags=re.IGNORECASE)
     return reasoning
 
@@ -7606,6 +7646,11 @@ class ScopeManager:
         def _reasoning_gaps(judgment: ScopeManagerJudgment) -> list[str]:
             return _informants_missing_from(judgment.reasoning, new_contribution.content)
 
+        def _reasoning_adopt(
+            judgment: ScopeManagerJudgment, retry: ScopeManagerJudgment
+        ) -> ScopeManagerJudgment:
+            return judgment.model_copy(update={"reasoning": retry.reasoning})
+
         def _reasoning_withdraw(
             judgment: ScopeManagerJudgment, names: Sequence[str]
         ) -> ScopeManagerJudgment:
@@ -7619,6 +7664,7 @@ class ScopeManager:
             tool=_judge_tool_for(acted_on_target),
             reasoning_gaps=_reasoning_gaps,
             reasoning_withdraw=_reasoning_withdraw,
+            reasoning_adopt=_reasoning_adopt,
             max_tokens=JUDGE_MAX_TOKENS,
             summary_max_words=summary_max_words,
             parse=_parse,
@@ -7694,9 +7740,10 @@ class ScopeManager:
             ),
         )
         # A "Hearsay:" label on a reasoning that itself says first-hand is a wrong label.
-        judgment = judgment.model_copy(
-            update={"reasoning": _drop_false_hearsay(judgment.reasoning)}
-        )
+        if _REASON_INFORMANT_CHECK:
+            judgment = judgment.model_copy(
+                update={"reasoning": _drop_false_hearsay(judgment.reasoning)}
+            )
         judgment = self._hold_inherited_conflicts(
             judgment.model_copy(update={"contribution_id": new_contribution.id}),
             scope=scope,
@@ -8089,6 +8136,7 @@ class ScopeManager:
         parse_generic_decline: Callable[[Exception], _JudgmentT] | None = None,
         reasoning_gaps: Callable[[_JudgmentT], list[str]] | None = None,
         reasoning_withdraw: Callable[[_JudgmentT, Sequence[str]], _JudgmentT] | None = None,
+        reasoning_adopt: Callable[[_JudgmentT, _JudgmentT], _JudgmentT] | None = None,
         is_outcome_report: bool = False,
         acted_on_is_directive: bool = False,
         post_judgment: Callable[[_JudgmentT, list[dict], object, object], _JudgmentT] | None = None,
@@ -8487,7 +8535,12 @@ class ScopeManager:
         # contribution (the judge described content from another contribution in its window).
         # Exactly ONE re-ask with the same tool; the verdict is never changed by it. If the
         # name is still there, the engine withdraws the reasoning and says so.
-        if reasoning_gaps is not None and reasoning_withdraw is not None:
+        if (
+            _REASON_INFORMANT_CHECK
+            and reasoning_gaps is not None
+            and reasoning_withdraw is not None
+            and reasoning_adopt is not None
+        ):
             missing = reasoning_gaps(judgment)
             if missing:
                 retry_messages = [
@@ -8511,12 +8564,9 @@ class ScopeManager:
                 if retry_judgment is not None and _decisions_of(retry_judgment) == _decisions_of(
                     judgment
                 ):
-                    if invalid_ops(retry_judgment):
-                        retry_judgment = drop_invalid(retry_judgment)
-                    judgment = retry_judgment
-                    response = retry_response
-                    tool_use_block = retry_block
-                    first_messages = retry_messages
+                    # ONLY the reasoning is taken from the retry: its ops, context and
+                    # summary never replace the ones the earlier correctives checked.
+                    judgment = reasoning_adopt(judgment, retry_judgment)
                 still = reasoning_gaps(judgment)
                 protocol_notes.append(
                     "Corrective re-ask: the reasoning named an informant that does not occur "
@@ -9559,6 +9609,21 @@ class ScopeManager:
                         names.append(name)
             return names
 
+        def _batch_reasoning_adopt(
+            judgment: ScopeManagerBatchJudgment, retry: ScopeManagerBatchJudgment
+        ) -> ScopeManagerBatchJudgment:
+            retried = {v.contribution_id: v.reasoning for v in retry.verdicts}
+            return judgment.model_copy(
+                update={
+                    "verdicts": [
+                        v.model_copy(
+                            update={"reasoning": retried.get(v.contribution_id, v.reasoning)}
+                        )
+                        for v in judgment.verdicts
+                    ]
+                }
+            )
+
         def _batch_reasoning_withdraw(
             judgment: ScopeManagerBatchJudgment, _names: Sequence[str]
         ) -> ScopeManagerBatchJudgment:
@@ -9581,6 +9646,7 @@ class ScopeManager:
             tool=JUDGE_BATCH_TOOL,
             reasoning_gaps=_batch_reasoning_gaps,
             reasoning_withdraw=_batch_reasoning_withdraw,
+            reasoning_adopt=_batch_reasoning_adopt,
             max_tokens=_batch_max_tokens(len(new_contributions)),
             summary_max_words=summary_max_words,
             parse=_parse,
@@ -9606,14 +9672,15 @@ class ScopeManager:
             # a second slip reaches).
             parse_generic_decline=_generic_second_slip_batch_decline,
         )
-        batch_judgment = batch_judgment.model_copy(
-            update={
-                "verdicts": [
-                    v.model_copy(update={"reasoning": _drop_false_hearsay(v.reasoning)})
-                    for v in batch_judgment.verdicts
-                ]
-            }
-        )
+        if _REASON_INFORMANT_CHECK:
+            batch_judgment = batch_judgment.model_copy(
+                update={
+                    "verdicts": [
+                        v.model_copy(update={"reasoning": _drop_false_hearsay(v.reasoning)})
+                        for v in batch_judgment.verdicts
+                    ]
+                }
+            )
         batch_judgment = self._hold_batch_inherited_conflicts(
             batch_judgment,
             scope=scope,

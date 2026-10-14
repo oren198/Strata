@@ -56,7 +56,8 @@ the release PR (`dev` → `main`) and the GitHub Release body are built from
   same tool, and if the reasoning still names it the engine replaces it with "Reason
   withdrawn: the judge described content that is not in this contribution (X). Verdict:
   <decision>." and notes the mismatch in the record. The verdict itself is never changed
-  by this. A "Hearsay:" label on a reasoning that itself says first-hand is dropped.
+  by this, and only the reasoning is taken from the re-ask. A "Hearsay:" label on a
+  reasoning that itself says first-hand is dropped (not when it says "not first-hand").
   Reading an artifact first-hand is now a telling event: "I read / opened / reviewed /
   drafted ... from" plus the artifact attributed to its source ("<source>'s file", "<file>
   by <source>") plus its path, URL or id right after it. It is admitted as context only,
