@@ -204,3 +204,140 @@ def test_a_restriction_or_a_weaker_requirement_is_still_a_narrowing(
     parent: str, child: str
 ) -> None:
     assert inherited_conflict(child, parent) is not None
+
+
+# ---------------------------------------------------------------------------
+# Iteration 2: the rescue-then-decline regression, two-bound parents, class C
+# without a modal, and polarity on another object
+# ---------------------------------------------------------------------------
+
+_RETENTION = "Application logs are retained for at most 14 days."
+_TOKEN_LIFE = "Access tokens expire after at most 15 minutes."
+
+
+def test_a_duration_bound_on_another_quantity_is_not_compared_across_units() -> None:
+    child = "The auth squad keeps token-service logs for at most 7 days."
+    assert inherited_conflict(child, _RETENTION) is None
+    # the token parent's 15 minutes is a different quantity from the logs' 7 days
+    assert inherited_conflict(child, _TOKEN_LIFE) is None
+
+
+def test_the_same_quantity_in_another_unit_is_still_compared() -> None:
+    assert (
+        inherited_conflict("Access tokens expire after at most 2 hours.", _TOKEN_LIFE) is not None
+    )
+    assert (
+        inherited_conflict("Access tokens expire after at most 600 seconds.", _TOKEN_LIFE) is None
+    )
+
+
+def test_a_rescued_grandchild_tightening_survives_the_inherited_check() -> None:
+    from unittest.mock import MagicMock  # noqa: PLC0415
+
+    from strata.fleet_config import Scope, Stratum  # noqa: PLC0415
+    from strata.record_store import Contribution, ContributorRef  # noqa: PLC0415
+    from strata.scope_manager import ScopeManager  # noqa: PLC0415
+    from strata.summary_store import Directive, ScopeSummary  # noqa: PLC0415
+
+    from .test_scope_manager import _fake_response  # noqa: PLC0415
+
+    stamp = "2026-10-01T00:00:00+00:00"
+    parents = [
+        Directive(id="c_ret", content=_RETENTION, source_scope_id="g_org", created_at=stamp),
+        Directive(id="c_tok", content=_TOKEN_LIFE, source_scope_id="g_org", created_at=stamp),
+    ]
+    text = "The auth squad keeps token-service logs for at most 7 days."
+    client = MagicMock()
+    client.messages.create.side_effect = [
+        _fake_response(
+            {
+                "decision": "decline",
+                "reasoning": "Contradicts inherited directive c_ret.",
+                "directive_ops": [],
+                "new_context": None,
+            }
+        ),
+        _fake_response(
+            {
+                "relation": "tightens",
+                "other_grounds_clear": True,
+                "parent_id": "c_ret",
+                "kept_span": "at most 14 days",
+                "tighten_kind": "rule",
+                "reasoning": "stricter retention",
+            }
+        ),
+    ]
+    judgment = ScopeManager(client=client).judge(
+        scope=Scope(id="g_squad", name="Auth squad", stratum_id="L2"),
+        stratum=Stratum(id="L2", name="squad", ordinal=2),
+        current_summary=ScopeSummary(
+            scope_id="g_squad", directives=[], context="", updated_at=stamp
+        ),
+        recent_contributions=[],
+        new_contribution=Contribution(
+            id="c_new",
+            scope_id="g_squad",
+            content=text,
+            proposed_classification="directive",
+            subject=None,
+            supersedes=None,
+            contributor=ContributorRef(
+                scope_id="g_squad", skill=None, session_id="s", ts="2026-10-12T10:00:00+00:00"
+            ),
+            created_at=stamp,
+        ),
+        ancestor_directives=[("g_org", parents)],
+    )
+    assert judgment.decision == "accept_as_directive", judgment.reasoning
+    assert judgment.inherited_holds == []
+
+
+@pytest.mark.parametrize(
+    ("child", "legit"),
+    [
+        (
+            "Our chlorine residual must be at or above 0.8 mg/L, and the dose no more than 3 mg/L.",
+            True,
+        ),
+        ("Our chlorine residual must be at or above 0.8 mg/L.", True),
+        ("Our dose must be no more than 3 mg/L.", True),
+        (
+            "Our chlorine residual must be at or above 0.3 mg/L, and the dose no more than 3 mg/L.",
+            False,
+        ),
+        (
+            "Our chlorine residual must be at or above 0.8 mg/L, and the dose no more than 6 mg/L.",
+            False,
+        ),
+    ],
+)
+def test_a_two_bound_parent_is_compared_bound_by_bound(child: str, legit: bool) -> None:
+    parent = (
+        "Chlorine residual must be at or above 0.5 mg/L, and the dose must be no more than 4 mg/L."
+    )
+    assert (inherited_conflict(child, parent) is None) is legit
+
+
+def test_a_present_indicative_sub_case_with_an_added_requirement_is_an_addition() -> None:
+    parent = "Every delivery van is inspected before it leaves the depot."
+    child = (
+        "Refrigerated vans: every van is inspected before it leaves the depot, and the driver "
+        "also logs the cabinet temperature."
+    )
+    assert inherited_conflict(child, parent) is None
+    assert (
+        inherited_conflict("Short-run vans: every van is inspected only on Mondays.", parent)
+        is not None
+    )
+
+
+def test_a_state_word_on_another_object_is_not_a_polarity_flip() -> None:
+    parent = "Fuel dock pumps must be switched off at or before 20:00 every evening."
+    assert (
+        inherited_conflict(
+            "Fuel dock pumps must be switched off by 19:30 and the nozzles locked.", parent
+        )
+        is None
+    )
+    assert inherited_conflict("Night-shift fuel dock pumps are kept on until 22:00.", parent)
