@@ -664,3 +664,47 @@ def test_compound_rules_with_a_trigger_tighten_on_both_bounds_or_conflict(
     assert (inherited_conflict(child, parent) is None) is legit, child
     ok, _ = _comparator_rule_ok(parent, child)
     assert (ok is True) is legit, child
+
+
+# ---------------------------------------------------------------------------
+# a3: a bound is compared only with a bound of the SAME dimension and unit word
+# ---------------------------------------------------------------------------
+
+_WATER = (
+    "Water must stay at 60C or above; any batch found below 60C for more than 2 hours is discarded."
+)
+
+
+@pytest.mark.parametrize(
+    "child",
+    [
+        "Water goes into jugs no deeper than 5 cm.",
+        "Water drawn for later use goes into clean jugs no deeper than 5 cm, labelled with "
+        "the date.",
+        "Water goes into jugs no deeper than five centimetres.",
+        "Water goes into jugs no deeper than 5 m.",
+        "Water is kept at most 5 cm deep.",
+        "Water is checked every 30 minutes.",
+        "Water is drawn at most 5 litres at a time.",
+    ],
+)
+def test_a_bound_on_another_dimension_is_never_read_against_a_temperature(child: str) -> None:
+    assert inherited_conflict(child, _WATER) is None
+
+
+def test_a_unit_is_never_matched_by_prefix() -> None:
+    from strata.scope_manager import _units_comparable  # noqa: PLC0415
+
+    assert not _units_comparable("c", "cm")
+    assert not _units_comparable("c", "m")
+    assert not _units_comparable("minutes", "metres")
+    assert _units_comparable("c", "celsius")
+    assert _units_comparable("hours", "minutes")
+    assert _units_comparable("cm", "cm")
+    assert not _units_comparable("cm", "m")
+
+
+def test_the_same_dimension_is_still_compared() -> None:
+    assert inherited_conflict("Water must stay at 55C or above.", _WATER) is not None
+    assert inherited_conflict("Water must stay at 65C or above.", _WATER) is None
+    assert inherited_conflict("Water must stay at 65 degrees or above.", _WATER) is None

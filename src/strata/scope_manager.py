@@ -5784,14 +5784,15 @@ def _bare_child_value(parent_text: str, parent_match: re.Match[str], content: st
             if amount is not None and key is not None:
                 values.add(amount * _DURATION_SECONDS[key] / scale)
     else:
-        stem = unit[:3]
         for m in re.finditer(
-            rf"\b(-?\d[\d,]*(?:\.\d+)?|{word_alt})\s+({re.escape(stem)}[A-Za-z]*)\b",
+            rf"\b(-?\d[\d,]*(?:\.\d+)?|{word_alt})\s*(°?[A-Za-z%]+)\b",
             content,
             re.IGNORECASE,
         ):
             amount = _number(m.group(1))
-            if amount is not None:
+            # the child's unit word must be the parent's unit, or the same dimension and
+            # scale ("60C" / "65 degrees"): never a prefix ("c" is not "cm")
+            if amount is not None and _units_comparable(unit, m.group(2)):
                 values.add(amount)
     values -= governed
     if len(values) != 1:
@@ -5918,6 +5919,53 @@ def _normalise_quantities(text: str) -> str:
     return text
 
 
+#: #244b a3: every comparison is between the SAME dimension in the SAME unit word. A prefix
+#: match let "c" (Celsius) read "5 cm" as "5 C". Unit -> (dimension, scale), word-bounded.
+_UNIT_DIMENSIONS: dict[str, tuple[str, str]] = {}
+for _dim, _scale, _words in (
+    ("temperature", "c", ("c", "°c", "°", "celsius", "centigrade", "degree", "degrees")),
+    ("temperature", "f", ("f", "°f", "fahrenheit")),
+    ("temperature", "k", ("k", "kelvin")),
+    ("length", "mm", ("mm", "millimetre", "millimetres", "millimeter", "millimeters")),
+    ("length", "cm", ("cm", "centimetre", "centimetres", "centimeter", "centimeters")),
+    ("length", "m", ("m", "metre", "metres", "meter", "meters")),
+    ("length", "km", ("km", "kilometre", "kilometres", "kilometer", "kilometers")),
+    ("length", "in", ("in", "inch", "inches")),
+    ("length", "ft", ("ft", "foot", "feet")),
+    ("mass", "g", ("g", "gram", "grams")),
+    ("mass", "kg", ("kg", "kilogram", "kilograms")),
+    ("mass", "mg", ("mg", "milligram", "milligrams")),
+    ("volume", "ml", ("ml", "millilitre", "millilitres", "milliliter", "milliliters")),
+    ("volume", "l", ("l", "litre", "litres", "liter", "liters")),
+    ("pressure", "bar", ("bar", "bars")),
+    ("pressure", "psi", ("psi",)),
+    ("ratio", "%", ("%", "percent", "per cent")),
+):
+    for _word in _words:
+        _UNIT_DIMENSIONS[_word] = (_dim, _scale)
+
+
+def _unit_word(word: str | None) -> str:
+    """A unit word, casefolded, with a plural "s" removed ("identifiers" is "identifier")."""
+    text = (word or "").casefold()
+    if text in _UNIT_DIMENSIONS:
+        return text
+    return text[:-1] if len(text) > 3 and text.endswith("s") and not text.endswith("ss") else text
+
+
+def _units_comparable(a: str | None, b: str | None) -> bool:
+    """May a bound in unit *a* be compared with one in unit *b*? The same unit word; two
+    duration units (converted); or two words for the same scale ("C" / "celsius"). A unit that
+    is a mere prefix of another ("c" / "cm") is a different dimension, never comparable."""
+    left, right = _unit_word(a), _unit_word(b)
+    if left == right:
+        return True
+    if _duration_key(left) and _duration_key(right):
+        return True
+    known = (_UNIT_DIMENSIONS.get(left), _UNIT_DIMENSIONS.get(right))
+    return known[0] is not None and known[0] == known[1]
+
+
 def _bound_family(pattern: re.Pattern[str]) -> str:
     """What kind of bound a comparator pattern states: a frequency ("every N"), a time of day
     ("at or before", "by", "no later than") or a quantity. A child's bound only stands in for
@@ -5976,10 +6024,7 @@ def _per_bound_comparison(parent_text: str, child_text: str) -> tuple[bool | Non
             for c in child
             if c["direction"] == bound["direction"]
             and c["family"] == bound["family"]
-            and (
-                (c["unit"] or "")[:3] == (bound["unit"] or "")[:3]
-                or (_duration_key(c["unit"] or "") and _duration_key(bound["unit"] or ""))
-            )
+            and _units_comparable(c["unit"], bound["unit"])
         ]
         if not candidates:
             continue
@@ -6054,7 +6099,10 @@ def _comparator_rule_ok(parent_text: str, kept_span: str) -> tuple[bool | None, 
         child_unit = _value_unit(kept_span, child_match)
         parent_key = _duration_key(parent_unit) if parent_unit else None
         child_key = _duration_key(child_unit) if child_unit else None
-        different_units = bool(parent_unit and child_unit and parent_unit[:3] != child_unit[:3])
+        # a different unit WORD, exactly (never a prefix: "c" is not "cm")
+        different_units = bool(
+            parent_unit and child_unit and _unit_word(parent_unit) != _unit_word(child_unit)
+        )
         if different_units and not _same_quantity(
             parent_text,
             kept_span,
@@ -6067,8 +6115,8 @@ def _comparator_rule_ok(parent_text: str, kept_span: str) -> tuple[bool | None, 
             # the same bound in another duration unit ("within 90 minutes" under "within 2 hours")
             parent_value *= _DURATION_SECONDS[parent_key]
             child_value *= _DURATION_SECONDS[child_key]
-        elif different_units:
-            # units that do not convert: claim no conflict, the judge decides
+        elif different_units and not _units_comparable(parent_unit, child_unit):
+            # units that do not convert, or another dimension: no comparison, no conflict
             return None, _UNCERTAIN
         ok = child_value <= parent_value if direction == "smaller" else child_value >= parent_value
         return ok, parent_value_str
