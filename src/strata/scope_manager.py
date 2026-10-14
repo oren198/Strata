@@ -5670,6 +5670,72 @@ def _bound_family(pattern: re.Pattern[str]) -> str:
     return "quantity"
 
 
+def _bounds_in(text: str) -> list[dict]:
+    """Every bound in *text* (already normalised): ``{"direction", "family", "value", "unit",
+    "raw"}``. Overlapping matches of one value (e.g. "at or before 20:00" also reads as
+    "before 20:00") are reported once."""
+    found: dict[int, dict] = {}
+    for pattern, direction in _COMPARATOR_PATTERNS:
+        for match in pattern.finditer(text):
+            start = next((m_start for (m_start, _e) in match.regs[1:] if m_start != -1), None)
+            if start is None or start in found:
+                continue
+            try:
+                value = _parse_comparable(_matched_value(match).replace(",", ""))
+            except ValueError:
+                continue
+            found[start] = {
+                "direction": direction,
+                "family": _bound_family(pattern),
+                "value": value,
+                "unit": _value_unit(text, match),
+                "raw": _matched_value(match).replace(",", ""),
+            }
+    return list(found.values())
+
+
+def _bound_seconds(bound: dict) -> float:
+    key = _duration_key(bound["unit"]) if bound["unit"] else None
+    return bound["value"] * _DURATION_SECONDS[key] if key else bound["value"]
+
+
+def _per_bound_comparison(parent_text: str, child_text: str) -> tuple[bool | None, list[str]]:
+    """#244b iteration 2: a parent with two or more bounds ("at or above A; no more than B"),
+    compared bound by bound. ``(True, raws)``: every bound the child restates is at least as
+    strict and at least one is restated; ``(False, raws)``: a restated bound is looser;
+    ``(None, [])``: fewer than two parent bounds, or none restated (the single-bound logic
+    decides). A bound the child does not restate stays bound by the parent, never a conflict."""
+    parent = _bounds_in(_normalise_quantities(parent_text))
+    if len(parent) < 2:
+        return None, []
+    child = _bounds_in(_normalise_quantities(child_text))
+    restated = False
+    for bound in parent:
+        candidates = [
+            c
+            for c in child
+            if c["direction"] == bound["direction"]
+            and c["family"] == bound["family"]
+            and (
+                (c["unit"] or "")[:3] == (bound["unit"] or "")[:3]
+                or (_duration_key(c["unit"] or "") and _duration_key(bound["unit"] or ""))
+            )
+        ]
+        if not candidates:
+            continue
+        restated = True
+        for c in candidates:
+            parent_value, child_value = _bound_seconds(bound), _bound_seconds(c)
+            ok = (
+                child_value <= parent_value
+                if bound["direction"] == "smaller"
+                else child_value >= parent_value
+            )
+            if not ok:
+                return False, [b["raw"] for b in parent]
+    return (True, [b["raw"] for b in parent]) if restated else (None, [])
+
+
 def _comparator_rule_ok(parent_text: str, kept_span: str) -> tuple[bool | None, str | None]:
     """``(True/False, matched_value)`` when the parent's value sits in one
     of :data:`_COMPARATOR_PATTERNS` AND *kept_span* restates it in the SAME
@@ -5685,6 +5751,9 @@ def _comparator_rule_ok(parent_text: str, kept_span: str) -> tuple[bool | None, 
     fallback (architect review round 3 — the fallback case is NOT the
     same as fact mode, which requires the value UNCHANGED).
     """
+    multi_ok, multi_raws = _per_bound_comparison(parent_text, kept_span)
+    if multi_ok is not None:
+        return multi_ok, " ".join(multi_raws)
     parent_text = _normalise_quantities(parent_text)
     kept_span = _normalise_quantities(kept_span)
     for pattern, direction in _COMPARATOR_PATTERNS:
@@ -5725,11 +5794,20 @@ def _comparator_rule_ok(parent_text: str, kept_span: str) -> tuple[bool | None, 
         child_unit = _value_unit(kept_span, child_match)
         parent_key = _duration_key(parent_unit) if parent_unit else None
         child_key = _duration_key(child_unit) if child_unit else None
+        different_units = bool(parent_unit and child_unit and parent_unit[:3] != child_unit[:3])
+        if different_units and not _same_quantity(
+            parent_text,
+            kept_span,
+            minimum=1 if _bound_family(pattern) == "frequency" else 2,
+        ):
+            # two different quantities that happen to be bounds ("tokens expire after at most
+            # 15 minutes" vs "logs kept for at most 7 days"): not comparable, no conflict
+            return None, _UNCERTAIN
         if parent_key and child_key:
             # the same bound in another duration unit ("within 90 minutes" under "within 2 hours")
             parent_value *= _DURATION_SECONDS[parent_key]
             child_value *= _DURATION_SECONDS[child_key]
-        elif parent_unit and child_unit and parent_unit[:3] != child_unit[:3]:
+        elif different_units:
             # units that do not convert: claim no conflict, the judge decides
             return None, _UNCERTAIN
         ok = child_value <= parent_value if direction == "smaller" else child_value >= parent_value
@@ -6115,25 +6193,26 @@ def _adds_a_requirement(parent_text: str, content: str) -> bool:
     child does not name. It qualifies only when it states a requirement, brings at least
     two content words the parent does not have, carries no relaxation marker and no
     restriction of when or where the parent's own requirement applies ("only on",
-    "except", "outside of", "on weekdays")."""
-    if _REQUIREMENT_MODAL_RE.search(content) is None:
-        return False
+    "except", "outside of", "on weekdays"), and restates at least half of the parent's
+    own words (or says "additionally" with a modal)."""
     if _RESTRICTION_RE.search(content) or _relaxation_marker(content, [parent_text]):
         return False
     parent_stems = _subject_stems(parent_text)
     child_stems = _subject_stems(content)
     if len(child_stems - parent_stems) < 2:
         return False
-    if _ADDITIVE_CUE_RE.search(content):
-        return True
-    # without an explicit "additionally / on top of", it must visibly keep the parent's
-    # requirement: most of the parent's words come back
+    # it must visibly keep the parent's requirement: at least half the parent's words come
+    # back. A present-indicative statement ("X is checked by ..., who also does Y") counts as
+    # much as a modal one; the restatement of the requirement is the evidence either way.
     kept = {
         stem
         for stem in parent_stems
         if stem in child_stems or any(_shared_prefix(stem, c) >= 5 for c in child_stems)
     }
-    return bool(parent_stems) and len(kept) / len(parent_stems) >= 0.5
+    if parent_stems and len(kept) / len(parent_stems) >= 0.5:
+        return True
+    # without that, an explicit additive cue and a stated requirement are needed
+    return bool(_ADDITIVE_CUE_RE.search(content) and _REQUIREMENT_MODAL_RE.search(content))
 
 
 def _restates_the_requirement_of(phrase: str, parent_text: str, content: str) -> bool:
@@ -7327,6 +7406,17 @@ _LOOSE_POLARITY_PAIRS: tuple[tuple[str, str], ...] = (
     ("stopped", "running"),
     ("disabled", "enabled"),
 )
+
+
+def _same_quantity(parent_text: str, child_text: str, *, minimum: int = 2) -> bool:
+    """Do two bounds in different units plausibly bound the SAME quantity? At least two shared
+    subject stems (modals, quantifiers and time words excluded): "tokens expire after at most
+    15 minutes" and "token-service logs kept for at most 7 days" share only "token" and are
+    two quantities, not one bound stated in two units."""
+    mine = _subject_stems(parent_text) - _LOOSE_STOPWORDS
+    other = _subject_stems(child_text) - _LOOSE_STOPWORDS
+    shared = {m for m in mine if m in other or any(_shared_prefix(m, w) >= 5 for w in other)}
+    return len(shared) >= minimum
 
 
 def _loose_covers(inherited_text: str, content: str) -> bool:

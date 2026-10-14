@@ -2577,10 +2577,21 @@ def value_polarity_flip(
             # other word of the pair is an added clause ("On night-shift,
             # pumps are switched off ..."), not a reversal of it.
             continue
+        flipped_from: tuple[str, str] | None = None
         if claim_has_first and ref_has_second and not ref_has_first:
-            return True
-        if claim_has_second and ref_has_first and not ref_has_second:
-            return True
+            flipped_from = (first, second)
+        elif claim_has_second and ref_has_first and not ref_has_second:
+            flipped_from = (second, first)
+        if flipped_from is None:
+            continue
+        if parent_term_kept_is_no_flip and not _antonym_on_same_object(
+            claim_cf, flipped_from[0], ref_cf, flipped_from[1]
+        ):
+            # #244b: the state word is on ANOTHER object of the claim ("... switched off by
+            # 19:30 and the nozzles locked"): an added requirement, not a reversal of the
+            # reference's own state.
+            continue
+        return True
 
     negation_alternation = "|".join(re.escape(marker) for marker in _NEGATION_MARKERS)
     for marker in _NEGATION_MARKERS:
@@ -2595,6 +2606,33 @@ def value_polarity_flip(
     return any(marker in claim_cf for marker in _CHANGE_MARKERS) and not any(
         marker in ref_cf for marker in _CHANGE_MARKERS
     )
+
+
+_CLAUSE_SPLIT_RE = re.compile(r"[,;:]|\band\b|\bbut\b|\bwhile\b|\bwhereas\b")
+
+
+def _antonym_on_same_object(claim_cf: str, claim_word: str, ref_cf: str, ref_word: str) -> bool:
+    """Does the claim's clause holding *claim_word* talk about what the reference's clause
+    holding *ref_word* talks about? They must share a content word other than the state
+    words themselves. When either clause cannot be found the flip stands."""
+    claim_clauses = [
+        c for c in _CLAUSE_SPLIT_RE.split(claim_cf) if re.search(rf"\b{re.escape(claim_word)}\b", c)
+    ]
+    ref_clauses = [
+        c for c in _CLAUSE_SPLIT_RE.split(ref_cf) if re.search(rf"\b{re.escape(ref_word)}\b", c)
+    ]
+    if not claim_clauses or not ref_clauses:
+        return True
+    skip = {claim_word, ref_word}
+
+    def words(clause: str) -> set[str]:
+        return {
+            _overlap_stem(w)
+            for w in re.findall(r"[a-z]{4,}", clause)
+            if w not in skip and w not in _CONTENT_OVERLAP_STOPWORDS
+        }
+
+    return any(words(c) & words(r) for c in claim_clauses for r in ref_clauses)
 
 
 #: Hole B (architect review round 3, bridge attack on 1ffc4e4): an

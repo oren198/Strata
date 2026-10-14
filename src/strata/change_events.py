@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import secrets
 from collections.abc import Sequence
 from datetime import UTC, datetime
@@ -328,6 +329,10 @@ def _render_notice(
     ]
     if claim_id is not None:
         lines.append(f"- corrected claim: {claim_id}")
+    if kind in STRUCTURE_KINDS:
+        payload = _structure_payload(after)
+        listed = payload.get("conflict_lines" if kind == CHAIN_CHANGED else "notices") or []
+        lines.extend(f"- notice: {line}" for line in listed if isinstance(line, str))
     if note is not None:
         lines.append(f"- note: {note}")
     return "\n".join(lines)
@@ -362,6 +367,7 @@ def emit(
     by_operator: bool = False,
     by_owner: bool = True,
     claim_id: str | None = None,
+    audience: Sequence[str] | None = None,
 ) -> list[str]:
     """Notify every scope affected by a change to *item*, and return its change ids.
 
@@ -424,6 +430,8 @@ def emit(
             the holding scope (see :func:`affected_scopes`).
         by_owner: Threaded straight to :func:`affected_scopes` — see its own
             docstring for what it means per kind.
+        audience: A structure kind's recorded audience (ADR 0014 D8), used
+            instead of :func:`affected_scopes`. Refused for any other kind.
         claim_id: ADR 0017 P4, ``claim_corrected`` only — the corrected claim's
             own id (``acted_on``), rendered as an extra line in the notice
             alongside *item* (the withdrawn published item's id): a reader
@@ -436,14 +444,21 @@ def emit(
     """
     change_ids = list(dict.fromkeys(wave_ids)) or [new_change_id()]
     try:
-        scope_ids = affected_scopes(
-            fleet,
-            item=item,
-            kind=kind,
-            source_scope_id=source_scope_id,
-            by_operator=by_operator,
-            by_owner=by_owner,
-        )
+        if audience is not None:
+            # ADR 0014 D8: a structure change names its audience from the act's
+            # RECORDED topology, never from today's fleet; no walk is made here.
+            if kind not in STRUCTURE_KINDS:
+                raise ValueError(f"an explicit audience is only for {sorted(STRUCTURE_KINDS)}")
+            scope_ids = sorted(dict.fromkeys(audience))
+        else:
+            scope_ids = affected_scopes(
+                fleet,
+                item=item,
+                kind=kind,
+                source_scope_id=source_scope_id,
+                by_operator=by_operator,
+                by_owner=by_owner,
+            )
     except Exception:  # noqa: BLE001 — the notice, never the act
         # An unknown kind is a bug in the caller and a broken traversal a bug
         # here; neither is a reason to undo an act that already succeeded.
@@ -947,3 +962,349 @@ def structure_conflicts(event) -> list[dict]:  # noqa: ANN001 — any object wit
         if isinstance(c, dict)
         and all(isinstance(c.get(k), str) for k in ("own_id", "inherited_id", "line"))
     ]
+
+
+# ---------------------------------------------------------------------------
+# ADR 0014 D8: emit_structure_change(act_id)
+# ---------------------------------------------------------------------------
+
+
+def _resolve_summaries_dir(record_store: RecordStore, summaries_dir: str | None) -> str:
+    """The directory holding the per-scope summaries, publications and operator layers.
+
+    An explicit *summaries_dir* wins. Otherwise the project's storage paths, when they
+    point at THIS store's database; otherwise the ``summaries`` directory beside it.
+    """
+    if summaries_dir is not None:
+        return summaries_dir
+    from pathlib import Path  # noqa: PLC0415
+
+    db_path = Path(record_store._db_path).resolve()  # noqa: SLF001
+    try:
+        from strata.project_config import resolve_storage_paths  # noqa: PLC0415
+
+        paths = resolve_storage_paths()
+        if Path(paths.db_path).expanduser().resolve() == db_path:
+            return paths.summaries_dir
+    except Exception:  # noqa: BLE001 — fall back to the convention
+        _logger.debug("no project storage paths; using the summaries beside the database")
+    return str(db_path.parent / "summaries")
+
+
+def _summaries_or_none(summaries_dir: str):  # noqa: ANN202
+    """A SummaryStore over *summaries_dir*, or ``None`` when it does not exist: reading
+    must never create a directory (the store's constructor does)."""
+    from pathlib import Path  # noqa: PLC0415
+
+    from strata.summary_store import SummaryStore  # noqa: PLC0415
+
+    return SummaryStore(summaries_dir) if Path(summaries_dir).is_dir() else None
+
+
+def _chain_before_after(act, moved: str) -> tuple[list[str], list[str]]:  # noqa: ANN001
+    before = (act.before_topology.get(moved) or {}).get("chain")
+    after = (act.after_topology.get(moved) or {}).get("chain")
+    if not isinstance(before, list) or not isinstance(after, list):
+        raise ValueError(f"act {act.id} records no chain for {moved}")
+    return [str(x) for x in before], [str(x) for x in after]
+
+
+def _inherited_by_scope(
+    scope_ids: Sequence[str], *, summaries_dir: str
+) -> list[tuple[str, str, str]]:
+    """``(id, label, text)`` of the directives *scope_ids* hold, plus the operator
+    directives attached at them (an operator layer at S binds S's subtree)."""
+    from strata.operator import read_operator_layer  # noqa: PLC0415
+
+    store = _summaries_or_none(summaries_dir)
+    found: list[tuple[str, str, str]] = []
+    if store is None:
+        return found
+    for scope_id in scope_ids:
+        summary = store.read(scope_id)
+        if summary is not None:
+            found.extend((d.id, scope_id, d.content) for d in summary.directives)
+        found.extend(
+            (item.id, f"operator, {scope_id}", item.content)
+            for item in read_operator_layer(scope_id, summaries_dir=summaries_dir)
+            if item.kind == "directive"
+        )
+    return found
+
+
+def _moved_scope(act) -> str:  # noqa: ANN001
+    moved = next(
+        (
+            scope_id
+            for scope_id, after in act.after_topology.items()
+            if isinstance(after, dict)
+            and isinstance(act.before_topology.get(scope_id), dict)
+            and after.get("parent") != act.before_topology[scope_id].get("parent")
+        ),
+        None,
+    )
+    if moved is None:
+        raise ValueError(f"act {act.id} records no moved scope")
+    return moved
+
+
+def _removed_edges(act) -> list[tuple[str, str]]:  # noqa: ANN001
+    """``(reader, source)`` for each reference edge the act's recorded topology lost."""
+    edges: list[tuple[str, str]] = []
+    for reader, before in act.before_topology.items():
+        if not isinstance(before, dict):
+            continue
+        after = act.after_topology.get(reader)
+        kept = set(after.get("references") or []) if isinstance(after, dict) else set()
+        edges.extend((reader, s) for s in (before.get("references") or []) if s not in kept)
+    return edges
+
+
+def _recorded_receivers(act) -> list[str]:  # noqa: ANN001
+    """The scopes the act's RECORDED topology says must be told, in a stable order."""
+    if act.change_type == "reparent":
+        moved = _moved_scope(act)
+        descendants = (act.after_topology.get(moved) or {}).get("descendants") or []
+        return list(dict.fromkeys([moved, *[str(d) for d in descendants]]))
+    if act.change_type == "remove_edge":
+        return list(dict.fromkeys(reader for reader, _source in _removed_edges(act)))
+    return []
+
+
+def unemitted_receivers(record_store: RecordStore, act_id: str) -> list[str]:
+    """The recorded receivers of structure act *act_id* that have no event for it yet.
+
+    ``[]`` when emission is complete, and for every change type that owes nothing. The
+    receivers are read from the act's recorded topology, the events from
+    :func:`events_for_act`; nothing is read from text.
+    """
+    act = record_store.get_fleet_structure_act(act_id)
+    told = {row["scope_id"] for row in events_for_act(record_store, act_id)}
+    return [r for r in _recorded_receivers(act) if r not in told]
+
+
+def _emit_chain_changed(
+    record_store: RecordStore,
+    act,
+    *,
+    summaries_dir: str,  # noqa: ANN001
+    skip: frozenset[str] = frozenset(),
+) -> list[dict]:
+    moved = _moved_scope(act)
+    chain_before, chain_after = _chain_before_after(act, moved)
+    # The receiving set is the RECORDED one: the moved scope and its subtree at apply time.
+    receivers = [r for r in _recorded_receivers(act) if r not in skip]
+    gained_scopes = [s for s in chain_after if s not in chain_before]
+    lost_scopes = [s for s in chain_before if s not in chain_after]
+    gained = _inherited_by_scope(gained_scopes, summaries_dir=summaries_dir)
+    lost = _inherited_by_scope(lost_scopes, summaries_dir=summaries_dir)
+    summaries = _summaries_or_none(summaries_dir)
+    change_ids = [new_change_id()]
+    emitted: list[dict] = []
+    for receiver in receivers:
+        summary = summaries.read(receiver) if summaries is not None else None
+        own = [(d.id, d.content) for d in (summary.directives if summary else [])]
+        conflicts = find_chain_conflicts(scope_id=receiver, own=own, gained=gained)
+        payload = {
+            "act_id": act.id,
+            "moved_scope": moved,
+            "chain_before": chain_before,
+            "chain_after": chain_after,
+            "gained": [{"id": i, "scope": o, "text": t} for i, o, t in gained],
+            "lost": [{"id": i, "scope": o, "text": t} for i, o, t in lost],
+            "conflicts": conflicts,
+            "conflict_lines": [c["line"] for c in conflicts],
+        }
+        emit(
+            fleet=None,  # type: ignore[arg-type] — the audience is explicit; no fleet is read
+            record_store=record_store,
+            item=act.id,
+            kind=CHAIN_CHANGED,
+            source_scope_id=moved,
+            before=" → ".join([*chain_before, moved]),
+            after=json.dumps(payload, sort_keys=True),
+            wave_ids=change_ids,
+            audience=[receiver],
+        )
+        emitted.append({"scope_id": receiver, "kind": CHAIN_CHANGED, "conflicts": len(conflicts)})
+    return emitted
+
+
+def _cited_directives(
+    record_store: RecordStore, reader: str, item_ids: Sequence[str], *, summaries_dir: str
+) -> list[str]:
+    """Ids of *reader*'s own directives whose originating contribution cites one of
+    *item_ids* (published item ids of the cut source). Stated limit: only a citation by
+    published-item id is found; a judge-declared ``context_sources`` is not persisted
+    on the directive's record, so a directive resting on the source only that way is
+    not named here."""
+    store = _summaries_or_none(summaries_dir)
+    summary = store.read(reader) if store is not None else None
+    if summary is None or not item_ids:
+        return []
+    cited: list[str] = []
+    for directive in summary.directives:
+        origin = record_store.get_contribution(directive.id)
+        text = " ".join(
+            part for part in (directive.content, origin.content if origin else "") if part
+        )
+        if any(re.search(rf"(?<![\w-]){re.escape(i)}(?![\w-])", text) for i in item_ids):
+            cited.append(directive.id)
+    return cited
+
+
+def _emit_channel_removed(
+    record_store: RecordStore,
+    act,
+    *,
+    summaries_dir: str,  # noqa: ANN001
+    skip: frozenset[str] = frozenset(),
+) -> list[dict]:
+    from strata.publication import read_publication  # noqa: PLC0415
+
+    emitted: list[dict] = []
+    change_ids = [new_change_id()]
+    for reader in dict.fromkeys(r for r, _s in _removed_edges(act)):
+        if reader in skip:
+            continue
+        for source in [s for r, s in _removed_edges(act) if r == reader]:
+            item_ids = [i.id for i in read_publication(source, summaries_dir=summaries_dir)]
+            notices = [
+                channel_removed_notice(own_id=own_id, source_scope=source, scope_id=reader)
+                for own_id in _cited_directives(
+                    record_store, reader, item_ids, summaries_dir=summaries_dir
+                )
+            ]
+            payload = {
+                "act_id": act.id,
+                "reader": reader,
+                "source": source,
+                "publication_item_ids": item_ids,
+                "notices": notices,
+            }
+            emit(
+                fleet=None,  # type: ignore[arg-type] — the audience is explicit; no fleet is read
+                record_store=record_store,
+                item=act.id,
+                kind=CHANNEL_REMOVED,
+                source_scope_id=source,
+                before=f"{reader} reads {source}",
+                after=json.dumps(payload, sort_keys=True),
+                wave_ids=change_ids,
+                audience=[reader],
+            )
+            emitted.append({"scope_id": reader, "kind": CHANNEL_REMOVED, "notices": len(notices)})
+    return emitted
+
+
+class StructureEmissionError(RuntimeError):
+    """Emission for a fleet structure act failed, or could not be attempted.
+
+    Raised by :func:`emit_structure_change` after it has recorded the failure. The apply
+    that called it stands (the file and the act are the truth) and reports the failure;
+    ``strata fleet reemit <act_id>`` emits to the receivers still owed.
+    """
+
+    def __init__(self, act_id: str, cause: BaseException | str) -> None:
+        super().__init__(f"structure emission for {act_id} failed: {cause}")
+        self.act_id = act_id
+        self.cause = cause
+
+
+def emit_structure_change(
+    act_id: str,
+    *,
+    record_store: RecordStore | None = None,
+    summaries_dir: str | None = None,
+) -> dict:
+    """Tell the scopes a fleet structure act affects (ADR 0014 D8), once per receiver.
+
+    Reads the act's RECORDED before/after topology, never today's fleet, so a later
+    structure change cannot redirect the notice:
+
+    - ``remove_edge``: one ``channel_removed`` to the reader, naming the source and the
+      source's publication item ids, plus a notice per own directive that cites one;
+    - ``reparent``: one ``chain_changed`` to the moved scope and each recorded
+      descendant, with the directives gained and lost and the 1.17 inherited check's
+      conflict lines for that receiver;
+    - every other change type: nothing.
+
+    Emission goes through :func:`emit` (change ids, once-per-scope, the notice row, the
+    hop budget). Idempotent per RECEIVER: a receiver that already has an event for the act
+    (see :func:`events_for_act`) is skipped and the rest are told, so a run that stopped
+    part-way is completed by calling again; see :func:`unemitted_receivers`.
+
+    Args:
+        act_id: The ``fleet_structure_acts`` id.
+        record_store: The store holding the act. Callers pass the one they hold.
+        summaries_dir: Where the summaries, publications and operator layers live;
+            resolved from the project's storage paths or beside the database when omitted.
+
+    Returns:
+        ``{"act_id", "change_type", "events": [...], "already_emitted": bool}`` on
+        success; ``events`` lists only what this call emitted, and ``already_emitted`` is
+        true when every recorded receiver already had its event.
+
+    Raises:
+        StructureEmissionError: Emission failed, or a recorded receiver is still without
+            its event afterwards, or no *record_store* was given. The failure is recorded
+            first (:func:`_record_emission_failure`) where a store is available.
+    """
+    if record_store is None:
+        _logger.error("structure emission for %s refused: no record store", act_id)
+        raise StructureEmissionError(act_id, "no record_store was given")
+    result: dict = {"act_id": act_id, "events": [], "already_emitted": False}
+    try:
+        act = record_store.get_fleet_structure_act(act_id)
+        result["change_type"] = act.change_type
+        owed = unemitted_receivers(record_store, act_id)
+        if act.change_type not in ("remove_edge", "reparent"):
+            return result
+        if not owed:
+            result["already_emitted"] = True
+            return result
+        skip = frozenset(r for r in _recorded_receivers(act) if r not in owed)
+        resolved = _resolve_summaries_dir(record_store, summaries_dir)
+        if act.change_type == "reparent":
+            result["events"] = _emit_chain_changed(
+                record_store, act, summaries_dir=resolved, skip=skip
+            )
+        else:
+            result["events"] = _emit_channel_removed(
+                record_store, act, summaries_dir=resolved, skip=skip
+            )
+        # emit() reports one receiver's store failure by log and note, not by raising; a
+        # receiver still owed after the loop is a failure of this call.
+        still_owed = unemitted_receivers(record_store, act_id)
+        if still_owed:
+            raise RuntimeError(f"no event was written for: {', '.join(still_owed)}")
+    except StructureEmissionError:
+        raise
+    except Exception as exc:  # noqa: BLE001 — recorded, then raised as one error type
+        _logger.exception("structure emission for %s failed", act_id)
+        scope = _failure_scope(record_store, act_id)
+        if scope is not None:
+            _record_emission_failure(
+                record_store,
+                change_id=act_id,
+                item=act_id,
+                kind=str(result.get("change_type", "structure change")),
+                source_scope_id=scope,
+                affected_scope_id=scope,
+            )
+        raise StructureEmissionError(act_id, exc) from exc
+    return result
+
+
+def _failure_scope(record_store: RecordStore, act_id: str) -> str | None:
+    """A scope known to be writable for the failure note: the first touched scope of the act."""
+    try:
+        act = record_store.get_fleet_structure_act(act_id)
+    except Exception:  # noqa: BLE001
+        return None
+    for scope_id, entry in act.after_topology.items():
+        if isinstance(entry, dict):
+            return str(scope_id)
+    for scope_id in act.before_topology:
+        return str(scope_id)
+    return None
