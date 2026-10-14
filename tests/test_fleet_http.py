@@ -43,12 +43,6 @@ edges:
     kind: chain
 """
 
-_REPARENT_NOTICE = (
-    "g_a now inherits from g_other. Its own directives are not re-checked "
-    "against the new inherited rules automatically (not built yet). Review them; "
-    "the 1.17 inherited check applies to new writes only."
-)
-
 _BANNED = {"emit", "affected_scopes", "emit_restore_notice", "drain_scope"}
 
 
@@ -86,9 +80,7 @@ def _pending_reparent(db_path: Path, fleet_path: Path) -> str:
     return result.proposal_id
 
 
-def test_http_cannot_propose_or_approve_as_a_scope(tmp_path: Path, monkeypatch) -> None:
-    # The stated-limit lines are the no-core state; the core now emits instead.
-    monkeypatch.delattr("strata.change_events.emit_structure_change")
+def test_http_cannot_propose_or_approve_as_a_scope(tmp_path: Path) -> None:
     client, db_path, fleet_path = _client(tmp_path)
     with client:
         proposal_id = _pending_reparent(db_path, fleet_path)
@@ -131,7 +123,7 @@ def test_http_cannot_propose_or_approve_as_a_scope(tmp_path: Path, monkeypatch) 
         body = applied.json()
         assert body["approver_position"] == "operator"
         assert body["proposer_position"] == "g_a"
-        assert body["notices"] == [_REPARENT_NOTICE]
+        assert body["notices"] == []
         assert body["changes_proposer_binding"] is True
 
     store = RecordStore(str(db_path))

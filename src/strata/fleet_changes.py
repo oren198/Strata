@@ -5,12 +5,11 @@ a load validates the file, applied when the actor is the owner scope or an
 ancestor of it (or the operator), and otherwise stored pending. It is
 recorded and never judged.
 
-Emission is the engine's operation (ADR 0014 D8). When
-``strata.change_events.emit_structure_change`` exists, apply calls it once
-after the act row is committed, still holding the fleet file lock. Until
-that operation lands, apply keeps the stated-limit lines and does not emit.
-The feature check and those lines are both removed when the core merges.
-This module never calls ``emit`` itself.
+Emission is the engine's operation (ADR 0014 D8). Apply calls
+``strata.change_events.emit_structure_change`` once after the act row is
+committed, still holding the fleet file lock. On ``StructureEmissionError``
+the file and the act stay as committed and the result carries the notice to
+run ``strata fleet reemit``. This module never calls ``emit`` itself.
 """
 
 from __future__ import annotations
@@ -38,7 +37,7 @@ from strata.fleet_config import (
     replace_fleet_bytes,
 )
 from strata.operator import record_fleet_structure_act
-from strata.record_store import FleetChangeProposal, FleetStructureAct, RecordStore
+from strata.record_store import FleetChangeProposal, RecordStore
 
 _logger = logging.getLogger("strata.fleet_changes")
 
@@ -249,38 +248,6 @@ def actor_qualifies(fleet: FleetConfig, actor: Actor, owner: str | None) -> bool
     if actor.scope_id == owner:
         return True
     return _is_ancestor(fleet, actor.scope_id, owner)
-
-
-def limit_notices(fleet: FleetConfig, change: FleetChange) -> list[str]:
-    """The stated-limit lines an applied change owes while emission is absent.
-
-    Rows 1 and 5 are empty. Removed, with the ``hasattr`` guard in
-    ``_apply``, when ``emit_structure_change`` is part of the core.
-    """
-    payload = change.payload
-    if change.change_type == "remove_edge":
-        reader = payload["from"]
-        source = payload["to"]
-        return [
-            f"{reader} no longer reads {source}'s publication. Items in {reader}'s memory "
-            f"attributed to {source} are not re-checked automatically (not built yet)."
-        ]
-    if change.change_type == "remove_scope":
-        scope_id = payload["scope_id"]
-        return [
-            f"{scope_id}'s memory is kept. remove_edge already gave notice to any reader; "
-            "attributed items are not re-checked automatically (not built yet)."
-        ]
-    if change.change_type == "reparent":
-        scope_id = payload["scope_id"]
-        subtree = _subtree_label(fleet, scope_id)
-        chain = _chain_label(fleet, payload["new_parent_id"])
-        return [
-            f"{subtree} now inherits from {chain}. Its own directives are not re-checked "
-            "against the new inherited rules automatically (not built yet). Review them; "
-            "the 1.17 inherited check applies to new writes only."
-        ]
-    return []
 
 
 def propose(
@@ -495,7 +462,6 @@ class _Preview:
     owner: str | None
     widens: bool
     binds: bool
-    notices: tuple[str, ...]
 
 
 def _normalize_payload(change_type: str, payload: dict) -> dict:
@@ -568,12 +534,7 @@ def _preview(fleet: FleetConfig, change: FleetChange, proposer: Actor) -> _Previ
     _validate_document(updated)
     owner = owner_scope(fleet, change)
     widens, binds = change_flags(fleet, change, proposer.scope_id)
-    return _Preview(
-        owner=owner,
-        widens=widens,
-        binds=binds,
-        notices=tuple(limit_notices(fleet, change)),
-    )
+    return _Preview(owner=owner, widens=widens, binds=binds)
 
 
 # Tests set this to pause inside an apply while the fleet file lock is held,
@@ -616,23 +577,19 @@ def _apply(
         _rollback(fleet, backup)
         raise
     # The act row is committed. Emission runs under the same fleet lock the
-    # caller of _apply already holds. A failure does not roll the file or
-    # the act back: those are the truth, and the core records the failure.
-    # REMOVED WHEN THE CORE MERGES: this hasattr guard, and the stated-limit
-    # lines limit_notices still returns while the operation is absent.
-    notices = preview.notices
-    if hasattr(change_events, "emit_structure_change"):
-        try:
-            change_events.emit_structure_change(act.id, record_store=record_store)
-        except Exception:
-            _logger.warning(
-                "structure emission failed for %s; the applied change stands",
-                act.id,
-                exc_info=True,
-            )
-            notices = (_emission_failed_notice(act.id),)
-        else:
-            notices = ()
+    # caller of _apply already holds. StructureEmissionError does not roll
+    # the file or the act back: those are the truth, and the core records
+    # the failure.
+    notices: tuple[str, ...] = ()
+    try:
+        change_events.emit_structure_change(act.id, record_store=record_store)
+    except change_events.StructureEmissionError:
+        _logger.warning(
+            "structure emission failed for %s; the applied change stands",
+            act.id,
+            exc_info=True,
+        )
+        notices = (_emission_failed_notice(act.id),)
     return FleetChangeResult(
         status="applied",
         proposal_id=proposal_id,
@@ -963,19 +920,6 @@ def _topology(fleet: FleetConfig, scope_ids: list[str], change: FleetChange) -> 
     return snapshot
 
 
-def _subtree_label(fleet: FleetConfig, scope_id: str) -> str:
-    descendants = [scope.id for scope in fleet.chain_descendants(scope_id)]
-    if not descendants:
-        return scope_id
-    listed = ", ".join(descendants)
-    return f"{scope_id} and its subtree ({listed})"
-
-
-def _chain_label(fleet: FleetConfig, parent_id: str) -> str:
-    ancestors = [scope.id for scope in fleet.inter_stratum_ancestors(parent_id)]
-    return " → ".join([*ancestors, parent_id])
-
-
 def _open_cli(db: str | None, fleet_path: str | None) -> tuple[FleetConfig, RecordStore]:
     from strata.migrator import run_migrations
     from strata.project_config import resolve_storage_paths
@@ -1004,7 +948,7 @@ def _cli_dispatch(args: object, fleet: FleetConfig, store: RecordStore) -> int:
         _print_result(result)
         return 0
     if command == "reemit":
-        return _reemit(fleet, store, args.act_id)
+        return _reemit(store, args.act_id)
     change = _change_from_cli(args, command)
     result = apply_as_operator(fleet, store, change)
     _print_result(result)
@@ -1072,31 +1016,29 @@ def _print_result(result: FleetChangeResult) -> None:
         print(f"backup: {result.backup}")
 
 
-def _reemit(fleet: FleetConfig, store: RecordStore, act_id: str) -> int:
-    """Operator re-run of emission for one act. Idempotent.
+def _reemit(store: RecordStore, act_id: str) -> int:
+    """Operator re-run of emission for one act. Idempotent per receiver.
 
-    An act that already has change events prints ``already emitted`` and
-    does not call the engine again. While ``emit_structure_change`` is
-    absent, the stated-limit line is printed instead of calling it.
+    ``already emitted`` means ``unemitted_receivers(record_store, act_id) == []``:
+    every recorded receiver already has an event, or the change type owes none.
+    That path does not call the engine again. Otherwise ``emit_structure_change``
+    tells the receivers still owed. ``StructureEmissionError`` prints the
+    failure notice and returns 1.
     """
     try:
-        act = store.get_fleet_structure_act(act_id)
+        store.get_fleet_structure_act(act_id)
     except KeyError:
         print(f"No fleet structure act {act_id}.", file=sys.stderr)
         return 1
-    if _events_for_act(store, act_id):
+    if change_events.unemitted_receivers(store, act_id) == []:
         print("already emitted")
         return 0
-    if hasattr(change_events, "emit_structure_change"):
-        try:
-            emitted = change_events.emit_structure_change(act_id, record_store=store)
-        except Exception:
-            print(_emission_failed_notice(act_id), file=sys.stderr)
-            return 1
-        _print_emitted(emitted)
-        return 0
-    for line in _stated_limit_for_act(fleet, act):
-        print(line)
+    try:
+        emitted = change_events.emit_structure_change(act_id, record_store=store)
+    except change_events.StructureEmissionError:
+        print(_emission_failed_notice(act_id), file=sys.stderr)
+        return 1
+    _print_emitted(emitted)
     return 0
 
 
@@ -1107,66 +1049,16 @@ def _print_emitted(emitted: object) -> None:
     print(json.dumps(emitted, sort_keys=True, default=str))
 
 
-def _stated_limit_for_act(fleet: FleetConfig, act: FleetStructureAct) -> list[str]:
-    change = _change_from_recorded_act(act)
-    if change is None:
-        return ["structure emission is not available yet (not built yet)."]
-    return limit_notices(fleet, change)
-
-
-def _change_from_recorded_act(act: FleetStructureAct) -> FleetChange | None:
-    """Rebuild the change the stated-limit line needs, from the recorded topology."""
-    if act.change_type == "reparent":
-        for scope_id, after in act.after_topology.items():
-            if isinstance(after, dict) and isinstance(after.get("parent"), str):
-                return parse_change(
-                    "reparent",
-                    {"scope_id": scope_id, "new_parent_id": after["parent"]},
-                )
-        return None
-    if act.change_type == "remove_edge":
-        for scope_id, before in act.before_topology.items():
-            if not isinstance(before, dict):
-                continue
-            after = act.after_topology.get(scope_id)
-            before_refs = set(before.get("references") or [])
-            after_refs = set(after.get("references") or []) if isinstance(after, dict) else set()
-            lost = sorted(before_refs - after_refs)
-            if lost:
-                return parse_change("remove_edge", {"from": scope_id, "to": lost[0]})
-        return None
-    if act.change_type == "remove_scope":
-        for scope_id, before in act.before_topology.items():
-            if before is not None and act.after_topology.get(scope_id) is None:
-                return parse_change("remove_scope", {"scope_id": scope_id})
-        return None
-    return None
-
-
 def _emission_failed_notice(act_id: str) -> str:
     return f"Structure emission failed for {act_id}; run `strata fleet reemit {act_id}`."
 
 
-def _events_for_act(record_store: RecordStore, act_id: str) -> list[dict]:
-    """Rows from the core's ``events_for_act``. Empty while that operation is absent.
-
-    Nothing here looks at event text or contribution text.
-    """
-    finder = getattr(change_events, "events_for_act", None)
-    if finder is None:
-        return []
-    return list(finder(record_store, act_id) or [])
-
-
 def _conflict_lines_from_core(events: list[dict]) -> list[str]:
-    """Lines from ``structure_conflict_lines`` only. Empty while it is absent."""
-    reader = getattr(change_events, "structure_conflict_lines", None)
-    if reader is None:
-        return []
+    """Lines from ``structure_conflict_lines`` only. Nothing is re-derived from text."""
     found: list[str] = []
     seen: set[str] = set()
     for event in events:
-        for line in reader(event) or []:
+        for line in change_events.structure_conflict_lines(event):
             if isinstance(line, str) and line not in seen:
                 seen.add(line)
                 found.append(line)
@@ -1174,28 +1066,29 @@ def _conflict_lines_from_core(events: list[dict]) -> list[str]:
 
 
 def unemitted_structure_acts(record_store: RecordStore) -> list[tuple[str, str]]:
-    """``remove_edge`` and ``reparent`` acts ``events_for_act`` does not return.
+    """``remove_edge`` and ``reparent`` acts that still owe a receiver.
 
-    Caller has already checked that ``events_for_act`` exists.
+    Emitted means ``unemitted_receivers(record_store, act_id) == []``.
     """
     missing: list[tuple[str, str]] = []
     for act in record_store.list_fleet_structure_acts():
         if act.change_type not in ("remove_edge", "reparent"):
             continue
-        if not _events_for_act(record_store, act.id):
-            missing.append((act.id, act.change_type))
+        if change_events.unemitted_receivers(record_store, act.id) == []:
+            continue
+        missing.append((act.id, act.change_type))
     return missing
 
 
 def structure_act_views(record_store: RecordStore) -> list[dict]:
     """Applied acts with the events and conflict lines the core reports. Read-only.
 
-    While ``events_for_act`` or ``structure_conflict_lines`` is absent, the
-    corresponding list is empty. This does not read event or contribution text.
+    Events come from ``events_for_act`` and lines from ``structure_conflict_lines``.
+    This does not read event or contribution text.
     """
     views: list[dict] = []
     for act in record_store.list_fleet_structure_acts():
-        events = _events_for_act(record_store, act.id)
+        events = change_events.events_for_act(record_store, act.id)
         views.append(
             {
                 "id": act.id,
