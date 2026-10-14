@@ -574,7 +574,11 @@ def test_a_scope_manager_without_the_check_cannot_publish(world) -> None:  # noq
     acts = store.list_publication_acts(scope_id="g_web")
     assert acts
     assert store.get_publication_judgment(acts[-1].id) is None
-    attempts = store.list_publication_judgment_attempts(act_id=acts[-1].id)
+    attempts = [
+        a
+        for a in store.list_publication_judgment_attempts(scope_id="g_web")
+        if a.act_id == acts[-1].id
+    ]
     assert attempts and attempts[-1].error_class == "AttributeError"
 
 
