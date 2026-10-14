@@ -47,6 +47,22 @@ the release PR (`dev` → `main`) and the GitHub Release body are built from
     with the previous context plus each remaining member's own text.
   - A report reaches the issuer only if the contributor follows the `acted_on`
     suggestion.
+- **A decline says which claim it is about, and a reason can't describe content that
+  isn't there.** When the telling-event check refuses an informant claim, the reason now
+  quotes the informant and the span it judged ("the claim attributed to 'the architect' has
+  no telling event ..."), so a reader can tell which claim failed. After any judgment, an
+  informant the judge's reasoning names ("Hearsay: ... told by X", "informant X") must occur
+  in the contribution's own text; if it doesn't, the judge gets one corrective re-ask on the
+  same tool, and if the reasoning still names it the engine replaces it with "Reason
+  withdrawn: the judge described content that is not in this contribution (X). Verdict:
+  <decision>." and notes the mismatch in the record. The verdict itself is never changed
+  by this, and only the reasoning is taken from the re-ask. A "Hearsay:" label on a
+  reasoning that itself says first-hand is dropped (not when it says "not first-hand").
+  Reading an artifact first-hand is now a telling event: "I read / opened / reviewed /
+  drafted ... from" plus the artifact attributed to its source ("<source>'s file", "<file>
+  by <source>") plus its path, URL or id right after it. It is admitted as context only,
+  recorded as the author's word as of the reading, never as the author's decision.
+
 
 - **A child directive that changes an inherited one is now declined, not held.**
   Since 1.17.1 a directive from a session bound to a scope that loosened,
