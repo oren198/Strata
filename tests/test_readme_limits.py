@@ -23,61 +23,79 @@ def test_the_stale_claim_is_gone() -> None:
     assert "Filtering this kind of junk relies on the agent today" not in _README
 
 
-# --- Choosing a judge (default-judge change) -------------------------------------------------
+# --- Judge models (v1.18; the operator's order of 2026-10-11) -------------------------------
+# The README names the judge we used and the one we recommend. The rule this replaces (1.13: "never
+# rank a judge") is retired by that order; its substance stays: every recommendation sits beside
+# its measured numbers and their source, no unmeasured superlatives, an unmeasured judge is not
+# called worse, and the stated limits are printed.
 
 
-def _choosing_a_judge() -> str:
-    start = _README.index("### Choosing a judge")
+def _judge_models() -> str:
+    start = _README.index("### Judge models")
     end = _README.index("### Environment variables", start)
     return _README[start:end]
 
 
-def test_choosing_a_judge_states_the_measurement_and_its_build() -> None:
-    section = _choosing_a_judge()
-    assert "2026-09-20" in section
-    assert "`release/v1.13.0` @ `5f5bf49`" in section
-    assert "docs/evidence/judge-baseline-2026-09-20.md" in section
+def test_judge_models_ties_the_recommendation_to_its_measurement_and_source() -> None:
+    section = _judge_models()
+    assert (
+        "I recommend `qwen/qwen3-235b-a22b-2507` on OpenRouter, pinned to the Nebius provider."
+        in section
+    )
+    # the v1.18 measurement: model, provider, build, date, reps, source
+    assert (
+        "`qwen/qwen3-235b-a22b-2507` on OpenRouter, pinned to Nebius, engine `ed31692`, "
+        "2026-10-14, 3 runs per item ([evidence](docs/evidence/v1.18-judge-baseline.md))"
+    ) in section
     for figure in (
-        "12",
-        "94.4% (51/54)",
-        "2.6% (2 of 76 scored; measured on the pre-#212 build)",
-        "0 of 130",
-        "$0.0157",
+        "6 of 279",
+        "11 of 126",
+        "139 of 144",
+        "144 of 144",
+        "108 of 108",
+        "72 of 72",
+        "0 of 10 published",
+        "32 of 32",
+        "141 of 162",
+        "$3.40",
     ):
-        assert figure in section  # qwen row
-    for figure in ("7", "0.0% (0 of 84)", "$0.2139"):
-        assert figure in section  # haiku row
+        assert figure in section, figure
+    # the cross-model study keeps its build and source, and is not set against v1.18
+    assert "2026-09-20, engine `release/v1.13.0` @ `5f5bf49`" in section
+    assert "docs/evidence/judge-baseline-2026-09-20.md" in section
+    assert "don't set them against the v1.18 table above" in section
+    for figure in ("$0.0157", "$0.2139", "0 of 84", "2 of 76 scored"):
+        assert figure in section, figure
+    assert "This is a new baseline." in section
 
 
-def test_choosing_a_judge_states_the_haiku_over_decline_and_the_no_silent_switch_rule() -> None:
-    section = _choosing_a_judge()
-    assert "over-declined 2 of 6 legitimate operational notes (`wi-102`, `wi-103`)" in section
-    # The upgrade promise and the key promise, each a sentence of its own.
+def test_judge_models_keeps_the_key_promise_and_the_no_silent_switch_rule() -> None:
+    section = _judge_models()
     assert (
-        "If your only key is an Anthropic one, the install stays on `claude-haiku-4-5` on "
-        "Anthropic's own endpoint."
+        "If your only key is an Anthropic one, the install uses `claude-haiku-4-5` on "
+        "Anthropic's own endpoint. That key is never sent to the router. Either way"
     ) in section
-    assert "Anthropic's own endpoint. That key is never sent to the router. Either way" in section
-    assert (
-        "Strata's judging runs on a model you choose. I tried six of them against the same "
-        "suites; three completed every one, and the table in this repo "
-        "([docs/evidence/judge-baseline-2026-09-20.md]"
-        "(docs/evidence/judge-baseline-2026-09-20.md)) "
-        "shows what each did and where a cell is empty — one produced no judgments at all, "
-        "one errored on most of the adversarial set, one ran partially."
-    ) in section
-    assert "`strata doctor` names the judge and endpoint you are actually running" in section
-    assert "so read it and pick" in section
-    assert "A model id ages" in section
-    assert "JUDGE_MODEL=qwen/qwen3-235b-a22b-2507" in section
+    assert "JUDGE_PROVIDER=Nebius" in section
+    assert "A model id ages." in section
+    assert "A new provider is a new measurement, not the same judge." in section
 
 
-def test_choosing_a_judge_never_ranks_a_judge() -> None:
-    """Truth rule: state what was measured, when, on which build — no 'best', no 'recommended'."""
-    section = _choosing_a_judge().lower()
-    for word in ("best", "recommend", "better", "safest", "superior", "strongest"):
-        assert word not in section, word
-    assert "it does not rank the judges" in section
+def test_judge_models_has_no_unmeasured_superlative_and_states_its_limits() -> None:
+    section = _judge_models()
+    lowered = section.lower()
+    for word in ("best", "safest", "superior", "strongest", "most accurate", "most secure"):
+        assert word not in lowered, word
+    assert "A model not in these tables is unmeasured, not known to be worse." in section
+    assert "it does not rank the judges" not in lowered  # retired by the operator's order
+    for limit in (
+        "A reworded exception that shares no words with the inherited rule can be admitted when "
+        "the judge calls it a refinement (seen in 2 of 3 runs on one test item).",
+        "the engine still admits 8 of 30 and 15 of 30 exceptions as directives",
+        "11 of 12 attempts",
+        "The ordinary judge's input wraps the scope summary in an ambiguous fence",
+        "the engine doesn't enforce it (#209)",
+    ):
+        assert limit in section, limit
 
 
 # --- "What the demo shows": the three sentences 1.13 made false (Show HN fix) -------------

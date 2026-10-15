@@ -633,7 +633,9 @@ def test_flat_rule_with_the_scope_name_as_span_fails_with_no_telling_event() -> 
     ]
     judgment, _ = _judge(mock_client, content)
     assert judgment.decision == "decline"
-    assert "no telling event is reported: state who told you" in judgment.reasoning
+    # the reason names the informant span it is about, verbatim
+    assert "the claim attributed to '225-other-scope' has no telling event" in judgment.reasoning
+    assert "state who told you, or report what you read and where" in judgment.reasoning
     assert judgment.interior_assertion["result"] == "declined (no telling event)"
 
 
@@ -651,7 +653,8 @@ def test_unaddressed_telling_verb_fails() -> None:
     ]
     judgment, _ = _judge(mock_client, content)
     assert judgment.decision == "decline"
-    assert "no telling event is reported: state who told you" in judgment.reasoning
+    assert "the claim attributed to '225-other-scope' has no telling event" in judgment.reasoning
+    assert "state who told you" in judgment.reasoning
 
 
 def test_stated_limit_a_real_telling_with_no_contributor_named_is_declined() -> None:
@@ -671,7 +674,8 @@ def test_stated_limit_a_real_telling_with_no_contributor_named_is_declined() -> 
     ]
     judgment, _ = _judge(mock_client, content)
     assert judgment.decision == "decline"
-    assert "the telling names no one it was told to" in judgment.reasoning
+    assert "names no one it was told to" in judgment.reasoning
+    assert "'the 225-other-scope lead'" in judgment.reasoning
     assert judgment.interior_assertion["result"] == "declined (no telling event)"
 
 

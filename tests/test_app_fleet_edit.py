@@ -346,6 +346,25 @@ class TestSaveFleet:
         assert resp.json()["saved"] is True
         assert client.fleet_yaml_path.read_bytes() == _FLEET_YAML_V2.encode("utf-8")
 
+    def test_missing_fcntl_refuses_and_leaves_the_file(self, client, monkeypatch):
+        import strata.fleet_config as fleet_config
+        from strata.fleet_config import FLEET_FILE_LOCK_UNAVAILABLE
+
+        monkeypatch.setattr(fleet_config, "fcntl", None)
+        etag = client.get("/fleet").json()["etag"]
+        before = client.fleet_yaml_path.read_bytes()
+        backup_path = client.fleet_yaml_path.parent / (client.fleet_yaml_path.name + ".bak")
+
+        resp = client.put("/fleet", json={"yaml": _FLEET_YAML_V2, "etag": etag})
+
+        assert resp.status_code == 503
+        body = resp.json()
+        assert body["detail"]["error"] == "fleet_lock_unavailable"
+        assert body["detail"]["detail"] == FLEET_FILE_LOCK_UNAVAILABLE
+        assert client.fleet_yaml_path.read_bytes() == before
+        assert not backup_path.exists()
+        assert not (client.fleet_yaml_path.parent / "fleet.yaml.tmp").exists()
+
     def test_comments_and_blank_lines_survive_byte_for_byte(self, client):
         etag = client.get("/fleet").json()["etag"]
 

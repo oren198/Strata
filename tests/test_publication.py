@@ -203,6 +203,14 @@ class _FakeScopeManager:
         self.bootstrap_calls.append(kwargs)
         return self._bootstrap_judgment
 
+    def check_publication_exception(self, **kwargs):
+        """#243: the engine's check is never skipped, so a fake provides it: the real one."""
+        from unittest.mock import MagicMock
+
+        from strata.scope_manager import ScopeManager
+
+        return ScopeManager(client=MagicMock()).check_publication_exception(**kwargs)
+
 
 # ---------------------------------------------------------------------------
 # 1. The publication artifact — render/parse round-trip, atomic write,

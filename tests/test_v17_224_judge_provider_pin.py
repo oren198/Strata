@@ -4,15 +4,11 @@ Covers:
 
 1. The choke point is ENFORCED, not conventional — an AST scan of every
    ``.py`` file under ``src/strata/`` fails on any ``<something>.messages.create(``
-   call outside a short allowlist of functions
-   (``_messages_create``, ``_default_draft_fn``, ``_probe_judge_live``),
-   and a second scan asserts each of those allowlisted functions actually
-   calls ``apply_provider_pin`` somewhere in its own body — being exempt
-   from the raw-call violation is not enough; it must actually pin.
-   Whichever branch merges a new judge call site second (#219 C's
-   `check_claim_carriers`, at this writing, still unmerged) must route
-   through one of these, and this test makes skipping that impossible to
-   miss.
+   call outside ``metered_messages_create``. The three entry points
+   (``_messages_create``, ``_default_draft_fn``, ``_probe_judge_live``)
+   must call that function, and it must call ``apply_provider_pin``.
+   A new judge call site has to go through it; skipping that records no
+   usage and applies no provider pin, and this test fails.
 2. Input identity: with no provider configured, the kwargs a mocked client
    receives are IDENTICAL to a pre-#224 call (no ``extra_body`` key at
    all) — on both an ordinary accept and a declined judgment. With a
@@ -63,15 +59,14 @@ _SRC = _REPO_ROOT / "src" / "strata"
 # ---------------------------------------------------------------------------
 
 
-_ALLOWLISTED_CALL_SITES = frozenset({"_messages_create", "_default_draft_fn", "_probe_judge_live"})
+_RAW_CREATE_SITES = frozenset({"metered_messages_create"})
+_ENTRY_POINTS = frozenset({"_messages_create", "_default_draft_fn", "_probe_judge_live"})
 
 
 def _raw_messages_create_calls(source: str, filename: str) -> list[tuple[str, int]]:
     """Every ``<expr>.messages.create(`` call in *source*, as
-    ``(filename, lineno)``, EXCEPT inside a function whose name is on
-    ``_ALLOWLISTED_CALL_SITES`` (the only places allowed to call the raw
-    client -- each of those is checked separately for actually calling
-    ``apply_provider_pin``, see ``test_allowlisted_call_sites_apply_the_pin``)."""
+    ``(filename, lineno)``, EXCEPT inside ``metered_messages_create`` (the
+    only place allowed to call the raw client)."""
     tree = ast.parse(source, filename=filename)
     violations: list[tuple[str, int]] = []
 
@@ -93,7 +88,7 @@ def _raw_messages_create_calls(source: str, filename: str) -> list[tuple[str, in
                 and func.attr == "create"
                 and isinstance(func.value, ast.Attribute)
                 and func.value.attr == "messages"
-                and not (set(self.func_stack) & _ALLOWLISTED_CALL_SITES)
+                and not (set(self.func_stack) & _RAW_CREATE_SITES)
             ):
                 violations.append((filename, node.lineno))
             self.generic_visit(node)
@@ -110,9 +105,9 @@ def test_every_messages_create_call_routes_through_the_choke_point() -> None:
             continue
         violations.extend(_raw_messages_create_calls(source, str(path.relative_to(_REPO_ROOT))))
     assert violations == [], (
-        "every judge API call must go through one of "
-        f"{sorted(_ALLOWLISTED_CALL_SITES)} (#224) -- found a raw "
-        f"<client>.messages.create(...) call outside them at: {violations}"
+        "every judge API call must go through metered_messages_create "
+        "(#224, #246) -- found a raw <client>.messages.create(...) call "
+        f"outside it at: {violations}"
     )
 
 
@@ -133,27 +128,35 @@ def _function_source_calls_name(tree: ast.AST, func_name: str, call_name: str) -
 
 
 def test_allowlisted_call_sites_apply_the_pin() -> None:
-    """Being exempt from the raw-call scan is not enough on its own -- each
-    allowlisted function must actually call ``apply_provider_pin`` itself."""
-    found: dict[str, bool] = dict.fromkeys(_ALLOWLISTED_CALL_SITES, False)
+    """``metered_messages_create`` pins, and every entry point calls it.
+
+    A direct ``messages.create`` inside an entry point would bypass both the
+    pin and the usage row. The raw-call scan above already forbids that;
+    this checks the entry points actually reach the meter.
+    """
     defined: set[str] = set()
+    pinned = False
+    reached: dict[str, bool] = dict.fromkeys(_ENTRY_POINTS, False)
     for path in _SRC.rglob("*.py"):
         source = path.read_text(encoding="utf-8")
-        if not any(name in source for name in _ALLOWLISTED_CALL_SITES):
-            continue
         tree = ast.parse(source, filename=str(path))
-        for func_name in _ALLOWLISTED_CALL_SITES:
+        if _function_source_calls_name(tree, "metered_messages_create", "apply_provider_pin"):
+            pinned = True
+            defined.add("metered_messages_create")
+        for func_name in _ENTRY_POINTS:
             if f"def {func_name}(" not in source:
                 continue
             defined.add(func_name)
-            if _function_source_calls_name(tree, func_name, "apply_provider_pin"):
-                found[func_name] = True
-    assert defined == _ALLOWLISTED_CALL_SITES, (
-        f"expected to find definitions for all of {sorted(_ALLOWLISTED_CALL_SITES)}, "
-        f"only found {sorted(defined)} -- update the allowlist or the scan"
+            if _function_source_calls_name(tree, func_name, "metered_messages_create"):
+                reached[func_name] = True
+    assert "metered_messages_create" in defined
+    assert pinned, "metered_messages_create never calls apply_provider_pin"
+    assert defined >= _ENTRY_POINTS, (
+        f"expected to find definitions for all of {sorted(_ENTRY_POINTS)}, "
+        f"only found {sorted(defined)}"
     )
-    missing = [name for name, ok in found.items() if not ok]
-    assert missing == [], f"these allowlisted call sites never call apply_provider_pin: {missing}"
+    missing = [name for name, ok in reached.items() if not ok]
+    assert missing == [], f"these call sites never call metered_messages_create: {missing}"
 
 
 # ---------------------------------------------------------------------------

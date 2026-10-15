@@ -64,7 +64,13 @@ from strata.change_events import emit as emit_change_event
 from strata.fleet_config import FleetConfig
 from strata.locks import scope_lock
 from strata.publication import propagate_directive_removals
-from strata.record_store import ContributorRef, OperatorAct, RecordStore, Retirement
+from strata.record_store import (
+    ContributorRef,
+    FleetStructureAct,
+    OperatorAct,
+    RecordStore,
+    Retirement,
+)
 from strata.summary_store import Directive, SummaryStore
 
 # ---------------------------------------------------------------------------
@@ -264,6 +270,44 @@ def read_operator_layer(scope_id: str, *, summaries_dir: str) -> list[OperatorIt
 
 def _operator_layer_lock_key(target_scope_id: str) -> str:
     return f"operator:{target_scope_id}"
+
+
+def record_fleet_structure_act(
+    *,
+    record_store: RecordStore,
+    change_type: str,
+    proposer_position: str,
+    approver_position: str,
+    widens_proposer_reach: bool,
+    changes_proposer_binding: bool,
+    owner_scope_id: str | None,
+    before_topology: dict,
+    after_topology: dict,
+    proposal_id: str | None = None,
+) -> FleetStructureAct:
+    """Append the one operator-act record for an applied fleet structure change.
+
+    Structure acts are authority acts: recorded, never judged, and never
+    announced as a change event. This is the same writer family as
+    :meth:`RecordStore.append_operator_act` — an append-only operator record
+    — but the row is not operator memory. ``operator_acts`` holds publish,
+    supersede, and retire of the operator stratum; a live row there is a
+    directive an outcome can name. A fleet change must not become one, so
+    the record is the sibling table ``fleet_structure_acts``.
+
+    No judge is called. No change event is emitted.
+    """
+    return record_store.append_fleet_structure_act(
+        change_type=change_type,
+        proposer_position=proposer_position,
+        approver_position=approver_position,
+        widens_proposer_reach=widens_proposer_reach,
+        changes_proposer_binding=changes_proposer_binding,
+        owner_scope_id=owner_scope_id,
+        before_topology=before_topology,
+        after_topology=after_topology,
+        proposal_id=proposal_id,
+    )
 
 
 def _emit_operator_layer_change(

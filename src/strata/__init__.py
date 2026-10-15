@@ -1,6 +1,6 @@
 """Strata — shared memory for agent fleets."""
 
-__version__ = "1.17.2"
+__version__ = "1.18.0"
 
 #: PyPI distribution name. The import name (``strata``) and console scripts
 #: (``strata``, ``strata-mcp``) are unchanged — only the package name pip

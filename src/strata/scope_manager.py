@@ -164,8 +164,65 @@ _REFRESH_ADDITION_KINDS: frozenset[str] = frozenset({"published", "amended", "di
 #: genuinely no longer stand — it may be asserting something its inputs no
 #: longer support — so `new_context` stays available.
 _REFRESH_REMOVAL_KINDS: frozenset[str] = frozenset(
-    {"withdrawn", "directive_retired", "directive_superseded", "operator_directive_changed"}
+    {
+        "withdrawn",
+        "directive_retired",
+        "directive_superseded",
+        "operator_directive_changed",
+        "channel_removed",
+        "chain_changed",
+    }
 )
+
+#: ADR 0014 D8: the kinds that record a fleet structure change. Spelled here
+#: rather than imported, as :data:`_REFRESH_NEUTRAL_KIND` is.
+_STRUCTURE_KINDS: frozenset[str] = frozenset({"channel_removed", "chain_changed"})
+
+#: The ops a structure refresh may never apply: the judge is not the scope's
+#: authority over its own directives (ADR 0014 D8 (b), the position gate).
+_STRUCTURE_DROPPED_OPS: tuple[str, ...] = ("supersede", "retire")
+
+
+def _structure_event(events: Sequence[_ChangeEventLike] | None) -> tuple[str, str] | None:
+    """The first structure event among a refresh's pending events: (kind, act id).
+
+    The act id is read from the event's structured JSON ``after`` payload,
+    never from free text; an unreadable payload yields an empty id.
+    """
+    for event in events or ():
+        if event.kind not in _STRUCTURE_KINDS:
+            continue
+        act_id = ""
+        try:
+            payload = json.loads(event.after or "")
+            if isinstance(payload, dict) and isinstance(payload.get("act_id"), str):
+                act_id = payload["act_id"]
+        except (TypeError, ValueError):
+            pass
+        return event.kind, act_id
+    return None
+
+
+def _drop_structure_ops(
+    ops: list[DirectiveOp],
+    structure: tuple[str, str] | None,
+) -> tuple[list[DirectiveOp], list[str]]:
+    """Drop supersede/retire ops on a structure refresh; return (kept ops, notes)."""
+    if structure is None:
+        return ops, []
+    kind, act_id = structure
+    kept: list[DirectiveOp] = []
+    notes: list[str] = []
+    for op in ops:
+        if op.op in _STRUCTURE_DROPPED_OPS:
+            notes.append(
+                f"Dropped {op.op} on {op.id}: a structure change ({kind}, act "
+                f"{act_id}) never retires or supersedes a scope's own directives."
+            )
+        else:
+            kept.append(op)
+    return kept, notes
+
 
 #: ADR 0015 D5's unsplice, spelled here rather than imported: this module does
 #: not depend on :mod:`strata.change_events` (see :class:`_ChangeEventLike`).
@@ -2708,6 +2765,20 @@ class ScopeManagerJudgment(_AmendmentJudgment):
     reasoning: str
     """Brief explanation of the verdict — written to the judgment record."""
 
+    inherited_relation: dict | None = None
+    """#242: ``{"contribution_id", "kind", "verdict", "fallback", "inherited_id",
+    "origin", "reason"}`` whenever the context re-ask fired (see
+    :meth:`ScopeManager.classify_inherited_context`) — ``None`` otherwise.
+    ``fallback`` is True when nothing was verified and no exception marker
+    stood in the way, so the admit stood: the counted fail-open door."""
+
+    directive_relation: dict | None = None
+    """#244 step 3: ``{"contribution_id", "relation", "verdict", "fallback",
+    "inherited_id", "origin", "reason"}`` whenever the directive re-ask fired (see
+    :meth:`ScopeManager.classify_inherited_directive`) — ``None`` otherwise.
+    ``fallback`` is True when the admit rests on an unreadable, unrelated or
+    unverified answer with no relaxation marker in the way: the counted door."""
+
     inherited_holds: list[dict] = Field(default_factory=list)
     """v1.17.1: ``{"contribution_id", "directive_id", "origin", "reason"}`` per
     contribution the inherited-conflict check held (see
@@ -2945,6 +3016,14 @@ class ScopeManagerBatchJudgment(_AmendmentJudgment):
 
     dropped_ops_by_contribution: dict[str, list[str]] = Field(default_factory=dict)
     """Dropped ops (rendered) keyed by the contribution whose record notes them."""
+
+    inherited_relations: list[dict] = Field(default_factory=list)
+    """#242: one outcome dict per member the context re-ask fired for (same
+    shape as :attr:`ScopeManagerJudgment.inherited_relation`)."""
+
+    directive_relations: list[dict] = Field(default_factory=list)
+    """#244 step 3: one outcome dict per member the directive re-ask fired for (same
+    shape as :attr:`ScopeManagerJudgment.directive_relation`)."""
 
     inherited_holds: list[dict] = Field(default_factory=list)
     """v1.17.1: the inherited-conflict check's holds, one dict per held member
@@ -3220,6 +3299,28 @@ def _render_entitlement(entitlement: EntitlementView) -> str:
         "as their own):\n"
         f"    {_render_entitlement_group(entitlement.others)}\n"
     )
+
+
+#: #244 step 2, placed with the rule it qualifies: it is in the user message after the ANCESTOR
+#: DIRECTIVES blocks, so it reaches only scopes that inherit directives and leaves every other
+#: judgment's input (and the system prompt) as it was.
+_EXCEPTION_RULE_TEXT = (
+    "An EXCEPTION is not a refinement. A contribution that lets some case skip, waive, defer "
+    'or do less than an inherited directive requires ("may ... without", "no need to", "can '
+    'skip", "doesn\'t need", "except when", "is fine to") EXEMPTS that case and contradicts '
+    "the directive: DECLINE it, in either classification. A refinement only adds detail or "
+    "tightens; it never removes a case from the directive's reach.\n\n"
+)
+
+
+def _summary_markers(summary_block: str) -> str:
+    """The publication and bootstrap judges' CURRENT SUMMARY block, with unambiguous markers.
+
+    The summary file begins with a "---" YAML frontmatter line, so a block fenced by "---"
+    rendered as "---\\n---" and read as EMPTY: the judge refused legitimate publications as
+    "not in the current summary". Explicit open and close markers keep the frontmatter
+    inside the block. (The ordinary judgment's renderer is separate and unchanged.)"""
+    return f"CURRENT SUMMARY (between the markers)\n<<<SUMMARY\n{summary_block}\nSUMMARY>>>\n"
 
 
 def _render_directives_only(directives: Sequence[Directive]) -> str:
@@ -4033,6 +4134,8 @@ def _build_judge_preamble(
         # so is noise in every descendant's prompt, forever.
         if directives
     )
+    if ancestor_block:
+        ancestor_block += _EXCEPTION_RULE_TEXT
 
     entitlement_block = ""
     if entitlement is not None:
@@ -4633,9 +4736,282 @@ def _teller_near_a_verb(telling_span: str, teller_span: str, *, window: int = 6)
     return False
 
 
+# ---------------------------------------------------------------------------
+# #reason-honesty: an informant the reasoning names must occur in the contribution
+# ---------------------------------------------------------------------------
+
+#: One internal switch for the whole "reason honesty" §2 (the informant check, its re-ask and
+#: withdrawal, and the dropped "Hearsay:" label). With it False no reasoning callable is wired
+#: into the judgment call and no extra call is ever made: a one-line way to turn it off.
+_REASON_INFORMANT_CHECK = True
+
+_REASONING_INFORMANT_RES: tuple[re.Pattern[str], ...] = (
+    re.compile(
+        r"\bHearsay:[^.;\n]*?\b(?:told|relayed|reported)\s+by\s+(?P<x>[^,.;:()\n]+)", re.IGNORECASE
+    ),
+    re.compile(r"\breports?\s+being\s+told\s+by\s+(?P<x>[^,.;:()\n]+)", re.IGNORECASE),
+    re.compile(r"(?P<x>[^,.;:()\n]+?)\s*\(a named informant\)", re.IGNORECASE),
+    re.compile(r"\binformant\s+(?P<x>[^,.;:()\n]+)", re.IGNORECASE),
+)
+_INFORMANT_CLAUSE_CUT_RE = re.compile(
+    r"\s+(?:that|who|which|and|but|to|about|on|in|for|because|since|so|as|when|while|"
+    r"saying|said|says|stating|regarding|relayed|via|from|with|told|tells|reported|reports|"
+    r"is|was|are|were|cited|named|has|had|claims?|claimed)\b"
+)
+_INFORMANT_QUOTES = "'\"‘’“”`"
+_INFORMANT_ARTICLES = frozenset({"a", "an", "the", "their", "his", "her", "its", "our", "my"})
+_INFORMANT_ROLE_WORDS = frozenset(
+    {"informant", "named", "person", "party", "contributor", "source", "scope", "agent"}
+)
+#: A captured "name" that starts with one of these is a clause, not an informant.
+_INFORMANT_NOT_A_NAME = frozenset(
+    {
+        "is", "was", "are", "were", "from", "or", "and", "not", "no", "none", "nobody",
+        "applicable", "any", "another", "other", "this", "that", "there", "it", "one",
+        "unknown", "unnamed", "identified", "identifiable", "named", "present", "stated",
+        "mentioned", "given", "available", "cited", "reported", "relevant",
+    }
+)  # fmt: skip
+_INFORMANT_NEGATED_BEFORE_RE = re.compile(
+    r"\b(?:no|not|any|an|without|neither|nor|zero)\s+(?:\w+\s+){0,2}$", re.IGNORECASE
+)
+
+
+def _informant_names(reasoning: str | None) -> list[str]:
+    """The informants *reasoning* names, articles, quotes and role words stripped, casefolded.
+
+    Patterns: "Hearsay: ... told by X", "reports being told by X", "X (a named informant)"
+    and "informant X". A capture ends at the first clause word (told, is, from, ...) or at a
+    closing quote; a capture that is a negation or function word ("no informant is named")
+    names no one. Pure; a reasoning that names no informant gives ``[]``."""
+    text = reasoning or ""
+    found: list[str] = []
+    for pattern in _REASONING_INFORMANT_RES:
+        for match in pattern.finditer(text):
+            if pattern.pattern.startswith(r"\binformant") and _INFORMANT_NEGATED_BEFORE_RE.search(
+                text[: match.start()]
+            ):
+                continue  # "no informant", "not an informant", "any informant"
+            raw = match.group("x").strip()
+            if raw and raw[0] in _INFORMANT_QUOTES:
+                inner = raw[1:]
+                end = next((i for i, c in enumerate(inner) if c in _INFORMANT_QUOTES), len(inner))
+                phrase = inner[:end]
+            else:
+                phrase = raw
+                for quote in _INFORMANT_QUOTES:
+                    phrase = phrase.split(quote, 1)[0]
+            phrase = _INFORMANT_CLAUSE_CUT_RE.split(phrase.casefold(), maxsplit=1)[0]
+            words = re.findall(r"[\w'’.-]+", phrase)[:5]
+            while words and words[0] in _INFORMANT_ARTICLES | _INFORMANT_ROLE_WORDS:
+                words.pop(0)
+            while words and words[-1] in _INFORMANT_ROLE_WORDS:
+                words.pop()
+            if not words or words[0] in _INFORMANT_NOT_A_NAME:
+                continue
+            name = " ".join(words).strip(" .'’-")
+            if name and name not in found:
+                found.append(name)
+    return found
+
+
+def _informants_missing_from(reasoning: str | None, content: str) -> list[str]:
+    """Informants the reasoning names that do not occur in *content* (word-bounded)."""
+    text = " ".join(content.split()).casefold()
+    missing: list[str] = []
+    for name in _informant_names(reasoning):
+        if not re.search(rf"(?<![\w-]){re.escape(name)}(?![\w-])", text):
+            missing.append(name)
+    return missing
+
+
+# --- the closed vocabulary of parties the engine knows (reason honesty, CEO/architect) ---
+
+_TELLING_CUE_RE = re.compile(
+    r"\b(?:told|tells|relayed|relays|reported by|conveyed|passed on|said|says|informant|"
+    r"named party|telling event|hearsay|according to)\b",
+    re.IGNORECASE,
+)
+#: A sentence that cites a party as the SOURCE of a rule or publication is not naming an
+#: informant: "Contradicts inherited c-x (s_y)", "per the ancestor directive ...".
+_SOURCE_CITATION_RE = re.compile(
+    r"\b(?:directive|inherited|ancestor|publication|published|operator memory)\b"
+    r"|\b(?:c|pub|op)[_-][\w-]+",
+    re.IGNORECASE,
+)
+_PARTY_GENERIC_WORDS = frozenset(
+    {"team", "scope", "group", "org", "the", "and", "for", "lead", "agent", "session"}
+)
+
+
+def _party_aliases(scope_id: str, name: str | None) -> frozenset[str]:
+    """Casefolded ways a text can name one scope: its id, the id without its prefix, its name
+    and each distinctive word of its name. "g_ceo", "ceo" and "CEO" are one party."""
+    aliases = {scope_id.casefold()}
+    if "_" in scope_id:
+        aliases.add(scope_id.split("_", 1)[1].casefold())
+    if name:
+        aliases.add(" ".join(name.split()).casefold())
+        aliases.update(
+            w for w in re.findall(r"[\w-]{3,}", name.casefold()) if w not in _PARTY_GENERIC_WORDS
+        )
+    return frozenset(a for a in aliases if a and a not in _PARTY_GENERIC_WORDS)
+
+
+def _party_vocabulary(
+    scope: object,
+    entitlement: object | None,
+    ancestor_ids: Sequence[str],
+    contributors: Sequence[tuple[str, str | None]],
+) -> tuple[list[frozenset[str]], frozenset[str]]:
+    """``(parties, own_aliases)``: every scope the engine knows as a party (alias sets), and the
+    aliases of the contributors' own scope(s) and skill(s), which are never "informants"."""
+    seen: dict[str, str | None] = {getattr(scope, "id", ""): getattr(scope, "name", None)}
+    for group in ("chain", "descendants", "referenced_peers", "others"):
+        for item in getattr(entitlement, group, ()) or ():
+            seen.setdefault(item.id, getattr(item, "name", None))
+    for ancestor_id in ancestor_ids:
+        seen.setdefault(ancestor_id, None)
+    seen.setdefault("operator", "operator")
+    parties = [_party_aliases(i, n) for i, n in seen.items() if i]
+    own: set[str] = set()
+    own.update(_party_aliases(getattr(scope, "id", ""), getattr(scope, "name", None)))
+    for contributor_scope_id, skill in contributors:
+        own.update(_party_aliases(contributor_scope_id, seen.get(contributor_scope_id)))
+        if skill:
+            own.add(skill.casefold())
+    return parties, frozenset(own)
+
+
+def _drop_own_names(names: Sequence[str], own_aliases: frozenset[str]) -> list[str]:
+    """Names the contributor's own scope, scope name or skill account for are not informants
+    ("informant 'lead' told the agent", "lead scope=s_van_pool"): the contributor speaking
+    in their own voice is the first-hand case, not an absent party."""
+    kept: list[str] = []
+    for name in names:
+        words = set(re.findall(r"[\w-]+", name.casefold()))
+        if name.casefold() in own_aliases or words & own_aliases:
+            continue
+        kept.append(name)
+    return kept
+
+
+def _text_names(text: str, alias: str) -> bool:
+    return re.search(rf"(?<![\w-]){re.escape(alias)}(?![\w-])", text, re.IGNORECASE) is not None
+
+
+def _vocabulary_informants_missing(
+    reasoning: str | None,
+    content: str,
+    parties: Sequence[frozenset[str]],
+    own_aliases: frozenset[str],
+) -> list[str]:
+    """Known parties the reasoning names AS AN INFORMANT that the contribution does not name.
+
+    A party counts as named when it occurs, on a word boundary, in a sentence of the
+    reasoning that carries a telling cue (told, relayed, reported by, conveyed, passed on,
+    said, informant, named party, telling event, hearsay, according to) and does NOT cite a
+    rule or publication (directive, inherited, ancestor, publication, published, c_/pub_ ids).
+    The contributor's own scope, name and skill are excluded. It is missing when none of its
+    aliases (id, id without prefix, name words) occurs in *content*."""
+    missing: list[str] = []
+    sentences = re.split(r"(?<=[.!?;])\s+|\n+", reasoning or "")
+    for sentence in sentences:
+        if not _TELLING_CUE_RE.search(sentence) or _SOURCE_CITATION_RE.search(sentence):
+            continue
+        for aliases in parties:
+            if aliases & own_aliases:
+                continue
+            hits = [a for a in aliases if _text_names(sentence, a)]
+            if not hits:
+                continue
+            if any(_text_names(content, a) for a in aliases):
+                continue
+            label = sorted(hits, key=len)[-1]
+            if label not in missing:
+                missing.append(label)
+    return missing
+
+
+def _drop_false_hearsay(reasoning: str) -> str:
+    """ "Hearsay:" on a reasoning that itself says first-hand is a wrong label: dropped."""
+    for match in re.finditer(r"\bfirst[- ]hand\b", reasoning, re.IGNORECASE):
+        before = " ".join(reasoning[: match.start()].split()[-3:])
+        if re.search(r"\b(?:not|no|never|isn['’]t|wasn['’]t|neither|nor|without)\b", before, re.I):
+            continue  # "not first-hand" keeps its "Hearsay:" label
+        return re.sub(r"^\s*Hearsay:\s*", "", reasoning, count=1, flags=re.IGNORECASE)
+    return reasoning
+
+
+def _decisions_of(judgment: object) -> object:
+    """The verdict(s) a judgment carries: one decision, or a batch's per-member tuple."""
+    verdicts = getattr(judgment, "verdicts", None)
+    if verdicts is not None:
+        return tuple((v.contribution_id, v.decision) for v in verdicts)
+    return getattr(judgment, "decision", None)
+
+
+def _withdrawn_reason(names: Sequence[str], decision: str) -> str:
+    return (
+        "Reason withdrawn: the judge described content that is not in this contribution "
+        f"({', '.join(names)}). Verdict: {decision}."
+    )
+
+
+#: #2b (the philosopher, c_9b1d2a2b136c4d96): reading an artifact is a telling event. A document
+#: is its author telling its readers in writing; the reader's first-person reading act IS the
+#: telling event. The accepted form has three parts, all verbatim in the contribution:
+#: (1) a first-person reading act, (2) the artifact attributed to its source, (3) a locator
+#: that belongs to THAT artifact and follows it.
+_READING_ACT_RE = re.compile(
+    r"\bI\s+(?:read|opened|reviewed|checked|consulted|worked from|"
+    r"(?:drafted|wrote|built|compiled|prepared)\b(?:(?!\.\s)[^;]){0,160}?\bfrom)\b",
+    re.IGNORECASE,
+)
+_ARTIFACT_NOUNS = r"(?:file|document|page|note|notes|report|spec|ADR|doc|memo|brief)"
+_ARTIFACT_OF_SOURCE_RE = re.compile(
+    rf"(?:\b[\w][\w'’.-]*(?:\s+[\w][\w'’.-]*){{0,3}}?['’]s\s+(?:[\w-]+\s+){{0,3}}?{_ARTIFACT_NOUNS}\b"
+    rf"|\b{_ARTIFACT_NOUNS}\s+(?:by|from)\s+[\w][\w'’.-]*(?:\s+[\w][\w'’.-]*){{0,2}})",
+    re.IGNORECASE,
+)
+_LOCATOR_RE = re.compile(
+    r"(?:https?://\S+|[\w.~-]*/[\w./~-]+|[\w-]+\.(?:md|txt|rst|json|ya?ml|py|pdf|html?)\b"
+    r"|\bpub_[0-9a-z]+|\b[a-z]_[0-9a-f]{6,}|[\"“][^\"”]{3,}[\"”])",
+    re.IGNORECASE,
+)
+
+
+def _document_telling_problem(telling_span: str, content: str) -> str | None:
+    """``None`` when *telling_span* is a first-hand reading of an artifact in the accepted
+    form, else the reason it is not. The span is already known to be verbatim in *content*."""
+    if not _READING_ACT_RE.search(telling_span):
+        return 'no first-person reading act ("I read / opened / reviewed / drafted ... from")'
+    artifact = None
+    for match in _ARTIFACT_OF_SOURCE_RE.finditer(telling_span):
+        artifact = match  # the last attribution in the span is the one a locator must follow
+    if artifact is None:
+        return 'no artifact attributed to its source ("<source>\'s file", "<file> by <source>")'
+    # The locator must belong to the attributed artifact: it follows that artifact's text in
+    # the contribution, in the next parenthesis or clause. A path elsewhere in the span, or
+    # before the artifact, does not count.
+    haystack = " ".join(content.split())
+    span = " ".join(telling_span.split())
+    start = haystack.casefold().find(span.casefold())
+    artifact_text = " ".join(artifact.group(0).split())
+    offset = span.casefold().rfind(artifact_text.casefold())
+    if start == -1 or offset == -1:
+        return "the attributed artifact could not be located in the contribution"
+    after = haystack[start + offset + len(artifact_text) :]
+    following = re.match(r"\s*(?:\(([^)]{0,200})\)|(?:at|in|:|—|-|,)\s*(\S+))", after)
+    candidate = (following.group(1) or following.group(2)) if following else None
+    if not candidate or not _LOCATOR_RE.search(candidate):
+        return "no locator (path, URL, publication id or title) follows the attributed artifact"
+    return None
+
+
 def _telling_span_problem_for(
-    telling_span: str, *, content: str
-) -> tuple[str | None, Literal["told", "joint"] | None]:
+    telling_span: str, *, content: str, informant_span: str | None = None
+) -> tuple[str | None, Literal["told", "joint", "document"] | None]:
     """#225 re-gate fix 4, Philis's ruling (module-level, shared with issue
     #237 v1.17's attribution re-check): a span that is only a scope's own
     name/id or a collective ("procurement", "the procurement team") is NOT
@@ -4655,27 +5031,41 @@ def _telling_span_problem_for(
     the first-person check even runs. The contributor-present first-person
     check still applies either way.
 
+    Philosopher c_9b1d2a2b136c4d96 (v1.18): a first-person READING of an artifact is a
+    third kind, ``"document"`` — see :func:`_document_telling_problem` for the accepted form.
+
     Returns ``(problem, verb_kind)``: *problem* is the full decline
     reasoning (sans the "Declined: " prefix) on failure, or ``None`` once
-    verified; *verb_kind* is ``"told"`` for one of :data:`_TELLING_VERBS` or
-    ``"joint"`` for one of :data:`_JOINT_EVENT_VERBS` — ``None`` whenever
-    *problem* is not ``None``. Record at the verb's strength: the caller
-    attributes a ``"joint"`` verdict as "in discussion with X: ...", never
-    "X says" — a ``"told"`` verdict keeps that form. *content* is the
-    contribution's own text the span must occur in verbatim.
+    verified; *verb_kind* is ``"told"`` for one of :data:`_TELLING_VERBS`,
+    ``"joint"`` for one of :data:`_JOINT_EVENT_VERBS` or ``"document"`` — ``None``
+    whenever *problem* is not ``None``. Record at the verb's strength: the caller
+    attributes a ``"joint"`` verdict as "in discussion with X: ...", never "X says" — a
+    ``"told"`` verdict keeps that form. *content* is the contribution's own text the span
+    must occur in verbatim. *informant_span* is the claim's attributed informant; when given,
+    every reason names it, so the reader can tell WHICH claim the decline is about.
     """
+    about = f"the claim attributed to {informant_span!r}" if informant_span else "the claim"
     haystack = " ".join(content.split()).casefold()
     normalized = " ".join(telling_span.split())
     if not normalized or normalized.casefold() not in haystack:
         return (
-            f"invented informant — the telling event {telling_span!r} does "
+            f"invented informant — {about}: the telling event {telling_span!r} does "
             "not occur in the contribution's own text.",
             None,
         )
     is_joint = bool(_JOINT_EVENT_VERB_RE.search(normalized))
     is_told = bool(_TELLING_VERB_RE.search(normalized))
     if not (is_joint or is_told):
-        return "no telling event is reported: state who told you.", None
+        document_problem = _document_telling_problem(normalized, content)
+        if document_problem is None:
+            return None, "document"
+        return (
+            f"{about} has no telling event ({telling_span!r}): state who told you, or report "
+            f"what you read and where. Reading an artifact counts when you say so in the first "
+            f"person, name whose it is, and give its path, URL or id right after it "
+            f"({document_problem}).",
+            None,
+        )
     if is_joint:
         # Addendum (bridge "before" run, j4_joint_verb): "discussed WITH X"
         # is itself the contributor-present check for a joint verb — the
@@ -4684,7 +5074,8 @@ def _telling_span_problem_for(
         # party still fails.
         if not _JOINT_EVENT_PARTY_RE.search(normalized):
             return (
-                'no telling event is reported: state who was involved ("with <party>").',
+                f"{about} has no telling event ({telling_span!r}): state who was involved "
+                '("with <party>").',
                 None,
             )
         return None, "joint"
@@ -4692,7 +5083,11 @@ def _telling_span_problem_for(
     tokens = [re.sub(r"[^\w-]", "", t) for t in normalized.casefold().split()]
     tokens = [t for t in tokens if t and t not in _TELLING_ARTICLES]
     if not any(t in _TELLING_FIRST_PERSON_WORDS for t in tokens):
-        return "the telling names no one it was told to — state who was told.", None
+        return (
+            f"the telling for {about} ({telling_span!r}) names no one it was told to — "
+            "state who was told.",
+            None,
+        )
     return None, "told"
 
 
@@ -4781,6 +5176,22 @@ def _partial_grounding_problem(span: str, content: str) -> str | None:
     return None
 
 
+def _shares_subject_words(
+    content: str, ref_text: str, exclude_words: Collection[str], *, minimum: int
+) -> bool:
+    """At least *minimum* content-word stems of *ref_text* occur in *content*, scope words
+    excluded. Coverage of a long contribution cannot be required (the attribution is most of
+    its words); what is required is that the cited rule's own subject is in it."""
+    from strata.publication import _overlap_stem, _overlap_words  # noqa: PLC0415
+
+    excluded = {_overlap_stem(w.casefold()) for w in exclude_words} | {
+        w.casefold() for w in exclude_words
+    }
+    ref = _overlap_words(ref_text) - excluded
+    mine = _overlap_words(content) - excluded
+    return len(ref & mine) >= minimum
+
+
 def verify_attribution_ground(
     answer: dict,
     content: str,
@@ -4789,6 +5200,7 @@ def verify_attribution_ground(
     previous_context: str = "",
     ref_source_scope_words: Mapping[str, frozenset[str]] | None = None,
     ancestor_scope_words: frozenset[str] = frozenset(),
+    directive_ref_ids: frozenset[str] = frozenset(),
 ) -> tuple[bool, str, str | None]:
     """The mechanical verifier, pure and judge-free: given the re-ask's own
     raw answer (``answer`` — the ``recheck_attribution`` tool's parsed
@@ -4888,7 +5300,19 @@ def verify_attribution_ground(
         exclude_words = set(ancestor_scope_words)
         if ref_source_scope_words is not None:
             exclude_words |= ref_source_scope_words.get(ref_id, frozenset())
-        if not content_overlap_required(span, ref_text, exclude_words=exclude_words):  # type: ignore[arg-type]
+        # #244 (j1-050): the model's span for an attribution is often just the attribution
+        # phrase ("Per platform-eng's own directive"), which shares nothing with the directive
+        # once scope words are excluded. For a rendered directive the whole contribution is
+        # checked instead; the span must still be verbatim and the ref visible, and every
+        # check below still runs on the span.
+        if not content_overlap_required(
+            span,  # type: ignore[arg-type]
+            ref_text,
+            exclude_words=exclude_words,
+        ) and not (
+            ref_id in directive_ref_ids
+            and _shares_subject_words(content, ref_text, exclude_words, minimum=3)
+        ):
             return False, "declined (no shared content with the referenced item)", None
         # #219's gate, reused, round 2 (architect review of 10327f6's bridge
         # replay): split into a VALUE check (numbers/ids/quotes — a strict
@@ -5041,7 +5465,9 @@ def verify_attribution_ground(
         verb_check_text = telling_span if teller_inside_telling else f"{teller_span} {telling_span}"
         if not _teller_near_a_verb(verb_check_text, teller_span):  # type: ignore[arg-type]
             return False, "declined (teller_span is not near the telling verb)", None
-        problem, _verb_kind = _telling_span_problem_for(telling_span, content=content)
+        problem, _verb_kind = _telling_span_problem_for(
+            telling_span, content=content, informant_span=teller_span
+        )
         if problem is not None:
             return False, f"declined (no telling event): {problem}", None
         # Hole A (architect review round 3, bridge attack on 1ffc4e4): the
@@ -5162,6 +5588,36 @@ def relation_decline_trigger(
     return None
 
 
+def relation_decline_scope_trigger(
+    reasoning: str | None,
+    content: str,
+    ancestor_directives: Sequence[tuple[str, Sequence[Directive]]] | None,
+) -> str | None:
+    """#244 fix 3: the ancestor directive a decline points at WITHOUT citing its id.
+
+    A decline that says "the ancestor scope g_org has already established that ..."
+    names the scope, not the directive. When *reasoning* names an ancestor scope id
+    (word-bounded) and *content* shares a content word with at least one of that
+    scope's directives, the directive sharing the most words is returned (ties go
+    to the first). ``None`` when no ancestor scope is named or nothing overlaps.
+    Pure and judge-free; a wrong pick only means the re-ask fails toward the rule.
+    """
+    from strata.publication import _overlap_words  # noqa: PLC0415
+
+    if not reasoning:
+        return None
+    content_words = _overlap_words(content)
+    best: tuple[int, str] | None = None
+    for ancestor_scope_id, directives in ancestor_directives or ():
+        if not re.search(rf"(?<![\w-]){re.escape(ancestor_scope_id)}(?![\w-])", reasoning):
+            continue
+        for directive in directives:
+            overlap = len(_overlap_words(directive.content) & content_words)
+            if overlap and (best is None or overlap > best[0]):
+                best = (overlap, directive.id)
+    return best[1] if best else None
+
+
 #: The design note's own four recognised comparative patterns for `tightens`
 #: RULE mode, each paired with which direction is stricter — "smaller" means
 #: a smaller value in the contribution is the stricter one (at or below,
@@ -5173,8 +5629,77 @@ def relation_decline_trigger(
 #: before"/"at or after" are the natural TIME-shaped twins of "at or
 #: below"/"at or above" ("watered at or before 07:00" vs "...before
 #: 06:30" is the same kind of threshold, just a clock value).
-_COMPARATOR_VALUE = r"(-?[\d:.,]+)"
+_NUMBER_WORD_ALT = (
+    "zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|"
+    "fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty|sixty|seventy|"
+    "eighty|ninety|hundred"
+)
+_COMPARATOR_VALUE = rf"(-?[\d:.,]+|(?:{_NUMBER_WORD_ALT})\b)"
+_TRIGGER_DURATION_AHEAD = (
+    r"(?=\s*[A-Za-z°%]{0,4}\s*,?\s*for\s+(?:more than|over|longer than|in excess of)\b)"
+)
 _COMPARATOR_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    # #244b a2: the level of a trigger whose duration follows it, whatever the verb or none
+    # ("any batch found below 60C for more than 2 hours", "kept above 5C for more than 4
+    # hours", "if it rises above 5C for more than 4 hours"): below a floor, a HIGHER floor is
+    # stricter; above a ceiling, a LOWER ceiling is stricter.
+    (
+        re.compile(rf"\b(?:below|under)\s+{_COMPARATOR_VALUE}{_TRIGGER_DURATION_AHEAD}", re.I),
+        "larger",
+    ),
+    (
+        re.compile(
+            rf"\b(?:above|over|exceeds?|exceeding)\s+{_COMPARATOR_VALUE}{_TRIGGER_DURATION_AHEAD}",
+            re.I,
+        ),
+        "smaller",
+    ),
+    # the mirrored motion verbs: "rises above A", "climbs / goes / exceeds"
+    (
+        re.compile(
+            rf"\b(?:rises?|rose|climbs?|goes?|go|creeps?|exceeds?)\s+(?:to\s+)?(?:above|over)\s+"
+            rf"{_COMPARATOR_VALUE}",
+            re.I,
+        ),
+        "smaller",
+    ),
+    # value-first limits: "60C or above", "5C or below" (any spelling of "or more / less")
+    (
+        re.compile(
+            rf"(?<![\w-]){_COMPARATOR_VALUE}\s*(?!(?:at|is|be|to|or|in|on)\b)[A-Za-z°%]{{0,4}}"
+            rf"\s+or\s+(?:above|more|higher|greater|over)\b",
+            re.I,
+        ),
+        "larger",
+    ),
+    (
+        re.compile(
+            rf"(?<![\w-]){_COMPARATOR_VALUE}\s*(?!(?:at|is|be|to|or|in|on)\b)[A-Za-z°%]{{0,4}}"
+            rf"\s+or\s+(?:below|less|lower|fewer|under)\b",
+            re.I,
+        ),
+        "smaller",
+    ),
+    # #244b iteration 3: the threshold of a trigger ("if it falls below A ..."): the higher
+    # the trigger level, the more cases it catches, the stricter the rule.
+    (
+        re.compile(
+            rf"\b(?:falls?|fell|drops?|dips?|goes?|go|sinks?)\s+(?:to\s+)?(?:below|under)\s+"
+            rf"{_COMPARATOR_VALUE}",
+            re.IGNORECASE,
+        ),
+        "larger",
+    ),
+    # #244b iteration 3: a trigger duration ("if below A for MORE THAN T, discard"): the
+    # shorter the trigger, the stricter the rule. First, so the plain "more than" (a
+    # floor) never claims the same value.
+    (
+        re.compile(
+            rf"\bfor\s+(?:more than|over|longer than|in excess of)\s+{_COMPARATOR_VALUE}",
+            re.IGNORECASE,
+        ),
+        "smaller",
+    ),
     (re.compile(rf"\bat or below\s+{_COMPARATOR_VALUE}", re.IGNORECASE), "smaller"),
     (re.compile(rf"\bat or above\s+{_COMPARATOR_VALUE}", re.IGNORECASE), "larger"),
     (re.compile(rf"\bat or before\s+{_COMPARATOR_VALUE}", re.IGNORECASE), "smaller"),
@@ -5182,6 +5707,11 @@ _COMPARATOR_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(rf"\bevery\s+{_COMPARATOR_VALUE}", re.IGNORECASE), "smaller"),
     (re.compile(rf"\bwithin\s+{_COMPARATOR_VALUE}", re.IGNORECASE), "smaller"),
     (re.compile(rf"\bat least\s+{_COMPARATOR_VALUE}", re.IGNORECASE), "larger"),
+    # #244b class A: other surface forms of a bound. "by"/"before" count only
+    # for a clock time (the bare words are everywhere: "before publishing").
+    (re.compile(r"\b(?:not|no) later than\s+(-?[\d:.,]+)", re.IGNORECASE), "smaller"),
+    (re.compile(r"\b(?:not|no) earlier than\s+(-?[\d:.,]+)", re.IGNORECASE), "larger"),
+    (re.compile(r"\b(?:by|before)\s+(\d{1,2}:\d{2})", re.IGNORECASE), "smaller"),
     # 1.17.2: upper- and lower-bound phrasings, direction read off the
     # parent's own words. A NEGATED bound flips the bare word's direction
     # ("never above -70" caps the value; "never below -70" floors it), so
@@ -5221,10 +5751,23 @@ _COMPARATOR_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
 )
 
 
+_WORD_VALUES = {
+    w: n
+    for w, n in zip(
+        _NUMBER_WORD_ALT.split("|"),
+        [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 30, 40, 50]
+        + [60, 70, 80, 90, 100],
+        strict=True,
+    )
+}
+
+
 def _parse_comparable(value_str: str) -> float:
     """A plain number ("500", "40,000") as a float, or a clock time
     ("06:30", "21:55") as minutes since midnight — both compare correctly
     with a bare ``<=``/``>=`` either way."""
+    if value_str.casefold() in _WORD_VALUES:
+        return float(_WORD_VALUES[value_str.casefold()])
     if ":" in value_str:
         parts = [int(p) for p in value_str.split(":")]
         while len(parts) < 3:
@@ -5238,6 +5781,372 @@ def _matched_value(match: re.Match[str]) -> str:
     """The value a comparator pattern captured — whichever alternative of an
     alternation matched — without a sentence-final "." or ","."""
     return next(group for group in match.groups() if group).rstrip(".,:")
+
+
+def _value_unit(text: str, match: re.Match[str]) -> str | None:
+    """The unit word right after the value a comparator pattern captured ("minutes" in
+    "at most 15 minutes"); ``""`` for a clock time, ``None`` when the value has no unit."""
+    end = next((m_end for (m_start, m_end) in match.regs[1:] if m_start != -1), None)
+    if end is None:
+        return None
+    value = _matched_value(match)
+    if ":" in value:
+        return ""
+    after = re.match(r"\s*([A-Za-z]+)", text[end:])
+    return after.group(1).casefold() if after else None
+
+
+#: #244 step 4: duration units in seconds, so "two months" is read against "14 days". A month is
+#: 30 days and a year 365: the comparison needs an order of magnitude, not a calendar.
+_DURATION_SECONDS: dict[str, int] = {
+    "sec": 1,
+    "min": 60,
+    "hou": 3600,
+    "day": 86400,
+    "wee": 604800,
+    "for": 1209600,  # fortnight
+    "mon": 2592000,
+    "yea": 31536000,
+}
+_DURATION_WORD_RE = (
+    r"(?:seconds?|minutes?|mins?|hours?|hrs?|days?|weeks?|fortnights?|months?|years?|yrs?)"
+)
+_DURATION_PREFIX = {
+    "sec": "sec",
+    "min": "min",
+    "hou": "hou",
+    "hrs": "hou",
+    "day": "day",
+    "wee": "wee",
+    "for": "for",
+    "mon": "mon",
+    "yea": "yea",
+    "yrs": "yea",
+}
+
+
+def _duration_key(word: str) -> str | None:
+    return _DURATION_PREFIX.get(word.casefold()[:3])
+
+
+def _bare_child_value(parent_text: str, parent_match: re.Match[str], content: str) -> float | None:
+    """The one value in *content* that has the parent value's unit and no comparator
+    governing it (#244 fix 1), or ``None`` when there is not exactly one such value.
+
+    A value a comparator pattern of any direction captured is not bare: "at least 10
+    minutes" under "at most 15 minutes" floors the value, it does not tighten it.
+
+    Step 4 reach: a duration is read in the parent's unit whatever unit it is written in
+    ("two months" against "14 days"; "a fortnight" is 14 days), and against a clock-time
+    parent a bare hour word after until/till/at/by/to ("until ten") is the 24-hour time
+    that falls after noon when the parent's time does: ten is 22:00 under "at or before
+    20:00", and 10:00 under "at or before 09:00".
+    """
+    from strata.publication import _NUMBER_WORDS  # noqa: PLC0415
+
+    unit = _value_unit(parent_text, parent_match)
+    if unit is None:
+        return None
+    governed: set[float] = set()
+    for pattern, _direction in _COMPARATOR_PATTERNS:
+        for found in pattern.finditer(content):
+            try:
+                governed.add(_parse_comparable(_matched_value(found).replace(",", "")))
+            except ValueError:
+                continue
+    word_alt = "|".join(sorted(_NUMBER_WORDS, key=len, reverse=True))
+    values: set[float] = set()
+
+    def _number(raw: str) -> float | None:
+        key = raw.casefold()
+        if key in ("a", "an"):
+            return 1.0
+        raw_number = _NUMBER_WORDS.get(key, raw).replace(",", "")
+        try:
+            return float(raw_number)
+        except ValueError:
+            return None
+
+    parent_duration = _duration_key(unit) if unit else None
+    if unit == "":
+        for m in re.finditer(r"(?<![\d:])(\d{1,2}:\d{2}(?::\d{2})?)(?![\d:])", content):
+            values.add(_parse_comparable(m.group(1)))
+        parent_clock = _parse_comparable(_matched_value(parent_match))
+        for m in re.finditer(
+            rf"\b(?:until|till|at|by|to)\s+({word_alt}|\d{{1,2}})\b(?!\s*(?::|{_DURATION_WORD_RE}))",
+            content,
+            re.IGNORECASE,
+        ):
+            hour = _number(m.group(1))
+            if hour is not None and 1 <= hour <= 12:
+                pm = parent_clock >= 12 * 3600 and hour < 12
+                values.add((hour + (12 if pm else 0)) * 3600)
+    elif parent_duration is not None:
+        scale = _DURATION_SECONDS[parent_duration]
+        for m in re.finditer(
+            rf"\b(-?\d[\d,]*(?:\.\d+)?|{word_alt}|an?)\s+({_DURATION_WORD_RE})\b",
+            content,
+            re.IGNORECASE,
+        ):
+            amount, key = _number(m.group(1)), _duration_key(m.group(2))
+            if amount is not None and key is not None:
+                values.add(amount * _DURATION_SECONDS[key] / scale)
+    else:
+        for m in re.finditer(
+            rf"\b(-?\d[\d,]*(?:\.\d+)?|{word_alt})\s*(°?[A-Za-z%]+)\b",
+            content,
+            re.IGNORECASE,
+        ):
+            amount = _number(m.group(1))
+            # the child's unit word must be the parent's unit, or the same dimension and
+            # scale ("60C" / "65 degrees"): never a prefix ("c" is not "cm")
+            if amount is not None and _units_comparable(unit, m.group(2)):
+                values.add(amount)
+    values -= governed
+    if len(values) != 1:
+        return None
+    return next(iter(values))
+
+
+_FREQ_UNITS = {
+    "second": 1,
+    "minute": 60,
+    "hour": 3600,
+    "day": 86400,
+    "night": 86400,
+    "week": 604800,
+    "fortnight": 1209600,
+    "month": 2592000,
+    "year": 31536000,
+}
+_FREQ_COUNT = {"once": 1, "twice": 2, "thrice": 3}
+_UNCERTAIN = "?uncertain"
+"""Second element of ``_comparator_rule_ok``'s ``(None, ...)`` when the child states the
+bound in a form that cannot be compared (units that do not convert): no conflict is
+claimed, the judge and the extra check decide."""
+
+
+def _every_phrase(seconds: float) -> str:
+    """ "every N <unit>" for a period, in the largest unit that divides it evenly."""
+    for name, size in (("week", 604800), ("day", 86400), ("hour", 3600), ("minute", 60)):
+        if seconds >= size and seconds % size == 0:
+            return f"every {int(seconds // size)} {name}{'s' if seconds // size != 1 else ''}"
+    if seconds >= 1:
+        return f"every {int(round(seconds))} seconds"
+    return f"every {seconds:g} seconds"
+
+
+def _normalise_quantities(text: str) -> str:
+    """#244b class A: the same bound in another surface form, written in one.
+
+    - clock times: "7 pm", "7:30 pm" -> "19:00", "19:30"; "noon" -> "12:00";
+      "midnight" -> "24:00";
+    - frequencies: "twice an hour", "four times a day", "hourly", "half-hourly", "daily",
+      "every hour", "every other day", "every fortnight" -> "every N <unit>".
+
+    Only used to compare values, never to rewrite anything shown or stored.
+    """
+
+    def clock(m: re.Match[str]) -> str:
+        hour, minute = int(m.group(1)), int(m.group(2) or 0)
+        meridiem = m.group(3).replace(".", "").casefold()
+        if meridiem == "pm" and hour < 12:
+            hour += 12
+        if meridiem == "am" and hour == 12:
+            hour = 0
+        return f"{hour:02d}:{minute:02d}"
+
+    text = re.sub(r"\b(\d{1,2})(?::(\d{2}))?\s*([ap]\.?m\.?)(?!\w)", clock, text, flags=re.I)
+    text = re.sub(r"\bnoon\b", "12:00", text, flags=re.I)
+    text = re.sub(r"\bmidnight\b", "24:00", text, flags=re.I)
+
+    unit_alt = "|".join(_FREQ_UNITS)
+
+    def times_per(m: re.Match[str]) -> str:
+        word = m.group("count").casefold()
+        count = _FREQ_COUNT.get(word) or _WORD_VALUES.get(word) or int(word)
+        if count <= 0:
+            return m.group(0)
+        return _every_phrase(_FREQ_UNITS[m.group("unit").casefold()] / count)
+
+    text = re.sub(
+        rf"(?<![\d:.])\b(?P<count>once|twice|thrice|\d+|{_NUMBER_WORD_ALT})(?: times)?\s+"
+        rf"(?:a|an|per|each|every)\s+(?P<unit>{unit_alt})\b",
+        times_per,
+        text,
+        flags=re.I,
+    )
+    text = re.sub(
+        r"\bevery\s+(?:half an? hour|half[- ]hour)\b", "every 30 minutes", text, flags=re.I
+    )
+    # "checked no more than 60 minutes apart" is a frequency: every 60 minutes at most
+    text = re.sub(
+        rf"\b(?:no more than|not more than|at most|up to|within)\s+(\d+|{_NUMBER_WORD_ALT})\s+"
+        rf"({unit_alt})s?\s+(?:apart|between|in between)\b",
+        lambda m: f"every {m.group(1)} {m.group(2)}s",
+        text,
+        flags=re.I,
+    )
+    # "no later than 90 minutes before departure": a larger lead time is stricter
+    text = re.sub(
+        rf"\b(?:no|not) later than\s+(\d+|{_NUMBER_WORD_ALT})\s+({unit_alt})s?\s+"
+        r"(?:before|prior to|ahead of)\b",
+        lambda m: f"at least {m.group(1)} {m.group(2)}s before",
+        text,
+        flags=re.I,
+    )
+    text = re.sub(
+        rf"\bevery\s+(?:second|other)\s+({unit_alt})\b",
+        lambda m: _every_phrase(2 * _FREQ_UNITS[m.group(1).casefold()]),
+        text,
+        flags=re.I,
+    )
+    text = re.sub(
+        rf"\bevery\s+third\s+({unit_alt})\b",
+        lambda m: _every_phrase(3 * _FREQ_UNITS[m.group(1).casefold()]),
+        text,
+        flags=re.I,
+    )
+    text = re.sub(r"\bhalf[- ]hourly\b", "every 30 minutes", text, flags=re.I)
+    text = re.sub(r"\bquarter[- ]hourly\b", "every 15 minutes", text, flags=re.I)
+    text = re.sub(
+        r"\bevery other (day|week|month)\b",
+        lambda m: _every_phrase(2 * _FREQ_UNITS[m.group(1).casefold()]),
+        text,
+        flags=re.I,
+    )
+    for adverb, unit in (
+        ("hourly", "hour"),
+        ("daily", "day"),
+        ("nightly", "night"),
+        ("weekly", "week"),
+        ("fortnightly", "fortnight"),
+        ("monthly", "month"),
+    ):
+        text = re.sub(rf"\b{adverb}\b", _every_phrase(_FREQ_UNITS[unit]), text, flags=re.I)
+    return text
+
+
+#: #244b a3: every comparison is between the SAME dimension in the SAME unit word. A prefix
+#: match let "c" (Celsius) read "5 cm" as "5 C". Unit -> (dimension, scale), word-bounded.
+_UNIT_DIMENSIONS: dict[str, tuple[str, str]] = {}
+for _dim, _scale, _words in (
+    ("temperature", "c", ("c", "°c", "°", "celsius", "centigrade", "degree", "degrees")),
+    ("temperature", "f", ("f", "°f", "fahrenheit")),
+    ("temperature", "k", ("k", "kelvin")),
+    ("length", "mm", ("mm", "millimetre", "millimetres", "millimeter", "millimeters")),
+    ("length", "cm", ("cm", "centimetre", "centimetres", "centimeter", "centimeters")),
+    ("length", "m", ("m", "metre", "metres", "meter", "meters")),
+    ("length", "km", ("km", "kilometre", "kilometres", "kilometer", "kilometers")),
+    ("length", "in", ("in", "inch", "inches")),
+    ("length", "ft", ("ft", "foot", "feet")),
+    ("mass", "g", ("g", "gram", "grams")),
+    ("mass", "kg", ("kg", "kilogram", "kilograms")),
+    ("mass", "mg", ("mg", "milligram", "milligrams")),
+    ("volume", "ml", ("ml", "millilitre", "millilitres", "milliliter", "milliliters")),
+    ("volume", "l", ("l", "litre", "litres", "liter", "liters")),
+    ("pressure", "bar", ("bar", "bars")),
+    ("pressure", "psi", ("psi",)),
+    ("ratio", "%", ("%", "percent", "per cent")),
+):
+    for _word in _words:
+        _UNIT_DIMENSIONS[_word] = (_dim, _scale)
+
+
+def _unit_word(word: str | None) -> str:
+    """A unit word, casefolded, with a plural "s" removed ("identifiers" is "identifier")."""
+    text = (word or "").casefold()
+    if text in _UNIT_DIMENSIONS:
+        return text
+    return text[:-1] if len(text) > 3 and text.endswith("s") and not text.endswith("ss") else text
+
+
+def _units_comparable(a: str | None, b: str | None) -> bool:
+    """May a bound in unit *a* be compared with one in unit *b*? The same unit word; two
+    duration units (converted); or two words for the same scale ("C" / "celsius"). A unit that
+    is a mere prefix of another ("c" / "cm") is a different dimension, never comparable."""
+    left, right = _unit_word(a), _unit_word(b)
+    if left == right:
+        return True
+    if _duration_key(left) and _duration_key(right):
+        return True
+    known = (_UNIT_DIMENSIONS.get(left), _UNIT_DIMENSIONS.get(right))
+    return known[0] is not None and known[0] == known[1]
+
+
+def _bound_family(pattern: re.Pattern[str]) -> str:
+    """What kind of bound a comparator pattern states: a frequency ("every N"), a time of day
+    ("at or before", "by", "no later than") or a quantity. A child's bound only stands in for
+    the parent's when both are the same kind."""
+    source = pattern.pattern
+    if "every" in source:
+        return "frequency"
+    if any(word in source for word in ("before", "after", "later than", "earlier than", "by|")):
+        return "time"
+    return "quantity"
+
+
+def _bounds_in(text: str) -> list[dict]:
+    """Every bound in *text* (already normalised): ``{"direction", "family", "value", "unit",
+    "raw"}``. Overlapping matches of one value (e.g. "at or before 20:00" also reads as
+    "before 20:00") are reported once."""
+    found: dict[int, dict] = {}
+    for pattern, direction in _COMPARATOR_PATTERNS:
+        for match in pattern.finditer(text):
+            start = next((m_start for (m_start, _e) in match.regs[1:] if m_start != -1), None)
+            if start is None or start in found:
+                continue
+            try:
+                value = _parse_comparable(_matched_value(match).replace(",", ""))
+            except ValueError:
+                continue
+            found[start] = {
+                "direction": direction,
+                "family": _bound_family(pattern),
+                "value": value,
+                "unit": _value_unit(text, match),
+                "raw": _matched_value(match).replace(",", ""),
+            }
+    return list(found.values())
+
+
+def _bound_seconds(bound: dict) -> float:
+    key = _duration_key(bound["unit"]) if bound["unit"] else None
+    return bound["value"] * _DURATION_SECONDS[key] if key else bound["value"]
+
+
+def _per_bound_comparison(parent_text: str, child_text: str) -> tuple[bool | None, list[str]]:
+    """#244b iteration 2: a parent with two or more bounds ("at or above A; no more than B"),
+    compared bound by bound. ``(True, raws)``: every bound the child restates is at least as
+    strict and at least one is restated; ``(False, raws)``: a restated bound is looser;
+    ``(None, [])``: fewer than two parent bounds, or none restated (the single-bound logic
+    decides). A bound the child does not restate stays bound by the parent, never a conflict."""
+    parent = _bounds_in(_normalise_quantities(parent_text))
+    if len(parent) < 2:
+        return None, []
+    child = _bounds_in(_normalise_quantities(child_text))
+    restated = False
+    for bound in parent:
+        candidates = [
+            c
+            for c in child
+            if c["direction"] == bound["direction"]
+            and c["family"] == bound["family"]
+            and _units_comparable(c["unit"], bound["unit"])
+        ]
+        if not candidates:
+            continue
+        restated = True
+        for c in candidates:
+            parent_value, child_value = _bound_seconds(bound), _bound_seconds(c)
+            ok = (
+                child_value <= parent_value
+                if bound["direction"] == "smaller"
+                else child_value >= parent_value
+            )
+            if not ok:
+                return False, [b["raw"] for b in parent]
+    return (True, [b["raw"] for b in parent]) if restated else (None, [])
 
 
 def _comparator_rule_ok(parent_text: str, kept_span: str) -> tuple[bool | None, str | None]:
@@ -5255,16 +6164,68 @@ def _comparator_rule_ok(parent_text: str, kept_span: str) -> tuple[bool | None, 
     fallback (architect review round 3 — the fallback case is NOT the
     same as fact mode, which requires the value UNCHANGED).
     """
+    multi_ok, multi_raws = _per_bound_comparison(parent_text, kept_span)
+    if multi_ok is not None:
+        return multi_ok, " ".join(multi_raws)
+    parent_text = _normalise_quantities(parent_text)
+    kept_span = _normalise_quantities(kept_span)
     for pattern, direction in _COMPARATOR_PATTERNS:
         parent_match = pattern.search(parent_text)
         if not parent_match:
             continue
         child_match = pattern.search(kept_span)
-        if not child_match:
-            return None, None
+        if child_match is None:
+            # the child may state the SAME kind of bound in another word ("by 7 pm" under
+            # "at or before 20:00"): any pattern of the parent's direction reads it
+            for other, other_direction in _COMPARATOR_PATTERNS:
+                if (
+                    other_direction == direction
+                    and other is not pattern
+                    and _bound_family(other) == _bound_family(pattern)
+                ):
+                    child_match = other.search(kept_span)
+                    if child_match is not None:
+                        break
         parent_value_str = _matched_value(parent_match).replace(",", "")
         parent_value = _parse_comparable(parent_value_str)
+        if not child_match:
+            # #244 fix 1: a bare value with no comparator of its own ("expire
+            # after 10 minutes" under "at most 15 minutes") is a value, and
+            # inside an upper bound a smaller value is a tightening. Read it
+            # only when it is the one value of the parent's unit and no
+            # comparator of any direction governs it.
+            bare = _bare_child_value(parent_text, parent_match, kept_span)
+            if bare is None:
+                # the child says nothing comparable about THIS bound; a parent with
+                # several bounds ("at most 15 minutes ... rotated every 30 days") may
+                # have one the child does restate
+                continue
+            ok = bare <= parent_value if direction == "smaller" else bare >= parent_value
+            return ok, parent_value_str
         child_value = _parse_comparable(_matched_value(child_match))
+        parent_unit = _value_unit(parent_text, parent_match)
+        child_unit = _value_unit(kept_span, child_match)
+        parent_key = _duration_key(parent_unit) if parent_unit else None
+        child_key = _duration_key(child_unit) if child_unit else None
+        # a different unit WORD, exactly (never a prefix: "c" is not "cm")
+        different_units = bool(
+            parent_unit and child_unit and _unit_word(parent_unit) != _unit_word(child_unit)
+        )
+        if different_units and not _same_quantity(
+            parent_text,
+            kept_span,
+            minimum=1 if _bound_family(pattern) == "frequency" else 2,
+        ):
+            # two different quantities that happen to be bounds ("tokens expire after at most
+            # 15 minutes" vs "logs kept for at most 7 days"): not comparable, no conflict
+            return None, _UNCERTAIN
+        if parent_key and child_key:
+            # the same bound in another duration unit ("within 90 minutes" under "within 2 hours")
+            parent_value *= _DURATION_SECONDS[parent_key]
+            child_value *= _DURATION_SECONDS[child_key]
+        elif different_units and not _units_comparable(parent_unit, child_unit):
+            # units that do not convert, or another dimension: no comparison, no conflict
+            return None, _UNCERTAIN
         ok = child_value <= parent_value if direction == "smaller" else child_value >= parent_value
         return ok, parent_value_str
     return None, None
@@ -5287,7 +6248,8 @@ _SOFTENED_WORDS: tuple[str, ...] = (
 
 def _quantifier_softened(parent_text: str, child_span: str) -> bool:
     parent_cf = parent_text.casefold()
-    child_cf = child_span.casefold()
+    # "at most 10 minutes" is a bound, not the softening quantifier "most"
+    child_cf = re.sub(r"\bat most\b", " ", child_span.casefold())
     has_quantifier = any(re.search(rf"\b{word}\b", parent_cf) for word in _QUANTIFIER_WORDS)
     has_softening = any(re.search(rf"\b{re.escape(word)}\b", child_cf) for word in _SOFTENED_WORDS)
     return has_quantifier and has_softening
@@ -5612,8 +6574,104 @@ def _universal_scope_preserved(parent_text: str, content: str) -> bool:
             continue
         if _stricter_universal_phrase_present(phrase, content_cf):
             continue
+        if _restates_the_requirement_of(phrase, parent_text, content):
+            continue
+        if _adds_a_requirement(parent_text, content):
+            continue
         return False
     return True
+
+
+_RESTRICTION_RE = re.compile(
+    r"\b(?:only|just|solely|exclusively)\s+(?:on|for|in|during|when|if|at|between)\b"
+    r"|\bexcept\b|\boutside (?:of )?\b|\bunless\b"
+    r"|\b(?:on|during|in|between|from)\s+(?:the\s+)?(?:weekdays?|weekends?|mornings?|"
+    r"evenings?|nights?|seasons?|summer|winter|holidays?|mondays?|tuesdays?|wednesdays?|"
+    r"thursdays?|fridays?|saturdays?|sundays?)\b",
+    re.IGNORECASE,
+)
+_REQUIREMENT_MODAL_RE = re.compile(
+    r"\b(?:must|shall|should|need(?:s)? to|needs?|require[sd]?|has to|have to|is required)\b",
+    re.IGNORECASE,
+)
+
+
+_ADDITIVE_CUE_RE = re.compile(
+    r"\badditionally\b|\bon top of\b|\bin addition\b|\bas well as\b|\balso must\b"
+    r"|\bmust also\b|\bplus\b|\bfurthermore\b",
+    re.IGNORECASE,
+)
+
+
+def _adds_a_requirement(parent_text: str, content: str) -> bool:
+    """#244b class C: a child for a sub-case that ADDS a requirement is an addition, not a
+    narrowing of the parent's universal phrase: the parent still binds every case the
+    child does not name. It qualifies only when it states a requirement, brings at least
+    two content words the parent does not have, carries no relaxation marker and no
+    restriction of when or where the parent's own requirement applies ("only on",
+    "except", "outside of", "on weekdays"), and restates at least half of the parent's
+    own words (or says "additionally" with a modal)."""
+    if _RESTRICTION_RE.search(content) or _relaxation_marker(content, [parent_text]):
+        return False
+    parent_stems = _subject_stems(parent_text)
+    child_stems = _subject_stems(content)
+    if len(child_stems - parent_stems) < 2:
+        return False
+    # it must visibly keep the parent's requirement: at least half the parent's words come
+    # back. A present-indicative statement ("X is checked by ..., who also does Y") counts as
+    # much as a modal one; the restatement of the requirement is the evidence either way.
+    kept = {
+        stem
+        for stem in parent_stems
+        if stem in child_stems or any(_shared_prefix(stem, c) >= 5 for c in child_stems)
+    }
+    if parent_stems and len(kept) / len(parent_stems) >= 0.5:
+        return True
+    # without that, an explicit additive cue and a stated requirement are needed
+    return bool(_ADDITIVE_CUE_RE.search(content) and _REQUIREMENT_MODAL_RE.search(content))
+
+
+def _restates_the_requirement_of(phrase: str, parent_text: str, content: str) -> bool:
+    """#244 (j1-050): an "all <noun>" parent narrowed to a subject that carries the noun
+    ("all deploys" -> "Deploy tickets must include a rollback-plan section before merge")
+    and restates most of the parent's requirement is an enforcement of the rule, not a
+    change to when it applies: the parent still binds every case the child does not name.
+    Only the "all <noun>" quantifier; "every day", "always" and the like are about WHEN."""
+    if not phrase.startswith("all ") or _relaxation_marker(content, [parent_text]) is not None:
+        return False
+    parent_head, _parent_leading = _subject_head(parent_text)
+    if parent_head is None:
+        # An imperative-shaped or "require"-verbed parent: the head is the last word of
+        # the quantified phrase before its verb ("all production deploys require ...").
+        spoken = re.search(
+            re.escape(phrase) + r"((?:\s+[\w-]+){0,3}?)\s+"
+            r"(?:require|must|shall|need|should|are|is|have|has|run|use)\b",
+            parent_text.casefold(),
+        )
+        words = (phrase.split()[1:] + (spoken.group(1).split() if spoken else []))[-1:]
+        stems = _subject_stems(" ".join(words))
+        parent_head = next(iter(stems), None)
+    child_head, _child_leading = _subject_head(content)
+    child = _subject_stems(content)
+    # The child's own subject must be a DIFFERENT thing that carries the parent's subject
+    # noun as a modifier ("deploy TICKETS" under "all deploys"). The same noun restated
+    # without "all" ("Services stay on ..." under "All services ...") is the narrowing the
+    # check exists for.
+    if parent_head is None or child_head is None:
+        return False
+    if parent_head == child_head or _shared_prefix(parent_head, child_head) >= 4:
+        return False
+    if not (parent_head in child or any(_shared_prefix(parent_head, c) >= 4 for c in child)):
+        return False
+    parent_stems = _subject_stems(parent_text)
+    if not parent_stems:
+        return False
+    kept = {
+        stem
+        for stem in parent_stems
+        if stem in child or any(_shared_prefix(stem, c) >= 5 for c in child)
+    }
+    return len(kept) / len(parent_stems) >= 0.6
 
 
 def _tighten_value_check(parent_text: str, content: str) -> tuple[bool, str]:
@@ -5629,6 +6687,8 @@ def _tighten_value_check(parent_text: str, content: str) -> tuple[bool, str]:
     from strata.publication import _POL_WORDS, _decomposed_value_tokens  # noqa: PLC0415
 
     rule_ok, compared_value = _comparator_rule_ok(parent_text, content)
+    if rule_ok is None and compared_value == _UNCERTAIN:
+        return True, "ok (bound in a form that cannot be compared)"
     if rule_ok is False:
         return False, "not stricter in the same direction"
     parent_values = _decomposed_value_tokens(parent_text) - _POL_WORDS
@@ -5636,9 +6696,59 @@ def _tighten_value_check(parent_text: str, content: str) -> tuple[bool, str]:
         parent_values = parent_values - _decomposed_value_tokens(compared_value)
     content_values = _decomposed_value_tokens(content) - _POL_WORDS
     if not parent_values <= content_values:
-        reason = "parent's other values not kept" if rule_ok is True else "parent's value not kept"
-        return False, reason
+        multi_valued = len({n for n, _keys in _value_slots(parent_text)}) >= 2
+        if rule_ok is not True and not multi_valued:
+            return False, "parent's value not kept"
+        # #244b class B: the child restates only part of the parent (it tightened one
+        # value, or added one). An absent value stays bound by the parent; only a DIFFERENT
+        # value for the same slot (the same unit or the same word before it) contradicts it.
+        if _slot_contradicted(parent_text, content, parent_values - content_values):
+            return False, "parent's other values not kept" if rule_ok else "parent's value not kept"
     return True, "ok"
+
+
+_SLOT_STOP = frozenset(
+    {
+        "or", "and", "to", "at", "of", "in", "on", "for", "the", "a", "an", "than", "by",
+        "before", "after", "until", "least", "most", "later", "earlier", "within", "every",
+        "each", "per", "about", "around", "over", "under", "below", "above", "is", "are",
+    }
+)  # fmt: skip
+
+
+def _value_slots(text: str) -> list[tuple[str, set[str]]]:
+    """``(number, slot keys)`` for each number in *text*: the stem of the unit after it and of
+    the word before it ("30 days" -> {"day"}; "TLS 1.3 or later" -> {"tls"})."""
+    from strata.publication import _NUMBER_WORDS  # noqa: PLC0415
+
+    found: list[tuple[str, set[str]]] = []
+    for m in re.finditer(
+        rf"(?:(?P<prev>[A-Za-z][A-Za-z_]*)(?:\s+|-))?(?P<num>\d{{1,2}}:\d{{2}}(?::\d{{2}})?|-?\d[\d,]*(?:\.\d+)?|{_NUMBER_WORD_ALT})"
+        r"(?:\s*(?P<unit>[A-Za-z°%]+))?",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        number = _NUMBER_WORDS.get(m.group("num").casefold(), m.group("num")).replace(",", "")
+        keys = {
+            word.casefold()[:3]
+            for word in (m.group("prev"), m.group("unit"))
+            if word and word.casefold() not in _SLOT_STOP
+        }
+        found.append((number, keys))
+    return found
+
+
+def _slot_contradicted(parent_text: str, content: str, missing: set[str]) -> bool:
+    """Is any value in *missing* (parent values the child did not restate) replaced in
+    the child by a different value in the same slot?"""
+    child = _value_slots(content)
+    for number, keys in _value_slots(parent_text):
+        if number not in missing or not keys:
+            continue
+        child_numbers = {n for n, k in child if k & keys}
+        if child_numbers and number not in child_numbers:
+            return True
+    return False
 
 
 def verify_relation_ground(
@@ -5759,9 +6869,9 @@ def verify_relation_ground(
         # different-instance divergence (the ferry REFINE admit: "the
         # FIRST ferry departs at 06:10" against a parent about the LAST
         # ferry is a new, uncovered subject, not a contradiction).
-        if _polarity_flip(parent_text, content) and not _names_a_different_instance(
-            parent_text, content
-        ):
+        if _polarity_flip(
+            parent_text, content, parent_term_kept_is_no_flip=True
+        ) and not _names_a_different_instance(parent_text, content):
             return False, "declined (polarity flip against parent)", None, None
         # P2 (same ruling): a COVERED subject (shares a word with the
         # parent's own leading noun phrase) can never be a genuine
@@ -5780,10 +6890,21 @@ def verify_relation_ground(
 
     # relation == "tightens"
     kept_span = answer.get("kept_span")
-    if not _verbatim(kept_span):
-        return False, "declined (kept_span not verbatim)", None, None
-    if _truncates_a_number(kept_span):
-        return False, "declined (kept_span truncates a number)", None, None
+    located_by_engine = False
+    if _verbatim(kept_span):
+        if _truncates_a_number(kept_span):
+            return False, "declined (kept_span truncates a number)", None, None
+    else:
+        # #244 fix 2: the model's span is a hint. Models quote the PARENT or
+        # paraphrase it, which a verbatim test refuses even when the
+        # contribution plainly carries a tighter value. The engine finds the
+        # value itself: the comparator must read a value in the contribution
+        # and find it inside the parent's bound. No such value fails toward
+        # the rule, as before.
+        located_ok, _located_value = _comparator_rule_ok(parent_text, content)
+        if located_ok is not True:
+            return False, "declined (kept_span not verbatim)", None, None
+        located_by_engine = True
     tighten_kind = answer.get("tighten_kind")
     if tighten_kind not in ("rule", "fact"):
         return False, "declined (tighten_kind is a required field)", None, None
@@ -5800,7 +6921,7 @@ def verify_relation_ground(
             None,
             None,
         )
-    if _polarity_flip(parent_text, content):
+    if _polarity_flip(parent_text, content, parent_term_kept_is_no_flip=True):
         return False, "declined (polarity flip against parent)", None, None
     if not _universal_scope_preserved(parent_text, content):
         return False, "declined (narrows when/where the rule applies)", None, None
@@ -5809,7 +6930,11 @@ def verify_relation_ground(
     if not tighten_ok:
         return False, f"declined ({tighten_reason})", None, None
 
-    return _context_or_fail("admitted (rescued, tightens parent)")
+    return _context_or_fail(
+        "admitted (rescued, tightens parent; kept value located by the engine)"
+        if located_by_engine
+        else "admitted (rescued, tightens parent)"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -5948,10 +7073,938 @@ def _first_inherited_conflict(
 
 
 def _inherited_hold_note(directive_id: str, origin: str) -> str:
+    """#244 step 1 (the philosopher's ruling A, c_6894f2b1d28a11ea): the engine's reason when a
+    child's directive changes an inherited one. The exception belongs to the scope that owns
+    the rule, so the contribution is declined and pointed there."""
+    owner = "the operator" if origin.startswith("operator") else origin
     return (
-        f"[Held: conflicts with inherited directive {directive_id} ({origin}); "
-        "a child may tighten an inherited rule, not change it.]"
+        f"Contradicts inherited {directive_id} ({origin}). "
+        f"An exception to it is {owner}'s to make; propose it there."
     )
+
+
+# ---------------------------------------------------------------------------
+# v1.18 (#242): a child's CONTEXT that undercuts an inherited directive
+# ---------------------------------------------------------------------------
+
+CLASSIFY_INHERITED_RELATION_TOOL: dict = {
+    "name": "classify_inherited_relation",
+    "description": (
+        "A context item from a session bound to this scope touches the subject of an "
+        "inherited directive. Say how the item relates to that directive. A "
+        "consequence_report describes ONE specific, dated or countable occurrence of "
+        "FOLLOWING the directive and what happened. A departure_report describes ONE "
+        "specific, dated or countable occurrence of NOT following it and what happened, "
+        "asserting nothing about what may be done instead. An exception states, in "
+        "general, what may or does happen INSTEAD of the directive, normatively ('may', "
+        "'doesn't need') or as a standing practice ('we leave the pumps running until "
+        "22:00'). unrelated: none of these."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "kind": {
+                "type": "string",
+                "enum": ["consequence_report", "departure_report", "exception", "unrelated"],
+            },
+            "inherited_id": {
+                "type": "string",
+                "description": "Required: the id of the inherited directive this relates to.",
+            },
+            "reasoning": {"type": "string", "description": "Brief explanation."},
+            "occurrence_span": {
+                "type": "string",
+                "description": (
+                    "Required for consequence_report and departure_report: the specific "
+                    "occurrence, copied VERBATIM from the contribution text."
+                ),
+            },
+            "instead_span": {
+                "type": "string",
+                "description": (
+                    "Required for exception: the general 'may / does instead', copied "
+                    "VERBATIM from the contribution text."
+                ),
+            },
+        },
+        "required": ["kind", "inherited_id", "reasoning"],
+    },
+}
+
+_INHERITED_RELATION_SYSTEM_PROMPT = (
+    "You classify ONE context item against ONE inherited directive. Context is what a "
+    "scope observed; a directive is a rule. Context never overrides a directive.\n"
+    "- consequence_report: a specific occurrence (dated or countable, past tense) of "
+    "FOLLOWING the directive, and what happened. Evidence about the world; it asserts "
+    "nothing about what may be done instead.\n"
+    "- departure_report: a specific occurrence (dated or countable, past tense) of NOT "
+    "following the directive, and what happened. It must stay specific: a generalising "
+    "clause ('so hotfixes don't need it') makes it an exception.\n"
+    "- exception: states what may or does happen INSTEAD of the directive, in general. "
+    "Normative ('may', 'doesn't need', 'that is fine') or habitual ('we leave the pumps "
+    "running until 22:00', 'we skip QA now'). A standing practice contrary to the rule "
+    "is an exception even when phrased as a plain description.\n"
+    "- unrelated: none of these.\n"
+    "Copy the span your kind requires verbatim from the item. Call "
+    "`classify_inherited_relation` exactly once."
+)
+
+_NORMATIVE_EXCEPTION_RES: tuple[re.Pattern[str], ...] = tuple(
+    re.compile(p, re.IGNORECASE)
+    for p in (
+        # lower-case only: "May" is the month ("on 12 May ...")
+        r"(?-i:\bmay\b(?!\s+(?:not|only|never)\b))",
+        # "can" is common in plain facts ("bookings can only be made ..."); only
+        # its permission shapes count.
+        r"\bcan\s+(?:\w+\s+)?(?:keep|skip|leave|hold|go|run|ship|release|publish|merge|"
+        r"waive|ignore|bypass|use|stay|wait|just|approve|sign\s+off|"
+        r"be\s+(?:skipped|waived|ignored|left|held))\b",
+        # who-widening: "any engineer can approve ...", "anyone may sign off ..."
+        r"\b(?:any|every|anyone|anybody|everyone|everybody)\b(?:\s+\w+)?\s+"
+        r"(?:can|may|is allowed to|are allowed to)\b",
+        r"\ballowed to\b",
+        r"\bpermitted\b",
+        r"\b(?:don['’]?t|doesn['’]?t|do not|does not|need not|needn['’]?t)\s+(?:even\s+)?"
+        r"(?:need|have to)\b",
+        r"\bneedn['’]?t\b",
+        r"\bno need\b",
+        r"\bnobody (?:else )?(?:has|needs) to\b",
+        r"\b(?:is|are|that['’]?s|it['’]?s) (?:fine|ok|okay|acceptable)\b",
+        r"\bwaived?\b",
+        r"\bnot required\b",
+        r"\bexempt\b",
+        r"\bexception\b",
+        r"\boptional\b",
+    )
+)
+_HABITUAL_EXCEPTION_RES: tuple[re.Pattern[str], ...] = tuple(
+    re.compile(p, re.IGNORECASE)
+    for p in (
+        r"\bwe\s+(?:\w+\s+){0,2}?(?:leave|skip|let|hold|keep|go|put|run|ship|release|publish|"
+        r"merge|land|send|use|stop|drop|bypass|allow|start|test|check|inspect|review|do|just)\b",
+        r"\bnow\s+(?:we|they)\b",
+        r"\bgo(?:es)? straight\b",
+        r"\bstraight (?:back|out|away|through)\b",
+        r"\bwhenever\b",
+        r"\b(?:keeps|lets|leaves)\b",
+        r"\balone\b",
+        r"\bnobody\b",
+        r"\b(?:usually|normally|typically|generally|by default|as standard|as a rule)\b",
+        r"\bstanding practice\b",
+        # A "so / therefore / which means" clause that negates or permits
+        # generalises the occurrence into a rule: the whole item is an exception.
+        r"\b(?:so|therefore|hence|thus|which means|meaning(?: that)?)\b[^.;]*?"
+        r"(?:n['’]t\b|\bnot\b|\bno\b|\bnever\b|\benough\b|\bsufficient\b|\bsuffices?\b)",
+    )
+)
+
+_MONTHS = r"(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*"
+_SPECIFICITY_ANCHOR_RE = re.compile(
+    rf"\b\d{{1,2}}(?:st|nd|rd|th)?\s+(?:of\s+)?{_MONTHS}\b"
+    rf"|\b{_MONTHS}\.?\s+\d{{1,2}}\b"
+    r"|\b\d{4}-\d{2}-\d{2}\b|\b\d{1,2}/\d{1,2}(?:/\d{2,4})?\b"
+    r"|\b(?:mon|tues|wednes|thurs|fri|satur|sun)day\b"
+    r"|\b\d+\.\d+\.\d+\b|\b(?:1[5-9]|20)\d{2}\b|\b\d{1,2}:\d{2}\b"
+    r"|\b(?:yesterday|last (?:night|week|month|shift)|this (?:morning|week)|earlier today)\b"
+    r"|\bthe night of\b|\b(?:once|twice|\d+ times|(?:two|three|four|five) times)\b",
+    re.IGNORECASE,
+)
+_PAST_TENSE_RE = re.compile(
+    r"\b(?:\w+ed|was|were|had|did|took|left|went|held|made|ran|got|came|found|lost|sent|"
+    r"broke|began|saw|gave|put|set|cut|hit|fell|stopped|spent|missed|drifted|shipped|"
+    r"overloaded|destroyed|reached|wasn['’]t|weren['’]t|didn['’]t|"
+    r"caught|kept|built|wrote|told|paid|chose|threw|knew|grew|drove|rose|woke|froze|"
+    r"stood|understood|met|led|slept|sold|bought|brought|thought|taught|won)\b",
+    re.IGNORECASE,
+)
+_DEPARTURE_CUE_RE = re.compile(
+    r"\b(?:not done|weren['’]t|wasn['’]t|didn['’]t|did not|was not|were not|skipped|"
+    r"bypassed|omitted|ignored|left running|instead of|without (?:running|checking|"
+    r"inspecting|review|the))\b",
+    re.IGNORECASE,
+)
+
+
+#: A report is SINGULAR (one act) or GENERAL (a practice); a date is one way to
+#: show singularity, never a requirement (the philosopher's ruling). Any of
+#: these on the act or its condition makes the text general.
+_GENERAL_MARKER_RES: tuple[re.Pattern[str], ...] = tuple(
+    re.compile(p, re.IGNORECASE)
+    for p in (
+        r"\b(?:always|usually|routinely|every time|whenever|used to|these days|lately|"
+        r"since|now)\b",
+        r"\beach\s+(?:time|day|night|week|month|morning|evening|shift|run|release|deploy)\b",
+        r"\b(?:we|i|they)\s+would\b",
+        r"\b(?:we|i|they)['’]ve\s+been\b|\bhave been\b|\bhas been\b",
+        r"\b(?:we|i|they)\s+(?:do not|don['’]?t)\b",
+    )
+)
+_GENERIC_PLURAL_PREPOSITIONS = frozenset(
+    {"on", "for", "during", "when", "if", "whenever", "across"}
+)
+_NOT_A_BARE_PLURAL = frozenset(
+    {"this", "was", "has", "does", "its", "his", "always", "perhaps", "sometimes", "less", "unless"}
+)
+_DETERMINERS = frozenset(
+    {"the", "a", "an", "this", "that", "these", "those", "my", "our", "your", "their", "its",
+     "his", "her", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine",
+     "ten", "both", "another", "any", "some", "no", "every"}
+)  # fmt: skip
+
+
+def _general_marker(text: str) -> str | None:
+    """The first marker that makes a report GENERAL rather than singular: a
+    habitual or iterative adverb, a habitual "would", a present-perfect or
+    negated-present form of the act, ``since / these days / lately / now``, or
+    a generic bare plural as the object or condition ("skipped QA on
+    hotfixes", "for repeat jobs"). A singular with a determiner or a number is
+    one instance ("the hotfix", "mould 17"), and a bare plural naming WHO was
+    acted on stays singular ("I paged the on-call engineers": determiner)."""
+    for pattern in _GENERAL_MARKER_RES:
+        match = pattern.search(text)
+        if match:
+            return f"general marker '{match.group(0)}'"
+    for sentence in re.split(r"[.;:,!?]", text):
+        tokens = re.findall(r"[A-Za-z0-9'’-]+", sentence)
+        for i, token in enumerate(tokens):
+            if token.casefold() not in _GENERIC_PLURAL_PREPOSITIONS:
+                continue
+            for k, word in enumerate(tokens[i + 1 : i + 4], start=i + 1):
+                low = word.casefold()
+                following = tokens[k + 1] if k + 1 < len(tokens) else ""
+                if low in _DETERMINERS or any(ch.isdigit() for ch in low):
+                    break
+                if low in _GENERIC_PLURAL_PREPOSITIONS:
+                    break
+                if (
+                    len(low) > 3
+                    and low.endswith("s")
+                    and not low.endswith(("ss", "us", "is"))
+                    and low not in _NOT_A_BARE_PLURAL
+                    and not any(ch.isdigit() for ch in following)  # "rows 4 to 6": named
+                ):
+                    return f"generic plural '{word}' after '{token}'"
+    return None
+
+
+def _norm_ws(text: str) -> str:
+    return " ".join(text.split())
+
+
+def _verbatim_span(answer: dict, key: str, content: str) -> str | None:
+    span = answer.get(key)
+    if not isinstance(span, str) or not span.strip():
+        return None
+    return span.strip() if _norm_ws(span) in _norm_ws(content) else None
+
+
+_CONTEXT_EXCEPTION_CONFLICTS = frozenset(
+    {"exemption language", "quantifier softened", "not stricter in the same direction"}
+)
+
+
+def _exception_marker(content: str, inherited_text: str) -> str | None:
+    """The first exception marker anywhere in *content* — normative, habitual,
+    or (for text that is not a specific past-tense report) the 1.17.2
+    inherited-conflict signal (a looser value, an exemption, a softened
+    "every/all" or an "only" narrowing on a covered subject) — else ``None``."""
+    for pattern in _NORMATIVE_EXCEPTION_RES:
+        match = pattern.search(content)
+        if match:
+            return f"normative marker '{match.group(0)}'"
+    for pattern in _HABITUAL_EXCEPTION_RES:
+        match = pattern.search(content)
+        if match:
+            return f"habitual marker '{match.group(0)}'"
+    specific_past = bool(_SPECIFICITY_ANCHOR_RE.search(content) and _PAST_TENSE_RE.search(content))
+    if not specific_past:
+        conflict = inherited_conflict(content, inherited_text)
+        # Only the shapes that ARE an exception: a looser value, an exemption,
+        # a softened "every/all" or an "only" narrowing. A fact that merely
+        # doesn't restate the rule's value is not one.
+        if conflict in _CONTEXT_EXCEPTION_CONFLICTS:
+            return f"undercuts the rule ({conflict})"
+    return None
+
+
+_NOT_PAST_BEFORE_PARTICIPLE = frozenset(
+    {
+        "is",
+        "are",
+        "am",
+        "be",
+        "being",
+        "been",
+        "to",
+        "must",
+        "should",
+        "will",
+        "can",
+        "may",
+        "shall",
+    }
+)
+
+
+def _has_past_tense(span: str) -> bool:
+    """A past-tense verb in *span*. A bare "-ed" participle after a present
+    auxiliary ("are switched off") is a present passive, not a past occurrence."""
+    for match in _PAST_TENSE_RE.finditer(span):
+        word = match.group(0).casefold()
+        if word.endswith("ed") and word not in {"need", "did"}:
+            before = span[: match.start()].split()
+            if before and before[-1].casefold().strip(",;") in _NOT_PAST_BEFORE_PARTICIPLE:
+                continue
+        return True
+    return False
+
+
+def _action_overlap(span: str, inherited_text: str) -> bool:
+    from strata.publication import _overlap_words  # noqa: PLC0415
+
+    if _overlap_words(span) & _overlap_words(inherited_text):
+        return True
+    numbers = set(re.findall(r"\d+(?:\.\d+)?", inherited_text))
+    return bool(numbers & set(re.findall(r"\d+(?:\.\d+)?", span)))
+
+
+def _context_covers(inherited_text: str, content: str) -> bool:
+    """Whether context *content* is about an inherited directive's subject:
+    1.17.2's covered-subject plus head-noun test, OR at least two shared
+    content words anywhere (the leading-noun-phrase test alone is built for
+    directive sentences and misses most context prose)."""
+    from strata.publication import _overlap_words  # noqa: PLC0415
+
+    if _is_covered_subject(inherited_text, content) and _head_nouns_compatible(
+        inherited_text, content
+    ):
+        return True
+    inherited_words = _overlap_words(_normalise_synonyms(inherited_text))
+    content_words = _overlap_words(_normalise_synonyms(content))
+    shared = {
+        mine
+        for mine in inherited_words
+        if any(_shared_prefix(mine, other) >= 5 or mine == other for other in content_words)
+    }
+    return len(shared) >= 2
+
+
+def _shared_prefix(a: str, b: str) -> int:
+    n = 0
+    for x, y in zip(a, b, strict=False):
+        if x != y:
+            break
+        n += 1
+    return n
+
+
+def verify_inherited_relation(
+    answer: dict | None,
+    content: str,
+    inherited_text: str,
+    other_texts: Sequence[str] = (),
+) -> tuple[str, str]:
+    """Engine verification of a ``classify_inherited_relation`` answer (#242).
+
+    Returns ``(verdict, reason)``; *verdict* is ``"decline"`` (the contribution
+    is an exception), ``"decline_unspecific"`` (the answer CLAIMED a report but
+    the span is not a specific occurrence), ``"consequence_report"`` or
+    ``"departure_report"`` (admitted, specific past-tense report), or
+    ``"admit"`` (the fallback, which callers count).
+
+    Fails toward the inherited rule, by how readable the answer was:
+
+    - a claimed report whose span fails verbatim, tense or anchor declines;
+    - ``unrelated`` (a readable answer), or a report that is not about the
+      rule's own action, is admitted unless the text covers an inherited
+      subject (*inherited_text* or any of *other_texts*; see
+      :func:`_context_covers`) AND carries an exception marker or
+      the conflict signal;
+    - an unreadable answer, or an exception claim with no verbatim span,
+      declines on a marker anywhere in the text and is otherwise admitted.
+    """
+    answer = answer if isinstance(answer, dict) else {}
+    kind = answer.get("kind")
+    marker = _exception_marker(content, inherited_text)
+    readable_unrelated = False
+
+    if kind == "exception":
+        span = _verbatim_span(answer, "instead_span", content)
+        if span is not None:
+            return "decline", "an exception: states what happens instead of the rule"
+        failure = "exception answer without a verbatim instead_span"
+    elif kind in ("consequence_report", "departure_report"):
+        span = _verbatim_span(answer, "occurrence_span", content)
+        unspecific = None
+        if span is None:
+            unspecific = "no verbatim occurrence_span"
+        elif not _has_past_tense(span):
+            unspecific = "occurrence not in the past tense"
+        if unspecific is not None:
+            return "decline_unspecific", unspecific
+        if not _action_overlap(span, inherited_text):
+            # The answer CLAIMED a report about the rule, so it is not an honest
+            # "unrelated": a marker anywhere declines (rule A), as does a habit.
+            failure = "occurrence does not concern the rule's own action"
+            general = _general_marker(content)
+            if general is not None:
+                # a claimed report that is also a habit is not an honest "unrelated"
+                return "decline", f"{failure}; generalises ({general})"
+        elif marker is not None or (general := _general_marker(content)) is not None:
+            # The generality check runs on EVERY report, including one that
+            # an `acted_on` points at the rule: `acted_on` never waives it
+            # ("acted on <rule>: we always skip it for hotfixes" declines).
+            return "decline", f"generalises beyond the occurrence ({marker or general})"
+        else:
+            verdict = "departure_report" if _DEPARTURE_CUE_RE.search(span) else kind
+            return verdict, "a specific past occurrence"
+    elif kind == "unrelated":
+        failure = "answered unrelated"
+        readable_unrelated = True
+    else:
+        failure = "unreadable answer"
+
+    if readable_unrelated:
+        covers = any(_context_covers(text, content) for text in (inherited_text, *other_texts))
+        if marker is not None and covers:
+            return "decline", f"{failure}; covers an inherited subject and ({marker})"
+        return "admit", f"{failure}; no covered exception"
+    if marker is not None:
+        return "decline", f"{failure}; exception marker present ({marker})"
+    return "admit", f"{failure}; no exception marker"
+
+
+_CONTEXT_REASK_DIRECTIVE_CHARS = 600
+_CONTEXT_REASK_BUDGET_CHARS = 2400
+
+
+def inherited_for_context(
+    content: str, inherited: Sequence[tuple[str, str, str]]
+) -> list[tuple[str, str, str]]:
+    """The inherited directives to show the #242 re-ask, most relevant first
+    (shared content words with *content*), within a character budget so the
+    re-ask stays compact. The trigger itself is NOT lexical: every ordinary
+    context admit by a session bound to the scope is classified when the scope
+    inherits anything (a lexical gate misses reworded exceptions, which is the
+    point of the check). Texts longer than the per-directive cap are cut for
+    display only; verification always uses the full text."""
+    from strata.publication import _overlap_words  # noqa: PLC0415
+
+    content_words = _overlap_words(content)
+    ranked = sorted(
+        inherited, key=lambda d: len(_overlap_words(d[2]) & content_words), reverse=True
+    )
+    shown: list[tuple[str, str, str]] = []
+    used = 0
+    for item in ranked:
+        cost = min(len(item[2]), _CONTEXT_REASK_DIRECTIVE_CHARS)
+        if shown and used + cost > _CONTEXT_REASK_BUDGET_CHARS:
+            break
+        shown.append(item)
+        used += cost
+    return shown
+
+
+_INHERITED_DECLINES = ("decline", "decline_unspecific")
+
+
+def _inherited_relation_note(outcome: dict) -> str:
+    """The engine-written suffix for a #242 outcome ("" when the admit stands
+    with nothing to say: the unverified fallback)."""
+    directive_id, origin = outcome["inherited_id"], outcome["origin"]
+    verdict = outcome["verdict"]
+    if verdict == "decline_unspecific":
+        return (
+            f"[Declined: a report of following or departing from {directive_id} ({origin}) "
+            "must name the specific occurrence (when, which); resubmit with it, or propose the "
+            f"exception to {origin}.]"
+        )
+    if verdict == "decline":
+        return (
+            f"[Declined: contrary to inherited directive {directive_id} ({origin}). A practice "
+            "that departs from an inherited rule can't be recorded as this scope's context. "
+            f"Report a specific occurrence of following the rule and what happened (admitted, "
+            f"and raised to {origin} with acted_on), or propose the exception to {origin}.]"
+        )
+    if verdict == "consequence_report":
+        return (
+            f"[A report of following {directive_id} ({origin}). To raise it to {origin}, "
+            f"resubmit with acted_on = {directive_id}.]"
+        )
+    if verdict == "departure_report":
+        return (
+            f"[A departure from {directive_id} ({origin}), not a licence: only {origin} decides "
+            f"whether the rule is slack. To raise it to {origin}, resubmit with "
+            f"acted_on = {directive_id}.]"
+        )
+    return ""
+
+
+# ---------------------------------------------------------------------------
+# v1.18 (#243): a publication that carries an exception down
+# ---------------------------------------------------------------------------
+
+_DEPARTURE_LABEL_RE = re.compile(r"\ADeparture from (\S+) \(([^)]*)\): ")
+_DEPARTURE_MARKER_RE = re.compile(r"\[Published as a departure from (\S+) \(([^)]*)\)\.\]")
+
+
+def departure_label(directive_id: str, origin: str) -> str:
+    """The engine's prefix for a published departure report (#243, ruling option 2)."""
+    return f"Departure from {directive_id} ({origin}): "
+
+
+def split_departure_label(text: str) -> tuple[str | None, str]:
+    """``(label or None, body)``: the leading departure label, verbatim, and the rest."""
+    match = _DEPARTURE_LABEL_RE.match(text)
+    if match is None:
+        return None, text
+    return match.group(0), text[match.end() :]
+
+
+def departure_marker(directive_id: str, origin: str) -> str:
+    """The structured line written into the publication judgment's reasoning when an item is
+    published with a departure label, so a restore re-applies the same label."""
+    return f"[Published as a departure from {directive_id} ({origin}).]"
+
+
+def departure_label_from_reasoning(reasoning: str | None) -> str | None:
+    """The label :func:`departure_marker` recorded in a judgment's reasoning, if any."""
+    match = _DEPARTURE_MARKER_RE.search(reasoning or "")
+    return departure_label(match.group(1), match.group(2)) if match else None
+
+
+def with_departure_label(text: str, label: str | None) -> str:
+    """*text* with *label* as its prefix. Idempotent: an item that already carries a departure
+    label keeps it (never doubled, never replaced), and no label leaves *text* alone."""
+    if label is None or _DEPARTURE_LABEL_RE.match(text):
+        return text
+    return f"{label}{text}"
+
+
+@dataclass(frozen=True)
+class PublicationExceptionCheck:
+    """The engine's ruling on a publication that was accepted by the judge (#243).
+
+    ``decision`` is ``accept`` or ``refuse``. ``content`` is what to publish: the proposed
+    text, with the departure label prefixed when the item reports a departure (or when a
+    relay carries one). ``note`` is the engine's refusal note, or the relay's separate
+    conflict note on an accept. ``inherited_relation`` is the #242 outcome dict when the
+    re-ask ran; ``fallback`` is True when the admit rests on the counted fail-open path.
+    """
+
+    decision: Literal["accept", "refuse"]
+    content: str
+    note: str | None = None
+    label: str | None = None
+    inherited_relation: dict | None = None
+    fallback: bool = False
+    conflict_note: str | None = None
+
+
+def _publication_refusal_note(directive_id: str, origin: str) -> str:
+    return (
+        f"[Refused: contrary to inherited directive {directive_id} ({origin}). A scope can't "
+        f"publish an exception to a rule it inherits. Publish a specific report instead, or "
+        f"propose the exception to {origin}.]"
+    )
+
+
+# v1.18 (#244 step 3): a child's DIRECTIVE that relaxes an inherited directive
+# ---------------------------------------------------------------------------
+
+CLASSIFY_DIRECTIVE_RELATION_TOOL: dict = {
+    "name": "classify_directive_relation",
+    "description": (
+        "A directive from a session bound to this scope is about to be admitted, and this "
+        "scope inherits directives. Say how the new directive relates to the inherited one "
+        "it is closest to. exempts: it lets some case skip, waive, defer or do less than the "
+        "inherited directive requires. contradicts: it states the opposite of it. refines: it "
+        "adds detail for a case the inherited directive does not cover and removes no case "
+        "from its reach. tightens: it keeps what the inherited directive requires and asks "
+        "for strictly more. unrelated: none of these."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "relation": {
+                "type": "string",
+                "enum": ["contradicts", "exempts", "refines", "tightens", "unrelated"],
+            },
+            "parent_id": {
+                "type": "string",
+                "description": "Required: the id of the inherited directive this relates to.",
+            },
+            "reasoning": {"type": "string", "description": "Brief explanation."},
+            "exempted_case_span": {
+                "type": "string",
+                "description": (
+                    "Required for exempts and contradicts: the words that skip, waive, defer "
+                    "or reverse the inherited requirement, copied VERBATIM from the directive."
+                ),
+            },
+            "uncovered_case_span": {
+                "type": "string",
+                "description": (
+                    "Required for refines: the case the inherited directive does not cover, "
+                    "copied VERBATIM from the directive."
+                ),
+            },
+            "kept_requirement": {
+                "type": "string",
+                "description": (
+                    "Required for refines: the inherited requirement that stays fully in force."
+                ),
+            },
+        },
+        "required": ["relation", "parent_id", "reasoning"],
+    },
+}
+
+_DIRECTIVE_RELATION_SYSTEM_PROMPT = (
+    "You classify ONE new directive against the inherited directives of the scope it is "
+    "being added to. Inherited directives bind this scope; a new directive may add to them "
+    "but never take a case out of their reach.\n"
+    "- exempts: lets some case skip, waive, defer or do less than an inherited directive "
+    "requires ('hotfix builds may be published without the full suite', 'the author's "
+    "sign-off alone is enough', 'vans do not need to be inspected', 'keep the pumps on until "
+    "22:00' under 'off by 20:00'). Judge what the words DO, not what they are called: an "
+    "exception phrased as a plain rule is still an exception.\n"
+    "- contradicts: states the opposite of an inherited directive.\n"
+    "- refines: adds detail for a case the inherited directive does not cover, and removes "
+    "no case from its reach.\n"
+    "- tightens: keeps everything the inherited directive requires and asks for strictly "
+    "more or a stricter value.\n"
+    "- unrelated: about something else.\n"
+    "Copy the span your relation requires verbatim from the directive. Call "
+    "`classify_directive_relation` exactly once."
+)
+
+#: Directive-only additions to the shared marker list. Context may legitimately REPORT a
+#: skipped step in the past tense ("the suite was skipped on 12 May"), so these live
+#: apart from :data:`_NORMATIVE_EXCEPTION_RES`, which #242 also applies; a directive
+#: is a standing rule, so the same words are relaxation wherever they occur.
+_DIRECTIVE_RELAXATION_EXTRA_RES: tuple[re.Pattern[str], ...] = tuple(
+    re.compile(p, re.IGNORECASE)
+    for p in (
+        r"\bskip(?:s|ped|ping)?\b",
+        r"\b(?:is|are)\s+enough\b",
+        r"\bsuffices?\b",
+        r"\bsufficient\b",
+        r"\bno\s+(?:\w+\s+){0,3}?(?:required|needed|necessary)\b",
+        r"\b(?:can|could|may)\b[^.;]{0,40}\bwithout\b",
+        r"\bexcept\b",
+        r"\bin place of\b|\binstead of\b|\brather than\b|\bno longer\b",
+        r"\bdrop(?:s|ped|ping)?\b|\breplac(?:e|es|ed|ing)\b",
+        r"\bevery\s+(?:other|second|third)\s+\w+",
+        r"\b(?:only|just|merely)\s+(?:need|needs|have to|has to|require|requires)\b",
+        r"\balone\b",
+        r"\bgo(?:es)?\s+(?:straight|directly)\b",
+        r"\b(?:straight|directly)\s+(?:back|out|away|through)\b",
+        r"\bwith(?:out)?\s+no\s+\w+",
+        r"\bno\s+(?:walk-?round|review|check|inspection|test(?:s|ing)?|qa|approval|"
+        r"sign-?off|audit|verification|validation|confirmation)\b",
+    )
+)
+_NEGATOR_BEFORE_RE = re.compile(
+    r"\b(?:never|not|no|cannot|can['’]?t|mustn['’]?t|must not|without)\b", re.IGNORECASE
+)
+_SELF_NEGATED_STARTS = (
+    "no ",
+    "not ",
+    "don",
+    "doesn",
+    "do not",
+    "does not",
+    "need not",
+    "needn",
+    "nobody",
+    "without",
+    "with no",
+)
+
+
+def _relaxation_marker(content: str, inherited_texts: Sequence[str] = ()) -> str | None:
+    """The first relaxation marker in a directive's text, else ``None``.
+
+    The shared normative list (#242) plus :data:`_DIRECTIVE_RELAXATION_EXTRA_RES`. A word
+    that is itself negated by an earlier "never / not / no" in the same clause ("never
+    skip the review", "no exceptions") tightens the rule instead of relaxing it and is
+    ignored; markers that are negations themselves ("no need", "don't need") are not. A
+    marker the inherited text carries in the same words ("archive volumes MAY be borrowed
+    ...") is the rule's own phrasing restated, not a relaxation, and is ignored too.
+    """
+    own_words = " ".join(inherited_texts).casefold()
+    for pattern in (*_NORMATIVE_EXCEPTION_RES, *_DIRECTIVE_RELAXATION_EXTRA_RES):
+        for match in pattern.finditer(content):
+            found = match.group(0)
+            if found.casefold() in own_words:
+                continue
+            if not found.casefold().startswith(_SELF_NEGATED_STARTS):
+                window = content[max(0, match.start() - 30) : match.start()]
+                clause = re.split(r"[.;:,]", window)[-1]
+                if _NEGATOR_BEFORE_RE.search(clause):
+                    continue
+            return f"relaxation marker '{found}'"
+    return None
+
+
+#: #244 (the synonym gap): a few word families that name the same act in rules and in
+#: restatements of them, collapsed to one token before subject words are compared.
+#: "Anyone may sign off on a release" is about the same thing as "Releases require two
+#: approvals" and shares no stem with it. Kept small and domain-neutral on purpose.
+_SYNONYM_FAMILIES: tuple[tuple[re.Pattern[str], str], ...] = (
+    (
+        re.compile(
+            r"\bsign(?:s|ed|ing)?[- ]?offs?\b|\bsign(?:s|ed|ing)? off\b|\bapprov\w*|"
+            r"\bauthori[sz]\w*|\bcountersign\w*",
+            re.IGNORECASE,
+        ),
+        "approval",
+    ),
+    (
+        re.compile(r"\bwalk-?rounds?\b|\binspect\w*", re.IGNORECASE),
+        "inspection",
+    ),
+    (
+        re.compile(r"\bsecond pair of eyes\b|\bpeer review\w*", re.IGNORECASE),
+        "second review",
+    ),
+)
+
+
+def _normalise_synonyms(text: str) -> str:
+    for pattern, token in _SYNONYM_FAMILIES:
+        text = pattern.sub(token, text)
+    return text
+
+
+def _subject_stems(text: str) -> set[str]:
+    """Content-word stems of *text*, three letters and up ("van", "QA"-free), minus the
+    overlap stopwords: the loosened subject test of #244 step 3."""
+    from strata.publication import _CONTENT_OVERLAP_STOPWORDS, _overlap_stem  # noqa: PLC0415
+
+    return {
+        _overlap_stem(word)
+        for word in re.findall(r"[a-z]{3,}", _normalise_synonyms(text).casefold())
+        if word not in _CONTENT_OVERLAP_STOPWORDS and word not in _LOOSE_STOPWORDS
+    }
+
+
+def _shares_content_word(a: str, b: str) -> bool:
+    """A shared content word (stem), or a 5-letter shared prefix ("approve"/"approval")."""
+    other = _subject_stems(b)
+    return any(
+        mine in other or any(_shared_prefix(mine, w) >= 5 for w in other)
+        for mine in _subject_stems(a)
+    )
+
+
+#: Words that carry no subject: modals, quantifiers, connectives and time words. Two directives
+#: sharing only these ("must ... every day") are not about the same thing.
+_LOOSE_STOPWORDS = frozenset(
+    {
+        "must", "should", "shall", "will", "would", "could", "never", "always", "every", "each",
+        "only", "also", "other", "when", "with", "that", "this", "these", "those", "from", "have",
+        "been", "being", "before", "after", "until", "than", "then", "into", "onto", "over",
+        "under", "within", "without", "least", "most", "more", "less", "same", "such", "any",
+        "all", "day", "days", "week", "weeks", "time", "times", "per", "are", "and", "the",
+        "for", "not", "can", "may", "its", "their", "they", "them", "who", "has", "had",
+        "was", "were", "but", "out", "one", "two", "our", "you", "your", "his", "her", "off",
+        "run", "get", "use", "set", "put", "new", "old",
+    }
+)  # fmt: skip
+
+#: Opposite states whose reversal is a relaxation on its own ("switched OFF by 20:00" vs
+#: "keeps the pumps ON").
+_LOOSE_POLARITY_PAIRS: tuple[tuple[str, str], ...] = (
+    ("off", "on"),
+    ("closed", "open"),
+    ("stopped", "running"),
+    ("disabled", "enabled"),
+)
+
+
+def _same_quantity(parent_text: str, child_text: str, *, minimum: int = 2) -> bool:
+    """Do two bounds in different units plausibly bound the SAME quantity? At least two shared
+    subject stems (modals, quantifiers and time words excluded): "tokens expire after at most
+    15 minutes" and "token-service logs kept for at most 7 days" share only "token" and are
+    two quantities, not one bound stated in two units."""
+    mine = _subject_stems(parent_text) - _LOOSE_STOPWORDS
+    other = _subject_stems(child_text) - _LOOSE_STOPWORDS
+    shared = {m for m in mine if m in other or any(_shared_prefix(m, w) >= 5 for w in other)}
+    return len(shared) >= minimum
+
+
+def _loose_covers(inherited_text: str, content: str) -> bool:
+    """Covered by the strict test, or at least two shared SUBJECT stems (not modals,
+    quantifiers or time words) anywhere: the shared subject may be an object."""
+    if _is_covered_subject(inherited_text, content) and _head_nouns_compatible(
+        inherited_text, content
+    ):
+        return True
+    mine = _subject_stems(inherited_text) - _LOOSE_STOPWORDS
+    other = _subject_stems(content) - _LOOSE_STOPWORDS
+    shared = {m for m in mine if m in other or any(_shared_prefix(m, w) >= 5 for w in other)}
+    return len(shared) >= 2
+
+
+def _loose_polarity(inherited_text: str, content: str) -> bool:
+    parent_words = set(re.findall(r"[a-z]+", inherited_text.casefold()))
+    child_words = set(re.findall(r"[a-z]+", content.casefold()))
+    for one, other in _LOOSE_POLARITY_PAIRS:
+        for kept, flipped in ((one, other), (other, one)):
+            if kept in parent_words and flipped in child_words and kept not in child_words:
+                return True
+    return False
+
+
+def _loose_conflict(content: str, inherited_text: str) -> str | None:
+    """#244 step 4: a conflict signal for a directive whose subject the narrow 1.17 test calls
+    uncovered because the shared subject is the OBJECT of its sentence ("night-shift keeps
+    the fuel dock pumps on until 22:00"). Under the loosened subject test only the strict
+    signals count: a reversed on/off-style state, or a value outside the parent's bound in
+    its own direction."""
+    if not _loose_covers(inherited_text, content):
+        return None
+    if _names_a_different_instance(inherited_text, content):
+        return None
+    if _loose_polarity(inherited_text, content):
+        return "polarity flip"
+    ok, reason = _tighten_value_check(inherited_text, content)
+    if not ok and reason == "not stricter in the same direction":
+        return reason
+    return None
+
+
+def verify_directive_relation(
+    answer: dict | None,
+    content: str,
+    inherited: Sequence[tuple[str, str, str]],
+) -> tuple[str, str, tuple[str, str] | None, bool]:
+    """Engine verification of a ``classify_directive_relation`` answer (#244 step 3).
+
+    Returns ``(verdict, reason, target, fallback)``: *verdict* is ``"decline"``, ``"hold"``
+    or ``"admit"``; *target* is the ``(id, origin)`` of the inherited directive the
+    decline or hold names (``None`` on an admit); *fallback* is True when the admit rests on an
+    unreadable, unrelated or unverified answer with no relaxation marker in the way,
+    which callers count (the directive path's door).
+
+    Fails toward the inherited rule:
+
+    - ``exempts`` or ``contradicts`` with a verbatim ``exempted_case_span`` is the MODEL's
+      claim; the span only proves the quote exists. It declines when the engine has evidence
+      of its own (a relaxation marker on an inherited subject, or a loose conflict), and is
+      otherwise a ``"hold"``: the contribution is kept as context and never binds;
+    - ``refines`` is admitted only with a verbatim ``uncovered_case_span``, a stated
+      kept requirement, and no relaxation marker; ``tightens`` only if the 1.17.2
+      comparator agrees and no marker is present;
+    - anything else (unrelated, unreadable, a claim that fails its own check) declines
+      when a relaxation marker is present and the text shares a content word with an
+      inherited directive or the answer names one; otherwise the admit stands, counted.
+    """
+    answer = answer if isinstance(answer, dict) else {}
+    relation = answer.get("relation")
+    named = answer.get("parent_id")
+    chosen = next((d for d in inherited if d[0] == named), None)
+    marker = _relaxation_marker(content, [d[2] for d in inherited])
+
+    def _target(default: tuple[str, str, str] | None = None) -> tuple[str, str] | None:
+        pick = chosen or default
+        return (pick[0], pick[1]) if pick is not None else None
+
+    def _best_overlap() -> tuple[str, str, str] | None:
+        return next((d for d in inherited if _shares_content_word(d[2], content)), None)
+
+    failure = "unreadable answer"
+    if relation in ("exempts", "contradicts"):
+        if _verbatim_span(answer, "exempted_case_span", content) is not None:
+            pick = chosen or _best_overlap() or (inherited[0] if inherited else None)
+            evidence = next(
+                (
+                    (d, loose)
+                    for d in inherited
+                    if (loose := _loose_conflict(content, d[2])) is not None
+                ),
+                None,
+            )
+            if evidence is not None:
+                return (
+                    "decline",
+                    f"{relation}: {evidence[1]} on an inherited subject",
+                    _target(evidence[0]),
+                    False,
+                )
+            if marker is not None and pick is not None and _shares_content_word(pick[2], content):
+                return (
+                    "decline",
+                    f"{relation}: {marker} on an inherited subject",
+                    _target(pick),
+                    False,
+                )
+            # the model's claim alone: held as context, never a directive
+            return (
+                "hold",
+                f"{relation} claimed by the judge; the engine found no conflict of its own",
+                _target(pick),
+                False,
+            )
+        failure = f"{relation} without a verbatim exempted_case_span"
+    elif relation == "refines":
+        kept = answer.get("kept_requirement")
+        if (
+            _verbatim_span(answer, "uncovered_case_span", content) is not None
+            and isinstance(kept, str)
+            and kept.strip()
+            and marker is None
+            and not any(_loose_conflict(content, d[2]) for d in inherited)
+        ):
+            return "admit", "verified refinement", None, False
+        failure = "refines claim not verified"
+    elif relation == "tightens":
+        if (
+            chosen is not None
+            and marker is None
+            and inherited_conflict(content, chosen[2]) is None
+            and _tighten_value_check(chosen[2], content)[0]
+            and not any(_loose_conflict(content, d[2]) for d in inherited)
+        ):
+            return "admit", "verified tightening", None, False
+        failure = "tightens claim not verified"
+    elif relation == "unrelated":
+        failure = "answered unrelated"
+
+    for candidate in inherited:
+        loose = _loose_conflict(content, candidate[2])
+        if loose is not None:
+            return (
+                "decline",
+                f"{failure}; {loose} on an inherited subject",
+                _target(candidate),
+                False,
+            )
+    if marker is not None:
+        covering = chosen if chosen is not None else _best_overlap()
+        if covering is None:
+            covering = next((d for d in inherited if _shares_content_word(d[2], content)), None)
+        if covering is not None:
+            return (
+                "decline",
+                f"{failure}; {marker} on an inherited subject",
+                _target(covering),
+                False,
+            )
+    return "admit", f"{failure}; no relaxation marker on an inherited subject", None, True
+
+
+def _directive_relation_note(outcome: dict) -> str:
+    """The engine reason for a declined directive: #244 step 1's, verbatim; or, for a
+    ``hold`` (the judge's claim alone), the note that the text is kept as context."""
+    if outcome["verdict"] == "hold":
+        return (
+            f"Held as context: the judge reads this as an exception to {outcome['inherited_id']} "
+            f"({outcome['origin']}); the engine could not confirm a conflict. Context never binds."
+        )
+    return _inherited_hold_note(outcome["inherited_id"], outcome["origin"])
 
 
 # ---------------------------------------------------------------------------
@@ -6014,8 +8067,8 @@ class ScopeManager:
 
     def _messages_create(self, **kwargs: Any) -> Any:
         """The ONE place every judge call's real API request goes through
-        (#224). Every ``self._client.messages.create(...)`` call site in
-        this class calls this instead — never the client directly — so a
+        (#224). Every judge call in this class goes through this method
+        instead of the client, so a
         pinned provider (and anything this method does in the future)
         reaches every judge call shape (ordinary, batch, publication,
         bootstrap, and any targeted re-ask) automatically, with nothing
@@ -6032,11 +8085,15 @@ class ScopeManager:
         decision is made across the whole engine (also used by the
         freshness evaluator's drafter and ``strata doctor``'s live probe);
         see that function's own docstring.
-        """
-        from strata.settings import apply_provider_pin  # noqa: PLC0415
 
-        apply_provider_pin(kwargs, provider=self._judge_provider, client=self._client)
-        return self._client.messages.create(**kwargs)
+        Usage metering (#246) is recorded here too, via
+        :func:`strata.judge_usage.metered_messages_create`. That function
+        does not add a field to *kwargs*. The daily token cap, when set,
+        is applied there before a first or standalone call.
+        """
+        from strata.judge_usage import metered_messages_create  # noqa: PLC0415
+
+        return metered_messages_create(self._client, kwargs, provider=self._judge_provider)
 
     def judge(
         self,
@@ -6299,6 +8356,9 @@ class ScopeManager:
                     mode == "input_change_refresh"
                     and _refresh_events_are_all_additions(input_changes)
                 ),
+                structure=(
+                    _structure_event(input_changes) if mode == "input_change_refresh" else None
+                ),
                 change_id=change_id,
                 hop=hop,
                 rendered_item_ids=rendered_item_ids,
@@ -6316,6 +8376,9 @@ class ScopeManager:
                 context_locked=(
                     mode == "input_change_refresh"
                     and _refresh_events_are_all_additions(input_changes)
+                ),
+                structure=(
+                    _structure_event(input_changes) if mode == "input_change_refresh" else None
                 ),
                 change_id=change_id,
                 hop=hop,
@@ -6527,12 +8590,14 @@ class ScopeManager:
                 )
 
             def _telling_span_problem(
-                telling_span: str,
-            ) -> tuple[str | None, Literal["told", "joint"] | None]:
+                telling_span: str, informant_span: str | None = None
+            ) -> tuple[str | None, Literal["told", "joint", "document"] | None]:
                 """Thin wrapper over the module-level
                 :func:`_telling_span_problem_for`, filling in this call's
                 own contribution text."""
-                return _telling_span_problem_for(telling_span, content=new_contribution.content)
+                return _telling_span_problem_for(
+                    telling_span, content=new_contribution.content, informant_span=informant_span
+                )
 
             corrective_text = (
                 "Your accepted contribution names another fleet scope this scope "
@@ -6726,7 +8791,7 @@ class ScopeManager:
                     classification,
                     "declined (invented informant)",
                 )
-            telling_problem, telling_verb_kind = _telling_span_problem(telling_span)
+            telling_problem, telling_verb_kind = _telling_span_problem(telling_span, informant_span)
             if telling_problem is not None:
                 return _noted(
                     judgment.model_copy(
@@ -6758,6 +8823,15 @@ class ScopeManager:
             # "X says"; a told/said verb keeps today's form.
             if telling_verb_kind == "joint":
                 engine_line = f"In discussion with {informant_span}: {new_contribution.content}"
+            elif telling_verb_kind == "document":
+                # c_9b1d2a2b136c4d96: the author's word as of the reading, never
+                # "<scope> holds/decided". Context only, like every informant claim.
+                engine_line = (
+                    f"{new_contribution.contributor.skill} "
+                    f"({new_contribution.contributor.scope_id}) reports reading {informant_span}'s "
+                    f"document ({telling_span.strip()}); as of that reading it says: "
+                    f"{new_contribution.content}"
+                )
             else:
                 engine_line = (
                     f"{new_contribution.contributor.skill} "
@@ -6913,10 +8987,44 @@ class ScopeManager:
                 new_contribution=new_contribution,
             )
 
+        _parties, _own_aliases = _party_vocabulary(
+            scope,
+            entitlement,
+            [ancestor_scope_id for ancestor_scope_id, _d in (ancestor_directives or ())],
+            [(new_contribution.contributor.scope_id, new_contribution.contributor.skill)],
+        )
+
+        def _reasoning_gaps(judgment: ScopeManagerJudgment) -> list[str]:
+            names = _drop_own_names(
+                _informants_missing_from(judgment.reasoning, new_contribution.content),
+                _own_aliases,
+            )
+            for name in _vocabulary_informants_missing(
+                judgment.reasoning, new_contribution.content, _parties, _own_aliases
+            ):
+                if name not in names:
+                    names.append(name)
+            return names
+
+        def _reasoning_adopt(
+            judgment: ScopeManagerJudgment, retry: ScopeManagerJudgment
+        ) -> ScopeManagerJudgment:
+            return judgment.model_copy(update={"reasoning": retry.reasoning})
+
+        def _reasoning_withdraw(
+            judgment: ScopeManagerJudgment, names: Sequence[str]
+        ) -> ScopeManagerJudgment:
+            return judgment.model_copy(
+                update={"reasoning": _withdrawn_reason(names, judgment.decision)}
+            )
+
         judgment = self._call_with_correctives(
             user_message=user_message,
             system_prompt=_SYSTEM_PROMPT,
             tool=_judge_tool_for(acted_on_target),
+            reasoning_gaps=_reasoning_gaps,
+            reasoning_withdraw=_reasoning_withdraw,
+            reasoning_adopt=_reasoning_adopt,
             max_tokens=JUDGE_MAX_TOKENS,
             summary_max_words=summary_max_words,
             parse=_parse,
@@ -6991,6 +9099,11 @@ class ScopeManager:
                 else None
             ),
         )
+        # A "Hearsay:" label on a reasoning that itself says first-hand is a wrong label.
+        if _REASON_INFORMANT_CHECK:
+            judgment = judgment.model_copy(
+                update={"reasoning": _drop_false_hearsay(judgment.reasoning)}
+            )
         judgment = self._hold_inherited_conflicts(
             judgment.model_copy(update={"contribution_id": new_contribution.id}),
             scope=scope,
@@ -7000,6 +9113,24 @@ class ScopeManager:
             ancestor_directives=ancestor_directives,
             operator_memory=operator_memory,
         )
+        if acted_on_target is None:
+            judgment = self.classify_inherited_context(
+                judgment,
+                scope=scope,
+                contribution=new_contribution,
+                ancestor_directives=ancestor_directives,
+                operator_memory=operator_memory,
+                mode=mode,
+            )
+            judgment = self.classify_inherited_directive(
+                judgment,
+                scope=scope,
+                contribution=new_contribution,
+                ancestor_directives=ancestor_directives,
+                operator_memory=operator_memory,
+                mode=mode,
+                current_summary=current_summary,
+            )
         return self._hold_directive_changes(
             judgment,
             scope=scope,
@@ -7026,10 +9157,11 @@ class ScopeManager:
         untouched). For an admitted directive op owned by a contributor bound
         to *scope*, checked against every rendered inherited directive
         (ancestor and operator) with :func:`inherited_conflict`. A conflict
-        holds the contribution: admitted as context under an engine-written
-        line carrying the held note, every directive op dropped. Fails toward
-        context, never toward a contradicting directive. Contributions from
-        any other position are the position gate's.
+        declines the contribution (#244 step 1, the philosopher's ruling A):
+        every directive op is dropped, no context line is written, and the
+        engine's reason points the contributor at the owning scope. Fails
+        toward the rule. Contributions from any other position are the
+        position gate's.
         """
         if judgment.decision == "decline" or mode != "ordinary":
             return judgment
@@ -7048,26 +9180,15 @@ class ScopeManager:
             return judgment
         directive_id, origin, reason = hit
         note = _inherited_hold_note(directive_id, origin)
-        who = new_contribution.contributor.skill or new_contribution.contributor.session_id
-        line = (
-            f"[{new_contribution.id}] {who} ({new_contribution.contributor.scope_id}) "
-            f"proposed: {new_contribution.content.strip()} — {note}"
-        )
-        previous = current_summary.context if current_summary is not None else ""
-        context = _append_line(previous, line)
         return judgment.model_copy(
             update={
-                "decision": "accept_as_context",
-                "reasoning": f"{judgment.reasoning} {note}",
+                "decision": "decline",
+                "reasoning": note,
                 "directive_ops": [],
-                "new_context": context,
-                "new_summary": _apply_amendment(
-                    scope=scope,
-                    current_summary=current_summary,
-                    contribution=new_contribution,
-                    ops=[],
-                    new_context=context,
-                ),
+                "new_context": None,
+                "new_summary": None,
+                "withdraw_published": [],
+                "context_sources": [],
                 "inherited_holds": [
                     {
                         "contribution_id": new_contribution.id,
@@ -7093,11 +9214,10 @@ class ScopeManager:
         """:meth:`_hold_inherited_conflicts`, carried to the batch.
 
         A member bound to *scope* whose admitted op conflicts has every op it
-        owns dropped and its verdict becomes ``accept_as_context``. Known gap
-        against the single path (the same one the position gate states): the
-        batch's one context rewrite belongs to every member, so the judge's
-        own rewrite is kept and the engine's held lines are appended to it;
-        a rewrite that itself restates the held claim is not removed.
+        owns dropped and its verdict becomes ``decline`` (#244 step 1). The
+        batch's one context rewrite belongs to every member, so it is withheld
+        and rebuilt from the previous context plus each remaining
+        context-admitted member's verbatim text.
         """
         if mode != "ordinary":
             return judgment
@@ -7120,23 +9240,11 @@ class ScopeManager:
         if not hits:
             return judgment
         kept = [op for op in judgment.directive_ops if op.contribution_id not in hits]
-        context = (
-            judgment.new_context
-            if judgment.new_context is not None
-            else (current_summary.context if current_summary is not None else "")
-        )
         holds: list[dict] = []
         notes: dict[str, str] = {}
         for cid in sorted(hits):
             directive_id, origin, reason = hits[cid]
-            note = _inherited_hold_note(directive_id, origin)
-            notes[cid] = note
-            who = contributions[cid].contributor.skill or contributions[cid].contributor.session_id
-            context = _append_line(
-                context,
-                f"[{cid}] {who} ({contributions[cid].contributor.scope_id}) "
-                f"proposed: {contributions[cid].content.strip()} — {note}",
-            )
+            notes[cid] = _inherited_hold_note(directive_id, origin)
             holds.append(
                 {
                     "contribution_id": cid,
@@ -7146,28 +9254,43 @@ class ScopeManager:
                 }
             )
         verdicts = [
-            v.model_copy(
-                update={
-                    "decision": "accept_as_context",
-                    "reasoning": f"{v.reasoning} {notes[v.contribution_id]}",
-                }
-            )
+            v.model_copy(update={"decision": "decline", "reasoning": notes[v.contribution_id]})
             if v.contribution_id in hits
             else v
             for v in judgment.verdicts
         ]
+        # Stated limit, as on #242's batch: the batch has ONE context rewrite,
+        # which the judge wrote with the declined text in view. It is withheld
+        # and replaced by the previous context plus each remaining
+        # context-admitted member's own text, verbatim, so a declined
+        # contribution can never survive in it.
+        context = current_summary.context if current_summary is not None else ""
+        for v in verdicts:
+            if v.decision == "accept_as_context":
+                member = contributions[v.contribution_id]
+                who = member.contributor.skill or member.contributor.session_id
+                context = _append_line(
+                    context,
+                    f"[{member.id}] {who} ({member.contributor.scope_id}) "
+                    f"observed: {member.content.strip()}",
+                )
+        any_accepted = any(v.decision != "decline" for v in verdicts)
         return judgment.model_copy(
             update={
                 "verdicts": verdicts,
                 "directive_ops": kept,
-                "new_context": context,
+                "new_context": context if any_accepted else None,
                 "inherited_holds": holds,
-                "new_summary": _apply_batch_amendment(
-                    scope=scope,
-                    current_summary=current_summary,
-                    contributions=contributions,
-                    ops=kept,
-                    new_context=context,
+                "new_summary": (
+                    _apply_batch_amendment(
+                        scope=scope,
+                        current_summary=current_summary,
+                        contributions=contributions,
+                        ops=kept,
+                        new_context=context,
+                    )
+                    if any_accepted
+                    else None
                 ),
             }
         )
@@ -7372,6 +9495,9 @@ class ScopeManager:
         parse_lenient: Callable[[object], _JudgmentT] | None = None,
         parse_forced_decline: Callable[[object], _JudgmentT] | None = None,
         parse_generic_decline: Callable[[Exception], _JudgmentT] | None = None,
+        reasoning_gaps: Callable[[_JudgmentT], list[str]] | None = None,
+        reasoning_withdraw: Callable[[_JudgmentT, Sequence[str]], _JudgmentT] | None = None,
+        reasoning_adopt: Callable[[_JudgmentT, _JudgmentT], _JudgmentT] | None = None,
         is_outcome_report: bool = False,
         acted_on_is_directive: bool = False,
         post_judgment: Callable[[_JudgmentT, list[dict], object, object], _JudgmentT] | None = None,
@@ -7766,6 +9892,55 @@ class ScopeManager:
                 if drop_stale_context is not None and stale_claims(judgment):
                     judgment = drop_stale_context(judgment)
 
+        # Reason honesty: the reasoning names an informant that does not occur in the
+        # contribution (the judge described content from another contribution in its window).
+        # Exactly ONE re-ask with the same tool; the verdict is never changed by it. If the
+        # name is still there, the engine withdraws the reasoning and says so.
+        if (
+            _REASON_INFORMANT_CHECK
+            and reasoning_gaps is not None
+            and reasoning_withdraw is not None
+            and reasoning_adopt is not None
+        ):
+            missing = reasoning_gaps(judgment)
+            if missing:
+                retry_messages = [
+                    *first_messages,
+                    *_corrective_turn(
+                        response,
+                        tool_use_block,
+                        f"Your reasoning names {', '.join(missing)} as an informant; that does "
+                        "not appear in the NEW CONTRIBUTION. Describe only the new "
+                        f"contribution. Call {tool_name} again with the SAME {verdict_noun} "
+                        f"and the SAME {decision_noun}, and `reasoning` that describes only "
+                        "what the NEW CONTRIBUTION says.",
+                    ),
+                ]
+                try:
+                    retry_response = _call(retry_messages)
+                    retry_block = self._extract_tool_use_block(retry_response)
+                    retry_judgment = parse(retry_block)
+                except Exception:  # noqa: BLE001 — deliberate: retry is best-effort
+                    retry_judgment = None
+                if retry_judgment is not None and _decisions_of(retry_judgment) == _decisions_of(
+                    judgment
+                ):
+                    # ONLY the reasoning is taken from the retry: its ops, context and
+                    # summary never replace the ones the earlier correctives checked.
+                    judgment = reasoning_adopt(judgment, retry_judgment)
+                still = reasoning_gaps(judgment)
+                protocol_notes.append(
+                    "Corrective re-ask: the reasoning named an informant that does not occur "
+                    f"in the contribution ({', '.join(missing)})"
+                    + (
+                        "; the second answer still did."
+                        if still
+                        else "; the second answer fixed it."
+                    )
+                )
+                if still:
+                    judgment = reasoning_withdraw(judgment, still)
+
         # Overflow re-ask (issue #63): the LLM was told the BUDGET but nothing
         # enforced it.  Give it exactly one corrective follow-up call if the
         # amended summary is over budget — never more than one retry.
@@ -8047,6 +10222,7 @@ class ScopeManager:
             previous_context,
             ref_source_scope_words,
             ancestor_scope_words,
+            frozenset(rid for rid, origin in ref_origins.items() if "directive" in origin),
         )
         ground_kind = answer.get("ground_kind")
         other_grounds_clear = answer.get("other_grounds_clear")
@@ -8138,6 +10314,10 @@ class ScopeManager:
             ancestor_map.update({d.id: d.content for d in directives})
 
         matched_id = relation_decline_trigger(first.reasoning, ancestor_map.keys())
+        if matched_id is None:
+            matched_id = relation_decline_scope_trigger(
+                first.reasoning, contribution.content, ancestor_directives
+            )
         if matched_id is None:
             return first
         parent_text = ancestor_map[matched_id]
@@ -8272,6 +10452,615 @@ class ScopeManager:
             }
         )
         return _noted(updated, relation, parent_id, result)
+
+    def _classify_inherited_relation(
+        self,
+        *,
+        scope: Scope,
+        contribution: Contribution,
+        covered: Sequence[tuple[str, str, str]],
+    ) -> dict:
+        """#242: the one targeted re-ask (``classify_inherited_relation``) and
+        the engine's verification of its answer, for a context contribution
+        that the scope inherits directives for (*covered*, ranked and capped).
+
+        Returns ``{"contribution_id", "kind", "verdict", "fallback",
+        "inherited_id", "origin", "reason"}``. A failed or unreadable call is
+        the unreadable-answer case, never an error: the verifier's marker
+        scan then decides (a marker declines, otherwise the admit stands and
+        ``fallback`` is True).
+        """
+        shown = list(covered)
+        listing = "\n".join(
+            f"- {d_id}: {text[:_CONTEXT_REASK_DIRECTIVE_CHARS]}" for d_id, _origin, text in shown
+        )
+        user_message = (
+            f"INHERITED DIRECTIVES:\n{listing}\n\nCONTEXT ITEM:\n{contribution.content}\n\n"
+            "Call `classify_inherited_relation` exactly once."
+        )
+        answer: dict = {}
+        failure: str | None = None
+        try:
+            response = self._messages_create(
+                model=self._model,
+                max_tokens=300,
+                system=[
+                    {
+                        "type": "text",
+                        "text": _INHERITED_RELATION_SYSTEM_PROMPT,
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ],
+                tools=[
+                    {**CLASSIFY_INHERITED_RELATION_TOOL, "cache_control": {"type": "ephemeral"}}
+                ],
+                tool_choice={
+                    "type": "tool",
+                    "name": CLASSIFY_INHERITED_RELATION_TOOL["name"],
+                    "disable_parallel_tool_use": True,
+                },
+                messages=[{"role": "user", "content": user_message}],
+            )
+            block = self._extract_tool_use_block(response)
+            answer = block.input if isinstance(block.input, dict) else {}
+        except Exception as exc:  # noqa: BLE001 — any slip is the unreadable-answer case
+            failure = f"{type(exc).__name__}: {exc}"
+
+        named = answer.get("inherited_id")
+        chosen = next((d for d in shown if d[0] == named), None)
+        if chosen is None:
+            chosen = shown[0]
+            answer = {}  # an answer naming no shown directive is unreadable
+        verdict, reason = verify_inherited_relation(
+            answer, contribution.content, chosen[2], [d[2] for d in shown if d is not chosen]
+        )
+        if failure is not None:
+            reason = f"re-ask failed ({failure}); {reason}"
+        kind = answer.get("kind")
+        return {
+            "contribution_id": contribution.id,
+            "kind": kind if isinstance(kind, str) else None,
+            "verdict": verdict,
+            "fallback": verdict == "admit",
+            "inherited_id": chosen[0],
+            "origin": chosen[1],
+            "reason": reason,
+        }
+
+    def classify_inherited_context(
+        self,
+        first: ScopeManagerJudgment,
+        *,
+        scope: Scope,
+        contribution: Contribution,
+        ancestor_directives: Sequence[tuple[str, Sequence[Directive]]] | None,
+        operator_memory: Sequence[tuple[str, Sequence[OperatorItem]]] | None,
+        mode: JudgeMode = "ordinary",
+    ) -> ScopeManagerJudgment:
+        """#242: a child's CONTEXT must not undercut an inherited directive.
+
+        Fires only for an ordinary ``accept_as_context`` from a contributor
+        bound to *scope* when the scope inherits at least one directive
+        (ancestor or operator); otherwise *first* is returned untouched with
+        no call. An exception is declined; a specific past
+        report stays admitted with a suffix naming it and suggesting
+        ``acted_on``; an unreadable or unrelated answer declines only when an
+        exception marker is present (the counted fail-open fallback).
+        """
+        if (
+            mode != "ordinary"
+            or first.decision != "accept_as_context"
+            or first.inherited_holds
+            or first.inherited_relation is not None
+            or contribution.contributor.scope_id != scope.id
+        ):
+            return first
+        inherited = _inherited_directive_texts(ancestor_directives, operator_memory)
+        if not inherited:
+            return first
+        covered = inherited_for_context(contribution.content, inherited)
+        outcome = self._classify_inherited_relation(
+            scope=scope, contribution=contribution, covered=covered
+        )
+        note = _inherited_relation_note(outcome)
+        update: dict = {
+            "inherited_relation": outcome,
+            "protocol_notes": [
+                *first.protocol_notes,
+                f"inherited relation: {outcome['verdict']}, {outcome['reason']}",
+            ],
+        }
+        if outcome["verdict"] in _INHERITED_DECLINES:
+            update.update(
+                decision="decline",
+                directive_ops=[],
+                new_context=None,
+                new_summary=None,
+                reasoning=f"{first.reasoning} {note}",
+            )
+        elif note:
+            update["reasoning"] = f"{first.reasoning} {note}"
+        return first.model_copy(update=update)
+
+    def check_publication_exception(
+        self,
+        *,
+        scope: Scope,
+        content: str,
+        kind: Literal["directive", "context"],
+        ancestor_directives: Sequence[tuple[str, Sequence[Directive]]] | None,
+        operator_memory: Sequence[tuple[str, Sequence[OperatorItem]]] | None,
+        relay_origin_scope_id: str | None = None,
+        relay_label: str | None = None,
+    ) -> PublicationExceptionCheck:
+        """#243: a scope may not publish what it may not hold.
+
+        Called for an item the publication judge ACCEPTED (publish or restore) by a scope that
+        inherits at least one directive; without one, nothing is checked and no call is made.
+
+        - a ``directive`` item: :func:`inherited_conflict` against every inherited directive,
+          no judge call; a conflict refuses;
+        - a ``context`` item: #242's re-ask and verifier, unchanged. An exception refuses;
+          a consequence report publishes; a departure report publishes with the engine's
+          label prefixed; the fail-open fallback publishes and is counted.
+        - a relay (*relay_origin_scope_id*): the origin's label is kept verbatim (re-applied
+          from *relay_label* if the relayer dropped it) and never replaced; the relayer's
+          directives get the exception test only (a singular report passes, a general one is
+          refused); a reported act that conflicts with a relayer directive adds a separate
+          note.
+        """
+        inherited = _inherited_directive_texts(ancestor_directives, operator_memory)
+        existing_label, body = split_departure_label(content)
+        if not inherited:
+            return PublicationExceptionCheck("accept", content, label=existing_label)
+
+        if relay_origin_scope_id is None and existing_label is not None:
+            # a label typed by the publisher is never trusted: the engine writes it
+            content = body
+
+        if relay_origin_scope_id is not None:
+            keep = existing_label or relay_label
+            if kind == "directive":
+                refusal = self._directive_item_refusal(body, inherited)
+                if refusal is not None:
+                    return PublicationExceptionCheck("refuse", content, note=refusal)
+            outcome: dict | None = None
+            if kind == "context":
+                outcome = self._classify_publication_text(scope, body, inherited)
+                if outcome["verdict"] in _INHERITED_DECLINES:
+                    return PublicationExceptionCheck(
+                        "refuse",
+                        content,
+                        note=_publication_refusal_note(outcome["inherited_id"], outcome["origin"]),
+                        inherited_relation=outcome,
+                    )
+            conflict = _first_inherited_conflict(body, inherited)
+            conflict_note = (
+                f"The reported act conflicts with {conflict[0]}, which binds {scope.id}."
+                if conflict is not None
+                else None
+            )
+            return PublicationExceptionCheck(
+                "accept",
+                with_departure_label(content, keep),
+                label=keep,
+                inherited_relation=outcome,
+                fallback=bool(outcome and outcome["fallback"]),
+                conflict_note=conflict_note,
+            )
+
+        if kind == "directive":
+            refusal = self._directive_item_refusal(body, inherited)
+            if refusal is not None:
+                return PublicationExceptionCheck("refuse", content, note=refusal)
+            return PublicationExceptionCheck("accept", body)
+
+        outcome = self._classify_publication_text(scope, body, inherited)
+        verdict = outcome["verdict"]
+        if verdict in _INHERITED_DECLINES:
+            return PublicationExceptionCheck(
+                "refuse",
+                content,
+                note=_publication_refusal_note(outcome["inherited_id"], outcome["origin"]),
+                inherited_relation=outcome,
+            )
+        if verdict == "departure_report":
+            label = departure_label(outcome["inherited_id"], outcome["origin"])
+            return PublicationExceptionCheck(
+                "accept",
+                with_departure_label(body, label),
+                label=label,
+                inherited_relation=outcome,
+            )
+        return PublicationExceptionCheck(
+            "accept", body, inherited_relation=outcome, fallback=bool(outcome["fallback"])
+        )
+
+    @staticmethod
+    def _directive_item_refusal(body: str, inherited: Sequence[tuple[str, str, str]]) -> str | None:
+        """The refusal note for a published DIRECTIVE item that changes or relaxes an
+        inherited directive, or ``None``. No judge call: the 1.17 inherited check, then the
+        #244 verifier read with no answer (a relaxation marker on an inherited subject, or a
+        reversed state or out-of-bound value on a shared object subject)."""
+        hit = _first_inherited_conflict(body, inherited)
+        if hit is not None:
+            return _publication_refusal_note(hit[0], hit[1])
+        verdict, _reason, target, _fallback = verify_directive_relation({}, body, inherited)
+        if verdict == "decline" and target is not None:
+            return _publication_refusal_note(target[0], target[1])
+        return None
+
+    def _classify_publication_text(
+        self, scope: Scope, text: str, inherited: Sequence[tuple[str, str, str]]
+    ) -> dict:
+        """The #242 re-ask for a published context item's text (a stand-in contribution)."""
+        from types import SimpleNamespace  # noqa: PLC0415
+
+        stand_in = SimpleNamespace(id="publication-item", content=text)
+        return self._classify_inherited_relation(
+            scope=scope,
+            contribution=stand_in,  # type: ignore[arg-type]
+            covered=inherited_for_context(text, inherited),
+        )
+
+    def _classify_directive_relation(
+        self,
+        *,
+        contribution: Contribution,
+        text: str,
+        covered: Sequence[tuple[str, str, str]],
+    ) -> dict:
+        """#244 step 3: the one targeted re-ask (``classify_directive_relation``) for a
+        directive about to be admitted, and the engine's verification of its answer.
+
+        Returns ``{"contribution_id", "relation", "verdict", "fallback", "inherited_id",
+        "origin", "reason"}``. A failed or unreadable call is the unreadable-answer case,
+        never an error: the verifier's marker scan then decides.
+        """
+        listing = "\n".join(
+            f"- {d_id}: {t[:_CONTEXT_REASK_DIRECTIVE_CHARS]}" for d_id, _origin, t in covered
+        )
+        user_message = (
+            f"INHERITED DIRECTIVES:\n{listing}\n\nNEW DIRECTIVE:\n{text}\n\n"
+            "Call `classify_directive_relation` exactly once."
+        )
+        answer: dict = {}
+        failure: str | None = None
+        try:
+            response = self._messages_create(
+                model=self._model,
+                max_tokens=400,
+                system=[
+                    {
+                        "type": "text",
+                        "text": _DIRECTIVE_RELATION_SYSTEM_PROMPT,
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ],
+                tools=[
+                    {**CLASSIFY_DIRECTIVE_RELATION_TOOL, "cache_control": {"type": "ephemeral"}}
+                ],
+                tool_choice={
+                    "type": "tool",
+                    "name": CLASSIFY_DIRECTIVE_RELATION_TOOL["name"],
+                    "disable_parallel_tool_use": True,
+                },
+                messages=[{"role": "user", "content": user_message}],
+            )
+            block = self._extract_tool_use_block(response)
+            answer = block.input if isinstance(block.input, dict) else {}
+        except Exception as exc:  # noqa: BLE001 — any slip is the unreadable-answer case
+            failure = f"{type(exc).__name__}: {exc}"
+
+        verdict, reason, target, fallback = verify_directive_relation(answer, text, covered)
+        if failure is not None:
+            reason = f"re-ask failed ({failure}); {reason}"
+        shown = target or (covered[0][0], covered[0][1])
+        relation = answer.get("relation")
+        return {
+            "contribution_id": contribution.id,
+            "relation": relation if isinstance(relation, str) else None,
+            "verdict": verdict,
+            "fallback": fallback,
+            "inherited_id": shown[0],
+            "origin": shown[1],
+            "reason": reason,
+        }
+
+    def classify_inherited_directive(
+        self,
+        first: ScopeManagerJudgment,
+        *,
+        scope: Scope,
+        contribution: Contribution,
+        ancestor_directives: Sequence[tuple[str, Sequence[Directive]]] | None,
+        operator_memory: Sequence[tuple[str, Sequence[OperatorItem]]] | None,
+        mode: JudgeMode = "ordinary",
+        current_summary: ScopeSummary | None = None,
+    ) -> ScopeManagerJudgment:
+        """#244 step 3: a child's DIRECTIVE must not relax an inherited directive.
+
+        Fires only for an ordinary judgment that admits a directive op for a contributor
+        bound to *scope*, when the scope inherits at least one directive and nothing has
+        already ruled on this contribution (a hold, or a #237 rescue that was verified
+        mechanically); otherwise *first* is returned untouched with no call. The trigger
+        is the engine's, with no lexical gate: the misses share no words with the rule.
+        A declined directive keeps nothing: no ops, no context line, the engine's reason.
+        """
+        if (
+            mode != "ordinary"
+            or first.decision == "decline"
+            or first.inherited_holds
+            or first.directive_relation is not None
+            or contribution.contributor.scope_id != scope.id
+        ):
+            return first
+        texts = [
+            op.content or contribution.content
+            for op in first.directive_ops
+            if op.op in _ADMITTING_OPS
+        ]
+        inherited = _inherited_directive_texts(ancestor_directives, operator_memory)
+        if not texts or not inherited:
+            return first
+        outcome: dict | None = None
+        if first.relation_recheck is not None:
+            # A #237 rescue ran: its verifier never looked for a relaxation marker or a
+            # loose conflict. Those engine checks run here, with no judge call; evidence
+            # of either means it does not become a directive.
+            for text in texts:
+                verdict, reason, target, _fallback = verify_directive_relation({}, text, inherited)
+                if verdict == "decline" and target is not None:
+                    outcome = {
+                        "contribution_id": contribution.id,
+                        "relation": "rescued",
+                        "verdict": "decline",
+                        "fallback": False,
+                        "inherited_id": target[0],
+                        "origin": target[1],
+                        "reason": f"rescued directive: {reason}",
+                    }
+                    break
+            if outcome is None:
+                return first
+        else:
+            for text in texts:
+                result = self._classify_directive_relation(
+                    contribution=contribution,
+                    text=text,
+                    covered=inherited_for_context(text, inherited),
+                )
+                if outcome is None or result["verdict"] in ("decline", "hold"):
+                    outcome = result
+                if result["verdict"] == "decline":
+                    break
+        assert outcome is not None  # noqa: S101 — texts is non-empty
+        update: dict = {
+            "directive_relation": outcome,
+            "protocol_notes": [
+                *first.protocol_notes,
+                f"directive relation: {outcome['verdict']}, {outcome['reason']}",
+            ],
+        }
+        if outcome["verdict"] == "decline":
+            update.update(
+                decision="decline",
+                directive_ops=[],
+                new_context=None,
+                new_summary=None,
+                withdraw_published=[],
+                context_sources=[],
+                reasoning=_directive_relation_note(outcome),
+            )
+        elif outcome["verdict"] == "hold":
+            # The judge's claim of an exception, with no engine evidence: the text is
+            # kept as context under an attributed line, the directive ops are removed.
+            note = _directive_relation_note(outcome)
+            who = contribution.contributor.skill or contribution.contributor.session_id
+            previous = current_summary.context if current_summary is not None else ""
+            context = _append_line(
+                previous,
+                f"[{contribution.id}] {who} ({contribution.contributor.scope_id}) "
+                f"proposed: {contribution.content.strip()} — {note}",
+            )
+            update.update(
+                decision="accept_as_context",
+                directive_ops=[],
+                new_context=context,
+                new_summary=_apply_amendment(
+                    scope=scope,
+                    current_summary=current_summary,
+                    contribution=contribution,
+                    ops=[],
+                    new_context=context,
+                ),
+                reasoning=f"{first.reasoning} {note}",
+            )
+        return first.model_copy(update=update)
+
+    def _classify_batch_inherited_directive(
+        self,
+        judgment: ScopeManagerBatchJudgment,
+        *,
+        scope: Scope,
+        current_summary: ScopeSummary | None,
+        contributions: Mapping[str, Contribution],
+        mode: JudgeMode,
+        ancestor_directives: Sequence[tuple[str, Sequence[Directive]]] | None,
+        operator_memory: Sequence[tuple[str, Sequence[OperatorItem]]] | None,
+    ) -> ScopeManagerBatchJudgment:
+        """:meth:`classify_inherited_directive`, carried to the batch: each accepted
+        member bound to *scope* with an admitting op gets its own re-ask. A declined
+        member loses its ops and its verdict becomes ``decline``; the judge's single
+        context rewrite is then withheld and rebuilt from the previous context plus
+        each remaining context-admitted member's own text, as on the hold path."""
+        if mode != "ordinary":
+            return judgment
+        inherited = _inherited_directive_texts(ancestor_directives, operator_memory)
+        if not inherited:
+            return judgment
+        held = {h["contribution_id"] for h in judgment.inherited_holds}
+        accepted = {v.contribution_id for v in judgment.accepted_verdicts}
+        outcomes: dict[str, dict] = {}
+        for op in judgment.directive_ops:
+            cid = op.contribution_id
+            if (
+                op.op not in _ADMITTING_OPS
+                or cid not in accepted
+                or cid in held
+                or cid in outcomes
+                or contributions[cid].contributor.scope_id != scope.id
+            ):
+                continue
+            member = contributions[cid]
+            text = op.content or member.content
+            outcomes[cid] = self._classify_directive_relation(
+                contribution=member, text=text, covered=inherited_for_context(text, inherited)
+            )
+        if not outcomes:
+            return judgment
+        declined = {cid for cid, o in outcomes.items() if o["verdict"] == "decline"}
+        held_out = {cid for cid, o in outcomes.items() if o["verdict"] == "hold"}
+        verdicts = []
+        for v in judgment.verdicts:
+            if v.contribution_id in declined:
+                v = v.model_copy(
+                    update={
+                        "decision": "decline",
+                        "reasoning": _directive_relation_note(outcomes[v.contribution_id]),
+                    }
+                )
+            elif v.contribution_id in held_out:
+                # the judge's claim of an exception with no engine evidence: held as context
+                v = v.model_copy(
+                    update={
+                        "decision": "accept_as_context",
+                        "reasoning": _directive_relation_note(outcomes[v.contribution_id]),
+                    }
+                )
+            verdicts.append(v)
+        update: dict = {"verdicts": verdicts, "directive_relations": list(outcomes.values())}
+        if declined or held_out:
+            kept = [
+                op for op in judgment.directive_ops if op.contribution_id not in declined | held_out
+            ]
+            context = current_summary.context if current_summary is not None else ""
+            for v in verdicts:
+                if v.decision == "accept_as_context":
+                    member = contributions[v.contribution_id]
+                    who = member.contributor.skill or member.contributor.session_id
+                    if v.contribution_id in held_out:
+                        context = _append_line(
+                            context,
+                            f"[{member.id}] {who} ({member.contributor.scope_id}) "
+                            f"proposed: {member.content.strip()} — {v.reasoning}",
+                        )
+                    else:
+                        context = _append_line(
+                            context,
+                            f"[{member.id}] {who} ({member.contributor.scope_id}) "
+                            f"observed: {member.content.strip()}",
+                        )
+            any_accepted = any(v.decision != "decline" for v in verdicts)
+            update["directive_ops"] = kept
+            update["new_context"] = context if any_accepted else None
+            update["new_summary"] = (
+                _apply_batch_amendment(
+                    scope=scope,
+                    current_summary=current_summary,
+                    contributions=contributions,
+                    ops=kept,
+                    new_context=context,
+                )
+                if any_accepted
+                else None
+            )
+        return judgment.model_copy(update=update)
+
+    def _classify_batch_inherited_context(
+        self,
+        judgment: ScopeManagerBatchJudgment,
+        *,
+        scope: Scope,
+        current_summary: ScopeSummary | None,
+        contributions: Mapping[str, Contribution],
+        mode: JudgeMode,
+        ancestor_directives: Sequence[tuple[str, Sequence[Directive]]] | None,
+        operator_memory: Sequence[tuple[str, Sequence[OperatorItem]]] | None,
+    ) -> ScopeManagerBatchJudgment:
+        """:meth:`classify_inherited_context`, carried to the batch.
+
+        Each member that was admitted as context and is bound to *scope* gets
+        its own re-ask (when the scope inherits anything). A declined member's
+        verdict becomes ``decline``. Stated limit: the batch has ONE context
+        rewrite, which the judge wrote with the declined text in view; when
+        any member is declined the rewrite is withheld and replaced by the
+        previous context plus each remaining context-admitted member's own
+        text, verbatim, so a declined exception can never survive in it.
+        Held members are the inherited check's, not this one's.
+        """
+        if mode != "ordinary":
+            return judgment
+        inherited = _inherited_directive_texts(ancestor_directives, operator_memory)
+        if not inherited:
+            return judgment
+        held = {h["contribution_id"] for h in judgment.inherited_holds}
+        outcomes: dict[str, dict] = {}
+        for verdict in judgment.verdicts:
+            cid = verdict.contribution_id
+            member = contributions[cid]
+            if (
+                verdict.decision != "accept_as_context"
+                or cid in held
+                or member.contributor.scope_id != scope.id
+            ):
+                continue
+            outcomes[cid] = self._classify_inherited_relation(
+                scope=scope,
+                contribution=member,
+                covered=inherited_for_context(member.content, inherited),
+            )
+        if not outcomes:
+            return judgment
+        declined = {cid for cid, o in outcomes.items() if o["verdict"] in _INHERITED_DECLINES}
+        verdicts = []
+        for v in judgment.verdicts:
+            outcome = outcomes.get(v.contribution_id)
+            note = _inherited_relation_note(outcome) if outcome else ""
+            if outcome is None or not note:
+                verdicts.append(v)
+            elif v.contribution_id in declined:
+                verdicts.append(
+                    v.model_copy(
+                        update={"decision": "decline", "reasoning": f"{v.reasoning} {note}"}
+                    )
+                )
+            else:
+                verdicts.append(v.model_copy(update={"reasoning": f"{v.reasoning} {note}"}))
+        update: dict = {
+            "verdicts": verdicts,
+            "inherited_relations": list(outcomes.values()),
+        }
+        if declined:
+            context = current_summary.context if current_summary is not None else ""
+            for v in verdicts:
+                if v.decision == "accept_as_context" and v.contribution_id not in held:
+                    member = contributions[v.contribution_id]
+                    who = member.contributor.skill or member.contributor.session_id
+                    context = _append_line(
+                        context,
+                        f"[{member.id}] {who} ({member.contributor.scope_id}) "
+                        f"observed: {member.content.strip()}",
+                    )
+            update["new_context"] = context
+            update["new_summary"] = _apply_batch_amendment(
+                scope=scope,
+                current_summary=current_summary,
+                contributions=contributions,
+                ops=judgment.directive_ops,
+                new_context=context,
+            )
+        return judgment.model_copy(update=update)
 
     def judge_batch(
         self,
@@ -8414,6 +11203,9 @@ class ScopeManager:
                     {only.id: list(judgment.dropped_ops)} if judgment.dropped_ops else {}
                 ),
                 inherited_holds=judgment.inherited_holds,
+                inherited_relations=(
+                    [judgment.inherited_relation] if judgment.inherited_relation else []
+                ),
                 held_directive_changes=judgment.held_directive_changes,
                 held_ops=judgment.held_ops,
                 held_context=judgment.held_context,
@@ -8478,6 +11270,9 @@ class ScopeManager:
                     mode == "input_change_refresh"
                     and _refresh_events_are_all_additions(input_changes)
                 ),
+                structure=(
+                    _structure_event(input_changes) if mode == "input_change_refresh" else None
+                ),
                 change_ids=wave_ids,
                 hop=hop,
                 rendered_item_ids=rendered_item_ids,
@@ -8494,6 +11289,9 @@ class ScopeManager:
                 context_locked=(
                     mode == "input_change_refresh"
                     and _refresh_events_are_all_additions(input_changes)
+                ),
+                structure=(
+                    _structure_event(input_changes) if mode == "input_change_refresh" else None
                 ),
                 change_ids=wave_ids,
                 hop=hop,
@@ -8561,10 +11359,69 @@ class ScopeManager:
                 hop=hop,
             )
 
+        _batch_parties, _batch_own = _party_vocabulary(
+            scope,
+            entitlement,
+            [ancestor_scope_id for ancestor_scope_id, _d in (ancestor_directives or ())],
+            [(c.contributor.scope_id, c.contributor.skill) for c in contributions.values()],
+        )
+
+        def _missing_for(reasoning: str, content: str) -> list[str]:
+            names = _drop_own_names(_informants_missing_from(reasoning, content), _batch_own)
+            for name in _vocabulary_informants_missing(
+                reasoning, content, _batch_parties, _batch_own
+            ):
+                if name not in names:
+                    names.append(name)
+            return names
+
+        def _batch_reasoning_gaps(judgment: ScopeManagerBatchJudgment) -> list[str]:
+            names: list[str] = []
+            for verdict in judgment.verdicts:
+                member = contributions.get(verdict.contribution_id)
+                if member is None:
+                    continue
+                for name in _missing_for(verdict.reasoning, member.content):
+                    if name not in names:
+                        names.append(name)
+            return names
+
+        def _batch_reasoning_adopt(
+            judgment: ScopeManagerBatchJudgment, retry: ScopeManagerBatchJudgment
+        ) -> ScopeManagerBatchJudgment:
+            retried = {v.contribution_id: v.reasoning for v in retry.verdicts}
+            return judgment.model_copy(
+                update={
+                    "verdicts": [
+                        v.model_copy(
+                            update={"reasoning": retried.get(v.contribution_id, v.reasoning)}
+                        )
+                        for v in judgment.verdicts
+                    ]
+                }
+            )
+
+        def _batch_reasoning_withdraw(
+            judgment: ScopeManagerBatchJudgment, _names: Sequence[str]
+        ) -> ScopeManagerBatchJudgment:
+            verdicts = []
+            for verdict in judgment.verdicts:
+                member = contributions.get(verdict.contribution_id)
+                missing = _missing_for(verdict.reasoning, member.content) if member else []
+                if missing:
+                    verdict = verdict.model_copy(
+                        update={"reasoning": _withdrawn_reason(missing, verdict.decision)}
+                    )
+                verdicts.append(verdict)
+            return judgment.model_copy(update={"verdicts": verdicts})
+
         batch_judgment = self._call_with_correctives(
             user_message=user_message,
             system_prompt=_BATCH_SYSTEM_PROMPT,
             tool=JUDGE_BATCH_TOOL,
+            reasoning_gaps=_batch_reasoning_gaps,
+            reasoning_withdraw=_batch_reasoning_withdraw,
+            reasoning_adopt=_batch_reasoning_adopt,
             max_tokens=_batch_max_tokens(len(new_contributions)),
             summary_max_words=summary_max_words,
             parse=_parse,
@@ -8590,7 +11447,34 @@ class ScopeManager:
             # a second slip reaches).
             parse_generic_decline=_generic_second_slip_batch_decline,
         )
+        if _REASON_INFORMANT_CHECK:
+            batch_judgment = batch_judgment.model_copy(
+                update={
+                    "verdicts": [
+                        v.model_copy(update={"reasoning": _drop_false_hearsay(v.reasoning)})
+                        for v in batch_judgment.verdicts
+                    ]
+                }
+            )
         batch_judgment = self._hold_batch_inherited_conflicts(
+            batch_judgment,
+            scope=scope,
+            current_summary=current_summary,
+            contributions=contributions,
+            mode=mode,
+            ancestor_directives=ancestor_directives,
+            operator_memory=operator_memory,
+        )
+        batch_judgment = self._classify_batch_inherited_directive(
+            batch_judgment,
+            scope=scope,
+            current_summary=current_summary,
+            contributions=contributions,
+            mode=mode,
+            ancestor_directives=ancestor_directives,
+            operator_memory=operator_memory,
+        )
+        batch_judgment = self._classify_batch_inherited_context(
             batch_judgment,
             scope=scope,
             current_summary=current_summary,
@@ -8617,6 +11501,7 @@ class ScopeManager:
         contributions: Mapping[str, Contribution],
         mode: JudgeMode = "ordinary",
         context_locked: bool = False,
+        structure: tuple[str, str] | None = None,
         change_ids: Sequence[str] = (),
         hop: int = 0,
         rendered_item_ids: Sequence[str] = (),
@@ -8712,6 +11597,10 @@ class ScopeManager:
                     f"contribution {op.contribution_id}, which this batch declined. A "
                     "declined contribution amends nothing, so no op belongs to it."
                 )
+
+        # ADR 0014 D8, exactly as on the single path.
+        ops, structure_notes = _drop_structure_ops(ops, structure)
+        protocol_notes = [*protocol_notes, *structure_notes]
 
         # ADR 0014 D2 (amended 2026-09-08, #198 third form), exactly as on the
         # single path: a refresh on additions alone has nothing of this
@@ -8951,6 +11840,7 @@ class ScopeManager:
         new_contribution: Contribution,
         mode: JudgeMode = "ordinary",
         context_locked: bool = False,
+        structure: tuple[str, str] | None = None,
         change_id: str | None = None,
         hop: int = 0,
         rendered_item_ids: Sequence[str] = (),
@@ -9071,6 +11961,11 @@ class ScopeManager:
             if admitting:
                 ops = [op for op in ops if op.op not in to_drop]
                 dropped = [op.describe() for op in admitting]
+
+        # ADR 0014 D8: a structure change never retires or supersedes the
+        # scope's own directives; mechanical, and named in the record.
+        ops, structure_notes = _drop_structure_ops(ops, structure)
+        protocol_notes = [*protocol_notes, *structure_notes]
 
         # ADR 0014 D2 (amended 2026-09-08, #198 third form): on a refresh whose
         # events are all additions the context is locked. A prompt obligation
@@ -9307,10 +12202,7 @@ class ScopeManager:
             f"{operator_block}"
             f"{publication_block}"
             f"{relay_block}"
-            "CURRENT SUMMARY\n"
-            "---\n"
-            f"{summary_block}\n"
-            "---\n\n"
+            f"{_summary_markers(summary_block)}\n"
             f"{proposal_block}\n"
             "Judge it. Call `submit_publication_judgment` exactly once."
         )
@@ -9419,10 +12311,7 @@ class ScopeManager:
         user_message = (
             f"SCOPE: {scope.name} (id={scope.id})\n\n"
             f"{budget_block}"
-            "CURRENT SUMMARY\n"
-            "---\n"
-            f"{summary_block}\n"
-            "---\n\n"
+            f"{_summary_markers(summary_block)}\n"
             "Propose this scope's initial publication (or decline). Call "
             "`submit_bootstrap_publication` exactly once."
         )

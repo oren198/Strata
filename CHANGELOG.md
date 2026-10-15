@@ -5,7 +5,275 @@ the release PR (`dev` → `main`) and the GitHub Release body are built from
 (`docs/releasing.md`, step 3) — write entries here as work lands, and the
 "Unreleased" section is cleared once a release ships.
 
-## Unreleased (v1.17.2)
+## 1.18.0 (2026-10-15)
+
+### Behaviour change
+
+- **A child's own context can no longer undercut an inherited directive.** Until
+  now a context note such as "for hotfix builds we don't need the whole test
+  suite" rested on the judge alone, and the inherited rule and the contrary note
+  then sat side by side in the perspective. After judgment, when a session bound
+  to a scope has its context admitted and the scope inherits a directive (from an
+  ancestor or the operator), the engine makes one compact extra call that asks how
+  the note relates to the rule, then verifies the answer itself. A note that states
+  what may or does happen instead of the rule (permitted, or a standing practice) is
+  declined, with a reason naming the two legitimate routes: report a specific
+  occurrence of following the rule (admitted, raised to the issuer with `acted_on`),
+  or propose the exception to the scope that issued the rule. A report of one
+  past act of following the rule, or of departing from it, stays admitted, dated
+  or not ("I paged the sev-1 through the primary rotation and it went wrong"); the
+  record names a departure as a departure from the directive, never as
+  permission, and suggests `acted_on`. A report becomes general, and is declined,
+  when its act or condition carries a habitual marker ("every time", "whenever",
+  "we would", "we skip", "these days") or a generic class ("on hotfixes", "for
+  repeat jobs"), or when it adds a generalising clause ("... so we don't need
+  it"); `acted_on` never waives that check. A permission widened to "any" or
+  "anyone" ("any engineer can approve migrations") is an exception marker. When
+  the answer says unrelated, the note is declined only if it also touches an
+  inherited directive's subject and carries an exception marker; when the answer
+  is unreadable, any exception marker declines. Otherwise the note is admitted,
+  and each such fallback is counted in the judgment's `inherited_relation` trace.
+  Measured without a key: the three-level drift set 48 of 48, a new held-out set
+  of 36 context items 36 of 36, J1 and J4 unchanged or better, and 228 of 228
+  forged report answers on exceptions declined
+  ([evidence](docs/evidence/v1.18-242-context-exception-2026-10-10.md)).
+  Stated limits:
+  - An exception phrased with no exception marker is admitted when the extra
+    call's answer is unreadable or says unrelated: 6 of the 38 exceptions in the
+    held-out measurement. In the live runs no fallback hid an exception (9 of 9
+    were plain facts or operator echoes). Better subject matching (#244) is
+    expected to shrink this.
+  - A batch that declines a member replaces the judge's single context rewrite
+    with the previous context plus each remaining member's own text.
+  - A report reaches the issuer only if the contributor follows the `acted_on`
+    suggestion.
+- **A decline says which claim it is about, and a reason can't describe content that
+  isn't there.** When the telling-event check refuses an informant claim, the reason now
+  quotes the informant and the span it judged ("the claim attributed to 'the architect' has
+  no telling event ..."), so a reader can tell which claim failed. After any judgment, a
+  party the judge's reasoning names as an informant must occur in the contribution's own
+  text. The engine matches the reasoning against the parties it knows (every fleet scope by
+  id, name or role word, and the operator), counting a party only in a sentence that says
+  someone told, relayed or reported something and does not cite it as the owner of a rule
+  or publication; the contributor's own scope and skill never count. Phrasings such as
+  "Hearsay: ... told by X" and "informant X" are caught for parties outside the fleet too.
+  If such a party is missing from the text, the judge gets one corrective re-ask on the
+  same tool, and if the reasoning still names it the engine replaces it with "Reason
+  withdrawn: the judge described content that is not in this contribution (X). Verdict:
+  <decision>." and notes the mismatch in the record. The verdict itself is never changed
+  by this, and only the reasoning is taken from the re-ask. A "Hearsay:" label on a
+  reasoning that itself says first-hand is dropped (not when it says "not first-hand").
+  Reading an artifact first-hand is now a telling event: "I read / opened / reviewed /
+  drafted ... from" plus the artifact attributed to its source ("<source>'s file", "<file>
+  by <source>") plus its path, URL or id right after it. It is admitted as context only,
+  recorded as the author's word as of the reading, never as the author's decision.
+  Why this matters: on the default judge, a reason can carry a neighbouring
+  contribution's informant into a record that never mentions it, across sessions as well
+  as within one. In the release replay of such a case, the first answer named an absent
+  party in 3 of 4 runs, and the one re-ask corrected it every time.
+
+
+- **A child directive that changes an inherited one is now declined, not held.**
+  Since 1.17.1 a directive from a session bound to a scope that loosened,
+  exempted or outdated an inherited directive was admitted as context under a
+  "Held" line. It is now declined, with no context line written, and the reason
+  names where the change belongs: "Contradicts inherited <id> (<scope>). An
+  exception to it is <scope>'s to make; propose it there." The declined
+  proposal stays in the record. A directive that only tightens the inherited
+  rule, or touches a subject the rule does not cover, is admitted as before. In
+  a batch, the judge's single context rewrite is replaced by the previous context
+  plus each remaining context member's own text.
+- **A bare value inside an inherited bound is a tightening.** "Tokens expire
+  after 10 minutes" under "at most 15 minutes", or a clock time earlier than an
+  "at or before" bound, no longer reads as the parent's value not kept; the
+  comparator reads the one value of the parent's unit that no comparator governs.
+  The engine also finds the kept value in the contribution itself when the
+  judge's quoted span is the parent's words or a paraphrase, and a decline that
+  names an ancestor scope (rather than a directive id) now triggers the same
+  extra check when the contribution shares a subject word with that scope's
+  directives.
+- **A directive the judge only CLAIMS is an exception is held as context, not declined.**
+  When the extra check on an admitted directive rests on the judge's own reading ("this
+  exempts a case") and the engine finds no conflict of its own (no relaxation marker on an
+  inherited subject, no reversed state or out-of-bound value), the text is kept as context
+  with the note "Held as context: the judge reads this as an exception to <id> (<scope>);
+  the engine could not confirm a conflict. Context never binds." and no directive is
+  written. A directive that carries a marker or a conflict the engine can see is still
+  declined. A directive admitted by the #237 rescue goes through the same engine checks
+  before it counts. "may not", "may only" and "may never" are restrictions, not the
+  permissive "may".
+- **A scope can't publish an exception to a rule it inherits.** After the publication
+  judge accepts a publish or restore by a scope that inherits a directive (from an
+  ancestor or the operator), the engine checks the item. A directive item that changes,
+  loosens or exempts from an inherited directive is refused with no extra call. A context
+  item goes through the same check as #242's context note: an exception is refused; a
+  report of one specific past act of following the rule is published; a report of one
+  specific act of departing from it is published only with the engine's label, prefixed to
+  the text, "Departure from <directive id> (<issuing scope>): ", which the publisher can't
+  drop, and which a restore puts back. A general or habitual clause is an exception and is
+  refused whole. A refusal is recorded beside the judge's own verdict and leaves the
+  published face untouched; the note names the two routes ("publish a specific report
+  instead, or propose the exception to <scope>"). A relayed item keeps its origin's label
+  verbatim and is never re-labelled as a departure from the relayer's own directive; the
+  relayer's directives get the exception test only, and a separate note says when the
+  reported act conflicts with one of them. A relay goes when its origin is withdrawn. The
+  one-shot initial publication runs the check per proposed item and drops refused ones.
+  No new judge tool; a published context item costs one extra call in a scope that
+  inherits directives. Stated limit: an exception already on a scope's face is not
+  withdrawn by this. Also fixed on the same path: the publication and bootstrap judges saw
+  the scope's summary as an empty block (its frontmatter "---" ran into the "---" fence),
+  and refused legitimate publications as not in the summary; the block now has explicit
+  markers.
+
+
+### Measured, and stated limits
+
+- **The v1.18.0 judge baseline** (`qwen/qwen3-235b-a22b-2507` pinned to Nebius; a new
+  baseline, not comparable with the v1.17 Alibaba numbers) is in
+  `docs/evidence/v1.18-judge-baseline.md`. A held-out drift set labelled blind: 48 of 48
+  in each of 3 reps, with no legitimate rule declined. The original drift set: 46, 46 and
+  47 of 48. Publication exceptions: 0 of 10 published. Legitimate tightenings: 32 of 32
+  kept as directives.
+- **Stated limit:** a reworded exception that shares no words with the inherited rule can
+  be admitted when the judge calls it a refinement (seen in 2 of 3 runs on one test item).
+- **Stated limit, the size of the judge-dependence:** fed deliberately wrong re-ask
+  answers, the engine still admits 8 of 30 drift exceptions and 15 of 30 held-out ones as
+  directives ("unrelated" or unreadable), and 3 of 30 and 11 of 30 ("tightens" or
+  "refines"). Those exceptions carry no relaxation word and no value the engine can
+  compare, so only the judge can stop them.
+- **Stated limit:** the ordinary judge's input wraps the scope summary in an ambiguous
+  fence; on qwen this can make it misread the summary.
+  The publication and bootstrap judges use unambiguous markers.
+- **Unchanged limits, new numbers:** another scope's rule named only by an alias is
+  admitted (11 of 12 attempts). A restricting directive held in the scope's own summary
+  is not weighed (2 items, every rep).
+
+### Added
+
+- **Windows CI runs the MCP round trip** (#232).
+  `scripts/ci_mcp_roundtrip.py` registers a temp project, then over stdio
+  calls `strata_read_perspective`, one `strata_contribute` with no judge key
+  (the contribution stays unjudged), and `strata_read_scope_record`. Where
+  `fcntl` is missing, a fleet structure change is refused before any write
+  and `export-fleet` onto an existing file is refused with no traceback; on
+  POSIX the fleet change is applied. The script runs on the existing
+  `windows-launch` job and on the Linux wheel-smoke leg. No judge key is
+  placed in CI.
+
+- **A re-parent records the chain and the subtree the emission will need**
+  (ADR 0014 D8). The act's before and after topology for a `reparent` also
+  carry `chain` (the moved scope's ancestors, root-first) and `descendants`
+  (its chain subtree ids at apply time). Other change types are unchanged.
+  Apply calls `emit_structure_change` once after the act row is committed,
+  under the same fleet lock. If that call raises `StructureEmissionError`,
+  the apply stands and the notice is "Structure emission failed
+  for <act_id>; run `strata fleet reemit <act_id>`." `strata doctor` lists
+  every `remove_edge` or `reparent` act for which `unemitted_receivers` is
+  not `[]`. `strata fleet reemit <act_id>` emits for the receivers still
+  owed, prints what was emitted, and prints `already emitted` only when
+  `unemitted_receivers` returns `[]`. The Console act list shows the rows
+  `events_for_act` returns and the lines `structure_conflict_lines` returns.
+  The perspective shows the `annotation` the engine put on a self-layer
+  directive. Neither surface reads event or contribution text.
+
+- **A fleet structure change now tells the scopes it affects** (ADR 0014 D8, core).
+  Two new change-event kinds, `channel_removed` (a reference edge a scope read
+  through was removed) and `chain_changed` (the chain above a scope moved), come
+  with migration 0025. `emit_structure_change(act_id)` reads the act's recorded
+  topology, never today's fleet: a removed edge tells the reader, with the
+  source's publication item ids and a notice for each own directive that cites
+  one of those items by id; a re-parent tells the moved scope and every scope in
+  its recorded subtree, with the directives gained and lost and, for each own
+  directive that conflicts with a newly inherited one under the 1.17 check, a
+  conflict line ("... Where they conflict, the inherited directive governs. ...").
+  It runs once per receiver (a call after a partial failure tells only the
+  receivers still owed), goes through the ordinary notice machinery, and on
+  failure records it and raises `StructureEmissionError`, which the apply turns
+  into the "run `strata fleet reemit`" notice without rolling anything back. A refresh that carries either kind drops any `retire` or
+  `supersede` the judge returns on the scope's own directives, and notes the drop:
+  a structure change is not the scope's own decision. The perspective's self layer
+  shows the conflict line as `annotation` on the own directive while both
+  directives stand. Stated limits: a conflict phrased with no value, polarity or
+  marker is not found; a directive that rests on the removed source only through
+  the judge's declared `context_sources` is not named in the notice, since that
+  declaration is not stored on the directive's record.
+
+- **`strata register` seeds Claude Code deny rules for the resolved store**
+  (#173, ADR 0013 D6). `permissions.deny` in `.claude/settings.json` gains
+  `Read` and `Edit` rules for the store `.strata/config.toml` resolves.
+  The seeded layout is `Read(/.strata/**)` and `Edit(/.strata/**)`. A
+  database elsewhere is named per file (`<db>*`, which also covers the
+  `-wal` and `-shm` files), not by denying the directory that holds it.
+  Summaries, the sessions directory beside them, and `.locks` are denied
+  as directories only when that directory is Strata's own. `fleet.yaml`
+  is denied as that file (`Read` and `Edit`, no wildcard) when a denied
+  directory does not already cover it. The backups beside that file are
+  denied as `Read(<file>.bak*)` and `Edit(<file>.bak*)`, which covers
+  `fleet.yaml.bak` and the timestamped `fleet.yaml.bak.<utc>` copies. The
+  directory holding the file is not denied. A generic `summaries` or `sessions` directory directly
+  under the home directory or an ancestor of the project is denied only
+  when Strata created it; otherwise `strata doctor` says it was left open.
+  A directory that resolves above the home directory is left open. Rules
+  are appended beside any the user already has and left unchanged on a
+  second register. `strata doctor` checks the resolved rules. A
+  `Write(path)` rule is not seeded: Claude Code accepts it and never
+  consults it. The rules block Claude Code's file tools, the shell file
+  commands it recognizes (`cat`, `head`, `tail`, `sed`, `tee`), and Bash
+  redirections onto those paths. They do not block a Python or Node
+  process, or the `sqlite3` shell, that opens the files itself. Codex's
+  sandbox config cannot deny a path inside a writable workspace, and its
+  permission profiles do not apply while `sandbox_mode` is set, so
+  register does not write a Codex deny. The Strata server still reads the
+  store — it is a process, not a harness tool.
+- **Fleet structure changes go through Strata** (#247). A scope proposes
+  with `strata_fleet_propose`; the change applies immediately when that
+  scope owns it or sits above the owner, and otherwise waits for
+  `strata_fleet_approve`, `strata fleet apply`, or the Console's Fleet
+  changes tab. The acting scope is the MCP session's binding. Over HTTP
+  the operator is the only actor: any local process that can reach the
+  Console port acts as the operator. Each applied change is recorded and
+  not judged. Removing a reference edge, removing a scope, or
+  re-parenting says what is not re-checked automatically yet.
+
+- **Every judge call records its token usage** (#246). One row per call,
+  at the single choke point, with tokens taken from the response. `strata
+  stats judge` groups them by scope, call kind, and day (`--since`,
+  `--scope`). `STRATA_JUDGE_PRICE_TABLE` is a JSON file of per-model
+  prices per million tokens; with no price for a call the report stays
+  tokens-only. `STRATA_JUDGE_DAILY_TOKEN_CAP`, when set, is checked
+  before a judgment's first call and before a standalone call. A
+  judgment that has started always finishes. Over the cap, the
+  contribution takes the existing judge-unavailable path (503, the
+  attempt recorded, re-judge later). `strata doctor` shows the cap and
+  today's usage. The Console's Judge usage tab shows the same numbers
+  and does not write.
+
+### Fixed
+
+- **The Console's raw fleet save takes the same lock as a fleet change**
+  (#247). `PUT /fleet` and every other write of `fleet.yaml` go through one
+  helper: an exclusive `fcntl.flock` on `fleet.yaml.lock` beside the file,
+  then a unique temporary file and `os.replace`. The save re-checks the
+  caller's etag while that lock is held, so a fleet change that landed
+  first is left in place (409). Where `fcntl` is unavailable (Windows), the
+  write is refused with "Refusing to write fleet.yaml: fcntl.flock is not
+  available on this platform, and Strata will not update the file without
+  that lock." The file is left unchanged. The replace keeps the mode
+  `fleet.yaml` already had: the temporary file is created `0o600`, then
+  given that mode before it is renamed into place. The caller's etag is
+  compared, inside the lock, with the bytes just re-read; a tag fetched
+  before a fleet change is `409 fleet_changed` and the file stays as the
+  change wrote it. Seeding a `fleet.yaml` that does not exist yet (`strata
+  register`, and the env-driven `strata start` seed) is an exclusive create
+  (`O_CREAT|O_EXCL`) and does not take the lock, so a fresh register where
+  `fcntl` is missing no longer stops after writing `config.toml`. An
+  existing file is left alone. `strata export-fleet` onto an existing file
+  still refuses, printing that message and exiting 1. If seeding itself
+  refuses, `strata register` says so before it writes `.strata/config.toml`
+  and removes a `.strata/` directory that this run created, so a re-run
+  finishes instead of leaving a half-registered project.
+
+## 1.17.2 (2026-10-06)
 
 ### Fixed
 
@@ -118,7 +386,7 @@ the release PR (`dev` → `main`) and the GitHub Release body are built from
   is listed in the Console's Correction withdrawals view and can be
   restored there by the operator. The owner's own judged restore recovered
   5 of 12 such items in our measurement; the operator path is the reliable
-  remedy ([evidence](docs/evidence/v1.17-219c-restore-2026-10-03.md)).
+  remedy ([evidence](docs/evidence/v1.17.219c-restore-2026-10-03.md)).
 
 - **A judge failure on `/contribute` now returns HTTP 503, not 500 (#235,
   #236).** A second protocol slip surviving the corrective re-ask — a
@@ -202,7 +470,7 @@ the release PR (`dev` → `main`) and the GitHub Release body are built from
   rule is outdated keeps the decline. Stated limits: a refinement whose subject
   shares a word with the inherited rule's subject is held to the tightening
   test, and the batch path is not covered
-  ([evidence](docs/evidence/v1.17-237-relation-recheck-2026-10-04.md)).
+  ([evidence](docs/evidence/v1.17.237-relation-recheck-2026-10-04.md)).
 
 - **Optional provider pinning for an OpenRouter judge, `JUDGE_PROVIDER` /
   `STRATA_JUDGE_PROVIDER` (#224).** OpenRouter routes the default judge

@@ -5,8 +5,10 @@ ADR 0002. It loads, validates, and mutates fleet configuration, ensuring
 ``fleet.yaml`` is always the source of truth.
 
 - :class:`FleetConfig` is the top-level model and public API.
-- All mutations acquire an in-process lock, write atomically, and refresh
-  in-memory state from the rendered output.
+- Replacing an existing fleet file takes the cross-process fleet file lock,
+  then an in-process lock, and publishes through :func:`replace_fleet_bytes`.
+- Seeding a fleet file that does not exist yet is :func:`create_fleet_file`:
+  an exclusive create, no lock. That is the only exception.
 - Validation raises :class:`FleetConfigError` on the first failure; the
   ``kind`` attribute identifies which invariant was violated.
 
@@ -26,10 +28,20 @@ reference edge, peer reference, fleet.
 from __future__ import annotations
 
 import os
+import stat
+import tempfile
 import threading
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Literal
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover — Windows has no fcntl
+    fcntl = None  # type: ignore[assignment]
 
 import yaml
 from pydantic import BaseModel, Field, ValidationError, field_validator
@@ -50,6 +62,20 @@ class FleetConfigError(Exception):
         super().__init__(message)
         self.kind = kind
         self.message = message
+
+
+# Quoted by the README and the Console's 503 body. Changing it changes both.
+FLEET_FILE_LOCK_UNAVAILABLE = (
+    "Refusing to write fleet.yaml: fcntl.flock is not available on this "
+    "platform, and Strata will not update the file without that lock."
+)
+
+
+class FleetFileLockUnavailable(FleetConfigError):
+    """``fcntl.flock`` is missing, so the fleet file must not be written."""
+
+    def __init__(self) -> None:
+        super().__init__(kind="fleet_lock_unavailable", message=FLEET_FILE_LOCK_UNAVAILABLE)
 
 
 # ---------------------------------------------------------------------------
@@ -829,28 +855,48 @@ class FleetConfig(BaseModel):
     # Mutation API
     # ------------------------------------------------------------------
 
-    def _commit(self, raw: dict) -> None:
+    def _commit(self, raw: dict, *, backup: bool = False) -> Path | None:
         """Validate *raw*, canonicalize its edges, write it, and refresh in-memory state.
 
         The shared tail of every mutation: nothing touches disk until the
         candidate validates, the edges written out are canonical (ADR 0010 D3
         — chain edges oriented child→parent), and the in-memory mirror is
         rebuilt from what was actually written rather than from the candidate.
-        Callers hold ``self._lock``.
+        Callers hold the fleet file lock and ``self._lock``, in that order.
+        *backup* copies the current file to a timestamped sibling before the
+        replace — fleet structure changes use it; ordinary mutations keep the
+        previous single-write behavior.
         """
         assert self._path is not None
+        path = self._path
+        lock = self._lock
         try:
             candidate = FleetConfig.model_validate(raw)
         except ValidationError as exc:
             raise _schema_error_to_fleet_config_error(exc, raw) from exc
         _validate(candidate)
         _canonicalize_raw_edges(candidate, raw["edges"])
-        _atomic_write(self._path, raw)
-        refreshed = FleetConfig.model_validate(
-            yaml.safe_load(self._path.read_text(encoding="utf-8"))
-        )
+        backup_path = _write_timestamped_backup(path) if backup else None
+        _atomic_write(path, raw)
+        refreshed = FleetConfig.model_validate(yaml.safe_load(path.read_text(encoding="utf-8")))
         _canonicalize(refreshed)
         self.__dict__.update(refreshed.__dict__)
+        object.__setattr__(self, "_path", path)
+        object.__setattr__(self, "_lock", lock)
+        return backup_path
+
+    @contextmanager
+    def _exclusive_update(self) -> Iterator[None]:
+        """Hold the fleet file lock, then this object's in-process lock.
+
+        The file lock is first. :func:`replace_fleet_bytes` takes it again on
+        this same thread, and an apply that already holds it re-enters.
+        Taking ``self._lock`` first would deadlock against the thread that
+        holds the file lock and is waiting for ``self._lock``.
+        """
+        assert self._path is not None and self._lock is not None
+        with fleet_file_lock(self._path), self._lock:
+            yield
 
     def add_stratum(self, *, id: str, name: str, ordinal: int) -> None:
         """Add a new stratum to the fleet config and persist to disk.
@@ -860,7 +906,7 @@ class FleetConfig(BaseModel):
                 stratum (invariants 1 and 3).
         """
         assert self._path is not None and self._lock is not None
-        with self._lock:
+        with self._exclusive_update():
             raw = yaml.safe_load(self._path.read_text(encoding="utf-8"))
             raw.setdefault("strata", [])
             raw.setdefault("scopes", [])
@@ -886,7 +932,7 @@ class FleetConfig(BaseModel):
                 stratum (invariant 4) or skill drift (invariant 8).
         """
         assert self._path is not None and self._lock is not None
-        with self._lock:
+        with self._exclusive_update():
             raw = yaml.safe_load(self._path.read_text(encoding="utf-8"))
             raw.setdefault("strata", [])
             raw.setdefault("scopes", [])
@@ -902,6 +948,47 @@ class FleetConfig(BaseModel):
                 entry["description"] = description.strip()
             raw["scopes"].append(entry)
             self._commit(raw)
+
+    def mutate(self, mutator: Callable[[dict], dict]) -> Path:
+        """Apply *mutator* to the on-disk document, then validate and replace it.
+
+        *mutator* receives the parsed YAML mapping and returns the mapping to
+        write. Nothing is written until that mapping passes the same checks
+        :meth:`load` runs. The previous file is copied to
+        ``fleet.yaml.bak.<timestamp>`` first, then replaced via a temp file
+        and ``os.replace``. Returns the backup path.
+        """
+        assert self._path is not None and self._lock is not None
+        with self._exclusive_update():
+            raw = yaml.safe_load(self._path.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict):
+                raise FleetConfigError(
+                    kind="invalid_schema",
+                    message="fleet.yaml must be a mapping.",
+                )
+            updated = mutator(raw)
+            if not isinstance(updated, dict):
+                raise FleetConfigError(
+                    kind="invalid_schema",
+                    message="fleet.yaml must be a mapping.",
+                )
+            backup = self._commit(updated, backup=True)
+            assert backup is not None
+            return backup
+
+    def reload_from_disk(self) -> None:
+        """Replace this object's fields from the file, keeping its path and lock.
+
+        Used when a structure change is rolled back after the file was already
+        replaced: the bytes are restored by the caller, then this re-reads them.
+        """
+        assert self._path is not None
+        path = self._path
+        lock = self._lock
+        refreshed = FleetConfig.load(path)
+        self.__dict__.update(refreshed.__dict__)
+        object.__setattr__(self, "_path", path)
+        object.__setattr__(self, "_lock", lock)
 
     def add_edge(
         self,
@@ -925,7 +1012,7 @@ class FleetConfig(BaseModel):
                 (invariant 5).
         """
         assert self._path is not None and self._lock is not None
-        with self._lock:
+        with self._exclusive_update():
             raw = yaml.safe_load(self._path.read_text(encoding="utf-8"))
             raw.setdefault("strata", [])
             raw.setdefault("scopes", [])
@@ -943,7 +1030,7 @@ class FleetConfig(BaseModel):
             FleetConfigError: If *scope_id* does not exist.
         """
         assert self._path is not None and self._lock is not None
-        with self._lock:
+        with self._exclusive_update():
             raw = yaml.safe_load(self._path.read_text(encoding="utf-8"))
             matched = False
             for entry in raw.get("scopes", []):
@@ -1152,12 +1239,161 @@ def _validate(config: FleetConfig) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Atomic write helper
+# The one fleet.yaml publisher
 # ---------------------------------------------------------------------------
 
 
+class _FleetYamlLock:
+    """A threading lock plus a cross-process flock on ``<fleet>.lock``.
+
+    The threading lock is outermost, then ``fcntl.flock``. The same thread
+    may enter again; only the outermost entry takes the flock, so a publish
+    inside an apply does not deadlock on the lock the apply already holds.
+    Where ``fcntl`` is missing, entering raises :class:`FleetFileLockUnavailable`
+    and nothing is written.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self._path = path
+        self._thread = threading.RLock()
+        self._fh: object | None = None
+        self._depth = 0
+
+    def __enter__(self) -> _FleetYamlLock:
+        self._thread.acquire()
+        try:
+            if self._depth == 0:
+                if fcntl is None:
+                    raise FleetFileLockUnavailable()
+                handle = None
+                try:
+                    lock_path = self._path.with_name(self._path.name + ".lock")
+                    handle = lock_path.open("a", encoding="utf-8")
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                except BaseException:
+                    if handle is not None:
+                        handle.close()
+                    raise
+                self._fh = handle
+            self._depth += 1
+        except BaseException:
+            self._thread.release()
+            raise
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        try:
+            self._depth -= 1
+            if self._depth == 0 and self._fh is not None:
+                try:
+                    fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)  # type: ignore[attr-defined]
+                finally:
+                    self._fh.close()  # type: ignore[attr-defined]
+                    self._fh = None
+        finally:
+            self._thread.release()
+
+
+_fleet_yaml_locks: dict[str, _FleetYamlLock] = {}
+_fleet_yaml_locks_guard = threading.Lock()
+
+
+def _fleet_yaml_lock(path: Path) -> _FleetYamlLock:
+    key = str(Path(path).resolve())
+    with _fleet_yaml_locks_guard:
+        lock = _fleet_yaml_locks.get(key)
+        if lock is None:
+            lock = _FleetYamlLock(Path(key))
+            _fleet_yaml_locks[key] = lock
+        return lock
+
+
+def fleet_file_lock(path: Path) -> _FleetYamlLock:
+    """Exclusive lock for the fleet file at *path*.
+
+    Raises :class:`FleetFileLockUnavailable` when ``fcntl.flock`` does not
+    exist. The same thread may enter again without taking a second flock.
+    """
+    return _fleet_yaml_lock(path)
+
+
+def create_fleet_file(path: Path, data: bytes) -> bool:
+    """Create *path* only when it does not exist. No fleet lock.
+
+    This is the only fleet-file write that does not go through
+    :func:`replace_fleet_bytes`. It seeds a missing ``fleet.yaml`` (``strata
+    register``, and the env-driven ``strata start`` seed). The create is
+    exclusive (``O_CREAT|O_EXCL``): a file that already exists is left
+    untouched and this returns ``False``. Replacing an existing file still
+    takes :func:`fleet_file_lock` and still refuses where ``fcntl.flock`` is
+    unavailable.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+    except FileExistsError:
+        return False
+    try:
+        remaining = memoryview(data)
+        while remaining:
+            written = os.write(fd, remaining)
+            remaining = remaining[written:]
+        os.close(fd)
+    except BaseException:
+        with suppress(OSError):
+            os.close(fd)
+        with suppress(OSError):
+            os.unlink(path)
+        raise
+    return True
+
+
+def replace_fleet_bytes(path: Path, data: bytes) -> None:
+    """Publish *data* as *path*. The only function that replaces a fleet file.
+
+    Takes :func:`fleet_file_lock` (reentrant for a caller that already holds
+    it) and writes a uniquely named temp file in *path*'s directory, then
+    ``os.replace``. A missing ``fcntl`` raises :class:`FleetFileLockUnavailable`
+    before any byte of *path* changes. Creating a file that does not exist yet
+    is :func:`create_fleet_file`, not this function.
+    """
+    with fleet_file_lock(path):
+        # The temp file is created mode 0o600. Copy the live file's mode onto
+        # it before the rename, or the replace would drop a 0o644 fleet.yaml
+        # down to the temp file's mode.
+        kept_mode = stat.S_IMODE(path.stat().st_mode) if path.exists() else None
+        tmp_name: str | None = None
+        try:
+            with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as handle:
+                tmp_name = handle.name
+                handle.write(data)
+                handle.flush()
+                if kept_mode is not None:
+                    os.chmod(handle.fileno(), kept_mode)
+        except BaseException:
+            if tmp_name is not None:
+                os.unlink(tmp_name)
+            raise
+        try:
+            os.replace(tmp_name, path)
+        except BaseException:
+            os.unlink(tmp_name)
+            raise
+
+
 def _atomic_write(path: Path, data: object) -> None:
-    """Render *data* as YAML and write atomically to *path*."""
-    tmp = Path(str(path) + ".tmp")
-    tmp.write_text(yaml.dump(data, default_flow_style=False, allow_unicode=True), encoding="utf-8")
-    os.replace(tmp, path)
+    """Render *data* as YAML and publish it with :func:`replace_fleet_bytes`."""
+    text = yaml.dump(data, default_flow_style=False, allow_unicode=True)
+    replace_fleet_bytes(path, text.encode("utf-8"))
+
+
+def _write_timestamped_backup(path: Path) -> Path:
+    """Copy *path* to ``<name>.bak.<utc timestamp>`` beside it and return that path."""
+    stamp = datetime.now(tz=UTC).strftime("%Y%m%dT%H%M%S%fZ")
+    backup = path.with_name(f"{path.name}.bak.{stamp}")
+    n = 0
+    while backup.exists():
+        n += 1
+        backup = path.with_name(f"{path.name}.bak.{stamp}.{n}")
+    backup.write_bytes(path.read_bytes())
+    return backup

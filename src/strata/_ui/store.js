@@ -253,6 +253,42 @@
     );
   }
 
+  // Judge usage (#246). Read-only; the same numbers as `strata stats judge`.
+  async function fetchJudgeUsage() {
+    const base = getApiBase();
+    const resp = await fetch(`${base}/judge-usage`);
+    if (!resp.ok) throw new Error(`GET /judge-usage returned ${resp.status}`);
+    return resp.json();
+  }
+
+  // Pending fleet structure changes. Apply and reject are operator-only;
+  // the request body does not name a scope.
+
+  async function fetchFleetChanges() {
+    const base = getApiBase();
+    const resp = await fetch(`${base}/fleet/changes`);
+    if (!resp.ok) throw new Error(`GET /fleet/changes returned ${resp.status}`);
+    return resp.json();
+  }
+
+  // Applied structure acts. Read-only: events and conflict lines already recorded.
+  async function fetchFleetActs() {
+    const base = getApiBase();
+    const resp = await fetch(`${base}/fleet/acts`);
+    if (!resp.ok) throw new Error(`GET /fleet/acts returned ${resp.status}`);
+    return resp.json();
+  }
+
+  async function applyFleetChange(change_id) {
+    const base = getApiBase();
+    return _post(`${base}/fleet/changes/${encodeURIComponent(change_id)}/apply`, {});
+  }
+
+  async function rejectFleetChange(change_id) {
+    const base = getApiBase();
+    return _post(`${base}/fleet/changes/${encodeURIComponent(change_id)}/reject`, {});
+  }
+
   // "Keep withdrawn": acknowledge the withdrawal without restoring it.
   async function acknowledgeCorrectionWithdrawal(scope_id, item_id) {
     const base = getApiBase();
@@ -295,6 +331,11 @@
     fetchCorrectionWithdrawals,
     restoreCorrectionWithdrawal,
     acknowledgeCorrectionWithdrawal,
+    fetchJudgeUsage,
+    fetchFleetChanges,
+    fetchFleetActs,
+    applyFleetChange,
+    rejectFleetChange,
     stratumIndex,
     edgeAllowed,
     loadPrefs,

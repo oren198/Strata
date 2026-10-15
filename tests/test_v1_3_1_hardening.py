@@ -24,6 +24,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from strata.app import create_app, get_scope_manager
+from strata.install import CLAUDE_STRATA_DENY_RULES
 from strata.migrator import run_migrations
 from strata.project_config import resolve_storage_paths
 from strata.record_store import ContributorRef, RecordStore
@@ -542,7 +543,10 @@ def test_register_valid_settings_json_merges_additively(tmp_path: Path) -> None:
     rc = main(["register", str(root), "--harness", "claude-code"])
     assert rc == 0
     data = json.loads((claude_dir / "settings.json").read_text(encoding="utf-8"))
-    assert data["permissions"] == {"allow": ["Bash"]}
+    # The user's allow list is preserved. Register appends the .strata/ deny
+    # rules beside it (ADR 0013 D6) and does not replace the permissions object.
+    assert data["permissions"]["allow"] == ["Bash"]
+    assert data["permissions"]["deny"] == list(CLAUDE_STRATA_DENY_RULES)
     assert "mcpServers" not in data
     mcp_data = json.loads((root / ".mcp.json").read_text(encoding="utf-8"))
     assert mcp_data["mcpServers"]["strata"]["command"] == "strata-mcp"

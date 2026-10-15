@@ -241,7 +241,12 @@ function LayerCard({ layer, total, state }) {
 
 function LayerBody({ layer }) {
   if (layer.summary) {
-    return <SummaryBody summary={layer.summary} />;
+    return (
+      <SummaryBody
+        summary={layer.summary}
+        showAnnotation={layer.relation === "self"}
+      />
+    );
   }
   if (layer.publication) {
     return <PublicationBody publication={layer.publication} />;
@@ -252,7 +257,7 @@ function LayerBody({ layer }) {
   return null;
 }
 
-function SummaryBody({ summary }) {
+function SummaryBody({ summary, showAnnotation }) {
   if (!summary.exists) {
     return <div className="at-caption" style={{ fontStyle: "italic" }}>This scope has no summary yet.</div>;
   }
@@ -266,6 +271,9 @@ function SummaryBody({ summary }) {
           {directives.map((d, i) => (
             <li key={d.id || i} className="at-body-sm">
               {d.subject ? `${d.subject}: ${d.content}` : d.content}
+              {showAnnotation && d.annotation ? (
+                <div className="at-caption" style={{ marginTop: 4 }}>{d.annotation}</div>
+              ) : null}
             </li>
           ))}
         </ul>

@@ -21,7 +21,6 @@ Vocabulary follows CONTEXT.md: stratum, scope, edge, fleet.
 
 from __future__ import annotations
 
-import os
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
@@ -98,7 +97,12 @@ def export_fleet(
         FleetConfigError:  If the exported data fails :class:`FleetConfig.load`
                            validation (surfaces load-time invariant violations).
     """
-    from strata.fleet_config import FleetConfig, _canonicalize_raw_edges, _validate
+    from strata.fleet_config import (
+        FleetConfig,
+        _canonicalize_raw_edges,
+        _validate,
+        replace_fleet_bytes,
+    )
 
     if not Path(db_path).exists():
         # sqlite3.connect would silently create an empty DB file at the typo'd
@@ -125,13 +129,10 @@ def export_fleet(
     # exported fleet composes rather than validating inertly (issue #123).
     _canonicalize_raw_edges(candidate, raw["edges"])
 
-    # Atomic write: tmp → rename.
-    tmp = Path(str(out_path) + ".tmp")
-    tmp.write_text(
-        yaml.dump(raw, default_flow_style=False, allow_unicode=True),
-        encoding="utf-8",
+    replace_fleet_bytes(
+        out_path,
+        yaml.dump(raw, default_flow_style=False, allow_unicode=True).encode("utf-8"),
     )
-    os.replace(tmp, out_path)
 
     return ExportResult(
         strata_count=len(raw["strata"]),

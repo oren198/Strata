@@ -122,6 +122,31 @@ is capped at the 50 most recent retirements for the scope — older ones stay
 in the record and are still retired, they just drop off this convenience
 list.
 
+## Fleet changes
+
+The "Fleet changes" tab lists structure changes that are waiting for the
+operator: a new scope, a re-parent, a reference edge, a removal, a
+description. Apply and Reject act as the operator. A request cannot name a
+scope to apply as. A change a scope already owned was applied when it was
+proposed and does not appear here.
+
+Below the pending list, each applied act is shown read-only. Its events
+and conflict lines are the ones `events_for_act` and
+`structure_conflict_lines` report. Nothing on this tab is judged, and
+nothing here emits a change event. The operator re-runs emission with
+`strata fleet reemit`.
+
+The perspective view ("View as") shows the `annotation` the engine put on
+an own directive in the self layer. The Console does not derive that line.
+
+## Judge usage
+
+The "Judge usage" tab shows judge calls, tokens, and cost grouped by day,
+scope, and call kind — the same numbers as `strata stats judge`. It also
+shows the daily token cap and today's usage. Cost appears only when a
+price is configured for that model. Nothing on this tab writes, and
+nothing here calls the judge.
+
 ## Editing the fleet
 
 The "Edit fleet" button in the graph tab's header opens a text editor over

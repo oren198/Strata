@@ -536,8 +536,12 @@ def cmd_start(args: argparse.Namespace) -> int:
             )
             return 1
         if _DEFAULT_TEMPLATE.exists():
-            shutil.copy(_DEFAULT_TEMPLATE, fleet_path)
-            print("seeded fleet.yaml from the default template; edit to suit")
+            from strata.fleet_config import create_fleet_file
+
+            # A file that is not there yet needs no flock. Exclusive create
+            # leaves an existing file alone if one appears first.
+            if create_fleet_file(fleet_path, _DEFAULT_TEMPLATE.read_bytes()):
+                print("seeded fleet.yaml from the default template; edit to suit")
 
     # 5. Serve.
     import uvicorn
@@ -816,6 +820,40 @@ def cmd_record(args: argparse.Namespace) -> int:
 
 
 _stats_parser: argparse.ArgumentParser | None = None
+
+
+def cmd_stats_judge(args: argparse.Namespace) -> int:
+    """``strata stats judge`` — tokens and cost per scope, call kind, and day.
+
+    Cost comes only from ``STRATA_JUDGE_PRICE_TABLE``. With no price for a
+    model, that row shows tokens and says so.
+    """
+    import json
+
+    from strata.judge_usage import (  # noqa: PLC0415
+        format_judge_usage_report,
+        judge_usage_report,
+    )
+    from strata.project_config import resolve_storage_paths  # noqa: PLC0415
+    from strata.stores import EmbeddedStoreError, open_embedded_stores  # noqa: PLC0415
+
+    since = args.since
+    if since is not None and not since.strip():
+        print("--since must be an ISO date or time.", file=sys.stderr)
+        return 1
+    try:
+        stores = open_embedded_stores()
+    except EmbeddedStoreError as exc:
+        print(exc.message, file=sys.stderr)
+        return 1
+    with stores:
+        db_path = resolve_storage_paths().db_path
+    report = judge_usage_report(db_path, since=since, scope_id=args.scope)
+    if args.json:
+        print(json.dumps(report, indent=2))
+    else:
+        print(format_judge_usage_report(report))
+    return 0
 
 
 def cmd_stats_root(args: argparse.Namespace) -> int:
@@ -1187,6 +1225,17 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         the READ-side trigger, symmetric with check 5.
     6c. ``hooks.SessionStart`` entry present in ``.claude/settings.json`` —
         symmetric with check 6.
+    6d. Claude Code ``permissions.deny`` rules for the resolved store
+        (ADR 0013 D6). The seeded layout is ``/.strata/**``. A database
+        elsewhere is a file rule; summaries, sessions, and ``.locks`` are
+        directory rules only when Strata owns that directory. ``fleet.yaml``
+        is an exact file rule when a denied directory does not already
+        cover it, plus ``<file>.bak*`` for the backups beside it; the
+        directory that holds the file stays open. Paths left
+        open (a shared parent, a generic name Strata did not create, a
+        directory above the home directory) are named in the check.
+        Codex's sandbox config cannot deny a workspace path; the check says
+        so instead of pretending a rule was seeded.
     7. Skills present in ``.claude/skills/``.
     8. Binding env vars (``STRATA_AGENT_SCOPE`` / ``_SKILL`` / ``_SESSION_ID``)
        set and valid against the fleet.
@@ -1197,6 +1246,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     10. Refresh queue depth and oldest pending event (ADR 0014 D6, pin 4) —
         soft, purely informational: an unprocessed ``change_events`` row is
         an input change awaiting its refresh, never a judge outage.
+    11. Structure emission (ADR 0014 D8) — soft. Lists every ``remove_edge``
+        or ``reparent`` act for which ``unemitted_receivers`` is not ``[]``.
     """
     from strata.bootstrap import load_fleet_config
     from strata.fleet_config import FleetConfigError
@@ -1686,6 +1737,59 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         )
 
     # -----------------------------------------------------------------------
+    # 6d. Claude Code deny rules for the resolved store (ADR 0013 D6, #173).
+    # The rules name whatever db / fleet / summaries config.toml resolves,
+    # not a hardcoded `.strata/` when the store lives elsewhere. The Strata
+    # server is a process: these rules bind the harness's tools, not the
+    # server. Codex cannot express the same deny — reported here, not seeded.
+    # -----------------------------------------------------------------------
+    store_deny = install.claude_store_deny_plan(project_root)
+    store_deny_rules = store_deny.rules
+    store_deny_text = ", ".join(store_deny_rules)
+    store_deny_skipped = (
+        " Not denied: " + "; ".join(store_deny.skipped) + "." if store_deny.skipped else ""
+    )
+    if settings_error is not None:
+        checks.append(
+            Check(
+                name="Store deny rules",
+                kind="hard",
+                passed=False,
+                message=(
+                    f".claude/settings.json is {settings_error} — fix the file, then "
+                    f"run 'strata register' to add the store deny rules ({store_deny_text}). "
+                    f"{install.CODEX_WORKSPACE_DENY_GAP}.{store_deny_skipped}"
+                ),
+            )
+        )
+    elif install.strata_deny_rules_present(settings_data, store_deny_rules):
+        checks.append(
+            Check(
+                name="Store deny rules",
+                kind="hard",
+                passed=True,
+                message=(
+                    f"present in .claude/settings.json permissions.deny ({store_deny_text}). "
+                    f"{install.CLAUDE_STRATA_DENY_COVERAGE}. "
+                    f"{install.CODEX_WORKSPACE_DENY_GAP}.{store_deny_skipped}"
+                ),
+            )
+        )
+    else:
+        checks.append(
+            Check(
+                name="Store deny rules",
+                kind="hard",
+                passed=False,
+                message=(
+                    "missing from .claude/settings.json permissions.deny — run "
+                    f"'strata register' to add {store_deny_text}. "
+                    f"{install.CODEX_WORKSPACE_DENY_GAP}.{store_deny_skipped}"
+                ),
+            )
+        )
+
+    # -----------------------------------------------------------------------
     # 7. Skills present AND matching the shipped version (drift detection,
     # same three-state semantics as the Stop-hook check above: a
     # stale-but-never-edited skill (an older shipped version) points at
@@ -1994,6 +2098,13 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         finally:
             if conn is not None:
                 conn.close()
+
+    # -----------------------------------------------------------------------
+    # 11. Structure emission (ADR 0014 D8). Soft: an act with no change
+    # events is waiting on emission, not a broken install. Read-only, like
+    # the refresh queue — doctor never writes the events it is listing.
+    # -----------------------------------------------------------------------
+    checks.append(_check_structure_emission(paths))
 
     return _run_preflight(checks)
 
@@ -2513,7 +2624,7 @@ def cmd_export_fleet(args: argparse.Namespace) -> int:
     migrations, converts to the V1.2 schema, and writes a ``fleet.yaml`` that
     round-trips through :class:`FleetConfig.load`.
     """
-    from strata.fleet_config import FleetConfigError
+    from strata.fleet_config import FleetConfigError, FleetFileLockUnavailable
     from strata.fleet_export import ExportResult, TablesAbsentError, export_fleet
 
     db_path = args.db or _db_path_default()
@@ -2538,6 +2649,11 @@ def cmd_export_fleet(args: argparse.Namespace) -> int:
             "different path with --out.",
             file=sys.stderr,
         )
+        return 1
+    except FleetFileLockUnavailable as exc:
+        # Subclass of FleetConfigError. Print the lock refusal itself, not
+        # the validation wrapper, and never a traceback.
+        print(exc.message, file=sys.stderr)
         return 1
     except FleetConfigError as exc:
         print(
@@ -3226,32 +3342,33 @@ def _probe_judge_live(resolved: object) -> str | None:
     endpoint (a router, a gateway) is guaranteed to serve; a model listing is not.
 
     Sends the SAME provider pin (#224, ``resolved.provider``) the real
-    judge calls would — via :func:`strata.settings.apply_provider_pin` —
-    so this probes the exact route a pinned run actually takes, never an
-    unpinned one a pin would never use. A ``NotFoundError`` against a
+    judge calls would — via :func:`strata.judge_usage.metered_messages_create`,
+    which applies :func:`strata.settings.apply_provider_pin` — so this
+    probes the exact route a pinned run actually takes, never an unpinned
+    one a pin would never use. A ``NotFoundError`` against a
     pinned probe is reported as the pinned provider rejecting the model,
     not a generic endpoint finding, since that is the more useful
     diagnosis once a provider is configured.
     """
     import anthropic  # noqa: PLC0415
 
-    from strata.settings import apply_provider_pin  # noqa: PLC0415
+    from strata.judge_usage import JudgeDailyCapReached, metered_messages_create  # noqa: PLC0415
 
     model = resolved.model  # type: ignore[attr-defined]
     provider = getattr(resolved, "provider", None)
     try:
         client = _build_probe_client(resolved)
-        client.messages.create(
-            **apply_provider_pin(
-                {
-                    "model": model,
-                    "max_tokens": 1,
-                    "messages": [{"role": "user", "content": "ping"}],
-                },
-                provider=provider,
-                client=client,
-            )
+        metered_messages_create(
+            client,
+            {
+                "model": model,
+                "max_tokens": 1,
+                "messages": [{"role": "user", "content": "ping"}],
+            },
+            provider=provider,
         )
+    except JudgeDailyCapReached as exc:
+        return str(exc)
     except anthropic.APIConnectionError as exc:
         return f"the endpoint is unreachable ({type(exc).__name__})"
     except anthropic.NotFoundError:
@@ -3273,11 +3390,25 @@ def _probe_judge(resolved: object) -> str | None:
 
 
 def _check_judge(project_root: Path) -> Check:
-    """Doctor's judge line: what will judge, and (with a key) whether it answers."""
+    """Doctor's judge line: what will judge, and (with a key) whether it answers.
+
+    The line also names the daily token cap and today's recorded usage (#246).
+    """
+    from strata.judge_usage import cap_status_text  # noqa: PLC0415
+    from strata.project_config import resolve_storage_paths  # noqa: PLC0415
     from strata.settings import Settings  # noqa: PLC0415
 
-    resolved = Settings(_env_file=project_root / ".env").resolved_judge
-    line = _judge_line(resolved)
+    settings = Settings(_env_file=project_root / ".env")
+    resolved = settings.resolved_judge
+    try:
+        db_path = resolve_storage_paths(settings, start=project_root).db_path
+    except Exception:  # noqa: BLE001 — the cap line must not hide the judge check
+        db_path = None
+    line = (
+        _judge_line(resolved)
+        + "\n    "
+        + cap_status_text(db_path, cap=settings.judge_daily_token_cap)
+    )
     if not resolved.api_key:
         return Check(name="Judge", kind="soft", passed=True, message=line)
     failure = _probe_judge(resolved)
@@ -3440,9 +3571,11 @@ def cmd_register(args: argparse.Namespace) -> int:
     Walks the registration steps in order:
     1. Detect project root (require a project marker).
     2. Create .strata/ directory.
-    3. Write .strata/config.toml (skip if exists).
-    4. Update .gitignore (idempotent block with # Strata marker).
-    5. Seed .strata/fleet.yaml from templates/minimal.yaml (skip if exists).
+    3. Seed fleet.yaml (skip if it exists). A refusal here is said before
+       .strata/config.toml is written, and a directory this run created is
+       removed so a re-run is not blocked.
+    4. Write .strata/config.toml (skip if exists).
+    5. Update .gitignore (idempotent block with # Strata marker).
     6. Copy strata skills to .claude/skills/ (skip each if exists).
     7. Merge strata into .mcp.json mcpServers (skip if exists; migrates a
        legacy .claude/settings.json mcpServers.strata entry if found).
@@ -3651,16 +3784,102 @@ def cmd_register(args: argparse.Namespace) -> int:
     # Step 2: Create .strata/ directory.
     # -----------------------------------------------------------------------
     strata_dir = project_root / ".strata"
-    if not strata_dir.exists():
+    strata_existed = strata_dir.exists()
+    if not strata_existed:
         if not diff_mode:
             strata_dir.mkdir(parents=True)
         _act("created", strata_dir)
 
     # -----------------------------------------------------------------------
-    # Step 3: Write .strata/config.toml.
+    # Step 3: Seed fleet.yaml before config.toml exists.
+    #
+    # config.toml is the registration marker. A refusal while seeding must
+    # be said before that file is written. If this run created .strata/ and
+    # then could not seed, remove that directory: step 1b would otherwise
+    # refuse the re-run ("no config.toml") and the project would stay stuck.
+    # A config.toml that was already there is left in place; the re-run
+    # seeds the missing fleet and finishes.
     # -----------------------------------------------------------------------
     config_toml = strata_dir / "config.toml"
     config_toml_already_registered = config_toml.exists()
+    if adopted_store is not None:
+        fleet_yaml = adopted_store.fleet_yaml
+    elif config_toml_already_registered:
+        from strata.project_config import (  # noqa: PLC0415
+            ProjectConfigError,
+            load_project_config,
+        )
+
+        try:
+            existing_project_config = load_project_config(project_root)
+        except ProjectConfigError:
+            # Malformed config.toml — not this step's problem to diagnose
+            # (doctor covers that). Fall back to the default layout so
+            # register can still finish the rest of its work.
+            existing_project_config = None
+        fleet_yaml = (
+            existing_project_config.fleet_yaml
+            if existing_project_config is not None
+            else strata_dir / "fleet.yaml"
+        )
+    else:
+        fleet_yaml = strata_dir / "fleet.yaml"
+    minimal_template = _TEMPLATES_DIR / "minimal.yaml"
+    try:
+        if fleet_yaml.exists():
+            _act("skip", fleet_yaml, skipped=True)
+        else:
+            # The first scope's description (#210): the flag, else ask when a person is
+            # there to answer. Only ever for a fleet this run seeds; never in --diff.
+            scope_description: str | None = None
+            if not diff_mode:
+                flagged = getattr(args, "description", None)
+                scope_description = (
+                    flagged.strip() or None
+                    if flagged is not None
+                    else _ask_scope_description(allowed=not getattr(args, "yes", False))
+                )
+            if not diff_mode:
+                # The configured fleet path can point anywhere (issue #184),
+                # including a directory that no longer exists — e.g. the
+                # recovery path `strata start` documents ("fleet.yaml missing
+                # ... Re-run `strata register` ... to re-seed it") must actually
+                # work even when the parent directory was removed too.
+                fleet_yaml.parent.mkdir(parents=True, exist_ok=True)
+                from strata.fleet_config import create_fleet_file
+
+                if minimal_template.exists():
+                    seeded = minimal_template.read_bytes()
+                else:
+                    # Fallback: write a minimal inline template.
+                    seeded = (
+                        b"# TODO: replace with your team's structure\n"
+                        b"strata:\n  - id: L0\n    name: root\n    ordinal: 0\n"
+                        b"scopes:\n  - id: g_root\n    name: Root\n    stratum_id: L0\n"
+                        b"edges: []\n"
+                    )
+                if scope_description:
+                    seeded = install.seed_scope_description(
+                        seeded.decode("utf-8"), scope_description
+                    ).encode("utf-8")
+                # Exclusive create, no flock. A file that landed first is left alone.
+                if create_fleet_file(fleet_yaml, seeded):
+                    _act("seeded", fleet_yaml)
+                else:
+                    _act("skip", fleet_yaml, skipped=True)
+            else:
+                _act("seeded", fleet_yaml)
+    except Exception as exc:
+        print(f"Refusing to register: {exc}", file=sys.stderr)
+        if not strata_existed and strata_dir.exists() and not config_toml.exists():
+            import shutil
+
+            shutil.rmtree(strata_dir)
+        return 1
+
+    # -----------------------------------------------------------------------
+    # Step 4: Write .strata/config.toml.
+    # -----------------------------------------------------------------------
     if config_toml_already_registered:
         _act("skip", config_toml, skipped=True)
     else:
@@ -3714,7 +3933,7 @@ def cmd_register(args: argparse.Namespace) -> int:
             _act(f"recorded the registering install ({registering[1]}) in", config_toml)
 
     # -----------------------------------------------------------------------
-    # Step 4: Update .gitignore.
+    # Step 5: Update .gitignore.
     # -----------------------------------------------------------------------
     gitignore = project_root / ".gitignore"
     existing_gitignore = gitignore.read_text(encoding="utf-8") if gitignore.exists() else ""
@@ -3728,79 +3947,6 @@ def cmd_register(args: argparse.Namespace) -> int:
                 f.write("\n")
                 f.write(_GITIGNORE_BLOCK)
         _act("appended Strata block to", gitignore)
-
-    # -----------------------------------------------------------------------
-    # Step 5: Seed .strata/fleet.yaml from templates/minimal.yaml.
-    #
-    # A project already carrying a config.toml is already registered — its
-    # config.toml is the source of truth for where the fleet lives, and may
-    # point anywhere (issue #184: seen pointing at an absolute path outside
-    # the project tree). Seeding must ask the resolver, not assume the
-    # default `.strata/fleet.yaml` layout, or it plants a second, misleading
-    # fleet file nothing reads while the project's real one goes untouched.
-    # -----------------------------------------------------------------------
-    if adopted_store is not None:
-        fleet_yaml = adopted_store.fleet_yaml
-    elif config_toml_already_registered:
-        from strata.project_config import (  # noqa: PLC0415
-            ProjectConfigError,
-            load_project_config,
-        )
-
-        try:
-            existing_project_config = load_project_config(project_root)
-        except ProjectConfigError:
-            # Malformed config.toml — not this step's problem to diagnose
-            # (doctor covers that). Fall back to the default layout so
-            # register can still finish the rest of its work.
-            existing_project_config = None
-        fleet_yaml = (
-            existing_project_config.fleet_yaml
-            if existing_project_config is not None
-            else strata_dir / "fleet.yaml"
-        )
-    else:
-        fleet_yaml = strata_dir / "fleet.yaml"
-    minimal_template = _TEMPLATES_DIR / "minimal.yaml"
-    if fleet_yaml.exists():
-        _act("skip", fleet_yaml, skipped=True)
-    else:
-        # The first scope's description (#210): the flag, else ask when a person is
-        # there to answer. Only ever for a fleet this run seeds; never in --diff.
-        scope_description: str | None = None
-        if not diff_mode:
-            flagged = getattr(args, "description", None)
-            scope_description = (
-                flagged.strip() or None
-                if flagged is not None
-                else _ask_scope_description(allowed=not getattr(args, "yes", False))
-            )
-        if not diff_mode:
-            # The configured fleet path can point anywhere (issue #184),
-            # including a directory that no longer exists — e.g. the
-            # recovery path `strata start` documents ("fleet.yaml missing
-            # ... Re-run `strata register` ... to re-seed it") must actually
-            # work even when the parent directory was removed too.
-            fleet_yaml.parent.mkdir(parents=True, exist_ok=True)
-            if minimal_template.exists():
-                shutil.copy(minimal_template, fleet_yaml)
-            else:
-                # Fallback: write a minimal inline template.
-                fleet_yaml.write_text(
-                    "# TODO: replace with your team's structure\n"
-                    "strata:\n  - id: L0\n    name: root\n    ordinal: 0\n"
-                    "scopes:\n  - id: g_root\n    name: Root\n    stratum_id: L0\n"
-                    "edges: []\n",
-                    encoding="utf-8",
-                )
-            if scope_description:
-                fleet_yaml.write_text(
-                    install.seed_scope_description(
-                        fleet_yaml.read_text(encoding="utf-8"), scope_description
-                    ),
-                    encoding="utf-8",
-                )
-        _act("seeded", fleet_yaml)
 
     def _seeded_binding_hint() -> tuple[bool, str]:
         """Return ``(single_scope, first_scope_id)`` for *fleet_yaml*.
@@ -4111,9 +4257,52 @@ def cmd_register(args: argparse.Namespace) -> int:
                 settings_changed = True
                 _act("merged SessionStart hook into", settings_json)
 
-        # One write for the settings.json changes (legacy-entry removal and/or
-        # the Stop/SessionStart hook merges) — so bootstrap-venv (step 8) reads
-        # the up-to-date file back.
+        # Step 7d: additive permissions.deny for the resolved store
+        # (ADR 0013 D6, #173). Config.toml is already written above, so the
+        # rules name the db / fleet / summaries this project actually uses.
+        # A user's own allow/deny rules stay. A second register appends
+        # nothing. The server process is not subject to these rules — they
+        # bind Claude Code's tools. Codex is reported, not faked; see
+        # install.codex_sandbox_can_deny_workspace_path.
+        if not settings_unreadable:
+            # An adopted store is not in config.toml yet on --diff (nothing
+            # is written). Name that store explicitly so the preview matches
+            # the rules a real register would persist.
+            if adopted_store is not None and not config_toml_already_registered:
+                store_deny = install.claude_store_deny_plan(
+                    project_root,
+                    db=adopted_store.root / "strata.db",
+                    fleet_yaml=adopted_store.fleet_yaml,
+                    summaries_dir=adopted_store.root / "summaries",
+                )
+            else:
+                store_deny = install.claude_store_deny_plan(project_root)
+            store_deny_rules = store_deny.rules
+            if install.strata_deny_rules_present(settings_data, store_deny_rules):
+                _act("skip store deny rules in", settings_json, skipped=True)
+            elif install.merge_strata_deny_rules(settings_data, store_deny_rules):
+                settings_changed = True
+                _act("merged store deny rules into", settings_json)
+            else:
+                print(
+                    f"  {_glyph('warn')} .claude/settings.json permissions is not a "
+                    "mergeable object (or deny is not a list) — store deny rules "
+                    "left unmerged. Fix the value, then re-run `strata register`.",
+                    file=sys.stderr,
+                )
+            print(
+                f"    store deny rules: {', '.join(store_deny_rules)}. "
+                f"{install.CLAUDE_STRATA_DENY_COVERAGE}. "
+                f"{install.CODEX_WORKSPACE_DENY_GAP}. "
+                "Outside a harness that enforces the deny, scoping is discipline, "
+                "not security."
+            )
+            if store_deny.skipped:
+                print("    not denied: " + "; ".join(store_deny.skipped) + ".")
+
+        # One write for the settings.json changes (legacy-entry removal, the
+        # Stop/SessionStart hook merges, and the .strata/ deny rules) — so
+        # bootstrap-venv (step 8) reads the up-to-date file back.
         if settings_changed and not diff_mode:
             (project_root / ".claude").mkdir(parents=True, exist_ok=True)
             settings_json.write_text(json.dumps(settings_data, indent=2) + "\n", encoding="utf-8")
@@ -4166,6 +4355,16 @@ def cmd_register(args: argparse.Namespace) -> int:
         )
         if hook_already and not hook_added:
             print("    (a Strata Stop-hook block already exists in Codex's config — left as-is)")
+
+        # ADR 0013 D6: do not write a deny Codex's sandbox config cannot
+        # enforce. Permission profiles can deny a workspace subpath, but they
+        # are ignored while sandbox_mode is set, so a seeded profile would be
+        # either a no-op or a replacement of the user's sandbox posture.
+        if not install.codex_sandbox_can_deny_workspace_path():
+            print(
+                f"  {install.CODEX_WORKSPACE_DENY_GAP}. Outside a harness that "
+                "enforces a deny, scoping is discipline, not security."
+            )
 
         if not diff_mode and (mcp_added or hook_added):
             codex_config.parent.mkdir(parents=True, exist_ok=True)
@@ -4815,6 +5014,17 @@ def cmd_unregister(args: argparse.Namespace) -> int:
                 else:  # absent
                     _ok(".claude/settings.json: nothing to do (no SessionStart hook)")
 
+                # Store deny rules (ADR 0013 D6) — only the exact strings the
+                # current config would seed. A user's own deny entries stay.
+                deny_status = install.remove_strata_deny_rules(
+                    settings_data, install.claude_store_deny_rules(project_root)
+                )
+                if deny_status == "removed":
+                    settings_changed = True
+                    _ok(f".claude/settings.json: {_would('remove', 'removed')} store deny rules")
+                else:
+                    _ok(".claude/settings.json: nothing to do (no store deny rules)")
+
                 if settings_changed and not dry_run:
                     settings_json.write_text(
                         json.dumps(settings_data, indent=2) + "\n", encoding="utf-8"
@@ -5158,6 +5368,72 @@ def cmd_freshness_evaluator(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 
+def _check_structure_emission(paths: object) -> Check:
+    """Report ``remove_edge`` and ``reparent`` acts that still owe a receiver.
+
+    An act is emitted when ``unemitted_receivers`` returns ``[]``.
+    """
+    if paths is None:
+        return Check(
+            name="Structure emission",
+            kind="soft",
+            passed=True,
+            message="skipped — fix the project config check above first.",
+        )
+    db_file = Path(paths.db_path)
+    if not db_file.exists():
+        return Check(
+            name="Structure emission",
+            kind="soft",
+            passed=True,
+            message="skipped — see the Database check above.",
+        )
+    from strata.fleet_changes import unemitted_structure_acts  # noqa: PLC0415
+    from strata.record_store import RecordStore  # noqa: PLC0415
+
+    store: RecordStore | None = None
+    missing: list[tuple[str, str]] | None = None
+    try:
+        store = RecordStore(str(db_file))
+        missing = unemitted_structure_acts(store)
+    except sqlite3.Error:
+        missing = None
+    finally:
+        if store is not None:
+            store.close()
+    if missing is None:
+        return Check(
+            name="Structure emission",
+            kind="soft",
+            passed=True,
+            message="skipped — see the Database check above.",
+        )
+    if not missing:
+        return Check(
+            name="Structure emission",
+            kind="soft",
+            passed=True,
+            message="no remove_edge or reparent act is missing its change events.",
+        )
+    listed = ", ".join(f"{act_id} ({change_type})" for act_id, change_type in missing)
+    return Check(
+        name="Structure emission",
+        kind="soft",
+        passed=False,
+        message=(
+            f"{listed} — no change event carries this act. "
+            "`strata fleet reemit <act_id>` emits for one act."
+        ),
+    )
+
+
+def cmd_fleet(args: argparse.Namespace) -> int:
+    """``strata fleet`` — apply or review fleet structure changes as the operator."""
+    from strata.fleet_changes import cli_fleet
+
+    return cli_fleet(args)
+
+
 def cmd_session_start_hook(args: argparse.Namespace) -> int:
     """Print the SessionStart hook's read-side trigger instruction.
 
@@ -5304,6 +5580,25 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Write one JSON line per session ({session_id, harness, outcome, accepted_count}).",
     )
     p_stats_wb.set_defaults(func=cmd_stats_writeback)
+
+    p_stats_judge = stats_sub.add_parser(
+        "judge",
+        help="Judge calls, tokens, and cost by scope, call kind, and day.",
+    )
+    p_stats_judge.add_argument(
+        "--since",
+        default=None,
+        metavar="ISO",
+        help="Only calls at or after this ISO 8601 date or time.",
+    )
+    p_stats_judge.add_argument(
+        "--scope",
+        default=None,
+        metavar="SCOPE",
+        help="Only calls recorded for this scope id.",
+    )
+    p_stats_judge.add_argument("--json", action="store_true", help="Print the report as JSON.")
+    p_stats_judge.set_defaults(func=cmd_stats_judge)
 
     p_doctor = sub.add_parser(
         "doctor",
@@ -5735,6 +6030,85 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Project root directory (default: current working directory).",
     )
     p_set_default_harness.set_defaults(func=cmd_set_default_harness)
+
+    # -------------------------------------------------------------------
+    # fleet — structure changes (#247). The operator applies directly.
+    # A bound scope proposes through the MCP tools instead.
+    # -------------------------------------------------------------------
+    p_fleet = sub.add_parser(
+        "fleet",
+        help="Apply or review fleet structure changes (operator).",
+    )
+    p_fleet.add_argument("--db", default=None, help="Record-store database path.")
+    p_fleet.add_argument(
+        "--fleet",
+        dest="fleet_path",
+        default=None,
+        help="fleet.yaml path (default: the resolved project fleet).",
+    )
+    fleet_sub = p_fleet.add_subparsers(dest="fleet_command", required=True)
+
+    p_fleet_pending = fleet_sub.add_parser("pending", help="List changes waiting for approval.")
+    p_fleet_pending.set_defaults(func=cmd_fleet)
+
+    p_fleet_apply = fleet_sub.add_parser("apply", help="Apply a pending change as the operator.")
+    p_fleet_apply.add_argument("change_id")
+    p_fleet_apply.set_defaults(func=cmd_fleet)
+
+    p_fleet_reject = fleet_sub.add_parser("reject", help="Reject a pending change as the operator.")
+    p_fleet_reject.add_argument("change_id")
+    p_fleet_reject.set_defaults(func=cmd_fleet)
+
+    p_fleet_add = fleet_sub.add_parser("add-scope", help="Add a scope and its chain edge.")
+    p_fleet_add.add_argument("--id", dest="scope_id", required=True)
+    p_fleet_add.add_argument("--name", required=True)
+    p_fleet_add.add_argument("--stratum", dest="stratum_id", required=True)
+    p_fleet_add.add_argument("--parent", dest="parent_id", default=None)
+    p_fleet_add.add_argument("--description", default=None)
+    p_fleet_add.add_argument(
+        "--reference",
+        action="append",
+        default=None,
+        help="Published scope the new scope reads. Repeatable.",
+    )
+    p_fleet_add.set_defaults(func=cmd_fleet)
+
+    p_fleet_remove = fleet_sub.add_parser(
+        "remove-scope",
+        help="Remove a scope that has no children and no reference edges. Memory is kept.",
+    )
+    p_fleet_remove.add_argument("scope_id")
+    p_fleet_remove.set_defaults(func=cmd_fleet)
+
+    p_fleet_reparent = fleet_sub.add_parser("reparent", help="Give a scope a new chain parent.")
+    p_fleet_reparent.add_argument("scope_id")
+    p_fleet_reparent.add_argument("--parent", dest="new_parent_id", required=True)
+    p_fleet_reparent.set_defaults(func=cmd_fleet)
+
+    p_fleet_add_edge = fleet_sub.add_parser(
+        "add-edge",
+        help="Add a reference edge (FROM reads TO).",
+    )
+    p_fleet_add_edge.add_argument("edge_from")
+    p_fleet_add_edge.add_argument("edge_to")
+    p_fleet_add_edge.set_defaults(func=cmd_fleet)
+
+    p_fleet_remove_edge = fleet_sub.add_parser("remove-edge", help="Remove a reference edge.")
+    p_fleet_remove_edge.add_argument("edge_from")
+    p_fleet_remove_edge.add_argument("edge_to")
+    p_fleet_remove_edge.set_defaults(func=cmd_fleet)
+
+    p_fleet_describe = fleet_sub.add_parser("describe", help="Set a scope's description.")
+    p_fleet_describe.add_argument("scope_id")
+    p_fleet_describe.add_argument("--description", required=True)
+    p_fleet_describe.set_defaults(func=cmd_fleet)
+
+    p_fleet_reemit = fleet_sub.add_parser(
+        "reemit",
+        help="Emit change events for one applied structure act (operator). Idempotent.",
+    )
+    p_fleet_reemit.add_argument("act_id")
+    p_fleet_reemit.set_defaults(func=cmd_fleet)
 
     # -------------------------------------------------------------------
     # Hidden engine subcommands for the freshness Stop-hook (issue #112).
