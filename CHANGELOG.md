@@ -67,6 +67,10 @@ the release PR (`dev` → `main`) and the GitHub Release body are built from
   drafted ... from" plus the artifact attributed to its source ("<source>'s file", "<file>
   by <source>") plus its path, URL or id right after it. It is admitted as context only,
   recorded as the author's word as of the reading, never as the author's decision.
+  Why this matters: on the default judge, a reason can carry a neighbouring
+  contribution's informant into a record that never mentions it, across sessions as well
+  as within one. In the release replay of such a case, the first answer named an absent
+  party in 3 of 4 runs, and the one re-ask corrected it every time.
 
 
 - **A child directive that changes an inherited one is now declined, not held.**
