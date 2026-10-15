@@ -1017,9 +1017,8 @@ of `strata launch`.
 **Windows.** From 1.18.0, CI on `windows-latest` runs `strata register`, an
 MCP stdio round trip (`strata_read_perspective`, one `strata_contribute`,
 `strata_read_scope_record`), a refused fleet structure change, and a refused
-`export-fleet` onto an existing file. The lane first runs on the 1.18.0
-release PR; until it passes there, treat Strata as an MCP server on Windows
-as untested.
+`export-fleet` onto an existing file. All four passed on the 1.18.0 release
+PR (#248).
 
 ### Upgrading from V1.1 to V1.2
 
