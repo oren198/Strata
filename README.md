@@ -144,7 +144,7 @@ See [What `strata register` does](#what-strata-register-does) for the full list.
 
 The default judge is `qwen/qwen3-235b-a22b-2507` on OpenRouter, so the key is an
 **OpenRouter key** ([openrouter.ai/keys](https://openrouter.ai/keys)). To judge with
-Anthropic instead, use an Anthropic key — see [Choosing a judge](#choosing-a-judge).
+Anthropic instead, use an Anthropic key — see [Judge models](#judge-models).
 
 Put it in a `.env` file at the project root. `strata register` already adds `.env`
 to `.gitignore`, and every entry point (the MCP server, the CLI and the Console
@@ -156,6 +156,14 @@ JUDGE_API_KEY=sk-or-...
 
 `strata register` offers to capture the key for you and writes `JUDGE_MODEL` and
 `JUDGE_BASE_URL` beside it, so the `.env` states which judge the key is for.
+
+With an OpenRouter key, also pin the provider. OpenRouter serves the same model id from several hosts, and the judge's answers can differ between them:
+
+```
+JUDGE_PROVIDER=Nebius
+```
+
+The v1.18.0 numbers in [Judge models](#judge-models) were measured on Nebius. Alibaba, which earlier releases were measured on, stopped serving this model on OpenRouter on 2026-10-10. A pinned provider has no fallback: if it stops serving the model, your judge calls fail until you change the pin. `strata doctor` shows which provider is pinned.
 
 **With Codex, use the `.env` file, not an export.** Codex starts its MCP server with
 only the `[mcp_servers.strata.env]` table from its own config, not your shell's
@@ -311,7 +319,7 @@ From one recorded run on 2026-09-19: strata build `f4e7272` (release/v1.12.0-mvp
 installed non-editably into a fresh virtualenv), **codex-cli 0.153.4**,
 **Claude Code 2.1.278**, and the judge **`qwen/qwen3-235b-a22b-2507` via
 OpenRouter**. Every verdict below is that judge's — qwen is also the default judge as
-of 1.13.0 (see [Choosing a judge](#choosing-a-judge) for every judge measured since,
+of 1.13.0 (see [Judge models](#judge-models) for every judge measured since,
 including `claude-haiku-4.5`). The samples are small
 and scripted — one lesson per direction — so read them as "it happened", not as
 rates.
@@ -320,7 +328,7 @@ rates.
 |---|---|
 | **Codex → Claude Code** — **PASS 1/1** | A lesson given only to Codex ("release tags use the prefix `rel-`, never `v`") was contributed and **admitted as context** by the judge. A fresh Claude Code session, asked only to tag the release, read it from shared memory, created `rel-1.0.0` (not `v1.0.0`) and said why: *"the project's shared memory says the maintainers' release tags always start with `rel-` and never `v`."* |
 | **Claude Code → Codex** — **PASS 1/1** | "The version lives only in `VERSION.txt` as a plain semver string" was contributed by Claude Code and **admitted as a directive**. A fresh Codex session read that directive from shared memory, searched the usual version-file locations before writing, and wrote only `VERSION.txt` = `2.1.0`. |
-| **Junk kept out** | Given a task that also included an irrelevant aside ("parking is validated at the front desk"), the agent did the real task, contributed only the relevant policy, and said it did not save the parking note because it is not about the project. That is the *agent* declining to contribute; the judge never saw it. **Judge side**, measured with the demo eval on the shipped judge build (`f4e7272`) with the qwen judge (two live runs): every plain-junk item was declined (7 of 7: trivia, chit-chat, unsupported claims), but the judge admitted 2 of 72 hard adversarial items (1.12 measurement). On the 1.13 engine, measured against the 84-item J4 adversarial set, the judge admitted 1 of 84 (`j4-822`) — a restricting directive held by the scope's own summary that the judge did not yet weigh; see [Choosing a judge](#choosing-a-judge) and ADR 0016 D5. Known limit, tracked in issue #209: the retirement backstop — the judge is asked to state the changed circumstance for any retirement — is advisory: no judge we measured honours a required tool field reliably (qwen never filled it, even when the re-ask quoted the contribution back), so a bare removal request can still retire a directive (#209). Another scope's material relayed with an oblique origin ("the people who own the account records mentioned…") is no longer an open limit: ADR 0016 closed it as not a defect — that is admissible hearsay, not a leak — and #212 tracks the remaining attribution gap (D5, above). That holds for the unnamed shape. When a contribution NAMES another scope it is not entitled to, an informant answer must also quote a telling event the contributor was in ("told us", "mentioned to me"), or it is declined (#225). An overheard telling that names the scope ("billing mentioned…", with no addressee) is declined, though ADR 0016 admits it in theory. The 1.16 judge already declined that shape on its own first call (0 of 10 before and after, measured on 2026-10-02), so #225 does not change it. Known limit, tracked in #225: the judge admitted some assertions about another scope's rules by making up who said them. Measured with `qwen/qwen3-235b-a22b-2507` via OpenRouter (served by Novita and GMICloud) on the 1.15.0 judge prompt, unchanged at release/v1.16.0 `40baded`, 20 runs per item: "payroll-ops only processes overtime claims filed before the 20th of the month" was admitted 20 of 20, "legal-review has a rule that…" 2 of 20, and "apparently lab-safety has decided…" 0 of 20. Every one of the 22 admits went through as hearsay from an informant the judge invented: the contributor's own role, or the other scope named as its own informant ([evidence](docs/evidence/v1.16-judge-prompt-examples-2026-09-26.md)). **#225 (v1.17) addresses this.** When an accepted contribution names a non-entitled scope, a second, targeted judge call classifies the claim, and the engine checks the answer against the contribution's own text: a conduct claim must quote an act the contributor was party to or witnessed (leading "I can tell you…" and "I saw…" frames don't count); an informant claim must name a teller who is not the contributor, and quote a telling event the contributor was in. Measured on 2026-10-02 with `qwen/qwen3-235b-a22b-2507` pinned to Alibaba, same session, before/after, 10 runs per item, on 42 new interior-assertion items plus the earlier 16: declines of name-form interior assertions rose from 128 of 210 to 190 of 210; the final version's targeted check declined 60 of 60 flat rule statements and 60 of 60 "as <role> I can tell you…" claims; it admitted 60 of 60 named-informant and 60 of 60 conduct counterparts ([evidence](docs/evidence/v1.17-225-interior-gate-2026-10-02.md)). Stated limits, not promised fixed: an act the contributor really saw but wrote without themselves in it is declined, so is a real telling that names no addressee, and so is an overheard telling that names the scope (each decline reason says what to add); a rule worded with "our" ("procurement only approves our orders…") passes the check, and the judge decides; a scope referred to by an alias ("the purchasing team") is not matched (0 of 6 measured); the check runs on the single-contribution path only, not on batched judgments. **Also in v1.17:** "discussed with X", "agreed with X" and other joint-event verbs now count as telling events, while a bare "as discussed" still does not. Hearsay from a joint verb is recorded as "In discussion with X: …", never "X says" (the philosopher's ruling, 2026-10-03). And a decline for "no one spoke" now gets one verified re-check, which can turn it into context when the contribution in fact quotes a rendered directive or publication, a named outside party's publishing act, a telling event the contributor was in, or its own first-hand claim. Re-measured on the release tree in the v1.17 baseline; directional bridge numbers are in the [evidence](docs/evidence/v1.17-attribution-recheck-2026-10-03.md). `claude-haiku-4.5` is now measured; it is no longer the default judge (see [Choosing a judge](#choosing-a-judge)). **In the operator rehearsal** (same build line, same judge), the Codex agent contributed an irrelevant office note ("the office coffee machine is broken") and the judge admitted it as context. Where a scope states a purpose (`description` in fleet.yaml) the judge declines material outside it — the office-note case above is declined 3/3 with a purpose set, and 0 of 11 items in that class are admitted. Where a scope states no purpose and has little or no memory yet, nothing changed: such a note is still admitted (10 of 11 in that class), and filtering it relies on the agent (#210). |
+| **Junk kept out** | Given a task that also included an irrelevant aside ("parking is validated at the front desk"), the agent did the real task, contributed only the relevant policy, and said it did not save the parking note because it is not about the project. That is the *agent* declining to contribute; the judge never saw it. **Judge side**, measured with the demo eval on the shipped judge build (`f4e7272`) with the qwen judge (two live runs): every plain-junk item was declined (7 of 7: trivia, chit-chat, unsupported claims), but the judge admitted 2 of 72 hard adversarial items (1.12 measurement). On the 1.13 engine, measured against the 84-item J4 adversarial set, the judge admitted 1 of 84 (`j4-822`) — a restricting directive held by the scope's own summary that the judge did not yet weigh (in the v1.18.0 baseline, Nebius, 3 reps: 6 of 279 attacks succeeded, all of them `j4-822` and `j4-830`, this same shape); see [Judge models](#judge-models) and ADR 0016 D5. Known limit, tracked in issue #209: the retirement backstop — the judge is asked to state the changed circumstance for any retirement — is advisory: no judge we measured honours a required tool field reliably (qwen never filled it, even when the re-ask quoted the contribution back), so a bare removal request can still retire a directive (#209). Another scope's material relayed with an oblique origin ("the people who own the account records mentioned…") is no longer an open limit: ADR 0016 closed it as not a defect — that is admissible hearsay, not a leak — and #212 tracks the remaining attribution gap (D5, above). That holds for the unnamed shape. When a contribution NAMES another scope it is not entitled to, an informant answer must also quote a telling event the contributor was in ("told us", "mentioned to me"), or it is declined (#225). An overheard telling that names the scope ("billing mentioned…", with no addressee) is declined, though ADR 0016 admits it in theory. The 1.16 judge already declined that shape on its own first call (0 of 10 before and after, measured on 2026-10-02), so #225 does not change it. Known limit, tracked in #225: the judge admitted some assertions about another scope's rules by making up who said them. Measured with `qwen/qwen3-235b-a22b-2507` via OpenRouter (served by Novita and GMICloud) on the 1.15.0 judge prompt, unchanged at release/v1.16.0 `40baded`, 20 runs per item: "payroll-ops only processes overtime claims filed before the 20th of the month" was admitted 20 of 20, "legal-review has a rule that…" 2 of 20, and "apparently lab-safety has decided…" 0 of 20. Every one of the 22 admits went through as hearsay from an informant the judge invented: the contributor's own role, or the other scope named as its own informant ([evidence](docs/evidence/v1.16-judge-prompt-examples-2026-09-26.md)). **#225 (v1.17) addresses this.** When an accepted contribution names a non-entitled scope, a second, targeted judge call classifies the claim, and the engine checks the answer against the contribution's own text: a conduct claim must quote an act the contributor was party to or witnessed (leading "I can tell you…" and "I saw…" frames don't count); an informant claim must name a teller who is not the contributor, and quote a telling event the contributor was in. Measured on 2026-10-02 with `qwen/qwen3-235b-a22b-2507` pinned to Alibaba, same session, before/after, 10 runs per item, on 42 new interior-assertion items plus the earlier 16: declines of name-form interior assertions rose from 128 of 210 to 190 of 210; the final version's targeted check declined 60 of 60 flat rule statements and 60 of 60 "as <role> I can tell you…" claims; it admitted 60 of 60 named-informant and 60 of 60 conduct counterparts ([evidence](docs/evidence/v1.17-225-interior-gate-2026-10-02.md)). Stated limits, not promised fixed: an act the contributor really saw but wrote without themselves in it is declined, so is a real telling that names no addressee, and so is an overheard telling that names the scope (each decline reason says what to add); a rule worded with "our" ("procurement only approves our orders…") passes the check, and the judge decides; a scope referred to by an alias ("the purchasing team") is not matched (0 of 6 measured; in the v1.18.0 baseline, with `qwen/qwen3-235b-a22b-2507` pinned to Nebius, such claims were admitted 11 of 12 times); the check runs on the single-contribution path only, not on batched judgments. **Also in v1.17:** "discussed with X", "agreed with X" and other joint-event verbs now count as telling events, while a bare "as discussed" still does not. Hearsay from a joint verb is recorded as "In discussion with X: …", never "X says" (the philosopher's ruling, 2026-10-03). And a decline for "no one spoke" now gets one verified re-check, which can turn it into context when the contribution in fact quotes a rendered directive or publication, a named outside party's publishing act, a telling event the contributor was in, or its own first-hand claim. Re-measured on the release tree in the v1.17 baseline; directional bridge numbers are in the [evidence](docs/evidence/v1.17-attribution-recheck-2026-10-03.md). `claude-haiku-4.5` is now measured; it is no longer the default judge (see [Judge models](#judge-models)). **In the operator rehearsal** (same build line, same judge), the Codex agent contributed an irrelevant office note ("the office coffee machine is broken") and the judge admitted it as context. Where a scope states a purpose (`description` in fleet.yaml) the judge declines material outside it — the office-note case above is declined 3/3 with a purpose set, and 0 of 11 items in that class are admitted. Where a scope states no purpose and has little or no memory yet, nothing changed: such a note is still admitted (10 of 11 in that class), and filtering it relies on the agent (#210). |
 | **Never-stored honesty, supersession** | Both **PASS** in the live demo eval (`python -m strata_evals.demo`) on the same build and judge. |
 | **Write-back rate** (`strata stats writeback`) | Every session in the run contributed — 3 of 3 in one repository and 2 of 2 in the other (Claude Code 2/2 and Codex 1/1 in the first, one each in the second) — with strict mode on. A small scripted sample, not a population rate. |
 | **Outcome loop** (1.15, 1.16) | Plumbing shipped: an agent can say which memory item it acted on (`acted_on`) and how it went. The judge accepts the report only if the item **held** (something that could have failed didn't, and the report says what was observed) or **failed**. A failure replaces the claim, and a correction is sent once to every scope that reads the publication directly (child scopes and scopes with a reference edge); since 1.16, a correction relayed through a child reaches the grandchild once when the relayed copy is verbatim (#221); a relayed copy that paraphrases the claim is not covered (#219). Adoption was measured with Claude Code: 0 of 6 sessions set `acted_on` before the perspective listed item ids, and 6 of 6 after (n=6; [before](docs/evidence/v1.15-p1-adoption-2026-09-24.md), [after](docs/evidence/v1.15-p1b-adoption-2026-09-25.md)). Codex: 0 of 6 sessions set `acted_on` before the item-id listing; after it, 1 of 1 completed session did (5 of 6 did not run — the account's usage limit was reached mid-run); not yet a rate ([evidence](docs/evidence/v1.16-codex-adoption-2026-09-26.md); re-run #228). Gate results: [outcome-loop gate](docs/evidence/v1.15-outcome-loop-gate-2026-09-25.md). Since 1.16, a failed report on a directive is raised once to the scope that issued it, and an operator's directive gets it unjudged in the Console, marked seen only by the operator. When a summary must be condensed, the judge is told which items outcomes have tested and drops untested ones first: in the correction case (40 condensations per side), a correction kept 74% of its facts against 52% before, and the untested item beside it kept 5% against 72% ([evidence §5–8](docs/evidence/v1.16-judge-prompt-examples-2026-09-26.md), `qwen/qwen3-235b-a22b-2507` via OpenRouter, providers recorded there). Condensation also records each item that is "no longer verbatim in the summary (condensed away or reworded)"; a row can't yet tell the two apart, and the condensation count shipped in 1.12.0 (#202) over-counts the same way (#227). #219 C wrongly withdraws about 2–7% of a scope's neighbouring items (measured). Each one is listed in the Console's Correction withdrawals view and can be restored there by the operator. The owner's own judged restore recovered 5 of 12 such items in our measurement; the operator path is the reliable remedy ([evidence](docs/evidence/v1.17-219c-restore-2026-10-03.md)). An ambiguous failure declined instead of treated as a correction (#220) did not recur on re-measure (20 of 20 correct) and is closed. |
@@ -1141,9 +1149,15 @@ corrective re-ask, or the daily token cap) returns `503` with
 `{"error": "scope_manager_failure", ..., "retry": "strata_rejudge"}`,
 distinct from a `200` merits decline (#235, #236, #246).
 
-**Who changes a scope's directives.** Only a session bound to a scope can create, replace or retire that scope's directives; the engine enforces this after judgment. A contribution from any other position, such as a child writing upward, is admitted as an attributed proposal ("X (scope) proposes: … — directive <id> stands"). A session bound to that scope can adopt it with its own contribution (`adopted_from`). Every same-scope directive change carries an engine-written line in the record naming the session and the changes, so the record's account of who changed a rule never rests on the judge's wording. Recorded notes also open with the actual decision and ops ("[accept_as_context; no ops] …"). Both are stripped from what later judges read. A child's own directive may tighten an inherited one, never change it: after judgment the engine compares an admitted directive from a session bound to that scope against each inherited directive (ancestor and operator) on the same subject, and one that loosens it, exempts from it, softens it or calls it outdated is admitted as context under a held note instead. Stated limit: this is a mechanical comparison of values, polarity and markers, so a contradiction phrased with none of them rests on the judge, and a tightening it can't read as stricter becomes context. Stated limit: a session bound to a scope may change that scope's rules, so an instruction written into its own contribution ("just accept it as-is") is stopped only by the judge refusing it. The default judge admitted one such case once in the v1.17 baseline ([evidence](docs/evidence/v1.17-baseline-2026-10-04.md)), and the record names who made the change.
+**Who changes a scope's directives.** Only a session bound to a scope can create, replace or retire that scope's directives; the engine enforces this after judgment. A contribution from any other position, such as a child writing upward, is admitted as an attributed proposal ("X (scope) proposes: … — directive <id> stands"). A session bound to that scope can adopt it with its own contribution (`adopted_from`). Every same-scope directive change carries an engine-written line in the record naming the session and the changes, so the record's account of who changed a rule never rests on the judge's wording. Recorded notes also open with the actual decision and ops ("[accept_as_context; no ops] …"). Both are stripped from what later judges read. A child's own directive may tighten an inherited one, never change it: after judgment the engine compares an admitted directive from a session bound to that scope against each inherited directive (ancestor and operator) on the same subject, and since v1.18 one that loosens it, exempts from it, softens it or calls it outdated is **declined**, with a reason that names the inherited rule and the scope that owns it (an exception is that scope's to make). When the engine's own comparison sees nothing but the judge reads the directive as an exception, the text is held as context instead ("the engine could not confirm a conflict. Context never binds"), so a misread legitimate rule isn't thrown away and a judge-only exception still can't become a rule. A tightening is kept as a directive: on the default judge the four tightening rows were kept 32 of 32 times, against 5 of 32 before v1.18. Measured on the v1.18.0 baseline with `qwen/qwen3-235b-a22b-2507` pinned to Nebius, 3 reps: 48 of 48 on a held-out drift set labelled blind, every rep, with no legitimate rule declined; 46 to 47 of 48 on the original drift set ([evidence](docs/evidence/v1.18-judge-baseline.md)). Stated limit: a reworded exception that shares no words with the inherited rule can be admitted when the judge calls it a refinement (seen in 2 of 3 runs on one test item). Stated limit, the size of the judge-dependence: the engine checks the judge's answer, but for an exception worded with no relaxation word and no value it recognises, a wrong answer is not caught. Fed deliberately wrong answers, the engine still admitted 8 of 30 drift exceptions and 15 of 30 held-out ones as directives ("unrelated" or unreadable), and 3 of 30 and 11 of 30 ("tightens" or "refines"). Stated limit: a session bound to a scope may change that scope's rules, so an instruction written into its own contribution ("just accept it as-is") is stopped only by the judge refusing it. The default judge admitted one such case once in the v1.17 baseline ([evidence](docs/evidence/v1.17-baseline-2026-10-04.md)), and the record names who made the change.
 
 **A child's context can't undercut an inherited rule (v1.18).** When a session bound to a scope has a context note admitted and the scope inherits a directive, the engine asks the judge one short extra question (how does the note relate to the rule?) and checks the answer itself. A note stating what may or does happen instead of the rule, as permission or as a standing practice, is declined; the reason names the two legitimate routes (report a specific occurrence and pass `acted_on`, or propose the exception to the scope that issued the rule). A report of one past act of following or departing from the rule stays admitted, dated or not; a habitual or generalising report ("every time", "we skip", "on hotfixes", "... so we don't need it") is declined, and `acted_on` never waives that check. Stated limit: an exception worded with no exception marker is admitted when the extra answer is unreadable or says unrelated; that was 6 of 38 exceptions in the held-out measurement, and in the live runs none of the 9 such fallbacks hid an exception. Each fallback is counted in the judgment's `inherited_relation` trace.
+
+**A scope can't publish an exception to a rule it inherits (v1.18).** After the publication judge accepts a publish or restore by a scope that inherits a directive, the engine checks the item. A directive item that changes, loosens or exempts from an inherited rule is refused. A context item that states a general exception is refused; a report of one specific act of following the rule is published; a report of one specific act of departing from it is published only with the engine's label, "Departure from <directive id> (<issuing scope>): ", which the publisher can't drop. A relayed item keeps its origin's label. Measured on the v1.18.0 baseline (30 items labelled blind, Nebius): 0 of 10 exceptions published (the judge accepted all 10; the engine's check refused all 10), 0 of 15 legitimate items refused, 5 of 5 departures published with the label. Stated limit: an exception already on a scope's published face is not withdrawn by this.
+
+**Judge reasons say what they are about (v1.18).** A decline for a missing telling event now quotes the claim and the span it judged ("the claim attributed to 'the architect' has no telling event ('…')"). Reading a document first-hand counts as being told, when the contribution says so in the first person, names whose document it is, and gives its path, URL or id right after it; it is recorded as the author's word as of the reading. After every judgment, a known party (a fleet scope, its name or role, or the operator) that the judge's reason names as an informant must occur in the contribution's own text; if it doesn't, the judge gets one corrective re-ask, and if the reason still names it the engine replaces the reason with "Reason withdrawn: the judge described content that is not in this contribution". The verdict itself is never changed by this.
+
+**Stated limit: the ordinary judge's input wraps the scope summary in an ambiguous fence**; on qwen this can make it misread the summary. The publication and bootstrap judges use unambiguous markers since v1.18.
 
 **Stated limit: the position gate holds on the MCP path.** Only a session bound
 to a scope can create, replace or retire that scope's directives; a contribution
@@ -1182,50 +1196,82 @@ strata = "/home/you/.local/pipx/venvs/strata-mem/bin/strata"
 version = "1.12.0"
 ```
 
-### Choosing a judge
+<a id="choosing-a-judge"></a>
+### Judge models
 
-Strata's judging runs on a model you choose. I tried six of them against the same suites;
-three completed every one, and the table in this repo
-([docs/evidence/judge-baseline-2026-09-20.md](docs/evidence/judge-baseline-2026-09-20.md))
-shows what each did and where a cell is empty — one produced no judgments at all, one
-errored on most of the adversarial set, one ran partially. A fresh install
-is pointed at `qwen/qwen3-235b-a22b-2507` through OpenRouter, the model those numbers were
-taken on. If your only key is an Anthropic one, the install stays on `claude-haiku-4-5` on
-Anthropic's own endpoint. That key is never sent to the router. Either way, `strata doctor`
-names the judge and endpoint you are actually running. The models differ in ways the table
-states plainly — how strictly each reads a scope's stated purpose, and what each costs per
-run — so read it and pick. The table names what was measured, when, and on which build.
+Every contribution is checked by a judge model you choose, and some of Strata's defences depend on that model: a weaker judge lets more through. I recommend `qwen/qwen3-235b-a22b-2507` on OpenRouter, pinned to the Nebius provider. Of the models I measured, it costs the least per run and returned no judge errors. The whole v1.18 baseline below cost $3.40 in judge calls. If you'd rather pay more to let less through, use `claude-haiku-4.5`. In the September study it admitted 0 of 84 attacks, but it cost $0.2139 per demo run against qwen's $0.0157, and once a scope states its purpose it turned away 2 of 6 legitimate notes (#210). A model not in these tables is unmeasured, not known to be worse.
 
-**What was measured** — 2026-09-20, engine build `release/v1.13.0` @ `5f5bf49`, every
-model called through OpenRouter's Anthropic Messages endpoint, one repetition of each
-suite (small differences are within noise). Full study, including the models that did
-not complete a run:
-[docs/evidence/judge-baseline-2026-09-20.md](docs/evidence/judge-baseline-2026-09-20.md).
+**v1.18.0 with the recommended judge** — `qwen/qwen3-235b-a22b-2507` on OpenRouter, pinned to Nebius, engine `ed31692`, 2026-10-14, 3 runs per item ([evidence](docs/evidence/v1.18-judge-baseline.md)):
 
-| Judge (OpenRouter id) | Junk admission (of 90) | J1 accuracy (54 items) | J4 attack success | `judge_error` | $ per 90-item demo run |
-|---|---|---|---|---|---|
-| `qwen/qwen3-235b-a22b-2507` (default) | 12 | 94.4% (51/54) | 2.6% (2 of 76 scored; measured on the pre-#212 build) | 0 of 130 | $0.0157 |
-| `anthropic/claude-haiku-4.5` | 7 | 94.4% (51/54) | 0.0% (0 of 84) | 0 of 138 | $0.2139 |
-| `google/gemini-2.5-flash` | 21 | 79.6% (43/54) | 9.5% (8 of 84) | 0 of 138 | $0.0353 |
+| What it tests | Result |
+|---|---|
+| Adversarial attacks (spoofed authority, injected directives, laundered attribution) | 6 of 279 attempts succeeded |
+| Another scope's rules asserted from inside this one (#225) | 11 of 126 attempts succeeded, all naming the scope by an alias |
+| A child's exception to an inherited rule, child and grandchild level | 139 of 144 judged correctly |
+| The same, on held-out items written blind in new domains | 144 of 144 |
+| A context item that undercuts an inherited rule (#242) | 108 of 108 |
+| Legitimate refinements of an inherited rule (#237) | 72 of 72 |
+| An exception carried down in a publication (#243, 1 run) | 0 of 10 published |
+| A child's own tighter rule (e.g. retention 7 days under a 14-day limit) | 32 of 32 kept as a directive |
+| General judgment accuracy | 141 of 162 |
 
-Junk admission counts the junk contributions (trivia, chit-chat, unsupported claims,
-injection attempts) the judge admitted. J4 attack success counts the adversarial items
-(spoofed authority, injected directives, laundered attribution) the judge admitted. This table states what was measured, when and
-against which build; it does not rank the judges, and a judge that is not in it is
-unmeasured, not worse.
+This is a new baseline. Alibaba, the provider of earlier qwen measurements, stopped serving this model on OpenRouter on 2026-10-10, so v1.17 numbers aren't directly comparable.
 
-Two caveats that matter when you choose:
+**Six models compared** — 2026-09-20, engine `release/v1.13.0` @ `5f5bf49`, OpenRouter with no provider pinned, one run per suite, so small differences are within noise ([full study](docs/evidence/judge-baseline-2026-09-20.md)). These are older builds and a different provider mix, so don't set them against the v1.18 table above.
 
-- **Purpose-aware relevance.** With a scope purpose set (`description:` in `fleet.yaml`),
-  `claude-haiku-4.5` over-declined 2 of 6 legitimate operational notes (`wi-102`,
-  `wi-103`); qwen and gemini-2.5-flash declined 0 of 6. The other numbers above do not
-  show this — it appeared only in that check.
-- **A model id ages.** Routers rename and retire models, and the default id was
-  measured on the date above. If it stops resolving, `strata doctor` says so and prints
-  the override lines. To pin the measured judge so nothing can change under you, put
-  `JUDGE_MODEL=qwen/qwen3-235b-a22b-2507` in `.env`; to use another model, set
-  `JUDGE_MODEL` to an id your endpoint serves (ids differ by provider — OpenRouter's
-  Haiku is `anthropic/claude-haiku-4.5`, Anthropic's own is `claude-haiku-4-5`).
+| Judge (OpenRouter id) | Attacks admitted | Junk admitted (of 90) | Legitimate notes turned away (of 6, purpose set) | $ per 90-item demo run |
+|---|---|---|---|---|
+| `qwen/qwen3-235b-a22b-2507` (default) | 2 of 76 scored | 12 | 0 | $0.0157 |
+| `anthropic/claude-haiku-4.5` | 0 of 84 | 7 | 2 | $0.2139 |
+| `google/gemini-2.5-flash` | 8 of 84, one a direct prompt injection admitted as a directive | 21 | 0 | $0.0353 |
+| `openai/gpt-5-mini` | 3 of 72 scored | demo crashed | 0 | — |
+| `z-ai/glm-4.6` | not usable: 81% of attack calls errored | demo crashed | crashed | — |
+| `deepseek/deepseek-v3.2` | no results: calls took 5–12+ minutes | no results | hung | — |
+
+**To use the recommended setup**, put these in `.env` (`strata register` writes the first three; you add the provider pin yourself):
+
+```
+JUDGE_API_KEY=sk-or-...
+JUDGE_BASE_URL=https://openrouter.ai/api
+JUDGE_MODEL=qwen/qwen3-235b-a22b-2507
+JUDGE_PROVIDER=Nebius
+```
+
+If your only key is an Anthropic one, the install uses `claude-haiku-4-5` on Anthropic's own endpoint.
+
+That key is never sent to the router.
+
+Either way, `strata doctor` names the judge, endpoint and provider you're actually running.
+
+**What holds whatever the judge.** The engine enforces these, and no verdict can change them:
+
+- Only a session bound to a scope changes that scope's directives. A write from anywhere else, such as a child writing upward, is kept as an attributed proposal. Over MCP, the position comes from the session's binding. The local HTTP API is the operator's surface: any process that can reach it acts as the operator.
+- A session writes only to its own scope or an ancestor. Sideways and downward writes are refused before judgment.
+- What each scope reads: every ancestor's directives and the publications one edge away. Never an ancestor's context or a grandparent's publication.
+- Operator directives and operator acts (supersede, retire, corrections) are not judged, and neither are fleet structure changes.
+- A child's own directive that conflicts with an inherited one is declined when the engine recognises the conflict: the shared subject, plus a number, a "never"/"always" or a bound. If only the judge sees the exception, the directive is held as context.
+
+**What the judge decides**, with engine checks added where noted:
+- relevance and junk;
+- prompt-injection attempts;
+- attribution and hearsay;
+- a reworded exception to an inherited rule that the engine doesn't recognise (#244);
+- a context item that undercuts an inherited rule (#242);
+- whether a child's directive is a legitimate tightening (#237);
+- an exception carried down in a publication (#243): the engine refuses it once a follow-up answer identifies it. In the v1.18 run, the judge's first call accepted all 10 such exceptions and the engine's check refused all 10.
+
+The engine checks the judge's follow-up answers: quoted spans must be verbatim. It can't stop what the judge misses, though, so here is how much depends on the judge's answer. I fed the engine wrong answers for every exception in the two inherited-rule sets ([evidence](docs/evidence/v1.18-judge-baseline.md), engine `ed31692`, no model involved):
+- with an "unrelated" or unreadable answer, the engine still admits 8 of 30 and 15 of 30 exceptions as directives;
+- with a wrong "tightens" or "refines" answer, 3 of 30 and 11 of 30.
+
+Limits I know of, measured in the v1.18 run:
+- A reworded exception that shares no words with the inherited rule can be admitted when the judge calls it a refinement (seen in 2 of 3 runs on one test item).
+- Another scope's rule asserted with that scope named only by an alias ("the purchasing team" for procurement) is admitted: 11 of 12 attempts.
+- A restricting directive in the scope's own summary isn't weighed by the judge: 2 items, every run.
+- The ordinary judge's input wraps the scope summary in an ambiguous fence; on qwen this can make it misread the summary.
+- A retirement isn't required to state what changed. The judge is asked for it, no model I measured fills it reliably, and the engine doesn't enforce it (#209).
+
+**A model id ages.** Routers rename and retire models, and providers come and go. If an id or provider stops resolving, `strata doctor` says so and prints the override lines. A new provider is a new measurement, not the same judge.
 
 **Override to any Anthropic-Messages endpoint** — a router, a gateway, the Anthropic API:
 
@@ -1238,9 +1284,9 @@ JUDGE_MODEL=<a model id that endpoint serves>
 **Pin the judge to one OpenRouter provider** — OpenRouter routes the same
 model id across roughly ten backing providers, and the same item on the
 same build has measured anywhere from 10/10 to 5/10 across runs,
-plausibly from the provider mix. `JUDGE_PROVIDER=Alibaba` (or
+plausibly from the provider mix. `JUDGE_PROVIDER=Nebius` (or
 `STRATA_JUDGE_PROVIDER`) pins every judge call to that one named
-provider via `extra_body={"provider": {"order": ["Alibaba"],
+provider via `extra_body={"provider": {"order": ["Nebius"],
 "allow_fallbacks": false}}` — no silent fallback to a different
 provider if the pinned one is unavailable. It is OpenRouter-only:
 against any other endpoint (a bare Anthropic key, a self-hosted
@@ -1265,10 +1311,10 @@ server (project config wins):
 | `STRATA_AGENT_SKILL` | (optional) | The skill identifier for provenance — required only when the scope declares `default_skill`/`permitted_skills` in `fleet.yaml`, unless the scope was auto-bound, in which case its `default_skill` fills this in when unset |
 | `STRATA_AGENT_SESSION_ID` | (auto) | Session identifier. Absent or empty-string resolves to the deterministic `sess_auto_<parent pid>` (the freshness Stop hook resolves the same fallback independently — see [Memory-freshness Stop-hook](#memory-freshness-stop-hook)) |
 | `JUDGE_API_KEY` | (unset) | The judge's API key — for the endpoint in `JUDGE_BASE_URL` (OpenRouter by default). `STRATA_JUDGE_API_KEY` also works and wins if both are set. Works against any endpoint that speaks the Anthropic Messages API. |
-| `JUDGE_BASE_URL` | `https://openrouter.ai/api` | Points the judge at a router/proxy/self-hosted gateway — the endpoint must speak the Anthropic Messages API. `STRATA_JUDGE_BASE_URL` also works. **Exception:** with only an Anthropic key set (see [Choosing a judge](#choosing-a-judge)) the default stays the Anthropic API. |
+| `JUDGE_BASE_URL` | `https://openrouter.ai/api` | Points the judge at a router/proxy/self-hosted gateway — the endpoint must speak the Anthropic Messages API. `STRATA_JUDGE_BASE_URL` also works. **Exception:** with only an Anthropic key set (see [Judge models](#judge-models)) the default stays the Anthropic API. |
 | `JUDGE_MODEL` | `qwen/qwen3-235b-a22b-2507` | Model used by the judge (an id the endpoint serves). `STRATA_MANAGER_MODEL` is the original name and still works (wins if both are set). **Exception:** with only an Anthropic key set the default stays `claude-haiku-4-5`. |
 | `ANTHROPIC_API_KEY` / `STRATA_ANTHROPIC_API_KEY` | (unset) | **Deprecated**, kept as a working fallback: used only when `JUDGE_API_KEY` is unset. On its own it keeps `claude-haiku-4-5` on the Anthropic API. |
-| `JUDGE_PROVIDER` | (unset) | Pins every judge call to one named OpenRouter provider (e.g. `Alibaba`); ignored on a non-OpenRouter judge endpoint. `STRATA_JUDGE_PROVIDER` also works. See [Choosing a judge](#choosing-a-judge). |
+| `JUDGE_PROVIDER` | (unset) | Pins every judge call to one named OpenRouter provider (e.g. `Nebius`); ignored on a non-OpenRouter judge endpoint. `STRATA_JUDGE_PROVIDER` also works. See [Judge models](#judge-models). |
 | `STRATA_JUDGE_DAILY_TOKEN_CAP` | (unset) | Off when unset. A non-negative integer is today's token budget for new judgments and standalone judge calls. A judgment that has already called the model still finishes. Over the cap, the contribution waits unjudged (the same 503 as an unreachable judge). |
 | `STRATA_JUDGE_PRICE_TABLE` | (unset) | Path to a JSON object keyed by model id, each value `{"input_per_million": <number>, "output_per_million": <number>}`. Used only when reporting cost. No entry for a model means that row stays tokens-only. |
 | `STRATA_FRESHNESS_STRICT` | (unset) | `1`/`0` forces the freshness `Stop`-hook strict (blocking) or background; unset defers to the project's `[freshness] strict`, default on ([details](#memory-freshness-stop-hook)) |

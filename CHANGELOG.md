@@ -50,9 +50,14 @@ the release PR (`dev` → `main`) and the GitHub Release body are built from
 - **A decline says which claim it is about, and a reason can't describe content that
   isn't there.** When the telling-event check refuses an informant claim, the reason now
   quotes the informant and the span it judged ("the claim attributed to 'the architect' has
-  no telling event ..."), so a reader can tell which claim failed. After any judgment, an
-  informant the judge's reasoning names ("Hearsay: ... told by X", "informant X") must occur
-  in the contribution's own text; if it doesn't, the judge gets one corrective re-ask on the
+  no telling event ..."), so a reader can tell which claim failed. After any judgment, a
+  party the judge's reasoning names as an informant must occur in the contribution's own
+  text. The engine matches the reasoning against the parties it knows (every fleet scope by
+  id, name or role word, and the operator), counting a party only in a sentence that says
+  someone told, relayed or reported something and does not cite it as the owner of a rule
+  or publication; the contributor's own scope and skill never count. Phrasings such as
+  "Hearsay: ... told by X" and "informant X" are caught for parties outside the fleet too.
+  If such a party is missing from the text, the judge gets one corrective re-ask on the
   same tool, and if the reasoning still names it the engine replaces it with "Reason
   withdrawn: the judge described content that is not in this contribution (X). Verdict:
   <decision>." and notes the mismatch in the record. The verdict itself is never changed
@@ -116,6 +121,28 @@ the release PR (`dev` → `main`) and the GitHub Release body are built from
   and refused legitimate publications as not in the summary; the block now has explicit
   markers.
 
+
+### Measured, and stated limits
+
+- **The v1.18.0 judge baseline** (`qwen/qwen3-235b-a22b-2507` pinned to Nebius; a new
+  baseline, not comparable with the v1.17 Alibaba numbers) is in
+  `docs/evidence/v1.18-judge-baseline.md`. A held-out drift set labelled blind: 48 of 48
+  in each of 3 reps, with no legitimate rule declined. The original drift set: 46, 46 and
+  47 of 48. Publication exceptions: 0 of 10 published. Legitimate tightenings: 32 of 32
+  kept as directives.
+- **Stated limit:** a reworded exception that shares no words with the inherited rule can
+  be admitted when the judge calls it a refinement (seen in 2 of 3 runs on one test item).
+- **Stated limit, the size of the judge-dependence:** fed deliberately wrong re-ask
+  answers, the engine still admits 8 of 30 drift exceptions and 15 of 30 held-out ones as
+  directives ("unrelated" or unreadable), and 3 of 30 and 11 of 30 ("tightens" or
+  "refines"). Those exceptions carry no relaxation word and no value the engine can
+  compare, so only the judge can stop them.
+- **Stated limit:** the ordinary judge's input wraps the scope summary in an ambiguous
+  fence; on qwen this can make it misread the summary.
+  The publication and bootstrap judges use unambiguous markers.
+- **Unchanged limits, new numbers:** another scope's rule named only by an alias is
+  admitted (11 of 12 attempts). A restricting directive held in the scope's own summary
+  is not weighed (2 items, every rep).
 
 ### Added
 
