@@ -17,6 +17,14 @@ links here.
 | `v1.16-judge-prompt-examples-2026-09-26.md` | v1.16 items 1b/1c: the acted_on block's worked example leaking into reasons (fixed: fabricated quotes 3/70 → 0/70); the ADR 0016 conduct example and two failed wording fixes (reverted); findings: an unstable conduct/interior boundary, interior assertions admitted via an invented informant (#225), unpinned runs can't gate wording (#224) |
 | `v1.16-codex-adoption-2026-09-26.md` | Codex adoption of `acted_on`, before and after the item-id listing: 0 of 6 before; after, 1 of 1 completed session (5 not run: the account's usage limit). Also records that #218 is fixed in practice (CODEX_HOME under ~), Codex's refusal of `.git` writes, and the contribute-retry caveat |
 
+## Adjacent projects
+
+Hands-on trials of other agent-memory projects. Each was run in a scratch directory, with nothing posted anywhere, and each finding is marked TRIED (reproduced) or READ (docs only).
+
+| file | what it measures |
+|---|---|
+| `adjacent-memorywire-trial-2026-09-26.md` | memorywire (commit `a85fc23`) together with Strata 1.16.0 (judge pinned to Alibaba, 14/14 calls). Covers install, the quickstart and the `approval_required` flow. On memorywire's own fused-directive fixtures, Strata's judge declined 2/4 and then 1/4, only as off-purpose, while memorywire's regex caught 4/4; Strata admitted nothing as a directive (0/14). Also records five reproduced doc and packaging issues in memorywire. |
+
 **Caveat for every unpinned before/after in v1.15–v1.16 (added 2026-09-26):** OpenRouter's
 routing appears to follow the prompt itself. Two builds that differed in one prompt line, run
 interleaved in the same session, were served by very different provider mixes. Any two prompts
