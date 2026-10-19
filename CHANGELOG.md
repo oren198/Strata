@@ -5,6 +5,19 @@ the release PR (`dev` → `main`) and the GitHub Release body are built from
 (`docs/releasing.md`, step 3) — write entries here as work lands, and the
 "Unreleased" section is cleared once a release ships.
 
+## 1.18.1 (2026-10-19)
+
+### Fixed
+
+- A child's own rule is no longer compared with every inherited rule that merely
+  names the same product, team or site. Before, a fleet whose rules shared a name had
+  legitimate tightenings declined by unrelated rules. Reported by Adam (@Adam13y), from
+  his regression gate on 1.18.0.
+- A rate bound ("at most N per day", "no more than N times per week", "at least N
+  times per day") and a count floor ("requires N approvals") are compared in the
+  right direction. Before, a stricter child rule was declined and a looser one could
+  pass the engine.
+
 ## 1.18.0 (2026-10-15)
 
 ### Behaviour change
