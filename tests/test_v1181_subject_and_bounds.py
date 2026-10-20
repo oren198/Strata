@@ -1,7 +1,7 @@
 """1.18.1: a shared product, team or site name is not a shared subject; rate and count bounds
 read the right way.
 
-The fleet is six inherited rules that all name the product `acme-api`. A child's legitimate
+The fleet is six inherited rules that all name the product `ledger-svc`. A child's legitimate
 tightening is compared with every one of them; before 1.18.1 an unrelated rule that only
 shared the product name declined it. Every path that runs the subject test is pinned here, and
 each test names the retention rule when an exception is caught: the right rule, not any rule.
@@ -38,12 +38,12 @@ from tests.test_scope_manager import (
     _judge_batch,
 )
 
-RETENTION = "Customer data in acme-api is retained for a maximum of 14 days."
-DEPLOY = "Every production deploy of acme-api requires two reviewer approvals before merge."
-TESTS = "Run the full test suite before publishing any release of acme-api."
-VERSION = "The version of acme-api lives only in VERSION.txt as a plain semver string."
-TOKENS = "Access tokens issued by acme-api expire after at most 15 minutes."
-LOGS = "Customer email addresses and phone numbers are always redacted in all acme-api logs."
+RETENTION = "Customer records stored in ledger-svc are held for a maximum of 14 days."
+DEPLOY = "Each production rollout of ledger-svc requires two reviewer sign-offs before merging."
+TESTS = "The whole regression suite passes before any build of ledger-svc ships."
+VERSION = "The version string of ledger-svc is kept only in VERSION.txt, in semver form."
+TOKENS = "Session tokens minted by ledger-svc expire after at most 15 minutes."
+LOGS = "Customer emails and phone numbers are always masked in every ledger-svc log line."
 FLEET = [
     ("c_deploy", "g_org", DEPLOY),
     ("c_tests", "g_org", TESTS),
@@ -54,10 +54,10 @@ FLEET = [
 ]
 TEXTS = [text for *_, text in FLEET]
 
-TIGHTEN_RETENTION = "Customer data in acme-api is retained for a maximum of 7 days."
-TIGHTEN_TOKENS = "Access tokens issued by acme-api expire after at most 10 minutes."
-EXCEPTION_RETENTION = "Customer data in acme-api is retained for a maximum of 90 days."
-UNRELATED = "Release notes for acme-api are written in plain English."
+TIGHTEN_RETENTION = "Customer records stored in ledger-svc are held for a maximum of 7 days."
+TIGHTEN_TOKENS = "Session tokens minted by ledger-svc expire after at most 10 minutes."
+EXCEPTION_RETENTION = "Customer records stored in ledger-svc are held for a maximum of 90 days."
+UNRELATED = "Changelog entries for ledger-svc are written in plain English."
 
 
 def _directives() -> list[tuple[str, list[Directive]]]:
@@ -68,7 +68,7 @@ def _directives() -> list[tuple[str, list[Directive]]]:
                 Directive(
                     id=i,
                     content=t,
-                    subject="acme",
+                    subject="ledger",
                     source_scope_id="g_org",
                     source_skill="lead",
                     created_at="2026-03-01T09:00:00+00:00",
@@ -84,8 +84,8 @@ def _directives() -> list[tuple[str, list[Directive]]]:
 
 def test_a_name_that_only_qualifies_the_subject_is_a_context_word() -> None:
     words = inherited_context_words(TEXTS)
-    assert "acme" in words
-    assert "retain" not in words and "deploy" not in words
+    assert "ledger" in words
+    assert "record" not in words and "rollout" not in words
 
 
 def test_a_word_in_a_head_phrase_is_never_a_context_word() -> None:
@@ -120,8 +120,8 @@ def test_the_exception_is_caught_by_its_own_rule() -> None:
 
 def test_the_pairwise_call_without_the_set_is_the_old_behaviour() -> None:
     """The default is the empty set, and that is exactly the 1.18.0 defect: callers pass it."""
-    assert inherited_conflict(TIGHTEN_RETENTION, DEPLOY) is not None
-    assert inherited_conflict(TIGHTEN_RETENTION, DEPLOY, inherited_context_words(TEXTS)) is None
+    assert inherited_conflict(TIGHTEN_RETENTION, TOKENS) is not None
+    assert inherited_conflict(TIGHTEN_RETENTION, TOKENS, inherited_context_words(TEXTS)) is None
 
 
 # -- step 1, the single and batch judge paths --------------------------------
@@ -207,7 +207,7 @@ def test_step3_names_the_retention_rule_for_the_exception() -> None:
 
 def test_step3_loose_test_does_not_count_the_product_name() -> None:
     """The loose matcher has its own subject test; two shared stems used to be enough."""
-    child = "Staging builds of acme-api are deleted after 30 days."
+    child = "Staging builds of ledger-svc are deleted after 30 days."
     verdict, _r, _t, _fb = verify_directive_relation({}, child, FLEET)
     assert verdict == "admit"
 
@@ -224,12 +224,12 @@ def test_step3_a_trimmed_list_needs_the_set_from_the_whole_list() -> None:
 
 
 def test_rescue_refines_a_sibling_subject_only_with_the_set() -> None:
-    child = "Staging builds of acme-api are deleted after 30 days."
+    child = "Staging builds of ledger-svc are deleted after 30 days."
     answer = {
         "relation": "refines",
         "parent_id": "c_retention",
         "other_grounds_clear": True,
-        "subject_span": "Staging builds of acme-api",
+        "subject_span": "Staging builds of ledger-svc",
         "classification": "directive",
     }
     without, why, _c, _x = verify_relation_ground(answer, RETENTION, child, "directive")
@@ -244,7 +244,7 @@ def test_rescue_refines_a_sibling_subject_only_with_the_set() -> None:
 
 
 def test_context_about_an_unrelated_rule_is_not_covered_by_the_product_name() -> None:
-    text = "Deploys of acme-api went out at 14:00 on the third and nothing broke."
+    text = "Production rollouts of ledger-svc went out at 14:00 on the third and nothing broke."
     verdict, reason = verify_inherited_relation(
         {"kind": "unrelated", "inherited_id": "c_retention"},
         text,
@@ -255,7 +255,7 @@ def test_context_about_an_unrelated_rule_is_not_covered_by_the_product_name() ->
 
 
 def test_context_that_undercuts_the_retention_rule_is_still_declined() -> None:
-    text = "Customer data in acme-api may be kept for 90 days."
+    text = "Customer records stored in ledger-svc may be held for 90 days."
     verdict, _reason = verify_inherited_relation(
         {"kind": "unrelated", "inherited_id": "c_retention"},
         text,
@@ -307,11 +307,11 @@ def test_the_shown_rules_are_ranked_without_the_product_name() -> None:
     """Sibling rules that share the product name must not push the true rule out of the
     re-ask's character budget."""
     padded = [
-        (f"c_pad{i}", "g_org", f"Export jobs of acme-api run nightly, batch {i}.")
+        (f"c_pad{i}", "g_org", f"Export jobs of ledger-svc run nightly, batch {i}.")
         for i in range(60)
     ]
     inherited = [*padded, ("c_true", "g_org", "Customer data must not leave the EU.")]
-    shown = inherited_for_context("Customer data in acme-api is exported to the US.", inherited)
+    shown = inherited_for_context("Customer data in ledger-svc is exported to the US.", inherited)
     assert "c_true" in [d[0] for d in shown]
 
 
@@ -335,9 +335,9 @@ _BOUND_ROWS = [
         "Backups run at least 1 time per day.",
     ),
     (
-        "Every production deploy requires two reviewer approvals before merge.",
-        "Every production deploy requires three reviewer approvals before merge.",
-        "Every production deploy requires one reviewer approval before merge.",
+        "Every schema migration requires two DBA approvals before it runs.",
+        "Every schema migration requires three DBA approvals before it runs.",
+        "Every schema migration requires one DBA approval before it runs.",
     ),
     # forms that read correctly before 1.18.1 and must keep doing so
     (

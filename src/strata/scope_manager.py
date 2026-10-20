@@ -6517,8 +6517,8 @@ def _leading_phrase_words(text: str, count: int = 4) -> set[str]:
     return words
 
 
-#: A preposition that opens a QUALIFIER of a rule's subject ("deploys OF acme-api", "data IN
-#: acme-api", "tokens issued BY acme-api"): what follows it names where or whose, not what.
+#: A preposition that opens a QUALIFIER of a rule's subject ("rollouts OF ledger-svc", "records
+#: IN ledger-svc", "tokens minted BY ledger-svc"): what follows it names where or whose, not what.
 _QUALIFIER_CUT_RE = re.compile(
     r"\b(?:in|on|at|for|of|during|from|with|within|across|per|to|by)\b", re.IGNORECASE
 )
@@ -6538,8 +6538,8 @@ def _head_phrase_words(text: str) -> set[str]:
 def inherited_context_words(texts: Sequence[str]) -> frozenset[str]:
     """1.18.1: the leading-phrase words that QUALIFY the subject of the inherited rules
     rather than being it: a word in the leading phrase of two or more of *texts* that, in
-    every one of them, sits only after the first preposition ("deploys of acme-api", "data
-    in acme-api"), never in the head phrase. A shared product, team or site name is one;
+    every one of them, sits only after the first preposition ("rollouts of ledger-svc",
+    "records in ledger-svc"), never in the head phrase. A shared product, team or site name is one;
     "pallets" in "Frozen pallets must ..." and "Frozen pallets are labelled ..." is not.
 
     Such a word is dropped from both sides of every subject test, so a child's rule is not

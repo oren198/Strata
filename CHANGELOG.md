@@ -5,7 +5,7 @@ the release PR (`dev` → `main`) and the GitHub Release body are built from
 (`docs/releasing.md`, step 3) — write entries here as work lands, and the
 "Unreleased" section is cleared once a release ships.
 
-## 1.18.1 (2026-10-19)
+## 1.18.1 (2026-10-20)
 
 ### Fixed
 
