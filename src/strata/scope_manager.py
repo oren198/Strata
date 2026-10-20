@@ -7184,12 +7184,34 @@ _DELIBERATION_RE = re.compile(
 )
 
 
+#: A practice in force wrapped in a proposal ("proposing that we retire it; hotfixes currently go
+#: out on one review") is not deliberation.
+_PRACTICE_IN_FORCE_RE = re.compile(
+    r"\b(?:currently|at the moment|right now|in practice|as things stand|meanwhile|"
+    r"in the meantime|already|anyway|for now|these days|at present)\b",
+    re.IGNORECASE,
+)
+
+
+def _wrapped_practice_cue(content: str) -> str | None:
+    """The practice-in-force cue in a note that also reads as a proposal, else ``None``."""
+    if not _DELIBERATION_RE.search(content):
+        return None
+    match = _PRACTICE_IN_FORCE_RE.search(content)
+    return match.group(0) if match else None
+
+
 def _is_deliberation(content: str, rule: str, context_words: frozenset[str]) -> bool:
-    """Reasoning about changing the rule, with no exception or general marker in force."""
+    """Reasoning about changing the rule, with no exception or general marker in force and no
+    practice-in-force cue."""
+    # a question states nothing in force ("Should we keep requiring ...?"): its words are not
+    # markers. The practice cues are read on the whole text.
+    asked = re.sub(r"[^.!?]*\?", " ", content)
     return bool(
         _DELIBERATION_RE.search(content)
-        and _exception_marker(content, rule, context_words) is None
-        and _general_marker(content) is None
+        and not _PRACTICE_IN_FORCE_RE.search(content)
+        and _exception_marker(asked, rule, context_words) is None
+        and _general_marker(asked) is None
     )
 
 
@@ -10999,8 +11021,23 @@ class ScopeManager:
         deliberation = _is_own_origin(chosen[1]) and _is_deliberation(
             contribution.content, chosen[2], context_words
         )
+        if deliberation and answer.get("kind") == "exception":
+            # the judge named an exception: it wins unless its span is itself the deliberation
+            span = _verbatim_span(answer, "instead_span", contribution.content)
+            if span is not None and not _DELIBERATION_RE.search(span):
+                deliberation = False
+        wrapped = _wrapped_practice_cue(contribution.content) if _is_own_origin(chosen[1]) else None
         if deliberation:
             verdict, reason = "admit", f"deliberation about {chosen[0]}"
+        elif (
+            wrapped is not None
+            and answer.get("kind") not in ("consequence_report", "departure_report", "exception")
+            and _exception_marker(contribution.content, chosen[2], context_words) is None
+            and _general_marker(contribution.content) is None
+        ):
+            # a proposal that also states what is in force now: with no readable report or
+            # exception answer to go on, the practice cue is the marker
+            verdict, reason = "decline", f"practice in force beside a proposal ('{wrapped}')"
         else:
             verdict, reason = verify_inherited_relation(
                 answer, contribution.content, chosen[2], others, context_words

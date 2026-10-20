@@ -350,3 +350,96 @@ def test_a_scope_with_both_sends_one_call_listing_both_candidates():
     assert "c_pump01" in content and "c_review01" in content
     assert content.startswith("DIRECTIVES THAT BIND THIS SCOPE:")
     assert reask["tool_choice"]["name"] == "classify_inherited_relation"
+
+
+# -- a practice in force wrapped in a proposal is not deliberation ----------
+
+HOTFIX_RULE = "Every hotfix must be reviewed by a second engineer before merge."
+HOTFIX = Directive(
+    id="c_review01",
+    content=HOTFIX_RULE,
+    subject="review",
+    source_scope_id=SCOPE.id,
+    source_skill="architect",
+    created_at="2026-04-01T09:00:00+00:00",
+)
+HOTFIX_SUMMARY = SUMMARY.model_copy(update={"directives": [HOTFIX]})
+WRAPPED = (
+    "Proposing that we retire the second-review rule; hotfixes currently go out on one review."
+)
+WRAPPED_SPAN = "hotfixes currently go out on one review"
+
+
+def test_a_practice_in_force_wrapped_in_a_proposal_declines_on_an_unreadable_answer():
+    judgment, _ = _judge(WRAPPED, _answer("banana"), summary=HOTFIX_SUMMARY)
+    assert judgment.decision == "decline"
+
+
+def test_a_judge_named_exception_wins_over_the_deliberation_wording():
+    judgment, _ = _judge(
+        WRAPPED, _answer("exception", instead_span=WRAPPED_SPAN), summary=HOTFIX_SUMMARY
+    )
+    assert judgment.decision == "decline"
+    assert judgment.reasoning.endswith(NOTE_DECLINE_OWN)
+
+
+PURE = "We are thinking about whether to change the hotfix review rule next quarter."
+
+
+@pytest.mark.parametrize("kind", ["exception", "unrelated"])
+def test_a_pure_deliberation_stays_admitted_when_the_span_is_the_deliberation(kind):
+    judgment, _ = _judge(PURE, _answer(kind, instead_span=PURE), summary=HOTFIX_SUMMARY)
+    assert judgment.decision == "accept_as_context"
+    assert judgment.inherited_relation["reason"] == "deliberation about c_review01"
+
+
+def test_a_question_followed_by_a_practice_in_force_declines():
+    note = "Should we keep this rule? Hotfixes can go out after one review anyway."
+    judgment, _ = _judge(note, _answer("banana"), summary=HOTFIX_SUMMARY)
+    assert judgment.decision == "decline"
+
+
+@pytest.mark.parametrize(
+    "cue",
+    [
+        "currently",
+        "at the moment",
+        "right now",
+        "in practice",
+        "as things stand",
+        "meanwhile",
+        "in the meantime",
+        "already",
+        "anyway",
+        "for now",
+        "these days",
+        "at present",
+    ],
+)
+def test_each_practice_cue_breaks_the_deliberation(cue):
+    note = f"We are considering retiring the review rule, and hotfixes go out on one review {cue}."
+    judgment, _ = _judge(note, _answer("banana"), summary=HOTFIX_SUMMARY)
+    assert judgment.inherited_relation["reason"] != "deliberation about c_review01"
+
+
+P3 = "Should we keep requiring a second reviewer for hotfixes once the team doubles?"
+
+
+@pytest.mark.parametrize("kind", ["exception", "unrelated", "banana"])
+def test_a_pure_question_about_keeping_the_rule_is_admitted_under_every_answer(kind):
+    judgment, _ = _judge(P3, _answer(kind, instead_span=P3), summary=HOTFIX_SUMMARY)
+    assert judgment.decision == "accept_as_context"
+    assert judgment.inherited_relation["reason"] == "deliberation about c_review01"
+
+
+@pytest.mark.parametrize(
+    "note",
+    [
+        "Should we keep skipping it? We skip it on hotfixes.",
+        "Should we keep this rule? Hotfixes can go out after one review anyway.",
+        "Should we keep this? We already skip it.",
+    ],
+)
+def test_a_question_followed_by_a_statement_in_force_still_declines(note):
+    judgment, _ = _judge(note, _answer("banana"), summary=HOTFIX_SUMMARY)
+    assert judgment.decision == "decline"
