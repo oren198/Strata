@@ -7342,6 +7342,29 @@ _DETERMINERS = frozenset(
 )  # fmt: skip
 
 
+#: Clauses that merely LOOK like markers: a purpose clause ("so we can review our tooling"), a
+#: counterfactual ("should have been declared"), a negated proposal ("not proposing we stop").
+#: A clause ends at . ; , or a dash with spaces around it; a hyphen inside a word ("SEV-1") is
+#: not a clause end.
+_CLAUSE_REST = r"(?:(?!\s[-–—]\s)[^.;,])*"
+_NON_MARKER_CLAUSE_RE = re.compile(
+    r"\b(?:so(?:\s+that)?|in\s+order\s+(?:to|that))\s+(?:we|i|they|the\s+team)\s+"
+    rf"(?:can|could|may|might)\b{_CLAUSE_REST}"
+    r"|\b(?:should|ought\s+to|would)\s+have\s+been\b"
+    r"|\b(?:was|were)\s+supposed\s+to\b"
+    r"|\bnot\s+(?:proposing|suggesting|asking|saying)\s+(?:that\s+)?(?:we|anyone|they)\b"
+    rf"{_CLAUSE_REST}",
+    re.IGNORECASE,
+)
+
+
+def _blank_non_marker_clauses(text: str) -> str:
+    """*text* with purpose clauses, counterfactuals and negated proposals blanked, so the
+    marker scans read only what the note says it does or did. A real marker elsewhere in
+    the text still fires."""
+    return _NON_MARKER_CLAUSE_RE.sub(" ", text)
+
+
 def _general_marker(text: str) -> str | None:
     """The first marker that makes a report GENERAL rather than singular: a
     habitual or iterative adverb, a habitual "would", a present-perfect or
@@ -7350,6 +7373,7 @@ def _general_marker(text: str) -> str | None:
     hotfixes", "for repeat jobs"). A singular with a determiner or a number is
     one instance ("the hotfix", "mould 17"), and a bare plural naming WHO was
     acted on stays singular ("I paged the on-call engineers": determiner)."""
+    text = _blank_non_marker_clauses(text)
     for pattern in _GENERAL_MARKER_RES:
         match = pattern.search(text)
         if match:
@@ -7400,12 +7424,13 @@ def _exception_marker(
     or (for text that is not a specific past-tense report) the 1.17.2
     inherited-conflict signal (a looser value, an exemption, a softened
     "every/all" or an "only" narrowing on a covered subject) — else ``None``."""
+    scanned = _blank_non_marker_clauses(content)
     for pattern in _NORMATIVE_EXCEPTION_RES:
-        match = pattern.search(content)
+        match = pattern.search(scanned)
         if match:
             return f"normative marker '{match.group(0)}'"
     for pattern in _HABITUAL_EXCEPTION_RES:
-        match = pattern.search(content)
+        match = pattern.search(scanned)
         if match:
             return f"habitual marker '{match.group(0)}'"
     specific_past = bool(_SPECIFICITY_ANCHOR_RE.search(content) and _PAST_TENSE_RE.search(content))
@@ -7451,10 +7476,26 @@ def _has_past_tense(span: str) -> bool:
     return False
 
 
-def _action_overlap(span: str, inherited_text: str) -> bool:
-    from strata.publication import _overlap_words  # noqa: PLC0415
+def _shared_subject_stems(a: str, b: str, context_words: frozenset[str] = frozenset()) -> int:
+    """How many subject stems of *a* are shared with *b* (same prefix-5 rule as
+    :func:`_loose_covers`); modals, quantifiers, time words and *context_words* don't count."""
+    mine = _subject_stems(a) - _LOOSE_STOPWORDS - context_words
+    other = _subject_stems(b) - _LOOSE_STOPWORDS - context_words
+    return len({m for m in mine if m in other or any(_shared_prefix(m, w) >= 5 for w in other)})
 
-    if _overlap_words(span) & _overlap_words(inherited_text):
+
+def _note_covers_rule(rule: str, content: str, context_words: frozenset[str] = frozenset()) -> bool:
+    """Whether *content* is about *rule*'s subject: the strict covered-subject plus head-noun
+    test, OR at least two shared subject stems (filler such as "from", "with", "must" and
+    *context_words* don't count). A directive covers the cases it governs, never notes that
+    merely share its words."""
+    if _is_covered_subject(rule, content, context_words) and _head_nouns_compatible(rule, content):
+        return True
+    return _shared_subject_stems(rule, content, context_words) >= 2
+
+
+def _action_overlap(span: str, inherited_text: str) -> bool:
+    if _shared_subject_stems(span, inherited_text) >= 1:
         return True
     numbers = set(re.findall(r"\d+(?:\.\d+)?", inherited_text))
     return bool(numbers & set(re.findall(r"\d+(?:\.\d+)?", span)))
@@ -7463,24 +7504,9 @@ def _action_overlap(span: str, inherited_text: str) -> bool:
 def _context_covers(
     inherited_text: str, content: str, context_words: frozenset[str] = frozenset()
 ) -> bool:
-    """Whether context *content* is about an inherited directive's subject:
-    1.17.2's covered-subject plus head-noun test, OR at least two shared
-    content words anywhere (the leading-noun-phrase test alone is built for
-    directive sentences and misses most context prose)."""
-    from strata.publication import _overlap_words  # noqa: PLC0415
-
-    if _is_covered_subject(inherited_text, content, context_words) and _head_nouns_compatible(
-        inherited_text, content
-    ):
-        return True
-    inherited_words = _overlap_words(_normalise_synonyms(inherited_text)) - context_words
-    content_words = _overlap_words(_normalise_synonyms(content)) - context_words
-    shared = {
-        mine
-        for mine in inherited_words
-        if any(_shared_prefix(mine, other) >= 5 or mine == other for other in content_words)
-    }
-    return len(shared) >= 2
+    """Whether context *content* is about an inherited directive's subject
+    (:func:`_note_covers_rule`)."""
+    return _note_covers_rule(inherited_text, content, context_words)
 
 
 def _shared_prefix(a: str, b: str) -> int:
@@ -7527,9 +7553,26 @@ def verify_inherited_relation(
 
     if kind == "exception":
         span = _verbatim_span(answer, "instead_span", content)
-        if span is not None:
+        if span is None:
+            failure = "exception answer without a verbatim instead_span"
+        elif not _note_covers_rule(inherited_text, content, context_words):
+            return "admit", "exception answer on a rule the note does not cover"
+        elif (
+            _SPECIFICITY_ANCHOR_RE.search(content)
+            and _PAST_TENSE_RE.search(content)
+            and marker is None
+            and _general_marker(content) is None
+        ):
+            # A dated report of something that already happened is a report, not an exception.
+            if not _action_overlap(span, inherited_text):
+                return (
+                    "admit",
+                    "exception answer on a past occurrence that is not the rule's action",
+                )
+            verdict = "departure_report" if _DEPARTURE_CUE_RE.search(span) else "consequence_report"
+            return verdict, "a specific past occurrence"
+        else:
             return "decline", "an exception: states what happens instead of the rule"
-        failure = "exception answer without a verbatim instead_span"
     elif kind in ("consequence_report", "departure_report"):
         span = _verbatim_span(answer, "occurrence_span", content)
         unspecific = None

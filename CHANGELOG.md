@@ -5,6 +5,18 @@ the release PR (`dev` → `main`) and the GitHub Release body are built from
 (`docs/releasing.md`, step 3) — write entries here as work lands, and the
 "Unreleased" section is cleared once a release ships.
 
+## Unreleased
+
+### Fixed
+
+- A context note is no longer declined as an exception to an inherited rule it isn't
+  about. The engine now checks that the note's subject is the rule's, ignoring common
+  words. A dated report of something that already happened is treated as a report, not
+  as an exception.
+- An honest report of a departure ("... should have been declared ... so we can review
+  our tooling") is no longer read as a standing practice. Purpose clauses, "should have
+  been" and "not proposing we ..." don't count as exception markers.
+
 ## 1.18.1 (2026-10-20)
 
 ### Fixed

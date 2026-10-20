@@ -48,7 +48,7 @@ ANCESTOR = Directive(
 ANCESTORS = [("g_arch", [ANCESTOR])]
 
 EXCEPTION_NORMATIVE = (
-    "FYI, on nights when the fleet returns the pumps may stay running until 22:00."
+    "FYI, on nights when the fleet returns the fuel dock pumps may stay running until 22:00."
 )
 EXCEPTION_HABITUAL = (
     "FYI, on nights when the fishing fleet is returning we leave the pumps running until 22:00."
