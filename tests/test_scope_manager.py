@@ -1902,7 +1902,9 @@ def test_current_publication_block_rendered_when_provided() -> None:
         current_publication=[_PUBLISHED_ITEM],
     )
 
-    content = mock_client.messages.create.call_args.kwargs["messages"][0]["content"]
+    content = mock_client.messages.create.call_args_list[0].kwargs["messages"][0][
+        "content"
+    ]  # [0]: the judgment call, not the own-directive re-ask
     assert "THIS SCOPE'S PUBLICATION" in content
     assert "pub_abc123" in content
     assert "Use protobuf for all RPC." in content
@@ -1938,7 +1940,9 @@ def test_current_publication_block_shows_none_yet_when_empty_list() -> None:
         current_publication=[],
     )
 
-    content = mock_client.messages.create.call_args.kwargs["messages"][0]["content"]
+    content = mock_client.messages.create.call_args_list[0].kwargs["messages"][0][
+        "content"
+    ]  # [0]: the judgment call, not the own-directive re-ask
     assert "THIS SCOPE'S PUBLICATION" in content
     assert "(none yet)" in content
 
@@ -1956,7 +1960,9 @@ def test_peer_publications_block_rendered_when_provided() -> None:
         peer_publications=[("g_peer_a", [_PUBLISHED_ITEM])],
     )
 
-    content = mock_client.messages.create.call_args.kwargs["messages"][0]["content"]
+    content = mock_client.messages.create.call_args_list[0].kwargs["messages"][0][
+        "content"
+    ]  # [0]: the judgment call, not the own-directive re-ask
     assert "REFERENCED PEER PUBLICATIONS" in content
     assert "g_peer_a" in content
     assert "pub_abc123" in content
@@ -3048,6 +3054,9 @@ def test_invalid_id_triggers_one_corrective_listing_the_valid_ids() -> None:
     mock_client.messages.create.side_effect = [
         _fake_response(_retire_input("c_hallucinated")),
         _fake_response(_retire_input(EXISTING_DIRECTIVE.id)),
+        _fake_response(
+            {"kind": "unrelated", "inherited_id": EXISTING_DIRECTIVE.id, "reasoning": "r"}
+        ),
     ]
     manager = ScopeManager(client=mock_client)
 
@@ -3059,7 +3068,7 @@ def test_invalid_id_triggers_one_corrective_listing_the_valid_ids() -> None:
         new_contribution=NEW_CONTRIBUTION,
     )
 
-    assert mock_client.messages.create.call_count == 2
+    assert mock_client.messages.create.call_count == 3  # +1: the own-directive re-ask
     followup = mock_client.messages.create.call_args_list[1].kwargs["messages"][-1]
     text = [b for b in followup["content"] if b["type"] == "text"][0]["text"]
     assert "c_hallucinated" in text
@@ -3074,6 +3083,7 @@ def test_invalid_id_triggers_one_corrective_listing_the_valid_ids() -> None:
     # Bound contributor, applied op: the engine provenance line is the only suffix.
     assert judgment.record_notes == (
         f"[accept_as_context; retire c_old001] {judgment.reasoning} "
+        "[inherited relation: admit, answered unrelated; no covered exception] "
         f"{_same_scope_line('retire c_old001')}"
     )
 
@@ -3244,7 +3254,7 @@ def test_overflow_retry_may_retire_to_fit() -> None:
         summary_max_words=5,
     )
 
-    assert mock_client.messages.create.call_count == 2
+    assert mock_client.messages.create.call_count == 3  # +1: the own-directive re-ask
     assert judgment.new_summary is not None
     assert judgment.new_summary.directives == []
     assert judgment.retired_directive_ids == [EXISTING_DIRECTIVE.id]
@@ -3457,7 +3467,7 @@ def test_no_operator_memory_rendered_gets_no_corrective() -> None:
         new_contribution=NEW_CONTRIBUTION,
     )
 
-    assert len(_judge_calls(mock_client)) == 1
+    assert len(_judge_calls(mock_client)) == 2  # +1: the own-directive re-ask
     assert judgment.new_summary is not None
     assert judgment.new_summary.context == UNATTRIBUTED_CONTEXT
 
@@ -5117,7 +5127,7 @@ def test_resurrected_context_claim_triggers_one_corrective_naming_the_rule() -> 
 
     judgment = _judge_context_supersession(mock_client)
 
-    assert mock_client.messages.create.call_count == 2
+    assert mock_client.messages.create.call_count == 3  # +1: the own-directive re-ask
     followup = mock_client.messages.create.call_args_list[1].kwargs["messages"][-1]
     text = [b for b in followup["content"] if b["type"] == "text"][0]["text"]
     assert RECENT_CONTRIBUTION.id in text
@@ -5189,7 +5199,7 @@ def test_retire_op_target_is_checked_the_same_way() -> None:
         new_contribution=NEW_CONTRIBUTION,
     )
 
-    assert mock_client.messages.create.call_count == 2
+    assert mock_client.messages.create.call_count == 3  # +1: the own-directive re-ask
     assert judgment.new_summary is not None
     assert judgment.new_summary.context == _CLEAN_CONTEXT
 
@@ -5207,7 +5217,7 @@ def test_second_answer_still_carrying_the_claim_drops_the_context_and_keeps_the_
 
     judgment = _judge_context_supersession(mock_client)
 
-    assert mock_client.messages.create.call_count == 2
+    assert mock_client.messages.create.call_count == 3  # +1: the own-directive re-ask
     assert judgment.decision == "accept_as_context"
     assert judgment.new_context is None
     assert judgment.dropped_superseded_context is True
@@ -5260,7 +5270,7 @@ def test_clean_first_answer_makes_exactly_one_call() -> None:
         new_contribution=_contribution_superseding(RECENT_CONTRIBUTION.id),
     )
 
-    assert mock_client.messages.create.call_count == 1
+    assert mock_client.messages.create.call_count == 2  # +1: the own-directive re-ask
     assert judgment.dropped_superseded_context is False
     assert judgment.new_summary is not None
     assert judgment.new_summary.context == _CLEAN_CONTEXT
@@ -5279,7 +5289,7 @@ def test_paraphrase_of_a_superseded_claim_is_not_re_asked() -> None:
         new_contribution=_contribution_superseding(RECENT_CONTRIBUTION.id),
     )
 
-    assert mock_client.messages.create.call_count == 1
+    assert mock_client.messages.create.call_count == 2  # +1: the own-directive re-ask
     assert judgment.dropped_superseded_context is False
     assert judgment.new_summary is not None
     assert judgment.new_summary.context == paraphrase
@@ -5296,7 +5306,7 @@ def test_whitespace_and_case_differences_do_not_evade_the_backstop() -> None:
 
     judgment = _judge_context_supersession(mock_client)
 
-    assert mock_client.messages.create.call_count == 2
+    assert mock_client.messages.create.call_count == 3  # +1: the own-directive re-ask
     assert judgment.new_summary is not None
     assert judgment.new_summary.context == _CLEAN_CONTEXT
 
@@ -5311,7 +5321,7 @@ def test_superseded_claim_corrective_failure_drops_the_context() -> None:
 
     judgment = _judge_context_supersession(mock_client)
 
-    assert mock_client.messages.create.call_count == 2
+    assert mock_client.messages.create.call_count == 3  # +1: the own-directive re-ask
     assert judgment.decision == "accept_as_context"
     assert judgment.dropped_superseded_context is True
     assert judgment.new_context is None
@@ -5327,7 +5337,7 @@ def test_superseded_claim_corrective_may_not_flip_the_verdict() -> None:
 
     judgment = _judge_context_supersession(mock_client)
 
-    assert mock_client.messages.create.call_count == 2
+    assert mock_client.messages.create.call_count == 3  # +1: the own-directive re-ask
     assert judgment.decision == "accept_as_context"
     # The discarded retry leaves the first judgment still carrying the claim.
     assert judgment.dropped_superseded_context is True
@@ -5347,7 +5357,7 @@ def test_a_supersedes_target_outside_the_window_is_not_checked() -> None:
         new_contribution=_contribution_superseding(RECENT_CONTRIBUTION.id),
     )
 
-    assert mock_client.messages.create.call_count == 1
+    assert mock_client.messages.create.call_count == 2  # +1: the own-directive re-ask
     assert judgment.new_summary is not None
     assert judgment.new_summary.context == context
 
@@ -5478,7 +5488,7 @@ def test_budget_rewrite_may_not_resurrect_the_superseded_claim() -> None:
         summary_max_words=20,
     )
 
-    assert mock_client.messages.create.call_count == 3
+    assert mock_client.messages.create.call_count == 4  # +1: the own-directive re-ask
     overflow_text = [
         b
         for b in mock_client.messages.create.call_args_list[2].kwargs["messages"][-1]["content"]

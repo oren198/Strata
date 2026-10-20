@@ -124,10 +124,11 @@ def _contribute(
     as_scope: str = PARENT,
     content: str = "Cap every outbound retry at three attempts.",
     skill: str = "lead",
+    then: tuple[dict, ...] = (),
     **fields: object,
 ) -> tuple[str, str]:
     """POST one contribution to PARENT judged by *verdict*; return (id, recorded notes)."""
-    client.queued.append(verdict)  # type: ignore[attr-defined]
+    client.queued.extend([verdict, *then])  # type: ignore[attr-defined]
     resp = client.post(
         "/contribute",
         json={
@@ -196,9 +197,11 @@ def test_bound_append_supersede_and_retire_each_carry_the_exact_line(client: Tes
             "new_context": "Retries are no longer capped here.",
         },
         content="Retire the retry cap; the retry layer was removed.",
+        then=({"kind": "unrelated", "inherited_id": second, "reasoning": "r"},),
     )
     assert notes == (
         f"[accept_as_context; retire {second}] The rule no longer applies. "
+        "[inherited relation: admit, answered unrelated; no covered exception] "
         f"{_line(f'retire {second}')}"
     )
 
@@ -436,7 +439,9 @@ def test_single_judge_call_inputs_are_unchanged_except_the_system_prompt() -> No
         recent_contributions=[],
         new_contribution=NEW_CONTRIBUTION,
     )
-    kwargs = mock_client.messages.create.call_args.kwargs
+    kwargs = mock_client.messages.create.call_args_list[
+        0
+    ].kwargs  # [0]: the judgment call, not the own-directive re-ask
     assert kwargs["system"][0]["text"] == _SYSTEM_PROMPT
     assert _sha_json(kwargs["messages"]) == _SINGLE_MESSAGES_SHA
     assert _sha_json(kwargs["tools"]) == _SINGLE_TOOLS_SHA
@@ -504,7 +509,9 @@ def test_a_later_single_judge_sees_the_window_exactly_as_before() -> None:
         recent_contributions=window,
         new_contribution=SECOND_CONTRIBUTION,
     )
-    messages = mock_client.messages.create.call_args.kwargs["messages"]
+    messages = mock_client.messages.create.call_args_list[0].kwargs[
+        "messages"
+    ]  # [0]: the judgment call, not the own-directive re-ask
     rendered = json.dumps(messages)
     assert "reasoning=An enforceable rule. content=" in rendered
     assert "[Engine:" not in rendered
@@ -535,7 +542,9 @@ def test_a_later_batch_judge_sees_the_window_exactly_as_before() -> None:
         recent_contributions=window,
         new_contributions=[SECOND_CONTRIBUTION, THIRD_CONTRIBUTION],
     )
-    messages = mock_client.messages.create.call_args.kwargs["messages"]
+    messages = mock_client.messages.create.call_args_list[0].kwargs[
+        "messages"
+    ]  # [0]: the judgment call, not the own-directive re-ask
     assert "[Engine:" not in json.dumps(messages)
     assert _sha_json(messages) == _WINDOW_BATCH_MESSAGES_SHA
 

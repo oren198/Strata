@@ -225,7 +225,7 @@ def test_one_row_uses_response_tokens_not_an_estimate(tmp_path: Path, monkeypatc
     finally:
         unbind_usage_db(previous)
     rows = _rows(db_path)
-    assert len(rows) == 1
+    assert len(rows) == 2  # +1: the own-directive re-ask
     assert rows[0]["call_kind"] == "judgment"
     assert rows[0]["input_tokens"] == 11
     assert rows[0]["output_tokens"] == 7
@@ -253,7 +253,7 @@ def test_recording_failure_does_not_block_the_judgment(tmp_path: Path, monkeypat
         _judge(ScopeManager(client=client))
     finally:
         unbind_usage_db(previous)
-    assert client.messages.create.call_count == 1
+    assert client.messages.create.call_count == 2  # +1: the own-directive re-ask
     assert _rows(db_path) == []
 
 
@@ -270,9 +270,13 @@ def test_reask_still_runs_after_the_cap_is_crossed(tmp_path: Path, monkeypatch) 
         _judge(ScopeManager(client=client))
     finally:
         unbind_usage_db(previous)
-    assert client.messages.create.call_count == 2
+    assert client.messages.create.call_count == 3  # +1: the own-directive re-ask
     rows = _rows(db_path)
-    assert [row["call_kind"] for row in rows] == ["judgment", "corrective_reask"]
+    assert [row["call_kind"] for row in rows] == [
+        "judgment",
+        "corrective_reask",
+        "own_directive_relation",
+    ]
     assert rows[0]["input_tokens"] == 80
     assert rows[1]["input_tokens"] == 5
 
