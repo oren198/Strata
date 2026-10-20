@@ -11,6 +11,21 @@ the release PR (`dev` → `main`) and the GitHub Release body are built from
 
 - The operator primitives (`operator_publish`, `operator_supersede_item`, `operator_retire_item`) called without `fleet` now read the fleet beside the store and tell the attachment scope and its subtree, as the CLI always did. Where no fleet can be found from the store they raise instead of writing silently (#195).
 
+## 1.18.2 (2026-10-21)
+
+### Fixed
+
+- A context note is no longer declined as an exception to an inherited rule it isn't
+  about. A dated report of something that already happened, with no change of practice
+  in it, is treated as a report, not as an exception.
+- An honest report of a departure ("... should have been declared ... so we can review
+  our tooling") is no longer read as a standing practice. Purpose clauses, "should have
+  been" and "not proposing we ..." don't count as exception markers.
+- Known limit: a dated note that describes a decision or a change (for example 'the
+  operator decided…' or '…no longer count as…') is still declined when the judge wrongly
+  reads it as an exception to an unrelated rule. The check fails closed here: an
+  exception to a rule is never let through on its wording.
+
 ## 1.18.1 (2026-10-20)
 
 ### Fixed
