@@ -7476,6 +7476,48 @@ def _has_past_tense(span: str) -> bool:
     return False
 
 
+_DATED_ANCHOR_RE = re.compile(
+    rf"\b\d{{1,2}}(?:st|nd|rd|th)?\s+(?:of\s+)?{_MONTHS}\b"
+    rf"|\b{_MONTHS}\.?\s+\d{{1,2}}\b"
+    r"|\b\d{4}-\d{2}-\d{2}\b|\b\d{1,2}/\d{1,2}(?:/\d{2,4})?\b"
+    r"|\b(?:mon|tues|wednes|thurs|fri|satur|sun)day\b"
+    r"|\b(?:yesterday|last (?:night|week|month|shift)|this (?:morning|week)|earlier today)\b"
+    r"|\bthe night of\b",
+    re.IGNORECASE,
+)
+#: A modal makes the text normative or permissive, never a plain report ("must-stay" is a
+#: name, not a modal).
+_MODAL_RE = re.compile(
+    r"\b(?:can|could|may|might|must|shall|should|will|would|needs? to|has to|have to|"
+    r"is allowed|are allowed)\b(?!-)",
+    re.IGNORECASE,
+)
+
+
+#: A note that says a practice changed or was decided is an exception however it is dated.
+_CHANGE_OF_PRACTICE_RE = re.compile(
+    r"\b(?:decided|decides|agreed|agrees|resolved|switched|moved|started|starts|began|begun|"
+    r"stopped|stops|extended|dropped|changed|adopted|introduced|relaxed|raised|lowered|"
+    r"replaced|scrapped|removed|waived|suspended|paused|retired|no longer|from now on|"
+    r"going forward|henceforth|until further notice|suffices?|"
+    r"(?:is|are) (?:enough|fine|ok|okay|acceptable))\b",
+    re.IGNORECASE,
+)
+
+
+def _is_dated_past_report(content: str) -> bool:
+    """A real date or day anchor, a past-tense verb, no modal and no change-of-practice cue,
+    once purpose clauses, counterfactuals and negated proposals are blanked. "once", "twice",
+    "N times", a bare clock time, a version or a bare year anchor nothing."""
+    text = _blank_non_marker_clauses(content)
+    return bool(
+        _DATED_ANCHOR_RE.search(text)
+        and _PAST_TENSE_RE.search(text)
+        and not _MODAL_RE.search(text)
+        and not _CHANGE_OF_PRACTICE_RE.search(text)
+    )
+
+
 def _shared_subject_stems(a: str, b: str, context_words: frozenset[str] = frozenset()) -> int:
     """How many subject stems of *a* are shared with *b* (same prefix-5 rule as
     :func:`_loose_covers`); modals, quantifiers, time words and *context_words* don't count."""
@@ -7566,14 +7608,7 @@ def verify_inherited_relation(
         span = _verbatim_span(answer, "instead_span", content)
         if span is None:
             failure = "exception answer without a verbatim instead_span"
-        elif not _covers_or_marked(inherited_text, content, marker, context_words):
-            return "admit", "exception answer on a rule the note does not cover"
-        elif (
-            _SPECIFICITY_ANCHOR_RE.search(content)
-            and _PAST_TENSE_RE.search(content)
-            and marker is None
-            and _general_marker(content) is None
-        ):
+        elif marker is None and _is_dated_past_report(content) and _general_marker(content) is None:
             # A dated report of something that already happened is a report, not an exception.
             if not _action_overlap(span, inherited_text):
                 return (

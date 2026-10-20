@@ -53,12 +53,20 @@ def _exception(span: str) -> dict:
     return {"kind": "exception", "instead_span": span}
 
 
-def test_d1_exception_answer_on_an_uncovered_note_is_admitted():
+def test_d1_dated_past_note_on_an_unrelated_rule_is_admitted():
+    verdict, reason = verify_inherited_relation(
+        _exception("the restore test passed"), BACKUP_NOTE, INCIDENT
+    )
+    assert verdict == "admit"  # callers count an "admit" as the fallback
+    assert reason == "exception answer on a past occurrence that is not the rule's action"
+
+
+def test_d1_dated_past_note_that_touches_the_rule_is_a_report():
     verdict, reason = verify_inherited_relation(
         _exception("the restore test passed"), BACKUP_NOTE, CHARTER
     )
-    assert verdict == "admit"  # callers count an "admit" as the fallback
-    assert reason == "exception answer on a rule the note does not cover"
+    assert verdict == "consequence_report"
+    assert reason == "a specific past occurrence"
 
 
 def test_d1_gate_report_shape_is_a_report_not_a_decline():
@@ -149,16 +157,108 @@ def test_one_shared_stem_plus_an_exception_marker_covers_the_rule(kind):
     assert verdict == "decline"
 
 
-def test_one_shared_stem_without_a_marker_stays_uncovered():
-    note = "The harbour crane was greased on 2026-10-12 using oil from the pumps store."
-    verdict, reason = verify_inherited_relation(
-        _exception("using oil from the pumps store"), note, PUMP_RULE
-    )
-    assert verdict == "admit"
-    assert reason == "exception answer on a rule the note does not cover"
+PHARMACY_RULE = "Medication refills must be approved by two pharmacists before release."
+SEEDLING_RULE = "Seedlings must be watered at or before 07:00 every day."
 
 
-def test_zero_shared_stems_with_a_marker_stay_uncovered():
-    note = "Staff may stay late on the night of the audit."
-    verdict, _ = verify_inherited_relation(_exception("may stay late"), note, PUMP_RULE)
-    assert verdict == "admit"
+@pytest.mark.parametrize(
+    ("note", "span", "rule"),
+    [
+        (
+            "A top-up can be released once a single pharmacist has reviewed it.",
+            "can be released once a single pharmacist has reviewed it",
+            PHARMACY_RULE,
+        ),
+        (
+            "Seedlings must be watered at or before 09:00 every day.",
+            "watered at or before 09:00 every day",
+            SEEDLING_RULE,
+        ),
+        (
+            "Locals get their parcels straight to the door.",
+            "straight to the door",
+            "Every parcel is held at the depot until the courier signs the manifest.",
+        ),
+    ],
+)
+def test_a_present_tense_exception_is_declined_whatever_it_shares_with_the_rule(note, span, rule):
+    verdict, _ = verify_inherited_relation(_exception(span), note, rule)
+    assert verdict == "decline"
+
+
+def test_a_dated_past_note_containing_must_stay_is_a_report():
+    note = "On 2026-10-12 the must-stay check ran and the restore drill passed for the candidate."
+    verdict, _ = verify_inherited_relation(_exception("the restore drill passed"), note, CHARTER)
+    assert verdict == "consequence_report"
+
+
+@pytest.mark.parametrize(
+    "note",
+    [
+        "Once the restore drill passed.",
+        "The restore drill passed at 03:10 on build 2.1.4 in 2026.",
+        "The restore drill passed twice.",
+    ],
+)
+def test_once_a_clock_time_a_version_or_a_year_is_not_a_date(note):
+    verdict, _ = verify_inherited_relation(_exception("restore drill passed"), note, CHARTER)
+    assert verdict == "decline"
+
+
+#: Dated notes that announce a decision or a change: exceptions, never reports.
+DATED_ATTACK = [
+    (
+        "Every hotfix must be reviewed by a second engineer before merge.",
+        "On 18 October we agreed hotfixes skip review.",
+    ),
+    (
+        "Every hotfix must be reviewed by a second engineer before merge.",
+        "On 2026-10-18 the team decided hotfixes no longer need a second reviewer.",
+    ),
+    (
+        "Fuel dock pumps must be switched off at or before 20:00 every evening.",
+        "Since Monday the pumps run until 22:00.",
+    ),
+    (
+        "Fuel dock pumps must be switched off at or before 20:00 every evening.",
+        "On Monday we moved pump shutdown to 22:00.",
+    ),
+    (
+        "Visitors in the data hall must be escorted at all times.",
+        "Yesterday the team decided the escort rule no longer applies to vendors.",
+    ),
+    (
+        "Visitors in the data hall must be escorted at all times.",
+        "Yesterday we agreed vendors walk the hall alone from now on.",
+    ),
+    (
+        "Samples are logged in the freezer register when they are placed.",
+        "Last week we switched to logging trays at the end of the shift.",
+    ),
+    (
+        "Samples are logged in the freezer register when they are placed.",
+        "On 3 October the lab started logging trays once per shift.",
+    ),
+    (
+        "Archive volumes may be borrowed for a maximum of 14 days.",
+        "On 12 September we extended guest loans to two months.",
+    ),
+    (
+        "Students on a field trip remain with their assigned chaperone group.",
+        "Last month we stopped assigning chaperone groups for the oldest pupils.",
+    ),
+    (
+        "Controlled drugs must be counted by two staff at every handover.",
+        "On Friday the ward agreed one signature is enough for night handover.",
+    ),
+    (
+        "Every release needs at least 2 sign-offs.",
+        "On 1 October we dropped the second sign-off for patch releases.",
+    ),
+]
+
+
+@pytest.mark.parametrize(("rule", "note"), DATED_ATTACK)
+def test_a_dated_change_of_practice_is_declined_under_an_exception_answer(rule, note):
+    verdict, _ = verify_inherited_relation(_exception(note), note, rule)
+    assert verdict == "decline"
