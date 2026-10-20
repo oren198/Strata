@@ -5704,9 +5704,25 @@ _COMPARATOR_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(rf"\bat or above\s+{_COMPARATOR_VALUE}", re.IGNORECASE), "larger"),
     (re.compile(rf"\bat or before\s+{_COMPARATOR_VALUE}", re.IGNORECASE), "smaller"),
     (re.compile(rf"\bat or after\s+{_COMPARATOR_VALUE}", re.IGNORECASE), "larger"),
-    (re.compile(rf"\bevery\s+{_COMPARATOR_VALUE}", re.IGNORECASE), "smaller"),
+    # 1.18.1: a CEILING on a rate ("at most 3 per day", normalised to the interval it implies)
+    # is a FLOOR on the interval between events: a longer interval is stricter. Before the
+    # plain "every N", whose interval reads the other way round.
+    (re.compile(rf"\bno more often than every\s+{_COMPARATOR_VALUE}", re.IGNORECASE), "larger"),
+    (
+        re.compile(rf"(?<!no more often than )\bevery\s+{_COMPARATOR_VALUE}", re.IGNORECASE),
+        "smaller",
+    ),
     (re.compile(rf"\bwithin\s+{_COMPARATOR_VALUE}", re.IGNORECASE), "smaller"),
     (re.compile(rf"\bat least\s+{_COMPARATOR_VALUE}", re.IGNORECASE), "larger"),
+    # 1.18.1: a count floor ("requires two reviewer approvals", "needs 3 sign-offs"): the
+    # bare count after the verb is the minimum, so a larger one is stricter.
+    (
+        re.compile(
+            rf"\b(?:requires?|required|needs?|needed|mandates?)\s+{_COMPARATOR_VALUE}",
+            re.IGNORECASE,
+        ),
+        "larger",
+    ),
     # #244b class A: other surface forms of a bound. "by"/"before" count only
     # for a clock time (the bare words are everywhere: "before publishing").
     (re.compile(r"\b(?:not|no) later than\s+(-?[\d:.,]+)", re.IGNORECASE), "smaller"),
@@ -5920,6 +5936,15 @@ _FREQ_UNITS = {
     "year": 31536000,
 }
 _FREQ_COUNT = {"once": 1, "twice": 2, "thrice": 3}
+#: The words that bound a RATE ("at most 3 per day", "at least twice a week"); see
+#: :func:`_normalise_quantities`.
+_RATE_CEILING_RE = (
+    r"\b(?:at most|no more than|not more than|up to|a maximum of|maximum of|no greater than"
+    r"|not exceeding|fewer than|less than)"
+)
+_RATE_FLOOR_RE = (
+    r"\b(?:at least|no fewer than|no less than|not less than|a minimum of|minimum of|more than)"
+)
 _UNCERTAIN = "?uncertain"
 """Second element of ``_comparator_rule_ok``'s ``(None, ...)`` when the child states the
 bound in a form that cannot be compared (units that do not convert): no conflict is
@@ -5967,10 +5992,18 @@ def _normalise_quantities(text: str) -> str:
         count = _FREQ_COUNT.get(word) or _WORD_VALUES.get(word) or int(word)
         if count <= 0:
             return m.group(0)
-        return _every_phrase(_FREQ_UNITS[m.group("unit").casefold()] / count)
+        every = _every_phrase(_FREQ_UNITS[m.group("unit").casefold()] / count)
+        # A rate is bounded the other way round from the interval it implies: "at most 3
+        # per day" is "no more often than every 8 hours" (a CEILING on the rate is a floor
+        # on the interval), "at least 3 per day" is "every 8 hours" (a floor on the rate is
+        # a ceiling on the interval). The bound word belongs to the rate, so it is consumed.
+        if m.group("ceiling"):
+            return f"no more often than {every}"
+        return every
 
     text = re.sub(
-        rf"(?<![\d:.])\b(?P<count>once|twice|thrice|\d+|{_NUMBER_WORD_ALT})(?: times)?\s+"
+        rf"(?:(?P<ceiling>{_RATE_CEILING_RE})|(?P<floor>{_RATE_FLOOR_RE}))?\s*"
+        rf"(?<![\d:.])\b(?P<count>once|twice|thrice|\d+|{_NUMBER_WORD_ALT})(?: times?)?\s+"
         rf"(?:a|an|per|each|every)\s+(?P<unit>{unit_alt})\b",
         times_per,
         text,
@@ -6484,7 +6517,49 @@ def _leading_phrase_words(text: str, count: int = 4) -> set[str]:
     return words
 
 
-def _is_covered_subject(parent_text: str, content: str) -> bool:
+#: A preposition that opens a QUALIFIER of a rule's subject ("rollouts OF ledger-svc", "records
+#: IN ledger-svc", "tokens minted BY ledger-svc"): what follows it names where or whose, not what.
+_QUALIFIER_CUT_RE = re.compile(
+    r"\b(?:in|on|at|for|of|during|from|with|within|across|per|to|by)\b", re.IGNORECASE
+)
+
+
+def _head_phrase_words(text: str) -> set[str]:
+    """The leading-phrase words of *text* that sit BEFORE its first preposition: the head
+    phrase of the subject, as opposed to a qualifier of it."""
+    marker = _LEADING_PHRASE_VERB_RE.search(text)
+    subject_text = text[: marker.start()] if marker is not None else text
+    body = _SCOPE_SETTING_PREFIX_RE.sub("", subject_text, count=1)
+    cut = _QUALIFIER_CUT_RE.search(body)
+    head = body[: cut.start()] if cut is not None else body
+    return _leading_phrase_words(head + " is")
+
+
+def inherited_context_words(texts: Sequence[str]) -> frozenset[str]:
+    """1.18.1: the leading-phrase words that QUALIFY the subject of the inherited rules
+    rather than being it: a word in the leading phrase of two or more of *texts* that, in
+    every one of them, sits only after the first preposition ("rollouts of ledger-svc",
+    "records in ledger-svc"), never in the head phrase. A shared product, team or site name is one;
+    "pallets" in "Frozen pallets must ..." and "Frozen pallets are labelled ..." is not.
+
+    Such a word is dropped from both sides of every subject test, so a child's rule is not
+    "about the same thing" as a rule that only names the same product. Fewer than two
+    texts give the empty set, so a single inherited rule is compared exactly as before."""
+    if len(texts) < 2:
+        return frozenset()
+    seen: dict[str, int] = {}
+    in_a_head: set[str] = set()
+    for text in texts:
+        leading = _leading_phrase_words(text)
+        for word in leading:
+            seen[word] = seen.get(word, 0) + 1
+        in_a_head |= leading & _head_phrase_words(text)
+    return frozenset(w for w, n in seen.items() if n >= 2 and w not in in_a_head)
+
+
+def _is_covered_subject(
+    parent_text: str, content: str, context_words: frozenset[str] = frozenset()
+) -> bool:
     """P2 (architect ruling, round 2): the subject is COVERED when *content*'s
     leading noun phrase shares ANY content word (prefix-tolerant, since
     `_overlap_stem` is "never a real stemmer" — "replace"/"replaced" stem
@@ -6504,8 +6579,8 @@ def _is_covered_subject(parent_text: str, content: str) -> bool:
     def _matches(a: str, b: str) -> bool:
         return a == b or (len(a) >= 4 and len(b) >= 4 and (a.startswith(b) or b.startswith(a)))
 
-    parent_words = _leading_phrase_words(parent_text)
-    content_words = _leading_phrase_words(content)
+    parent_words = _leading_phrase_words(parent_text) - context_words
+    content_words = _leading_phrase_words(content) - context_words
     return any(_matches(cw, pw) for cw in content_words for pw in parent_words)
 
 
@@ -6691,6 +6766,12 @@ def _tighten_value_check(parent_text: str, content: str) -> tuple[bool, str]:
         return True, "ok (bound in a form that cannot be compared)"
     if rule_ok is False:
         return False, "not stricter in the same direction"
+    if rule_ok is True and compared_value is not None:
+        # The bound was compared in its normalised form ("2 times per day" as "every 12
+        # hours"), so the values it leaves behind are read in that form too: the original
+        # number of a rewritten bound is not a "parent value the child dropped".
+        parent_text = _normalise_quantities(parent_text)
+        content = _normalise_quantities(content)
     parent_values = _decomposed_value_tokens(parent_text) - _POL_WORDS
     if rule_ok is True and compared_value is not None:
         parent_values = parent_values - _decomposed_value_tokens(compared_value)
@@ -6756,6 +6837,7 @@ def verify_relation_ground(
     parent_text: str,
     content: str,
     proposed_classification: Literal["directive", "context"],
+    context_words: frozenset[str] = frozenset(),
 ) -> tuple[bool, str, Literal["directive", "context"] | None, str | None]:
     """The mechanical verifier, pure and judge-free: given the re-ask's own
     raw answer (the ``recheck_relation`` tool's parsed input), the cited
@@ -6878,9 +6960,9 @@ def verify_relation_ground(
         # refinement — it is held to the tighten value test instead, or
         # the decline stands. P3: it must also keep the parent's own
         # universal scope phrase, or a stricter one.
-        if _is_covered_subject(parent_text, content) and not _names_a_different_instance(
-            parent_text, content
-        ):
+        if _is_covered_subject(
+            parent_text, content, context_words
+        ) and not _names_a_different_instance(parent_text, content):
             if not _universal_scope_preserved(parent_text, content):
                 return False, "declined (narrows when/where the rule applies)", None, None
             tighten_ok, tighten_reason = _tighten_value_check(parent_text, content)
@@ -7003,7 +7085,9 @@ def _head_nouns_compatible(parent_text: str, op_text: str) -> bool:
 _CITED_ID = re.compile(r"\b(?:op|c|pub|d)_[0-9a-z]*\d[0-9a-z]*\b")
 
 
-def inherited_conflict(op_text: str, ancestor_text: str) -> str | None:
+def inherited_conflict(
+    op_text: str, ancestor_text: str, context_words: frozenset[str] = frozenset()
+) -> str | None:
     """Why *op_text* (a directive a bound session wants admitted) conflicts
     with the inherited directive *ancestor_text*, or ``None`` when it does not.
 
@@ -7018,11 +7102,16 @@ def inherited_conflict(op_text: str, ancestor_text: str) -> str | None:
     proxy, and a parent with no comparable value, polarity word or marker
     gives the value test nothing to compare, so a contradiction phrased
     without any of them is not caught here (the judge's own ruling stands).
+
+    *context_words* (:func:`inherited_context_words` over ALL the inherited texts) are
+    dropped from the subject test: a name that only qualifies the subject of several rules
+    is not a shared subject. A caller that compares against more than one inherited rule
+    must pass them; the empty default is the pairwise comparison.
     """
     # A cited directive id ("per operator directive op_tls123") is a
     # reference, not a value; left in, its digits read as an unkept value.
     op_text = _CITED_ID.sub("", op_text)
-    if not _is_covered_subject(ancestor_text, op_text):
+    if not _is_covered_subject(ancestor_text, op_text, context_words):
         return None
     if _names_a_different_instance(ancestor_text, op_text):
         return None
@@ -7065,8 +7154,9 @@ def _inherited_directive_texts(
 def _first_inherited_conflict(
     op_text: str, inherited: Sequence[tuple[str, str, str]]
 ) -> tuple[str, str, str] | None:
+    context_words = inherited_context_words([text for *_, text in inherited])
     for directive_id, origin, text in inherited:
-        reason = inherited_conflict(op_text, text)
+        reason = inherited_conflict(op_text, text, context_words)
         if reason is not None:
             return directive_id, origin, reason
     return None
@@ -7303,7 +7393,9 @@ _CONTEXT_EXCEPTION_CONFLICTS = frozenset(
 )
 
 
-def _exception_marker(content: str, inherited_text: str) -> str | None:
+def _exception_marker(
+    content: str, inherited_text: str, context_words: frozenset[str] = frozenset()
+) -> str | None:
     """The first exception marker anywhere in *content* — normative, habitual,
     or (for text that is not a specific past-tense report) the 1.17.2
     inherited-conflict signal (a looser value, an exemption, a softened
@@ -7318,7 +7410,7 @@ def _exception_marker(content: str, inherited_text: str) -> str | None:
             return f"habitual marker '{match.group(0)}'"
     specific_past = bool(_SPECIFICITY_ANCHOR_RE.search(content) and _PAST_TENSE_RE.search(content))
     if not specific_past:
-        conflict = inherited_conflict(content, inherited_text)
+        conflict = inherited_conflict(content, inherited_text, context_words)
         # Only the shapes that ARE an exception: a looser value, an exemption,
         # a softened "every/all" or an "only" narrowing. A fact that merely
         # doesn't restate the rule's value is not one.
@@ -7368,19 +7460,21 @@ def _action_overlap(span: str, inherited_text: str) -> bool:
     return bool(numbers & set(re.findall(r"\d+(?:\.\d+)?", span)))
 
 
-def _context_covers(inherited_text: str, content: str) -> bool:
+def _context_covers(
+    inherited_text: str, content: str, context_words: frozenset[str] = frozenset()
+) -> bool:
     """Whether context *content* is about an inherited directive's subject:
     1.17.2's covered-subject plus head-noun test, OR at least two shared
     content words anywhere (the leading-noun-phrase test alone is built for
     directive sentences and misses most context prose)."""
     from strata.publication import _overlap_words  # noqa: PLC0415
 
-    if _is_covered_subject(inherited_text, content) and _head_nouns_compatible(
+    if _is_covered_subject(inherited_text, content, context_words) and _head_nouns_compatible(
         inherited_text, content
     ):
         return True
-    inherited_words = _overlap_words(_normalise_synonyms(inherited_text))
-    content_words = _overlap_words(_normalise_synonyms(content))
+    inherited_words = _overlap_words(_normalise_synonyms(inherited_text)) - context_words
+    content_words = _overlap_words(_normalise_synonyms(content)) - context_words
     shared = {
         mine
         for mine in inherited_words
@@ -7403,6 +7497,7 @@ def verify_inherited_relation(
     content: str,
     inherited_text: str,
     other_texts: Sequence[str] = (),
+    context_words: frozenset[str] | None = None,
 ) -> tuple[str, str]:
     """Engine verification of a ``classify_inherited_relation`` answer (#242).
 
@@ -7425,7 +7520,9 @@ def verify_inherited_relation(
     """
     answer = answer if isinstance(answer, dict) else {}
     kind = answer.get("kind")
-    marker = _exception_marker(content, inherited_text)
+    if context_words is None:
+        context_words = inherited_context_words([inherited_text, *other_texts])
+    marker = _exception_marker(content, inherited_text, context_words)
     readable_unrelated = False
 
     if kind == "exception":
@@ -7465,7 +7562,9 @@ def verify_inherited_relation(
         failure = "unreadable answer"
 
     if readable_unrelated:
-        covers = any(_context_covers(text, content) for text in (inherited_text, *other_texts))
+        covers = any(
+            _context_covers(text, content, context_words) for text in (inherited_text, *other_texts)
+        )
         if marker is not None and covers:
             return "decline", f"{failure}; covers an inherited subject and ({marker})"
         return "admit", f"{failure}; no covered exception"
@@ -7490,9 +7589,14 @@ def inherited_for_context(
     display only; verification always uses the full text."""
     from strata.publication import _overlap_words  # noqa: PLC0415
 
-    content_words = _overlap_words(content)
+    # A name that only qualifies several rules' subjects says nothing about which rule the
+    # text is about; ranked on it, the true rule could fall outside the budget.
+    context_words = inherited_context_words([d[2] for d in inherited])
+    content_words = _overlap_words(content) - context_words
     ranked = sorted(
-        inherited, key=lambda d: len(_overlap_words(d[2]) & content_words), reverse=True
+        inherited,
+        key=lambda d: len((_overlap_words(d[2]) - context_words) & content_words),
+        reverse=True,
     )
     shown: list[tuple[str, str, str]] = []
     used = 0
@@ -7790,12 +7894,13 @@ def _subject_stems(text: str) -> set[str]:
     }
 
 
-def _shares_content_word(a: str, b: str) -> bool:
-    """A shared content word (stem), or a 5-letter shared prefix ("approve"/"approval")."""
-    other = _subject_stems(b)
+def _shares_content_word(a: str, b: str, context_words: frozenset[str] = frozenset()) -> bool:
+    """A shared content word (stem), or a 5-letter shared prefix ("approve"/"approval").
+    *context_words* (a name that only qualifies the inherited rules' subjects) don't count."""
+    other = _subject_stems(b) - context_words
     return any(
         mine in other or any(_shared_prefix(mine, w) >= 5 for w in other)
-        for mine in _subject_stems(a)
+        for mine in _subject_stems(a) - context_words
     )
 
 
@@ -7835,15 +7940,18 @@ def _same_quantity(parent_text: str, child_text: str, *, minimum: int = 2) -> bo
     return len(shared) >= minimum
 
 
-def _loose_covers(inherited_text: str, content: str) -> bool:
+def _loose_covers(
+    inherited_text: str, content: str, context_words: frozenset[str] = frozenset()
+) -> bool:
     """Covered by the strict test, or at least two shared SUBJECT stems (not modals,
-    quantifiers or time words) anywhere: the shared subject may be an object."""
-    if _is_covered_subject(inherited_text, content) and _head_nouns_compatible(
+    quantifiers or time words, nor *context_words*) anywhere: the shared subject may be an
+    object."""
+    if _is_covered_subject(inherited_text, content, context_words) and _head_nouns_compatible(
         inherited_text, content
     ):
         return True
-    mine = _subject_stems(inherited_text) - _LOOSE_STOPWORDS
-    other = _subject_stems(content) - _LOOSE_STOPWORDS
+    mine = _subject_stems(inherited_text) - _LOOSE_STOPWORDS - context_words
+    other = _subject_stems(content) - _LOOSE_STOPWORDS - context_words
     shared = {m for m in mine if m in other or any(_shared_prefix(m, w) >= 5 for w in other)}
     return len(shared) >= 2
 
@@ -7858,13 +7966,15 @@ def _loose_polarity(inherited_text: str, content: str) -> bool:
     return False
 
 
-def _loose_conflict(content: str, inherited_text: str) -> str | None:
+def _loose_conflict(
+    content: str, inherited_text: str, context_words: frozenset[str] = frozenset()
+) -> str | None:
     """#244 step 4: a conflict signal for a directive whose subject the narrow 1.17 test calls
     uncovered because the shared subject is the OBJECT of its sentence ("night-shift keeps
     the fuel dock pumps on until 22:00"). Under the loosened subject test only the strict
     signals count: a reversed on/off-style state, or a value outside the parent's bound in
     its own direction."""
-    if not _loose_covers(inherited_text, content):
+    if not _loose_covers(inherited_text, content, context_words):
         return None
     if _names_a_different_instance(inherited_text, content):
         return None
@@ -7880,8 +7990,13 @@ def verify_directive_relation(
     answer: dict | None,
     content: str,
     inherited: Sequence[tuple[str, str, str]],
+    context_words: frozenset[str] | None = None,
 ) -> tuple[str, str, tuple[str, str] | None, bool]:
     """Engine verification of a ``classify_directive_relation`` answer (#244 step 3).
+
+    *context_words* default to :func:`inherited_context_words` over *inherited*; a caller
+    that passes only a trimmed list must pass the set computed over the whole inherited
+    list.
 
     Returns ``(verdict, reason, target, fallback)``: *verdict* is ``"decline"``, ``"hold"``
     or ``"admit"``; *target* is the ``(id, origin)`` of the inherited directive the
@@ -7907,13 +8022,17 @@ def verify_directive_relation(
     named = answer.get("parent_id")
     chosen = next((d for d in inherited if d[0] == named), None)
     marker = _relaxation_marker(content, [d[2] for d in inherited])
+    if context_words is None:
+        context_words = inherited_context_words([d[2] for d in inherited])
 
     def _target(default: tuple[str, str, str] | None = None) -> tuple[str, str] | None:
         pick = chosen or default
         return (pick[0], pick[1]) if pick is not None else None
 
     def _best_overlap() -> tuple[str, str, str] | None:
-        return next((d for d in inherited if _shares_content_word(d[2], content)), None)
+        return next(
+            (d for d in inherited if _shares_content_word(d[2], content, context_words)), None
+        )
 
     failure = "unreadable answer"
     if relation in ("exempts", "contradicts"):
@@ -7923,7 +8042,7 @@ def verify_directive_relation(
                 (
                     (d, loose)
                     for d in inherited
-                    if (loose := _loose_conflict(content, d[2])) is not None
+                    if (loose := _loose_conflict(content, d[2], context_words)) is not None
                 ),
                 None,
             )
@@ -7934,7 +8053,11 @@ def verify_directive_relation(
                     _target(evidence[0]),
                     False,
                 )
-            if marker is not None and pick is not None and _shares_content_word(pick[2], content):
+            if (
+                marker is not None
+                and pick is not None
+                and _shares_content_word(pick[2], content, context_words)
+            ):
                 return (
                     "decline",
                     f"{relation}: {marker} on an inherited subject",
@@ -7956,7 +8079,7 @@ def verify_directive_relation(
             and isinstance(kept, str)
             and kept.strip()
             and marker is None
-            and not any(_loose_conflict(content, d[2]) for d in inherited)
+            and not any(_loose_conflict(content, d[2], context_words) for d in inherited)
         ):
             return "admit", "verified refinement", None, False
         failure = "refines claim not verified"
@@ -7964,9 +8087,9 @@ def verify_directive_relation(
         if (
             chosen is not None
             and marker is None
-            and inherited_conflict(content, chosen[2]) is None
+            and inherited_conflict(content, chosen[2], context_words) is None
             and _tighten_value_check(chosen[2], content)[0]
-            and not any(_loose_conflict(content, d[2]) for d in inherited)
+            and not any(_loose_conflict(content, d[2], context_words) for d in inherited)
         ):
             return "admit", "verified tightening", None, False
         failure = "tightens claim not verified"
@@ -7974,7 +8097,7 @@ def verify_directive_relation(
         failure = "answered unrelated"
 
     for candidate in inherited:
-        loose = _loose_conflict(content, candidate[2])
+        loose = _loose_conflict(content, candidate[2], context_words)
         if loose is not None:
             return (
                 "decline",
@@ -7985,7 +8108,10 @@ def verify_directive_relation(
     if marker is not None:
         covering = chosen if chosen is not None else _best_overlap()
         if covering is None:
-            covering = next((d for d in inherited if _shares_content_word(d[2], content)), None)
+            covering = next(
+                (d for d in inherited if _shares_content_word(d[2], content, context_words)),
+                None,
+            )
         if covering is not None:
             return (
                 "decline",
@@ -10394,7 +10520,11 @@ class ScopeManager:
         judge_reasoning = judge_reasoning if isinstance(judge_reasoning, str) else ""
 
         ok, result, classification, context_text = verify_relation_ground(
-            answer, parent_text, contribution.content, contribution.proposed_classification
+            answer,
+            parent_text,
+            contribution.content,
+            contribution.proposed_classification,
+            inherited_context_words(list(ancestor_map.values())),
         )
         relation = answer.get("relation")
         parent_id = answer.get("parent_id")
@@ -10459,6 +10589,7 @@ class ScopeManager:
         scope: Scope,
         contribution: Contribution,
         covered: Sequence[tuple[str, str, str]],
+        context_words: frozenset[str] | None = None,
     ) -> dict:
         """#242: the one targeted re-ask (``classify_inherited_relation``) and
         the engine's verification of its answer, for a context contribution
@@ -10512,7 +10643,11 @@ class ScopeManager:
             chosen = shown[0]
             answer = {}  # an answer naming no shown directive is unreadable
         verdict, reason = verify_inherited_relation(
-            answer, contribution.content, chosen[2], [d[2] for d in shown if d is not chosen]
+            answer,
+            contribution.content,
+            chosen[2],
+            [d[2] for d in shown if d is not chosen],
+            context_words,
         )
         if failure is not None:
             reason = f"re-ask failed ({failure}); {reason}"
@@ -10560,7 +10695,10 @@ class ScopeManager:
             return first
         covered = inherited_for_context(contribution.content, inherited)
         outcome = self._classify_inherited_relation(
-            scope=scope, contribution=contribution, covered=covered
+            scope=scope,
+            contribution=contribution,
+            covered=covered,
+            context_words=inherited_context_words([d[2] for d in inherited]),
         )
         note = _inherited_relation_note(outcome)
         update: dict = {
@@ -10701,6 +10839,7 @@ class ScopeManager:
             scope=scope,
             contribution=stand_in,  # type: ignore[arg-type]
             covered=inherited_for_context(text, inherited),
+            context_words=inherited_context_words([d[2] for d in inherited]),
         )
 
     def _classify_directive_relation(
@@ -10709,6 +10848,7 @@ class ScopeManager:
         contribution: Contribution,
         text: str,
         covered: Sequence[tuple[str, str, str]],
+        context_words: frozenset[str] | None = None,
     ) -> dict:
         """#244 step 3: the one targeted re-ask (``classify_directive_relation``) for a
         directive about to be admitted, and the engine's verification of its answer.
@@ -10752,7 +10892,9 @@ class ScopeManager:
         except Exception as exc:  # noqa: BLE001 — any slip is the unreadable-answer case
             failure = f"{type(exc).__name__}: {exc}"
 
-        verdict, reason, target, fallback = verify_directive_relation(answer, text, covered)
+        verdict, reason, target, fallback = verify_directive_relation(
+            answer, text, covered, context_words
+        )
         if failure is not None:
             reason = f"re-ask failed ({failure}); {reason}"
         shown = target or (covered[0][0], covered[0][1])
@@ -10829,6 +10971,7 @@ class ScopeManager:
                     contribution=contribution,
                     text=text,
                     covered=inherited_for_context(text, inherited),
+                    context_words=inherited_context_words([d[2] for d in inherited]),
                 )
                 if outcome is None or result["verdict"] in ("decline", "hold"):
                     outcome = result
@@ -10915,7 +11058,10 @@ class ScopeManager:
             member = contributions[cid]
             text = op.content or member.content
             outcomes[cid] = self._classify_directive_relation(
-                contribution=member, text=text, covered=inherited_for_context(text, inherited)
+                contribution=member,
+                text=text,
+                covered=inherited_for_context(text, inherited),
+                context_words=inherited_context_words([d[2] for d in inherited]),
             )
         if not outcomes:
             return judgment
