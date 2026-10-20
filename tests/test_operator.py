@@ -130,7 +130,7 @@ def fleet(tmp_path: Path) -> FleetConfig:
 # ---------------------------------------------------------------------------
 
 
-def test_publish_appends_exactly_one_operator_act_row(record_store, summaries_dir) -> None:
+def test_publish_appends_exactly_one_operator_act_row(fleet, record_store, summaries_dir) -> None:
     item = operator_publish(
         "g_team",
         "All services must use TLS 1.3.",
@@ -152,7 +152,9 @@ def test_publish_appends_exactly_one_operator_act_row(record_store, summaries_di
     assert act.id.startswith("op_")
 
 
-def test_supersede_item_appends_supersede_act_with_reference(record_store, summaries_dir) -> None:
+def test_supersede_item_appends_supersede_act_with_reference(
+    fleet, record_store, summaries_dir
+) -> None:
     first = operator_publish("g_team", "v1", record_store=record_store, summaries_dir=summaries_dir)
     second = operator_supersede_item(
         "g_team", first.id, "v2", record_store=record_store, summaries_dir=summaries_dir
@@ -168,7 +170,7 @@ def test_supersede_item_appends_supersede_act_with_reference(record_store, summa
 
 
 def test_retire_item_appends_retire_act_with_null_kind_and_content(
-    record_store, summaries_dir
+    fleet, record_store, summaries_dir
 ) -> None:
     item = operator_publish(
         "g_team", "context item", record_store=record_store, summaries_dir=summaries_dir
@@ -182,7 +184,9 @@ def test_retire_item_appends_retire_act_with_null_kind_and_content(
     assert act.content is None
 
 
-def test_operator_acts_are_append_only_across_multiple_ops(record_store, summaries_dir) -> None:
+def test_operator_acts_are_append_only_across_multiple_ops(
+    fleet, record_store, summaries_dir
+) -> None:
     a = operator_publish("g_team", "one", record_store=record_store, summaries_dir=summaries_dir)
     b = operator_supersede_item(
         "g_team", a.id, "two", record_store=record_store, summaries_dir=summaries_dir
@@ -195,14 +199,14 @@ def test_operator_acts_are_append_only_across_multiple_ops(record_store, summari
     assert len(ids) == 3  # every act has a distinct id, nothing overwritten
 
 
-def test_supersede_item_unknown_id_raises_keyerror(record_store, summaries_dir) -> None:
+def test_supersede_item_unknown_id_raises_keyerror(fleet, record_store, summaries_dir) -> None:
     with pytest.raises(KeyError):
         operator_supersede_item(
             "g_team", "op_doesnotexist", "x", record_store=record_store, summaries_dir=summaries_dir
         )
 
 
-def test_operator_publish_writes_a_directive_item(record_store, summaries_dir) -> None:
+def test_operator_publish_writes_a_directive_item(fleet, record_store, summaries_dir) -> None:
     """ADR 0013 D5: there is no kind argument any more — every fresh write is a directive."""
     item = operator_publish(
         "g_team", "New operator memory.", record_store=record_store, summaries_dir=summaries_dir
@@ -212,7 +216,7 @@ def test_operator_publish_writes_a_directive_item(record_store, summaries_dir) -
     assert act.kind == "directive"
 
 
-def test_supersede_item_rejects_a_legacy_context_item(record_store, summaries_dir) -> None:
+def test_supersede_item_rejects_a_legacy_context_item(fleet, record_store, summaries_dir) -> None:
     """ADR 0013 D5/D7: a legacy context item cannot be superseded — only retired.
 
     Superseding it would mint a fresh, non-binding operator write, which D5
@@ -235,7 +239,7 @@ def test_supersede_item_rejects_a_legacy_context_item(record_store, summaries_di
     assert items == [legacy]
 
 
-def test_retire_item_accepts_a_legacy_context_item(record_store, summaries_dir) -> None:
+def test_retire_item_accepts_a_legacy_context_item(fleet, record_store, summaries_dir) -> None:
     """Retire remains the one path off a legacy context item — no new write, just removal."""
     legacy = _seed_legacy_context_item(
         "g_team", "Old observation.", record_store=record_store, summaries_dir=summaries_dir
@@ -246,7 +250,7 @@ def test_retire_item_accepts_a_legacy_context_item(record_store, summaries_dir) 
     assert read_operator_layer("g_team", summaries_dir=summaries_dir) == []
 
 
-def test_retire_item_unknown_id_raises_keyerror(record_store, summaries_dir) -> None:
+def test_retire_item_unknown_id_raises_keyerror(fleet, record_store, summaries_dir) -> None:
     with pytest.raises(KeyError):
         operator_retire_item(
             "g_team", "op_doesnotexist", record_store=record_store, summaries_dir=summaries_dir
@@ -258,7 +262,7 @@ def test_retire_item_unknown_id_raises_keyerror(record_store, summaries_dir) -> 
 # ---------------------------------------------------------------------------
 
 
-def test_publish_writes_layer_file_readable_back(record_store, summaries_dir) -> None:
+def test_publish_writes_layer_file_readable_back(fleet, record_store, summaries_dir) -> None:
     item = operator_publish(
         "g_team",
         "Content for the layer file.",
@@ -277,7 +281,7 @@ def test_read_operator_layer_empty_for_unattached_scope(summaries_dir) -> None:
     assert read_operator_layer("g_nonexistent", summaries_dir=summaries_dir) == []
 
 
-def test_supersede_item_replaces_old_item_in_layer(record_store, summaries_dir) -> None:
+def test_supersede_item_replaces_old_item_in_layer(fleet, record_store, summaries_dir) -> None:
     first = operator_publish(
         "g_team", "v1", "sub", record_store=record_store, summaries_dir=summaries_dir
     )
@@ -292,7 +296,7 @@ def test_supersede_item_replaces_old_item_in_layer(record_store, summaries_dir) 
     assert items[0].subject == "sub"
 
 
-def test_retire_item_removes_from_layer(record_store, summaries_dir) -> None:
+def test_retire_item_removes_from_layer(fleet, record_store, summaries_dir) -> None:
     item = operator_publish(
         "g_team", "gone soon", record_store=record_store, summaries_dir=summaries_dir
     )
@@ -301,7 +305,9 @@ def test_retire_item_removes_from_layer(record_store, summaries_dir) -> None:
     assert items == []
 
 
-def test_layer_file_content_survives_byte_identical_round_trip(record_store, summaries_dir) -> None:
+def test_layer_file_content_survives_byte_identical_round_trip(
+    fleet, record_store, summaries_dir
+) -> None:
     """Multi-line, markdown-ish content must round-trip byte-for-byte."""
     tricky_content = (
         "# Not a heading, just quoted text\n"
@@ -323,7 +329,7 @@ def test_layer_file_content_survives_byte_identical_round_trip(record_store, sum
     assert items[0].content == item.content
 
 
-def test_multiple_items_coexist_in_one_layer_file(record_store, summaries_dir) -> None:
+def test_multiple_items_coexist_in_one_layer_file(fleet, record_store, summaries_dir) -> None:
     """A fresh directive and a legacy (pre-ADR-0013) context item coexist in one layer file."""
     a = operator_publish("g_team", "first", record_store=record_store, summaries_dir=summaries_dir)
     b = _seed_legacy_context_item(
@@ -337,7 +343,7 @@ def test_multiple_items_coexist_in_one_layer_file(record_store, summaries_dir) -
 
 
 def test_new_directive_write_does_not_stealth_migrate_a_legacy_context_item(
-    record_store, summaries_dir
+    fleet, record_store, summaries_dir
 ) -> None:
     """ADR 0013 D7: a fresh operator_publish read-modify-writes the layer file — the
     legacy context item already on disk must survive that write byte-for-byte
@@ -356,7 +362,9 @@ def test_new_directive_write_does_not_stealth_migrate_a_legacy_context_item(
     assert by_id[fresh.id].kind == "directive"
 
 
-def test_layers_for_different_scopes_are_independent_files(record_store, summaries_dir) -> None:
+def test_layers_for_different_scopes_are_independent_files(
+    fleet, record_store, summaries_dir
+) -> None:
     operator_publish("g_team", "team item", record_store=record_store, summaries_dir=summaries_dir)
     operator_publish("g_func", "func item", record_store=record_store, summaries_dir=summaries_dir)
     team_items = read_operator_layer("g_team", summaries_dir=summaries_dir)
@@ -443,7 +451,7 @@ def test_memory_binding_excludes_scope_with_only_legacy_context(
 # ---------------------------------------------------------------------------
 
 
-def test_health_reports_per_scope_and_total_counts(record_store, summaries_dir) -> None:
+def test_health_reports_per_scope_and_total_counts(fleet, record_store, summaries_dir) -> None:
     operator_publish(
         "g_team",
         "one two three",
@@ -458,7 +466,7 @@ def test_health_reports_per_scope_and_total_counts(record_store, summaries_dir) 
     assert health["total_words"] == 5
 
 
-def test_health_reports_act_counts_and_churn(record_store, summaries_dir) -> None:
+def test_health_reports_act_counts_and_churn(fleet, record_store, summaries_dir) -> None:
     item = operator_publish("g_team", "one", record_store=record_store, summaries_dir=summaries_dir)
     operator_supersede_item(
         "g_team", item.id, "two", record_store=record_store, summaries_dir=summaries_dir
@@ -482,7 +490,7 @@ def test_health_empty_when_no_operator_memory(record_store, summaries_dir) -> No
     }
 
 
-def test_health_retired_items_do_not_count_toward_size(record_store, summaries_dir) -> None:
+def test_health_retired_items_do_not_count_toward_size(fleet, record_store, summaries_dir) -> None:
     item = operator_publish(
         "g_team",
         "will be retired",
@@ -916,6 +924,8 @@ def test_corrections_are_explainable_by_the_record(fleet, record_store, summary_
 def test_operator_stratum_acts_never_appear_in_scope_record(
     fleet, record_store, summary_store, summaries_dir
 ) -> None:
+    # No `fleet=` on purpose: the call resolves it from beside the store (#195), and the fleet
+    # fixture above is only there to place that fleet.yaml.
     operator_publish(
         "g_team",
         "operator layer item",
@@ -923,7 +933,14 @@ def test_operator_stratum_acts_never_appear_in_scope_record(
         summaries_dir=summaries_dir,
     )
     contributions = record_store.list_contributions(scope_id="g_team")
-    assert contributions == []
+    # whatever is there is the engine's own refresh notice (it quotes the change), never an
+    # operator act
+    assert all(
+        c.contributor.session_id == "change-event"
+        and c.contributor.skill == "scope-manager"
+        and c.subject == "manager-refresh"
+        for c in contributions
+    )
 
 
 def test_scope_corrections_never_appear_in_operator_acts(
@@ -1023,21 +1040,24 @@ def test_operator_retire_item_emits_with_nothing_after(fleet, record_store, summ
     assert last.after is None
 
 
-def test_operator_layer_writes_without_a_fleet_emit_nothing(
-    fleet, record_store, summaries_dir
-) -> None:
-    """KNOWN SEAM, asserted so it stays visible: *fleet* is optional on these
-    primitives (dozens of existing callers pass none), and a caller that
-    omits it silently informs nobody. Precondition first — the same call WITH
-    a fleet does emit."""
+def test_operator_layer_writes_without_a_fleet_emit_195(fleet, record_store, summaries_dir) -> None:
+    """#195: this used to pin the silent gap. *fleet* is optional on these
+    primitives, and a call that omits it now reads the fleet beside the store and
+    informs the subtree exactly as one that passes it. Precondition first — the
+    same call WITH a fleet emits."""
     operator_publish(
         "g_func", "with fleet", fleet=fleet, record_store=record_store, summaries_dir=summaries_dir
     )
-    assert len(record_store.list_change_events(scope_id="g_team")) == 1
+    (with_fleet,) = record_store.list_change_events(scope_id="g_team")
 
     operator_publish("g_func", "no fleet", record_store=record_store, summaries_dir=summaries_dir)
 
-    assert len(record_store.list_change_events(scope_id="g_team")) == 1
+    events = record_store.list_change_events(scope_id="g_team")
+    assert len(events) == 2
+    without_fleet = events[1]
+    assert without_fleet.kind == with_fleet.kind == "operator_directive_changed"
+    assert without_fleet.source_scope_id == with_fleet.source_scope_id == "g_func"
+    assert without_fleet.item_id.startswith("op_") and without_fleet.item_id != with_fleet.item_id
 
 
 def test_operator_supersede_correction_tells_the_descendants(

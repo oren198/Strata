@@ -5,6 +5,12 @@ the release PR (`dev` → `main`) and the GitHub Release body are built from
 (`docs/releasing.md`, step 3) — write entries here as work lands, and the
 "Unreleased" section is cleared once a release ships.
 
+## Unreleased
+
+### Behaviour change
+
+- The operator primitives (`operator_publish`, `operator_supersede_item`, `operator_retire_item`) called without `fleet` now read the fleet beside the store and tell the attachment scope and its subtree, as the CLI always did. Where no fleet can be found from the store they raise instead of writing silently (#195).
+
 ## 1.18.1 (2026-10-20)
 
 ### Fixed
