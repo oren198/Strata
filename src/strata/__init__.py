@@ -1,5 +1,9 @@
 """Strata — shared memory for agent fleets."""
 
+# Re-exported so hosts can ask "was this accepted?" without restating the
+# verdict pair (issue #145). Defined once, beside the record's Judgment.
+from strata.record_store import ACCEPTED_DECISIONS as ACCEPTED_DECISIONS
+
 __version__ = "1.18.0"
 
 #: PyPI distribution name. The import name (``strata``) and console scripts

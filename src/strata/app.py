@@ -145,6 +145,7 @@ from strata.publication import (
     read_publication,
 )
 from strata.record_store import (
+    ACCEPTED_DECISIONS,
     JUDGE_FAILED,
     RECENCY_WINDOW_SIZE,
     ChangeEvent,
@@ -1853,13 +1854,6 @@ def _fail_batch(
     return results
 
 
-#: Verdicts that count as "admitted into memory" for ADR 0017 P1's acted_on rule — a
-#: decline never entered it, and neither does an unjudged / judge-failed contribution
-#: (no verdict at all). Mirrors record_store's own accepted-decision set (kept separate:
-#: that one is private, and this check belongs to the write boundary, not the store).
-ACTED_ON_ADMITTED_DECISIONS = frozenset({"accept_as_directive", "accept_as_context"})
-
-
 def validate_acted_on(
     fleet: FleetConfig,
     record_store: RecordStore,
@@ -1963,7 +1957,7 @@ def validate_acted_on(
             "layer inside your own perspective — never as its own record or "
             "perspective target."
         )
-    if entry.judgment is None or entry.judgment.decision not in ACTED_ON_ADMITTED_DECISIONS:
+    if entry.judgment is None or entry.judgment.decision not in ACCEPTED_DECISIONS:
         raise RuntimeError(
             f"acted_on={acted_on!r} references a contribution that was never admitted "
             "into memory (it was declined, or has no verdict yet) — you can only report "

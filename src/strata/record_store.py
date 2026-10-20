@@ -246,10 +246,16 @@ class Judgment:
 JUDGE_FAILED = "judge_failed"
 
 
-# The verdicts that count as an *accepted* contribution.  A ``decline`` is the
-# scope-manager rejecting a proposal — it never enters the scope summary, so it
-# is not an acceptance.
-_ACCEPTED_DECISIONS = frozenset({"accept_as_directive", "accept_as_context"})
+#: Verdicts that admit a contribution into a scope's memory (issue #145).
+#:
+#: This is the one definition of "accepted". A ``decline`` is the
+#: scope-manager rejecting a proposal: it never enters the summary, so it is
+#: not in the set. The record, the scope manager, the acted-on check, the
+#: freshness evaluator, and the MCP session counter all read this constant.
+#: Hosts should too (``from strata import ACCEPTED_DECISIONS``) rather than
+#: restate the pair. Adding a verdict to the judgment ``decision`` Literal
+#: without adding it here is a bug the suite catches.
+ACCEPTED_DECISIONS: frozenset[str] = frozenset({"accept_as_directive", "accept_as_context"})
 
 
 #: The engine default for the recency window (ADR 0011 D2): how many of the
@@ -1846,7 +1852,7 @@ class RecordStore:
             WHERE c.supersedes = ? AND j.decision IN (?, ?)
             LIMIT 1
             """,
-            (contribution_id, *_ACCEPTED_DECISIONS),
+            (contribution_id, *ACCEPTED_DECISIONS),
         ).fetchone()
         return row is not None
 
@@ -1970,7 +1976,7 @@ class RecordStore:
         Returns:
             The newest accepted :class:`Contribution`, or ``None``.
         """
-        decisions = tuple(_ACCEPTED_DECISIONS)
+        decisions = tuple(ACCEPTED_DECISIONS)
         placeholders = ", ".join("?" for _ in decisions)
         row = self._conn.execute(
             f"""
@@ -3696,7 +3702,7 @@ def _outcome_reading(
     *outcome_itself_superseded* — a retracted report is not evidence of anything,
     whether it read as held or replaced.
     """
-    if judgment is None or judgment.decision not in _ACCEPTED_DECISIONS:
+    if judgment is None or judgment.decision not in ACCEPTED_DECISIONS:
         return _READING_EXCLUDED
     if outcome_itself_superseded:
         return _READING_EXCLUDED

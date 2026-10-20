@@ -5,6 +5,15 @@ the release PR (`dev` → `main`) and the GitHub Release body are built from
 (`docs/releasing.md`, step 3) — write entries here as work lands, and the
 "Unreleased" section is cleared once a release ships.
 
+## Unreleased
+
+### Changed
+
+- **One public definition of which verdicts are accepted** (#145).
+  `strata.ACCEPTED_DECISIONS` is that set. The record, the scope manager,
+  the acted-on check, the freshness evaluator, and the MCP session counter
+  all read it, instead of each restating the pair.
+
 ## 1.18.0 (2026-10-15)
 
 ### Behaviour change
