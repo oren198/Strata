@@ -135,3 +135,30 @@ def test_d3_a_hyphen_inside_a_word_is_not_a_clause_end():
     assert blanked.count("SEV-1") == 1  # the clause before "so" is kept whole
     assert "tooling" not in blanked
     assert "then moved on" in blanked
+
+
+PUMP_RULE = "Fuel dock pumps must be switched off at or before 20:00 every evening."
+PUMP_EXCEPTION = "FYI, on nights when the fleet returns the pumps may stay running until 22:00."
+PUMP_SPAN = "the pumps may stay running until 22:00"
+
+
+@pytest.mark.parametrize("kind", ["exception", "unrelated", "unreadable"])
+def test_one_shared_stem_plus_an_exception_marker_covers_the_rule(kind):
+    answer = {"kind": kind, "instead_span": PUMP_SPAN}
+    verdict, _ = verify_inherited_relation(answer, PUMP_EXCEPTION, PUMP_RULE)
+    assert verdict == "decline"
+
+
+def test_one_shared_stem_without_a_marker_stays_uncovered():
+    note = "The harbour crane was greased on 2026-10-12 using oil from the pumps store."
+    verdict, reason = verify_inherited_relation(
+        _exception("using oil from the pumps store"), note, PUMP_RULE
+    )
+    assert verdict == "admit"
+    assert reason == "exception answer on a rule the note does not cover"
+
+
+def test_zero_shared_stems_with_a_marker_stay_uncovered():
+    note = "Staff may stay late on the night of the audit."
+    verdict, _ = verify_inherited_relation(_exception("may stay late"), note, PUMP_RULE)
+    assert verdict == "admit"

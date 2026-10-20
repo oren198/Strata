@@ -7494,6 +7494,17 @@ def _note_covers_rule(rule: str, content: str, context_words: frozenset[str] = f
     return _shared_subject_stems(rule, content, context_words) >= 2
 
 
+def _covers_or_marked(
+    rule: str, content: str, marker: str | None, context_words: frozenset[str] = frozenset()
+) -> bool:
+    """:func:`_note_covers_rule`, or one shared subject stem when the note carries an
+    exception marker: a one-word subject ("the pumps may stay running until 22:00") is still
+    an exception to the rule about those pumps."""
+    return _note_covers_rule(rule, content, context_words) or (
+        marker is not None and _shared_subject_stems(rule, content, context_words) >= 1
+    )
+
+
 def _action_overlap(span: str, inherited_text: str) -> bool:
     if _shared_subject_stems(span, inherited_text) >= 1:
         return True
@@ -7555,7 +7566,7 @@ def verify_inherited_relation(
         span = _verbatim_span(answer, "instead_span", content)
         if span is None:
             failure = "exception answer without a verbatim instead_span"
-        elif not _note_covers_rule(inherited_text, content, context_words):
+        elif not _covers_or_marked(inherited_text, content, marker, context_words):
             return "admit", "exception answer on a rule the note does not cover"
         elif (
             _SPECIFICITY_ANCHOR_RE.search(content)
@@ -7606,7 +7617,8 @@ def verify_inherited_relation(
 
     if readable_unrelated:
         covers = any(
-            _context_covers(text, content, context_words) for text in (inherited_text, *other_texts)
+            _covers_or_marked(text, content, marker, context_words)
+            for text in (inherited_text, *other_texts)
         )
         if marker is not None and covers:
             return "decline", f"{failure}; covers an inherited subject and ({marker})"
