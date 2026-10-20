@@ -7,6 +7,13 @@ the release PR (`dev` → `main`) and the GitHub Release body are built from
 
 ## Unreleased
 
+### Fixed
+
+- **A perspective read no longer waits without a bound on a scope lock**
+  (#196). The MCP drain waits at most two seconds. If the lock is still
+  held, the read returns the perspective with `refresh_pending` and leaves
+  the pending events unprocessed.
+
 ### Changed
 
 - **One public definition of which verdicts are accepted** (#145).

@@ -2603,6 +2603,7 @@ def drain_scope(
     summary_max_words: int,
     window_verbatim_tail: int = WINDOW_VERBATIM_TAIL,
     recency_window_size: int = RECENCY_WINDOW_SIZE,
+    lock_timeout: float | None = None,
 ) -> DrainOutcome:
     """Judge what changed for *scope_id* (ADR 0014 D6, ADR 0015 D6).
 
@@ -2654,6 +2655,13 @@ def drain_scope(
     Runs under ``scope_lock`` (ADR 0012), like every other summary write. The
     caller must NOT already hold it; the MCP read path does not.
 
+    *lock_timeout* bounds that wait, in seconds. ``None`` (the CLI and every
+    other caller) waits until the lock is free. A number gives up instead:
+    the drain touches nothing and returns an outcome with
+    ``events_processed == 0``, so the caller can still report the events as
+    owed. The MCP read path passes one so a perspective read does not block
+    for the length of an in-flight judgment (issue #196).
+
     Raises:
         RuntimeError: *scope_id* or its stratum no longer resolves in the fleet.
         DrainFailed: the judge call failed. A judgment-attempt-failed event is
@@ -2669,7 +2677,17 @@ def drain_scope(
             f"Stratum {scope.stratum_id!r} for scope {scope.id!r} not found in fleet config."
         )
 
-    with _scope_lock(scope.id):
+    lock = _scope_lock(scope.id)
+    if lock_timeout is None:
+        lock.__enter__()
+    elif not lock.try_enter(lock_timeout):
+        return DrainOutcome(
+            scope_id=scope.id,
+            events_processed=0,
+            judged=False,
+            outcomes=[],
+        )
+    try:
         # ADR 0015 D5, first and once: a legacy spliced row still sitting in
         # this scope's summary would otherwise land in the sweep's surviving
         # set below and keep an un-anchored item alive after its directive was
@@ -2832,6 +2850,8 @@ def drain_scope(
             # surface shows its reader on this very read (ADR 0014 D5, #203).
             processed_events=list(events),
         )
+    finally:
+        lock.__exit__(None, None, None)
 
 
 # ---------------------------------------------------------------------------

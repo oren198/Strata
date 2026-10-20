@@ -18,6 +18,8 @@ owns emission, so these fabricate what a writer would have emitted.
 from __future__ import annotations
 
 import sys
+import threading
+import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -27,6 +29,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 sys.path.insert(0, str(Path(__file__).parent))
 
 from strata.fleet_config import FleetConfig
+from strata.locks import scope_lock
 from strata.migrator import run_migrations
 from strata.record_store import ContributorRef, RecordStore
 from strata.scope_manager import ScopeManagerJudgment
@@ -163,6 +166,51 @@ async def test_a_judge_outage_during_the_drain_never_fails_the_read(tmp_path: Pa
     ):
         result = await mod.strata_read_perspective()
 
+    assert result["layers"]
+    assert result["refresh_pending"] == 1
+    with RecordStore(db_path) as rs:
+        assert len(rs.list_change_events(scope_id="g_team", unprocessed_only=True)) == 1
+
+
+async def test_a_held_scope_lock_returns_the_read_within_the_bound(tmp_path: Path) -> None:
+    """Issue #196: a read with work pending does not wait out a held lock.
+
+    The holder stands in for an in-flight judgment. The read comes back with
+    ``refresh_pending`` and leaves the event unprocessed.
+    """
+    mod, db_path, fleet = _setup(tmp_path)
+    with RecordStore(db_path) as rs:
+        _emit(rs, change_id="chg_a", item_id="p_1", scope_id="g_team")
+
+    bound = 0.3
+    mod.READ_DRAIN_LOCK_TIMEOUT_S = bound
+    held = threading.Event()
+    release = threading.Event()
+
+    def _hold() -> None:
+        with scope_lock("g_team"):
+            held.set()
+            release.wait(timeout=3)
+
+    holder = threading.Thread(target=_hold)
+    holder.start()
+    assert held.wait(timeout=2)
+    started = time.monotonic()
+    try:
+        with (
+            patch.object(mod, "_AGENT_SCOPE", "g_team"),
+            patch.object(mod, "_AGENT_SKILL", None),
+            patch.object(mod, "_AGENT_SESSION_ID", "sess_test"),
+            patch.object(mod, "_load_fleet", return_value=fleet),
+            patch("strata.scope_manager.ScopeManager.judge", return_value=_accepting_judgment()),
+            patch("anthropic.Anthropic", return_value=MagicMock()),
+        ):
+            result = await mod.strata_read_perspective()
+    finally:
+        release.set()
+        holder.join(timeout=2)
+    elapsed = time.monotonic() - started
+    assert elapsed < bound + 0.75
     assert result["layers"]
     assert result["refresh_pending"] == 1
     with RecordStore(db_path) as rs:
