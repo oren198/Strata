@@ -50,14 +50,30 @@ def test_a_practice_start_date_declines_under_the_exception_answer(note):
 @pytest.mark.parametrize(
     "note",
     [
+        "On 3 October we closed the pumps at 23:00.",
+        "On 3 October the crew closed the pumps at 23:00.",
+        "After the storm on 3 October we closed the pumps at 23:00.",
+    ],
+)
+def test_one_dated_act_with_a_past_only_verb_stays_a_consequence_report(note):
+    verdict, _ = verify_inherited_relation(_exception(note), note, PUMPS)
+    assert verdict == "consequence_report"
+
+
+# A same-form present/past verb ("shut", "cut", "set") is never the past-tense evidence on the
+# exception-path report route: the accepted fail-closed cost, and what 1.18.2 did.
+@pytest.mark.parametrize(
+    "note",
+    [
         "On 3 October we shut the pumps at 23:00.",
         "On 3 October the crew shut the pumps at 23:00.",
         "After the storm on 3 October we shut the pumps at 23:00.",
+        "Between 3 October and 5 October we shut the pumps at 23:00 every night.",
     ],
 )
-def test_one_dated_act_stays_a_consequence_report(note):
+def test_a_same_form_verb_alone_is_not_evidence_of_one_past_occurrence(note):
     verdict, _ = verify_inherited_relation(_exception(note), note, PUMPS)
-    assert verdict == "consequence_report"
+    assert verdict == "decline"
 
 
 @pytest.mark.parametrize("end", ["to", "through", "until", "-", "\u2013"])
@@ -99,3 +115,35 @@ def test_the_added_irregular_past_forms_match(word):
 @pytest.mark.parametrize("word", ["cast", "fit", "rid", "reset", "forecast", "misread", "sublet"])
 def test_same_form_present_and_past_verbs_are_not_added(word):
     assert not _PAST_TENSE_RE.search(f"On 3 October the crew {word} it.")
+
+
+@pytest.mark.parametrize(
+    "note",
+    [
+        "From 3 October and onwards we shut the pumps at 23:00.",
+        "After 3 October and the audit we shut the pumps at 23:00.",
+        "From 3 October till further notice we shut the pumps at 23:00.",
+        "From 3 October - indefinitely - we shut the pumps at 23:00.",
+        "Following 3 October we shut the pumps at 23:00.",
+        "From 3 October through today we shut the pumps at 23:00.",
+        "From 3 October to date we shut the pumps at 23:00.",
+        "On 3 October we shut the pumps at 23:00 onwards.",
+    ],
+)
+def test_an_open_ended_practice_start_declines(note):
+    verdict, _ = verify_inherited_relation(_exception(note), note, PUMPS)
+    assert verdict == "decline"
+
+
+@pytest.mark.parametrize(
+    "note",
+    [
+        "From 3 October to 5 October we closed the pumps at 23:00.",
+        "From 3 October - 5 October we closed the pumps at 23:00.",
+        "After 3 October and before 5 October we closed the pumps at 23:00.",
+        "Between 3 October and 5 October we ran the pumps until 23:00.",
+    ],
+)
+def test_a_range_closed_by_a_date_stays_a_consequence_report(note):
+    verdict, _ = verify_inherited_relation(_exception(note), note, PUMPS)
+    assert verdict == "consequence_report"

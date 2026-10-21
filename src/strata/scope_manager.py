@@ -7798,13 +7798,17 @@ _CHANGE_OF_PRACTICE_RE = re.compile(
     r"\b(?:decided|decides|agreed|agrees|resolved|switched|moved|started|starts|began|begun|"
     r"stopped|stops|extended|dropped|changed|adopted|introduced|relaxed|raised|lowered|"
     r"replaced|scrapped|removed|waived|suspended|paused|retired|no longer|from now on|"
-    r"going forward|henceforth|until further notice|suffices?|"
+    r"going forward|henceforth|(?:until|till) further notice|onwards?|suffices?|"
     r"(?:is|are) (?:enough|fine|ok|okay|acceptable))\b"
     r"|\b(?:as of|effective|(?:starting|beginning)(?:\s+(?:on|from))?)\s+(?:"
     + _DATED_ANCHOR_RE.pattern
     + r")"
-    r"|\b(?:from|after|post|beyond)\s+(?:" + _DATED_ANCHOR_RE.pattern + r")"
-    r"(?!\s*(?:to|through|thru|until|till|and|[-\u2013])\b|\s*[-\u2013])"
+    r"|\b(?:from|after|post|beyond|following)\s+(?:" + _DATED_ANCHOR_RE.pattern + r")"
+    # a range end counts only when a date follows it ("to 5 October", "- 8 March");
+    # "and onwards", "till further notice", "- indefinitely -" keep the practice-start reading
+    r"(?!\s*(?:(?:to|through|thru|until|till|and(?:\s+before)?)\s+|[-\u2013]\s*)(?:"
+    + _DATED_ANCHOR_RE.pattern
+    + r"))"
     r"|\beffective immediately\b",
     re.IGNORECASE,
 )
@@ -8014,6 +8018,32 @@ _GENERALITY_RE = re.compile(
 )
 
 
+#: Irregular forms spelled the same in present and past: on the exception-path report route
+#: they are no evidence of a PAST occurrence ("we shut the pumps" may be a practice or a plan).
+_SAME_FORM_PAST: frozenset[str] = frozenset(
+    {
+        "shut",
+        "cut",
+        "let",
+        "put",
+        "set",
+        "hit",
+        "quit",
+        "spread",
+        "cost",
+        "hurt",
+        "burst",
+        "split",
+        "thrust",
+        "bet",
+        "shed",
+        "read",
+        "beat",
+        "slit",
+    }
+)
+
+
 def _positive_single_occurrence(content: str, rule: str | None = None) -> bool:
     """Positive evidence of ONE occurrence, for the report route under an "exception" answer.
 
@@ -8026,8 +8056,13 @@ def _positive_single_occurrence(content: str, rule: str | None = None) -> bool:
         return False
     # a subject and auxiliary left stranded by a blanked clause ("We are  .") is not a verb in force
     text = re.sub(r"\b\w+\s+(?:are|am|is)\s+(?=[.!?;,]|$)", " ", _blank_non_marker_clauses(content))
+    # the past-tense evidence must be a form that is past only, never a same-form verb
+    if not any(m.group(0).casefold() not in _SAME_FORM_PAST for m in _PAST_TENSE_RE.finditer(text)):
+        return False
     for match in _PRESENT_FINITE_RE.finditer(text):
         verb = match.groupdict().get("verb")
+        if verb and verb.casefold() in _SAME_FORM_PAST:
+            return False
         if verb and (_PAST_TENSE_RE.fullmatch(verb) or verb.casefold().endswith("ed")):
             continue
         return False
