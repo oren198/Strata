@@ -2257,6 +2257,11 @@ class _AmendmentJudgment(BaseModel):
     the amendment may carry context and lifecycle ops only (ADR 0011 D4).
     Either way the drop is noted in :attr:`record_notes`."""
 
+    departure_label_restored: int = 0
+    """How many of those lost labelled lines the engine re-inserted verbatim (FIX 6): all of them.
+    A past departure stays on the record whatever the judge's rewrite did, even when its directive
+    has since been superseded or retired."""
+
     departure_label_lost: int = 0
     """How many ``Departure from <id> (<scope>): `` lines of the previous context this
     judgment's context write no longer carries byte for byte (the label was dropped or the line
@@ -7909,18 +7914,62 @@ def _departure_label_for(outcome: dict) -> str:
     return departure_label(outcome["inherited_id"], origin)
 
 
-def _with_departure_label_count(judgment, current_summary):  # noqa: ANN001, ANN202
-    """*judgment* with ``departure_label_lost`` set after a context write: how many labelled
-    lines of the previous context its new context no longer holds byte for byte."""
-    if current_summary is None or judgment.new_context is None:
+def _with_departure_labels_restored(judgment, current_summary, summary_max_words):  # noqa: ANN001, ANN202
+    """After ANY context write: every labelled "Departure from ..." line of the previous context
+    that the new context no longer holds byte for byte is RE-INSERTED verbatim (no re-ask, as the
+    position gate substitutes its attributed line). Where it was, relative to neighbours that
+    survive; else before the newest note. A line the judge reworded unlabelled is replaced in
+    place by the labelled one. The engine never drops a labelled line, so restoration may leave
+    the summary over budget; that overflow is recorded."""
+    if current_summary is None or judgment.new_context is None or judgment.new_summary is None:
         return judgment
-    lost = count_lost_departure_labels(current_summary.context, judgment.new_context)
+    previous = current_summary.context.split("\n")
+    lost = [
+        line
+        for line in previous
+        if _LABELLED_LINE_RE.fullmatch(line) and line not in judgment.new_context
+    ]
     if not lost:
         return judgment
+    lines = judgment.new_context.split("\n")
+    for line in lost:
+        body = split_departure_label(line)[1]
+        if body in lines:
+            lines[lines.index(body)] = line
+            continue
+        at = previous.index(line)
+        position = next(
+            (lines.index(previous[j]) + 1 for j in range(at - 1, -1, -1) if previous[j] in lines),
+            None,
+        )
+        if position is None:
+            position = next(
+                (
+                    lines.index(previous[k])
+                    for k in range(at + 1, len(previous))
+                    if previous[k] in lines
+                ),
+                None,
+            )
+        if position is None:
+            position = max(len(lines) - 1, 0) if any(x.strip() for x in lines) else 0
+        lines.insert(position, line)
+    context = "\n".join(lines)
+    summary = judgment.new_summary.model_copy(update={"context": context})
+    notes = [f"departure_label_lost: {len(lost)}", f"departure_label_restored: {len(lost)}"]
+    words = _summary_word_count(summary)
+    if words > summary_max_words:
+        notes.append(
+            f"departure_label_overflow: {words - summary_max_words} words over the "
+            f"{summary_max_words}-word budget"
+        )
     return judgment.model_copy(
         update={
-            "departure_label_lost": lost,
-            "protocol_notes": [*judgment.protocol_notes, f"departure_label_lost: {lost}"],
+            "new_context": context,
+            "new_summary": summary,
+            "departure_label_lost": len(lost),
+            "departure_label_restored": len(lost),
+            "protocol_notes": [*judgment.protocol_notes, *notes],
         }
     )
 
@@ -9512,7 +9561,7 @@ class ScopeManager:
                 mode=mode,
                 current_summary=current_summary,
             )
-        return _with_departure_label_count(
+        return _with_departure_labels_restored(
             self._hold_directive_changes(
                 judgment,
                 scope=scope,
@@ -9522,6 +9571,7 @@ class ScopeManager:
                 input_changes=input_changes,
             ),
             current_summary,
+            summary_max_words,
         )
 
     @staticmethod
@@ -12108,7 +12158,7 @@ class ScopeManager:
             ancestor_directives=ancestor_directives,
             operator_memory=operator_memory,
         )
-        return _with_departure_label_count(
+        return _with_departure_labels_restored(
             self._hold_batch_directive_changes(
                 batch_judgment,
                 scope=scope,
@@ -12118,6 +12168,7 @@ class ScopeManager:
                 input_changes=input_changes,
             ),
             current_summary,
+            summary_max_words,
         )
 
     @staticmethod
