@@ -5,6 +5,14 @@ the release PR (`dev` → `main`) and the GitHub Release body are built from
 (`docs/releasing.md`, step 3) — write entries here as work lands, and the
 "Unreleased" section is cleared once a release ships.
 
+## 1.18.3
+
+### Fixed
+
+- A dated report of one specific past departure — a single identified act, or one bounded completed past episode such as "The pumps ran 24/7 last week." — is admitted, with the departure label in the judgment's record line. A note that grants, approves or reports approval of an exception for a class, or that states a practice (present tense, open-ended present perfect, or a bare generic plural of the rule's class with no determiner, number or id, even when dated), is declined. The decline reason tells the writer to report the specific act (with acted_on), or to ask the issuing scope to record the exception itself. An approval scoped to one identified act ("On 18 October hotfix 4411 merged without review; the lead told me he approved this one merge.") stays an admitted departure, with the departure label in the judgment's record line. Known limit: an admitted departure is stored as written; the departure label is in the judgment's record line, not in the stored note, so a reader of the summary may take it as precedent. The stored label comes in v1.19.
+- A slash date anchors a report only when it carries a year (day/month/yy or day/month/yyyy). A bare day/month never anchors. "The pumps ran 24/7." anchors nothing. "The pumps ran 24/7 last week." is anchored by "last week". "On 3/10/2026" is anchored by that date.
+- A consequence report reached from an exception answer is worded, in the judgment's record line, as a departure from the rule, not as "A report of following" it. A consequence report reached from a follows answer keeps the following wording. That wording is the record line; the stored note is the text as written.
+
 ## 1.18.2 (2026-10-21)
 
 ### Fixed
