@@ -7544,6 +7544,71 @@ _IRREGULAR_PAST_FORMS: tuple[str, ...] = (
     "upheld",
     "misled",
     "retold",
+    "cast",
+    "fit",
+    "rid",
+    "wed",
+    "dwelt",
+    "spilt",
+    "forsook",
+    "oversaw",
+    "smelt",
+    "spelt",
+    "learnt",
+    "leant",
+    "spoilt",
+    "bade",
+    "begot",
+    "beset",
+    "broadcast",
+    "forecast",
+    "outran",
+    "outdid",
+    "overdid",
+    "overate",
+    "overdrew",
+    "overflew",
+    "oversold",
+    "overslept",
+    "overspent",
+    "overpaid",
+    "overrode",
+    "overwrote",
+    "partook",
+    "rewound",
+    "resold",
+    "reset",
+    "reran",
+    "repaid",
+    "remade",
+    "reread",
+    "rethought",
+    "retaught",
+    "slew",
+    "smote",
+    "throve",
+    "underwrote",
+    "unwound",
+    "unbound",
+    "wrought",
+    "mislaid",
+    "misspelt",
+    "misread",
+    "mishit",
+    "offset",
+    "outsold",
+    "outshone",
+    "outbid",
+    "overshot",
+    "overheard",
+    "forwent",
+    "forbore",
+    "beheld",
+    "bespoke",
+    "besought",
+    "betook",
+    "sublet",
+    "undersold",
 )
 _PAST_TENSE_RE = re.compile(
     r"\b(?:\w+ed|"
@@ -7740,12 +7805,20 @@ _MODAL_RE = re.compile(
 
 
 #: A note that says a practice changed or was decided is an exception however it is dated.
+#: So is one that dates the START of a practice ("as of 3 October", "effective 3 October",
+#: "starting 3 October", "from 3 October on"): the date is anchored to a real one, so "fuel from
+#: the dock on the north side" is not a cue. A bare "from <date>" counts only with "on/onward".
 _CHANGE_OF_PRACTICE_RE = re.compile(
     r"\b(?:decided|decides|agreed|agrees|resolved|switched|moved|started|starts|began|begun|"
     r"stopped|stops|extended|dropped|changed|adopted|introduced|relaxed|raised|lowered|"
     r"replaced|scrapped|removed|waived|suspended|paused|retired|no longer|from now on|"
     r"going forward|henceforth|until further notice|suffices?|"
-    r"(?:is|are) (?:enough|fine|ok|okay|acceptable))\b",
+    r"(?:is|are) (?:enough|fine|ok|okay|acceptable))\b"
+    r"|\b(?:as of|effective|(?:starting|beginning)(?:\s+(?:on|from))?)\s+(?:"
+    + _DATED_ANCHOR_RE.pattern
+    + r")"
+    r"|\bfrom\s+(?:" + _DATED_ANCHOR_RE.pattern + r")\s+on(?:wards?)?\b"
+    r"|\beffective immediately\b",
     re.IGNORECASE,
 )
 
