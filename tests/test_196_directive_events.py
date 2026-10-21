@@ -5,8 +5,9 @@ directive, under one change id. A descendant refreshes once for that id.
 The sweep withdraws every retired id. A re-read does not duplicate the lines.
 
 A one-for-one replacement stays the single ``directive_superseded`` event
-the existing suite already requires. These tests cover the other shape:
-two directives retired and one added.
+the existing suite already requires. One test here checks that event names
+the superseded id, so the sweep withdraws a publication anchored on it. The
+rest cover the other shape: two directives retired and one added.
 """
 
 from __future__ import annotations
@@ -271,6 +272,59 @@ def test_the_sweep_removes_both_retired_ids(fleet, record_store, summary_store) 
         if event.kind in ("directive_retired", "directive_superseded")
     }
     assert removal_ids == {OLD_A, OLD_B}
+
+    drain_scope(
+        "g_196_child",
+        fleet=fleet,
+        record_store=record_store,
+        summary_store=summary_store,
+        scope_manager=None,
+        summary_max_words=500,
+    )
+
+    assert read_publication("g_196_child", summaries_dir=summaries_dir) == []
+
+
+def test_a_one_for_one_event_names_the_superseded_id(fleet, record_store, summary_store) -> None:
+    """The single directive_superseded event names the id that left, and the sweep withdraws it."""
+    summaries_dir = str(summary_store.summaries_dir)
+    summary_store.write("g_196_parent", _summary(_directive(OLD_A, "Pumps off at 20:00.")))
+    summary_store.write(
+        "g_196_child",
+        ScopeSummary(
+            scope_id="g_196_child",
+            directives=[],
+            context="",
+            updated_at="2026-10-21T00:00:00+00:00",
+        ),
+    )
+    _publish(fleet, record_store, summary_store, "The night pump order.", [f"directive:{OLD_A}"])
+    assert len(read_publication("g_196_child", summaries_dir=summaries_dir)) == 1
+
+    run_contribution(
+        scope=fleet.get_scope("g_196_parent"),
+        stratum=next(s for s in fleet.strata if s.id == "L0"),
+        content="Replace the pump rule.",
+        proposed_classification="directive",
+        subject="ops",
+        supersedes=None,
+        contributor=_contributor(),
+        fleet=fleet,
+        record_store=record_store,
+        summary_store=summary_store,
+        scope_manager=_ScriptedManager(
+            ScopeManagerJudgment(
+                decision="accept_as_directive",
+                reasoning="One rule replaces the other.",
+                new_summary=_summary(_directive(NEW, "Dock pumps follow the night order.")),
+            )
+        ),
+        summary_max_words=500,
+    )
+
+    (event,) = _child_events(record_store)
+    assert event.kind == "directive_superseded"
+    assert event.item_id == OLD_A
 
     drain_scope(
         "g_196_child",
