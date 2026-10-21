@@ -56,7 +56,7 @@ from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
-from strata.record_store import ContributorRef
+from strata.record_store import ENGINE_NOTE_SUBJECT, ContributorRef
 
 if TYPE_CHECKING:
     from strata.fleet_config import FleetConfig
@@ -747,7 +747,7 @@ def _record_emission_failure(
                 "underlying error.]"
             ),
             proposed_classification="context",
-            subject="change-emission-failed",
+            subject=ENGINE_NOTE_SUBJECT,
             supersedes=None,
             contributor=_notice_contributor(source_scope_id),
         )

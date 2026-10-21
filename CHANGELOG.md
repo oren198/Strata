@@ -21,6 +21,10 @@ the release PR (`dev` → `main`) and the GitHub Release body are built from
   The events share one change id and each names its own directive. `before`
   and `after` stay the full id sets. A one-for-one replacement stays a
   single `directive_superseded` event.
+- **A failed change emission is an engine note, not a pending judgment**
+  (#196). A `change-emission-failed` row reads as state `note`. Pending
+  counts leave it out, and `strata_rejudge` refuses it. The judge digest
+  is unchanged.
 
 ### Changed
 

@@ -156,6 +156,8 @@ from strata.record_store import (
     RaisedContributionInput,
     RecentContribution,
     RecordStore,
+    engine_note_rejudge_message,
+    is_engine_note,
     standing_evidence,
 )
 from strata.scope_manager import (
@@ -2294,6 +2296,8 @@ def rejudge_contribution(
     contribution = record_store.get_contribution(contribution_id)
     if contribution is None:
         raise KeyError(f"Contribution not found: {contribution_id!r}")
+    if is_engine_note(contribution.subject):
+        raise RuntimeError(engine_note_rejudge_message(contribution_id))
 
     scope = fleet.get_scope(contribution.scope_id)
     if scope is None:

@@ -98,7 +98,13 @@ from strata.publication import (
     propose_withdraw,
     read_publication,
 )
-from strata.record_store import ACCEPTED_DECISIONS, ContributorRef, RecordStore
+from strata.record_store import (
+    ACCEPTED_DECISIONS,
+    ContributorRef,
+    RecordStore,
+    engine_note_rejudge_message,
+    is_engine_note,
+)
 from strata.session_state import (
     SessionState,
     SessionStateStore,
@@ -2701,6 +2707,8 @@ async def strata_rejudge(contribution_id: str) -> dict:
     contribution = _record_store.get_contribution(contribution_id)
     if contribution is None:
         raise RuntimeError(f"Contribution not found: {contribution_id!r}")
+    if is_engine_note(contribution.subject):
+        raise RuntimeError(engine_note_rejudge_message(contribution_id))
     _check_entitled_write(
         fleet,
         _AGENT_SCOPE,
@@ -3542,8 +3550,9 @@ async def strata_read_scope_record(
             # Failed-judgment events (issue #57): a contribution with attempts but
             # no judgment is pending, distinguishable in the forensic view.
             "judgment_attempts": [asdict(a) for a in page.judgment_attempts],
-            # Per-contribution state (issue #118): judged / judge_failed /
-            # pending, so "the judge errored" never reads as "still in flight".
+            # Per-contribution state (issue #118, #196): judged / judge_failed /
+            # pending / note. "the judge errored" never reads as "still in
+            # flight", and an engine note never reads as pending.
             "contribution_states": [asdict(s) for s in page.contribution_states],
             # ADR 0017 P6 part 1, issue #202: every condensation-drop row for this
             # scope — small, rare, never paginated the way contributions are.
@@ -3586,11 +3595,12 @@ async def strata_read_contribution(contribution_id: str) -> dict:
     duplicate it. This costs a few hundred bytes where the same question asked
     through strata_read_scope_record costs the scope's whole record.
 
-    The three states are the ones the record distinguishes (issues #57, #118):
+    The states are the ones the record distinguishes (issues #57, #118, #196):
     ``judged`` (a verdict exists — ``judgment`` carries the decision and the
     scope-manager's notes), ``judge_failed`` (the judge was attempted and
-    errored; nothing more happens without strata_rejudge), and ``pending``
-    (judgment is in flight or was never attempted).
+    errored; nothing more happens without strata_rejudge), ``pending``
+    (judgment is in flight or was never attempted), and ``note`` (an engine
+    note, not a judgment — ``strata_rejudge`` refuses it).
 
     Read surface: the contribution's own scope must be within this agent's
     entitled (chain-only) surface, exactly as strata_read_scope_record requires
