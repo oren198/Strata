@@ -60,6 +60,8 @@ _FOLLOW_KIND = {
     "submit_batch_judgment": "batch_corrective_reask",
 }
 
+_ECHO_MATCH_MARK = "The engine matched the admitted text to operator directive"
+_CITED_MARK = "Your reasoning cites operator directive"
 _SCOPE_MARK = "SCOPE: "
 _CONTRIBUTION_MARK = "NEW CONTRIBUTION TO JUDGE:\n- id: "
 
@@ -166,6 +168,8 @@ def call_kind_from_request(kwargs: dict[str, Any]) -> str:
     if _is_follow_up(messages) and tool in _FOLLOW_KIND:
         if _is_overflow(messages):
             return "condensation" if tool == "submit_judgment" else "batch_condensation"
+        if _is_echo_only_recheck(messages):
+            return "attribution_echo_recheck"
         return _FOLLOW_KIND[tool]
     return _FIRST_KIND.get(tool, tool)
 
@@ -547,6 +551,17 @@ def _is_follow_up(messages: list[Any]) -> bool:
     return any(
         isinstance(message, dict) and message.get("role") == "assistant" for message in messages
     )
+
+
+def _is_echo_only_recheck(messages: list[Any]) -> bool:
+    """The RULE 2 re-ask fired ONLY because the engine matched an echo (#138): the judge's own
+    reasoning cited no operator directive, so the message lacks the "Your reasoning cites"
+    opening."""
+    for message in reversed(messages):
+        if isinstance(message, dict) and message.get("role") == "user":
+            text = _content_text(message.get("content"))
+            return _ECHO_MATCH_MARK in text and _CITED_MARK not in text
+    return False
 
 
 def _is_overflow(messages: list[Any]) -> bool:
