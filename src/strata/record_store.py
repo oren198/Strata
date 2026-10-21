@@ -3944,6 +3944,7 @@ def _recent_contribution_from_row(row: sqlite3.Row) -> RecentContribution:
     elif failed_marks:
         state = "judge_failed"
     else:
+        # Engine notes keep their raw state: judge input, app.py ~567, _render_recent_contributions.
         state = "pending"
     return RecentContribution(
         contribution=Contribution(**d, contributor=contributor),
