@@ -7542,7 +7542,31 @@ _CLAUSE_SPLIT_RE = re.compile(
 _SENTENCE_SPLIT_RE = re.compile(r"[.;!?]")
 _DETERMINER_OR_NUMBER_RE = re.compile(
     r"^(?:the|a|an|this|that|these|those|my|our|your|their|its|his|her|one|two|three|four|five|"
-    r"six|seven|eight|nine|ten|both|another|some|any|no|every|each|several|many|few|\d+)$",
+    r"six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|"
+    r"eighteen|nineteen|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred|dozen|"
+    r"both|another|some|any|no|every|each|several|many|few|\d+)$",
+    re.IGNORECASE,
+)
+_TIME_UNITS = frozenset(
+    {"seconds", "minutes", "hours", "days", "weeks", "months", "years", "times"}
+)
+#: "every evening", "nightly": repetition. With only a point date ("On 5 October the pumps ran past
+#: 20:00 every evening") it is a practice; inside a CLOSED past period ("last week", "from 1 to 7
+#: October", "during the outage") it is one episode and stays a report.
+_HABITUAL_QUANTIFIER_RE = re.compile(
+    r"\b(?:every|each)\s+(?:evening|night|day|morning|afternoon|week|month|shift|run|time|"
+    r"release|deploy\w*)\b"
+    # "nightly" as an adverb ("ran past 20:00 nightly."), not an adjective ("the nightly backup")
+    r"|\b(?:nightly|daily|weekly|hourly|monthly)\b(?=\s*(?:[.,;!?]|$|\b(?:and|but|or|so|because|while|"
+    r"until|after|before|at|on|in)\b))",
+    re.IGNORECASE,
+)
+_CLOSED_PERIOD_RE = re.compile(
+    r"\b(?:last|this|that)\s+(?:week|month|shift|night|weekend|quarter|sprint)\b"
+    r"|\bfrom\s+[^.;]{1,30}?\s+(?:to|until|through)\s+"
+    r"|\bbetween\s+[^.;]{1,30}?\s+and\s+"
+    r"|\b(?:during|throughout|over)\s+(?:the|that|this)\s+\w+"
+    r"|\ball\s+(?:week|month|weekend)\b",
     re.IGNORECASE,
 )
 _LICENCE_REASON = "a licence or a practice in force, not one specific act"
@@ -7617,7 +7641,7 @@ def _bare_generic_plural_of_class(text: str, rule: str) -> bool:
         low = word.casefold()
         if not (len(low) > 3 and low.endswith("s") and not low.endswith(("ss", "us", "is"))):
             continue
-        if _shared_subject_stems(low, rule) < 1:
+        if low in _TIME_UNITS or _shared_subject_stems(low, rule) < 1:
             continue
         if any(
             _DETERMINER_OR_NUMBER_RE.match(w) or w.casefold().endswith(("'s", "’s"))
@@ -7638,6 +7662,8 @@ def _dated_report_blocker(content: str, rule: str | None) -> str | None:
         return "a practice in force"
     if rule is not None and _bare_generic_plural_of_class(text, rule):
         return "the class in the bare plural"
+    if _HABITUAL_QUANTIFIER_RE.search(text) and not _CLOSED_PERIOD_RE.search(text):
+        return "a habit with no closed period"
     return None
 
 

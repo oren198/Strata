@@ -260,3 +260,58 @@ def test_a_sign_off_on_one_definite_thing_is_not_a_licence_but_on_a_class_is():
     assert _grants_a_licence("The reviewer signed off on merges without review.")
     assert _grants_a_licence("The lead approved that the nightly releases skip review.")
     assert _grants_a_licence("The merges were approved by the lead.")
+
+
+DEPOT_RULE = "At the cobble-line depot, cars are tied down on every run longer than twenty minutes."
+DEPOT_NOTE = (
+    "On 9 June the dusk run lasted thirty minutes with the cars untied so we could review the late "
+    "departure. The cars should have been tied down. We are not proposing we stop tying cars down."
+)
+
+
+def test_a_counterfactual_and_a_disclaimer_do_not_make_a_dated_report_general():
+    verdict, reason = verify_inherited_relation(_exception(DEPOT_NOTE), DEPOT_NOTE, DEPOT_RULE)
+    assert verdict in ("consequence_report", "departure_report")
+    assert reason == "a specific past occurrence"
+
+
+def test_a_number_word_and_a_unit_of_time_never_make_a_bare_plural():
+    note = "On 9 June the dusk run lasted thirty minutes with the cars untied."
+    verdict, _ = verify_inherited_relation(_exception(note), note, DEPOT_RULE)
+    assert verdict in ("consequence_report", "departure_report")
+
+
+def test_a_dated_note_that_adds_a_practice_still_declines_beside_the_same_rule():
+    note = (
+        "On 9 June the dusk run lasted thirty minutes with the cars untied. "
+        "Cars go untied on short-staffed nights."
+    )
+    verdict, _ = verify_inherited_relation(_exception(note), note, DEPOT_RULE)
+    assert verdict == "decline"
+
+
+@pytest.mark.parametrize(
+    "note",
+    [
+        "On 5 October the dock pumps ran past 20:00 every evening.",
+        "On 5 October the dock pumps ran past 20:00 nightly.",
+        "On 5 October the dock pumps ran past 20:00 each night.",
+    ],
+)
+def test_a_habitual_quantifier_with_only_a_point_date_is_a_practice(note):
+    verdict, _ = verify_inherited_relation(_exception(note), note, PUMPS)
+    assert verdict == "decline"
+
+
+@pytest.mark.parametrize(
+    "note",
+    [
+        "The dock pumps ran past 20:00 every evening last week.",
+        "The dock pumps ran past 20:00 every evening from 1 to 7 October.",
+        "On 3 October the dock pumps ran past 20:00 every evening during the outage.",
+        "On 5 October the pumps ran past 20:00 once.",
+    ],
+)
+def test_repetition_inside_a_closed_past_period_is_one_episode(note):
+    verdict, _ = verify_inherited_relation(_exception(note), note, PUMPS)
+    assert verdict in ("consequence_report", "departure_report")
