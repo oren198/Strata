@@ -17,16 +17,21 @@ owns emission, so these fabricate what a writer would have emitted.
 
 from __future__ import annotations
 
+import multiprocessing
 import sys
+import threading
+import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
 import yaml
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 sys.path.insert(0, str(Path(__file__).parent))
 
 from strata.fleet_config import FleetConfig
+from strata.locks import configure_lock_dir, fcntl, scope_lock
 from strata.migrator import run_migrations
 from strata.record_store import ContributorRef, RecordStore
 from strata.scope_manager import ScopeManagerJudgment
@@ -167,6 +172,142 @@ async def test_a_judge_outage_during_the_drain_never_fails_the_read(tmp_path: Pa
     assert result["refresh_pending"] == 1
     with RecordStore(db_path) as rs:
         assert len(rs.list_change_events(scope_id="g_team", unprocessed_only=True)) == 1
+
+
+async def test_a_held_scope_lock_returns_the_read_within_the_bound(tmp_path: Path) -> None:
+    """Issue #196: a read with work pending does not wait out a held lock.
+
+    The holder stands in for an in-flight judgment. The read comes back with
+    ``refresh_pending`` and leaves the event unprocessed.
+    """
+    mod, db_path, fleet = _setup(tmp_path)
+    with RecordStore(db_path) as rs:
+        _emit(rs, change_id="chg_a", item_id="p_1", scope_id="g_team")
+
+    bound = 0.3
+    mod.READ_DRAIN_LOCK_TIMEOUT_S = bound
+    held = threading.Event()
+    release = threading.Event()
+
+    def _hold() -> None:
+        with scope_lock("g_team"):
+            held.set()
+            release.wait(timeout=3)
+
+    holder = threading.Thread(target=_hold)
+    holder.start()
+    assert held.wait(timeout=2)
+    started = time.monotonic()
+    try:
+        with (
+            patch.object(mod, "_AGENT_SCOPE", "g_team"),
+            patch.object(mod, "_AGENT_SKILL", None),
+            patch.object(mod, "_AGENT_SESSION_ID", "sess_test"),
+            patch.object(mod, "_load_fleet", return_value=fleet),
+            patch("strata.scope_manager.ScopeManager.judge", return_value=_accepting_judgment()),
+            patch("anthropic.Anthropic", return_value=MagicMock()),
+        ):
+            result = await mod.strata_read_perspective()
+    finally:
+        release.set()
+        holder.join(timeout=2)
+    elapsed = time.monotonic() - started
+    assert elapsed < bound + 0.75
+    assert result["layers"]
+    assert result["refresh_pending"] == 1
+    with RecordStore(db_path) as rs:
+        assert len(rs.list_change_events(scope_id="g_team", unprocessed_only=True)) == 1
+
+
+# Hang ceiling for the child only. The parent learns the lock is held from the
+# ready event and lets go of it with the release event. The ceiling is what
+# stops an unbounded drain (the pre-fix ``with scope_lock``) from wedging the
+# suite; the passing path signals release and never reaches it.
+_FLOCK_HOLD_CEILING_S = 3.0
+
+
+def _hold_scope_flock(lock_dir: str, scope_id: str, held, release) -> None:
+    """Take the scope's flock in this process and hold it until released.
+
+    Runs in a spawned child. ``configure_lock_dir`` has to happen here: a
+    fresh process does not inherit the parent's lock directory, and without
+    it ``scope_lock`` never opens the lock file.
+    """
+    configure_lock_dir(Path(lock_dir))
+    with scope_lock(scope_id):
+        held.set()
+        release.wait(timeout=_FLOCK_HOLD_CEILING_S)
+
+
+async def test_a_flock_held_in_another_process_returns_the_read_within_the_bound(
+    tmp_path: Path,
+) -> None:
+    """Issue #196: the bound covers the cross-process flock, not only a thread.
+
+    A child process holds the scope's flock. The parent's read returns inside
+    ``READ_DRAIN_LOCK_TIMEOUT_S`` plus a small margin, with ``refresh_pending``
+    set and the event still unprocessed. After the child releases, the next
+    read drains the event.
+    """
+    if fcntl is None:
+        pytest.skip("cross-process flock is unavailable without fcntl")
+
+    mod, db_path, fleet = _setup(tmp_path)
+    with RecordStore(db_path) as rs:
+        _emit(rs, change_id="chg_a", item_id="p_1", scope_id="g_team")
+
+    # The harness loads the MCP module without ``_init_stores``, which is the
+    # path that configures ``<db_dir>/.locks``. Both processes must agree on
+    # that directory or the parent's ``try_enter`` never sees the child's flock.
+    lock_dir = Path(db_path).parent / ".locks"
+    configure_lock_dir(lock_dir)
+
+    bound = 0.3
+    mod.READ_DRAIN_LOCK_TIMEOUT_S = bound
+    ctx = multiprocessing.get_context("spawn")
+    held = ctx.Event()
+    release = ctx.Event()
+    child = ctx.Process(
+        target=_hold_scope_flock,
+        args=(str(lock_dir), "g_team", held, release),
+    )
+    child.start()
+    try:
+        assert held.wait(timeout=5), "child never signalled that the flock is held"
+        started = time.monotonic()
+        with (
+            patch.object(mod, "_AGENT_SCOPE", "g_team"),
+            patch.object(mod, "_AGENT_SKILL", None),
+            patch.object(mod, "_AGENT_SESSION_ID", "sess_test"),
+            patch.object(mod, "_load_fleet", return_value=fleet),
+            patch("strata.scope_manager.ScopeManager.judge", return_value=_accepting_judgment()),
+            patch("anthropic.Anthropic", return_value=MagicMock()),
+        ):
+            result = await mod.strata_read_perspective()
+        elapsed = time.monotonic() - started
+        assert elapsed < bound + 0.75
+        assert result["layers"]
+        assert result["refresh_pending"] == 1
+        with RecordStore(db_path) as rs:
+            assert len(rs.list_change_events(scope_id="g_team", unprocessed_only=True)) == 1
+    finally:
+        release.set()
+        child.join(timeout=5)
+    assert child.exitcode == 0
+
+    with (
+        patch.object(mod, "_AGENT_SCOPE", "g_team"),
+        patch.object(mod, "_AGENT_SKILL", None),
+        patch.object(mod, "_AGENT_SESSION_ID", "sess_test"),
+        patch.object(mod, "_load_fleet", return_value=fleet),
+        patch("strata.scope_manager.ScopeManager.judge", return_value=_accepting_judgment()),
+        patch("anthropic.Anthropic", return_value=MagicMock()),
+    ):
+        second = await mod.strata_read_perspective()
+    assert second.get("refresh_pending", 0) == 0
+    with RecordStore(db_path) as rs:
+        assert rs.list_change_events(scope_id="g_team", unprocessed_only=True) == []
+        assert len(rs.list_judgments(scope_id="g_team")) == 1
 
 
 async def test_a_read_with_nothing_pending_reports_zero_and_calls_no_judge(

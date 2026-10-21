@@ -66,7 +66,7 @@ from pydantic import BaseModel, Field
 
 from strata.fleet_config import EntitlementView, Scope, Stratum
 from strata.operator import OperatorItem
-from strata.record_store import Contribution, ContributorRef, RecentContribution
+from strata.record_store import ACCEPTED_DECISIONS, Contribution, ContributorRef, RecentContribution
 from strata.summary_store import Directive, ScopeSummary, _render_summary, adopted_suffix
 
 _logger = logging.getLogger(__name__)
@@ -2434,10 +2434,6 @@ class _AmendmentJudgment(BaseModel):
 #: drives without caring which of the two it is holding.
 _JudgmentT = TypeVar("_JudgmentT", bound=_AmendmentJudgment)
 
-#: The two verdicts that admit material into the summary — the only ones an
-#: unattributed echo can hide in (a decline amends nothing).
-_ACCEPT_DECISIONS = ("accept_as_directive", "accept_as_context")
-
 
 def _attribution_pattern(operator_id: str) -> re.Pattern[str]:
     """The attribution phrase RULE 2 requires for *operator_id*, as a matcher.
@@ -2487,7 +2483,7 @@ def _unattributed_operator_echoes(
     directive, and demanding it for an operator context item would have the
     judge write a false label.
     """
-    if not operator_directive_ids or judgment.decision not in _ACCEPT_DECISIONS:
+    if not operator_directive_ids or judgment.decision not in ACCEPTED_DECISIONS:
         return []
     admitted = _amendment_summary_text(judgment, contribution)
     return [
@@ -8837,7 +8833,7 @@ class ScopeManager:
             to `protocol_notes` on every path below, so a trigger is always
             countable in the record whatever it resolves to.
             """
-            if judgment.decision not in ("accept_as_directive", "accept_as_context"):
+            if judgment.decision not in ACCEPTED_DECISIONS:
                 return judgment
             if entitlement is None:
                 return judgment

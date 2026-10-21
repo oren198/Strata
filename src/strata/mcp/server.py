@@ -98,7 +98,7 @@ from strata.publication import (
     propose_withdraw,
     read_publication,
 )
-from strata.record_store import ContributorRef, RecordStore
+from strata.record_store import ACCEPTED_DECISIONS, ContributorRef, RecordStore
 from strata.session_state import (
     SessionState,
     SessionStateStore,
@@ -176,6 +176,13 @@ def _init_stores() -> None:
     _publish_connect_seam_problem()
 
 
+#: How long a perspective read waits for ``scope_lock`` before giving up
+#: (issue #196). An in-flight judgment holds that lock across an LLM call.
+#: Two seconds outlasts an uncontended acquire and does not wait the call out.
+#: On expiry the read returns the perspective with ``refresh_pending``.
+READ_DRAIN_LOCK_TIMEOUT_S = 2.0
+
+
 def _drain_for_read(fleet, scope_id: str) -> tuple[int, list]:
     """Bring *scope_id* up to date before it is read, and say what it did.
 
@@ -219,7 +226,9 @@ def _drain_for_read(fleet, scope_id: str) -> tuple[int, list]:
     Deadlock: :func:`strata.app.drain_scope` takes ``scope_lock`` (ADR 0012)
     and the read path holds no scope lock of its own, so this can only ever
     WAIT on an in-flight judgment for the same scope, never deadlock against
-    one.
+    one. That wait is bounded by :data:`READ_DRAIN_LOCK_TIMEOUT_S`. When it
+    expires the drain touches nothing and this returns the events still
+    owed, which the caller surfaces as ``refresh_pending``.
     """
     from strata.app import DrainFailed, drain_is_noop, drain_scope  # noqa: PLC0415
 
@@ -253,6 +262,7 @@ def _drain_for_read(fleet, scope_id: str) -> tuple[int, list]:
             summary_max_words=_settings.summary_max_words,
             window_verbatim_tail=_settings.window_verbatim_tail,
             recency_window_size=_settings.recency_window_size,
+            lock_timeout=READ_DRAIN_LOCK_TIMEOUT_S,
         )
         return (
             len(_record_store.list_change_events(scope_id=scope_id, unprocessed_only=True)),
@@ -269,6 +279,7 @@ def _drain_for_read(fleet, scope_id: str) -> tuple[int, list]:
             summary_max_words=_settings.summary_max_words,
             window_verbatim_tail=_settings.window_verbatim_tail,
             recency_window_size=_settings.recency_window_size,
+            lock_timeout=READ_DRAIN_LOCK_TIMEOUT_S,
         )
     except DrainFailed as exc:
         _logger.warning(
@@ -624,7 +635,7 @@ def _record_accepted_contribution(decision: str) -> None:
     valve; a decline is the scope-manager rejecting the proposal, not the session
     contributing. Same best-effort discipline as :func:`_record_read`.
     """
-    if _session_store is None or decision not in ("accept_as_directive", "accept_as_context"):
+    if _session_store is None or decision not in ACCEPTED_DECISIONS:
         return
     try:
         _session_store.record_contribution(_AGENT_SESSION_ID, harness=_client_harness())
@@ -3247,8 +3258,9 @@ async def strata_read_perspective(scope_id: str | None = None) -> dict:
     ancestor or operator directive changed — is judged by this scope's own
     scope-manager first (ADR 0014 D6), so nobody reads a scope whose memory
     has not been re-judged against its current inputs. The read never fails
-    on that account: if the refresh cannot run, the perspective comes back
-    anyway carrying ``refresh_pending``.
+    on that account: if the refresh cannot run, including when ``scope_lock``
+    is still held after :data:`READ_DRAIN_LOCK_TIMEOUT_S`, the perspective
+    comes back anyway carrying ``refresh_pending``.
 
     Returns:
         ``{layers: [{scope_id, stratum_id, relation, binding, summary |
