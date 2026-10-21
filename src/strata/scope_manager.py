@@ -7721,6 +7721,16 @@ def _inherited_relation_note(outcome: dict) -> str:
             f"and raised to {origin} with acted_on), or propose the exception to {origin}.]"
         )
     if verdict == "consequence_report":
+        # An exception answer the engine kept as one specific past report is a
+        # departure, not a report of following the rule. A follows answer
+        # (kind consequence_report) keeps the following wording.
+        if outcome.get("kind") == "exception":
+            return (
+                "[A departure from "
+                f"{directive_id} ({origin}), not a licence: only {origin} decides "
+                f"whether the rule is slack. To raise it to {origin}, resubmit with "
+                f"acted_on = {directive_id}.]"
+            )
         return (
             f"[A report of following {directive_id} ({origin}). To raise it to {origin}, "
             f"resubmit with acted_on = {directive_id}.]"
