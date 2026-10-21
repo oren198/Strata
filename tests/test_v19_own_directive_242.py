@@ -144,7 +144,9 @@ def test_a_dated_own_directive_departure_is_admitted_with_the_departure_note():
     assert judgment.reasoning == f"A note. {NOTE_DEPARTURE_OWN}"
     assert judgment.inherited_relation["verdict"] == "departure_report"
     assert judgment.inherited_relation["origin"] == OWN_ORIGIN
-    assert judgment.new_summary.context == "Existing context plus the note."  # no prefix written
+    assert judgment.new_summary.context == (
+        f"Existing context.\nDeparture from c_review01 (this scope): {DEPARTURE}"
+    )  # the stored line carries the label (ruling c_608b66f359ee5a65)
 
 
 @pytest.mark.parametrize("note", DELIBERATIONS)
@@ -487,3 +489,111 @@ def test_a_proposal_followed_by_a_practice_in_force_still_declines():
         note, _frost_answer("exception", "we skip it on warm nights"), summary=FROST_SUMMARY
     )
     assert judgment.decision == "decline"
+
+
+# -- the stored line carries the departure label, and the label is counted when it is lost ----
+
+LABELLED = f"Departure from c_review01 (this scope): {DEPARTURE}"
+INHERITED_DEPARTURE = (
+    "Switching the dock pumps off at 20:00 on 9 October left two trawlers without fuel at the quay."
+)
+
+
+def test_an_own_directive_departure_is_stored_with_its_label_and_not_the_judges_rewrite():
+    judgment, _ = _judge(DEPARTURE, _answer("departure_report", occurrence_span=DEPARTURE[:-1]))
+    assert judgment.new_context == f"Existing context.\n{LABELLED}"
+    assert judgment.new_summary.context == judgment.new_context
+
+
+def test_an_inherited_departure_is_stored_with_the_issuing_scope_in_the_label():
+    departure = "On 9 October the dock pumps were not switched off until 21:10."
+    answer = {
+        "kind": "departure_report",
+        "inherited_id": "c_pump01",
+        "reasoning": "r",
+        "occurrence_span": departure[:-1],
+    }
+    judgment, _ = _judge(departure, answer, summary=EMPTY, ancestors=ANCESTORS)
+    assert judgment.new_context == (
+        f"Existing context.\nDeparture from c_pump01 (g_arch): {departure}"
+    )
+
+
+def test_a_report_of_following_the_rule_is_stored_without_a_label():
+    answer = {
+        "kind": "consequence_report",
+        "inherited_id": "c_pump01",
+        "reasoning": "r",
+        "occurrence_span": INHERITED_DEPARTURE[:-1],
+    }
+    judgment, _ = _judge(INHERITED_DEPARTURE, answer, summary=EMPTY, ancestors=ANCESTORS)
+    assert judgment.new_context == "Existing context plus the note."  # the judge's own rewrite
+    assert "Departure from" not in judgment.new_context
+
+
+LATER = {
+    "decision": "accept_as_context",
+    "reasoning": "A note.",
+    "directive_ops": [],
+}
+
+
+def _later_judge(new_context: str):
+    summary = ScopeSummary(
+        scope_id=SCOPE.id,
+        directives=[],
+        context=f"Older line.\n{LABELLED}",
+        updated_at="2026-04-01T09:00:00+00:00",
+    )
+    judgment, _ = _judge(
+        "Integration tests run on every pull request.",
+        None,
+        first={**LATER, "new_context": new_context},
+        summary=summary,
+    )
+    return judgment
+
+
+def test_a_later_rewrite_that_keeps_the_label_byte_for_byte_loses_nothing():
+    judgment = _later_judge(f"Older line, condensed.\n{LABELLED}\nTests run on every PR.")
+    assert judgment.departure_label_lost == 0
+
+
+def test_a_later_rewrite_that_drops_the_label_is_counted():
+    judgment = _later_judge("One PR merged after one review on 12 October. Tests run on every PR.")
+    assert judgment.departure_label_lost == 1
+    assert "departure_label_lost: 1" in judgment.protocol_notes
+
+
+def test_the_batch_path_stores_a_departure_with_its_label():
+    client = MagicMock()
+    batch = _batch_input(
+        verdicts=[
+            {
+                "contribution_id": NEW_CONTRIBUTION.id,
+                "decision": "accept_as_context",
+                "reasoning": "a dated departure",
+            },
+        ],
+        directive_ops=[],
+        new_context="The judge's condensed rewrite.",
+    )
+    client.messages.create.side_effect = [
+        _fake_response(batch),
+        _fake_response(_answer("departure_report", occurrence_span=DEPARTURE[:-1])),
+    ]
+    only = replace(NEW_CONTRIBUTION, content=DEPARTURE, proposed_classification="context")
+    other = replace(SECOND_CONTRIBUTION, proposed_classification="directive")
+    batch["verdicts"].append(
+        {"contribution_id": other.id, "decision": "accept_as_directive", "reasoning": "a rule"}
+    )
+    batch["directive_ops"].append({"op": "append", "contribution_id": other.id})
+    judgment = ScopeManager(client=client).judge_batch(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=SUMMARY,
+        recent_contributions=[],
+        new_contributions=[only, other],
+    )
+    assert LABELLED in judgment.new_context
+    assert "The judge's condensed rewrite." not in judgment.new_context

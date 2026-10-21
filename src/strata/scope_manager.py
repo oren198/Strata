@@ -1346,6 +1346,9 @@ When a BUDGET is given in the user message:
   longer earn their words.
 - Citations ("according to <scope>", "per operator directive <id>") are
   never what gets condensed away: drop detail, keep the attribution.
+- A context line that opens "Departure from <id> (<scope>): " keeps that
+  opening, byte for byte, through every rewrite and condensation, as an
+  attribution does.
 
 When THIS SCOPE'S PUBLICATION is rendered in the user message (ADR 0007 D2/D3):
 this is your own scope's CURRENT outward face — items already judged fit for
@@ -2253,6 +2256,11 @@ class _AmendmentJudgment(BaseModel):
     its verdict), and an ``append``/``publish`` op on the refresh path, where
     the amendment may carry context and lifecycle ops only (ADR 0011 D4).
     Either way the drop is noted in :attr:`record_notes`."""
+
+    departure_label_lost: int = 0
+    """How many ``Departure from <id> (<scope>): `` lines of the previous context this
+    judgment's context write no longer carries byte for byte (the label was dropped or the line
+    reworded away). Measured, not repaired: no re-ask in v1.19."""
 
     protocol_notes: list[str] = Field(default_factory=list)
     """What the engine repaired about the judge's PROTOCOL, not its judgment.
@@ -7889,6 +7897,41 @@ def with_departure_label(text: str, label: str | None) -> str:
     return f"{label}{text}"
 
 
+_LABELLED_LINE_RE = re.compile(r"^Departure from \S+ \([^)]*\): .*$", re.MULTILINE)
+
+
+def _departure_label_for(outcome: dict) -> str:
+    """The stored-line label for an admitted departure: the issuing scope, or "this scope" for
+    one of the scope's own directives."""
+    origin = outcome["origin"]
+    if _is_own_origin(origin):
+        origin = "this scope"
+    return departure_label(outcome["inherited_id"], origin)
+
+
+def _with_departure_label_count(judgment, current_summary):  # noqa: ANN001, ANN202
+    """*judgment* with ``departure_label_lost`` set after a context write: how many labelled
+    lines of the previous context its new context no longer holds byte for byte."""
+    if current_summary is None or judgment.new_context is None:
+        return judgment
+    lost = count_lost_departure_labels(current_summary.context, judgment.new_context)
+    if not lost:
+        return judgment
+    return judgment.model_copy(
+        update={
+            "departure_label_lost": lost,
+            "protocol_notes": [*judgment.protocol_notes, f"departure_label_lost: {lost}"],
+        }
+    )
+
+
+def count_lost_departure_labels(previous_context: str, new_context: str | None) -> int:
+    """Labelled lines of *previous_context* that *new_context* no longer holds byte for byte."""
+    if new_context is None:
+        return 0
+    return sum(1 for line in _LABELLED_LINE_RE.findall(previous_context) if line not in new_context)
+
+
 @dataclass(frozen=True)
 class PublicationExceptionCheck:
     """The engine's ruling on a publication that was accepted by the judge (#243).
@@ -9469,13 +9512,16 @@ class ScopeManager:
                 mode=mode,
                 current_summary=current_summary,
             )
-        return self._hold_directive_changes(
-            judgment,
-            scope=scope,
-            current_summary=current_summary,
-            new_contribution=new_contribution,
-            mode=mode,
-            input_changes=input_changes,
+        return _with_departure_label_count(
+            self._hold_directive_changes(
+                judgment,
+                scope=scope,
+                current_summary=current_summary,
+                new_contribution=new_contribution,
+                mode=mode,
+                input_changes=input_changes,
+            ),
+            current_summary,
         )
 
     @staticmethod
@@ -11120,6 +11166,22 @@ class ScopeManager:
             )
         elif note:
             update["reasoning"] = f"{first.reasoning} {note}"
+        if outcome["verdict"] == "departure_report":
+            # Agents read the summary, not the reasoning: the stored line carries the label, and
+            # the judge's own rewrite of this note is replaced by the engine's line.
+            previous = current_summary.context if current_summary is not None else ""
+            context = _append_line(
+                previous,
+                with_departure_label(contribution.content.strip(), _departure_label_for(outcome)),
+            )
+            update["new_context"] = context
+            update["new_summary"] = _apply_amendment(
+                scope=scope,
+                current_summary=current_summary,
+                contribution=contribution,
+                ops=first.directive_ops,
+                new_context=context,
+            )
         return first.model_copy(update=update)
 
     def check_publication_exception(
@@ -11591,17 +11653,23 @@ class ScopeManager:
             "verdicts": verdicts,
             "inherited_relations": list(outcomes.values()),
         }
-        if declined:
+        departed = {cid for cid, o in outcomes.items() if o["verdict"] == "departure_report"}
+        if declined or departed:
             context = current_summary.context if current_summary is not None else ""
             for v in verdicts:
                 if v.decision == "accept_as_context" and v.contribution_id not in held:
                     member = contributions[v.contribution_id]
                     who = member.contributor.skill or member.contributor.session_id
-                    context = _append_line(
-                        context,
-                        f"[{member.id}] {who} ({member.contributor.scope_id}) "
-                        f"observed: {member.content.strip()}",
-                    )
+                    if v.contribution_id in departed:
+                        line = with_departure_label(
+                            member.content.strip(), _departure_label_for(outcomes[member.id])
+                        )
+                    else:
+                        line = (
+                            f"[{member.id}] {who} ({member.contributor.scope_id}) "
+                            f"observed: {member.content.strip()}"
+                        )
+                    context = _append_line(context, line)
             update["new_context"] = context
             update["new_summary"] = _apply_batch_amendment(
                 scope=scope,
@@ -12040,13 +12108,16 @@ class ScopeManager:
             ancestor_directives=ancestor_directives,
             operator_memory=operator_memory,
         )
-        return self._hold_batch_directive_changes(
-            batch_judgment,
-            scope=scope,
-            current_summary=current_summary,
-            contributions=contributions,
-            mode=mode,
-            input_changes=input_changes,
+        return _with_departure_label_count(
+            self._hold_batch_directive_changes(
+                batch_judgment,
+                scope=scope,
+                current_summary=current_summary,
+                contributions=contributions,
+                mode=mode,
+                input_changes=input_changes,
+            ),
+            current_summary,
         )
 
     @staticmethod

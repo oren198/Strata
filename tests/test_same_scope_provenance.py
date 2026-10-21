@@ -414,17 +414,34 @@ def _sha_json(value: object) -> str:
     return _sha(json.dumps(value, sort_keys=True))
 
 
+#: v1.19 FIX 5 (reviewed by Aron 2026-10-21): the one other sentence in the judge's prompt. It sits
+#: right after the citation bullet, so the stored departure label survives condensation.
+_CITATION_BULLET_END = "drop detail, keep the attribution.\n"
+_DEPARTURE_PROMPT_LINE = (
+    '- A context line that opens "Departure from <id> (<scope>): " keeps that\n'
+    "  opening, byte for byte, through every rewrite and condensation, as an\n"
+    "  attribution does."
+)
+
+
+def _without_the_reviewed_lines(prompt: str) -> str:
+    return prompt.replace(f"\n{_PROMPT_LINE}", "").replace(f"{_DEPARTURE_PROMPT_LINE}\n", "")
+
+
 def test_system_prompt_is_the_previous_one_plus_exactly_one_sentence() -> None:
     assert _SYSTEM_PROMPT.count(_PROMPT_LINE) == 1
     assert _SYSTEM_PROMPT.endswith(f"\n{_PROMPT_LINE}")
-    assert _sha(_SYSTEM_PROMPT.replace(f"\n{_PROMPT_LINE}", "")) == _OLD_SYSTEM_PROMPT_SHA
-    # The batch prompt is built from the single one, so the sentence lands there too.
+    assert _SYSTEM_PROMPT.count(_DEPARTURE_PROMPT_LINE) == 1
+    assert f"{_CITATION_BULLET_END}{_DEPARTURE_PROMPT_LINE}\n" in _SYSTEM_PROMPT
+    assert _sha(_without_the_reviewed_lines(_SYSTEM_PROMPT)) == _OLD_SYSTEM_PROMPT_SHA
+    # The batch prompt is built from the single one, so both sentences land there too.
     assert _BATCH_SYSTEM_PROMPT.count(_PROMPT_LINE) == 1
-    assert (
-        _sha(_BATCH_SYSTEM_PROMPT.replace(f"\n{_PROMPT_LINE}", "")) == _OLD_BATCH_SYSTEM_PROMPT_SHA
-    )
+    assert _BATCH_SYSTEM_PROMPT.count(_DEPARTURE_PROMPT_LINE) == 1
+    assert f"{_CITATION_BULLET_END}{_DEPARTURE_PROMPT_LINE}\n" in _BATCH_SYSTEM_PROMPT
+    assert _sha(_without_the_reviewed_lines(_BATCH_SYSTEM_PROMPT)) == _OLD_BATCH_SYSTEM_PROMPT_SHA
     # The publication judge has its own prompt and does not share the text.
     assert _PROMPT_LINE not in _PUBLICATION_SYSTEM_PROMPT
+    assert _DEPARTURE_PROMPT_LINE not in _PUBLICATION_SYSTEM_PROMPT
 
 
 def test_single_judge_call_inputs_are_unchanged_except_the_system_prompt() -> None:
