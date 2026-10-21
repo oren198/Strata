@@ -7544,10 +7544,6 @@ _IRREGULAR_PAST_FORMS: tuple[str, ...] = (
     "upheld",
     "misled",
     "retold",
-    "cast",
-    "fit",
-    "rid",
-    "wed",
     "dwelt",
     "spilt",
     "forsook",
@@ -7559,9 +7555,6 @@ _IRREGULAR_PAST_FORMS: tuple[str, ...] = (
     "spoilt",
     "bade",
     "begot",
-    "beset",
-    "broadcast",
-    "forecast",
     "outran",
     "outdid",
     "overdid",
@@ -7577,11 +7570,9 @@ _IRREGULAR_PAST_FORMS: tuple[str, ...] = (
     "partook",
     "rewound",
     "resold",
-    "reset",
     "reran",
     "repaid",
     "remade",
-    "reread",
     "rethought",
     "retaught",
     "slew",
@@ -7593,12 +7584,8 @@ _IRREGULAR_PAST_FORMS: tuple[str, ...] = (
     "wrought",
     "mislaid",
     "misspelt",
-    "misread",
-    "mishit",
-    "offset",
     "outsold",
     "outshone",
-    "outbid",
     "overshot",
     "overheard",
     "forwent",
@@ -7607,7 +7594,6 @@ _IRREGULAR_PAST_FORMS: tuple[str, ...] = (
     "bespoke",
     "besought",
     "betook",
-    "sublet",
     "undersold",
 )
 _PAST_TENSE_RE = re.compile(
@@ -7817,7 +7803,8 @@ _CHANGE_OF_PRACTICE_RE = re.compile(
     r"|\b(?:as of|effective|(?:starting|beginning)(?:\s+(?:on|from))?)\s+(?:"
     + _DATED_ANCHOR_RE.pattern
     + r")"
-    r"|\bfrom\s+(?:" + _DATED_ANCHOR_RE.pattern + r")\s+on(?:wards?)?\b"
+    r"|\b(?:from|after|post|beyond)\s+(?:" + _DATED_ANCHOR_RE.pattern + r")"
+    r"(?!\s*(?:to|through|thru|until|till|and|[-\u2013])\b|\s*[-\u2013])"
     r"|\beffective immediately\b",
     re.IGNORECASE,
 )
