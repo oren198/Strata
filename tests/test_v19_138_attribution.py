@@ -71,7 +71,7 @@ def _accept(context: str, reasoning: str = "A fine note.") -> dict:
     }
 
 
-def _judge(first: dict, second: dict | None = None, *, memory=MEMORY, content="A release note."):
+def _judge(first: dict, second: dict | None = None, *, memory=MEMORY, content=ECHO, summary=EMPTY):
     client = MagicMock()
     client.messages.create.side_effect = [
         _fake_response(first),
@@ -81,7 +81,7 @@ def _judge(first: dict, second: dict | None = None, *, memory=MEMORY, content="A
     judgment = ScopeManager(client=client).judge(
         scope=SCOPE,
         stratum=STRATUM,
-        current_summary=EMPTY,
+        current_summary=summary,
         recent_contributions=[],
         new_contribution=contribution,
         operator_memory=memory,
@@ -113,7 +113,7 @@ def test_a_judge_that_returns_the_amendment_unchanged_is_kept_and_recorded():
 
 
 def test_an_unrelated_accept_with_operator_memory_gets_no_corrective():
-    judgment, client = _judge(_accept(UNRELATED))
+    judgment, client = _judge(_accept(UNRELATED), content=UNRELATED)
     assert len(_judge_calls(client)) == 1
     assert judgment.attribution_gap_kept == []
 
@@ -242,3 +242,22 @@ def test_the_meter_names_the_two_kinds_by_the_corrective_that_was_sent(text, kin
         ],
     }
     assert call_kind_from_request(request) == kind
+
+
+def test_an_old_context_line_that_echoes_a_directive_does_not_fire_for_an_unrelated_note():
+    old = ScopeSummary(
+        scope_id=SCOPE.id,
+        directives=[],
+        context=ECHO,  # an old line, already in the scope's context
+        updated_at="2026-04-01T09:00:00Z",
+    )
+    judgment, client = _judge(_accept(f"{ECHO} {UNRELATED}"), content=UNRELATED, summary=old)
+    assert len(_judge_calls(client)) == 1
+    assert judgment.attribution_gap_kept == []
+
+
+def test_a_note_that_shares_only_two_subject_words_with_a_directive_does_not_fire():
+    two = "The tagged inventory was published to the wiki on Monday."
+    judgment, client = _judge(_accept(two), content=two)
+    assert len(_judge_calls(client)) == 1
+    assert judgment.attribution_gap_kept == []

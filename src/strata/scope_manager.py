@@ -2508,26 +2508,41 @@ def _decision_signature(judgment: object) -> object:
     return getattr(judgment, "decision", None)
 
 
+def _note_echoes_directive(directive_text: str, text: str) -> bool:
+    """Whether *text* echoes an operator directive's subject (#138): the strict covered-subject
+    and head-noun test, or at least THREE shared subject stems. Three, not the two
+    :func:`_note_covers_rule` takes: measured on unrelated contributions it fires about half as
+    often for one echo lost."""
+    if _is_covered_subject(directive_text, text) and _head_nouns_compatible(directive_text, text):
+        return True
+    return _shared_subject_stems(directive_text, text) >= 3
+
+
 def _engine_detected_operator_echoes(
     judgment: ScopeManagerJudgment,
     *,
     operator_directives: Sequence[tuple[str, str]],
     contribution: Contribution,
 ) -> list[str]:
-    """Operator directive ids whose SUBJECT the admitted text covers (#138), even when the judge
-    never cites the id: ``_note_covers_rule`` (the covered-subject test #242 uses) on the
-    directive's text against :func:`_amendment_summary_text`. Directives only (not operator
-    context) and accepts only; ids already attributed in the admitted text are left out."""
+    """Operator directive ids whose SUBJECT the contribution echoes (#138), even when the judge
+    never cites the id. The echo is matched on what this contribution brings (its own content and
+    any ``publish``ed directive content), not on the whole rewritten context, which would fire on
+    old lines; the attribution is looked for in the admitted text (:func:`_amendment_summary_text`).
+    Directives only (not operator context) and accepts only; ids already attributed are left out."""
     if not operator_directives or judgment.decision not in ACCEPTED_DECISIONS:
         return []
     admitted = _amendment_summary_text(judgment, contribution)
     if not admitted.strip():
         return []
+    brought = "\n".join(
+        [contribution.content]
+        + [op.content for op in judgment.directive_ops if op.op == "publish" and op.content]
+    )
     return [
         operator_id
         for operator_id, text in dict(operator_directives).items()
         if not _attribution_pattern(operator_id).search(admitted)
-        and _note_covers_rule(text, admitted)
+        and _note_echoes_directive(text, brought)
     ]
 
 
@@ -2577,7 +2592,7 @@ def _batch_attribution_gaps(
             key = f"{member.id}:{operator_id}"
             if operator_id in verdict.reasoning:
                 cited.append(key)
-            elif _note_covers_rule(text, own):
+            elif _note_echoes_directive(text, own):
                 engine_only.append(key)
     return cited, engine_only
 
