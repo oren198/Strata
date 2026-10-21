@@ -7,6 +7,10 @@ the release PR (`dev` → `main`) and the GitHub Release body are built from
 
 ## Unreleased
 
+### Behaviour change
+
+- The operator primitives (`operator_publish`, `operator_supersede_item`, `operator_retire_item`) called without `fleet` now read the fleet beside the store and tell the attachment scope and its subtree, as the CLI always did. Where no fleet can be found from the store they raise instead of writing silently (#195).
+
 ### Fixed
 
 - **A perspective read no longer waits without a bound on a scope lock**
@@ -20,6 +24,34 @@ the release PR (`dev` → `main`) and the GitHub Release body are built from
   `strata.ACCEPTED_DECISIONS` is that set. The record, the scope manager,
   the acted-on check, the freshness evaluator, and the MCP session counter
   all read it, instead of each restating the pair.
+
+## 1.18.2 (2026-10-21)
+
+### Fixed
+
+- A context note is no longer declined as an exception to an inherited rule it isn't
+  about. A dated report of something that already happened, with no change of practice
+  in it, is treated as a report, not as an exception.
+- An honest report of a departure ("... should have been declared ... so we can review
+  our tooling") is no longer read as a standing practice. Purpose clauses, "should have
+  been" and "not proposing we ..." don't count as exception markers.
+- Known limit: a dated note that describes a decision or a change (for example 'the
+  operator decided…' or '…no longer count as…') is still declined when the judge wrongly
+  reads it as an exception to an unrelated rule. The check fails closed here: an
+  exception to a rule is never let through on its wording.
+
+## 1.18.1 (2026-10-20)
+
+### Fixed
+
+- A child's own rule is no longer compared with every inherited rule that merely
+  names the same product, team or site. Before, a fleet whose rules shared a name had
+  legitimate tightenings declined by unrelated rules. Reported by Adam (@Adam13y), from
+  his regression gate on 1.18.0.
+- A rate bound ("at most N per day", "no more than N times per week", "at least N
+  times per day") and a count floor ("requires N approvals") are compared in the
+  right direction. Before, a stricter child rule was declined and a looser one could
+  pass the engine.
 
 ## 1.18.0 (2026-10-15)
 

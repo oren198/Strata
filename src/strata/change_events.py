@@ -918,12 +918,16 @@ def find_chain_conflicts(
     check's stated limits apply: a conflict phrased with no value, polarity or
     marker is not found.
     """
-    from strata.scope_manager import inherited_conflict  # lazy: heavy, one-way dependency
+    from strata.scope_manager import (  # lazy: heavy, one-way dependency  # noqa: PLC0415
+        inherited_conflict,
+        inherited_context_words,
+    )
 
+    context_words = inherited_context_words([text for *_, text in gained])
     found: list[dict] = []
     for own_id, own_text in own:
         for inherited_id, inherited_scope, inherited_text in gained:
-            reason = inherited_conflict(own_text, inherited_text)
+            reason = inherited_conflict(own_text, inherited_text, context_words)
             if reason is None:
                 continue
             found.append(

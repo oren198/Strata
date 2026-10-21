@@ -942,6 +942,11 @@ class RecordStore:
             c = rs.append_contribution(scope_id="g_arch", ...)
     """
 
+    @property
+    def db_path(self) -> str:
+        """The database file this store was opened on (read-only)."""
+        return self._db_path
+
     def __init__(self, db_path: str) -> None:
         self._db_path = str(Path(db_path).expanduser())
         # check_same_thread=False: FastAPI runs a sync generator dependency
