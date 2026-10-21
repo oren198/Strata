@@ -17,6 +17,10 @@ the release PR (`dev` → `main`) and the GitHub Release body are built from
   (#196). The MCP drain waits at most two seconds. If the lock is still
   held, the read returns the perspective with `refresh_pending` and leaves
   the pending events unprocessed.
+- **An amendment emits one change event per changed directive** (#196).
+  The events share one change id and each names its own directive. `before`
+  and `after` stay the full id sets. A one-for-one replacement stays a
+  single `directive_superseded` event.
 
 ### Changed
 
