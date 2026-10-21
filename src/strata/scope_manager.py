@@ -3210,7 +3210,7 @@ def _render_digest_row(row: RecentContribution, *, verbatim: bool) -> str:
     return (
         f"[{c.id}] at={c.created_at} subject={c.subject or '(none)'} "
         f"state={row.state} decision={row.decision or '(none)'} "
-        f"reasoning={strip_record_only_notes(row.judgment_notes or '') or '(none)'} "
+        f"reasoning={strip_notes_for_judge(row.judgment_notes or '') or '(none)'} "
         f"content={content!r}"
     )
 
@@ -3604,6 +3604,85 @@ def strip_record_only_notes(notes: str) -> str:
     note and every other note stay.
     """
     return strip_provenance_note(_DECISION_PREFIX_RE.sub("", notes, count=1))
+
+
+#: The engine-written bracketed suffixes of a recorded verdict, by their exact opener, each tied to
+#: the function that writes it. A later judge must not read them: the engine's own decline wording
+#: on a same-subject note a moment earlier is authoritative-looking, and judges copy it.
+_ENGINE_NOTE_OPENERS: tuple[str, ...] = (
+    "[inherited relation: ",  # classify_inherited_context / its batch twin (protocol note)
+    "[directive relation: ",  # classify_inherited_directive / its batch twin (protocol note)
+    "[Declined: ",  # _inherited_relation_note: decline, decline_unspecific, licence decline
+    "[A report of following ",  # _inherited_relation_note: consequence_report
+    "[A departure from ",  # _inherited_relation_note: departure_report
+    "[Recorded as a departure from ",  # the own-directive departure note (v1.19)
+    "[Engine: ",  # _provenance_line and the engine's own record notes (v1.19 op-drop note)
+)
+#: Whole-reasoning engine notes: the engine REPLACES the judge's reasoning with them.
+_ENGINE_WHOLE_NOTE_RES: tuple[re.Pattern[str], ...] = (
+    # _inherited_hold_note (#244 step 1)
+    re.compile(
+        r"Contradicts inherited \S+ \([^)]*\)\. An exception to it is .+? to make; "
+        r"propose it there\."
+    ),
+    # _directive_relation_note, hold
+    re.compile(
+        r"Held as context: the judge reads this as an exception to \S+ \([^)]*\); the engine "
+        r"could not confirm a conflict\. Context never binds\."
+    ),
+)
+
+
+def _trailing_bracket_groups(notes: str) -> tuple[str, list[str]]:
+    """``(head, groups)``: *notes* split into the text before its trailing run of top-level
+    ``[...]`` groups (each preceded by a space) and those groups in order."""
+    groups: list[str] = []
+    rest = notes.rstrip()
+    while rest.endswith("]"):
+        depth = 0
+        start = None
+        for k in range(len(rest) - 1, -1, -1):
+            if rest[k] == "]":
+                depth += 1
+            elif rest[k] == "[":
+                depth -= 1
+                if depth == 0:
+                    start = k
+                    break
+        if start is None or (start > 0 and rest[start - 1] != " "):
+            break
+        groups.insert(0, rest[start:])
+        rest = rest[:start].rstrip()
+    return rest, groups
+
+
+def strip_engine_notes(notes: str) -> str:
+    """*notes* without the engine-written suffixes (see :data:`_ENGINE_NOTE_OPENERS`).
+
+    End-anchored and exact: only a trailing bracket group whose opener is on the list is removed,
+    so the judge's own reasoning that merely CONTAINS such words (even such an opener mid-text) is
+    never touched. Any other trailing group (the held note, for one) stays. A reasoning the engine
+    wrote whole (:data:`_ENGINE_WHOLE_NOTE_RES`) comes back empty."""
+    head, groups = _trailing_bracket_groups(notes)
+    if not groups:
+        kept = notes
+    else:
+        survivors = [g for g in groups if not g.startswith(_ENGINE_NOTE_OPENERS)]
+        if len(survivors) == len(groups):
+            kept = notes
+        else:
+            kept = " ".join([head, *survivors]) if head else " ".join(survivors)
+    if any(pattern.fullmatch(kept.strip()) for pattern in _ENGINE_WHOLE_NOTE_RES):
+        return ""
+    return kept
+
+
+def strip_notes_for_judge(notes: str) -> str:
+    """Recorded *notes* as a JUDGE input: no decision prefix, no provenance line, and none of the
+    engine-written suffixes. The recency digest renders every judgment through here (the API's
+    idempotent re-contribute keeps :func:`strip_record_only_notes`, which leaves the engine's
+    suffixes in the reasoning it returns)."""
+    return strip_engine_notes(strip_record_only_notes(notes))
 
 
 def strip_provenance_note(notes: str) -> str:
