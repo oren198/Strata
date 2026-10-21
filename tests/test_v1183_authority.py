@@ -12,6 +12,7 @@ import pytest
 from strata.scope_manager import (
     _AUTHORITY_GRANT_RE,
     _is_dated_past_report,
+    _positive_single_occurrence,
     _states_present_practice,
     verify_inherited_relation,
 )
@@ -315,3 +316,104 @@ def test_a_habitual_quantifier_with_only_a_point_date_is_a_practice(note):
 def test_repetition_inside_a_closed_past_period_is_one_episode(note):
     verdict, _ = verify_inherited_relation(_exception(note), note, PUMPS)
     assert verdict in ("consequence_report", "departure_report")
+
+
+# -- round 3: the report route under an "exception" answer needs positive evidence of one occurrence
+
+
+@pytest.mark.parametrize(
+    "note",
+    [
+        "On 5 October the dock pumps ran past 20:00 every other evening.",
+        "On 5 October the dock pumps ran past 20:00, as usual.",
+        "On 5 October the dock pumps ran past 20:00, like they tend to.",
+        "On 5 October the dock pumps ran past 20:00, which has become the norm.",
+        "On 5 October the dock pumps ran past 20:00 on a regular basis.",
+        "On 5 October the dock pumps ran past 20:00, and the crews run them late as a rule.",
+        "On 5 October the dock pumps ran past 20:00 and are left on overnight.",
+    ],
+)
+def test_a_habit_or_a_present_verb_beside_a_date_fails_closed_under_the_exception_answer(note):
+    verdict, _ = verify_inherited_relation(_exception(note), note, PUMPS)
+    assert verdict == "decline"
+
+
+@pytest.mark.parametrize(
+    ("note", "rule"),
+    [
+        ("On 5 October the dock pumps ran past 20:00 because the fleet was late.", PUMPS),
+        ("The dock pumps ran past 20:00 every evening last week.", PUMPS),
+        ("On 9 June the dusk run lasted thirty minutes with the cars untied.", DEPOT_RULE),
+        (DEPOT_NOTE, DEPOT_RULE),
+        (
+            "On 18 October the night staff caught up on the backlog and hotfix 4411 merged "
+            "without a second review.",
+            HOTFIX,
+        ),
+        ("On 18 October we left hotfix 4411 unreviewed during the outage.", HOTFIX),
+        ("On 18 October each tray was released unreviewed at 2 am during the outage.", HOTFIX),
+        (
+            "Last night's 20-minute outage didn't get formally declared SEV-1 by the on-call "
+            "engineer even though it should have been -- noting the gap so we can review our "
+            "tooling, not proposing we stop doing SEV-1 declarations.",
+            "Every production incident that lasts more than 15 minutes must be declared SEV-1 by "
+            "the on-call engineer and logged in the incident tracker.",
+        ),
+    ],
+)
+def test_one_occurrence_in_the_past_stays_a_report_under_the_exception_answer(note, rule):
+    verdict, _ = verify_inherited_relation(_exception(note), note, rule)
+    assert not verdict.startswith("decline")  # a report, or admitted as not the rule's action
+
+
+def test_the_positive_helper_leaves_the_plain_dated_report_check_untouched():
+    note = "On 5 October the dock pumps ran past 20:00 as usual."
+    assert _is_dated_past_report(note, PUMPS)  # the plain check is unchanged: it has no tense test
+    assert not _positive_single_occurrence(note, PUMPS)
+
+
+def test_nightly_as_an_adjective_is_not_a_generality_signal_but_as_an_adverb_is():
+    names = "On 2026-10-19 the nightly backup of the build server finished at 03:10."
+    assert _positive_single_occurrence(names, "The build server backup must finish by 04:00.")
+    adverb = "On 5 October the dock pumps ran past 20:00 nightly."
+    assert not _positive_single_occurrence(adverb, PUMPS)
+
+
+def test_every_listed_irregular_past_form_matches_the_past_tense_pattern():
+    from strata.scope_manager import _IRREGULAR_PAST_FORMS, _PAST_TENSE_RE
+
+    assert len(_IRREGULAR_PAST_FORMS) >= 150
+    for form in _IRREGULAR_PAST_FORMS:
+        assert _PAST_TENSE_RE.search(f"they {form} it"), form
+    for form in ("wore", "rode", "hid", "shook", "sat", "spoke", "sang", "swam", "wept"):
+        assert form in _IRREGULAR_PAST_FORMS
+
+
+@pytest.mark.parametrize(
+    "note",
+    [
+        "On 18 October the night crew wore no harness during the outage.",
+        "On 18 October hotfix 4411 rode out without a second review.",
+        "On 18 October the old build hid a failing test until hotfix 4411 merged unreviewed.",
+        "On 18 October the build shook loose and hotfix 4411 merged unreviewed.",
+        "On 18 October we sat on hotfix 4411 and merged it unreviewed.",
+    ],
+)
+def test_an_honest_departure_with_an_irregular_past_verb_is_a_report(note):
+    verdict, _ = verify_inherited_relation(_exception(note), note, HOTFIX)
+    assert not verdict.startswith("decline")
+
+
+@pytest.mark.parametrize(
+    "note",
+    [
+        "On 5 October we put the pumps on late every night.",
+        "On 5 October we set the pumps to run late every other evening.",
+        "On 5 October we cut the escort, as we usually do.",
+        "On 5 October we let the pumps run past 20:00 on a regular basis.",
+        "On 5 October we hit the pumps late as a rule.",
+    ],
+)
+def test_an_ambiguous_present_or_past_verb_never_lets_a_habit_through(note):
+    verdict, _ = verify_inherited_relation(_exception(note), note, PUMPS)
+    assert verdict == "decline"

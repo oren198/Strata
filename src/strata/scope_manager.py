@@ -7299,12 +7299,178 @@ _SPECIFICITY_ANCHOR_RE = re.compile(
     r"|\bthe night of\b|\b(?:once|twice|\d+ times|(?:two|three|four|five) times)\b",
     re.IGNORECASE,
 )
+#: Irregular simple-past forms, complete for common English. It includes the ambiguous
+#: present/past homographs (read, put, set, cut, hit, let, quit, shut, spread, cost, hurt,
+#: burst, split, thrust, bet, shed): a habit made of them is caught by the generality signal.
+_IRREGULAR_PAST_FORMS: tuple[str, ...] = (
+    "arose",
+    "awoke",
+    "bore",
+    "beat",
+    "became",
+    "began",
+    "bent",
+    "bet",
+    "bit",
+    "bled",
+    "blew",
+    "broke",
+    "bred",
+    "brought",
+    "built",
+    "burnt",
+    "burst",
+    "bought",
+    "caught",
+    "chose",
+    "clung",
+    "came",
+    "cost",
+    "crept",
+    "cut",
+    "dealt",
+    "dug",
+    "dove",
+    "drew",
+    "dreamt",
+    "drank",
+    "drove",
+    "ate",
+    "fell",
+    "fed",
+    "felt",
+    "fought",
+    "found",
+    "fled",
+    "flung",
+    "flew",
+    "forbade",
+    "forgot",
+    "forgave",
+    "froze",
+    "got",
+    "gave",
+    "went",
+    "ground",
+    "grew",
+    "hung",
+    "had",
+    "heard",
+    "hid",
+    "hit",
+    "held",
+    "hurt",
+    "kept",
+    "knelt",
+    "knew",
+    "laid",
+    "led",
+    "leapt",
+    "left",
+    "lent",
+    "let",
+    "lay",
+    "lit",
+    "lost",
+    "made",
+    "meant",
+    "met",
+    "paid",
+    "put",
+    "quit",
+    "read",
+    "rode",
+    "rang",
+    "rose",
+    "ran",
+    "said",
+    "saw",
+    "sought",
+    "sold",
+    "sent",
+    "set",
+    "shook",
+    "shed",
+    "shone",
+    "shot",
+    "shown",
+    "shrank",
+    "shut",
+    "sang",
+    "sank",
+    "sat",
+    "slept",
+    "slid",
+    "slung",
+    "slit",
+    "spoke",
+    "sped",
+    "spent",
+    "spun",
+    "spat",
+    "split",
+    "spread",
+    "sprang",
+    "sprung",
+    "stood",
+    "stole",
+    "stuck",
+    "stung",
+    "stank",
+    "strode",
+    "struck",
+    "strung",
+    "strove",
+    "swore",
+    "swept",
+    "swam",
+    "swung",
+    "took",
+    "taught",
+    "tore",
+    "told",
+    "thought",
+    "threw",
+    "thrust",
+    "trod",
+    "understood",
+    "woke",
+    "wore",
+    "wove",
+    "wept",
+    "won",
+    "wound",
+    "wrung",
+    "wrote",
+    "bound",
+    "did",
+    "was",
+    "were",
+    "undertook",
+    "withdrew",
+    "withheld",
+    "overcame",
+    "rebuilt",
+    "rewrote",
+    "overtook",
+    "mistook",
+    "retook",
+    "foresaw",
+    "outgrew",
+    "overthrew",
+    "underwent",
+    "withstood",
+    "overran",
+    "undid",
+    "upheld",
+    "misled",
+    "retold",
+)
 _PAST_TENSE_RE = re.compile(
-    r"\b(?:\w+ed|was|were|had|did|took|left|went|held|made|ran|got|came|found|lost|sent|"
-    r"broke|began|saw|gave|put|set|cut|hit|fell|stopped|spent|missed|drifted|shipped|"
-    r"overloaded|destroyed|reached|wasn['’]t|weren['’]t|didn['’]t|"
-    r"caught|kept|built|wrote|told|paid|chose|threw|knew|grew|drove|rose|woke|froze|"
-    r"stood|understood|met|led|slept|sold|bought|brought|thought|taught|won)\b",
+    r"\b(?:\w+ed|"
+    + "|".join(_IRREGULAR_PAST_FORMS)
+    + r"|stopped|missed|drifted|shipped|overloaded|"
+    r"destroyed|reached|wasn['’]t|weren['’]t|didn['’]t)\b",
     re.IGNORECASE,
 )
 _DEPARTURE_CUE_RE = re.compile(
@@ -7682,6 +7848,53 @@ def _is_dated_past_report(content: str, rule: str | None = None) -> bool:
     )
 
 
+#: A finite present or present-perfect verb in a note: something in force now. A pronoun or
+#: collective subject followed by a verb that is not past tense counts too ("they tend to",
+#: "crews skip"), as does "<verb>s to".
+_PRESENT_FINITE_RE = re.compile(
+    r"\b(?:is|are|(?<!\d )am|isn['’]t|aren['’]t|has|have|hasn['’]t|haven['’]t|does|doesn['’]t|"
+    r"don['’]t)\b"
+    r"|\b(?:we|they|you|i|people|crews?|staff|everyone|nobody)\s+(?:\w+ly\s+)?"
+    r"(?!was\b|were\b|had\b|did\b|could\b|would\b|should\b|might\b)(?P<verb>\w+)\b"
+    r"(?=\s|[.,;!?]|$)"
+    r"|\b\w+s\s+to\b",
+    re.IGNORECASE,
+)
+#: Any frequency or norm signal: regularity is not one occurrence unless a closed period bounds it.
+_GENERALITY_RE = re.compile(
+    r"\b(?:regular(?:ly)?|often|frequently|usually|normally|typically|generally|always|"
+    r"routine(?:ly)?|habit(?:ual(?:ly)?)?|customar(?:y|ily)|norm(?:al)?|tend(?:s|ed)?\s+to|"
+    r"(?:every|each)\s+(?:other\s+|second\s+|few\s+)?(?:evening|night|day|morning|afternoon|"
+    r"week|month|shift|run|time|release|deploy\w*|weekend|fortnight)s?|most|whenever|any\s*time|"
+    r"all\s+the\s+time|as\s+usual|again\s+and\s+again|repeatedly|constantly|standard|practice|"
+    r"policy|by\s+default|as\s+a\s+rule)\b"
+    # "nightly" as an adverb ("ran past 20:00 nightly."), not an adjective ("the nightly backup")
+    r"|\b(?:nightly|daily|weekly|monthly|hourly)\b(?=\s*(?:[.,;!?]|$|\b(?:and|but|or|so|because|while|"
+    r"until|after|before|at|on|in)\b))",
+    re.IGNORECASE,
+)
+
+
+def _positive_single_occurrence(content: str, rule: str | None = None) -> bool:
+    """Positive evidence of ONE occurrence, for the report route under an "exception" answer.
+
+    Everything :func:`_is_dated_past_report` requires, AND no finite present or present-perfect
+    verb in the clause-blanked note (a grammar test, so a habit phrased in the present that no
+    list names still fails closed; a verb in ``_PAST_TENSE_RE`` or ending in -ed is past), AND no
+    generality signal unless a closed past period bounds it. Everything else is the exception
+    branch's decline, as in 1.18.1."""
+    if not _is_dated_past_report(content, rule):
+        return False
+    # a subject and auxiliary left stranded by a blanked clause ("We are  .") is not a verb in force
+    text = re.sub(r"\b\w+\s+(?:are|am|is)\s+(?=[.!?;,]|$)", " ", _blank_non_marker_clauses(content))
+    for match in _PRESENT_FINITE_RE.finditer(text):
+        verb = match.groupdict().get("verb")
+        if verb and (_PAST_TENSE_RE.fullmatch(verb) or verb.casefold().endswith("ed")):
+            continue
+        return False
+    return not (_GENERALITY_RE.search(text) and not _CLOSED_PERIOD_RE.search(text))
+
+
 def _shared_subject_stems(a: str, b: str, context_words: frozenset[str] = frozenset()) -> int:
     """How many subject stems of *a* are shared with *b* (same prefix-5 rule as
     :func:`_loose_covers`); modals, quantifiers, time words and *context_words* don't count."""
@@ -7774,7 +7987,7 @@ def verify_inherited_relation(
             failure = "exception answer without a verbatim instead_span"
         elif (
             marker is None
-            and _is_dated_past_report(content, inherited_text)
+            and _positive_single_occurrence(content, inherited_text)
             and _general_marker(content) is None
         ):
             # A dated report of something that already happened is a report, not an exception.
