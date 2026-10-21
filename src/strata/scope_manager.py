@@ -7479,7 +7479,7 @@ def _has_past_tense(span: str) -> bool:
 _DATED_ANCHOR_RE = re.compile(
     rf"\b\d{{1,2}}(?:st|nd|rd|th)?\s+(?:of\s+)?{_MONTHS}\b"
     rf"|\b{_MONTHS}\.?\s+\d{{1,2}}\b"
-    r"|\b\d{4}-\d{2}-\d{2}\b|\b\d{1,2}/\d{1,2}(?:/\d{2,4})?\b"
+    r"|\b\d{4}-\d{2}-\d{2}\b|\b\d{1,2}/\d{1,2}/\d{2,4}\b"
     r"|\b(?:mon|tues|wednes|thurs|fri|satur|sun)day\b"
     r"|\b(?:yesterday|last (?:night|week|month|shift)|this (?:morning|week)|earlier today)\b"
     r"|\bthe night of\b",
