@@ -7197,12 +7197,22 @@ def _wrapped_practice_cue(content: str) -> str | None:
     return match.group(0) if match else None
 
 
+#: What a deliberation verb governs ("proposing that we review ...", "considering whether to ...")
+#: up to the end of its sentence or clause: words in it are being discussed, not done.
+_DELIBERATION_COMPLEMENT_RE = re.compile(
+    r"\b(?:propos(?:ing|e)\s+(?:that|to)|considering\s+(?:whether|retiring|changing|superseding|"
+    r"dropping|relaxing)|thinking\s+about(?:\s+whether)?|whether(?:\s+to|\s+we\s+should)?|"
+    r"would\s+like\s+to\s+(?:change|retire|supersede))\b[^.!?;,]*",
+    re.IGNORECASE,
+)
+
+
 def _is_deliberation(content: str, rule: str, context_words: frozenset[str]) -> bool:
     """Reasoning about changing the rule, with no exception or general marker in force and no
     practice-in-force cue."""
     # a question states nothing in force ("Should we keep requiring ...?"): its words are not
     # markers. The practice cues are read on the whole text.
-    asked = re.sub(r"[^.!?]*\?", " ", content)
+    asked = _DELIBERATION_COMPLEMENT_RE.sub(" ", re.sub(r"[^.!?]*\?", " ", content))
     return bool(
         _DELIBERATION_RE.search(content)
         and not _PRACTICE_IN_FORCE_RE.search(content)

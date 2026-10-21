@@ -443,3 +443,47 @@ def test_a_pure_question_about_keeping_the_rule_is_admitted_under_every_answer(k
 def test_a_question_followed_by_a_statement_in_force_still_declines(note):
     judgment, _ = _judge(note, _answer("banana"), summary=HOTFIX_SUMMARY)
     assert judgment.decision == "decline"
+
+
+# -- the complement of a deliberation verb is being discussed, not done ----------------------
+
+FROST_RULE = "The frost check is required before every irrigation cycle."
+FROST = Directive(
+    id="c-j3od-025",
+    content=FROST_RULE,
+    subject="frost",
+    source_scope_id=SCOPE.id,
+    source_skill="architect",
+    created_at="2026-04-01T09:00:00+00:00",
+)
+FROST_SUMMARY = SUMMARY.model_copy(update={"directives": [FROST]})
+REVIEW_PROPOSAL = (
+    "Proposing that we review whether c-j3od-025 still fits the new irrigation schedule."
+)
+
+
+def _frost_answer(kind: str, note: str) -> dict:
+    return {"kind": kind, "inherited_id": "c-j3od-025", "reasoning": "r", "instead_span": note}
+
+
+@pytest.mark.parametrize(
+    "note",
+    [
+        REVIEW_PROPOSAL,
+        REVIEW_PROPOSAL + " The frost check remains required.",
+        "We are considering whether to review the frost check against the new schedule.",
+    ],
+)
+@pytest.mark.parametrize("kind", ["exception", "unrelated", "banana"])
+def test_a_review_inside_a_proposal_is_deliberation_under_every_answer(note, kind):
+    judgment, _ = _judge(note, _frost_answer(kind, note), summary=FROST_SUMMARY)
+    assert judgment.decision == "accept_as_context"
+    assert judgment.inherited_relation["reason"] == "deliberation about c-j3od-025"
+
+
+def test_a_proposal_followed_by_a_practice_in_force_still_declines():
+    note = "Proposing that we review the frost check; meanwhile we skip it on warm nights."
+    judgment, _ = _judge(
+        note, _frost_answer("exception", "we skip it on warm nights"), summary=FROST_SUMMARY
+    )
+    assert judgment.decision == "decline"
