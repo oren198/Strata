@@ -1,10 +1,13 @@
 """1.18.3 F4: characterise the checks a report passes through. No behaviour change.
 
-A case that admits wording the rule does not support is pinned as it behaves
-today and marked ``# F4-SUSPECT``. Nothing here is fixed.
+Three cases that admit wording the rule does not support are strict xfails of
+the correct expectation, and the reason keeps the F4-SUSPECT marker. The other
+cases pin behaviour that holds.
 """
 
 from __future__ import annotations
+
+import pytest
 
 from strata.scope_manager import _action_overlap, _context_covers, verify_inherited_relation
 
@@ -34,17 +37,23 @@ def test_words_outside_the_rule_do_not_overlap() -> None:
     assert _action_overlap("the quay stayed lit", PUMP) is False
 
 
-def test_a_clock_time_digit_makes_an_unrelated_span_the_rules_action() -> None:
-    # F4-SUSPECT: weighing crate 20 shares the digit in "20:00", so an exception
-    # answer about that crate is admitted as a report of following the pump rule.
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "F4-SUSPECT: weighing crate 20 still shares the digit in '20:00', so an "
+        "exception answer is admitted as a report of following the pump rule"
+    ),
+)
+def test_weighing_crate_20_is_not_admitted_as_a_report_of_the_pump_rule() -> None:
+    """Crate 20 is not the pump rule's action, so the note is not a report of it."""
     span = "crate 20 was weighed"
     text = "On 5 October crate 20 was weighed on the quay."
-    assert _action_overlap(span, PUMP) is True
+    assert _action_overlap(span, PUMP) is False
     verdict, reason = verify_inherited_relation(
         {"kind": "exception", "instead_span": span}, text, PUMP
     )
-    assert verdict == "consequence_report"
-    assert reason == "a specific past occurrence"
+    assert verdict == "admit"
+    assert reason == "exception answer on a past occurrence that is not the rule's action"
 
 
 # -- _context_covers --------------------------------------------------------
@@ -63,14 +72,20 @@ def test_the_restore_drill_covers_the_charter() -> None:
     assert _context_covers(CHARTER, note) is True
 
 
-def test_a_waiver_of_the_rules_clock_time_is_not_covered() -> None:
-    # F4-SUSPECT: "The 20:00 shutdown is waived." is this rule, and an unrelated
-    # answer is admitted because the note shares no subject stem with it.
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "F4-SUSPECT: 'The 20:00 shutdown is waived.' is this rule, and an unrelated "
+        "answer is still admitted because the note shares no subject stem with it"
+    ),
+)
+def test_a_waiver_of_the_rules_clock_time_is_declined() -> None:
+    """A waiver of the rule's own clock time is this rule, so unrelated does not admit it."""
     note = "The 20:00 shutdown is waived."
-    assert _context_covers(PUMP, note) is False
+    assert _context_covers(PUMP, note) is True
     verdict, reason = verify_inherited_relation({"kind": "unrelated"}, note, PUMP)
-    assert verdict == "admit"
-    assert reason == "answered unrelated; no covered exception"
+    assert verdict == "decline"
+    assert "waived" in reason
 
 
 # -- clause-blanked _general_marker, report branch -------------------------
@@ -109,15 +124,21 @@ def test_a_habit_beside_a_blanked_purpose_clause_still_declines() -> None:
     assert "always" in reason
 
 
-def test_every_evening_is_admitted_as_one_occurrence() -> None:
-    # F4-SUSPECT: "every evening" is a practice, and the report branch admits it.
-    # "every evening" is not one of the general markers ("every time", "each evening").
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "F4-SUSPECT: 'every evening' is a practice, and the report branch still "
+        "admits it as one occurrence"
+    ),
+)
+def test_every_evening_in_the_report_branch_is_declined() -> None:
+    """'every evening' is a practice, so the report branch declines it."""
     text = "On 5 October the dock pumps were switched off every evening."
     verdict, reason = verify_inherited_relation(
         _report("the dock pumps were switched off"), text, PUMP
     )
-    assert verdict == "consequence_report"
-    assert reason == "a specific past occurrence"
+    assert verdict == "decline"
+    assert "every evening" in reason
 
 
 def test_since_meaning_because_declines_the_report() -> None:
