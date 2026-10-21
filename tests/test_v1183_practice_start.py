@@ -31,6 +31,12 @@ STARTS = [
     "From 3 October onwards the crew shut the pumps at 23:00.",
     "As of October 3 we shut the pumps at 23:00.",
     "As of 2026-10-03 we shut the pumps at 23:00.",
+    "After 3 October we reset the pumps at 23:00.",
+    "From 3 October we reset the pumps at 23:00.",
+    "Post 3 October we reset the pumps at 23:00.",
+    "After 3 October we shut the pumps at 23:00.",
+    "From 3 October we shut the pumps at 23:00.",
+    "After 2 March we ran the pumps 24/7.",
     "Effective immediately we shut the pumps at 23:00.",
 ]
 
@@ -46,9 +52,17 @@ def test_a_practice_start_date_declines_under_the_exception_answer(note):
     [
         "On 3 October we shut the pumps at 23:00.",
         "On 3 October the crew shut the pumps at 23:00.",
+        "After the storm on 3 October we shut the pumps at 23:00.",
     ],
 )
 def test_one_dated_act_stays_a_consequence_report(note):
+    verdict, _ = verify_inherited_relation(_exception(note), note, PUMPS)
+    assert verdict == "consequence_report"
+
+
+@pytest.mark.parametrize("end", ["to", "through", "until", "-", "\u2013"])
+def test_a_dated_range_stays_a_consequence_report(end):
+    note = f"The pumps ran 24/7 from 2 March {end} 8 March."
     verdict, _ = verify_inherited_relation(_exception(note), note, PUMPS)
     assert verdict == "consequence_report"
 
@@ -65,6 +79,7 @@ def test_a_from_on_inside_a_dated_act_is_not_a_cue():
     [
         "fuel from the dock on the north side",
         "pumps shut from 3 October to 5 October",
+        "pumps shut from 3 October through 5 October",
         "On 3 October we shut the pumps at 23:00.",
         "as of the audit we shut the pumps",
     ],
@@ -75,7 +90,12 @@ def test_the_cue_needs_a_real_date_and_a_bare_from_needs_on(text):
 
 @pytest.mark.parametrize(
     "word",
-    ["cast", "fit", "rid", "wed", "dwelt", "spilt", "forsook", "oversaw", "reset", "slew"],
+    ["dwelt", "spilt", "forsook", "oversaw", "slew", "overheard"],
 )
 def test_the_added_irregular_past_forms_match(word):
     assert _PAST_TENSE_RE.search(f"On 3 October the crew {word} it.")
+
+
+@pytest.mark.parametrize("word", ["cast", "fit", "rid", "reset", "forecast", "misread", "sublet"])
+def test_same_form_present_and_past_verbs_are_not_added(word):
+    assert not _PAST_TENSE_RE.search(f"On 3 October the crew {word} it.")
