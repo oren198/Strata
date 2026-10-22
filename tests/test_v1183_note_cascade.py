@@ -150,9 +150,15 @@ def test_the_next_judge_is_not_shown_the_engines_decline_wording():
         recent_contributions=[declined],
         new_contribution=replace(NEW_CONTRIBUTION, proposed_classification="context"),
     )
-    message = client.messages.create.call_args.kwargs["messages"][0]["content"]
-    assert "contrary to inherited directive" not in message.lower()
-    assert "[inherited relation:" not in message
-    assert "[Declined:" not in message
+    # An accept may make further calls (the own-directive relation call); none
+    # of them may show the engine's wording, and exactly one carries the window.
+    messages = [c.kwargs["messages"][0]["content"] for c in client.messages.create.call_args_list]
+    for message in messages:
+        assert "contrary to inherited directive" not in message.lower()
+        assert "[inherited relation:" not in message
+        assert "[Declined:" not in message
+    windowed = [m for m in messages if "RECENT CONTRIBUTIONS" in m]
+    assert len(windowed) == 1
+    message = windowed[0]
     assert "decision=decline" in message  # the row still shows the verdict
     assert "first-hand observation" in message  # and the judge's own sentence
