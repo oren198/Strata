@@ -2267,6 +2267,12 @@ class _AmendmentJudgment(BaseModel):
     judgment's context write no longer carries byte for byte (the label was dropped or the line
     reworded away). Measured, not repaired: no re-ask in v1.19."""
 
+    attribution_gap_kept: list[str] = Field(default_factory=list)
+    """Operator directive ids (batch: ``<contribution id>:<directive id>``) whose attribution gap
+    remained after the one corrective re-ask: the judge returned the amendment unchanged and the
+    engine kept it (the judge's call). Never repaired mechanically: a label the engine inserted on
+    a false match would be a false attribution."""
+
     protocol_notes: list[str] = Field(default_factory=list)
     """What the engine repaired about the judge's PROTOCOL, not its judgment.
 
@@ -2505,6 +2511,138 @@ def _unattributed_operator_echoes(
         if operator_id in judgment.reasoning
         and not _attribution_pattern(operator_id).search(admitted)
     ]
+
+
+def _decision_signature(judgment: object) -> object:
+    """What an attribution re-ask must not change: the single decision, or every batch decision."""
+    verdicts = getattr(judgment, "verdicts", None)
+    if verdicts is not None:
+        return tuple((v.contribution_id, v.decision) for v in verdicts)
+    return getattr(judgment, "decision", None)
+
+
+def _note_echoes_directive(directive_text: str, text: str) -> bool:
+    """Whether *text* echoes an operator directive's subject (#138): the strict covered-subject
+    and head-noun test, or at least THREE shared subject stems. Three, not the two
+    :func:`_note_covers_rule` takes: measured on unrelated contributions it fires about half as
+    often for one echo lost."""
+    if _is_covered_subject(directive_text, text) and _head_nouns_compatible(directive_text, text):
+        return True
+    return _shared_subject_stems(directive_text, text) >= 3
+
+
+def _engine_detected_operator_echoes(
+    judgment: ScopeManagerJudgment,
+    *,
+    operator_directives: Sequence[tuple[str, str]],
+    contribution: Contribution,
+) -> list[str]:
+    """Operator directive ids whose SUBJECT the contribution echoes (#138), even when the judge
+    never cites the id. The echo is matched on what this contribution brings (its own content and
+    any ``publish``ed directive content), not on the whole rewritten context, which would fire on
+    old lines; the attribution is looked for in the admitted text (:func:`_amendment_summary_text`).
+    Directives only (not operator context) and accepts only; ids already attributed are left out."""
+    if not operator_directives or judgment.decision not in ACCEPTED_DECISIONS:
+        return []
+    admitted = _amendment_summary_text(judgment, contribution)
+    if not admitted.strip():
+        return []
+    brought = "\n".join(
+        [contribution.content]
+        + [op.content for op in judgment.directive_ops if op.op == "publish" and op.content]
+    )
+    return [
+        operator_id
+        for operator_id, text in dict(operator_directives).items()
+        if not _attribution_pattern(operator_id).search(admitted)
+        and _note_echoes_directive(text, brought)
+    ]
+
+
+def _batch_admitted_text(
+    judgment: ScopeManagerBatchJudgment, contributions: Mapping[str, Contribution]
+) -> str:
+    """The text a batch amendment sends to the summary: the one rewritten context, every
+    ``publish``ed directive's content, and the bytes of each ``append``ed member."""
+    parts: list[str] = []
+    if judgment.new_context is not None:
+        parts.append(judgment.new_context)
+    for op in judgment.directive_ops:
+        if op.op == "publish" and op.content:
+            parts.append(op.content)
+        elif op.op == "append" and op.contribution_id in contributions:
+            parts.append(contributions[op.contribution_id].content)
+    return "\n".join(parts)
+
+
+def _batch_attribution_gaps(
+    judgment: ScopeManagerBatchJudgment,
+    *,
+    operator_directives: Sequence[tuple[str, str]],
+    contributions: Mapping[str, Contribution],
+) -> tuple[list[str], list[str]]:
+    """``(cited, engine_only)`` gaps of a batch, as ``<contribution id>:<directive id>``: per
+    accepted member, an operator directive its reasoning cites or whose subject its text covers,
+    that no text the batch amendment sends to the summary attributes."""
+    if not operator_directives:
+        return [], []
+    admitted = _batch_admitted_text(judgment, contributions)
+    texts = dict(operator_directives)
+    cited: list[str] = []
+    engine_only: list[str] = []
+    for verdict in judgment.verdicts:
+        member = contributions.get(verdict.contribution_id)
+        if member is None or verdict.decision not in ACCEPTED_DECISIONS:
+            continue
+        own = member.content + "\n".join(
+            op.content
+            for op in judgment.directive_ops
+            if op.op == "publish" and op.content and op.contribution_id == member.id
+        )
+        for operator_id, text in texts.items():
+            if _attribution_pattern(operator_id).search(admitted):
+                continue
+            key = f"{member.id}:{operator_id}"
+            if operator_id in verdict.reasoning:
+                cited.append(key)
+            elif _note_echoes_directive(text, own):
+                engine_only.append(key)
+    return cited, engine_only
+
+
+_ECHO_MATCH_SENTENCE = (
+    "The engine matched the admitted text to operator directive {ids} on its subject; if it "
+    "does not echo that directive, return the same amendment unchanged."
+)
+
+
+def _attribution_corrective_text(cited: Sequence[str], engine_only: Sequence[str]) -> str:
+    """The RULE 2 corrective: today's wording when the judge cited the id, the same wording opened
+    differently when only the engine matched, plus the one added sentence for engine matches."""
+    names = ", ".join([*cited, *engine_only])
+    opening = (
+        f"Your reasoning cites operator directive(s) {', '.join(cited)}, but "
+        if cited
+        else f"Your amendment may echo operator directive(s) {names}, but "
+    )
+    text = (
+        f"{opening}"
+        "no text your amendment sends to the summary carries the attribution "
+        "'per operator directive <id>'. RULE 2: when admitted material echoes "
+        "the substance of an operator directive, the attribution phrase is "
+        "PART of the echoed text and must appear in text you author — a "
+        "`publish`ed directive's content or `new_context`; reasoning is never "
+        "composed into any perspective. Call submit_judgment again with the "
+        "SAME decision: if the admitted material echoes the operator "
+        "directive, rewrite the amendment so the attribution phrase appears "
+        "in the authored text (an `append` whose bytes lack the attribution "
+        "becomes a `publish` with the attribution written in); if it "
+        "genuinely does not echo the operator directive, return the same "
+        "amendment unchanged."
+    )
+    if engine_only:
+        text += " " + _ECHO_MATCH_SENTENCE.format(ids=", ".join(engine_only))
+    return text
 
 
 def _collapse_whitespace(text: str) -> str:
@@ -9918,36 +10056,35 @@ class ScopeManager:
 
         # The operator directives actually rendered to this call — the only
         # ids a reasoning citation can be checked against (ADR 0008 D3).
-        operator_directive_ids = [
-            item.id
+        operator_directives = [
+            (item.id, item.content)
             for _attachment_scope_id, items in (operator_memory or [])
             for item in items
             if item.kind == "directive"
         ]
+        operator_directive_ids = [operator_id for operator_id, _text in operator_directives]
+        echo_state: dict[str, list[str]] = {"cited": [], "engine_only": []}
 
         def _attribution_gaps(judgment: ScopeManagerJudgment) -> list[str]:
-            return _unattributed_operator_echoes(
+            cited = _unattributed_operator_echoes(
                 judgment,
                 operator_directive_ids=operator_directive_ids,
                 contribution=new_contribution,
             )
+            engine_only = [
+                operator_id
+                for operator_id in _engine_detected_operator_echoes(
+                    judgment,
+                    operator_directives=operator_directives,
+                    contribution=new_contribution,
+                )
+                if operator_id not in cited
+            ]
+            echo_state["cited"], echo_state["engine_only"] = cited, engine_only
+            return [*cited, *engine_only]
 
-        def _attribution_corrective(gap_ids: Sequence[str]) -> str:
-            return (
-                f"Your reasoning cites operator directive(s) {', '.join(gap_ids)}, but "
-                "no text your amendment sends to the summary carries the attribution "
-                "'per operator directive <id>'. RULE 2: when admitted material echoes "
-                "the substance of an operator directive, the attribution phrase is "
-                "PART of the echoed text and must appear in text you author — a "
-                "`publish`ed directive's content or `new_context`; reasoning is never "
-                "composed into any perspective. Call submit_judgment again with the "
-                "SAME decision: if the admitted material echoes the operator "
-                "directive, rewrite the amendment so the attribution phrase appears "
-                "in the authored text (an `append` whose bytes lack the attribution "
-                "becomes a `publish` with the attribution written in); if it "
-                "genuinely does not echo the operator directive, return the same "
-                "amendment unchanged."
-            )
+        def _attribution_corrective(_gap_ids: Sequence[str]) -> str:
+            return _attribution_corrective_text(echo_state["cited"], echo_state["engine_only"])
 
         # Superseded-claim backstop (#199): the mechanical half of "a
         # superseded or retracted claim leaves the context". Everything it
@@ -10687,7 +10824,8 @@ class ScopeManager:
 
         *attribution_gaps* and *attribution_corrective* are supplied together
         or not at all; leaving both ``None`` skips the echo check entirely,
-        which is what the batch path does. The three *stale_claim* callables
+        which the single path and (since #138) the batch path both wire.
+        The three *stale_claim* callables
         (#199) work the same way and are wired in by the same single path: a
         batch's several contributions each carry their own ``supersedes``,
         which the cumulative amendment's one ``new_context`` does not resolve
@@ -11006,8 +11144,7 @@ class ScopeManager:
                 if (
                     retry_judgment is not None
                     and retry_judgment.new_summary is not None
-                    and getattr(retry_judgment, "decision", None)
-                    == getattr(judgment, "decision", None)
+                    and _decision_signature(retry_judgment) == _decision_signature(judgment)
                 ):
                     # A rewrite that resolves the attribution by naming a bad
                     # id is still subject to D1's drop-and-note rule.
@@ -11017,6 +11154,12 @@ class ScopeManager:
                     response = retry_response
                     tool_use_block = retry_block
                     first_messages = retry_messages
+                # The gap that survives the one re-ask is the judge's call (it returned the
+                # amendment unchanged, or the retry was unusable): recorded, never filled in by
+                # the engine, because a label on a false match is a false attribution.
+                kept = attribution_gaps(judgment)
+                if kept:
+                    judgment = judgment.model_copy(update={"attribution_gap_kept": kept})
 
         # Superseded-claim backstop (#199): the amendment removes an item and
         # the rewritten context puts its own words straight back — the dead
@@ -12665,10 +12808,34 @@ class ScopeManager:
                 verdicts.append(verdict)
             return judgment.model_copy(update={"verdicts": verdicts})
 
+        batch_operator_directives = [
+            (item.id, item.content)
+            for _attachment_scope_id, items in (operator_memory or [])
+            for item in items
+            if item.kind == "directive"
+        ]
+        batch_echo_state: dict[str, list[str]] = {"cited": [], "engine_only": []}
+
+        def _batch_attribution_gap_ids(judgment: ScopeManagerBatchJudgment) -> list[str]:
+            cited, engine_only = _batch_attribution_gaps(
+                judgment,
+                operator_directives=batch_operator_directives,
+                contributions=contributions,
+            )
+            batch_echo_state["cited"], batch_echo_state["engine_only"] = cited, engine_only
+            return [*cited, *engine_only]
+
+        def _batch_attribution_corrective(_gap_ids: Sequence[str]) -> str:
+            return _attribution_corrective_text(
+                batch_echo_state["cited"], batch_echo_state["engine_only"]
+            )
+
         batch_judgment = self._call_with_correctives(
             user_message=user_message,
             system_prompt=_BATCH_SYSTEM_PROMPT,
             tool=JUDGE_BATCH_TOOL,
+            attribution_gaps=_batch_attribution_gap_ids,
+            attribution_corrective=_batch_attribution_corrective,
             reasoning_gaps=_batch_reasoning_gaps,
             reasoning_withdraw=_batch_reasoning_withdraw,
             reasoning_adopt=_batch_reasoning_adopt,
