@@ -1346,9 +1346,6 @@ When a BUDGET is given in the user message:
   longer earn their words.
 - Citations ("according to <scope>", "per operator directive <id>") are
   never what gets condensed away: drop detail, keep the attribution.
-- A context line that opens "Departure from <id> (<scope>): " keeps that
-  opening, byte for byte, through every rewrite and condensation, as an
-  attribution does.
 
 When THIS SCOPE'S PUBLICATION is rendered in the user message (ADR 0007 D2/D3):
 this is your own scope's CURRENT outward face — items already judged fit for
