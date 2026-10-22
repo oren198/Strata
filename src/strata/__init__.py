@@ -4,7 +4,7 @@
 # verdict pair (issue #145). Defined once, beside the record's Judgment.
 from strata.record_store import ACCEPTED_DECISIONS as ACCEPTED_DECISIONS
 
-__version__ = "1.18.2"
+__version__ = "1.18.3"
 
 #: PyPI distribution name. The import name (``strata``) and console scripts
 #: (``strata``, ``strata-mcp``) are unchanged — only the package name pip
