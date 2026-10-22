@@ -3210,7 +3210,7 @@ def _render_digest_row(row: RecentContribution, *, verbatim: bool) -> str:
     return (
         f"[{c.id}] at={c.created_at} subject={c.subject or '(none)'} "
         f"state={row.state} decision={row.decision or '(none)'} "
-        f"reasoning={strip_record_only_notes(row.judgment_notes or '') or '(none)'} "
+        f"reasoning={strip_notes_for_judge(row.judgment_notes or '') or '(none)'} "
         f"content={content!r}"
     )
 
@@ -3604,6 +3604,85 @@ def strip_record_only_notes(notes: str) -> str:
     note and every other note stay.
     """
     return strip_provenance_note(_DECISION_PREFIX_RE.sub("", notes, count=1))
+
+
+#: The engine-written bracketed suffixes of a recorded verdict, by their exact opener, each tied to
+#: the function that writes it. A later judge must not read them: the engine's own decline wording
+#: on a same-subject note a moment earlier is authoritative-looking, and judges copy it.
+_ENGINE_NOTE_OPENERS: tuple[str, ...] = (
+    "[inherited relation: ",  # classify_inherited_context / its batch twin (protocol note)
+    "[directive relation: ",  # classify_inherited_directive / its batch twin (protocol note)
+    "[Declined: ",  # _inherited_relation_note: decline, decline_unspecific, licence decline
+    "[A report of following ",  # _inherited_relation_note: consequence_report
+    "[A departure from ",  # _inherited_relation_note: departure_report
+    "[Recorded as a departure from ",  # the own-directive departure note (v1.19)
+    "[Engine: ",  # _provenance_line and the engine's own record notes (v1.19 op-drop note)
+)
+#: Whole-reasoning engine notes: the engine REPLACES the judge's reasoning with them.
+_ENGINE_WHOLE_NOTE_RES: tuple[re.Pattern[str], ...] = (
+    # _inherited_hold_note (#244 step 1)
+    re.compile(
+        r"Contradicts inherited \S+ \([^)]*\)\. An exception to it is .+? to make; "
+        r"propose it there\."
+    ),
+    # _directive_relation_note, hold
+    re.compile(
+        r"Held as context: the judge reads this as an exception to \S+ \([^)]*\); the engine "
+        r"could not confirm a conflict\. Context never binds\."
+    ),
+)
+
+
+def _trailing_bracket_groups(notes: str) -> tuple[str, list[str]]:
+    """``(head, groups)``: *notes* split into the text before its trailing run of top-level
+    ``[...]`` groups (each preceded by a space) and those groups in order."""
+    groups: list[str] = []
+    rest = notes.rstrip()
+    while rest.endswith("]"):
+        depth = 0
+        start = None
+        for k in range(len(rest) - 1, -1, -1):
+            if rest[k] == "]":
+                depth += 1
+            elif rest[k] == "[":
+                depth -= 1
+                if depth == 0:
+                    start = k
+                    break
+        if start is None or (start > 0 and rest[start - 1] != " "):
+            break
+        groups.insert(0, rest[start:])
+        rest = rest[:start].rstrip()
+    return rest, groups
+
+
+def strip_engine_notes(notes: str) -> str:
+    """*notes* without the engine-written suffixes (see :data:`_ENGINE_NOTE_OPENERS`).
+
+    End-anchored and exact: only a trailing bracket group whose opener is on the list is removed,
+    so the judge's own reasoning that merely CONTAINS such words (even such an opener mid-text) is
+    never touched. Any other trailing group (the held note, for one) stays. A reasoning the engine
+    wrote whole (:data:`_ENGINE_WHOLE_NOTE_RES`) comes back empty."""
+    head, groups = _trailing_bracket_groups(notes)
+    if not groups:
+        kept = notes
+    else:
+        survivors = [g for g in groups if not g.startswith(_ENGINE_NOTE_OPENERS)]
+        if len(survivors) == len(groups):
+            kept = notes
+        else:
+            kept = " ".join([head, *survivors]) if head else " ".join(survivors)
+    if any(pattern.fullmatch(kept.strip()) for pattern in _ENGINE_WHOLE_NOTE_RES):
+        return ""
+    return kept
+
+
+def strip_notes_for_judge(notes: str) -> str:
+    """Recorded *notes* as a JUDGE input: no decision prefix, no provenance line, and none of the
+    engine-written suffixes. The recency digest renders every judgment through here (the API's
+    idempotent re-contribute keeps :func:`strip_record_only_notes`, which leaves the engine's
+    suffixes in the reasoning it returns)."""
+    return strip_engine_notes(strip_record_only_notes(notes))
 
 
 def strip_provenance_note(notes: str) -> str:
@@ -7299,12 +7378,229 @@ _SPECIFICITY_ANCHOR_RE = re.compile(
     r"|\bthe night of\b|\b(?:once|twice|\d+ times|(?:two|three|four|five) times)\b",
     re.IGNORECASE,
 )
+#: Irregular simple-past forms, complete for common English. It includes the ambiguous
+#: present/past homographs (read, put, set, cut, hit, let, quit, shut, spread, cost, hurt,
+#: burst, split, thrust, bet, shed): a habit made of them is caught by the generality signal.
+_IRREGULAR_PAST_FORMS: tuple[str, ...] = (
+    "arose",
+    "awoke",
+    "bore",
+    "beat",
+    "became",
+    "began",
+    "bent",
+    "bet",
+    "bit",
+    "bled",
+    "blew",
+    "broke",
+    "bred",
+    "brought",
+    "built",
+    "burnt",
+    "burst",
+    "bought",
+    "caught",
+    "chose",
+    "clung",
+    "came",
+    "cost",
+    "crept",
+    "cut",
+    "dealt",
+    "dug",
+    "dove",
+    "drew",
+    "dreamt",
+    "drank",
+    "drove",
+    "ate",
+    "fell",
+    "fed",
+    "felt",
+    "fought",
+    "found",
+    "fled",
+    "flung",
+    "flew",
+    "forbade",
+    "forgot",
+    "forgave",
+    "froze",
+    "got",
+    "gave",
+    "went",
+    "ground",
+    "grew",
+    "hung",
+    "had",
+    "heard",
+    "hid",
+    "hit",
+    "held",
+    "hurt",
+    "kept",
+    "knelt",
+    "knew",
+    "laid",
+    "led",
+    "leapt",
+    "left",
+    "lent",
+    "let",
+    "lay",
+    "lit",
+    "lost",
+    "made",
+    "meant",
+    "met",
+    "paid",
+    "put",
+    "quit",
+    "read",
+    "rode",
+    "rang",
+    "rose",
+    "ran",
+    "said",
+    "saw",
+    "sought",
+    "sold",
+    "sent",
+    "set",
+    "shook",
+    "shed",
+    "shone",
+    "shot",
+    "shown",
+    "shrank",
+    "shut",
+    "sang",
+    "sank",
+    "sat",
+    "slept",
+    "slid",
+    "slung",
+    "slit",
+    "spoke",
+    "sped",
+    "spent",
+    "spun",
+    "spat",
+    "split",
+    "spread",
+    "sprang",
+    "sprung",
+    "stood",
+    "stole",
+    "stuck",
+    "stung",
+    "stank",
+    "strode",
+    "struck",
+    "strung",
+    "strove",
+    "swore",
+    "swept",
+    "swam",
+    "swung",
+    "took",
+    "taught",
+    "tore",
+    "told",
+    "thought",
+    "threw",
+    "thrust",
+    "trod",
+    "understood",
+    "woke",
+    "wore",
+    "wove",
+    "wept",
+    "won",
+    "wound",
+    "wrung",
+    "wrote",
+    "bound",
+    "did",
+    "was",
+    "were",
+    "undertook",
+    "withdrew",
+    "withheld",
+    "overcame",
+    "rebuilt",
+    "rewrote",
+    "overtook",
+    "mistook",
+    "retook",
+    "foresaw",
+    "outgrew",
+    "overthrew",
+    "underwent",
+    "withstood",
+    "overran",
+    "undid",
+    "upheld",
+    "misled",
+    "retold",
+    "dwelt",
+    "spilt",
+    "forsook",
+    "oversaw",
+    "smelt",
+    "spelt",
+    "learnt",
+    "leant",
+    "spoilt",
+    "bade",
+    "begot",
+    "outran",
+    "outdid",
+    "overdid",
+    "overate",
+    "overdrew",
+    "overflew",
+    "oversold",
+    "overslept",
+    "overspent",
+    "overpaid",
+    "overrode",
+    "overwrote",
+    "partook",
+    "rewound",
+    "resold",
+    "reran",
+    "repaid",
+    "remade",
+    "rethought",
+    "retaught",
+    "slew",
+    "smote",
+    "throve",
+    "underwrote",
+    "unwound",
+    "unbound",
+    "wrought",
+    "mislaid",
+    "misspelt",
+    "outsold",
+    "outshone",
+    "overshot",
+    "overheard",
+    "forwent",
+    "forbore",
+    "beheld",
+    "bespoke",
+    "besought",
+    "betook",
+    "undersold",
+)
 _PAST_TENSE_RE = re.compile(
-    r"\b(?:\w+ed|was|were|had|did|took|left|went|held|made|ran|got|came|found|lost|sent|"
-    r"broke|began|saw|gave|put|set|cut|hit|fell|stopped|spent|missed|drifted|shipped|"
-    r"overloaded|destroyed|reached|wasn['’]t|weren['’]t|didn['’]t|"
-    r"caught|kept|built|wrote|told|paid|chose|threw|knew|grew|drove|rose|woke|froze|"
-    r"stood|understood|met|led|slept|sold|bought|brought|thought|taught|won)\b",
+    r"\b(?:\w+ed|"
+    + "|".join(_IRREGULAR_PAST_FORMS)
+    + r"|stopped|missed|drifted|shipped|overloaded|"
+    r"destroyed|reached|wasn['’]t|weren['’]t|didn['’]t)\b",
     re.IGNORECASE,
 )
 _DEPARTURE_CUE_RE = re.compile(
@@ -7479,7 +7775,7 @@ def _has_past_tense(span: str) -> bool:
 _DATED_ANCHOR_RE = re.compile(
     rf"\b\d{{1,2}}(?:st|nd|rd|th)?\s+(?:of\s+)?{_MONTHS}\b"
     rf"|\b{_MONTHS}\.?\s+\d{{1,2}}\b"
-    r"|\b\d{4}-\d{2}-\d{2}\b|\b\d{1,2}/\d{1,2}(?:/\d{2,4})?\b"
+    r"|\b\d{4}-\d{2}-\d{2}\b|\b\d{1,2}/\d{1,2}/\d{2,4}\b"
     r"|\b(?:mon|tues|wednes|thurs|fri|satur|sun)day\b"
     r"|\b(?:yesterday|last (?:night|week|month|shift)|this (?:morning|week)|earlier today)\b"
     r"|\bthe night of\b",
@@ -7495,27 +7791,282 @@ _MODAL_RE = re.compile(
 
 
 #: A note that says a practice changed or was decided is an exception however it is dated.
+#: So is one that dates the START of a practice ("as of 3 October", "effective 3 October",
+#: "starting 3 October", "from 3 October on"): the date is anchored to a real one, so "fuel from
+#: the dock on the north side" is not a cue. A bare "from <date>" counts only with "on/onward".
 _CHANGE_OF_PRACTICE_RE = re.compile(
     r"\b(?:decided|decides|agreed|agrees|resolved|switched|moved|started|starts|began|begun|"
     r"stopped|stops|extended|dropped|changed|adopted|introduced|relaxed|raised|lowered|"
     r"replaced|scrapped|removed|waived|suspended|paused|retired|no longer|from now on|"
-    r"going forward|henceforth|until further notice|suffices?|"
-    r"(?:is|are) (?:enough|fine|ok|okay|acceptable))\b",
+    r"going forward|henceforth|(?:until|till) further notice|onwards?|suffices?|"
+    r"(?:is|are) (?:enough|fine|ok|okay|acceptable))\b"
+    r"|\b(?:as of|effective|(?:starting|beginning)(?:\s+(?:on|from))?)\s+(?:"
+    + _DATED_ANCHOR_RE.pattern
+    + r")"
+    r"|\b(?:from|after|post|beyond|following)\s+(?:" + _DATED_ANCHOR_RE.pattern + r")"
+    # a range end counts only when a date follows it ("to 5 October", "- 8 March");
+    # "and onwards", "till further notice", "- indefinitely -" keep the practice-start reading
+    r"(?!\s*(?:(?:to|through|thru|until|till|and(?:\s+before)?)\s+|[-\u2013]\s*)(?:"
+    + _DATED_ANCHOR_RE.pattern
+    + r"))"
+    r"|\beffective immediately\b",
     re.IGNORECASE,
 )
 
 
-def _is_dated_past_report(content: str) -> bool:
+#: A note that reports an authority granting, approving or ruling on an exception is an
+#: exception however it is dated ("On 18 October the lead approved that hotfixes skip review"):
+#: a date on an approval dates the approval, not an occurrence.
+_AUTHORITY_GRANT_RE = re.compile(
+    r"\b(?:approv(?:ed|es|ing|al)|authori[sz](?:ed|es|ing|ation)|confirmed|confirms|"
+    r"exempt(?:ed|s|ing|ion)|permitted|permits|allowed|allows|granted|grants|"
+    r"sign(?:ed|s)[- ]off|cleared|clears|okay(?:ed|s)|ok['’]?d|ruled|rules\s+that|ruling|"
+    r"sanction(?:ed|s)|green[- ]?light(?:ed)?|go-ahead|blessing|blessed|waived)\b"
+    r"|\bsign[- ]off\s+(?:on|from|by)\b"
+    r"|\bper\s+[^.;,]{0,40}?\b(?:decision|instruction)\b",
+    re.IGNORECASE,
+)
+#: An approval scoped to ONE identified act ("approved this one merge", "approved hotfix 4411")
+#: stays attributed hearsay about that act and never removes a departure label.
+_SINGLE_ACT_RE = re.compile(
+    r"\bthis\b|\bthat\s+(?:one|merge|release|change|deploy|patch|hotfix|case)\b"
+    r"|\bone\s+(?:merge|release|change|deploy|patch|case)\b"
+    r"|#\d+|\b[A-Za-z]+-\d+\b|\b\d{2,}\b",
+    re.IGNORECASE,
+)
+#: Verbs a present-tense practice clause is made of ("hotfixes skip review", "vendors go
+#: unescorted", "patches ship with one sign-off"). Deliberately broad: in doubt it counts as
+#: practice, and that only costs a decline on the exception answer.
+_PRACTICE_VERB_RE = re.compile(
+    r"\b(?:skip|skips|go|goes|ship|ships|run|runs|leave|leaves|merge|merges|release|releases|"
+    r"publish|publishes|use|uses|stay|stays|walk|walks|get|gets|take|takes|bypass|bypasses|"
+    r"ignore|ignores|drop|drops|hold|holds|keep|keeps|start|starts|stop|stops|work|works|"
+    r"pass|passes|enter|enters|operate|operates|proceed|proceeds|count|counts|"
+    r"suffice|suffices|need|needs|require|requires|is|are)\b",
+    re.IGNORECASE,
+)
+_CLAUSE_SPLIT_RE = re.compile(
+    r"[.;:!?,]|\s[-–—]\s|\b(?:that|said|says|because|so|and|but)\b", re.IGNORECASE
+)
+_SENTENCE_SPLIT_RE = re.compile(r"[.;!?]")
+_DETERMINER_OR_NUMBER_RE = re.compile(
+    r"^(?:the|a|an|this|that|these|those|my|our|your|their|its|his|her|one|two|three|four|five|"
+    r"six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|"
+    r"eighteen|nineteen|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred|dozen|"
+    r"both|another|some|any|no|every|each|several|many|few|\d+)$",
+    re.IGNORECASE,
+)
+_TIME_UNITS = frozenset(
+    {"seconds", "minutes", "hours", "days", "weeks", "months", "years", "times"}
+)
+#: "every evening", "nightly": repetition. With only a point date ("On 5 October the pumps ran past
+#: 20:00 every evening") it is a practice; inside a CLOSED past period ("last week", "from 1 to 7
+#: October", "during the outage") it is one episode and stays a report.
+_HABITUAL_QUANTIFIER_RE = re.compile(
+    r"\b(?:every|each)\s+(?:evening|night|day|morning|afternoon|week|month|shift|run|time|"
+    r"release|deploy\w*)\b"
+    # "nightly" as an adverb ("ran past 20:00 nightly."), not an adjective ("the nightly backup")
+    r"|\b(?:nightly|daily|weekly|hourly|monthly)\b(?=\s*(?:[.,;!?]|$|\b(?:and|but|or|so|because|while|"
+    r"until|after|before|at|on|in)\b))",
+    re.IGNORECASE,
+)
+_CLOSED_PERIOD_RE = re.compile(
+    r"\b(?:last|this|that)\s+(?:week|month|shift|night|weekend|quarter|sprint)\b"
+    r"|\bfrom\s+[^.;]{1,30}?\s+(?:to|until|through)\s+"
+    r"|\bbetween\s+[^.;]{1,30}?\s+and\s+"
+    r"|\b(?:during|throughout|over)\s+(?:the|that|this)\s+\w+"
+    r"|\ball\s+(?:week|month|weekend)\b",
+    re.IGNORECASE,
+)
+_LICENCE_REASON = "a licence or a practice in force, not one specific act"
+
+
+def _undated(text: str) -> str:
+    return _DATED_ANCHOR_RE.sub(" ", text)
+
+
+def _states_present_practice(text: str, rule: str) -> bool:
+    """A clause with a present-simple verb, a subject shared with *rule*, no date of its own
+    and no past tense: the note states a practice in force ("hotfixes skip review")."""
+    for clause in _CLAUSE_SPLIT_RE.split(text):
+        if not clause or not clause.strip():
+            continue
+        if (
+            _DATED_ANCHOR_RE.search(clause)
+            or _PAST_TENSE_RE.search(re.sub(r"\b(?:un|non)\w+ed\b", " ", clause))
+            or not _PRACTICE_VERB_RE.search(clause)
+        ):
+            continue
+        if _shared_subject_stems(re.sub(r"\bun(?=\w{4})", "", clause), rule) >= 1:
+            return True
+    return False
+
+
+_OBJECT_LEAD_RE = re.compile(r"^(?:that|on|of|for|to|in|about|with)\b\s*", re.IGNORECASE)
+_SINGULAR_OBJECT_RE = re.compile(
+    r"^(?:the|this|a|an|one|its|his|her)\s+((?:[A-Za-z0-9'’-]+\s*){1,3})", re.IGNORECASE
+)
+
+
+def _object_is_one_act(after: str) -> bool:
+    """The grant's object is a singular definite thing ("signed off on the merge"), not a class
+    ("approved that hotfixes skip review") and not an agent ("approved by the lead"). Any plural
+    among the next three words makes it a class (in doubt: class)."""
+    after = after.strip()
+    if after.casefold().startswith("by "):
+        return False
+    while _OBJECT_LEAD_RE.match(after):
+        after = _OBJECT_LEAD_RE.sub("", after, count=1)
+    match = _SINGULAR_OBJECT_RE.match(after)
+    if match is None:
+        return False
+    for word in match.group(1).split():
+        low = word.casefold()
+        if len(low) > 3 and low.endswith("s") and not low.endswith(("ss", "us", "is")):
+            return False
+    return True
+
+
+def _grants_a_licence(text: str) -> bool:
+    """An authority-grant verb whose object is the class or a practice. A grant scoped to one
+    identified act (the same sentence names it: "this one merge", an id, a number, or the grant's
+    object is one definite thing) is not."""
+    for sentence in _SENTENCE_SPLIT_RE.split(text):
+        match = _AUTHORITY_GRANT_RE.search(sentence)
+        if match is None or _SINGLE_ACT_RE.search(_undated(sentence)):
+            continue
+        if _object_is_one_act(sentence[match.end() :]):
+            continue
+        return True
+    return False
+
+
+def _bare_generic_plural_of_class(text: str, rule: str) -> bool:
+    """A plural of the rule's subject class with no determiner, number, id or demonstrative
+    ("hotfixes were merged", "patch releases shipped", "vendors went"): the note speaks of the
+    class, so it is general, not one dated occurrence."""
+    words = re.findall(r"[A-Za-z0-9'’-]+", _undated(text))
+    for k, word in enumerate(words):
+        low = word.casefold()
+        if not (len(low) > 3 and low.endswith("s") and not low.endswith(("ss", "us", "is"))):
+            continue
+        if low in _TIME_UNITS or _shared_subject_stems(low, rule) < 1:
+            continue
+        if any(
+            _DETERMINER_OR_NUMBER_RE.match(w) or w.casefold().endswith(("'s", "’s"))
+            for w in words[max(0, k - 2) : k]
+        ):
+            continue
+        return True
+    return False
+
+
+def _dated_report_blocker(content: str, rule: str | None) -> str | None:
+    """Why a text that is otherwise a dated past report is not one: it grants or reports a
+    licence for the class, states a practice in force, or speaks of the class in the bare plural."""
+    text = _blank_non_marker_clauses(content)
+    if _grants_a_licence(text):
+        return "an authority's grant for the class"
+    if rule is not None and _states_present_practice(text, rule):
+        return "a practice in force"
+    if rule is not None and _bare_generic_plural_of_class(text, rule):
+        return "the class in the bare plural"
+    if _HABITUAL_QUANTIFIER_RE.search(text) and not _CLOSED_PERIOD_RE.search(text):
+        return "a habit with no closed period"
+    return None
+
+
+def _is_dated_past_report(content: str, rule: str | None = None) -> bool:
     """A real date or day anchor, a past-tense verb, no modal and no change-of-practice cue,
-    once purpose clauses, counterfactuals and negated proposals are blanked. "once", "twice",
-    "N times", a bare clock time, a version or a bare year anchor nothing."""
+    once purpose clauses, counterfactuals and negated proposals are blanked, and no licence
+    for the class, practice in force or bare generic plural (see :func:`_dated_report_blocker`).
+    "once", "twice", "N times", a bare clock time, a version or a bare year anchor nothing."""
     text = _blank_non_marker_clauses(content)
     return bool(
         _DATED_ANCHOR_RE.search(text)
         and _PAST_TENSE_RE.search(text)
         and not _MODAL_RE.search(text)
         and not _CHANGE_OF_PRACTICE_RE.search(text)
+        and _dated_report_blocker(content, rule) is None
     )
+
+
+#: A finite present or present-perfect verb in a note: something in force now. A pronoun or
+#: collective subject followed by a verb that is not past tense counts too ("they tend to",
+#: "crews skip"), as does "<verb>s to".
+_PRESENT_FINITE_RE = re.compile(
+    r"\b(?:is|are|(?<!\d )am|isn['’]t|aren['’]t|has|have|hasn['’]t|haven['’]t|does|doesn['’]t|"
+    r"don['’]t)\b"
+    r"|\b(?:we|they|you|i|people|crews?|staff|everyone|nobody)\s+(?:\w+ly\s+)?"
+    r"(?!was\b|were\b|had\b|did\b|could\b|would\b|should\b|might\b)(?P<verb>\w+)\b"
+    r"(?=\s|[.,;!?]|$)"
+    r"|\b\w+s\s+to\b",
+    re.IGNORECASE,
+)
+#: Any frequency or norm signal: regularity is not one occurrence unless a closed period bounds it.
+_GENERALITY_RE = re.compile(
+    r"\b(?:regular(?:ly)?|often|frequently|usually|normally|typically|generally|always|"
+    r"routine(?:ly)?|habit(?:ual(?:ly)?)?|customar(?:y|ily)|norm(?:al)?|tend(?:s|ed)?\s+to|"
+    r"(?:every|each)\s+(?:other\s+|second\s+|few\s+)?(?:evening|night|day|morning|afternoon|"
+    r"week|month|shift|run|time|release|deploy\w*|weekend|fortnight)s?|most|whenever|any\s*time|"
+    r"all\s+the\s+time|as\s+usual|again\s+and\s+again|repeatedly|constantly|standard|practice|"
+    r"policy|by\s+default|as\s+a\s+rule)\b"
+    # "nightly" as an adverb ("ran past 20:00 nightly."), not an adjective ("the nightly backup")
+    r"|\b(?:nightly|daily|weekly|monthly|hourly)\b(?=\s*(?:[.,;!?]|$|\b(?:and|but|or|so|because|while|"
+    r"until|after|before|at|on|in)\b))",
+    re.IGNORECASE,
+)
+
+
+#: Irregular forms spelled the same in present and past: on the exception-path report route
+#: they are no evidence of a PAST occurrence ("we shut the pumps" may be a practice or a plan).
+_SAME_FORM_PAST: frozenset[str] = frozenset(
+    {
+        "shut",
+        "cut",
+        "let",
+        "put",
+        "set",
+        "hit",
+        "quit",
+        "spread",
+        "cost",
+        "hurt",
+        "burst",
+        "split",
+        "thrust",
+        "bet",
+        "shed",
+        "read",
+        "beat",
+        "slit",
+    }
+)
+
+
+def _positive_single_occurrence(content: str, rule: str | None = None) -> bool:
+    """Positive evidence of ONE occurrence, for the report route under an "exception" answer.
+
+    Everything :func:`_is_dated_past_report` requires, AND no finite present or present-perfect
+    verb in the clause-blanked note (a grammar test, so a habit phrased in the present that no
+    list names still fails closed; a verb in ``_PAST_TENSE_RE`` or ending in -ed is past), AND no
+    generality signal unless a closed past period bounds it. Everything else is the exception
+    branch's decline, as in 1.18.1."""
+    if not _is_dated_past_report(content, rule):
+        return False
+    # a subject and auxiliary left stranded by a blanked clause ("We are  .") is not a verb in force
+    text = re.sub(r"\b\w+\s+(?:are|am|is)\s+(?=[.!?;,]|$)", " ", _blank_non_marker_clauses(content))
+    # the past-tense evidence must be a form that is past only, never a same-form verb
+    if not any(m.group(0).casefold() not in _SAME_FORM_PAST for m in _PAST_TENSE_RE.finditer(text)):
+        return False
+    for match in _PRESENT_FINITE_RE.finditer(text):
+        verb = match.groupdict().get("verb")
+        if verb and verb.casefold() in _SAME_FORM_PAST:
+            return False
+        if verb and (_PAST_TENSE_RE.fullmatch(verb) or verb.casefold().endswith("ed")):
+            continue
+        return False
+    return not (_GENERALITY_RE.search(text) and not _CLOSED_PERIOD_RE.search(text))
 
 
 def _shared_subject_stems(a: str, b: str, context_words: frozenset[str] = frozenset()) -> int:
@@ -7608,7 +8159,11 @@ def verify_inherited_relation(
         span = _verbatim_span(answer, "instead_span", content)
         if span is None:
             failure = "exception answer without a verbatim instead_span"
-        elif marker is None and _is_dated_past_report(content) and _general_marker(content) is None:
+        elif (
+            marker is None
+            and _positive_single_occurrence(content, inherited_text)
+            and _general_marker(content) is None
+        ):
             # A dated report of something that already happened is a report, not an exception.
             if not _action_overlap(span, inherited_text):
                 return (
@@ -7618,6 +8173,17 @@ def verify_inherited_relation(
             verdict = "departure_report" if _DEPARTURE_CUE_RE.search(span) else "consequence_report"
             return verdict, "a specific past occurrence"
         else:
+            blocker = _dated_report_blocker(content, inherited_text)
+            if (
+                blocker is not None
+                and marker is None
+                and _general_marker(content) is None
+                and _DATED_ANCHOR_RE.search(_blank_non_marker_clauses(content))
+                and _PAST_TENSE_RE.search(content)
+                and not _MODAL_RE.search(content)
+                and not _CHANGE_OF_PRACTICE_RE.search(content)
+            ):
+                return "decline", f"{_LICENCE_REASON} ({blocker})"
             return "decline", "an exception: states what happens instead of the rule"
     elif kind in ("consequence_report", "departure_report"):
         span = _verbatim_span(answer, "occurrence_span", content)
@@ -7713,6 +8279,12 @@ def _inherited_relation_note(outcome: dict) -> str:
             "must name the specific occurrence (when, which); resubmit with it, or propose the "
             f"exception to {origin}.]"
         )
+    if verdict == "decline" and str(outcome.get("reason", "")).startswith(_LICENCE_REASON):
+        return (
+            f"[Declined: {directive_id} ({origin}). A report of an approval, or of a practice, is "
+            "not a report of one specific act. Report the specific act (with acted_on), or ask "
+            f"{origin} to record the exception itself.]"
+        )
     if verdict == "decline":
         return (
             f"[Declined: contrary to inherited directive {directive_id} ({origin}). A practice "
@@ -7721,6 +8293,16 @@ def _inherited_relation_note(outcome: dict) -> str:
             f"and raised to {origin} with acted_on), or propose the exception to {origin}.]"
         )
     if verdict == "consequence_report":
+        # An exception answer the engine kept as one specific past report is a
+        # departure, not a report of following the rule. A follows answer
+        # (kind consequence_report) keeps the following wording.
+        if outcome.get("kind") == "exception":
+            return (
+                "[A departure from "
+                f"{directive_id} ({origin}), not a licence: only {origin} decides "
+                f"whether the rule is slack. To raise it to {origin}, resubmit with "
+                f"acted_on = {directive_id}.]"
+            )
         return (
             f"[A report of following {directive_id} ({origin}). To raise it to {origin}, "
             f"resubmit with acted_on = {directive_id}.]"
