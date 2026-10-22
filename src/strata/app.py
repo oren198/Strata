@@ -156,6 +156,8 @@ from strata.record_store import (
     RaisedContributionInput,
     RecentContribution,
     RecordStore,
+    engine_note_rejudge_message,
+    is_engine_note,
     standing_evidence,
 )
 from strata.scope_manager import (
@@ -1391,10 +1393,11 @@ def _write_amendment(
 
     # ADR 0014 D1/D3 — a scope's own contribution is not a trigger for the
     # scope, but it IS one for every descendant this amendment's directive
-    # ops now bind differently. One event per affected scope per amendment,
-    # not per op: ADR 0014 D4's once-per-scope-per-change-id rule is a row
-    # lookup, so several rows sharing an id would collapse to the first
-    # anyway — the payload carries the whole directive-id diff instead.
+    # ops now bind differently. One event per changed directive, sharing this
+    # amendment's change id (issue #196). ADR 0014 D4 still refreshes a scope
+    # once per change id: a processed row for that id marks the wave refreshed,
+    # and the drain judges every still-pending notice in one call. before and
+    # after on every row carry the full id sets.
     _emit_directive_set_change(
         judgment,
         scope=scope,
@@ -1476,13 +1479,17 @@ def _emit_directive_set_change(
     Damping is structural (implementation pin 7): the comparison is between
     the directive ID SETS before and after the amendment, so a context-only
     rewrite — however extensive — emits nothing and a rewording can never
-    restart a wave. When the set did change, one event goes to each
-    descendant carrying the whole diff.
+    restart a wave.
 
-    ``item_id`` names one changed directive (the most consequential kind
-    present, ids sorted so the pick is deterministic) while ``before`` and
-    ``after`` carry the full sets, so nothing about what moved is lost even
-    though a single id heads the row.
+    When the set did change, each changed directive is its own event (issue
+    #196). Every event of this amendment shares one change id, so a descendant
+    still refreshes once for the wave (ADR 0014 D4). ``before`` and ``after``
+    on every row are the full id sets.
+
+    A one-for-one replacement stays a single ``directive_superseded`` event
+    whose ``item_id`` is the id that left. That is the shape a replaced
+    directive already reads as. Any other diff emits one event per id that
+    left and one per id that arrived, ids sorted so the order is fixed.
     """
     assert judgment.new_summary is not None  # noqa: S101 — caller-checked invariant
     previous_ids = {d.id for d in previous_summary.directives} if previous_summary else set()
@@ -1492,29 +1499,35 @@ def _emit_directive_set_change(
     if not removed and not added:
         return
 
-    if removed and added:
-        # Something left and something arrived in one amendment: from a
-        # descendant's side that is a replacement, whichever ops produced it.
-        kind, item = "directive_superseded", removed[0]
-    elif removed:
-        kind, item = "directive_retired", removed[0]
-    else:
-        kind, item = "directive_appended", added[0]
+    before = ", ".join(sorted(previous_ids)) or None
+    after = ", ".join(sorted(current_ids)) or None
+    # Mint once. An empty wave_ids would otherwise mint a fresh id on every
+    # emit() call, and the descendant would refresh once per id.
+    shared_ids = list(dict.fromkeys(change_ids)) or [new_change_id()]
 
-    emit_change_event(
-        fleet=fleet,
-        record_store=record_store,
-        item=item,
-        kind=kind,
-        source_scope_id=scope.id,
-        before=", ".join(sorted(previous_ids)) or None,
-        after=", ".join(sorted(current_ids)) or None,
-        # The amendment's own change ids, minted or inherited by
-        # _write_amendment: one act, one change per wave it belongs to
-        # (ADR 0014 D4).
-        wave_ids=change_ids,
-        hop=hop,
-    )
+    def emit_one(kind: str, item: str) -> None:
+        emit_change_event(
+            fleet=fleet,
+            record_store=record_store,
+            item=item,
+            kind=kind,
+            source_scope_id=scope.id,
+            before=before,
+            after=after,
+            wave_ids=shared_ids,
+            hop=hop,
+        )
+
+    if len(removed) == 1 and len(added) == 1:
+        emit_one("directive_superseded", removed[0])
+        return
+
+    for item in removed:
+        # Something also arrived: each id that left is a supersession. A
+        # pure retirement (nothing arrived) names each id directive_retired.
+        emit_one("directive_superseded" if added else "directive_retired", item)
+    for item in added:
+        emit_one("directive_appended", item)
 
 
 def _judge_batch_and_record(
@@ -2283,6 +2296,8 @@ def rejudge_contribution(
     contribution = record_store.get_contribution(contribution_id)
     if contribution is None:
         raise KeyError(f"Contribution not found: {contribution_id!r}")
+    if is_engine_note(contribution.subject):
+        raise RuntimeError(engine_note_rejudge_message(contribution_id))
 
     scope = fleet.get_scope(contribution.scope_id)
     if scope is None:
@@ -2547,9 +2562,10 @@ def _sweep_ancestor_removals(
     which is why a keyless drain runs it too.
 
     The removed ids come off the change events themselves: ``before`` minus
-    ``after`` when the event carries both directive-id sets (an ancestor
-    amendment can remove several ids at once and ``item_id`` names only the
-    most consequential one — ADR 0014 D4), falling back to ``item_id`` alone.
+    ``after`` when the event carries both directive-id sets, plus ``item_id``.
+    An amendment that changes several directives emits one event per id (issue
+    #196); a one-for-one replacement is still one ``directive_superseded`` row
+    whose sets carry both ids. Either shape withdraws every id that left.
 
     The surviving set is every id that still binds this scope — its own
     summary plus the CURRENT ancestor walk — so an item anchored to a second,
