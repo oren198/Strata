@@ -157,13 +157,13 @@ JUDGE_API_KEY=sk-or-...
 `strata register` offers to capture the key for you and writes `JUDGE_MODEL` and
 `JUDGE_BASE_URL` beside it, so the `.env` states which judge the key is for.
 
-With an OpenRouter key, also pin the provider. OpenRouter serves the same model id from several hosts, and the judge's answers can differ between them:
+With an OpenRouter key you can also pin the provider; it's optional. OpenRouter serves the same model id from several hosts, and the judge's answers can differ between them. Left unset, OpenRouter picks a provider for each call and falls back to another if one is unavailable. Pinned, every judge call goes to that one provider, which makes results easier to reproduce, but there is no fallback: if that provider stops serving the model, your judge calls fail until you change or remove the pin.
 
 ```
-JUDGE_PROVIDER=Nebius
+JUDGE_PROVIDER=<provider name>
 ```
 
-The v1.18.0 numbers in [Judge models](#judge-models) were measured on Nebius. Alibaba, which earlier releases were measured on, stopped serving this model on OpenRouter on 2026-10-10. A pinned provider has no fallback: if it stops serving the model, your judge calls fail until you change the pin. `strata doctor` shows which provider is pinned.
+The v1.18.0 numbers in [Judge models](#judge-models) were measured pinned to Nebius. Alibaba, which earlier releases were measured on, stopped serving this model on OpenRouter on 2026-10-10. `strata doctor` shows which provider is pinned.
 
 **With Codex, use the `.env` file, not an export.** Codex starts its MCP server with
 only the `[mcp_servers.strata.env]` table from its own config, not your shell's
@@ -1200,9 +1200,9 @@ version = "1.12.0"
 <a id="choosing-a-judge"></a>
 ### Judge models
 
-Every contribution is checked by a judge model you choose, and some of Strata's defences depend on that model: a weaker judge lets more through. I recommend `qwen/qwen3-235b-a22b-2507` on OpenRouter, pinned to the Nebius provider. Of the models I measured, it costs the least per run and returned no judge errors. The whole v1.18 baseline below cost $3.40 in judge calls. If you'd rather pay more to let less through, use `claude-haiku-4.5`. In the September study it admitted 0 of 84 attacks, but it cost $0.2139 per demo run against qwen's $0.0157, and once a scope states its purpose it turned away 2 of 6 legitimate notes (#210). A model not in these tables is unmeasured, not known to be worse.
+Every contribution is checked by a judge model you choose, and some of Strata's defences depend on that model: a weaker judge lets more through. Below is what I measured, and exactly what each measurement ran on. The v1.18 baseline ran `qwen/qwen3-235b-a22b-2507` on OpenRouter, pinned to the Nebius provider, and cost $3.40 in judge calls. In the September study, `claude-haiku-4.5` admitted 0 of 84 attacks, but it cost $0.2139 per demo run against qwen's $0.0157, and once a scope states its purpose it turned away 2 of 6 legitimate notes (#210). A model or provider not in these tables is unmeasured, not known to be worse.
 
-**v1.18.0 with the recommended judge** — `qwen/qwen3-235b-a22b-2507` on OpenRouter, pinned to Nebius, engine `ed31692`, 2026-10-14, 3 runs per item ([evidence](docs/evidence/v1.18-judge-baseline.md)):
+**v1.18.0 baseline** — `qwen/qwen3-235b-a22b-2507` on OpenRouter, pinned to Nebius, engine `ed31692`, 2026-10-14, 3 runs per item ([evidence](docs/evidence/v1.18-judge-baseline.md)):
 
 | What it tests | Result |
 |---|---|
@@ -1229,14 +1229,15 @@ This is a new baseline. Alibaba, the provider of earlier qwen measurements, stop
 | `z-ai/glm-4.6` | not usable: 81% of attack calls errored | demo crashed | crashed | — |
 | `deepseek/deepseek-v3.2` | no results: calls took 5–12+ minutes | no results | hung | — |
 
-**To use the recommended setup**, put these in `.env` (`strata register` writes the first three; you add the provider pin yourself):
+**The default setup.** `strata register` writes these to `.env`:
 
 ```
 JUDGE_API_KEY=sk-or-...
 JUDGE_BASE_URL=https://openrouter.ai/api
 JUDGE_MODEL=qwen/qwen3-235b-a22b-2507
-JUDGE_PROVIDER=Nebius
 ```
+
+No provider is pinned, so OpenRouter routes each call and falls back between providers. To pin one, see **Pin the judge to one OpenRouter provider** below.
 
 If your only key is an Anthropic one, the install uses `claude-haiku-4-5` on Anthropic's own endpoint.
 
@@ -1282,14 +1283,18 @@ JUDGE_BASE_URL=https://your-gateway.example/api
 JUDGE_MODEL=<a model id that endpoint serves>
 ```
 
-**Pin the judge to one OpenRouter provider** — OpenRouter routes the same
-model id across roughly ten backing providers, and the same item on the
-same build has measured anywhere from 10/10 to 5/10 across runs,
-plausibly from the provider mix. `JUDGE_PROVIDER=Nebius` (or
+**Pin the judge to one OpenRouter provider** (optional) — OpenRouter
+routes the same model id across several backing providers, and the same
+item on the same build has measured anywhere from 10/10 to 5/10 across
+runs, plausibly from the provider mix. Unset, OpenRouter picks the
+provider for each call and falls back to another when one is
+unavailable. `JUDGE_PROVIDER=<provider name>` (or
 `STRATA_JUDGE_PROVIDER`) pins every judge call to that one named
-provider via `extra_body={"provider": {"order": ["Nebius"],
-"allow_fallbacks": false}}` — no silent fallback to a different
-provider if the pinned one is unavailable. It is OpenRouter-only:
+provider via `extra_body={"provider": {"order": ["<provider name>"],
+"allow_fallbacks": false}}`. That makes results easier to reproduce,
+but there is no fallback: if the pinned provider stops serving the
+model, judge calls fail until you change or remove the pin. It is
+OpenRouter-only:
 against any other endpoint (a bare Anthropic key, a self-hosted
 gateway) it is read but ignored, since a request-level OpenRouter
 provider preference means nothing elsewhere. `strata doctor` reports
@@ -1315,7 +1320,7 @@ server (project config wins):
 | `JUDGE_BASE_URL` | `https://openrouter.ai/api` | Points the judge at a router/proxy/self-hosted gateway — the endpoint must speak the Anthropic Messages API. `STRATA_JUDGE_BASE_URL` also works. **Exception:** with only an Anthropic key set (see [Judge models](#judge-models)) the default stays the Anthropic API. |
 | `JUDGE_MODEL` | `qwen/qwen3-235b-a22b-2507` | Model used by the judge (an id the endpoint serves). `STRATA_MANAGER_MODEL` is the original name and still works (wins if both are set). **Exception:** with only an Anthropic key set the default stays `claude-haiku-4-5`. |
 | `ANTHROPIC_API_KEY` / `STRATA_ANTHROPIC_API_KEY` | (unset) | **Deprecated**, kept as a working fallback: used only when `JUDGE_API_KEY` is unset. On its own it keeps `claude-haiku-4-5` on the Anthropic API. |
-| `JUDGE_PROVIDER` | (unset) | Pins every judge call to one named OpenRouter provider (e.g. `Nebius`); ignored on a non-OpenRouter judge endpoint. `STRATA_JUDGE_PROVIDER` also works. See [Judge models](#judge-models). |
+| `JUDGE_PROVIDER` | (unset) | Optional. Unset, OpenRouter routes each judge call and falls back between providers. Set to a provider name, every judge call goes to that one OpenRouter provider with no fallback, so calls fail if it stops serving the model. Ignored on a non-OpenRouter judge endpoint. `STRATA_JUDGE_PROVIDER` also works. See [Judge models](#judge-models). |
 | `STRATA_JUDGE_DAILY_TOKEN_CAP` | (unset) | Off when unset. A non-negative integer is today's token budget for new judgments and standalone judge calls. A judgment that has already called the model still finishes. Over the cap, the contribution waits unjudged (the same 503 as an unreachable judge). |
 | `STRATA_JUDGE_PRICE_TABLE` | (unset) | Path to a JSON object keyed by model id, each value `{"input_per_million": <number>, "output_per_million": <number>}`. Used only when reporting cost. No entry for a model means that row stays tokens-only. |
 | `STRATA_FRESHNESS_STRICT` | (unset) | `1`/`0` forces the freshness `Stop`-hook strict (blocking) or background; unset defers to the project's `[freshness] strict`, default on ([details](#memory-freshness-stop-hook)) |
