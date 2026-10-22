@@ -46,6 +46,7 @@ ANCESTOR = Directive(
     created_at="2026-03-01T09:00:00+00:00",
 )
 ANCESTORS = [("g_arch", [ANCESTOR])]
+NO_OWN_DIRECTIVE = CURRENT_SUMMARY.model_copy(update={"directives": []})
 
 EXCEPTION_NORMATIVE = (
     "FYI, on nights when the fleet returns the pumps may stay running until 22:00."
@@ -236,6 +237,7 @@ def _judge(
     ancestors=ANCESTORS,  # noqa: ANN001
     operator_memory=None,  # noqa: ANN001
     contributor: ContributorRef | None = None,
+    current_summary=CURRENT_SUMMARY,  # noqa: ANN001
 ):  # noqa: ANN202
     client = MagicMock()
     responses = [_fake_response(first or FIRST_CONTEXT)]
@@ -250,7 +252,7 @@ def _judge(
     judgment = ScopeManager(client=client).judge(
         scope=SCOPE,
         stratum=STRATUM,
-        current_summary=CURRENT_SUMMARY,
+        current_summary=current_summary,
         recent_contributions=[],
         new_contribution=contribution,
         ancestor_directives=ancestors,
@@ -354,7 +356,8 @@ def test_an_operator_directive_is_an_inherited_source_too() -> None:
 
 
 def test_the_reask_message_carries_only_the_definitions_the_directives_and_the_item() -> None:
-    _j, client = _judge(PLAIN_FACT, _answer("unrelated"))
+    # a scope with no own directive: the heading and the listing are the inherited ones
+    _j, client = _judge(PLAIN_FACT, _answer("unrelated"), current_summary=NO_OWN_DIRECTIVE)
     kwargs = client.messages.create.call_args_list[1].kwargs
     assert kwargs["max_tokens"] <= 300
     assert [t["name"] for t in kwargs["tools"]] == ["classify_inherited_relation"]
@@ -390,7 +393,13 @@ def test_no_extra_call_for_a_decline_a_directive_admit_or_no_inherited_directive
         ),
         (FIRST_CONTEXT, None),
     ):
-        judgment, client = _judge(EXCEPTION_HABITUAL, None, first=first, ancestors=ancestors)
+        judgment, client = _judge(
+            EXCEPTION_HABITUAL,
+            None,
+            first=first,
+            ancestors=ancestors,
+            current_summary=NO_OWN_DIRECTIVE,  # no rule at all -> no call
+        )
         # A directive admit gets #244's own re-ask, never #242's context one.
         names = [c.kwargs["tools"][0]["name"] for c in client.messages.create.call_args_list]
         assert "classify_inherited_relation" not in names
@@ -537,8 +546,12 @@ def test_a_batch_without_inherited_directives_makes_no_extra_call() -> None:
             directive_ops=[],
         )
     )
-    result = _judge_batch(
-        client, contributions=[replace(NEW_CONTRIBUTION), replace(SECOND_CONTRIBUTION)]
+    result = ScopeManager(client=client).judge_batch(  # a scope with no rule at all
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=NO_OWN_DIRECTIVE,
+        recent_contributions=[],
+        new_contributions=[replace(NEW_CONTRIBUTION), replace(SECOND_CONTRIBUTION)],
     )
     assert client.messages.create.call_count == 1
     assert result.inherited_relations == []

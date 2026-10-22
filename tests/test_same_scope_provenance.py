@@ -124,10 +124,11 @@ def _contribute(
     as_scope: str = PARENT,
     content: str = "Cap every outbound retry at three attempts.",
     skill: str = "lead",
+    then: tuple[dict, ...] = (),
     **fields: object,
 ) -> tuple[str, str]:
     """POST one contribution to PARENT judged by *verdict*; return (id, recorded notes)."""
-    client.queued.append(verdict)  # type: ignore[attr-defined]
+    client.queued.extend([verdict, *then])  # type: ignore[attr-defined]
     resp = client.post(
         "/contribute",
         json={
@@ -196,9 +197,11 @@ def test_bound_append_supersede_and_retire_each_carry_the_exact_line(client: Tes
             "new_context": "Retries are no longer capped here.",
         },
         content="Retire the retry cap; the retry layer was removed.",
+        then=({"kind": "unrelated", "inherited_id": second, "reasoning": "r"},),
     )
     assert notes == (
         f"[accept_as_context; retire {second}] The rule no longer applies. "
+        "[inherited relation: admit, answered unrelated; no covered exception] "
         f"{_line(f'retire {second}')}"
     )
 
@@ -411,17 +414,34 @@ def _sha_json(value: object) -> str:
     return _sha(json.dumps(value, sort_keys=True))
 
 
+#: v1.19 FIX 5 (reviewed by Aron 2026-10-21): the one other sentence in the judge's prompt. It sits
+#: right after the citation bullet, so the stored departure label survives condensation.
+_CITATION_BULLET_END = "drop detail, keep the attribution.\n"
+_DEPARTURE_PROMPT_LINE = (
+    '- A context line that opens "Departure from <id> (<scope>): " keeps that\n'
+    "  opening, byte for byte, through every rewrite and condensation, as an\n"
+    "  attribution does."
+)
+
+
+def _without_the_reviewed_lines(prompt: str) -> str:
+    return prompt.replace(f"\n{_PROMPT_LINE}", "").replace(f"{_DEPARTURE_PROMPT_LINE}\n", "")
+
+
 def test_system_prompt_is_the_previous_one_plus_exactly_one_sentence() -> None:
     assert _SYSTEM_PROMPT.count(_PROMPT_LINE) == 1
     assert _SYSTEM_PROMPT.endswith(f"\n{_PROMPT_LINE}")
-    assert _sha(_SYSTEM_PROMPT.replace(f"\n{_PROMPT_LINE}", "")) == _OLD_SYSTEM_PROMPT_SHA
-    # The batch prompt is built from the single one, so the sentence lands there too.
+    assert _SYSTEM_PROMPT.count(_DEPARTURE_PROMPT_LINE) == 1
+    assert f"{_CITATION_BULLET_END}{_DEPARTURE_PROMPT_LINE}\n" in _SYSTEM_PROMPT
+    assert _sha(_without_the_reviewed_lines(_SYSTEM_PROMPT)) == _OLD_SYSTEM_PROMPT_SHA
+    # The batch prompt is built from the single one, so both sentences land there too.
     assert _BATCH_SYSTEM_PROMPT.count(_PROMPT_LINE) == 1
-    assert (
-        _sha(_BATCH_SYSTEM_PROMPT.replace(f"\n{_PROMPT_LINE}", "")) == _OLD_BATCH_SYSTEM_PROMPT_SHA
-    )
+    assert _BATCH_SYSTEM_PROMPT.count(_DEPARTURE_PROMPT_LINE) == 1
+    assert f"{_CITATION_BULLET_END}{_DEPARTURE_PROMPT_LINE}\n" in _BATCH_SYSTEM_PROMPT
+    assert _sha(_without_the_reviewed_lines(_BATCH_SYSTEM_PROMPT)) == _OLD_BATCH_SYSTEM_PROMPT_SHA
     # The publication judge has its own prompt and does not share the text.
     assert _PROMPT_LINE not in _PUBLICATION_SYSTEM_PROMPT
+    assert _DEPARTURE_PROMPT_LINE not in _PUBLICATION_SYSTEM_PROMPT
 
 
 def test_single_judge_call_inputs_are_unchanged_except_the_system_prompt() -> None:
@@ -436,7 +456,9 @@ def test_single_judge_call_inputs_are_unchanged_except_the_system_prompt() -> No
         recent_contributions=[],
         new_contribution=NEW_CONTRIBUTION,
     )
-    kwargs = mock_client.messages.create.call_args.kwargs
+    kwargs = mock_client.messages.create.call_args_list[
+        0
+    ].kwargs  # [0]: the judgment call, not the own-directive re-ask
     assert kwargs["system"][0]["text"] == _SYSTEM_PROMPT
     assert _sha_json(kwargs["messages"]) == _SINGLE_MESSAGES_SHA
     assert _sha_json(kwargs["tools"]) == _SINGLE_TOOLS_SHA
@@ -504,7 +526,9 @@ def test_a_later_single_judge_sees_the_window_exactly_as_before() -> None:
         recent_contributions=window,
         new_contribution=SECOND_CONTRIBUTION,
     )
-    messages = mock_client.messages.create.call_args.kwargs["messages"]
+    messages = mock_client.messages.create.call_args_list[0].kwargs[
+        "messages"
+    ]  # [0]: the judgment call, not the own-directive re-ask
     rendered = json.dumps(messages)
     assert "reasoning=An enforceable rule. content=" in rendered
     assert "[Engine:" not in rendered
@@ -535,7 +559,9 @@ def test_a_later_batch_judge_sees_the_window_exactly_as_before() -> None:
         recent_contributions=window,
         new_contributions=[SECOND_CONTRIBUTION, THIRD_CONTRIBUTION],
     )
-    messages = mock_client.messages.create.call_args.kwargs["messages"]
+    messages = mock_client.messages.create.call_args_list[0].kwargs[
+        "messages"
+    ]  # [0]: the judgment call, not the own-directive re-ask
     assert "[Engine:" not in json.dumps(messages)
     assert _sha_json(messages) == _WINDOW_BATCH_MESSAGES_SHA
 

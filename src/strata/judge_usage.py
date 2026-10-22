@@ -48,6 +48,7 @@ _FIRST_KIND = {
     "recheck_attribution": "attribution_recheck",
     "recheck_relation": "relation_recheck",
     "classify_inherited_relation": "inherited_relation_recheck",
+    "classify_own_directive_relation": "own_directive_relation",
     "classify_directive_relation": "directive_relation_recheck",
     "classify_claim_carriers": "carrier_check",
     "submit_publication_judgment": "publication",
