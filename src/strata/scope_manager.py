@@ -56,6 +56,7 @@ import copy
 import json
 import logging
 import re
+import time
 from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -9151,6 +9152,28 @@ def _directive_relation_note(outcome: dict) -> str:
 # ---------------------------------------------------------------------------
 
 
+class InheritedReaskUnavailable(RuntimeError):
+    """The relation re-ask (#242 / #243 / #244) could not reach the judge: a 429, a 5xx, a
+    timeout or a connection error that outlasted the bounded retries. Raised, never folded into
+    the unreadable-answer case: that case fails OPEN (admit unless a marker), so a transport
+    error would let an exception or a bare departure through. Callers record it as a judge
+    failure and the item waits, unjudged and retryable, the same as an unreachable judge."""
+
+
+#: Extra attempts after the first for a re-ask that hits a transport error, and the wait before
+#: each. The judge client's own retries (the SDK default) run inside every attempt; these sit on
+#: top so a rate-limited provider gets seconds, not milliseconds, before the item is held.
+_REASK_BACKOFF_SECONDS: tuple[float, ...] = (1.0, 3.0)
+
+
+def _is_transport_error(exc: BaseException) -> bool:
+    """429, 5xx (and 408), a timeout or a connection error. Any other failure, including a
+    4xx other than those, keeps the unreadable-answer path."""
+    if isinstance(exc, anthropic.APIStatusError):
+        return exc.status_code in (408, 429) or exc.status_code >= 500
+    return isinstance(exc, anthropic.APITimeoutError | anthropic.APIConnectionError)
+
+
 class ScopeManager:
     """Invokes the Anthropic API to judge a contribution against a scope.
 
@@ -9233,6 +9256,25 @@ class ScopeManager:
         from strata.judge_usage import metered_messages_create  # noqa: PLC0415
 
         return metered_messages_create(self._client, kwargs, provider=self._judge_provider)
+
+    def _reask_create(self, **kwargs: Any) -> Any:
+        """:meth:`_messages_create` for a relation re-ask, with bounded backoff on a transport
+        error. Raises :class:`InheritedReaskUnavailable` when it still fails; every other
+        exception propagates unchanged to the caller's unreadable-answer handling."""
+        waits = iter(_REASK_BACKOFF_SECONDS)
+        while True:
+            try:
+                return self._messages_create(**kwargs)
+            except Exception as exc:
+                if not _is_transport_error(exc):
+                    raise
+                wait = next(waits, None)
+                if wait is None:
+                    raise InheritedReaskUnavailable(
+                        f"relation re-ask failed ({type(exc).__name__}: {exc}) after "
+                        f"{len(_REASK_BACKOFF_SECONDS) + 1} attempts; nothing was decided on it"
+                    ) from exc
+                time.sleep(wait)
 
     def judge(
         self,
@@ -11780,10 +11822,12 @@ class ScopeManager:
         that the scope inherits directives for (*covered*, ranked and capped).
 
         Returns ``{"contribution_id", "kind", "verdict", "fallback",
-        "inherited_id", "origin", "reason"}``. A failed or unreadable call is
-        the unreadable-answer case, never an error: the verifier's marker
-        scan then decides (a marker declines, otherwise the admit stands and
-        ``fallback`` is True).
+        "inherited_id", "origin", "reason"}``. An unreadable answer (bad tool
+        input, a wrong id, a non-transport failure) is the unreadable-answer case, never an
+        error: the verifier's marker scan then decides (a marker declines, otherwise the admit
+        stands and ``fallback`` is True). A transport error that outlasts the bounded retries
+        (:meth:`_reask_create`) raises :class:`InheritedReaskUnavailable` instead: nothing is
+        decided on a call that never happened.
         """
         shown = list(covered)
         listing = "\n".join(
@@ -11811,7 +11855,7 @@ class ScopeManager:
         answer: dict = {}
         failure: str | None = None
         try:
-            response = self._messages_create(
+            response = self._reask_create(
                 model=self._model,
                 max_tokens=300,
                 system=[
@@ -11831,6 +11875,8 @@ class ScopeManager:
             )
             block = self._extract_tool_use_block(response)
             answer = block.input if isinstance(block.input, dict) else {}
+        except InheritedReaskUnavailable:
+            raise
         except Exception as exc:  # noqa: BLE001 — any slip is the unreadable-answer case
             failure = f"{type(exc).__name__}: {exc}"
 
@@ -12090,8 +12136,9 @@ class ScopeManager:
         directive about to be admitted, and the engine's verification of its answer.
 
         Returns ``{"contribution_id", "relation", "verdict", "fallback", "inherited_id",
-        "origin", "reason"}``. A failed or unreadable call is the unreadable-answer case,
-        never an error: the verifier's marker scan then decides.
+        "origin", "reason"}``. An unreadable answer is the unreadable-answer case, never an
+        error: the verifier's marker scan then decides. A transport error that outlasts the
+        bounded retries raises :class:`InheritedReaskUnavailable`.
         """
         listing = "\n".join(
             f"- {d_id}: {t[:_CONTEXT_REASK_DIRECTIVE_CHARS]}" for d_id, _origin, t in covered
@@ -12103,7 +12150,7 @@ class ScopeManager:
         answer: dict = {}
         failure: str | None = None
         try:
-            response = self._messages_create(
+            response = self._reask_create(
                 model=self._model,
                 max_tokens=400,
                 system=[
@@ -12125,6 +12172,8 @@ class ScopeManager:
             )
             block = self._extract_tool_use_block(response)
             answer = block.input if isinstance(block.input, dict) else {}
+        except InheritedReaskUnavailable:
+            raise
         except Exception as exc:  # noqa: BLE001 — any slip is the unreadable-answer case
             failure = f"{type(exc).__name__}: {exc}"
 
