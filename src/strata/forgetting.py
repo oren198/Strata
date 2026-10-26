@@ -16,7 +16,6 @@ from datetime import UTC, date, datetime, timedelta
 from typing import TYPE_CHECKING, Literal
 
 from strata.change_events import emit as emit_change_event
-from strata.change_events import new_change_id
 from strata.locks import scope_lock
 from strata.record_store import ContributorRef, Retirement, RetirementCandidate
 from strata.summary_store import Directive, EndCondition
@@ -210,7 +209,6 @@ def _retire_locked(
         record_store=record_store,
         summaries_dir=str(summary_store.summaries_dir),
     )
-    change_id = new_change_id()
     emit_change_event(
         fleet=fleet,
         record_store=record_store,
@@ -218,10 +216,6 @@ def _retire_locked(
         kind="directive_retired",
         source_scope_id=scope_id,
         before=existing.content,
-        wave_ids=[change_id],
-    )
-    record_store.link_change_events_to_retirement(
-        change_id=change_id, item_id=directive_id, retirement_id=retirement.id
     )
     for candidate in record_store.list_retirement_candidates(scope_id=scope_id):
         if candidate.directive_id == directive_id:
@@ -401,7 +395,7 @@ def evidence_acceptable(evidence: str | None) -> bool:
 
 def condition_met_reason(condition: str, evidence: str) -> str:
     """The recorded reason of a confirmed judged end condition."""
-    return f"end condition judged met: {condition!r} / {evidence.strip()}"
+    return f'end condition judged met: "{condition}" / {evidence.strip()}'
 
 
 def confirm_judged_end_condition(

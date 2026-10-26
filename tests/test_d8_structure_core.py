@@ -98,7 +98,10 @@ def test_0025_keeps_rows_and_admits_both_kinds(tmp_path: Path) -> None:
     conn.commit()
     conn.close()
 
-    assert run_migrations(db) == ["0025_structure_change_kinds.sql"]
+    assert run_migrations(db) == [
+        "0025_structure_change_kinds.sql",
+        "0026_directive_forgetting.sql",
+    ]
 
     conn = sqlite3.connect(db)
     conn.execute("PRAGMA foreign_keys = ON")

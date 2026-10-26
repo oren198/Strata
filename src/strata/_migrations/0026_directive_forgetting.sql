@@ -10,10 +10,9 @@
 -- 2. `contributions` gains the two inputs a creating/confirming contribution can carry:
 --    `ends` (an end condition for the directive it creates, JSON) and `fulfils` (the id of a
 --    judged-condition directive this contribution is evidence for).
--- 3. `change_events` gains `retirement_id`, so the ordinary directive_retired change event
---    (R3: one path) can carry the label and the notice to the reader's perspective.
---    No new change-event kind: a release and a retraction are the same event; the retirement
---    row it points at says which label.
+-- 3. `change_events` is NOT changed: the ordinary directive_retired event (R3: one path) finds
+--    its retirement through its directive id (RecordStore.retirement_for_directive). No new
+--    change-event kind: a release and a retraction are the same event; the row says the label.
 -- 4. `retirement_candidates`: SQL-only prompts (date_near, condition_evidence, age, disuse).
 --    A candidate never retires anything.
 --
@@ -31,8 +30,6 @@ ALTER TABLE retirements ADD COLUMN evidence_contribution_id TEXT REFERENCES cont
 
 ALTER TABLE contributions ADD COLUMN ends TEXT;
 ALTER TABLE contributions ADD COLUMN fulfils TEXT;
-
-ALTER TABLE change_events ADD COLUMN retirement_id TEXT REFERENCES retirements(id);
 
 CREATE TABLE retirement_candidates (
     id              TEXT PRIMARY KEY,

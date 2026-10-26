@@ -914,14 +914,12 @@ class ChangeEvent:
     self_notice: int = 0
     shown_at: str | None = None
     claim_id: str | None = None
-    retirement_id: str | None = None
-    """The :class:`Retirement` a ``directive_retired`` event reports (migration 0026), so a
-    reader's notice carries its label and the authority's notice. ``None`` for every other
-    event and for any row written before the column."""
     retirement: Retirement | None = None
-    """The retirement ``retirement_id`` points at, attached by
-    :meth:`RecordStore.list_change_events` so a reader's notice carries the label and the
-    authority's notice; never a column."""
+    """The retirement this event reports, found through the event itself (its directive id and
+    source scope) and attached by :meth:`RecordStore.list_change_events` so a reader's notice
+    carries the label and the authority's notice. Not a column. ``None`` for every other event
+    and for a retirement written without a kind (an operator correction or a plain judged
+    retire), whose notice shape is unchanged."""
 
 
 @dataclass(frozen=True)
@@ -2638,6 +2636,23 @@ class RecordStore:
         ).fetchone()
         return row is not None
 
+    def retirement_for_directive(
+        self, directive_id: str, *, scope_id: str | None = None
+    ) -> Retirement | None:
+        """The retirement of *directive_id*, or ``None``. A directive is retired at most once
+        and directive ids are unique contribution ids, so one row answers."""
+        sql = (
+            "SELECT id, scope_id, directive_id, retired_by, reason, created_at, "
+            "changed_circumstance, kind, notice, actor_session_id, cause, end_condition, "
+            "evidence_contribution_id FROM retirements WHERE directive_id = ?"
+        )
+        params: list[str] = [directive_id]
+        if scope_id is not None:
+            sql += " AND scope_id = ?"
+            params.append(scope_id)
+        row = self._conn.execute(sql + " ORDER BY created_at DESC, rowid DESC", params).fetchone()
+        return Retirement(**dict(row)) if row is not None else None
+
     def get_retirement(self, retirement_id: str) -> Retirement | None:
         """One retirement event by id, or ``None``."""
         row = self._conn.execute(
@@ -2650,25 +2665,6 @@ class RecordStore:
             (retirement_id,),
         ).fetchone()
         return Retirement(**dict(row)) if row is not None else None
-
-    def link_change_events_to_retirement(
-        self, *, change_id: str, item_id: str, retirement_id: str
-    ) -> int:
-        """Point the ``directive_retired`` (or ``directive_superseded``) events of one wave at
-        the retirement they report.
-
-        Returns the number of rows linked."""
-        cur = self._conn.execute(
-            """
-            UPDATE change_events SET retirement_id = ?
-            WHERE change_id = ? AND item_id = ?
-              AND kind IN ('directive_retired', 'directive_superseded')
-              AND retirement_id IS NULL
-            """,
-            (retirement_id, change_id, item_id),
-        )
-        self._conn.commit()
-        return cur.rowcount
 
     def open_retirement_candidate(
         self,
@@ -3014,8 +3010,7 @@ class RecordStore:
         rows = self._conn.execute(
             f"""
             SELECT id, change_id, contribution_id, scope_id, source_scope_id, item_id, kind,
-                   before, after, hop, processed_at, created_at, self_notice, shown_at, claim_id,
-                   retirement_id
+                   before, after, hop, processed_at, created_at, self_notice, shown_at, claim_id
             FROM change_events
             WHERE {" AND ".join(clauses)}
             ORDER BY created_at ASC, rowid ASC
@@ -3037,8 +3032,7 @@ class RecordStore:
         rows = self._conn.execute(
             f"""
             SELECT id, change_id, contribution_id, scope_id, source_scope_id, item_id, kind,
-                   before, after, hop, processed_at, created_at, self_notice, shown_at, claim_id,
-                   retirement_id
+                   before, after, hop, processed_at, created_at, self_notice, shown_at, claim_id
             FROM change_events
             WHERE kind IN ({marks})
               AND CASE WHEN json_valid(after) THEN json_extract(after, '$.act_id') END = ?
@@ -3654,8 +3648,7 @@ class RecordStore:
         """
         sql = """
             SELECT id, change_id, contribution_id, scope_id, source_scope_id, item_id, kind,
-                   before, after, hop, processed_at, created_at, self_notice, shown_at, claim_id,
-                   retirement_id
+                   before, after, hop, processed_at, created_at, self_notice, shown_at, claim_id
             FROM change_events
             WHERE scope_id = ?
         """
@@ -3666,10 +3659,16 @@ class RecordStore:
         return [self._with_retirement(ChangeEvent(**dict(row))) for row in rows]
 
     def _with_retirement(self, event: ChangeEvent) -> ChangeEvent:
-        """*event* with the retirement it reports attached (a no-op for any other event)."""
-        if event.retirement_id is None:
+        """*event* with the retirement it reports attached, found by its directive id.
+
+        Only a retirement written with a kind (the v1.20 act, a date lapse or a confirmed
+        condition) is attached; every other event keeps its shape."""
+        if event.kind not in ("directive_retired", "directive_superseded"):
             return event
-        return replace(event, retirement=self.get_retirement(event.retirement_id))
+        retirement = self.retirement_for_directive(event.item_id, scope_id=event.source_scope_id)
+        if retirement is None or retirement.kind is None:
+            return event
+        return replace(event, retirement=retirement)
 
     def mark_change_event_processed(self, event_id: str) -> None:
         """Mark *event_id* consumed by a refresh, whatever the verdict (ADR 0014 D5).
@@ -3725,8 +3724,7 @@ class RecordStore:
         row = self._conn.execute(
             """
             SELECT id, change_id, contribution_id, scope_id, source_scope_id, item_id, kind,
-                   before, after, hop, processed_at, created_at, self_notice, shown_at, claim_id,
-                   retirement_id
+                   before, after, hop, processed_at, created_at, self_notice, shown_at, claim_id
             FROM change_events WHERE id = ?
             """,
             (event_id,),

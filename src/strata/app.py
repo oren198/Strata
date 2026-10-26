@@ -1289,7 +1289,6 @@ def _write_amendment(
     # reserved for exactly this scope-manager explicit-retire. Superseded
     # directives get none: their explanation is the incoming directive's
     # own supersedes reference.
-    confirmed_retirements: dict[str, str] = {}
     for directive_id, reason, changed_circumstance in retirements:
         # v1.20: a judged retire of a directive with a JUDGED end condition reached here only
         # through the engine's confirmation check (scope_manager), so it is recorded as one:
@@ -1323,7 +1322,7 @@ def _write_amendment(
                 "end_condition": judged_condition.end_condition.model_dump_json(),
                 "evidence_contribution_id": evidence.id if evidence else None,
             }
-        row = record_store.append_retirement(
+        record_store.append_retirement(
             scope_id=scope.id,
             directive_id=directive_id,
             retired_by="scope-manager",
@@ -1331,8 +1330,6 @@ def _write_amendment(
             changed_circumstance=changed_circumstance,
             **extra,
         )
-        if extra:
-            confirmed_retirements[directive_id] = row.id
 
     # ADR 0007 D3 — staleness propagation, two paths, both under the
     # lock this function's caller already holds:
@@ -1454,12 +1451,6 @@ def _write_amendment(
         change_ids=change_ids,
         hop=judgment.hop,
     )
-    for directive_id, retirement_id in confirmed_retirements.items():
-        for cid in dict.fromkeys(change_ids):
-            record_store.link_change_events_to_retirement(
-                change_id=cid, item_id=directive_id, retirement_id=retirement_id
-            )
-
     # Issue #197, the context half: a contribution that supersedes an earlier
     # one whose claim lived in CONTEXT moves no directive, so the diff above is
     # silent about it — yet the scope's own readers relied on that claim and

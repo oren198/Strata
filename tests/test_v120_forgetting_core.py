@@ -271,7 +271,7 @@ def test_the_owners_judge_retires_a_judged_condition_with_the_honest_reason(worl
     assert retirement is not None
     assert retirement.cause == "condition_judged" and retirement.kind == "currency"
     assert retirement.notice == (
-        "end condition judged met: 'the audit closes' / "
+        'end condition judged met: "the audit closes" / '
         "The note says the audit closed on 9 November."
     )
     assert "verified" not in retirement.notice
@@ -378,7 +378,7 @@ def test_a_judged_retire_with_fulfils_and_evidence_stands_with_the_engines_reaso
     )
     assert [op.op for op in judgment.directive_ops] == ["retire"]
     assert judgment.directive_ops[0].changed_circumstance == (
-        "end condition judged met: 'the audit closes' / The note reports the audit closed."
+        'end condition judged met: "the audit closes" / The note reports the audit closed.'
     )
     assert "c_cond" not in [d.id for d in judgment.new_summary.directives]
 
@@ -598,3 +598,20 @@ def test_ends_and_fulfils_are_checked_before_anything_is_appended(world) -> None
     with pytest.raises(ValueError):
         run_contribution(proposed_classification="context", fulfils="c_suite", **base)
     assert store.list_contributions(scope_id="g_org") == []
+
+
+def test_a_retirement_is_found_through_its_directive_not_through_the_event(world) -> None:  # noqa: ANN001
+    store = world[1]
+    assert store.retirement_for_directive("c_suite") is None
+    retirement = retire_directive("g_org", "c_suite", "correction", NOTICE, OWNER, **_kw(world))
+    assert store.retirement_for_directive("c_suite").id == retirement.id
+    assert store.retirement_for_directive("c_suite", scope_id="g_web") is None
+    assert "retirement_id" not in {
+        row[1] for row in store._conn.execute("pragma table_info(change_events)")
+    }
+    # an operator correction (no kind) keeps its event shape: no retirement object
+    store.append_retirement(
+        scope_id="g_org", directive_id="c_tokens", retired_by="operator", reason="gone"
+    )
+    plain = next(e for e in store.list_change_events(scope_id="g_web") if e.item_id == "c_suite")
+    assert plain.retirement.label == "retracted"
