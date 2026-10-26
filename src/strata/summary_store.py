@@ -15,9 +15,11 @@ Vocabulary follows ``CONTEXT.md`` verbatim: *scope*, *scope summary*,
 
 from __future__ import annotations
 
+import json
 import os
 import re
 from pathlib import Path
+from typing import Literal
 
 import yaml
 from pydantic import BaseModel
@@ -25,6 +27,21 @@ from pydantic import BaseModel
 # ---------------------------------------------------------------------------
 # Models
 # ---------------------------------------------------------------------------
+
+
+class EndCondition(BaseModel):
+    """The end condition a directive was created with (v1.20, directive forgetting).
+
+    Set only when the directive is written, by the authority that writes it; nothing else
+    ever changes it. ``kind == "date"``: the directive binds through 23:59:59 UTC on
+    ``until`` (``YYYY-MM-DD``) and is then retired by mechanism. ``kind == "judged"``: the
+    directive binds until the owning scope's judge or a session bound to that scope confirms
+    ``condition``; it never lapses by itself.
+    """
+
+    kind: Literal["date", "judged"]
+    until: str | None = None
+    condition: str | None = None
 
 
 class Directive(BaseModel):
@@ -61,6 +78,14 @@ class Directive(BaseModel):
     bound to this scope admitted it by adopting another position's proposal;
     ``None`` otherwise (and for every directive written before the field
     existed). Rendered as a short suffix on the source line only when set."""
+
+    end_condition: EndCondition | None = None
+    """The end condition written into the directive when it was created, or ``None``
+    (and for every directive written before the field existed). Rendered as one
+    ``- ends:`` line only when set."""
+
+    set_by: str | None = None
+    """The id of the contribution that wrote :attr:`end_condition`; ``None`` with it."""
 
 
 class ScopeSummary(BaseModel):
@@ -192,6 +217,37 @@ def adopted_suffix(directive: Directive) -> str:
     return f" (adopted from proposal {directive.adopted_from})"
 
 
+# Matches:  - ends: until=2026-11-30 · set_by=c_abc   or   - ends: when="<json text>" · set_by=c_abc
+# Absent on a directive with no end condition, so every older file parses and renders as before.
+_ENDS_LINE_RE = re.compile(
+    r"^-\s+ends:\s+(?:until=(\d{4}-\d{2}-\d{2})|when=(\"(?:[^\"\\]|\\.)*\"))"
+    r"(?:\s+·\s+set_by=(\S+))?$"
+)
+
+
+def ends_line_for(directive: Directive) -> str | None:
+    """The ``- ends:`` line for a directive that carries an end condition, else ``None``.
+
+    A judged condition is written as a JSON string so quotes and newlines round-trip on
+    one line."""
+    end = directive.end_condition
+    if end is None:
+        return None
+    if end.kind == "date":
+        body = f"until={end.until}"
+    else:
+        body = f"when={json.dumps(end.condition or '', ensure_ascii=False)}"
+    suffix = f" · set_by={directive.set_by}" if directive.set_by else ""
+    return f"- ends: {body}{suffix}"
+
+
+def _parse_ends(match: re.Match[str]) -> tuple[EndCondition, str | None]:
+    until, when, set_by = match.groups()
+    if until is not None:
+        return EndCondition(kind="date", until=until), set_by
+    return EndCondition(kind="judged", condition=json.loads(when)), set_by
+
+
 # Matches:  > blockquote body
 _BLOCKQUOTE_RE = re.compile(r"^>\s*(.*)")
 
@@ -248,6 +304,9 @@ def _render_summary(summary: ScopeSummary) -> str:
                     f"- source: scope={directive.source_scope_id} · at={directive.created_at}"
                     f"{adopted_suffix(directive)}"
                 )
+            ends_line = ends_line_for(directive)
+            if ends_line is not None:
+                lines.append(ends_line)
             lines.append("")
             # Blockquote every line so multi-line directives round-trip
             # instead of being truncated to their first line.
@@ -303,13 +362,15 @@ def _parse_summary(text: str) -> ScopeSummary:
     cur_source_skill: str | None = None
     cur_created_at: str | None = None
     cur_adopted_from: str | None = None
+    cur_end: EndCondition | None = None
+    cur_set_by: str | None = None
     cur_blockquote_lines: list[str] = []
 
     def _flush_directive() -> None:
         """Save the current in-progress directive to the list."""
         nonlocal cur_id, cur_content_from_heading, cur_subject
         nonlocal cur_source_scope, cur_source_skill, cur_created_at, cur_blockquote_lines
-        nonlocal cur_adopted_from
+        nonlocal cur_adopted_from, cur_end, cur_set_by
         if cur_id is None:
             return
         # Use blockquote as canonical content (as spec requires); the heading
@@ -329,6 +390,8 @@ def _parse_summary(text: str) -> ScopeSummary:
                 source_skill=cur_source_skill,
                 created_at=cur_created_at or "",
                 adopted_from=cur_adopted_from,
+                end_condition=cur_end,
+                set_by=cur_set_by,
             )
         )
         cur_id = None
@@ -338,6 +401,8 @@ def _parse_summary(text: str) -> ScopeSummary:
         cur_source_skill = None
         cur_created_at = None
         cur_adopted_from = None
+        cur_end = None
+        cur_set_by = None
         cur_blockquote_lines = []
 
     for raw_line in body.splitlines():
@@ -385,6 +450,11 @@ def _parse_summary(text: str) -> ScopeSummary:
                 cur_source_skill = m_source.group(2)
                 cur_created_at = m_source.group(3).strip()
                 cur_adopted_from = m_source.group(4)
+                continue
+
+            m_ends = _ENDS_LINE_RE.match(line)
+            if m_ends:
+                cur_end, cur_set_by = _parse_ends(m_ends)
                 continue
 
             m_bq = _BLOCKQUOTE_RE.match(line)
