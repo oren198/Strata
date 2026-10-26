@@ -78,6 +78,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib.resources
+import inspect
 import json
 import logging
 import os
@@ -641,6 +642,19 @@ def _read_judge_inputs(
 _EXAMINED_CONTEXT_CAP = 10
 
 
+def _takes_kwarg(method: object, name: str) -> bool:
+    """Whether *method* accepts the keyword *name* (a named parameter or ``**kwargs``).
+
+    The lineage view is an optional input of the real scope-manager. A stand-in judge with a
+    fixed signature (an eval harness, a test double) never asked for it and must not be
+    handed it."""
+    try:
+        params = inspect.signature(method).parameters  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return False
+    return name in params or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
 def _context_item_facts(
     contribution_id: str,
     *,
@@ -950,7 +964,7 @@ def _judge_and_record(
             record_store=record_store,
             summary_store=summary_store,
         )
-        if lineage_view:
+        if lineage_view and _takes_kwarg(scope_manager.judge, "lineage_view"):
             judge_kwargs["lineage_view"] = lineage_view
     # Adoption link: the held proposal this contribution adopts, so the judge sees
     # what is adopted. Same discipline — the kwarg appears only when set.
@@ -1895,7 +1909,7 @@ def _judge_batch_and_record(
             record_store=record_store,
             summary_store=summary_store,
         )
-        if lineage_view:
+        if lineage_view and _takes_kwarg(scope_manager.judge_batch, "lineage_view"):
             batch_judge_kwargs["lineage_view"] = lineage_view
     # Adoption link: each member's adopted proposal, keyed by the member's id —
     # the kwarg appears only when at least one member adopts.

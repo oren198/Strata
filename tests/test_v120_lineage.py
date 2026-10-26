@@ -394,3 +394,51 @@ def test_a_small_context_gets_exactly_the_old_message_and_the_old_tool(world) ->
 def test_no_corpus_prompt_carries_the_block() -> None:
     for name, text in capture_corpus(acted_on=None).items():
         assert "CONTEXT LINES" not in text, name
+
+
+def test_the_lineage_view_goes_only_to_a_judge_that_takes_it() -> None:
+    from strata.app import _takes_kwarg  # noqa: PLC0415
+
+    def fixed(*, scope, examined_context=None): ...  # noqa: ANN001, ANN202
+    def named(*, scope, lineage_view=None): ...  # noqa: ANN001, ANN202
+    def open_ended(**kwargs): ...  # noqa: ANN003, ANN202
+
+    assert not _takes_kwarg(fixed, "lineage_view")
+    assert _takes_kwarg(named, "lineage_view")
+    assert _takes_kwarg(open_ended, "lineage_view")
+
+
+def test_a_judge_that_takes_keywords_gets_the_stored_lineage_view_when_offered(world) -> None:  # noqa: ANN001
+    from strata.scope_manager import ScopeManagerJudgment  # noqa: PLC0415
+
+    fleet, store, summaries = world
+    context = "a b c d e f"
+    summaries.write(
+        "g_sv",
+        ScopeSummary(
+            scope_id="g_sv", directives=[], context=context, updated_at="2026-10-01T00:00:00Z"
+        ),
+    )
+    store.store_context_lineage("g_sv", context_hash(context), [(1, [])], 1)
+    seen: dict = {}
+
+    class Judge:
+        def judge(self, **kw):  # noqa: ANN003, ANN202
+            seen.update(kw)
+            return ScopeManagerJudgment(decision="decline", reasoning="no", new_summary=None)
+
+    run_contribution(
+        scope=fleet.get_scope("g_sv"),
+        stratum=fleet.strata[0],
+        content="a note",
+        proposed_classification="context",
+        subject=None,
+        supersedes=None,
+        contributor=_who(),
+        fleet=fleet,
+        record_store=store,
+        summary_store=summaries,
+        scope_manager=Judge(),
+        summary_max_words=10,
+    )
+    assert seen["lineage_view"] == [LineageLineView(1, ())]
