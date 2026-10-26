@@ -38,6 +38,12 @@ class CallStats:
 
     calls: int = 0
     corrective: int = 0
+    relation_calls: int = 0
+    """Calls that were a relation re-ask (inherited / own-directive relation checks)."""
+    relation_errors: int = 0
+    """Relation re-ask HTTP calls that raised (each failed attempt, retried or not)."""
+    main_errors: int = 0
+    """Every other judge call that raised."""
 
 
 class _Messages:
@@ -46,6 +52,18 @@ class _Messages:
 
     def create(self, **kwargs: Any) -> Any:
         return self._owner._create(**kwargs)  # noqa: SLF001
+
+
+#: The relation re-asks: the engine's second calls that classify a note against a directive.
+#: Counted apart from the main judgment call because they fail (429s, timeouts) on their own.
+RELATION_CALL_KINDS = frozenset(
+    {
+        "inherited_relation_recheck",
+        "own_directive_relation",
+        "directive_relation_recheck",
+        "relation_recheck",
+    }
+)
 
 
 class CountingClient:
@@ -69,14 +87,25 @@ class CountingClient:
 
         self._budget.check_before(kwargs)  # may raise CapReached: nothing is sent
         self.stats.calls += 1
-        if call_kind_from_request(kwargs) == "corrective_reask":
+        kind = call_kind_from_request(kwargs)
+        if kind == "corrective_reask":
             self.stats.corrective += 1
+        is_relation = kind in RELATION_CALL_KINDS
+        if is_relation:
+            self.stats.relation_calls += 1
         # This wrapper IS the transport below the choke point: the engine's judge calls reach it
         # through `metered_messages_create` (which pins, meters and caps first), and it hands the
         # request to the real client. It is bound to a name rather than called inline because the
         # guard tests allow a literal call to the client send method only in `judge_usage.py`.
         send = self._client.messages.create
-        response = send(**kwargs)
+        try:
+            response = send(**kwargs)
+        except Exception:
+            if is_relation:
+                self.stats.relation_errors += 1
+            else:
+                self.stats.main_errors += 1
+            raise
         self._budget.add_after(kwargs, response)
         return response
 
@@ -269,7 +298,15 @@ def run_one(
 def _stamp(result: ItemResult, client: CountingClient, *, recovered: bool) -> ItemResult:
     from dataclasses import replace  # noqa: PLC0415
 
-    return replace(result, calls=client.stats.calls, tool_recovered=recovered)
+    stats = client.stats
+    return replace(
+        result,
+        calls=stats.calls,
+        tool_recovered=recovered,
+        relation_calls=stats.relation_calls,
+        relation_errors=stats.relation_errors,
+        main_call_errors=stats.main_errors,
+    )
 
 
 # -- the run ------------------------------------------------------------------------------

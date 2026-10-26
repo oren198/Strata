@@ -63,6 +63,12 @@ class ItemResult:
     """Judge HTTP calls this judgment made."""
     tool_recovered: bool = False
     """A malformed first attempt that the corrective retry fixed (reported, never a fail)."""
+    relation_calls: int = 0
+    """Of ``calls``, the relation re-asks."""
+    relation_errors: int = 0
+    """Relation re-ask calls that raised (reported only; no bar until measured)."""
+    main_call_errors: int = 0
+    """Other judge calls that raised."""
 
 
 @dataclass(frozen=True)
@@ -381,6 +387,9 @@ def score(
         "tool_call_failures": tool_failures,
         "tool_call_recovered": recovered,
         "judge_errors": len(errors),
+        "relation_calls": sum(r.relation_calls for r in results),
+        "relation_errors": sum(r.relation_errors for r in results),
+        "main_call_errors": sum(r.main_call_errors for r in results),
         "errors_by_status": by_status,
         "timeouts": timeouts,
         "error_rate": error_rate,
