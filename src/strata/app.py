@@ -123,7 +123,12 @@ from strata.fleet_config import (
     replace_fleet_bytes,
 )
 from strata.fleet_reload import FleetReloader
-from strata.forgetting import sweep_date_lapses_locked, validate_ends, validate_fulfils
+from strata.forgetting import (
+    sweep_date_lapses_locked,
+    sweep_for_read,
+    validate_ends,
+    validate_fulfils,
+)
 from strata.locks import BATCH_CAP, QUEUE_WAIT_TIMEOUT_S, QueueTicket, configure_lock_dir
 from strata.locks import scope_append_lock as _scope_append_lock
 from strata.locks import scope_lock as _scope_lock
@@ -3635,6 +3640,11 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
         scope = fleet.get_scope(scope_id)
         if scope is None:
             raise HTTPException(status_code=404, detail=f"Scope not found: {scope_id!r}")
+
+        # v1.20: what an agent would read has already lapsed any date end condition that is over.
+        sweep_for_read(
+            scope_id, fleet=fleet, record_store=record_store, summary_store=summary_store
+        )
 
         def _operator_reader(attachment_scope_id: str) -> list:
             return read_operator_layer(

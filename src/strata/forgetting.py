@@ -9,6 +9,7 @@ judge call, and nothing here creates a directive.
 
 from __future__ import annotations
 
+import logging
 import time
 from collections.abc import Mapping, Sequence
 from datetime import UTC, date, datetime, timedelta
@@ -24,6 +25,8 @@ if TYPE_CHECKING:
     from strata.fleet_config import FleetConfig
     from strata.record_store import Contribution, RecordStore
     from strata.summary_store import SummaryStore
+
+_logger = logging.getLogger("strata.forgetting")
 
 RetireKind = Literal["currency", "correction"]
 """``currency``: a release (right to follow, no longer binds). ``correction``: a retraction
@@ -313,6 +316,38 @@ def sweep_date_lapses(
             summary_store=summary_store,
             now=now,
         )
+
+
+def sweep_for_read(
+    scope_id: str,
+    *,
+    fleet: FleetConfig,
+    record_store: RecordStore,
+    summary_store: SummaryStore,
+    now: datetime | None = None,
+) -> list[Retirement]:
+    """Before a perspective of *scope_id* is composed: lapse every date end condition that is
+    over in the scope and in each of its chain ancestors (their directives bind it), and open
+    the scope's candidates. No judge call, and no lock unless something is due. Never raises:
+    a read must not fail on housekeeping."""
+    from strata.perspective import ancestor_directives  # noqa: PLC0415
+
+    done: list[Retirement] = []
+    try:
+        owners = [
+            sid
+            for sid, _ds in ancestor_directives(scope_id, fleet=fleet, summary_store=summary_store)
+        ]
+        for owner in [*owners, scope_id]:
+            done += sweep_date_lapses(
+                owner, fleet=fleet, record_store=record_store, summary_store=summary_store, now=now
+            )
+        compute_retirement_candidates(
+            scope_id, record_store=record_store, summary_store=summary_store, now=now
+        )
+    except Exception:  # noqa: BLE001
+        _logger.exception("forgetting housekeeping failed for scope %r", scope_id)
+    return done
 
 
 # -- fulfils and the owner's confirmation (R2) ---------------------------------------------

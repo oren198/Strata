@@ -74,6 +74,7 @@ from strata.summary_store import (
     ScopeSummary,
     _render_summary,
     adopted_suffix,
+    ends_line_for,
 )
 
 _logger = logging.getLogger(__name__)
@@ -3601,6 +3602,9 @@ def _render_directives_only(directives: Sequence[Directive]) -> str:
             f"- source: scope={directive.source_scope_id} · at={directive.created_at}"
             f"{adopted_suffix(directive)}"
         )
+        ends_line = ends_line_for(directive)
+        if ends_line is not None:
+            lines.append(ends_line)
         lines.append("")
     return "\n".join(lines).rstrip()
 
@@ -4188,6 +4192,7 @@ def _render_contribution_block(
         f"- proposed classification: {contribution.proposed_classification}\n"
         f"- subject: {contribution.subject or '(none)'}\n"
         f"- supersedes: {contribution.supersedes or '(none)'}\n"
+        f"{_render_forgetting_lines(contribution)}"
         f"{_render_adoption_line(adopted)}"
         # Skill is optional (issue #121): show scope alone when absent so the
         # judge never sees a literal "None".
@@ -4195,6 +4200,29 @@ def _render_contribution_block(
         "- content:\n"
         f"    {contribution.content}\n"
     )
+
+
+def _render_forgetting_lines(contribution: Contribution) -> str:
+    """The v1.20 lines of a contribution block, each only when it applies — so a contribution
+    with none of them is byte-identical to before.
+
+    ``ends``: the end condition the directive would carry; the judge judges its merit as it
+    does the rest and does not decide the condition. ``fulfils``: the judged-condition
+    directive this is evidence for. A contribution that names a directive it supersedes may be
+    a pure release or retraction, which has no replacement: ``retire``, not ``publish``."""
+    lines = ""
+    ends = _contribution_end_condition(contribution)
+    if ends is not None:
+        text = f"until {ends.until}" if ends.kind == "date" else f"until: {ends.condition}"
+        lines += f"- binds {text}\n"
+    if getattr(contribution, "fulfils", None):
+        lines += f"- fulfils: {contribution.fulfils}\n"
+    if contribution.supersedes:
+        lines += (
+            "- if this only releases or retracts that directive and states no replacement "
+            "rule, answer `retire`, not `publish`\n"
+        )
+    return lines
 
 
 def _render_adoption_line(adopted: Contribution | None) -> str:

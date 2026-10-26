@@ -155,12 +155,11 @@ def test_a_correction_is_labelled_retracted_and_otherwise_the_same_event(world) 
     assert by_item["c_tokens"]["retirement"]["label"] == "retired"
     # R3: one path, two labels. Same event kind, same audience, same shape.
     assert by_item["c_suite"]["kind"] == by_item["c_tokens"]["kind"] == "directive_retired"
-    strip = lambda c: {
-        k: v
-        for k, v in c.items()
-        if k
-        not in ("retirement", "item_id", "change_id", "created_at", "contribution_id", "before")
-    }  # noqa: E731
+
+    def strip(c: dict) -> dict:
+        skip = ("retirement", "item_id", "change_id", "created_at", "contribution_id", "before")
+        return {k: v for k, v in c.items() if k not in skip}
+
     assert strip(by_item["c_suite"]) == strip(by_item["c_tokens"])
 
 
@@ -272,7 +271,8 @@ def test_the_owners_judge_retires_a_judged_condition_with_the_honest_reason(worl
     assert retirement is not None
     assert retirement.cause == "condition_judged" and retirement.kind == "currency"
     assert retirement.notice == (
-        "end condition judged met: 'the audit closes' / The note says the audit closed on 9 November."
+        "end condition judged met: 'the audit closes' / "
+        "The note says the audit closed on 9 November."
     )
     assert "verified" not in retirement.notice
     assert retirement.evidence_contribution_id == contribution.id
@@ -519,3 +519,82 @@ def test_a_directive_is_minted_with_the_end_condition_its_contribution_carries()
     assert minted.set_by == contribution.id
     plain = _mint_directive(DirectiveOp(op="append"), NEW_CONTRIBUTION)
     assert plain.end_condition is None and plain.set_by is None
+
+
+# -- reads, the judge's view, and the write boundary ---------------------------------------
+
+
+def test_a_descendants_read_lapses_an_ancestors_over_date_and_opens_its_own_candidates(
+    world,
+) -> None:  # noqa: ANN001
+    _set_end(world, "c_suite", EndCondition(kind="date", until="2026-11-09"))
+    done = forgetting.sweep_for_read("g_web", now=NOW, **_kw(world))
+    assert [r.directive_id for r in done] == ["c_suite"]
+    assert "c_suite" not in _binding_ids(_perspective(world, "g_web"))
+    assert any(c["item_id"] == "c_suite" for c in _perspective(world, "g_web")["input_changes"])
+    assert forgetting.sweep_for_read("g_web", now=NOW, **_kw(world)) == []
+
+
+def test_the_judge_sees_the_end_condition_the_fulfils_and_the_retire_not_publish_line() -> None:
+    from strata.scope_manager import _render_contribution_block  # noqa: PLC0415
+    from tests.test_scope_manager import NEW_CONTRIBUTION  # noqa: PLC0415
+
+    plain = _render_contribution_block(NEW_CONTRIBUTION)
+    assert "binds" not in plain and "fulfils" not in plain and "retire" not in plain
+    both = replace(
+        NEW_CONTRIBUTION,
+        ends='{"kind":"judged","until":null,"condition":"the audit closes"}',
+        fulfils="c_x",
+        supersedes="c_y",
+    )
+    text = _render_contribution_block(both)
+    assert "- binds until: the audit closes\n" in text
+    assert "- fulfils: c_x\n" in text
+    assert "answer `retire`, not `publish`" in text
+
+
+def test_the_directive_block_shown_to_a_judge_carries_the_ends_line() -> None:
+    from strata.scope_manager import _render_directives_only  # noqa: PLC0415
+
+    d = Directive(
+        id="c_1",
+        content="Freeze deploys.",
+        source_scope_id="g_a",
+        created_at="2026-10-01T09:00:00+00:00",
+        end_condition=EndCondition(kind="date", until="2026-12-01"),
+        set_by="c_1",
+    )
+    assert "- ends: until=2026-12-01 · set_by=c_1" in _render_directives_only([d])
+    assert "ends:" not in _render_directives_only([replace_ends(d)])
+
+
+def replace_ends(d: Directive) -> Directive:
+    return d.model_copy(update={"end_condition": None, "set_by": None})
+
+
+def test_ends_and_fulfils_are_checked_before_anything_is_appended(world) -> None:  # noqa: ANN001
+    from strata.app import run_contribution  # noqa: PLC0415
+    from strata.fleet_config import Stratum  # noqa: PLC0415
+
+    fleet, store, summaries = world
+    scope = fleet.get_scope("g_org")
+    base = dict(
+        scope=scope,
+        stratum=MagicMock(spec=Stratum),
+        content="Freeze deploys.",
+        subject=None,
+        supersedes=None,
+        contributor=OWNER,
+        fleet=fleet,
+        record_store=store,
+        summary_store=summaries,
+        scope_manager=MagicMock(),
+        summary_max_words=500,
+    )
+    with pytest.raises(ValueError, match="past"):
+        run_contribution(proposed_classification="directive", ends={"until": "2020-01-01"}, **base)
+    with pytest.raises(ValueError, match="only meaningful"):
+        run_contribution(proposed_classification="context", ends={"until": "2999-01-01"}, **base)
+    with pytest.raises(ValueError):
+        run_contribution(proposed_classification="context", fulfils="c_suite", **base)
+    assert store.list_contributions(scope_id="g_org") == []
