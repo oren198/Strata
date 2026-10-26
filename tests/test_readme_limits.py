@@ -39,9 +39,11 @@ def _judge_models() -> str:
 def test_judge_models_ties_the_recommendation_to_its_measurement_and_source() -> None:
     section = _judge_models()
     assert (
-        "I recommend `qwen/qwen3-235b-a22b-2507` on OpenRouter, pinned to the Nebius provider."
-        in section
-    )
+        "The v1.18 baseline ran `qwen/qwen3-235b-a22b-2507` on OpenRouter, pinned to the Nebius "
+        "provider"
+    ) in section
+    # what we used, not what to use
+    assert "I recommend" not in section
     # the v1.18 measurement: model, provider, build, date, reps, source
     assert (
         "`qwen/qwen3-235b-a22b-2507` on OpenRouter, pinned to Nebius, engine `ed31692`, "
@@ -75,7 +77,7 @@ def test_judge_models_keeps_the_key_promise_and_the_no_silent_switch_rule() -> N
         "If your only key is an Anthropic one, the install uses `claude-haiku-4-5` on "
         "Anthropic's own endpoint. That key is never sent to the router. Either way"
     ) in section
-    assert "JUDGE_PROVIDER=Nebius" in section
+    assert "JUDGE_PROVIDER=<provider name>" in section
     assert "A model id ages." in section
     assert "A new provider is a new measurement, not the same judge." in section
 
@@ -85,7 +87,9 @@ def test_judge_models_has_no_unmeasured_superlative_and_states_its_limits() -> N
     lowered = section.lower()
     for word in ("best", "safest", "superior", "strongest", "most accurate", "most secure"):
         assert word not in lowered, word
-    assert "A model not in these tables is unmeasured, not known to be worse." in section
+    assert (
+        "A model or provider not in these tables is unmeasured, not known to be worse." in section
+    )
     assert "it does not rank the judges" not in lowered  # retired by the operator's order
     for limit in (
         "A reworded exception that shares no words with the inherited rule can be admitted when "

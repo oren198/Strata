@@ -246,10 +246,16 @@ class Judgment:
 JUDGE_FAILED = "judge_failed"
 
 
-# The verdicts that count as an *accepted* contribution.  A ``decline`` is the
-# scope-manager rejecting a proposal — it never enters the scope summary, so it
-# is not an acceptance.
-_ACCEPTED_DECISIONS = frozenset({"accept_as_directive", "accept_as_context"})
+#: Verdicts that admit a contribution into a scope's memory (issue #145).
+#:
+#: This is the one definition of "accepted". A ``decline`` is the
+#: scope-manager rejecting a proposal: it never enters the summary, so it is
+#: not in the set. The record, the scope manager, the acted-on check, the
+#: freshness evaluator, and the MCP session counter all read this constant.
+#: Hosts should too (``from strata import ACCEPTED_DECISIONS``) rather than
+#: restate the pair. Adding a verdict to the judgment ``decision`` Literal
+#: without adding it here is a bug the suite catches.
+ACCEPTED_DECISIONS: frozenset[str] = frozenset({"accept_as_directive", "accept_as_context"})
 
 
 #: The engine default for the recency window (ADR 0011 D2): how many of the
@@ -315,6 +321,11 @@ class ContributionState:
       predate the marker.  ``failed_attempts`` still counts its attempts
       (issue #57), so an orphan reads as "pending, N failed attempts" rather
       than being retroactively declared terminal.
+    - ``note`` — an engine note (:func:`is_engine_note`). The engine wrote the
+      row to record that a change notice could not be delivered. It is not
+      waiting on a judgment, and it is not a judge outage. The recency window
+      still reports these rows as ``pending``, so the judge digest does not
+      change.
 
     ``failed_attempts`` counts every attempt event on the contribution,
     marked or not — including attempts that a later successful re-judge
@@ -322,7 +333,7 @@ class ContributionState:
     """
 
     contribution_id: str
-    state: Literal["judged", "judge_failed", "pending"]
+    state: Literal["judged", "judge_failed", "pending", "note"]
     decision: Literal["accept_as_directive", "accept_as_context", "decline"] | None
     failed_attempts: int
     error_class: str | None
@@ -935,6 +946,11 @@ class RecordStore:
         with RecordStore("./strata.db") as rs:
             c = rs.append_contribution(scope_id="g_arch", ...)
     """
+
+    @property
+    def db_path(self) -> str:
+        """The database file this store was opened on (read-only)."""
+        return self._db_path
 
     def __init__(self, db_path: str) -> None:
         self._db_path = str(Path(db_path).expanduser())
@@ -1576,6 +1592,7 @@ class RecordStore:
                 contribution.id,
                 judgments.get(contribution.id),
                 attempts_by_contribution.get(contribution.id, []),
+                subject=contribution.subject,
             )
             for contribution in contributions
         ]
@@ -1683,6 +1700,7 @@ class RecordStore:
                     c.id,
                     judgment_by_contribution.get(c.id),
                     attempts_by_contribution.get(c.id, []),
+                    subject=c.subject,
                 )
                 for c in contributions
             ],
@@ -1801,7 +1819,9 @@ class RecordStore:
         judgment_attempts = self._judgment_attempts_for([contribution_id])
         return RecordEntry(
             contribution=contribution,
-            state=_derive_contribution_state(contribution_id, judgment, judgment_attempts),
+            state=_derive_contribution_state(
+                contribution_id, judgment, judgment_attempts, subject=contribution.subject
+            ),
             judgment=judgment,
             judgment_attempts=judgment_attempts,
         )
@@ -1846,7 +1866,7 @@ class RecordStore:
             WHERE c.supersedes = ? AND j.decision IN (?, ?)
             LIMIT 1
             """,
-            (contribution_id, *_ACCEPTED_DECISIONS),
+            (contribution_id, *ACCEPTED_DECISIONS),
         ).fetchone()
         return row is not None
 
@@ -1970,7 +1990,7 @@ class RecordStore:
         Returns:
             The newest accepted :class:`Contribution`, or ``None``.
         """
-        decisions = tuple(_ACCEPTED_DECISIONS)
+        decisions = tuple(ACCEPTED_DECISIONS)
         placeholders = ", ".join("?" for _ in decisions)
         row = self._conn.execute(
             f"""
@@ -3497,10 +3517,40 @@ class RecordStore:
 # ---------------------------------------------------------------------------
 
 
+ENGINE_NOTE_SUBJECT = "change-emission-failed"
+"""Subject of a row the engine writes when a change notice could not be delivered.
+
+One string, read only through :func:`is_engine_note`. The writer in
+:mod:`strata.change_events` uses this constant; no other site compares it.
+"""
+
+
+def is_engine_note(subject: str | None) -> bool:
+    """True when *subject* marks an engine note, not a contribution to judge.
+
+    A ``change-emission-failed`` row records that a notice could not be
+    written. It has no verdict by design. Readers of derived contribution
+    state use this predicate so the row renders as ``note`` and stays out of
+    pending counts. The judge digest does not: its recency window still
+    reports the row as ``pending``.
+    """
+    return subject == ENGINE_NOTE_SUBJECT
+
+
+def engine_note_rejudge_message(contribution_id: str) -> str:
+    """The refusal ``strata_rejudge`` raises for an engine note."""
+    return (
+        f"Contribution {contribution_id} is an engine note (change emission failed), "
+        "not a judgment waiting to be taken. strata_rejudge does not judge engine notes."
+    )
+
+
 def _derive_contribution_state(
     contribution_id: str,
     judgment: Judgment | None,
     attempts: list[JudgmentAttempt],
+    *,
+    subject: str | None = None,
 ) -> ContributionState:
     """Derive one contribution's :class:`ContributionState` from its verdict and attempts.
 
@@ -3513,7 +3563,9 @@ def _derive_contribution_state(
     # A verdict always wins: a contribution that failed twice and was then
     # re-judged successfully is judged, not judge_failed.
     if judgment is not None:
-        state: Literal["judged", "judge_failed", "pending"] = "judged"
+        state: Literal["judged", "judge_failed", "pending", "note"] = "judged"
+    elif is_engine_note(subject):
+        state = "note"
     elif any(a.outcome == JUDGE_FAILED for a in attempts):
         state = "judge_failed"
     else:
@@ -3696,7 +3748,7 @@ def _outcome_reading(
     *outcome_itself_superseded* — a retracted report is not evidence of anything,
     whether it read as held or replaced.
     """
-    if judgment is None or judgment.decision not in _ACCEPTED_DECISIONS:
+    if judgment is None or judgment.decision not in ACCEPTED_DECISIONS:
         return _READING_EXCLUDED
     if outcome_itself_superseded:
         return _READING_EXCLUDED
@@ -3892,6 +3944,7 @@ def _recent_contribution_from_row(row: sqlite3.Row) -> RecentContribution:
     elif failed_marks:
         state = "judge_failed"
     else:
+        # Engine notes keep their raw state: judge input, app.py ~567, _render_recent_contributions.
         state = "pending"
     return RecentContribution(
         contribution=Contribution(**d, contributor=contributor),

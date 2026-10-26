@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from strata import ACCEPTED_DECISIONS
 from strata.migrator import run_migrations
 from strata.record_store import ContributorRef, RecordStore
 from strata.session_state import (
@@ -546,7 +547,7 @@ def _legacy_last_accepted_contribution_at(
     :func:`strata.session_state._last_accepted_contribution_at` did before the
     record grew a bounded query for it.
     """
-    accepted = frozenset({"accept_as_directive", "accept_as_context"})
+    accepted = ACCEPTED_DECISIONS
     contributions = record_store.list_contributions(scope_id=scope_id)
     judgments = {j.contribution_id: j for j in record_store.list_judgments(scope_id=scope_id)}
 

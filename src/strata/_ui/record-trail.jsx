@@ -25,6 +25,11 @@ const JUDGE_FAILED_META = { label: "Judgment failed", chipClass: "at-pill at-pil
 // distinct label so it never reads as an ordinary stuck judgment.
 const REFRESH_PENDING_META = { label: "Refresh pending", chipClass: "at-pill", icon: "clock" };
 
+// Issue #196: an engine note (state "note", from is_engine_note) is the
+// engine's own record that a change notice could not be delivered. It is
+// not awaiting a judgment.
+const ENGINE_NOTE_META = { label: "Engine note", chipClass: "at-pill", icon: "info" };
+
 // Pure — decides the plain-language label, chip class, and icon for one
 // contribution's state. The single place these words are decided.
 // `attempts` is accepted for signature parity with the judge_failed
@@ -34,6 +39,7 @@ const REFRESH_PENDING_META = { label: "Refresh pending", chipClass: "at-pill", i
 // never plain "Awaiting judgment" — an operator scanning this list for
 // judge outages must not count it as one.
 function stateWords(stateEntry, attempts, subject) {
+  if (stateEntry && stateEntry.state === "note") return ENGINE_NOTE_META;
   if (!stateEntry || stateEntry.state === "pending") {
     return subject === "manager-refresh" ? REFRESH_PENDING_META : FALLBACK_META;
   }
