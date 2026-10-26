@@ -548,6 +548,17 @@ skips all of this and is used as-is. (Reused pids are an edge case for any
 pid-derived id; a new connection that finds a record from an earlier server pid
 archives it and starts fresh.)
 
+**`/mcp reconnect` keeps the session and its binding.** A reconnect restarts the MCP server
+but not the harness. With the automatic session id, the server recognises the same harness
+process (its pid and start time), keeps one session record (counting the reconnect), and
+restores the scope and skill you confirmed with `strata_bind`, after checking them again
+against the current `fleet.yaml` exactly as `strata_bind` would. If that scope was removed
+or the skill is no longer permitted, the session comes up unbound and says why. The saved
+binding is `.strata/sessions/<id>.binding` (mode 0600; deleted after 30 days unused). An
+explicit `STRATA_AGENT_SESSION_ID` turns this off (nothing saved, nothing restored, a new
+connection starts a fresh session), and so does Windows, which has no readable process start
+time.
+
 **Windows: session-state counters are not cross-process locked.** The MCP server
 and the detached evaluator both read-modify-write the same `.strata/sessions/`
 state file. On POSIX each update takes an advisory `fcntl.flock` on a
