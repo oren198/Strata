@@ -30,6 +30,7 @@ the release PR (`dev` → `main`) and the GitHub Release body are built from
 
 ### Changed
 
+- `strata_contribute`'s reply now includes the relation check's answer (kind, verdict, cause) when that check ran, as `strata_publish`'s already does.
 - **One public definition of which verdicts are accepted** (#145).
   `strata.ACCEPTED_DECISIONS` is that set. The record, the scope manager,
   the acted-on check, the freshness evaluator, and the MCP session counter
