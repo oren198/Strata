@@ -10,6 +10,7 @@ the release PR (`dev` → `main`) and the GitHub Release body are built from
 ### Behaviour change
 
 - A context note from a session bound to a scope is now checked against the scope's OWN directives, the way it already was against inherited ones. A note stating an exception in force is declined ("... is this scope's own directive. To change it, supersede or retire it."), a dated departure is admitted as context, and deliberation about changing the rule is admitted. A context note proposed without `supersedes` can no longer supersede or retire an own directive, whatever the judge returns: the engine drops those ops and records it. A context note on a scope that has its own directives but inherits none now costs one extra judge call (shown as its own kind, `own_directive_relation`, in `strata stats judge`). Where the scope also inherits rules, the same single check covers both.
+- "No longer required" and "no longer needed" are now read as a relaxation. A forged "unrelated" relation answer no longer lets a relayed "X is no longer required" through.
 - The operator primitives (`operator_publish`, `operator_supersede_item`, `operator_retire_item`) called without `fleet` now read the fleet beside the store and tell the attachment scope and its subtree, as the CLI always did. Where no fleet can be found from the store they raise instead of writing silently (#195).
 
 ### Fixed

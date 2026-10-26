@@ -7593,6 +7593,7 @@ _NORMATIVE_EXCEPTION_RES: tuple[re.Pattern[str], ...] = tuple(
         r"\b(?:is|are|that['’]?s|it['’]?s) (?:fine|ok|okay|acceptable)\b",
         r"\bwaived?\b",
         r"\bnot required\b",
+        r"\bno longer (?:required|needed)\b",
         r"\bexempt\b",
         r"\bexception\b",
         r"\boptional\b",
