@@ -77,6 +77,7 @@ CONTRIBUTION 3 OF 3:
 - proposed classification: context
 - subject: corpus-item
 - supersedes: c_p1_batch1
+- if this only releases or retracts that directive and states no replacement rule, answer `retire`, not `publish`
 - contributor: skill=engineer scope=g_p1other at=2026-09-24T10:00:00+00:00
 - content:
     Third batch item, superseding the first.
