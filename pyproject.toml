@@ -46,6 +46,7 @@ packages = ["src/strata"]
 include = [
     "src/strata/_skills/**/*",
     "src/strata/_migrations/**/*",
+    "src/strata/_judgecheck/**/*",
     "src/strata/_templates/**/*",
     "src/strata/_hooks/**/*",
     "src/strata/_ui/**/*",
