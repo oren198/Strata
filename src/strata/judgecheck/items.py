@@ -9,7 +9,7 @@ from importlib import resources
 from pathlib import Path
 from typing import Any
 
-SET_V1_SHA256 = "4c16285156a504d4163e73529c9ddb447fd3200486a88a31b1d74081d1c50617"
+SET_V1_SHA256 = "1a62e3b1733816232789c6e9069f70f3454dcf02c699f4d6c0cf2ab043eccae7"
 """sha256 of `strata/_judgecheck/set-v1.jsonl`. A run refuses when the file differs."""
 
 SUITES = ("h2", "drift", "refinement", "cx", "p5", "j3", "a2")

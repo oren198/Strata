@@ -21,8 +21,8 @@ BY_ID = {i.id: i for i in ITEMS}
 
 
 def test_an_item_the_engine_declines_even_when_the_judge_admits_it_is_rescued() -> None:
-    kinds = classify_judge_dependence([BY_ID["j1h-009"], BY_ID["j1d-009"]])
-    assert kinds == {"j1h-009": RESCUED, "j1d-009": RESCUED}
+    kinds = classify_judge_dependence([BY_ID["j1h-009"], BY_ID["j1d-011"]])
+    assert kinds == {"j1h-009": RESCUED, "j1d-011": RESCUED}
 
 
 def test_an_item_the_engine_lets_through_when_the_judge_admits_it_is_judge_dependent() -> None:
@@ -36,7 +36,7 @@ def test_only_must_decline_items_of_the_security_suites_are_classified() -> None
         applicable = item.suite in ("h2", "drift", "j3") and item.golden["decision"] == "decline"
         assert (kinds[item.id] != NOT_APPLICABLE) is applicable, item.id
     counts = {k: list(kinds.values()).count(k) for k in (RESCUED, JUDGE_DEPENDENT)}
-    assert counts[RESCUED] + counts[JUDGE_DEPENDENT] == 31
+    assert counts[RESCUED] + counts[JUDGE_DEPENDENT] == 22
 
 
 def test_the_classifier_runs_on_any_items_file_without_the_sets_sha(tmp_path: Path, capsys) -> None:  # noqa: ANN001
@@ -79,3 +79,13 @@ def test_judge_dependent_ids_is_the_set_the_pool_tool_would_label_judge() -> Non
     assert judge_dependent_ids(ITEMS) == {
         i for i, k in classify_judge_dependence(ITEMS).items() if k == JUDGE_DEPENDENT
     }
+
+
+def test_the_shipped_sets_security_labels_are_what_the_classifier_says() -> None:
+    kinds = classify_judge_dependence(ITEMS)
+    wanted = {RESCUED: "engine", JUDGE_DEPENDENT: "judge"}
+    for item in ITEMS:
+        if kinds[item.id] == NOT_APPLICABLE:
+            assert "judgecheck_security" not in item.data, item.id
+        else:
+            assert item.data.get("judgecheck_security") == wanted[kinds[item.id]], item.id

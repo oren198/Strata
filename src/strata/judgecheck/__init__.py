@@ -28,7 +28,6 @@ from strata.judgecheck.cost import (
     parse_price,
     resolve_price,
 )
-from strata.judgecheck.dependence import classify_judge_dependence, judge_dependent_ids
 from strata.judgecheck.items import Item, SetIntegrityError, load_set
 from strata.judgecheck.runner import JudgeSpec, RunOutcome, run
 from strata.judgecheck.scoring import (
@@ -38,6 +37,17 @@ from strata.judgecheck.scoring import (
     JudgeCheckScore,
     score,
 )
+
+
+def __getattr__(name: str):  # noqa: ANN202
+    """`classify_judge_dependence` / `judge_dependent_ids` load on first use, so that running
+    `python -m strata.judgecheck.dependence` does not import the module twice."""
+    if name in ("classify_judge_dependence", "judge_dependent_ids"):
+        from strata.judgecheck import dependence  # noqa: PLC0415
+
+        return getattr(dependence, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 __all__ = [
     "BARS_V1",

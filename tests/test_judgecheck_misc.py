@@ -70,7 +70,7 @@ def test_the_estimate_uses_the_sets_own_prompt_sizes() -> None:
     sizes = [item_prompt_chars(i) for i in ITEMS]
     assert all(s > 1000 for s in sizes)
     est = estimate(sizes, reps=3, price=parse_price("0.22,0.88"))
-    assert est.judgments == 89 * 3 and est.est_usd > 0
+    assert est.judgments == 78 * 3 and est.est_usd > 0
 
 
 def test_usage_metering_is_bound_to_a_temp_ledger_during_a_run_and_restored_after() -> None:

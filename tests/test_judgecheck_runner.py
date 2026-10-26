@@ -41,7 +41,7 @@ VERSION = "9.9.9"
 #: Two a2 items whose golden (a context note that RETIRES an own directive) cannot be met on
 #: this engine: it drops the ops of a context note and declines a note that contradicts an own
 #: directive. Any judge, however good, fails them; reported to the set's owner.
-UNATTAINABLE = {"a2-004", "a2-009"}
+UNATTAINABLE: set[str] = set()  # a2-004 / a2-009 left the set: nothing is out of a judge's reach
 
 BARS = Bars(
     suite_accuracy={
@@ -69,7 +69,7 @@ def _go(client: GoldenClient, *, reps: int = 1, **kw):  # noqa: ANN003, ANN202
 
 def test_a_judge_that_follows_the_goldens_meets() -> None:
     outcome, s = _go(GoldenClient(ITEMS))
-    assert len(outcome.results["cand"]) == 89 and outcome.incomplete is None
+    assert len(outcome.results["cand"]) == 78 and outcome.incomplete is None
     wrong = {i for i, v in s.per_item.items() if not v["strict"][0]}
     assert wrong == UNATTAINABLE
     assert s.failed_legs == [] and s.verdict == f"meets the judge-check v1 bar for Strata {VERSION}"
@@ -123,8 +123,8 @@ def test_the_cap_stops_the_run_and_never_overspends() -> None:
     assert outcome.incomplete is not None and outcome.incomplete.reason == "cap reached"
     assert outcome.spent_usd <= 0.5
     done = len(outcome.results["cand"])
-    assert s.verdict == f"incomplete: cap reached at {done}/89"
-    assert 0 < done < 89
+    assert s.verdict == f"incomplete: cap reached at {done}/78"
+    assert 0 < done < 78
     # the run stopped within one call's worst case of the cap
     from strata.judgecheck.cost import worst_case_cost  # noqa: PLC0415
 

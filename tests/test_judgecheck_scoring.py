@@ -28,17 +28,17 @@ def _run(reps: int = 3, mutate=None, **kw):  # noqa: ANN001, ANN003, ANN202
     return score(results, ITEMS, reps=reps, strata_version=VERSION, **kw)
 
 
-def test_the_set_is_the_89_items_in_seven_suites() -> None:
+def test_the_set_is_the_78_items_in_seven_suites() -> None:
     counts: dict[str, int] = {}
     for i in ITEMS.values():
         counts[i.suite] = counts.get(i.suite, 0) + 1
     assert counts == {
-        "h2": 16,
-        "drift": 16,
+        "h2": 10,
+        "drift": 12,
         "p5": 15,
         "cx": 12,
-        "j3": 12,
-        "a2": 10,
+        "j3": 13,
+        "a2": 8,
         "refinement": 8,
     }
 
@@ -73,7 +73,9 @@ def test_flipping_one_must_decline_item_fails_the_security_leg() -> None:
 
 def test_a_must_decline_item_declined_in_two_of_three_reps_still_passes_the_leg() -> None:
     target = next(
-        i for i in ITEMS.values() if i.suite == "drift" and i.golden["decision"] == "decline"
+        i
+        for i in ITEMS.values()
+        if i.suite == "drift" and i.data.get("judgecheck_security") == "judge"
     )
 
     def flip_one_rep(item, r, rep):  # noqa: ANN001, ANN202
@@ -207,10 +209,10 @@ def test_an_incomplete_run_says_how_far_it_got_whatever_else_is_true() -> None:
         reps=1,
         strata_version=VERSION,
         bars=BARS,
-        incomplete=IncompleteInfo("cap reached", 30, 89),
+        incomplete=IncompleteInfo("cap reached", 30, 78),
     )
-    assert s.verdict == "incomplete: cap reached at 30/89"
-    assert s.incomplete == {"reason": "cap reached", "completed": 30, "total": 89}
+    assert s.verdict == "incomplete: cap reached at 30/78"
+    assert s.incomplete == {"reason": "cap reached", "completed": 30, "total": 78}
 
 
 def test_the_verdict_never_uses_the_forbidden_words() -> None:
@@ -265,11 +267,10 @@ def test_a2_op_choice_is_graded_on_the_op_not_only_the_decision() -> None:
 def test_a_failed_judgment_is_wrong_both_ways_and_the_result_is_json_ready() -> None:
     import json  # noqa: PLC0415
 
-    r = ItemResult("j1d-009", "drift", 0, "c", "judge_error", error_status=503, calls=2)
+    drift_id = next(i.id for i in ITEMS.values() if i.suite == "drift")
+    r = ItemResult(drift_id, "drift", 0, "c", "judge_error", error_status=503, calls=2)
     s = score([r], ITEMS, reps=1, strata_version=VERSION)
-    assert s.per_item["j1d-009"]["strict"] == [False] and s.per_item["j1d-009"]["lenient"] == [
-        False
-    ]
+    assert s.per_item[drift_id]["strict"] == [False] and s.per_item[drift_id]["lenient"] == [False]
     json.dumps(s.to_dict())
 
 
@@ -342,7 +343,32 @@ def test_a_judge_item_that_is_not_declined_still_fails_the_leg() -> None:
 
 
 def test_an_unclassified_set_counts_every_must_decline_item_as_the_judges() -> None:
-    s = _run()
-    assert s.hard_legs["security"]["must_decline_items"] == 31
+    from strata.judgecheck.items import Item  # noqa: PLC0415
+
+    bare = {
+        iid: Item(
+            id=iid,
+            suite=i.suite,
+            data={k: v for k, v in i.data.items() if k != "judgecheck_security"},
+        )
+        for iid, i in ITEMS.items()
+    }
+    results = [golden_result(i) for i in bare.values()]
+    s = score(results, bare, reps=1, strata_version=VERSION)
+    assert s.hard_legs["security"]["must_decline_items"] == 22
     assert s.hard_legs["engine_defences"]["items"] == 0
     assert s.hard_legs["engine_defences"]["label"] == "engine defences held: 0/0"
+
+
+def test_the_shipped_set_marks_exactly_its_22_must_decline_items() -> None:
+    marked = {i.id: i.data.get("judgecheck_security") for i in ITEMS.values()}
+    must_decline = {
+        i.id
+        for i in ITEMS.values()
+        if i.suite in ("h2", "drift", "j3") and i.golden["decision"] == "decline"
+    }
+    assert {k for k, v in marked.items() if v} == must_decline and len(must_decline) == 22
+    assert sorted(v for v in marked.values() if v).count("judge") == 16
+    s = _run()
+    assert s.hard_legs["security"]["must_decline_items"] == 16
+    assert s.hard_legs["engine_defences"]["label"] == "engine defences held: 6/6"
