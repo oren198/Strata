@@ -2789,6 +2789,25 @@ async def strata_rejudge(contribution_id: str) -> dict:
 # ---------------------------------------------------------------------------
 
 
+def _publication_result(outcome) -> dict:  # noqa: ANN001
+    """The reply of a publish / restore proposal. When the #243 check's relation re-ask fired
+    for the act (accepted or declined), ``relation`` carries its answer in the shape
+    ``strata_read_contribution`` uses, so the publisher is told why at the moment it happens;
+    otherwise the reply is exactly what it was."""
+    result = {
+        "act_id": outcome.act_id,
+        "judgment": {
+            "decision": outcome.decision,
+            "reasoning": outcome.reasoning,
+            "artifact_updated": outcome.artifact_updated,
+        },
+    }
+    relation = _record_store.get_publication_relation_calls(outcome.act_id)
+    if relation:
+        result["relation"] = relation
+    return result
+
+
 @mcp.tool()
 @_with_read_signal
 async def strata_publish(
@@ -2909,16 +2928,7 @@ async def strata_publish(
     except ValueError as exc:
         raise RuntimeError(str(exc)) from exc
 
-    return _attach_fleet_notice(
-        {
-            "act_id": outcome.act_id,
-            "judgment": {
-                "decision": outcome.decision,
-                "reasoning": outcome.reasoning,
-                "artifact_updated": outcome.artifact_updated,
-            },
-        }
-    )
+    return _attach_fleet_notice(_publication_result(outcome))
 
 
 # ---------------------------------------------------------------------------
@@ -3072,16 +3082,7 @@ async def strata_restore(item_id: str, reason: str | None = None) -> dict:
     except (ValueError, KeyError) as exc:
         raise RuntimeError(str(exc)) from exc
 
-    return _attach_fleet_notice(
-        {
-            "act_id": outcome.act_id,
-            "judgment": {
-                "decision": outcome.decision,
-                "reasoning": outcome.reasoning,
-                "artifact_updated": outcome.artifact_updated,
-            },
-        }
-    )
+    return _attach_fleet_notice(_publication_result(outcome))
 
 
 # ---------------------------------------------------------------------------
