@@ -7,6 +7,12 @@ the release PR (`dev` → `main`) and the GitHub Release body are built from
 
 ## Unreleased
 
+### Added
+
+- A bound session retires its own directive with the MCP tool `strata_retire`, and lists or dismisses its own candidates with `strata_retirement_candidates` and `strata_dismiss_candidate`. Those tools take no scope and no actor. `strata_contribute` accepts `ends` (a date or a judged condition, on a directive proposal) and `fulfils` (evidence that a judged condition was met). `POST /contribute` is unchanged.
+- The operator commands `strata operator publish` and `strata operator supersede` take `--until` or `--when` (on supersede, only an `op_` id). `strata operator retire-item`, `strata operator candidates`, and `strata operator dismiss-candidate` cover operator-item forgetting. `strata stats forgetting` counts scope retirements and candidates, and says that operator items are not counted.
+- The Console shows an end condition on a directive, a retirement's label and notice, read-only scope candidates, operator candidates with dismiss, and the forgetting counts.
+
 ### Behaviour change
 
 - A context note from a session bound to a scope is now checked against the scope's OWN directives, the way it already was against inherited ones. A note stating an exception in force is declined ("... is this scope's own directive. To change it, supersede or retire it."), a dated departure is admitted as context, and deliberation about changing the rule is admitted. A context note proposed without `supersedes` can no longer supersede or retire an own directive, whatever the judge returns: the engine drops those ops and records it. A context note on a scope that has its own directives but inherits none now costs one extra judge call (shown as its own kind, `own_directive_relation`, in `strata stats judge`). Where the scope also inherits rules, the same single check covers both.

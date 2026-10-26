@@ -195,18 +195,194 @@ function ScopeDetail({ scope_id, state, dispatch, onBack, onFlash, embedded = fa
   );
 }
 
+function bindsUntilLine(directive) {
+  const end = directive && directive.end_condition;
+  if (!end) return null;
+  if (end.until) return `binds until ${end.until}`;
+  if (end.condition) return `binds until: ${end.condition}`;
+  return null;
+}
+
+function retirementLabel(kind) {
+  return kind === "correction" ? "retracted" : "retired";
+}
+
+const PROMPT_ONLY = "prompts the question only";
+
+function candidateDisplay(candidate) {
+  const stored = ((candidate && candidate.note) || "").trim();
+  if (candidate && (candidate.ground === "age" || candidate.ground === "disuse")) {
+    return `${stored} ${PROMPT_ONLY}`.trim();
+  }
+  return (candidate && candidate.display) || stored;
+}
+
+function ScopeCandidateList({ candidates }) {
+  const rows = (candidates || []).filter((row) => !String(row.directive_id || "").startsWith("op_"));
+  return (
+    <div>
+      <div style={{
+        fontSize: 11, fontWeight: 600, color: "var(--at-muted)",
+        textTransform: "uppercase", letterSpacing: "0.1em", marginBottom: 8,
+      }}>
+        Scope candidates
+      </div>
+      {rows.length === 0 ? (
+        <div style={{ fontSize: 13, color: "var(--at-muted)", fontStyle: "italic" }}>
+          No open scope candidates.
+        </div>
+      ) : (
+        <ul style={{ listStyle: "none", padding: 0, margin: 0, display: "flex", flexDirection: "column", gap: 4 }}>
+          {rows.map((row) => (
+            <li key={row.id} className="at-caption" style={{ color: "var(--at-muted)" }}>
+              <code style={{ fontFamily: "var(--font-mono)" }}>{row.directive_id}</code>
+              {" "}{row.ground}{" — "}{candidateDisplay(row)}
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+function OperatorCandidateList({ candidates, onDismissed }) {
+  const [reason, setReason] = React.useState("");
+  const [days, setDays] = React.useState("30");
+  const [error, setError] = React.useState(null);
+  const rows = candidates || [];
+
+  async function dismiss(candidateId) {
+    const parsed = Number(days);
+    if (!Number.isInteger(parsed) || parsed < 1 || parsed > 365) {
+      setError("days must be an integer from 1 to 365.");
+      return;
+    }
+    if (!reason.trim()) {
+      setError("A dismissal needs a reason.");
+      return;
+    }
+    setError(null);
+    try {
+      await window.STRATA_STORE.dismissOperatorCandidate(candidateId, { reason: reason.trim(), days: parsed });
+      setReason("");
+      if (onDismissed) onDismissed();
+    } catch (err) {
+      setError(err.message || String(err));
+    }
+  }
+
+  return (
+    <div>
+      <div style={{
+        fontSize: 11, fontWeight: 600, color: "var(--at-muted)",
+        textTransform: "uppercase", letterSpacing: "0.1em", marginBottom: 8,
+      }}>
+        Operator candidates
+      </div>
+      {rows.length === 0 ? (
+        <div style={{ fontSize: 13, color: "var(--at-muted)", fontStyle: "italic" }}>
+          No open operator candidates.
+        </div>
+      ) : (
+        <ul style={{ listStyle: "none", padding: 0, margin: 0, display: "flex", flexDirection: "column", gap: 8 }}>
+          {rows.map((row) => (
+            <li key={row.id} className="at-caption" style={{ color: "var(--at-muted)" }}>
+              <div>
+                <code style={{ fontFamily: "var(--font-mono)" }}>{row.directive_id}</code>
+                {" "}{row.ground}{" — "}{candidateDisplay(row)}
+              </div>
+              <button type="button" onClick={() => dismiss(row.id)}>Dismiss</button>
+            </li>
+          ))}
+        </ul>
+      )}
+      {rows.length > 0 && (
+        <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+          <input
+            aria-label="Dismissal reason"
+            value={reason}
+            onChange={(event) => setReason(event.target.value)}
+            placeholder="Reason"
+          />
+          <input
+            aria-label="Dismissal days"
+            value={days}
+            onChange={(event) => setDays(event.target.value)}
+            placeholder="Days"
+          />
+        </div>
+      )}
+      {error && <div style={{ color: "var(--at-bear)", fontSize: 12, marginTop: 6 }}>{error}</div>}
+    </div>
+  );
+}
+
+function ForgettingMetricsPanel({ metrics }) {
+  if (!metrics) return null;
+  const condensation = metrics.condensation || {};
+  const candidates = metrics.candidates || {};
+  return (
+    <div>
+      <div style={{
+        fontSize: 11, fontWeight: 600, color: "var(--at-muted)",
+        textTransform: "uppercase", letterSpacing: "0.1em", marginBottom: 8,
+      }}>
+        Forgetting
+      </div>
+      <div className="at-caption" style={{ color: "var(--at-muted)" }}>
+        lapses: {metrics.lapses}; releases: {metrics.releases}; retractions: {metrics.retractions}; condition_judged: {metrics.condition_judged}
+      </div>
+      {Object.keys(candidates).map((ground) => (
+        <div key={ground} className="at-caption" style={{ color: "var(--at-muted)" }}>
+          {ground}: open {candidates[ground].open}, dismissed {candidates[ground].dismissed}, acted {candidates[ground].acted}
+        </div>
+      ))}
+      <div className="at-caption" style={{ color: "var(--at-muted)" }}>
+        condensation writes: {condensation.writes}; measured: {condensation.measured}; unmeasured: {condensation.unmeasured}; inversions: {condensation.inversions}; coverage: {String(condensation.coverage)}
+      </div>
+      <div className="at-caption" style={{ color: "var(--at-muted)" }}>
+        condensation unmeasured_by_reason: {JSON.stringify(condensation.unmeasured_by_reason || {})}
+      </div>
+      <div className="at-caption">{metrics.operator_items || "operator items not counted"}</div>
+    </div>
+  );
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // BackendScopeSummary — renders the directives + context from the backend.
 // ─────────────────────────────────────────────────────────────────────
 function BackendScopeSummary({ scope, summary, loading, error, onRefetch, onFlash }) {
   const [supersedeTarget, setSupersedeTarget] = React.useState(null);
   const [retireTarget, setRetireTarget] = React.useState(null);
+  const [scopeCandidates, setScopeCandidates] = React.useState([]);
+  const [operatorCandidates, setOperatorCandidates] = React.useState([]);
+  const [forgettingMetrics, setForgettingMetrics] = React.useState(null);
+  const scopeId = scope && scope.id;
+
+  const loadForgetting = React.useCallback(() => {
+    const store = window.STRATA_STORE;
+    if (!store || !scopeId || !store.fetchScopeCandidates) return;
+    Promise.all([
+      store.fetchScopeCandidates(scopeId),
+      store.fetchOperatorCandidates(scopeId),
+      store.fetchForgettingMetrics(scopeId),
+    ]).then(([scopeRows, operatorRows, metrics]) => {
+      setScopeCandidates((scopeRows && scopeRows.candidates) || []);
+      setOperatorCandidates((operatorRows && operatorRows.candidates) || []);
+      setForgettingMetrics(metrics || null);
+    }).catch(() => {});
+  }, [scopeId]);
+
+  React.useEffect(() => {
+    loadForgetting();
+  }, [loadForgetting, summary]);
 
   const handleDone = React.useCallback(() => {
     setSupersedeTarget(null);
     setRetireTarget(null);
     if (onRefetch) onRefetch();
-  }, [onRefetch]);
+    loadForgetting();
+  }, [onRefetch, loadForgetting]);
 
   if (loading) {
     return (
@@ -259,7 +435,9 @@ function BackendScopeSummary({ scope, summary, loading, error, onRefetch, onFlas
           </div>
         ) : (
           <ul style={{ listStyle: "none", padding: 0, margin: 0, display: "flex", flexDirection: "column", gap: 8 }}>
-            {directives.map((d, i) => (
+            {directives.map((d, i) => {
+              const untilLine = bindsUntilLine(d);
+              return (
               <li key={d.id || i} style={{
                 background: "var(--at-bg)",
                 border: "1px solid var(--at-rule)",
@@ -276,6 +454,11 @@ function BackendScopeSummary({ scope, summary, loading, error, onRefetch, onFlas
                   <div style={{ fontSize: 13, color: "var(--at-ink-soft)", lineHeight: 1.5, whiteSpace: "pre-wrap" }}>
                     {d.content || d}
                   </div>
+                  {untilLine && (
+                    <div className="at-caption" style={{ color: "var(--at-muted)", marginTop: 4 }}>
+                      {untilLine}
+                    </div>
+                  )}
                 </div>
                 {d.id && (
                   <div style={{ display: "flex", gap: 2, flexShrink: 0 }}>
@@ -293,7 +476,8 @@ function BackendScopeSummary({ scope, summary, loading, error, onRefetch, onFlas
                   </div>
                 )}
               </li>
-            ))}
+              );
+            })}
           </ul>
         )}
       </div>
@@ -308,16 +492,26 @@ function BackendScopeSummary({ scope, summary, loading, error, onRefetch, onFlas
             Retired here
           </div>
           <ul style={{ listStyle: "none", padding: 0, margin: 0, display: "flex", flexDirection: "column", gap: 4 }}>
-            {retirements.map((r) => (
+            {retirements.map((r) => {
+              const label = retirementLabel(r.kind);
+              const notice = r.notice || r.reason;
+              return (
               <li key={r.id} className="at-caption" style={{ color: "var(--at-muted)" }}>
                 <code style={{ fontFamily: "var(--font-mono)" }}>{r.directive_id}</code>
-                {" retired "}{humanAgo(r.created_at)}
-                {r.changed_circumstance ? ` — changed circumstance: ${r.changed_circumstance}` : (r.reason ? ` — ${r.reason}` : "")}
+                {" "}{label}{" "}{humanAgo(r.created_at)}
+                {notice ? ` — ${notice}` : ""}
+                {r.cause ? ` — ${r.cause}` : ""}
+                {r.changed_circumstance ? ` — changed circumstance: ${r.changed_circumstance}` : ""}
               </li>
-            ))}
+              );
+            })}
           </ul>
         </div>
       )}
+
+      <ScopeCandidateList candidates={scopeCandidates} />
+      <OperatorCandidateList candidates={operatorCandidates} onDismissed={loadForgetting} />
+      <ForgettingMetricsPanel metrics={forgettingMetrics} />
 
       {/* Context */}
       <div>
