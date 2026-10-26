@@ -928,7 +928,16 @@ The set is public, which shapes what a pass means:
 
 **The report** records the model, the provider and the host part of the base URL. It never records the API key, the full base URL or a query string.
 
-**In `strata doctor`.** Doctor shows one line for the report saved for this engine version, in one of four states: meets, does not meet, incomplete (with the report's date and a prompt to re-run), or unmeasured. The line does not change doctor's exit status.
+**In `strata doctor`.** Doctor shows one line about the judge-check report saved for this engine version. It reads that report and never runs the judge itself. The line never changes doctor's exit status. It has one of six forms, and doctor never shows one form in place of another:
+
+| Doctor shows | When |
+|---|---|
+| meets the v1 bar (report \<date\>) | the saved report meets the bar |
+| does not meet (\<failed legs\>) | the saved report misses the bar; the line names the parts that failed |
+| incomplete (report \<date\>); re-run | the saved run stopped before it finished |
+| report not understood (report \<date\>); re-run | a report is saved, but doctor can't interpret it |
+| could not read the report (\<ExceptionClass\>) | the report file exists, but doctor can't read it |
+| unmeasured for this engine version | no report is saved for this engine version, or this build has no reference bars |
 
 ### Fleet structure changes
 
