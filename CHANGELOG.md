@@ -5,15 +5,40 @@ the release PR (`dev` → `main`) and the GitHub Release body are built from
 (`docs/releasing.md`, step 3) — write entries here as work lands, and the
 "Unreleased" section is cleared once a release ships.
 
-## Unreleased
+## 1.19.0 (2026-10-26)
+
+Measured on `qwen/qwen3-235b-a22b-2507` pinned to Parasail; the numbers are in
+[docs/evidence/v1.19-judge-baseline.md](docs/evidence/v1.19-judge-baseline.md).
 
 ### Behaviour change
 
 - A context note from a session bound to a scope is now checked against the scope's OWN directives, the way it already was against inherited ones. A note stating an exception in force is declined ("... is this scope's own directive. To change it, supersede or retire it."), a dated departure is admitted as context, and deliberation about changing the rule is admitted. A context note proposed without `supersedes` can no longer supersede or retire an own directive, whatever the judge returns: the engine drops those ops and records it. A context note on a scope that has its own directives but inherits none now costs one extra judge call (shown as its own kind, `own_directive_relation`, in `strata stats judge`). Where the scope also inherits rules, the same single check covers both.
 - The operator primitives (`operator_publish`, `operator_supersede_item`, `operator_retire_item`) called without `fleet` now read the fleet beside the store and tell the attachment scope and its subtree, as the CLI always did. Where no fleet can be found from the store they raise instead of writing silently (#195).
+- **An admitted departure keeps its label** (#243). When a note that departs
+  from a rule is admitted, the stored context line starts "Departure from <id>
+  (<scope>): ", so agents reading the summary see it as a departure. After any
+  context write the engine puts a labelled line back if the new context lost
+  it, and counts each loss (`departure_label_lost`) and each restore
+  (`departure_label_restored`). Under a tight summary budget the rest of the
+  note can still be reworded.
+- **The operator-attribution re-check also fires on an echo** (#138). The one
+  corrective re-ask used to fire only when the judge cited an operator
+  directive. It now also fires when the admitted content matches an operator
+  directive's subject. The judge may keep its answer; the gap is then
+  recorded, never filled in by the engine.
 
 ### Fixed
 
+- **A transport error on the relation re-ask now fails closed.** A 429, 5xx,
+  timeout or connection error on the #242/#243/#244 re-ask used to be read
+  as "no answer" and let the note or publication through, so a departure
+  could be published without its label. The re-ask is now retried, and if it
+  still fails the contribution waits unjudged, or the publication is not
+  made, the same as with an unreachable judge. It can be retried.
+- **Deliberation about a rule is not read as practice.** "Proposing that we
+  review whether <rule> still fits" and questions such as "Should we keep
+  requiring ...?" are admitted as deliberation. A note that says what is
+  already done ("currently", "anyway", "already") is still read as practice.
 - **A perspective read no longer waits without a bound on a scope lock**
   (#196). The MCP drain waits at most two seconds. If the lock is still
   held, the read returns the perspective with `refresh_pending` and leaves
@@ -33,6 +58,10 @@ the release PR (`dev` → `main`) and the GitHub Release body are built from
   `strata.ACCEPTED_DECISIONS` is that set. The record, the scope manager,
   the acted-on check, the freshness evaluator, and the MCP session counter
   all read it, instead of each restating the pair.
+- **README: which judge each number was measured on.** The README states the
+  judge model and provider behind each number, not which judge to use.
+  `JUDGE_PROVIDER` is optional: unset, OpenRouter routes with fallback;
+  pinned, it never falls back.
 
 ## 1.18.3 (2026-10-22)
 
