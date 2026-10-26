@@ -162,6 +162,75 @@ def test_doctor_no_bars_verdict_stays_unmeasured(
     assert doc_rc == 1
 
 
+def test_doctor_unrecognised_verdict_says_report_not_understood(
+    _offline, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An unrecognised verdict string is not printed as unmeasured."""
+    _box, state = _offline
+    rc, _out, err = invoke(capsys, ["judge-check", "--yes", "--price", "0.2,0.8", "--reps", "1"])
+    assert rc == 0, err
+    path = report_json(state)
+    report = json.loads(path.read_text(encoding="utf-8"))
+    report["verdict"] = "not-a-known-line VERDICT-SECRET"
+    path.write_text(json.dumps(report), encoding="utf-8")
+    date = report["header"]["date"]
+    doc_rc, out, err = _doctor(capsys)
+    line = f"Judge check: report not understood (report {date}); re-run"
+    assert line in out
+    assert _judge_lines(out, err) == [f"  ✓ {line}"] or _judge_lines(out, err) == [f"  OK {line}"]
+    assert "VERDICT-SECRET" not in out + err
+    assert "unmeasured" not in "".join(_judge_lines(out, err))
+    assert "Judge check:" not in err
+    assert doc_rc == 1
+
+
+def test_doctor_lookup_exception_names_the_class_only(
+    _offline, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A lookup exception names the class. The exception message is not printed."""
+
+    class LookupBoom(RuntimeError):
+        pass
+
+    def explode(_settings: object) -> dict[str, str]:
+        raise LookupBoom("sk-or-v1-THIS-MESSAGE-MUST-NOT-PRINT")
+
+    monkeypatch.setattr("strata.judgecheck.config.describe_judge", explode)
+    doc_rc, out, err = _doctor(capsys)
+    line = "Judge check: could not read the report (LookupBoom)"
+    assert line in out
+    assert _judge_lines(out, err) == [f"  ✓ {line}"] or _judge_lines(out, err) == [f"  OK {line}"]
+    assert "THIS-MESSAGE-MUST-NOT-PRINT" not in out + err
+    assert "unmeasured" not in "".join(_judge_lines(out, err))
+    assert "Judge check:" not in err
+    assert doc_rc == 1
+
+
+def test_doctor_multiline_message_is_report_not_understood(
+    _offline, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A newline in the judge-check message is an unrecognised report."""
+    _box, state = _offline
+    rc, _out, err = invoke(capsys, ["judge-check", "--yes", "--price", "0.2,0.8", "--reps", "1"])
+    assert rc == 0, err
+    report = json.loads(report_json(state).read_text(encoding="utf-8"))
+    date = report["header"]["date"]
+
+    def multiline() -> str:
+        return f"meets the v1 bar (report {date})\nMULTI-LINE-SECRET"
+
+    monkeypatch.setattr("strata.judgecheck.report.doctor_judge_check_message", multiline)
+    doc_rc, out, err = _doctor(capsys)
+    line = f"Judge check: report not understood (report {date}); re-run"
+    assert line in out
+    assert _judge_lines(out, err) == [f"  ✓ {line}"] or _judge_lines(out, err) == [f"  OK {line}"]
+    assert "MULTI-LINE-SECRET" not in out + err
+    assert "unmeasured" not in "".join(_judge_lines(out, err))
+    assert "\n" not in _judge_lines(out, err)[0]
+    assert "Judge check:" not in err
+    assert doc_rc == 1
+
+
 def test_doctor_does_not_run_the_judge_or_prompt(
     _offline, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

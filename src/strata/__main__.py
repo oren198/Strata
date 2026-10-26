@@ -1253,8 +1253,9 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     11. Structure emission (ADR 0014 D8) — soft. Lists every ``remove_edge``
         or ``reparent`` act for which ``unemitted_receivers`` is not ``[]``.
     12. Judge check — one informational line (meets, does not meet,
-        incomplete, or unmeasured for this engine version). Soft and always
-        passing: it never calls the judge and never changes the exit status.
+        incomplete, unmeasured, report not understood, or could not read
+        the report). Soft and always passing: it never calls the judge and
+        never changes the exit status.
     """
     from strata.bootstrap import load_fleet_config
     from strata.fleet_config import FleetConfigError
@@ -2124,18 +2125,21 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 def _judge_check_status() -> Check:
     """One judge-check line. Always a passing soft check.
 
-    The message is one of the four states from ``doctor_judge_check_message``.
-    A lookup error is the unmeasured state. Doctor's exit status is the other
-    checks' alone.
+    A lookup exception names the exception class. A message that contains a
+    newline is an unrecognised report, so it uses the report-not-understood
+    line. Doctor's exit status is the other checks' alone.
     """
-    from strata.judgecheck.report import doctor_judge_check_message
+    from strata.judgecheck.report import (
+        doctor_judge_check_message,
+        report_not_understood_message,
+    )
 
     try:
         message = doctor_judge_check_message()
-    except Exception:  # noqa: BLE001 — this line must not abort doctor
-        message = "unmeasured for this engine version"
+    except Exception as exc:  # noqa: BLE001 — this line must not abort doctor
+        message = f"could not read the report ({type(exc).__name__})"
     if "\n" in message or "\r" in message:
-        message = "unmeasured for this engine version"
+        message = report_not_understood_message()
     return Check(name="Judge check", kind="soft", passed=True, message=message)
 
 

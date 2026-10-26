@@ -49,8 +49,10 @@ Reports are written under the user state directory, `$XDG_STATE_HOME/strata/judg
 - `Judge check: does not meet (<legs>)`
 - `Judge check: incomplete (report <date>); re-run`
 - `Judge check: unmeasured for this engine version`
+- `Judge check: report not understood (report <date>); re-run`
+- `Judge check: could not read the report (<ExceptionClass>)`
 
-The incomplete line is for a saved verdict that starts with `incomplete`, including `incomplete: cap reached at N/M` and `incomplete, re-run: all errors were 429s`. The unmeasured line is only for no saved report for this engine version, or for the verdict `unmeasured: no reference bars in this build`. One state is not reworded into another.
+The incomplete line is for a saved verdict that starts with `incomplete`, including `incomplete: cap reached at N/M` and `incomplete, re-run: all errors were 429s`. The unmeasured line is only for no saved report for this engine version, or for the verdict `unmeasured: no reference bars in this build`. An unrecognised verdict string is `Judge check: report not understood (report <date>); re-run`. A lookup that raises is `Judge check: could not read the report (<ExceptionClass>)`: the exception class name only, not the exception message. A doctor message that contains a newline is an unrecognised report and uses the report-not-understood line. One state is not reworded into another.
 
 The line does not call the judge, does not ask a question, and does not change `strata doctor`'s exit status.
 

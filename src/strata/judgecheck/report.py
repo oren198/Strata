@@ -214,13 +214,63 @@ def _read_report(path: Path) -> dict[str, Any] | None:
     return loaded if isinstance(loaded, dict) else None
 
 
+def _one_line_date(value: object) -> str | None:
+    """A report date that can sit inside one doctor line."""
+    if isinstance(value, str) and value and "\n" not in value and "\r" not in value:
+        return value
+    return None
+
+
+def _saved_report_date() -> str | None:
+    """The saved report's date, when this engine version has one single-line date."""
+    from strata import __version__
+    from strata.judgecheck.config import describe_judge
+    from strata.settings import Settings
+
+    settings = Settings()
+    described = describe_judge(settings)
+    path = (
+        report_dir(
+            engine_version=__version__,
+            model=str(described.get("model")),
+            provider=described.get("provider"),
+            host=described.get("base_url_host"),
+        )
+        / "report.json"
+    )
+    report = _read_report(path)
+    if not isinstance(report, dict):
+        return None
+    header = report.get("header")
+    if not isinstance(header, dict) or header.get("engine_version") != __version__:
+        return None
+    return _one_line_date(header.get("date"))
+
+
+def report_not_understood_message() -> str:
+    """Suffix for an unrecognised report. One line, and this does not raise.
+
+    The date is the saved report's date when that date is a single line.
+    Otherwise it is ``unknown``. The verdict text is not copied.
+    """
+    date = "unknown"
+    try:
+        date = _saved_report_date() or "unknown"
+    except Exception:  # noqa: BLE001 — a date lookup must not raise into doctor
+        date = "unknown"
+    text = f"report not understood (report {date}); re-run"
+    if "\n" in text or "\r" in text:
+        return "report not understood (report unknown); re-run"
+    return text
+
+
 def doctor_judge_check_message() -> str:
     """The suffix ``strata doctor`` prints after ``Judge check:``.
 
-    One of four states. Reads a local file only: no judge call, no prompt.
-    No report for this engine version, or the verdict ``unmeasured: no reference
-    bars in this build``, is the unmeasured line. An incomplete verdict is its
-    own line and is not reworded into another state.
+    Reads a local file only: no judge call, no prompt. No report for this
+    engine version, or the verdict ``unmeasured: no reference bars in this
+    build``, is the unmeasured line. An incomplete verdict, an unrecognised
+    verdict string, and a lookup exception each have their own line.
     """
     unmeasured = "unmeasured for this engine version"
     try:
@@ -240,8 +290,8 @@ def doctor_judge_check_message() -> str:
             / "report.json"
         )
         report = _read_report(path)
-    except Exception:  # noqa: BLE001 — this line must not raise into doctor
-        return unmeasured
+    except Exception as exc:  # noqa: BLE001 — this line must not raise into doctor
+        return f"could not read the report ({type(exc).__name__})"
     if report is None:
         return unmeasured
     header = report.get("header")
@@ -250,7 +300,7 @@ def doctor_judge_check_message() -> str:
     verdict = report.get("verdict")
     if not isinstance(verdict, str):
         return unmeasured
-    date = header.get("date") or "unknown"
+    date = _one_line_date(header.get("date")) or "unknown"
     if verdict.startswith("meets the judge-check v1 bar"):
         return f"meets the v1 bar (report {date})"
     if verdict.startswith("does not meet"):
@@ -261,4 +311,4 @@ def doctor_judge_check_message() -> str:
         return f"incomplete (report {date}); re-run"
     if verdict == "unmeasured: no reference bars in this build":
         return unmeasured
-    return unmeasured
+    return f"report not understood (report {date}); re-run"
