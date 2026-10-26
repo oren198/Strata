@@ -35,6 +35,24 @@ def _bundled_bytes() -> bytes:
     return resources.files("strata._judgecheck").joinpath(SET_V1_PATH_NAME).read_bytes()
 
 
+def load_items_unchecked(path: str | Path) -> list[Item]:
+    """Items from ANY file of the set's row shape, with NO integrity check.
+
+    For tooling that works on item files outside the shipped set (for example
+    `strata.judgecheck.dependence`). A judge-check RUN never uses this: it goes through
+    :func:`load_set`, which refuses a set whose sha256 differs from the one in code."""
+    items = []
+    for line in Path(path).read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        row = json.loads(line)
+        suite = row.get("judgecheck_suite")
+        if suite not in SUITES:
+            raise SetIntegrityError(f"item {row.get('id')!r} names an unknown suite {suite!r}.")
+        items.append(Item(id=row["id"], suite=suite, data=row))
+    return items
+
+
 def load_set(path: str | Path | None = None, *, expected_sha256: str = SET_V1_SHA256) -> list[Item]:
     """The items of the set, in file order.
 

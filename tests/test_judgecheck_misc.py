@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 from types import SimpleNamespace
 
 from strata import judge_usage
@@ -84,3 +85,34 @@ def test_usage_metering_is_bound_to_a_temp_ledger_during_a_run_and_restored_afte
     run(ITEMS[:3], reps=1, judges=[JudgeSpec("c", Spy(ITEMS), "m")])
     assert seen and all(path and "strata-judgecheck-" in path for path in seen)
     assert judge_usage._bound_db == before  # noqa: SLF001
+
+
+def test_the_env_usage_binding_and_temp_dir_are_restored_even_on_a_keyboard_interrupt(
+    monkeypatch,  # noqa: ANN001
+) -> None:
+    import os  # noqa: PLC0415
+    from pathlib import Path  # noqa: PLC0415
+
+    monkeypatch.setenv("STRATA_JUDGE_DAILY_TOKEN_CAP", "42")
+    before_binding = judge_usage._bound_db  # noqa: SLF001
+    seen_root: list[str] = []
+
+    class Interrupted(GoldenClient):
+        def create(self, **kwargs):  # noqa: ANN003, ANN201
+            seen_root.append(judge_usage._bound_db)  # noqa: SLF001
+            raise KeyboardInterrupt
+
+    try:
+        run(ITEMS[:3], reps=1, judges=[JudgeSpec("c", Interrupted(ITEMS), "m")])
+    except KeyboardInterrupt:
+        pass
+    else:  # pragma: no cover
+        raise AssertionError("the interrupt must propagate")
+    assert os.environ["STRATA_JUDGE_DAILY_TOKEN_CAP"] == "42"  # the user's cap is put back
+    assert judge_usage._bound_db == before_binding  # noqa: SLF001
+    assert seen_root and not Path(seen_root[0]).exists()  # the temp dir is gone
+
+    monkeypatch.delenv("STRATA_JUDGE_DAILY_TOKEN_CAP")
+    with contextlib.suppress(KeyboardInterrupt):
+        run(ITEMS[:3], reps=1, judges=[JudgeSpec("c", Interrupted(ITEMS), "m")])
+    assert "STRATA_JUDGE_DAILY_TOKEN_CAP" not in os.environ  # and removed if it was unset

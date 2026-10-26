@@ -53,7 +53,8 @@ def test_a_judge_that_gives_the_golden_answer_scores_100_percent_and_meets() -> 
 
 def test_without_bars_the_hard_legs_still_run_and_the_verdict_says_unmeasured() -> None:
     s = _run()
-    assert all(leg["meets"] for leg in s.hard_legs.values()) and s.operational["meets"]
+    legs = {k: v for k, v in s.hard_legs.items() if k != "engine_defences"}
+    assert all(leg["meets"] for leg in legs.values()) and s.operational["meets"]
     assert s.verdict == "unmeasured: no reference bars in this build"
 
 
@@ -270,3 +271,78 @@ def test_a_failed_judgment_is_wrong_both_ways_and_the_result_is_json_ready() -> 
         False
     ]
     json.dumps(s.to_dict())
+
+
+def _tag(security: dict[str, str]):  # noqa: ANN202
+    """The set with `judgecheck_security` set on the named must-decline items."""
+    from strata.judgecheck.items import Item  # noqa: PLC0415
+
+    tagged = {}
+    for iid, item in ITEMS.items():
+        data = dict(item.data)
+        if iid in security:
+            data["judgecheck_security"] = security[iid]
+        tagged[iid] = Item(id=iid, suite=item.suite, data=data)
+    return tagged
+
+
+def _run_tagged(tagged, flip_id: str):  # noqa: ANN001, ANN202
+    results = []
+    for rep in range(3):
+        for item in tagged.values():
+            r = golden_result(item, rep)
+            results.append(with_decision(r, "accept_as_directive") if item.id == flip_id else r)
+    return score(results, tagged, reps=3, strata_version=VERSION, bars=BARS)
+
+
+def test_only_judge_items_count_in_the_security_leg_and_engine_items_are_reported_apart() -> None:
+    must_decline = [
+        i.id
+        for i in ITEMS.values()
+        if i.suite in ("h2", "drift", "j3") and i.golden["decision"] == "decline"
+    ]
+    engine_ids = must_decline[:10]
+    tagged = _tag({i: ("engine" if i in engine_ids else "judge") for i in must_decline})
+    s = _run_tagged(tagged, flip_id="none")
+    assert s.hard_legs["security"]["must_decline_items"] == len(must_decline) - 10
+    assert s.hard_legs["engine_defences"] == {
+        "items": 10,
+        "held": 10,
+        "not_held": 0,
+        "not_held_items": [],
+        "label": "engine defences held: 10/10",
+    }
+
+
+def test_an_engine_item_that_is_not_held_is_reported_and_never_fails_the_run() -> None:
+    must_decline = [
+        i.id
+        for i in ITEMS.values()
+        if i.suite in ("h2", "drift", "j3") and i.golden["decision"] == "decline"
+    ]
+    tagged = _tag({i: "engine" if i == must_decline[0] else "judge" for i in must_decline})
+    s = _run_tagged(tagged, flip_id=must_decline[0])
+    assert s.hard_legs["engine_defences"]["not_held_items"] == [must_decline[0]]
+    assert s.hard_legs["engine_defences"]["label"] == "engine defences held: 0/1"
+    assert s.hard_legs["security"]["meets"] and "security leg" not in s.failed_legs
+    # the suite score still counts every item, engine ones included
+    assert s.failed_legs and all(leg.startswith("suite ") for leg in s.failed_legs)
+
+
+def test_a_judge_item_that_is_not_declined_still_fails_the_leg() -> None:
+    must_decline = [
+        i.id
+        for i in ITEMS.values()
+        if i.suite in ("h2", "drift", "j3") and i.golden["decision"] == "decline"
+    ]
+    tagged = _tag({i: "judge" for i in must_decline})
+    s = _run_tagged(tagged, flip_id=must_decline[0])
+    assert s.hard_legs["security"]["zero_decline_items"] == [must_decline[0]]
+    assert "security leg" in s.failed_legs
+
+
+def test_an_unclassified_set_counts_every_must_decline_item_as_the_judges() -> None:
+    s = _run()
+    assert s.hard_legs["security"]["must_decline_items"] == 31
+    assert s.hard_legs["engine_defences"]["items"] == 0
+    assert s.hard_legs["engine_defences"]["label"] == "engine defences held: 0/0"

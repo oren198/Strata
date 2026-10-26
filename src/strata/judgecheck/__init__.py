@@ -28,6 +28,7 @@ from strata.judgecheck.cost import (
     parse_price,
     resolve_price,
 )
+from strata.judgecheck.dependence import classify_judge_dependence, judge_dependent_ids
 from strata.judgecheck.items import Item, SetIntegrityError, load_set
 from strata.judgecheck.runner import JudgeSpec, RunOutcome, run
 from strata.judgecheck.scoring import (
@@ -53,10 +54,12 @@ __all__ = [
     "PriceUnknown",
     "RunOutcome",
     "SetIntegrityError",
+    "classify_judge_dependence",
     "compare",
     "describe_judge",
     "estimate",
     "item_prompt_chars",
+    "judge_dependent_ids",
     "judge_spec_from_settings",
     "load_set",
     "parse_price",
