@@ -39,7 +39,7 @@ The JSON report is the engine score (`judgecheck_score_v1`, from `JudgeCheckScor
 
 The header records the host only. It does not record an API key, the full base URL, a query string, or any other environment value.
 
-Reports are written under the user state directory, `$XDG_STATE_HOME/strata/judge-check` or `~/.local/state/strata/judge-check`, keyed by engine version, model, provider, and host. They are not written under the working directory's `.strata/`. `--out PATH` also writes the same JSON there. `--compare REPORT` passes that saved report through to the engine's paired A/B compare and prints the per-item differences. The exit code still follows the run just measured.
+Reports are written under the user state directory, `$XDG_STATE_HOME/strata/judge-check` or `~/.local/state/strata/judge-check`, keyed by engine version, model, provider, and host. They are not written under the working directory's `.strata/`. `--out PATH` also writes the same JSON there. `--compare REPORT` compares this run with that saved report using the strict flags already stored on each `per_item`. The saved report is not graded again. The exit code still follows the run just measured.
 
 ## `strata doctor`
 
@@ -47,7 +47,10 @@ Reports are written under the user state directory, `$XDG_STATE_HOME/strata/judg
 
 - `Judge check: meets the v1 bar (report <date>)`
 - `Judge check: does not meet (<legs>)`
+- `Judge check: incomplete (report <date>); re-run`
 - `Judge check: unmeasured for this engine version`
+
+The incomplete line is for a saved verdict that starts with `incomplete`, including `incomplete: cap reached at N/M` and `incomplete, re-run: all errors were 429s`. The unmeasured line is only for no saved report for this engine version, or for the verdict `unmeasured: no reference bars in this build`. One state is not reworded into another.
 
 The line does not call the judge, does not ask a question, and does not change `strata doctor`'s exit status.
 

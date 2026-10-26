@@ -1252,9 +1252,9 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         an input change awaiting its refresh, never a judge outage.
     11. Structure emission (ADR 0014 D8) — soft. Lists every ``remove_edge``
         or ``reparent`` act for which ``unemitted_receivers`` is not ``[]``.
-    12. Judge check — one informational line (meets, does not meet, or
-        unmeasured for this engine version). Soft and always passing: it
-        never calls the judge and never changes the exit status.
+    12. Judge check — one informational line (meets, does not meet,
+        incomplete, or unmeasured for this engine version). Soft and always
+        passing: it never calls the judge and never changes the exit status.
     """
     from strata.bootstrap import load_fleet_config
     from strata.fleet_config import FleetConfigError
@@ -2124,8 +2124,9 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 def _judge_check_status() -> Check:
     """One judge-check line. Always a passing soft check.
 
-    A missing report, an unreadable report, or an error inside the lookup is
-    the unmeasured state. Doctor's exit status is the other checks' alone.
+    The message is one of the four states from ``doctor_judge_check_message``.
+    A lookup error is the unmeasured state. Doctor's exit status is the other
+    checks' alone.
     """
     from strata.judgecheck.report import doctor_judge_check_message
 
@@ -5677,7 +5678,10 @@ def _build_parser() -> argparse.ArgumentParser:
         "--compare",
         default=None,
         metavar="REPORT",
-        help="Pass a saved report through to the paired A/B compare.",
+        help=(
+            "Compare this run with a saved report using the strict flags "
+            "already stored on each per_item. Does not re-grade that report."
+        ),
     )
     from strata.judgecheck.cli import cmd_judge_check
 

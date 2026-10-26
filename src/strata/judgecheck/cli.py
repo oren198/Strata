@@ -1,9 +1,10 @@
-"""``strata judge-check``: wire the engine's runner, price, score and compare.
+"""``strata judge-check``: wire the engine's runner, price and score.
 
 The command prints the engine's estimate, asks y/N (``--yes`` skips the question),
 runs :func:`strata.judgecheck.run`, and renders :meth:`JudgeCheckScore.to_dict`
-without scoring the run a second time. ``--compare`` is handed to
-:func:`strata.judgecheck.compare`.
+without scoring the run a second time. ``--compare`` reads strict flags already
+stored on each report's ``per_item``. It does not call :func:`strata.judgecheck.compare`
+and it does not grade the saved report again.
 """
 
 from __future__ import annotations
@@ -13,38 +14,65 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from strata.judgecheck.scoring import ItemResult
+
+def _decision_at(entry: dict[str, Any], rep: int) -> str | None:
+    decisions = entry.get("decisions")
+    if isinstance(decisions, list) and rep < len(decisions) and decisions[rep] is not None:
+        return str(decisions[rep])
+    return None
 
 
-def _results_from_stored_per_item(report: dict[str, Any]) -> list[ItemResult]:
-    """Item results that carry the saved report's decisions, for the engine's compare.
+def _compare_stored_per_item(saved_per_item: object, candidate_per_item: object) -> dict[str, Any]:
+    """Strict flips over common ``(item, rep)`` pairs.
 
-    Decisions come from ``per_item`` in the saved ``to_dict``. This does not call
-    ``score``.
+    Incumbent strictness is ``per_item[id].strict[rep]`` from the saved report.
+    Candidate strictness is this run's ``score(...).to_dict()["per_item"]``.
+    Neither side is graded here.
     """
-    per_item = report.get("per_item")
-    if not isinstance(per_item, dict):
-        return []
-    label = str(report.get("judge_label") or "incumbent")
-    rows: list[ItemResult] = []
-    for item_id, entry in per_item.items():
-        if not isinstance(entry, dict):
+    if not isinstance(saved_per_item, dict):
+        raise ValueError("compare report has no per_item")
+    if not isinstance(candidate_per_item, dict):
+        raise ValueError("this run has no per_item")
+    flips: list[dict[str, Any]] = []
+    suites: dict[str, dict[str, int]] = {}
+    for item_id, inc in saved_per_item.items():
+        cand = candidate_per_item.get(item_id)
+        if not isinstance(inc, dict) or not isinstance(cand, dict):
             continue
-        decisions = entry.get("decisions") or []
-        suite = str(entry.get("suite") or "")
-        if not isinstance(decisions, list):
+        inc_strict = inc.get("strict")
+        cand_strict = cand.get("strict")
+        if not isinstance(inc_strict, list) or not isinstance(cand_strict, list):
             continue
-        for rep, decision in enumerate(decisions):
-            rows.append(
-                ItemResult(
-                    item_id=str(item_id),
-                    suite=suite,
-                    rep=rep,
-                    judge_label=label,
-                    decision=str(decision),
-                )
+        suite = inc.get("suite")
+        if not isinstance(suite, str) or not suite:
+            suite = cand.get("suite") if isinstance(cand.get("suite"), str) else ""
+        for rep in range(min(len(inc_strict), len(cand_strict))):
+            left = inc_strict[rep]
+            right = cand_strict[rep]
+            if not isinstance(left, bool) or not isinstance(right, bool):
+                continue
+            entry = suites.setdefault(
+                suite, {"judgments": 0, "incumbent_strict": 0, "candidate_strict": 0}
             )
-    return rows
+            entry["judgments"] += 1
+            entry["incumbent_strict"] += int(left)
+            entry["candidate_strict"] += int(right)
+            if left != right:
+                flips.append(
+                    {
+                        "item_id": str(item_id),
+                        "rep": rep,
+                        "suite": suite,
+                        "incumbent_strict": left,
+                        "candidate_strict": right,
+                        "decisions": {
+                            "incumbent": _decision_at(inc, rep),
+                            "candidate": _decision_at(cand, rep),
+                        },
+                    }
+                )
+    flips.sort(key=lambda row: (row["suite"], row["item_id"], row["rep"]))
+    return {"flips": flips, "suites": suites}
 
 
 def _exit_for_verdict(verdict: str) -> int:
@@ -176,10 +204,9 @@ def cmd_judge_check(args: Any) -> int:
 
     if saved_compare is not None:
         try:
-            diff = judgecheck.compare(
-                _results_from_stored_per_item(saved_compare),
-                outcome.results[spec.label],
-                by_id,
+            diff = _compare_stored_per_item(
+                saved_compare.get("per_item"),
+                scored.to_dict()["per_item"],
             )
         except Exception as exc:  # noqa: BLE001 — a bad compare file is a config refusal
             return _refuse(f"config error: compare failed: {exc}")

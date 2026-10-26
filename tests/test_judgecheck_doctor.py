@@ -125,6 +125,43 @@ def test_doctor_line_does_not_change_exit_status(
     assert before_rc == after_rc
 
 
+def test_doctor_incomplete_report_says_re_run(_offline, capsys: pytest.CaptureFixture[str]) -> None:
+    """An incomplete saved report is its own line, not the unmeasured line."""
+    from strata.judgecheck.runner import IncompleteInfo
+
+    box, state = _offline
+    box.incomplete = IncompleteInfo("cap reached", 4, 20)
+    rc, _out, err = invoke(capsys, ["judge-check", "--yes", "--price", "0.2,0.8", "--reps", "1"])
+    assert rc == 2, err
+    report = json.loads(report_json(state).read_text(encoding="utf-8"))
+    assert report["verdict"] == "incomplete: cap reached at 4/20"
+    date = report["header"]["date"]
+    doc_rc, out, err = _doctor(capsys)
+    line = f"Judge check: incomplete (report {date}); re-run"
+    assert line in out
+    assert _judge_lines(out, err) == [f"  ✓ {line}"] or _judge_lines(out, err) == [f"  OK {line}"]
+    assert "unmeasured" not in out
+    assert "Judge check:" not in err
+    assert doc_rc == 1
+
+
+def test_doctor_no_bars_verdict_stays_unmeasured(
+    _offline, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The no-bars verdict stays the unmeasured line. It is not called incomplete."""
+    monkeypatch.setattr("strata.judgecheck.BARS_V1", None)
+    _box, state = _offline
+    rc, _out, err = invoke(capsys, ["judge-check", "--yes", "--price", "0.2,0.8", "--reps", "1"])
+    assert rc == 2, err
+    report = json.loads(report_json(state).read_text(encoding="utf-8"))
+    assert report["verdict"] == "unmeasured: no reference bars in this build"
+    doc_rc, out, err = _doctor(capsys)
+    assert "Judge check: unmeasured for this engine version" in out
+    assert "incomplete" not in out
+    assert len(_judge_lines(out, err)) == 1
+    assert doc_rc == 1
+
+
 def test_doctor_does_not_run_the_judge_or_prompt(
     _offline, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

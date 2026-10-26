@@ -1,4 +1,4 @@
-"""``strata judge-check``: CLI wiring, report rendering, cost guard, compare pass-through.
+"""``strata judge-check``: CLI wiring, report rendering, cost guard, stored-strict compare.
 
 No live judge calls. The runner is replaced; the score, the price parser and the
 verdict strings are the engine's.
@@ -326,31 +326,56 @@ def test_fields_beyond_the_frozen_interface_stay_in_json_and_are_not_printed(
     assert "not_held_items" not in text
 
 
-def test_compare_report_is_passed_through_to_the_engine_compare(
-    _offline, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+def _a2_with_directive_ops() -> str:
+    from strata.judgecheck import load_set
+
+    for item in load_set():
+        if item.suite == "a2" and item.golden.get("expected_admit_op"):
+            return item.id
+    raise AssertionError("the set has no a2 item with an admit op")
+
+
+def _p5_departure() -> str:
+    from strata.judgecheck import load_set
+
+    for item in load_set():
+        if item.suite == "p5" and item.golden.get("departs_from"):
+            return item.id
+    raise AssertionError("the set has no p5 departure item")
+
+
+def _load_compare(out: str) -> dict:
+    start = out.rfind("\n{")
+    assert start != -1, out
+    payload = json.loads(out[start + 1 :])
+    assert isinstance(payload, dict)
+    return payload
+
+
+def test_compare_identical_results_report_zero_flips(
+    _offline, capsys: pytest.CaptureFixture[str], tmp_path: Path
 ) -> None:
-    import strata.judgecheck as judgecheck
+    """A run compared with itself is 0 flips, including a2 ops and a p5 label.
 
-    seen: dict[str, int] = {}
-
-    def fake_compare(incumbent, candidate, items):  # noqa: ANN001
-        seen["incumbent"] = len(list(incumbent))
-        seen["candidate"] = len(list(candidate))
-        seen["items"] = len(items)
-        return {"flips": [{"item_id": "from-engine-compare"}], "suites": {}}
-
-    monkeypatch.setattr(judgecheck, "compare", fake_compare)
-    saved = tmp_path / "incumbent.json"
-    saved.write_text(
-        json.dumps(
-            {
-                "judge_label": "incumbent",
-                "verdict": "meets the judge-check v1 bar for Strata 1.19.0",
-                "per_item": {"j1h-021": {"suite": "h2", "decisions": ["decline"]}},
-            }
-        ),
-        encoding="utf-8",
+    Strictness comes from the saved ``per_item.strict`` and this run's own
+    ``to_dict()["per_item"]``. Re-grading the saved decisions would mark the
+    a2 item and the p5 departure wrong.
+    """
+    _box, state = _offline
+    a2_id = _a2_with_directive_ops()
+    p5_id = _p5_departure()
+    saved = tmp_path / "saved-report.json"
+    rc, _out, err = invoke(
+        capsys,
+        ["judge-check", "--yes", "--price", "0.2,0.8", "--reps", "1", "--out", str(saved)],
     )
+    assert rc == 0, err
+    report = json.loads(saved.read_text(encoding="utf-8"))
+    assert report["per_item"][a2_id]["strict"] == [True]
+    assert report["per_item"][a2_id]["suite"] == "a2"
+    assert report["per_item"][p5_id]["strict"] == [True]
+    assert report["per_item"][p5_id]["suite"] == "p5"
+
     rc, out, err = invoke(
         capsys,
         [
@@ -365,10 +390,14 @@ def test_compare_report_is_passed_through_to_the_engine_compare(
         ],
     )
     assert rc == 0, err
-    assert seen["incumbent"] == 1
-    assert seen["candidate"] > 1
-    assert seen["items"] > 1
-    assert "from-engine-compare" in out
+    diff = _load_compare(out)
+    assert diff["flips"] == []
+    assert "a2" in diff["suites"] and "p5" in diff["suites"]
+    for suite, entry in diff["suites"].items():
+        assert entry["incumbent_strict"] == entry["candidate_strict"], suite
+        assert entry["judgments"] >= 1
+    state_report = json.loads(report_json(state).read_text(encoding="utf-8"))
+    assert state_report["per_item"][a2_id]["strict"] == [True]
 
 
 def test_missing_compare_report_exits_3_before_the_run(
@@ -420,3 +449,5 @@ def test_docs_page_states_what_judge_check_measures_and_its_limits() -> None:
         assert banned not in lowered
     assert "qwen/qwen3-235b-a22b-2507" in text
     assert "Parasail" in text
+    assert "Judge check: incomplete (report <date>); re-run" in text
+    assert "unmeasured: no reference bars in this build" in text

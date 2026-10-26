@@ -217,8 +217,10 @@ def _read_report(path: Path) -> dict[str, Any] | None:
 def doctor_judge_check_message() -> str:
     """The suffix ``strata doctor`` prints after ``Judge check:``.
 
-    One of the three states. Reads a local file only: no judge call, no prompt.
-    Any failure to read the report is the unmeasured state, so doctor still finishes.
+    One of four states. Reads a local file only: no judge call, no prompt.
+    No report for this engine version, or the verdict ``unmeasured: no reference
+    bars in this build``, is the unmeasured line. An incomplete verdict is its
+    own line and is not reworded into another state.
     """
     unmeasured = "unmeasured for this engine version"
     try:
@@ -248,11 +250,15 @@ def doctor_judge_check_message() -> str:
     verdict = report.get("verdict")
     if not isinstance(verdict, str):
         return unmeasured
+    date = header.get("date") or "unknown"
     if verdict.startswith("meets the judge-check v1 bar"):
-        date = header.get("date") or "unknown"
         return f"meets the v1 bar (report {date})"
     if verdict.startswith("does not meet"):
         legs = report.get("failed_legs")
         inside = ", ".join(str(leg) for leg in legs) if isinstance(legs, list) else ""
         return f"does not meet ({inside})"
+    if verdict.startswith("incomplete"):
+        return f"incomplete (report {date}); re-run"
+    if verdict == "unmeasured: no reference bars in this build":
+        return unmeasured
     return unmeasured
