@@ -1050,6 +1050,10 @@ three kinds:
       who own the account records mentioned this account was flagged", "whoever runs
       the vendor relationship shared some numbers with me" all point at people who
       spoke: hearsay, ADMIT. A group or role named as the speaker is still a speaker.
+      HEARSAY NEEDS A TELLING ACT IN THE CONTRIBUTION: it must say that someone told,
+      mentioned or shared this with the agent. A contributor reporting what they saw or
+      did themselves is first-hand even when the note names their own role (hatch-keeper,
+      pit-hand); never label it hearsay and never apply the informant rule to it.
   (3) ANOTHER SCOPE'S JUDGED ACT that reached this scope: an ANCESTOR DIRECTIVE, an
       OPERATOR MEMORY item, or a publication rendered in this message.
 A scope has no voice except its channels — publication and direction. A document is
