@@ -892,11 +892,43 @@ shows the same numbers.
 
 ```bash
 strata doctor                                    # diagnose config/DB/fleet/wiring/binding, offline
+strata judge-check                               # measure the configured judge against the frozen set
 strata migrate                                  # apply pending SQLite migrations only
 strata bootstrap --config path/to/fleet.yaml    # validate a fleet YAML (no DB writes)
 strata start --reload                           # uvicorn auto-reload (dev mode)
 strata start --port 8001                        # serve on a different port
 ```
+
+### `strata judge-check`
+
+`strata judge-check` tests the judge this install is set up to use. It runs the bundled judge-check set (v1) through the engine and compares each decision with the right answer stored for that item. It does not change your project.
+
+The set is public, which shapes what a pass means:
+
+> "the public set will be tuned against; a pass shows the model meets this set, not that it is good in general."
+
+**What the bar is.** The pass bars in this build come from running `qwen/qwen3-235b-a22b-2507` on Parasail 5 times on the frozen set. Your run is compared with those bars. The verdict line is printed in the engine's own words.
+
+**What it does not measure.** Version 1 does not test whether the judge's stated reasons are honest, apart from one pattern check: a reason that calls an item "hearsay" when the item is labelled first-hand. Nothing wider than that is measured. A context note cannot retire a directive (the engine drops its ops), so that case is not tested either.
+
+**Cost.** Before it runs, the command prints a cost estimate and asks `y/N`. `--yes` skips the question.
+
+- `--price IN,OUT` sets the price in dollars per million tokens, input and output. It wins over the provider's listed price. On OpenRouter, the listed price is the pinned provider's endpoint, or the most expensive endpoint when no provider is pinned.
+- If no price is known, the command prints the engine's message and does not run.
+- `--max-usd` is a hard spending cap during the run. If the cap stops the run, the verdict is "incomplete".
+
+**Exit codes:**
+
+| Code | Meaning |
+|---|---|
+| `0` | meets the bar |
+| `1` | does not meet the bar |
+| `2` | incomplete or unmeasured |
+| `3` | refused: no price, a tampered set, a config error, or you answered no at the prompt |
+
+**The report** records the model, the provider and the host part of the base URL. It never records the API key, the full base URL or a query string.
+
+**In `strata doctor`.** Doctor shows one line for the report saved for this engine version, in one of four states: meets, does not meet, incomplete (with the report's date and a prompt to re-run), or unmeasured. The line does not change doctor's exit status.
 
 ### Fleet structure changes
 
@@ -1343,6 +1375,7 @@ CONTEXT.md               # Canonical glossary (23 terms — single source of voc
 docs/
   philosophy.md          # Theoretical foundations — why Strata exists
   ROADMAP.md             # Enduring principles + sequenced direction (post-V1.2)
+  judge-check.md         # What `strata judge-check` measures, and what it does not
   adr/
     0001-v1-architecture.md
     0002-fleet-config-source-of-truth.md
