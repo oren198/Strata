@@ -124,7 +124,9 @@ def test_0027_creates_the_table_and_touches_nothing_else(tmp_path: Path) -> None
     conn = sqlite3.connect(db)
     cols = [r[1] for r in conn.execute("PRAGMA table_info(relation_calls)")]
     assert cols == [
+        "id",
         "contribution_id",
+        "act_id",
         "call",
         "answer_kind",
         "inherited_id",

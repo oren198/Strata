@@ -126,6 +126,10 @@ def _new_publication_act_id() -> str:
     return f"pub_{secrets.token_hex(8)}"
 
 
+def _new_relation_call_id() -> str:
+    return f"rc_{secrets.token_hex(8)}"
+
+
 def _new_publication_judgment_id() -> str:
     return f"pubj_{secrets.token_hex(8)}"
 
@@ -1338,7 +1342,7 @@ class RecordStore:
                 """,
                 (judgment_id, contribution_id, decision, judged_by, notes),
             )
-            self._insert_relation_calls(contribution_id, relations)
+            self._insert_relation_calls(relations, contribution_id=contribution_id)
             if claim_event is not None:
                 self._insert_change_event(
                     change_id=claim_event.change_id,
@@ -1355,19 +1359,28 @@ class RecordStore:
         return self._fetch_judgment(judgment_id)
 
     def _insert_relation_calls(
-        self, contribution_id: str, relations: Sequence[Mapping[str, Any]]
+        self,
+        relations: Sequence[Mapping[str, Any]],
+        *,
+        contribution_id: str | None = None,
+        act_id: str | None = None,
     ) -> None:
+        """Write relation rows keyed by exactly one of *contribution_id* / *act_id* (the table
+        CHECKs it). Inside the caller's transaction; never commits."""
         for outcome in relations:
             call = outcome.get("call", "context")
             self._conn.execute(
                 """
                 INSERT OR REPLACE INTO relation_calls
-                    (contribution_id, call, answer_kind, inherited_id, origin, occurrence_span,
-                     instead_span, requirement_span, verdict, fallback, reason, marker)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (id, contribution_id, act_id, call, answer_kind, inherited_id, origin,
+                     occurrence_span, instead_span, requirement_span, verdict, fallback, reason,
+                     marker)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
+                    _new_relation_call_id(),
                     contribution_id,
+                    act_id,
                     call,
                     outcome.get("kind") or outcome.get("relation"),
                     outcome.get("inherited_id"),
@@ -1385,13 +1398,22 @@ class RecordStore:
     def get_relation_calls(self, contribution_id: str) -> list[dict[str, Any]]:
         """The relation re-ask answers recorded with *contribution_id*'s judgment (oldest
         first; empty when no re-ask fired or the judgment predates the table)."""
+        return self._relation_rows("contribution_id", contribution_id)
+
+    def get_publication_relation_calls(self, act_id: str) -> list[dict[str, Any]]:
+        """The relation re-ask answers recorded with a publication act's judgment, accepted or
+        declined (empty when the #243 check ran no re-ask for it)."""
+        return self._relation_rows("act_id", act_id)
+
+    def _relation_rows(self, key: str, value: str) -> list[dict[str, Any]]:
+        assert key in ("contribution_id", "act_id")
         rows = self._conn.execute(
-            """
+            f"""
             SELECT call, answer_kind, inherited_id, origin, occurrence_span, instead_span,
                    requirement_span, verdict, fallback, reason, marker
-            FROM relation_calls WHERE contribution_id = ? ORDER BY rowid
-            """,
-            (contribution_id,),
+            FROM relation_calls WHERE {key} = ? ORDER BY rowid
+            """,  # noqa: S608 - key is one of two fixed column names
+            (value,),
         ).fetchall()
         return [{**dict(r), "fallback": bool(r["fallback"])} for r in rows]
 
@@ -3076,6 +3098,7 @@ class RecordStore:
         decision: Literal["accept", "decline"],
         judged_by: str,
         reasoning: str | None = None,
+        relations: Sequence[Mapping[str, Any]] = (),
     ) -> PublicationJudgment:
         """Record the scope-manager's verdict on a publish/withdraw act.
 
@@ -3090,6 +3113,8 @@ class RecordStore:
             judged_by: Identifier of the judging authority (``"scope-manager"``
                        for the normal judged path).
             reasoning: Optional free-text rationale.
+            relations: The #243 relation re-ask outcomes that fed this verdict, written in the
+                       same transaction (keyed by *act_id*, accepted or declined alike).
 
         Returns:
             The newly recorded :class:`PublicationJudgment`.
@@ -3099,14 +3124,15 @@ class RecordStore:
                 already has a judgment (UNIQUE).
         """
         judgment_id = _new_publication_judgment_id()
-        self._conn.execute(
-            """
-            INSERT INTO publication_judgments (id, act_id, decision, judged_by, reasoning)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (judgment_id, act_id, decision, judged_by, reasoning),
-        )
-        self._conn.commit()
+        with self._conn:  # one transaction: the judgment and the relation rows it rests on
+            self._conn.execute(
+                """
+                INSERT INTO publication_judgments (id, act_id, decision, judged_by, reasoning)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (judgment_id, act_id, decision, judged_by, reasoning),
+            )
+            self._insert_relation_calls(relations, act_id=act_id)
         return self._fetch_publication_judgment(judgment_id)
 
     def get_publication_judgment(self, act_id: str) -> PublicationJudgment | None:
