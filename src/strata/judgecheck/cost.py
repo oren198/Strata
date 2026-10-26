@@ -40,27 +40,34 @@ class CapReached(Exception):
 
 @dataclass(frozen=True)
 class Price:
-    """Dollars per million tokens."""
+    """Dollars per million tokens. The cache prices are optional: a provider that bills cache
+    reads/writes differently lists them; unknown means "charge at the input price" (pessimistic)."""
 
     input_per_m: float
     output_per_m: float
     source: str
+    cache_read_per_m: float | None = None
+    cache_write_per_m: float | None = None
 
     def cost(self, input_tokens: float, output_tokens: float) -> float:
         return (input_tokens * self.input_per_m + output_tokens * self.output_per_m) / 1_000_000
 
 
 def parse_price(text: str) -> Price:
-    """`--price IN,OUT` (dollars per million tokens), e.g. ``0.22,0.88``."""
+    """`--price IN,OUT[,CACHE_READ]` (dollars per million tokens), e.g. ``0.22,0.88`` or
+    ``0.14,0.80,0.05``. The optional third field is the price of cache reads."""
     try:
-        low, high = (float(part) for part in text.split(","))
+        parts = [float(part) for part in text.split(",")]
+        if len(parts) not in (2, 3):
+            raise ValueError(text)
     except ValueError as exc:
         raise ValueError(
-            f"--price must look like 0.22,0.88 (input,output per million), got {text!r}"
+            f"--price must look like 0.22,0.88 or 0.14,0.80,0.05 "
+            f"(input,output[,cache read] per million), got {text!r}"
         ) from exc
-    if low < 0 or high < 0:
+    if any(part < 0 for part in parts):
         raise ValueError("--price must not be negative.")
-    return Price(low, high, "--price")
+    return Price(parts[0], parts[1], "--price", parts[2] if len(parts) == 3 else None)
 
 
 _OPENROUTER_V1 = "https://openrouter.ai/api/v1"
@@ -94,6 +101,11 @@ def _per_million(pricing: dict[str, Any]) -> tuple[float, float]:
     return float(pricing["prompt"]) * 1_000_000, float(pricing["completion"]) * 1_000_000
 
 
+def _optional_per_million(pricing: dict[str, Any], key: str) -> float | None:
+    value = pricing.get(key)
+    return None if value in (None, "") else float(value) * 1_000_000
+
+
 def _openrouter_price(
     model: str, provider: str | None, http_get: Callable[[str], Any] | None
 ) -> Price | None:
@@ -104,6 +116,10 @@ def _openrouter_price(
     body = _get_json(f"{_OPENROUTER_V1}/models/{model}/endpoints", http_get)
     endpoints = (body.get("data") or {}).get("endpoints") or []
     priced = [(e, _per_million(e["pricing"])) for e in endpoints if e.get("pricing")]
+
+    def cache(endpoint: dict[str, Any], key: str) -> float | None:
+        return _optional_per_million(endpoint["pricing"], key)
+
     if provider:
         wanted = provider.strip().lower()
         for endpoint, (low, high) in priced:
@@ -113,17 +129,27 @@ def _openrouter_price(
                 str(endpoint.get("tag", "")).split("/")[0].lower(),
             }
             if wanted in names:
-                return Price(low, high, f"provider endpoint listing ({provider})")
+                return Price(
+                    low,
+                    high,
+                    f"provider endpoint listing ({provider})",
+                    cache(endpoint, "input_cache_read"),
+                    cache(endpoint, "input_cache_write"),
+                )
         raise PriceUnknown(
             f"The pinned provider {provider!r} is not listed for model {model!r} on OpenRouter; "
             "pass --price IN,OUT, or fix the provider pin."
         )
     if not priced:
         return None
+    # An endpoint that lists no cache price bills its cache tokens at its input price, as far as
+    # this budget can tell, so the dearest cache price falls back to that endpoint's input price.
     return Price(
         max(p[0] for _, p in priced),
         max(p[1] for _, p in priced),
         "provider endpoint listing (dearest endpoint; the run is not pinned)",
+        max(cache(e, "input_cache_read") or p[0] for e, p in priced),
+        max(cache(e, "input_cache_write") or p[0] for e, p in priced),
     )
 
 
@@ -217,7 +243,9 @@ class Estimate:
 
 def estimate(item_sizes: Sequence[int], reps: int, price: Price) -> Estimate:
     """Estimate before the run. *item_sizes* are the prompt sizes in characters of the set's
-    items (system prompt included); tokens use the real-text ratio (4 chars), not the cap's."""
+    items (system prompt included); tokens use the real-text ratio (4 chars), not the cap's.
+    Every input token is priced at the full input price, so this is an UPPER bound: a provider
+    that bills cached prompt tokens lower (the judge's system prompt is cached) costs less."""
     judgments = len(item_sizes) * reps
     calls = judgments * CALLS_PER_JUDGMENT
     avg_in = (sum(item_sizes) / len(item_sizes) / 4.0) if item_sizes else 0.0
@@ -256,10 +284,17 @@ class Budget:
                 kwargs, self.price
             )  # unknown usage: charge the worst case
             return
-        extra = (getattr(usage, "cache_creation_input_tokens", 0) or 0) + (
-            getattr(usage, "cache_read_input_tokens", 0) or 0
+        written = float(getattr(usage, "cache_creation_input_tokens", 0) or 0)
+        read = float(getattr(usage, "cache_read_input_tokens", 0) or 0)
+        price = self.price
+        read_price = price.input_per_m if price.cache_read_per_m is None else price.cache_read_per_m
+        write_price = (
+            price.input_per_m if price.cache_write_per_m is None else price.cache_write_per_m
         )
-        self.spent_usd += self.price.cost(float(tin) + float(extra), float(tout))
+        self.spent_usd += (
+            price.cost(float(tin), float(tout))
+            + (read * read_price + written * write_price) / 1_000_000
+        )
 
 
 def item_prompt_chars(item: Any) -> int:
