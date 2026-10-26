@@ -349,6 +349,7 @@ def _restore_persisted_binding(fleet: FleetConfig | None) -> None:
     ``_resolve_bind``, a config-class failure blocks it, and a binding that no longer holds
     leaves the session NOT bound with the reason, never on a stale scope."""
     global _AGENT_SCOPE, _AGENT_SKILL, _UNRESOLVED, _STARTUP_ERRORS_BINDING
+    global _RESTORED_NOTICE, _RESTORED_SCOPE
     if not _HARNESS_TOKEN or not _sessions_dir:
         return
     binding_persist.delete_stale(_sessions_dir)
@@ -368,11 +369,30 @@ def _restore_persisted_binding(fleet: FleetConfig | None) -> None:
         _AGENT_SKILL = result.skill
         _STARTUP_ERRORS_BINDING = []
         _UNRESOLVED = bool(_STARTUP_ERRORS_CONFIG)
+        who = f"{result.scope_id}/{result.skill}" if result.skill else result.scope_id
+        _RESTORED_SCOPE = result.scope_id
+        _RESTORED_NOTICE = (
+            f"binding restored after reconnect: {who}, confirmed {result.bound_at or 'earlier'}"
+        )
     elif result.status == "invalid":
         _AGENT_SCOPE = ""
         _AGENT_SKILL = None
         _STARTUP_ERRORS_BINDING = [result.message]
         _UNRESOLVED = True
+
+
+def _take_restored_notice(result: dict) -> dict:
+    """Carry the one-time ``binding_notice`` (see :data:`_RESTORED_NOTICE`) on *result*.
+
+    Delivered once, then cleared; only while the session is still on the restored scope (a later
+    bind elsewhere makes it stale), and never on an unbound session."""
+    global _RESTORED_NOTICE, _RESTORED_SCOPE
+    with _binding_lock:
+        notice, scope = _RESTORED_NOTICE, _RESTORED_SCOPE
+        _RESTORED_NOTICE = _RESTORED_SCOPE = ""
+    if notice and not _UNRESOLVED and scope == _AGENT_SCOPE:
+        result["binding_notice"] = notice
+    return result
 
 
 def _record_connect(session: object) -> None:
@@ -795,6 +815,11 @@ _AGENT_SESSION_ID: str = resolve_agent_session_id()
 # explicit STRATA_AGENT_SESSION_ID or an unreadable start time: then a binding is neither
 # persisted nor restored and a reconnect rolls the session over, as before.
 _HARNESS_TOKEN: str = ""
+# One line saying the binding was restored after a reconnect, owed to the agent (and so the user)
+# exactly once: the first strata_read_perspective or strata_bind status carries it as
+# ``binding_notice`` and clears it. Empty when nothing was restored.
+_RESTORED_NOTICE: str = ""
+_RESTORED_SCOPE: str = ""
 # The harness the connected client belongs to, from its initialize handshake;
 # resolved lazily on the first request (no client is connected at import) by
 # _client_harness() and held for the process's lifetime.
@@ -2484,7 +2509,7 @@ async def strata_bind(scope_id: str, skill: str | None = None, confirm: bool = F
             "or database). Fix the file(s) and restart the server — strata_bind "
             "cannot clear these."
         )
-    return _attach_nudge(result)
+    return _attach_nudge(_take_restored_notice(result))
 
 
 # ---------------------------------------------------------------------------
@@ -3435,7 +3460,7 @@ async def strata_read_perspective(scope_id: str | None = None) -> dict:
         (layer for layer in perspective["layers"] if layer["relation"] == "self"), None
     )
     context_items = None if self_layer is None else self_layer.get("context_items")
-    return _attach_nudge(perspective, context_items=context_items)
+    return _attach_nudge(_take_restored_notice(perspective), context_items=context_items)
 
 
 # ---------------------------------------------------------------------------

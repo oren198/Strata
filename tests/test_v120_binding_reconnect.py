@@ -229,6 +229,28 @@ def test_no_token_means_no_restore(srv, tmp_path: Path, monkeypatch) -> None:  #
     assert srv._AGENT_SCOPE == "" and srv._UNRESOLVED is True
 
 
+def test_a_restore_leaves_one_visible_notice_delivered_once(srv, tmp_path: Path) -> None:  # noqa: ANN001
+    bp.write_binding(tmp_path, SID, TOKEN, "g_b", "s1")
+    srv._restore_persisted_binding(_fleet())
+    first = srv._take_restored_notice({})
+    assert first["binding_notice"].startswith(
+        "binding restored after reconnect: g_b/s1, confirmed "
+    )
+    assert srv._take_restored_notice({}) == {}
+
+
+def test_no_notice_when_nothing_was_restored_or_the_scope_has_changed(
+    srv,
+    tmp_path: Path,
+    monkeypatch,  # noqa: ANN001
+) -> None:
+    assert srv._take_restored_notice({}) == {}
+    bp.write_binding(tmp_path, SID, TOKEN, "g_b", "s1")
+    srv._restore_persisted_binding(_fleet())
+    monkeypatch.setattr(srv, "_AGENT_SCOPE", "g_a")  # the user bound elsewhere since
+    assert srv._take_restored_notice({}) == {}
+
+
 def test_persist_writes_only_a_bound_session(srv, tmp_path: Path, monkeypatch) -> None:  # noqa: ANN001
     srv._persist_binding()  # unresolved: nothing
     assert not bp.binding_path(tmp_path, SID).exists()
@@ -315,6 +337,13 @@ def test_a_real_reconnect_keeps_the_binding_and_the_session(tmp_path: Path) -> N
         _connect(tmp_path, [("strata_read_perspective", {}), ("strata_session_stats", {})])
     )
     assert "error" not in second[0] and second[0].get("scope_id", "g_b") == "g_b"
+    bound_at = json.loads(next((tmp_path / ".strata/sessions").glob("*.binding")).read_text())[
+        "bound_at"
+    ]
+    assert second[0]["binding_notice"] == (
+        f"binding restored after reconnect: g_b, confirmed {bound_at}"
+    )
+    assert "binding_notice" not in second[1]  # said once, not on every call
     sessions = tmp_path / ".strata" / "sessions"
     assert len(list(sessions.glob("*.json"))) == 1  # one session record, no .rolled-
     state = json.loads(next(sessions.glob("*.json")).read_text(encoding="utf-8"))

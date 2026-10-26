@@ -553,7 +553,8 @@ but not the harness. With the automatic session id, the server recognises the sa
 process (its pid and start time), keeps one session record (counting the reconnect), and
 restores the scope and skill you confirmed with `strata_bind`, after checking them again
 against the current `fleet.yaml` exactly as `strata_bind` would. If that scope was removed
-or the skill is no longer permitted, the session comes up unbound and says why. The saved
+or the skill is no longer permitted, the session comes up unbound and says why. A restored binding is announced once, as `binding_notice` on the first
+`strata_read_perspective` (or `strata_bind`) reply: scope, skill and when you confirmed it. The saved
 binding is `.strata/sessions/<id>.binding` (mode 0600; deleted after 30 days unused). An
 explicit `STRATA_AGENT_SESSION_ID` turns this off (nothing saved, nothing restored, a new
 connection starts a fresh session), and so does Windows, which has no readable process start

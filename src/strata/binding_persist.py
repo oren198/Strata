@@ -132,6 +132,7 @@ class Restore:
     scope_id: str = ""
     skill: str | None = None
     message: str = ""
+    bound_at: str = ""
 
 
 NONE = Restore("none")
@@ -192,4 +193,4 @@ def restore_binding(
             skill,
             f"your earlier binding to {scope_id!r} no longer holds: " + "; ".join(errors),
         )
-    return Restore("restored", scope_id, resolved)
+    return Restore("restored", scope_id, resolved, "", str(data.get("bound_at") or ""))
