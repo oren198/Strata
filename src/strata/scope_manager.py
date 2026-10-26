@@ -9226,6 +9226,15 @@ class ScopeManager:
         self._model = model
         self._implied_purpose_min_words = implied_purpose_min_words
         self._judge_provider = judge_provider
+        # What a relation re-ask's answer said beyond the outcome dict (the quoted spans, the
+        # marker the engine fired on), keyed (contribution id, call), for the record's
+        # `relation_calls`. Kept off the outcome dict, whose shape callers compare exactly.
+        self._relation_extras: dict[tuple[str, str], dict] = {}
+
+    def take_relation_extras(self, contribution_id: str, call: str) -> dict:
+        """The recorded-only detail of the relation re-ask for *contribution_id* (``call`` is
+        ``"context"`` or ``"directive"``), removed on read; ``{}`` when there is none."""
+        return self._relation_extras.pop((contribution_id, call), {})
 
     def _messages_create(self, **kwargs: Any) -> Any:
         """The ONE place every judge call's real API request goes through
@@ -11915,6 +11924,16 @@ class ScopeManager:
         if failure is not None:
             reason = f"re-ask failed ({failure}); {reason}"
         kind = answer.get("kind")
+
+        def _span(key: str) -> str | None:
+            value = answer.get(key)
+            return value if isinstance(value, str) and value.strip() else None
+
+        self._relation_extras[(contribution.id, "context")] = {
+            "occurrence_span": _span("occurrence_span"),
+            "instead_span": _span("instead_span"),
+            "marker": _exception_marker(contribution.content, chosen[2], context_words),
+        }
         return {
             "contribution_id": contribution.id,
             "kind": kind if isinstance(kind, str) else None,

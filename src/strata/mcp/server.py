@@ -3646,15 +3646,19 @@ async def strata_read_contribution(contribution_id: str) -> dict:
 
     # Forensic, like the scope record read: no read counter increment (#110),
     # but the nudge still rides along.
-    return _attach_nudge(
-        {
-            "contribution": asdict(entry.contribution),
-            "state": asdict(entry.state),
-            "judgment": asdict(entry.judgment) if entry.judgment is not None else None,
-            "judgment_attempts": [asdict(a) for a in entry.judgment_attempts],
-            "raised_to": raised_to,
-        }
-    )
+    payload = {
+        "contribution": asdict(entry.contribution),
+        "state": asdict(entry.state),
+        "judgment": asdict(entry.judgment) if entry.judgment is not None else None,
+        "judgment_attempts": [asdict(a) for a in entry.judgment_attempts],
+        "raised_to": raised_to,
+    }
+    # v1.20 (#242 b): the relation re-ask answers behind this verdict, so a decline is
+    # explainable after the fact. Present only when a re-ask fired for it.
+    relation = _record_store.get_relation_calls(contribution_id)
+    if relation:
+        payload["relation"] = relation
+    return _attach_nudge(payload)
 
 
 # ---------------------------------------------------------------------------

@@ -446,6 +446,20 @@ class RestoreCorrectionWithdrawalRequest(BaseModel):
 # ---------------------------------------------------------------------------
 # Contribute choke point (issues #38, #57)
 #
+def _relation_rows(
+    scope_manager: object, context: dict | None, directive: dict | None
+) -> list[dict]:
+    """The relation re-ask outcomes that fed a verdict, tagged for ``relation_calls`` and
+    joined with the detail the manager kept (a stand-in manager keeps none)."""
+    take = getattr(scope_manager, "take_relation_extras", None)
+    rows = []
+    for call, outcome in (("context", context), ("directive", directive)):
+        if outcome:
+            extras = take(outcome["contribution_id"], call) if callable(take) else {}
+            rows.append({**outcome, **extras, "call": call})
+    return rows
+
+
 # The single place where the read-summary -> judge -> record-judgment ->
 # summary-write sequence for a scope runs. Both agent (MCP ``strata_contribute``
 # / ``strata_rejudge``) and operator (HTTP ``POST /contribute``) surfaces route
@@ -1002,6 +1016,9 @@ def _judge_and_record(
             # the engine dropped (ADR 0011 D1) — the record shows what applied.
             notes=judgment.record_notes,
             claim_event=claim_event,
+            relations=_relation_rows(
+                scope_manager, judgment.inherited_relation, judgment.directive_relation
+            ),
         )
 
     # ADR 0017 P4: the correction's fan-out, split on who authored it.
@@ -1757,6 +1774,25 @@ def _judge_batch_and_record(
             decision=verdict.decision,
             judged_by="scope-manager",
             notes=batch.record_notes_for(verdict.contribution_id),
+            relations=_relation_rows(
+                scope_manager,
+                next(
+                    (
+                        o
+                        for o in batch.inherited_relations
+                        if o.get("contribution_id") == verdict.contribution_id
+                    ),
+                    None,
+                ),
+                next(
+                    (
+                        o
+                        for o in batch.directive_relations
+                        if o.get("contribution_id") == verdict.contribution_id
+                    ),
+                    None,
+                ),
+            ),
         )
 
     summary_updated = False

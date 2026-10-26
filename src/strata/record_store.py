@@ -60,10 +60,10 @@ from __future__ import annotations
 import json
 import secrets
 import sqlite3
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from strata.fleet_config import FleetConfig
 from strata.summary_store import SummaryStore
@@ -1292,6 +1292,7 @@ class RecordStore:
         judged_by: str,
         notes: str | None = None,
         claim_event: ClaimEventInput | None = None,
+        relations: Sequence[Mapping[str, Any]] = (),
     ) -> Judgment:
         """Record the scope-manager's verdict on a contribution.
 
@@ -1324,6 +1325,9 @@ class RecordStore:
                 its own referenced contribution/item does not exist. Nothing
                 is written — the transaction rolls back, so a judgment never
                 survives without its event, or the reverse.
+
+        *relations* are the relation re-ask outcomes that fed this verdict (see
+        :meth:`record_relation_calls`); they are written in the same transaction.
         """
         judgment_id = _new_judgment_id()
         with self._conn:  # one transaction: the judgment, and the event if given
@@ -1334,6 +1338,7 @@ class RecordStore:
                 """,
                 (judgment_id, contribution_id, decision, judged_by, notes),
             )
+            self._insert_relation_calls(contribution_id, relations)
             if claim_event is not None:
                 self._insert_change_event(
                     change_id=claim_event.change_id,
@@ -1348,6 +1353,47 @@ class RecordStore:
                     processed=True,
                 )
         return self._fetch_judgment(judgment_id)
+
+    def _insert_relation_calls(
+        self, contribution_id: str, relations: Sequence[Mapping[str, Any]]
+    ) -> None:
+        for outcome in relations:
+            call = outcome.get("call", "context")
+            self._conn.execute(
+                """
+                INSERT OR REPLACE INTO relation_calls
+                    (contribution_id, call, answer_kind, inherited_id, origin, occurrence_span,
+                     instead_span, requirement_span, verdict, fallback, reason, marker)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    contribution_id,
+                    call,
+                    outcome.get("kind") or outcome.get("relation"),
+                    outcome.get("inherited_id"),
+                    outcome.get("origin"),
+                    outcome.get("occurrence_span"),
+                    outcome.get("instead_span"),
+                    outcome.get("requirement_span"),
+                    outcome["verdict"],
+                    1 if outcome.get("fallback") else 0,
+                    outcome.get("reason"),
+                    outcome.get("marker"),
+                ),
+            )
+
+    def get_relation_calls(self, contribution_id: str) -> list[dict[str, Any]]:
+        """The relation re-ask answers recorded with *contribution_id*'s judgment (oldest
+        first; empty when no re-ask fired or the judgment predates the table)."""
+        rows = self._conn.execute(
+            """
+            SELECT call, answer_kind, inherited_id, origin, occurrence_span, instead_span,
+                   requirement_span, verdict, fallback, reason, marker
+            FROM relation_calls WHERE contribution_id = ? ORDER BY rowid
+            """,
+            (contribution_id,),
+        ).fetchall()
+        return [{**dict(r), "fallback": bool(r["fallback"])} for r in rows]
 
     def record_judgment_and_raise(
         self,
