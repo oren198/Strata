@@ -231,6 +231,96 @@ def test_doctor_multiline_message_is_report_not_understood(
     assert doc_rc == 1
 
 
+def test_doctor_non_string_verdict_is_not_understood(
+    _offline, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A missing, null, number, or list verdict is not printed as unmeasured."""
+    _box, state = _offline
+    rc, _out, err = invoke(capsys, ["judge-check", "--yes", "--price", "0.2,0.8", "--reps", "1"])
+    assert rc == 0, err
+    path = report_json(state)
+    report = json.loads(path.read_text(encoding="utf-8"))
+    date = report["header"]["date"]
+    for verdict in (None, 3, ["decline"], "drop-key"):
+        body = dict(report)
+        if verdict == "drop-key":
+            body.pop("verdict", None)
+        else:
+            body["verdict"] = verdict
+        path.write_text(json.dumps(body), encoding="utf-8")
+        doc_rc, out, err = _doctor(capsys)
+        line = f"Judge check: report not understood (report {date}); re-run"
+        assert line in out
+        assert _judge_lines(out, err) == [f"  ✓ {line}"] or _judge_lines(out, err) == [
+            f"  OK {line}"
+        ]
+        assert "unmeasured" not in "".join(_judge_lines(out, err))
+        assert doc_rc == 1
+    body = dict(report)
+    body["verdict"] = None
+    body["header"] = {key: value for key, value in report["header"].items() if key != "date"}
+    path.write_text(json.dumps(body), encoding="utf-8")
+    doc_rc, out, err = _doctor(capsys)
+    line = "Judge check: report not understood (report date unknown); re-run"
+    assert line in out
+    assert _judge_lines(out, err) == [f"  ✓ {line}"] or _judge_lines(out, err) == [f"  OK {line}"]
+    assert "unmeasured" not in "".join(_judge_lines(out, err))
+    assert doc_rc == 1
+
+
+def test_doctor_invalid_json_names_the_parse_error(
+    _offline, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A report file that exists but is not JSON names JSONDecodeError."""
+    _box, state = _offline
+    rc, _out, err = invoke(capsys, ["judge-check", "--yes", "--price", "0.2,0.8", "--reps", "1"])
+    assert rc == 0, err
+    path = report_json(state)
+    path.write_text('{"verdict": SECRET-JSON-SNIPPET', encoding="utf-8")
+    doc_rc, out, err = _doctor(capsys)
+    line = "Judge check: could not read the report (JSONDecodeError)"
+    assert line in out
+    assert _judge_lines(out, err) == [f"  ✓ {line}"] or _judge_lines(out, err) == [f"  OK {line}"]
+    assert "SECRET-JSON-SNIPPET" not in out + err
+    assert "unmeasured" not in "".join(_judge_lines(out, err))
+    assert "Judge check:" not in err
+    assert doc_rc == 1
+
+
+def test_doctor_unreadable_file_names_permission_error(
+    _offline, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An existing report Path.read_text cannot read names PermissionError."""
+    _box, state = _offline
+    rc, _out, err = invoke(capsys, ["judge-check", "--yes", "--price", "0.2,0.8", "--reps", "1"])
+    assert rc == 0, err
+    path = report_json(state)
+    assert path.is_file()
+    real_read = Path.read_text
+    real_open = Path.open
+
+    def read_text(self: Path, *args: object, **kwargs: object) -> str:
+        if self.name == "report.json":
+            raise PermissionError("SECRET-PERM-MUST-NOT-PRINT")
+        return real_read(self, *args, **kwargs)
+
+    def open_path(self: Path, *args: object, **kwargs: object) -> object:
+        if self.name == "report.json":
+            raise PermissionError("SECRET-PERM-MUST-NOT-PRINT")
+        return real_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", read_text)
+    monkeypatch.setattr(Path, "open", open_path)
+    doc_rc, out, err = _doctor(capsys)
+    line = "Judge check: could not read the report (PermissionError)"
+    assert line in out
+    assert _judge_lines(out, err) == [f"  ✓ {line}"] or _judge_lines(out, err) == [f"  OK {line}"]
+    assert "SECRET-PERM-MUST-NOT-PRINT" not in out + err
+    assert "unmeasured" not in "".join(_judge_lines(out, err))
+    assert "Judge check:" not in err
+    assert doc_rc == 1
+
+
 def test_doctor_does_not_run_the_judge_or_prompt(
     _offline, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

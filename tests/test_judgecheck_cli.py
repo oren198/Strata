@@ -452,4 +452,5 @@ def test_docs_page_states_what_judge_check_measures_and_its_limits() -> None:
     assert "Judge check: incomplete (report <date>); re-run" in text
     assert "unmeasured: no reference bars in this build" in text
     assert "Judge check: report not understood (report <date>); re-run" in text
+    assert "Judge check: report not understood (report date unknown); re-run" in text
     assert "Judge check: could not read the report (<ExceptionClass>)" in text

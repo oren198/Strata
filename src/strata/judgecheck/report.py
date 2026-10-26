@@ -204,14 +204,25 @@ def write_report(report: dict[str, Any], text: str, *, out: Path | None = None) 
     return path
 
 
-def _read_report(path: Path) -> dict[str, Any] | None:
-    if not path.is_file():
+def _read_report(path: Path) -> dict[str, Any] | None | BaseException:
+    """Load the report at *path*.
+
+    ``None`` only when the path does not exist (no report). A path that exists
+    is never treated as absent because a read failed: the exception is returned
+    so the caller can name its class. A parsed value that is not an object is
+    returned as that value.
+    """
+    if not path.exists():
         return None
+    is_file = path.is_file()
     try:
+        if not is_file:
+            # Exists, but not a file. Read it so the OS error keeps its class.
+            path.read_text(encoding="utf-8")
         loaded = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError):
-        return None
-    return loaded if isinstance(loaded, dict) else None
+    except Exception as exc:  # noqa: BLE001 — the caller prints the class, not this message
+        return exc
+    return loaded
 
 
 def _one_line_date(value: object) -> str | None:
@@ -221,8 +232,8 @@ def _one_line_date(value: object) -> str | None:
     return None
 
 
-def _saved_report_date() -> str | None:
-    """The saved report's date, when this engine version has one single-line date."""
+def _saved_report_header() -> dict[str, Any] | None:
+    """The saved report's header when the file parses as an object."""
     from strata import __version__
     from strata.judgecheck.config import describe_judge
     from strata.settings import Settings
@@ -243,34 +254,42 @@ def _saved_report_date() -> str | None:
         return None
     header = report.get("header")
     if not isinstance(header, dict) or header.get("engine_version") != __version__:
-        return None
-    return _one_line_date(header.get("date"))
+        return header if isinstance(header, dict) else None
+    return header
+
+
+def _not_understood(header: object) -> str:
+    """``report not understood (report <date>); re-run``.
+
+    A missing or multi-line date is the words ``date unknown``. The parenthetical
+    stays. The verdict text is not copied.
+    """
+    date = _one_line_date(header.get("date")) if isinstance(header, dict) else None
+    shown = date if date else "date unknown"
+    text = f"report not understood (report {shown}); re-run"
+    if "\n" in text or "\r" in text:
+        return "report not understood (report date unknown); re-run"
+    return text
 
 
 def report_not_understood_message() -> str:
-    """Suffix for an unrecognised report. One line, and this does not raise.
-
-    The date is the saved report's date when that date is a single line.
-    Otherwise it is ``unknown``. The verdict text is not copied.
-    """
-    date = "unknown"
+    """Suffix for an unrecognised report. One line, and this does not raise."""
+    header: object = None
     try:
-        date = _saved_report_date() or "unknown"
+        header = _saved_report_header()
     except Exception:  # noqa: BLE001 — a date lookup must not raise into doctor
-        date = "unknown"
-    text = f"report not understood (report {date}); re-run"
-    if "\n" in text or "\r" in text:
-        return "report not understood (report unknown); re-run"
-    return text
+        header = None
+    return _not_understood(header)
 
 
 def doctor_judge_check_message() -> str:
     """The suffix ``strata doctor`` prints after ``Judge check:``.
 
-    Reads a local file only: no judge call, no prompt. No report for this
-    engine version, or the verdict ``unmeasured: no reference bars in this
-    build``, is the unmeasured line. An incomplete verdict, an unrecognised
-    verdict string, and a lookup exception each have their own line.
+    Reads a local file only: no judge call, no prompt. Unmeasured is only a
+    path that does not exist, or the verdict ``unmeasured: no reference bars
+    in this build``. A file that exists but cannot be read or parsed names the
+    exception class. Any other saved report doctor cannot interpret is
+    ``report not understood``.
     """
     unmeasured = "unmeasured for this engine version"
     try:
@@ -289,17 +308,26 @@ def doctor_judge_check_message() -> str:
             )
             / "report.json"
         )
-        report = _read_report(path)
     except Exception as exc:  # noqa: BLE001 — this line must not raise into doctor
         return f"could not read the report ({type(exc).__name__})"
-    if report is None:
+    # Absence is exists() / is_file(), not a caught error. is_file() is recorded
+    # so a non-file that exists is still read and keeps the OS error's class.
+    if not path.exists():
         return unmeasured
+    _is_file = path.is_file()
+    report = _read_report(path)
+    if isinstance(report, BaseException):
+        return f"could not read the report ({type(report).__name__})"
+    if not isinstance(report, dict):
+        return _not_understood(None)
+    if not _is_file:
+        return _not_understood(report.get("header"))
     header = report.get("header")
     if not isinstance(header, dict) or header.get("engine_version") != __version__:
-        return unmeasured
+        return _not_understood(header if isinstance(header, dict) else None)
     verdict = report.get("verdict")
     if not isinstance(verdict, str):
-        return unmeasured
+        return _not_understood(header)
     date = _one_line_date(header.get("date")) or "unknown"
     if verdict.startswith("meets the judge-check v1 bar"):
         return f"meets the v1 bar (report {date})"
@@ -311,4 +339,4 @@ def doctor_judge_check_message() -> str:
         return f"incomplete (report {date}); re-run"
     if verdict == "unmeasured: no reference bars in this build":
         return unmeasured
-    return f"report not understood (report {date}); re-run"
+    return _not_understood(header)
