@@ -339,7 +339,21 @@ def change_event_dict(event: _ChangeEventLike) -> dict:
         "after": event.after,
         "created_at": event.created_at,
         "contribution_id": event.contribution_id,
+        **_retirement_part(event),
     }
+
+
+def _retirement_part(event: _ChangeEventLike) -> dict:
+    """The ``retirement`` entry of a ``directive_retired`` notice: label ("retired" for a
+    release, "retracted" for a correction), the authority's notice, kind and cause. Absent
+    for every other event, so their shape is unchanged. One path, two labels: nothing else
+    about a release and a retraction differs."""
+    retirement = getattr(event, "retirement", None)
+    if retirement is None:
+        return {}
+    from strata.forgetting import retirement_notice  # noqa: PLC0415
+
+    return {"retirement": retirement_notice(retirement)}
 
 
 def _composes_as_input_change(event: _ChangeEventLike, *, scope_id: str) -> bool:

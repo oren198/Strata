@@ -84,7 +84,7 @@ import os
 import pathlib
 import sqlite3
 import tempfile
-from collections.abc import AsyncGenerator, Generator, Sequence
+from collections.abc import AsyncGenerator, Generator, Mapping, Sequence
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -123,6 +123,7 @@ from strata.fleet_config import (
     replace_fleet_bytes,
 )
 from strata.fleet_reload import FleetReloader
+from strata.forgetting import sweep_date_lapses_locked, validate_ends, validate_fulfils
 from strata.locks import BATCH_CAP, QUEUE_WAIT_TIMEOUT_S, QueueTicket, configure_lock_dir
 from strata.locks import scope_append_lock as _scope_append_lock
 from strata.locks import scope_lock as _scope_lock
@@ -736,6 +737,11 @@ def _judge_and_record(
     serialized unit. On judge failure it records a judgment-attempt-failed
     event and raises :class:`JudgeUnavailable`; no judgment row is written.
     """
+    # v1.20: a date end condition that is over retires its directive by mechanism before
+    # anything below reads the summary. The lock is already held; no judge call.
+    sweep_date_lapses_locked(
+        scope.id, fleet=fleet, record_store=record_store, summary_store=summary_store
+    )
     # #234 §8: the PRE-write watermark, taken before anything below reads or
     # writes — same lock as the write that follows, so this is the exact
     # "nothing else had changed before this write" baseline the self-trigger
@@ -1278,14 +1284,50 @@ def _write_amendment(
     # reserved for exactly this scope-manager explicit-retire. Superseded
     # directives get none: their explanation is the incoming directive's
     # own supersedes reference.
+    confirmed_retirements: dict[str, str] = {}
     for directive_id, reason, changed_circumstance in retirements:
-        record_store.append_retirement(
+        # v1.20: a judged retire of a directive with a JUDGED end condition reached here only
+        # through the engine's confirmation check (scope_manager), so it is recorded as one:
+        # kind, cause and the end condition, and its change event carries the notice.
+        judged_condition = next(
+            (
+                d
+                for d in (previous_summary.directives if previous_summary else [])
+                if d.id == directive_id
+                and d.end_condition is not None
+                and d.end_condition.kind == "judged"
+            ),
+            None,
+        )
+        extra: dict = {}
+        if judged_condition is not None:
+            evidence = next(
+                (
+                    c
+                    for cid in judged_contribution_ids
+                    if (c := record_store.get_contribution(cid)) is not None
+                    and c.fulfils == directive_id
+                ),
+                None,
+            )
+            extra = {
+                "kind": "currency",
+                "notice": changed_circumstance,
+                "actor_session_id": evidence.contributor.session_id if evidence else None,
+                "cause": "condition_judged",
+                "end_condition": judged_condition.end_condition.model_dump_json(),
+                "evidence_contribution_id": evidence.id if evidence else None,
+            }
+        row = record_store.append_retirement(
             scope_id=scope.id,
             directive_id=directive_id,
             retired_by="scope-manager",
             reason=reason,
             changed_circumstance=changed_circumstance,
+            **extra,
         )
+        if extra:
+            confirmed_retirements[directive_id] = row.id
 
     # ADR 0007 D3 — staleness propagation, two paths, both under the
     # lock this function's caller already holds:
@@ -1407,6 +1449,11 @@ def _write_amendment(
         change_ids=change_ids,
         hop=judgment.hop,
     )
+    for directive_id, retirement_id in confirmed_retirements.items():
+        for cid in dict.fromkeys(change_ids):
+            record_store.link_change_events_to_retirement(
+                change_id=cid, item_id=directive_id, retirement_id=retirement_id
+            )
 
     # Issue #197, the context half: a contribution that supersedes an earlier
     # one whose claim lived in CONTEXT moves no directive, so the diff above is
@@ -1581,6 +1628,10 @@ def _judge_batch_and_record(
 
     The caller MUST hold ``_scope_lock(scope.id)``.
     """
+    # v1.20: see _judge_and_record. Idempotent, so a batch of one that takes that path sweeps twice.
+    sweep_date_lapses_locked(
+        scope.id, fleet=fleet, record_store=record_store, summary_store=summary_store
+    )
     wave_ids = list(dict.fromkeys(change_ids or ()))
     # A batch of ONE takes the single-contribution path verbatim (ADR 0011
     # D3) — unless it belongs to several waves. The single judgment shape
@@ -2084,6 +2135,8 @@ def run_contribution(
     queue_timeout_s: float = QUEUE_WAIT_TIMEOUT_S,
     acted_on: str | None = None,
     adopted_from: str | None = None,
+    ends: Mapping[str, object] | None = None,
+    fulfils: str | None = None,
 ) -> ContributionOutcome:
     """Append a contribution to the record and get it judged (ADR 0011 D3).
 
@@ -2122,6 +2175,14 @@ def run_contribution(
         raise ValueError("acted_on and supersedes cannot both be set on one contribution.")
     if adopted_from is not None and acted_on is not None:
         raise ValueError("adopted_from and acted_on cannot both be set on one contribution.")
+    # v1.20: an end condition for the directive this contribution creates, and the id of a
+    # judged-condition directive it is evidence for. Both are checked here, before anything is
+    # appended; neither decides anything by itself.
+    end_condition = validate_ends(ends)
+    if end_condition is not None and proposed_classification != "directive":
+        raise ValueError("ends is only meaningful on a contribution that proposes a directive.")
+    if fulfils is not None:
+        validate_fulfils(fulfils, contributor, fleet=fleet, summary_store=summary_store)
     # ADR 0017 P5: the API keeps ONE `acted_on` field; the app resolves which
     # storage column the id belongs in. Ids are minted so this dispatch is
     # unambiguous and never needs a lookup: contribution ids are `c_`-prefixed,
@@ -2140,6 +2201,8 @@ def run_contribution(
             acted_on=None if is_operator_target else acted_on,
             acted_on_operator_item=acted_on if is_operator_target else None,
             adopted_from=adopted_from,
+            ends=end_condition.model_dump_json() if end_condition is not None else None,
+            fulfils=fulfils,
         )
         ticket = queue.enqueue(contribution.id, contribution)
 

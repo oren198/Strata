@@ -68,7 +68,13 @@ from pydantic import BaseModel, Field
 from strata.fleet_config import EntitlementView, Scope, Stratum
 from strata.operator import OperatorItem
 from strata.record_store import ACCEPTED_DECISIONS, Contribution, ContributorRef, RecentContribution
-from strata.summary_store import Directive, ScopeSummary, _render_summary, adopted_suffix
+from strata.summary_store import (
+    Directive,
+    EndCondition,
+    ScopeSummary,
+    _render_summary,
+    adopted_suffix,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -2105,6 +2111,104 @@ def _partition_ops(
     return applicable, invalid
 
 
+def _contribution_end_condition(contribution: Contribution) -> EndCondition | None:
+    """The end condition a contribution carries for the directive it creates (validated at the
+    write boundary; an unreadable value is dropped rather than failing the judgment)."""
+    raw = getattr(contribution, "ends", None)
+    if not raw:
+        return None
+    try:
+        return EndCondition.model_validate_json(raw)
+    except ValueError:
+        return None
+
+
+def _guard_judged_end_condition_retires(
+    judgment: _JudgmentT,
+    *,
+    scope: Scope,
+    current_summary: ScopeSummary | None,
+    contributions: Mapping[str, Contribution],
+) -> _JudgmentT:
+    """A judged ``retire`` of a directive with a JUDGED end condition is the owner's judge
+    confirming that condition (v1.20, R2), and only that: it stands when the contribution it
+    belongs to was contributed in this (the owning) scope, carries ``fulfils`` for the
+    directive, and states what the judge checked ("verified" is refused). Otherwise the op is
+    dropped, with a protocol note, and the directive stands.
+
+    A plain judged ``retire`` of a directive WITHOUT such a condition keeps today's #209 path
+    untouched. The op that stands has its ``changed_circumstance`` replaced by the engine's
+    reason, "end condition judged met: <condition> / <evidence>".
+    """
+    from strata.forgetting import condition_met_reason, evidence_acceptable  # noqa: PLC0415
+
+    if current_summary is None or not judgment.directive_ops:
+        return judgment
+    judged = {
+        d.id: d
+        for d in current_summary.directives
+        if d.end_condition is not None and d.end_condition.kind == "judged"
+    }
+    if not judged:
+        return judgment
+    kept: list[DirectiveOp] = []
+    notes: list[str] = []
+    changed = False
+    for op in judgment.directive_ops:
+        directive = judged.get(op.id or "") if op.op == "retire" else None
+        if directive is None:
+            kept.append(op)
+            continue
+        owner = contributions.get(getattr(op, "contribution_id", None) or "")
+        if owner is None and len(contributions) == 1:
+            owner = next(iter(contributions.values()))
+        evidence = op.changed_circumstance
+        if (
+            owner is not None
+            and owner.scope_id == scope.id
+            and owner.fulfils == directive.id
+            and evidence_acceptable(evidence)
+        ):
+            condition = directive.end_condition.condition or ""  # type: ignore[union-attr]
+            kept.append(
+                op.model_copy(
+                    update={"changed_circumstance": condition_met_reason(condition, evidence or "")}
+                )
+            )
+            changed = True
+        else:
+            notes.append(
+                f"retire of {directive.id} refused: it has a judged end condition and the "
+                "contribution carries no fulfils for it, or states no evidence."
+            )
+            changed = True
+    if not changed:
+        return judgment
+    update: dict = {
+        "directive_ops": kept,
+        "protocol_notes": [*judgment.protocol_notes, *notes],
+    }
+    if judgment.new_summary is not None:
+        if isinstance(judgment, ScopeManagerBatchJudgment):
+            update["new_summary"] = _apply_batch_amendment(
+                scope=scope,
+                current_summary=current_summary,
+                contributions=contributions,
+                ops=kept,
+                new_context=judgment.new_context,
+            )
+        else:
+            only = next(iter(contributions.values()))
+            update["new_summary"] = _apply_amendment(
+                scope=scope,
+                current_summary=current_summary,
+                contribution=only,
+                ops=kept,
+                new_context=judgment.new_context,
+            )
+    return judgment.model_copy(update=update)
+
+
 def _mint_directive(op: DirectiveOp, contribution: Contribution) -> Directive:
     """Build the directive row an ``append``/``publish`` op admits.
 
@@ -2128,6 +2232,8 @@ def _mint_directive(op: DirectiveOp, contribution: Contribution) -> Directive:
         source_skill=contribution.contributor.skill,
         created_at=contribution.created_at,
         adopted_from=contribution.adopted_from,
+        end_condition=_contribution_end_condition(contribution),
+        set_by=contribution.id if contribution.ends else None,
     )
 
 
@@ -4018,6 +4124,14 @@ def _render_input_changes(events: Sequence[_ChangeEventLike] | None) -> str:
             f"      before: {event.before or '(none)'}\n"
             f"      after:  {event.after or '(none)'}"
         )
+        retirement = getattr(event, "retirement", None)
+        if retirement is not None:
+            # v1.20: a retired or retracted directive carries its authority's notice. One path,
+            # two labels; only the words differ. Every other event renders as before.
+            lines.append(
+                f"      {retirement.label.capitalize()} by its owner: "
+                f"{retirement.notice or retirement.reason or '(no notice)'}"
+            )
         if event.kind == "claim_corrected":
             # ADR 0017 P4 (CEO decision A, philosopher's follow-up): the engine
             # already withdraws THIS SCOPE'S PUBLICATION's own items that carry the
@@ -10320,13 +10434,18 @@ class ScopeManager:
                 current_summary=current_summary,
             )
         return _with_departure_labels_restored(
-            self._hold_directive_changes(
-                judgment,
+            _guard_judged_end_condition_retires(
+                self._hold_directive_changes(
+                    judgment,
+                    scope=scope,
+                    current_summary=current_summary,
+                    new_contribution=new_contribution,
+                    mode=mode,
+                    input_changes=input_changes,
+                ),
                 scope=scope,
                 current_summary=current_summary,
-                new_contribution=new_contribution,
-                mode=mode,
-                input_changes=input_changes,
+                contributions={new_contribution.id: new_contribution},
             ),
             current_summary,
             summary_max_words,
@@ -12954,13 +13073,18 @@ class ScopeManager:
             operator_memory=operator_memory,
         )
         return _with_departure_labels_restored(
-            self._hold_batch_directive_changes(
-                batch_judgment,
+            _guard_judged_end_condition_retires(
+                self._hold_batch_directive_changes(
+                    batch_judgment,
+                    scope=scope,
+                    current_summary=current_summary,
+                    contributions=contributions,
+                    mode=mode,
+                    input_changes=input_changes,
+                ),
                 scope=scope,
                 current_summary=current_summary,
                 contributions=contributions,
-                mode=mode,
-                input_changes=input_changes,
             ),
             current_summary,
             summary_max_words,
