@@ -69,6 +69,7 @@ from strata.fleet_config import EntitlementView, Scope, Stratum
 from strata.operator import OperatorItem
 from strata.record_store import ACCEPTED_DECISIONS, Contribution, ContributorRef, RecentContribution
 from strata.summary_store import Directive, ScopeSummary, _render_summary, adopted_suffix
+from strata.telling import has_telling_act
 
 _logger = logging.getLogger(__name__)
 
@@ -5157,14 +5158,47 @@ def _vocabulary_informants_missing(
     return missing
 
 
-def _drop_false_hearsay(reasoning: str) -> str:
-    """ "Hearsay:" on a reasoning that itself says first-hand is a wrong label: dropped."""
+def _drop_false_hearsay(reasoning: str, content: str | None = None) -> str:
+    """A hearsay claim that cannot be right is dropped from the reasoning (reason text only: the
+    decision is never touched).
+
+    - "Hearsay:" on a reasoning that itself says first-hand is a wrong label: dropped.
+    - With *content* given: a reasoning that calls the contribution hearsay or says an informant
+      "told the agent", for a contribution whose text records no telling act at all
+      (:func:`strata.telling.has_telling_act`), loses its hearsay sentences, and the engine says
+      what is true instead. The cue test fails toward keeping the claim: any cue keeps it."""
     for match in re.finditer(r"\bfirst[- ]hand\b", reasoning, re.IGNORECASE):
         before = " ".join(reasoning[: match.start()].split()[-3:])
         if re.search(r"\b(?:not|no|never|isn['’]t|wasn['’]t|neither|nor|without)\b", before, re.I):
             continue  # "not first-hand" keeps its "Hearsay:" label
         return re.sub(r"^\s*Hearsay:\s*", "", reasoning, count=1, flags=re.IGNORECASE)
-    return reasoning
+    if content is None or has_telling_act(content):
+        return reasoning
+    sentences = re.split(r"(?<=[.!?])\s+(?![^\[]*\])", reasoning.strip())
+    kept = [s for s in sentences if not _claims_hearsay(s)]
+    if len(kept) == len(sentences):
+        return reasoning
+    return " ".join([*kept, _NO_TELLING_NOTE])
+
+
+def _claims_hearsay(sentence: str) -> bool:
+    """Whether *sentence* asserts hearsay or an informant (a negated mention, "no informant told
+    the agent", is a statement about its absence and is not a claim)."""
+    match = _HEARSAY_SENTENCE_RE.search(sentence)
+    if match is None:
+        return False
+    before = " ".join(sentence[: match.start()].split()[-4:])
+    return not re.search(r"\b(?:no|not|never|neither|nor|without|none)\b", before, re.IGNORECASE)
+
+
+#: A sentence that calls the contribution hearsay, or says an informant told the agent, or
+#: restates the informant rule ("an informant's word is never a directive").
+_HEARSAY_SENTENCE_RE = re.compile(
+    r"^\s*Hearsay:|\binformant\b[^.]*\b(?:told|reports?|said|mentioned)\b"
+    r"|\binformant['’]s word\b|\bhearsay\b",
+    re.IGNORECASE,
+)
+_NO_TELLING_NOTE = "[Engine: the contribution records no telling act; it is first-hand.]"
 
 
 def _decisions_of(judgment: object) -> object:
@@ -10282,7 +10316,12 @@ class ScopeManager:
         # A "Hearsay:" label on a reasoning that itself says first-hand is a wrong label.
         if _REASON_INFORMANT_CHECK:
             judgment = judgment.model_copy(
-                update={"reasoning": _drop_false_hearsay(judgment.reasoning)}
+                update={
+                    "reasoning": _drop_false_hearsay(
+                        judgment.reasoning,
+                        new_contribution.content if judgment.decision != "decline" else None,
+                    )
+                }
             )
         judgment = self._hold_inherited_conflicts(
             judgment.model_copy(update={"contribution_id": new_contribution.id}),
@@ -12911,10 +12950,20 @@ class ScopeManager:
             parse_generic_decline=_generic_second_slip_batch_decline,
         )
         if _REASON_INFORMANT_CHECK:
+            text_of = {c.id: c.content for c in new_contributions}
             batch_judgment = batch_judgment.model_copy(
                 update={
                     "verdicts": [
-                        v.model_copy(update={"reasoning": _drop_false_hearsay(v.reasoning)})
+                        v.model_copy(
+                            update={
+                                "reasoning": _drop_false_hearsay(
+                                    v.reasoning,
+                                    text_of.get(v.contribution_id)
+                                    if v.decision != "decline"
+                                    else None,
+                                )
+                            }
+                        )
                         for v in batch_judgment.verdicts
                     ]
                 }
