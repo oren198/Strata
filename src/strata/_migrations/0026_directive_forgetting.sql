@@ -31,6 +31,19 @@ ALTER TABLE retirements ADD COLUMN evidence_contribution_id TEXT REFERENCES cont
 ALTER TABLE contributions ADD COLUMN ends TEXT;
 ALTER TABLE contributions ADD COLUMN fulfils TEXT;
 
+-- 5. `operator_act_forgetting`: what the forgetting acts add to an OPERATOR item, in a side
+--    table so `operator_acts` (append-only, pinned by older code) is untouched. For a
+--    publish/supersede act: the end condition (`ends`, JSON). For a retire act: the kind,
+--    the notice, the cause and who made it.
+CREATE TABLE operator_act_forgetting (
+    act_id           TEXT PRIMARY KEY REFERENCES operator_acts(id),
+    ends             TEXT,
+    kind             TEXT CHECK (kind IN ('currency', 'correction')),
+    notice           TEXT,
+    cause            TEXT CHECK (cause IN ('act', 'date_lapse', 'condition_judged')),
+    actor_session_id TEXT
+);
+
 CREATE TABLE retirement_candidates (
     id              TEXT PRIMARY KEY,
     directive_id    TEXT NOT NULL,

@@ -2614,25 +2614,27 @@ class RecordStore:
         ).fetchone()
         return Retirement(**dict(row))
 
-    def fulfils_evidence_ids(self, *, directive_id: str, outside_scope_id: str) -> list[str]:
+    def fulfils_evidence_ids(self, *, directive_id: str, outside_scope_id: str | None) -> list[str]:
         """Ids of ADMITTED contributions in other scopes' records that carry ``fulfils`` for
         *directive_id* (migration 0026) — evidence for a candidate, never a retirement."""
         rows = self._conn.execute(
             """
             SELECT c.id FROM contributions c
             JOIN judgments j ON j.contribution_id = c.id
-            WHERE c.fulfils = ? AND c.scope_id != ? AND j.decision != 'decline'
+            WHERE c.fulfils = ? AND (? IS NULL OR c.scope_id != ?)
+              AND j.decision != 'decline'
             ORDER BY c.created_at ASC, c.rowid ASC
             """,
-            (directive_id, outside_scope_id),
+            (directive_id, outside_scope_id, outside_scope_id),
         ).fetchall()
         return [row["id"] for row in rows]
 
     def directive_acted_on_since(self, directive_id: str, *, since: str) -> bool:
         """Whether any contribution reported acting on *directive_id* at or after *since*."""
         row = self._conn.execute(
-            "SELECT 1 FROM contributions WHERE acted_on = ? AND created_at >= ? LIMIT 1",
-            (directive_id, since.replace("T", " ")[:19]),
+            "SELECT 1 FROM contributions WHERE (acted_on = ? OR acted_on_operator_item = ?) "
+            "AND created_at >= ? LIMIT 1",
+            (directive_id, directive_id, since.replace("T", " ")[:19]),
         ).fetchone()
         return row is not None
 
@@ -2652,6 +2654,67 @@ class RecordStore:
             params.append(scope_id)
         row = self._conn.execute(sql + " ORDER BY created_at DESC, rowid DESC", params).fetchone()
         return Retirement(**dict(row)) if row is not None else None
+
+    def set_operator_act_forgetting(
+        self,
+        act_id: str,
+        *,
+        ends: str | None = None,
+        kind: str | None = None,
+        notice: str | None = None,
+        cause: str | None = None,
+        actor_session_id: str | None = None,
+    ) -> None:
+        """What a forgetting act adds to an operator act (migration 0026): the end condition of
+        a publish/supersede, or the kind/notice/cause/actor of a retire."""
+        self._conn.execute(
+            """
+            INSERT OR REPLACE INTO operator_act_forgetting
+                (act_id, ends, kind, notice, cause, actor_session_id)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (act_id, ends, kind, notice, cause, actor_session_id),
+        )
+        self._conn.commit()
+
+    def get_operator_act_forgetting(self, act_id: str) -> dict | None:
+        row = self._conn.execute(
+            "SELECT ends, kind, notice, cause, actor_session_id "
+            "FROM operator_act_forgetting WHERE act_id = ?",
+            (act_id,),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def operator_retirement_for_item(self, item_id: str) -> Retirement | None:
+        """The retirement of operator item *item_id*, as a :class:`Retirement`, or ``None``.
+
+        Only a retire act written with a kind (the v1.20 act, a lapse) is returned. An older
+        retire act keeps its event shape."""
+        row = self._conn.execute(
+            """
+            SELECT a.id, a.target_scope_id, a.retires, a.created_at,
+                   f.kind, f.notice, f.cause, f.actor_session_id
+            FROM operator_acts a
+            JOIN operator_act_forgetting f ON f.act_id = a.id
+            WHERE a.act = 'retire' AND a.retires = ? AND f.kind IS NOT NULL
+            ORDER BY a.created_at DESC, a.rowid DESC
+            """,
+            (item_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return Retirement(
+            id=row["id"],
+            scope_id=row["target_scope_id"],
+            directive_id=row["retires"],
+            retired_by="operator",
+            reason=row["notice"],
+            created_at=row["created_at"],
+            kind=row["kind"],
+            notice=row["notice"],
+            actor_session_id=row["actor_session_id"],
+            cause=row["cause"],
+        )
 
     def get_retirement(self, retirement_id: str) -> Retirement | None:
         """One retirement event by id, or ``None``."""
@@ -2689,6 +2752,18 @@ class RecordStore:
         )
         self._conn.commit()
         return self.get_retirement_candidate(candidate_id) if cur.rowcount else None
+
+    def list_all_retirement_candidates(
+        self, *, states: Sequence[str] = ("open",)
+    ) -> list[RetirementCandidate]:
+        marks = ", ".join("?" for _ in states)
+        rows = self._conn.execute(
+            f"SELECT id, directive_id, scope_id, ground, evidence_ids, opened_at, state, "
+            f"dismissed_until, note FROM retirement_candidates WHERE state IN ({marks}) "
+            f"ORDER BY opened_at ASC, rowid ASC",
+            tuple(states),
+        ).fetchall()
+        return [RetirementCandidate(**dict(row)) for row in rows]
 
     def get_retirement_candidate(self, candidate_id: str) -> RetirementCandidate | None:
         row = self._conn.execute(
@@ -3663,6 +3738,11 @@ class RecordStore:
 
         Only a retirement written with a kind (the v1.20 act, a date lapse or a confirmed
         condition) is attached; every other event keeps its shape."""
+        if event.kind == "operator_directive_changed":
+            if event.after is not None:  # a publish or supersede, not the item leaving
+                return event
+            retirement = self.operator_retirement_for_item(event.item_id)
+            return event if retirement is None else replace(event, retirement=retirement)
         if event.kind not in ("directive_retired", "directive_superseded"):
             return event
         retirement = self.retirement_for_directive(event.item_id, scope_id=event.source_scope_id)

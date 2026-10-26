@@ -225,20 +225,31 @@ _ENDS_LINE_RE = re.compile(
 )
 
 
-def ends_line_for(directive: Directive) -> str | None:
-    """The ``- ends:`` line for a directive that carries an end condition, else ``None``.
+def ends_line(end: EndCondition | None, set_by: str | None) -> str | None:
+    """The ``- ends:`` line for something that carries an end condition, else ``None``.
 
     A judged condition is written as a JSON string so quotes and newlines round-trip on
-    one line."""
-    end = directive.end_condition
+    one line. Shared by scope directives and operator items."""
     if end is None:
         return None
     if end.kind == "date":
         body = f"until={end.until}"
     else:
         body = f"when={json.dumps(end.condition or '', ensure_ascii=False)}"
-    suffix = f" · set_by={directive.set_by}" if directive.set_by else ""
+    suffix = f" · set_by={set_by}" if set_by else ""
     return f"- ends: {body}{suffix}"
+
+
+def ends_line_for(directive: Directive) -> str | None:
+    """:func:`ends_line` for a scope directive."""
+    return ends_line(directive.end_condition, directive.set_by)
+
+
+def parse_ends_line(line: str) -> tuple[EndCondition, str | None] | None:
+    """Parse a ``- ends:`` line back to ``(end condition, set_by)``, or ``None`` if it is not
+    one."""
+    match = _ENDS_LINE_RE.match(line)
+    return _parse_ends(match) if match else None
 
 
 def _parse_ends(match: re.Match[str]) -> tuple[EndCondition, str | None]:

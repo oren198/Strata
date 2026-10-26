@@ -336,6 +336,16 @@ def sweep_for_read(
             done += sweep_date_lapses(
                 owner, fleet=fleet, record_store=record_store, summary_store=summary_store, now=now
             )
+        from strata.operator import sweep_operator_date_lapses  # noqa: PLC0415
+
+        for owner in [*owners, scope_id]:
+            sweep_operator_date_lapses(
+                owner,
+                record_store=record_store,
+                summaries_dir=str(summary_store.summaries_dir),
+                fleet=fleet,
+                now=now,
+            )
         compute_retirement_candidates(
             scope_id, record_store=record_store, summary_store=summary_store, now=now
         )
@@ -368,6 +378,28 @@ def validate_fulfils(
             contributor.scope_id, fleet=fleet, summary_store=summary_store
         )
     ]
+    from strata.operator import read_operator_layer  # noqa: PLC0415
+
+    for sid in [contributor.scope_id, *[o for o, _ds in surface[1:]]]:
+        layer = read_operator_layer(sid, summaries_dir=str(summary_store.summaries_dir))
+        surface.append(
+            (
+                sid,
+                [
+                    Directive(
+                        id=it.id,
+                        content=it.content,
+                        subject=it.subject,
+                        source_scope_id=sid,
+                        created_at=it.created_at,
+                        end_condition=it.end_condition,
+                        set_by=it.set_by,
+                    )
+                    for it in layer
+                    if it.kind == "directive"
+                ],
+            )
+        )
     for owner, directives in surface:
         for d in directives:
             if d.id == directive_id:
@@ -499,7 +531,15 @@ def compute_retirement_candidates(
         if row is not None:
             opened.append(row)
 
-    for d in summary.directives:
+    from strata.operator import read_operator_layer  # noqa: PLC0415
+
+    operator_items = [
+        it
+        for it in read_operator_layer(scope_id, summaries_dir=str(summary_store.summaries_dir))
+        if it.kind == "directive"
+    ]
+    # An operator item's owner is the operator, so its candidates are the operator's to see.
+    for d in [*summary.directives, *operator_items]:
         end = d.end_condition
         if end is not None and end.kind == "date" and end.until:
             try:
@@ -509,7 +549,11 @@ def compute_retirement_candidates(
             if left is not None and 0 <= left <= DATE_NEAR_DAYS:
                 _open(d.id, "date_near")
         if end is not None and end.kind == "judged":
-            ids = record_store.fulfils_evidence_ids(directive_id=d.id, outside_scope_id=scope_id)
+            # an operator item is the operator's: evidence from anywhere is worth showing it
+            ids = record_store.fulfils_evidence_ids(
+                directive_id=d.id,
+                outside_scope_id=None if d.id.startswith("op_") else scope_id,
+            )
             if ids:
                 _open(d.id, "condition_evidence", ids)
         try:
@@ -535,7 +579,43 @@ def visible_candidates(
     """The open candidates, for a session bound to *scope_id* only. Never a descendant's."""
     if actor.scope_id != scope_id:
         return []
-    return record_store.list_retirement_candidates(scope_id=scope_id)
+    return [
+        c
+        for c in record_store.list_retirement_candidates(scope_id=scope_id)
+        if not c.directive_id.startswith("op_")
+    ]
+
+
+def operator_candidates(
+    record_store: RecordStore, *, scope_id: str | None = None
+) -> list[RetirementCandidate]:
+    """The open candidates on OPERATOR items (their owner is the operator), for the operator's
+    own surfaces only. Never shown to a scope's sessions."""
+    scopes = (
+        [scope_id]
+        if scope_id is not None
+        else sorted({c.scope_id for c in record_store.list_all_retirement_candidates()})
+    )
+    return [
+        c
+        for sid in scopes
+        for c in record_store.list_retirement_candidates(scope_id=sid)
+        if c.directive_id.startswith("op_")
+    ]
+
+
+def dismiss_operator_candidate(
+    candidate_id: str, *, reason: str, days: int, record_store: RecordStore
+) -> None:
+    """The operator snoozes a candidate on one of its own items. The item is unchanged.
+
+    Raises:
+        KeyError: no such candidate, or it is not on an operator item.
+        ValueError: a blank reason, or *days* < 1."""
+    candidate = record_store.get_retirement_candidate(candidate_id)
+    if candidate is None or not candidate.directive_id.startswith("op_"):
+        raise KeyError(candidate_id)
+    _snooze(candidate_id, reason=reason, days=days, record_store=record_store)
 
 
 def dismiss_candidate(
@@ -557,6 +637,12 @@ def dismiss_candidate(
         raise KeyError(candidate_id)
     if actor.scope_id != candidate.scope_id or actor.session_id == ENGINE_ACTOR:
         raise PositionGateRefusal("Only a session bound to the owning scope may dismiss it.")
+    if candidate.directive_id.startswith("op_"):
+        raise PositionGateRefusal("A candidate on an operator item is the operator's to dismiss.")
+    _snooze(candidate_id, reason=reason, days=days, record_store=record_store)
+
+
+def _snooze(candidate_id: str, *, reason: str, days: int, record_store: RecordStore) -> None:
     if not reason or not reason.strip():
         raise ValueError("A dismissal needs a reason.")
     if days < 1:

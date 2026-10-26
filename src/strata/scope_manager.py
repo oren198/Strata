@@ -74,6 +74,7 @@ from strata.summary_store import (
     ScopeSummary,
     _render_summary,
     adopted_suffix,
+    ends_line,
     ends_line_for,
 )
 
@@ -3631,6 +3632,9 @@ def _render_operator_memory(
                 f"[{item.id}] ({item.kind}, attached at {attachment_scope_id}){subject_part} "
                 f"{item.content}"
             )
+            ends = ends_line(getattr(item, "end_condition", None), getattr(item, "set_by", None))
+            if ends is not None:
+                lines.append(f"    {ends[2:]}")
     return "\n".join(lines) + "\n\n"
 
 

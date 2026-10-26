@@ -411,12 +411,18 @@ def _operator_directives(items: Sequence[_OperatorItemLike]) -> list[dict]:
     """
 
     def _item_dict(item: _OperatorItemLike) -> dict:
-        return {
+        entry = {
             "id": item.id,
             "content": item.content,
             "subject": item.subject,
             "created_at": item.created_at,
         }
+        # v1.20: an operator item written with an end condition shows it; any other item's
+        # dict is exactly as before.
+        end = getattr(item, "end_condition", None)
+        if end is not None:
+            entry["ends"] = end.model_dump(exclude_none=True)
+        return entry
 
     return [_item_dict(i) for i in items if i.kind == "directive"]
 
