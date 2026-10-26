@@ -17,6 +17,7 @@ runnable. Subcommands:
                            the V1 → V1.2 upgrade path.
 * ``strata doctor``       — diagnose a project's config/DB/fleet/install
                            wiring/agent binding in one offline pass.
+* ``strata judge-check``  — measure the configured judge against the frozen set.
 
 All commands — including the inspection commands (``scopes``, ``summary``,
 ``record``) and ``launch`` — read ``fleet.yaml`` and the record/summary
@@ -1251,6 +1252,9 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         an input change awaiting its refresh, never a judge outage.
     11. Structure emission (ADR 0014 D8) — soft. Lists every ``remove_edge``
         or ``reparent`` act for which ``unemitted_receivers`` is not ``[]``.
+    12. Judge check — one informational line (meets, does not meet, or
+        unmeasured for this engine version). Soft and always passing: it
+        never calls the judge and never changes the exit status.
     """
     from strata.bootstrap import load_fleet_config
     from strata.fleet_config import FleetConfigError
@@ -2109,7 +2113,29 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     # -----------------------------------------------------------------------
     checks.append(_check_structure_emission(paths))
 
+    # 12. Judge-check measurement for this engine version and the configured
+    # judge. Informational only: one line, never a failure, so it cannot
+    # change this command's exit status and it never calls the judge.
+    checks.append(_judge_check_status())
+
     return _run_preflight(checks)
+
+
+def _judge_check_status() -> Check:
+    """One judge-check line. Always a passing soft check.
+
+    A missing report, an unreadable report, or an error inside the lookup is
+    the unmeasured state. Doctor's exit status is the other checks' alone.
+    """
+    from strata.judgecheck.report import doctor_judge_check_message
+
+    try:
+        message = doctor_judge_check_message()
+    except Exception:  # noqa: BLE001 — this line must not abort doctor
+        message = "unmeasured for this engine version"
+    if "\n" in message or "\r" in message:
+        message = "unmeasured for this engine version"
+    return Check(name="Judge check", kind="soft", passed=True, message=message)
 
 
 # ---------------------------------------------------------------------------
@@ -5608,6 +5634,54 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Diagnose a project's Strata wiring: config, DB, fleet, install, binding.",
     )
     p_doctor.set_defaults(func=cmd_doctor)
+
+    p_judge_check = sub.add_parser(
+        "judge-check",
+        help=(
+            "Measure the configured judge against the frozen judge-check set. "
+            "Prints the engine's cost estimate and asks y/N unless --yes."
+        ),
+    )
+    p_judge_check.add_argument(
+        "--reps",
+        type=int,
+        default=3,
+        help="Repetitions of each item (default: 3).",
+    )
+    p_judge_check.add_argument(
+        "--max-usd",
+        type=float,
+        default=None,
+        dest="max_usd",
+        help="Stop the run when the next call would pass this many dollars.",
+    )
+    p_judge_check.add_argument(
+        "--price",
+        default=None,
+        help=(
+            "Input,output[,cache read] dollars per million tokens "
+            "(for example 0.22,0.88). Wins over the provider listing."
+        ),
+    )
+    p_judge_check.add_argument(
+        "--yes",
+        action="store_true",
+        help="Run without asking y/N.",
+    )
+    p_judge_check.add_argument(
+        "--out",
+        default=None,
+        help="Also write the JSON report to this path.",
+    )
+    p_judge_check.add_argument(
+        "--compare",
+        default=None,
+        metavar="REPORT",
+        help="Pass a saved report through to the paired A/B compare.",
+    )
+    from strata.judgecheck.cli import cmd_judge_check
+
+    p_judge_check.set_defaults(func=cmd_judge_check)
 
     # -------------------------------------------------------------------
     # strata operator — ADR 0008 D1's local entry surface: publish/supersede/
