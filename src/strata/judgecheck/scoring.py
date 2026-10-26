@@ -12,6 +12,7 @@ what the report, the CLI and `strata doctor` consume.
 from __future__ import annotations
 
 import math
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
@@ -150,6 +151,18 @@ def post_checks(item: Item, result: ItemResult) -> dict[str, bool]:
             raise ValueError(f"unknown post_check: {name!r}")
         out[name] = check(item, result)
     return out
+
+
+def _hearsay_on_first_hand(items: Mapping[str, Item], result: ItemResult) -> bool:
+    """A reasoning that opens "Hearsay:" for a contribution whose text records no telling act
+    (:func:`strata.telling.has_telling_act`). Lexical and report-only."""
+    from strata.telling import has_telling_act  # noqa: PLC0415
+
+    item = items.get(result.item_id)
+    if item is None or not re.match(r"\s*Hearsay:", result.reasoning or "", re.IGNORECASE):
+        return False
+    data = item.data.get("contribution") or item.data.get("proposal") or {}
+    return not has_telling_act(str(data.get("content", "")))
 
 
 def p5_flags(item: Item, result: ItemResult) -> tuple[bool, bool, bool]:
@@ -369,6 +382,7 @@ def score(
 
     # operational
     calls = sum(r.calls for r in results)
+    hearsay_on_first_hand = sum(1 for r in results if _hearsay_on_first_hand(items, r))
     tool_failures = sum(1 for r in results if r.decision == "tool_error")
     recovered = sum(1 for r in results if r.tool_recovered)
     errors = [r for r in results if r.decision == "judge_error"]
@@ -387,6 +401,7 @@ def score(
         "tool_call_failures": tool_failures,
         "tool_call_recovered": recovered,
         "judge_errors": len(errors),
+        "hearsay_labels_on_first_hand": hearsay_on_first_hand,
         "relation_calls": sum(r.relation_calls for r in results),
         "relation_errors": sum(r.relation_errors for r in results),
         "main_call_errors": sum(r.main_call_errors for r in results),
