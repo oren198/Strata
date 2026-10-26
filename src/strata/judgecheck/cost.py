@@ -15,6 +15,7 @@ import json
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlparse
 
 #: Judge HTTP calls per judgment, measured on the 1.18.3 gate.
 CALLS_PER_JUDGMENT = 1.5
@@ -62,32 +63,97 @@ def parse_price(text: str) -> Price:
     return Price(low, high, "--price")
 
 
-def fetch_price(
-    base_url: str | None, model: str, *, http_get: Callable[[str], Any] | None = None
-) -> Price | None:
-    """The model's price from the provider's models endpoint (OpenRouter shape), or ``None``.
+_OPENROUTER_V1 = "https://openrouter.ai/api/v1"
 
-    Reads ``{base_url}/models`` and the entry whose id is *model*: ``pricing.prompt`` and
-    ``pricing.completion`` are dollars PER TOKEN there. Any failure, or a provider without the
-    endpoint, is ``None``: the caller then needs ``--price``."""
+
+def _is_openrouter(base_url: str) -> bool:
+    host = (urlparse(base_url).hostname or "").lower()
+    return host == "openrouter.ai" or host.endswith(".openrouter.ai")
+
+
+def models_url(base_url: str) -> str:
+    """Where the provider lists its models. For OpenRouter, whatever form the Anthropic-
+    compatible base takes (``https://openrouter.ai/api``, ``.../api/``, ``.../api/v1``), the
+    listing is at ``https://openrouter.ai/api/v1/models``. Other hosts: ``<base>/models``."""
+    if _is_openrouter(base_url):
+        return _OPENROUTER_V1 + "/models"
+    return base_url.rstrip("/") + "/models"
+
+
+def _get_json(url: str, http_get: Callable[[str], Any] | None) -> Any:
+    if http_get is not None:
+        return http_get(url)
+    import httpx  # noqa: PLC0415
+
+    response = httpx.get(url, timeout=10.0)
+    response.raise_for_status()
+    return response.json()
+
+
+def _per_million(pricing: dict[str, Any]) -> tuple[float, float]:
+    return float(pricing["prompt"]) * 1_000_000, float(pricing["completion"]) * 1_000_000
+
+
+def _openrouter_price(
+    model: str, provider: str | None, http_get: Callable[[str], Any] | None
+) -> Price | None:
+    """OpenRouter lists a model once, at its CHEAPEST provider's price, so that listing would
+    undercount a run pinned to a dearer provider. The per-endpoint listing has every provider's
+    price: a pinned provider is priced at its own endpoint (refused when it is not listed), an
+    unpinned run at the dearest endpoint, because OpenRouter may route to any of them."""
+    body = _get_json(f"{_OPENROUTER_V1}/models/{model}/endpoints", http_get)
+    endpoints = (body.get("data") or {}).get("endpoints") or []
+    priced = [(e, _per_million(e["pricing"])) for e in endpoints if e.get("pricing")]
+    if provider:
+        wanted = provider.strip().lower()
+        for endpoint, (low, high) in priced:
+            names = {
+                str(endpoint.get("provider_name", "")).lower(),
+                str(endpoint.get("name", "")).split("|")[0].strip().lower(),
+                str(endpoint.get("tag", "")).split("/")[0].lower(),
+            }
+            if wanted in names:
+                return Price(low, high, f"provider endpoint listing ({provider})")
+        raise PriceUnknown(
+            f"The pinned provider {provider!r} is not listed for model {model!r} on OpenRouter; "
+            "pass --price IN,OUT, or fix the provider pin."
+        )
+    if not priced:
+        return None
+    return Price(
+        max(p[0] for _, p in priced),
+        max(p[1] for _, p in priced),
+        "provider endpoint listing (dearest endpoint; the run is not pinned)",
+    )
+
+
+def fetch_price(
+    base_url: str | None,
+    model: str,
+    *,
+    provider: str | None = None,
+    http_get: Callable[[str], Any] | None = None,
+) -> Price | None:
+    """The model's price from the provider's listing, or ``None`` when it cannot be read.
+
+    OpenRouter (any form of its base URL): the per-endpoint listing, priced at the pinned
+    *provider* or, unpinned, at the dearest endpoint (see :func:`_openrouter_price`); a pinned
+    provider that is not listed raises :class:`PriceUnknown`. Other hosts: ``<base>/models``,
+    the entry whose id is *model* (``pricing.prompt`` / ``completion`` are dollars PER TOKEN).
+    Any read failure is ``None``: the caller then needs ``--price``. It never falls back to
+    OpenRouter's single-price listing, which is the cheapest provider's."""
     if not base_url:
         return None
-    url = base_url.rstrip("/") + "/models"
     try:
-        if http_get is None:
-            import httpx  # noqa: PLC0415
-
-            body = httpx.get(url, timeout=10.0).json()
-        else:
-            body = http_get(url)
+        if _is_openrouter(base_url):
+            return _openrouter_price(model, provider, http_get)
+        body = _get_json(models_url(base_url), http_get)
         for entry in body.get("data", []):
             if entry.get("id") == model:
-                pricing = entry["pricing"]
-                return Price(
-                    float(pricing["prompt"]) * 1_000_000,
-                    float(pricing["completion"]) * 1_000_000,
-                    "provider models endpoint",
-                )
+                low, high = _per_million(entry["pricing"])
+                return Price(low, high, "provider models endpoint")
+    except PriceUnknown:
+        raise
     except Exception:  # noqa: BLE001 — a price lookup must never break a run
         return None
     return None
@@ -98,12 +164,14 @@ def resolve_price(
     base_url: str | None,
     model: str,
     *,
+    provider: str | None = None,
     http_get: Callable[[str], Any] | None = None,
 ) -> Price:
-    """`--price` wins; else the provider's endpoint; else refuse, naming --price."""
+    """`--price` wins; else the provider's listing (pinned provider's price on OpenRouter);
+    else refuse, naming --price."""
     if cli_price:
         return parse_price(cli_price)
-    found = fetch_price(base_url, model, http_get=http_get)
+    found = fetch_price(base_url, model, provider=provider, http_get=http_get)
     if found is None:
         raise PriceUnknown(
             f"No price is known for model {model!r}. Pass --price IN,OUT (dollars per million "
