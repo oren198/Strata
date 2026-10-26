@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -588,3 +589,102 @@ def test_console_renders_the_label_the_notice_and_the_phrase() -> None:
     assert "dismiss" not in body.lower()
     assert "c.retirement.label" in view
     assert "c.retirement.notice" in view
+
+
+# operator_retire*, operator_publish, operator_supersede*, and an operator
+# dismiss or candidates tool. forgetting_surface defines none of these; the
+# scan still includes that module so a function added there is covered.
+_OPERATOR_ACT = re.compile(
+    r"(?<![\w])(?:"
+    r"operator_retire\w*"
+    r"|operator_publish\w*"
+    r"|operator_supersede\w*"
+    r"|operator_dismiss\w*"
+    r"|operator_candidates\w*"
+    r"|dismiss_operator\w*"
+    r")(?![\w])"
+)
+
+
+def _operator_act_names() -> set[str]:
+    """Operator acts an MCP tool must not call.
+
+    ``forgetting_surface`` is included because that is the peripherals module.
+    It defines none of these today. The acts themselves live in
+    ``strata.forgetting`` and ``strata.operator``.
+    """
+    import strata.forgetting as forgetting
+    import strata.forgetting_surface as surface
+    import strata.operator as operator
+
+    names: set[str] = set()
+    for module in (surface, forgetting, operator):
+        for name, value in vars(module).items():
+            if callable(value) and _OPERATOR_ACT.search(name):
+                names.add(name)
+    return names
+
+
+def _tool_source(fn: object) -> str:
+    """Source of a registered tool, including the function under the wrappers."""
+    chunks: list[str] = []
+    seen: list[object] = []
+    current = fn
+    while current is not None and current not in seen:
+        seen.append(current)
+        try:
+            chunks.append(inspect.getsource(current))
+        except (OSError, TypeError):
+            chunks.append("")
+        current = getattr(current, "__wrapped__", None)
+    source = "\n".join(chunks)
+    if not source.strip():
+        raise AssertionError("registered tool has no readable source")
+    return source
+
+
+async def test_mcp_exposes_no_operator_tool_and_retire_takes_no_scope(tmp_path: Path) -> None:
+    """Every exposed MCP tool, by name and by what it calls.
+
+    ``strata_retire``'s input schema has no ``scope_id`` and no ``actor``.
+    """
+    mod = _load_mcp_module(
+        _make_db(tmp_path),
+        str(tmp_path / "summaries"),
+        str(_make_fleet_yaml(tmp_path)),
+    )
+    listed = await mod.mcp.list_tools()
+    assert listed, "the MCP server exposed no tools"
+    listed_names = {tool.name for tool in listed}
+    registered = set(mod.mcp._tool_manager._tools)
+    assert listed_names == registered
+
+    operator_named = sorted(name for name in listed_names if _OPERATOR_ACT.search(name))
+    assert operator_named == [], operator_named
+
+    acts = _operator_act_names()
+    assert {
+        "dismiss_operator_candidate",
+        "operator_candidates",
+        "operator_publish",
+        "operator_retire",
+        "operator_retire_item",
+        "operator_supersede",
+        "operator_supersede_item",
+    } <= acts
+    dispatched: list[str] = []
+    for name in sorted(listed_names):
+        source = _tool_source(mod.mcp._tool_manager._tools[name].fn)
+        used = sorted(
+            act for act in acts if re.search(rf"(?<![\w]){re.escape(act)}(?![\w])", source)
+        )
+        if used:
+            dispatched.append(f"{name}: {', '.join(used)}")
+    assert dispatched == [], dispatched
+
+    schema = {tool.name: tool for tool in listed}["strata_retire"].inputSchema
+    if not isinstance(schema, dict):
+        schema = schema.model_dump()
+    properties = schema.get("properties") or {}
+    assert "scope_id" not in properties
+    assert "actor" not in properties
