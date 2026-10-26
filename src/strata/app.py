@@ -129,6 +129,13 @@ from strata.forgetting import (
     validate_ends,
     validate_fulfils,
 )
+from strata.lineage import (
+    TIER_LABELS,
+    LineageLineView,
+    context_hash,
+    lineage_offered,
+    record_context_write,
+)
 from strata.locks import BATCH_CAP, QUEUE_WAIT_TIMEOUT_S, QueueTicket, configure_lock_dir
 from strata.locks import scope_append_lock as _scope_append_lock
 from strata.locks import scope_lock as _scope_lock
@@ -634,6 +641,95 @@ def _read_judge_inputs(
 _EXAMINED_CONTEXT_CAP = 10
 
 
+def _context_item_facts(
+    contribution_id: str,
+    *,
+    fleet: FleetConfig,
+    record_store: RecordStore,
+    summary_store: SummaryStore,
+) -> tuple[int, str]:
+    """``(tier, admitted_at)`` of a context note, for the condensation order: tier 0 when newer
+    context supersedes it, 2 when an outcome has TESTED it (the three examined states of ADR
+    0017 P6), else 1 (unexamined). An id the record does not know reads as unexamined and
+    undated, which can only make a check less strict, never invent an inversion."""
+    contribution = record_store.get_contribution(contribution_id)
+    if contribution is None:
+        return 1, ""
+    if record_store.is_context_superseded(contribution_id):
+        return 0, contribution.created_at
+    evidence = standing_evidence(record_store, fleet, contribution_id, summary_store=summary_store)
+    examined = (
+        any(e.replaced_kind is None and e.correction_pending_kind is None for e in evidence)
+        or record_store.claim_event_for(contribution_id) is not None
+        or contribution.raised_from is not None
+    )
+    return (2 if examined else 1), contribution.created_at
+
+
+def _resolve_lineage_view(
+    scope_id: str,
+    current_summary: ScopeSummary | None,
+    *,
+    fleet: FleetConfig,
+    record_store: RecordStore,
+    summary_store: SummaryStore,
+) -> list[LineageLineView] | None:
+    """The stored lineage of the CURRENT context as the judge is shown it (per line: note id,
+    admission date, state), or ``None`` when none is stored for exactly this text."""
+    if current_summary is None:
+        return None
+    stored = record_store.context_lineage_for(scope_id, context_hash(current_summary.context))
+    if not stored:
+        return None
+    view = []
+    for entry in stored:
+        items = []
+        for note_id in entry.sources:
+            tier, admitted = _context_item_facts(
+                note_id, fleet=fleet, record_store=record_store, summary_store=summary_store
+            )
+            items.append((note_id, admitted[:10] or "?", TIER_LABELS[tier]))
+        view.append(LineageLineView(entry.line, tuple(items)))
+    return view
+
+
+def _record_lineage(
+    *,
+    scope: Scope,
+    previous_summary: ScopeSummary | None,
+    written: ScopeSummary,
+    judgment: ScopeManagerJudgment | ScopeManagerBatchJudgment,
+    judged_contribution_ids: Sequence[str],
+    fleet: FleetConfig,
+    record_store: RecordStore,
+    summary_store: SummaryStore,
+) -> None:
+    """After a summary write: record the context's lineage and the order check, one
+    `condensation_order_checks` row per write that changed the context (measured or not)."""
+    allowed = {c.id for c in record_store.list_accepted_context_contributions(scope_id=scope.id)}
+    allowed.update(judged_contribution_ids)
+
+    def foreign(note_id: str) -> bool:
+        other = record_store.get_contribution(note_id)
+        return other is not None and other.scope_id != scope.id
+
+    record_context_write(
+        scope_id=scope.id,
+        previous_context=previous_summary.context if previous_summary else None,
+        new_context=written.context,
+        summary_version=written.version,
+        raw_lineage=getattr(judgment, "context_lineage", None),
+        offered=bool(getattr(judgment, "lineage_offered", False)),
+        judged_ids=list(judged_contribution_ids),
+        allowed_ids=allowed,
+        foreign=foreign,
+        info=lambda note_id: _context_item_facts(
+            note_id, fleet=fleet, record_store=record_store, summary_store=summary_store
+        ),
+        record_store=record_store,
+    )
+
+
 def _resolve_examined_context(
     *,
     scope_id: str,
@@ -839,6 +935,23 @@ def _judge_and_record(
     )
     if examined_context:
         judge_kwargs["examined_context"] = examined_context
+    # v1.20: the stored lineage of the current context, shown only on a call that is offered the
+    # lineage block (context near its budget). The kwarg appears only then.
+    if inputs.current_summary is not None and lineage_offered(
+        inputs.current_summary.context,
+        summary_max_words,
+        mode=mode,
+        acted_on=acted_on_target is not None,
+    ):
+        lineage_view = _resolve_lineage_view(
+            scope.id,
+            inputs.current_summary,
+            fleet=fleet,
+            record_store=record_store,
+            summary_store=summary_store,
+        )
+        if lineage_view:
+            judge_kwargs["lineage_view"] = lineage_view
     # Adoption link: the held proposal this contribution adopts, so the judge sees
     # what is adopted. Same discipline — the kwarg appears only when set.
     adopted_proposal = _resolve_adopted_proposal(contribution, record_store=record_store)
@@ -1217,6 +1330,21 @@ def _write_amendment(
     # one value on every accepted row, so a batch's N verdicts tie to their
     # one write without anyone counting rows against `version`.
     record_store.stamp_summary_version(judged_contribution_ids, version=written.version)
+
+    # v1.20 item 7(d): lineage and the order check. Never load-bearing: the summary is written.
+    try:
+        _record_lineage(
+            scope=scope,
+            previous_summary=previous_summary,
+            written=written,
+            judgment=judgment,
+            judged_contribution_ids=judged_contribution_ids,
+            fleet=fleet,
+            record_store=record_store,
+            summary_store=summary_store,
+        )
+    except Exception:
+        _logger.exception("condensation lineage write failed for scope %r", scope.id)
 
     # ADR 0017 P6 part 1, issue #202: one condensation_drops row per accepted
     # context contribution this amendment mechanically dropped — present
@@ -1757,6 +1885,18 @@ def _judge_batch_and_record(
     )
     if examined_context:
         batch_judge_kwargs["examined_context"] = examined_context
+    if inputs.current_summary is not None and lineage_offered(
+        inputs.current_summary.context, summary_max_words, mode=mode
+    ):
+        lineage_view = _resolve_lineage_view(
+            scope.id,
+            inputs.current_summary,
+            fleet=fleet,
+            record_store=record_store,
+            summary_store=summary_store,
+        )
+        if lineage_view:
+            batch_judge_kwargs["lineage_view"] = lineage_view
     # Adoption link: each member's adopted proposal, keyed by the member's id —
     # the kwarg appears only when at least one member adopts.
     adopted_proposals = {

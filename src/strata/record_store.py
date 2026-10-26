@@ -2716,6 +2716,117 @@ class RecordStore:
             cause=row["cause"],
         )
 
+    def store_context_lineage(
+        self,
+        scope_id: str,
+        context_hash: str,
+        lines: Sequence[tuple[int, Sequence[str]]],
+        summary_version: int | None,
+    ) -> None:
+        """Store the lineage of the context text *context_hash* names (migration 0026),
+        replacing any earlier rows for that exact text."""
+        self._conn.execute(
+            "DELETE FROM context_lineage WHERE scope_id = ? AND context_hash = ?",
+            (scope_id, context_hash),
+        )
+        self._conn.executemany(
+            "INSERT INTO context_lineage "
+            "(scope_id, context_hash, line_no, contribution_ids, summary_version) "
+            "VALUES (?, ?, ?, ?, ?)",
+            [
+                (scope_id, context_hash, n, json.dumps(list(ids)), summary_version)
+                for n, ids in lines
+            ],
+        )
+        self._conn.commit()
+
+    def context_lineage_for(self, scope_id: str, context_hash: str):  # noqa: ANN201
+        """The stored lineage of exactly that context text, as a list of
+        :class:`strata.lineage.LineageEntry`, or ``None`` when none is stored."""
+        from strata.lineage import LineageEntry  # noqa: PLC0415
+
+        rows = self._conn.execute(
+            "SELECT line_no, contribution_ids FROM context_lineage "
+            "WHERE scope_id = ? AND context_hash = ? ORDER BY line_no",
+            (scope_id, context_hash),
+        ).fetchall()
+        if not rows:
+            return None
+        return [LineageEntry(r["line_no"], tuple(json.loads(r["contribution_ids"]))) for r in rows]
+
+    def append_condensation_order_check(
+        self,
+        *,
+        scope_id: str,
+        summary_version: int | None,
+        measured: int,
+        reason: str | None,
+        dropped_n: int,
+        kept_n: int,
+        unattributed_n: int,
+        inversions_n: int,
+        detail: str,
+    ) -> str:
+        check_id = f"coc_{secrets.token_hex(8)}"
+        self._conn.execute(
+            """
+            INSERT INTO condensation_order_checks
+                (id, scope_id, summary_version, measured, reason, dropped_n, kept_n,
+                 unattributed_n, inversions_n, detail)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                check_id,
+                scope_id,
+                summary_version,
+                measured,
+                reason,
+                dropped_n,
+                kept_n,
+                unattributed_n,
+                inversions_n,
+                detail,
+            ),
+        )
+        self._conn.commit()
+        return check_id
+
+    def condensation_order_metrics(self, *, scope_id: str | None = None) -> dict:
+        """Coverage and inversions over every context-changing write: ``writes`` (all),
+        ``measured``, ``unmeasured`` by reason, ``inversions`` (measured writes only) and
+        ``coverage`` (measured / writes, ``None`` with no writes). "Unmeasured" is never
+        folded into "no inversion"."""
+        where, params = ("WHERE scope_id = ?", (scope_id,)) if scope_id else ("", ())
+        rows = self._conn.execute(
+            f"SELECT measured, reason, inversions_n FROM condensation_order_checks {where}",
+            params,
+        ).fetchall()
+        reasons: dict[str, int] = {}
+        for r in rows:
+            if not r["measured"]:
+                reasons[r["reason"] or "unknown"] = reasons.get(r["reason"] or "unknown", 0) + 1
+        measured = sum(1 for r in rows if r["measured"])
+        return {
+            "writes": len(rows),
+            "measured": measured,
+            "unmeasured": len(rows) - measured,
+            "unmeasured_by_reason": reasons,
+            "inversions": sum(r["inversions_n"] for r in rows if r["measured"]),
+            "measured_with_inversion": sum(1 for r in rows if r["measured"] and r["inversions_n"]),
+            "coverage": (measured / len(rows)) if rows else None,
+        }
+
+    def is_context_superseded(self, contribution_id: str) -> bool:
+        """Whether an admitted contribution names *contribution_id* as what it supersedes."""
+        row = self._conn.execute(
+            """
+            SELECT 1 FROM contributions c JOIN judgments j ON j.contribution_id = c.id
+            WHERE c.supersedes = ? AND j.decision != 'decline' LIMIT 1
+            """,
+            (contribution_id,),
+        ).fetchone()
+        return row is not None
+
     def get_retirement(self, retirement_id: str) -> Retirement | None:
         """One retirement event by id, or ``None``."""
         row = self._conn.execute(

@@ -66,6 +66,11 @@ import anthropic
 from pydantic import BaseModel, Field
 
 from strata.fleet_config import EntitlementView, Scope, Stratum
+from strata.lineage import (
+    LineageLineView,
+    lineage_offered,
+    render_lineage_block,
+)
 from strata.operator import OperatorItem
 from strata.record_store import ACCEPTED_DECISIONS, Contribution, ContributorRef, RecentContribution
 from strata.summary_store import (
@@ -503,6 +508,59 @@ def _judge_tool_for(acted_on_target: ActedOnTarget | None) -> dict:
     )
     tool["input_schema"]["properties"]["decision"] = copy.deepcopy(decision_property)
     return tool
+
+
+def _with_lineage_block(
+    message: str,
+    view: Sequence[LineageLineView] | None,
+    current_summary: ScopeSummary | None,
+    summary_max_words: int,
+    *,
+    mode: JudgeMode,
+    acted_on: bool = False,
+) -> str:
+    """*message* with the CONTEXT LINES block ahead of the CURRENT SUMMARY, when this call is
+    offered the lineage field; otherwise *message* unchanged, byte for byte.
+
+    Spliced in after the message is built rather than by the builders, whose source is pinned
+    (`test_judge_message_builders_are_byte_identical`)."""
+    if current_summary is None or not lineage_offered(
+        current_summary.context, summary_max_words, mode=mode, acted_on=acted_on
+    ):
+        return message
+    block = render_lineage_block(view, current_summary.context)
+    marker = "CURRENT SUMMARY\n---\n"
+    at = message.find(marker)
+    if at < 0:
+        return message + "\n" + block
+    return message[:at] + block + message[at:]
+
+
+def _raw_context_lineage(raw: object) -> list | None:
+    """The judge's `context_lineage` as sent, a list or ``None``. Anything else is dropped
+    here and read as absent; the engine validates the entries after the write."""
+    value = raw.get("context_lineage") if isinstance(raw, Mapping) else None
+    return list(value) if isinstance(value, list) else None
+
+
+def _with_lineage_property(tool: dict) -> dict:
+    """*tool* with the optional `context_lineage` property added (a deep copy). Offered only
+    on a call whose message carries the CONTEXT LINES block, so every other call keeps the
+    exact tool bytes it always had."""
+    from strata.lineage import CONTEXT_LINEAGE_PROPERTY  # noqa: PLC0415
+
+    variant = copy.deepcopy(tool)
+    variant["input_schema"]["properties"]["context_lineage"] = copy.deepcopy(
+        CONTEXT_LINEAGE_PROPERTY
+    )
+    return variant
+
+
+def _judge_tool_for_call(acted_on_target: ActedOnTarget | None, *, offered: bool) -> dict:
+    """:func:`_judge_tool_for`, plus the `context_lineage` property on a call that is offered
+    the lineage block (never on an ``acted_on`` call)."""
+    tool = _judge_tool_for(acted_on_target)
+    return _with_lineage_property(tool) if offered and acted_on_target is None else tool
 
 
 def _build_batch_judge_tool() -> dict:
@@ -2468,6 +2526,11 @@ class _AmendmentJudgment(BaseModel):
     contribution, which starts no wave and is at no distance from one."""
 
     context_sources: list[str] = Field(default_factory=list)
+    context_lineage: list | None = None
+    """v1.20: the judge's raw `context_lineage` (one entry per line of its new_context),
+    unvalidated; the engine checks it against the record after the write (`strata.lineage`)."""
+    lineage_offered: bool = False
+    """Whether this call was offered the lineage block and field (context near its budget)."""
     """Published item ids the judge declares its ``new_context`` rests on.
 
     RECORD, never trigger (ADR 0014 D3): the affected set for a changed item
@@ -9445,6 +9508,7 @@ class ScopeManager:
         acted_on_target: ActedOnTarget | None = None,
         examined_context: Sequence[ExaminedContextItem] | None = None,
         adopted_proposal: Contribution | None = None,
+        lineage_view: Sequence[LineageLineView] | None = None,
         **_extra: object,
     ) -> ScopeManagerJudgment:
         """Judge a new contribution against the scope's current state.
@@ -9657,6 +9721,14 @@ class ScopeManager:
             examined_context=examined_context,
             adopted_proposal=adopted_proposal,
         )
+        user_message = _with_lineage_block(
+            user_message,
+            lineage_view,
+            current_summary,
+            summary_max_words,
+            mode=mode,
+            acted_on=acted_on_target is not None,
+        )
         # ADR 0017 P3: a failed_* disposition replaces `acted_on` through the #199
         # path exactly like an ordinary `supersedes` reference does — but only when
         # the target is not a directive (D6: an outcome never replaces a directive).
@@ -9665,6 +9737,12 @@ class ScopeManager:
         # ADR 0014 D3: what a declared `context_sources` is audited against —
         # derived from the same arguments the message above was built from, so
         # the check and the prompt can never disagree.
+        _lineage_offered_now = current_summary is not None and lineage_offered(
+            current_summary.context,
+            summary_max_words,
+            mode=mode,
+            acted_on=acted_on_target is not None,
+        )
         rendered_item_ids = _rendered_publication_item_ids(
             current_publication, peer_publications, parent_publication
         )
@@ -10347,7 +10425,7 @@ class ScopeManager:
         judgment = self._call_with_correctives(
             user_message=user_message,
             system_prompt=_SYSTEM_PROMPT,
-            tool=_judge_tool_for(acted_on_target),
+            tool=_judge_tool_for_call(acted_on_target, offered=_lineage_offered_now),
             reasoning_gaps=_reasoning_gaps,
             reasoning_withdraw=_reasoning_withdraw,
             reasoning_adopt=_reasoning_adopt,
@@ -10425,6 +10503,7 @@ class ScopeManager:
                 else None
             ),
         )
+        judgment = judgment.model_copy(update={"lineage_offered": _lineage_offered_now})
         # A "Hearsay:" label on a reasoning that itself says first-hand is a wrong label.
         if _REASON_INFORMANT_CHECK:
             judgment = judgment.model_copy(
@@ -12674,6 +12753,7 @@ class ScopeManager:
         hop: int = 0,
         examined_context: Sequence[ExaminedContextItem] | None = None,
         adopted_proposals: Mapping[str, Contribution] | None = None,
+        lineage_view: Sequence[LineageLineView] | None = None,
         **_extra: object,
     ) -> ScopeManagerBatchJudgment:
         """Judge several new contributions, in arrival order, in ONE call (ADR 0011 D3).
@@ -12774,6 +12854,7 @@ class ScopeManager:
                 hop=hop,
                 examined_context=examined_context,
                 adopted_proposal=(adopted_proposals or {}).get(only.id),
+                lineage_view=lineage_view,
             )
             return ScopeManagerBatchJudgment(
                 verdicts=[
@@ -12843,7 +12924,13 @@ class ScopeManager:
             examined_context=examined_context,
             adopted_proposals=adopted_proposals,
         )
+        user_message = _with_lineage_block(
+            user_message, lineage_view, current_summary, summary_max_words, mode=mode
+        )
 
+        _batch_lineage_offered = current_summary is not None and lineage_offered(
+            current_summary.context, summary_max_words, mode=mode
+        )
         rendered_item_ids = _rendered_publication_item_ids(
             current_publication, peer_publications, parent_publication
         )
@@ -13030,7 +13117,11 @@ class ScopeManager:
         batch_judgment = self._call_with_correctives(
             user_message=user_message,
             system_prompt=_BATCH_SYSTEM_PROMPT,
-            tool=JUDGE_BATCH_TOOL,
+            tool=(
+                _with_lineage_property(JUDGE_BATCH_TOOL)
+                if _batch_lineage_offered
+                else JUDGE_BATCH_TOOL
+            ),
             attribution_gaps=_batch_attribution_gap_ids,
             attribution_corrective=_batch_attribution_corrective,
             reasoning_gaps=_batch_reasoning_gaps,
@@ -13060,6 +13151,9 @@ class ScopeManager:
             # defaults to False here, so the generic branch is always what
             # a second slip reaches).
             parse_generic_decline=_generic_second_slip_batch_decline,
+        )
+        batch_judgment = batch_judgment.model_copy(
+            update={"lineage_offered": _batch_lineage_offered}
         )
         if _REASON_INFORMANT_CHECK:
             batch_judgment = batch_judgment.model_copy(
@@ -13260,6 +13354,7 @@ class ScopeManager:
             hop=hop,
             context_sources=context_sources,
             dropped_context_sources=dropped_sources,
+            context_lineage=_raw_context_lineage(raw),
             protocol_notes=protocol_notes,
         )
 
@@ -13626,6 +13721,7 @@ class ScopeManager:
             hop=hop,
             context_sources=context_sources,
             dropped_context_sources=dropped_sources,
+            context_lineage=_raw_context_lineage(raw),
             protocol_notes=protocol_notes,
             outcome_disposition=outcome_disposition,
         )

@@ -62,3 +62,35 @@ CREATE INDEX idx_retirement_candidates_scope ON retirement_candidates(scope_id, 
 -- one open candidate per (directive, ground): a recompute never duplicates
 CREATE UNIQUE INDEX idx_retirement_candidates_open
     ON retirement_candidates(directive_id, ground) WHERE state = 'open';
+
+-- 6. Condensation lineage (v1.20 item 7(d)). `context_lineage` holds, per line of a scope's
+--    stored context, the ids of the contributions that line rests on; `context_hash` ties the
+--    rows to the exact context text they describe, so a write that leaves the context alone
+--    keeps the chain and a write that rewrites it without lineage breaks it.
+--    `condensation_order_checks` has one row per write that changed the context: measured or
+--    not (with the reason), and, when measured, the dropped/kept counts and the inversions.
+CREATE TABLE context_lineage (
+    scope_id         TEXT NOT NULL,
+    context_hash     TEXT NOT NULL,
+    line_no          INTEGER NOT NULL,
+    contribution_ids TEXT NOT NULL DEFAULT '[]',
+    summary_version  INTEGER,
+    stored_at        TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (scope_id, context_hash, line_no)
+);
+
+CREATE TABLE condensation_order_checks (
+    id              TEXT PRIMARY KEY,
+    scope_id        TEXT NOT NULL,
+    summary_version INTEGER,
+    measured        INTEGER NOT NULL CHECK (measured IN (0, 1)),
+    reason          TEXT,
+    dropped_n       INTEGER NOT NULL DEFAULT 0,
+    kept_n          INTEGER NOT NULL DEFAULT 0,
+    unattributed_n  INTEGER NOT NULL DEFAULT 0,
+    inversions_n    INTEGER NOT NULL DEFAULT 0,
+    detail          TEXT NOT NULL DEFAULT '{}',
+    checked_at      TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX idx_condensation_order_checks_scope ON condensation_order_checks(scope_id);
