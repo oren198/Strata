@@ -397,7 +397,8 @@ _PROMPT_LINE = (
 )
 
 # sha256 of the judge inputs captured at 3180f1f, before this change, for the
-# same fixed scenarios built below.
+# same fixed scenarios built below. The two system-prompt values were re-pinned for the
+# v1.20 hearsay sentence at 63af122.
 _OLD_SYSTEM_PROMPT_SHA = "d203696f88b33a283c4d33a42744cca101d3329ace216855d4bbbc2072d845ec"
 _OLD_BATCH_SYSTEM_PROMPT_SHA = "eaf3336220407edb2bae669298849c288b600644ed0d1a41a22b516d41952561"
 _SINGLE_MESSAGES_SHA = "e9bb0459c9cd61259246ce0cf80feb32ac473b62d8da455b809b8f1f9914f315"
