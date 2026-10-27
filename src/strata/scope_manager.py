@@ -4275,8 +4275,7 @@ def _render_forgetting_lines(contribution: Contribution) -> str:
 
     ``ends``: the end condition the directive would carry; the judge judges its merit as it
     does the rest and does not decide the condition. ``fulfils``: the judged-condition
-    directive this is evidence for. A contribution that names a directive it supersedes may be
-    a pure release or retraction, which has no replacement: ``retire``, not ``publish``."""
+    directive this is evidence for."""
     lines = ""
     ends = _contribution_end_condition(contribution)
     if ends is not None:
