@@ -258,15 +258,19 @@ def _saved_report_header() -> dict[str, Any] | None:
     return header
 
 
+def _report_date_text(header: object) -> str:
+    """A single-line report date, or the words ``date unknown``."""
+    date = _one_line_date(header.get("date")) if isinstance(header, dict) else None
+    return date if date else "date unknown"
+
+
 def _not_understood(header: object) -> str:
     """``report not understood (report <date>); re-run``.
 
     A missing or multi-line date is the words ``date unknown``. The parenthetical
     stays. The verdict text is not copied.
     """
-    date = _one_line_date(header.get("date")) if isinstance(header, dict) else None
-    shown = date if date else "date unknown"
-    text = f"report not understood (report {shown}); re-run"
+    text = f"report not understood (report {_report_date_text(header)}); re-run"
     if "\n" in text or "\r" in text:
         return "report not understood (report date unknown); re-run"
     return text
@@ -328,15 +332,17 @@ def doctor_judge_check_message() -> str:
     verdict = report.get("verdict")
     if not isinstance(verdict, str):
         return _not_understood(header)
-    date = _one_line_date(header.get("date")) or "unknown"
+    shown = _report_date_text(header)
     if verdict.startswith("meets the judge-check v1 bar"):
-        return f"meets the v1 bar (report {date})"
+        return f"meets the v1 bar (report {shown})"
     if verdict.startswith("does not meet"):
         legs = report.get("failed_legs")
         inside = ", ".join(str(leg) for leg in legs) if isinstance(legs, list) else ""
+        if shown == "date unknown":
+            return f"does not meet ({inside}) (report date unknown)"
         return f"does not meet ({inside})"
     if verdict.startswith("incomplete"):
-        return f"incomplete (report {date}); re-run"
+        return f"incomplete (report {shown}); re-run"
     if verdict == "unmeasured: no reference bars in this build":
         return unmeasured
     return _not_understood(header)

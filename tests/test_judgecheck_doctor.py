@@ -321,6 +321,118 @@ def test_doctor_unreadable_file_names_permission_error(
     assert doc_rc == 1
 
 
+def _strip_date(path: Path, *, date: object = "drop") -> dict:
+    report = json.loads(path.read_text(encoding="utf-8"))
+    header = dict(report["header"])
+    if date == "drop":
+        header.pop("date", None)
+    else:
+        header["date"] = date
+    report["header"] = header
+    path.write_text(json.dumps(report), encoding="utf-8")
+    return report
+
+
+def test_doctor_other_engine_version_directory_is_unmeasured(
+    _offline, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A report stored under another engine version is not this version's report."""
+    from strata import __version__
+
+    _box, state = _offline
+    rc, _out, err = invoke(capsys, ["judge-check", "--yes", "--price", "0.2,0.8", "--reps", "1"])
+    assert rc == 0, err
+    path = report_json(state)
+    version_dir = path.parents[3]
+    assert version_dir.name == __version__
+    version_dir.rename(version_dir.with_name("0.0.0-other"))
+    doc_rc, out, err = _doctor(capsys)
+    line = "Judge check: unmeasured for this engine version"
+    assert line in out
+    assert _judge_lines(out, err) == [f"  ✓ {line}"] or _judge_lines(out, err) == [f"  OK {line}"]
+    assert "not understood" not in "".join(_judge_lines(out, err))
+    assert doc_rc == 1
+
+
+def test_doctor_header_names_another_version_is_not_understood(
+    _offline, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A file at this version's key whose header names another version is damaged."""
+    _box, state = _offline
+    rc, _out, err = invoke(capsys, ["judge-check", "--yes", "--price", "0.2,0.8", "--reps", "1"])
+    assert rc == 0, err
+    path = report_json(state)
+    report = json.loads(path.read_text(encoding="utf-8"))
+    report["header"]["engine_version"] = "0.0.0-other"
+    path.write_text(json.dumps(report), encoding="utf-8")
+    date = report["header"]["date"]
+    doc_rc, out, err = _doctor(capsys)
+    line = f"Judge check: report not understood (report {date}); re-run"
+    assert line in out
+    assert _judge_lines(out, err) == [f"  ✓ {line}"] or _judge_lines(out, err) == [f"  OK {line}"]
+    assert "unmeasured" not in "".join(_judge_lines(out, err))
+    assert doc_rc == 1
+
+
+def test_doctor_non_object_json_is_not_understood(
+    _offline, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A file at this key that parses but is not a JSON object is not understood."""
+    _box, state = _offline
+    rc, _out, err = invoke(capsys, ["judge-check", "--yes", "--price", "0.2,0.8", "--reps", "1"])
+    assert rc == 0, err
+    path = report_json(state)
+    path.write_text("[1, 2, 3]\n", encoding="utf-8")
+    doc_rc, out, err = _doctor(capsys)
+    line = "Judge check: report not understood (report date unknown); re-run"
+    assert line in out
+    assert _judge_lines(out, err) == [f"  ✓ {line}"] or _judge_lines(out, err) == [f"  OK {line}"]
+    assert "unmeasured" not in "".join(_judge_lines(out, err))
+    assert doc_rc == 1
+
+
+def test_doctor_missing_date_says_date_unknown_for_meets_miss_and_incomplete(
+    _offline, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Meets, does-not-meet, and incomplete use ``(report date unknown)``."""
+    from strata.judgecheck.runner import IncompleteInfo
+
+    box, state = _offline
+    rc, _out, err = invoke(capsys, ["judge-check", "--yes", "--price", "0.2,0.8", "--reps", "1"])
+    assert rc == 0, err
+    path = report_json(state)
+    _strip_date(path, date="2026-10-26\nSECRET-DATE")
+    doc_rc, out, err = _doctor(capsys)
+    line = "Judge check: meets the v1 bar (report date unknown)"
+    assert line in out
+    assert "SECRET-DATE" not in out + err
+    assert "(report unknown)" not in out
+    assert doc_rc == 1
+
+    box.flip_ids.add(judge_must_decline_id())
+    rc, _out, err = invoke(capsys, ["judge-check", "--yes", "--price", "0.2,0.8", "--reps", "1"])
+    assert rc == 1, err
+    report = _strip_date(path)
+    legs = ", ".join(report["failed_legs"])
+    doc_rc, out, err = _doctor(capsys)
+    line = f"Judge check: does not meet ({legs}) (report date unknown)"
+    assert line in out
+    assert "(report unknown)" not in out
+    assert doc_rc == 1
+
+    box.flip_ids.clear()
+    box.incomplete = IncompleteInfo("cap reached", 4, 20)
+    rc, _out, err = invoke(capsys, ["judge-check", "--yes", "--price", "0.2,0.8", "--reps", "1"])
+    assert rc == 2, err
+    _strip_date(path, date=12)
+    doc_rc, out, err = _doctor(capsys)
+    line = "Judge check: incomplete (report date unknown); re-run"
+    assert line in out
+    assert "(report unknown)" not in out
+    assert _judge_lines(out, err) == [f"  ✓ {line}"] or _judge_lines(out, err) == [f"  OK {line}"]
+    assert doc_rc == 1
+
+
 def test_doctor_does_not_run_the_judge_or_prompt(
     _offline, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
