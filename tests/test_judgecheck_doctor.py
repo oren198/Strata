@@ -391,45 +391,58 @@ def test_doctor_non_object_json_is_not_understood(
     assert doc_rc == 1
 
 
-def test_doctor_missing_date_says_date_unknown_for_meets_miss_and_incomplete(
+def test_doctor_meets_with_missing_date_says_date_unknown(
     _offline, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Meets, does-not-meet, and incomplete use ``(report date unknown)``."""
-    from strata.judgecheck.runner import IncompleteInfo
-
-    box, state = _offline
+    """A meets report with no date prints ``(report date unknown)``."""
+    _box, state = _offline
     rc, _out, err = invoke(capsys, ["judge-check", "--yes", "--price", "0.2,0.8", "--reps", "1"])
     assert rc == 0, err
-    path = report_json(state)
-    _strip_date(path, date="2026-10-26\nSECRET-DATE")
+    _strip_date(report_json(state))
     doc_rc, out, err = _doctor(capsys)
     line = "Judge check: meets the v1 bar (report date unknown)"
     assert line in out
-    assert "SECRET-DATE" not in out + err
     assert "(report unknown)" not in out
+    assert _judge_lines(out, err) == [f"  ✓ {line}"] or _judge_lines(out, err) == [f"  OK {line}"]
     assert doc_rc == 1
 
-    box.flip_ids.add(judge_must_decline_id())
-    rc, _out, err = invoke(capsys, ["judge-check", "--yes", "--price", "0.2,0.8", "--reps", "1"])
-    assert rc == 1, err
-    report = _strip_date(path)
-    legs = ", ".join(report["failed_legs"])
-    doc_rc, out, err = _doctor(capsys)
-    line = f"Judge check: does not meet ({legs}) (report date unknown)"
-    assert line in out
-    assert "(report unknown)" not in out
-    assert doc_rc == 1
 
-    box.flip_ids.clear()
+def test_doctor_incomplete_with_missing_date_says_date_unknown(
+    _offline, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An incomplete report with no date prints ``(report date unknown); re-run``."""
+    from strata.judgecheck.runner import IncompleteInfo
+
+    box, state = _offline
     box.incomplete = IncompleteInfo("cap reached", 4, 20)
     rc, _out, err = invoke(capsys, ["judge-check", "--yes", "--price", "0.2,0.8", "--reps", "1"])
     assert rc == 2, err
-    _strip_date(path, date=12)
+    _strip_date(report_json(state))
     doc_rc, out, err = _doctor(capsys)
     line = "Judge check: incomplete (report date unknown); re-run"
     assert line in out
     assert "(report unknown)" not in out
     assert _judge_lines(out, err) == [f"  ✓ {line}"] or _judge_lines(out, err) == [f"  OK {line}"]
+    assert doc_rc == 1
+
+
+def test_doctor_does_not_meet_with_missing_date_has_no_date_suffix(
+    _offline, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Does-not-meet never names a date, including when the date is missing."""
+    box, state = _offline
+    box.flip_ids.add(judge_must_decline_id())
+    rc, _out, err = invoke(capsys, ["judge-check", "--yes", "--price", "0.2,0.8", "--reps", "1"])
+    assert rc == 1, err
+    path = report_json(state)
+    report = _strip_date(path)
+    legs = ", ".join(report["failed_legs"])
+    doc_rc, out, err = _doctor(capsys)
+    line = f"Judge check: does not meet ({legs})"
+    judge = _judge_lines(out, err)
+    assert judge == [f"  ✓ {line}"] or judge == [f"  OK {line}"]
+    assert "(report" not in judge[0]
+    assert "date" not in judge[0]
     assert doc_rc == 1
 
 

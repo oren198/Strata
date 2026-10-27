@@ -338,8 +338,6 @@ def doctor_judge_check_message() -> str:
     if verdict.startswith("does not meet"):
         legs = report.get("failed_legs")
         inside = ", ".join(str(leg) for leg in legs) if isinstance(legs, list) else ""
-        if shown == "date unknown":
-            return f"does not meet ({inside}) (report date unknown)"
         return f"does not meet ({inside})"
     if verdict.startswith("incomplete"):
         return f"incomplete (report {shown}); re-run"
