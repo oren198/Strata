@@ -535,7 +535,7 @@ def test_a_descendants_read_lapses_an_ancestors_over_date_and_opens_its_own_cand
     assert forgetting.sweep_for_read("g_web", now=NOW, **_kw(world)) == []
 
 
-def test_the_judge_sees_the_end_condition_the_fulfils_and_the_retire_not_publish_line() -> None:
+def test_the_judge_sees_the_end_condition_and_the_fulfils_but_no_retire_line() -> None:
     from strata.scope_manager import _render_contribution_block  # noqa: PLC0415
     from tests.test_scope_manager import NEW_CONTRIBUTION  # noqa: PLC0415
 
@@ -550,7 +550,7 @@ def test_the_judge_sees_the_end_condition_the_fulfils_and_the_retire_not_publish
     text = _render_contribution_block(both)
     assert "- binds until: the audit closes\n" in text
     assert "- fulfils: c_x\n" in text
-    assert "answer `retire`, not `publish`" in text
+    assert "retire" not in text  # the retire-not-publish line was removed (A/B bar missed)
 
 
 def test_the_directive_block_shown_to_a_judge_carries_the_ends_line() -> None:

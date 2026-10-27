@@ -4284,11 +4284,6 @@ def _render_forgetting_lines(contribution: Contribution) -> str:
         lines += f"- binds {text}\n"
     if getattr(contribution, "fulfils", None):
         lines += f"- fulfils: {contribution.fulfils}\n"
-    if contribution.supersedes:
-        lines += (
-            "- if this only releases or retracts that directive and states no replacement "
-            "rule, answer `retire`, not `publish`\n"
-        )
     return lines
 
 
