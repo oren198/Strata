@@ -18,7 +18,7 @@ Reason honesty beyond the regex check is not measured in v1. The regex check is 
 
 ## Cost guard
 
-Before the run, the command prints the engine's estimate (items, repetitions, calls per judgment, and the model's per-token price) and asks `y/N`. `--yes` skips the question. Any other answer does not start the run and exits 3.
+Before the run, the command prints the engine's estimate (items, repetitions, calls per judgment, and the model's per-token price) and asks `y/N`. `--yes` skips the question. Any other answer does not start the run and exits 3. The estimate is an upper bound: it ignores cached input, and measured runs have cost 35-70% of it.
 
 `--max-usd X` is a hard cap enforced in the process during the run. When the next call would pass the cap, the run stops. The report's verdict is the engine's line `incomplete: cap reached at N/M`, and the command exits 2.
 
