@@ -157,13 +157,13 @@ JUDGE_API_KEY=sk-or-...
 `strata register` offers to capture the key for you and writes `JUDGE_MODEL` and
 `JUDGE_BASE_URL` beside it, so the `.env` states which judge the key is for.
 
-With an OpenRouter key, also pin the provider. OpenRouter serves the same model id from several hosts, and the judge's answers can differ between them:
+With an OpenRouter key you can also pin the provider; it's optional. OpenRouter serves the same model id from several hosts, and the judge's answers can differ between them. Left unset, OpenRouter picks a provider for each call and falls back to another if one is unavailable. Pinned, every judge call goes to that one provider, which makes results easier to reproduce, but there is no fallback: if that provider stops serving the model, your judge calls fail until you change or remove the pin.
 
 ```
-JUDGE_PROVIDER=Nebius
+JUDGE_PROVIDER=<provider name>
 ```
 
-The v1.18.0 numbers in [Judge models](#judge-models) were measured on Nebius. Alibaba, which earlier releases were measured on, stopped serving this model on OpenRouter on 2026-10-10. A pinned provider has no fallback: if it stops serving the model, your judge calls fail until you change the pin. `strata doctor` shows which provider is pinned.
+The v1.18.0 numbers in [Judge models](#judge-models) were measured pinned to Nebius. Alibaba, which earlier releases were measured on, stopped serving this model on OpenRouter on 2026-10-10. `strata doctor` shows which provider is pinned.
 
 **With Codex, use the `.env` file, not an export.** Codex starts its MCP server with
 only the `[mcp_servers.strata.env]` table from its own config, not your shell's
@@ -1152,6 +1152,8 @@ distinct from a `200` merits decline (#235, #236, #246).
 
 **A child's context can't undercut an inherited rule (v1.18).** When a session bound to a scope has a context note admitted and the scope inherits a directive, the engine asks the judge one short extra question (how does the note relate to the rule?) and checks the answer itself. A note stating what may or does happen instead of the rule, as permission or as a standing practice, is declined; the reason names the two legitimate routes (report a specific occurrence and pass `acted_on`, or propose the exception to the scope that issued the rule). A dated report of one specific past departure (a single identified act, or one bounded completed past episode such as "The pumps ran 24/7 last week.") is admitted, with the departure label in the judgment's record line. A note that grants, approves or reports approval of an exception for a class, or states a practice (present tense, open-ended present perfect, or a bare generic plural of the rule's class with no determiner, number or id, even when dated), is declined. The decline reason tells the writer to report the specific act (with `acted_on`), or to ask the issuing scope to record the exception itself. An approval scoped to one identified act ("On 18 October hotfix 4411 merged without review; the lead told me he approved this one merge.") stays an admitted departure, with the departure label in the judgment's record line. A habitual or generalising report ("every time", "we skip", "on hotfixes", "... so we don't need it") is declined, and `acted_on` never waives that check. When the judge's extra answer says the note is an exception, the note is admitted as a report only on positive evidence of ONE past occurrence: a date or a closed period, a past-tense verb, no present-tense or present-perfect verb, and no habit or generality word unless a closed period bounds it. Anything else is declined, so a new habit phrasing fails closed instead of passing. The list of irregular past forms is extended with unambiguous forms (dwelt, spilt, forsook, oversaw, ...). A verb spelled the same in present and past (shut, let, cut, put, set, cast, reset, ...) never counts as the past verb, so a present-tense habit built on one is not read as one past act (it fails closed). A dated practice start is not one occurrence: "as of / effective / starting / beginning / following <date>", and "from / after / post / beyond <date>" unless a date closes the range ("from 2 March through 8 March"); "onwards" and "till further notice" mark a practice too. Such notes are declined under an exception answer. Known limit: a report whose only past verb is spelled the same in present and past (shut, let, cut, put, set, ...) is declined under an exception answer, as in 1.18.2, because nothing shows it is past; write an unambiguous past form such as "closed", "turned off" or "powered down". Known limit: an admitted departure is stored as written; the departure label is in the judgment's record line, not in the stored note, so a reader of the summary may take it as precedent; the stored label comes in v1.19. On the 1.18.3 authority regression set (66 items), when the judge calls the note an exception, 0 of 47 class-level claims or habits are admitted and 1 of 19 honest single departures is declined. The stated cost is that a departure whose object is a bare plural of the rule's class ("wore quay boots onto the pump deck") is declined, which fails closed. Still admitted, unchanged from 1.18.1: 38 of 47 when the extra answer says unrelated, 38 of 47 when it is unreadable, and 25 of 47 when the judge calls it a departure. Closing these is v1.19 work. Stated limit: an exception worded with no exception marker is admitted when the extra answer is unreadable or says unrelated; that was 6 of 38 exceptions in the held-out measurement, and in the live runs none of the 9 such fallbacks hid an exception. Each fallback is counted in the judgment's `inherited_relation` trace.
 
+**A context note can't undercut the scope's own directives either (v1.19).** The same check now runs on the scope's own directives. A context note on a scope that has its own directives but inherits none now costs one extra judge call. Where the scope also inherits rules, the same single check covers both. A note stating an exception in force now ("let's treat single-engineer review as sufficient for now") is declined, with a reason that says the directive is this scope's own and that the way to change it is to supersede or retire it. A specific dated departure is admitted as context ("Recorded as a departure from <id> (this scope): not a licence; ..."). Reasoning about whether to change the rule ("we are considering retiring it", "should we change it?") is admitted. A context note also never changes the scope's own rules: if the judge returns a supersede or retire of an own directive for a note proposed as context with no `supersedes`, the engine drops those ops, records the drop, and judges the note as context. `strata stats judge` shows the extra call as its own kind, `own_directive_relation`.
+
 **A scope can't publish an exception to a rule it inherits (v1.18).** After the publication judge accepts a publish or restore by a scope that inherits a directive, the engine checks the item. A directive item that changes, loosens or exempts from an inherited rule is refused. A context item that states a general exception is refused; a report of one specific act of following the rule is published; a report of one specific act of departing from it is published only with the engine's label, "Departure from <directive id> (<issuing scope>): ", which the publisher can't drop. A relayed item keeps its origin's label. Measured on the v1.18.0 baseline (30 items labelled blind, Nebius): 0 of 10 exceptions published (the judge accepted all 10; the engine's check refused all 10), 0 of 15 legitimate items refused, 5 of 5 departures published with the label. Stated limit: an exception already on a scope's published face is not withdrawn by this.
 
 **Judge reasons say what they are about (v1.18).** A decline for a missing telling event now quotes the claim and the span it judged ("the claim attributed to 'the architect' has no telling event ('…')"). Reading a document first-hand counts as being told, when the contribution says so in the first person, names whose document it is, and gives its path, URL or id right after it; it is recorded as the author's word as of the reading. After every judgment, a known party (a fleet scope, its name or role, or the operator) that the judge's reason names as an informant must occur in the contribution's own text; if it doesn't, the judge gets one corrective re-ask, and if the reason still names it the engine replaces the reason with "Reason withdrawn: the judge described content that is not in this contribution". The verdict itself is never changed by this.
@@ -1198,9 +1200,9 @@ version = "1.12.0"
 <a id="choosing-a-judge"></a>
 ### Judge models
 
-Every contribution is checked by a judge model you choose, and some of Strata's defences depend on that model: a weaker judge lets more through. I recommend `qwen/qwen3-235b-a22b-2507` on OpenRouter, pinned to the Nebius provider. Of the models I measured, it costs the least per run and returned no judge errors. The whole v1.18 baseline below cost $3.40 in judge calls. If you'd rather pay more to let less through, use `claude-haiku-4.5`. In the September study it admitted 0 of 84 attacks, but it cost $0.2139 per demo run against qwen's $0.0157, and once a scope states its purpose it turned away 2 of 6 legitimate notes (#210). A model not in these tables is unmeasured, not known to be worse.
+Every contribution is checked by a judge model you choose, and some of Strata's defences depend on that model: a weaker judge lets more through. Below is what I measured, and exactly what each measurement ran on. The v1.18 baseline ran `qwen/qwen3-235b-a22b-2507` on OpenRouter, pinned to the Nebius provider, and cost $3.40 in judge calls. In the September study, `claude-haiku-4.5` admitted 0 of 84 attacks, but it cost $0.2139 per demo run against qwen's $0.0157, and once a scope states its purpose it turned away 2 of 6 legitimate notes (#210). A model or provider not in these tables is unmeasured, not known to be worse.
 
-**v1.18.0 with the recommended judge** — `qwen/qwen3-235b-a22b-2507` on OpenRouter, pinned to Nebius, engine `ed31692`, 2026-10-14, 3 runs per item ([evidence](docs/evidence/v1.18-judge-baseline.md)):
+**v1.18.0 baseline** — `qwen/qwen3-235b-a22b-2507` on OpenRouter, pinned to Nebius, engine `ed31692`, 2026-10-14, 3 runs per item ([evidence](docs/evidence/v1.18-judge-baseline.md)):
 
 | What it tests | Result |
 |---|---|
@@ -1227,14 +1229,15 @@ This is a new baseline. Alibaba, the provider of earlier qwen measurements, stop
 | `z-ai/glm-4.6` | not usable: 81% of attack calls errored | demo crashed | crashed | — |
 | `deepseek/deepseek-v3.2` | no results: calls took 5–12+ minutes | no results | hung | — |
 
-**To use the recommended setup**, put these in `.env` (`strata register` writes the first three; you add the provider pin yourself):
+**The default setup.** `strata register` writes these to `.env`:
 
 ```
 JUDGE_API_KEY=sk-or-...
 JUDGE_BASE_URL=https://openrouter.ai/api
 JUDGE_MODEL=qwen/qwen3-235b-a22b-2507
-JUDGE_PROVIDER=Nebius
 ```
+
+No provider is pinned, so OpenRouter routes each call and falls back between providers. To pin one, see **Pin the judge to one OpenRouter provider** below.
 
 If your only key is an Anthropic one, the install uses `claude-haiku-4-5` on Anthropic's own endpoint.
 
@@ -1280,14 +1283,18 @@ JUDGE_BASE_URL=https://your-gateway.example/api
 JUDGE_MODEL=<a model id that endpoint serves>
 ```
 
-**Pin the judge to one OpenRouter provider** — OpenRouter routes the same
-model id across roughly ten backing providers, and the same item on the
-same build has measured anywhere from 10/10 to 5/10 across runs,
-plausibly from the provider mix. `JUDGE_PROVIDER=Nebius` (or
+**Pin the judge to one OpenRouter provider** (optional) — OpenRouter
+routes the same model id across several backing providers, and the same
+item on the same build has measured anywhere from 10/10 to 5/10 across
+runs, plausibly from the provider mix. Unset, OpenRouter picks the
+provider for each call and falls back to another when one is
+unavailable. `JUDGE_PROVIDER=<provider name>` (or
 `STRATA_JUDGE_PROVIDER`) pins every judge call to that one named
-provider via `extra_body={"provider": {"order": ["Nebius"],
-"allow_fallbacks": false}}` — no silent fallback to a different
-provider if the pinned one is unavailable. It is OpenRouter-only:
+provider via `extra_body={"provider": {"order": ["<provider name>"],
+"allow_fallbacks": false}}`. That makes results easier to reproduce,
+but there is no fallback: if the pinned provider stops serving the
+model, judge calls fail until you change or remove the pin. It is
+OpenRouter-only:
 against any other endpoint (a bare Anthropic key, a self-hosted
 gateway) it is read but ignored, since a request-level OpenRouter
 provider preference means nothing elsewhere. `strata doctor` reports
@@ -1313,7 +1320,7 @@ server (project config wins):
 | `JUDGE_BASE_URL` | `https://openrouter.ai/api` | Points the judge at a router/proxy/self-hosted gateway — the endpoint must speak the Anthropic Messages API. `STRATA_JUDGE_BASE_URL` also works. **Exception:** with only an Anthropic key set (see [Judge models](#judge-models)) the default stays the Anthropic API. |
 | `JUDGE_MODEL` | `qwen/qwen3-235b-a22b-2507` | Model used by the judge (an id the endpoint serves). `STRATA_MANAGER_MODEL` is the original name and still works (wins if both are set). **Exception:** with only an Anthropic key set the default stays `claude-haiku-4-5`. |
 | `ANTHROPIC_API_KEY` / `STRATA_ANTHROPIC_API_KEY` | (unset) | **Deprecated**, kept as a working fallback: used only when `JUDGE_API_KEY` is unset. On its own it keeps `claude-haiku-4-5` on the Anthropic API. |
-| `JUDGE_PROVIDER` | (unset) | Pins every judge call to one named OpenRouter provider (e.g. `Nebius`); ignored on a non-OpenRouter judge endpoint. `STRATA_JUDGE_PROVIDER` also works. See [Judge models](#judge-models). |
+| `JUDGE_PROVIDER` | (unset) | Optional. Unset, OpenRouter routes each judge call and falls back between providers. Set to a provider name, every judge call goes to that one OpenRouter provider with no fallback, so calls fail if it stops serving the model. Ignored on a non-OpenRouter judge endpoint. `STRATA_JUDGE_PROVIDER` also works. See [Judge models](#judge-models). |
 | `STRATA_JUDGE_DAILY_TOKEN_CAP` | (unset) | Off when unset. A non-negative integer is today's token budget for new judgments and standalone judge calls. A judgment that has already called the model still finishes. Over the cap, the contribution waits unjudged (the same 503 as an unreachable judge). |
 | `STRATA_JUDGE_PRICE_TABLE` | (unset) | Path to a JSON object keyed by model id, each value `{"input_per_million": <number>, "output_per_million": <number>}`. Used only when reporting cost. No entry for a model means that row stays tokens-only. |
 | `STRATA_FRESHNESS_STRICT` | (unset) | `1`/`0` forces the freshness `Stop`-hook strict (blocking) or background; unset defers to the project's `[freshness] strict`, default on ([details](#memory-freshness-stop-hook)) |

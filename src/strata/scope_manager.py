@@ -56,6 +56,7 @@ import copy
 import json
 import logging
 import re
+import time
 from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -66,7 +67,7 @@ from pydantic import BaseModel, Field
 
 from strata.fleet_config import EntitlementView, Scope, Stratum
 from strata.operator import OperatorItem
-from strata.record_store import Contribution, ContributorRef, RecentContribution
+from strata.record_store import ACCEPTED_DECISIONS, Contribution, ContributorRef, RecentContribution
 from strata.summary_store import Directive, ScopeSummary, _render_summary, adopted_suffix
 
 _logger = logging.getLogger(__name__)
@@ -2254,6 +2255,22 @@ class _AmendmentJudgment(BaseModel):
     the amendment may carry context and lifecycle ops only (ADR 0011 D4).
     Either way the drop is noted in :attr:`record_notes`."""
 
+    departure_label_restored: int = 0
+    """How many of those lost labelled lines the engine re-inserted verbatim (FIX 6): all of them.
+    A past departure stays on the record whatever the judge's rewrite did, even when its directive
+    has since been superseded or retired."""
+
+    departure_label_lost: int = 0
+    """How many ``Departure from <id> (<scope>): `` lines of the previous context this
+    judgment's context write no longer carries byte for byte (the label was dropped or the line
+    reworded away). Measured, not repaired: no re-ask in v1.19."""
+
+    attribution_gap_kept: list[str] = Field(default_factory=list)
+    """Operator directive ids (batch: ``<contribution id>:<directive id>``) whose attribution gap
+    remained after the one corrective re-ask: the judge returned the amendment unchanged and the
+    engine kept it (the judge's call). Never repaired mechanically: a label the engine inserted on
+    a false match would be a false attribution."""
+
     protocol_notes: list[str] = Field(default_factory=list)
     """What the engine repaired about the judge's PROTOCOL, not its judgment.
 
@@ -2434,10 +2451,6 @@ class _AmendmentJudgment(BaseModel):
 #: drives without caring which of the two it is holding.
 _JudgmentT = TypeVar("_JudgmentT", bound=_AmendmentJudgment)
 
-#: The two verdicts that admit material into the summary — the only ones an
-#: unattributed echo can hide in (a decline amends nothing).
-_ACCEPT_DECISIONS = ("accept_as_directive", "accept_as_context")
-
 
 def _attribution_pattern(operator_id: str) -> re.Pattern[str]:
     """The attribution phrase RULE 2 requires for *operator_id*, as a matcher.
@@ -2487,7 +2500,7 @@ def _unattributed_operator_echoes(
     directive, and demanding it for an operator context item would have the
     judge write a false label.
     """
-    if not operator_directive_ids or judgment.decision not in _ACCEPT_DECISIONS:
+    if not operator_directive_ids or judgment.decision not in ACCEPTED_DECISIONS:
         return []
     admitted = _amendment_summary_text(judgment, contribution)
     return [
@@ -2496,6 +2509,138 @@ def _unattributed_operator_echoes(
         if operator_id in judgment.reasoning
         and not _attribution_pattern(operator_id).search(admitted)
     ]
+
+
+def _decision_signature(judgment: object) -> object:
+    """What an attribution re-ask must not change: the single decision, or every batch decision."""
+    verdicts = getattr(judgment, "verdicts", None)
+    if verdicts is not None:
+        return tuple((v.contribution_id, v.decision) for v in verdicts)
+    return getattr(judgment, "decision", None)
+
+
+def _note_echoes_directive(directive_text: str, text: str) -> bool:
+    """Whether *text* echoes an operator directive's subject (#138): the strict covered-subject
+    and head-noun test, or at least THREE shared subject stems. Three, not the two
+    :func:`_note_covers_rule` takes: measured on unrelated contributions it fires about half as
+    often for one echo lost."""
+    if _is_covered_subject(directive_text, text) and _head_nouns_compatible(directive_text, text):
+        return True
+    return _shared_subject_stems(directive_text, text) >= 3
+
+
+def _engine_detected_operator_echoes(
+    judgment: ScopeManagerJudgment,
+    *,
+    operator_directives: Sequence[tuple[str, str]],
+    contribution: Contribution,
+) -> list[str]:
+    """Operator directive ids whose SUBJECT the contribution echoes (#138), even when the judge
+    never cites the id. The echo is matched on what this contribution brings (its own content and
+    any ``publish``ed directive content), not on the whole rewritten context, which would fire on
+    old lines; the attribution is looked for in the admitted text (:func:`_amendment_summary_text`).
+    Directives only (not operator context) and accepts only; ids already attributed are left out."""
+    if not operator_directives or judgment.decision not in ACCEPTED_DECISIONS:
+        return []
+    admitted = _amendment_summary_text(judgment, contribution)
+    if not admitted.strip():
+        return []
+    brought = "\n".join(
+        [contribution.content]
+        + [op.content for op in judgment.directive_ops if op.op == "publish" and op.content]
+    )
+    return [
+        operator_id
+        for operator_id, text in dict(operator_directives).items()
+        if not _attribution_pattern(operator_id).search(admitted)
+        and _note_echoes_directive(text, brought)
+    ]
+
+
+def _batch_admitted_text(
+    judgment: ScopeManagerBatchJudgment, contributions: Mapping[str, Contribution]
+) -> str:
+    """The text a batch amendment sends to the summary: the one rewritten context, every
+    ``publish``ed directive's content, and the bytes of each ``append``ed member."""
+    parts: list[str] = []
+    if judgment.new_context is not None:
+        parts.append(judgment.new_context)
+    for op in judgment.directive_ops:
+        if op.op == "publish" and op.content:
+            parts.append(op.content)
+        elif op.op == "append" and op.contribution_id in contributions:
+            parts.append(contributions[op.contribution_id].content)
+    return "\n".join(parts)
+
+
+def _batch_attribution_gaps(
+    judgment: ScopeManagerBatchJudgment,
+    *,
+    operator_directives: Sequence[tuple[str, str]],
+    contributions: Mapping[str, Contribution],
+) -> tuple[list[str], list[str]]:
+    """``(cited, engine_only)`` gaps of a batch, as ``<contribution id>:<directive id>``: per
+    accepted member, an operator directive its reasoning cites or whose subject its text covers,
+    that no text the batch amendment sends to the summary attributes."""
+    if not operator_directives:
+        return [], []
+    admitted = _batch_admitted_text(judgment, contributions)
+    texts = dict(operator_directives)
+    cited: list[str] = []
+    engine_only: list[str] = []
+    for verdict in judgment.verdicts:
+        member = contributions.get(verdict.contribution_id)
+        if member is None or verdict.decision not in ACCEPTED_DECISIONS:
+            continue
+        own = member.content + "\n".join(
+            op.content
+            for op in judgment.directive_ops
+            if op.op == "publish" and op.content and op.contribution_id == member.id
+        )
+        for operator_id, text in texts.items():
+            if _attribution_pattern(operator_id).search(admitted):
+                continue
+            key = f"{member.id}:{operator_id}"
+            if operator_id in verdict.reasoning:
+                cited.append(key)
+            elif _note_echoes_directive(text, own):
+                engine_only.append(key)
+    return cited, engine_only
+
+
+_ECHO_MATCH_SENTENCE = (
+    "The engine matched the admitted text to operator directive {ids} on its subject; if it "
+    "does not echo that directive, return the same amendment unchanged."
+)
+
+
+def _attribution_corrective_text(cited: Sequence[str], engine_only: Sequence[str]) -> str:
+    """The RULE 2 corrective: today's wording when the judge cited the id, the same wording opened
+    differently when only the engine matched, plus the one added sentence for engine matches."""
+    names = ", ".join([*cited, *engine_only])
+    opening = (
+        f"Your reasoning cites operator directive(s) {', '.join(cited)}, but "
+        if cited
+        else f"Your amendment may echo operator directive(s) {names}, but "
+    )
+    text = (
+        f"{opening}"
+        "no text your amendment sends to the summary carries the attribution "
+        "'per operator directive <id>'. RULE 2: when admitted material echoes "
+        "the substance of an operator directive, the attribution phrase is "
+        "PART of the echoed text and must appear in text you author — a "
+        "`publish`ed directive's content or `new_context`; reasoning is never "
+        "composed into any perspective. Call submit_judgment again with the "
+        "SAME decision: if the admitted material echoes the operator "
+        "directive, rewrite the amendment so the attribution phrase appears "
+        "in the authored text (an `append` whose bytes lack the attribution "
+        "becomes a `publish` with the attribution written in); if it "
+        "genuinely does not echo the operator directive, return the same "
+        "amendment unchanged."
+    )
+    if engine_only:
+        text += " " + _ECHO_MATCH_SENTENCE.format(ids=", ".join(engine_only))
+    return text
 
 
 def _collapse_whitespace(text: str) -> str:
@@ -7230,6 +7375,80 @@ def _inherited_directive_texts(
     return out
 
 
+_OWN_ORIGIN_SUFFIX = " (this scope)"
+
+
+def _own_directive_texts(
+    current_summary: ScopeSummary | None, scope: Scope
+) -> list[tuple[str, str, str]]:
+    """``(id, "<scope> (this scope)", text)`` for every directive in the scope's own summary."""
+    if current_summary is None:
+        return []
+    return [
+        (d.id, f"{scope.id}{_OWN_ORIGIN_SUFFIX}", d.content) for d in current_summary.directives
+    ]
+
+
+def _is_own_origin(origin: str) -> bool:
+    return origin.endswith(_OWN_ORIGIN_SUFFIX)
+
+
+#: A note that reasons about whether to change a rule, as opposed to stating an exception in
+#: force now. Narrow on purpose: "let's treat X as sufficient for now" and "agreed we should
+#: just stretch it" are decisions in force, and they carry markers, so they still decline.
+_DELIBERATION_RE = re.compile(
+    r"\b(?:(?:we|i|they)(?:['’]re|\s+are|\s+is)?\s+(?:considering|thinking\s+about)\b"
+    r"|considering\s+(?:whether|retiring|changing|superseding|dropping|relaxing)\b"
+    r"|whether\s+(?:to|we\s+should)\b"
+    r"|should\s+we\b"
+    r"|propos(?:ing|e)\s+(?:that|to)\b"
+    r"|would\s+like\s+to\s+(?:change|retire|supersede)\b"
+    r"|raise\s+it\s+with\b)",
+    re.IGNORECASE,
+)
+
+
+#: A practice in force wrapped in a proposal ("proposing that we retire it; hotfixes currently go
+#: out on one review") is not deliberation.
+_PRACTICE_IN_FORCE_RE = re.compile(
+    r"\b(?:currently|at the moment|right now|in practice|as things stand|meanwhile|"
+    r"in the meantime|already|anyway|for now|these days|at present)\b",
+    re.IGNORECASE,
+)
+
+
+def _wrapped_practice_cue(content: str) -> str | None:
+    """The practice-in-force cue in a note that also reads as a proposal, else ``None``."""
+    if not _DELIBERATION_RE.search(content):
+        return None
+    match = _PRACTICE_IN_FORCE_RE.search(content)
+    return match.group(0) if match else None
+
+
+#: What a deliberation verb governs ("proposing that we review ...", "considering whether to ...")
+#: up to the end of its sentence or clause: words in it are being discussed, not done.
+_DELIBERATION_COMPLEMENT_RE = re.compile(
+    r"\b(?:propos(?:ing|e)\s+(?:that|to)|considering\s+(?:whether|retiring|changing|superseding|"
+    r"dropping|relaxing)|thinking\s+about(?:\s+whether)?|whether(?:\s+to|\s+we\s+should)?|"
+    r"would\s+like\s+to\s+(?:change|retire|supersede))\b[^.!?;,]*",
+    re.IGNORECASE,
+)
+
+
+def _is_deliberation(content: str, rule: str, context_words: frozenset[str]) -> bool:
+    """Reasoning about changing the rule, with no exception or general marker in force and no
+    practice-in-force cue."""
+    # a question states nothing in force ("Should we keep requiring ...?"): its words are not
+    # markers. The practice cues are read on the whole text.
+    asked = _DELIBERATION_COMPLEMENT_RE.sub(" ", re.sub(r"[^.!?]*\?", " ", content))
+    return bool(
+        _DELIBERATION_RE.search(content)
+        and not _PRACTICE_IN_FORCE_RE.search(content)
+        and _exception_marker(asked, rule, context_words) is None
+        and _general_marker(asked) is None
+    )
+
+
 def _first_inherited_conflict(
     op_text: str, inherited: Sequence[tuple[str, str, str]]
 ) -> tuple[str, str, str] | None:
@@ -7316,6 +7535,38 @@ _INHERITED_RELATION_SYSTEM_PROMPT = (
     "- unrelated: none of these.\n"
     "Copy the span your kind requires verbatim from the item. Call "
     "`classify_inherited_relation` exactly once."
+)
+
+
+def _neutral(text: str) -> str:
+    """The re-ask wording for a candidate set that includes the scope's own directives."""
+    return (
+        text.replace("INHERITED DIRECTIVES", "DIRECTIVES THAT BIND THIS SCOPE")
+        .replace("an inherited directive", "a directive that binds this scope")
+        .replace("ONE inherited directive", "ONE directive that binds this scope")
+        .replace("the inherited directive", "the directive that binds this scope")
+    )
+
+
+_NEUTRAL_RELATION_SYSTEM_PROMPT = _neutral(_INHERITED_RELATION_SYSTEM_PROMPT)
+
+
+def _neutral_relation_tool(name: str) -> dict:
+    """The re-ask tool in the neutral wording, under *name* (a copy; the inherited tool is
+    never touched)."""
+    tool = json.loads(json.dumps(CLASSIFY_INHERITED_RELATION_TOOL))
+    tool["name"] = name
+    tool["description"] = _neutral(CLASSIFY_INHERITED_RELATION_TOOL["description"])
+    tool["input_schema"]["properties"]["inherited_id"]["description"] = (
+        "Required: the id of the directive this relates to."
+    )
+    return tool
+
+
+#: The same re-ask, made ONLY because the scope has its own directives and inherits nothing: its
+#: own tool name so the judge meter records it as its own kind (``own_directive_relation``).
+CLASSIFY_OWN_DIRECTIVE_RELATION_TOOL: dict = _neutral_relation_tool(
+    "classify_own_directive_relation"
 )
 
 _NORMATIVE_EXCEPTION_RES: tuple[re.Pattern[str], ...] = tuple(
@@ -8273,6 +8524,18 @@ def _inherited_relation_note(outcome: dict) -> str:
     with nothing to say: the unverified fallback)."""
     directive_id, origin = outcome["inherited_id"], outcome["origin"]
     verdict = outcome["verdict"]
+    if _is_own_origin(origin):
+        if verdict in _INHERITED_DECLINES:
+            return (
+                f"[Declined: {directive_id} is this scope's own directive. To change it, "
+                "supersede or retire it.]"
+            )
+        if verdict == "departure_report":
+            return (
+                f"[Recorded as a departure from {directive_id} (this scope): not a licence; "
+                "to change the rule, supersede or retire it.]"
+            )
+        return ""
     if verdict == "decline_unspecific":
         return (
             f"[Declined: a report of following or departing from {directive_id} ({origin}) "
@@ -8355,6 +8618,85 @@ def with_departure_label(text: str, label: str | None) -> str:
     if label is None or _DEPARTURE_LABEL_RE.match(text):
         return text
     return f"{label}{text}"
+
+
+_LABELLED_LINE_RE = re.compile(r"^Departure from \S+ \([^)]*\): .*$", re.MULTILINE)
+
+
+def _departure_label_for(outcome: dict) -> str:
+    """The stored-line label for an admitted departure: the issuing scope, or "this scope" for
+    one of the scope's own directives."""
+    origin = outcome["origin"]
+    if _is_own_origin(origin):
+        origin = "this scope"
+    return departure_label(outcome["inherited_id"], origin)
+
+
+def _with_departure_labels_restored(judgment, current_summary, summary_max_words):  # noqa: ANN001, ANN202
+    """After ANY context write: every labelled "Departure from ..." line of the previous context
+    that the new context no longer holds byte for byte is RE-INSERTED verbatim (no re-ask, as the
+    position gate substitutes its attributed line). Where it was, relative to neighbours that
+    survive; else before the newest note. A line the judge reworded unlabelled is replaced in
+    place by the labelled one. The engine never drops a labelled line, so restoration may leave
+    the summary over budget; that overflow is recorded."""
+    if current_summary is None or judgment.new_context is None or judgment.new_summary is None:
+        return judgment
+    previous = current_summary.context.split("\n")
+    lost = [
+        line
+        for line in previous
+        if _LABELLED_LINE_RE.fullmatch(line) and line not in judgment.new_context
+    ]
+    if not lost:
+        return judgment
+    lines = judgment.new_context.split("\n")
+    for line in lost:
+        body = split_departure_label(line)[1]
+        if body in lines:
+            lines[lines.index(body)] = line
+            continue
+        at = previous.index(line)
+        position = next(
+            (lines.index(previous[j]) + 1 for j in range(at - 1, -1, -1) if previous[j] in lines),
+            None,
+        )
+        if position is None:
+            position = next(
+                (
+                    lines.index(previous[k])
+                    for k in range(at + 1, len(previous))
+                    if previous[k] in lines
+                ),
+                None,
+            )
+        if position is None:
+            position = max(len(lines) - 1, 0) if any(x.strip() for x in lines) else 0
+        lines.insert(position, line)
+    context = "\n".join(lines)
+    summary = judgment.new_summary.model_copy(update={"context": context})
+    notes = [f"departure_label_lost: {len(lost)}", f"departure_label_restored: {len(lost)}"]
+    words = _summary_word_count(summary)
+    if words > summary_max_words:
+        notes.append(
+            f"departure_label_overflow: {words - summary_max_words} words over the "
+            f"{summary_max_words}-word budget"
+        )
+    return judgment.model_copy(
+        update={
+            "new_context": context,
+            "new_summary": summary,
+            "departure_label_lost": len(lost),
+            "departure_label_restored": len(lost),
+            "protocol_notes": [*judgment.protocol_notes, *notes],
+        }
+    )
+
+
+def count_lost_departure_labels(previous_context: str, new_context: str | None) -> int:
+    """Labelled lines of *previous_context* that *new_context* no longer holds byte for byte."""
+    if new_context is None:
+        return 0
+    return sum(1 for line in _LABELLED_LINE_RE.findall(previous_context) if line not in new_context)
 
 
 @dataclass(frozen=True)
@@ -8810,6 +9152,28 @@ def _directive_relation_note(outcome: dict) -> str:
 # ---------------------------------------------------------------------------
 
 
+class InheritedReaskUnavailable(RuntimeError):
+    """The relation re-ask (#242 / #243 / #244) could not reach the judge: a 429, a 5xx, a
+    timeout or a connection error that outlasted the bounded retries. Raised, never folded into
+    the unreadable-answer case: that case fails OPEN (admit unless a marker), so a transport
+    error would let an exception or a bare departure through. Callers record it as a judge
+    failure and the item waits, unjudged and retryable, the same as an unreachable judge."""
+
+
+#: Extra attempts after the first for a re-ask that hits a transport error, and the wait before
+#: each. The judge client's own retries (the SDK default) run inside every attempt; these sit on
+#: top so a rate-limited provider gets seconds, not milliseconds, before the item is held.
+_REASK_BACKOFF_SECONDS: tuple[float, ...] = (1.0, 3.0)
+
+
+def _is_transport_error(exc: BaseException) -> bool:
+    """429, 5xx (and 408), a timeout or a connection error. Any other failure, including a
+    4xx other than those, keeps the unreadable-answer path."""
+    if isinstance(exc, anthropic.APIStatusError):
+        return exc.status_code in (408, 429) or exc.status_code >= 500
+    return isinstance(exc, anthropic.APITimeoutError | anthropic.APIConnectionError)
+
+
 class ScopeManager:
     """Invokes the Anthropic API to judge a contribution against a scope.
 
@@ -8892,6 +9256,25 @@ class ScopeManager:
         from strata.judge_usage import metered_messages_create  # noqa: PLC0415
 
         return metered_messages_create(self._client, kwargs, provider=self._judge_provider)
+
+    def _reask_create(self, **kwargs: Any) -> Any:
+        """:meth:`_messages_create` for a relation re-ask, with bounded backoff on a transport
+        error. Raises :class:`InheritedReaskUnavailable` when it still fails; every other
+        exception propagates unchanged to the caller's unreadable-answer handling."""
+        waits = iter(_REASK_BACKOFF_SECONDS)
+        while True:
+            try:
+                return self._messages_create(**kwargs)
+            except Exception as exc:
+                if not _is_transport_error(exc):
+                    raise
+                wait = next(waits, None)
+                if wait is None:
+                    raise InheritedReaskUnavailable(
+                        f"relation re-ask failed ({type(exc).__name__}: {exc}) after "
+                        f"{len(_REASK_BACKOFF_SECONDS) + 1} attempts; nothing was decided on it"
+                    ) from exc
+                time.sleep(wait)
 
     def judge(
         self,
@@ -9311,7 +9694,7 @@ class ScopeManager:
             to `protocol_notes` on every path below, so a trigger is always
             countable in the record whatever it resolves to.
             """
-            if judgment.decision not in ("accept_as_directive", "accept_as_context"):
+            if judgment.decision not in ACCEPTED_DECISIONS:
                 return judgment
             if entitlement is None:
                 return judgment
@@ -9712,36 +10095,35 @@ class ScopeManager:
 
         # The operator directives actually rendered to this call — the only
         # ids a reasoning citation can be checked against (ADR 0008 D3).
-        operator_directive_ids = [
-            item.id
+        operator_directives = [
+            (item.id, item.content)
             for _attachment_scope_id, items in (operator_memory or [])
             for item in items
             if item.kind == "directive"
         ]
+        operator_directive_ids = [operator_id for operator_id, _text in operator_directives]
+        echo_state: dict[str, list[str]] = {"cited": [], "engine_only": []}
 
         def _attribution_gaps(judgment: ScopeManagerJudgment) -> list[str]:
-            return _unattributed_operator_echoes(
+            cited = _unattributed_operator_echoes(
                 judgment,
                 operator_directive_ids=operator_directive_ids,
                 contribution=new_contribution,
             )
+            engine_only = [
+                operator_id
+                for operator_id in _engine_detected_operator_echoes(
+                    judgment,
+                    operator_directives=operator_directives,
+                    contribution=new_contribution,
+                )
+                if operator_id not in cited
+            ]
+            echo_state["cited"], echo_state["engine_only"] = cited, engine_only
+            return [*cited, *engine_only]
 
-        def _attribution_corrective(gap_ids: Sequence[str]) -> str:
-            return (
-                f"Your reasoning cites operator directive(s) {', '.join(gap_ids)}, but "
-                "no text your amendment sends to the summary carries the attribution "
-                "'per operator directive <id>'. RULE 2: when admitted material echoes "
-                "the substance of an operator directive, the attribution phrase is "
-                "PART of the echoed text and must appear in text you author — a "
-                "`publish`ed directive's content or `new_context`; reasoning is never "
-                "composed into any perspective. Call submit_judgment again with the "
-                "SAME decision: if the admitted material echoes the operator "
-                "directive, rewrite the amendment so the attribution phrase appears "
-                "in the authored text (an `append` whose bytes lack the attribution "
-                "becomes a `publish` with the attribution written in); if it "
-                "genuinely does not echo the operator directive, return the same "
-                "amendment unchanged."
-            )
+        def _attribution_corrective(_gap_ids: Sequence[str]) -> str:
+            return _attribution_corrective_text(echo_state["cited"], echo_state["engine_only"])
 
         # Superseded-claim backstop (#199): the mechanical half of "a
         # superseded or retracted claim leaves the context". Everything it
@@ -9912,6 +10294,13 @@ class ScopeManager:
             operator_memory=operator_memory,
         )
         if acted_on_target is None:
+            judgment = self._drop_context_directive_changes(
+                judgment,
+                scope=scope,
+                current_summary=current_summary,
+                new_contribution=new_contribution,
+                mode=mode,
+            )
             judgment = self.classify_inherited_context(
                 judgment,
                 scope=scope,
@@ -9919,6 +10308,7 @@ class ScopeManager:
                 ancestor_directives=ancestor_directives,
                 operator_memory=operator_memory,
                 mode=mode,
+                current_summary=current_summary,
             )
             judgment = self.classify_inherited_directive(
                 judgment,
@@ -9929,13 +10319,17 @@ class ScopeManager:
                 mode=mode,
                 current_summary=current_summary,
             )
-        return self._hold_directive_changes(
-            judgment,
-            scope=scope,
-            current_summary=current_summary,
-            new_contribution=new_contribution,
-            mode=mode,
-            input_changes=input_changes,
+        return _with_departure_labels_restored(
+            self._hold_directive_changes(
+                judgment,
+                scope=scope,
+                current_summary=current_summary,
+                new_contribution=new_contribution,
+                mode=mode,
+                input_changes=input_changes,
+            ),
+            current_summary,
+            summary_max_words,
         )
 
     @staticmethod
@@ -10090,6 +10484,159 @@ class ScopeManager:
                     if any_accepted
                     else None
                 ),
+            }
+        )
+
+    @staticmethod
+    def _dropped_ops_and_note(
+        ops: Sequence[DirectiveOp], own_ids: set[str]
+    ) -> tuple[list[DirectiveOp], str] | None:
+        """The ops a context note may not carry (supersede or retire of an own directive, and
+        the append or publish paired with a supersede), with the record note. ``None`` when the
+        ops touch no own directive."""
+        hit = [op for op in ops if op.op in ("supersede", "retire") and op.id in own_ids]
+        if not hit:
+            return None
+        paired = (
+            [op for op in ops if op.op in ("append", "publish") and op not in hit]
+            if any(op.op == "supersede" for op in hit)
+            else []
+        )
+        dropped = [*hit, *paired]
+        ids = ", ".join(dict.fromkeys(str(op.id) for op in hit))
+        note = (
+            f"[Engine: a context note can't change {ids}; supersede or retire it explicitly. "
+            f"Ops dropped: {'; '.join(op.describe() for op in dropped)}.]"
+        )
+        return dropped, note
+
+    @staticmethod
+    def _drop_context_directive_changes(
+        judgment: ScopeManagerJudgment,
+        *,
+        scope: Scope,
+        current_summary: ScopeSummary | None,
+        new_contribution: Contribution,
+        mode: JudgeMode,
+    ) -> ScopeManagerJudgment:
+        """A context note proposed with no ``supersedes`` never changes the scope's own rules,
+        whatever the judge returned: its supersede/retire ops on own directives (and the append
+        paired with a supersede) are dropped, the note is recorded, and the contribution is
+        judged as context, through the own-directive #242 check."""
+        if (
+            mode != "ordinary"
+            or judgment.decision == "decline"
+            or current_summary is None
+            or new_contribution.contributor.scope_id != scope.id
+            or new_contribution.proposed_classification != "context"
+            or new_contribution.supersedes is not None
+        ):
+            return judgment
+        found = ScopeManager._dropped_ops_and_note(
+            judgment.directive_ops, {d.id for d in current_summary.directives}
+        )
+        if found is None:
+            return judgment
+        dropped, note = found
+        kept = [op for op in judgment.directive_ops if op not in dropped]
+        context = (
+            judgment.new_context
+            if judgment.new_context is not None
+            else _append_line(
+                current_summary.context,
+                f"[{new_contribution.id}] "
+                f"{new_contribution.contributor.skill or new_contribution.contributor.session_id}"
+                f" ({scope.id}) observed: {new_contribution.content.strip()}",
+            )
+        )
+        return judgment.model_copy(
+            update={
+                "decision": "accept_as_context",
+                "directive_ops": kept,
+                "new_context": context,
+                "new_summary": _apply_amendment(
+                    scope=scope,
+                    current_summary=current_summary,
+                    contribution=new_contribution,
+                    ops=kept,
+                    new_context=context,
+                ),
+                "reasoning": f"{judgment.reasoning} {note}",
+                "protocol_notes": [*judgment.protocol_notes, f"context note ops dropped: {note}"],
+            }
+        )
+
+    @staticmethod
+    def _drop_batch_context_directive_changes(
+        judgment: ScopeManagerBatchJudgment,
+        *,
+        scope: Scope,
+        current_summary: ScopeSummary | None,
+        contributions: Mapping[str, Contribution],
+        mode: JudgeMode,
+    ) -> ScopeManagerBatchJudgment:
+        """:meth:`_drop_context_directive_changes`, carried to the batch, member by member
+        (an op is read as a member's by its ``contribution_id``)."""
+        if mode != "ordinary" or current_summary is None:
+            return judgment
+        own_ids = {d.id for d in current_summary.directives}
+        dropped_all: list[DirectiveOp] = []
+        notes: dict[str, str] = {}
+        for verdict in judgment.verdicts:
+            cid = verdict.contribution_id
+            member = contributions[cid]
+            if (
+                verdict.decision == "decline"
+                or member.contributor.scope_id != scope.id
+                or member.proposed_classification != "context"
+                or member.supersedes is not None
+            ):
+                continue
+            mine = [op for op in judgment.directive_ops if op.contribution_id == cid]
+            found = ScopeManager._dropped_ops_and_note(mine, own_ids)
+            if found is not None:
+                dropped_all.extend(found[0])
+                notes[cid] = found[1]
+        if not notes:
+            return judgment
+        kept = [op for op in judgment.directive_ops if op not in dropped_all]
+        context = (
+            judgment.new_context if judgment.new_context is not None else current_summary.context
+        )
+        verdicts = [
+            v.model_copy(
+                update={
+                    "decision": "accept_as_context",
+                    "reasoning": f"{v.reasoning} {notes[v.contribution_id]}",
+                }
+            )
+            if v.contribution_id in notes
+            else v
+            for v in judgment.verdicts
+        ]
+        for cid in notes:
+            if judgment.new_context is None:
+                member = contributions[cid]
+                who = member.contributor.skill or member.contributor.session_id
+                context = _append_line(
+                    context, f"[{member.id}] {who} ({scope.id}) observed: {member.content.strip()}"
+                )
+        return judgment.model_copy(
+            update={
+                "verdicts": verdicts,
+                "directive_ops": kept,
+                "new_context": context,
+                "new_summary": _apply_batch_amendment(
+                    scope=scope,
+                    current_summary=current_summary,
+                    contributions=contributions,
+                    ops=kept,
+                    new_context=context,
+                ),
+                "protocol_notes": [
+                    *judgment.protocol_notes,
+                    *(f"context note ops dropped: {n}" for n in notes.values()),
+                ],
             }
         )
 
@@ -10316,7 +10863,8 @@ class ScopeManager:
 
         *attribution_gaps* and *attribution_corrective* are supplied together
         or not at all; leaving both ``None`` skips the echo check entirely,
-        which is what the batch path does. The three *stale_claim* callables
+        which the single path and (since #138) the batch path both wire.
+        The three *stale_claim* callables
         (#199) work the same way and are wired in by the same single path: a
         batch's several contributions each carry their own ``supersedes``,
         which the cumulative amendment's one ``new_context`` does not resolve
@@ -10635,8 +11183,7 @@ class ScopeManager:
                 if (
                     retry_judgment is not None
                     and retry_judgment.new_summary is not None
-                    and getattr(retry_judgment, "decision", None)
-                    == getattr(judgment, "decision", None)
+                    and _decision_signature(retry_judgment) == _decision_signature(judgment)
                 ):
                     # A rewrite that resolves the attribution by naming a bad
                     # id is still subject to D1's drop-and-note rule.
@@ -10646,6 +11193,12 @@ class ScopeManager:
                     response = retry_response
                     tool_use_block = retry_block
                     first_messages = retry_messages
+                # The gap that survives the one re-ask is the judge's call (it returned the
+                # amendment unchanged, or the retry was unusable): recorded, never filled in by
+                # the engine, because a label on a false match is a false attribution.
+                kept = attribution_gaps(judgment)
+                if kept:
+                    judgment = judgment.model_copy(update={"attribution_gap_kept": kept})
 
         # Superseded-claim backstop (#199): the amendment removes an item and
         # the rewritten context puts its own words straight back — the dead
@@ -11262,50 +11815,68 @@ class ScopeManager:
         contribution: Contribution,
         covered: Sequence[tuple[str, str, str]],
         context_words: frozenset[str] | None = None,
+        own_only: bool = False,
     ) -> dict:
         """#242: the one targeted re-ask (``classify_inherited_relation``) and
         the engine's verification of its answer, for a context contribution
         that the scope inherits directives for (*covered*, ranked and capped).
 
         Returns ``{"contribution_id", "kind", "verdict", "fallback",
-        "inherited_id", "origin", "reason"}``. A failed or unreadable call is
-        the unreadable-answer case, never an error: the verifier's marker
-        scan then decides (a marker declines, otherwise the admit stands and
-        ``fallback`` is True).
+        "inherited_id", "origin", "reason"}``. An unreadable answer (bad tool
+        input, a wrong id, a non-transport failure) is the unreadable-answer case, never an
+        error: the verifier's marker scan then decides (a marker declines, otherwise the admit
+        stands and ``fallback`` is True). A transport error that outlasts the bounded retries
+        (:meth:`_reask_create`) raises :class:`InheritedReaskUnavailable` instead: nothing is
+        decided on a call that never happened.
         """
         shown = list(covered)
         listing = "\n".join(
             f"- {d_id}: {text[:_CONTEXT_REASK_DIRECTIVE_CHARS]}" for d_id, _origin, text in shown
         )
+        neutral = any(_is_own_origin(origin) for _id, origin, _text in shown)
         user_message = (
-            f"INHERITED DIRECTIVES:\n{listing}\n\nCONTEXT ITEM:\n{contribution.content}\n\n"
+            f"{'DIRECTIVES THAT BIND THIS SCOPE' if neutral else 'INHERITED DIRECTIVES'}:\n"
+            f"{listing}\n\nCONTEXT ITEM:\n{contribution.content}\n\n"
             "Call `classify_inherited_relation` exactly once."
         )
+        system_text = _INHERITED_RELATION_SYSTEM_PROMPT
+        tool = CLASSIFY_INHERITED_RELATION_TOOL
+        if neutral:
+            system_text = _NEUTRAL_RELATION_SYSTEM_PROMPT
+            tool = _neutral_relation_tool("classify_inherited_relation")
+        if own_only:
+            system_text = system_text.replace(
+                "classify_inherited_relation", CLASSIFY_OWN_DIRECTIVE_RELATION_TOOL["name"]
+            )
+            tool = CLASSIFY_OWN_DIRECTIVE_RELATION_TOOL
+            user_message = user_message.replace(
+                "classify_inherited_relation", CLASSIFY_OWN_DIRECTIVE_RELATION_TOOL["name"]
+            )
         answer: dict = {}
         failure: str | None = None
         try:
-            response = self._messages_create(
+            response = self._reask_create(
                 model=self._model,
                 max_tokens=300,
                 system=[
                     {
                         "type": "text",
-                        "text": _INHERITED_RELATION_SYSTEM_PROMPT,
+                        "text": system_text,
                         "cache_control": {"type": "ephemeral"},
                     }
                 ],
-                tools=[
-                    {**CLASSIFY_INHERITED_RELATION_TOOL, "cache_control": {"type": "ephemeral"}}
-                ],
+                tools=[{**tool, "cache_control": {"type": "ephemeral"}}],
                 tool_choice={
                     "type": "tool",
-                    "name": CLASSIFY_INHERITED_RELATION_TOOL["name"],
+                    "name": tool["name"],
                     "disable_parallel_tool_use": True,
                 },
                 messages=[{"role": "user", "content": user_message}],
             )
             block = self._extract_tool_use_block(response)
             answer = block.input if isinstance(block.input, dict) else {}
+        except InheritedReaskUnavailable:
+            raise
         except Exception as exc:  # noqa: BLE001 — any slip is the unreadable-answer case
             failure = f"{type(exc).__name__}: {exc}"
 
@@ -11314,13 +11885,33 @@ class ScopeManager:
         if chosen is None:
             chosen = shown[0]
             answer = {}  # an answer naming no shown directive is unreadable
-        verdict, reason = verify_inherited_relation(
-            answer,
-            contribution.content,
-            chosen[2],
-            [d[2] for d in shown if d is not chosen],
-            context_words,
+        others = [d[2] for d in shown if d is not chosen]
+        if context_words is None:
+            context_words = inherited_context_words([chosen[2], *others])
+        deliberation = _is_own_origin(chosen[1]) and _is_deliberation(
+            contribution.content, chosen[2], context_words
         )
+        if deliberation and answer.get("kind") == "exception":
+            # the judge named an exception: it wins unless its span is itself the deliberation
+            span = _verbatim_span(answer, "instead_span", contribution.content)
+            if span is not None and not _DELIBERATION_RE.search(span):
+                deliberation = False
+        wrapped = _wrapped_practice_cue(contribution.content) if _is_own_origin(chosen[1]) else None
+        if deliberation:
+            verdict, reason = "admit", f"deliberation about {chosen[0]}"
+        elif (
+            wrapped is not None
+            and answer.get("kind") not in ("consequence_report", "departure_report", "exception")
+            and _exception_marker(contribution.content, chosen[2], context_words) is None
+            and _general_marker(contribution.content) is None
+        ):
+            # a proposal that also states what is in force now: with no readable report or
+            # exception answer to go on, the practice cue is the marker
+            verdict, reason = "decline", f"practice in force beside a proposal ('{wrapped}')"
+        else:
+            verdict, reason = verify_inherited_relation(
+                answer, contribution.content, chosen[2], others, context_words
+            )
         if failure is not None:
             reason = f"re-ask failed ({failure}); {reason}"
         kind = answer.get("kind")
@@ -11328,7 +11919,7 @@ class ScopeManager:
             "contribution_id": contribution.id,
             "kind": kind if isinstance(kind, str) else None,
             "verdict": verdict,
-            "fallback": verdict == "admit",
+            "fallback": verdict == "admit" and not deliberation,
             "inherited_id": chosen[0],
             "origin": chosen[1],
             "reason": reason,
@@ -11343,6 +11934,7 @@ class ScopeManager:
         ancestor_directives: Sequence[tuple[str, Sequence[Directive]]] | None,
         operator_memory: Sequence[tuple[str, Sequence[OperatorItem]]] | None,
         mode: JudgeMode = "ordinary",
+        current_summary: ScopeSummary | None = None,
     ) -> ScopeManagerJudgment:
         """#242: a child's CONTEXT must not undercut an inherited directive.
 
@@ -11363,14 +11955,16 @@ class ScopeManager:
         ):
             return first
         inherited = _inherited_directive_texts(ancestor_directives, operator_memory)
-        if not inherited:
+        own = _own_directive_texts(current_summary, scope)
+        if not inherited and not own:
             return first
-        covered = inherited_for_context(contribution.content, inherited)
+        covered = inherited_for_context(contribution.content, [*inherited, *own])
         outcome = self._classify_inherited_relation(
             scope=scope,
             contribution=contribution,
             covered=covered,
-            context_words=inherited_context_words([d[2] for d in inherited]),
+            context_words=inherited_context_words([d[2] for d in [*inherited, *own]]),
+            own_only=not inherited,
         )
         note = _inherited_relation_note(outcome)
         update: dict = {
@@ -11390,6 +11984,22 @@ class ScopeManager:
             )
         elif note:
             update["reasoning"] = f"{first.reasoning} {note}"
+        if outcome["verdict"] == "departure_report":
+            # Agents read the summary, not the reasoning: the stored line carries the label, and
+            # the judge's own rewrite of this note is replaced by the engine's line.
+            previous = current_summary.context if current_summary is not None else ""
+            context = _append_line(
+                previous,
+                with_departure_label(contribution.content.strip(), _departure_label_for(outcome)),
+            )
+            update["new_context"] = context
+            update["new_summary"] = _apply_amendment(
+                scope=scope,
+                current_summary=current_summary,
+                contribution=contribution,
+                ops=first.directive_ops,
+                new_context=context,
+            )
         return first.model_copy(update=update)
 
     def check_publication_exception(
@@ -11526,8 +12136,9 @@ class ScopeManager:
         directive about to be admitted, and the engine's verification of its answer.
 
         Returns ``{"contribution_id", "relation", "verdict", "fallback", "inherited_id",
-        "origin", "reason"}``. A failed or unreadable call is the unreadable-answer case,
-        never an error: the verifier's marker scan then decides.
+        "origin", "reason"}``. An unreadable answer is the unreadable-answer case, never an
+        error: the verifier's marker scan then decides. A transport error that outlasts the
+        bounded retries raises :class:`InheritedReaskUnavailable`.
         """
         listing = "\n".join(
             f"- {d_id}: {t[:_CONTEXT_REASK_DIRECTIVE_CHARS]}" for d_id, _origin, t in covered
@@ -11539,7 +12150,7 @@ class ScopeManager:
         answer: dict = {}
         failure: str | None = None
         try:
-            response = self._messages_create(
+            response = self._reask_create(
                 model=self._model,
                 max_tokens=400,
                 system=[
@@ -11561,6 +12172,8 @@ class ScopeManager:
             )
             block = self._extract_tool_use_block(response)
             answer = block.input if isinstance(block.input, dict) else {}
+        except InheritedReaskUnavailable:
+            raise
         except Exception as exc:  # noqa: BLE001 — any slip is the unreadable-answer case
             failure = f"{type(exc).__name__}: {exc}"
 
@@ -11820,7 +12433,8 @@ class ScopeManager:
         if mode != "ordinary":
             return judgment
         inherited = _inherited_directive_texts(ancestor_directives, operator_memory)
-        if not inherited:
+        own = _own_directive_texts(current_summary, scope)
+        if not inherited and not own:
             return judgment
         held = {h["contribution_id"] for h in judgment.inherited_holds}
         outcomes: dict[str, dict] = {}
@@ -11836,7 +12450,8 @@ class ScopeManager:
             outcomes[cid] = self._classify_inherited_relation(
                 scope=scope,
                 contribution=member,
-                covered=inherited_for_context(member.content, inherited),
+                covered=inherited_for_context(member.content, [*inherited, *own]),
+                own_only=not inherited,
             )
         if not outcomes:
             return judgment
@@ -11859,17 +12474,23 @@ class ScopeManager:
             "verdicts": verdicts,
             "inherited_relations": list(outcomes.values()),
         }
-        if declined:
+        departed = {cid for cid, o in outcomes.items() if o["verdict"] == "departure_report"}
+        if declined or departed:
             context = current_summary.context if current_summary is not None else ""
             for v in verdicts:
                 if v.decision == "accept_as_context" and v.contribution_id not in held:
                     member = contributions[v.contribution_id]
                     who = member.contributor.skill or member.contributor.session_id
-                    context = _append_line(
-                        context,
-                        f"[{member.id}] {who} ({member.contributor.scope_id}) "
-                        f"observed: {member.content.strip()}",
-                    )
+                    if v.contribution_id in departed:
+                        line = with_departure_label(
+                            member.content.strip(), _departure_label_for(outcomes[member.id])
+                        )
+                    else:
+                        line = (
+                            f"[{member.id}] {who} ({member.contributor.scope_id}) "
+                            f"observed: {member.content.strip()}"
+                        )
+                    context = _append_line(context, line)
             update["new_context"] = context
             update["new_summary"] = _apply_batch_amendment(
                 scope=scope,
@@ -12233,10 +12854,34 @@ class ScopeManager:
                 verdicts.append(verdict)
             return judgment.model_copy(update={"verdicts": verdicts})
 
+        batch_operator_directives = [
+            (item.id, item.content)
+            for _attachment_scope_id, items in (operator_memory or [])
+            for item in items
+            if item.kind == "directive"
+        ]
+        batch_echo_state: dict[str, list[str]] = {"cited": [], "engine_only": []}
+
+        def _batch_attribution_gap_ids(judgment: ScopeManagerBatchJudgment) -> list[str]:
+            cited, engine_only = _batch_attribution_gaps(
+                judgment,
+                operator_directives=batch_operator_directives,
+                contributions=contributions,
+            )
+            batch_echo_state["cited"], batch_echo_state["engine_only"] = cited, engine_only
+            return [*cited, *engine_only]
+
+        def _batch_attribution_corrective(_gap_ids: Sequence[str]) -> str:
+            return _attribution_corrective_text(
+                batch_echo_state["cited"], batch_echo_state["engine_only"]
+            )
+
         batch_judgment = self._call_with_correctives(
             user_message=user_message,
             system_prompt=_BATCH_SYSTEM_PROMPT,
             tool=JUDGE_BATCH_TOOL,
+            attribution_gaps=_batch_attribution_gap_ids,
+            attribution_corrective=_batch_attribution_corrective,
             reasoning_gaps=_batch_reasoning_gaps,
             reasoning_withdraw=_batch_reasoning_withdraw,
             reasoning_adopt=_batch_reasoning_adopt,
@@ -12292,6 +12937,13 @@ class ScopeManager:
             ancestor_directives=ancestor_directives,
             operator_memory=operator_memory,
         )
+        batch_judgment = self._drop_batch_context_directive_changes(
+            batch_judgment,
+            scope=scope,
+            current_summary=current_summary,
+            contributions=contributions,
+            mode=mode,
+        )
         batch_judgment = self._classify_batch_inherited_context(
             batch_judgment,
             scope=scope,
@@ -12301,13 +12953,17 @@ class ScopeManager:
             ancestor_directives=ancestor_directives,
             operator_memory=operator_memory,
         )
-        return self._hold_batch_directive_changes(
-            batch_judgment,
-            scope=scope,
-            current_summary=current_summary,
-            contributions=contributions,
-            mode=mode,
-            input_changes=input_changes,
+        return _with_departure_labels_restored(
+            self._hold_batch_directive_changes(
+                batch_judgment,
+                scope=scope,
+                current_summary=current_summary,
+                contributions=contributions,
+                mode=mode,
+                input_changes=input_changes,
+            ),
+            current_summary,
+            summary_max_words,
         )
 
     @staticmethod

@@ -310,8 +310,45 @@ def record_fleet_structure_act(
     )
 
 
+class OperatorFleetUnresolved(RuntimeError):
+    """An operator primitive was called without ``fleet`` and none could be found from its store."""
+
+
+def _resolve_operator_fleet(fleet: FleetConfig | None, record_store: RecordStore) -> FleetConfig:
+    """The fleet an operator write tells about its change.
+
+    An explicit *fleet* wins, unchanged. Otherwise the fleet is found from the store the
+    caller handed in and from nothing else: with ``D`` the directory holding its db file,
+    ``D/config.toml`` when ``D`` is a ``.strata`` directory (its ``fleet_yaml``, used only
+    when its ``db`` is this same file), then ``D/fleet.yaml``. Never ``Settings``, the
+    ``STRATA_*`` environment, the working directory or a parent directory: a library call on
+    a temp store must not emit against some other, live fleet.
+
+    Raises:
+        OperatorFleetUnresolved: neither position holds a fleet.
+    """
+    if fleet is not None:
+        return fleet
+    from strata.fleet_reload import FleetReloader  # noqa: PLC0415
+    from strata.project_config import load_project_config  # noqa: PLC0415
+
+    db_file = Path(record_store.db_path).resolve()
+    here = db_file.parent
+    if here.name == ".strata" and (here / "config.toml").is_file():
+        config = load_project_config(here.parent)  # finds exactly here/config.toml
+        if config is not None and config.db.resolve() == db_file and config.fleet_yaml.is_file():
+            return FleetReloader(config.fleet_yaml).get()
+    beside = here / "fleet.yaml"
+    if beside.is_file():
+        return FleetReloader(beside).get()
+    raise OperatorFleetUnresolved(
+        f"no fleet found beside the store {db_file}: pass fleet=, or keep fleet.yaml next to it "
+        "(or a .strata/config.toml that names this database)"
+    )
+
+
 def _emit_operator_layer_change(
-    fleet: FleetConfig | None,
+    fleet: FleetConfig,
     *,
     record_store: RecordStore,
     target_scope_id: str,
@@ -331,13 +368,7 @@ def _emit_operator_layer_change(
     ``operator_directive_changed`` kind: the operator's stratum is not judged
     (ADR 0008 D1), so what an affected scope needs to know is that the
     binding layer above it moved — ``before``/``after`` say which way.
-
-    A *fleet* of ``None`` emits nothing. That is the cost of leaving the
-    parameter optional on primitives with many pre-existing callers; every
-    caller inside the engine passes one.
     """
-    if fleet is None:
-        return
     emit_change_event(
         fleet=fleet,
         record_store=record_store,
@@ -379,14 +410,17 @@ def operator_publish(
         content: Verbatim operator memory text.
         subject: Optional short subject line.
         fleet: Read to name the scopes this write affects (ADR 0014 D3 — the
-            attachment scope and its subtree). Optional only because this
-            primitive predates change events and has many callers that have
-            no fleet to hand; a call without one informs nobody, which is a
-            silent gap rather than an error.
+            attachment scope and its subtree). Optional: when omitted it is
+            read from beside *record_store* (see :func:`_resolve_operator_fleet`).
+
+    Raises:
+        OperatorFleetUnresolved: *fleet* is omitted and none is beside the store;
+            nothing is written.
 
     Returns:
         The newly published :class:`OperatorItem` (``kind="directive"``).
     """
+    fleet = _resolve_operator_fleet(fleet, record_store)  # before any write
     with scope_lock(_operator_layer_lock_key(target_scope_id)):
         act = record_store.append_operator_act(
             act="publish",
@@ -447,15 +481,21 @@ def operator_supersede_item(
         content: Verbatim replacement content.
         subject: Optional short subject line for the replacement; defaults
             to the superseded item's subject when omitted.
+        fleet: Optional; read to name the scopes this write affects (ADR 0014 D3). When
+            omitted it is read from beside *record_store* (see
+            :func:`_resolve_operator_fleet`).
 
     Returns:
         The new :class:`OperatorItem` (``kind="directive"``).
 
     Raises:
+        OperatorFleetUnresolved: *fleet* is omitted and none is beside the store;
+            nothing is written.
         KeyError: *item_id* is not in *target_scope_id*'s current operator layer.
         ValueError: *item_id* is a legacy ``context``-kind item — retire it
             instead of superseding it.
     """
+    fleet = _resolve_operator_fleet(fleet, record_store)  # before any write
     with scope_lock(_operator_layer_lock_key(target_scope_id)):
         items = read_operator_layer(target_scope_id, summaries_dir=summaries_dir)
         index = next((i for i, it in enumerate(items) if it.id == item_id), None)
@@ -519,13 +559,19 @@ def operator_retire_item(
     Args:
         target_scope_id: The attachment scope the item lives at.
         item_id: The ``op_``-prefixed id of the operator item being retired.
+        fleet: Optional; read to name the scopes this write affects (ADR 0014 D3). When
+            omitted it is read from beside *record_store* (see
+            :func:`_resolve_operator_fleet`).
 
     Returns:
         The ``retire`` :class:`~strata.record_store.OperatorAct`.
 
     Raises:
+        OperatorFleetUnresolved: *fleet* is omitted and none is beside the store;
+            nothing is written.
         KeyError: *item_id* is not in *target_scope_id*'s current operator layer.
     """
+    fleet = _resolve_operator_fleet(fleet, record_store)  # before any write
     with scope_lock(_operator_layer_lock_key(target_scope_id)):
         items = read_operator_layer(target_scope_id, summaries_dir=summaries_dir)
         retired = next((it for it in items if it.id == item_id), None)

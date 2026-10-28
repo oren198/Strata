@@ -690,6 +690,7 @@ def cmd_record(args: argparse.Namespace) -> int:
     newest page, walked back with ``--before``.  The record only ever grows, so
     printing all of it was unbounded by construction.
     """
+    from strata.record_store import is_engine_note
     from strata.settings import get_settings
     from strata.stores import EmbeddedStoreError, open_embedded_stores
 
@@ -726,18 +727,20 @@ def cmd_record(args: argparse.Namespace) -> int:
         print(f"Judgments:     {len(judgments)}")
         print()
         for c in contributions:
-            # The three states the library derives (issue #118): a verdict, the
-            # mechanical judge-failed marker, or neither. "judge errored" is what
-            # #118 exists for — a contribution the judge tried and failed to
-            # judge must not read as one still in flight. A verdict is never
-            # fabricated for it; it stays re-judgeable.
+            # The states the library derives (issue #118, #196): a verdict, the
+            # mechanical judge-failed marker, an engine note, or pending.
+            # "judge errored" is what #118 exists for — a contribution the
+            # judge tried and failed to judge must not read as one still in
+            # flight. An engine note is not pending and is not re-judged.
             #
             # Failed attempts recorded before the marker existed keep the #57
             # rendering — "(pending — N failed attempts)" — because nothing
             # observed that those runs ended, and the record is not rewritten to
             # pretend otherwise.
             state = states.get(c.id)
-            if state is None or state.state == "pending":
+            if is_engine_note(c.subject):
+                verdict = "(note)"
+            elif state is None or state.state == "pending":
                 n = state.failed_attempts if state is not None else 0
                 verdict = (
                     f"(pending — {n} failed attempt{'s' if n != 1 else ''})" if n else "(pending)"

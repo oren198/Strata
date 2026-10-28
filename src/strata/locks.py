@@ -51,6 +51,7 @@ Vocabulary follows CONTEXT.md verbatim: scope, record, scope summary.
 
 from __future__ import annotations
 
+import errno
 import re
 import threading
 import time
@@ -150,6 +151,47 @@ class _ScopeFileLock:
 
     def locked(self) -> bool:
         return self._lock.locked()
+
+    def try_enter(self, timeout: float) -> bool:
+        """Acquire within *timeout* seconds.
+
+        ``True`` means the lock is held and the caller must ``__exit__``.
+        ``False`` means the wait expired and nothing is held. The bound
+        covers both the in-process lock and the cross-process flock, so a
+        read does not sit behind an in-flight judgment (issue #196).
+        """
+        deadline = time.monotonic() + max(0.0, timeout)
+        remaining = deadline - time.monotonic()
+        if not self._lock.acquire(timeout=max(0.0, remaining)):
+            return False
+        if fcntl is None or _lock_dir is None:
+            return True
+        handle = None
+        try:
+            path = _lock_file_path(self._scope_id, self._suffix)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            handle = path.open("a", encoding="utf-8")
+            while True:
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except OSError as exc:
+                    if exc.errno not in (errno.EAGAIN, errno.EWOULDBLOCK):
+                        raise
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        handle.close()
+                        handle = None
+                        self._lock.release()
+                        return False
+                    time.sleep(min(0.02, remaining))
+            self._fh = handle
+            return True
+        except BaseException:
+            if handle is not None:
+                handle.close()
+            self._lock.release()
+            raise
 
     def __enter__(self) -> _ScopeFileLock:
         self._lock.acquire()
