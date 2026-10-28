@@ -921,7 +921,7 @@ The set is public, which shapes what a pass means:
 
 **What the bar is.** The pass bars in this build come from running `qwen/qwen3-235b-a22b-2507` on Parasail 5 times on the frozen set. Your run is compared with those bars. The verdict line is printed in the engine's own words.
 
-**What it does not measure.** Version 1 does not test whether the judge's stated reasons are honest, apart from one pattern check: a reason that calls an item "hearsay" when the item is labelled first-hand. Nothing wider than that is measured. A context note cannot retire a directive (the engine drops its ops), so that case is not tested either.
+**What it does not measure.** Version 1 does not test whether the judge's stated reasons are honest, apart from one pattern check: a reason that opens "Hearsay:" on an item whose text records no telling act. Counted with a cue list known to miss some forms of reported speech; read it as an upper bound, not a measured error rate. Nothing wider than that is measured. A context note cannot retire a directive (the engine drops its ops), so that case is not tested either.
 
 **Cost.** Before it runs, the command prints a cost estimate and asks `y/N`. `--yes` skips the question.
 

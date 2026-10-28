@@ -181,6 +181,10 @@ def render_text(report: dict[str, Any]) -> str:
         )
     lines.append("")
     lines.append("Reason honesty beyond the regex check is not measured in v1.")
+    lines.append(
+        "Hearsay-on-first-hand count (JSON report only): counted with a cue list known to miss "
+        "some forms of reported speech; read it as an upper bound, not a measured error rate."
+    )
     return "\n".join(lines) + "\n"
 
 
