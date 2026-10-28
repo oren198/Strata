@@ -155,6 +155,14 @@ def resolve_agent_session_id(env: dict[str, str] | None = None) -> str:
     return f"sess_auto_{os.getppid()}"
 
 
+def session_id_is_auto(env: dict[str, str] | None = None) -> bool:
+    """True when :func:`resolve_agent_session_id` derives the id (no explicit
+    ``STRATA_AGENT_SESSION_ID``). Only an auto id is tied to a harness process, so only then do
+    binding persistence and reconnect continuity apply."""
+    env = os.environ if env is None else env
+    return not env.get("STRATA_AGENT_SESSION_ID", "")
+
+
 #: The harnesses a session's state can name. ``unknown`` is a client that
 #: identified itself as something else (or not at all); ``""`` on a
 #: :class:`SessionState` means the file predates harness recording.
@@ -281,6 +289,14 @@ class SessionState(BaseModel):
     ``unknown``), from the MCP client's ``initialize`` handshake. ``""`` for a
     file written before harness recording. Set once by the MCP server; a known
     harness is never overwritten (see :func:`_stamp_harness`)."""
+
+    harness_token: str = ""
+    """The harness process this session belongs to (``"<pid>:<start time>"``); ``""`` for an
+    explicit session id, an unreadable start time, or a file from before reconnect continuity."""
+
+    reconnects: int = 0
+    """How many times the MCP server reconnected under the same harness (``/mcp reconnect``)
+    without splitting the session."""
 
     updated_at: str = ""
     """ISO 8601 timestamp of the last mutation."""
@@ -554,6 +570,7 @@ class SessionStateStore:
         now: datetime | None = None,
         pid: int | None = None,
         strict: bool | None = None,
+        harness_token: str = "",
     ) -> SessionState:
         """Record that *session_id* connected — the write-back denominator.
 
@@ -566,12 +583,27 @@ class SessionStateStore:
         or a recycled pid. The earlier record is archived as
         ``<id>.rolled-<n>.json`` with ``ended_at`` set to now (it still counts in
         the write-back report as its own session) and a fresh record starts.
+
+        Exception: a new server pid under the SAME non-empty *harness_token* is a reconnect of
+        the same harness (``/mcp reconnect``), not a reused id. The record and its counters are
+        kept, the new pid takes over, ``ended_at`` (stamped by the old server's exit) is cleared
+        and ``reconnects`` counts it. An empty or different token rolls over as before.
         """
         ts = (now or datetime.now(UTC)).isoformat()
         pid = os.getpid() if pid is None else pid
         with self._locked(session_id):
             state = self.read(session_id)
-            if state is not None and state.connected_at and state.server_pid != pid:
+            if (
+                state is not None
+                and state.connected_at
+                and state.server_pid != pid
+                and harness_token
+                and state.harness_token == harness_token
+            ):
+                state.server_pid = pid
+                state.ended_at = ""
+                state.reconnects += 1
+            elif state is not None and state.connected_at and state.server_pid != pid:
                 if not state.ended_at:
                     state.ended_at = ts
                 self._write_to(state, self._next_archive_path(session_id))
@@ -582,6 +614,8 @@ class SessionStateStore:
                 state.connected_at = ts
             if not state.server_pid:
                 state.server_pid = pid
+            if harness_token:
+                state.harness_token = harness_token
             self._stamp_harness(state, harness)
             if strict is not None:
                 state.strict = strict

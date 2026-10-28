@@ -75,6 +75,7 @@ from mcp.types import (
 )
 from pydantic import BaseModel, Field
 
+from strata import binding_persist
 from strata.fleet_config import FleetConfig, FleetConfigError, Scope
 from strata.fleet_reload import FleetReloader
 from strata.locks import configure_lock_dir
@@ -112,6 +113,7 @@ from strata.session_state import (
     classify_harness,
     compute_nudge,
     resolve_agent_session_id,
+    session_id_is_auto,
     sessions_dir_for,
 )
 from strata.settings import get_settings
@@ -333,6 +335,67 @@ def _strict_now() -> bool:
     return strict_enabled(dict(os.environ), _project_root)
 
 
+def _persist_binding() -> None:
+    """Keep the binding the user just confirmed, so a reconnect restores it (best effort)."""
+    if _HARNESS_TOKEN and _sessions_dir and _AGENT_SCOPE and not _UNRESOLVED:
+        binding_persist.write_binding(
+            _sessions_dir, _AGENT_SESSION_ID, _HARNESS_TOKEN, _AGENT_SCOPE, _AGENT_SKILL
+        )
+
+
+def _restore_persisted_binding(fleet: FleetConfig | None) -> None:
+    """At startup, restore the binding this session confirmed before an MCP reconnect.
+
+    No more power than ``strata_bind``: the persisted scope/skill goes through the same
+    ``_resolve_bind``, a config-class failure blocks it, and a binding that no longer holds
+    leaves the session NOT bound with the reason, never on a stale scope."""
+    global _AGENT_SCOPE, _AGENT_SKILL, _UNRESOLVED, _STARTUP_ERRORS_BINDING
+    global _RESTORED_NOTICE, _RESTORED_SCOPE
+    if not _HARNESS_TOKEN or not _sessions_dir:
+        return
+    binding_persist.delete_stale(_sessions_dir)
+    result = binding_persist.restore_binding(
+        _sessions_dir,
+        _AGENT_SESSION_ID,
+        _HARNESS_TOKEN,
+        lambda scope, skill: (
+            _resolve_bind(fleet, scope, skill)
+            if fleet is not None
+            else (None, ["the fleet config is not loaded"])
+        ),
+        config_errors=_STARTUP_ERRORS_CONFIG,
+    )
+    if result.status == "restored":
+        _AGENT_SCOPE = result.scope_id
+        _AGENT_SKILL = result.skill
+        _STARTUP_ERRORS_BINDING = []
+        _UNRESOLVED = bool(_STARTUP_ERRORS_CONFIG)
+        who = f"{result.scope_id}/{result.skill}" if result.skill else result.scope_id
+        _RESTORED_SCOPE = result.scope_id
+        _RESTORED_NOTICE = (
+            f"binding restored after reconnect: {who}, confirmed {result.bound_at or 'earlier'}"
+        )
+    elif result.status == "invalid":
+        _AGENT_SCOPE = ""
+        _AGENT_SKILL = None
+        _STARTUP_ERRORS_BINDING = [result.message]
+        _UNRESOLVED = True
+
+
+def _take_restored_notice(result: dict) -> dict:
+    """Carry the one-time ``binding_notice`` (see :data:`_RESTORED_NOTICE`) on *result*.
+
+    Delivered once, then cleared; only while the session is still on the restored scope (a later
+    bind elsewhere makes it stale), and never on an unbound session."""
+    global _RESTORED_NOTICE, _RESTORED_SCOPE
+    with _binding_lock:
+        notice, scope = _RESTORED_NOTICE, _RESTORED_SCOPE
+        _RESTORED_NOTICE = _RESTORED_SCOPE = ""
+    if notice and not _UNRESOLVED and scope == _AGENT_SCOPE:
+        result["binding_notice"] = notice
+    return result
+
+
 def _record_connect(session: object) -> None:
     """Record this session's connect — the write-back denominator (M2).
 
@@ -352,7 +415,11 @@ def _record_connect(session: object) -> None:
         return
     try:
         _session_store.record_connect(
-            _AGENT_SESSION_ID, harness=_HARNESS, pid=os.getpid(), strict=_strict_now()
+            _AGENT_SESSION_ID,
+            harness=_HARNESS,
+            pid=os.getpid(),
+            strict=_strict_now(),
+            harness_token=_HARNESS_TOKEN,
         )
     except OSError as exc:  # pragma: no cover - defensive; disk failure only
         _logger.warning("failed to record connect for session %r: %s", _AGENT_SESSION_ID, exc)
@@ -745,6 +812,15 @@ def _build_scope_manager():
 _AGENT_SCOPE: str = os.environ.get("STRATA_AGENT_SCOPE", "")
 _AGENT_SKILL: str | None = os.environ.get("STRATA_AGENT_SKILL") or None
 _AGENT_SESSION_ID: str = resolve_agent_session_id()
+# The harness this server was spawned by ("<pid>:<start time>"), set by main(). Empty for an
+# explicit STRATA_AGENT_SESSION_ID or an unreadable start time: then a binding is neither
+# persisted nor restored and a reconnect rolls the session over, as before.
+_HARNESS_TOKEN: str = ""
+# One line saying the binding was restored after a reconnect, owed to the agent (and so the user)
+# exactly once: the first strata_read_perspective or strata_bind status carries it as
+# ``binding_notice`` and clears it. Empty when nothing was restored.
+_RESTORED_NOTICE: str = ""
+_RESTORED_SCOPE: str = ""
 # The harness the connected client belongs to, from its initialize handshake;
 # resolved lazily on the first request (no client is connected at import) by
 # _client_harness() and held for the process's lifetime.
@@ -1922,6 +1998,7 @@ async def _attempt_elicit_bind(fleet: FleetConfig) -> bool:
         # top): a client marked non-functional once isn't locked out of
         # elicitation forever by that.
         _ELICIT_UNAVAILABLE = False
+    _persist_binding()
     return True
 
 
@@ -2385,6 +2462,7 @@ async def strata_bind(scope_id: str, skill: str | None = None, confirm: bool = F
         # stay confirmable after unrelated bind activity moved the session
         # on.
         _PENDING_SWITCH = None
+    _persist_binding()
 
     if is_switch:
         message = (
@@ -2432,7 +2510,7 @@ async def strata_bind(scope_id: str, skill: str | None = None, confirm: bool = F
             "or database). Fix the file(s) and restart the server — strata_bind "
             "cannot clear these."
         )
-    return _attach_nudge(result)
+    return _attach_nudge(_take_restored_notice(result))
 
 
 # ---------------------------------------------------------------------------
@@ -3417,7 +3495,7 @@ async def strata_read_perspective(scope_id: str | None = None) -> dict:
         (layer for layer in perspective["layers"] if layer["relation"] == "self"), None
     )
     context_items = None if self_layer is None else self_layer.get("context_items")
-    return _attach_nudge(perspective, context_items=context_items)
+    return _attach_nudge(_take_restored_notice(perspective), context_items=context_items)
 
 
 # ---------------------------------------------------------------------------
@@ -4055,6 +4133,12 @@ def main() -> None:
         extra_errors=startup_errors,
     )
     _UNRESOLVED = bool(_STARTUP_ERRORS_CONFIG) or bool(_STARTUP_ERRORS_BINDING)
+
+    # A reconnect restarts this process but not the harness: restore the binding the user
+    # confirmed earlier in this session (auto session ids only; see binding_persist).
+    global _HARNESS_TOKEN
+    _HARNESS_TOKEN = binding_persist.harness_token() if session_id_is_auto() else ""
+    _restore_persisted_binding(fleet)
 
     # Storage init after validation — failures here (unwritable directory,
     # corrupt DB) also render as a refuse-to-start message, not a traceback.
