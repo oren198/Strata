@@ -70,6 +70,8 @@ class ItemResult:
     """Relation re-ask calls that raised (reported only; no bar until measured)."""
     main_call_errors: int = 0
     """Other judge calls that raised."""
+    rate_limited_calls: int = 0
+    """Calls of this judgment that were answered 429, relation re-asks included."""
 
 
 @dataclass(frozen=True)
@@ -297,9 +299,14 @@ def score(
     needs), ``margin_items`` and ``meets``. ``hard_legs`` and ``operational`` need no
     reference. ``verdict`` is one of the fixed lines (see :func:`_verdict`).
     """
+    # A judgment in which any call was answered 429 is not a judgment of the judge: the engine
+    # may have fallen back (a relation re-ask) or failed. It is left out of every leg and the
+    # run is reported incomplete, whatever the error rate.
+    rate_limited = [r for r in results if _hit_a_429(r)]
     by_item: dict[str, list[ItemResult]] = {}
     for r in results:
-        by_item.setdefault(r.item_id, []).append(r)
+        if not _hit_a_429(r):
+            by_item.setdefault(r.item_id, []).append(r)
 
     flags: dict[str, list[tuple[bool, bool]]] = {
         iid: [grade(items[iid], r) for r in rs] for iid, rs in by_item.items()
@@ -410,7 +417,9 @@ def score(
         "error_rate": error_rate,
         "timeout_rate": timeout_rate,
         "only_429_errors": only_429,
+        "rate_limited_judgments": len(rate_limited),
         "meets": tool_failures == 0
+        and not rate_limited
         and (errors_ok or only_429)
         and timeout_rate <= MAX_TIMEOUT_RATE,
     }
@@ -452,7 +461,7 @@ def score(
         operational=operational,
         incomplete=info,
         failed_legs=failed,
-        verdict=_verdict(strata_version, failed, info, rerun, bars),
+        verdict=_verdict(strata_version, failed, info, rerun, bars, len(rate_limited)),
         judge_label=judge_label,
         per_item={
             i: {
@@ -466,8 +475,19 @@ def score(
     )
 
 
+def _hit_a_429(result: ItemResult) -> bool:
+    return result.rate_limited_calls > 0 or (
+        result.decision == "judge_error" and result.error_status == 429
+    )
+
+
 def _verdict(
-    version: str, failed: list[str], incomplete: dict | None, rerun: bool, bars: Bars | None
+    version: str,
+    failed: list[str],
+    incomplete: dict | None,
+    rerun: bool,
+    bars: Bars | None,
+    rate_limited: int = 0,
 ) -> str:
     """The fixed verdict lines. Never "safe", "approved" or "recommended"."""
     if incomplete is not None:
@@ -476,6 +496,8 @@ def _verdict(
         )
     if rerun:
         return "incomplete, re-run: all errors were 429s"
+    if rate_limited:
+        return f"incomplete, re-run: {rate_limited} judgment(s) hit a 429 and were not scored"
     if failed:
         return f"does not meet the judge-check v1 bar for Strata {version}: {', '.join(failed)}"
     if bars is None:
