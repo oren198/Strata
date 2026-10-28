@@ -928,6 +928,7 @@ The set is public, which shapes what a pass means:
 - `--price IN,OUT` sets the price in dollars per million tokens, input and output. It wins over the provider's listed price. On OpenRouter, the listed price is the pinned provider's endpoint, or the most expensive endpoint when no provider is pinned.
 - If no price is known, the command prints the engine's message and does not run.
 - `--max-usd` is a hard spending cap during the run. If the cap stops the run, the verdict is "incomplete".
+- If the provider answers any call of a judgment with 429 (rate limited), that judgment is not scored, and the verdict is "incomplete, re-run" with exit code 2.
 
 **Exit codes:**
 
