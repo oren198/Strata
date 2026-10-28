@@ -14,7 +14,7 @@ The reference bars shipped with this build were measured with `qwen/qwen3-235b-a
 - Operational counts: tool-call failures, judge errors after the engine's retries, timeouts, and dollars spent.
 - Relation re-asks, printed as `relation re-asks: N calls, E errors; main-call errors: M`. Those counts are reported only. They have no bar and they do not change the verdict.
 
-Reason honesty beyond the regex check is not measured in v1. The regex check is a stored reason that says "hearsay" on an item labelled first-hand. A wider reading, such as a reason that asserts authority the run could not establish, is not part of judge-check v1. The text report says so.
+Reason honesty beyond the regex check is not measured in v1. The regex check is a stored reason that opens "Hearsay:" on an item whose text records no telling act. The JSON report counts these as `hearsay_labels_on_first_hand`, which has no bar. Counted with a cue list known to miss some forms of reported speech; read it as an upper bound, not a measured error rate. A wider reading, such as a reason that asserts authority the run could not establish, is not part of judge-check v1. The text report says so.
 
 ## Cost guard
 
