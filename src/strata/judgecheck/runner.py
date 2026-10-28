@@ -44,6 +44,8 @@ class CallStats:
     """Relation re-ask HTTP calls that raised (each failed attempt, retried or not)."""
     main_errors: int = 0
     """Every other judge call that raised."""
+    rate_limited: int = 0
+    """Calls of either kind that were answered 429 (a subset of the two error counts)."""
 
 
 class _Messages:
@@ -100,7 +102,9 @@ class CountingClient:
         send = self._client.messages.create
         try:
             response = send(**kwargs)
-        except Exception:
+        except Exception as exc:
+            if _status_of(exc) == 429:
+                self.stats.rate_limited += 1
             if is_relation:
                 self.stats.relation_errors += 1
             else:
@@ -306,6 +310,7 @@ def _stamp(result: ItemResult, client: CountingClient, *, recovered: bool) -> It
         relation_calls=stats.relation_calls,
         relation_errors=stats.relation_errors,
         main_call_errors=stats.main_errors,
+        rate_limited_calls=stats.rate_limited,
     )
 
 
