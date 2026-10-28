@@ -78,13 +78,14 @@ from __future__ import annotations
 
 import hashlib
 import importlib.resources
+import inspect
 import json
 import logging
 import os
 import pathlib
 import sqlite3
 import tempfile
-from collections.abc import AsyncGenerator, Generator, Sequence
+from collections.abc import AsyncGenerator, Generator, Mapping, Sequence
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -123,6 +124,19 @@ from strata.fleet_config import (
     replace_fleet_bytes,
 )
 from strata.fleet_reload import FleetReloader
+from strata.forgetting import (
+    sweep_date_lapses_locked,
+    sweep_for_read,
+    validate_ends,
+    validate_fulfils,
+)
+from strata.lineage import (
+    TIER_LABELS,
+    LineageLineView,
+    context_hash,
+    lineage_offered,
+    record_context_write,
+)
 from strata.locks import BATCH_CAP, QUEUE_WAIT_TIMEOUT_S, QueueTicket, configure_lock_dir
 from strata.locks import scope_append_lock as _scope_append_lock
 from strata.locks import scope_lock as _scope_lock
@@ -642,6 +656,108 @@ def _read_judge_inputs(
 _EXAMINED_CONTEXT_CAP = 10
 
 
+def _takes_kwarg(method: object, name: str) -> bool:
+    """Whether *method* accepts the keyword *name* (a named parameter or ``**kwargs``).
+
+    The lineage view is an optional input of the real scope-manager. A stand-in judge with a
+    fixed signature (an eval harness, a test double) never asked for it and must not be
+    handed it."""
+    try:
+        params = inspect.signature(method).parameters  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return False
+    return name in params or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
+def _context_item_facts(
+    contribution_id: str,
+    *,
+    fleet: FleetConfig,
+    record_store: RecordStore,
+    summary_store: SummaryStore,
+) -> tuple[int, str]:
+    """``(tier, admitted_at)`` of a context note, for the condensation order: tier 0 when newer
+    context supersedes it, 2 when an outcome has TESTED it (the three examined states of ADR
+    0017 P6), else 1 (unexamined). An id the record does not know reads as unexamined and
+    undated, which can only make a check less strict, never invent an inversion."""
+    contribution = record_store.get_contribution(contribution_id)
+    if contribution is None:
+        return 1, ""
+    if record_store.is_context_superseded(contribution_id):
+        return 0, contribution.created_at
+    evidence = standing_evidence(record_store, fleet, contribution_id, summary_store=summary_store)
+    examined = (
+        any(e.replaced_kind is None and e.correction_pending_kind is None for e in evidence)
+        or record_store.claim_event_for(contribution_id) is not None
+        or contribution.raised_from is not None
+    )
+    return (2 if examined else 1), contribution.created_at
+
+
+def _resolve_lineage_view(
+    scope_id: str,
+    current_summary: ScopeSummary | None,
+    *,
+    fleet: FleetConfig,
+    record_store: RecordStore,
+    summary_store: SummaryStore,
+) -> list[LineageLineView] | None:
+    """The stored lineage of the CURRENT context as the judge is shown it (per line: note id,
+    admission date, state), or ``None`` when none is stored for exactly this text."""
+    if current_summary is None:
+        return None
+    stored = record_store.context_lineage_for(scope_id, context_hash(current_summary.context))
+    if not stored:
+        return None
+    view = []
+    for entry in stored:
+        items = []
+        for note_id in entry.sources:
+            tier, admitted = _context_item_facts(
+                note_id, fleet=fleet, record_store=record_store, summary_store=summary_store
+            )
+            items.append((note_id, admitted[:10] or "?", TIER_LABELS[tier]))
+        view.append(LineageLineView(entry.line, tuple(items)))
+    return view
+
+
+def _record_lineage(
+    *,
+    scope: Scope,
+    previous_summary: ScopeSummary | None,
+    written: ScopeSummary,
+    judgment: ScopeManagerJudgment | ScopeManagerBatchJudgment,
+    judged_contribution_ids: Sequence[str],
+    fleet: FleetConfig,
+    record_store: RecordStore,
+    summary_store: SummaryStore,
+) -> None:
+    """After a summary write: record the context's lineage and the order check, one
+    `condensation_order_checks` row per write that changed the context (measured or not)."""
+    allowed = {c.id for c in record_store.list_accepted_context_contributions(scope_id=scope.id)}
+    allowed.update(judged_contribution_ids)
+
+    def foreign(note_id: str) -> bool:
+        other = record_store.get_contribution(note_id)
+        return other is not None and other.scope_id != scope.id
+
+    record_context_write(
+        scope_id=scope.id,
+        previous_context=previous_summary.context if previous_summary else None,
+        new_context=written.context,
+        summary_version=written.version,
+        raw_lineage=getattr(judgment, "context_lineage", None),
+        offered=bool(getattr(judgment, "lineage_offered", False)),
+        judged_ids=list(judged_contribution_ids),
+        allowed_ids=allowed,
+        foreign=foreign,
+        info=lambda note_id: _context_item_facts(
+            note_id, fleet=fleet, record_store=record_store, summary_store=summary_store
+        ),
+        record_store=record_store,
+    )
+
+
 def _resolve_examined_context(
     *,
     scope_id: str,
@@ -750,6 +866,11 @@ def _judge_and_record(
     serialized unit. On judge failure it records a judgment-attempt-failed
     event and raises :class:`JudgeUnavailable`; no judgment row is written.
     """
+    # v1.20: a date end condition that is over retires its directive by mechanism before
+    # anything below reads the summary. The lock is already held; no judge call.
+    sweep_date_lapses_locked(
+        scope.id, fleet=fleet, record_store=record_store, summary_store=summary_store
+    )
     # #234 §8: the PRE-write watermark, taken before anything below reads or
     # writes — same lock as the write that follows, so this is the exact
     # "nothing else had changed before this write" baseline the self-trigger
@@ -842,6 +963,23 @@ def _judge_and_record(
     )
     if examined_context:
         judge_kwargs["examined_context"] = examined_context
+    # v1.20: the stored lineage of the current context, shown only on a call that is offered the
+    # lineage block (context near its budget). The kwarg appears only then.
+    if inputs.current_summary is not None and lineage_offered(
+        inputs.current_summary.context,
+        summary_max_words,
+        mode=mode,
+        acted_on=acted_on_target is not None,
+    ):
+        lineage_view = _resolve_lineage_view(
+            scope.id,
+            inputs.current_summary,
+            fleet=fleet,
+            record_store=record_store,
+            summary_store=summary_store,
+        )
+        if lineage_view and _takes_kwarg(scope_manager.judge, "lineage_view"):
+            judge_kwargs["lineage_view"] = lineage_view
     # Adoption link: the held proposal this contribution adopts, so the judge sees
     # what is adopted. Same discipline — the kwarg appears only when set.
     adopted_proposal = _resolve_adopted_proposal(contribution, record_store=record_store)
@@ -1224,6 +1362,21 @@ def _write_amendment(
     # one write without anyone counting rows against `version`.
     record_store.stamp_summary_version(judged_contribution_ids, version=written.version)
 
+    # v1.20 item 7(d): lineage and the order check. Never load-bearing: the summary is written.
+    try:
+        _record_lineage(
+            scope=scope,
+            previous_summary=previous_summary,
+            written=written,
+            judgment=judgment,
+            judged_contribution_ids=judged_contribution_ids,
+            fleet=fleet,
+            record_store=record_store,
+            summary_store=summary_store,
+        )
+    except Exception:
+        _logger.exception("condensation lineage write failed for scope %r", scope.id)
+
     # ADR 0017 P6 part 1, issue #202: one condensation_drops row per accepted
     # context contribution this amendment mechanically dropped — present
     # verbatim in the OLD context, absent from the NEW one. NOT one SQL
@@ -1296,12 +1449,45 @@ def _write_amendment(
     # directives get none: their explanation is the incoming directive's
     # own supersedes reference.
     for directive_id, reason, changed_circumstance in retirements:
+        # v1.20: a judged retire of a directive with a JUDGED end condition reached here only
+        # through the engine's confirmation check (scope_manager), so it is recorded as one:
+        # kind, cause and the end condition, and its change event carries the notice.
+        judged_condition = next(
+            (
+                d
+                for d in (previous_summary.directives if previous_summary else [])
+                if d.id == directive_id
+                and d.end_condition is not None
+                and d.end_condition.kind == "judged"
+            ),
+            None,
+        )
+        extra: dict = {}
+        if judged_condition is not None:
+            evidence = next(
+                (
+                    c
+                    for cid in judged_contribution_ids
+                    if (c := record_store.get_contribution(cid)) is not None
+                    and c.fulfils == directive_id
+                ),
+                None,
+            )
+            extra = {
+                "kind": "currency",
+                "notice": changed_circumstance,
+                "actor_session_id": evidence.contributor.session_id if evidence else None,
+                "cause": "condition_judged",
+                "end_condition": judged_condition.end_condition.model_dump_json(),
+                "evidence_contribution_id": evidence.id if evidence else None,
+            }
         record_store.append_retirement(
             scope_id=scope.id,
             directive_id=directive_id,
             retired_by="scope-manager",
             reason=reason,
             changed_circumstance=changed_circumstance,
+            **extra,
         )
 
     # ADR 0007 D3 — staleness propagation, two paths, both under the
@@ -1424,7 +1610,6 @@ def _write_amendment(
         change_ids=change_ids,
         hop=judgment.hop,
     )
-
     # Issue #197, the context half: a contribution that supersedes an earlier
     # one whose claim lived in CONTEXT moves no directive, so the diff above is
     # silent about it — yet the scope's own readers relied on that claim and
@@ -1598,6 +1783,10 @@ def _judge_batch_and_record(
 
     The caller MUST hold ``_scope_lock(scope.id)``.
     """
+    # v1.20: see _judge_and_record. Idempotent, so a batch of one that takes that path sweeps twice.
+    sweep_date_lapses_locked(
+        scope.id, fleet=fleet, record_store=record_store, summary_store=summary_store
+    )
     wave_ids = list(dict.fromkeys(change_ids or ()))
     # A batch of ONE takes the single-contribution path verbatim (ADR 0011
     # D3) — unless it belongs to several waves. The single judgment shape
@@ -1727,6 +1916,18 @@ def _judge_batch_and_record(
     )
     if examined_context:
         batch_judge_kwargs["examined_context"] = examined_context
+    if inputs.current_summary is not None and lineage_offered(
+        inputs.current_summary.context, summary_max_words, mode=mode
+    ):
+        lineage_view = _resolve_lineage_view(
+            scope.id,
+            inputs.current_summary,
+            fleet=fleet,
+            record_store=record_store,
+            summary_store=summary_store,
+        )
+        if lineage_view and _takes_kwarg(scope_manager.judge_batch, "lineage_view"):
+            batch_judge_kwargs["lineage_view"] = lineage_view
     # Adoption link: each member's adopted proposal, keyed by the member's id —
     # the kwarg appears only when at least one member adopts.
     adopted_proposals = {
@@ -2120,6 +2321,8 @@ def run_contribution(
     queue_timeout_s: float = QUEUE_WAIT_TIMEOUT_S,
     acted_on: str | None = None,
     adopted_from: str | None = None,
+    ends: Mapping[str, object] | None = None,
+    fulfils: str | None = None,
 ) -> ContributionOutcome:
     """Append a contribution to the record and get it judged (ADR 0011 D3).
 
@@ -2158,6 +2361,14 @@ def run_contribution(
         raise ValueError("acted_on and supersedes cannot both be set on one contribution.")
     if adopted_from is not None and acted_on is not None:
         raise ValueError("adopted_from and acted_on cannot both be set on one contribution.")
+    # v1.20: an end condition for the directive this contribution creates, and the id of a
+    # judged-condition directive it is evidence for. Both are checked here, before anything is
+    # appended; neither decides anything by itself.
+    end_condition = validate_ends(ends)
+    if end_condition is not None and proposed_classification != "directive":
+        raise ValueError("ends is only meaningful on a contribution that proposes a directive.")
+    if fulfils is not None:
+        validate_fulfils(fulfils, contributor, fleet=fleet, summary_store=summary_store)
     # ADR 0017 P5: the API keeps ONE `acted_on` field; the app resolves which
     # storage column the id belongs in. Ids are minted so this dispatch is
     # unambiguous and never needs a lookup: contribution ids are `c_`-prefixed,
@@ -2176,6 +2387,8 @@ def run_contribution(
             acted_on=None if is_operator_target else acted_on,
             acted_on_operator_item=acted_on if is_operator_target else None,
             adopted_from=adopted_from,
+            ends=end_condition.model_dump_json() if end_condition is not None else None,
+            fulfils=fulfils,
         )
         ticket = queue.enqueue(contribution.id, contribution)
 
@@ -3608,6 +3821,11 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
         scope = fleet.get_scope(scope_id)
         if scope is None:
             raise HTTPException(status_code=404, detail=f"Scope not found: {scope_id!r}")
+
+        # v1.20: what an agent would read has already lapsed any date end condition that is over.
+        sweep_for_read(
+            scope_id, fleet=fleet, record_store=record_store, summary_store=summary_store
+        )
 
         def _operator_reader(attachment_scope_id: str) -> list:
             return read_operator_layer(

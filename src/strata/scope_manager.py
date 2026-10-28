@@ -67,9 +67,22 @@ import anthropic
 from pydantic import BaseModel, Field
 
 from strata.fleet_config import EntitlementView, Scope, Stratum
+from strata.lineage import (
+    LineageLineView,
+    lineage_offered,
+    render_lineage_block,
+)
 from strata.operator import OperatorItem
 from strata.record_store import ACCEPTED_DECISIONS, Contribution, ContributorRef, RecentContribution
-from strata.summary_store import Directive, ScopeSummary, _render_summary, adopted_suffix
+from strata.summary_store import (
+    Directive,
+    EndCondition,
+    ScopeSummary,
+    _render_summary,
+    adopted_suffix,
+    ends_line,
+    ends_line_for,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -496,6 +509,59 @@ def _judge_tool_for(acted_on_target: ActedOnTarget | None) -> dict:
     )
     tool["input_schema"]["properties"]["decision"] = copy.deepcopy(decision_property)
     return tool
+
+
+def _with_lineage_block(
+    message: str,
+    view: Sequence[LineageLineView] | None,
+    current_summary: ScopeSummary | None,
+    summary_max_words: int,
+    *,
+    mode: JudgeMode,
+    acted_on: bool = False,
+) -> str:
+    """*message* with the CONTEXT LINES block ahead of the CURRENT SUMMARY, when this call is
+    offered the lineage field; otherwise *message* unchanged, byte for byte.
+
+    Spliced in after the message is built rather than by the builders, whose source is pinned
+    (`test_judge_message_builders_are_byte_identical`)."""
+    if current_summary is None or not lineage_offered(
+        current_summary.context, summary_max_words, mode=mode, acted_on=acted_on
+    ):
+        return message
+    block = render_lineage_block(view, current_summary.context)
+    marker = "CURRENT SUMMARY\n---\n"
+    at = message.find(marker)
+    if at < 0:
+        return message + "\n" + block
+    return message[:at] + block + message[at:]
+
+
+def _raw_context_lineage(raw: object) -> list | None:
+    """The judge's `context_lineage` as sent, a list or ``None``. Anything else is dropped
+    here and read as absent; the engine validates the entries after the write."""
+    value = raw.get("context_lineage") if isinstance(raw, Mapping) else None
+    return list(value) if isinstance(value, list) else None
+
+
+def _with_lineage_property(tool: dict) -> dict:
+    """*tool* with the optional `context_lineage` property added (a deep copy). Offered only
+    on a call whose message carries the CONTEXT LINES block, so every other call keeps the
+    exact tool bytes it always had."""
+    from strata.lineage import CONTEXT_LINEAGE_PROPERTY  # noqa: PLC0415
+
+    variant = copy.deepcopy(tool)
+    variant["input_schema"]["properties"]["context_lineage"] = copy.deepcopy(
+        CONTEXT_LINEAGE_PROPERTY
+    )
+    return variant
+
+
+def _judge_tool_for_call(acted_on_target: ActedOnTarget | None, *, offered: bool) -> dict:
+    """:func:`_judge_tool_for`, plus the `context_lineage` property on a call that is offered
+    the lineage block (never on an ``acted_on`` call)."""
+    tool = _judge_tool_for(acted_on_target)
+    return _with_lineage_property(tool) if offered and acted_on_target is None else tool
 
 
 def _build_batch_judge_tool() -> dict:
@@ -2106,6 +2172,104 @@ def _partition_ops(
     return applicable, invalid
 
 
+def _contribution_end_condition(contribution: Contribution) -> EndCondition | None:
+    """The end condition a contribution carries for the directive it creates (validated at the
+    write boundary; an unreadable value is dropped rather than failing the judgment)."""
+    raw = getattr(contribution, "ends", None)
+    if not raw:
+        return None
+    try:
+        return EndCondition.model_validate_json(raw)
+    except ValueError:
+        return None
+
+
+def _guard_judged_end_condition_retires(
+    judgment: _JudgmentT,
+    *,
+    scope: Scope,
+    current_summary: ScopeSummary | None,
+    contributions: Mapping[str, Contribution],
+) -> _JudgmentT:
+    """A judged ``retire`` of a directive with a JUDGED end condition is the owner's judge
+    confirming that condition (v1.20, R2), and only that: it stands when the contribution it
+    belongs to was contributed in this (the owning) scope, carries ``fulfils`` for the
+    directive, and states what the judge checked ("verified" is refused). Otherwise the op is
+    dropped, with a protocol note, and the directive stands.
+
+    A plain judged ``retire`` of a directive WITHOUT such a condition keeps today's #209 path
+    untouched. The op that stands has its ``changed_circumstance`` replaced by the engine's
+    reason, "end condition judged met: <condition> / <evidence>".
+    """
+    from strata.forgetting import condition_met_reason, evidence_acceptable  # noqa: PLC0415
+
+    if current_summary is None or not judgment.directive_ops:
+        return judgment
+    judged = {
+        d.id: d
+        for d in current_summary.directives
+        if d.end_condition is not None and d.end_condition.kind == "judged"
+    }
+    if not judged:
+        return judgment
+    kept: list[DirectiveOp] = []
+    notes: list[str] = []
+    changed = False
+    for op in judgment.directive_ops:
+        directive = judged.get(op.id or "") if op.op == "retire" else None
+        if directive is None:
+            kept.append(op)
+            continue
+        owner = contributions.get(getattr(op, "contribution_id", None) or "")
+        if owner is None and len(contributions) == 1:
+            owner = next(iter(contributions.values()))
+        evidence = op.changed_circumstance
+        if (
+            owner is not None
+            and owner.scope_id == scope.id
+            and owner.fulfils == directive.id
+            and evidence_acceptable(evidence)
+        ):
+            condition = directive.end_condition.condition or ""  # type: ignore[union-attr]
+            kept.append(
+                op.model_copy(
+                    update={"changed_circumstance": condition_met_reason(condition, evidence or "")}
+                )
+            )
+            changed = True
+        else:
+            notes.append(
+                f"retire of {directive.id} refused: it has a judged end condition and the "
+                "contribution carries no fulfils for it, or states no evidence."
+            )
+            changed = True
+    if not changed:
+        return judgment
+    update: dict = {
+        "directive_ops": kept,
+        "protocol_notes": [*judgment.protocol_notes, *notes],
+    }
+    if judgment.new_summary is not None:
+        if isinstance(judgment, ScopeManagerBatchJudgment):
+            update["new_summary"] = _apply_batch_amendment(
+                scope=scope,
+                current_summary=current_summary,
+                contributions=contributions,
+                ops=kept,
+                new_context=judgment.new_context,
+            )
+        else:
+            only = next(iter(contributions.values()))
+            update["new_summary"] = _apply_amendment(
+                scope=scope,
+                current_summary=current_summary,
+                contribution=only,
+                ops=kept,
+                new_context=judgment.new_context,
+            )
+    return judgment.model_copy(update=update)
+
+
 def _mint_directive(op: DirectiveOp, contribution: Contribution) -> Directive:
     """Build the directive row an ``append``/``publish`` op admits.
 
@@ -2129,6 +2293,8 @@ def _mint_directive(op: DirectiveOp, contribution: Contribution) -> Directive:
         source_skill=contribution.contributor.skill,
         created_at=contribution.created_at,
         adopted_from=contribution.adopted_from,
+        end_condition=_contribution_end_condition(contribution),
+        set_by=contribution.id if contribution.ends else None,
     )
 
 
@@ -2361,6 +2527,11 @@ class _AmendmentJudgment(BaseModel):
     contribution, which starts no wave and is at no distance from one."""
 
     context_sources: list[str] = Field(default_factory=list)
+    context_lineage: list | None = None
+    """v1.20: the judge's raw `context_lineage` (one entry per line of its new_context),
+    unvalidated; the engine checks it against the record after the write (`strata.lineage`)."""
+    lineage_offered: bool = False
+    """Whether this call was offered the lineage block and field (context near its budget)."""
     """Published item ids the judge declares its ``new_context`` rests on.
 
     RECORD, never trigger (ADR 0014 D3): the affected set for a changed item
@@ -3496,6 +3667,9 @@ def _render_directives_only(directives: Sequence[Directive]) -> str:
             f"- source: scope={directive.source_scope_id} · at={directive.created_at}"
             f"{adopted_suffix(directive)}"
         )
+        ends_line = ends_line_for(directive)
+        if ends_line is not None:
+            lines.append(ends_line)
         lines.append("")
     return "\n".join(lines).rstrip()
 
@@ -3522,6 +3696,9 @@ def _render_operator_memory(
                 f"[{item.id}] ({item.kind}, attached at {attachment_scope_id}){subject_part} "
                 f"{item.content}"
             )
+            ends = ends_line(getattr(item, "end_condition", None), getattr(item, "set_by", None))
+            if ends is not None:
+                lines.append(f"    {ends[2:]}")
     return "\n".join(lines) + "\n\n"
 
 
@@ -4019,6 +4196,14 @@ def _render_input_changes(events: Sequence[_ChangeEventLike] | None) -> str:
             f"      before: {event.before or '(none)'}\n"
             f"      after:  {event.after or '(none)'}"
         )
+        retirement = getattr(event, "retirement", None)
+        if retirement is not None:
+            # v1.20: a retired or retracted directive carries its authority's notice. One path,
+            # two labels; only the words differ. Every other event renders as before.
+            lines.append(
+                f"      {retirement.label.capitalize()} by its owner: "
+                f"{retirement.notice or retirement.reason or '(no notice)'}"
+            )
         if event.kind == "claim_corrected":
             # ADR 0017 P4 (CEO decision A, philosopher's follow-up): the engine
             # already withdraws THIS SCOPE'S PUBLICATION's own items that carry the
@@ -4075,6 +4260,7 @@ def _render_contribution_block(
         f"- proposed classification: {contribution.proposed_classification}\n"
         f"- subject: {contribution.subject or '(none)'}\n"
         f"- supersedes: {contribution.supersedes or '(none)'}\n"
+        f"{_render_forgetting_lines(contribution)}"
         f"{_render_adoption_line(adopted)}"
         # Skill is optional (issue #121): show scope alone when absent so the
         # judge never sees a literal "None".
@@ -4082,6 +4268,23 @@ def _render_contribution_block(
         "- content:\n"
         f"    {contribution.content}\n"
     )
+
+
+def _render_forgetting_lines(contribution: Contribution) -> str:
+    """The v1.20 lines of a contribution block, each only when it applies — so a contribution
+    with none of them is byte-identical to before.
+
+    ``ends``: the end condition the directive would carry; the judge judges its merit as it
+    does the rest and does not decide the condition. ``fulfils``: the judged-condition
+    directive this is evidence for."""
+    lines = ""
+    ends = _contribution_end_condition(contribution)
+    if ends is not None:
+        text = f"until {ends.until}" if ends.kind == "date" else f"until: {ends.condition}"
+        lines += f"- binds {text}\n"
+    if getattr(contribution, "fulfils", None):
+        lines += f"- fulfils: {contribution.fulfils}\n"
+    return lines
 
 
 def _render_adoption_line(adopted: Contribution | None) -> str:
@@ -9313,6 +9516,7 @@ class ScopeManager:
         acted_on_target: ActedOnTarget | None = None,
         examined_context: Sequence[ExaminedContextItem] | None = None,
         adopted_proposal: Contribution | None = None,
+        lineage_view: Sequence[LineageLineView] | None = None,
         **_extra: object,
     ) -> ScopeManagerJudgment:
         """Judge a new contribution against the scope's current state.
@@ -9525,6 +9729,14 @@ class ScopeManager:
             examined_context=examined_context,
             adopted_proposal=adopted_proposal,
         )
+        user_message = _with_lineage_block(
+            user_message,
+            lineage_view,
+            current_summary,
+            summary_max_words,
+            mode=mode,
+            acted_on=acted_on_target is not None,
+        )
         # ADR 0017 P3: a failed_* disposition replaces `acted_on` through the #199
         # path exactly like an ordinary `supersedes` reference does — but only when
         # the target is not a directive (D6: an outcome never replaces a directive).
@@ -9533,6 +9745,12 @@ class ScopeManager:
         # ADR 0014 D3: what a declared `context_sources` is audited against —
         # derived from the same arguments the message above was built from, so
         # the check and the prompt can never disagree.
+        _lineage_offered_now = current_summary is not None and lineage_offered(
+            current_summary.context,
+            summary_max_words,
+            mode=mode,
+            acted_on=acted_on_target is not None,
+        )
         rendered_item_ids = _rendered_publication_item_ids(
             current_publication, peer_publications, parent_publication
         )
@@ -10215,7 +10433,7 @@ class ScopeManager:
         judgment = self._call_with_correctives(
             user_message=user_message,
             system_prompt=_SYSTEM_PROMPT,
-            tool=_judge_tool_for(acted_on_target),
+            tool=_judge_tool_for_call(acted_on_target, offered=_lineage_offered_now),
             reasoning_gaps=_reasoning_gaps,
             reasoning_withdraw=_reasoning_withdraw,
             reasoning_adopt=_reasoning_adopt,
@@ -10293,6 +10511,7 @@ class ScopeManager:
                 else None
             ),
         )
+        judgment = judgment.model_copy(update={"lineage_offered": _lineage_offered_now})
         # A "Hearsay:" label on a reasoning that itself says first-hand is a wrong label.
         if _REASON_INFORMANT_CHECK:
             judgment = judgment.model_copy(
@@ -10334,13 +10553,18 @@ class ScopeManager:
                 current_summary=current_summary,
             )
         return _with_departure_labels_restored(
-            self._hold_directive_changes(
-                judgment,
+            _guard_judged_end_condition_retires(
+                self._hold_directive_changes(
+                    judgment,
+                    scope=scope,
+                    current_summary=current_summary,
+                    new_contribution=new_contribution,
+                    mode=mode,
+                    input_changes=input_changes,
+                ),
                 scope=scope,
                 current_summary=current_summary,
-                new_contribution=new_contribution,
-                mode=mode,
-                input_changes=input_changes,
+                contributions={new_contribution.id: new_contribution},
             ),
             current_summary,
             summary_max_words,
@@ -12560,6 +12784,7 @@ class ScopeManager:
         hop: int = 0,
         examined_context: Sequence[ExaminedContextItem] | None = None,
         adopted_proposals: Mapping[str, Contribution] | None = None,
+        lineage_view: Sequence[LineageLineView] | None = None,
         **_extra: object,
     ) -> ScopeManagerBatchJudgment:
         """Judge several new contributions, in arrival order, in ONE call (ADR 0011 D3).
@@ -12660,6 +12885,7 @@ class ScopeManager:
                 hop=hop,
                 examined_context=examined_context,
                 adopted_proposal=(adopted_proposals or {}).get(only.id),
+                lineage_view=lineage_view,
             )
             return ScopeManagerBatchJudgment(
                 verdicts=[
@@ -12729,7 +12955,13 @@ class ScopeManager:
             examined_context=examined_context,
             adopted_proposals=adopted_proposals,
         )
+        user_message = _with_lineage_block(
+            user_message, lineage_view, current_summary, summary_max_words, mode=mode
+        )
 
+        _batch_lineage_offered = current_summary is not None and lineage_offered(
+            current_summary.context, summary_max_words, mode=mode
+        )
         rendered_item_ids = _rendered_publication_item_ids(
             current_publication, peer_publications, parent_publication
         )
@@ -12916,7 +13148,11 @@ class ScopeManager:
         batch_judgment = self._call_with_correctives(
             user_message=user_message,
             system_prompt=_BATCH_SYSTEM_PROMPT,
-            tool=JUDGE_BATCH_TOOL,
+            tool=(
+                _with_lineage_property(JUDGE_BATCH_TOOL)
+                if _batch_lineage_offered
+                else JUDGE_BATCH_TOOL
+            ),
             attribution_gaps=_batch_attribution_gap_ids,
             attribution_corrective=_batch_attribution_corrective,
             reasoning_gaps=_batch_reasoning_gaps,
@@ -12946,6 +13182,9 @@ class ScopeManager:
             # defaults to False here, so the generic branch is always what
             # a second slip reaches).
             parse_generic_decline=_generic_second_slip_batch_decline,
+        )
+        batch_judgment = batch_judgment.model_copy(
+            update={"lineage_offered": _batch_lineage_offered}
         )
         if _REASON_INFORMANT_CHECK:
             batch_judgment = batch_judgment.model_copy(
@@ -12991,13 +13230,18 @@ class ScopeManager:
             operator_memory=operator_memory,
         )
         return _with_departure_labels_restored(
-            self._hold_batch_directive_changes(
-                batch_judgment,
+            _guard_judged_end_condition_retires(
+                self._hold_batch_directive_changes(
+                    batch_judgment,
+                    scope=scope,
+                    current_summary=current_summary,
+                    contributions=contributions,
+                    mode=mode,
+                    input_changes=input_changes,
+                ),
                 scope=scope,
                 current_summary=current_summary,
                 contributions=contributions,
-                mode=mode,
-                input_changes=input_changes,
             ),
             current_summary,
             summary_max_words,
@@ -13141,6 +13385,7 @@ class ScopeManager:
             hop=hop,
             context_sources=context_sources,
             dropped_context_sources=dropped_sources,
+            context_lineage=_raw_context_lineage(raw),
             protocol_notes=protocol_notes,
         )
 
@@ -13507,6 +13752,7 @@ class ScopeManager:
             hop=hop,
             context_sources=context_sources,
             dropped_context_sources=dropped_sources,
+            context_lineage=_raw_context_lineage(raw),
             protocol_notes=protocol_notes,
             outcome_disposition=outcome_disposition,
         )

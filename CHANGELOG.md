@@ -5,6 +5,23 @@ the release PR (`dev` → `main`) and the GitHub Release body are built from
 (`docs/releasing.md`, step 3) — write entries here as work lands, and the
 "Unreleased" section is cleared once a release ships.
 
+## Unreleased
+
+### Behaviour change
+
+- "No longer required" and "no longer needed" are now read as a relaxation. A forged "unrelated" relation answer no longer lets a relayed "X is no longer required" through.
+- A contribution that names `supersedes` and only releases that directive, through `strata_contribute`, behaves as in 1.19: the judge may retire the old directive and also publish a note restating the release. To retire a directive, use `strata_retire` (MCP) or `strata operator retire`.
+
+### Added
+
+- A bound session retires its own directive with the MCP tool `strata_retire`, and lists or dismisses its own candidates with `strata_retirement_candidates` and `strata_dismiss_candidate`. Those tools take no scope and no actor. `strata_contribute` accepts `ends` (a date or a judged condition, on a directive proposal) and `fulfils` (evidence that a judged condition was met). `POST /contribute` is unchanged.
+- The operator commands `strata operator publish` and `strata operator supersede` take `--until` or `--when` (on supersede, only an `op_` id). `strata operator retire-item`, `strata operator candidates`, and `strata operator dismiss-candidate` cover operator-item forgetting. `strata stats forgetting` counts scope retirements and candidates, and says that operator items are not counted.
+- The Console shows an end condition on a directive, a retirement's label and notice, read-only scope candidates, operator candidates with dismiss, and the forgetting counts.
+
+### Changed
+
+- `strata_contribute`'s reply now includes the relation check's answer (kind, verdict, cause) when that check ran, as `strata_publish`'s already does.
+
 ## 1.19.0 (2026-10-26)
 
 Measured on `qwen/qwen3-235b-a22b-2507` pinned to Parasail; the numbers are in
@@ -13,7 +30,6 @@ Measured on `qwen/qwen3-235b-a22b-2507` pinned to Parasail; the numbers are in
 ### Behaviour change
 
 - A context note from a session bound to a scope is now checked against the scope's OWN directives, the way it already was against inherited ones. A note stating an exception in force is declined ("... is this scope's own directive. To change it, supersede or retire it."), a dated departure is admitted as context, and deliberation about changing the rule is admitted. A context note proposed without `supersedes` can no longer supersede or retire an own directive, whatever the judge returns: the engine drops those ops and records it. A context note on a scope that has its own directives but inherits none now costs one extra judge call (shown as its own kind, `own_directive_relation`, in `strata stats judge`). Where the scope also inherits rules, the same single check covers both.
-- "No longer required" and "no longer needed" are now read as a relaxation. A forged "unrelated" relation answer no longer lets a relayed "X is no longer required" through.
 - The operator primitives (`operator_publish`, `operator_supersede_item`, `operator_retire_item`) called without `fleet` now read the fleet beside the store and tell the attachment scope and its subtree, as the CLI always did. Where no fleet can be found from the store they raise instead of writing silently (#195).
 - **An admitted departure keeps its label** (#243). When a note that departs
   from a rule is admitted, the stored context line starts "Departure from <id>
@@ -55,7 +71,6 @@ Measured on `qwen/qwen3-235b-a22b-2507` pinned to Parasail; the numbers are in
 
 ### Changed
 
-- `strata_contribute`'s reply now includes the relation check's answer (kind, verdict, cause) when that check ran, as `strata_publish`'s already does.
 - **One public definition of which verdicts are accepted** (#145).
   `strata.ACCEPTED_DECISIONS` is that set. The record, the scope manager,
   the acted-on check, the freshness evaluator, and the MCP session counter

@@ -240,9 +240,14 @@ def _drain_for_read(fleet, scope_id: str) -> tuple[int, list]:
     owed, which the caller surfaces as ``refresh_pending``.
     """
     from strata.app import DrainFailed, drain_is_noop, drain_scope  # noqa: PLC0415
+    from strata.forgetting import sweep_for_read  # noqa: PLC0415
 
     if _record_store is None or _summary_store is None:
         return 0, []
+
+    # v1.20: a date end condition that is over leaves the binding layers on this very read,
+    # with the ordinary change event to its readers, which the drain below then processes.
+    sweep_for_read(scope_id, fleet=fleet, record_store=_record_store, summary_store=_summary_store)
 
     # Nothing pending is nothing to do (ADR 0015 D6), and `drain_is_noop`
     # answers it lock-free: a quiet read must cost what reading a current

@@ -406,6 +406,7 @@ def test_migration_0022_applies_on_a_populated_0021_database(tmp_path: Path) -> 
         "0023_fleet_structure_act.sql",
         "0024_judge_usage.sql",
         "0025_structure_change_kinds.sql",
+        "0026_directive_forgetting.sql",
         "0027_relation_calls.sql",
     ]
 

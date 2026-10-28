@@ -61,7 +61,7 @@ import json
 import secrets
 import sqlite3
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Literal
 
@@ -102,6 +102,10 @@ def _new_fleet_proposal_id() -> str:
 
 def _new_fleet_structure_act_id() -> str:
     return f"fsa_{secrets.token_hex(8)}"
+
+
+def _new_candidate_id() -> str:
+    return f"rc_{secrets.token_hex(8)}"
 
 
 def _new_retirement_id() -> str:
@@ -219,6 +223,13 @@ class Contribution:
     to the target scope, naming a proposal that another position made to that
     same scope (validated at the write boundary, `validate_adopted_from`). A
     directive admitted from it carries the link as provenance."""
+    ends: str | None = None
+    """The end condition the directive this contribution creates is to carry (migration
+    0026), as the JSON of a validated :class:`~strata.summary_store.EndCondition`
+    (`strata.forgetting.validate_ends`); ``None`` for no end condition."""
+    fulfils: str | None = None
+    """The id of a judged-condition directive this contribution is evidence for (migration
+    0026); validated at the write boundary (`strata.forgetting.validate_fulfils`)."""
 
 
 @dataclass(frozen=True)
@@ -591,6 +602,43 @@ class Retirement:
     """The changed circumstance the scope-manager stated for a judged retirement (#209),
     in the contribution's own words; ``None`` for an operator retirement or a row that
     predates the column."""
+    kind: str | None = None
+    """``"currency"`` (a release: right to follow, no longer binds) or ``"correction"`` (a
+    retraction: should not have bound); ``None`` for a row written before migration 0026,
+    which reads as the neutral label "retired"."""
+    notice: str | None = None
+    """The notice the retiring authority wrote, verbatim (migration 0026)."""
+    actor_session_id: str | None = None
+    """The session that made the act; ``"engine"`` for a date lapse."""
+    cause: str | None = None
+    """``"act"``, ``"date_lapse"`` or ``"condition_judged"`` (migration 0026)."""
+    end_condition: str | None = None
+    """The directive's end condition as JSON, when one caused this retirement."""
+    evidence_contribution_id: str | None = None
+    """The ``fulfils`` contribution a confirmed judged condition rests on."""
+
+    @property
+    def label(self) -> str:
+        """The reader-facing label: "retracted" for a correction, else "retired"."""
+        return "retracted" if self.kind == "correction" else "retired"
+
+
+@dataclass(frozen=True)
+class RetirementCandidate:
+    """A prompt to ask whether a directive should be retired (migration 0026).
+
+    Opened mechanically, with SQL only. It never retires anything: ``age`` and ``disuse``
+    prompt the question and are labelled so in every surface."""
+
+    id: str
+    directive_id: str
+    scope_id: str
+    ground: str
+    evidence_ids: str
+    opened_at: str
+    state: str
+    dismissed_until: str | None
+    note: str | None
 
 
 @dataclass(frozen=True)
@@ -870,6 +918,12 @@ class ChangeEvent:
     self_notice: int = 0
     shown_at: str | None = None
     claim_id: str | None = None
+    retirement: Retirement | None = None
+    """The retirement this event reports, found through the event itself (its directive id and
+    source scope) and attached by :meth:`RecordStore.list_change_events` so a reader's notice
+    carries the label and the authority's notice. Not a column. ``None`` for every other event
+    and for a retirement written without a kind (an operator correction or a plain judged
+    retire), whose notice shape is unchanged."""
 
 
 @dataclass(frozen=True)
@@ -1006,6 +1060,8 @@ class RecordStore:
         acted_on_operator_item: str | None = None,
         raised_from: str | None = None,
         adopted_from: str | None = None,
+        ends: str | None = None,
+        fulfils: str | None = None,
     ) -> Contribution:
         """Append a contribution to the scope's immutable record and return it.
 
@@ -1045,6 +1101,10 @@ class RecordStore:
                                      adopts (migration 0022). Callers validate it
                                      first (:func:`validate_adopted_from`) — this
                                      layer only persists what it is given.
+            ends, fulfils:           Optional end condition (JSON) for the directive
+                                     this contribution creates, and the id of a
+                                     judged-condition directive it is evidence for
+                                     (migration 0026); validated by the caller.
 
         Returns:
             The newly appended :class:`Contribution`.
@@ -1065,6 +1125,8 @@ class RecordStore:
             acted_on_operator_item=acted_on_operator_item,
             raised_from=raised_from,
             adopted_from=adopted_from,
+            ends=ends,
+            fulfils=fulfils,
         )
         self._conn.commit()
         return self._fetch_contribution(contribution_id)
@@ -1082,6 +1144,8 @@ class RecordStore:
         acted_on_operator_item: str | None = None,
         raised_from: str | None = None,
         adopted_from: str | None = None,
+        ends: str | None = None,
+        fulfils: str | None = None,
     ) -> str:
         """INSERT one contribution row and return its id. Does NOT commit.
 
@@ -1098,8 +1162,8 @@ class RecordStore:
                 subject, supersedes,
                 contributor_scope_id, contributor_skill,
                 contributor_session_id, contributor_ts,
-                acted_on, acted_on_operator_item, raised_from, adopted_from
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                acted_on, acted_on_operator_item, raised_from, adopted_from, ends, fulfils
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 contribution_id,
@@ -1116,6 +1180,8 @@ class RecordStore:
                 acted_on_operator_item,
                 raised_from,
                 adopted_from,
+                ends,
+                fulfils,
             ),
         )
         return contribution_id
@@ -1141,6 +1207,7 @@ class RecordStore:
             SELECT id, scope_id, content, proposed_classification,
                    subject, supersedes, acted_on, acted_on_operator_item, raised_from,
                    adopted_from,
+                   ends, fulfils,
                    contributor_scope_id, contributor_skill,
                    contributor_session_id, contributor_ts,
                    created_at
@@ -1184,6 +1251,7 @@ class RecordStore:
             SELECT c.id, c.scope_id, c.content, c.proposed_classification,
                    c.subject, c.supersedes, c.acted_on, c.acted_on_operator_item, c.raised_from,
                    c.adopted_from,
+                   c.ends, c.fulfils,
                    c.contributor_scope_id, c.contributor_skill,
                    c.contributor_session_id, c.contributor_ts,
                    c.created_at
@@ -1215,6 +1283,7 @@ class RecordStore:
             SELECT id, scope_id, content, proposed_classification,
                    subject, supersedes, acted_on, acted_on_operator_item, raised_from,
                    adopted_from,
+                   ends, fulfils,
                    contributor_scope_id, contributor_skill,
                    contributor_session_id, contributor_ts,
                    created_at
@@ -1244,6 +1313,7 @@ class RecordStore:
             SELECT id, scope_id, content, proposed_classification,
                    subject, supersedes, acted_on, acted_on_operator_item, raised_from,
                    adopted_from,
+                   ends, fulfils,
                    contributor_scope_id, contributor_skill,
                    contributor_session_id, contributor_ts,
                    created_at
@@ -1726,6 +1796,7 @@ class RecordStore:
             SELECT id, scope_id, content, proposed_classification,
                    subject, supersedes, acted_on, acted_on_operator_item, raised_from,
                    adopted_from,
+                   ends, fulfils,
                    contributor_scope_id, contributor_skill,
                    contributor_session_id, contributor_ts,
                    created_at
@@ -1827,6 +1898,7 @@ class RecordStore:
             SELECT c.id, c.scope_id, c.content, c.proposed_classification,
                    c.subject, c.supersedes, c.acted_on, c.acted_on_operator_item, c.raised_from,
                    c.adopted_from,
+                   c.ends, c.fulfils,
                    c.contributor_scope_id, c.contributor_skill,
                    c.contributor_session_id, c.contributor_ts,
                    c.created_at,
@@ -1907,6 +1979,7 @@ class RecordStore:
             SELECT id, scope_id, content, proposed_classification,
                    subject, supersedes, acted_on, acted_on_operator_item, raised_from,
                    adopted_from,
+                   ends, fulfils,
                    contributor_scope_id, contributor_skill,
                    contributor_session_id, contributor_ts,
                    created_at
@@ -2021,6 +2094,7 @@ class RecordStore:
             SELECT c.id, c.scope_id, c.content, c.proposed_classification,
                    c.subject, c.supersedes, c.acted_on, c.acted_on_operator_item, c.raised_from,
                    c.adopted_from,
+                   c.ends, c.fulfils,
                    c.contributor_scope_id, c.contributor_skill,
                    c.contributor_session_id, c.contributor_ts,
                    c.created_at,
@@ -2065,6 +2139,7 @@ class RecordStore:
             SELECT c.id, c.scope_id, c.content, c.proposed_classification,
                    c.subject, c.supersedes, c.acted_on, c.acted_on_operator_item, c.raised_from,
                    c.adopted_from,
+                   c.ends, c.fulfils,
                    c.contributor_scope_id, c.contributor_skill,
                    c.contributor_session_id, c.contributor_ts,
                    c.created_at
@@ -2544,6 +2619,12 @@ class RecordStore:
         retired_by: str,
         reason: str | None = None,
         changed_circumstance: str | None = None,
+        kind: str | None = None,
+        notice: str | None = None,
+        actor_session_id: str | None = None,
+        cause: str | None = None,
+        end_condition: str | None = None,
+        evidence_contribution_id: str | None = None,
     ) -> Retirement:
         """Append a retirement event to *scope_id*'s own record.
 
@@ -2569,22 +2650,335 @@ class RecordStore:
         self._conn.execute(
             """
             INSERT INTO retirements (
-                id, scope_id, directive_id, retired_by, reason, changed_circumstance
+                id, scope_id, directive_id, retired_by, reason, changed_circumstance,
+                kind, notice, actor_session_id, cause, end_condition, evidence_contribution_id
             )
-            VALUES (?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (retirement_id, scope_id, directive_id, retired_by, reason, changed_circumstance),
+            (
+                retirement_id,
+                scope_id,
+                directive_id,
+                retired_by,
+                reason,
+                changed_circumstance,
+                kind,
+                notice,
+                actor_session_id,
+                cause,
+                end_condition,
+                evidence_contribution_id,
+            ),
         )
         self._conn.commit()
         row = self._conn.execute(
             """
             SELECT id, scope_id, directive_id, retired_by, reason, created_at,
-                       changed_circumstance
+                       changed_circumstance, kind, notice, actor_session_id, cause,
+                       end_condition, evidence_contribution_id
             FROM retirements WHERE id = ?
             """,
             (retirement_id,),
         ).fetchone()
         return Retirement(**dict(row))
+
+    def fulfils_evidence_ids(self, *, directive_id: str, outside_scope_id: str | None) -> list[str]:
+        """Ids of ADMITTED contributions in other scopes' records that carry ``fulfils`` for
+        *directive_id* (migration 0026) — evidence for a candidate, never a retirement."""
+        rows = self._conn.execute(
+            """
+            SELECT c.id FROM contributions c
+            JOIN judgments j ON j.contribution_id = c.id
+            WHERE c.fulfils = ? AND (? IS NULL OR c.scope_id != ?)
+              AND j.decision != 'decline'
+            ORDER BY c.created_at ASC, c.rowid ASC
+            """,
+            (directive_id, outside_scope_id, outside_scope_id),
+        ).fetchall()
+        return [row["id"] for row in rows]
+
+    def directive_acted_on_since(self, directive_id: str, *, since: str) -> bool:
+        """Whether any contribution reported acting on *directive_id* at or after *since*."""
+        row = self._conn.execute(
+            "SELECT 1 FROM contributions WHERE (acted_on = ? OR acted_on_operator_item = ?) "
+            "AND created_at >= ? LIMIT 1",
+            (directive_id, directive_id, since.replace("T", " ")[:19]),
+        ).fetchone()
+        return row is not None
+
+    def retirement_for_directive(
+        self, directive_id: str, *, scope_id: str | None = None
+    ) -> Retirement | None:
+        """The retirement of *directive_id*, or ``None``. A directive is retired at most once
+        and directive ids are unique contribution ids, so one row answers."""
+        sql = (
+            "SELECT id, scope_id, directive_id, retired_by, reason, created_at, "
+            "changed_circumstance, kind, notice, actor_session_id, cause, end_condition, "
+            "evidence_contribution_id FROM retirements WHERE directive_id = ?"
+        )
+        params: list[str] = [directive_id]
+        if scope_id is not None:
+            sql += " AND scope_id = ?"
+            params.append(scope_id)
+        row = self._conn.execute(sql + " ORDER BY created_at DESC, rowid DESC", params).fetchone()
+        return Retirement(**dict(row)) if row is not None else None
+
+    def set_operator_act_forgetting(
+        self,
+        act_id: str,
+        *,
+        ends: str | None = None,
+        kind: str | None = None,
+        notice: str | None = None,
+        cause: str | None = None,
+        actor_session_id: str | None = None,
+    ) -> None:
+        """What a forgetting act adds to an operator act (migration 0026): the end condition of
+        a publish/supersede, or the kind/notice/cause/actor of a retire."""
+        self._conn.execute(
+            """
+            INSERT OR REPLACE INTO operator_act_forgetting
+                (act_id, ends, kind, notice, cause, actor_session_id)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (act_id, ends, kind, notice, cause, actor_session_id),
+        )
+        self._conn.commit()
+
+    def get_operator_act_forgetting(self, act_id: str) -> dict | None:
+        row = self._conn.execute(
+            "SELECT ends, kind, notice, cause, actor_session_id "
+            "FROM operator_act_forgetting WHERE act_id = ?",
+            (act_id,),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def operator_retirement_for_item(self, item_id: str) -> Retirement | None:
+        """The retirement of operator item *item_id*, as a :class:`Retirement`, or ``None``.
+
+        Only a retire act written with a kind (the v1.20 act, a lapse) is returned. An older
+        retire act keeps its event shape."""
+        row = self._conn.execute(
+            """
+            SELECT a.id, a.target_scope_id, a.retires, a.created_at,
+                   f.kind, f.notice, f.cause, f.actor_session_id
+            FROM operator_acts a
+            JOIN operator_act_forgetting f ON f.act_id = a.id
+            WHERE a.act = 'retire' AND a.retires = ? AND f.kind IS NOT NULL
+            ORDER BY a.created_at DESC, a.rowid DESC
+            """,
+            (item_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return Retirement(
+            id=row["id"],
+            scope_id=row["target_scope_id"],
+            directive_id=row["retires"],
+            retired_by="operator",
+            reason=row["notice"],
+            created_at=row["created_at"],
+            kind=row["kind"],
+            notice=row["notice"],
+            actor_session_id=row["actor_session_id"],
+            cause=row["cause"],
+        )
+
+    def store_context_lineage(
+        self,
+        scope_id: str,
+        context_hash: str,
+        lines: Sequence[tuple[int, Sequence[str]]],
+        summary_version: int | None,
+    ) -> None:
+        """Store the lineage of the context text *context_hash* names (migration 0026),
+        replacing any earlier rows for that exact text."""
+        self._conn.execute(
+            "DELETE FROM context_lineage WHERE scope_id = ? AND context_hash = ?",
+            (scope_id, context_hash),
+        )
+        self._conn.executemany(
+            "INSERT INTO context_lineage "
+            "(scope_id, context_hash, line_no, contribution_ids, summary_version) "
+            "VALUES (?, ?, ?, ?, ?)",
+            [
+                (scope_id, context_hash, n, json.dumps(list(ids)), summary_version)
+                for n, ids in lines
+            ],
+        )
+        self._conn.commit()
+
+    def context_lineage_for(self, scope_id: str, context_hash: str):  # noqa: ANN201
+        """The stored lineage of exactly that context text, as a list of
+        :class:`strata.lineage.LineageEntry`, or ``None`` when none is stored."""
+        from strata.lineage import LineageEntry  # noqa: PLC0415
+
+        rows = self._conn.execute(
+            "SELECT line_no, contribution_ids FROM context_lineage "
+            "WHERE scope_id = ? AND context_hash = ? ORDER BY line_no",
+            (scope_id, context_hash),
+        ).fetchall()
+        if not rows:
+            return None
+        return [LineageEntry(r["line_no"], tuple(json.loads(r["contribution_ids"]))) for r in rows]
+
+    def append_condensation_order_check(
+        self,
+        *,
+        scope_id: str,
+        summary_version: int | None,
+        measured: int,
+        reason: str | None,
+        dropped_n: int,
+        kept_n: int,
+        unattributed_n: int,
+        inversions_n: int,
+        detail: str,
+    ) -> str:
+        check_id = f"coc_{secrets.token_hex(8)}"
+        self._conn.execute(
+            """
+            INSERT INTO condensation_order_checks
+                (id, scope_id, summary_version, measured, reason, dropped_n, kept_n,
+                 unattributed_n, inversions_n, detail)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                check_id,
+                scope_id,
+                summary_version,
+                measured,
+                reason,
+                dropped_n,
+                kept_n,
+                unattributed_n,
+                inversions_n,
+                detail,
+            ),
+        )
+        self._conn.commit()
+        return check_id
+
+    def condensation_order_metrics(self, *, scope_id: str | None = None) -> dict:
+        """Coverage and inversions over every context-changing write: ``writes`` (all),
+        ``measured``, ``unmeasured`` by reason, ``inversions`` (measured writes only) and
+        ``coverage`` (measured / writes, ``None`` with no writes). "Unmeasured" is never
+        folded into "no inversion"."""
+        where, params = ("WHERE scope_id = ?", (scope_id,)) if scope_id else ("", ())
+        rows = self._conn.execute(
+            f"SELECT measured, reason, inversions_n FROM condensation_order_checks {where}",
+            params,
+        ).fetchall()
+        reasons: dict[str, int] = {}
+        for r in rows:
+            if not r["measured"]:
+                reasons[r["reason"] or "unknown"] = reasons.get(r["reason"] or "unknown", 0) + 1
+        measured = sum(1 for r in rows if r["measured"])
+        return {
+            "writes": len(rows),
+            "measured": measured,
+            "unmeasured": len(rows) - measured,
+            "unmeasured_by_reason": reasons,
+            "inversions": sum(r["inversions_n"] for r in rows if r["measured"]),
+            "measured_with_inversion": sum(1 for r in rows if r["measured"] and r["inversions_n"]),
+            "coverage": (measured / len(rows)) if rows else None,
+        }
+
+    def is_context_superseded(self, contribution_id: str) -> bool:
+        """Whether an admitted contribution names *contribution_id* as what it supersedes."""
+        row = self._conn.execute(
+            """
+            SELECT 1 FROM contributions c JOIN judgments j ON j.contribution_id = c.id
+            WHERE c.supersedes = ? AND j.decision != 'decline' LIMIT 1
+            """,
+            (contribution_id,),
+        ).fetchone()
+        return row is not None
+
+    def get_retirement(self, retirement_id: str) -> Retirement | None:
+        """One retirement event by id, or ``None``."""
+        row = self._conn.execute(
+            """
+            SELECT id, scope_id, directive_id, retired_by, reason, created_at,
+                   changed_circumstance, kind, notice, actor_session_id, cause,
+                   end_condition, evidence_contribution_id
+            FROM retirements WHERE id = ?
+            """,
+            (retirement_id,),
+        ).fetchone()
+        return Retirement(**dict(row)) if row is not None else None
+
+    def open_retirement_candidate(
+        self,
+        *,
+        directive_id: str,
+        scope_id: str,
+        ground: str,
+        evidence_ids: Sequence[str] = (),
+    ) -> RetirementCandidate | None:
+        """Open a candidate unless one is already open for (directive, ground).
+
+        Returns the new row, or ``None`` when an open one exists (a recompute never
+        duplicates). A candidate never changes the directive."""
+        candidate_id = _new_candidate_id()
+        cur = self._conn.execute(
+            """
+            INSERT OR IGNORE INTO retirement_candidates
+                (id, directive_id, scope_id, ground, evidence_ids)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (candidate_id, directive_id, scope_id, ground, json.dumps(list(evidence_ids))),
+        )
+        self._conn.commit()
+        return self.get_retirement_candidate(candidate_id) if cur.rowcount else None
+
+    def list_all_retirement_candidates(
+        self, *, states: Sequence[str] = ("open",)
+    ) -> list[RetirementCandidate]:
+        marks = ", ".join("?" for _ in states)
+        rows = self._conn.execute(
+            f"SELECT id, directive_id, scope_id, ground, evidence_ids, opened_at, state, "
+            f"dismissed_until, note FROM retirement_candidates WHERE state IN ({marks}) "
+            f"ORDER BY opened_at ASC, rowid ASC",
+            tuple(states),
+        ).fetchall()
+        return [RetirementCandidate(**dict(row)) for row in rows]
+
+    def get_retirement_candidate(self, candidate_id: str) -> RetirementCandidate | None:
+        row = self._conn.execute(
+            "SELECT id, directive_id, scope_id, ground, evidence_ids, opened_at, state, "
+            "dismissed_until, note FROM retirement_candidates WHERE id = ?",
+            (candidate_id,),
+        ).fetchone()
+        return RetirementCandidate(**dict(row)) if row is not None else None
+
+    def list_retirement_candidates(
+        self, *, scope_id: str, states: Sequence[str] = ("open",)
+    ) -> list[RetirementCandidate]:
+        marks = ", ".join("?" for _ in states)
+        rows = self._conn.execute(
+            f"SELECT id, directive_id, scope_id, ground, evidence_ids, opened_at, state, "
+            f"dismissed_until, note FROM retirement_candidates "
+            f"WHERE scope_id = ? AND state IN ({marks}) ORDER BY opened_at ASC, rowid ASC",
+            (scope_id, *states),
+        ).fetchall()
+        return [RetirementCandidate(**dict(row)) for row in rows]
+
+    def set_retirement_candidate_state(
+        self,
+        candidate_id: str,
+        *,
+        state: str,
+        dismissed_until: str | None = None,
+        note: str | None = None,
+    ) -> None:
+        """Move a candidate to ``dismissed`` or ``acted``. Never touches a directive."""
+        self._conn.execute(
+            "UPDATE retirement_candidates SET state = ?, dismissed_until = ?, note = ? "
+            "WHERE id = ?",
+            (state, dismissed_until, note, candidate_id),
+        )
+        self._conn.commit()
 
     def list_retirements(self, *, scope_id: str | None = None) -> list[Retirement]:
         """Return retirement events ordered by ``created_at`` ascending.
@@ -2598,7 +2992,8 @@ class RecordStore:
             rows = self._conn.execute(
                 """
                 SELECT id, scope_id, directive_id, retired_by, reason, created_at,
-                       changed_circumstance
+                       changed_circumstance, kind, notice, actor_session_id, cause,
+                       end_condition, evidence_contribution_id
                 FROM retirements
                 WHERE scope_id = ?
                 ORDER BY created_at ASC, rowid ASC
@@ -2609,7 +3004,8 @@ class RecordStore:
             rows = self._conn.execute(
                 """
                 SELECT id, scope_id, directive_id, retired_by, reason, created_at,
-                       changed_circumstance
+                       changed_circumstance, kind, notice, actor_session_id, cause,
+                       end_condition, evidence_contribution_id
                 FROM retirements
                 ORDER BY created_at ASC, rowid ASC
                 """
@@ -3518,7 +3914,24 @@ class RecordStore:
             sql += " AND processed_at IS NULL"
         sql += " ORDER BY created_at ASC, rowid ASC"
         rows = self._conn.execute(sql, (scope_id,)).fetchall()
-        return [ChangeEvent(**dict(row)) for row in rows]
+        return [self._with_retirement(ChangeEvent(**dict(row))) for row in rows]
+
+    def _with_retirement(self, event: ChangeEvent) -> ChangeEvent:
+        """*event* with the retirement it reports attached, found by its directive id.
+
+        Only a retirement written with a kind (the v1.20 act, a date lapse or a confirmed
+        condition) is attached; every other event keeps its shape."""
+        if event.kind == "operator_directive_changed":
+            if event.after is not None:  # a publish or supersede, not the item leaving
+                return event
+            retirement = self.operator_retirement_for_item(event.item_id)
+            return event if retirement is None else replace(event, retirement=retirement)
+        if event.kind not in ("directive_retired", "directive_superseded"):
+            return event
+        retirement = self.retirement_for_directive(event.item_id, scope_id=event.source_scope_id)
+        if retirement is None or retirement.kind is None:
+            return event
+        return replace(event, retirement=retirement)
 
     def mark_change_event_processed(self, event_id: str) -> None:
         """Mark *event_id* consumed by a refresh, whatever the verdict (ADR 0014 D5).
