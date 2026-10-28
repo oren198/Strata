@@ -2533,6 +2533,8 @@ async def strata_contribute(
     supersedes: str | None = None,
     acted_on: str | None = None,
     adopted_from: str | None = None,
+    ends: dict[str, object] | None = None,
+    fulfils: str | None = None,
 ) -> dict:
     """Submit a contribution to a scope's scope-manager for judgment.
 
@@ -2598,6 +2600,16 @@ async def strata_contribute(
             where it came from. The proposal must exist, be a contribution to
             ``scope_id``, and come from another scope's session. Cannot be
             combined with ``acted_on``.
+        ends: Optional end condition for a directive proposal:
+            ``{"until": "YYYY-MM-DD"}`` or ``{"when": "<text>"}``.
+            Meaningful only when ``proposed_classification`` is ``directive``.
+        fulfils: Optional id of a directive with a judged end condition that
+            this contribution is evidence for.
+
+    a release-only contribution with supersedes is answered `retire`.
+    use `strata_retire` to retire your own directive.
+    `fulfils` is evidence, and only the owning scope's judge or a session
+    bound to the owner can confirm it.
 
     Returns:
         ``contribution_id`` and ``judgment`` (decision, reasoning, summary_updated).
@@ -2682,6 +2694,8 @@ async def strata_contribute(
             supersedes=supersedes,
             acted_on=acted_on,
             adopted_from=adopted_from,
+            ends=ends,
+            fulfils=fulfils,
             contributor=contributor,
             fleet=fleet,
             record_store=_record_store,
@@ -2768,6 +2782,134 @@ def public_relation_rows(rows: list[dict], own_text: str) -> list[dict]:
             row["reason"] = f"{_RE_ASK_FAILED}{name.group(0) if name else 'error'})"
         public.append(row)
     return public
+
+
+def _bound_actor() -> ContributorRef:
+    """The calling session, snapshotted the same way ``strata_contribute`` stamps one.
+
+    The actor comes from the binding, never from a tool argument.
+    """
+    agent_scope, agent_skill, agent_session_id = (
+        _AGENT_SCOPE,
+        _AGENT_SKILL,
+        _AGENT_SESSION_ID,
+    )
+    return ContributorRef(
+        scope_id=agent_scope,
+        skill=agent_skill,
+        session_id=agent_session_id,
+        ts=datetime.now(UTC).isoformat(),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tool: strata_retire
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+@_with_read_signal
+async def strata_retire(
+    directive_id: str,
+    kind: Literal["currency", "correction"],
+    notice: str,
+) -> dict:
+    """Retire one directive of this session's own scope, with a notice.
+
+    Use `strata_retire` to retire your own directive. A release (kind
+    ``currency``) is labelled retired; a retraction (kind ``correction``)
+    is labelled retracted. This tool takes no scope and no actor: both come
+    from the session binding. A refusal is returned as its own text, and
+    this tool does not retry with another scope.
+
+    Returns:
+        The reader-facing retirement notice, plus ``directive_id``.
+    """
+    await _require_bound_or_elicit()
+    actor = _bound_actor()
+    fleet = _load_fleet()
+    from strata.forgetting import (  # noqa: PLC0415
+        PositionGateRefusal,
+        retire_directive,
+        retirement_notice,
+    )
+
+    try:
+        retirement = retire_directive(
+            actor.scope_id,
+            directive_id,
+            kind,
+            notice,
+            actor,
+            fleet=fleet,
+            record_store=_record_store,
+            summary_store=_summary_store,
+        )
+    except (PositionGateRefusal, ValueError, KeyError) as exc:
+        raise RuntimeError(str(exc)) from exc
+    return {**retirement_notice(retirement), "directive_id": directive_id}
+
+
+# ---------------------------------------------------------------------------
+# Tool: strata_retirement_candidates
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+@_with_read_signal
+async def strata_retirement_candidates() -> dict:
+    """List this session's own open retirement candidates.
+
+    Age and disuse candidates carry "prompts the question only" on
+    ``display``. That phrase is not written into ``note``. Operator items
+    are not listed. This tool takes no scope and no actor.
+    """
+    await _require_bound_or_elicit()
+    actor = _bound_actor()
+    from strata.forgetting import visible_candidates  # noqa: PLC0415
+    from strata.forgetting_surface import present_candidate  # noqa: PLC0415
+
+    rows = visible_candidates(actor.scope_id, actor, record_store=_record_store)
+    return {"candidates": [present_candidate(row) for row in rows]}
+
+
+# ---------------------------------------------------------------------------
+# Tool: strata_dismiss_candidate
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+@_with_read_signal
+async def strata_dismiss_candidate(candidate_id: str, reason: str, days: int) -> dict:
+    """Snooze one of this session's own candidates. The directive stays.
+
+    ``days`` must be an integer from 1 to 365. A value outside that range,
+    including 366, is refused before the engine is called. This tool takes
+    no scope and no actor.
+    """
+    await _require_bound_or_elicit()
+    from strata.forgetting import (  # noqa: PLC0415
+        PositionGateRefusal,
+        dismiss_candidate,
+    )
+    from strata.forgetting_surface import reject_dismiss_days  # noqa: PLC0415
+
+    try:
+        checked = reject_dismiss_days(days)
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from exc
+    actor = _bound_actor()
+    try:
+        dismiss_candidate(
+            candidate_id,
+            reason=reason,
+            days=checked,
+            actor=actor,
+            record_store=_record_store,
+        )
+    except (PositionGateRefusal, ValueError, KeyError) as exc:
+        raise RuntimeError(str(exc)) from exc
+    return {"candidate_id": candidate_id, "dismissed": True}
 
 
 # ---------------------------------------------------------------------------

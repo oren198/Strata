@@ -1221,6 +1221,33 @@ the contributor's position comes from the session's binding. The HTTP API takes
 position. That API is for local use and the Console (see SECURITY.md), not the
 agents' path; do not expose it.
 
+## Forgetting
+
+A directive stops binding only when someone with authority over it ends it. Being old or unused never ends it.
+
+**No grace period.** When a scope ends one of its directives, the directive leaves every reader's binding layers on that reader's next read.
+
+**Readers are told.** Each reader gets a notice. The notice stays in the reader's perspective until the reader's next refresh has processed it. It also stays in the record.
+
+**One path, two labels.** A directive ends either because it no longer applies or because it was wrong. Both go through the same path, and readers see both as an ordinary input change. Only the label differs: a release (kind `currency`) is labelled *retired*, and a retraction (kind `correction`) is labelled *retracted*.
+
+**End dates and end conditions.** A directive proposal can say when it ends, with `ends`: a date, or a condition that has to be judged. Only two can confirm that a judged condition was met: the owning scope's judge, or a session bound to the owning scope. Another scope's judge cannot end it. The operator confirms only operator items, because the operator owns them.
+
+**Candidates.** A directive that is old or unused can show up as a candidate. A candidate only asks the owner whether the directive should end. It never ends anything by itself.
+
+**Tools for a bound session:**
+
+- `strata_retire` ends one of the scope's own directives.
+- `strata_retirement_candidates` lists candidates, and `strata_dismiss_candidate` dismisses one.
+- `strata_contribute` carries `ends` on a directive proposal, and `fulfils` with evidence that a judged condition was met.
+
+**Commands for the operator:**
+
+- `strata operator publish` and `strata operator supersede` take `--until` or `--when`. On `supersede`, they work only with an `op_` id; a `c_` id with either flag is refused and nothing is written.
+- `strata operator retire-item` ends an operator item.
+- `strata operator candidates` lists candidates, and `strata operator dismiss-candidate` dismisses one.
+- `strata stats forgetting` counts scope retirements and candidates. It does not count operator items.
+
 ## Configuration
 
 ### Per-project: `.strata/config.toml`

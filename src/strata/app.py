@@ -450,6 +450,20 @@ class RetireDirectiveRequest(BaseModel):
     reason: str | None = None
 
 
+class DismissCandidateRequest(BaseModel):
+    """Snooze one operator-item candidate. Days are checked again in the route."""
+
+    reason: str
+    days: int
+
+    @field_validator("reason")
+    @classmethod
+    def _reason_not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("A dismissal needs a reason.")
+        return value
+
+
 class RestoreCorrectionWithdrawalRequest(BaseModel):
     """Operator restore, in person — a published item a correction sweep wrongly
     withdrew, back under its original id and bytes (the restore act design)."""
@@ -3645,6 +3659,85 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
         from strata.judge_usage import judge_usage_report  # noqa: PLC0415
 
         return judge_usage_report(paths.db_path, since=since, scope_id=scope_id)
+
+    # -----------------------------------------------------------------------
+    # Forgetting peripherals (v1.20). Read-only except the operator dismiss.
+    # POST /contribute is unchanged: no ends or fulfils on that body.
+    # -----------------------------------------------------------------------
+
+    @application.get("/scopes/{scope_id}/retirement-candidates")
+    def get_scope_retirement_candidates(
+        scope_id: str,
+        request: Request,
+        record_store: RecordStore = Depends(get_record_store),
+    ) -> dict:
+        """Open scope candidates. Operator items are left out. No dismiss here."""
+        from strata.forgetting_surface import present_candidate  # noqa: PLC0415
+
+        fleet: FleetConfig = request.app.state.fleet_reloader.get()
+        if fleet.get_scope(scope_id) is None:
+            raise HTTPException(status_code=404, detail=f"Scope not found: {scope_id!r}")
+        rows = record_store.list_retirement_candidates(scope_id=scope_id, states=("open",))
+        visible = [present_candidate(row) for row in rows if not row.directive_id.startswith("op_")]
+        return {"candidates": visible}
+
+    @application.get("/operator/retirement-candidates")
+    def get_operator_retirement_candidates(
+        request: Request,
+        scope_id: str | None = None,
+        record_store: RecordStore = Depends(get_record_store),
+    ) -> dict:
+        """Open candidates on operator items. The operator dismisses these."""
+        from strata.forgetting import operator_candidates  # noqa: PLC0415
+        from strata.forgetting_surface import present_candidate  # noqa: PLC0415
+
+        fleet: FleetConfig = request.app.state.fleet_reloader.get()
+        if scope_id is not None and fleet.get_scope(scope_id) is None:
+            raise HTTPException(status_code=404, detail=f"Scope not found: {scope_id!r}")
+        rows = operator_candidates(record_store, scope_id=scope_id)
+        return {"candidates": [present_candidate(row) for row in rows]}
+
+    @application.post("/operator/retirement-candidates/{candidate_id}/dismiss")
+    def post_dismiss_operator_candidate(
+        candidate_id: str,
+        body: DismissCandidateRequest,
+        record_store: RecordStore = Depends(get_record_store),
+    ) -> dict:
+        """Snooze one operator-item candidate. Days outside 1..365 never reach the engine."""
+        from strata.forgetting import dismiss_operator_candidate  # noqa: PLC0415
+        from strata.forgetting_surface import reject_dismiss_days  # noqa: PLC0415
+
+        try:
+            days = reject_dismiss_days(body.days)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        try:
+            dismiss_operator_candidate(
+                candidate_id,
+                reason=body.reason,
+                days=days,
+                record_store=record_store,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return {"candidate_id": candidate_id, "dismissed": True}
+
+    @application.get("/forgetting-metrics")
+    def get_forgetting_metrics(
+        request: Request,
+        scope_id: str | None = None,
+        record_store: RecordStore = Depends(get_record_store),
+    ) -> dict:
+        """Scope forgetting counts. The body says operator items are not counted."""
+        from strata.forgetting_surface import forgetting_metrics  # noqa: PLC0415
+
+        fleet: FleetConfig = request.app.state.fleet_reloader.get()
+        if scope_id is not None and fleet.get_scope(scope_id) is None:
+            raise HTTPException(status_code=404, detail=f"Scope not found: {scope_id!r}")
+        scope_ids = [scope.id for scope in fleet.active_scopes()]
+        return forgetting_metrics(record_store, scope_ids=scope_ids, scope_id=scope_id)
 
     # -----------------------------------------------------------------------
     # GET /staleness

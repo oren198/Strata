@@ -860,6 +860,43 @@ def cmd_stats_judge(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_stats_forgetting(args: argparse.Namespace) -> int:
+    """``strata stats forgetting`` — scope retirements and candidates.
+
+    Operator-item forgetting is left out. The report says so on its own line.
+    """
+    import json
+
+    from strata.forgetting_surface import (  # noqa: PLC0415
+        forgetting_metrics,
+        format_forgetting_metrics,
+    )
+    from strata.stores import EmbeddedStoreError, open_embedded_stores  # noqa: PLC0415
+
+    try:
+        stores = open_embedded_stores()
+    except EmbeddedStoreError as exc:
+        print(exc.message, file=sys.stderr)
+        return 1
+    with stores:
+        fleet = stores.fleet_config
+        if args.scope is not None:
+            if fleet.get_scope(args.scope) is None:
+                print(f"Scope not found: {args.scope}", file=sys.stderr)
+                return 1
+            scope_ids = [args.scope]
+            scope_id = args.scope
+        else:
+            scope_ids = [scope.id for scope in fleet.active_scopes()]
+            scope_id = None
+        report = forgetting_metrics(stores.record_store, scope_ids=scope_ids, scope_id=scope_id)
+    if args.json:
+        print(json.dumps(report))
+    else:
+        print(format_forgetting_metrics(report))
+    return 0
+
+
 def cmd_stats_root(args: argparse.Namespace) -> int:
     """``strata stats`` with no subcommand — print the group's help."""
     if _stats_parser is not None:
@@ -2161,6 +2198,23 @@ def cmd_operator_root(args: argparse.Namespace) -> int:
     return 0
 
 
+def _ends_arg(args: argparse.Namespace) -> dict[str, str] | None:
+    """``--until`` or ``--when`` as the engine's ``ends`` object, or ``None``."""
+    until = getattr(args, "until", None)
+    when = getattr(args, "when", None)
+    if until is not None:
+        return {"until": until}
+    if when is not None:
+        return {"when": when}
+    return None
+
+
+def _nothing_written(message: str) -> int:
+    """A surface refusal that must not be followed by a write."""
+    print(f"{message} Nothing was written.", file=sys.stderr)
+    return 1
+
+
 def cmd_operator_publish(args: argparse.Namespace) -> int:
     """``strata operator publish`` — publish a new operator memory item (ADR 0008 D1)."""
     from strata.operator import operator_publish
@@ -2178,14 +2232,19 @@ def cmd_operator_publish(args: argparse.Namespace) -> int:
             print(f"Scope not found: {args.scope_id}", file=sys.stderr)
             return 1
 
-        item = operator_publish(
-            args.scope_id,
-            args.content,
-            args.subject,
-            fleet=stores.fleet_config,
-            record_store=stores.record_store,
-            summaries_dir=stores.summary_store.summaries_dir,
-        )
+        try:
+            item = operator_publish(
+                args.scope_id,
+                args.content,
+                args.subject,
+                fleet=stores.fleet_config,
+                record_store=stores.record_store,
+                summaries_dir=stores.summary_store.summaries_dir,
+                ends=_ends_arg(args),
+            )
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
         print(f"Published operator {item.kind} [{item.id}] attached at {args.scope_id!r}.")
     return 0
 
@@ -2195,8 +2254,15 @@ def cmd_operator_supersede(args: argparse.Namespace) -> int:
 
     ``op_`` ids supersede an operator-stratum item (capacity 1, not judged).
     ``c_`` ids correct a scope's own native directive in person (capacity 2,
-    a judgment made by the operator).
+    a judgment made by the operator). ``--until`` and ``--when`` apply only
+    to an ``op_`` id; a ``c_`` id with either flag is refused before any write.
     """
+    ends = _ends_arg(args)
+    if ends is not None and not str(args.id).startswith("op_"):
+        return _nothing_written(
+            "An end condition on supersede applies only to an operator item (an op_ id)."
+        )
+
     from strata.operator import operator_supersede, operator_supersede_item
     from strata.stores import EmbeddedStoreError, open_embedded_stores
 
@@ -2223,6 +2289,7 @@ def cmd_operator_supersede(args: argparse.Namespace) -> int:
                     fleet=stores.fleet_config,
                     record_store=stores.record_store,
                     summaries_dir=stores.summary_store.summaries_dir,
+                    ends=ends,
                 )
             except (KeyError, ValueError) as exc:
                 print(str(exc), file=sys.stderr)
@@ -2319,6 +2386,102 @@ def cmd_operator_retire(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 1
+    return 0
+
+
+def cmd_operator_retire_item(args: argparse.Namespace) -> int:
+    """``strata operator retire-item`` — retire an operator item, with an optional notice.
+
+    ``--kind`` and ``--notice`` go together. One without the other is refused
+    before any write. This is not ``strata operator retire``.
+    """
+    kind = args.kind
+    notice = args.notice
+    if (kind is None) != (notice is None):
+        return _nothing_written("kind and notice go together: give both or neither.")
+
+    from strata.operator import operator_retire_item
+    from strata.stores import EmbeddedStoreError, open_embedded_stores
+
+    try:
+        stores = open_embedded_stores()
+    except EmbeddedStoreError as exc:
+        print(exc.message, file=sys.stderr)
+        return 1
+
+    with stores:
+        if stores.fleet_config.get_scope(args.scope_id) is None:
+            print(f"Scope not found: {args.scope_id}", file=sys.stderr)
+            return 1
+        try:
+            act = operator_retire_item(
+                args.scope_id,
+                args.id,
+                fleet=stores.fleet_config,
+                record_store=stores.record_store,
+                summaries_dir=stores.summary_store.summaries_dir,
+                kind=kind,
+                notice=notice,
+            )
+        except (KeyError, ValueError) as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        print(f"Retired operator item {args.id} (act {act.id}).")
+    return 0
+
+
+def cmd_operator_candidates(args: argparse.Namespace) -> int:
+    """``strata operator candidates`` — open candidates on operator items only."""
+    from strata.forgetting import operator_candidates
+    from strata.forgetting_surface import present_candidate
+    from strata.stores import EmbeddedStoreError, open_embedded_stores
+
+    try:
+        stores = open_embedded_stores()
+    except EmbeddedStoreError as exc:
+        print(exc.message, file=sys.stderr)
+        return 1
+
+    with stores:
+        if args.scope is not None and stores.fleet_config.get_scope(args.scope) is None:
+            print(f"Scope not found: {args.scope}", file=sys.stderr)
+            return 1
+        rows = operator_candidates(stores.record_store, scope_id=args.scope)
+        for row in rows:
+            shown = present_candidate(row)
+            print(f"{shown['id']}\t{shown['ground']}\t{shown['directive_id']}\t{shown['display']}")
+    return 0
+
+
+def cmd_operator_dismiss_candidate(args: argparse.Namespace) -> int:
+    """``strata operator dismiss-candidate`` — snooze one operator-item candidate."""
+    from strata.forgetting import dismiss_operator_candidate
+    from strata.forgetting_surface import reject_dismiss_days
+    from strata.stores import EmbeddedStoreError, open_embedded_stores
+
+    try:
+        days = reject_dismiss_days(args.days)
+    except ValueError as exc:
+        return _nothing_written(str(exc))
+
+    try:
+        stores = open_embedded_stores()
+    except EmbeddedStoreError as exc:
+        print(exc.message, file=sys.stderr)
+        return 1
+
+    with stores:
+        try:
+            dismiss_operator_candidate(
+                args.id,
+                reason=args.reason,
+                days=days,
+                record_store=stores.record_store,
+            )
+        except (KeyError, ValueError) as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        print(f"Dismissed candidate {args.id} for {days} days.")
     return 0
 
 
@@ -5634,6 +5797,19 @@ def _build_parser() -> argparse.ArgumentParser:
     p_stats_judge.add_argument("--json", action="store_true", help="Print the report as JSON.")
     p_stats_judge.set_defaults(func=cmd_stats_judge)
 
+    p_stats_forget = stats_sub.add_parser(
+        "forgetting",
+        help="Scope retirements and candidates. Operator items are left out.",
+    )
+    p_stats_forget.add_argument(
+        "--scope",
+        default=None,
+        metavar="SCOPE",
+        help="Only this scope. Omit for every active scope.",
+    )
+    p_stats_forget.add_argument("--json", action="store_true", help="Print the report as JSON.")
+    p_stats_forget.set_defaults(func=cmd_stats_forgetting)
+
     p_doctor = sub.add_parser(
         "doctor",
         help="Diagnose a project's Strata wiring: config, DB, fleet, install, binding.",
@@ -5714,6 +5890,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p_op_publish.add_argument("scope_id")
     p_op_publish.add_argument("--content", required=True, help="Verbatim operator memory text.")
     p_op_publish.add_argument("--subject", default=None, help="Optional short subject line.")
+    publish_ends = p_op_publish.add_mutually_exclusive_group()
+    publish_ends.add_argument("--until", default=None, metavar="DATE", help="End date, YYYY-MM-DD.")
+    publish_ends.add_argument("--when", default=None, metavar="TEXT", help="Judged end condition.")
     p_op_publish.set_defaults(func=cmd_operator_publish)
 
     p_op_supersede = operator_sub.add_parser(
@@ -5729,6 +5908,13 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_op_supersede.add_argument("--content", required=True, help="Verbatim replacement content.")
     p_op_supersede.add_argument("--subject", default=None, help="Optional short subject line.")
+    supersede_ends = p_op_supersede.add_mutually_exclusive_group()
+    supersede_ends.add_argument(
+        "--until", default=None, metavar="DATE", help="End date, only for an op_ id."
+    )
+    supersede_ends.add_argument(
+        "--when", default=None, metavar="TEXT", help="Judged end condition, only for an op_ id."
+    )
     p_op_supersede.set_defaults(func=cmd_operator_supersede)
 
     p_op_retire = operator_sub.add_parser(
@@ -5742,6 +5928,51 @@ def _build_parser() -> argparse.ArgumentParser:
     p_op_retire.add_argument("id", help="An 'op_...' operator item id or a 'c_...' directive id.")
     p_op_retire.add_argument("--reason", default=None, help="Optional free-text rationale.")
     p_op_retire.set_defaults(func=cmd_operator_retire)
+
+    p_op_retire_item = operator_sub.add_parser(
+        "retire-item",
+        help="Retire an operator item, optionally as a release or a retraction.",
+    )
+    p_op_retire_item.add_argument("scope_id")
+    p_op_retire_item.add_argument("id", help="An 'op_...' operator item id.")
+    p_op_retire_item.add_argument(
+        "--kind",
+        choices=("currency", "correction"),
+        default=None,
+        help="currency (a release) or correction (a retraction). Requires --notice.",
+    )
+    p_op_retire_item.add_argument(
+        "--notice",
+        default=None,
+        help="Notice readers get. Requires --kind.",
+    )
+    p_op_retire_item.set_defaults(func=cmd_operator_retire_item)
+
+    p_op_candidates = operator_sub.add_parser(
+        "candidates",
+        help="List open candidates on operator items.",
+    )
+    p_op_candidates.add_argument(
+        "--scope",
+        default=None,
+        metavar="S",
+        help="Only candidates attached at this scope.",
+    )
+    p_op_candidates.set_defaults(func=cmd_operator_candidates)
+
+    p_op_dismiss = operator_sub.add_parser(
+        "dismiss-candidate",
+        help="Snooze one operator-item candidate.",
+    )
+    p_op_dismiss.add_argument("id", help="The candidate id.")
+    p_op_dismiss.add_argument("--reason", required=True, help="Why it is snoozed.")
+    p_op_dismiss.add_argument(
+        "--days",
+        type=int,
+        required=True,
+        help="Snooze length, an integer from 1 to 365.",
+    )
+    p_op_dismiss.set_defaults(func=cmd_operator_dismiss_candidate)
 
     p_op_restore = operator_sub.add_parser(
         "restore",
