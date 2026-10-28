@@ -56,6 +56,7 @@ import copy
 import json
 import logging
 import re
+import secrets
 import time
 from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
@@ -7592,6 +7593,7 @@ _NORMATIVE_EXCEPTION_RES: tuple[re.Pattern[str], ...] = tuple(
         r"\b(?:is|are|that['’]?s|it['’]?s) (?:fine|ok|okay|acceptable)\b",
         r"\bwaived?\b",
         r"\bnot required\b",
+        r"\bno longer (?:required|needed)\b",
         r"\bexempt\b",
         r"\bexception\b",
         r"\boptional\b",
@@ -8717,6 +8719,9 @@ class PublicationExceptionCheck:
     inherited_relation: dict | None = None
     fallback: bool = False
     conflict_note: str | None = None
+    relation_extras: dict | None = None
+    """What the re-ask's answer said beyond ``inherited_relation`` (the quoted spans, the marker
+    the engine fired on), for the record's ``relation_calls``."""
 
 
 def _publication_refusal_note(directive_id: str, origin: str) -> str:
@@ -9226,6 +9231,15 @@ class ScopeManager:
         self._model = model
         self._implied_purpose_min_words = implied_purpose_min_words
         self._judge_provider = judge_provider
+        # What a relation re-ask's answer said beyond the outcome dict (the quoted spans, the
+        # marker the engine fired on), keyed (contribution id, call), for the record's
+        # `relation_calls`. Kept off the outcome dict, whose shape callers compare exactly.
+        self._relation_extras: dict[tuple[str, str], dict] = {}
+
+    def take_relation_extras(self, contribution_id: str, call: str) -> dict:
+        """The recorded-only detail of the relation re-ask for *contribution_id* (``call`` is
+        ``"context"`` or ``"directive"``), removed on read; ``{}`` when there is none."""
+        return self._relation_extras.pop((contribution_id, call), {})
 
     def _messages_create(self, **kwargs: Any) -> Any:
         """The ONE place every judge call's real API request goes through
@@ -11915,6 +11929,16 @@ class ScopeManager:
         if failure is not None:
             reason = f"re-ask failed ({failure}); {reason}"
         kind = answer.get("kind")
+
+        def _span(key: str) -> str | None:
+            value = answer.get(key)
+            return value if isinstance(value, str) and value.strip() else None
+
+        self._relation_extras[(contribution.id, "context")] = {
+            "occurrence_span": _span("occurrence_span"),
+            "instead_span": _span("instead_span"),
+            "marker": _exception_marker(contribution.content, chosen[2], context_words),
+        }
         return {
             "contribution_id": contribution.id,
             "kind": kind if isinstance(kind, str) else None,
@@ -12045,14 +12069,17 @@ class ScopeManager:
                 if refusal is not None:
                     return PublicationExceptionCheck("refuse", content, note=refusal)
             outcome: dict | None = None
+            extras: dict | None = None
             if kind == "context":
                 outcome = self._classify_publication_text(scope, body, inherited)
+                extras = self.take_relation_extras(outcome["contribution_id"], "context")
                 if outcome["verdict"] in _INHERITED_DECLINES:
                     return PublicationExceptionCheck(
                         "refuse",
                         content,
                         note=_publication_refusal_note(outcome["inherited_id"], outcome["origin"]),
                         inherited_relation=outcome,
+                        relation_extras=extras,
                     )
             conflict = _first_inherited_conflict(body, inherited)
             conflict_note = (
@@ -12067,6 +12094,7 @@ class ScopeManager:
                 inherited_relation=outcome,
                 fallback=bool(outcome and outcome["fallback"]),
                 conflict_note=conflict_note,
+                relation_extras=extras,
             )
 
         if kind == "directive":
@@ -12076,6 +12104,7 @@ class ScopeManager:
             return PublicationExceptionCheck("accept", body)
 
         outcome = self._classify_publication_text(scope, body, inherited)
+        extras = self.take_relation_extras(outcome["contribution_id"], "context")
         verdict = outcome["verdict"]
         if verdict in _INHERITED_DECLINES:
             return PublicationExceptionCheck(
@@ -12083,6 +12112,7 @@ class ScopeManager:
                 content,
                 note=_publication_refusal_note(outcome["inherited_id"], outcome["origin"]),
                 inherited_relation=outcome,
+                relation_extras=extras,
             )
         if verdict == "departure_report":
             label = departure_label(outcome["inherited_id"], outcome["origin"])
@@ -12091,9 +12121,14 @@ class ScopeManager:
                 with_departure_label(body, label),
                 label=label,
                 inherited_relation=outcome,
+                relation_extras=extras,
             )
         return PublicationExceptionCheck(
-            "accept", body, inherited_relation=outcome, fallback=bool(outcome["fallback"])
+            "accept",
+            body,
+            inherited_relation=outcome,
+            fallback=bool(outcome["fallback"]),
+            relation_extras=extras,
         )
 
     @staticmethod
@@ -12116,7 +12151,9 @@ class ScopeManager:
         """The #242 re-ask for a published context item's text (a stand-in contribution)."""
         from types import SimpleNamespace  # noqa: PLC0415
 
-        stand_in = SimpleNamespace(id="publication-item", content=text)
+        # a fresh id per call: the manager's extras are keyed by it, and publications of
+        # different scopes can be judged at once on one manager
+        stand_in = SimpleNamespace(id=f"publication-item-{secrets.token_hex(4)}", content=text)
         return self._classify_inherited_relation(
             scope=scope,
             contribution=stand_in,  # type: ignore[arg-type]

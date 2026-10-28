@@ -47,6 +47,7 @@ import functools
 import inspect
 import logging
 import os
+import re
 import signal
 import sqlite3
 import sys
@@ -2645,16 +2646,45 @@ async def strata_contribute(
                 "failed to advance read receipt for session %r: %s", _AGENT_SESSION_ID, exc
             )
 
-    return _attach_fleet_notice(
-        {
-            "contribution_id": outcome.contribution_id,
-            "judgment": {
-                "decision": outcome.decision,
-                "reasoning": outcome.reasoning,
-                "summary_updated": outcome.summary_updated,
-            },
-        }
+    result = {
+        "contribution_id": outcome.contribution_id,
+        "judgment": {
+            "decision": outcome.decision,
+            "reasoning": outcome.reasoning,
+            "summary_updated": outcome.summary_updated,
+        },
+    }
+    relation = public_relation_rows(
+        _record_store.get_relation_calls(outcome.contribution_id), content
     )
+    if relation:
+        result["relation"] = relation
+    return _attach_fleet_notice(result)
+
+
+_RE_ASK_FAILED = "re-ask failed ("
+
+
+def public_relation_rows(rows: list[dict], own_text: str) -> list[dict]:
+    """The relation re-ask answers as an agent-facing surface shows them (v1.20). The stored
+    rows keep the judge's raw answer (only the operator CLI and Console show it raw). Here a
+    span survives only when it is verbatim in *own_text*, the caller's own contribution or
+    publication, else it is null; a ``re-ask failed (...)`` reason, whose text can hold raw
+    judge output, is cut to the exception class name."""
+    public = []
+    for stored in rows:
+        row = dict(stored)
+        for key in ("occurrence_span", "instead_span", "requirement_span"):
+            if row.get(key) is not None and row[key] not in own_text:
+                row[key] = None
+        reason = row.get("reason")
+        if isinstance(reason, str) and reason.startswith(_RE_ASK_FAILED):
+            # Cut right after the class name: the failure message may hold ")" or "; " itself,
+            # so where the parenthetical ends (and the judge's own reason resumes) is unknowable.
+            name = re.match(r"\w+", reason[len(_RE_ASK_FAILED) :])
+            row["reason"] = f"{_RE_ASK_FAILED}{name.group(0) if name else 'error'})"
+        public.append(row)
+    return public
 
 
 # ---------------------------------------------------------------------------
@@ -2789,6 +2819,29 @@ async def strata_rejudge(contribution_id: str) -> dict:
 # ---------------------------------------------------------------------------
 
 
+def _publication_result(outcome) -> dict:  # noqa: ANN001
+    """The reply of a publish / restore proposal. When the #243 check's relation re-ask fired
+    for the act (accepted or declined), ``relation`` carries its answer in the shape
+    ``strata_read_contribution`` uses, so the publisher is told why at the moment it happens;
+    otherwise the reply is exactly what it was."""
+    result = {
+        "act_id": outcome.act_id,
+        "judgment": {
+            "decision": outcome.decision,
+            "reasoning": outcome.reasoning,
+            "artifact_updated": outcome.artifact_updated,
+        },
+    }
+    act = _record_store.get_publication_act(outcome.act_id)
+    relation = public_relation_rows(
+        _record_store.get_publication_relation_calls(outcome.act_id),
+        (act.content if act is not None else None) or "",
+    )
+    if relation:
+        result["relation"] = relation
+    return result
+
+
 @mcp.tool()
 @_with_read_signal
 async def strata_publish(
@@ -2909,16 +2962,7 @@ async def strata_publish(
     except ValueError as exc:
         raise RuntimeError(str(exc)) from exc
 
-    return _attach_fleet_notice(
-        {
-            "act_id": outcome.act_id,
-            "judgment": {
-                "decision": outcome.decision,
-                "reasoning": outcome.reasoning,
-                "artifact_updated": outcome.artifact_updated,
-            },
-        }
-    )
+    return _attach_fleet_notice(_publication_result(outcome))
 
 
 # ---------------------------------------------------------------------------
@@ -3072,16 +3116,7 @@ async def strata_restore(item_id: str, reason: str | None = None) -> dict:
     except (ValueError, KeyError) as exc:
         raise RuntimeError(str(exc)) from exc
 
-    return _attach_fleet_notice(
-        {
-            "act_id": outcome.act_id,
-            "judgment": {
-                "decision": outcome.decision,
-                "reasoning": outcome.reasoning,
-                "artifact_updated": outcome.artifact_updated,
-            },
-        }
-    )
+    return _attach_fleet_notice(_publication_result(outcome))
 
 
 # ---------------------------------------------------------------------------
@@ -3646,15 +3681,21 @@ async def strata_read_contribution(contribution_id: str) -> dict:
 
     # Forensic, like the scope record read: no read counter increment (#110),
     # but the nudge still rides along.
-    return _attach_nudge(
-        {
-            "contribution": asdict(entry.contribution),
-            "state": asdict(entry.state),
-            "judgment": asdict(entry.judgment) if entry.judgment is not None else None,
-            "judgment_attempts": [asdict(a) for a in entry.judgment_attempts],
-            "raised_to": raised_to,
-        }
+    payload = {
+        "contribution": asdict(entry.contribution),
+        "state": asdict(entry.state),
+        "judgment": asdict(entry.judgment) if entry.judgment is not None else None,
+        "judgment_attempts": [asdict(a) for a in entry.judgment_attempts],
+        "raised_to": raised_to,
+    }
+    # v1.20 (#242 b): the relation re-ask answers behind this verdict, so a decline is
+    # explainable after the fact. Present only when a re-ask fired for it.
+    relation = public_relation_rows(
+        _record_store.get_relation_calls(contribution_id), entry.contribution.content
     )
+    if relation:
+        payload["relation"] = relation
+    return _attach_nudge(payload)
 
 
 # ---------------------------------------------------------------------------
