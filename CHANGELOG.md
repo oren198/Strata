@@ -7,20 +7,47 @@ the release PR (`dev` → `main`) and the GitHub Release body are built from
 
 ## Unreleased
 
+The judge-check bar was measured on `qwen/qwen3-235b-a22b-2507` pinned to Parasail. It is the only judge measured to meet the bar. There is no measured backup: four other candidates were tested, and none met the bar. If the judge can't be reached, contributions wait unjudged until `strata_rejudge`.
+
+The store migrates by itself on first start (0026, 0027). There is no manual step.
+
 ### Behaviour change
 
-- "No longer required" and "no longer needed" are now read as a relaxation. A forged "unrelated" relation answer no longer lets a relayed "X is no longer required" through.
-- A contribution that names `supersedes` and only releases that directive, through `strata_contribute`, behaves as in 1.19: the judge may retire the old directive and also publish a note restating the release. To retire a directive, use `strata_retire` (MCP) or `strata operator retire`.
+- "No longer required" and "no longer needed" now count as relaxing a rule. Before, a relayed "X is no longer required" could get through if the relation answer was forged as "unrelated". It no longer can.
+- `strata_contribute` with `supersedes`, where the contribution only releases that directive, works as it did in 1.19: the judge may retire the old directive and also publish a note restating the release. To retire a directive, use `strata_retire` (MCP) or `strata operator retire`.
+- A directive can now end.
+  - When it is retired, it leaves the owning scope's summary at once. There is no grace period.
+  - Every reader's perspective gets a notice. Kind `currency` is labelled *retired*: a release, meaning it no longer binds and following it was right. Kind `correction` is labelled *retracted*: it should not have bound.
+  - A directive with a date end condition binds through that date (UTC). After that, the engine retires it for currency, with no judge call, before the perspective of that scope or any descendant is next composed. Operator items with a date lapse the same way.
+  - A judged end condition is confirmed only by the owning scope's judge. The confirming contribution has to be made in that scope and carry `fulfils` with evidence. Any other `fulfils` only opens a candidate. [TODO-R2: fill from the final code once the operator rules.]
+  - A candidate (an old or unused directive, or evidence from elsewhere) only asks the owner. It never retires anything.
 
 ### Added
 
-- A bound session retires its own directive with the MCP tool `strata_retire`, and lists or dismisses its own candidates with `strata_retirement_candidates` and `strata_dismiss_candidate`. Those tools take no scope and no actor. `strata_contribute` accepts `ends` (a date or a judged condition, on a directive proposal) and `fulfils` (evidence that a judged condition was met). `POST /contribute` is unchanged.
-- The operator commands `strata operator publish` and `strata operator supersede` take `--until` or `--when` (on supersede, only an `op_` id). `strata operator retire-item`, `strata operator candidates`, and `strata operator dismiss-candidate` cover operator-item forgetting. `strata stats forgetting` counts scope retirements and candidates, and says that operator items are not counted.
-- The Console shows an end condition on a directive, a retirement's label and notice, read-only scope candidates, operator candidates with dismiss, and the forgetting counts.
+- `strata judge-check` tests the judge this install is set up to use.
+  - It runs the bundled judge-check set (v1, public) through the engine. It compares the results with reference bars measured on `qwen/qwen3-235b-a22b-2507` pinned to Parasail.
+  - Before it runs, it prints a cost estimate and asks `y/N`. The estimate is an upper bound, because it ignores cached input; measured runs have cost 35-70% of it. `--max-usd` is a hard cap.
+  - A judgment in which the provider answered any call with 429 (rate limited) is not scored, and the run is reported incomplete.
+  - Errors in the relation re-ask are reported separately from errors in the main call. They have no bar.
+  - Exit codes: 0 meets, 1 does not meet, 2 incomplete or unmeasured, 3 refused.
+  - The report records the model, the provider and the host part of the base URL. It never records the key.
+  - See [docs/judge-check.md](docs/judge-check.md).
+- `strata doctor` shows one line about the judge-check report saved for this engine version, in one of six forms. It never runs the judge, and the line never changes doctor's exit status.
+- `/mcp reconnect` keeps the session and its binding. With the automatic session id, the server recognises the same harness process. It checks the scope and skill you confirmed with `strata_bind` against the current `fleet.yaml`, restores them, and announces the restored binding once, as `binding_notice`. An explicit `STRATA_AGENT_SESSION_ID`, or Windows, turns this off.
+- MCP tools for a bound session:
+  - `strata_retire` retires one of the session's own directives.
+  - `strata_retirement_candidates` lists its own candidates, and `strata_dismiss_candidate` dismisses one.
+  - These three tools take no scope and no actor.
+  - `strata_contribute` accepts `ends` (a date or a judged condition, on a directive proposal) and `fulfils` (evidence that a judged condition was met). `POST /contribute` is unchanged.
+- Operator commands for forgetting:
+  - `strata operator publish` and `strata operator supersede` take `--until` or `--when`. On supersede, they work only with an `op_` id.
+  - `strata operator retire-item`, `strata operator candidates` and `strata operator dismiss-candidate` cover forgetting for operator items.
+  - `strata stats forgetting` counts scope retirements and candidates, and says that operator items are not counted.
+- The Console shows a directive's end condition, a retirement's label and notice, the scope candidates (read-only), the operator candidates (which the operator can dismiss), and the forgetting counts.
 
 ### Changed
 
-- `strata_contribute`'s reply now includes the relation check's answer (kind, verdict, cause) when that check ran, as `strata_publish`'s already does.
+- When the relation check ran, its answer (kind, verdict, cause) now appears in the reply of `strata_contribute`, `strata_read_contribution`, `strata_publish` and `strata_restore`. A quoted span is shown only when it appears in your own text.
 
 ## 1.19.0 (2026-10-26)
 
