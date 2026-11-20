@@ -5,7 +5,7 @@ the release PR (`dev` → `main`) and the GitHub Release body are built from
 (`docs/releasing.md`, step 3) — write entries here as work lands, and the
 "Unreleased" section is cleared once a release ships.
 
-## Unreleased
+## 1.20.0 (2026-11-20)
 
 The judge-check bar was measured on `qwen/qwen3-235b-a22b-2507` pinned to Parasail. It is the only judge measured to meet the bar. There is no measured backup: four other candidates were tested, and none met the bar. If the judge can't be reached, contributions wait unjudged until `strata_rejudge`.
 

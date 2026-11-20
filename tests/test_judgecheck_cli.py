@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+from strata import __version__
 from tests.judgecheck_peripherals_support import (
     first_hand_id,
     install_offline_guards,
@@ -271,7 +272,7 @@ def test_report_is_written_under_the_user_state_dir_not_under_cwd_strata(
     after = sorted(path.relative_to(strata_dir).as_posix() for path in strata_dir.rglob("*"))
     assert after == before
     path = report_json(state)
-    assert "1.19.0" in path.parts
+    assert __version__ in path.parts
     assert "Parasail" not in path.parts  # provider unset in this test
     assert "openrouter.ai" in path.parts
     assert any("qwen" in part for part in path.parts)

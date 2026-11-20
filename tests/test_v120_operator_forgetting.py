@@ -24,6 +24,21 @@ from tests import test_v18_243_publication_exception as t243
 world = t243.world
 
 NOW = datetime(2026, 11, 10, 12, 0, tzinfo=UTC)
+
+
+class _BeforeTheEndDate(datetime):
+    """The wall clock at publish time, fixed before the 2026-11-09 end date these tests use."""
+
+    @classmethod
+    def now(cls, tz=None):  # noqa: ANN001, ANN206
+        return datetime(2026, 11, 1, 12, 0, tzinfo=UTC).astimezone(tz)
+
+
+@pytest.fixture
+def _publish_before_the_end_date(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(forgetting, "datetime", _BeforeTheEndDate)
+
+
 OWNER_SESSION = ContributorRef(scope_id="g_org", skill=None, session_id="s_org", ts="t")
 NOTICE = "The freeze is over; deploys are open again."
 
@@ -93,6 +108,7 @@ def test_a_bad_end_condition_writes_nothing(world) -> None:  # noqa: ANN001
     assert _layer(world) == [] and world[1].list_operator_acts(target_scope_id="g_org") == []
 
 
+@pytest.mark.usefixtures("_publish_before_the_end_date")
 def test_a_date_lapse_retires_an_operator_item_and_tells_its_readers(world) -> None:  # noqa: ANN001
     item = operator_publish("g_org", "Freeze deploys.", ends={"until": "2026-11-09"}, **_kw(world))
     assert (
@@ -166,6 +182,7 @@ def test_kind_and_notice_go_together_and_nothing_is_written_otherwise(world) -> 
     assert [i.id for i in _layer(world)] == [item.id]
 
 
+@pytest.mark.usefixtures("_publish_before_the_end_date")
 def test_a_read_through_a_descendant_lapses_an_ancestors_operator_item(world) -> None:  # noqa: ANN001
     item = operator_publish("g_org", "Freeze deploys.", ends={"until": "2026-11-09"}, **_kw(world))
     forgetting.sweep_for_read(
