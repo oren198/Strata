@@ -188,3 +188,14 @@ def test_every_allowed_file_still_needs_its_allowance() -> None:
     assert all(not f.endswith("*") and "*" not in f for f in ALLOWED)
     unused = sorted(set(ALLOWED) - set(_all_hits()))
     assert unused == [], f"stale allow-list entries: {unused}"
+
+
+def test_accepted_rides_in_the_serialised_state(tmp_path: Path) -> None:
+    """The read surfaces serialise the state with ``asdict``; a host reads ``accepted`` there."""
+    from dataclasses import asdict
+
+    db_path = _make_db(tmp_path)
+    with RecordStore(db_path) as store:
+        cid = _append(store, "d")
+        store.record_judgment(contribution_id=cid, decision=CONTEXT, judged_by="t")
+        assert asdict(store.get_record_entry(cid).state)["accepted"] is True
