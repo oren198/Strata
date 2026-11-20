@@ -101,10 +101,10 @@ from strata.publication import (
     read_publication,
 )
 from strata.record_store import (
-    ACCEPTED_DECISIONS,
     ContributorRef,
     RecordStore,
     engine_note_rejudge_message,
+    is_accepted,
     is_engine_note,
 )
 from strata.session_state import (
@@ -714,7 +714,7 @@ def _record_accepted_contribution(decision: str) -> None:
     valve; a decline is the scope-manager rejecting the proposal, not the session
     contributing. Same best-effort discipline as :func:`_record_read`.
     """
-    if _session_store is None or decision not in ACCEPTED_DECISIONS:
+    if _session_store is None or not is_accepted(decision):
         return
     try:
         _session_store.record_contribution(_AGENT_SESSION_ID, harness=_client_harness())

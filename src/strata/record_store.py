@@ -273,6 +273,17 @@ JUDGE_FAILED = "judge_failed"
 ACCEPTED_DECISIONS: frozenset[str] = frozenset({"accept_as_directive", "accept_as_context"})
 
 
+def is_accepted(decision: str | None) -> bool:
+    """Was this verdict an admission? True for exactly ``accept_as_directive`` and
+    ``accept_as_context``; False for ``decline``, ``None`` (no verdict) and any other string.
+
+    The supported way to ask "was this admitted" (``from strata import is_accepted``). Use it,
+    or :attr:`ContributionState.accepted`, rather than testing membership in
+    :data:`ACCEPTED_DECISIONS`.
+    """
+    return decision in ACCEPTED_DECISIONS
+
+
 #: The engine default for the recency window (ADR 0011 D2): how many of the
 #: newest contributions :meth:`RecordStore.list_recent_contributions` returns
 #: to the judgment and refresh paths.  Deployments override it via
@@ -345,6 +356,11 @@ class ContributionState:
     ``failed_attempts`` counts every attempt event on the contribution,
     marked or not — including attempts that a later successful re-judge
     superseded, which is why it is meaningful even in the ``judged`` state.
+
+    ``accepted`` is derived, not stored: ``is_accepted(decision)``, True only for a judged
+    ``accept_as_directive`` or ``accept_as_context`` (False for a decline and for judge_failed,
+    pending and note). It is the supported way to ask "was this admitted", and it rides in the
+    serialised state of every read surface.
     """
 
     contribution_id: str
@@ -354,6 +370,7 @@ class ContributionState:
     error_class: str | None
     error_message: str | None
     failed_at: str | None
+    accepted: bool
 
 
 @dataclass(frozen=True)
@@ -4067,6 +4084,7 @@ def _derive_contribution_state(
         error_class=last_failure.error_class if last_failure is not None else None,
         error_message=last_failure.message if last_failure is not None else None,
         failed_at=last_failure.attempted_at if last_failure is not None else None,
+        accepted=is_accepted(judgment.decision if judgment is not None else None),
     )
 
 
@@ -4233,7 +4251,7 @@ def _outcome_reading(
     *outcome_itself_superseded* — a retracted report is not evidence of anything,
     whether it read as held or replaced.
     """
-    if judgment is None or judgment.decision not in ACCEPTED_DECISIONS:
+    if judgment is None or not is_accepted(judgment.decision):
         return _READING_EXCLUDED
     if outcome_itself_superseded:
         return _READING_EXCLUDED

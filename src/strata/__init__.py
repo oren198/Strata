@@ -1,8 +1,10 @@
 """Strata — shared memory for agent fleets."""
 
 # Re-exported so hosts can ask "was this accepted?" without restating the
-# verdict pair (issue #145). Defined once, beside the record's Judgment.
+# verdict pair (issue #145). Defined once, beside the record's Judgment; ask with
+# ``is_accepted(decision)`` or ``ContributionState.accepted``.
 from strata.record_store import ACCEPTED_DECISIONS as ACCEPTED_DECISIONS
+from strata.record_store import is_accepted as is_accepted
 
 __version__ = "1.20.0"
 
