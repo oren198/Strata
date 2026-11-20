@@ -27,7 +27,7 @@ NOW = datetime(2026, 11, 10, 12, 0, tzinfo=UTC)
 
 
 class _BeforeTheEndDate(datetime):
-    """The wall clock at publish time, fixed before the 2026-11-09 end date these tests use."""
+    """The wall clock at publish time, fixed before the end dates these tests use."""
 
     @classmethod
     def now(cls, tz=None):  # noqa: ANN001, ANN206
@@ -74,6 +74,7 @@ def _operator_ids(perspective: dict) -> set[str]:
     }
 
 
+@pytest.mark.usefixtures("_publish_before_the_end_date")
 def test_an_operator_item_carries_its_end_condition_through_the_layer_file(world) -> None:  # noqa: ANN001
     item = operator_publish("g_org", "Freeze deploys.", ends={"until": "2026-12-01"}, **_kw(world))
     assert item.end_condition == EndCondition(kind="date", until="2026-12-01")

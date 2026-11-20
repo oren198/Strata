@@ -11,11 +11,13 @@ from __future__ import annotations
 import inspect
 import json
 import re
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 
+from strata import forgetting
 from strata.app import ContributeRequest, create_app
 from strata.forgetting_surface import (
     OPERATOR_ITEMS_NOTE,
@@ -29,6 +31,22 @@ from strata.summary_store import Directive, ScopeSummary, SummaryStore
 from tests.test_mcp_server import _load_mcp_module, _make_db, _make_fleet_yaml
 
 _UNTIL = "2027-06-01"
+
+
+class _BeforeTheEndDate(datetime):
+    """The wall clock at publish time, fixed before _UNTIL so a test gives the same result
+    on any day."""
+
+    @classmethod
+    def now(cls, tz=None):  # noqa: ANN001, ANN206
+        return datetime(2026, 11, 1, 12, 0, tzinfo=UTC).astimezone(tz)
+
+
+@pytest.fixture
+def _publish_before_the_end_date(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(forgetting, "datetime", _BeforeTheEndDate)
+
+
 _NOTICE = "The tide table changed, so this no longer binds."
 _ROOT = Path(__file__).resolve().parents[1]
 
@@ -298,6 +316,7 @@ async def test_contribute_docstring_ends_and_fulfils(tmp_path: Path) -> None:
     assert "issue #" not in (mod.strata_retire.__doc__ or "").lower()
 
 
+@pytest.mark.usefixtures("_publish_before_the_end_date")
 async def test_ends_on_a_context_proposal_writes_nothing(tmp_path: Path) -> None:
     from unittest.mock import patch
 
@@ -352,6 +371,7 @@ def test_there_is_no_scope_session_cli(capsys: pytest.CaptureFixture[str]) -> No
     capsys.readouterr()
 
 
+@pytest.mark.usefixtures("_publish_before_the_end_date")
 def test_operator_publish_until_and_supersede_when(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
