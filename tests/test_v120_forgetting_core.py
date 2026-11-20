@@ -33,6 +33,21 @@ from tests.test_scope_manager import SCOPE, STRATUM, _fake_response
 world = t243.world
 
 NOW = datetime(2026, 11, 10, 12, 0, tzinfo=UTC)
+
+
+class _AtNow(datetime):
+    """The wall clock fixed at NOW, so a test that reads it gives the same result on any day."""
+
+    @classmethod
+    def now(cls, tz=None):  # noqa: ANN001, ANN206
+        return NOW.astimezone(tz)
+
+
+@pytest.fixture
+def _clock_at_now(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(forgetting, "datetime", _AtNow)
+
+
 OWNER = ContributorRef(scope_id="g_org", skill=None, session_id="s_org", ts="t")
 READER = ContributorRef(scope_id="g_web", skill=None, session_id="s_web", ts="t")
 NOTICE = "The test-suite rule was replaced by the release checklist."
@@ -449,6 +464,7 @@ def test_candidates_are_shown_to_the_owning_scope_only(world) -> None:  # noqa: 
     assert visible_candidates("g_org", READER, record_store=world[1]) == []
 
 
+@pytest.mark.usefixtures("_clock_at_now")
 def test_dismiss_snoozes_and_changes_nothing_else(world) -> None:  # noqa: ANN001
     _backdate(world, "c_suite", 120)
     compute_retirement_candidates(
@@ -467,7 +483,7 @@ def test_dismiss_snoozes_and_changes_nothing_else(world) -> None:  # noqa: ANN00
     assert world[2].read("g_org") == before
     row = store.get_retirement_candidate(candidate.id)
     assert row.state == "dismissed" and row.note == "still wanted"
-    # while snoozed (real clock: +30 days from now), a recompute does not reopen it
+    # while snoozed (+30 days from the clock), a recompute does not reopen it
     compute_retirement_candidates("g_org", record_store=store, summary_store=world[2], force=True)
     assert [
         c for c in store.list_retirement_candidates(scope_id="g_org") if c.ground == "age"
