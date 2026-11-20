@@ -166,8 +166,8 @@ def _retire_locked(
 ) -> Retirement:
     """The retire act itself. PRIVATE: the caller holds ``scope_lock(scope_id)`` and has done
     the authority check; ``cause``, the end condition and the evidence are set only by the
-    sweep and by the engine's confirmation of a judged end condition (the scope manager's
-    guard, recorded in ``app._write_amendment``), never by a public caller."""
+    date-lapse sweep, never by a public caller. A confirmed judged end condition is recorded on
+    its own path (``app._write_amendment``), not through this function."""
     from strata.publication import propagate_directive_removals  # noqa: PLC0415
 
     if fleet.get_scope(scope_id) is None:
