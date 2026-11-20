@@ -17,7 +17,6 @@ from strata.forgetting import (
     ENGINE_ACTOR,
     PositionGateRefusal,
     compute_retirement_candidates,
-    confirm_judged_end_condition,
     dismiss_candidate,
     retire_directive,
     sweep_date_lapses,
@@ -266,71 +265,6 @@ def _fulfils_contribution(world, scope_id: str, session: str = "s_org"):  # noqa
         contributor=ContributorRef(scope_id=scope_id, skill=None, session_id=session, ts="t"),
         fulfils="c_suite",
     )
-
-
-def _confirm(world, contribution, evidence, judging="g_org"):  # noqa: ANN001, ANN202
-    return confirm_judged_end_condition(
-        "g_org",
-        "c_suite",
-        contribution,
-        evidence,
-        judging_scope_id=judging,
-        **_kw(world),
-    )
-
-
-def test_the_owners_judge_retires_a_judged_condition_with_the_honest_reason(world) -> None:  # noqa: ANN001
-    _set_end(world, "c_suite", EndCondition(kind="judged", condition="the audit closes"))
-    contribution = _fulfils_contribution(world, "g_org")
-    retirement = _confirm(world, contribution, "The note says the audit closed on 9 November.")
-    assert retirement is not None
-    assert retirement.cause == "condition_judged" and retirement.kind == "currency"
-    assert retirement.notice == (
-        'end condition judged met: "the audit closes" / '
-        "The note says the audit closed on 9 November."
-    )
-    assert "verified" not in retirement.notice
-    assert retirement.evidence_contribution_id == contribution.id
-    assert "c_suite" not in _org_ids(world)
-
-
-@pytest.mark.parametrize(
-    "case",
-    ["other_scope_contribution", "other_judging_scope", "no_fulfils", "verified", "blank"],
-)
-def test_nobody_else_retires_a_judged_condition(world, case) -> None:  # noqa: ANN001
-    _set_end(world, "c_suite", EndCondition(kind="judged", condition="the audit closes"))
-    contribution = _fulfils_contribution(
-        world, "g_web" if case == "other_scope_contribution" else "g_org", "s_x"
-    )
-    evidence = "The note says it closed."
-    judging = "g_org"
-    if case == "other_judging_scope":
-        judging = "g_web"
-    if case == "no_fulfils":
-        contribution = replace(contribution, fulfils=None)
-    if case == "verified":
-        evidence = "I verified it closed."
-    if case == "blank":
-        evidence = "  "
-    assert _confirm(world, contribution, evidence, judging) is None
-    assert "c_suite" in _org_ids(world)
-    assert world[1].list_retirements(scope_id="g_org") == []
-
-
-def test_fulfils_judged_elsewhere_opens_a_candidate_never_a_retirement(world) -> None:  # noqa: ANN001
-    _set_end(world, "c_suite", EndCondition(kind="judged", condition="the audit closes"))
-    contribution = _fulfils_contribution(world, "g_web", "s_web")
-    assert _confirm(world, contribution, "It closed.", judging="g_web") is None
-    (candidate,) = world[1].list_retirement_candidates(scope_id="g_org")
-    assert candidate.ground == "condition_evidence" and candidate.directive_id == "c_suite"
-    assert contribution.id in candidate.evidence_ids
-
-
-def test_a_directive_without_a_judged_condition_is_never_confirmed(world) -> None:  # noqa: ANN001
-    contribution = _fulfils_contribution(world, "g_org")
-    assert _confirm(world, contribution, "It closed.") is None
-    assert "c_suite" in _org_ids(world)
 
 
 # -- (f) a plain judged retire cannot bypass R2 --------------------------------------------

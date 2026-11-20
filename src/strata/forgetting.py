@@ -22,7 +22,7 @@ from strata.summary_store import Directive, EndCondition
 
 if TYPE_CHECKING:
     from strata.fleet_config import FleetConfig
-    from strata.record_store import Contribution, RecordStore
+    from strata.record_store import RecordStore
     from strata.summary_store import SummaryStore
 
 _logger = logging.getLogger("strata.forgetting")
@@ -166,7 +166,8 @@ def _retire_locked(
 ) -> Retirement:
     """The retire act itself. PRIVATE: the caller holds ``scope_lock(scope_id)`` and has done
     the authority check; ``cause``, the end condition and the evidence are set only by the
-    sweep and by :func:`confirm_judged_end_condition`, never by a public caller."""
+    date-lapse sweep, never by a public caller. A confirmed judged end condition is recorded on
+    its own path (``app._write_amendment``), not through this function."""
     from strata.publication import propagate_directive_removals  # noqa: PLC0415
 
     if fleet.get_scope(scope_id) is None:
@@ -428,58 +429,6 @@ def evidence_acceptable(evidence: str | None) -> bool:
 def condition_met_reason(condition: str, evidence: str) -> str:
     """The recorded reason of a confirmed judged end condition."""
     return f'end condition judged met: "{condition}" / {evidence.strip()}'
-
-
-def confirm_judged_end_condition(
-    scope_id: str,
-    directive_id: str,
-    contribution: Contribution,
-    evidence: str,
-    *,
-    judging_scope_id: str,
-    fleet: FleetConfig,
-    record_store: RecordStore,
-    summary_store: SummaryStore,
-) -> Retirement | None:
-    """The owner's judge confirms a judged end condition (R2). Fail closed.
-
-    Called with ``scope_lock(scope_id)`` held, for a judge ``retire`` of *directive_id*.
-    Retires only when ALL hold: the judging scope is the owner (*judging_scope_id* ==
-    *scope_id*) AND the contribution was contributed in the owner's scope; the directive has
-    a judged end condition; the contribution carries ``fulfils`` for it; and the evidence
-    sentence does not claim verification. Anything else returns ``None`` and, when the
-    contribution does carry a valid ``fulfils``, opens a ``condition_evidence`` candidate.
-    It never retires on a lesser basis. (A contribution "raised to" the owner is left out for
-    now: a possible later step.)"""
-    directive = judged_end_condition_directive(scope_id, directive_id, summary_store=summary_store)
-    if directive is None:
-        return None
-    reason_ok = evidence_acceptable(evidence)
-    owner_judged = judging_scope_id == scope_id and contribution.scope_id == scope_id
-    if not (owner_judged and contribution.fulfils == directive_id and reason_ok):
-        if contribution.fulfils == directive_id:
-            record_store.open_retirement_candidate(
-                directive_id=directive_id,
-                scope_id=scope_id,
-                ground="condition_evidence",
-                evidence_ids=[contribution.id],
-            )
-        return None
-    condition = directive.end_condition.condition  # type: ignore[union-attr]
-    return _retire_locked(
-        scope_id,
-        directive_id,
-        "currency",
-        condition_met_reason(condition, evidence),
-        actor_session_id=contribution.contributor.session_id,
-        retired_by="scope-manager:condition-judged",
-        cause="condition_judged",
-        end_condition=directive.end_condition,
-        evidence_contribution_id=contribution.id,
-        fleet=fleet,
-        record_store=record_store,
-        summary_store=summary_store,
-    )
 
 
 # -- candidates: prompts, never retirements ------------------------------------------------

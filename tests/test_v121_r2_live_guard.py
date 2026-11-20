@@ -3,7 +3,7 @@
 The cases run ``app.run_contribution`` with a real ``ScopeManager`` whose judge answer is
 scripted, so the answer goes through ``ScopeManager.judge`` (which calls
 ``_guard_judged_end_condition_retires``), the amendment write and the retirement record. None
-of them touches ``forgetting.confirm_judged_end_condition``.
+of them calls a standalone confirmation function (there is none).
 
 The fleet is the #243 test world: g_org owns c_suite and c_tokens, g_web and g_api read them.
 """
