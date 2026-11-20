@@ -1232,7 +1232,7 @@ A directive stops binding only when someone with authority over it ends it. Bein
 
 **One path, two labels.** A directive ends either because it no longer applies or because it was wrong. Both go through the same path, and readers see both as an ordinary input change. Only the label differs: a release (kind `currency`) is labelled *retired*, and a retraction (kind `correction`) is labelled *retracted*.
 
-**End dates and end conditions.** A directive proposal can say when it ends, with `ends`: a date, or a condition that has to be judged. Only two can confirm that a judged condition was met: the owning scope's judge, or a session bound to the owning scope. Another scope's judge cannot end it. The operator confirms only operator items, because the operator owns them.
+**End dates and end conditions.** A directive proposal can say when it ends, with `ends`: a date, or a condition that has to be judged. The owner decides whether a judged condition was met. The owning scope's judge confirms it, from a contribution made in that scope that carries `fulfils` with evidence. A session bound to the owning scope can also end the directive at any time with `strata_retire`. The operator can rule on a scope's directive with `strata operator retire`. Everyone else can only suggest: a `fulfils` from another scope opens a candidate for the owner, and another scope's judge cannot end the directive. An operator item belongs to the operator, so only the operator ends it; evidence for it shows up in `strata operator candidates`.
 
 **Candidates.** A directive that is old or unused can show up as a candidate. A candidate only asks the owner whether the directive should end. It never ends anything by itself.
 

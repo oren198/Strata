@@ -19,7 +19,9 @@ The store migrates by itself on first start (0026, 0027). There is no manual ste
   - When it is retired, it leaves the owning scope's summary at once. There is no grace period.
   - Every reader's perspective gets a notice. Kind `currency` is labelled *retired*: a release, meaning it no longer binds and following it was right. Kind `correction` is labelled *retracted*: it should not have bound.
   - A directive with a date end condition binds through that date (UTC). After that, the engine retires it for currency, with no judge call, before the perspective of that scope or any descendant is next composed. Operator items with a date lapse the same way.
-  - A judged end condition is confirmed only by the owning scope's judge. The confirming contribution has to be made in that scope and carry `fulfils` with evidence. Any other `fulfils` only opens a candidate. [TODO-R2: fill from the final code once the operator rules.]
+  - The owner decides a judged end condition. The owning scope's judge confirms it: the confirming contribution has to be made in that scope and carry `fulfils` with evidence, and the directive is then retired with the reason "end condition judged met". A session bound to the owning scope can also end the directive at any time with `strata_retire`.
+  - The operator can rule: `strata operator retire <scope> <c_ id>` ends a scope's directive. An operator item belongs to the operator, and only the operator ends it (`strata operator retire-item`).
+  - Everyone else can only suggest. A `fulfils` from another scope opens a candidate for the owner, and another scope's judge cannot end the directive.
   - A candidate (an old or unused directive, or evidence from elsewhere) only asks the owner. It never retires anything.
 
 ### Added
