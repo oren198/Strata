@@ -1,0 +1,33 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "strata-hermes"
+version = "0.1.0"
+description = "A Strata memory provider for Hermes Agent: reads a perspective, writes only through the judged strata_contribute path."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+    "strata-mem>=1.20",
+    "mcp >=1.28,<1.30",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[project.entry-points."hermes_agent.memory_providers"]
+strata = "strata_hermes:register"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/strata_hermes"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src", "tests/fake_hermes"]
+
+[tool.ruff]
+extend = "../../pyproject.toml"
+# the verbatim copy of Hermes's ABC is a test double; it is not edited to pass our lint
+extend-exclude = ["tests/fake_hermes"]
