@@ -181,6 +181,8 @@ def test_a_held_retire_request_lapses_when_its_directive_was_retired_meanwhile(
 
 
 def test_a_held_retire_lapses_when_its_directive_was_superseded_meanwhile(world: World) -> None:
+    """The test world seeds directives straight into the summary, so a supersession is
+    simulated by what it leaves behind: the old row gone, the replacement in its place."""
     outcome = world.propose(directive_answer([{"op": "retire", "id": "c_tokens"}]))
     world.replace_directive("c_tokens", "c_tokens_v2", "Tokens expire after 10 minutes.")
     with _judge_must_not_run():

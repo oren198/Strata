@@ -152,6 +152,7 @@ class World:
         classification: str = "directive",
         fulfils: str | None = None,
         session: str | None = None,
+        contributor_scope: str | None = None,
     ):  # noqa: ANN201
         client = MagicMock()
         client.messages.create.return_value = _fake_response(answer)
@@ -164,9 +165,9 @@ class World:
             subject=None,
             supersedes=None,
             contributor=ContributorRef(
-                scope_id=scope_id,
+                scope_id=contributor_scope or scope_id,
                 skill=None,
-                session_id=session or f"s_{scope_id}",
+                session_id=session or f"s_{contributor_scope or scope_id}",
                 ts="2026-11-21T09:00:00Z",
             ),
             fleet=self.fleet,

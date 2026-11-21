@@ -169,3 +169,66 @@ def test_a_held_item_is_not_pending_judgment(world1: World) -> None:
     world1.propose(directive_answer([{"op": "append"}]))
     states = world1.store.list_contribution_states(scope_id="g_org")
     assert [s.state for s in states] == ["held"]
+
+
+# -- the position gate fires first; the review hold never double-handles ---------------------------
+
+
+def _non_owner_proposal(w: World):  # noqa: ANN202
+    """g_api is not g_org's bound position, so the position gate (ScopeManager.judge) holds the
+    directive change itself, before the review hold seam is reached."""
+    return w.propose(
+        directive_answer([{"op": "append"}]),
+        scope_id="g_org",
+        session="s_g_api",
+        contributor_scope="g_api",
+    )
+
+
+def test_where_the_position_gate_fires_level_one_behaves_exactly_as_today(
+    world0: World, world1: World
+) -> None:
+    today = _non_owner_proposal(world0)
+    level1 = _non_owner_proposal(world1)
+    j0 = world0.store.get_judgment(today.contribution_id)
+    j1 = world1.store.get_judgment(level1.contribution_id)
+    assert (j1.decision, j1.notes, j1.disposition) == (j0.decision, j0.notes, None)
+    assert world1.summaries.read("g_org").directives == world0.summaries.read("g_org").directives
+    assert NEW_RULE not in [d.content for d in world1.summaries.read("g_org").directives]
+    # the position gate fired first, so there was nothing left for the review hold to hold
+    from strata import review  # noqa: PLC0415
+
+    assert review.list_held(record_store=world1.store).count == 0
+
+
+# -- a no-op accept_as_directive is held, and approve is today's path ------------------------------
+
+
+def _normalised(w: World, outcome) -> dict:  # noqa: ANN001
+    summary = w.summaries.read("g_org")
+    judgment = w.store.get_judgment(outcome.contribution_id)
+    return {
+        "directives": [(d.content, d.subject) for d in summary.directives],
+        "context": summary.context,
+        "decision": judgment.decision,
+        "notes": judgment.notes,
+    }
+
+
+def test_approving_a_no_op_accept_as_directive_equals_the_level_zero_result(
+    world0: World, world1: World
+) -> None:
+    from strata import review  # noqa: PLC0415
+
+    answer = {
+        "decision": "accept_as_directive",
+        "reasoning": "Binding, but it changes nothing.",
+        "directive_ops": [],
+        "new_context": "The audit closed on 9 November.",
+    }
+    today = world0.propose(answer, content="The audit closed on 9 November.")
+    held = world1.propose(answer, content="The audit closed on 9 November.")
+    state = world1.store.get_record_entry(held.contribution_id).state
+    assert state.state == "held" and state.accepted is False  # the decision alone is the trigger
+    review.approve(held.contribution_id, operator="oren", **world1.kw())
+    assert _normalised(world1, held) == _normalised(world0, today)
