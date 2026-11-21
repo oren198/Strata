@@ -302,6 +302,14 @@
     return resp.json();
   }
 
+  // Held items (ADR 0018). Read-only: approve and reject are the CLI's, never the Console's.
+  async function fetchReviewHeld() {
+    const base = getApiBase();
+    const resp = await fetch(`${base}/review/held`);
+    if (!resp.ok) throw new Error(`GET /review/held returned ${resp.status}`);
+    return resp.json();
+  }
+
   // Pending fleet structure changes. Apply and reject are operator-only;
   // the request body does not name a scope.
 
@@ -377,6 +385,7 @@
     dismissOperatorCandidate,
     fetchForgettingMetrics,
     fetchJudgeUsage,
+    fetchReviewHeld,
     fetchFleetChanges,
     fetchFleetActs,
     applyFleetChange,
