@@ -254,19 +254,6 @@ def test_the_sweep_runs_inside_a_judgment_without_deadlocking_on_the_scope_lock(
 # -- R2: only the owner confirms a judged end condition -----------------------------------
 
 
-def _fulfils_contribution(world, scope_id: str, session: str = "s_org"):  # noqa: ANN001, ANN202
-    store = world[1]
-    return store.append_contribution(
-        scope_id=scope_id,
-        content="The audit closed on 9 November.",
-        proposed_classification="context",
-        subject=None,
-        supersedes=None,
-        contributor=ContributorRef(scope_id=scope_id, skill=None, session_id=session, ts="t"),
-        fulfils="c_suite",
-    )
-
-
 # -- (f) a plain judged retire cannot bypass R2 --------------------------------------------
 
 _JUDGED_SUMMARY = ScopeSummary(

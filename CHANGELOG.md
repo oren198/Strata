@@ -5,14 +5,23 @@ the release PR (`dev` → `main`) and the GitHub Release body are built from
 (`docs/releasing.md`, step 3) — write entries here as work lands, and the
 "Unreleased" section is cleared once a release ships.
 
-## Unreleased
+## 1.21.0 (2026-11-21)
+
+The store migrates by itself on first start (0028). There is no manual step.
 
 ### Added
 
-- `ContributionState.accepted` answers "was this contribution admitted?" on every record read (`strata_read_scope_record`, `strata_read_contribution`, `GET /scopes/{scope_id}/record` and `GET /scopes/{scope_id}/record/{contribution_id}`). `strata.verdict_admits(decision)` is the lower-level check: it answers whether a verdict admits (True only for `accept_as_directive` and `accept_as_context`). Hosts no longer need to restate the pair of verdicts. `ACCEPTED_DECISIONS` stays.
+- `ContributionState.accepted` answers "was this contribution admitted?" on every record read: `strata_read_scope_record`, `strata_read_contribution`, `GET /scopes/{scope_id}/record` and `GET /scopes/{scope_id}/record/{contribution_id}`. Hosts no longer need to restate the pair of verdicts.
+  - `strata.verdict_admits(decision)` is the lower-level check. It answers whether a verdict admits: True only for `accept_as_directive` and `accept_as_context`.
+  - `ACCEPTED_DECISIONS` stays.
 
-- **Human review levels** (ADR 0018). A scope can set `human_review: 1` in `fleet.yaml`: the judge still judges every contribution and its verdict is recorded as it was given, but every directive change by a delegated party is held for the operator. That covers a judged add, supersede, retire or end-condition confirmation, and a bound session's own `strata_retire`, which becomes a held request. The directive keeps binding until the operator approves. `0` (the default) is off and changes nothing; any other value except `1` is refused when `fleet.yaml` loads. Review the held items with `strata operator review list`, `approve <id>` and `reject <id> --reason ...`. An approval re-checks the targets and the inherited rules mechanically (no judge call) before it applies the judge's ops unchanged. If the scope's context changed after the hold, the approval keeps the current context and applies the directive ops alone, and approving twice never applies twice. The contributing scope's perspective shows the held item as "held for the operator", then "approved" or "rejected: <reason>". The Console has a Held tab (`GET /review/held`) with the same list, read-only; approve and reject are CLI only. One migration (0028).
-- `ContributionState` has a `held` state and a `disposition` field. `accepted` is False while an item is held, and after it is rejected or lapsed; it is True once an approval admits it.
+- **Human review levels** (ADR 0018). A scope can set `human_review: 1` in `fleet.yaml`.
+  - **What it does.** The judge still judges every contribution, and its verdict is recorded as given. But every directive change by a delegated party is held for the operator. That covers a judged add, supersede, retire or end-condition confirmation. It also covers a bound session's own `strata_retire`, which becomes a held request. The directive keeps binding until the operator approves. The operator's own acts and date-based end conditions are not held.
+  - **Settings.** `0` (the default) is off and changes nothing. Any value other than `0` or `1` is refused when `fleet.yaml` loads.
+  - **How to review.** `strata operator review list` shows the held items. `strata operator review approve <id>` approves one, and `strata operator review reject <id> --reason ...` rejects one.
+  - **Safety.** Before it applies anything, an approval re-checks the targets, the inherited rules and the scope's position mechanically, with no judge call. If a check fails, the approval is refused with the reason and nothing is applied. A held retirement whose directive was retired or superseded in the meantime lapses instead: nothing is applied. If the checks pass, the approval applies the judge's ops unchanged. If the scope's context changed after the hold, the approval keeps the current context and applies only the directive ops. Approving twice never applies twice (ADR 0018, Known limits, lists the crash cases).
+  - **Where it shows.** The contributing scope's perspective shows the held item as "held for the operator", then "approved" or "rejected: <reason>". The Console has a Held tab (`GET /review/held`) with the same list, read-only. Approve and reject are CLI only.
+- `ContributionState` has a `held` state and a `disposition` field. `accepted` is False while an item is held, and after it is rejected or lapsed. It is True once an approval admits it.
 
 ## 1.20.0 (2026-11-20)
 
