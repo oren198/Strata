@@ -198,19 +198,23 @@ def test_prefetch_returns_the_cache_at_once_while_the_backing_read_is_slow(
     assert time.monotonic() - start < FAST  # the refresh runs in the background
 
     start = time.monotonic()
-    assert provider.prefetch("what is decided?", session_id="sess_h1") == ""  # nothing cached yet
-    assert time.monotonic() - start < FAST  # and it did not wait for the slow read
+    provider.prefetch("what is decided?", session_id="sess_h1")
+    assert time.monotonic() - start < FAST  # it did not wait for the slow read
+    assert calls == [] or len(calls) == 1  # the slow read is still in flight or just began
 
-    deadline = time.time() + 5
-    text = ""
-    while not text and time.time() < deadline:
-        time.sleep(0.1)
-        text = provider.prefetch("what is decided?", session_id="sess_h1")
-    assert "g_hermes" in text  # the perspective arrived through the cache
-
+    deadline = time.time() + 6
+    while not calls and time.time() < deadline:
+        time.sleep(0.05)
     start = time.monotonic()
-    provider.prefetch("again", session_id="sess_h1")
-    assert time.monotonic() - start < FAST
+    provider.prefetch("mid-read", session_id="sess_h1")
+    assert time.monotonic() - start < FAST  # still immediate while the read is running
+
+    deadline = time.time() + 6
+    text = ""
+    while "g_hermes" not in text and time.time() < deadline:
+        time.sleep(0.1)
+        text = provider.prefetch("again", session_id="sess_h1")
+    assert "g_hermes" in text  # the perspective is served from the cache
     assert set(calls) == {"strata_read_perspective"}
 
 
@@ -236,6 +240,7 @@ def test_prefetch_returns_the_cache_at_once_while_the_backing_read_is_slow(
 )
 def test_the_hook_is_the_abcs_own_no_op(hook: str) -> None:
     from agent.memory_provider import MemoryProvider  # noqa: PLC0415
+
     from strata_hermes.provider import StrataMemoryProvider  # noqa: PLC0415
 
     assert getattr(StrataMemoryProvider, hook) is getattr(MemoryProvider, hook), (

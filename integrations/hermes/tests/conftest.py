@@ -53,9 +53,14 @@ def strata_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setenv(
         "STRATA_MCP_COMMAND", f"{shlex.quote(sys.executable)} {shlex.quote(str(SERVER))}"
     )
-    monkeypatch.setenv("STRATA_FLEET_CONFIG", str(store / "fleet.yaml"))
-    monkeypatch.setenv("STRATA_DB_PATH", str(store / "strata.db"))
-    monkeypatch.setenv("STRATA_SUMMARIES_DIR", str(store / "summaries"))
+    (store / ".strata").mkdir()
+    (store / ".strata" / "config.toml").write_text(
+        f'db = "{store / "strata.db"}"\n'
+        f'fleet_yaml = "{store / "fleet.yaml"}"\n'
+        f'summaries_dir = "{store / "summaries"}"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("STRATA_PROJECT_DIR", str(store))
     monkeypatch.setenv(
         "PYTHONPATH", os.pathsep.join([str(REPO_SRC), os.environ.get("PYTHONPATH", "")])
     )
