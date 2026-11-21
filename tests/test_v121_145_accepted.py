@@ -1,8 +1,8 @@
 """#145: one public definition of "accepted" (v1.21).
 
-``strata.is_accepted(decision)`` is the one question a host asks ("was this admitted?"), and
-``ContributionState.accepted`` answers it on every read surface. No engine code tests acceptance
-by naming the two accepting verdicts together.
+``ContributionState.accepted`` answers "was this contribution admitted?" on every read surface,
+and ``strata.verdict_admits(decision)`` answers "does this verdict admit?". No engine code tests
+acceptance by naming the two accepting verdicts together.
 """
 
 from __future__ import annotations
@@ -26,17 +26,17 @@ CONTEXT = "accept_as_context"
 
 
 @pytest.mark.parametrize("decision", [DIRECTIVE, CONTEXT])
-def test_is_accepted_is_true_for_the_two_accepting_verdicts(decision: str) -> None:
-    assert strata.is_accepted(decision) is True
+def test_verdict_admits_is_true_for_the_two_accepting_verdicts(decision: str) -> None:
+    assert strata.verdict_admits(decision) is True
 
 
 @pytest.mark.parametrize("decision", ["decline", None, "", "held", "Accept_As_Context"])
-def test_is_accepted_is_false_for_everything_else(decision: str | None) -> None:
-    assert strata.is_accepted(decision) is False
+def test_verdict_admits_is_false_for_everything_else(decision: str | None) -> None:
+    assert strata.verdict_admits(decision) is False
 
 
-def test_is_accepted_agrees_with_the_kept_constant() -> None:
-    assert {d for d in (DIRECTIVE, CONTEXT, "decline") if strata.is_accepted(d)} == set(
+def test_verdict_admits_agrees_with_the_kept_constant() -> None:
+    assert {d for d in (DIRECTIVE, CONTEXT, "decline") if strata.verdict_admits(d)} == set(
         strata.ACCEPTED_DECISIONS
     )
 
@@ -99,7 +99,7 @@ def test_the_state_carries_accepted_in_every_state(tmp_path: Path) -> None:
             row = surface[ids[name]]
             assert row.state == state, name
             assert row.accepted is accepted, name
-            assert row.accepted == strata.is_accepted(row.decision), name
+            assert row.accepted == strata.verdict_admits(row.decision), name
 
 
 # -- c. nobody else names the two verdicts together ----------------------------------------
@@ -112,7 +112,7 @@ _SQL_IN = re.compile(
 
 #: EXPLICIT file paths (relative to src/strata), each with why it may name both verdicts.
 ALLOWED = {
-    "record_store.py": "defines ACCEPTED_DECISIONS and is_accepted, the one definition",
+    "record_store.py": "defines ACCEPTED_DECISIONS and verdict_admits, the one definition",
     "scope_manager.py": "the judge contract: tool-schema enums and the batch decision tuple "
     "tell the judge its three choices; they are not an acceptance test",
     "_migrations/0001_initial.sql": "CHECK constraint on the judgments.decision column",
@@ -179,7 +179,7 @@ def _all_hits() -> dict[str, list[int]]:
 def test_no_code_outside_the_definition_names_both_accepting_verdicts() -> None:
     stray = {f: lines for f, lines in _all_hits().items() if f not in ALLOWED}
     assert stray == {}, (
-        "name the pair through strata.is_accepted / ACCEPTED_DECISIONS instead, or add the "
+        "name the pair through strata.verdict_admits / ACCEPTED_DECISIONS instead, or add the "
         "file to ALLOWED with a one-line reason"
     )
 

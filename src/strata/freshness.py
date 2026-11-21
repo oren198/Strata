@@ -58,7 +58,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, TextIO
 
-from strata.record_store import is_accepted
+from strata.record_store import verdict_admits
 from strata.session_state import (
     NUDGE_MIN_READS,
     SessionStateStore,
@@ -778,7 +778,7 @@ def run_evaluator(
             return "declined"
 
         decision = _submit_judged_contribution(draft, env=env, session_id=session_id)  # type: ignore[arg-type]
-        if is_accepted(decision):
+        if verdict_admits(decision):
             store.record_contribution(session_id, now=_as_dt(now))
             return "contributed"
         # The judge declined the draft: nothing entered memory. Reset the

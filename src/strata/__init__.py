@@ -2,9 +2,9 @@
 
 # Re-exported so hosts can ask "was this accepted?" without restating the
 # verdict pair (issue #145). Defined once, beside the record's Judgment; ask with
-# ``is_accepted(decision)`` or ``ContributionState.accepted``.
+# ``ContributionState.accepted``; ``verdict_admits(decision)`` is the lower-level verdict check.
 from strata.record_store import ACCEPTED_DECISIONS as ACCEPTED_DECISIONS
-from strata.record_store import is_accepted as is_accepted
+from strata.record_store import verdict_admits as verdict_admits
 
 __version__ = "1.20.0"
 

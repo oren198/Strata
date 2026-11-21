@@ -9,7 +9,7 @@ the release PR (`dev` → `main`) and the GitHub Release body are built from
 
 ### Added
 
-- `strata.is_accepted(decision)` answers "was this contribution admitted?": True only for `accept_as_directive` and `accept_as_context`. `ContributionState.accepted` carries the same answer on every record read (`strata_read_scope_record`, `strata_read_contribution`, `GET /scopes/{scope_id}/record` and `GET /scopes/{scope_id}/record/{contribution_id}`). Hosts no longer need to restate the pair of verdicts. `ACCEPTED_DECISIONS` stays.
+- `ContributionState.accepted` answers "was this contribution admitted?" on every record read (`strata_read_scope_record`, `strata_read_contribution`, `GET /scopes/{scope_id}/record` and `GET /scopes/{scope_id}/record/{contribution_id}`). `strata.verdict_admits(decision)` is the lower-level check: it answers whether a verdict admits (True only for `accept_as_directive` and `accept_as_context`). Hosts no longer need to restate the pair of verdicts. `ACCEPTED_DECISIONS` stays.
 
 ## 1.20.0 (2026-11-20)
 

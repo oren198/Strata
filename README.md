@@ -1222,9 +1222,9 @@ the contributor's position comes from the session's binding. The HTTP API takes
 position. That API is for local use and the Console (see SECURITY.md), not the
 agents' path; do not expose it.
 
-### Was this admitted? (`is_accepted`, v1.21)
+### Was this admitted? (`ContributionState.accepted`, v1.21)
 
-To ask whether a contribution was admitted, call `strata.is_accepted(decision)` (True only for `accept_as_directive` and `accept_as_context`; False for `decline`, for no verdict and for any other string), or read `ContributionState.accepted`, which carries the same answer on every record read (`strata_read_contribution`, `strata_read_scope_record` and the HTTP record routes). This is the supported way; do not restate the pair of verdicts in host code. `ACCEPTED_DECISIONS` stays, so nothing that imports it breaks.
+To ask whether a contribution was admitted, read `ContributionState.accepted`. It carries the answer on every record read (`strata_read_contribution`, `strata_read_scope_record` and the HTTP record routes). This is the supported way; do not restate the pair of verdicts in host code. `strata.verdict_admits(decision)` is the lower-level check: it answers whether a *verdict* admits (True only for `accept_as_directive` and `accept_as_context`; False for `decline`, for no verdict and for any other string). `ACCEPTED_DECISIONS` stays, so nothing that imports it breaks.
 
 ## Forgetting
 
