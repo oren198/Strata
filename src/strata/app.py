@@ -3785,6 +3785,37 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
         return judge_usage_report(paths.db_path, since=since, scope_id=scope_id)
 
     # -----------------------------------------------------------------------
+    # GET /review/held: read-only (ADR 0018 D4). The held count, the age of the oldest, and each
+    # held item across scopes. There is no write route for review; approve and reject are CLI only.
+    # -----------------------------------------------------------------------
+
+    @application.get("/review/held")
+    def get_review_held(
+        scope_id: str | None = None,
+        record_store: RecordStore = Depends(get_record_store),
+    ) -> dict:
+        """Every item a review scope is holding for the operator. Nothing here is written."""
+        from strata.review import list_held  # noqa: PLC0415
+
+        listing = list_held(record_store=record_store, scope_id=scope_id)
+        return {
+            "count": listing.count,
+            "oldest_age_seconds": listing.oldest_age_seconds,
+            "items": [
+                {
+                    "id": item.id,
+                    "kind": item.kind,
+                    "scope_id": item.scope_id,
+                    "held_at": item.held_at,
+                    "content": item.summary,
+                    "label": "held for the operator",
+                    "requester": item.requester,
+                }
+                for item in listing.items
+            ],
+        }
+
+    # -----------------------------------------------------------------------
     # Forgetting peripherals (v1.20). Read-only except the operator dismiss.
     # POST /contribute is unchanged: no ends or fulfils on that body.
     # -----------------------------------------------------------------------

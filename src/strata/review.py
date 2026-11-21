@@ -73,6 +73,8 @@ class HeldItem:
     scope_id: str
     held_at: str
     summary: str
+    requester: str | None = None
+    """The session that asked, for a retirement request; ``None`` for a judge-held item."""
 
 
 @dataclass(frozen=True)
@@ -105,6 +107,7 @@ def list_held(
                 request.scope_id,
                 request.requested_at,
                 f"retire {request.directive_id} ({request.kind}): {request.notice}",
+                requester=request.actor_session_id,
             )
         )
     items.sort(key=lambda item: _parse(item.held_at))
