@@ -354,7 +354,7 @@ def _approve_judgment(
         _inherited_directive_texts,
     )
 
-    _judgment, contribution = _held_judgment(item_id, record_store)
+    held_row, contribution = _held_judgment(item_id, record_store)
     scope = fleet.get_scope(contribution.scope_id)
     if scope is None:
         raise ReviewRefusal(f"scope {contribution.scope_id!r} no longer exists.")
@@ -366,7 +366,9 @@ def _approve_judgment(
     with scope_lock(scope.id):
         current = summary_store.read(scope.id)
         live = {d.id for d in current.directives} if current is not None else set()
-        if _already_applied(payload, contribution.id, scope.id, live, record_store):
+        if _already_applied(
+            payload, contribution.id, scope.id, live, record_store, written=held_row.summary_version
+        ):
             # a crash after the write and before the disposition: record the approval only
             record_store.set_judgment_disposition(item_id, APPROVED)
             return record_store.append_review_act(
@@ -479,12 +481,23 @@ def _minted_id(payload: Any, contribution_id: str) -> str | None:
 
 
 def _already_applied(
-    payload: Any, contribution_id: str, scope_id: str, live: set[str], record_store: RecordStore
+    payload: Any,
+    contribution_id: str,
+    scope_id: str,
+    live: set[str],
+    record_store: RecordStore,
+    *,
+    written: int | None = None,
 ) -> bool:
     """Did an earlier approval of this item write its amendment and die before recording the
-    disposition? An admitting op is applied when the directive it mints is live; a retire-only
-    judgment is applied when every target already has a retirement carrying this judgment's
-    reasoning."""
+    disposition? The record says so first: a held judgment has no ``summary_version`` until its
+    own amendment is written (the writer stamps it), so a stamp means this item's write happened.
+    That also covers a supersede-only judgment, which mints nothing and removes a target the
+    summary alone cannot attribute to this item. Failing that, an admitting op is applied when the
+    directive it mints is live, and a retire-only judgment when every target already has a
+    retirement carrying this judgment's reasoning."""
+    if written is not None:
+        return True
     if _minted_id(payload, contribution_id) is not None:
         return contribution_id in live
     retires = [op.id for op in payload.directive_ops if op.op == "retire"]
