@@ -107,6 +107,7 @@ from strata.record_store import (
     is_engine_note,
     verdict_admits,
 )
+from strata.review import perspective_notes as review_perspective_notes
 from strata.session_state import (
     SessionState,
     SessionStateStore,
@@ -2847,6 +2848,19 @@ async def strata_retire(
         )
     except (PositionGateRefusal, ValueError, KeyError) as exc:
         raise RuntimeError(str(exc)) from exc
+    from strata.record_store import RetirementRequest  # noqa: PLC0415
+
+    if isinstance(retirement, RetirementRequest):
+        # ADR 0018 D5: a level-1 scope holds a session's own retire for the operator.
+        return {
+            "directive_id": directive_id,
+            "request_id": retirement.id,
+            "disposition": retirement.disposition,
+            "message": (
+                f"retirement requested; held for the operator; {directive_id} still binds. "
+                "The notice goes out only when the operator enacts it."
+            ),
+        }
     return {**retirement_notice(retirement), "directive_id": directive_id}
 
 
@@ -3612,6 +3626,7 @@ async def strata_read_perspective(scope_id: str | None = None) -> dict:
         publication_reader=_publication_reader,
         change_event_reader=_change_event_reader,
         contribution_reader=_contribution_reader,
+        review_reader=lambda target: review_perspective_notes(target, record_store=_record_store),
         # ADR 0014 D5, issue #203: what the drain above just consumed. Notice
         # is immediate, only absorption is deferred — without this the reader
         # whose read paid for the refresh is the one reader never told what

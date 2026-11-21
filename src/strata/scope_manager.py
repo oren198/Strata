@@ -3524,9 +3524,17 @@ def _render_digest_row(row: RecentContribution, *, verbatim: bool) -> str:
     """
     c = row.contribution
     content = c.content if verbatim else _content_excerpt(c.content)
+    # ADR 0018: a held verdict was never admitted, so the judge must not read it as precedent.
+    # Only a scope that has held items renders differently; every other row is byte-identical.
+    if row.disposition == "held":
+        state_text = f"state=held for the operator (judge said {row.decision})"
+        decision_text = "decision=(held)"
+    else:
+        state_text = f"state={row.state}"
+        decision_text = f"decision={row.decision or '(none)'}"
     return (
         f"[{c.id}] at={c.created_at} subject={c.subject or '(none)'} "
-        f"state={row.state} decision={row.decision or '(none)'} "
+        f"{state_text} {decision_text} "
         f"reasoning={strip_notes_for_judge(row.judgment_notes or '') or '(none)'} "
         f"content={content!r}"
     )

@@ -73,7 +73,7 @@ publication, operator, change event.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from typing import Protocol, TypeVar
 
@@ -634,6 +634,7 @@ def compose_perspective(
     change_event_reader: ChangeEventReader | None = None,
     just_processed: Sequence[_ChangeEventLike] = (),
     contribution_reader: ContributionReader | None = None,
+    review_reader: Callable[[str], Sequence[Mapping[str, str]]] | None = None,
 ) -> dict:
     """Compose *scope_id*'s perspective: own summary, ancestor directives, one-hop publications.
 
@@ -837,6 +838,7 @@ def compose_perspective(
             # One call, shared by the condensation count and the context-ids list below
             # (ADR 0017 P1b) — both read the same accepted-context contributions.
             accepted_context = None if contribution_reader is None else contribution_reader(s.id)
+            review_notes = list(review_reader(s.id)) if review_reader is not None else []
             layers.append(
                 {
                     "scope_id": s.id,
@@ -844,6 +846,9 @@ def compose_perspective(
                     "summary": self_summary,
                     "relation": "self",
                     "binding": True,
+                    # ADR 0018 D6: the contributing scope's own reviewed items, labelled; absent
+                    # when there are none, so a scope without review reads exactly as before.
+                    **({"review": review_notes} if review_notes else {}),
                     # Issue #202: the condensation signal rides the self layer
                     # only — it describes THIS scope's own context, the one
                     # payload composition still carries in full.

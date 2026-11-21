@@ -17,7 +17,12 @@ from typing import TYPE_CHECKING, Literal
 
 from strata.change_events import emit as emit_change_event
 from strata.locks import scope_lock
-from strata.record_store import ContributorRef, Retirement, RetirementCandidate
+from strata.record_store import (
+    ContributorRef,
+    Retirement,
+    RetirementCandidate,
+    RetirementRequest,
+)
 from strata.summary_store import Directive, EndCondition
 
 if TYPE_CHECKING:
@@ -107,8 +112,11 @@ def retire_directive(
     fleet: FleetConfig,
     record_store: RecordStore,
     summary_store: SummaryStore,
-) -> Retirement:
+) -> Retirement | RetirementRequest:
     """Retire one of *scope_id*'s own directives, in person, with a notice. NOT judged.
+
+    In a level-1 review scope (ADR 0018) this records a held retirement REQUEST instead and
+    returns it; the directive keeps binding until the operator approves.
 
     The authority's act: only a session bound to the owning scope may make it. *actor* MUST
     come from the server-side binding of the calling session, never from a tool argument; a
@@ -132,6 +140,22 @@ def retire_directive(
         )
     if kind not in RETIRE_KINDS:
         raise ValueError(f"kind must be one of {RETIRE_KINDS}, got {kind!r}.")
+    scope = fleet.get_scope(scope_id)
+    if scope is not None and scope.human_review >= 1:
+        # ADR 0018 D5: at level 1 a bound session's own retire is a HELD request. The directive
+        # keeps binding for everyone and no notice goes out until the operator enacts it.
+        from strata.review import request_retirement  # noqa: PLC0415
+
+        return request_retirement(
+            scope_id,
+            directive_id,
+            kind,
+            notice,
+            actor_session_id=actor.session_id,
+            fleet=fleet,
+            record_store=record_store,
+            summary_store=summary_store,
+        )
     with scope_lock(scope_id):
         return _retire_locked(
             scope_id,
