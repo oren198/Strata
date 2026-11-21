@@ -14,6 +14,7 @@ judge is down.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
@@ -47,6 +48,19 @@ def review_holds(judgment: Any) -> bool:
     return judgment.decision == "accept_as_directive" or any(
         op.op in _HELD_OPS for op in getattr(judgment, "directive_ops", None) or []
     )
+
+
+def encode_held(judgment_json: str, summary_version: int) -> str:
+    """The stored form of a held judgment: the judge's whole answer plus the version of the
+    scope's summary it was judged against, so an approval can tell whether the scope moved on."""
+    return json.dumps({"summary_version": summary_version, "judgment": json.loads(judgment_json)})
+
+
+def _decode_held(raw: str) -> tuple[str, int | None]:
+    data = json.loads(raw)
+    if isinstance(data, dict) and "judgment" in data:
+        return json.dumps(data["judgment"]), data.get("summary_version")
+    return raw, None  # a bare judgment (no version recorded)
 
 
 # -- the held list ----------------------------------------------------------------------------
@@ -271,7 +285,24 @@ def _approve_request(
     request = _held_request(item_id, record_store)
     with scope_lock(request.scope_id):
         summary = summary_store.read(request.scope_id)
-        if summary is None or request.directive_id not in {d.id for d in summary.directives}:
+        live = {d.id for d in summary.directives} if summary is not None else set()
+        if request.directive_id not in live and any(
+            r.directive_id == request.directive_id
+            and r.retired_by == "scope-session"
+            and r.actor_session_id == request.actor_session_id
+            for r in record_store.list_retirements(scope_id=request.scope_id)
+        ):
+            # a crash after the retirement and before the disposition: record the approval only
+            record_store.set_request_disposition(item_id, APPROVED)
+            return record_store.append_review_act(
+                item_id=item_id,
+                scope_id=request.scope_id,
+                action="approve",
+                actor=operator,
+                reason="already enacted; recorded the approval",
+                directive_id=request.directive_id,
+            )
+        if summary is None or request.directive_id not in live:
             # the SAME directive must still stand; if it was superseded or retired meanwhile
             # the request lapses and nothing is applied (ADR 0018 D5)
             record_store.set_request_disposition(item_id, LAPSED)
@@ -327,13 +358,25 @@ def _approve_judgment(
     scope = fleet.get_scope(contribution.scope_id)
     if scope is None:
         raise ReviewRefusal(f"scope {contribution.scope_id!r} no longer exists.")
-    payload_json = record_store.get_held_payload(item_id)
-    if payload_json is None:
+    stored = record_store.get_held_payload(item_id)
+    if stored is None:
         raise ReviewRefusal(f"{item_id} has no stored judgment to apply.")
+    payload_json, held_version = _decode_held(stored)
     payload = ScopeManagerJudgment.model_validate_json(payload_json)
     with scope_lock(scope.id):
         current = summary_store.read(scope.id)
         live = {d.id for d in current.directives} if current is not None else set()
+        if _already_applied(payload, contribution.id, scope.id, live, record_store):
+            # a crash after the write and before the disposition: record the approval only
+            record_store.set_judgment_disposition(item_id, APPROVED)
+            return record_store.append_review_act(
+                item_id=item_id,
+                scope_id=scope.id,
+                action="approve",
+                actor=operator,
+                reason="already applied; recorded the approval",
+                directive_id=_minted_id(payload, contribution.id),
+            )
         # -- the mechanical re-check: no judge call ------------------------------------------
         lapsed = False
         for op in payload.directive_ops:
@@ -377,10 +420,19 @@ def _approve_judgment(
                         "when enacted in person."
                     )
         # -- apply, through the same writer the accept path uses -----------------------------
-        directive_id = next(
-            (contribution.id for op in payload.directive_ops if op.op in ("append", "publish")),
-            None,
-        )
+        directive_id = _minted_id(payload, contribution.id)
+        # The judge's context rewrite REPLACES the whole context. Apply it only if the scope's
+        # summary has not moved since the hold; otherwise keep the current context and apply the
+        # directive ops alone, so context admitted meanwhile is never wiped.
+        current_version = current.version if current is not None else 0
+        apply_context = held_version is not None and current_version == held_version
+        new_context = payload.new_context if apply_context else None
+        if payload.new_context is None:
+            how = None
+        elif apply_context:
+            how = "applied the judge's context rewrite"
+        else:
+            how = "kept the current context: the scope's summary changed since the hold"
         if payload.new_summary is not None:
             fresh = payload.model_copy(
                 update={
@@ -389,7 +441,7 @@ def _approve_judgment(
                         current_summary=current,
                         contribution=contribution,
                         ops=payload.directive_ops,
-                        new_context=payload.new_context,
+                        new_context=new_context,
                     )
                 }
             )
@@ -415,5 +467,32 @@ def _approve_judgment(
             scope_id=scope.id,
             action="approve",
             actor=operator,
+            reason=how,
             directive_id=directive_id,
         )
+
+
+def _minted_id(payload: Any, contribution_id: str) -> str | None:
+    """The directive an append/publish op mints: its id is the contribution's own."""
+    admits = any(op.op in ("append", "publish") for op in payload.directive_ops)
+    return contribution_id if admits else None
+
+
+def _already_applied(
+    payload: Any, contribution_id: str, scope_id: str, live: set[str], record_store: RecordStore
+) -> bool:
+    """Did an earlier approval of this item write its amendment and die before recording the
+    disposition? An admitting op is applied when the directive it mints is live; a retire-only
+    judgment is applied when every target already has a retirement carrying this judgment's
+    reasoning."""
+    if _minted_id(payload, contribution_id) is not None:
+        return contribution_id in live
+    retires = [op.id for op in payload.directive_ops if op.op == "retire"]
+    if not retires:
+        return False
+    done = {
+        r.directive_id
+        for r in record_store.list_retirements(scope_id=scope_id)
+        if r.reason == payload.reasoning
+    }
+    return all(target in done for target in retires)

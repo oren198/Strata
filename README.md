@@ -1248,7 +1248,7 @@ strata operator review approve <id>         # enact it (a contribution id, or an
 strata operator review reject <id> --reason "..."
 ```
 
-An approval applies the judge's ops unchanged, as the scope's own directive, after a mechanical re-check against the scope as it is now: the targets must still exist, the contributor must still be bound to the scope, and the directive must not contradict what the scope inherits. No judge is called, so approvals work while the judge is down. A request whose directive was changed in the meantime lapses instead. The contributing scope's perspective shows the item as "held for the operator", then "approved" or "rejected: <reason>".
+An approval applies the judge's ops unchanged, as the scope's own directive, after a mechanical re-check against the scope as it is now: the targets must still exist, the contributor must still be bound to the scope, and the directive must not contradict what the scope inherits. No judge is called, so approvals work while the judge is down. A request whose directive was changed in the meantime lapses instead. If the scope's context changed after the hold, the approval applies the directive ops only and keeps the current context, so nothing admitted meanwhile is overwritten; the review act records which happened. Approving the same item twice (for example after a crash) never applies it twice. The contributing scope's perspective shows the item as "held for the operator", then "approved" or "rejected: <reason>".
 
 Limits: Console review is read-only, and approve and reject are CLI only. There is no amend: change a held proposal by contributing a new one. A hold nobody gets to stalls the scope, so check `review list` regularly; this level suits scopes with few, weighty directives.
 

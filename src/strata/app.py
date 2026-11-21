@@ -175,7 +175,7 @@ from strata.record_store import (
     verdict_admits,
 )
 from strata.review import _HELD_OPS as _REVIEW_HELD_OPS
-from strata.review import perspective_notes, review_holds
+from strata.review import encode_held, perspective_notes, review_holds
 from strata.scope_manager import (
     WINDOW_VERBATIM_TAIL,
     ActedOnTarget,
@@ -1066,7 +1066,10 @@ def _judge_and_record(
             relations=_relation_rows(
                 scope_manager, judgment.inherited_relation, judgment.directive_relation
             ),
-            held_payload=judgment.model_dump_json(),
+            held_payload=encode_held(
+                judgment.model_dump_json(),
+                inputs.current_summary.version if inputs.current_summary is not None else 0,
+            ),
         )
         return ContributionOutcome(
             contribution_id=contribution.id,
@@ -2022,7 +2025,11 @@ def _judge_batch_and_record(
     for verdict in batch.verdicts:
         record_store.record_judgment(
             held_payload=(
-                _held_member_payload(batch, verdict)
+                _held_member_payload(
+                    batch,
+                    verdict,
+                    inputs.current_summary.version if inputs.current_summary is not None else 0,
+                )
                 if verdict.contribution_id in held_ids
                 else None
             ),
@@ -2160,7 +2167,9 @@ def _batch_held_member_ids(batch: ScopeManagerBatchJudgment, scope: Scope) -> se
     return held & {v.contribution_id for v in accepted}
 
 
-def _held_member_payload(batch: ScopeManagerBatchJudgment, verdict: BatchVerdict) -> str:
+def _held_member_payload(
+    batch: ScopeManagerBatchJudgment, verdict: BatchVerdict, summary_version: int
+) -> str:
     """The judge's answer for one held batch member, shaped like a single judgment so that an
     approval applies it through the same path: its own verdict and its own ops."""
     accepted = [v for v in batch.verdicts if v.decision != "decline"]
@@ -2168,13 +2177,14 @@ def _held_member_payload(batch: ScopeManagerBatchJudgment, verdict: BatchVerdict
     ops = [
         op for op in batch.directive_ops if (op.contribution_id or first) == verdict.contribution_id
     ]
-    return ScopeManagerJudgment(
+    held = ScopeManagerJudgment(
         decision=verdict.decision,
         reasoning=verdict.reasoning,
         directive_ops=ops,
         new_context=None,
         new_summary=batch.new_summary if ops else None,
-    ).model_dump_json()
+    )
+    return encode_held(held.model_dump_json(), summary_version)
 
 
 def _batch_without_held(
