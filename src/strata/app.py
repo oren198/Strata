@@ -170,9 +170,9 @@ from strata.record_store import (
     RecentContribution,
     RecordStore,
     engine_note_rejudge_message,
-    is_accepted,
     is_engine_note,
     standing_evidence,
+    verdict_admits,
 )
 from strata.scope_manager import (
     WINDOW_VERBATIM_TAIL,
@@ -2221,7 +2221,7 @@ def validate_acted_on(
             "layer inside your own perspective — never as its own record or "
             "perspective target."
         )
-    if entry.judgment is None or not is_accepted(entry.judgment.decision):
+    if entry.judgment is None or not verdict_admits(entry.judgment.decision):
         raise RuntimeError(
             f"acted_on={acted_on!r} references a contribution that was never admitted "
             "into memory (it was declined, or has no verdict yet) — you can only report "

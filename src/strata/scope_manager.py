@@ -73,7 +73,7 @@ from strata.lineage import (
     render_lineage_block,
 )
 from strata.operator import OperatorItem
-from strata.record_store import Contribution, ContributorRef, RecentContribution, is_accepted
+from strata.record_store import Contribution, ContributorRef, RecentContribution, verdict_admits
 from strata.summary_store import (
     Directive,
     EndCondition,
@@ -2672,7 +2672,7 @@ def _unattributed_operator_echoes(
     directive, and demanding it for an operator context item would have the
     judge write a false label.
     """
-    if not operator_directive_ids or not is_accepted(judgment.decision):
+    if not operator_directive_ids or not verdict_admits(judgment.decision):
         return []
     admitted = _amendment_summary_text(judgment, contribution)
     return [
@@ -2712,7 +2712,7 @@ def _engine_detected_operator_echoes(
     any ``publish``ed directive content), not on the whole rewritten context, which would fire on
     old lines; the attribution is looked for in the admitted text (:func:`_amendment_summary_text`).
     Directives only (not operator context) and accepts only; ids already attributed are left out."""
-    if not operator_directives or not is_accepted(judgment.decision):
+    if not operator_directives or not verdict_admits(judgment.decision):
         return []
     admitted = _amendment_summary_text(judgment, contribution)
     if not admitted.strip():
@@ -2762,7 +2762,7 @@ def _batch_attribution_gaps(
     engine_only: list[str] = []
     for verdict in judgment.verdicts:
         member = contributions.get(verdict.contribution_id)
-        if member is None or not is_accepted(verdict.decision):
+        if member is None or not verdict_admits(verdict.decision):
             continue
         own = member.content + "\n".join(
             op.content
@@ -9926,7 +9926,7 @@ class ScopeManager:
             to `protocol_notes` on every path below, so a trigger is always
             countable in the record whatever it resolves to.
             """
-            if not is_accepted(judgment.decision):
+            if not verdict_admits(judgment.decision):
                 return judgment
             if entitlement is None:
                 return judgment
