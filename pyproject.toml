@@ -41,6 +41,9 @@ dev = [
     "httpx",
 ]
 
+[tool.hatch.build.targets.sdist]
+exclude = ["/integrations"]
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/strata"]
 include = [
