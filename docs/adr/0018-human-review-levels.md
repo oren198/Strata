@@ -83,3 +83,6 @@ Nothing is deleted. A rejected item stays in the record.
 2. **Re-check before apply is mechanical only** (inherited conflict, target exists, position gate), with no judge call. If a check fails, the approval is refused with the reason and nothing enters. Approvals work while the judge is down.
 3. **A level, not a boolean.** The setting is `human_review: 0|1`.
 4. **The operator's own acts and date lapses pass directly, and context is not gated** (the operator, 2026-11-21).
+
+## Known limits
+- **Approving again after a crash.** Approval writes the amendment, then records the disposition, and a second approve recognises an item that was already applied. One window is not recognised: if the process dies after the summary file is written but before the judgment row is stamped, nothing records that the item was applied. A second approve then runs the re-check as if it had not been: a supersede is refused because its target is gone, and an append or publish is recognised because its directive is live. Nothing is ever written twice.
