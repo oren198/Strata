@@ -2594,6 +2594,100 @@ def cmd_operator_show(args: argparse.Namespace) -> int:
 _operator_evidence_parser: argparse.ArgumentParser | None = None
 
 
+_operator_review_parser: argparse.ArgumentParser | None = None
+
+
+def cmd_operator_review_root(args: argparse.Namespace) -> int:
+    """``strata operator review`` with no subcommand: print the group's help."""
+    if _operator_review_parser is not None:
+        _operator_review_parser.print_help()
+    return 0
+
+
+def _format_age(seconds: float | None) -> str:
+    if seconds is None:
+        return "none"
+    minutes = int(seconds // 60)
+    if minutes < 60:
+        return f"{minutes}m"
+    hours, rest = divmod(minutes, 60)
+    if hours < 48:
+        return f"{hours}h{rest:02d}m"
+    return f"{hours // 24}d"
+
+
+def cmd_operator_review_list(args: argparse.Namespace) -> int:
+    """``strata operator review list``: the held count and the age of the oldest (ADR 0018 D4)."""
+    from strata.review import list_held
+    from strata.stores import EmbeddedStoreError, open_embedded_stores
+
+    try:
+        stores = open_embedded_stores()
+    except EmbeddedStoreError as exc:
+        print(exc.message, file=sys.stderr)
+        return 1
+    with stores:
+        listing = list_held(record_store=stores.record_store, scope_id=args.scope)
+    print(f"{listing.count} held, oldest {_format_age(listing.oldest_age_seconds)}")
+    for item in listing.items:
+        print(f"{item.id}\t{item.scope_id}\t{item.kind}\t{item.held_at}\t{item.summary}")
+    return 0
+
+
+def cmd_operator_review_approve(args: argparse.Namespace) -> int:
+    """``strata operator review approve <id>``: enact a held item, mechanically re-checked."""
+    from strata.review import ReviewRefusal, approve
+    from strata.stores import EmbeddedStoreError, open_embedded_stores
+
+    try:
+        stores = open_embedded_stores()
+    except EmbeddedStoreError as exc:
+        print(exc.message, file=sys.stderr)
+        return 1
+    with stores:
+        try:
+            act = approve(
+                args.id,
+                operator="operator",
+                fleet=stores.fleet_config,
+                record_store=stores.record_store,
+                summary_store=stores.summary_store,
+            )
+        except ReviewRefusal as exc:
+            print(f"Refused: {exc}", file=sys.stderr)
+            return 1
+    outcome = "lapsed (nothing applied)" if act.action == "lapse" else "approved"
+    print(f"{args.id} {outcome} (review act {act.id}).")
+    return 0
+
+
+def cmd_operator_review_reject(args: argparse.Namespace) -> int:
+    """``strata operator review reject <id> --reason ...``: nothing enters; the reason is kept."""
+    from strata.review import ReviewRefusal, reject
+    from strata.stores import EmbeddedStoreError, open_embedded_stores
+
+    try:
+        stores = open_embedded_stores()
+    except EmbeddedStoreError as exc:
+        print(exc.message, file=sys.stderr)
+        return 1
+    with stores:
+        try:
+            act = reject(
+                args.id,
+                args.reason,
+                operator="operator",
+                fleet=stores.fleet_config,
+                record_store=stores.record_store,
+                summary_store=stores.summary_store,
+            )
+        except (ReviewRefusal, ValueError) as exc:
+            print(f"Refused: {exc}", file=sys.stderr)
+            return 1
+    print(f"{args.id} rejected (review act {act.id}).")
+    return 0
+
+
 def cmd_operator_evidence_root(args: argparse.Namespace) -> int:
     """``strata operator evidence`` with no subcommand — print the group's help."""
     if _operator_evidence_parser is not None:
@@ -5997,6 +6091,34 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Attachment scope to show. Omit to show every attachment scope + totals.",
     )
     p_op_show.set_defaults(func=cmd_operator_show)
+
+    global _operator_review_parser
+    p_op_review = operator_sub.add_parser(
+        "review",
+        help="Dispose of the directive changes a human-review scope holds.",
+    )
+    _operator_review_parser = p_op_review
+    p_op_review.set_defaults(func=cmd_operator_review_root)
+    review_sub = p_op_review.add_subparsers(dest="review_command", metavar="<review-command>")
+    p_op_review_list = review_sub.add_parser(
+        "list", help="Show the held count and the age of the oldest held item."
+    )
+    p_op_review_list.add_argument("--scope", default=None, help="Only this scope's held items.")
+    p_op_review_list.set_defaults(func=cmd_operator_review_list)
+    p_op_review_approve = review_sub.add_parser(
+        "approve",
+        help="Enact a held item (the judge's ops unchanged, after a mechanical re-check).",
+    )
+    p_op_review_approve.add_argument(
+        "id", help="A held contribution id (c_...) or request (rr_...)."
+    )
+    p_op_review_approve.set_defaults(func=cmd_operator_review_approve)
+    p_op_review_reject = review_sub.add_parser(
+        "reject", help="Reject a held item. The reason is recorded and reaches the scope."
+    )
+    p_op_review_reject.add_argument("id")
+    p_op_review_reject.add_argument("--reason", required=True)
+    p_op_review_reject.set_defaults(func=cmd_operator_review_reject)
 
     global _operator_evidence_parser
     p_op_evidence = operator_sub.add_parser(

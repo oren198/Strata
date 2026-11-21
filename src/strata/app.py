@@ -174,14 +174,18 @@ from strata.record_store import (
     standing_evidence,
     verdict_admits,
 )
+from strata.review import _HELD_OPS as _REVIEW_HELD_OPS
+from strata.review import encode_held, perspective_notes, review_holds
 from strata.scope_manager import (
     WINDOW_VERBATIM_TAIL,
     ActedOnTarget,
+    BatchVerdict,
     ExaminedContextItem,
     JudgeMode,
     ScopeManager,
     ScopeManagerBatchJudgment,
     ScopeManagerJudgment,
+    _apply_batch_amendment,
     is_held_note,
     strip_record_only_notes,
 )
@@ -1047,6 +1051,36 @@ def _judge_and_record(
     # judge) still records the right id.
     if isinstance(judgment, ScopeManagerJudgment) and judgment.contribution_id is None:
         judgment = judgment.model_copy(update={"contribution_id": contribution.id})
+
+    # ADR 0018 (#126): a review scope HOLDS a judgment that would change its directives. This is
+    # the one seam on the single path: after the judge and every engine guard (the position gate,
+    # the inherited-conflict check, the R2 guard), before any amendment, so nothing below runs for
+    # a held item. The verdict is recorded verbatim with disposition `held`, and the judge's whole
+    # answer rides beside it so an approval can apply exactly those ops later.
+    if scope.human_review >= 1 and review_holds(judgment):
+        record_store.record_judgment(
+            contribution_id=contribution.id,
+            decision=judgment.decision,
+            judged_by="scope-manager",
+            notes=judgment.record_notes,
+            relations=_relation_rows(
+                scope_manager, judgment.inherited_relation, judgment.directive_relation
+            ),
+            held_payload=encode_held(
+                judgment.model_dump_json(),
+                inputs.current_summary.version if inputs.current_summary is not None else 0,
+            ),
+        )
+        return ContributionOutcome(
+            contribution_id=contribution.id,
+            decision=judgment.decision,
+            reasoning=judgment.reasoning,
+            summary_updated=False,
+            watermark_before=watermark_before,
+            watermark_after=_scope_watermark(
+                scope.id, fleet=fleet, record_store=record_store, summary_store=summary_store
+            ),
+        )
 
     # ADR 0017 P3: a failed outcome mints its linking event in the SAME transaction
     # as the judgment (RecordStore.record_judgment's claim_event, atomic). Gated on
@@ -1981,10 +2015,24 @@ def _judge_batch_and_record(
         # its own contribution rather than someone else's.
         return _fail_batch(contributions, exc, record_store=record_store, outcome=JUDGE_FAILED)
 
+    # ADR 0018 (#126): at level 1 a member whose verdict reads as binding, or who owns an op
+    # that changes the directives, is HELD for the operator: its verdict is recorded verbatim
+    # with its own ops beside it, and the batch's one amendment is rebuilt without those ops.
+    held_ids = _batch_held_member_ids(batch, scope)
+
     # One judgment row per verdict, against its own contribution id, in
     # arrival order — the record's shape does not know this was a batch.
     for verdict in batch.verdicts:
         record_store.record_judgment(
+            held_payload=(
+                _held_member_payload(
+                    batch,
+                    verdict,
+                    inputs.current_summary.version if inputs.current_summary is not None else 0,
+                )
+                if verdict.contribution_id in held_ids
+                else None
+            ),
             contribution_id=verdict.contribution_id,
             decision=verdict.decision,
             judged_by="scope-manager",
@@ -2010,23 +2058,30 @@ def _judge_batch_and_record(
             ),
         )
 
+    amend = _batch_without_held(
+        batch,
+        held_ids,
+        scope=scope,
+        contributions=contributions,
+        current_summary=inputs.current_summary,
+    )
     summary_updated = False
-    if batch.accepted_verdicts and batch.new_summary is not None:
+    if amend.accepted_verdicts and amend.new_summary is not None:
         # Every op names the batch member that motivated it (ADR 0011 D3), so
         # each retirement's reason and each withdrawal's trigger come off the
         # op itself — the record never guesses which contribution meant it.
-        circumstances = batch.retirement_circumstances()
+        circumstances = amend.retirement_circumstances()
         retirements = [
             (
                 directive_id,
-                batch.verdict_reasoning(contribution_id or ""),
+                amend.verdict_reasoning(contribution_id or ""),
                 circumstances.get(directive_id),
             )
-            for directive_id, contribution_id in batch.directive_retirements()
+            for directive_id, contribution_id in amend.directive_retirements()
         ]
         removals = [
             (directive_id, contribution_id or "")
-            for directive_id, contribution_id in batch.directive_removals()
+            for directive_id, contribution_id in amend.directive_removals()
         ]
         # ADR 0017 P4: a coalesced drain is always the batch shape (D4's own note),
         # so the JUDGE's own withdraw_published, if it makes one, must still be
@@ -2040,7 +2095,7 @@ def _judge_batch_and_record(
             else None
         )
         _write_amendment(
-            batch,
+            amend,
             scope=scope,
             fleet=fleet,
             record_store=record_store,
@@ -2052,8 +2107,8 @@ def _judge_batch_and_record(
             # A withdraw_published verdict is submitted against the amendment
             # as a whole, so it carries every accepted member's reasoning
             # rather than a guess at which one meant it.
-            withdraw_reasoning=batch.batch_reasoning,
-            judged_contribution_ids=[v.contribution_id for v in batch.accepted_verdicts],
+            withdraw_reasoning=amend.batch_reasoning,
+            judged_contribution_ids=[v.contribution_id for v in amend.accepted_verdicts],
             withdraw_notice_kind=(
                 "claim_corrected" if batch_refresh_correction is not None else "withdrawn"
             ),
@@ -2082,12 +2137,81 @@ def _judge_batch_and_record(
             reasoning=verdict.reasoning,
             # A declined member did not update the summary, whatever its
             # batch-mates did — the same thing a single decline reports.
-            summary_updated=summary_updated and verdict.decision != "decline",
+            summary_updated=(
+                summary_updated
+                and verdict.decision != "decline"
+                and verdict.contribution_id not in held_ids
+            ),
             watermark_before=watermark_before,
             watermark_after=watermark_after,
         )
         for verdict in batch.verdicts
     ]
+
+
+def _batch_held_member_ids(batch: ScopeManagerBatchJudgment, scope: Scope) -> set[str]:
+    """The batch members a review scope HOLDS (ADR 0018): empty below level 1."""
+    if scope.human_review < 1:
+        return set()
+    accepted = [v for v in batch.verdicts if v.decision != "decline"]
+    if not accepted:
+        return set()
+    held: set[str] = set()
+    for verdict in accepted:
+        if verdict.decision == "accept_as_directive":
+            held.add(verdict.contribution_id)
+    for op in batch.directive_ops:
+        if op.op in _REVIEW_HELD_OPS:
+            # an op that names no member belongs to the first accepted one
+            held.add(op.contribution_id or accepted[0].contribution_id)
+    return held & {v.contribution_id for v in accepted}
+
+
+def _held_member_payload(
+    batch: ScopeManagerBatchJudgment, verdict: BatchVerdict, summary_version: int
+) -> str:
+    """The judge's answer for one held batch member, shaped like a single judgment so that an
+    approval applies it through the same path: its own verdict and its own ops."""
+    accepted = [v for v in batch.verdicts if v.decision != "decline"]
+    first = accepted[0].contribution_id if accepted else None
+    ops = [
+        op for op in batch.directive_ops if (op.contribution_id or first) == verdict.contribution_id
+    ]
+    held = ScopeManagerJudgment(
+        decision=verdict.decision,
+        reasoning=verdict.reasoning,
+        directive_ops=ops,
+        new_context=None,
+        new_summary=batch.new_summary if ops else None,
+    )
+    return encode_held(held.model_dump_json(), summary_version)
+
+
+def _batch_without_held(
+    batch: ScopeManagerBatchJudgment,
+    held_ids: set[str],
+    *,
+    scope: Scope,
+    contributions: Sequence[Contribution],
+    current_summary: ScopeSummary | None,
+) -> ScopeManagerBatchJudgment:
+    """The batch as the AMENDMENT sees it: held members' verdicts and ops removed, the one new
+    summary rebuilt from what is left. Unchanged when nothing is held."""
+    if not held_ids:
+        return batch
+    first = next((v.contribution_id for v in batch.verdicts if v.decision != "decline"), None)
+    kept_ops = [op for op in batch.directive_ops if (op.contribution_id or first) not in held_ids]
+    kept_verdicts = [v for v in batch.verdicts if v.contribution_id not in held_ids]
+    update: dict = {"directive_ops": kept_ops, "verdicts": kept_verdicts}
+    if batch.new_summary is not None and any(v.decision != "decline" for v in kept_verdicts):
+        update["new_summary"] = _apply_batch_amendment(
+            scope=scope,
+            current_summary=current_summary,
+            contributions={c.id: c for c in contributions},
+            ops=kept_ops,
+            new_context=batch.new_context,
+        )
+    return batch.model_copy(update=update)
 
 
 def _fail_batch(
@@ -3948,6 +4072,8 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
                 operator_reader=_operator_reader,
                 publication_reader=_publication_reader,
                 change_event_reader=_change_event_reader,
+                # ADR 0018 D6: the operator sees exactly what the agent sees, held items included.
+                review_reader=lambda target: perspective_notes(target, record_store=record_store),
             )
         except ValueError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc

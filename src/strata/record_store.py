@@ -84,6 +84,14 @@ def _new_judgment_id() -> str:
     return f"j_{secrets.token_hex(8)}"
 
 
+def _new_retirement_request_id() -> str:
+    return f"rr_{secrets.token_hex(8)}"
+
+
+def _new_review_act_id() -> str:
+    return f"ra_{secrets.token_hex(8)}"
+
+
 def _new_judgment_attempt_id() -> str:
     return f"ja_{secrets.token_hex(8)}"
 
@@ -252,6 +260,51 @@ class Judgment:
     Shared by every accepted row of one batch (ADR 0011 D3: one write);
     ``None`` for a decline and for rows judged before the column existed."""
 
+    disposition: str | None = None
+    """ADR 0018 (migration 0028): ``None`` when no review applied (today's behaviour), else
+    ``held`` | ``approved`` | ``rejected`` | ``lapsed``. It sits beside the verdict, which is
+    never overwritten: a held ``accept_as_directive`` was not admitted."""
+
+
+@dataclass(frozen=True)
+class HeldJudgment:
+    """A judgment held for the operator (ADR 0018): which contribution, where, since when."""
+
+    contribution_id: str
+    scope_id: str
+    decision: str
+    held_at: str
+
+
+@dataclass(frozen=True)
+class RetirementRequest:
+    """A bound session's own ``strata_retire`` at level 1 (ADR 0018 D5): actor session, kind,
+    notice and time, awaiting the operator. The directive keeps binding until it is approved."""
+
+    id: str
+    scope_id: str
+    directive_id: str
+    kind: Literal["currency", "correction"]
+    notice: str
+    actor_session_id: str
+    requested_at: str
+    disposition: Literal["held", "approved", "rejected", "lapsed"]
+    reason: str | None
+
+
+@dataclass(frozen=True)
+class ReviewAct:
+    """The operator's review act (ADR 0018 D4/D8): who, what, why, and the resulting directive."""
+
+    id: str
+    item_id: str
+    scope_id: str
+    action: Literal["approve", "reject", "lapse"]
+    actor: str
+    reason: str | None
+    directive_id: str | None
+    created_at: str
+
 
 #: The mechanical failed-judgment marker (issue #118).  Written on a
 #: :class:`JudgmentAttempt` when the scope-manager's ``judge()`` call failed and
@@ -347,6 +400,9 @@ class ContributionState:
       predate the marker.  ``failed_attempts`` still counts its attempts
       (issue #57), so an orphan reads as "pending, N failed attempts" rather
       than being retroactively declared terminal.
+    - ``held`` — a verdict exists and a review level HELD it for the operator (ADR 0018):
+      ``decision`` carries the judge's verdict verbatim, but the contribution was never admitted.
+      It is not pending (the judge has spoken) and not accepted.
     - ``note`` — an engine note (:func:`is_engine_note`). The engine wrote the
       row to record that a change notice could not be delivered. It is not
       waiting on a judgment, and it is not a judge outage. The recency window
@@ -358,19 +414,22 @@ class ContributionState:
     superseded, which is why it is meaningful even in the ``judged`` state.
 
     ``accepted`` is derived, not stored. It is THE answer to "was this contribution admitted",
-    and it rides in the serialised state of every read surface. Today it is True only for a
-    judged ``accept_as_directive`` or ``accept_as_context`` (False for a decline and for
-    judge_failed, pending and note).
+    and it rides in the serialised state of every read surface. It is True only for a judged
+    ``accept_as_directive`` or ``accept_as_context`` that review did not hold: False for a
+    decline, for judge_failed, pending and note, and for an item that is held, rejected or lapsed
+    (``disposition``). An approved item is accepted. It derives from the verdict AND the
+    disposition, in the one derivation (:func:`_derive_contribution_state`).
     """
 
     contribution_id: str
-    state: Literal["judged", "judge_failed", "pending", "note"]
+    state: Literal["judged", "judge_failed", "pending", "note", "held"]
     decision: Literal["accept_as_directive", "accept_as_context", "decline"] | None
     failed_attempts: int
     error_class: str | None
     error_message: str | None
     failed_at: str | None
     accepted: bool
+    disposition: str | None = None
 
 
 @dataclass(frozen=True)
@@ -395,6 +454,9 @@ class RecentContribution:
     state: Literal["judged", "judge_failed", "pending"]
     decision: Literal["accept_as_directive", "accept_as_context", "decline"] | None
     judgment_notes: str | None
+    disposition: str | None = None
+    """ADR 0018: ``held`` for a judgment a review scope holds for the operator; the digest renders
+    it as held, never as precedent. ``None`` when no review applied (every level-0 row)."""
 
 
 @dataclass(frozen=True)
@@ -1275,6 +1337,7 @@ class RecordStore:
             FROM contributions c
             JOIN judgments j ON j.contribution_id = c.id
             WHERE c.scope_id = ? AND j.decision = 'accept_as_context'
+              AND (j.disposition IS NULL OR j.disposition = 'approved')
             ORDER BY c.created_at ASC, c.rowid ASC
             """,
             (scope_id,),
@@ -1384,6 +1447,7 @@ class RecordStore:
         notes: str | None = None,
         claim_event: ClaimEventInput | None = None,
         relations: Sequence[Mapping[str, Any]] = (),
+        held_payload: str | None = None,
     ) -> Judgment:
         """Record the scope-manager's verdict on a contribution.
 
@@ -1419,16 +1483,33 @@ class RecordStore:
 
         *relations* are the relation re-ask outcomes that fed this verdict (see
         :meth:`record_relation_calls`); they are written in the same transaction.
+
+        *held_payload* (ADR 0018) is the judge's whole answer as JSON, given only when the
+        review level HOLDS this judgment: the verdict is stored verbatim with disposition
+        ``held`` and the payload beside it, in the same transaction.
         """
         judgment_id = _new_judgment_id()
         with self._conn:  # one transaction: the judgment, and the event if given
             self._conn.execute(
                 """
-                INSERT INTO judgments (id, contribution_id, decision, judged_by, notes)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO judgments (id, contribution_id, decision, judged_by, notes,
+                                       disposition)
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (judgment_id, contribution_id, decision, judged_by, notes),
+                (
+                    judgment_id,
+                    contribution_id,
+                    decision,
+                    judged_by,
+                    notes,
+                    "held" if held_payload is not None else None,
+                ),
             )
+            if held_payload is not None:
+                self._conn.execute(
+                    "INSERT INTO held_judgments (contribution_id, payload_json) VALUES (?, ?)",
+                    (contribution_id, held_payload),
+                )
             self._insert_relation_calls(relations, contribution_id=contribution_id)
             if claim_event is not None:
                 self._insert_change_event(
@@ -1444,6 +1525,134 @@ class RecordStore:
                     processed=True,
                 )
         return self._fetch_judgment(judgment_id)
+
+    # -- human review (ADR 0018, #126) ---------------------------------------------------------
+
+    def get_held_payload(self, contribution_id: str) -> str | None:
+        """The judge's whole answer for a held judgment (JSON), or ``None``."""
+        row = self._conn.execute(
+            "SELECT payload_json FROM held_judgments WHERE contribution_id = ?",
+            (contribution_id,),
+        ).fetchone()
+        return None if row is None else str(row["payload_json"])
+
+    def set_judgment_disposition(self, contribution_id: str, disposition: str) -> None:
+        """Move a held judgment to ``approved`` / ``rejected`` / ``lapsed``. Only the disposition
+        changes; the verdict is never touched. Raises ``KeyError`` when the contribution has no
+        HELD judgment (an item is disposed of once)."""
+        with self._conn:
+            cursor = self._conn.execute(
+                "UPDATE judgments SET disposition = ? "
+                "WHERE contribution_id = ? AND disposition = 'held'",
+                (disposition, contribution_id),
+            )
+        if cursor.rowcount != 1:
+            raise KeyError(f"{contribution_id} has no held judgment.")
+
+    def list_held_judgments(self, *, scope_id: str | None = None) -> list[HeldJudgment]:
+        """Judgments held for the operator, oldest first."""
+        where = "AND c.scope_id = ?" if scope_id is not None else ""
+        params: tuple[str, ...] = (scope_id,) if scope_id is not None else ()
+        rows = self._conn.execute(
+            f"""
+            SELECT c.id AS contribution_id, c.scope_id AS scope_id, j.decision AS decision,
+                   j.created_at AS held_at
+            FROM judgments j JOIN contributions c ON c.id = j.contribution_id
+            WHERE j.disposition = 'held' {where}
+            ORDER BY j.created_at ASC, j.rowid ASC
+            """,
+            params,
+        ).fetchall()
+        return [HeldJudgment(**dict(row)) for row in rows]
+
+    def append_retirement_request(
+        self,
+        *,
+        scope_id: str,
+        directive_id: str,
+        kind: Literal["currency", "correction"],
+        notice: str,
+        actor_session_id: str,
+    ) -> RetirementRequest:
+        """Record a bound session's own retire as a HELD request (level 1). Changes nothing else."""
+        request_id = _new_retirement_request_id()
+        with self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO retirement_requests
+                    (id, scope_id, directive_id, kind, notice, actor_session_id)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (request_id, scope_id, directive_id, kind, notice, actor_session_id),
+            )
+        request = self.get_retirement_request(request_id)
+        assert request is not None
+        return request
+
+    def get_retirement_request(self, request_id: str) -> RetirementRequest | None:
+        row = self._conn.execute(
+            "SELECT * FROM retirement_requests WHERE id = ?", (request_id,)
+        ).fetchone()
+        return None if row is None else RetirementRequest(**dict(row))
+
+    def list_retirement_requests(
+        self, *, scope_id: str | None = None, disposition: str | None = None
+    ) -> list[RetirementRequest]:
+        clauses, params = [], []
+        if scope_id is not None:
+            clauses.append("scope_id = ?")
+            params.append(scope_id)
+        if disposition is not None:
+            clauses.append("disposition = ?")
+            params.append(disposition)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self._conn.execute(
+            f"SELECT * FROM retirement_requests {where} ORDER BY requested_at ASC, rowid ASC",
+            params,
+        ).fetchall()
+        return [RetirementRequest(**dict(row)) for row in rows]
+
+    def set_request_disposition(
+        self, request_id: str, disposition: str, *, reason: str | None = None
+    ) -> None:
+        """Move a HELD request to ``approved`` / ``rejected`` / ``lapsed`` (disposed of once)."""
+        with self._conn:
+            cursor = self._conn.execute(
+                "UPDATE retirement_requests SET disposition = ?, reason = ? "
+                "WHERE id = ? AND disposition = 'held'",
+                (disposition, reason, request_id),
+            )
+        if cursor.rowcount != 1:
+            raise KeyError(f"{request_id} is not a held retirement request.")
+
+    def append_review_act(
+        self,
+        *,
+        item_id: str,
+        scope_id: str,
+        action: Literal["approve", "reject", "lapse"],
+        actor: str,
+        reason: str | None = None,
+        directive_id: str | None = None,
+    ) -> ReviewAct:
+        act_id = _new_review_act_id()
+        with self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO review_acts (id, item_id, scope_id, action, actor, reason, directive_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (act_id, item_id, scope_id, action, actor, reason, directive_id),
+            )
+        row = self._conn.execute("SELECT * FROM review_acts WHERE id = ?", (act_id,)).fetchone()
+        return ReviewAct(**dict(row))
+
+    def list_review_acts(self, *, item_id: str | None = None) -> list[ReviewAct]:
+        where, params = ("WHERE item_id = ?", (item_id,)) if item_id is not None else ("", ())
+        rows = self._conn.execute(
+            f"SELECT * FROM review_acts {where} ORDER BY created_at ASC, rowid ASC", params
+        ).fetchall()
+        return [ReviewAct(**dict(row)) for row in rows]
 
     def _insert_relation_calls(
         self,
@@ -1606,7 +1815,7 @@ class RecordStore:
         rows = self._conn.execute(
             """
             SELECT j.id, j.contribution_id, j.decision, j.judged_by, j.notes, j.created_at,
-                   j.summary_version
+                   j.summary_version, j.disposition
             FROM judgments j
             JOIN contributions c ON j.contribution_id = c.id
             WHERE c.scope_id = ?
@@ -1625,7 +1834,8 @@ class RecordStore:
         """
         row = self._conn.execute(
             """
-            SELECT id, contribution_id, decision, judged_by, notes, created_at, summary_version
+            SELECT id, contribution_id, decision, judged_by, notes, created_at, summary_version,
+                   disposition
             FROM judgments WHERE contribution_id = ?
             """,
             (contribution_id,),
@@ -1637,7 +1847,8 @@ class RecordStore:
     def _fetch_judgment(self, judgment_id: str) -> Judgment:
         row = self._conn.execute(
             """
-            SELECT id, contribution_id, decision, judged_by, notes, created_at, summary_version
+            SELECT id, contribution_id, decision, judged_by, notes, created_at, summary_version,
+                   disposition
             FROM judgments WHERE id = ?
             """,
             (judgment_id,),
@@ -2022,6 +2233,7 @@ class RecordStore:
             FROM contributions c
             JOIN judgments j ON j.contribution_id = c.id
             WHERE c.supersedes = ? AND j.decision IN (?, ?)
+              AND (j.disposition IS NULL OR j.disposition = 'approved')
             LIMIT 1
             """,
             (contribution_id, *ACCEPTED_DECISIONS),
@@ -2053,7 +2265,8 @@ class RecordStore:
         placeholders = ", ".join("?" for _ in contribution_ids)
         rows = self._conn.execute(
             f"""
-            SELECT id, contribution_id, decision, judged_by, notes, created_at, summary_version
+            SELECT id, contribution_id, decision, judged_by, notes, created_at, summary_version,
+                   disposition
             FROM judgments
             WHERE contribution_id IN ({placeholders})
             ORDER BY created_at ASC, rowid ASC
@@ -2116,6 +2329,7 @@ class RecordStore:
                    c.contributor_session_id, c.contributor_ts,
                    c.created_at,
                    j.decision AS decision, j.notes AS judgment_notes,
+                   j.disposition AS disposition,
                    (SELECT COUNT(*) FROM judgment_attempts a
                      WHERE a.contribution_id = c.id AND a.outcome = ?) AS failed_marks
             FROM contributions c
@@ -2163,6 +2377,7 @@ class RecordStore:
             FROM contributions c
             JOIN judgments j ON j.contribution_id = c.id
             WHERE c.scope_id = ? AND j.decision IN ({placeholders})
+              AND (j.disposition IS NULL OR j.disposition = 'approved')
             ORDER BY c.created_at DESC, c.rowid DESC
             LIMIT 1
             """,
@@ -4065,7 +4280,9 @@ def _derive_contribution_state(
     # A verdict always wins: a contribution that failed twice and was then
     # re-judged successfully is judged, not judge_failed.
     if judgment is not None:
-        state: Literal["judged", "judge_failed", "pending", "note"] = "judged"
+        state: Literal["judged", "judge_failed", "pending", "note", "held"] = (
+            "held" if judgment.disposition == "held" else "judged"
+        )
     elif is_engine_note(subject):
         state = "note"
     elif any(a.outcome == JUDGE_FAILED for a in attempts):
@@ -4084,7 +4301,12 @@ def _derive_contribution_state(
         error_class=last_failure.error_class if last_failure is not None else None,
         error_message=last_failure.message if last_failure is not None else None,
         failed_at=last_failure.attempted_at if last_failure is not None else None,
-        accepted=verdict_admits(judgment.decision if judgment is not None else None),
+        accepted=(
+            judgment is not None
+            and verdict_admits(judgment.decision)
+            and judgment.disposition in (None, "approved")
+        ),
+        disposition=judgment.disposition if judgment is not None else None,
     )
 
 
@@ -4435,6 +4657,7 @@ def _recent_contribution_from_row(row: sqlite3.Row) -> RecentContribution:
     d = dict(row)
     decision = d.pop("decision")
     judgment_notes = d.pop("judgment_notes")
+    disposition = d.pop("disposition")
     failed_marks = d.pop("failed_marks")
     contributor = ContributorRef(
         scope_id=d.pop("contributor_scope_id"),
@@ -4454,6 +4677,7 @@ def _recent_contribution_from_row(row: sqlite3.Row) -> RecentContribution:
         state=state,
         decision=decision,
         judgment_notes=judgment_notes,
+        disposition=disposition,
     )
 
 

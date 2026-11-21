@@ -194,6 +194,17 @@ class Scope(BaseModel):
     """What this scope's memory is for — its stated purpose (#210). The judge measures
     relevance against it; without one it falls back to "the project's work". Optional:
     absent (or blank) is ``None`` and existing fleets load unchanged."""
+    human_review: int = 0
+    """The scope's human review LEVEL (ADR 0018, #126). ``0`` (the default) is off and changes
+    nothing. ``1``: every directive change by a delegated party is held for the operator. Any
+    other value is refused at load; an unknown level never falls back to 0 or 1."""
+
+    @field_validator("human_review", mode="before")
+    @classmethod
+    def _only_defined_levels(cls, value: object) -> int:
+        if isinstance(value, bool) or not isinstance(value, int) or value not in (0, 1):
+            raise ValueError(f"human_review: level {value!r} is not defined (levels 0 and 1)")
+        return value
 
     @field_validator("description")
     @classmethod

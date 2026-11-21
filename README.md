@@ -1224,7 +1224,33 @@ agents' path; do not expose it.
 
 ### Was this admitted? (`ContributionState.accepted`, v1.21)
 
-To ask whether a contribution was admitted, read `ContributionState.accepted`. It carries the answer on every record read (`strata_read_contribution`, `strata_read_scope_record` and the HTTP record routes). This is the supported way; do not restate the pair of verdicts in host code. `strata.verdict_admits(decision)` is the lower-level check: it answers whether a *verdict* admits (True only for `accept_as_directive` and `accept_as_context`; False for `decline`, for no verdict and for any other string). `ACCEPTED_DECISIONS` stays, so nothing that imports it breaks.
+To ask whether a contribution was admitted, read `ContributionState.accepted`. It carries the answer on every record read (`strata_read_contribution`, `strata_read_scope_record` and the HTTP record routes), and it is False while a review scope holds the item and after it is rejected (see Human review). This is the supported way; do not restate the pair of verdicts in host code. `strata.verdict_admits(decision)` is the lower-level check: it answers whether a *verdict* admits (True only for `accept_as_directive` and `accept_as_context`; False for `decline`, for no verdict and for any other string). `ACCEPTED_DECISIONS` stays, so nothing that imports it breaks.
+
+## Human review
+
+By default a scope's judge decides what binds it. For a scope where directives are rare and weighty you can take that decision back. Set a review level on the scope in `fleet.yaml`:
+
+```yaml
+scopes:
+  - id: g_ops
+    name: Ops
+    stratum_id: L1
+    human_review: 1
+```
+
+`0` (the default) is off and changes nothing. `1` holds every directive change by a delegated party for you to approve. Any other value is refused when `fleet.yaml` loads; it never falls back to 0 or 1.
+
+At level 1 the judge still judges every contribution and its verdict is recorded as it was given, but nothing that would change the scope's directives is applied: a judged add, supersede or retire, an end-condition confirmation, and a bound session's own `strata_retire`. A held retirement leaves the directive binding for everyone, the requester included; a held addition stays out. Context and declines land as before. Your own acts (`strata operator publish`, `supersede`, `retire`, `retire-item`) and date lapses go through directly.
+
+```
+strata operator review list                 # how many are held, and how old the oldest is
+strata operator review approve <id>         # enact it (a contribution id, or an rr_ request id)
+strata operator review reject <id> --reason "..."
+```
+
+An approval applies the judge's ops unchanged, as the scope's own directive, after a mechanical re-check against the scope as it is now: the targets must still exist, the contributor must still be bound to the scope, and the directive must not contradict what the scope inherits. No judge is called, so approvals work while the judge is down. A request whose directive was changed in the meantime lapses instead. If the scope's context changed after the hold, the approval applies the directive ops only and keeps the current context, so nothing admitted meanwhile is overwritten; the review act records which happened. Approving the same item twice (for example after a crash) never applies it twice. The contributing scope's perspective shows the item as "held for the operator", then "approved" or "rejected: <reason>".
+
+Limits: Console review is read-only, and approve and reject are CLI only. There is no amend: change a held proposal by contributing a new one. A hold nobody gets to stalls the scope, so check `review list` regularly; this level suits scopes with few, weighty directives.
 
 ## Forgetting
 
