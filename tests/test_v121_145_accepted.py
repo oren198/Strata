@@ -1,8 +1,8 @@
 """#145: one public definition of "accepted" (v1.21).
 
-``strata.verdict_admits(decision)`` is the one question a host asks ("was this admitted?"), and
-``ContributionState.accepted`` answers it on every read surface. No engine code tests acceptance
-by naming the two accepting verdicts together.
+``ContributionState.accepted`` answers "was this contribution admitted?" on every read surface,
+and ``strata.verdict_admits(decision)`` answers "does this verdict admit?". No engine code tests
+acceptance by naming the two accepting verdicts together.
 """
 
 from __future__ import annotations

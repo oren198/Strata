@@ -357,10 +357,10 @@ class ContributionState:
     marked or not — including attempts that a later successful re-judge
     superseded, which is why it is meaningful even in the ``judged`` state.
 
-    ``accepted`` is derived, not stored: THE answer to "was this contribution admitted", and it
-    rides in the serialised state of every read surface. Today it is ``verdict_admits(decision)``:
-    True only for a judged ``accept_as_directive`` or ``accept_as_context`` (False for a decline
-    and for judge_failed, pending and note).
+    ``accepted`` is derived, not stored. It is THE answer to "was this contribution admitted",
+    and it rides in the serialised state of every read surface. Today it is True only for a
+    judged ``accept_as_directive`` or ``accept_as_context`` (False for a decline and for
+    judge_failed, pending and note).
     """
 
     contribution_id: str
