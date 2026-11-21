@@ -120,7 +120,7 @@ class _Manager:
 def test_0027_creates_the_table_and_touches_nothing_else(tmp_path: Path) -> None:
     db = str(tmp_path / "m.db")
     applied = run_migrations(db)
-    assert applied[-1] == "0027_relation_calls.sql"
+    assert applied[applied.index("0026_directive_forgetting.sql") + 1] == "0027_relation_calls.sql"
     conn = sqlite3.connect(db)
     cols = [r[1] for r in conn.execute("PRAGMA table_info(relation_calls)")]
     assert cols == [

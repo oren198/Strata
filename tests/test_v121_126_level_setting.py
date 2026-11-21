@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from strata.fleet_config import FleetConfig
+from strata.fleet_config import FleetConfig, FleetConfigError
 from tests.v121_126_support import write_fleet
 
 
@@ -33,5 +33,5 @@ def test_levels_zero_and_one_load(tmp_path: Path, level: int) -> None:
 
 @pytest.mark.parametrize("value", [2, -1, "yes", True, 1.5])
 def test_every_other_value_is_refused_at_load_with_no_fallback(tmp_path: Path, value) -> None:  # noqa: ANN001
-    with pytest.raises(ValueError, match=r"level .* is not defined"):
+    with pytest.raises(FleetConfigError, match=r"level .* is not defined"):
         _load(tmp_path, value)

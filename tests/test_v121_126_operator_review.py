@@ -217,7 +217,7 @@ def test_a_held_append_that_now_conflicts_with_a_newly_inherited_directive_is_re
         outcome = w.propose(
             directive_answer([{"op": "append"}]),
             scope_id="g_web",
-            content="Releases may be published without running the full test suite.",
+            content="The full test suite is optional before publishing a release.",
         )
         w.summaries.write(
             "g_org",
@@ -236,7 +236,8 @@ def test_a_held_append_that_now_conflicts_with_a_newly_inherited_directive_is_re
         )
         with _judge_must_not_run(), pytest.raises(_review().ReviewRefusal, match="c_suite"):
             _review().approve(outcome.contribution_id, operator="oren", **w.kw())
-        assert w.summaries.read("g_web").directives == []
+        web = w.summaries.read("g_web")
+        assert web is None or web.directives == []
         assert w.store.get_judgment(outcome.contribution_id).disposition == "held"
     finally:
         w.close()

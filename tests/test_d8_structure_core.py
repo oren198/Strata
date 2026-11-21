@@ -102,6 +102,7 @@ def test_0025_keeps_rows_and_admits_both_kinds(tmp_path: Path) -> None:
         "0025_structure_change_kinds.sql",
         "0026_directive_forgetting.sql",
         "0027_relation_calls.sql",
+        "0028_human_review.sql",
     ]
 
     conn = sqlite3.connect(db)

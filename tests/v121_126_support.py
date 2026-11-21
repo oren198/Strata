@@ -14,6 +14,7 @@ from unittest.mock import MagicMock
 
 import yaml
 
+from strata import review
 from strata.app import run_contribution
 from strata.fleet_config import FleetConfig
 from strata.migrator import run_migrations
@@ -133,6 +134,7 @@ class World:
             fleet=self.fleet,
             summary_store=self.summaries,
             change_event_reader=lambda s: self.store.list_change_events(scope_id=s),
+            review_reader=lambda s: review.perspective_notes(s, record_store=self.store),
         )
 
     def binding_contents(self, scope_id: str) -> list[str]:

@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 import yaml
 
+from strata import review
 from strata.summary_store import Directive, ScopeSummary, SummaryStore
 from tests.test_mcp_server import _load_mcp_module, _make_db
 
@@ -96,7 +97,10 @@ async def test_the_requester_next_perspective_still_binds_and_shows_the_request(
     with _bound(mod, "g_arch", "sess_a"):
         await mod.strata_retire("c_keep", "correction", NOTICE)
     perspective = compose_perspective(
-        "g_arch", fleet=mod._load_fleet(), summary_store=SummaryStore(summaries)
+        "g_arch",
+        fleet=mod._load_fleet(),
+        summary_store=SummaryStore(summaries),
+        review_reader=lambda s: review.perspective_notes(s, record_store=mod._record_store),
     )
     own = next(layer for layer in perspective["layers"] if layer.get("relation") == "self")
     assert RULE in str(own["summary"]["directives"])
