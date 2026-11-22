@@ -283,10 +283,15 @@ def _approve_request(
     record_store: RecordStore,
     summary_store: SummaryStore,
 ) -> ReviewAct:
+    from strata.app import recover_amendment_intents  # noqa: PLC0415
     from strata.forgetting import _retire_locked  # noqa: PLC0415
 
     request = _held_request(item_id, record_store)
     with scope_lock(request.scope_id):
+        # finish what a death during an earlier approval left pending (the intent journal)
+        recover_amendment_intents(
+            request.scope_id, fleet=fleet, record_store=record_store, summary_store=summary_store
+        )
         summary = summary_store.read(request.scope_id)
         live = {d.id for d in summary.directives} if summary is not None else set()
         if request.directive_id not in live and any(

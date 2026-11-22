@@ -1806,15 +1806,28 @@ def recover_amendment_intents(
         if scope is None or version < intent.expected_version:
             record_store.mark_amendment_intent(intent.id, "abandoned")
         elif version == intent.expected_version:
-            _apply_amendment_effects(
-                json.loads(intent.payload_json),
-                scope=scope,
-                fleet=fleet,
-                record_store=record_store,
-                summary_store=summary_store,
-                written_version=version,
-                intent_id=intent.id,
-            )
+            plan = json.loads(intent.payload_json)
+            if plan.get("type") == "retire_act":
+                from strata.forgetting import apply_retire_effects  # noqa: PLC0415
+
+                apply_retire_effects(
+                    plan,
+                    scope_id=scope_id,
+                    fleet=fleet,
+                    record_store=record_store,
+                    summary_store=summary_store,
+                    intent_id=intent.id,
+                )
+            else:
+                _apply_amendment_effects(
+                    plan,
+                    scope=scope,
+                    fleet=fleet,
+                    record_store=record_store,
+                    summary_store=summary_store,
+                    written_version=version,
+                    intent_id=intent.id,
+                )
             record_store.mark_amendment_intent(intent.id, "done")
             replayed.append(intent.id)
         else:
