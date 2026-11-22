@@ -110,6 +110,7 @@ def test_full_chain_drops_fleet_tables_and_preserves_record(tmp_path: Path) -> N
         "0026_directive_forgetting.sql",
         "0027_relation_calls.sql",
         "0028_human_review.sql",
+        "0029_amendment_intents.sql",
     ]
 
     # Fleet tables gone.
@@ -386,6 +387,7 @@ def test_idempotent_reapply(tmp_path: Path) -> None:
         "0026_directive_forgetting.sql",
         "0027_relation_calls.sql",
         "0028_human_review.sql",
+        "0029_amendment_intents.sql",
     ]
 
     second = run_migrations(db_path, migrations_dir=migrations_dir)
@@ -610,6 +612,7 @@ def test_crash_at_tracking_insert_rolls_back_script_too(
         "0026_directive_forgetting.sql",
         "0027_relation_calls.sql",
         "0028_human_review.sql",
+        "0029_amendment_intents.sql",
     ]
 
 
@@ -993,6 +996,7 @@ def test_0011_preserves_change_events_written_before_it(tmp_path: Path) -> None:
         "0026_directive_forgetting.sql",
         "0027_relation_calls.sql",
         "0028_human_review.sql",
+        "0029_amendment_intents.sql",
     ]
 
     conn = sqlite3.connect(db_path)

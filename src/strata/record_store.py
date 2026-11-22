@@ -84,6 +84,10 @@ def _new_judgment_id() -> str:
     return f"j_{secrets.token_hex(8)}"
 
 
+def _new_amendment_intent_id() -> str:
+    return f"ai_{secrets.token_hex(8)}"
+
+
 def _new_retirement_request_id() -> str:
     return f"rr_{secrets.token_hex(8)}"
 
@@ -264,6 +268,19 @@ class Judgment:
     """ADR 0018 (migration 0028): ``None`` when no review applied (today's behaviour), else
     ``held`` | ``approved`` | ``rejected`` | ``lapsed``. It sits beside the verdict, which is
     never overwritten: a held ``accept_as_directive`` was not admitted."""
+
+
+@dataclass(frozen=True)
+class AmendmentIntent:
+    """One write-ahead intent for an amendment (migration 0029, v1.22 P2)."""
+
+    id: str
+    scope_id: str
+    expected_version: int
+    state: Literal["pending", "done", "abandoned", "suspect"]
+    payload_json: str
+    created_at: str
+    updated_at: str
 
 
 @dataclass(frozen=True)
@@ -2857,6 +2874,7 @@ class RecordStore:
         cause: str | None = None,
         end_condition: str | None = None,
         evidence_contribution_id: str | None = None,
+        intent_id: str | None = None,
     ) -> Retirement:
         """Append a retirement event to *scope_id*'s own record.
 
@@ -2875,17 +2893,30 @@ class RecordStore:
                           required to state (#209); ``None`` for an operator
                           retirement.
 
+            intent_id:    The amendment intent that writes this row (v1.22 P2). With it the
+                          write is idempotent: a second append for the same (scope,
+                          directive, intent) returns the existing row and writes nothing.
+
         Returns:
             The newly appended :class:`Retirement`.
         """
+        if intent_id is not None:
+            existing = self._conn.execute(
+                "SELECT id FROM retirements WHERE scope_id = ? AND directive_id = ? "
+                "AND intent_id = ?",
+                (scope_id, directive_id, intent_id),
+            ).fetchone()
+            if existing is not None:
+                return self._get_retirement(existing["id"])
         retirement_id = _new_retirement_id()
         self._conn.execute(
             """
             INSERT INTO retirements (
                 id, scope_id, directive_id, retired_by, reason, changed_circumstance,
-                kind, notice, actor_session_id, cause, end_condition, evidence_contribution_id
+                kind, notice, actor_session_id, cause, end_condition, evidence_contribution_id,
+                intent_id
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 retirement_id,
@@ -2900,9 +2931,13 @@ class RecordStore:
                 cause,
                 end_condition,
                 evidence_contribution_id,
+                intent_id,
             ),
         )
         self._conn.commit()
+        return self._get_retirement(retirement_id)
+
+    def _get_retirement(self, retirement_id: str) -> Retirement:
         row = self._conn.execute(
             """
             SELECT id, scope_id, directive_id, retired_by, reason, created_at,
@@ -2913,6 +2948,62 @@ class RecordStore:
             (retirement_id,),
         ).fetchone()
         return Retirement(**dict(row))
+
+    # -- amendment intents (v1.22 P2) -----------------------------------------------------------
+
+    def create_amendment_intent(
+        self, *, scope_id: str, expected_version: int, payload_json: str
+    ) -> str:
+        """Record, BEFORE the summary file is written, what the after-write steps will need."""
+        intent_id = _new_amendment_intent_id()
+        with self._conn:
+            self._conn.execute(
+                "INSERT INTO amendment_intents (id, scope_id, expected_version, payload_json) "
+                "VALUES (?, ?, ?, ?)",
+                (intent_id, scope_id, expected_version, payload_json),
+            )
+        return intent_id
+
+    def get_amendment_intent(self, intent_id: str) -> AmendmentIntent | None:
+        row = self._conn.execute(
+            "SELECT * FROM amendment_intents WHERE id = ?", (intent_id,)
+        ).fetchone()
+        return None if row is None else AmendmentIntent(**dict(row))
+
+    def list_amendment_intents(
+        self, *, scope_id: str | None = None, state: str | None = None
+    ) -> list[AmendmentIntent]:
+        clauses, params = [], []
+        if scope_id is not None:
+            clauses.append("scope_id = ?")
+            params.append(scope_id)
+        if state is not None:
+            clauses.append("state = ?")
+            params.append(state)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self._conn.execute(
+            f"SELECT * FROM amendment_intents {where} ORDER BY created_at ASC, rowid ASC", params
+        ).fetchall()
+        return [AmendmentIntent(**dict(row)) for row in rows]
+
+    def mark_amendment_intent(self, intent_id: str, state: str) -> None:
+        with self._conn:
+            self._conn.execute(
+                "UPDATE amendment_intents SET state = ?, updated_at = datetime('now') WHERE id = ?",
+                (state, intent_id),
+            )
+
+    def intent_for_contribution(self, contribution_id: str) -> AmendmentIntent | None:
+        """The newest intent whose amendment judged *contribution_id*, or ``None``."""
+        row = self._conn.execute(
+            """
+            SELECT i.* FROM amendment_intents i, json_each(i.payload_json, '$.judged_ids') j
+            WHERE j.value = ?
+            ORDER BY i.created_at DESC, i.rowid DESC LIMIT 1
+            """,
+            (contribution_id,),
+        ).fetchone()
+        return None if row is None else AmendmentIntent(**dict(row))
 
     def fulfils_evidence_ids(self, *, directive_id: str, outside_scope_id: str | None) -> list[str]:
         """Ids of ADMITTED contributions in other scopes' records that carry ``fulfils`` for
