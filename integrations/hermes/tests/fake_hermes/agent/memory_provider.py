@@ -33,20 +33,11 @@ def ctx_bound(fn: Callable[..., Any]) -> Callable[..., Any]:
     return lambda *args, **kwargs: ctx.run(fn, *args, **kwargs)
 
 
-def spawn_context_thread(
-    target: Callable[..., Any],
-    *,
-    name: str,
-    daemon: bool = True,
-    args: tuple = (),
-    kwargs: Optional[dict[str, Any]] = None,
-) -> threading.Thread:
+def spawn_context_thread(target: Callable[..., Any], *, name: str, daemon: bool = True,
+                         args: tuple = (), kwargs: Optional[dict[str, Any]] = None) -> threading.Thread:
     """Unstarted thread running *target* under the spawner's contextvars (see :func:`ctx_bound`).
     Every memory-provider background job (prefetch, sync, writer loops) must go through this."""
-    return threading.Thread(
-        target=ctx_bound(target), args=args, kwargs=kwargs, name=name, daemon=daemon
-    )
-
+    return threading.Thread(target=ctx_bound(target), args=args, kwargs=kwargs, name=name, daemon=daemon)
 
 # v1 = best-effort on_pre_compress() with the raw message list; v2 = opt-in fail-closed
 # checkpoint (normalized evidence handoff + strict-mode failure propagation).
@@ -80,12 +71,10 @@ class RecallStatus:
 # provider-side classifiers. Anchored and followed only by whitespace/punctuation, so
 # "k8s"/"yolo"/"note" do NOT match while "hi!"/"thanks :)"/"done???" do.
 TRIVIAL_PROMPT_RE = re.compile(
-    r"^(yes|no|ok|okay|sure|thanks|thank you|y|n|yep|nope|yeah|nah|"
-    r"hi|hey|hello|yo|sup|"
-    r"continue|go ahead|do it|proceed|got it|cool|nice|great|done|next|lgtm|k)"
-    r'[\s!?.:;,"'
-    + "'"
-    + r"~\u2018\u2019\u201c\u201d\u2014\u2013\u2026()\[\]{}<>*&^%$#@!+=`\u00a0]*$",
+    r'^(yes|no|ok|okay|sure|thanks|thank you|y|n|yep|nope|yeah|nah|'
+    r'hi|hey|hello|yo|sup|'
+    r'continue|go ahead|do it|proceed|got it|cool|nice|great|done|next|lgtm|k)'
+    r'[\s!?.:;,"' + "'" + r'~\u2018\u2019\u201c\u201d\u2014\u2013\u2026()\[\]{}<>*&^%$#@!+=`\u00a0]*$',
     re.IGNORECASE,
 )
 
@@ -173,12 +162,8 @@ class MemoryProvider(ABC):
         return None
 
     def sync_turn(
-        self,
-        user_content: str,
-        assistant_content: str,
-        *,
-        session_id: str = "",
-        messages: Optional[list[dict[str, Any]]] = None,
+        self, user_content: str, assistant_content: str, *,
+        session_id: str = "", messages: Optional[list[dict[str, Any]]] = None,
         turn_author: Optional[dict[str, Any]] = None,
     ) -> None:
         """Persist a completed turn (non-blocking). ``messages`` is the OpenAI-style list so far.
@@ -220,13 +205,7 @@ class MemoryProvider(ABC):
         """End-of-session extraction; fires only at real session boundaries, never per-turn."""
 
     def on_session_switch(
-        self,
-        new_session_id: str,
-        *,
-        parent_session_id: str = "",
-        reset: bool = False,
-        rewound: bool = False,
-        **kwargs,
+        self, new_session_id: str, *, parent_session_id: str = "", reset: bool = False, rewound: bool = False, **kwargs,
     ) -> None:
         """session_id reassigned mid-process (/resume, /branch, /reset, /new, compression)
         without teardown: rebind per-session state so later writes land in the right record.
@@ -237,9 +216,7 @@ class MemoryProvider(ABC):
         """Extract insights from ``messages`` about to be compressed, fed into the summary prompt."""
         return ""
 
-    def on_delegation(
-        self, task: str, result: str, *, child_session_id: str = "", **kwargs
-    ) -> None:
+    def on_delegation(self, task: str, result: str, *, child_session_id: str = "", **kwargs) -> None:
         """PARENT-side observation of a completed delegation (the subagent has no provider session)."""
 
     def get_config_schema(self) -> list[dict[str, Any]]:
@@ -253,9 +230,7 @@ class MemoryProvider(ABC):
         """Write non-secret setup ``values`` to the provider's native config. Plugins MUST either
         override this or use only env vars (every schema field carrying ``env_var``)."""
 
-    def on_memory_write(
-        self, action: str, target: str, content: str, metadata: Optional[dict[str, Any]] = None
-    ) -> None:
+    def on_memory_write(self, action: str, target: str, content: str, metadata: Optional[dict[str, Any]] = None) -> None:
         """Mirror a built-in memory-tool write (``action``: add | replace | remove; ``target``:
         memory | user; ``metadata``: provenance such as write_origin, session_id, tool_name).
         For replace/remove, ``metadata["previous_content"]`` is the full entry selected
@@ -296,6 +271,4 @@ class MemoryProvider(ABC):
         key, non-blank secrets included (core saves each to ``.env`` under its ``env_key`` once this
         returns). Raise ``ValueError`` (a subclass such as ``json.JSONDecodeError`` counts, also under
         ``plugins.isolation: host``) to refuse the save (the dashboard shows it as a 400)."""
-        raise NotImplementedError(
-            f"memory provider {self.name} declares storage=provider but cannot write it"
-        )
+        raise NotImplementedError(f"memory provider {self.name} declares storage=provider but cannot write it")
