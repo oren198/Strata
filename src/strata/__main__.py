@@ -2161,7 +2161,48 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     # check, never changes this command's exit status.
     checks.append(_check_directive_integrity(paths))
 
+    # 14. Amendment intents recovery marked suspect (a summary version ahead of the expected one).
+    # only, like the line above.
+    checks.append(_check_suspect_intents(paths))
+
     return _run_preflight(checks)
+
+
+def _check_suspect_intents(paths: object) -> Check:
+    """One informational line: how many amendment intents recovery marked suspect. Always a
+    passing soft check; it reports only and never changes doctor's exit status."""
+    name = "Suspect intents"
+    if paths is None or not Path(paths.db_path).exists():
+        return Check(name=name, kind="soft", passed=True, message="skipped — see the checks above.")
+    from strata.record_store import RecordStore  # noqa: PLC0415
+
+    store: RecordStore | None = None
+    try:
+        store = RecordStore(str(paths.db_path))
+        suspect = store.list_amendment_intents(state="suspect")
+    except Exception as exc:  # noqa: BLE001 — this line must not abort doctor
+        return Check(
+            name=name,
+            kind="soft",
+            passed=True,
+            message=f"could not check ({type(exc).__name__}); nothing was changed.",
+        )
+    finally:
+        if store is not None:
+            store.close()
+    if not suspect:
+        return Check(name=name, kind="soft", passed=True, message="no amendment intent is suspect.")
+    listed = ", ".join(f"{i.id} ({i.scope_id})" for i in suspect)
+    return Check(
+        name=name,
+        kind="soft",
+        passed=True,
+        message=(
+            f"{len(suspect)} amendment intents are suspect: {listed}. Each was found with the "
+            "summary ahead of its expected version and was not replayed. Report only: nothing "
+            "was changed, and this line does not change doctor's exit status."
+        ),
+    )
 
 
 def _check_directive_integrity(paths: object) -> Check:

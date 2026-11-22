@@ -159,6 +159,7 @@ from strata.publication import (
     read_publication,
 )
 from strata.record_store import (
+    ENGINE_NOTE_SUBJECT,
     JUDGE_FAILED,
     RECENCY_WINDOW_SIZE,
     ChangeEvent,
@@ -1759,6 +1760,36 @@ def _apply_amendment_effects(
     )
 
 
+def _record_suspect_intent_note(
+    record_store: RecordStore, *, scope_id: str, intent_id: str, expected: int, found: int
+) -> None:
+    """Leave an engine note in the scope's record, ``change-emission-failed`` style: it renders as
+    ``note`` and stays out of pending counts. Best-effort, and it names only ids and versions
+    (never the payload): the log line above is the whole record if even this fails."""
+    try:
+        record_store.append_contribution(
+            scope_id=scope_id,
+            content=(
+                f"[Amendment intent {intent_id} was not replayed: it expected summary version "
+                f"{expected} but the scope's summary is at version {found}, which cannot happen "
+                "under the scope lock. Whatever it would have written (a retirement row, a "
+                "withdrawal, a notice to readers) was NOT written by recovery. See "
+                "`strata doctor`.]"
+            ),
+            proposed_classification="context",
+            subject=ENGINE_NOTE_SUBJECT,
+            supersedes=None,
+            contributor=ContributorRef(
+                scope_id=scope_id,
+                skill="scope-manager",
+                session_id="amendment-recovery",
+                ts=datetime.now(tz=UTC).isoformat(),
+            ),
+        )
+    except Exception:  # noqa: BLE001 — the record itself is unreachable
+        _logger.exception("could not record the suspect intent note for %s", intent_id)
+
+
 def recover_all_amendment_intents(
     *, fleet: FleetConfig, record_store: RecordStore, summary_store: SummaryStore
 ) -> dict[str, list[str]]:
@@ -1840,6 +1871,13 @@ def recover_amendment_intents(
                 version,
             )
             record_store.mark_amendment_intent(intent.id, "suspect")
+            _record_suspect_intent_note(
+                record_store,
+                scope_id=scope_id,
+                intent_id=intent.id,
+                expected=intent.expected_version,
+                found=version,
+            )
     return replayed
 
 
