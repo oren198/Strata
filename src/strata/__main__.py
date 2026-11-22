@@ -2156,7 +2156,58 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     # change this command's exit status and it never calls the judge.
     checks.append(_judge_check_status())
 
+    # 13. Directives the record admitted that are missing from their summary with no retirement or
+    # supersession on record (v1.22 P2). Report only: it repairs nothing and, as a passing soft
+    # check, never changes this command's exit status.
+    checks.append(_check_directive_integrity(paths))
+
     return _run_preflight(checks)
+
+
+def _check_directive_integrity(paths: object) -> Check:
+    """One informational line. Always a passing soft check; it never repairs anything."""
+    name = "Directive integrity"
+    if paths is None or not Path(paths.db_path).exists():
+        return Check(name=name, kind="soft", passed=True, message="skipped — see the checks above.")
+    from strata.fleet_config import FleetConfig  # noqa: PLC0415
+    from strata.integrity import missing_directives  # noqa: PLC0415
+    from strata.record_store import RecordStore  # noqa: PLC0415
+    from strata.summary_store import SummaryStore  # noqa: PLC0415
+
+    store: RecordStore | None = None
+    try:
+        store = RecordStore(str(paths.db_path))
+        fleet = FleetConfig.load(Path(paths.fleet_yaml_path))
+        missing = missing_directives(
+            fleet=fleet, record_store=store, summary_store=SummaryStore(str(paths.summaries_dir))
+        )
+    except Exception as exc:  # noqa: BLE001 — this line must not abort doctor
+        return Check(
+            name=name,
+            kind="soft",
+            passed=True,
+            message=f"could not check ({type(exc).__name__}); nothing was changed.",
+        )
+    finally:
+        if store is not None:
+            store.close()
+    if not missing:
+        return Check(
+            name=name,
+            kind="soft",
+            passed=True,
+            message="no admitted directive is missing without a retirement or supersession.",
+        )
+    listed = ", ".join(f"{m.directive_id} ({m.scope_id})" for m in missing)
+    return Check(
+        name=name,
+        kind="soft",
+        passed=True,
+        message=(
+            f"directive missing with no retirement or supersession: {listed}. Report only: "
+            "nothing was repaired, and this line does not change doctor's exit status."
+        ),
+    )
 
 
 def _judge_check_status() -> Check:
