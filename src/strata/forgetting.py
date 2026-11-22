@@ -9,6 +9,7 @@ judge call, and nothing here creates a directive.
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from collections.abc import Mapping, Sequence
@@ -16,6 +17,7 @@ from datetime import UTC, date, datetime, timedelta
 from typing import TYPE_CHECKING, Literal
 
 from strata.change_events import emit as emit_change_event
+from strata.change_events import new_change_id
 from strata.locks import scope_lock
 from strata.record_store import (
     ContributorRef,
@@ -192,7 +194,6 @@ def _retire_locked(
     the authority check; ``cause``, the end condition and the evidence are set only by the
     date-lapse sweep, never by a public caller. A confirmed judged end condition is recorded on
     its own path (``app._write_amendment``), not through this function."""
-    from strata.publication import propagate_directive_removals  # noqa: PLC0415
 
     if fleet.get_scope(scope_id) is None:
         raise ValueError(f"Scope not found: {scope_id!r}")
@@ -206,30 +207,83 @@ def _retire_locked(
         raise KeyError(
             f"Directive {directive_id!r} is not in scope {scope_id!r}'s current summary."
         )
-    retirement = record_store.append_retirement(
-        scope_id=scope_id,
-        directive_id=directive_id,
-        retired_by=retired_by,
-        reason=notice,
-        kind=kind,
-        notice=notice,
-        actor_session_id=actor_session_id,
-        cause=cause,
-        end_condition=end_condition.model_dump_json() if end_condition is not None else None,
-        evidence_contribution_id=evidence_contribution_id,
-    )
+    # v1.22: the retire act goes through the amendment intent journal. The intent comes first, then
+    # the summary file, then the retirement row, the withdrawals and the reader notice, each
+    # idempotent per intent, then the intent is marked done. A death in between leaves a pending
+    # intent that recovery replays (the file was written) or abandons (it was not).
     remaining = [d for d in summary.directives if d.id != directive_id]
+    plan = {
+        "type": "retire_act",
+        "judged_ids": [],
+        "directive_id": directive_id,
+        "kind": kind,
+        "notice": notice,
+        "actor_session_id": actor_session_id,
+        "retired_by": retired_by,
+        "cause": cause,
+        "end_condition": end_condition.model_dump_json() if end_condition is not None else None,
+        "evidence_contribution_id": evidence_contribution_id,
+        "before": existing.content,
+        "remaining_ids": sorted(d.id for d in remaining),
+        "change_id": new_change_id(),
+    }
+    intent_id = record_store.create_amendment_intent(
+        scope_id=scope_id,
+        expected_version=summary.version + 1,
+        payload_json=json.dumps(plan),
+    )
     summary_store.write(
         scope_id,
         summary.model_copy(
             update={"directives": remaining, "updated_at": datetime.now(tz=UTC).isoformat()}
         ),
     )
+    retirement = apply_retire_effects(
+        plan,
+        scope_id=scope_id,
+        fleet=fleet,
+        record_store=record_store,
+        summary_store=summary_store,
+        intent_id=intent_id,
+    )
+    record_store.mark_amendment_intent(intent_id, "done")
+    return retirement
+
+
+def apply_retire_effects(
+    plan: dict,
+    *,
+    scope_id: str,
+    fleet: FleetConfig,
+    record_store: RecordStore,
+    summary_store: SummaryStore,
+    intent_id: str,
+) -> Retirement:
+    """The after-write steps of a retire act, each idempotent per intent, so the act and a
+    recovery replay run the same code: the retirement row (unique per scope, directive and intent),
+    the withdrawal of published items anchored to the directive, the reader notice (one per change
+    id and item, and the change id is in the plan), and the candidates it closes."""
+    from strata.publication import propagate_directive_removals  # noqa: PLC0415
+
+    directive_id = plan["directive_id"]
+    retirement = record_store.append_retirement(
+        scope_id=scope_id,
+        directive_id=directive_id,
+        retired_by=plan["retired_by"],
+        reason=plan["notice"],
+        kind=plan["kind"],
+        notice=plan["notice"],
+        actor_session_id=plan["actor_session_id"],
+        cause=plan["cause"],
+        end_condition=plan["end_condition"],
+        evidence_contribution_id=plan["evidence_contribution_id"],
+        intent_id=intent_id,
+    )
     propagate_directive_removals(
         scope_id,
         {directive_id},
         retirement.id,
-        surviving_directive_ids={d.id for d in remaining},
+        surviving_directive_ids=set(plan["remaining_ids"]),
         fleet=fleet,
         record_store=record_store,
         summaries_dir=str(summary_store.summaries_dir),
@@ -240,7 +294,8 @@ def _retire_locked(
         item=directive_id,
         kind="directive_retired",
         source_scope_id=scope_id,
-        before=existing.content,
+        before=plan["before"],
+        wave_ids=[plan["change_id"]],
     )
     for candidate in record_store.list_retirement_candidates(scope_id=scope_id):
         if candidate.directive_id == directive_id:
