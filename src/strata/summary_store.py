@@ -498,6 +498,21 @@ def _parse_summary(text: str) -> ScopeSummary:
 # ---------------------------------------------------------------------------
 
 
+def _fsync_directory(directory: Path) -> None:
+    """Flush a directory entry (the rename) to disk. Not possible on every platform: a platform
+    that cannot open a directory for reading keeps the atomic rename without the flush."""
+    try:
+        fd = os.open(directory, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
 class SummaryStore:
     """Owns the on-disk markdown files for all scope summaries.
 
@@ -575,8 +590,15 @@ class SummaryStore:
         to_write = summary.model_copy(update={"version": next_version, "exists": True})
 
         tmp = final.with_suffix(".md.tmp")
-        tmp.write_text(_render_summary(to_write), encoding="utf-8")
+        # Durable, not only atomic: fsync the temp file before the rename and the directory after
+        # it, so a power loss or an OS crash cannot bring the renamed file back empty. The
+        # amendment intent journal reads "the expected version was written" as a yes/no fact.
+        with tmp.open("w", encoding="utf-8") as handle:
+            handle.write(_render_summary(to_write))
+            handle.flush()
+            os.fsync(handle.fileno())
         os.replace(tmp, final)
+        _fsync_directory(final.parent)
         return to_write
 
     def delete(self, scope_id: str) -> bool:
