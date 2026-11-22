@@ -349,7 +349,11 @@ def _approve_judgment(
     summary_store: SummaryStore,
     summary_max_words: int,
 ) -> ReviewAct:
-    from strata.app import _read_judge_inputs, _write_amendment  # noqa: PLC0415
+    from strata.app import (  # noqa: PLC0415
+        _read_judge_inputs,
+        _write_amendment,
+        recover_amendment_intents,
+    )
     from strata.scope_manager import (  # noqa: PLC0415
         ScopeManagerJudgment,
         _apply_amendment,
@@ -367,11 +371,13 @@ def _approve_judgment(
     payload_json, held_version = _decode_held(stored)
     payload = ScopeManagerJudgment.model_validate_json(payload_json)
     with scope_lock(scope.id):
+        # finish what a death after a summary write left pending (v1.22): the intent journal
+        recover_amendment_intents(
+            scope.id, fleet=fleet, record_store=record_store, summary_store=summary_store
+        )
         current = summary_store.read(scope.id)
         live = {d.id for d in current.directives} if current is not None else set()
-        if _already_applied(
-            payload, contribution.id, scope.id, live, record_store, written=held_row.summary_version
-        ):
+        if _already_applied(contribution.id, record_store):
             # a crash after the write and before the disposition: record the approval only
             record_store.set_judgment_disposition(item_id, APPROVED)
             return record_store.append_review_act(
@@ -483,32 +489,11 @@ def _minted_id(payload: Any, contribution_id: str) -> str | None:
     return contribution_id if admits else None
 
 
-def _already_applied(
-    payload: Any,
-    contribution_id: str,
-    scope_id: str,
-    live: set[str],
-    record_store: RecordStore,
-    *,
-    written: int | None = None,
-) -> bool:
+def _already_applied(contribution_id: str, record_store: RecordStore) -> bool:
     """Did an earlier approval of this item write its amendment and die before recording the
-    disposition? The record says so first: a held judgment has no ``summary_version`` until its
-    own amendment is written (the writer stamps it), so a stamp means this item's write happened.
-    That also covers a supersede-only judgment, which mints nothing and removes a target the
-    summary alone cannot attribute to this item. Failing that, an admitting op is applied when the
-    directive it mints is live, and a retire-only judgment when every target already has a
-    retirement carrying this judgment's reasoning."""
-    if written is not None:
-        return True
-    if _minted_id(payload, contribution_id) is not None:
-        return contribution_id in live
-    retires = [op.id for op in payload.directive_ops if op.op == "retire"]
-    if not retires:
-        return False
-    done = {
-        r.directive_id
-        for r in record_store.list_retirements(scope_id=scope_id)
-        if r.reason == payload.reasoning
-    }
-    return all(target in done for target in retires)
+    disposition? The amendment intent journal answers it (v1.22): the writer records an intent
+    before the summary file is written and marks it done after the last step, and recovery (run
+    just before this check, under the scope lock) finishes a pending intent whose file was
+    written, so "done" means exactly "this item's amendment was applied", whatever its ops were."""
+    intent = record_store.intent_for_contribution(contribution_id)
+    return intent is not None and intent.state == "done"

@@ -4317,6 +4317,17 @@ def main() -> None:
         )
         sys.exit(1)
 
+    # v1.22 P2: finish any amendment a death left half-written, before the first read.
+    if fleet is not None and _record_store is not None and _summary_store is not None:
+        from strata.app import recover_all_amendment_intents  # noqa: PLC0415
+
+        try:
+            recover_all_amendment_intents(
+                fleet=fleet, record_store=_record_store, summary_store=_summary_store
+            )
+        except Exception:  # noqa: BLE001 — never keep the server from starting
+            _logger.exception("amendment intent recovery failed at start")
+
     signal.signal(signal.SIGTERM, _terminate_cleanly)
     try:
         mcp.run(transport="stdio")

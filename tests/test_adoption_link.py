@@ -409,6 +409,7 @@ def test_migration_0022_applies_on_a_populated_0021_database(tmp_path: Path) -> 
         "0026_directive_forgetting.sql",
         "0027_relation_calls.sql",
         "0028_human_review.sql",
+        "0029_amendment_intents.sql",
     ]
 
     conn = sqlite3.connect(db_path)
