@@ -8569,6 +8569,29 @@ def _action_overlap(span: str, inherited_text: str) -> bool:
     return bool(numbers & set(re.findall(r"\d+(?:\.\d+)?", span)))
 
 
+def _span_concerns_subject(
+    span: str, inherited_text: str, context_words: frozenset[str] = frozenset()
+) -> bool:
+    """Whether an occurrence *span* is about the rule's SUBJECT, the test a departure or
+    consequence label must pass before it is written into memory: the same covered-subject
+    machinery the exception path uses (:func:`_is_covered_subject`), two shared subject stems, or
+    a shared number (a "14 days" loan period is the rule's own figure). One shared word that is not
+    the subject ("work" in "no further work" against "no work happens in strata-web") is not it."""
+    if _is_covered_subject(inherited_text, span, context_words):
+        return True
+    if _shared_subject_stems(span, inherited_text, context_words) >= 2:
+        return True
+    # one shared stem counts when it sits in the rule's own SUBJECT phrase ("van" in "Every
+    # delivery van is inspected ..."), not in its predicate
+    marker = _LEADING_PHRASE_VERB_RE.search(inherited_text)
+    if marker is not None and _shared_subject_stems(
+        inherited_text[: marker.start()], span, context_words
+    ):
+        return True
+    numbers = set(re.findall(r"\d+(?:\.\d+)?", inherited_text))
+    return bool(numbers & set(re.findall(r"\d+(?:\.\d+)?", span)))
+
+
 def _context_covers(
     inherited_text: str, content: str, context_words: frozenset[str] = frozenset()
 ) -> bool:
@@ -8658,7 +8681,20 @@ def verify_inherited_relation(
             unspecific = "occurrence not in the past tense"
         if unspecific is not None:
             return "decline_unspecific", unspecific
-        if not _action_overlap(span, inherited_text):
+        if (
+            _action_overlap(span, inherited_text)
+            and not _span_concerns_subject(span, inherited_text, context_words)
+            and marker is None
+            and _general_marker(content) is None
+        ):
+            # A label (departure or consequence) is written into memory, so the occurrence must
+            # be about the rule's SUBJECT, not merely share a word with its action ("no further
+            # work" against "no work happens in strata-web"). Otherwise the judge's answer is
+            # an unrelated one: admit with no label. (A marker or a habit still declines, below:
+            # it fails toward the rule exactly as before.)
+            failure = "occurrence does not concern the rule's subject"
+            readable_unrelated = True
+        elif not _action_overlap(span, inherited_text):
             # The answer CLAIMED a report about the rule, so it is not an honest
             # "unrelated": a marker anywhere declines (rule A), as does a habit.
             failure = "occurrence does not concern the rule's own action"
