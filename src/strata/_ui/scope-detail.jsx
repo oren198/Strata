@@ -10,6 +10,18 @@
 // standing operator-mode toggle).
 // ─────────────────────────────────────────────────────────────────────
 
+// #210: the description relevance is measured against: the scope's own, else the nearest
+// ancestor's (named), else a report-only suggestion from its memory, else "no description".
+function scopeDescriptionText(scope) {
+  if (scope.description) return scope.description;
+  const inherited = scope.effective_description;
+  if (inherited) return `${inherited.text} (inherited from ${inherited.source_scope_id})`;
+  if (scope.description_suggestion) {
+    return `no description; your scope's memory suggests: ${scope.description_suggestion}`;
+  }
+  return "no description";
+}
+
 function ScopeDetail({ scope_id, state, dispatch, onBack, onFlash, embedded = false }) {
   const scope = state.scopes.find((g) => g.id === scope_id);
 
@@ -76,14 +88,15 @@ function ScopeDetail({ scope_id, state, dispatch, onBack, onFlash, embedded = fa
             {state.strata.find((s) => s.id === scope.stratum_id)?.name || "—"}
           </span>
           <span
-            title={scope.description || "no description"}
+            title={scopeDescriptionText(scope)}
             style={{
-              fontSize: 13, color: scope.description ? "var(--at-ink-soft)" : "var(--at-muted)",
-              fontStyle: scope.description ? "normal" : "italic",
+              fontSize: 13,
+              color: scope.effective_description ? "var(--at-ink-soft)" : "var(--at-muted)",
+              fontStyle: scope.effective_description ? "normal" : "italic",
               overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", minWidth: 0,
             }}
           >
-            {scope.description || "no description"}
+            {scopeDescriptionText(scope)}
           </span>
           <div style={{ flex: 1 }} />
         </div>
@@ -138,14 +151,14 @@ function ScopeDetail({ scope_id, state, dispatch, onBack, onFlash, embedded = fa
             <Field label="Description">
               <div style={{
                 fontSize: 14,
-                color: scope.description ? "var(--at-ink)" : "var(--at-muted)",
-                fontStyle: scope.description ? "normal" : "italic",
+                color: scope.effective_description ? "var(--at-ink)" : "var(--at-muted)",
+                fontStyle: scope.effective_description ? "normal" : "italic",
                 padding: "8px 10px",
                 background: "var(--at-bg)",
                 border: "1px solid var(--at-rule)",
                 borderRadius: 8,
               }}>
-                {scope.description || "no description"}
+                {scopeDescriptionText(scope)}
               </div>
             </Field>
             <Field label="Stratum">

@@ -178,6 +178,7 @@ from strata.record_store import (
 from strata.review import _HELD_OPS as _REVIEW_HELD_OPS
 from strata.review import encode_held, perspective_notes, review_holds
 from strata.scope_manager import (
+    IMPLIED_PURPOSE_MIN_WORDS,
     WINDOW_VERBATIM_TAIL,
     ActedOnTarget,
     BatchVerdict,
@@ -189,6 +190,7 @@ from strata.scope_manager import (
     _apply_batch_amendment,
     is_held_note,
     strip_record_only_notes,
+    suggest_description,
 )
 from strata.session_state import (
     DEFAULT_STALENESS_WINDOW_DAYS,
@@ -240,6 +242,29 @@ def get_record_store(
         yield store
     finally:
         store.close()
+
+
+def _scope_with_description_fields(
+    scope: Scope, fleet: FleetConfig, summary_store: SummaryStore
+) -> dict:
+    """A scope's Console row plus the #210 description fields: the description relevance is
+    measured against (own, else the nearest ancestor's) with its source, and, only when the
+    chain has none, a report-only suggestion from the scope's own memory."""
+    row = scope.model_dump()
+    found = fleet.effective_description(scope.id)
+    row["effective_description"] = (
+        {"text": found[0], "source_scope_id": found[1]} if found is not None else None
+    )
+    suggestion = None
+    if found is None:
+        try:
+            suggestion = suggest_description(
+                summary_store.read(scope.id), IMPLIED_PURPOSE_MIN_WORDS
+            )
+        except Exception:  # noqa: BLE001 — a hint must never fail the scope list
+            suggestion = None
+    row["description_suggestion"] = suggestion
+    return row
 
 
 def get_summary_store(
@@ -3726,7 +3751,9 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
     # -----------------------------------------------------------------------
 
     @application.get("/scopes")
-    def list_scopes_endpoint(request: Request) -> dict:
+    def list_scopes_endpoint(
+        request: Request, summary_store: SummaryStore = Depends(get_summary_store)
+    ) -> dict:
         """Return active scopes and strata from the in-memory FleetConfig.
 
         ``fleet_file_warning`` (Feature A, lazy reload — ADR 0002 addendum)
@@ -3751,7 +3778,7 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
 
         return {
             "strata": [s.model_dump() for s in fleet.strata],
-            "scopes": [s.model_dump() for s in active],
+            "scopes": [_scope_with_description_fields(s, fleet, summary_store) for s in active],
             # ``kind`` (ADR 0010) tells a client which edges bind: a chain
             # edge always runs child→parent after load canonicalization, a
             # reference edge always runs referencer→referenced.

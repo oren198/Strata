@@ -2021,17 +2021,37 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     # and cannot tell what is irrelevant to it. One warning per scope.
     # -----------------------------------------------------------------------
     if fleet_config is not None:
+        from strata.scope_manager import (  # noqa: PLC0415
+            IMPLIED_PURPOSE_MIN_WORDS,
+            suggest_description,
+        )
+        from strata.summary_store import SummaryStore as _SummaryStore  # noqa: PLC0415
+
         for scope in fleet_config.active_scopes():
-            if not scope.description:
+            # #210 re-ruling: a description anywhere in the chain (own, else the nearest
+            # ancestor's) is enough; the scope's own memory only SUGGESTS one.
+            if fleet_config.effective_description(scope.id) is None:
+                suggestion = None
+                if paths is not None:
+                    try:
+                        suggestion = suggest_description(
+                            _SummaryStore(str(paths.summaries_dir)).read(scope.id),
+                            IMPLIED_PURPOSE_MIN_WORDS,
+                        )
+                    except Exception:  # noqa: BLE001 — a hint must never abort doctor
+                        suggestion = None
+                message = (
+                    "no description — the judge can't tell what's irrelevant to it; "
+                    "add one in fleet.yaml (a `description:` line under the scope)."
+                    if suggestion is None
+                    else f"no description; your scope's memory suggests: {suggestion}"
+                )
                 checks.append(
                     Check(
                         name=f"Scope description ({scope.id})",
                         kind="soft",
                         passed=False,
-                        message=(
-                            "no description — the judge can't tell what's irrelevant to it; "
-                            "add one in fleet.yaml (a `description:` line under the scope)."
-                        ),
+                        message=message,
                     )
                 )
 

@@ -599,6 +599,20 @@ class FleetConfig(BaseModel):
                 parents.setdefault(resolution.from_, resolution.to)
         return parents
 
+    def effective_description(self, scope_id: str) -> tuple[str, str] | None:
+        """The description relevance is measured against for *scope_id* (#210), as
+        ``(text, source_scope_id)``: the scope's own, else the nearest ancestor's up to
+        the root, else ``None`` (nothing is declined as irrelevant). Chain edges only."""
+        scope = self.get_scope(scope_id)
+        if scope is None:
+            return None
+        if scope.description:
+            return scope.description, scope.id
+        for ancestor in reversed(self.inter_stratum_ancestors(scope_id)):
+            if ancestor.description:
+                return ancestor.description, ancestor.id
+        return None
+
     def inter_stratum_ancestors(self, scope_id: str) -> list[Scope]:
         """Return the ancestor chain from root (L0) down to *scope_id*'s parent.
 
