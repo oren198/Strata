@@ -3,8 +3,9 @@ the scope's own ``description``, else the nearest ancestor's, up to the root, el
 The own-memory implied purpose is no longer a decline ground (it was circular: what a scope
 holds decided what could enter it).
 
-The whole change sits behind ``_RELEVANCE_CHAIN`` (an internal switch, tested in both
-positions): True is the 1.22 behaviour, False restores the shipped own-memory behaviour
+The whole change sits behind two internal switches (``_RELEVANCE_ANCESTOR_FALLBACK`` and
+``_RELEVANCE_DROP_IMPLIED``), tested in all four positions in test_v122_210_split.py: both
+True is the 1.22 behaviour, both False restores the shipped own-memory behaviour
 byte-for-byte until the C5 verdict, after which the dead path is removed.
 """
 
@@ -196,13 +197,15 @@ def test_an_input_change_refresh_has_nothing_to_judge_for_relevance() -> None:
 
 
 def test_the_switch_is_on_by_default() -> None:
-    assert sm._RELEVANCE_CHAIN is True
+    assert sm._RELEVANCE_ANCESTOR_FALLBACK is True
+    assert sm._RELEVANCE_DROP_IMPLIED is True
 
 
 def test_switch_off_restores_the_shipped_own_memory_behaviour(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(sm, "_RELEVANCE_CHAIN", False)
+    monkeypatch.setattr(sm, "_RELEVANCE_ANCESTOR_FALLBACK", False)
+    monkeypatch.setattr(sm, "_RELEVANCE_DROP_IMPLIED", False)
     message = _message(LEAF, [ROOT, MID], _summary(_POPULATED))
     # No own description: the ancestors' are NOT used; the own memory implies a purpose.
     assert "Billing: invoices and payouts." not in message
@@ -210,7 +213,8 @@ def test_switch_off_restores_the_shipped_own_memory_behaviour(
 
 
 def test_switch_off_without_memory_carries_no_rule(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(sm, "_RELEVANCE_CHAIN", False)
+    monkeypatch.setattr(sm, "_RELEVANCE_ANCESTOR_FALLBACK", False)
+    monkeypatch.setattr(sm, "_RELEVANCE_DROP_IMPLIED", False)
     message = _message(LEAF, [ROOT, MID], _summary("Short."))
     for marker in _MARKERS:
         assert marker not in message
@@ -219,7 +223,8 @@ def test_switch_off_without_memory_carries_no_rule(monkeypatch: pytest.MonkeyPat
 def test_switch_off_an_own_description_is_the_shipped_text(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(sm, "_RELEVANCE_CHAIN", False)
+    monkeypatch.setattr(sm, "_RELEVANCE_ANCESTOR_FALLBACK", False)
+    monkeypatch.setattr(sm, "_RELEVANCE_DROP_IMPLIED", False)
     message = _message(LEAF_OWN, [ROOT, MID])
     assert "SCOPE PURPOSE: Leaf: refunds only." in message
     assert "Never decline as irrelevant" not in message
