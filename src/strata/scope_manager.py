@@ -8713,6 +8713,142 @@ def _covers_or_marked(
     )
 
 
+#: C6 (broad-directive false declines): the INTERNAL SWITCH. On, a marker on a readable
+#: ``unrelated`` answer no longer declines when the clause carrying it is the contributor's OWN
+#: act or artefact (engine floor only: no judge field; an unclassifiable clause declines as
+#: today). Off: today's verdicts. Tested in both positions; one revertible commit.
+_MARKER_GOVERNOR_CHECK = True
+
+#: The CLOSED list of own-artefact nouns (CEO 2026-11-23, FROZEN once the first blind-set output
+#: is seen: a change after that is a new prereg). "version" and "draft" were added at the
+#: anaphora ruling (1300Z), before any blind output.
+_OWN_ARTEFACT_NOUNS = frozenset(
+    {
+        "edit",
+        "change",
+        "pr",
+        "patch",
+        "commit",
+        "field",
+        "flag",
+        "option",
+        "variable",
+        "version",
+        "draft",
+    }
+)
+_OWN_ACT_VERBS = frozenset(
+    {
+        "added",
+        "introduced",
+        "created",
+        "wrote",
+        "made",
+        "built",
+        "changed",
+        "edited",
+        "updated",
+        "sent",
+        "drafted",
+        "opened",
+        "renamed",
+        "extended",
+        "documented",
+        "logged",
+        "recorded",
+    }
+)
+#: The only markers an own-act clause may carry: the adjective "optional" on the contributor's
+#: new artefact, or the artefact's own verb keeps/leaves/lets ("my edit keeps the diff small").
+_OWN_ACT_MARKER_WORDS = frozenset({"optional", "keeps", "leaves", "lets"})
+_OWN_ACT_FIRST_PERSON_RE = re.compile(
+    r"^(?:i|we)\s+(?:(?:also|just|then|have|had|['’]ve)\s+)*(?:"
+    + "|".join(sorted(_OWN_ACT_VERBS))
+    + r")\b(?P<rest>.*)$",
+    re.IGNORECASE,
+)
+_OWN_ACT_ARTEFACT_RE = re.compile(
+    r"^(?:my|our|this|that|the)\s+(?:[\w-]+\s+)?(?:"
+    + "|".join(sorted(_OWN_ARTEFACT_NOUNS))
+    + r")\s+(?:adds|introduces|keeps|leaves|lets)\b(?P<rest>.*)$",
+    re.IGNORECASE,
+)
+_OWN_ACT_CLAUSE_SPLIT_RE = re.compile(r"[.;,!?]|\s[-–—]\s")
+_OWN_ACT_CLAUSE_LEAD_RE = re.compile(
+    r"^\W*(?:\d{4}-\d{2}-\d{2}:?\s*)?(?:(?:and|but|so|also|then|today|update:?)\s+)*",
+    re.IGNORECASE,
+)
+
+
+def _marker_hits(scanned: str) -> list[re.Match[str]]:
+    return [
+        m
+        for pattern in (*_NORMATIVE_EXCEPTION_RES, *_HABITUAL_EXCEPTION_RES)
+        for m in pattern.finditer(scanned)
+    ]
+
+
+def _rule_leading_phrases(texts: Sequence[str]) -> list[str]:
+    """The leading phrase (the rule's SUBJECT) of every sentence of every inherited text."""
+    phrases: list[str] = []
+    for text in texts:
+        for unit in re.split(r"(?<=[.!?])\s+|\n+", text):
+            unit = unit.strip()
+            if not unit:
+                continue
+            verb = _LEADING_PHRASE_VERB_RE.search(unit)
+            phrases.append(unit[: verb.start()] if verb else " ".join(unit.split()[:4]))
+    return phrases
+
+
+def _own_act_clause(clause: str) -> tuple[str, str] | None:
+    """``(path, object_text)`` when *clause* is the contributor's own act or artefact, else
+    ``None``. ``path`` is ``first_person`` or ``artefact``."""
+    text = _OWN_ACT_CLAUSE_LEAD_RE.sub("", clause.strip())
+    for path, pattern in (
+        ("first_person", _OWN_ACT_FIRST_PERSON_RE),
+        ("artefact", _OWN_ACT_ARTEFACT_RE),
+    ):
+        match = pattern.match(text)
+        if match is not None:
+            return path, match.group("rest")
+    return None
+
+
+def _own_act_path(
+    content: str, texts: Sequence[str], context_words: frozenset[str] = frozenset()
+) -> str | None:
+    """C6: the path ("first_person", "artefact" or both joined by ``+``) when EVERY exception
+    marker in *content* sits in a clause that is the contributor's own act or artefact, carries
+    only the markers an own act may carry, and whose object shares no stem with any inherited
+    rule's subject (an own act that creates the exception, "I added an optional flag to skip the
+    review", declines). ``None`` otherwise: today's decline stands."""
+    scanned = _blank_non_marker_clauses(content)
+    hits = _marker_hits(scanned)
+    if not hits:
+        return None
+    phrases = _rule_leading_phrases(texts)
+    paths: set[str] = set()
+    cursor = 0
+    for piece in _OWN_ACT_CLAUSE_SPLIT_RE.split(scanned):
+        start = scanned.find(piece, cursor)
+        end = start + len(piece)
+        cursor = end
+        clause_hits = [m for m in hits if start <= m.start() < max(end, start + 1)]
+        if not clause_hits:
+            continue
+        if any(m.group(0).casefold() not in _OWN_ACT_MARKER_WORDS for m in clause_hits):
+            return None
+        classified = _own_act_clause(piece)
+        if classified is None:
+            return None
+        path, obj = classified
+        if any(_shared_subject_stems(obj, phrase, context_words) >= 1 for phrase in phrases):
+            return None
+        paths.add(path)
+    return "+".join(sorted(paths)) if paths else None
+
+
 def _action_overlap(span: str, inherited_text: str) -> bool:
     if _shared_subject_stems(span, inherited_text) >= 1:
         return True
@@ -8873,6 +9009,13 @@ def verify_inherited_relation(
             for text in (inherited_text, *other_texts)
         )
         if marker is not None and covers:
+            if _MARKER_GOVERNOR_CHECK:
+                path = _own_act_path(content, [inherited_text, *other_texts], context_words)
+                if path is not None:
+                    return (
+                        "admit",
+                        f"{failure}; own-act:{path}; ({marker}) governs the contributor's own act",
+                    )
             return "decline", f"{failure}; covers an inherited subject and ({marker})"
         return "admit", f"{failure}; no covered exception"
     if marker is not None:
