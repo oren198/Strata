@@ -102,13 +102,17 @@ WINDOW_VERBATIM_TAIL = 3
 #: ``Settings.implied_purpose_min_words`` (``STRATA_IMPLIED_PURPOSE_MIN_WORDS``).
 IMPLIED_PURPOSE_MIN_WORDS = 50
 
-#: #210 re-ruling (CEO 2026-11-23): the INTERNAL SWITCH for the relevance fallback. On
-#: (1.22): relevance is measured against the scope's own ``description``, else the nearest
-#: ancestor's up to the root, else not at all; the own-memory implied purpose is NOT a
-#: decline ground (it only suggests a description, in doctor and the Console). Off: the
-#: shipped 1.13 behaviour, byte for byte (own description, else the own-memory implied
-#: purpose). Tested in both positions; the off path is removed after the C5 verdict.
-_RELEVANCE_CHAIN = True
+#: #210 re-ruling (CEO 2026-11-23), as TWO internal switches so a live miss on one behaviour
+#: does not remove the other. Both default True (the 1.22 behaviour); (False, False) is the
+#: shipped 1.21 behaviour, byte for byte. Tested in all four positions; each off path is
+#: removed after the C5 verdict.
+#:
+#: ``_RELEVANCE_ANCESTOR_FALLBACK``: a scope with no description of its own is judged against
+#: the nearest ancestor's, plus the never-decline sentence and the outcome-report exemption.
+_RELEVANCE_ANCESTOR_FALLBACK = True
+#: ``_RELEVANCE_DROP_IMPLIED``: the own-memory implied purpose is NOT a decline ground (it
+#: only suggests a description, in doctor and the Console). Off: it is, as in 1.21.
+_RELEVANCE_DROP_IMPLIED = True
 
 #: ADR 0013 D3 — the word budget for a scope's published face (its own
 #: current publication plus whatever a ``publish`` act would add). The
@@ -4543,10 +4547,9 @@ def _render_relevance(
 ) -> str:
     """The per-call relevance block (#210), or ``""`` when there is nothing to judge it against.
 
-    With :data:`_RELEVANCE_CHAIN` on (1.22) the purpose is the scope's own ``description``,
-    else the nearest ancestor's (``entitlement.chain``, root first, scope last), else there
-    is no relevance rule at all; an outcome report never gets one. The shipped text below
-    is what the switch's off position keeps.
+    Two internal switches (see :data:`_RELEVANCE_ANCESTOR_FALLBACK` and
+    :data:`_RELEVANCE_DROP_IMPLIED`) choose between the 1.22 behaviour and the shipped one,
+    independently; with both off this is the 1.21 text exactly.
 
     Relevance is a decline ground only where a purpose exists to measure it against:
 
@@ -4563,21 +4566,26 @@ def _render_relevance(
     """
     if mode != "ordinary":
         return ""
-    if _RELEVANCE_CHAIN:
-        if outcome_report:
-            return ""
-        source, description = scope.id, scope.description
-        if not description and entitlement is not None:
-            for ancestor in reversed(entitlement.chain[:-1]):
-                if ancestor.description:
-                    source, description = ancestor.id, ancestor.description
-                    break
-        if not description:
-            return ""
+    if _RELEVANCE_ANCESTOR_FALLBACK and outcome_report:
+        return ""
+    source, description = scope.id, scope.description
+    if not description and _RELEVANCE_ANCESTOR_FALLBACK and entitlement is not None:
+        for ancestor in reversed(entitlement.chain[:-1]):
+            if ancestor.description:
+                source, description = ancestor.id, ancestor.description
+                break
+    if description:
         label = (
             "SCOPE PURPOSE"
             if source == scope.id
             else f"SCOPE PURPOSE (stated by the ancestor scope {source}; this scope states none)"
+        )
+        never_decline = (
+            " Never decline as irrelevant: an outcome report on one of this scope's own "
+            "items, a report bearing on a directive this scope holds, or a withdrawal "
+            "reaching it."
+            if _RELEVANCE_ANCESTOR_FALLBACK
+            else ""
         )
         return (
             f"{label}: {description}\n"
@@ -4587,23 +4595,12 @@ def _render_relevance(
             'stated purpose: <the purpose as stated>." Anything a worker in this scope '
             "could plausibly need — observations about the work the purpose covers, however "
             "small or transient — is on-purpose and is admitted by the rules above; when in "
-            "doubt, admit. Never decline as irrelevant: an outcome report on one of this "
-            "scope's own items, a report bearing on a directive this scope holds, or a "
-            "withdrawal reaching it.\n\n"
+            f"doubt, admit.{never_decline}\n\n"
         )
-    if scope.description:
-        return (
-            f"SCOPE PURPOSE: {scope.description}\n"
-            "RELEVANCE (an additional decline ground for this scope): judge whether the "
-            "contribution is about the work this stated purpose covers. Material clearly "
-            "outside it is declined, and your reasoning must begin \"Outside this scope's "
-            'stated purpose: <the purpose as stated>." Anything a worker in this scope '
-            "could plausibly need — observations about the work the purpose covers, however "
-            "small or transient — is on-purpose and is admitted by the rules above; when in "
-            "doubt, admit.\n\n"
-        )
-    if current_summary is not None and _summary_word_count(current_summary) >= (
-        implied_purpose_min_words
+    if (
+        not _RELEVANCE_DROP_IMPLIED
+        and current_summary is not None
+        and _summary_word_count(current_summary) >= implied_purpose_min_words
     ):
         return (
             "RELEVANCE (an additional decline ground for this scope): this scope states no "
