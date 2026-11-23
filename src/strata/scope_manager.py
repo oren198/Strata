@@ -5402,6 +5402,10 @@ def _vocabulary_informants_missing(
     return missing
 
 
+#: #212: the judge's own hearsay label, at the start of its reasoning.
+_HEARSAY_LABEL_RE = re.compile(r"^\s*Hearsay:", re.IGNORECASE)
+
+
 def _drop_false_hearsay(reasoning: str) -> str:
     """ "Hearsay:" on a reasoning that itself says first-hand is a wrong label: dropped."""
     for match in re.finditer(r"\bfirst[- ]hand\b", reasoning, re.IGNORECASE):
@@ -10624,6 +10628,13 @@ class ScopeManager:
                 new_contribution=new_contribution,
                 mode=mode,
             )
+            judgment = self._refuse_hearsay_directive_ops(
+                judgment,
+                scope=scope,
+                current_summary=current_summary,
+                new_contribution=new_contribution,
+                mode=mode,
+            )
             judgment = self.classify_inherited_context(
                 judgment,
                 scope=scope,
@@ -10891,6 +10902,61 @@ class ScopeManager:
                 ),
                 "reasoning": f"{judgment.reasoning} {note}",
                 "protocol_notes": [*judgment.protocol_notes, f"context note ops dropped: {note}"],
+            }
+        )
+
+    @staticmethod
+    def _refuse_hearsay_directive_ops(
+        judgment: ScopeManagerJudgment,
+        *,
+        scope: Scope,
+        current_summary: ScopeSummary | None,
+        new_contribution: Contribution,
+        mode: JudgeMode,
+    ) -> ScopeManagerJudgment:
+        """#212 (ADR 0016 D4): an item the judge itself labelled "Hearsay:" is context only.
+        Whatever directive ops it carries are refused (an informant's word never admits,
+        removes or replaces a directive), the item is kept as context, and a protocol note
+        names the refused ops. Reads the label after the reason-honesty check has dropped a
+        wrong one. The verified-informant path already drops its ops; this covers the label
+        the judge gave without that path running."""
+        if (
+            mode != "ordinary"
+            or judgment.decision == "decline"
+            or not judgment.directive_ops
+            or not _HEARSAY_LABEL_RE.match(judgment.reasoning or "")
+        ):
+            return judgment
+        refused = list(judgment.directive_ops)
+        previous = current_summary.context if current_summary is not None else ""
+        context = (
+            judgment.new_context
+            if judgment.new_context is not None
+            else _append_line(
+                previous,
+                f"[{new_contribution.id}] "
+                f"{new_contribution.contributor.skill or new_contribution.contributor.session_id}"
+                f" ({new_contribution.contributor.scope_id}) reports (hearsay): "
+                f"{new_contribution.content.strip()}",
+            )
+        )
+        return judgment.model_copy(
+            update={
+                "decision": "accept_as_context",
+                "directive_ops": [],
+                "new_context": context,
+                "new_summary": _apply_amendment(
+                    scope=scope,
+                    current_summary=current_summary,
+                    contribution=new_contribution,
+                    ops=[],
+                    new_context=context,
+                ),
+                "protocol_notes": [
+                    *judgment.protocol_notes,
+                    "hearsay item, directive op(s) refused (an informant's word never binds): "
+                    + "; ".join(op.describe() for op in refused),
+                ],
             }
         )
 
