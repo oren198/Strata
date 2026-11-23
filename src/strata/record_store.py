@@ -58,6 +58,7 @@ Vocabulary throughout follows CONTEXT.md verbatim.
 from __future__ import annotations
 
 import json
+import re
 import secrets
 import sqlite3
 from collections.abc import Mapping, Sequence
@@ -4573,6 +4574,16 @@ def _outcome_reading(
     return _READING_REPLACED if claim_content_absent else _READING_CORRECTION_PENDING
 
 
+#: #212 (ADR 0016 D3): the two marks a recorded judgment carries when its item is hearsay:
+#: the judge's own "Hearsay:" label, and the engine's verified-informant note.
+_HEARSAY_MARK_RE = re.compile(r"\bHearsay:|interior assertion: [^\n]*?, informant, admitted")
+
+
+def is_hearsay_judgment(judgment: Judgment | None) -> bool:
+    """Whether *judgment* records its item as hearsay (read from the judgment's own notes)."""
+    return judgment is not None and bool(_HEARSAY_MARK_RE.search(judgment.notes or ""))
+
+
 def standing_evidence(
     record_store: RecordStore, fleet: FleetConfig, item_id: str, *, summary_store: SummaryStore
 ) -> list[StandingEvidence]:
@@ -4646,6 +4657,10 @@ def standing_evidence(
             ),
         )
         if reading == _READING_EXCLUDED:
+            continue
+        # #212 (ADR 0016 D3): hearsay counts for nothing toward the item's standing, and
+        # never revives: there is no echo (Concept 8).
+        if is_hearsay_judgment(judgment):
             continue
         entitled = _currently_entitled(
             fleet, outcome.contributor.scope_id, target.contribution.scope_id

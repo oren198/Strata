@@ -1380,6 +1380,7 @@ The engine checks the judge's follow-up answers: quoted spans must be verbatim. 
 Limits I know of, measured in the v1.18 run:
 - A reworded exception that shares no words with the inherited rule can be admitted when the judge calls it a refinement (seen in 2 of 3 runs on one test item).
 - Another scope's rule asserted with that scope named only by an alias ("the purchasing team" for procurement) is admitted: 11 of 12 attempts.
+- Only a literal scope name triggers the #212 basis-check backstop (a referenced peer named with no publication, inherited directive or operator item behind it); oblique references rely on the judge's own reading.
 - A restricting directive in the scope's own summary isn't weighed by the judge: 2 items, every run.
 - The ordinary judge's input wraps the scope summary in an ambiguous fence; on qwen this can make it misread the summary.
 - A retirement isn't required to state what changed. The judge is asked for it, no model I measured fills it reliably, and the engine doesn't enforce it (#209).

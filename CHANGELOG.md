@@ -5,6 +5,16 @@ the release PR (`dev` → `main`) and the GitHub Release body are built from
 (`docs/releasing.md`, step 3) — write entries here as work lands, and the
 "Unreleased" section is cleared once a release ships.
 
+## Unreleased
+
+### Changed
+
+- **Hearsay and manufactured attribution (#212, ADR 0016).** Three mechanical backstops, each its own commit.
+  - A note that names a referenced peer with nothing behind it in the record (no publication, inherited directive or operator item) gets one re-ask: decline, restate as hearsay from a named informant, or keep with a stated reason quoted from the note. A keep with no reason is declined. Internal switch: `_MANUFACTURED_BASIS_CHECK`.
+  - Only a literal scope name triggers this backstop; oblique references rely on the judge's own reading.
+  - An item the judge labels "Hearsay:" may not carry a directive op; the ops are refused with a protocol note.
+  - Hearsay counts for nothing in `standing_evidence` and does not revive when the item it reported on is replaced or withdrawn.
+
 ## 1.21.0 (2026-11-21)
 
 The store migrates by itself on first start (0028). There is no manual step.

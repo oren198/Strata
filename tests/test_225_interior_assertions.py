@@ -8,6 +8,7 @@ re-ask's own response.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from strata.fleet_config import EntitlementView, Scope, Stratum
@@ -121,7 +122,29 @@ def test_mentioning_an_entitled_referenced_peer_does_not_trigger() -> None:
     mock_client = MagicMock()
     content = "225-peer only approves changes under budget."
     mock_client.messages.create.return_value = _ordinary_accept(content)
-    judgment, _ = _judge(mock_client, content)
+    # #212: a peer that has published to this scope is a basis; with none, the basis
+    # check (backstop 1) would re-ask, which tests/test_v122_212_manufactured_basis.py pins.
+    published = SimpleNamespace(
+        id="p_225peer",
+        kind="context",
+        content="Changes follow the standard schedule.",
+        subject=None,
+        anchors=[],
+        published_at="2026-09-01T00:00:00+00:00",
+        origin_scope_id=None,
+        relay_scope_id=None,
+        relay_item_id=None,
+    )
+    manager = ScopeManager(client=mock_client)
+    judgment = manager.judge(
+        scope=SCOPE,
+        stratum=STRATUM,
+        current_summary=CURRENT_SUMMARY,
+        recent_contributions=[],
+        new_contribution=_contribution(content),
+        entitlement=ENTITLEMENT,
+        peer_publications=[(PEER.id, [published])],
+    )
     assert mock_client.messages.create.call_count == 1
     assert not any("interior assertion" in n for n in judgment.protocol_notes)
 
