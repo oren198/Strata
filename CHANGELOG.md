@@ -7,6 +7,10 @@ the release PR (`dev` → `main`) and the GitHub Release body are built from
 
 ## Unreleased
 
+### Behaviour change
+
+- **A scope with no description anywhere in its chain no longer declines material as irrelevant; set a description to turn relevance checks on (#210).** Relevance is measured against the scope's own `description`, else the nearest ancestor's up to the root (a `description` on the root scope bounds a whole fleet), else not at all. The shipped own-memory "implied purpose" is no longer a decline ground, because what a scope holds then decides what may enter it. It only suggests a description now: `strata doctor` and the Console say "no description; your scope's memory suggests: …", report-only. An outcome report on the scope's own items, a report bearing on a directive it holds, and a withdrawal are never declined as irrelevant. Internal switch `_RELEVANCE_CHAIN` (off restores the 1.21 behaviour) until the C5 verdict.
+
 ### Changed
 
 - **Hearsay and manufactured attribution (#212, ADR 0016).** Three mechanical backstops, each its own commit.

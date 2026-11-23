@@ -16,6 +16,7 @@ import yaml
 from fastapi.testclient import TestClient
 
 import strata.__main__ as cli
+import strata.scope_manager as scope_manager
 from strata.__main__ import _build_parser, cmd_doctor, cmd_register
 from strata.app import create_app
 from strata.fleet_config import FleetConfig, Scope, Stratum
@@ -297,7 +298,10 @@ def test_a_scope_with_no_description_and_no_real_memory_carries_no_relevance_rul
     assert "None" not in _message(None, summary).split("NEW CONTRIBUTION TO JUDGE")[0]
 
 
-def test_a_populated_scope_with_no_description_gets_an_implied_purpose_rule() -> None:
+def test_a_populated_scope_with_no_description_gets_an_implied_purpose_rule(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(scope_manager, "_RELEVANCE_CHAIN", False)
     message = _flat(_message(None, _summary(_POPULATED_CONTEXT)))
 
     assert "RELEVANCE" in message
@@ -308,7 +312,8 @@ def test_a_populated_scope_with_no_description_gets_an_implied_purpose_rule() ->
     assert "name what you read" in message
 
 
-def test_directives_count_toward_a_populated_scope() -> None:
+def test_directives_count_toward_a_populated_scope(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(scope_manager, "_RELEVANCE_CHAIN", False)
     directives = [
         Directive(
             id="c_1",
@@ -325,7 +330,8 @@ def test_directives_count_toward_a_populated_scope() -> None:
     )
 
 
-def test_a_populated_scope_still_admits_on_topic_work() -> None:
+def test_a_populated_scope_still_admits_on_topic_work(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(scope_manager, "_RELEVANCE_CHAIN", False)
     """Must-still-accept twin, implied-purpose path."""
     message = _flat(_message(None, _summary(_POPULATED_CONTEXT)))
 
@@ -333,7 +339,8 @@ def test_a_populated_scope_still_admits_on_topic_work() -> None:
     assert "when in doubt, admit" in message.lower()
 
 
-def test_the_words_needed_to_imply_a_purpose_are_tunable() -> None:
+def test_the_words_needed_to_imply_a_purpose_are_tunable(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(scope_manager, "_RELEVANCE_CHAIN", False)
     assert "implied by" not in _message(None, _summary("Coffee is upstairs on the third floor."))
     assert "implied by" in _message(
         None, _summary("Coffee is upstairs on the third floor."), min_words=3

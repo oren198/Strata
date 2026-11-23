@@ -191,13 +191,18 @@ see [Binding past one scope](#binding-past-one-scope).
 
 Give each scope a one-line `description:` in `fleet.yaml` — what its memory is for.
 The judge measures relevance against it: material "outside this scope's stated
-purpose" is declined, and the decline reason quotes the purpose. Without a
-description the judge may use what the scope already holds as an implied purpose,
-but only once there is enough of it to tell what the scope is about (about 50 words
-of summary and directives; `STRATA_IMPLIED_PURPOSE_MIN_WORDS`); a scope with an
-empty summary is judged exactly as before, with no relevance rule at all. `strata
-doctor` warns once per scope that has no description, and the Console shows it in
-the scope header ("no description" when unset).
+purpose" is declined, and the decline reason quotes the purpose. A scope with no
+description of its own uses the nearest ancestor's, up to the root; a `description`
+on the root scope therefore bounds a whole fleet. If nothing in the chain has one,
+nothing is declined as irrelevant (since 1.22; before it, a scope's own existing
+memory could imply a purpose, which is no longer a decline ground). Never declined
+as irrelevant: an outcome report on the scope's own items, a report bearing on a
+directive the scope holds, or a withdrawal reaching it. `strata doctor` warns once
+per scope with no description anywhere in its chain, and when the scope already
+holds enough memory (about 50 words, `STRATA_IMPLIED_PURPOSE_MIN_WORDS`) it says
+"no description; your scope's memory suggests: …". That suggestion is report-only:
+nothing is declined or written from it. The Console shows the same in the scope
+header ("no description" when unset, and an inherited one names its source).
 
 ### 6. Two terminals, same project
 

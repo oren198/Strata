@@ -102,6 +102,14 @@ WINDOW_VERBATIM_TAIL = 3
 #: ``Settings.implied_purpose_min_words`` (``STRATA_IMPLIED_PURPOSE_MIN_WORDS``).
 IMPLIED_PURPOSE_MIN_WORDS = 50
 
+#: #210 re-ruling (CEO 2026-11-23): the INTERNAL SWITCH for the relevance fallback. On
+#: (1.22): relevance is measured against the scope's own ``description``, else the nearest
+#: ancestor's up to the root, else not at all; the own-memory implied purpose is NOT a
+#: decline ground (it only suggests a description, in doctor and the Console). Off: the
+#: shipped 1.13 behaviour, byte for byte (own description, else the own-memory implied
+#: purpose). Tested in both positions; the off path is removed after the C5 verdict.
+_RELEVANCE_CHAIN = True
+
 #: ADR 0013 D3 — the word budget for a scope's published face (its own
 #: current publication plus whatever a ``publish`` act would add). The
 #: engine default behind :attr:`strata.settings.Settings.publication_max_words`
@@ -4510,14 +4518,35 @@ def _render_directive_outcome_block(target: ActedOnTarget) -> str:
     )
 
 
+def suggest_description(summary: ScopeSummary | None, min_words: int) -> str | None:
+    """#210 re-ruling: a description to SUGGEST to the operator from a scope's own memory,
+    or ``None``. Report-only (doctor, the Console): never a decline ground, never written.
+    Needs at least *min_words* words of memory; the suggestion is its opening words (the
+    context, else the first directive)."""
+    if summary is None or _summary_word_count(summary) < min_words:
+        return None
+    source = summary.context.strip() or next(
+        (d.content.strip() for d in summary.directives if d.content.strip()), ""
+    )
+    words = source.split()
+    return " ".join(words[:25]) or None
+
+
 def _render_relevance(
     scope: Scope,
     current_summary: ScopeSummary | None,
     *,
     mode: JudgeMode,
     implied_purpose_min_words: int,
+    entitlement: EntitlementView | None = None,
+    outcome_report: bool = False,
 ) -> str:
     """The per-call relevance block (#210), or ``""`` when there is nothing to judge it against.
+
+    With :data:`_RELEVANCE_CHAIN` on (1.22) the purpose is the scope's own ``description``,
+    else the nearest ancestor's (``entitlement.chain``, root first, scope last), else there
+    is no relevance rule at all; an outcome report never gets one. The shipped text below
+    is what the switch's off position keeps.
 
     Relevance is a decline ground only where a purpose exists to measure it against:
 
@@ -4534,6 +4563,34 @@ def _render_relevance(
     """
     if mode != "ordinary":
         return ""
+    if _RELEVANCE_CHAIN:
+        if outcome_report:
+            return ""
+        source, description = scope.id, scope.description
+        if not description and entitlement is not None:
+            for ancestor in reversed(entitlement.chain[:-1]):
+                if ancestor.description:
+                    source, description = ancestor.id, ancestor.description
+                    break
+        if not description:
+            return ""
+        label = (
+            "SCOPE PURPOSE"
+            if source == scope.id
+            else f"SCOPE PURPOSE (stated by the ancestor scope {source}; this scope states none)"
+        )
+        return (
+            f"{label}: {description}\n"
+            "RELEVANCE (an additional decline ground for this scope): judge whether the "
+            "contribution is about the work this stated purpose covers. Material clearly "
+            "outside it is declined, and your reasoning must begin \"Outside this scope's "
+            'stated purpose: <the purpose as stated>." Anything a worker in this scope '
+            "could plausibly need — observations about the work the purpose covers, however "
+            "small or transient — is on-purpose and is admitted by the rules above; when in "
+            "doubt, admit. Never decline as irrelevant: an outcome report on one of this "
+            "scope's own items, a report bearing on a directive this scope holds, or a "
+            "withdrawal reaching it.\n\n"
+        )
     if scope.description:
         return (
             f"SCOPE PURPOSE: {scope.description}\n"
@@ -4606,6 +4663,7 @@ def _build_judge_preamble(
     window_verbatim_tail: int = WINDOW_VERBATIM_TAIL,
     implied_purpose_min_words: int = IMPLIED_PURPOSE_MIN_WORDS,
     examined_context: Sequence[ExaminedContextItem] | None = None,
+    outcome_report: bool = False,
 ) -> str:
     """Compose everything in the user message ahead of the contributions to judge.
 
@@ -4705,7 +4763,12 @@ def _build_judge_preamble(
     input_changes_block = _render_input_changes(input_changes)
 
     relevance_block = _render_relevance(
-        scope, current_summary, mode=mode, implied_purpose_min_words=implied_purpose_min_words
+        scope,
+        current_summary,
+        mode=mode,
+        implied_purpose_min_words=implied_purpose_min_words,
+        entitlement=entitlement,
+        outcome_report=outcome_report,
     )
 
     return (
@@ -4783,6 +4846,7 @@ def _build_user_message(
         window_verbatim_tail=window_verbatim_tail,
         implied_purpose_min_words=implied_purpose_min_words,
         examined_context=examined_context,
+        outcome_report=acted_on_target is not None,
     )
     outcome_block = "" if acted_on_target is None else _render_outcome_block(acted_on_target)
     return (
