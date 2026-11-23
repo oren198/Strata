@@ -862,6 +862,56 @@ INTERIOR_ASSERTION_TOOL: dict = {
     },
 }
 
+#: #212 backstop 1 (ADR 0016 D2): the INTERNAL SWITCH for the basis check. On, a note that
+#: names a referenced peer with no basis in the record gets the interior-assertion re-ask
+#: (see ``_check_interior_assertion``). Off, only the #225 trigger (non-entitled scopes)
+#: remains: today's behaviour. Tested in both positions; no setting, no CLI flag.
+_MANUFACTURED_BASIS_CHECK = True
+
+
+#: The re-ask tool for the basis check: the same tool plus the third answer of Philis's
+#: ruling (a), "keep WITH a stated reason that the note does not assert the peer's
+#: position". A SEPARATE object, so the #225 re-ask for a non-entitled scope keeps its
+#: tool byte-for-byte.
+def _interior_assertion_basis_tool() -> dict:
+    """The basis-check re-ask tool (a function, not a module-level dict: it shares the #225
+    tool's name, and tool inventories read module-level dicts by name)."""
+    return {
+        **INTERIOR_ASSERTION_TOOL,
+        "input_schema": {
+            **INTERIOR_ASSERTION_TOOL["input_schema"],
+            "properties": {
+                **INTERIOR_ASSERTION_TOOL["input_schema"]["properties"],
+                "classification": {
+                    **INTERIOR_ASSERTION_TOOL["input_schema"]["properties"]["classification"],
+                    "enum": [
+                        *INTERIOR_ASSERTION_TOOL["input_schema"]["properties"]["classification"][
+                            "enum"
+                        ],
+                        "not_an_assertion",
+                    ],
+                    "description": (
+                        INTERIOR_ASSERTION_TOOL["input_schema"]["properties"]["classification"][
+                            "description"
+                        ]
+                        + " not_an_assertion: the note does NOT state that scope's position "
+                        "(for example it reports the contributor's own observation); give the "
+                        "reason as reason_span. A keep with no reason is not accepted."
+                    ),
+                },
+                "reason_span": {
+                    "type": "string",
+                    "description": (
+                        "Required when classification is not_an_assertion: the EXACT verbatim "
+                        "span of the contribution's own text that shows it does not assert the "
+                        "named scope's position. Must occur in the contribution text."
+                    ),
+                },
+            },
+        },
+    }
+
+
 # ---------------------------------------------------------------------------
 # Attribution re-check tool (v1.17 item 1 — #225 in reverse, a decline-only
 # re-ask). A SEPARATE tool, never a `_judge_tool_for` variant of the ordinary
@@ -9995,6 +10045,25 @@ class ScopeManager:
                         return item.content
             return None
 
+        def _has_basis(peer: Scope) -> bool:
+            """#212: whether the record gives this scope a basis to speak of *peer*: a
+            publication from it that reached this scope, a directive inherited from it,
+            or an operator item that names it. Facts the call already rendered, never a
+            fresh lookup, and never a reading of what the note means."""
+            if any(sid == peer.id and items for sid, items in peer_publications or ()):
+                return True
+            if any(
+                d.source_scope_id == peer.id
+                for _aid, directives in ancestor_directives or ()
+                for d in directives
+            ):
+                return True
+            return any(
+                _match_other_scopes(item.content, [peer])
+                for _sid, items in operator_memory or ()
+                for item in items
+            )
+
         def _check_interior_assertion(
             judgment: ScopeManagerJudgment,
             messages: list[dict],
@@ -10016,6 +10085,18 @@ class ScopeManager:
             if entitlement is None:
                 return judgment
             matched = _match_other_scopes(new_contribution.content, entitlement.others)
+            unbased = (
+                [
+                    peer
+                    for peer in _match_other_scopes(
+                        new_contribution.content, entitlement.referenced_peers
+                    )
+                    if not _has_basis(peer)
+                ]
+                if _MANUFACTURED_BASIS_CHECK
+                else []
+            )
+            matched = [*matched, *(p for p in unbased if p not in matched)]
             if not matched:
                 return judgment
 
@@ -10126,7 +10207,16 @@ class ScopeManager:
                             "cache_control": {"type": "ephemeral"},
                         }
                     ],
-                    tools=[{**INTERIOR_ASSERTION_TOOL, "cache_control": {"type": "ephemeral"}}],
+                    tools=[
+                        {
+                            **(
+                                _interior_assertion_basis_tool()
+                                if unbased
+                                else INTERIOR_ASSERTION_TOOL
+                            ),
+                            "cache_control": {"type": "ephemeral"},
+                        }
+                    ],
                     tool_choice={
                         "type": "tool",
                         "name": INTERIOR_ASSERTION_TOOL["name"],
@@ -10143,12 +10233,14 @@ class ScopeManager:
                     "publication",
                     "directive",
                     "none",
+                    *(("not_an_assertion",) if unbased else ()),
                 ):
                     raise ValueError(f"unreadable classification {classification!r}")
                 informant_span = raw.get("informant_span")
                 telling_span = raw.get("telling_span")
                 ref_id = raw.get("ref_id")
                 act_span = raw.get("act_span")
+                reason_span = raw.get("reason_span")
                 if classification == "informant" and not (
                     isinstance(informant_span, str) and informant_span.strip()
                 ):
@@ -10211,6 +10303,34 @@ class ScopeManager:
                     ),
                     classification,
                     "declined (no observed act in own dealings)",
+                )
+
+            if classification == "not_an_assertion":
+                # Philis's ruling (a): the third answer is a KEEP, and only a stated reason
+                # counts. The reason must be a verbatim span of the note; anything else is
+                # unresolved and declined (the keep-first rule), never kept on trust.
+                haystack = " ".join(new_contribution.content.split()).casefold()
+                needle = (
+                    " ".join(reason_span.split()).casefold() if isinstance(reason_span, str) else ""
+                )
+                if needle and needle in haystack:
+                    return _noted(judgment, classification, "admitted as judged")
+                return _noted(
+                    judgment.model_copy(
+                        update={
+                            "decision": "decline",
+                            "new_summary": None,
+                            "directive_ops": [],
+                            "new_context": None,
+                            "reasoning": (
+                                "Declined: the note names a scope that has given this scope "
+                                "no basis, and it was kept without a stated reason that it "
+                                "does not assert that scope's position."
+                            ),
+                        }
+                    ),
+                    classification,
+                    "declined (kept with no stated reason)",
                 )
 
             if classification == "none":
