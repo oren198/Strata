@@ -9,12 +9,12 @@ the release PR (`dev` → `main`) and the GitHub Release body are built from
 
 ### Behaviour change
 
-- **A scope with no description anywhere in its chain no longer declines material as irrelevant; set a description to turn relevance checks on (#210).** Relevance is measured against the scope's own `description`, else the nearest ancestor's up to the root (a `description` on the root scope bounds a whole fleet), else not at all. The shipped own-memory "implied purpose" is no longer a decline ground, because what a scope holds then decides what may enter it. It only suggests a description now: `strata doctor` and the Console say "no description; your scope's memory suggests: …", report-only. An outcome report on the scope's own items, a report bearing on a directive it holds, and a withdrawal are never declined as irrelevant. Internal switch `_RELEVANCE_CHAIN` (off restores the 1.21 behaviour) until the C5 verdict.
+- **A scope with no description anywhere in its chain no longer declines material as irrelevant; set a description to turn relevance checks on (#210).** Relevance is measured against the scope's own `description`, else the nearest ancestor's up to the root (a `description` on the root scope bounds a whole fleet), else not at all. The shipped own-memory "implied purpose" is no longer a decline ground, because what a scope holds then decides what may enter it. It only suggests a description now: `strata doctor` and the Console say "no description; your scope's memory suggests: …", report-only. An outcome report on the scope's own items, a report bearing on a directive it holds, and a withdrawal are never declined as irrelevant.
 
 ### Changed
 
 - **Hearsay and manufactured attribution (#212, ADR 0016).** Three mechanical backstops, each its own commit.
-  - A note that names a referenced peer with nothing behind it in the record (no publication, inherited directive or operator item) gets one re-ask: decline, restate as hearsay from a named informant, or keep with a stated reason quoted from the note. A keep with no reason is declined. Internal switch: `_MANUFACTURED_BASIS_CHECK`.
+  - A note that names a referenced peer with nothing behind it in the record (no publication, inherited directive or operator item) gets one re-ask: decline, restate as hearsay from a named informant, or keep with a stated reason quoted from the note. A keep with no reason is declined.
   - Only a literal scope name triggers this backstop; oblique references rely on the judge's own reading.
   - An item the judge labels "Hearsay:" may not carry a directive op; the ops are refused with a protocol note.
   - Hearsay counts for nothing in `standing_evidence` and does not revive when the item it reported on is replaced or withdrawn.
