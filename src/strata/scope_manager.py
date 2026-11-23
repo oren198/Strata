@@ -2791,7 +2791,7 @@ def _batch_attribution_gaps(
 _ATTRIBUTION_REASK_ARMS = ("C", "A")
 _ATTRIBUTION_REASK_ARM = "C"
 #: How many shared subject stems make an engine-detected echo (besides the covered-subject branch).
-_ECHO_SHARED_STEMS = 3
+_ECHO_SHARED_STEMS = 2
 
 
 def _attribution_reask_arm() -> str:
