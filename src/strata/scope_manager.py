@@ -8773,7 +8773,18 @@ _OWN_ACT_ARTEFACT_RE = re.compile(
     + r")\s+(?:adds|introduces|keeps|leaves|lets)\b(?P<rest>.*)$",
     re.IGNORECASE,
 )
-_OWN_ACT_CLAUSE_SPLIT_RE = re.compile(r"[.;,!?]|\s[-–—]\s")
+#: C6 anaphora (CEO 1300Z): its own switch, nested under :data:`_MARKER_GOVERNOR_CHECK`, in its
+#: own commit. On, "it/this/that" + a marker resolves ONLY to a my/our own-artefact noun in the
+#: immediately PRECEDING clause; anything else is unclassified and declines.
+_MARKER_GOVERNOR_ANAPHORA = True
+_OWN_ACT_PRONOUN_RE = re.compile(
+    r"^(?:it|this|that)\s+(?:keeps|leaves|lets|adds|introduces)\b(?P<rest>.*)$", re.IGNORECASE
+)
+_OWN_ACT_ANTECEDENT_RE = re.compile(
+    r"\b(?:my|our)\s+(?:[\w-]+\s+)?(?:" + "|".join(sorted(_OWN_ARTEFACT_NOUNS)) + r")\b",
+    re.IGNORECASE,
+)
+_OWN_ACT_CLAUSE_SPLIT_RE = re.compile(r"[;,!?]|\.(?=\s|$)|\s[-–—]\s")
 _OWN_ACT_CLAUSE_LEAD_RE = re.compile(
     r"^\W*(?:\d{4}-\d{2}-\d{2}:?\s*)?(?:(?:and|but|so|also|then|today|update:?)\s+)*",
     re.IGNORECASE,
@@ -8830,16 +8841,22 @@ def _own_act_path(
     phrases = _rule_leading_phrases(texts)
     paths: set[str] = set()
     cursor = 0
+    previous: str | None = None  # the immediately preceding non-empty clause
     for piece in _OWN_ACT_CLAUSE_SPLIT_RE.split(scanned):
         start = scanned.find(piece, cursor)
         end = start + len(piece)
         cursor = end
+        before, previous = previous, (piece.strip() or previous)
         clause_hits = [m for m in hits if start <= m.start() < max(end, start + 1)]
         if not clause_hits:
             continue
         if any(m.group(0).casefold() not in _OWN_ACT_MARKER_WORDS for m in clause_hits):
             return None
         classified = _own_act_clause(piece)
+        if classified is None and _MARKER_GOVERNOR_ANAPHORA and before is not None:
+            pronoun = _OWN_ACT_PRONOUN_RE.match(_OWN_ACT_CLAUSE_LEAD_RE.sub("", piece.strip()))
+            if pronoun is not None and _OWN_ACT_ANTECEDENT_RE.search(before):
+                classified = ("anaphora", pronoun.group("rest"))
         if classified is None:
             return None
         path, obj = classified
