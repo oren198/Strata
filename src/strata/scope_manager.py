@@ -2698,7 +2698,7 @@ def _note_echoes_directive(directive_text: str, text: str) -> bool:
     often for one echo lost."""
     if _is_covered_subject(directive_text, text) and _head_nouns_compatible(directive_text, text):
         return True
-    return _shared_subject_stems(directive_text, text) >= 3
+    return _shared_subject_stems(directive_text, text) >= _ECHO_SHARED_STEMS
 
 
 def _engine_detected_operator_echoes(
@@ -2721,11 +2721,12 @@ def _engine_detected_operator_echoes(
         [contribution.content]
         + [op.content for op in judgment.directive_ops if op.op == "publish" and op.content]
     )
+    blanket = _attribution_reask_arm() == "A"  # the #138 comparison arm: every unattributed one
     return [
         operator_id
         for operator_id, text in dict(operator_directives).items()
         if not _attribution_pattern(operator_id).search(admitted)
-        and _note_echoes_directive(text, brought)
+        and (blanket or _note_echoes_directive(text, brought))
     ]
 
 
@@ -2757,6 +2758,7 @@ def _batch_attribution_gaps(
     if not operator_directives:
         return [], []
     admitted = _batch_admitted_text(judgment, contributions)
+    blanket = _attribution_reask_arm() == "A"  # the #138 comparison arm
     texts = dict(operator_directives)
     cited: list[str] = []
     engine_only: list[str] = []
@@ -2775,18 +2777,48 @@ def _batch_attribution_gaps(
             key = f"{member.id}:{operator_id}"
             if operator_id in verdict.reasoning:
                 cited.append(key)
-            elif _note_echoes_directive(text, own):
+            elif blanket or _note_echoes_directive(text, own):
                 engine_only.append(key)
     return cited, engine_only
+
+
+#: #138 A/B switches. INTERNAL: no setting, no fleet.yaml key, no flag. The live A/B sets these two
+#: module attributes for the arms and the winning arm ships as the only behaviour.
+#: "C" (the shipped default): the engine re-asks only when it can match an admitted text to an
+#: operator directive's subject (:func:`_note_echoes_directive`) or the judge cites the id.
+#: "A" (the comparison arm): the engine re-asks on EVERY accept in a scope with operator
+#: directives whose admitted text attributes none of them.
+_ATTRIBUTION_REASK_ARMS = ("C", "A")
+_ATTRIBUTION_REASK_ARM = "C"
+#: How many shared subject stems make an engine-detected echo (besides the covered-subject branch).
+_ECHO_SHARED_STEMS = 2
+
+
+def _attribution_reask_arm() -> str:
+    if _ATTRIBUTION_REASK_ARM not in _ATTRIBUTION_REASK_ARMS:
+        raise ValueError(
+            f"unknown attribution re-ask arm {_ATTRIBUTION_REASK_ARM!r}; "
+            f"expected one of {_ATTRIBUTION_REASK_ARMS}"
+        )
+    return _ATTRIBUTION_REASK_ARM
 
 
 _ECHO_MATCH_SENTENCE = (
     "The engine matched the admitted text to operator directive {ids} on its subject; if it "
     "does not echo that directive, return the same amendment unchanged."
 )
+#: Arm A (#138): the engine matched nothing; it asks this of every accept in the scope.
+_BLANKET_SENTENCE = (
+    "The engine asks this of every accept in a scope that has operator directives: confirm that "
+    "none of the material you admitted echoes the substance of operator directive(s) {ids}; if "
+    "any does, resubmit with the attribution written into the text; otherwise return the same "
+    "amendment unchanged."
+)
 
 
-def _attribution_corrective_text(cited: Sequence[str], engine_only: Sequence[str]) -> str:
+def _attribution_corrective_text(
+    cited: Sequence[str], engine_only: Sequence[str], *, blanket: bool = False
+) -> str:
     """The RULE 2 corrective: today's wording when the judge cited the id, the same wording opened
     differently when only the engine matched, plus the one added sentence for engine matches."""
     names = ", ".join([*cited, *engine_only])
@@ -2811,7 +2843,8 @@ def _attribution_corrective_text(cited: Sequence[str], engine_only: Sequence[str
         "amendment unchanged."
     )
     if engine_only:
-        text += " " + _ECHO_MATCH_SENTENCE.format(ids=", ".join(engine_only))
+        sentence = _BLANKET_SENTENCE if blanket else _ECHO_MATCH_SENTENCE
+        text += " " + sentence.format(ids=", ".join(engine_only))
     return text
 
 
@@ -9482,6 +9515,10 @@ class ScopeManager:
         # marker the engine fired on), keyed (contribution id, call), for the record's
         # `relation_calls`. Kept off the outcome dict, whose shape callers compare exactly.
         self._relation_extras: dict[tuple[str, str], dict] = {}
+        # #138 A/B cost: accepts the attribution check looked at (in a scope with operator
+        # directives) and the extra judge calls it made. Counters only; nothing reads them in
+        # the engine.
+        self.attribution_reask_counts: dict[str, int] = {"accepts_checked": 0, "reasks_fired": 0}
 
     def take_relation_extras(self, contribution_id: str, call: str) -> dict:
         """The recorded-only detail of the relation re-ask for *contribution_id* (``call`` is
@@ -10398,8 +10435,16 @@ class ScopeManager:
             echo_state["cited"], echo_state["engine_only"] = cited, engine_only
             return [*cited, *engine_only]
 
+        def _attribution_checked(judgment: ScopeManagerJudgment) -> int:
+            _attribution_reask_arm()  # an unknown arm is refused, never guessed
+            return int(bool(operator_directives) and verdict_admits(judgment.decision))
+
         def _attribution_corrective(_gap_ids: Sequence[str]) -> str:
-            return _attribution_corrective_text(echo_state["cited"], echo_state["engine_only"])
+            return _attribution_corrective_text(
+                echo_state["cited"],
+                echo_state["engine_only"],
+                blanket=_attribution_reask_arm() == "A",
+            )
 
         # Superseded-claim backstop (#199): the mechanical half of "a
         # superseded or retracted claim leaves the context". Everything it
@@ -10495,6 +10540,7 @@ class ScopeManager:
             ),
             attribution_gaps=_attribution_gaps,
             attribution_corrective=_attribution_corrective,
+            attribution_checked=_attribution_checked,
             stale_claims=_stale_claims,
             stale_claim_corrective=_stale_claim_corrective,
             drop_stale_context=_drop_stale_context,
@@ -11116,6 +11162,7 @@ class ScopeManager:
         schema_reminder: str,
         attribution_gaps: Callable[[_JudgmentT], list[str]] | None = None,
         attribution_corrective: Callable[[Sequence[str]], str] | None = None,
+        attribution_checked: Callable[[_JudgmentT], int] | None = None,
         stale_claims: Callable[[_JudgmentT], list[str]] | None = None,
         stale_claim_corrective: Callable[[Sequence[str]], str] | None = None,
         drop_stale_context: Callable[[_JudgmentT], _JudgmentT] | None = None,
@@ -11445,7 +11492,10 @@ class ScopeManager:
         # corrective rewrite is still measured against the BUDGET.
         if attribution_gaps is not None and attribution_corrective is not None:
             gaps = attribution_gaps(judgment)
+            if attribution_checked is not None:
+                self.attribution_reask_counts["accepts_checked"] += attribution_checked(judgment)
             if gaps:
+                self.attribution_reask_counts["reasks_fired"] += 1
                 retry_messages = [
                     *first_messages,
                     *_corrective_turn(response, tool_use_block, attribution_corrective(gaps)),
@@ -13184,9 +13234,17 @@ class ScopeManager:
             batch_echo_state["cited"], batch_echo_state["engine_only"] = cited, engine_only
             return [*cited, *engine_only]
 
+        def _batch_attribution_checked(judgment: ScopeManagerBatchJudgment) -> int:
+            _attribution_reask_arm()
+            if not batch_operator_directives:
+                return 0
+            return sum(1 for v in judgment.verdicts if verdict_admits(v.decision))
+
         def _batch_attribution_corrective(_gap_ids: Sequence[str]) -> str:
             return _attribution_corrective_text(
-                batch_echo_state["cited"], batch_echo_state["engine_only"]
+                batch_echo_state["cited"],
+                batch_echo_state["engine_only"],
+                blanket=_attribution_reask_arm() == "A",
             )
 
         batch_judgment = self._call_with_correctives(
@@ -13199,6 +13257,7 @@ class ScopeManager:
             ),
             attribution_gaps=_batch_attribution_gap_ids,
             attribution_corrective=_batch_attribution_corrective,
+            attribution_checked=_batch_attribution_checked,
             reasoning_gaps=_batch_reasoning_gaps,
             reasoning_withdraw=_batch_reasoning_withdraw,
             reasoning_adopt=_batch_reasoning_adopt,
