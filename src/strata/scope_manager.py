@@ -2721,11 +2721,12 @@ def _engine_detected_operator_echoes(
         [contribution.content]
         + [op.content for op in judgment.directive_ops if op.op == "publish" and op.content]
     )
+    blanket = _attribution_reask_arm() == "A"  # the #138 comparison arm: every unattributed one
     return [
         operator_id
         for operator_id, text in dict(operator_directives).items()
         if not _attribution_pattern(operator_id).search(admitted)
-        and _note_echoes_directive(text, brought)
+        and (blanket or _note_echoes_directive(text, brought))
     ]
 
 
@@ -2757,6 +2758,7 @@ def _batch_attribution_gaps(
     if not operator_directives:
         return [], []
     admitted = _batch_admitted_text(judgment, contributions)
+    blanket = _attribution_reask_arm() == "A"  # the #138 comparison arm
     texts = dict(operator_directives)
     cited: list[str] = []
     engine_only: list[str] = []
@@ -2775,7 +2777,7 @@ def _batch_attribution_gaps(
             key = f"{member.id}:{operator_id}"
             if operator_id in verdict.reasoning:
                 cited.append(key)
-            elif _note_echoes_directive(text, own):
+            elif blanket or _note_echoes_directive(text, own):
                 engine_only.append(key)
     return cited, engine_only
 
@@ -2805,9 +2807,18 @@ _ECHO_MATCH_SENTENCE = (
     "The engine matched the admitted text to operator directive {ids} on its subject; if it "
     "does not echo that directive, return the same amendment unchanged."
 )
+#: Arm A (#138): the engine matched nothing; it asks this of every accept in the scope.
+_BLANKET_SENTENCE = (
+    "The engine asks this of every accept in a scope that has operator directives: confirm that "
+    "none of the material you admitted echoes the substance of operator directive(s) {ids}; if "
+    "any does, resubmit with the attribution written into the text; otherwise return the same "
+    "amendment unchanged."
+)
 
 
-def _attribution_corrective_text(cited: Sequence[str], engine_only: Sequence[str]) -> str:
+def _attribution_corrective_text(
+    cited: Sequence[str], engine_only: Sequence[str], *, blanket: bool = False
+) -> str:
     """The RULE 2 corrective: today's wording when the judge cited the id, the same wording opened
     differently when only the engine matched, plus the one added sentence for engine matches."""
     names = ", ".join([*cited, *engine_only])
@@ -2832,7 +2843,8 @@ def _attribution_corrective_text(cited: Sequence[str], engine_only: Sequence[str
         "amendment unchanged."
     )
     if engine_only:
-        text += " " + _ECHO_MATCH_SENTENCE.format(ids=", ".join(engine_only))
+        sentence = _BLANKET_SENTENCE if blanket else _ECHO_MATCH_SENTENCE
+        text += " " + sentence.format(ids=", ".join(engine_only))
     return text
 
 
@@ -10428,7 +10440,11 @@ class ScopeManager:
             return int(bool(operator_directives) and verdict_admits(judgment.decision))
 
         def _attribution_corrective(_gap_ids: Sequence[str]) -> str:
-            return _attribution_corrective_text(echo_state["cited"], echo_state["engine_only"])
+            return _attribution_corrective_text(
+                echo_state["cited"],
+                echo_state["engine_only"],
+                blanket=_attribution_reask_arm() == "A",
+            )
 
         # Superseded-claim backstop (#199): the mechanical half of "a
         # superseded or retracted claim leaves the context". Everything it
@@ -13226,7 +13242,9 @@ class ScopeManager:
 
         def _batch_attribution_corrective(_gap_ids: Sequence[str]) -> str:
             return _attribution_corrective_text(
-                batch_echo_state["cited"], batch_echo_state["engine_only"]
+                batch_echo_state["cited"],
+                batch_echo_state["engine_only"],
+                blanket=_attribution_reask_arm() == "A",
             )
 
         batch_judgment = self._call_with_correctives(
