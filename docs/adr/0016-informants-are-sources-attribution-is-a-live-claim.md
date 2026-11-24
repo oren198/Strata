@@ -130,17 +130,11 @@ field. The philosopher's rulings on what verifies:
   single-contribution path); and alias references to a scope (the trigger
   matches by id/name only, word-bounded, no fuzzy or alias matching).
 
-**Note (2026-11-23, #212).** Three mechanical backstops enforce D2-D4 beyond the
-prompt. (1) A note that names a *referenced peer* with no basis in the record (a
-publication from it reaching this scope, a directive inherited from it, or an
-operator item naming it) gets the same one-shot re-ask, with a third answer:
-keep, with a stated reason quoted from the note that it does not assert the
-peer's position. A keep with no such reason is declined. (2) An item the judge
-labels "Hearsay:" may not carry a directive op; the ops are refused with a
-protocol note. (3) A hearsay outcome counts for nothing in `standing_evidence`
-and does not revive when the item it reported on is replaced or withdrawn.
-Stated limit: only a literal scope name triggers the backstop; oblique
-references rely on the judge's own reading (no fuzzy matcher, as for #225).
+**Note (2026-11-23, #212).** Two mechanical backstops enforce D2-D4 beyond the
+prompt. (1) An item the judge labels "Hearsay:" may not carry a directive op; the
+ops are refused with a protocol note. (2) A hearsay outcome counts for nothing in
+`standing_evidence` and does not revive when the item it reported on is replaced
+or withdrawn.
 
 Measured on 2026-10-02: see the README's J4 row and
 docs/evidence/v1.17-225-interior-gate-2026-10-02.md; the baseline this

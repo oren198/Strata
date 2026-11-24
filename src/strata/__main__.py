@@ -2018,7 +2018,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     # -----------------------------------------------------------------------
     # 8c. Every active scope states its purpose (#210). Soft: a scope without a
     # description works, but the judge can only fall back to "the project's work"
-    # and cannot tell what is irrelevant to it. One warning per scope.
+    # and cannot tell what is irrelevant to it. One warning per scope (the scope's own
+    # description only: an ancestor's is not inherited).
     # -----------------------------------------------------------------------
     if fleet_config is not None:
         from strata.scope_manager import (  # noqa: PLC0415
@@ -2028,9 +2029,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         from strata.summary_store import SummaryStore as _SummaryStore  # noqa: PLC0415
 
         for scope in fleet_config.active_scopes():
-            # #210 re-ruling: a description anywhere in the chain (own, else the nearest
-            # ancestor's) is enough; the scope's own memory only SUGGESTS one.
-            if fleet_config.effective_description(scope.id) is None:
+            # The scope's own memory only SUGGESTS a description; it is never a purpose.
+            if not scope.description:
                 suggestion = None
                 if paths is not None:
                     try:
@@ -2987,7 +2987,6 @@ def cmd_publication_bootstrap(args: argparse.Namespace) -> int:
         manager = ScopeManager(
             client=settings.build_judge_client(),
             model=settings.manager_model,
-            implied_purpose_min_words=settings.implied_purpose_min_words,
             judge_provider=settings.judge_provider,
         )
 
@@ -3188,7 +3187,6 @@ def _refresh_stores(settings):  # noqa: ANN001, ANN201
     manager = ScopeManager(
         client=settings.build_judge_client(),
         model=settings.manager_model,
-        implied_purpose_min_words=settings.implied_purpose_min_words,
         judge_provider=settings.judge_provider,
     )
     return fleet_config, record_store, summary_store, manager
