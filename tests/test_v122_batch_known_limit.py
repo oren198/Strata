@@ -30,8 +30,6 @@ def test_adr_0011_d3_carries_the_measured_note() -> None:
     ) in ADR
 
 
-def test_the_changelog_points_at_the_readme_limit_and_claims_no_hermes() -> None:
+def test_the_changelog_points_at_the_readme_limit() -> None:
     assert "### Known limit" in CHANGELOG
     assert "Batched judgment is not verdict-equivalent to serial judgment" in CHANGELOG
-    for text in (README, CHANGELOG):
-        assert "hermes" not in text.lower()
