@@ -7,17 +7,27 @@ the release PR (`dev` → `main`) and the GitHub Release body are built from
 
 ## Unreleased
 
+The store migrates by itself on first start (0029). There is no manual step.
+
 ### Behaviour change
 
-- **A scope with no description anywhere in its chain no longer declines material as irrelevant; set a description to turn relevance checks on (#210).** Relevance is measured against the scope's own `description`, else the nearest ancestor's up to the root (a `description` on the root scope bounds a whole fleet), else not at all. The shipped own-memory "implied purpose" is no longer a decline ground, because what a scope holds then decides what may enter it. It only suggests a description now: `strata doctor` and the Console say "no description; your scope's memory suggests: …", report-only. An outcome report on the scope's own items, a report bearing on a directive it holds, and a withdrawal are never declined as irrelevant.
+- **A scope's own memory is no longer used as an implied purpose to decline (#210).** Relevance is measured against the scope's own `description`; a scope with no description declines nothing as irrelevant, so set one to turn relevance checks on. The scope's memory only suggests a description now: `strata doctor` and the Console say "no description; your scope's memory suggests: …", report-only.
+- **A departure or consequence label needs the note to concern the rule's subject.** The relation check used to accept a "departure from <rule>" or "consequence of <rule>" label when the quoted occurrence shared a single word with the rule's action, so a note about something else could get a label written into memory. The occurrence must now concern the rule's subject. Otherwise the answer is treated as unrelated and the note is admitted with no label. A marker or a habit still declines.
+- **Attribution re-ask (#138).** An admitted note that echoes an operator directive's subject is now detected with two shared subject stems, not three, so more such echoes get the one re-ask.
 
 ### Changed
 
-- **Hearsay and manufactured attribution (#212, ADR 0016).** Three mechanical backstops, each its own commit.
-  - A note that names a referenced peer with nothing behind it in the record (no publication, inherited directive or operator item) gets one re-ask: decline, restate as hearsay from a named informant, or keep with a stated reason quoted from the note. A keep with no reason is declined.
-  - Only a literal scope name triggers this backstop; oblique references rely on the judge's own reading.
+- **Amendments survive a crash.** A write-ahead journal records each summary amendment before the summary file is written, and recovery replays or abandons it on the next drain or server start. The summary file is fsynced (the file and its directory). The retire act, a date-based retirement and the approval of a held retirement request go through the same journal. The store gains migration 0029.
+  - `strata doctor` gains two report-only lines: one for a directive missing with no retirement or supersession, and "Suspect intents".
+  - A suspect intent also leaves an engine note.
+  - The crash cases listed under ADR 0018's known limits no longer apply.
+- **Hearsay and manufactured attribution (#212, ADR 0016).** Two mechanical backstops.
   - An item the judge labels "Hearsay:" may not carry a directive op; the ops are refused with a protocol note.
   - Hearsay counts for nothing in `standing_evidence` and does not revive when the item it reported on is replaced or withdrawn.
+
+### Known limit
+
+- Batched judgment is not verdict-equivalent to serial judgment; see the README's judge limits ("Batched judgment is not verdict-equivalent to serial judgment"). `judgment_batch_cap = 1` makes every judgment a single call.
 
 ## 1.21.0 (2026-11-21)
 

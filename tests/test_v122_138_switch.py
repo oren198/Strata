@@ -1,10 +1,9 @@
-"""#138 (v1.22): the internal attribution re-ask switch and the extra-call counter.
+"""#138 (v1.22): the extra-call counter, and the shipped single behaviour (arm C).
 
-``_ATTRIBUTION_REASK_ARM`` ("C" default, "A" the comparison arm) is a module constant for the live
-A/B, never a setting. ``ScopeManager.attribution_reask_counts`` counts the accepts the attribution
-check looked at (in a scope with operator directives) and the extra judge calls it made, so the A/B
-can report cost per arm. This file holds only what is true under EVERY arm and stem floor; the arm
-A and arm C behaviours have their own files, so reverting either commit leaves this suite green.
+``ScopeManager.attribution_reask_counts`` counts the accepts the attribution check looked at (in
+a scope with operator directives) and the extra judge calls it made. The A/B arm switch is gone:
+the engine re-asks only when it can match an admitted text to an operator directive's subject (two
+shared stems) or the judge cites the id; an unrelated accept gets no re-ask.
 """
 
 from __future__ import annotations
@@ -12,13 +11,11 @@ from __future__ import annotations
 from dataclasses import replace
 from unittest.mock import MagicMock
 
-import pytest
-
 from strata import scope_manager as sm
 from strata.scope_manager import ScopeManager
 from tests.test_scope_manager import NEW_CONTRIBUTION, SCOPE, STRATUM
 from tests.test_scope_manager import _fake_response as fake_response
-from tests.test_v19_138_attribution import ECHO, EMPTY, MEMORY, UNRELATED, _accept, _judge
+from tests.test_v19_138_attribution import ECHO, EMPTY, MEMORY, UNRELATED, _accept
 
 DECLINE = {"decision": "decline", "reasoning": "No.", "directive_ops": [], "new_context": None}
 
@@ -55,14 +52,12 @@ def _script(*answers: dict) -> MagicMock:
     return client
 
 
-def test_the_default_arm_is_c() -> None:
-    assert sm._ATTRIBUTION_REASK_ARM == "C"
-
-
-def test_an_unknown_arm_is_refused_not_guessed(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(sm, "_ATTRIBUTION_REASK_ARM", "B")
-    with pytest.raises(ValueError, match="attribution re-ask arm"):
-        _judge(_accept(UNRELATED), content=UNRELATED)
+def test_there_is_no_arm_switch_and_an_unrelated_accept_gets_no_reask() -> None:
+    assert not hasattr(sm, "_ATTRIBUTION_REASK_ARM")
+    assert not hasattr(sm, "_attribution_reask_arm")
+    manager = ScopeManager(client=_script(_accept(UNRELATED)))
+    _run(manager, UNRELATED)  # operator memory in scope, the text echoes none of it
+    assert manager.attribution_reask_counts == {"accepts_checked": 1, "reasks_fired": 0}
 
 
 def test_the_counter_counts_checked_accepts_and_fired_reasks() -> None:

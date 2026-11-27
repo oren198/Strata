@@ -76,7 +76,7 @@ edges:
 """
 
 # re-pinned for #244 step 2: the exception rule joined the ancestor block of the user message
-_JUDGE_BUILDER_SHA256 = "294e76ba1462577a879dab7e5495daaa1122f60a97a447baa0910636f1ccdfeb"
+_JUDGE_BUILDER_SHA256 = "5c8fdd3dc58e8f3473651191d51c5c28a99e8c07f10d74497c853218a54c2f46"
 
 
 def _world(tmp_path: Path) -> tuple[FleetConfig, RecordStore]:

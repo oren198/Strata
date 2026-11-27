@@ -1,8 +1,8 @@
 """#210 re-ruling: the own-memory implied purpose may only SUGGEST a description, report-only.
 
 doctor and the Console say "no description; your scope's memory suggests: ..." when a scope
-has no description anywhere in its chain and enough memory to suggest one. Nothing is ever
-declined or written from it. A scope that inherits a description is not warned about.
+has no description of its own and enough memory to suggest one. Nothing is ever declined or
+written from it. An ancestor's description is not inherited: such a scope is warned about too.
 """
 
 from __future__ import annotations
@@ -133,7 +133,7 @@ def test_doctor_without_memory_keeps_the_plain_warning(
     assert "g_a" in flat and "memory suggests" not in flat
 
 
-def test_doctor_does_not_warn_about_a_scope_that_inherits_a_description(
+def test_doctor_warns_about_a_scope_even_when_an_ancestor_has_a_description(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
 ) -> None:
     _doctor_project(
@@ -146,7 +146,7 @@ def test_doctor_does_not_warn_about_a_scope_that_inherits_a_description(
         [{"from": "g_leaf", "to": "g_root", "kind": "chain"}],
     )
     _, lines = _doctor(capsys)
-    assert not any("g_leaf" in line for line in lines)
+    assert any("g_leaf" in line for line in lines)  # no inheritance: its own description only
 
 
 def test_the_suggestion_never_changes_doctors_exit_code(
@@ -201,22 +201,22 @@ def _scopes(client: TestClient) -> dict:
     return {s["id"]: s for s in client.get("/scopes").json()["scopes"]}
 
 
-def test_the_api_names_an_inherited_description_and_its_source(client: TestClient) -> None:
+def test_the_api_does_not_name_an_inherited_description(client: TestClient) -> None:
     a = _scopes(client)["g_a"]
     assert a["description"] is None
-    assert a["effective_description"] == {"text": "Payments.", "source_scope_id": "g_root"}
-    assert a["description_suggestion"] is None
+    assert "effective_description" not in a
+    assert a["description_suggestion"] is None  # no memory to suggest from
 
 
-def test_the_api_suggests_for_a_scope_with_none_in_its_chain(client: TestClient) -> None:
+def test_the_api_suggests_for_a_scope_with_no_own_description(client: TestClient) -> None:
     c = _scopes(client)["g_c"]
-    assert c["effective_description"] is None
+    assert "effective_description" not in c
     assert c["description_suggestion"].startswith("The billing service issues invoices")
 
 
 def test_the_api_has_no_suggestion_for_a_described_scope(client: TestClient) -> None:
     b = _scopes(client)["g_b"]
-    assert b["effective_description"] == {"text": "Own purpose.", "source_scope_id": "g_b"}
+    assert b["description"] == "Own purpose." and "effective_description" not in b
     assert b["description_suggestion"] is None
 
 

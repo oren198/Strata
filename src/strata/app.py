@@ -244,19 +244,12 @@ def get_record_store(
         store.close()
 
 
-def _scope_with_description_fields(
-    scope: Scope, fleet: FleetConfig, summary_store: SummaryStore
-) -> dict:
-    """A scope's Console row plus the #210 description fields: the description relevance is
-    measured against (own, else the nearest ancestor's) with its source, and, only when the
-    chain has none, a report-only suggestion from the scope's own memory."""
+def _scope_with_description_fields(scope: Scope, summary_store: SummaryStore) -> dict:
+    """A scope's Console row plus, only when the scope has no description of its own, a
+    report-only suggestion from its own memory."""
     row = scope.model_dump()
-    found = fleet.effective_description(scope.id)
-    row["effective_description"] = (
-        {"text": found[0], "source_scope_id": found[1]} if found is not None else None
-    )
     suggestion = None
-    if found is None:
+    if not scope.description:
         try:
             suggestion = suggest_description(
                 summary_store.read(scope.id), IMPLIED_PURPOSE_MIN_WORDS
@@ -324,7 +317,6 @@ def get_scope_manager(
     return ScopeManager(
         client=client,
         model=settings.manager_model,
-        implied_purpose_min_words=settings.implied_purpose_min_words,
         judge_provider=settings.judge_provider,
     )
 
@@ -3778,7 +3770,7 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
 
         return {
             "strata": [s.model_dump() for s in fleet.strata],
-            "scopes": [_scope_with_description_fields(s, fleet, summary_store) for s in active],
+            "scopes": [_scope_with_description_fields(s, summary_store) for s in active],
             # ``kind`` (ADR 0010) tells a client which edges bind: a chain
             # edge always runs child→parent after load canonicalization, a
             # reference edge always runs referencer→referenced.

@@ -192,17 +192,14 @@ see [Binding past one scope](#binding-past-one-scope).
 Give each scope a one-line `description:` in `fleet.yaml` — what its memory is for.
 The judge measures relevance against it: material "outside this scope's stated
 purpose" is declined, and the decline reason quotes the purpose. A scope with no
-description of its own uses the nearest ancestor's, up to the root; a `description`
-on the root scope therefore bounds a whole fleet. If nothing in the chain has one,
-nothing is declined as irrelevant (since 1.22; before it, a scope's own existing
-memory could imply a purpose, which is no longer a decline ground). Never declined
-as irrelevant: an outcome report on the scope's own items, a report bearing on a
-directive the scope holds, or a withdrawal reaching it. `strata doctor` warns once
-per scope with no description anywhere in its chain, and when the scope already
-holds enough memory (about 50 words, `STRATA_IMPLIED_PURPOSE_MIN_WORDS`) it says
-"no description; your scope's memory suggests: …". That suggestion is report-only:
-nothing is declined or written from it. The Console shows the same in the scope
-header ("no description" when unset, and an inherited one names its source).
+description of its own is not judged for relevance at all: it declines nothing as
+irrelevant, whatever its memory or its ancestors say. A scope's own memory is not
+used as an implied purpose to decline (it was circular: what a scope holds would
+decide what may enter it). `strata doctor` warns once per scope with no description
+of its own, and when the scope already holds enough memory (about 50 words,
+`STRATA_IMPLIED_PURPOSE_MIN_WORDS`) it says "no description; your scope's memory
+suggests: …". That suggestion is report-only: nothing is declined or written from
+it. The Console shows the same in the scope header ("no description" when unset).
 
 ### 6. Two terminals, same project
 
@@ -1385,10 +1382,10 @@ The engine checks the judge's follow-up answers: quoted spans must be verbatim. 
 Limits I know of, measured in the v1.18 run:
 - A reworded exception that shares no words with the inherited rule can be admitted when the judge calls it a refinement (seen in 2 of 3 runs on one test item).
 - Another scope's rule asserted with that scope named only by an alias ("the purchasing team" for procurement) is admitted: 11 of 12 attempts.
-- Only a literal scope name triggers the #212 basis-check backstop (a referenced peer named with no publication, inherited directive or operator item behind it); oblique references rely on the judge's own reading.
 - A restricting directive in the scope's own summary isn't weighed by the judge: 2 items, every run.
 - The ordinary judge's input wraps the scope summary in an ambiguous fence; on qwen this can make it misread the summary.
 - A retirement isn't required to state what changed. The judge is asked for it, no model I measured fills it reliably, and the engine doesn't enforce it (#209).
+- Batched judgment is not verdict-equivalent to serial judgment: measured batch-vs-serial agreement 0.808 against a serial-repeat floor of 0.975 (qwen/qwen3-235b-a22b-2507 @ Parasail, n=120). Batches form only when several contributions to one scope queue in one process (mostly `strata start` serving many clients). Setting `judgment_batch_cap = 1` makes every judgment a single call.
 
 **A model id ages.** Routers rename and retire models, and providers come and go. If an id or provider stops resolving, `strata doctor` says so and prints the override lines. A new provider is a new measurement, not the same judge.
 

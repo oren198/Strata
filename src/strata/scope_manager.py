@@ -95,24 +95,11 @@ _logger = logging.getLogger(__name__)
 #: cost. The engine default behind :attr:`strata.settings.Settings.window_verbatim_tail`.
 WINDOW_VERBATIM_TAIL = 3
 
-#: Words of existing memory (summary context plus directive text) a scope needs before
-#: the judge may treat that memory as its implied purpose (#210). Below it there is not
-#: enough to tell what the scope is about, so no relevance judgement is made at all —
-#: a scope with nothing in it keeps today's behaviour exactly. Mirrors
-#: ``Settings.implied_purpose_min_words`` (``STRATA_IMPLIED_PURPOSE_MIN_WORDS``).
+#: Words of existing memory (summary context plus directive text) a scope with no description
+#: needs before ``strata doctor`` and the Console SUGGEST a description drawn from it (#210).
+#: A suggestion only: a scope's own memory is never used as an implied purpose to decline.
+#: Mirrors ``Settings.implied_purpose_min_words`` (``STRATA_IMPLIED_PURPOSE_MIN_WORDS``).
 IMPLIED_PURPOSE_MIN_WORDS = 50
-
-#: #210 re-ruling (CEO 2026-11-23), as TWO internal switches so a live miss on one behaviour
-#: does not remove the other. Both default True (the 1.22 behaviour); (False, False) is the
-#: shipped 1.21 behaviour, byte for byte. Tested in all four positions; each off path is
-#: removed after the C5 verdict.
-#:
-#: ``_RELEVANCE_ANCESTOR_FALLBACK``: a scope with no description of its own is judged against
-#: the nearest ancestor's, plus the never-decline sentence and the outcome-report exemption.
-_RELEVANCE_ANCESTOR_FALLBACK = True
-#: ``_RELEVANCE_DROP_IMPLIED``: the own-memory implied purpose is NOT a decline ground (it
-#: only suggests a description, in doctor and the Console). Off: it is, as in 1.21.
-_RELEVANCE_DROP_IMPLIED = True
 
 #: ADR 0013 D3 — the word budget for a scope's published face (its own
 #: current publication plus whatever a ``publish`` act would add). The
@@ -873,56 +860,6 @@ INTERIOR_ASSERTION_TOOL: dict = {
         "required": ["classification", "reasoning"],
     },
 }
-
-#: #212 backstop 1 (ADR 0016 D2): the INTERNAL SWITCH for the basis check. On, a note that
-#: names a referenced peer with no basis in the record gets the interior-assertion re-ask
-#: (see ``_check_interior_assertion``). Off, only the #225 trigger (non-entitled scopes)
-#: remains: today's behaviour. Tested in both positions; no setting, no CLI flag.
-_MANUFACTURED_BASIS_CHECK = True
-
-
-#: The re-ask tool for the basis check: the same tool plus the third answer of Philis's
-#: ruling (a), "keep WITH a stated reason that the note does not assert the peer's
-#: position". A SEPARATE object, so the #225 re-ask for a non-entitled scope keeps its
-#: tool byte-for-byte.
-def _interior_assertion_basis_tool() -> dict:
-    """The basis-check re-ask tool (a function, not a module-level dict: it shares the #225
-    tool's name, and tool inventories read module-level dicts by name)."""
-    return {
-        **INTERIOR_ASSERTION_TOOL,
-        "input_schema": {
-            **INTERIOR_ASSERTION_TOOL["input_schema"],
-            "properties": {
-                **INTERIOR_ASSERTION_TOOL["input_schema"]["properties"],
-                "classification": {
-                    **INTERIOR_ASSERTION_TOOL["input_schema"]["properties"]["classification"],
-                    "enum": [
-                        *INTERIOR_ASSERTION_TOOL["input_schema"]["properties"]["classification"][
-                            "enum"
-                        ],
-                        "not_an_assertion",
-                    ],
-                    "description": (
-                        INTERIOR_ASSERTION_TOOL["input_schema"]["properties"]["classification"][
-                            "description"
-                        ]
-                        + " not_an_assertion: the note does NOT state that scope's position "
-                        "(for example it reports the contributor's own observation); give the "
-                        "reason as reason_span. A keep with no reason is not accepted."
-                    ),
-                },
-                "reason_span": {
-                    "type": "string",
-                    "description": (
-                        "Required when classification is not_an_assertion: the EXACT verbatim "
-                        "span of the contribution's own text that shows it does not assert the "
-                        "named scope's position. Must occur in the contribution text."
-                    ),
-                },
-            },
-        },
-    }
-
 
 # ---------------------------------------------------------------------------
 # Attribution re-check tool (v1.17 item 1 — #225 in reverse, a decline-only
@@ -2783,12 +2720,11 @@ def _engine_detected_operator_echoes(
         [contribution.content]
         + [op.content for op in judgment.directive_ops if op.op == "publish" and op.content]
     )
-    blanket = _attribution_reask_arm() == "A"  # the #138 comparison arm: every unattributed one
     return [
         operator_id
         for operator_id, text in dict(operator_directives).items()
         if not _attribution_pattern(operator_id).search(admitted)
-        and (blanket or _note_echoes_directive(text, brought))
+        and _note_echoes_directive(text, brought)
     ]
 
 
@@ -2820,7 +2756,6 @@ def _batch_attribution_gaps(
     if not operator_directives:
         return [], []
     admitted = _batch_admitted_text(judgment, contributions)
-    blanket = _attribution_reask_arm() == "A"  # the #138 comparison arm
     texts = dict(operator_directives)
     cited: list[str] = []
     engine_only: list[str] = []
@@ -2839,48 +2774,22 @@ def _batch_attribution_gaps(
             key = f"{member.id}:{operator_id}"
             if operator_id in verdict.reasoning:
                 cited.append(key)
-            elif blanket or _note_echoes_directive(text, own):
+            elif _note_echoes_directive(text, own):
                 engine_only.append(key)
     return cited, engine_only
 
 
-#: #138 A/B switches. INTERNAL: no setting, no fleet.yaml key, no flag. The live A/B sets these two
-#: module attributes for the arms and the winning arm ships as the only behaviour.
-#: "C" (the shipped default): the engine re-asks only when it can match an admitted text to an
-#: operator directive's subject (:func:`_note_echoes_directive`) or the judge cites the id.
-#: "A" (the comparison arm): the engine re-asks on EVERY accept in a scope with operator
-#: directives whose admitted text attributes none of them.
-_ATTRIBUTION_REASK_ARMS = ("C", "A")
-_ATTRIBUTION_REASK_ARM = "C"
 #: How many shared subject stems make an engine-detected echo (besides the covered-subject branch).
 _ECHO_SHARED_STEMS = 2
-
-
-def _attribution_reask_arm() -> str:
-    if _ATTRIBUTION_REASK_ARM not in _ATTRIBUTION_REASK_ARMS:
-        raise ValueError(
-            f"unknown attribution re-ask arm {_ATTRIBUTION_REASK_ARM!r}; "
-            f"expected one of {_ATTRIBUTION_REASK_ARMS}"
-        )
-    return _ATTRIBUTION_REASK_ARM
 
 
 _ECHO_MATCH_SENTENCE = (
     "The engine matched the admitted text to operator directive {ids} on its subject; if it "
     "does not echo that directive, return the same amendment unchanged."
 )
-#: Arm A (#138): the engine matched nothing; it asks this of every accept in the scope.
-_BLANKET_SENTENCE = (
-    "The engine asks this of every accept in a scope that has operator directives: confirm that "
-    "none of the material you admitted echoes the substance of operator directive(s) {ids}; if "
-    "any does, resubmit with the attribution written into the text; otherwise return the same "
-    "amendment unchanged."
-)
 
 
-def _attribution_corrective_text(
-    cited: Sequence[str], engine_only: Sequence[str], *, blanket: bool = False
-) -> str:
+def _attribution_corrective_text(cited: Sequence[str], engine_only: Sequence[str]) -> str:
     """The RULE 2 corrective: today's wording when the judge cited the id, the same wording opened
     differently when only the engine matched, plus the one added sentence for engine matches."""
     names = ", ".join([*cited, *engine_only])
@@ -2905,8 +2814,7 @@ def _attribution_corrective_text(
         "amendment unchanged."
     )
     if engine_only:
-        sentence = _BLANKET_SENTENCE if blanket else _ECHO_MATCH_SENTENCE
-        text += " " + sentence.format(ids=", ".join(engine_only))
+        text += " " + _ECHO_MATCH_SENTENCE.format(ids=", ".join(engine_only))
     return text
 
 
@@ -4536,84 +4444,30 @@ def suggest_description(summary: ScopeSummary | None, min_words: int) -> str | N
     return " ".join(words[:25]) or None
 
 
-def _render_relevance(
-    scope: Scope,
-    current_summary: ScopeSummary | None,
-    *,
-    mode: JudgeMode,
-    implied_purpose_min_words: int,
-    entitlement: EntitlementView | None = None,
-    outcome_report: bool = False,
-) -> str:
-    """The per-call relevance block (#210), or ``""`` when there is nothing to judge it against.
+def _render_relevance(scope: Scope, *, mode: JudgeMode) -> str:
+    """The per-call relevance block (#210), or ``""`` when the scope states no purpose.
 
-    Two internal switches (see :data:`_RELEVANCE_ANCESTOR_FALLBACK` and
-    :data:`_RELEVANCE_DROP_IMPLIED`) choose between the 1.22 behaviour and the shipped one,
-    independently; with both off this is the 1.21 text exactly.
-
-    Relevance is a decline ground only where a purpose exists to measure it against:
-
-    - the scope STATES one (``description``): judge against it;
-    - it states none but its existing memory is substantial enough
-      (``implied_purpose_min_words``) to tell what it is about: that memory is the
-      implied purpose;
-    - otherwise no rule, no wording — the prompt is exactly what it was before #210, so
-      a scope with nothing in it never starts declining what it accepts today.
+    Relevance is a decline ground only where the scope STATES a purpose
+    (``description``): judge against it. A scope with no description of its own gets no
+    relevance block at all, whatever its memory or its ancestors say — the prompt is
+    exactly what it was before #210.
 
     Lives in the per-call message, not the static system prompt, so a scope with no
     purpose carries no relevance wording anywhere. Only a contribution can be off-purpose:
     an input-change refresh admits nothing and gets no block.
     """
-    if mode != "ordinary":
+    if mode != "ordinary" or not scope.description:
         return ""
-    if _RELEVANCE_ANCESTOR_FALLBACK and outcome_report:
-        return ""
-    source, description = scope.id, scope.description
-    if not description and _RELEVANCE_ANCESTOR_FALLBACK and entitlement is not None:
-        for ancestor in reversed(entitlement.chain[:-1]):
-            if ancestor.description:
-                source, description = ancestor.id, ancestor.description
-                break
-    if description:
-        label = (
-            "SCOPE PURPOSE"
-            if source == scope.id
-            else f"SCOPE PURPOSE (stated by the ancestor scope {source}; this scope states none)"
-        )
-        never_decline = (
-            " Never decline as irrelevant: an outcome report on one of this scope's own "
-            "items, a report bearing on a directive this scope holds, or a withdrawal "
-            "reaching it."
-            if _RELEVANCE_ANCESTOR_FALLBACK
-            else ""
-        )
-        return (
-            f"{label}: {description}\n"
-            "RELEVANCE (an additional decline ground for this scope): judge whether the "
-            "contribution is about the work this stated purpose covers. Material clearly "
-            "outside it is declined, and your reasoning must begin \"Outside this scope's "
-            'stated purpose: <the purpose as stated>." Anything a worker in this scope '
-            "could plausibly need — observations about the work the purpose covers, however "
-            "small or transient — is on-purpose and is admitted by the rules above; when in "
-            f"doubt, admit.{never_decline}\n\n"
-        )
-    if (
-        not _RELEVANCE_DROP_IMPLIED
-        and current_summary is not None
-        and _summary_word_count(current_summary) >= implied_purpose_min_words
-    ):
-        return (
-            "RELEVANCE (an additional decline ground for this scope): this scope states no "
-            "purpose, but its existing memory — the CURRENT SUMMARY below — is enough to tell "
-            "what it is about; treat that as its implied purpose. Material clearly unrelated "
-            "to what that memory is about is declined, and your reasoning must say the purpose "
-            "was implied by the scope's existing memory and name what you read: begin "
-            "\"Outside the purpose implied by this scope's existing memory (<the directives or "
-            'context you read>): ..." A contribution that extends, corrects, or sits '
-            "alongside the subject of the existing memory is on-purpose and is admitted by the "
-            "rules above; when in doubt, admit.\n\n"
-        )
-    return ""
+    return (
+        f"SCOPE PURPOSE: {scope.description}\n"
+        "RELEVANCE (an additional decline ground for this scope): judge whether the "
+        "contribution is about the work this stated purpose covers. Material clearly "
+        "outside it is declined, and your reasoning must begin \"Outside this scope's "
+        'stated purpose: <the purpose as stated>." Anything a worker in this scope '
+        "could plausibly need — observations about the work the purpose covers, however "
+        "small or transient — is on-purpose and is admitted by the rules above; when in "
+        "doubt, admit.\n\n"
+    )
 
 
 def _render_examined_context(items: Sequence[ExaminedContextItem]) -> str:
@@ -4658,9 +4512,7 @@ def _build_judge_preamble(
     mode: JudgeMode = "ordinary",
     input_changes: Sequence[_ChangeEventLike] | None = None,
     window_verbatim_tail: int = WINDOW_VERBATIM_TAIL,
-    implied_purpose_min_words: int = IMPLIED_PURPOSE_MIN_WORDS,
     examined_context: Sequence[ExaminedContextItem] | None = None,
-    outcome_report: bool = False,
 ) -> str:
     """Compose everything in the user message ahead of the contributions to judge.
 
@@ -4759,14 +4611,7 @@ def _build_judge_preamble(
 
     input_changes_block = _render_input_changes(input_changes)
 
-    relevance_block = _render_relevance(
-        scope,
-        current_summary,
-        mode=mode,
-        implied_purpose_min_words=implied_purpose_min_words,
-        entitlement=entitlement,
-        outcome_report=outcome_report,
-    )
+    relevance_block = _render_relevance(scope, mode=mode)
 
     return (
         f"SCOPE: {scope.name} (id={scope.id})\n"
@@ -4811,7 +4656,6 @@ def _build_user_message(
     mode: JudgeMode = "ordinary",
     input_changes: Sequence[_ChangeEventLike] | None = None,
     window_verbatim_tail: int = WINDOW_VERBATIM_TAIL,
-    implied_purpose_min_words: int = IMPLIED_PURPOSE_MIN_WORDS,
     acted_on_target: ActedOnTarget | None = None,
     examined_context: Sequence[ExaminedContextItem] | None = None,
     adopted_proposal: Contribution | None = None,
@@ -4841,9 +4685,7 @@ def _build_user_message(
         mode=mode,
         input_changes=input_changes,
         window_verbatim_tail=window_verbatim_tail,
-        implied_purpose_min_words=implied_purpose_min_words,
         examined_context=examined_context,
-        outcome_report=acted_on_target is not None,
     )
     outcome_block = "" if acted_on_target is None else _render_outcome_block(acted_on_target)
     return (
@@ -4874,7 +4716,6 @@ def _build_batch_user_message(
     mode: JudgeMode = "ordinary",
     input_changes: Sequence[_ChangeEventLike] | None = None,
     window_verbatim_tail: int = WINDOW_VERBATIM_TAIL,
-    implied_purpose_min_words: int = IMPLIED_PURPOSE_MIN_WORDS,
     examined_context: Sequence[ExaminedContextItem] | None = None,
     adopted_proposals: Mapping[str, Contribution] | None = None,
 ) -> str:
@@ -4902,7 +4743,6 @@ def _build_batch_user_message(
         mode=mode,
         input_changes=input_changes,
         window_verbatim_tail=window_verbatim_tail,
-        implied_purpose_min_words=implied_purpose_min_words,
         examined_context=examined_context,
     )
     adopted = adopted_proposals or {}
@@ -9597,9 +9437,6 @@ class ScopeManager:
         client: A configured :class:`anthropic.Anthropic` instance.
         model:  The model ID to use.  Defaults to ``"claude-haiku-4-5"`` to
                 match the UI prototype.
-        implied_purpose_min_words: Words of existing memory a scope with no
-                description needs before that memory counts as its implied purpose
-                (#210); see :data:`IMPLIED_PURPOSE_MIN_WORDS`.
         judge_provider: #224 — an OpenRouter provider name to pin every judge
                 call to (``extra_body={"provider": {"order": [name],
                 "allow_fallbacks": False}}``), or ``None`` (the default) for
@@ -9619,12 +9456,10 @@ class ScopeManager:
         *,
         client: anthropic.Anthropic,
         model: str = "claude-haiku-4-5",
-        implied_purpose_min_words: int = IMPLIED_PURPOSE_MIN_WORDS,
         judge_provider: str | None = None,
     ) -> None:
         self._client = client
         self._model = model
-        self._implied_purpose_min_words = implied_purpose_min_words
         self._judge_provider = judge_provider
         # What a relation re-ask's answer said beyond the outcome dict (the quoted spans, the
         # marker the engine fired on), keyed (contribution id, call), for the record's
@@ -9920,7 +9755,6 @@ class ScopeManager:
             mode=mode,
             input_changes=input_changes,
             window_verbatim_tail=window_verbatim_tail,
-            implied_purpose_min_words=self._implied_purpose_min_words,
             acted_on_target=acted_on_target,
             examined_context=examined_context,
             adopted_proposal=adopted_proposal,
@@ -10106,25 +9940,6 @@ class ScopeManager:
                         return item.content
             return None
 
-        def _has_basis(peer: Scope) -> bool:
-            """#212: whether the record gives this scope a basis to speak of *peer*: a
-            publication from it that reached this scope, a directive inherited from it,
-            or an operator item that names it. Facts the call already rendered, never a
-            fresh lookup, and never a reading of what the note means."""
-            if any(sid == peer.id and items for sid, items in peer_publications or ()):
-                return True
-            if any(
-                d.source_scope_id == peer.id
-                for _aid, directives in ancestor_directives or ()
-                for d in directives
-            ):
-                return True
-            return any(
-                _match_other_scopes(item.content, [peer])
-                for _sid, items in operator_memory or ()
-                for item in items
-            )
-
         def _check_interior_assertion(
             judgment: ScopeManagerJudgment,
             messages: list[dict],
@@ -10146,18 +9961,6 @@ class ScopeManager:
             if entitlement is None:
                 return judgment
             matched = _match_other_scopes(new_contribution.content, entitlement.others)
-            unbased = (
-                [
-                    peer
-                    for peer in _match_other_scopes(
-                        new_contribution.content, entitlement.referenced_peers
-                    )
-                    if not _has_basis(peer)
-                ]
-                if _MANUFACTURED_BASIS_CHECK
-                else []
-            )
-            matched = [*matched, *(p for p in unbased if p not in matched)]
             if not matched:
                 return judgment
 
@@ -10268,16 +10071,7 @@ class ScopeManager:
                             "cache_control": {"type": "ephemeral"},
                         }
                     ],
-                    tools=[
-                        {
-                            **(
-                                _interior_assertion_basis_tool()
-                                if unbased
-                                else INTERIOR_ASSERTION_TOOL
-                            ),
-                            "cache_control": {"type": "ephemeral"},
-                        }
-                    ],
+                    tools=[{**INTERIOR_ASSERTION_TOOL, "cache_control": {"type": "ephemeral"}}],
                     tool_choice={
                         "type": "tool",
                         "name": INTERIOR_ASSERTION_TOOL["name"],
@@ -10294,14 +10088,12 @@ class ScopeManager:
                     "publication",
                     "directive",
                     "none",
-                    *(("not_an_assertion",) if unbased else ()),
                 ):
                     raise ValueError(f"unreadable classification {classification!r}")
                 informant_span = raw.get("informant_span")
                 telling_span = raw.get("telling_span")
                 ref_id = raw.get("ref_id")
                 act_span = raw.get("act_span")
-                reason_span = raw.get("reason_span")
                 if classification == "informant" and not (
                     isinstance(informant_span, str) and informant_span.strip()
                 ):
@@ -10364,34 +10156,6 @@ class ScopeManager:
                     ),
                     classification,
                     "declined (no observed act in own dealings)",
-                )
-
-            if classification == "not_an_assertion":
-                # Philis's ruling (a): the third answer is a KEEP, and only a stated reason
-                # counts. The reason must be a verbatim span of the note; anything else is
-                # unresolved and declined (the keep-first rule), never kept on trust.
-                haystack = " ".join(new_contribution.content.split()).casefold()
-                needle = (
-                    " ".join(reason_span.split()).casefold() if isinstance(reason_span, str) else ""
-                )
-                if needle and needle in haystack:
-                    return _noted(judgment, classification, "admitted as judged")
-                return _noted(
-                    judgment.model_copy(
-                        update={
-                            "decision": "decline",
-                            "new_summary": None,
-                            "directive_ops": [],
-                            "new_context": None,
-                            "reasoning": (
-                                "Declined: the note names a scope that has given this scope "
-                                "no basis, and it was kept without a stated reason that it "
-                                "does not assert that scope's position."
-                            ),
-                        }
-                    ),
-                    classification,
-                    "declined (kept with no stated reason)",
                 )
 
             if classification == "none":
@@ -10621,15 +10385,10 @@ class ScopeManager:
             return [*cited, *engine_only]
 
         def _attribution_checked(judgment: ScopeManagerJudgment) -> int:
-            _attribution_reask_arm()  # an unknown arm is refused, never guessed
             return int(bool(operator_directives) and verdict_admits(judgment.decision))
 
         def _attribution_corrective(_gap_ids: Sequence[str]) -> str:
-            return _attribution_corrective_text(
-                echo_state["cited"],
-                echo_state["engine_only"],
-                blanket=_attribution_reask_arm() == "A",
-            )
+            return _attribution_corrective_text(echo_state["cited"], echo_state["engine_only"])
 
         # Superseded-claim backstop (#199): the mechanical half of "a
         # superseded or retracted claim leaves the context". Everything it
@@ -13292,7 +13051,6 @@ class ScopeManager:
             mode=mode,
             input_changes=input_changes,
             window_verbatim_tail=window_verbatim_tail,
-            implied_purpose_min_words=self._implied_purpose_min_words,
             examined_context=examined_context,
             adopted_proposals=adopted_proposals,
         )
@@ -13482,16 +13240,13 @@ class ScopeManager:
             return [*cited, *engine_only]
 
         def _batch_attribution_checked(judgment: ScopeManagerBatchJudgment) -> int:
-            _attribution_reask_arm()
             if not batch_operator_directives:
                 return 0
             return sum(1 for v in judgment.verdicts if verdict_admits(v.decision))
 
         def _batch_attribution_corrective(_gap_ids: Sequence[str]) -> str:
             return _attribution_corrective_text(
-                batch_echo_state["cited"],
-                batch_echo_state["engine_only"],
-                blanket=_attribution_reask_arm() == "A",
+                batch_echo_state["cited"], batch_echo_state["engine_only"]
             )
 
         batch_judgment = self._call_with_correctives(
