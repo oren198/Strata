@@ -110,3 +110,26 @@ def test_two_instances_keep_their_own_binding(named_profile, hermes_home) -> Non
     finally:
         a.shutdown()
         b.shutdown()
+
+
+def test_a_scope_missing_from_the_profile_scope_and_os_environ_is_unavailable_with_a_clear_reason(
+    named_profile, hermes_home, monkeypatch
+) -> None:  # noqa: ANN001
+    """Neither the profile scope nor os.environ has STRATA_AGENT_SCOPE: the provider is
+    unavailable, says WHICH setting is missing, and initialize reports the UNBOUND code."""
+    from strata_hermes.client import UNBOUND  # noqa: PLC0415
+
+    monkeypatch.delenv("STRATA_AGENT_SCOPE", raising=False)
+    without_scope = {k: v for k, v in named_profile.items() if k != "STRATA_AGENT_SCOPE"}
+    provider = _new()
+    with ss.scoped(without_scope):
+        assert provider.is_available() is False
+        reason = provider.unavailable_reason()
+        assert "STRATA_AGENT_SCOPE" in reason and "not set" in reason
+        provider.initialize("sess_missing", hermes_home=str(hermes_home), platform="cli")
+    assert provider._init_error is not None  # noqa: SLF001
+    assert provider._init_error.code == UNBOUND  # noqa: SLF001
+    assert "STRATA_AGENT_SCOPE" in provider._init_error.message  # noqa: SLF001
+    out = json.loads(provider.handle_tool_call("strata_read_perspective", {}))
+    assert out["code"] == UNBOUND and "STRATA_AGENT_SCOPE" in out["error"]
+    assert provider._client is None  # noqa: SLF001  no server was started
