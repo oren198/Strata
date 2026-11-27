@@ -42,7 +42,7 @@ dev = [
 ]
 
 [tool.hatch.build.targets.sdist]
-exclude = ["/integrations"]
+exclude = ["/integrations", "/.claude", "/.superpowers"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/strata"]
