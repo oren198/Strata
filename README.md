@@ -815,6 +815,61 @@ has a shared local app-server daemon behind `codex agents` — sessions started
 through it were not exercised); pid reuse across long gaps (the existing
 caveat on `sess_auto_<pid>` ids).
 
+### Using Strata with Hermes Agent (`strata-hermes`)
+
+A [Hermes Agent](https://github.com/NousResearch/hermes-agent) profile can be an agent on a Strata
+scope, next to a Claude Code session. The provider, `strata-hermes`, lives in this repository
+(`integrations/hermes`). It is not on PyPI and is not part of the `strata-mem` package.
+
+**What was measured.** One scope, a Claude Code session and a Hermes profile both bound to it,
+on the 1.22 line:
+
+- the Claude Code session contributed a decision and the judge admitted it;
+- the Hermes profile read the scope's perspective and quoted that decision;
+- the Hermes profile contributed a second decision through `strata_contribute` and the judge
+  admitted it;
+- the Claude Code session then read it back verbatim, with its provenance (scope, skill, session
+  id and time). Every change to the scope's summary had a judgment.
+
+**Where it was measured: Hermes Agent v0.23.3 only, with one layout.** The layout is a *named*
+profile (`hermes -p <name>`) under a `HERMES_HOME` that is not your default Hermes home, with the
+profile's settings in its own `.env`. Other Hermes versions, the default profile, other homes and
+service installs of the gateway were not measured, and nothing is claimed for them.
+
+**Setup, as it was tested:**
+
+1. Register a Strata project (`strata register`, in a folder that is not the Strata repository)
+   whose fleet has the scope. Set the judge key for the project as in
+   [step 4](#4-set-your-judge-api-key).
+2. Install the provider into the environment Hermes runs in, from a checkout of this repository:
+   `pip install -e integrations/hermes` (the test used the `uv pip` equivalent in Hermes's own
+   virtual environment).
+3. Create the profile and select the provider, with Hermes in the isolated home:
+   `hermes profile create <name>`, then `hermes -p <name> config set memory.provider strata` and
+   `hermes -p <name> config set plugins.isolation in_process` (Hermes refuses a pip-installed
+   provider otherwise).
+4. Put these in the profile's own `.env`, `<HERMES_HOME>/profiles/<name>/.env`:
+   `STRATA_AGENT_SCOPE`, `STRATA_AGENT_SKILL`, `STRATA_PROJECT_DIR` (the registered project from
+   step 1) and `STRATA_MCP_COMMAND` (the path of `strata-mcp` when it is not on `PATH`). The model
+   provider key Hermes uses (an OpenRouter key in the test) goes in the same file: a named profile
+   reads its provider keys only from its own `.env`, so an exported environment variable is not
+   seen.
+5. Check it: `hermes -p <name> memory status` should show `Provider: strata` and an available
+   status. Then use the profile as usual (`hermes -p <name> chat ...`, or a gateway).
+
+**Limits:**
+
+- **No turn-end write-back nudge.** In Claude Code, Strata can stop a session that has read memory
+  and written nothing and ask it to contribute. None occurred in Hermes. A Hermes agent contributes
+  when it chooses to.
+- **Chats served through one gateway are one Strata session.** Two chats on one Hermes gateway
+  were recorded under the same Strata session id.
+- Anything the test did not measure (for example long sessions, several profiles on one scope, or
+  the write-back counters) is not claimed.
+
+More detail, including the error codes the provider returns, is in
+[`integrations/hermes/README.md`](integrations/hermes/README.md).
+
 ### Undoing it: `strata unregister`
 
 `strata unregister` reverses register's wiring. Like register, it is strictly

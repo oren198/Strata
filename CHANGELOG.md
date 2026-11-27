@@ -9,6 +9,18 @@ the release PR (`dev` → `main`) and the GitHub Release body are built from
 
 The store migrates by itself on first start (0029). There is no manual step.
 
+### Added
+
+- **Hermes Agent support.** A Hermes Agent profile can act on a Strata scope next to a Claude Code
+  session, through the `strata-hermes` memory provider (`integrations/hermes`; not on PyPI, and not
+  part of the `strata-mem` package). In the measured run, a Claude Code session and a Hermes profile
+  shared one scope: each admitted contribution was visible to the other harness verbatim, with its
+  provenance. Measured on Hermes Agent v0.23.3 only, with a named profile under an isolated
+  `HERMES_HOME`. A named profile's settings are read from its own `.env` (Hermes's profile secret
+  scope), not from the launch environment. Limits: Hermes has no turn-end write-back nudge, and
+  chats served through one Hermes gateway are one Strata session. Setup: see the README, "Using
+  Strata with Hermes Agent".
+
 ### Behaviour change
 
 - **A scope's own memory is no longer used as an implied purpose to decline (#210).** Relevance is measured against the scope's own `description`; a scope with no description declines nothing as irrelevant, so set one to turn relevance checks on. The scope's memory only suggests a description now: `strata doctor` and the Console say "no description; your scope's memory suggests: …", report-only.

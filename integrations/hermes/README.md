@@ -2,11 +2,13 @@
 
 A Strata memory provider for [Hermes Agent](https://github.com/NousResearch/hermes-agent).
 
-**Status: under development. This package is not released, and Hermes support is not claimed
-until a live two-profile demo (a Claude Code session and a Hermes profile on one scope) has
-passed.** Everything below describes what the code does; none of it has been run against a real
-Hermes install yet. The tests run against a verbatim copy of Hermes's `MemoryProvider` base class
-(v0.23.3, `caafe53`) and a real `strata-mcp` server with a scripted judge.
+**Status: measured on Hermes Agent v0.23.3 (`caafe53`) with one layout: a named profile under an
+isolated `HERMES_HOME`, with its settings in the profile's own `.env`.** A Claude Code session and a
+Hermes profile shared one scope; each admitted contribution was visible to the other harness
+verbatim, with provenance. Other Hermes versions and layouts are not claimed. This package is not
+published to PyPI. The root README's "Using Strata with Hermes Agent" section is the setup guide;
+this file describes what the code does. The unit tests run against a verbatim copy of Hermes's
+`MemoryProvider` base class (v0.23.3) and a real `strata-mcp` server with a scripted judge.
 
 ## What it does
 
@@ -36,7 +38,10 @@ memory:
   provider: strata
 ```
 
-Set these in **each profile's environment** (one Hermes profile is one Strata agent):
+Set these in **each profile's own `.env`** (one Hermes profile is one Strata agent). For a named
+profile Hermes keeps that file in the profile's secret scope, and the provider reads it from there
+(`agent.secret_scope.get_secret`); `os.environ` is the launch profile's and is not consulted for a
+named profile:
 
 | Variable | Meaning |
 |---|---|
@@ -76,9 +81,9 @@ it is not memory until it is judged, and `strata_rejudge` asks again.
 - **Pip entry points are for owner-managed installs.** Hermes's own guide says entry-point
   discovery does not install packages and recommends a directory provider on package-manager-managed
   installs. This package is the entry-point form.
-- **Session identity is untested.** One Hermes process holds one Strata server, so a gateway that
-  serves several chats from one process is probably one Strata session. Whether that skews the
-  write-back counters has not been tested.
+- **Chats served through one gateway are one Strata session.** Measured: two chats on one Hermes
+  gateway were recorded under the same Strata session id. Whether that skews the write-back
+  counters has not been tested.
 - **The server needs a registered project.** `strata-mcp` reads `.strata/config.toml`; without
   `STRATA_PROJECT_DIR` pointing at one it starts unbound.
 
