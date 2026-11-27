@@ -29,6 +29,7 @@ The store migrates by itself on first start (0029). There is no manual step.
 
 ### Changed
 
+- The source distribution no longer includes internal agent files (.claude/, .superpowers/).
 - **Amendments survive a crash.** A write-ahead journal records each summary amendment before the summary file is written, and recovery replays or abandons it on the next drain or server start. The summary file is fsynced (the file and its directory). The retire act, a date-based retirement and the approval of a held retirement request go through the same journal. The store gains migration 0029.
   - `strata doctor` gains two report-only lines: one for a directive missing with no retirement or supersession, and "Suspect intents".
   - A suspect intent also leaves an engine note.

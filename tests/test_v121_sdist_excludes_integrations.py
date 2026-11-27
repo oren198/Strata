@@ -22,7 +22,7 @@ ROOT = Path(__file__).resolve().parent.parent
 def test_the_root_pyproject_excludes_integrations_from_the_sdist() -> None:
     config = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     sdist = config["tool"]["hatch"]["build"]["targets"]["sdist"]
-    assert sdist == {"exclude": ["/integrations"]}
+    assert sdist == {"exclude": ["/integrations", "/.claude", "/.superpowers"]}
 
 
 @pytest.mark.skipif(
