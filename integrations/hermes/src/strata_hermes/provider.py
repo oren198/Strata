@@ -10,6 +10,14 @@ server, which may be waiting on the scope lock.
 Scope and skill come from the profile's environment (``STRATA_AGENT_SCOPE``,
 ``STRATA_AGENT_SKILL``); ``STRATA_AGENT_SESSION_ID`` is never set, so the server derives the
 session from this process. Nothing here imports Strata: the engine runs in ``strata-mcp``.
+
+Profile settings are read the way Hermes 0.23.3 reads a profile's secrets, NOT from
+``os.environ``: for a named profile the profile ``.env`` lives in the profile's SECRET SCOPE
+(``agent.secret_scope.get_secret``, which ``plugins/memory/retaindb`` and ``byterover`` use for the
+same purpose), and ``os.environ`` is the launch profile's. The values are resolved once, from
+``initialize(hermes_home=...)`` (the multiplexing contract in ``agent/memory_provider.py``: bind
+from ``hermes_home`` and the scoped secrets read during ``initialize``, keep the binding on the
+instance), and passed to the ``strata-mcp`` subprocess explicitly.
 """
 
 from __future__ import annotations
@@ -20,6 +28,7 @@ import os
 import shlex
 import shutil
 import threading
+from pathlib import Path
 from typing import Any
 
 from agent.memory_provider import MemoryProvider, RecallStatus, spawn_context_thread
@@ -35,22 +44,46 @@ DEFAULT_COMMAND = "strata-mcp"
 _UNTOUCHED = "Hermes built-in memory is untouched."
 
 
-def _command() -> list[str]:
-    return shlex.split(os.environ.get(COMMAND_ENV, "").strip() or DEFAULT_COMMAND)
+SCOPE_ENV = "STRATA_AGENT_SCOPE"
+SKILL_ENV = "STRATA_AGENT_SKILL"
+
+
+def _read(name: str, hermes_home: str | None = None) -> str:
+    """One profile setting. Order: the profile secret scope (``get_secret``: the profile ``.env``
+    for a named profile, ``os.environ`` for the default one), then the profile's own ``.env``
+    under ``hermes_home`` (bound by ``initialize``), then ``os.environ`` ONLY where Hermes' secret
+    scope is not importable (the provider's own test run). A routed profile never reads another
+    profile's ``os.environ`` value."""
+    try:
+        from agent.secret_scope import UnscopedSecretError, get_secret  # noqa: PLC0415
+    except ImportError:
+        return os.environ.get(name, "").strip()
+    try:
+        value = get_secret(name, "")
+    except UnscopedSecretError:
+        value = ""  # multiplexing with no scope bound: never fall back to the launch environ
+    except Exception:  # noqa: BLE001 - a settings read must never raise into Hermes
+        value = ""
+    if (value or "").strip():
+        return str(value).strip()
+    if hermes_home:
+        try:
+            from agent.secret_scope import load_env_file  # noqa: PLC0415
+
+            return (load_env_file(Path(hermes_home) / ".env").get(name) or "").strip()
+        except Exception:  # noqa: BLE001
+            return ""
+    return ""
+
+
+def _split_command(text: str) -> list[str]:
+    return shlex.split(text.strip() or DEFAULT_COMMAND)
 
 
 def _resolvable(command: list[str]) -> bool:
     return bool(command) and (
         shutil.which(command[0]) is not None or os.access(command[0], os.X_OK)
     )
-
-
-def _scope() -> str:
-    return os.environ.get("STRATA_AGENT_SCOPE", "").strip()
-
-
-def _skill() -> str:
-    return os.environ.get("STRATA_AGENT_SKILL", "").strip()
 
 
 def render_perspective(data: dict[str, Any]) -> str:
@@ -79,6 +112,9 @@ class StrataMemoryProvider(MemoryProvider):
         self._directives = 0
         self._refreshing = False
         self._again = False
+        # the profile binding: resolved by initialize() (or lazily for is_available) and kept here
+        self._hermes_home: str | None = None
+        self._bound: dict[str, str] | None = None
 
     # -- identity and availability ----------------------
 
@@ -86,41 +122,70 @@ class StrataMemoryProvider(MemoryProvider):
     def name(self) -> str:
         return "strata"
 
+    def _settings(self) -> dict[str, str]:
+        """The profile's Strata settings: the binding ``initialize`` made, else a fresh read."""
+        if self._bound is not None:
+            return self._bound
+        return self._resolve(self._hermes_home)
+
+    @staticmethod
+    def _resolve(hermes_home: str | None) -> dict[str, str]:
+        return {
+            "scope": _read(SCOPE_ENV, hermes_home),
+            "skill": _read(SKILL_ENV, hermes_home),
+            "project": _read(PROJECT_ENV, hermes_home),
+            "command": _read(COMMAND_ENV, hermes_home),
+        }
+
+    def _scope(self) -> str:
+        return self._settings()["scope"]
+
+    def _skill(self) -> str:
+        return self._settings()["skill"]
+
+    def _command(self) -> list[str]:
+        return _split_command(self._settings()["command"])
+
     def is_available(self) -> bool:
         """Config only, no network: a scope is set and the strata-mcp command resolves."""
-        return bool(_scope()) and _resolvable(_command())
+        return bool(self._scope()) and _resolvable(self._command())
 
     def unavailable_reason(self) -> str:
-        if not _scope():
+        if not self._scope():
             return (
                 "STRATA_AGENT_SCOPE is not set for this profile; set it (and STRATA_AGENT_SKILL) "
                 "in the profile's env to bind it to a Strata scope."
             )
         return (
-            f"the strata-mcp command {' '.join(_command())!r} was not found; install strata-mem "
-            f"or set {COMMAND_ENV}."
+            f"the strata-mcp command {' '.join(self._command())!r} was not found; "
+            f"install strata-mem or set {COMMAND_ENV}."
         )
 
     def identity_signature(self) -> dict[str, Any]:
-        return {"strata": {"scope": _scope(), "skill": _skill()}}
+        return {"strata": {"scope": self._scope(), "skill": self._skill()}}
 
     # -- lifecycle ----------------------
 
     def initialize(self, session_id: str, **kwargs: Any) -> None:
         self._session_id = session_id
         self._init_error = None
-        if not _scope():
+        home = kwargs.get("hermes_home")
+        self._hermes_home = str(home) if home else self._hermes_home
+        self._bound = self._resolve(self._hermes_home)  # bound once for this profile
+        settings = self._bound
+        if not settings["scope"]:
             self._init_error = StrataError(UNBOUND, self.unavailable_reason())
             return
-        command = _command()
+        command = self._command()
         if not _resolvable(command):
             self._init_error = StrataError(UNREACHABLE, self.unavailable_reason())
             return
-        env = {**os.environ, "STRATA_AGENT_SCOPE": _scope()}
-        if _skill():
-            env["STRATA_AGENT_SKILL"] = _skill()
+        # the scoped values go to strata-mcp EXPLICITLY: the launch environ is not this profile's
+        env = {**os.environ, SCOPE_ENV: settings["scope"]}
+        if settings["skill"]:
+            env[SKILL_ENV] = settings["skill"]
         env.pop("STRATA_AGENT_SESSION_ID", None)  # the server derives it; setting one splits it
-        client = StrataClient(command, env, cwd=os.environ.get(PROJECT_ENV, "").strip() or None)
+        client = StrataClient(command, env, cwd=settings["project"] or None)
         try:
             client.start()
         except StrataError as exc:
@@ -137,7 +202,7 @@ class StrataMemoryProvider(MemoryProvider):
     # -- recall: always from the cache ----------------------
 
     def system_prompt_block(self) -> str:
-        return tools.SYSTEM_BLOCK.format(scope=_scope() or "(unbound)")
+        return tools.SYSTEM_BLOCK.format(scope=self._scope() or "(unbound)")
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         with self._lock:
@@ -190,7 +255,7 @@ class StrataMemoryProvider(MemoryProvider):
                 return json.dumps(self._status())
             if tool_name == tools.READ_PERSPECTIVE:
                 return json.dumps(self._require_client().call_tool(tool_name, {}))
-            sent = tools.server_arguments(tool_name, args or {}, _scope())
+            sent = tools.server_arguments(tool_name, args or {}, self._scope())
             return json.dumps(self._require_client().call_tool(tool_name, sent))
         except KeyError:
             return json.dumps(
@@ -207,8 +272,8 @@ class StrataMemoryProvider(MemoryProvider):
     def _status(self) -> dict[str, Any]:
         up = self._client is not None and self._client.is_up()
         return {
-            "scope": _scope() or None,
-            "skill": _skill() or None,
+            "scope": self._scope() or None,
+            "skill": self._skill() or None,
             "server": "up" if up else "down",
             "problem": None if up or self._init_error is None else self._init_error.message,
         }
