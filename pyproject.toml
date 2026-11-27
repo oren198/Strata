@@ -41,6 +41,9 @@ dev = [
     "httpx",
 ]
 
+[tool.hatch.build.targets.sdist]
+exclude = ["/integrations"]
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/strata"]
 include = [
@@ -64,6 +67,8 @@ markers = [
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+# a verbatim copy of Hermes's ABC (a test double): neither check nor format may touch it
+extend-exclude = ["integrations/hermes/tests/fake_hermes"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP", "SIM"]
