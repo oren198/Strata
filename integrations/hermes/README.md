@@ -28,7 +28,8 @@ this file describes what the code does. The unit tests run against a verbatim co
 ## Install and set up
 
 Install `strata-hermes` into the environment Hermes runs in. It depends on `strata-mem>=1.20`
-(which ships `strata-mcp`). Hermes finds a pip-installed provider through the
+(which ships `strata-mcp`). The tested command, from a checkout of the Strata repository, is
+`uv pip install --python <hermes venv>/bin/python -e . -e integrations/hermes`. Hermes finds a pip-installed provider through the
 `hermes_agent.memory_providers` entry point; the provider's name is `strata`.
 
 Then select it, with `hermes memory setup` or in the profile's config:

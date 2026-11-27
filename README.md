@@ -841,13 +841,22 @@ service installs of the gateway were not measured, and nothing is claimed for th
 1. Register a Strata project (`strata register`, in a folder that is not the Strata repository)
    whose fleet has the scope. Set the judge key for the project as in
    [step 4](#4-set-your-judge-api-key).
-2. Install the provider into the environment Hermes runs in, from a checkout of this repository:
-   `pip install -e integrations/hermes` (the test used the `uv pip` equivalent in Hermes's own
-   virtual environment).
+2. Install the provider into Hermes's own virtual environment, from a checkout of this repository,
+   with uv. This is the form that was tested: one `uv pip install` of the Strata checkout (which
+   provides `strata-mem` and `strata-mcp`) and of the provider, both editable, into Hermes's
+   environment:
+
+   ```
+   uv pip install --python <hermes venv>/bin/python -e . -e integrations/hermes
+   ```
+
+   Plain `pip install -e . -e integrations/hermes` into that environment should also work; it is
+   not what was tested.
 3. Create the profile and select the provider, with Hermes in the isolated home:
    `hermes profile create <name>`, then `hermes -p <name> config set memory.provider strata` and
-   `hermes -p <name> config set plugins.isolation in_process` (Hermes refuses a pip-installed
-   provider otherwise).
+   `hermes -p <name> config set plugins.isolation in_process`. In 0.23.3 `in_process` is also the
+   default; the test set it explicitly. With `plugins.isolation: host` Hermes refuses to load
+   third-party code in its process, which includes this provider.
 4. Put these in the profile's own `.env`, `<HERMES_HOME>/profiles/<name>/.env`:
    `STRATA_AGENT_SCOPE`, `STRATA_AGENT_SKILL`, `STRATA_PROJECT_DIR` (the registered project from
    step 1) and `STRATA_MCP_COMMAND` (the path of `strata-mcp` when it is not on `PATH`). The model
