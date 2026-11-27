@@ -6,7 +6,7 @@
 from strata.record_store import ACCEPTED_DECISIONS as ACCEPTED_DECISIONS
 from strata.record_store import verdict_admits as verdict_admits
 
-__version__ = "1.21.0"
+__version__ = "1.22.0"
 
 #: PyPI distribution name. The import name (``strata``) and console scripts
 #: (``strata``, ``strata-mcp``) are unchanged — only the package name pip

@@ -5,7 +5,7 @@ the release PR (`dev` → `main`) and the GitHub Release body are built from
 (`docs/releasing.md`, step 3) — write entries here as work lands, and the
 "Unreleased" section is cleared once a release ships.
 
-## Unreleased
+## 1.22.0 (2026-11-27)
 
 The store migrates by itself on first start (0029). There is no manual step.
 
