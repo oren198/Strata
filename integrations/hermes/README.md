@@ -27,6 +27,10 @@ this file describes what the code does. The unit tests run against a verbatim co
 
 ## Install and set up
 
+Tested only in a Hermes environment built with `uv sync` (no `[all]` extra, mcp 1.29.1). A
+standard Hermes install (`[all]`) pins mcp 2.3.0, which conflicts with strata-mem's mcp<1.30, so
+the install command below fails there. A one-step install for standard Hermes is planned.
+
 Install `strata-hermes` into the environment Hermes runs in. It depends on `strata-mem>=1.20`
 (which ships `strata-mcp`). The tested command, from a checkout of the Strata repository, is
 `uv pip install --python <hermes venv>/bin/python -e . -e integrations/hermes`. Hermes finds a pip-installed provider through the
