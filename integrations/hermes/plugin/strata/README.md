@@ -13,14 +13,14 @@ named profile, Strata 1.22.0, an existing Strata project. Other combinations are
 You need a registered Strata project first (`strata register`, in a folder that is not the Strata
 repository) whose fleet has the scope. Then:
 
-    hermes -p <profile> plugins install <this plugin's address>
+    hermes -p <profile> plugins install https://github.com/oren198/Strata#integrations/hermes/plugin/strata
 
 Answer the prompts (scope, project folder, optional skill, optional judge key) and `y` to "Use
 'strata' as the memory provider now?". The answers go into the profile's own `.env`.
 
-The Strata engine (`strata-mem`, pinned to the exact version this plugin was tested with) is
-installed the first time the profile starts a chat, by Hermes's own package manager into a side
-environment under the profile's Hermes home. The plugin declares no Python dependencies and
+The Strata engine (`strata-mem` 1.22.0, pinned exactly) is downloaded from PyPI the first time the
+profile starts a chat, by Hermes's own package manager into a side environment under the profile's
+Hermes home. The plugin declares no Python dependencies and
 installs nothing into Hermes's environment.
 
 If your Hermes has `security.allow_lazy_installs: false`, `hermes -p <profile> memory status` says
@@ -86,5 +86,6 @@ it is not memory until it is judged, and `strata_rejudge` asks again.
   counters has not been tested.
 - **The engine needs a registered project.** Without `STRATA_PROJECT_DIR` pointing at one it starts
   unbound.
-- **`plugins.isolation`:** TODO(C10b): the measured result for `host`; `in_process` is the tested
-  mode.
+- **Tested once.** Hermes v0.23.3 (standard install), Linux/WSL2, 2026-11-28; `hermes pm repair`
+  and `plugins.isolation: host` were tried and worked. `hermes update` was not run; Hermes's own
+  guide says the plugins directory survives it.

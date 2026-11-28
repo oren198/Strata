@@ -823,11 +823,16 @@ that lives in this repository (`integrations/hermes/plugin/strata`). It is not a
 is not on PyPI and is not part of the `strata-mem` package, and nothing is installed into Hermes's
 own Python environment.
 
-**What was tested.** Hermes Agent v0.23.3 (`caafe538`) installed with Hermes's official installer,
-on Linux/WSL2, using a *named* profile, with an existing Strata project (a new user runs
-`strata register` first, below). TODO(C10b): fill from the run's evidence (date, run id, what
-passed). Other Hermes versions, the default profile, other operating systems, Windows, and service
-installs of the gateway were not tested, and nothing is claimed for them.
+**What was tested (2026-11-28).** Hermes Agent v0.23.3 (`caafe538`) installed with Hermes's official
+installer (a standard install: all extras, so Hermes's own `mcp` is 2.3.0), on Linux/WSL2, with
+*named* profiles and an existing Strata project (a new user runs `strata register` first, below). A
+Claude Code session and a Hermes profile shared one scope: each admitted contribution was visible
+to the other harness verbatim, with its provenance. The plugin took 1 command to install, or 2 with
+lazy installs off. Two things differed from what you will run: the test installed the plugin from a
+`file://` clone of this same tree rather than the GitHub address below, and, because 1.22.0 was not
+yet published, Hermes's package manager took the identical 1.22.0 wheel from a local index instead of
+PyPI; the install from PyPI and from GitHub is checked after publishing. Other Hermes versions, the default profile, other operating systems, Windows, and
+service installs of the gateway were not tested, and nothing is claimed for them.
 
 **Install: one command.**
 
@@ -837,18 +842,19 @@ installs of the gateway were not tested, and nothing is claimed for them.
 2. Install the plugin into the profile:
 
    ```
-   hermes -p <profile> plugins install <owner>/<repo>/integrations/hermes/plugin/strata
+   hermes -p <profile> plugins install https://github.com/oren198/Strata#integrations/hermes/plugin/strata
    ```
 
-   (TODO(C10b): the exact address that was tested.) Hermes asks for the scope
+   Hermes asks for the scope
    (`STRATA_AGENT_SCOPE`), the project folder (`STRATA_PROJECT_DIR`), an optional skill and an
    optional judge key, saves the answers in the profile's own `.env`, and asks "Use 'strata' as the
    memory provider now?". Answer `y`.
 
-That is all. The Strata engine (`strata-mem`, pinned to the exact version this plugin was tested
-with) is installed the first time the profile starts a chat, by Hermes's own package manager into a
-side environment under the profile's Hermes home, so it never meets Hermes's own `mcp`. The first
-chat is slower for that reason (TODO(C10b): measured first-use time).
+That is all. The Strata engine (`strata-mem` 1.22.0, pinned exactly) is downloaded from PyPI the
+first time the profile starts a chat, by Hermes's own package manager into a side environment under
+the profile's Hermes home, so it never meets Hermes's own `mcp`. The first chat is slower for that
+reason: in the test it took 35 s with the engine download included (the Hermes installer itself took
+248 s).
 
 **If your Hermes has lazy installs off** (`security.allow_lazy_installs: false`), the provider says
 so in `hermes -p <profile> memory status` ("engine: not installed ... run `hermes memory setup
@@ -872,8 +878,12 @@ available status.
   gave one at install, in the profile's `.env` (read through Hermes's secret scope and passed only
   into the engine process). The plugin never reads a `.env` file itself.
 
-**Isolation.** TODO(C10b): the result of `plugins.isolation: host` (reported, not a requirement);
-the default `in_process` is the tested mode.
+**Durability and isolation.** After `hermes pm repair` (which rebuilds Hermes's own environment) the
+same engine was still found and the provider was still available. For `hermes update` only Hermes's
+own guarantee is quoted: "`HERMES_HOME/plugins/` survives `hermes update` ... the updater only
+rebuilds the venv and the checkout, never the home directory" (Hermes developer guide, plugins); a
+`hermes update` was not run in the test. With `plugins.isolation: host` the provider worked in the
+test run (a chat read the other harness's item); that is reported, not a guarantee.
 
 **Limits:**
 

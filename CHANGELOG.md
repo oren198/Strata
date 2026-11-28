@@ -12,15 +12,18 @@ The store migrates by itself on first start (0029). There is no manual step.
 ### Added
 
 - **Hermes Agent support, one command.** A Hermes Agent profile can act on a Strata scope next to
-  a Claude Code session: `hermes -p <profile> plugins install <address>` installs the `strata`
+  a Claude Code session: `hermes -p <profile> plugins install https://github.com/oren198/Strata#integrations/hermes/plugin/strata` installs the `strata`
   memory provider (a Hermes directory plugin in `integrations/hermes/plugin/strata`; not on PyPI,
   not part of the `strata-mem` package, and with no Python dependencies of its own). The Strata
-  engine is installed on the profile's first chat by Hermes's own package manager, into a side
-  environment, so it does not meet Hermes's own `mcp` (TODO(C10b): confirm on a standard `[all]` install,
-  mcp 2.3.0); with lazy installs off,
-  `hermes -p <profile> memory setup strata` does it. Tested on Hermes Agent v0.23.3 installed by its
-  official installer, Linux/WSL2, a named profile, an existing Strata project; TODO(C10b): date and
-  result. Limits: Hermes has no turn-end write-back nudge, and chats served through one Hermes
+  engine (`strata-mem` 1.22.0) is downloaded from PyPI on the profile's first chat by Hermes's own package manager, into a side
+  environment, so it does not meet Hermes's own `mcp`; with lazy installs off,
+  `hermes -p <profile> memory setup strata` does it (two commands in all). Tested on 2026-11-28 on
+  Hermes Agent v0.23.3 installed by its official installer (all extras, mcp 2.3.0), Linux/WSL2,
+  named profiles, an existing Strata project (run `strata register` first): the first chat took
+  35 s including the engine download, the provider survived `hermes pm repair`, and it worked with
+  `plugins.isolation: host` (reported, not a guarantee). The test installed the plugin from a
+  `file://` clone of this tree and took the identical 1.22.0 wheel from a local index, since 1.22.0
+  was not yet published; the GitHub and PyPI installs are checked after publishing. Limits: Hermes has no turn-end write-back nudge, and chats served through one Hermes
   gateway are one Strata session. See the README, "Using Strata with Hermes Agent".
 
 ### Behaviour change
