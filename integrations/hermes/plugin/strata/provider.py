@@ -43,6 +43,10 @@ PROJECT_ENV = "STRATA_PROJECT_DIR"
 ENGINE_ENV = "STRATA_ENGINE_REQUIREMENT"
 JUDGE_KEY_ENV = "STRATA_JUDGE_API_KEY"  # the profile-side name; the engine reads JUDGE_API_KEY
 ENGINE_JUDGE_ENV = "JUDGE_API_KEY"
+#: Hermes sets these for ITS interpreter at startup (PYTHONPATH = its checkout + its site-packages,
+#: with mcp 2.3.0). The engine is a different environment (mcp 1.x): inheriting them makes it import
+#: Hermes's mcp and die on import (C10b live run 1), so they never reach the subprocess.
+_PYTHON_ENV_NAMES = frozenset({"PYTHONPATH", "PYTHONHOME", "VIRTUAL_ENV", "__HERMES_ACTIVATED"})
 #: Names the engine would take a judge key from; never inherited from the launch environment.
 _JUDGE_KEY_NAMES = frozenset(
     {"JUDGE_API_KEY", "ANTHROPIC_API_KEY", "STRATA_ANTHROPIC_API_KEY", "STRATA_JUDGE_API_KEY"}
@@ -190,12 +194,15 @@ class StrataMemoryProvider(MemoryProvider):
         if not _resolvable(command):
             self._init_error = StrataError(UNREACHABLE, self.unavailable_reason())
             return
-        # Not the launch profile's Strata or judge settings: under a multiplexed gateway those
-        # belong to another profile. Only this profile's scoped values are added.
+        # Not the launch profile's Strata or judge settings (under a multiplexed gateway those
+        # belong to another profile), and not Hermes's own Python environment. Only this
+        # profile's scoped values are added.
         env = {
             k: v
             for k, v in os.environ.items()
-            if not k.startswith("STRATA_") and k not in _JUDGE_KEY_NAMES
+            if not k.startswith("STRATA_")
+            and k not in _JUDGE_KEY_NAMES
+            and k not in _PYTHON_ENV_NAMES
         }
         env[SCOPE_ENV] = settings["scope"]
         if settings["skill"]:

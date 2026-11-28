@@ -409,3 +409,11 @@ def test_the_engine_env_drops_the_launch_interpreters_python_environment(
     for name in _PYTHON_ENV:
         assert name not in captured["env"], f"{name} reached the engine"
     assert "PATH" in captured["env"]  # the rest of the environment is kept
+
+
+def test_the_spend_guard_is_a_test_harness_tool_and_never_ships_in_the_plugin() -> None:
+    for path in PLUGIN_DIR.rglob("*"):
+        if path.is_file():
+            text = path.read_text(encoding="utf-8", errors="ignore")
+            assert "sitecustomize" not in path.name
+            assert "HERMES_GUARD" not in text and "hermes_guard" not in text, path.name
