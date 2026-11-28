@@ -838,6 +838,10 @@ service installs of the gateway were not measured, and nothing is claimed for th
 
 **Setup, as it was tested:**
 
+Tested only in a Hermes environment built with `uv sync` (no `[all]` extra, mcp 1.29.1). A
+standard Hermes install (`[all]`) pins mcp 2.3.0, which conflicts with strata-mem's mcp<1.30, so
+the install command below fails there. A one-step install for standard Hermes is planned.
+
 1. Register a Strata project (`strata register`, in a folder that is not the Strata repository)
    whose fleet has the scope. Set the judge key for the project as in
    [step 4](#4-set-your-judge-api-key).

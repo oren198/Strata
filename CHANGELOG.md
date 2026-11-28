@@ -18,8 +18,8 @@ The store migrates by itself on first start (0029). There is no manual step.
   provenance. Measured on Hermes Agent v0.23.3 only, with a named profile under an isolated
   `HERMES_HOME`. A named profile's settings are read from its own `.env` (Hermes's profile secret
   scope), not from the launch environment. Limits: Hermes has no turn-end write-back nudge, and
-  chats served through one Hermes gateway are one Strata session. Setup: see the README, "Using
-  Strata with Hermes Agent".
+  chats served through one Hermes gateway are one Strata session; standard Hermes installs ([all])
+  are not yet supported; see README. Setup: see the README, "Using Strata with Hermes Agent".
 
 ### Behaviour change
 
