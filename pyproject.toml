@@ -33,7 +33,7 @@ strata-mcp = "strata.mcp.server:main"
 dev = [
     "pytest",
     "pytest-asyncio",
-    "ruff",
+    "ruff==0.17.6",
     # httpx: no longer a runtime dependency (issue #64 — the CLI inspection
     # commands were ported to embedded store reads, dropping the last src/
     # consumer). Kept for tests only: FastAPI's starlette.testclient.TestClient

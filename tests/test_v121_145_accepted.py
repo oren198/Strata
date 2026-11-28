@@ -146,9 +146,12 @@ def _python_hits(path: Path) -> list[int]:
             }
             if DIRECTIVE in names and CONTEXT in names:
                 lines.append(node.lineno)
-        elif isinstance(node, ast.Constant) and isinstance(node.value, str):
-            if _SQL_IN.search(node.value):  # a SQL ``decision IN ('..', '..')`` in a string
-                lines.append(node.lineno)
+        elif (
+            isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and _SQL_IN.search(node.value)  # a SQL ``decision IN ('..', '..')`` in a string
+        ):
+            lines.append(node.lineno)
     return lines
 
 
