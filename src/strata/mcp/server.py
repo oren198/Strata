@@ -47,6 +47,7 @@ import functools
 import inspect
 import logging
 import os
+import re
 import signal
 import sqlite3
 import sys
@@ -74,6 +75,7 @@ from mcp.types import (
 )
 from pydantic import BaseModel, Field
 
+from strata import binding_persist
 from strata.fleet_config import FleetConfig, FleetConfigError, Scope
 from strata.fleet_reload import FleetReloader
 from strata.locks import configure_lock_dir
@@ -99,18 +101,20 @@ from strata.publication import (
     read_publication,
 )
 from strata.record_store import (
-    ACCEPTED_DECISIONS,
     ContributorRef,
     RecordStore,
     engine_note_rejudge_message,
     is_engine_note,
+    verdict_admits,
 )
+from strata.review import perspective_notes as review_perspective_notes
 from strata.session_state import (
     SessionState,
     SessionStateStore,
     classify_harness,
     compute_nudge,
     resolve_agent_session_id,
+    session_id_is_auto,
     sessions_dir_for,
 )
 from strata.settings import get_settings
@@ -237,9 +241,14 @@ def _drain_for_read(fleet, scope_id: str) -> tuple[int, list]:
     owed, which the caller surfaces as ``refresh_pending``.
     """
     from strata.app import DrainFailed, drain_is_noop, drain_scope  # noqa: PLC0415
+    from strata.forgetting import sweep_for_read  # noqa: PLC0415
 
     if _record_store is None or _summary_store is None:
         return 0, []
+
+    # v1.20: a date end condition that is over leaves the binding layers on this very read,
+    # with the ordinary change event to its readers, which the drain below then processes.
+    sweep_for_read(scope_id, fleet=fleet, record_store=_record_store, summary_store=_summary_store)
 
     # Nothing pending is nothing to do (ADR 0015 D6), and `drain_is_noop`
     # answers it lock-free: a quiet read must cost what reading a current
@@ -332,6 +341,67 @@ def _strict_now() -> bool:
     return strict_enabled(dict(os.environ), _project_root)
 
 
+def _persist_binding() -> None:
+    """Keep the binding the user just confirmed, so a reconnect restores it (best effort)."""
+    if _HARNESS_TOKEN and _sessions_dir and _AGENT_SCOPE and not _UNRESOLVED:
+        binding_persist.write_binding(
+            _sessions_dir, _AGENT_SESSION_ID, _HARNESS_TOKEN, _AGENT_SCOPE, _AGENT_SKILL
+        )
+
+
+def _restore_persisted_binding(fleet: FleetConfig | None) -> None:
+    """At startup, restore the binding this session confirmed before an MCP reconnect.
+
+    No more power than ``strata_bind``: the persisted scope/skill goes through the same
+    ``_resolve_bind``, a config-class failure blocks it, and a binding that no longer holds
+    leaves the session NOT bound with the reason, never on a stale scope."""
+    global _AGENT_SCOPE, _AGENT_SKILL, _UNRESOLVED, _STARTUP_ERRORS_BINDING
+    global _RESTORED_NOTICE, _RESTORED_SCOPE
+    if not _HARNESS_TOKEN or not _sessions_dir:
+        return
+    binding_persist.delete_stale(_sessions_dir)
+    result = binding_persist.restore_binding(
+        _sessions_dir,
+        _AGENT_SESSION_ID,
+        _HARNESS_TOKEN,
+        lambda scope, skill: (
+            _resolve_bind(fleet, scope, skill)
+            if fleet is not None
+            else (None, ["the fleet config is not loaded"])
+        ),
+        config_errors=_STARTUP_ERRORS_CONFIG,
+    )
+    if result.status == "restored":
+        _AGENT_SCOPE = result.scope_id
+        _AGENT_SKILL = result.skill
+        _STARTUP_ERRORS_BINDING = []
+        _UNRESOLVED = bool(_STARTUP_ERRORS_CONFIG)
+        who = f"{result.scope_id}/{result.skill}" if result.skill else result.scope_id
+        _RESTORED_SCOPE = result.scope_id
+        _RESTORED_NOTICE = (
+            f"binding restored after reconnect: {who}, confirmed {result.bound_at or 'earlier'}"
+        )
+    elif result.status == "invalid":
+        _AGENT_SCOPE = ""
+        _AGENT_SKILL = None
+        _STARTUP_ERRORS_BINDING = [result.message]
+        _UNRESOLVED = True
+
+
+def _take_restored_notice(result: dict) -> dict:
+    """Carry the one-time ``binding_notice`` (see :data:`_RESTORED_NOTICE`) on *result*.
+
+    Delivered once, then cleared; only while the session is still on the restored scope (a later
+    bind elsewhere makes it stale), and never on an unbound session."""
+    global _RESTORED_NOTICE, _RESTORED_SCOPE
+    with _binding_lock:
+        notice, scope = _RESTORED_NOTICE, _RESTORED_SCOPE
+        _RESTORED_NOTICE = _RESTORED_SCOPE = ""
+    if notice and not _UNRESOLVED and scope == _AGENT_SCOPE:
+        result["binding_notice"] = notice
+    return result
+
+
 def _record_connect(session: object) -> None:
     """Record this session's connect — the write-back denominator (M2).
 
@@ -351,7 +421,11 @@ def _record_connect(session: object) -> None:
         return
     try:
         _session_store.record_connect(
-            _AGENT_SESSION_ID, harness=_HARNESS, pid=os.getpid(), strict=_strict_now()
+            _AGENT_SESSION_ID,
+            harness=_HARNESS,
+            pid=os.getpid(),
+            strict=_strict_now(),
+            harness_token=_HARNESS_TOKEN,
         )
     except OSError as exc:  # pragma: no cover - defensive; disk failure only
         _logger.warning("failed to record connect for session %r: %s", _AGENT_SESSION_ID, exc)
@@ -641,7 +715,7 @@ def _record_accepted_contribution(decision: str) -> None:
     valve; a decline is the scope-manager rejecting the proposal, not the session
     contributing. Same best-effort discipline as :func:`_record_read`.
     """
-    if _session_store is None or decision not in ACCEPTED_DECISIONS:
+    if _session_store is None or not verdict_admits(decision):
         return
     try:
         _session_store.record_contribution(_AGENT_SESSION_ID, harness=_client_harness())
@@ -726,7 +800,6 @@ def _build_scope_manager():
     return ScopeManager(
         client=_settings.build_judge_client(),
         model=_settings.manager_model,
-        implied_purpose_min_words=_settings.implied_purpose_min_words,
         judge_provider=_settings.judge_provider,
     )
 
@@ -744,6 +817,15 @@ def _build_scope_manager():
 _AGENT_SCOPE: str = os.environ.get("STRATA_AGENT_SCOPE", "")
 _AGENT_SKILL: str | None = os.environ.get("STRATA_AGENT_SKILL") or None
 _AGENT_SESSION_ID: str = resolve_agent_session_id()
+# The harness this server was spawned by ("<pid>:<start time>"), set by main(). Empty for an
+# explicit STRATA_AGENT_SESSION_ID or an unreadable start time: then a binding is neither
+# persisted nor restored and a reconnect rolls the session over, as before.
+_HARNESS_TOKEN: str = ""
+# One line saying the binding was restored after a reconnect, owed to the agent (and so the user)
+# exactly once: the first strata_read_perspective or strata_bind status carries it as
+# ``binding_notice`` and clears it. Empty when nothing was restored.
+_RESTORED_NOTICE: str = ""
+_RESTORED_SCOPE: str = ""
 # The harness the connected client belongs to, from its initialize handshake;
 # resolved lazily on the first request (no client is connected at import) by
 # _client_harness() and held for the process's lifetime.
@@ -1921,6 +2003,7 @@ async def _attempt_elicit_bind(fleet: FleetConfig) -> bool:
         # top): a client marked non-functional once isn't locked out of
         # elicitation forever by that.
         _ELICIT_UNAVAILABLE = False
+    _persist_binding()
     return True
 
 
@@ -2384,6 +2467,7 @@ async def strata_bind(scope_id: str, skill: str | None = None, confirm: bool = F
         # stay confirmable after unrelated bind activity moved the session
         # on.
         _PENDING_SWITCH = None
+    _persist_binding()
 
     if is_switch:
         message = (
@@ -2431,7 +2515,7 @@ async def strata_bind(scope_id: str, skill: str | None = None, confirm: bool = F
             "or database). Fix the file(s) and restart the server — strata_bind "
             "cannot clear these."
         )
-    return _attach_nudge(result)
+    return _attach_nudge(_take_restored_notice(result))
 
 
 # ---------------------------------------------------------------------------
@@ -2449,6 +2533,8 @@ async def strata_contribute(
     supersedes: str | None = None,
     acted_on: str | None = None,
     adopted_from: str | None = None,
+    ends: dict[str, object] | None = None,
+    fulfils: str | None = None,
 ) -> dict:
     """Submit a contribution to a scope's scope-manager for judgment.
 
@@ -2514,6 +2600,16 @@ async def strata_contribute(
             where it came from. The proposal must exist, be a contribution to
             ``scope_id``, and come from another scope's session. Cannot be
             combined with ``acted_on``.
+        ends: Optional end condition for a directive proposal:
+            ``{"until": "YYYY-MM-DD"}`` or ``{"when": "<text>"}``.
+            Meaningful only when ``proposed_classification`` is ``directive``.
+        fulfils: Optional id of a directive with a judged end condition that
+            this contribution is evidence for.
+
+    a release-only contribution with supersedes is answered `retire`.
+    use `strata_retire` to retire your own directive.
+    `fulfils` is evidence, and only the owning scope's judge or a session
+    bound to the owner can confirm it.
 
     Returns:
         ``contribution_id`` and ``judgment`` (decision, reasoning, summary_updated).
@@ -2598,6 +2694,8 @@ async def strata_contribute(
             supersedes=supersedes,
             acted_on=acted_on,
             adopted_from=adopted_from,
+            ends=ends,
+            fulfils=fulfils,
             contributor=contributor,
             fleet=fleet,
             record_store=_record_store,
@@ -2645,16 +2743,186 @@ async def strata_contribute(
                 "failed to advance read receipt for session %r: %s", _AGENT_SESSION_ID, exc
             )
 
-    return _attach_fleet_notice(
-        {
-            "contribution_id": outcome.contribution_id,
-            "judgment": {
-                "decision": outcome.decision,
-                "reasoning": outcome.reasoning,
-                "summary_updated": outcome.summary_updated,
-            },
-        }
+    result = {
+        "contribution_id": outcome.contribution_id,
+        "judgment": {
+            "decision": outcome.decision,
+            "reasoning": outcome.reasoning,
+            "summary_updated": outcome.summary_updated,
+        },
+    }
+    relation = public_relation_rows(
+        _record_store.get_relation_calls(outcome.contribution_id), content
     )
+    if relation:
+        result["relation"] = relation
+    return _attach_fleet_notice(result)
+
+
+_RE_ASK_FAILED = "re-ask failed ("
+
+
+def public_relation_rows(rows: list[dict], own_text: str) -> list[dict]:
+    """The relation re-ask answers as an agent-facing surface shows them (v1.20). The stored
+    rows keep the judge's raw answer (only the operator CLI and Console show it raw). Here a
+    span survives only when it is verbatim in *own_text*, the caller's own contribution or
+    publication, else it is null; a ``re-ask failed (...)`` reason, whose text can hold raw
+    judge output, is cut to the exception class name."""
+    public = []
+    for stored in rows:
+        row = dict(stored)
+        for key in ("occurrence_span", "instead_span", "requirement_span"):
+            if row.get(key) is not None and row[key] not in own_text:
+                row[key] = None
+        reason = row.get("reason")
+        if isinstance(reason, str) and reason.startswith(_RE_ASK_FAILED):
+            # Cut right after the class name: the failure message may hold ")" or "; " itself,
+            # so where the parenthetical ends (and the judge's own reason resumes) is unknowable.
+            name = re.match(r"\w+", reason[len(_RE_ASK_FAILED) :])
+            row["reason"] = f"{_RE_ASK_FAILED}{name.group(0) if name else 'error'})"
+        public.append(row)
+    return public
+
+
+def _bound_actor() -> ContributorRef:
+    """The calling session, snapshotted the same way ``strata_contribute`` stamps one.
+
+    The actor comes from the binding, never from a tool argument.
+    """
+    agent_scope, agent_skill, agent_session_id = (
+        _AGENT_SCOPE,
+        _AGENT_SKILL,
+        _AGENT_SESSION_ID,
+    )
+    return ContributorRef(
+        scope_id=agent_scope,
+        skill=agent_skill,
+        session_id=agent_session_id,
+        ts=datetime.now(UTC).isoformat(),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tool: strata_retire
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+@_with_read_signal
+async def strata_retire(
+    directive_id: str,
+    kind: Literal["currency", "correction"],
+    notice: str,
+) -> dict:
+    """Retire one directive of this session's own scope, with a notice.
+
+    Use `strata_retire` to retire your own directive. A release (kind
+    ``currency``) is labelled retired; a retraction (kind ``correction``)
+    is labelled retracted. This tool takes no scope and no actor: both come
+    from the session binding. A refusal is returned as its own text, and
+    this tool does not retry with another scope.
+
+    Returns:
+        The reader-facing retirement notice, plus ``directive_id``.
+    """
+    await _require_bound_or_elicit()
+    actor = _bound_actor()
+    fleet = _load_fleet()
+    from strata.forgetting import (  # noqa: PLC0415
+        PositionGateRefusal,
+        retire_directive,
+        retirement_notice,
+    )
+
+    try:
+        retirement = retire_directive(
+            actor.scope_id,
+            directive_id,
+            kind,
+            notice,
+            actor,
+            fleet=fleet,
+            record_store=_record_store,
+            summary_store=_summary_store,
+        )
+    except (PositionGateRefusal, ValueError, KeyError) as exc:
+        raise RuntimeError(str(exc)) from exc
+    from strata.record_store import RetirementRequest  # noqa: PLC0415
+
+    if isinstance(retirement, RetirementRequest):
+        # ADR 0018 D5: a level-1 scope holds a session's own retire for the operator.
+        return {
+            "directive_id": directive_id,
+            "request_id": retirement.id,
+            "disposition": retirement.disposition,
+            "message": (
+                f"retirement requested; held for the operator; {directive_id} still binds. "
+                "The notice goes out only when the operator enacts it."
+            ),
+        }
+    return {**retirement_notice(retirement), "directive_id": directive_id}
+
+
+# ---------------------------------------------------------------------------
+# Tool: strata_retirement_candidates
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+@_with_read_signal
+async def strata_retirement_candidates() -> dict:
+    """List this session's own open retirement candidates.
+
+    Age and disuse candidates carry "prompts the question only" on
+    ``display``. That phrase is not written into ``note``. Operator items
+    are not listed. This tool takes no scope and no actor.
+    """
+    await _require_bound_or_elicit()
+    actor = _bound_actor()
+    from strata.forgetting import visible_candidates  # noqa: PLC0415
+    from strata.forgetting_surface import present_candidate  # noqa: PLC0415
+
+    rows = visible_candidates(actor.scope_id, actor, record_store=_record_store)
+    return {"candidates": [present_candidate(row) for row in rows]}
+
+
+# ---------------------------------------------------------------------------
+# Tool: strata_dismiss_candidate
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+@_with_read_signal
+async def strata_dismiss_candidate(candidate_id: str, reason: str, days: int) -> dict:
+    """Snooze one of this session's own candidates. The directive stays.
+
+    ``days`` must be an integer from 1 to 365. A value outside that range,
+    including 366, is refused before the engine is called. This tool takes
+    no scope and no actor.
+    """
+    await _require_bound_or_elicit()
+    from strata.forgetting import (  # noqa: PLC0415
+        PositionGateRefusal,
+        dismiss_candidate,
+    )
+    from strata.forgetting_surface import reject_dismiss_days  # noqa: PLC0415
+
+    try:
+        checked = reject_dismiss_days(days)
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from exc
+    actor = _bound_actor()
+    try:
+        dismiss_candidate(
+            candidate_id,
+            reason=reason,
+            days=checked,
+            actor=actor,
+            record_store=_record_store,
+        )
+    except (PositionGateRefusal, ValueError, KeyError) as exc:
+        raise RuntimeError(str(exc)) from exc
+    return {"candidate_id": candidate_id, "dismissed": True}
 
 
 # ---------------------------------------------------------------------------
@@ -2789,6 +3057,29 @@ async def strata_rejudge(contribution_id: str) -> dict:
 # ---------------------------------------------------------------------------
 
 
+def _publication_result(outcome) -> dict:  # noqa: ANN001
+    """The reply of a publish / restore proposal. When the #243 check's relation re-ask fired
+    for the act (accepted or declined), ``relation`` carries its answer in the shape
+    ``strata_read_contribution`` uses, so the publisher is told why at the moment it happens;
+    otherwise the reply is exactly what it was."""
+    result = {
+        "act_id": outcome.act_id,
+        "judgment": {
+            "decision": outcome.decision,
+            "reasoning": outcome.reasoning,
+            "artifact_updated": outcome.artifact_updated,
+        },
+    }
+    act = _record_store.get_publication_act(outcome.act_id)
+    relation = public_relation_rows(
+        _record_store.get_publication_relation_calls(outcome.act_id),
+        (act.content if act is not None else None) or "",
+    )
+    if relation:
+        result["relation"] = relation
+    return result
+
+
 @mcp.tool()
 @_with_read_signal
 async def strata_publish(
@@ -2909,16 +3200,7 @@ async def strata_publish(
     except ValueError as exc:
         raise RuntimeError(str(exc)) from exc
 
-    return _attach_fleet_notice(
-        {
-            "act_id": outcome.act_id,
-            "judgment": {
-                "decision": outcome.decision,
-                "reasoning": outcome.reasoning,
-                "artifact_updated": outcome.artifact_updated,
-            },
-        }
-    )
+    return _attach_fleet_notice(_publication_result(outcome))
 
 
 # ---------------------------------------------------------------------------
@@ -3072,16 +3354,7 @@ async def strata_restore(item_id: str, reason: str | None = None) -> dict:
     except (ValueError, KeyError) as exc:
         raise RuntimeError(str(exc)) from exc
 
-    return _attach_fleet_notice(
-        {
-            "act_id": outcome.act_id,
-            "judgment": {
-                "decision": outcome.decision,
-                "reasoning": outcome.reasoning,
-                "artifact_updated": outcome.artifact_updated,
-            },
-        }
-    )
+    return _attach_fleet_notice(_publication_result(outcome))
 
 
 # ---------------------------------------------------------------------------
@@ -3352,6 +3625,7 @@ async def strata_read_perspective(scope_id: str | None = None) -> dict:
         publication_reader=_publication_reader,
         change_event_reader=_change_event_reader,
         contribution_reader=_contribution_reader,
+        review_reader=lambda target: review_perspective_notes(target, record_store=_record_store),
         # ADR 0014 D5, issue #203: what the drain above just consumed. Notice
         # is immediate, only absorption is deferred — without this the reader
         # whose read paid for the refresh is the one reader never told what
@@ -3382,7 +3656,7 @@ async def strata_read_perspective(scope_id: str | None = None) -> dict:
         (layer for layer in perspective["layers"] if layer["relation"] == "self"), None
     )
     context_items = None if self_layer is None else self_layer.get("context_items")
-    return _attach_nudge(perspective, context_items=context_items)
+    return _attach_nudge(_take_restored_notice(perspective), context_items=context_items)
 
 
 # ---------------------------------------------------------------------------
@@ -3646,15 +3920,21 @@ async def strata_read_contribution(contribution_id: str) -> dict:
 
     # Forensic, like the scope record read: no read counter increment (#110),
     # but the nudge still rides along.
-    return _attach_nudge(
-        {
-            "contribution": asdict(entry.contribution),
-            "state": asdict(entry.state),
-            "judgment": asdict(entry.judgment) if entry.judgment is not None else None,
-            "judgment_attempts": [asdict(a) for a in entry.judgment_attempts],
-            "raised_to": raised_to,
-        }
+    payload = {
+        "contribution": asdict(entry.contribution),
+        "state": asdict(entry.state),
+        "judgment": asdict(entry.judgment) if entry.judgment is not None else None,
+        "judgment_attempts": [asdict(a) for a in entry.judgment_attempts],
+        "raised_to": raised_to,
+    }
+    # v1.20 (#242 b): the relation re-ask answers behind this verdict, so a decline is
+    # explainable after the fact. Present only when a re-ask fired for it.
+    relation = public_relation_rows(
+        _record_store.get_relation_calls(contribution_id), entry.contribution.content
     )
+    if relation:
+        payload["relation"] = relation
+    return _attach_nudge(payload)
 
 
 # ---------------------------------------------------------------------------
@@ -4015,6 +4295,12 @@ def main() -> None:
     )
     _UNRESOLVED = bool(_STARTUP_ERRORS_CONFIG) or bool(_STARTUP_ERRORS_BINDING)
 
+    # A reconnect restarts this process but not the harness: restore the binding the user
+    # confirmed earlier in this session (auto session ids only; see binding_persist).
+    global _HARNESS_TOKEN
+    _HARNESS_TOKEN = binding_persist.harness_token() if session_id_is_auto() else ""
+    _restore_persisted_binding(fleet)
+
     # Storage init after validation — failures here (unwritable directory,
     # corrupt DB) also render as a refuse-to-start message, not a traceback.
     try:
@@ -4029,6 +4315,17 @@ def main() -> None:
             file=sys.stderr,
         )
         sys.exit(1)
+
+    # v1.22 P2: finish any amendment a death left half-written, before the first read.
+    if fleet is not None and _record_store is not None and _summary_store is not None:
+        from strata.app import recover_all_amendment_intents  # noqa: PLC0415
+
+        try:
+            recover_all_amendment_intents(
+                fleet=fleet, record_store=_record_store, summary_store=_summary_store
+            )
+        except Exception:  # noqa: BLE001 — never keep the server from starting
+            _logger.exception("amendment intent recovery failed at start")
 
     signal.signal(signal.SIGTERM, _terminate_cleanly)
     try:

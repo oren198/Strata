@@ -256,8 +256,8 @@ def test_an_old_context_line_that_echoes_a_directive_does_not_fire_for_an_unrela
     assert judgment.attribution_gap_kept == []
 
 
-def test_a_note_that_shares_only_two_subject_words_with_a_directive_does_not_fire():
-    two = "The tagged inventory was published to the wiki on Monday."
-    judgment, client = _judge(_accept(two), content=two)
+def test_a_note_that_shares_only_one_subject_word_with_a_directive_does_not_fire():
+    one = "A tag is pushed once the release candidate is approved."
+    judgment, client = _judge(_accept(one), content=one)
     assert len(_judge_calls(client)) == 1
     assert judgment.attribution_gap_kept == []

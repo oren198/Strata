@@ -253,11 +253,60 @@
     );
   }
 
+  // Open scope candidates (non-operator items). Read-only in the Console.
+  async function fetchScopeCandidates(scope_id) {
+    const base = getApiBase();
+    const resp = await fetch(
+      `${base}/scopes/${encodeURIComponent(scope_id)}/retirement-candidates`,
+    );
+    if (!resp.ok) {
+      throw new Error(`GET /scopes/${scope_id}/retirement-candidates returned ${resp.status}`);
+    }
+    return resp.json();
+  }
+
+  // Open candidates on operator items.
+  async function fetchOperatorCandidates(scope_id) {
+    const base = getApiBase();
+    const qs = scope_id ? `?scope_id=${encodeURIComponent(scope_id)}` : "";
+    const resp = await fetch(`${base}/operator/retirement-candidates${qs}`);
+    if (!resp.ok) {
+      throw new Error(`GET /operator/retirement-candidates returned ${resp.status}`);
+    }
+    return resp.json();
+  }
+
+  // Snooze one operator-item candidate. The caller rejects days outside 1..365 first.
+  async function dismissOperatorCandidate(candidate_id, { reason, days }) {
+    const base = getApiBase();
+    return _post(
+      `${base}/operator/retirement-candidates/${encodeURIComponent(candidate_id)}/dismiss`,
+      { reason, days },
+    );
+  }
+
+  // Scope forgetting counts. Operator items are not in the totals.
+  async function fetchForgettingMetrics(scope_id) {
+    const base = getApiBase();
+    const qs = scope_id ? `?scope_id=${encodeURIComponent(scope_id)}` : "";
+    const resp = await fetch(`${base}/forgetting-metrics${qs}`);
+    if (!resp.ok) throw new Error(`GET /forgetting-metrics returned ${resp.status}`);
+    return resp.json();
+  }
+
   // Judge usage (#246). Read-only; the same numbers as `strata stats judge`.
   async function fetchJudgeUsage() {
     const base = getApiBase();
     const resp = await fetch(`${base}/judge-usage`);
     if (!resp.ok) throw new Error(`GET /judge-usage returned ${resp.status}`);
+    return resp.json();
+  }
+
+  // Held items (ADR 0018). Read-only: approve and reject are the CLI's, never the Console's.
+  async function fetchReviewHeld() {
+    const base = getApiBase();
+    const resp = await fetch(`${base}/review/held`);
+    if (!resp.ok) throw new Error(`GET /review/held returned ${resp.status}`);
     return resp.json();
   }
 
@@ -331,7 +380,12 @@
     fetchCorrectionWithdrawals,
     restoreCorrectionWithdrawal,
     acknowledgeCorrectionWithdrawal,
+    fetchScopeCandidates,
+    fetchOperatorCandidates,
+    dismissOperatorCandidate,
+    fetchForgettingMetrics,
     fetchJudgeUsage,
+    fetchReviewHeld,
     fetchFleetChanges,
     fetchFleetActs,
     applyFleetChange,

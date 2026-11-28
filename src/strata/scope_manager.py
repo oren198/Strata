@@ -56,6 +56,7 @@ import copy
 import json
 import logging
 import re
+import secrets
 import time
 from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
@@ -66,9 +67,22 @@ import anthropic
 from pydantic import BaseModel, Field
 
 from strata.fleet_config import EntitlementView, Scope, Stratum
+from strata.lineage import (
+    LineageLineView,
+    lineage_offered,
+    render_lineage_block,
+)
 from strata.operator import OperatorItem
-from strata.record_store import ACCEPTED_DECISIONS, Contribution, ContributorRef, RecentContribution
-from strata.summary_store import Directive, ScopeSummary, _render_summary, adopted_suffix
+from strata.record_store import Contribution, ContributorRef, RecentContribution, verdict_admits
+from strata.summary_store import (
+    Directive,
+    EndCondition,
+    ScopeSummary,
+    _render_summary,
+    adopted_suffix,
+    ends_line,
+    ends_line_for,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -81,11 +95,10 @@ _logger = logging.getLogger(__name__)
 #: cost. The engine default behind :attr:`strata.settings.Settings.window_verbatim_tail`.
 WINDOW_VERBATIM_TAIL = 3
 
-#: Words of existing memory (summary context plus directive text) a scope needs before
-#: the judge may treat that memory as its implied purpose (#210). Below it there is not
-#: enough to tell what the scope is about, so no relevance judgement is made at all —
-#: a scope with nothing in it keeps today's behaviour exactly. Mirrors
-#: ``Settings.implied_purpose_min_words`` (``STRATA_IMPLIED_PURPOSE_MIN_WORDS``).
+#: Words of existing memory (summary context plus directive text) a scope with no description
+#: needs before ``strata doctor`` and the Console SUGGEST a description drawn from it (#210).
+#: A suggestion only: a scope's own memory is never used as an implied purpose to decline.
+#: Mirrors ``Settings.implied_purpose_min_words`` (``STRATA_IMPLIED_PURPOSE_MIN_WORDS``).
 IMPLIED_PURPOSE_MIN_WORDS = 50
 
 #: ADR 0013 D3 — the word budget for a scope's published face (its own
@@ -495,6 +508,59 @@ def _judge_tool_for(acted_on_target: ActedOnTarget | None) -> dict:
     )
     tool["input_schema"]["properties"]["decision"] = copy.deepcopy(decision_property)
     return tool
+
+
+def _with_lineage_block(
+    message: str,
+    view: Sequence[LineageLineView] | None,
+    current_summary: ScopeSummary | None,
+    summary_max_words: int,
+    *,
+    mode: JudgeMode,
+    acted_on: bool = False,
+) -> str:
+    """*message* with the CONTEXT LINES block ahead of the CURRENT SUMMARY, when this call is
+    offered the lineage field; otherwise *message* unchanged, byte for byte.
+
+    Spliced in after the message is built rather than by the builders, whose source is pinned
+    (`test_judge_message_builders_are_byte_identical`)."""
+    if current_summary is None or not lineage_offered(
+        current_summary.context, summary_max_words, mode=mode, acted_on=acted_on
+    ):
+        return message
+    block = render_lineage_block(view, current_summary.context)
+    marker = "CURRENT SUMMARY\n---\n"
+    at = message.find(marker)
+    if at < 0:
+        return message + "\n" + block
+    return message[:at] + block + message[at:]
+
+
+def _raw_context_lineage(raw: object) -> list | None:
+    """The judge's `context_lineage` as sent, a list or ``None``. Anything else is dropped
+    here and read as absent; the engine validates the entries after the write."""
+    value = raw.get("context_lineage") if isinstance(raw, Mapping) else None
+    return list(value) if isinstance(value, list) else None
+
+
+def _with_lineage_property(tool: dict) -> dict:
+    """*tool* with the optional `context_lineage` property added (a deep copy). Offered only
+    on a call whose message carries the CONTEXT LINES block, so every other call keeps the
+    exact tool bytes it always had."""
+    from strata.lineage import CONTEXT_LINEAGE_PROPERTY  # noqa: PLC0415
+
+    variant = copy.deepcopy(tool)
+    variant["input_schema"]["properties"]["context_lineage"] = copy.deepcopy(
+        CONTEXT_LINEAGE_PROPERTY
+    )
+    return variant
+
+
+def _judge_tool_for_call(acted_on_target: ActedOnTarget | None, *, offered: bool) -> dict:
+    """:func:`_judge_tool_for`, plus the `context_lineage` property on a call that is offered
+    the lineage block (never on an ``acted_on`` call)."""
+    tool = _judge_tool_for(acted_on_target)
+    return _with_lineage_property(tool) if offered and acted_on_target is None else tool
 
 
 def _build_batch_judge_tool() -> dict:
@@ -2105,6 +2171,104 @@ def _partition_ops(
     return applicable, invalid
 
 
+def _contribution_end_condition(contribution: Contribution) -> EndCondition | None:
+    """The end condition a contribution carries for the directive it creates (validated at the
+    write boundary; an unreadable value is dropped rather than failing the judgment)."""
+    raw = getattr(contribution, "ends", None)
+    if not raw:
+        return None
+    try:
+        return EndCondition.model_validate_json(raw)
+    except ValueError:
+        return None
+
+
+def _guard_judged_end_condition_retires(
+    judgment: _JudgmentT,
+    *,
+    scope: Scope,
+    current_summary: ScopeSummary | None,
+    contributions: Mapping[str, Contribution],
+) -> _JudgmentT:
+    """A judged ``retire`` of a directive with a JUDGED end condition is the owner's judge
+    confirming that condition (v1.20, R2), and only that: it stands when the contribution it
+    belongs to was contributed in this (the owning) scope, carries ``fulfils`` for the
+    directive, and states what the judge checked ("verified" is refused). Otherwise the op is
+    dropped, with a protocol note, and the directive stands.
+
+    A plain judged ``retire`` of a directive WITHOUT such a condition keeps today's #209 path
+    untouched. The op that stands has its ``changed_circumstance`` replaced by the engine's
+    reason, "end condition judged met: <condition> / <evidence>".
+    """
+    from strata.forgetting import condition_met_reason, evidence_acceptable  # noqa: PLC0415
+
+    if current_summary is None or not judgment.directive_ops:
+        return judgment
+    judged = {
+        d.id: d
+        for d in current_summary.directives
+        if d.end_condition is not None and d.end_condition.kind == "judged"
+    }
+    if not judged:
+        return judgment
+    kept: list[DirectiveOp] = []
+    notes: list[str] = []
+    changed = False
+    for op in judgment.directive_ops:
+        directive = judged.get(op.id or "") if op.op == "retire" else None
+        if directive is None:
+            kept.append(op)
+            continue
+        owner = contributions.get(getattr(op, "contribution_id", None) or "")
+        if owner is None and len(contributions) == 1:
+            owner = next(iter(contributions.values()))
+        evidence = op.changed_circumstance
+        if (
+            owner is not None
+            and owner.scope_id == scope.id
+            and owner.fulfils == directive.id
+            and evidence_acceptable(evidence)
+        ):
+            condition = directive.end_condition.condition or ""  # type: ignore[union-attr]
+            kept.append(
+                op.model_copy(
+                    update={"changed_circumstance": condition_met_reason(condition, evidence or "")}
+                )
+            )
+            changed = True
+        else:
+            notes.append(
+                f"retire of {directive.id} refused: it has a judged end condition and the "
+                "contribution carries no fulfils for it, or states no evidence."
+            )
+            changed = True
+    if not changed:
+        return judgment
+    update: dict = {
+        "directive_ops": kept,
+        "protocol_notes": [*judgment.protocol_notes, *notes],
+    }
+    if judgment.new_summary is not None:
+        if isinstance(judgment, ScopeManagerBatchJudgment):
+            update["new_summary"] = _apply_batch_amendment(
+                scope=scope,
+                current_summary=current_summary,
+                contributions=contributions,
+                ops=kept,
+                new_context=judgment.new_context,
+            )
+        else:
+            only = next(iter(contributions.values()))
+            update["new_summary"] = _apply_amendment(
+                scope=scope,
+                current_summary=current_summary,
+                contribution=only,
+                ops=kept,
+                new_context=judgment.new_context,
+            )
+    return judgment.model_copy(update=update)
+
+
 def _mint_directive(op: DirectiveOp, contribution: Contribution) -> Directive:
     """Build the directive row an ``append``/``publish`` op admits.
 
@@ -2128,6 +2292,8 @@ def _mint_directive(op: DirectiveOp, contribution: Contribution) -> Directive:
         source_skill=contribution.contributor.skill,
         created_at=contribution.created_at,
         adopted_from=contribution.adopted_from,
+        end_condition=_contribution_end_condition(contribution),
+        set_by=contribution.id if contribution.ends else None,
     )
 
 
@@ -2360,6 +2526,11 @@ class _AmendmentJudgment(BaseModel):
     contribution, which starts no wave and is at no distance from one."""
 
     context_sources: list[str] = Field(default_factory=list)
+    context_lineage: list | None = None
+    """v1.20: the judge's raw `context_lineage` (one entry per line of its new_context),
+    unvalidated; the engine checks it against the record after the write (`strata.lineage`)."""
+    lineage_offered: bool = False
+    """Whether this call was offered the lineage block and field (context near its budget)."""
     """Published item ids the judge declares its ``new_context`` rests on.
 
     RECORD, never trigger (ADR 0014 D3): the affected set for a changed item
@@ -2500,7 +2671,7 @@ def _unattributed_operator_echoes(
     directive, and demanding it for an operator context item would have the
     judge write a false label.
     """
-    if not operator_directive_ids or judgment.decision not in ACCEPTED_DECISIONS:
+    if not operator_directive_ids or not verdict_admits(judgment.decision):
         return []
     admitted = _amendment_summary_text(judgment, contribution)
     return [
@@ -2526,7 +2697,7 @@ def _note_echoes_directive(directive_text: str, text: str) -> bool:
     often for one echo lost."""
     if _is_covered_subject(directive_text, text) and _head_nouns_compatible(directive_text, text):
         return True
-    return _shared_subject_stems(directive_text, text) >= 3
+    return _shared_subject_stems(directive_text, text) >= _ECHO_SHARED_STEMS
 
 
 def _engine_detected_operator_echoes(
@@ -2540,7 +2711,7 @@ def _engine_detected_operator_echoes(
     any ``publish``ed directive content), not on the whole rewritten context, which would fire on
     old lines; the attribution is looked for in the admitted text (:func:`_amendment_summary_text`).
     Directives only (not operator context) and accepts only; ids already attributed are left out."""
-    if not operator_directives or judgment.decision not in ACCEPTED_DECISIONS:
+    if not operator_directives or not verdict_admits(judgment.decision):
         return []
     admitted = _amendment_summary_text(judgment, contribution)
     if not admitted.strip():
@@ -2590,7 +2761,7 @@ def _batch_attribution_gaps(
     engine_only: list[str] = []
     for verdict in judgment.verdicts:
         member = contributions.get(verdict.contribution_id)
-        if member is None or verdict.decision not in ACCEPTED_DECISIONS:
+        if member is None or not verdict_admits(verdict.decision):
             continue
         own = member.content + "\n".join(
             op.content
@@ -2606,6 +2777,10 @@ def _batch_attribution_gaps(
             elif _note_echoes_directive(text, own):
                 engine_only.append(key)
     return cited, engine_only
+
+
+#: How many shared subject stems make an engine-detected echo (besides the covered-subject branch).
+_ECHO_SHARED_STEMS = 2
 
 
 _ECHO_MATCH_SENTENCE = (
@@ -3352,9 +3527,17 @@ def _render_digest_row(row: RecentContribution, *, verbatim: bool) -> str:
     """
     c = row.contribution
     content = c.content if verbatim else _content_excerpt(c.content)
+    # ADR 0018: a held verdict was never admitted, so the judge must not read it as precedent.
+    # Only a scope that has held items renders differently; every other row is byte-identical.
+    if row.disposition == "held":
+        state_text = f"state=held for the operator (judge said {row.decision})"
+        decision_text = "decision=(held)"
+    else:
+        state_text = f"state={row.state}"
+        decision_text = f"decision={row.decision or '(none)'}"
     return (
         f"[{c.id}] at={c.created_at} subject={c.subject or '(none)'} "
-        f"state={row.state} decision={row.decision or '(none)'} "
+        f"{state_text} {decision_text} "
         f"reasoning={strip_notes_for_judge(row.judgment_notes or '') or '(none)'} "
         f"content={content!r}"
     )
@@ -3495,6 +3678,9 @@ def _render_directives_only(directives: Sequence[Directive]) -> str:
             f"- source: scope={directive.source_scope_id} · at={directive.created_at}"
             f"{adopted_suffix(directive)}"
         )
+        ends_line = ends_line_for(directive)
+        if ends_line is not None:
+            lines.append(ends_line)
         lines.append("")
     return "\n".join(lines).rstrip()
 
@@ -3521,6 +3707,9 @@ def _render_operator_memory(
                 f"[{item.id}] ({item.kind}, attached at {attachment_scope_id}){subject_part} "
                 f"{item.content}"
             )
+            ends = ends_line(getattr(item, "end_condition", None), getattr(item, "set_by", None))
+            if ends is not None:
+                lines.append(f"    {ends[2:]}")
     return "\n".join(lines) + "\n\n"
 
 
@@ -4018,6 +4207,14 @@ def _render_input_changes(events: Sequence[_ChangeEventLike] | None) -> str:
             f"      before: {event.before or '(none)'}\n"
             f"      after:  {event.after or '(none)'}"
         )
+        retirement = getattr(event, "retirement", None)
+        if retirement is not None:
+            # v1.20: a retired or retracted directive carries its authority's notice. One path,
+            # two labels; only the words differ. Every other event renders as before.
+            lines.append(
+                f"      {retirement.label.capitalize()} by its owner: "
+                f"{retirement.notice or retirement.reason or '(no notice)'}"
+            )
         if event.kind == "claim_corrected":
             # ADR 0017 P4 (CEO decision A, philosopher's follow-up): the engine
             # already withdraws THIS SCOPE'S PUBLICATION's own items that carry the
@@ -4074,6 +4271,7 @@ def _render_contribution_block(
         f"- proposed classification: {contribution.proposed_classification}\n"
         f"- subject: {contribution.subject or '(none)'}\n"
         f"- supersedes: {contribution.supersedes or '(none)'}\n"
+        f"{_render_forgetting_lines(contribution)}"
         f"{_render_adoption_line(adopted)}"
         # Skill is optional (issue #121): show scope alone when absent so the
         # judge never sees a literal "None".
@@ -4081,6 +4279,23 @@ def _render_contribution_block(
         "- content:\n"
         f"    {contribution.content}\n"
     )
+
+
+def _render_forgetting_lines(contribution: Contribution) -> str:
+    """The v1.20 lines of a contribution block, each only when it applies — so a contribution
+    with none of them is byte-identical to before.
+
+    ``ends``: the end condition the directive would carry; the judge judges its merit as it
+    does the rest and does not decide the condition. ``fulfils``: the judged-condition
+    directive this is evidence for."""
+    lines = ""
+    ends = _contribution_end_condition(contribution)
+    if ends is not None:
+        text = f"until {ends.until}" if ends.kind == "date" else f"until: {ends.condition}"
+        lines += f"- binds {text}\n"
+    if getattr(contribution, "fulfils", None):
+        lines += f"- fulfils: {contribution.fulfils}\n"
+    return lines
 
 
 def _render_adoption_line(adopted: Contribution | None) -> str:
@@ -4215,56 +4430,44 @@ def _render_directive_outcome_block(target: ActedOnTarget) -> str:
     )
 
 
-def _render_relevance(
-    scope: Scope,
-    current_summary: ScopeSummary | None,
-    *,
-    mode: JudgeMode,
-    implied_purpose_min_words: int,
-) -> str:
-    """The per-call relevance block (#210), or ``""`` when there is nothing to judge it against.
+def suggest_description(summary: ScopeSummary | None, min_words: int) -> str | None:
+    """#210 re-ruling: a description to SUGGEST to the operator from a scope's own memory,
+    or ``None``. Report-only (doctor, the Console): never a decline ground, never written.
+    Needs at least *min_words* words of memory; the suggestion is its opening words (the
+    context, else the first directive)."""
+    if summary is None or _summary_word_count(summary) < min_words:
+        return None
+    source = summary.context.strip() or next(
+        (d.content.strip() for d in summary.directives if d.content.strip()), ""
+    )
+    words = source.split()
+    return " ".join(words[:25]) or None
 
-    Relevance is a decline ground only where a purpose exists to measure it against:
 
-    - the scope STATES one (``description``): judge against it;
-    - it states none but its existing memory is substantial enough
-      (``implied_purpose_min_words``) to tell what it is about: that memory is the
-      implied purpose;
-    - otherwise no rule, no wording — the prompt is exactly what it was before #210, so
-      a scope with nothing in it never starts declining what it accepts today.
+def _render_relevance(scope: Scope, *, mode: JudgeMode) -> str:
+    """The per-call relevance block (#210), or ``""`` when the scope states no purpose.
+
+    Relevance is a decline ground only where the scope STATES a purpose
+    (``description``): judge against it. A scope with no description of its own gets no
+    relevance block at all, whatever its memory or its ancestors say — the prompt is
+    exactly what it was before #210.
 
     Lives in the per-call message, not the static system prompt, so a scope with no
     purpose carries no relevance wording anywhere. Only a contribution can be off-purpose:
     an input-change refresh admits nothing and gets no block.
     """
-    if mode != "ordinary":
+    if mode != "ordinary" or not scope.description:
         return ""
-    if scope.description:
-        return (
-            f"SCOPE PURPOSE: {scope.description}\n"
-            "RELEVANCE (an additional decline ground for this scope): judge whether the "
-            "contribution is about the work this stated purpose covers. Material clearly "
-            "outside it is declined, and your reasoning must begin \"Outside this scope's "
-            'stated purpose: <the purpose as stated>." Anything a worker in this scope '
-            "could plausibly need — observations about the work the purpose covers, however "
-            "small or transient — is on-purpose and is admitted by the rules above; when in "
-            "doubt, admit.\n\n"
-        )
-    if current_summary is not None and _summary_word_count(current_summary) >= (
-        implied_purpose_min_words
-    ):
-        return (
-            "RELEVANCE (an additional decline ground for this scope): this scope states no "
-            "purpose, but its existing memory — the CURRENT SUMMARY below — is enough to tell "
-            "what it is about; treat that as its implied purpose. Material clearly unrelated "
-            "to what that memory is about is declined, and your reasoning must say the purpose "
-            "was implied by the scope's existing memory and name what you read: begin "
-            "\"Outside the purpose implied by this scope's existing memory (<the directives or "
-            'context you read>): ..." A contribution that extends, corrects, or sits '
-            "alongside the subject of the existing memory is on-purpose and is admitted by the "
-            "rules above; when in doubt, admit.\n\n"
-        )
-    return ""
+    return (
+        f"SCOPE PURPOSE: {scope.description}\n"
+        "RELEVANCE (an additional decline ground for this scope): judge whether the "
+        "contribution is about the work this stated purpose covers. Material clearly "
+        "outside it is declined, and your reasoning must begin \"Outside this scope's "
+        'stated purpose: <the purpose as stated>." Anything a worker in this scope '
+        "could plausibly need — observations about the work the purpose covers, however "
+        "small or transient — is on-purpose and is admitted by the rules above; when in "
+        "doubt, admit.\n\n"
+    )
 
 
 def _render_examined_context(items: Sequence[ExaminedContextItem]) -> str:
@@ -4309,7 +4512,6 @@ def _build_judge_preamble(
     mode: JudgeMode = "ordinary",
     input_changes: Sequence[_ChangeEventLike] | None = None,
     window_verbatim_tail: int = WINDOW_VERBATIM_TAIL,
-    implied_purpose_min_words: int = IMPLIED_PURPOSE_MIN_WORDS,
     examined_context: Sequence[ExaminedContextItem] | None = None,
 ) -> str:
     """Compose everything in the user message ahead of the contributions to judge.
@@ -4409,9 +4611,7 @@ def _build_judge_preamble(
 
     input_changes_block = _render_input_changes(input_changes)
 
-    relevance_block = _render_relevance(
-        scope, current_summary, mode=mode, implied_purpose_min_words=implied_purpose_min_words
-    )
+    relevance_block = _render_relevance(scope, mode=mode)
 
     return (
         f"SCOPE: {scope.name} (id={scope.id})\n"
@@ -4456,7 +4656,6 @@ def _build_user_message(
     mode: JudgeMode = "ordinary",
     input_changes: Sequence[_ChangeEventLike] | None = None,
     window_verbatim_tail: int = WINDOW_VERBATIM_TAIL,
-    implied_purpose_min_words: int = IMPLIED_PURPOSE_MIN_WORDS,
     acted_on_target: ActedOnTarget | None = None,
     examined_context: Sequence[ExaminedContextItem] | None = None,
     adopted_proposal: Contribution | None = None,
@@ -4486,7 +4685,6 @@ def _build_user_message(
         mode=mode,
         input_changes=input_changes,
         window_verbatim_tail=window_verbatim_tail,
-        implied_purpose_min_words=implied_purpose_min_words,
         examined_context=examined_context,
     )
     outcome_block = "" if acted_on_target is None else _render_outcome_block(acted_on_target)
@@ -4518,7 +4716,6 @@ def _build_batch_user_message(
     mode: JudgeMode = "ordinary",
     input_changes: Sequence[_ChangeEventLike] | None = None,
     window_verbatim_tail: int = WINDOW_VERBATIM_TAIL,
-    implied_purpose_min_words: int = IMPLIED_PURPOSE_MIN_WORDS,
     examined_context: Sequence[ExaminedContextItem] | None = None,
     adopted_proposals: Mapping[str, Contribution] | None = None,
 ) -> str:
@@ -4546,7 +4743,6 @@ def _build_batch_user_message(
         mode=mode,
         input_changes=input_changes,
         window_verbatim_tail=window_verbatim_tail,
-        implied_purpose_min_words=implied_purpose_min_words,
         examined_context=examined_context,
     )
     adopted = adopted_proposals or {}
@@ -5155,6 +5351,10 @@ def _vocabulary_informants_missing(
             if label not in missing:
                 missing.append(label)
     return missing
+
+
+#: #212: the judge's own hearsay label, at the start of its reasoning.
+_HEARSAY_LABEL_RE = re.compile(r"^\s*Hearsay:", re.IGNORECASE)
 
 
 def _drop_false_hearsay(reasoning: str) -> str:
@@ -7592,6 +7792,7 @@ _NORMATIVE_EXCEPTION_RES: tuple[re.Pattern[str], ...] = tuple(
         r"\b(?:is|are|that['’]?s|it['’]?s) (?:fine|ok|okay|acceptable)\b",
         r"\bwaived?\b",
         r"\bnot required\b",
+        r"\bno longer (?:required|needed)\b",
         r"\bexempt\b",
         r"\bexception\b",
         r"\boptional\b",
@@ -8356,6 +8557,29 @@ def _action_overlap(span: str, inherited_text: str) -> bool:
     return bool(numbers & set(re.findall(r"\d+(?:\.\d+)?", span)))
 
 
+def _span_concerns_subject(
+    span: str, inherited_text: str, context_words: frozenset[str] = frozenset()
+) -> bool:
+    """Whether an occurrence *span* is about the rule's SUBJECT, the test a departure or
+    consequence label must pass before it is written into memory: the same covered-subject
+    machinery the exception path uses (:func:`_is_covered_subject`), two shared subject stems, or
+    a shared number (a "14 days" loan period is the rule's own figure). One shared word that is not
+    the subject ("work" in "no further work" against "no work happens in strata-web") is not it."""
+    if _is_covered_subject(inherited_text, span, context_words):
+        return True
+    if _shared_subject_stems(span, inherited_text, context_words) >= 2:
+        return True
+    # one shared stem counts when it sits in the rule's own SUBJECT phrase ("van" in "Every
+    # delivery van is inspected ..."), not in its predicate
+    marker = _LEADING_PHRASE_VERB_RE.search(inherited_text)
+    if marker is not None and _shared_subject_stems(
+        inherited_text[: marker.start()], span, context_words
+    ):
+        return True
+    numbers = set(re.findall(r"\d+(?:\.\d+)?", inherited_text))
+    return bool(numbers & set(re.findall(r"\d+(?:\.\d+)?", span)))
+
+
 def _context_covers(
     inherited_text: str, content: str, context_words: frozenset[str] = frozenset()
 ) -> bool:
@@ -8445,7 +8669,20 @@ def verify_inherited_relation(
             unspecific = "occurrence not in the past tense"
         if unspecific is not None:
             return "decline_unspecific", unspecific
-        if not _action_overlap(span, inherited_text):
+        if (
+            _action_overlap(span, inherited_text)
+            and not _span_concerns_subject(span, inherited_text, context_words)
+            and marker is None
+            and _general_marker(content) is None
+        ):
+            # A label (departure or consequence) is written into memory, so the occurrence must
+            # be about the rule's SUBJECT, not merely share a word with its action ("no further
+            # work" against "no work happens in strata-web"). Otherwise the judge's answer is
+            # an unrelated one: admit with no label. (A marker or a habit still declines, below:
+            # it fails toward the rule exactly as before.)
+            failure = "occurrence does not concern the rule's subject"
+            readable_unrelated = True
+        elif not _action_overlap(span, inherited_text):
             # The answer CLAIMED a report about the rule, so it is not an honest
             # "unrelated": a marker anywhere declines (rule A), as does a habit.
             failure = "occurrence does not concern the rule's own action"
@@ -8717,6 +8954,9 @@ class PublicationExceptionCheck:
     inherited_relation: dict | None = None
     fallback: bool = False
     conflict_note: str | None = None
+    relation_extras: dict | None = None
+    """What the re-ask's answer said beyond ``inherited_relation`` (the quoted spans, the marker
+    the engine fired on), for the record's ``relation_calls``."""
 
 
 def _publication_refusal_note(directive_id: str, origin: str) -> str:
@@ -9197,9 +9437,6 @@ class ScopeManager:
         client: A configured :class:`anthropic.Anthropic` instance.
         model:  The model ID to use.  Defaults to ``"claude-haiku-4-5"`` to
                 match the UI prototype.
-        implied_purpose_min_words: Words of existing memory a scope with no
-                description needs before that memory counts as its implied purpose
-                (#210); see :data:`IMPLIED_PURPOSE_MIN_WORDS`.
         judge_provider: #224 — an OpenRouter provider name to pin every judge
                 call to (``extra_body={"provider": {"order": [name],
                 "allow_fallbacks": False}}``), or ``None`` (the default) for
@@ -9219,13 +9456,24 @@ class ScopeManager:
         *,
         client: anthropic.Anthropic,
         model: str = "claude-haiku-4-5",
-        implied_purpose_min_words: int = IMPLIED_PURPOSE_MIN_WORDS,
         judge_provider: str | None = None,
     ) -> None:
         self._client = client
         self._model = model
-        self._implied_purpose_min_words = implied_purpose_min_words
         self._judge_provider = judge_provider
+        # What a relation re-ask's answer said beyond the outcome dict (the quoted spans, the
+        # marker the engine fired on), keyed (contribution id, call), for the record's
+        # `relation_calls`. Kept off the outcome dict, whose shape callers compare exactly.
+        self._relation_extras: dict[tuple[str, str], dict] = {}
+        # #138 A/B cost: accepts the attribution check looked at (in a scope with operator
+        # directives) and the extra judge calls it made. Counters only; nothing reads them in
+        # the engine.
+        self.attribution_reask_counts: dict[str, int] = {"accepts_checked": 0, "reasks_fired": 0}
+
+    def take_relation_extras(self, contribution_id: str, call: str) -> dict:
+        """The recorded-only detail of the relation re-ask for *contribution_id* (``call`` is
+        ``"context"`` or ``"directive"``), removed on read; ``{}`` when there is none."""
+        return self._relation_extras.pop((contribution_id, call), {})
 
     def _messages_create(self, **kwargs: Any) -> Any:
         """The ONE place every judge call's real API request goes through
@@ -9299,6 +9547,7 @@ class ScopeManager:
         acted_on_target: ActedOnTarget | None = None,
         examined_context: Sequence[ExaminedContextItem] | None = None,
         adopted_proposal: Contribution | None = None,
+        lineage_view: Sequence[LineageLineView] | None = None,
         **_extra: object,
     ) -> ScopeManagerJudgment:
         """Judge a new contribution against the scope's current state.
@@ -9506,10 +9755,17 @@ class ScopeManager:
             mode=mode,
             input_changes=input_changes,
             window_verbatim_tail=window_verbatim_tail,
-            implied_purpose_min_words=self._implied_purpose_min_words,
             acted_on_target=acted_on_target,
             examined_context=examined_context,
             adopted_proposal=adopted_proposal,
+        )
+        user_message = _with_lineage_block(
+            user_message,
+            lineage_view,
+            current_summary,
+            summary_max_words,
+            mode=mode,
+            acted_on=acted_on_target is not None,
         )
         # ADR 0017 P3: a failed_* disposition replaces `acted_on` through the #199
         # path exactly like an ordinary `supersedes` reference does — but only when
@@ -9519,6 +9775,12 @@ class ScopeManager:
         # ADR 0014 D3: what a declared `context_sources` is audited against —
         # derived from the same arguments the message above was built from, so
         # the check and the prompt can never disagree.
+        _lineage_offered_now = current_summary is not None and lineage_offered(
+            current_summary.context,
+            summary_max_words,
+            mode=mode,
+            acted_on=acted_on_target is not None,
+        )
         rendered_item_ids = _rendered_publication_item_ids(
             current_publication, peer_publications, parent_publication
         )
@@ -9694,7 +9956,7 @@ class ScopeManager:
             to `protocol_notes` on every path below, so a trigger is always
             countable in the record whatever it resolves to.
             """
-            if judgment.decision not in ACCEPTED_DECISIONS:
+            if not verdict_admits(judgment.decision):
                 return judgment
             if entitlement is None:
                 return judgment
@@ -10122,6 +10384,9 @@ class ScopeManager:
             echo_state["cited"], echo_state["engine_only"] = cited, engine_only
             return [*cited, *engine_only]
 
+        def _attribution_checked(judgment: ScopeManagerJudgment) -> int:
+            return int(bool(operator_directives) and verdict_admits(judgment.decision))
+
         def _attribution_corrective(_gap_ids: Sequence[str]) -> str:
             return _attribution_corrective_text(echo_state["cited"], echo_state["engine_only"])
 
@@ -10201,7 +10466,7 @@ class ScopeManager:
         judgment = self._call_with_correctives(
             user_message=user_message,
             system_prompt=_SYSTEM_PROMPT,
-            tool=_judge_tool_for(acted_on_target),
+            tool=_judge_tool_for_call(acted_on_target, offered=_lineage_offered_now),
             reasoning_gaps=_reasoning_gaps,
             reasoning_withdraw=_reasoning_withdraw,
             reasoning_adopt=_reasoning_adopt,
@@ -10219,6 +10484,7 @@ class ScopeManager:
             ),
             attribution_gaps=_attribution_gaps,
             attribution_corrective=_attribution_corrective,
+            attribution_checked=_attribution_checked,
             stale_claims=_stale_claims,
             stale_claim_corrective=_stale_claim_corrective,
             drop_stale_context=_drop_stale_context,
@@ -10279,6 +10545,7 @@ class ScopeManager:
                 else None
             ),
         )
+        judgment = judgment.model_copy(update={"lineage_offered": _lineage_offered_now})
         # A "Hearsay:" label on a reasoning that itself says first-hand is a wrong label.
         if _REASON_INFORMANT_CHECK:
             judgment = judgment.model_copy(
@@ -10295,6 +10562,13 @@ class ScopeManager:
         )
         if acted_on_target is None:
             judgment = self._drop_context_directive_changes(
+                judgment,
+                scope=scope,
+                current_summary=current_summary,
+                new_contribution=new_contribution,
+                mode=mode,
+            )
+            judgment = self._refuse_hearsay_directive_ops(
                 judgment,
                 scope=scope,
                 current_summary=current_summary,
@@ -10320,13 +10594,18 @@ class ScopeManager:
                 current_summary=current_summary,
             )
         return _with_departure_labels_restored(
-            self._hold_directive_changes(
-                judgment,
+            _guard_judged_end_condition_retires(
+                self._hold_directive_changes(
+                    judgment,
+                    scope=scope,
+                    current_summary=current_summary,
+                    new_contribution=new_contribution,
+                    mode=mode,
+                    input_changes=input_changes,
+                ),
                 scope=scope,
                 current_summary=current_summary,
-                new_contribution=new_contribution,
-                mode=mode,
-                input_changes=input_changes,
+                contributions={new_contribution.id: new_contribution},
             ),
             current_summary,
             summary_max_words,
@@ -10563,6 +10842,61 @@ class ScopeManager:
                 ),
                 "reasoning": f"{judgment.reasoning} {note}",
                 "protocol_notes": [*judgment.protocol_notes, f"context note ops dropped: {note}"],
+            }
+        )
+
+    @staticmethod
+    def _refuse_hearsay_directive_ops(
+        judgment: ScopeManagerJudgment,
+        *,
+        scope: Scope,
+        current_summary: ScopeSummary | None,
+        new_contribution: Contribution,
+        mode: JudgeMode,
+    ) -> ScopeManagerJudgment:
+        """#212 (ADR 0016 D4): an item the judge itself labelled "Hearsay:" is context only.
+        Whatever directive ops it carries are refused (an informant's word never admits,
+        removes or replaces a directive), the item is kept as context, and a protocol note
+        names the refused ops. Reads the label after the reason-honesty check has dropped a
+        wrong one. The verified-informant path already drops its ops; this covers the label
+        the judge gave without that path running."""
+        if (
+            mode != "ordinary"
+            or judgment.decision == "decline"
+            or not judgment.directive_ops
+            or not _HEARSAY_LABEL_RE.match(judgment.reasoning or "")
+        ):
+            return judgment
+        refused = list(judgment.directive_ops)
+        previous = current_summary.context if current_summary is not None else ""
+        context = (
+            judgment.new_context
+            if judgment.new_context is not None
+            else _append_line(
+                previous,
+                f"[{new_contribution.id}] "
+                f"{new_contribution.contributor.skill or new_contribution.contributor.session_id}"
+                f" ({new_contribution.contributor.scope_id}) reports (hearsay): "
+                f"{new_contribution.content.strip()}",
+            )
+        )
+        return judgment.model_copy(
+            update={
+                "decision": "accept_as_context",
+                "directive_ops": [],
+                "new_context": context,
+                "new_summary": _apply_amendment(
+                    scope=scope,
+                    current_summary=current_summary,
+                    contribution=new_contribution,
+                    ops=[],
+                    new_context=context,
+                ),
+                "protocol_notes": [
+                    *judgment.protocol_notes,
+                    "hearsay item, directive op(s) refused (an informant's word never binds): "
+                    + "; ".join(op.describe() for op in refused),
+                ],
             }
         )
 
@@ -10834,6 +11168,7 @@ class ScopeManager:
         schema_reminder: str,
         attribution_gaps: Callable[[_JudgmentT], list[str]] | None = None,
         attribution_corrective: Callable[[Sequence[str]], str] | None = None,
+        attribution_checked: Callable[[_JudgmentT], int] | None = None,
         stale_claims: Callable[[_JudgmentT], list[str]] | None = None,
         stale_claim_corrective: Callable[[Sequence[str]], str] | None = None,
         drop_stale_context: Callable[[_JudgmentT], _JudgmentT] | None = None,
@@ -11163,7 +11498,10 @@ class ScopeManager:
         # corrective rewrite is still measured against the BUDGET.
         if attribution_gaps is not None and attribution_corrective is not None:
             gaps = attribution_gaps(judgment)
+            if attribution_checked is not None:
+                self.attribution_reask_counts["accepts_checked"] += attribution_checked(judgment)
             if gaps:
+                self.attribution_reask_counts["reasks_fired"] += 1
                 retry_messages = [
                     *first_messages,
                     *_corrective_turn(response, tool_use_block, attribution_corrective(gaps)),
@@ -11915,6 +12253,16 @@ class ScopeManager:
         if failure is not None:
             reason = f"re-ask failed ({failure}); {reason}"
         kind = answer.get("kind")
+
+        def _span(key: str) -> str | None:
+            value = answer.get(key)
+            return value if isinstance(value, str) and value.strip() else None
+
+        self._relation_extras[(contribution.id, "context")] = {
+            "occurrence_span": _span("occurrence_span"),
+            "instead_span": _span("instead_span"),
+            "marker": _exception_marker(contribution.content, chosen[2], context_words),
+        }
         return {
             "contribution_id": contribution.id,
             "kind": kind if isinstance(kind, str) else None,
@@ -12045,14 +12393,17 @@ class ScopeManager:
                 if refusal is not None:
                     return PublicationExceptionCheck("refuse", content, note=refusal)
             outcome: dict | None = None
+            extras: dict | None = None
             if kind == "context":
                 outcome = self._classify_publication_text(scope, body, inherited)
+                extras = self.take_relation_extras(outcome["contribution_id"], "context")
                 if outcome["verdict"] in _INHERITED_DECLINES:
                     return PublicationExceptionCheck(
                         "refuse",
                         content,
                         note=_publication_refusal_note(outcome["inherited_id"], outcome["origin"]),
                         inherited_relation=outcome,
+                        relation_extras=extras,
                     )
             conflict = _first_inherited_conflict(body, inherited)
             conflict_note = (
@@ -12067,6 +12418,7 @@ class ScopeManager:
                 inherited_relation=outcome,
                 fallback=bool(outcome and outcome["fallback"]),
                 conflict_note=conflict_note,
+                relation_extras=extras,
             )
 
         if kind == "directive":
@@ -12076,6 +12428,7 @@ class ScopeManager:
             return PublicationExceptionCheck("accept", body)
 
         outcome = self._classify_publication_text(scope, body, inherited)
+        extras = self.take_relation_extras(outcome["contribution_id"], "context")
         verdict = outcome["verdict"]
         if verdict in _INHERITED_DECLINES:
             return PublicationExceptionCheck(
@@ -12083,6 +12436,7 @@ class ScopeManager:
                 content,
                 note=_publication_refusal_note(outcome["inherited_id"], outcome["origin"]),
                 inherited_relation=outcome,
+                relation_extras=extras,
             )
         if verdict == "departure_report":
             label = departure_label(outcome["inherited_id"], outcome["origin"])
@@ -12091,9 +12445,14 @@ class ScopeManager:
                 with_departure_label(body, label),
                 label=label,
                 inherited_relation=outcome,
+                relation_extras=extras,
             )
         return PublicationExceptionCheck(
-            "accept", body, inherited_relation=outcome, fallback=bool(outcome["fallback"])
+            "accept",
+            body,
+            inherited_relation=outcome,
+            fallback=bool(outcome["fallback"]),
+            relation_extras=extras,
         )
 
     @staticmethod
@@ -12116,7 +12475,9 @@ class ScopeManager:
         """The #242 re-ask for a published context item's text (a stand-in contribution)."""
         from types import SimpleNamespace  # noqa: PLC0415
 
-        stand_in = SimpleNamespace(id="publication-item", content=text)
+        # a fresh id per call: the manager's extras are keyed by it, and publications of
+        # different scopes can be judged at once on one manager
+        stand_in = SimpleNamespace(id=f"publication-item-{secrets.token_hex(4)}", content=text)
         return self._classify_inherited_relation(
             scope=scope,
             contribution=stand_in,  # type: ignore[arg-type]
@@ -12523,6 +12884,7 @@ class ScopeManager:
         hop: int = 0,
         examined_context: Sequence[ExaminedContextItem] | None = None,
         adopted_proposals: Mapping[str, Contribution] | None = None,
+        lineage_view: Sequence[LineageLineView] | None = None,
         **_extra: object,
     ) -> ScopeManagerBatchJudgment:
         """Judge several new contributions, in arrival order, in ONE call (ADR 0011 D3).
@@ -12623,6 +12985,7 @@ class ScopeManager:
                 hop=hop,
                 examined_context=examined_context,
                 adopted_proposal=(adopted_proposals or {}).get(only.id),
+                lineage_view=lineage_view,
             )
             return ScopeManagerBatchJudgment(
                 verdicts=[
@@ -12688,11 +13051,16 @@ class ScopeManager:
             mode=mode,
             input_changes=input_changes,
             window_verbatim_tail=window_verbatim_tail,
-            implied_purpose_min_words=self._implied_purpose_min_words,
             examined_context=examined_context,
             adopted_proposals=adopted_proposals,
         )
+        user_message = _with_lineage_block(
+            user_message, lineage_view, current_summary, summary_max_words, mode=mode
+        )
 
+        _batch_lineage_offered = current_summary is not None and lineage_offered(
+            current_summary.context, summary_max_words, mode=mode
+        )
         rendered_item_ids = _rendered_publication_item_ids(
             current_publication, peer_publications, parent_publication
         )
@@ -12871,6 +13239,11 @@ class ScopeManager:
             batch_echo_state["cited"], batch_echo_state["engine_only"] = cited, engine_only
             return [*cited, *engine_only]
 
+        def _batch_attribution_checked(judgment: ScopeManagerBatchJudgment) -> int:
+            if not batch_operator_directives:
+                return 0
+            return sum(1 for v in judgment.verdicts if verdict_admits(v.decision))
+
         def _batch_attribution_corrective(_gap_ids: Sequence[str]) -> str:
             return _attribution_corrective_text(
                 batch_echo_state["cited"], batch_echo_state["engine_only"]
@@ -12879,9 +13252,14 @@ class ScopeManager:
         batch_judgment = self._call_with_correctives(
             user_message=user_message,
             system_prompt=_BATCH_SYSTEM_PROMPT,
-            tool=JUDGE_BATCH_TOOL,
+            tool=(
+                _with_lineage_property(JUDGE_BATCH_TOOL)
+                if _batch_lineage_offered
+                else JUDGE_BATCH_TOOL
+            ),
             attribution_gaps=_batch_attribution_gap_ids,
             attribution_corrective=_batch_attribution_corrective,
+            attribution_checked=_batch_attribution_checked,
             reasoning_gaps=_batch_reasoning_gaps,
             reasoning_withdraw=_batch_reasoning_withdraw,
             reasoning_adopt=_batch_reasoning_adopt,
@@ -12909,6 +13287,9 @@ class ScopeManager:
             # defaults to False here, so the generic branch is always what
             # a second slip reaches).
             parse_generic_decline=_generic_second_slip_batch_decline,
+        )
+        batch_judgment = batch_judgment.model_copy(
+            update={"lineage_offered": _batch_lineage_offered}
         )
         if _REASON_INFORMANT_CHECK:
             batch_judgment = batch_judgment.model_copy(
@@ -12954,13 +13335,18 @@ class ScopeManager:
             operator_memory=operator_memory,
         )
         return _with_departure_labels_restored(
-            self._hold_batch_directive_changes(
-                batch_judgment,
+            _guard_judged_end_condition_retires(
+                self._hold_batch_directive_changes(
+                    batch_judgment,
+                    scope=scope,
+                    current_summary=current_summary,
+                    contributions=contributions,
+                    mode=mode,
+                    input_changes=input_changes,
+                ),
                 scope=scope,
                 current_summary=current_summary,
                 contributions=contributions,
-                mode=mode,
-                input_changes=input_changes,
             ),
             current_summary,
             summary_max_words,
@@ -13104,6 +13490,7 @@ class ScopeManager:
             hop=hop,
             context_sources=context_sources,
             dropped_context_sources=dropped_sources,
+            context_lineage=_raw_context_lineage(raw),
             protocol_notes=protocol_notes,
         )
 
@@ -13470,6 +13857,7 @@ class ScopeManager:
             hop=hop,
             context_sources=context_sources,
             dropped_context_sources=dropped_sources,
+            context_lineage=_raw_context_lineage(raw),
             protocol_notes=protocol_notes,
             outcome_disposition=outcome_disposition,
         )

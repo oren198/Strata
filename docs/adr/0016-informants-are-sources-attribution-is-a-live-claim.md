@@ -130,6 +130,12 @@ field. The philosopher's rulings on what verifies:
   single-contribution path); and alias references to a scope (the trigger
   matches by id/name only, word-bounded, no fuzzy or alias matching).
 
+**Note (2026-11-23, #212).** Two mechanical backstops enforce D2-D4 beyond the
+prompt. (1) An item the judge labels "Hearsay:" may not carry a directive op; the
+ops are refused with a protocol note. (2) A hearsay outcome counts for nothing in
+`standing_evidence` and does not revive when the item it reported on is replaced
+or withdrawn.
+
 Measured on 2026-10-02: see the README's J4 row and
 docs/evidence/v1.17-225-interior-gate-2026-10-02.md; the baseline this
 addresses is docs/evidence/v1.16-judge-prompt-examples-2026-09-26.md.

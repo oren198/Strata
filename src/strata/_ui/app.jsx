@@ -251,6 +251,10 @@ function App() {
           <JudgeUsageView />
         )}
 
+        {tab === "review" && (
+          <ReviewView />
+        )}
+
         {tab === "fleet-edit" && (
           <FleetEditView
             onDirtyChange={setFleetEditDirty}
@@ -384,6 +388,13 @@ function TopBar({ tab, onTab, dark, onToggleDark }) {
         >
           <Icon name="bar-chart-3" size={13} style={{ marginRight: 6, verticalAlign: "-2px" }} />
           Judge usage
+        </button>
+        <button
+          className={"at-tab" + (tab === "review" ? " active" : "")}
+          onClick={() => onTab("review")}
+        >
+          <Icon name="hand" size={13} style={{ marginRight: 6, verticalAlign: "-2px" }} />
+          Held
         </button>
         <button
           className={"at-tab" + (tab === "settings" ? " active" : "")}

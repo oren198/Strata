@@ -579,6 +579,14 @@ def _exception_check_dict(check) -> dict | None:  # noqa: ANN001
     }
 
 
+def _relation_rows(check) -> list[dict]:  # noqa: ANN001
+    """The #243 check's relation re-ask outcome as ``relation_calls`` input (none when the
+    check ran no re-ask: no inherited directive, a directive item, or a refusal without one)."""
+    if check is None or not check.inherited_relation:
+        return []
+    return [{**check.inherited_relation, **(check.relation_extras or {}), "call": "context"}]
+
+
 def _origin_label(
     relay_source_scope_id: str | None,
     relay_source_item_id: str | None,
@@ -900,6 +908,7 @@ def propose_publish(
             decision=judgment.decision,
             judged_by="scope-manager",
             reasoning=judgment.reasoning,
+            relations=_relation_rows(exception_check),
         )
 
         artifact_updated = False
@@ -1660,6 +1669,7 @@ def propose_restore(
             decision=judgment.decision,
             judged_by="scope-manager",
             reasoning=judgment.reasoning,
+            relations=_relation_rows(exception_check),
         )
 
         artifact_updated = False
@@ -3301,6 +3311,7 @@ def bootstrap_publication(
                     decision="decline",
                     judged_by="scope-manager",
                     reasoning=boot_verdict.reasoning,
+                    relations=_relation_rows(boot_check),
                 )
                 refused_notes.append(f"Dropped one proposed item. {boot_check.note}")
                 continue
@@ -3312,6 +3323,7 @@ def bootstrap_publication(
                 decision="accept",
                 judged_by="scope-manager",
                 reasoning=item_reasoning,
+                relations=_relation_rows(boot_check),
             )
             recorded.append(
                 PublishedItem(

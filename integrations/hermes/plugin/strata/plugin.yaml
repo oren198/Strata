@@ -1,0 +1,16 @@
+name: strata
+version: 0.2.0
+description: "Strata shared, judged memory for a Hermes profile: reads the scope's perspective and writes only through the judged strata_contribute tool."
+author: Strata
+kind: memory
+requires_hermes: ">=0.23.3"
+requires_env:
+  - name: STRATA_AGENT_SCOPE
+    description: "The Strata scope this profile acts as (for example g_dev)"
+  - name: STRATA_PROJECT_DIR
+    description: "The registered Strata project folder (the one holding .strata/config.toml)"
+  - name: STRATA_AGENT_SKILL
+    description: "Optional: the skill name this profile acts as; blank for the scope's default"
+  - name: STRATA_JUDGE_API_KEY
+    description: "Optional: the judge key, passed only to the Strata engine process as JUDGE_API_KEY. Blank to keep it in the project's .env"
+    secret: true

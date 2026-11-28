@@ -154,6 +154,7 @@ function InputChangesPanel({ inputChanges }) {
           style={{ fontFamily: "var(--font-mono)", fontSize: 11, color: "var(--at-muted)" }}
         >
           {c.created_at} — {c.kind} — {c.item_id}
+          {c.retirement ? ` — ${c.retirement.label} — ${c.retirement.notice}` : ""}
         </div>
       ))}
     </div>

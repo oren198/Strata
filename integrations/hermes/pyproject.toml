@@ -1,0 +1,15 @@
+# Test and lint configuration for the Hermes directory plugin (plugin/strata). The plugin is NOT
+# a Python package: Hermes installs the directory itself (`hermes plugins install`), and the Strata
+# engine never imports it. Nothing here is built or published.
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["tests", "tests/fake_hermes"]
+
+[tool.ruff]
+extend = "../../pyproject.toml"
+# the verbatim copy of Hermes's ABC is a test double; it is not edited to pass our lint
+extend-exclude = ["tests/fake_hermes"]
+
+[tool.ruff.lint.isort]
+# the suite imports the plugin through the alias in tests/conftest.py
+known-first-party = ["strata_hermes"]

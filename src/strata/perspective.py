@@ -73,7 +73,7 @@ publication, operator, change event.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from typing import Protocol, TypeVar
 
@@ -339,7 +339,21 @@ def change_event_dict(event: _ChangeEventLike) -> dict:
         "after": event.after,
         "created_at": event.created_at,
         "contribution_id": event.contribution_id,
+        **_retirement_part(event),
     }
+
+
+def _retirement_part(event: _ChangeEventLike) -> dict:
+    """The ``retirement`` entry of a ``directive_retired`` notice: label ("retired" for a
+    release, "retracted" for a correction), the authority's notice, kind and cause. Absent
+    for every other event, so their shape is unchanged. One path, two labels: nothing else
+    about a release and a retraction differs."""
+    retirement = getattr(event, "retirement", None)
+    if retirement is None:
+        return {}
+    from strata.forgetting import retirement_notice  # noqa: PLC0415
+
+    return {"retirement": retirement_notice(retirement)}
 
 
 def _composes_as_input_change(event: _ChangeEventLike, *, scope_id: str) -> bool:
@@ -397,12 +411,18 @@ def _operator_directives(items: Sequence[_OperatorItemLike]) -> list[dict]:
     """
 
     def _item_dict(item: _OperatorItemLike) -> dict:
-        return {
+        entry = {
             "id": item.id,
             "content": item.content,
             "subject": item.subject,
             "created_at": item.created_at,
         }
+        # v1.20: an operator item written with an end condition shows it; any other item's
+        # dict is exactly as before.
+        end = getattr(item, "end_condition", None)
+        if end is not None:
+            entry["ends"] = end.model_dump(exclude_none=True)
+        return entry
 
     return [_item_dict(i) for i in items if i.kind == "directive"]
 
@@ -614,6 +634,7 @@ def compose_perspective(
     change_event_reader: ChangeEventReader | None = None,
     just_processed: Sequence[_ChangeEventLike] = (),
     contribution_reader: ContributionReader | None = None,
+    review_reader: Callable[[str], Sequence[Mapping[str, str]]] | None = None,
 ) -> dict:
     """Compose *scope_id*'s perspective: own summary, ancestor directives, one-hop publications.
 
@@ -817,6 +838,7 @@ def compose_perspective(
             # One call, shared by the condensation count and the context-ids list below
             # (ADR 0017 P1b) — both read the same accepted-context contributions.
             accepted_context = None if contribution_reader is None else contribution_reader(s.id)
+            review_notes = list(review_reader(s.id)) if review_reader is not None else []
             layers.append(
                 {
                     "scope_id": s.id,
@@ -824,6 +846,9 @@ def compose_perspective(
                     "summary": self_summary,
                     "relation": "self",
                     "binding": True,
+                    # ADR 0018 D6: the contributing scope's own reviewed items, labelled; absent
+                    # when there are none, so a scope without review reads exactly as before.
+                    **({"review": review_notes} if review_notes else {}),
                     # Issue #202: the condensation signal rides the self layer
                     # only — it describes THIS scope's own context, the one
                     # payload composition still carries in full.

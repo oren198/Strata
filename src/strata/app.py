@@ -78,13 +78,14 @@ from __future__ import annotations
 
 import hashlib
 import importlib.resources
+import inspect
 import json
 import logging
 import os
 import pathlib
 import sqlite3
 import tempfile
-from collections.abc import AsyncGenerator, Generator, Sequence
+from collections.abc import AsyncGenerator, Callable, Generator, Mapping, Sequence
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -123,6 +124,19 @@ from strata.fleet_config import (
     replace_fleet_bytes,
 )
 from strata.fleet_reload import FleetReloader
+from strata.forgetting import (
+    sweep_date_lapses_locked,
+    sweep_for_read,
+    validate_ends,
+    validate_fulfils,
+)
+from strata.lineage import (
+    TIER_LABELS,
+    LineageLineView,
+    context_hash,
+    lineage_offered,
+    record_context_write,
+)
 from strata.locks import BATCH_CAP, QUEUE_WAIT_TIMEOUT_S, QueueTicket, configure_lock_dir
 from strata.locks import scope_append_lock as _scope_append_lock
 from strata.locks import scope_lock as _scope_lock
@@ -145,7 +159,7 @@ from strata.publication import (
     read_publication,
 )
 from strata.record_store import (
-    ACCEPTED_DECISIONS,
+    ENGINE_NOTE_SUBJECT,
     JUDGE_FAILED,
     RECENCY_WINDOW_SIZE,
     ChangeEvent,
@@ -159,17 +173,24 @@ from strata.record_store import (
     engine_note_rejudge_message,
     is_engine_note,
     standing_evidence,
+    verdict_admits,
 )
+from strata.review import _HELD_OPS as _REVIEW_HELD_OPS
+from strata.review import encode_held, perspective_notes, review_holds
 from strata.scope_manager import (
+    IMPLIED_PURPOSE_MIN_WORDS,
     WINDOW_VERBATIM_TAIL,
     ActedOnTarget,
+    BatchVerdict,
     ExaminedContextItem,
     JudgeMode,
     ScopeManager,
     ScopeManagerBatchJudgment,
     ScopeManagerJudgment,
+    _apply_batch_amendment,
     is_held_note,
     strip_record_only_notes,
+    suggest_description,
 )
 from strata.session_state import (
     DEFAULT_STALENESS_WINDOW_DAYS,
@@ -221,6 +242,22 @@ def get_record_store(
         yield store
     finally:
         store.close()
+
+
+def _scope_with_description_fields(scope: Scope, summary_store: SummaryStore) -> dict:
+    """A scope's Console row plus, only when the scope has no description of its own, a
+    report-only suggestion from its own memory."""
+    row = scope.model_dump()
+    suggestion = None
+    if not scope.description:
+        try:
+            suggestion = suggest_description(
+                summary_store.read(scope.id), IMPLIED_PURPOSE_MIN_WORDS
+            )
+        except Exception:  # noqa: BLE001 — a hint must never fail the scope list
+            suggestion = None
+    row["description_suggestion"] = suggestion
+    return row
 
 
 def get_summary_store(
@@ -280,7 +317,6 @@ def get_scope_manager(
     return ScopeManager(
         client=client,
         model=settings.manager_model,
-        implied_purpose_min_words=settings.implied_purpose_min_words,
         judge_provider=settings.judge_provider,
     )
 
@@ -436,6 +472,20 @@ class RetireDirectiveRequest(BaseModel):
     reason: str | None = None
 
 
+class DismissCandidateRequest(BaseModel):
+    """Snooze one operator-item candidate. Days are checked again in the route."""
+
+    reason: str
+    days: int
+
+    @field_validator("reason")
+    @classmethod
+    def _reason_not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("A dismissal needs a reason.")
+        return value
+
+
 class RestoreCorrectionWithdrawalRequest(BaseModel):
     """Operator restore, in person — a published item a correction sweep wrongly
     withdrew, back under its original id and bytes (the restore act design)."""
@@ -446,6 +496,20 @@ class RestoreCorrectionWithdrawalRequest(BaseModel):
 # ---------------------------------------------------------------------------
 # Contribute choke point (issues #38, #57)
 #
+def _relation_rows(
+    scope_manager: object, context: dict | None, directive: dict | None
+) -> list[dict]:
+    """The relation re-ask outcomes that fed a verdict, tagged for ``relation_calls`` and
+    joined with the detail the manager kept (a stand-in manager keeps none)."""
+    take = getattr(scope_manager, "take_relation_extras", None)
+    rows = []
+    for call, outcome in (("context", context), ("directive", directive)):
+        if outcome:
+            extras = take(outcome["contribution_id"], call) if callable(take) else {}
+            rows.append({**outcome, **extras, "call": call})
+    return rows
+
+
 # The single place where the read-summary -> judge -> record-judgment ->
 # summary-write sequence for a scope runs. Both agent (MCP ``strata_contribute``
 # / ``strata_rejudge``) and operator (HTTP ``POST /contribute``) surfaces route
@@ -628,6 +692,108 @@ def _read_judge_inputs(
 _EXAMINED_CONTEXT_CAP = 10
 
 
+def _takes_kwarg(method: object, name: str) -> bool:
+    """Whether *method* accepts the keyword *name* (a named parameter or ``**kwargs``).
+
+    The lineage view is an optional input of the real scope-manager. A stand-in judge with a
+    fixed signature (an eval harness, a test double) never asked for it and must not be
+    handed it."""
+    try:
+        params = inspect.signature(method).parameters  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return False
+    return name in params or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
+def _context_item_facts(
+    contribution_id: str,
+    *,
+    fleet: FleetConfig,
+    record_store: RecordStore,
+    summary_store: SummaryStore,
+) -> tuple[int, str]:
+    """``(tier, admitted_at)`` of a context note, for the condensation order: tier 0 when newer
+    context supersedes it, 2 when an outcome has TESTED it (the three examined states of ADR
+    0017 P6), else 1 (unexamined). An id the record does not know reads as unexamined and
+    undated, which can only make a check less strict, never invent an inversion."""
+    contribution = record_store.get_contribution(contribution_id)
+    if contribution is None:
+        return 1, ""
+    if record_store.is_context_superseded(contribution_id):
+        return 0, contribution.created_at
+    evidence = standing_evidence(record_store, fleet, contribution_id, summary_store=summary_store)
+    examined = (
+        any(e.replaced_kind is None and e.correction_pending_kind is None for e in evidence)
+        or record_store.claim_event_for(contribution_id) is not None
+        or contribution.raised_from is not None
+    )
+    return (2 if examined else 1), contribution.created_at
+
+
+def _resolve_lineage_view(
+    scope_id: str,
+    current_summary: ScopeSummary | None,
+    *,
+    fleet: FleetConfig,
+    record_store: RecordStore,
+    summary_store: SummaryStore,
+) -> list[LineageLineView] | None:
+    """The stored lineage of the CURRENT context as the judge is shown it (per line: note id,
+    admission date, state), or ``None`` when none is stored for exactly this text."""
+    if current_summary is None:
+        return None
+    stored = record_store.context_lineage_for(scope_id, context_hash(current_summary.context))
+    if not stored:
+        return None
+    view = []
+    for entry in stored:
+        items = []
+        for note_id in entry.sources:
+            tier, admitted = _context_item_facts(
+                note_id, fleet=fleet, record_store=record_store, summary_store=summary_store
+            )
+            items.append((note_id, admitted[:10] or "?", TIER_LABELS[tier]))
+        view.append(LineageLineView(entry.line, tuple(items)))
+    return view
+
+
+def _record_lineage(
+    *,
+    scope: Scope,
+    previous_summary: ScopeSummary | None,
+    written: ScopeSummary,
+    judgment: ScopeManagerJudgment | ScopeManagerBatchJudgment,
+    judged_contribution_ids: Sequence[str],
+    fleet: FleetConfig,
+    record_store: RecordStore,
+    summary_store: SummaryStore,
+) -> None:
+    """After a summary write: record the context's lineage and the order check, one
+    `condensation_order_checks` row per write that changed the context (measured or not)."""
+    allowed = {c.id for c in record_store.list_accepted_context_contributions(scope_id=scope.id)}
+    allowed.update(judged_contribution_ids)
+
+    def foreign(note_id: str) -> bool:
+        other = record_store.get_contribution(note_id)
+        return other is not None and other.scope_id != scope.id
+
+    record_context_write(
+        scope_id=scope.id,
+        previous_context=previous_summary.context if previous_summary else None,
+        new_context=written.context,
+        summary_version=written.version,
+        raw_lineage=getattr(judgment, "context_lineage", None),
+        offered=bool(getattr(judgment, "lineage_offered", False)),
+        judged_ids=list(judged_contribution_ids),
+        allowed_ids=allowed,
+        foreign=foreign,
+        info=lambda note_id: _context_item_facts(
+            note_id, fleet=fleet, record_store=record_store, summary_store=summary_store
+        ),
+        record_store=record_store,
+    )
+
+
 def _resolve_examined_context(
     *,
     scope_id: str,
@@ -736,6 +902,11 @@ def _judge_and_record(
     serialized unit. On judge failure it records a judgment-attempt-failed
     event and raises :class:`JudgeUnavailable`; no judgment row is written.
     """
+    # v1.20: a date end condition that is over retires its directive by mechanism before
+    # anything below reads the summary. The lock is already held; no judge call.
+    sweep_date_lapses_locked(
+        scope.id, fleet=fleet, record_store=record_store, summary_store=summary_store
+    )
     # #234 §8: the PRE-write watermark, taken before anything below reads or
     # writes — same lock as the write that follows, so this is the exact
     # "nothing else had changed before this write" baseline the self-trigger
@@ -828,6 +999,23 @@ def _judge_and_record(
     )
     if examined_context:
         judge_kwargs["examined_context"] = examined_context
+    # v1.20: the stored lineage of the current context, shown only on a call that is offered the
+    # lineage block (context near its budget). The kwarg appears only then.
+    if inputs.current_summary is not None and lineage_offered(
+        inputs.current_summary.context,
+        summary_max_words,
+        mode=mode,
+        acted_on=acted_on_target is not None,
+    ):
+        lineage_view = _resolve_lineage_view(
+            scope.id,
+            inputs.current_summary,
+            fleet=fleet,
+            record_store=record_store,
+            summary_store=summary_store,
+        )
+        if lineage_view and _takes_kwarg(scope_manager.judge, "lineage_view"):
+            judge_kwargs["lineage_view"] = lineage_view
     # Adoption link: the held proposal this contribution adopts, so the judge sees
     # what is adopted. Same discipline — the kwarg appears only when set.
     adopted_proposal = _resolve_adopted_proposal(contribution, record_store=record_store)
@@ -881,6 +1069,36 @@ def _judge_and_record(
     # judge) still records the right id.
     if isinstance(judgment, ScopeManagerJudgment) and judgment.contribution_id is None:
         judgment = judgment.model_copy(update={"contribution_id": contribution.id})
+
+    # ADR 0018 (#126): a review scope HOLDS a judgment that would change its directives. This is
+    # the one seam on the single path: after the judge and every engine guard (the position gate,
+    # the inherited-conflict check, the R2 guard), before any amendment, so nothing below runs for
+    # a held item. The verdict is recorded verbatim with disposition `held`, and the judge's whole
+    # answer rides beside it so an approval can apply exactly those ops later.
+    if scope.human_review >= 1 and review_holds(judgment):
+        record_store.record_judgment(
+            contribution_id=contribution.id,
+            decision=judgment.decision,
+            judged_by="scope-manager",
+            notes=judgment.record_notes,
+            relations=_relation_rows(
+                scope_manager, judgment.inherited_relation, judgment.directive_relation
+            ),
+            held_payload=encode_held(
+                judgment.model_dump_json(),
+                inputs.current_summary.version if inputs.current_summary is not None else 0,
+            ),
+        )
+        return ContributionOutcome(
+            contribution_id=contribution.id,
+            decision=judgment.decision,
+            reasoning=judgment.reasoning,
+            summary_updated=False,
+            watermark_before=watermark_before,
+            watermark_after=_scope_watermark(
+                scope.id, fleet=fleet, record_store=record_store, summary_store=summary_store
+            ),
+        )
 
     # ADR 0017 P3: a failed outcome mints its linking event in the SAME transaction
     # as the judgment (RecordStore.record_judgment's claim_event, atomic). Gated on
@@ -1002,6 +1220,9 @@ def _judge_and_record(
             # the engine dropped (ADR 0011 D1) — the record shows what applied.
             notes=judgment.record_notes,
             claim_event=claim_event,
+            relations=_relation_rows(
+                scope_manager, judgment.inherited_relation, judgment.directive_relation
+            ),
         )
 
     # ADR 0017 P4: the correction's fan-out, split on who authored it.
@@ -1199,184 +1420,328 @@ def _write_amendment(
         previous_summary.context if previous_summary is not None else None,
         judgment.new_summary.context,
     )
+    # v1.22 P2 — the write-ahead intent. The summary is a FILE and the rest of this function is
+    # database work, so no transaction spans them. Before the file is written, the intent records
+    # everything the after-write steps need; each of those steps is idempotent per intent; the
+    # intent is marked done at the end. A process death in between leaves a pending intent that
+    # `recover_amendment_intents` replays (version written) or abandons (not written).
+    plan = _amendment_plan(
+        judgment,
+        scope=scope,
+        previous_summary=previous_summary,
+        retirements=retirements,
+        removals=removals,
+        judged_contribution_ids=judged_contribution_ids,
+        change_ids=change_ids,
+        withdraw_reasoning=withdraw_reasoning,
+        withdraw_notice_kind=withdraw_notice_kind,
+        withdraw_correcting_after=withdraw_correcting_after,
+        withdraw_correcting_claim_id=withdraw_correcting_claim_id,
+        record_store=record_store,
+    )
+    on_disk = summary_store.read(scope.id)
+    intent_id = record_store.create_amendment_intent(
+        scope_id=scope.id,
+        expected_version=(on_disk.version if on_disk is not None else 0) + 1,
+        payload_json=json.dumps(plan),
+    )
     written = summary_store.write(
         scope.id, judgment.new_summary.model_copy(update={"condensed": condensed})
     )
-    # Migration 0013: the record says which version this amendment wrote —
-    # one value on every accepted row, so a batch's N verdicts tie to their
-    # one write without anyone counting rows against `version`.
-    record_store.stamp_summary_version(judged_contribution_ids, version=written.version)
 
-    # ADR 0017 P6 part 1, issue #202: one condensation_drops row per accepted
-    # context contribution this amendment mechanically dropped — present
-    # verbatim in the OLD context, absent from the NEW one. NOT one SQL
-    # transaction with the summary write above (the summary is a markdown
-    # file, this is a DB row) — same `_scope_lock` ordering is the only
-    # atomicity available, so a crash between the two lines above and this
-    # one leaves a written summary with no drop rows for it, never the
-    # reverse. A failure writing the rows is logged loudly and swallowed —
-    # never silent, but never rolling back an already-committed summary
-    # write for a purely diagnostic side table.
-    try:
-        candidates = record_store.list_accepted_context_contributions(scope_id=scope.id)
-        dropped_ids = dropped_context_contribution_ids(
-            previous_summary.context if previous_summary is not None else None,
-            judgment.new_summary.context,
-            candidates,
-        )
-        # A claim THIS SAME amendment corrected (P3/P4) was REPLACED, not
-        # condensed — its own outcome already gets the record's claim_corrected/
-        # claim_superseded event; a second, condensation-flavoured row for the
-        # same fact would misname why it left the context.
-        corrected_targets = {
-            event.item_id
-            for jid in judged_contribution_ids
-            if (event := record_store.claim_event_for(jid)) is not None
-        }
-        dropped_ids = [d for d in dropped_ids if d not in corrected_targets]
-        if dropped_ids:
-            by_id = {c.id: c for c in candidates}
-            words_before = len((previous_summary.context if previous_summary else "").split())
-            words_after = len(judgment.new_summary.context.split())
-            drops: list[tuple[str, str, int, int]] = []
-            for dropped_id in dropped_ids:
-                evidence = standing_evidence(
-                    record_store, fleet, dropped_id, summary_store=summary_store
+    def _after_stamp() -> None:
+        # v1.20 item 7(d): lineage and the order check. Never load-bearing: the summary is written.
+        try:
+            _record_lineage(
+                scope=scope,
+                previous_summary=previous_summary,
+                written=written,
+                judgment=judgment,
+                judged_contribution_ids=judged_contribution_ids,
+                fleet=fleet,
+                record_store=record_store,
+                summary_store=summary_store,
+            )
+        except Exception:
+            _logger.exception("condensation lineage write failed for scope %r", scope.id)
+
+        # ADR 0017 P6 part 1, issue #202: one condensation_drops row per accepted
+        # context contribution this amendment mechanically dropped — present
+        # verbatim in the OLD context, absent from the NEW one. NOT one SQL
+        # transaction with the summary write above (the summary is a markdown
+        # file, this is a DB row) — same `_scope_lock` ordering is the only
+        # atomicity available, so a crash between the two lines above and this
+        # one leaves a written summary with no drop rows for it, never the
+        # reverse. A failure writing the rows is logged loudly and swallowed —
+        # never silent, but never rolling back an already-committed summary
+        # write for a purely diagnostic side table.
+        try:
+            candidates = record_store.list_accepted_context_contributions(scope_id=scope.id)
+            dropped_ids = dropped_context_contribution_ids(
+                previous_summary.context if previous_summary is not None else None,
+                judgment.new_summary.context,
+                candidates,
+            )
+            # A claim THIS SAME amendment corrected (P3/P4) was REPLACED, not
+            # condensed — its own outcome already gets the record's claim_corrected/
+            # claim_superseded event; a second, condensation-flavoured row for the
+            # same fact would misname why it left the context.
+            corrected_targets = {
+                event.item_id
+                for jid in judged_contribution_ids
+                if (event := record_store.claim_event_for(jid)) is not None
+            }
+            dropped_ids = [d for d in dropped_ids if d not in corrected_targets]
+            if dropped_ids:
+                by_id = {c.id: c for c in candidates}
+                words_before = len((previous_summary.context if previous_summary else "").split())
+                words_after = len(judgment.new_summary.context.split())
+                drops: list[tuple[str, str, int, int]] = []
+                for dropped_id in dropped_ids:
+                    evidence = standing_evidence(
+                        record_store, fleet, dropped_id, summary_store=summary_store
+                    )
+                    if any(
+                        e.replaced_kind is None and e.correction_pending_kind is None
+                        for e in evidence
+                    ):
+                        state_at_drop = "corroborated"
+                    elif record_store.claim_event_for(dropped_id) is not None:
+                        state_at_drop = "correcting"
+                    # The philosopher ruled a raised consequence's own acceptance at the
+                    # issuer is EXAMINED (P5) — part 2 (`_resolve_examined_context`)
+                    # already lists 'raised' among the examined states on the
+                    # judge-input side too, the same priority order as here.
+                    elif by_id[dropped_id].raised_from is not None:
+                        state_at_drop = "raised"
+                    else:
+                        state_at_drop = "unexamined"
+                    drops.append((dropped_id, state_at_drop, words_before, words_after))
+                record_store.append_condensation_drops(
+                    scope_id=scope.id,
+                    summary_version=written.version,
+                    budget=summary_max_words,
+                    drops=drops,
                 )
-                if any(
-                    e.replaced_kind is None and e.correction_pending_kind is None for e in evidence
-                ):
-                    state_at_drop = "corroborated"
-                elif record_store.claim_event_for(dropped_id) is not None:
-                    state_at_drop = "correcting"
-                # The philosopher ruled a raised consequence's own acceptance at the
-                # issuer is EXAMINED (P5) — part 2 (`_resolve_examined_context`)
-                # already lists 'raised' among the examined states on the
-                # judge-input side too, the same priority order as here.
-                elif by_id[dropped_id].raised_from is not None:
-                    state_at_drop = "raised"
-                else:
-                    state_at_drop = "unexamined"
-                drops.append((dropped_id, state_at_drop, words_before, words_after))
-            record_store.append_condensation_drops(
-                scope_id=scope.id,
-                summary_version=written.version,
-                budget=summary_max_words,
-                drops=drops,
+        except Exception:
+            _logger.exception(
+                "condensation_drops write failed for scope %r at summary version %s "
+                "(summary already written; the drop rows are missing, not the amendment)",
+                scope.id,
+                written.version,
             )
-    except Exception:
-        _logger.exception(
-            "condensation_drops write failed for scope %r at summary version %s "
-            "(summary already written; the drop rows are missing, not the amendment)",
-            scope.id,
-            written.version,
-        )
 
-    # ADR 0011 D1: a `retire` op removes a directive with no replacement,
-    # so no contribution row carries the explanation — the retirement
-    # event does (CONTEXT.md § Retirement), in the shape ADR 0008 D4
-    # reserved for exactly this scope-manager explicit-retire. Superseded
-    # directives get none: their explanation is the incoming directive's
-    # own supersedes reference.
-    for directive_id, reason, changed_circumstance in retirements:
-        record_store.append_retirement(
-            scope_id=scope.id,
-            directive_id=directive_id,
-            retired_by="scope-manager",
-            reason=reason,
-            changed_circumstance=changed_circumstance,
-        )
-
-    # ADR 0007 D3 — staleness propagation, two paths, both under the
-    # lock this function's caller already holds:
-    #
-    # 1. Judged propagation (D3/D5): the judge itself named published
-    #    items whose belief this rewrite drops or contradicts. Each
-    #    withdrawal carries the SAME judged_by/reasoning as the judgment it
-    #    came with — it was judged, just as part of that call rather than a
-    #    fresh one.
-    if judgment.withdraw_published:
-        apply_judged_withdrawals(
-            scope.id,
-            judgment.withdraw_published,
-            judged_by="scope-manager",
-            reasoning=withdraw_reasoning,
-            fleet=fleet,
-            record_store=record_store,
-            summaries_dir=str(summary_store.summaries_dir),
-            change_ids=change_ids,
-            hop=judgment.hop,
-            notice_kind=withdraw_notice_kind,
-            correcting_after=withdraw_correcting_after,
-            correcting_claim_id=withdraw_correcting_claim_id,
-        )
-
-    # 1b. ENGINE propagation (ADR 0017 P4, CEO decision A): a claim just found
-    #     WRONG must not stay published verbatim in this scope's OWN face,
-    #     whatever the judge did or omitted (qwen's own optional-field pattern —
-    #     #209/M1 — makes `withdraw_published` an unreliable sole signal). Skips
-    #     whatever the judge already withdrew above — one notice per reader
-    #     either way, and the record shows which path closed it.
-    if withdraw_corrected_claim_content is not None:
-        # Restore act design, point 2: the claim's own text and the
-        # correcting text, once per change id in this wave — never once per
-        # withdrawn item. Written inside the same lock the sweep itself
-        # runs under (this function's own caller already holds it).
-        for restore_change_id in change_ids:
-            record_store.record_claim_correction(
-                change_id=restore_change_id,
-                claim_id=withdraw_correcting_claim_id or "",
-                scope_id=scope.id,
-                corrected_claim_content=withdraw_corrected_claim_content,
-                correcting_content=withdraw_correcting_after or "",
-            )
-        verbatim_withdrawn = propagate_claim_correction(
-            scope.id,
-            claim_id=withdraw_correcting_claim_id or "",
-            corrected_claim_content=withdraw_corrected_claim_content,
-            correcting_content=withdraw_correcting_after or "",
-            trigger_id=judged_contribution_ids[0],
-            already_withdrawn=judgment.withdraw_published or [],
-            fleet=fleet,
-            record_store=record_store,
-            summaries_dir=str(summary_store.summaries_dir),
-            change_ids=change_ids,
-            hop=judgment.hop,
-        )
-        # Issue #219 C: the owner-judge's own paraphrase check, over whatever
-        # the verbatim sweep (above) and the judge's own withdraw_published
-        # still left standing — same-scope `failed_corrected` only (the
-        # drain-path site is `drain_scope`'s own #221 sweep).
-        if scope_manager is not None:
-            check_claim_carriers(
+    def _after_withdrawals() -> None:
+        # 1b. ENGINE propagation (ADR 0017 P4, CEO decision A): a claim just found
+        #     WRONG must not stay published verbatim in this scope's OWN face,
+        #     whatever the judge did or omitted (qwen's own optional-field pattern —
+        #     #209/M1 — makes `withdraw_published` an unreliable sole signal). Skips
+        #     whatever the judge already withdrew above — one notice per reader
+        #     either way, and the record shows which path closed it.
+        if withdraw_corrected_claim_content is not None:
+            # Restore act design, point 2: the claim's own text and the
+            # correcting text, once per change id in this wave — never once per
+            # withdrawn item. Written inside the same lock the sweep itself
+            # runs under (this function's own caller already holds it).
+            for restore_change_id in change_ids:
+                record_store.record_claim_correction(
+                    change_id=restore_change_id,
+                    claim_id=withdraw_correcting_claim_id or "",
+                    scope_id=scope.id,
+                    corrected_claim_content=withdraw_corrected_claim_content,
+                    correcting_content=withdraw_correcting_after or "",
+                )
+            verbatim_withdrawn = propagate_claim_correction(
                 scope.id,
                 claim_id=withdraw_correcting_claim_id or "",
                 corrected_claim_content=withdraw_corrected_claim_content,
                 correcting_content=withdraw_correcting_after or "",
                 trigger_id=judged_contribution_ids[0],
-                already_withdrawn=[
-                    *(judgment.withdraw_published or []),
-                    *(item.id for item in verbatim_withdrawn),
-                ],
-                scope_manager=scope_manager,
+                already_withdrawn=judgment.withdraw_published or [],
                 fleet=fleet,
                 record_store=record_store,
                 summaries_dir=str(summary_store.summaries_dir),
                 change_ids=change_ids,
                 hop=judgment.hop,
             )
+            # Issue #219 C: the owner-judge's own paraphrase check, over whatever
+            # the verbatim sweep (above) and the judge's own withdraw_published
+            # still left standing — same-scope `failed_corrected` only (the
+            # drain-path site is `drain_scope`'s own #221 sweep).
+            if scope_manager is not None:
+                check_claim_carriers(
+                    scope.id,
+                    claim_id=withdraw_correcting_claim_id or "",
+                    corrected_claim_content=withdraw_corrected_claim_content,
+                    correcting_content=withdraw_correcting_after or "",
+                    trigger_id=judged_contribution_ids[0],
+                    already_withdrawn=[
+                        *(judgment.withdraw_published or []),
+                        *(item.id for item in verbatim_withdrawn),
+                    ],
+                    scope_manager=scope_manager,
+                    fleet=fleet,
+                    record_store=record_store,
+                    summaries_dir=str(summary_store.summaries_dir),
+                    change_ids=change_ids,
+                    hop=judgment.hop,
+                )
 
-    # 2. Mechanical propagation (D3): any published item anchored ONLY to
-    #    directives that just left the summary is withdrawn, no LLM in the
-    #    loop. The removed ids come straight off the amendment's
-    #    supersede/retire ops (ADR 0011 D1) — the ops ARE the removal, so
-    #    there is no longer anything to diff between two summary
-    #    generations. Removals are grouped by the contribution each op names,
-    #    so every withdraw act's trigger is the contribution that actually
-    #    motivated it.
-    surviving = {d.id for d in judgment.new_summary.directives}
+    _apply_amendment_effects(
+        plan,
+        scope=scope,
+        fleet=fleet,
+        record_store=record_store,
+        summary_store=summary_store,
+        written_version=written.version,
+        intent_id=intent_id,
+        after_stamp=_after_stamp,
+        after_withdrawals=_after_withdrawals,
+    )
+    record_store.mark_amendment_intent(intent_id, "done")
+
+
+def _amendment_plan(
+    judgment: ScopeManagerJudgment | ScopeManagerBatchJudgment,
+    *,
+    scope: Scope,
+    previous_summary: ScopeSummary | None,
+    retirements: Sequence[tuple[str, str, str | None]],
+    removals: Sequence[tuple[str, str]],
+    judged_contribution_ids: Sequence[str],
+    change_ids: Sequence[str],
+    withdraw_reasoning: str,
+    withdraw_notice_kind: str,
+    withdraw_correcting_after: str | None,
+    withdraw_correcting_claim_id: str | None,
+    record_store: RecordStore,
+) -> dict:
+    """Everything the after-write steps need, as plain JSON: ids, op targets, reasons and
+    circumstances the record already stores, the directive-id sets and the change ids. No judge
+    transcript and nothing from the environment."""
+    assert judgment.new_summary is not None  # noqa: S101
+    resolved: list[dict] = []
+    for directive_id, reason, changed_circumstance in retirements:
+        # v1.20: a judged retire of a directive with a JUDGED end condition reached here only
+        # through the engine's confirmation check (scope_manager), so it is recorded as one:
+        # kind, cause and the end condition, and its change event carries the notice.
+        judged_condition = next(
+            (
+                d
+                for d in (previous_summary.directives if previous_summary else [])
+                if d.id == directive_id
+                and d.end_condition is not None
+                and d.end_condition.kind == "judged"
+            ),
+            None,
+        )
+        extra: dict = {}
+        if judged_condition is not None:
+            evidence = next(
+                (
+                    c
+                    for cid in judged_contribution_ids
+                    if (c := record_store.get_contribution(cid)) is not None
+                    and c.fulfils == directive_id
+                ),
+                None,
+            )
+            extra = {
+                "kind": "currency",
+                "notice": changed_circumstance,
+                "actor_session_id": evidence.contributor.session_id if evidence else None,
+                "cause": "condition_judged",
+                "end_condition": judged_condition.end_condition.model_dump_json(),
+                "evidence_contribution_id": evidence.id if evidence else None,
+            }
+        resolved.append(
+            {
+                "directive_id": directive_id,
+                "reason": reason,
+                "changed_circumstance": changed_circumstance,
+                "extra": extra,
+            }
+        )
+    return {
+        "judged_ids": list(judged_contribution_ids),
+        "change_ids": list(change_ids),
+        "hop": judgment.hop,
+        "previous_ids": sorted(d.id for d in previous_summary.directives)
+        if previous_summary is not None
+        else [],
+        "new_ids": sorted(d.id for d in judgment.new_summary.directives),
+        "retirements": resolved,
+        "removals": [[d, trigger] for d, trigger in removals],
+        "removed_directive_ids": sorted(judgment.removed_directive_ids),
+        "withdraw_published": list(judgment.withdraw_published or []),
+        "withdraw_reasoning": withdraw_reasoning,
+        "withdraw_notice_kind": withdraw_notice_kind,
+        "withdraw_correcting_after": withdraw_correcting_after,
+        "withdraw_correcting_claim_id": withdraw_correcting_claim_id,
+    }
+
+
+def _apply_amendment_effects(
+    plan: dict,
+    *,
+    scope: Scope,
+    fleet: FleetConfig,
+    record_store: RecordStore,
+    summary_store: SummaryStore,
+    written_version: int,
+    intent_id: str,
+    after_stamp: Callable[[], None] | None = None,
+    after_withdrawals: Callable[[], None] | None = None,
+) -> None:
+    """The after-write steps of an amendment, each idempotent per intent, so that the writer and
+    a recovery replay run exactly the same code. ``after_stamp`` and ``after_withdrawals`` carry
+    the diagnostic lineage/drop rows and the claim-correction sweep, which only the live writer
+    has the inputs for; a replay does not run them."""
+    # step 2: the record says which version this amendment wrote (migration 0013)
+    record_store.stamp_summary_version(plan["judged_ids"], version=written_version)
+    if after_stamp is not None:
+        after_stamp()
+
+    # step 5: ADR 0011 D1: a `retire` op removes a directive with no replacement, so no
+    # contribution row carries the explanation: the retirement event does. The unique
+    # (scope, directive, intent) index makes a replay write nothing twice.
+    for item in plan["retirements"]:
+        record_store.append_retirement(
+            scope_id=scope.id,
+            directive_id=item["directive_id"],
+            retired_by="scope-manager",
+            reason=item["reason"],
+            changed_circumstance=item["changed_circumstance"],
+            intent_id=intent_id,
+            **item["extra"],
+        )
+
+    # step 6: ADR 0007 D3, judged propagation: the judge named published items whose belief this
+    # rewrite drops or contradicts. A withdrawn item is no longer published, so a replay skips it.
+    if plan["withdraw_published"]:
+        apply_judged_withdrawals(
+            scope.id,
+            plan["withdraw_published"],
+            judged_by="scope-manager",
+            reasoning=plan["withdraw_reasoning"],
+            fleet=fleet,
+            record_store=record_store,
+            summaries_dir=str(summary_store.summaries_dir),
+            change_ids=plan["change_ids"],
+            hop=plan["hop"],
+            notice_kind=plan["withdraw_notice_kind"],
+            correcting_after=plan["withdraw_correcting_after"],
+            correcting_claim_id=plan["withdraw_correcting_claim_id"],
+        )
+    if after_withdrawals is not None:
+        after_withdrawals()
+
+    # ADR 0007 D3, mechanical propagation: any published item anchored ONLY to directives that
+    # just left the summary is withdrawn, no LLM in the loop, grouped by the contribution that
+    # motivated each removal so every withdraw act's trigger is the right one.
+    surviving = set(plan["new_ids"])
     by_trigger: dict[str, set[str]] = {}
-    for directive_id, trigger_contribution_id in removals:
+    for directive_id, trigger_contribution_id in plan["removals"]:
         by_trigger.setdefault(trigger_contribution_id, set()).add(directive_id)
     for trigger_contribution_id, directive_ids in by_trigger.items():
         propagate_directive_removals(
@@ -1387,40 +1752,150 @@ def _write_amendment(
             fleet=fleet,
             record_store=record_store,
             summaries_dir=str(summary_store.summaries_dir),
-            change_ids=change_ids,
-            hop=judgment.hop,
+            change_ids=plan["change_ids"],
+            hop=plan["hop"],
         )
 
-    # ADR 0014 D1/D3 — a scope's own contribution is not a trigger for the
-    # scope, but it IS one for every descendant this amendment's directive
-    # ops now bind differently. One event per changed directive, sharing this
-    # amendment's change id (issue #196). ADR 0014 D4 still refreshes a scope
-    # once per change id: a processed row for that id marks the wave refreshed,
-    # and the drain judges every still-pending notice in one call. before and
-    # after on every row carry the full id sets.
-    _emit_directive_set_change(
-        judgment,
+    # step 7: ADR 0014 D1/D3 and issue #197: the reader change events. emit() writes one notice
+    # per (change id, item) and never a second, so a replay tells nobody twice.
+    _emit_directive_set_change_ids(
+        set(plan["previous_ids"]),
+        set(plan["new_ids"]),
         scope=scope,
         fleet=fleet,
         record_store=record_store,
-        previous_summary=previous_summary,
-        change_ids=change_ids,
-        hop=judgment.hop,
+        change_ids=plan["change_ids"],
+        hop=plan["hop"],
     )
-
-    # Issue #197, the context half: a contribution that supersedes an earlier
-    # one whose claim lived in CONTEXT moves no directive, so the diff above is
-    # silent about it — yet the scope's own readers relied on that claim and
-    # are owed the same `withdrawn` notice a published item's readers get.
-    # Directive supersessions are already covered by the directive-set diff.
     _emit_context_supersession_self_notices(
-        judged_contribution_ids,
+        plan["judged_ids"],
         scope=scope,
         record_store=record_store,
-        removed_directive_ids=set(judgment.removed_directive_ids),
-        change_ids=change_ids,
-        hop=judgment.hop,
+        removed_directive_ids=set(plan["removed_directive_ids"]),
+        change_ids=plan["change_ids"],
+        hop=plan["hop"],
     )
+
+
+def _record_suspect_intent_note(
+    record_store: RecordStore, *, scope_id: str, intent_id: str, expected: int, found: int
+) -> None:
+    """Leave an engine note in the scope's record, ``change-emission-failed`` style: it renders as
+    ``note`` and stays out of pending counts. Best-effort, and it names only ids and versions
+    (never the payload): the log line above is the whole record if even this fails."""
+    try:
+        record_store.append_contribution(
+            scope_id=scope_id,
+            content=(
+                f"[Amendment intent {intent_id} was not replayed: it expected summary version "
+                f"{expected} but the scope's summary is at version {found}, which cannot happen "
+                "under the scope lock. Whatever it would have written (a retirement row, a "
+                "withdrawal, a notice to readers) was NOT written by recovery. See "
+                "`strata doctor`.]"
+            ),
+            proposed_classification="context",
+            subject=ENGINE_NOTE_SUBJECT,
+            supersedes=None,
+            contributor=ContributorRef(
+                scope_id=scope_id,
+                skill="scope-manager",
+                session_id="amendment-recovery",
+                ts=datetime.now(tz=UTC).isoformat(),
+            ),
+        )
+    except Exception:  # noqa: BLE001 — the record itself is unreachable
+        _logger.exception("could not record the suspect intent note for %s", intent_id)
+
+
+def recover_all_amendment_intents(
+    *, fleet: FleetConfig, record_store: RecordStore, summary_store: SummaryStore
+) -> dict[str, list[str]]:
+    """Recover every scope's pending intents, each under its own scope lock (server start).
+    Returns ``{scope_id: [replayed intent ids]}`` for the scopes that replayed anything."""
+    done: dict[str, list[str]] = {}
+    for scope in fleet.scopes:
+        if not record_store.list_amendment_intents(scope_id=scope.id, state="pending"):
+            continue
+        with _scope_lock(scope.id):
+            replayed = recover_amendment_intents(
+                scope.id, fleet=fleet, record_store=record_store, summary_store=summary_store
+            )
+        if replayed:
+            done[scope.id] = replayed
+    return done
+
+
+def recover_amendment_intents(
+    scope_id: str,
+    *,
+    fleet: FleetConfig,
+    record_store: RecordStore,
+    summary_store: SummaryStore,
+) -> list[str]:
+    """Finish or abandon every pending amendment intent of *scope_id* (v1.22 P2).
+
+    The caller holds ``scope_lock(scope_id)`` (the drain, or server start), so no amendment is in
+    flight. The summary file is fsynced before it is renamed, so "the expected version is on disk"
+    is a yes/no fact:
+
+    - version == expected: the file was written, so replay the after-write steps from the payload
+      (idempotent) and mark the intent done;
+    - version < expected: the file was never written, so nothing was applied and nothing is owed;
+      the intent is abandoned and the contribution stays judged-but-unapplied, as before;
+    - version > expected: cannot happen under the lock. Do not replay; mark the intent suspect,
+      log it, and leave it for the operator (``strata doctor`` reports it).
+
+    Returns the ids of the intents it replayed."""
+    scope = fleet.get_scope(scope_id)
+    replayed: list[str] = []
+    for intent in record_store.list_amendment_intents(scope_id=scope_id, state="pending"):
+        summary = summary_store.read(scope_id)
+        version = summary.version if summary is not None else 0
+        if scope is None or version < intent.expected_version:
+            record_store.mark_amendment_intent(intent.id, "abandoned")
+        elif version == intent.expected_version:
+            plan = json.loads(intent.payload_json)
+            if plan.get("type") == "retire_act":
+                from strata.forgetting import apply_retire_effects  # noqa: PLC0415
+
+                apply_retire_effects(
+                    plan,
+                    scope_id=scope_id,
+                    fleet=fleet,
+                    record_store=record_store,
+                    summary_store=summary_store,
+                    intent_id=intent.id,
+                )
+            else:
+                _apply_amendment_effects(
+                    plan,
+                    scope=scope,
+                    fleet=fleet,
+                    record_store=record_store,
+                    summary_store=summary_store,
+                    written_version=version,
+                    intent_id=intent.id,
+                )
+            record_store.mark_amendment_intent(intent.id, "done")
+            replayed.append(intent.id)
+        else:
+            _logger.error(
+                "amendment intent %s for scope %r expected summary version %s but found %s; "
+                "not replayed",
+                intent.id,
+                scope_id,
+                intent.expected_version,
+                version,
+            )
+            record_store.mark_amendment_intent(intent.id, "suspect")
+            _record_suspect_intent_note(
+                record_store,
+                scope_id=scope_id,
+                intent_id=intent.id,
+                expected=intent.expected_version,
+                found=version,
+            )
+    return replayed
 
 
 def _emit_context_supersession_self_notices(
@@ -1492,8 +1967,29 @@ def _emit_directive_set_change(
     left and one per id that arrived, ids sorted so the order is fixed.
     """
     assert judgment.new_summary is not None  # noqa: S101 — caller-checked invariant
-    previous_ids = {d.id for d in previous_summary.directives} if previous_summary else set()
-    current_ids = {d.id for d in judgment.new_summary.directives}
+    _emit_directive_set_change_ids(
+        {d.id for d in previous_summary.directives} if previous_summary else set(),
+        {d.id for d in judgment.new_summary.directives},
+        scope=scope,
+        fleet=fleet,
+        record_store=record_store,
+        change_ids=change_ids,
+        hop=hop,
+    )
+
+
+def _emit_directive_set_change_ids(
+    previous_ids: set[str],
+    current_ids: set[str],
+    *,
+    scope: Scope,
+    fleet: FleetConfig,
+    record_store: RecordStore,
+    change_ids: Sequence[str],
+    hop: int = 0,
+) -> None:
+    """:func:`_emit_directive_set_change` over the two id sets, so an intent replay (which has
+    ids, not summaries) emits exactly what the writer would have."""
     removed = sorted(previous_ids - current_ids)
     added = sorted(current_ids - previous_ids)
     if not removed and not added:
@@ -1581,6 +2077,10 @@ def _judge_batch_and_record(
 
     The caller MUST hold ``_scope_lock(scope.id)``.
     """
+    # v1.20: see _judge_and_record. Idempotent, so a batch of one that takes that path sweeps twice.
+    sweep_date_lapses_locked(
+        scope.id, fleet=fleet, record_store=record_store, summary_store=summary_store
+    )
     wave_ids = list(dict.fromkeys(change_ids or ()))
     # A batch of ONE takes the single-contribution path verbatim (ADR 0011
     # D3) — unless it belongs to several waves. The single judgment shape
@@ -1710,6 +2210,18 @@ def _judge_batch_and_record(
     )
     if examined_context:
         batch_judge_kwargs["examined_context"] = examined_context
+    if inputs.current_summary is not None and lineage_offered(
+        inputs.current_summary.context, summary_max_words, mode=mode
+    ):
+        lineage_view = _resolve_lineage_view(
+            scope.id,
+            inputs.current_summary,
+            fleet=fleet,
+            record_store=record_store,
+            summary_store=summary_store,
+        )
+        if lineage_view and _takes_kwarg(scope_manager.judge_batch, "lineage_view"):
+            batch_judge_kwargs["lineage_view"] = lineage_view
     # Adoption link: each member's adopted proposal, keyed by the member's id —
     # the kwarg appears only when at least one member adopts.
     adopted_proposals = {
@@ -1749,33 +2261,73 @@ def _judge_batch_and_record(
         # its own contribution rather than someone else's.
         return _fail_batch(contributions, exc, record_store=record_store, outcome=JUDGE_FAILED)
 
+    # ADR 0018 (#126): at level 1 a member whose verdict reads as binding, or who owns an op
+    # that changes the directives, is HELD for the operator: its verdict is recorded verbatim
+    # with its own ops beside it, and the batch's one amendment is rebuilt without those ops.
+    held_ids = _batch_held_member_ids(batch, scope)
+
     # One judgment row per verdict, against its own contribution id, in
     # arrival order — the record's shape does not know this was a batch.
     for verdict in batch.verdicts:
         record_store.record_judgment(
+            held_payload=(
+                _held_member_payload(
+                    batch,
+                    verdict,
+                    inputs.current_summary.version if inputs.current_summary is not None else 0,
+                )
+                if verdict.contribution_id in held_ids
+                else None
+            ),
             contribution_id=verdict.contribution_id,
             decision=verdict.decision,
             judged_by="scope-manager",
             notes=batch.record_notes_for(verdict.contribution_id),
+            relations=_relation_rows(
+                scope_manager,
+                next(
+                    (
+                        o
+                        for o in batch.inherited_relations
+                        if o.get("contribution_id") == verdict.contribution_id
+                    ),
+                    None,
+                ),
+                next(
+                    (
+                        o
+                        for o in batch.directive_relations
+                        if o.get("contribution_id") == verdict.contribution_id
+                    ),
+                    None,
+                ),
+            ),
         )
 
+    amend = _batch_without_held(
+        batch,
+        held_ids,
+        scope=scope,
+        contributions=contributions,
+        current_summary=inputs.current_summary,
+    )
     summary_updated = False
-    if batch.accepted_verdicts and batch.new_summary is not None:
+    if amend.accepted_verdicts and amend.new_summary is not None:
         # Every op names the batch member that motivated it (ADR 0011 D3), so
         # each retirement's reason and each withdrawal's trigger come off the
         # op itself — the record never guesses which contribution meant it.
-        circumstances = batch.retirement_circumstances()
+        circumstances = amend.retirement_circumstances()
         retirements = [
             (
                 directive_id,
-                batch.verdict_reasoning(contribution_id or ""),
+                amend.verdict_reasoning(contribution_id or ""),
                 circumstances.get(directive_id),
             )
-            for directive_id, contribution_id in batch.directive_retirements()
+            for directive_id, contribution_id in amend.directive_retirements()
         ]
         removals = [
             (directive_id, contribution_id or "")
-            for directive_id, contribution_id in batch.directive_removals()
+            for directive_id, contribution_id in amend.directive_removals()
         ]
         # ADR 0017 P4: a coalesced drain is always the batch shape (D4's own note),
         # so the JUDGE's own withdraw_published, if it makes one, must still be
@@ -1789,7 +2341,7 @@ def _judge_batch_and_record(
             else None
         )
         _write_amendment(
-            batch,
+            amend,
             scope=scope,
             fleet=fleet,
             record_store=record_store,
@@ -1801,8 +2353,8 @@ def _judge_batch_and_record(
             # A withdraw_published verdict is submitted against the amendment
             # as a whole, so it carries every accepted member's reasoning
             # rather than a guess at which one meant it.
-            withdraw_reasoning=batch.batch_reasoning,
-            judged_contribution_ids=[v.contribution_id for v in batch.accepted_verdicts],
+            withdraw_reasoning=amend.batch_reasoning,
+            judged_contribution_ids=[v.contribution_id for v in amend.accepted_verdicts],
             withdraw_notice_kind=(
                 "claim_corrected" if batch_refresh_correction is not None else "withdrawn"
             ),
@@ -1831,12 +2383,81 @@ def _judge_batch_and_record(
             reasoning=verdict.reasoning,
             # A declined member did not update the summary, whatever its
             # batch-mates did — the same thing a single decline reports.
-            summary_updated=summary_updated and verdict.decision != "decline",
+            summary_updated=(
+                summary_updated
+                and verdict.decision != "decline"
+                and verdict.contribution_id not in held_ids
+            ),
             watermark_before=watermark_before,
             watermark_after=watermark_after,
         )
         for verdict in batch.verdicts
     ]
+
+
+def _batch_held_member_ids(batch: ScopeManagerBatchJudgment, scope: Scope) -> set[str]:
+    """The batch members a review scope HOLDS (ADR 0018): empty below level 1."""
+    if scope.human_review < 1:
+        return set()
+    accepted = [v for v in batch.verdicts if v.decision != "decline"]
+    if not accepted:
+        return set()
+    held: set[str] = set()
+    for verdict in accepted:
+        if verdict.decision == "accept_as_directive":
+            held.add(verdict.contribution_id)
+    for op in batch.directive_ops:
+        if op.op in _REVIEW_HELD_OPS:
+            # an op that names no member belongs to the first accepted one
+            held.add(op.contribution_id or accepted[0].contribution_id)
+    return held & {v.contribution_id for v in accepted}
+
+
+def _held_member_payload(
+    batch: ScopeManagerBatchJudgment, verdict: BatchVerdict, summary_version: int
+) -> str:
+    """The judge's answer for one held batch member, shaped like a single judgment so that an
+    approval applies it through the same path: its own verdict and its own ops."""
+    accepted = [v for v in batch.verdicts if v.decision != "decline"]
+    first = accepted[0].contribution_id if accepted else None
+    ops = [
+        op for op in batch.directive_ops if (op.contribution_id or first) == verdict.contribution_id
+    ]
+    held = ScopeManagerJudgment(
+        decision=verdict.decision,
+        reasoning=verdict.reasoning,
+        directive_ops=ops,
+        new_context=None,
+        new_summary=batch.new_summary if ops else None,
+    )
+    return encode_held(held.model_dump_json(), summary_version)
+
+
+def _batch_without_held(
+    batch: ScopeManagerBatchJudgment,
+    held_ids: set[str],
+    *,
+    scope: Scope,
+    contributions: Sequence[Contribution],
+    current_summary: ScopeSummary | None,
+) -> ScopeManagerBatchJudgment:
+    """The batch as the AMENDMENT sees it: held members' verdicts and ops removed, the one new
+    summary rebuilt from what is left. Unchanged when nothing is held."""
+    if not held_ids:
+        return batch
+    first = next((v.contribution_id for v in batch.verdicts if v.decision != "decline"), None)
+    kept_ops = [op for op in batch.directive_ops if (op.contribution_id or first) not in held_ids]
+    kept_verdicts = [v for v in batch.verdicts if v.contribution_id not in held_ids]
+    update: dict = {"directive_ops": kept_ops, "verdicts": kept_verdicts}
+    if batch.new_summary is not None and any(v.decision != "decline" for v in kept_verdicts):
+        update["new_summary"] = _apply_batch_amendment(
+            scope=scope,
+            current_summary=current_summary,
+            contributions={c.id: c for c in contributions},
+            ops=kept_ops,
+            new_context=batch.new_context,
+        )
+    return batch.model_copy(update=update)
 
 
 def _fail_batch(
@@ -1970,7 +2591,7 @@ def validate_acted_on(
             "layer inside your own perspective — never as its own record or "
             "perspective target."
         )
-    if entry.judgment is None or entry.judgment.decision not in ACCEPTED_DECISIONS:
+    if entry.judgment is None or not verdict_admits(entry.judgment.decision):
         raise RuntimeError(
             f"acted_on={acted_on!r} references a contribution that was never admitted "
             "into memory (it was declined, or has no verdict yet) — you can only report "
@@ -2084,6 +2705,8 @@ def run_contribution(
     queue_timeout_s: float = QUEUE_WAIT_TIMEOUT_S,
     acted_on: str | None = None,
     adopted_from: str | None = None,
+    ends: Mapping[str, object] | None = None,
+    fulfils: str | None = None,
 ) -> ContributionOutcome:
     """Append a contribution to the record and get it judged (ADR 0011 D3).
 
@@ -2122,6 +2745,14 @@ def run_contribution(
         raise ValueError("acted_on and supersedes cannot both be set on one contribution.")
     if adopted_from is not None and acted_on is not None:
         raise ValueError("adopted_from and acted_on cannot both be set on one contribution.")
+    # v1.20: an end condition for the directive this contribution creates, and the id of a
+    # judged-condition directive it is evidence for. Both are checked here, before anything is
+    # appended; neither decides anything by itself.
+    end_condition = validate_ends(ends)
+    if end_condition is not None and proposed_classification != "directive":
+        raise ValueError("ends is only meaningful on a contribution that proposes a directive.")
+    if fulfils is not None:
+        validate_fulfils(fulfils, contributor, fleet=fleet, summary_store=summary_store)
     # ADR 0017 P5: the API keeps ONE `acted_on` field; the app resolves which
     # storage column the id belongs in. Ids are minted so this dispatch is
     # unambiguous and never needs a lookup: contribution ids are `c_`-prefixed,
@@ -2140,6 +2771,8 @@ def run_contribution(
             acted_on=None if is_operator_target else acted_on,
             acted_on_operator_item=acted_on if is_operator_target else None,
             adopted_from=adopted_from,
+            ends=end_condition.model_dump_json() if end_condition is not None else None,
+            fulfils=fulfils,
         )
         ticket = queue.enqueue(contribution.id, contribution)
 
@@ -2704,6 +3337,12 @@ def drain_scope(
             outcomes=[],
         )
     try:
+        # v1.22 P2: finish what a death between a summary write and its after-write steps left
+        # pending. We hold the scope lock here (a drain that could not get it returned above,
+        # so a replay is deferred, never waited on).
+        recover_amendment_intents(
+            scope.id, fleet=fleet, record_store=record_store, summary_store=summary_store
+        )
         # ADR 0015 D5, first and once: a legacy spliced row still sitting in
         # this scope's summary would otherwise land in the sweep's surviving
         # set below and keep an un-anchored item alive after its directive was
@@ -3104,7 +3743,9 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
     # -----------------------------------------------------------------------
 
     @application.get("/scopes")
-    def list_scopes_endpoint(request: Request) -> dict:
+    def list_scopes_endpoint(
+        request: Request, summary_store: SummaryStore = Depends(get_summary_store)
+    ) -> dict:
         """Return active scopes and strata from the in-memory FleetConfig.
 
         ``fleet_file_warning`` (Feature A, lazy reload — ADR 0002 addendum)
@@ -3129,7 +3770,7 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
 
         return {
             "strata": [s.model_dump() for s in fleet.strata],
-            "scopes": [s.model_dump() for s in active],
+            "scopes": [_scope_with_description_fields(s, summary_store) for s in active],
             # ``kind`` (ADR 0010) tells a client which edges bind: a chain
             # edge always runs child→parent after load canonicalization, a
             # reference edge always runs referencer→referenced.
@@ -3398,6 +4039,116 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
         return judge_usage_report(paths.db_path, since=since, scope_id=scope_id)
 
     # -----------------------------------------------------------------------
+    # GET /review/held: read-only (ADR 0018 D4). The held count, the age of the oldest, and each
+    # held item across scopes. There is no write route for review; approve and reject are CLI only.
+    # -----------------------------------------------------------------------
+
+    @application.get("/review/held")
+    def get_review_held(
+        scope_id: str | None = None,
+        record_store: RecordStore = Depends(get_record_store),
+    ) -> dict:
+        """Every item a review scope is holding for the operator. Nothing here is written."""
+        from strata.review import list_held  # noqa: PLC0415
+
+        listing = list_held(record_store=record_store, scope_id=scope_id)
+        return {
+            "count": listing.count,
+            "oldest_age_seconds": listing.oldest_age_seconds,
+            "items": [
+                {
+                    "id": item.id,
+                    "kind": item.kind,
+                    "scope_id": item.scope_id,
+                    "held_at": item.held_at,
+                    "content": item.summary,
+                    "label": "held for the operator",
+                    "requester": item.requester,
+                }
+                for item in listing.items
+            ],
+        }
+
+    # -----------------------------------------------------------------------
+    # Forgetting peripherals (v1.20). Read-only except the operator dismiss.
+    # POST /contribute is unchanged: no ends or fulfils on that body.
+    # -----------------------------------------------------------------------
+
+    @application.get("/scopes/{scope_id}/retirement-candidates")
+    def get_scope_retirement_candidates(
+        scope_id: str,
+        request: Request,
+        record_store: RecordStore = Depends(get_record_store),
+    ) -> dict:
+        """Open scope candidates. Operator items are left out. No dismiss here."""
+        from strata.forgetting_surface import present_candidate  # noqa: PLC0415
+
+        fleet: FleetConfig = request.app.state.fleet_reloader.get()
+        if fleet.get_scope(scope_id) is None:
+            raise HTTPException(status_code=404, detail=f"Scope not found: {scope_id!r}")
+        rows = record_store.list_retirement_candidates(scope_id=scope_id, states=("open",))
+        visible = [present_candidate(row) for row in rows if not row.directive_id.startswith("op_")]
+        return {"candidates": visible}
+
+    @application.get("/operator/retirement-candidates")
+    def get_operator_retirement_candidates(
+        request: Request,
+        scope_id: str | None = None,
+        record_store: RecordStore = Depends(get_record_store),
+    ) -> dict:
+        """Open candidates on operator items. The operator dismisses these."""
+        from strata.forgetting import operator_candidates  # noqa: PLC0415
+        from strata.forgetting_surface import present_candidate  # noqa: PLC0415
+
+        fleet: FleetConfig = request.app.state.fleet_reloader.get()
+        if scope_id is not None and fleet.get_scope(scope_id) is None:
+            raise HTTPException(status_code=404, detail=f"Scope not found: {scope_id!r}")
+        rows = operator_candidates(record_store, scope_id=scope_id)
+        return {"candidates": [present_candidate(row) for row in rows]}
+
+    @application.post("/operator/retirement-candidates/{candidate_id}/dismiss")
+    def post_dismiss_operator_candidate(
+        candidate_id: str,
+        body: DismissCandidateRequest,
+        record_store: RecordStore = Depends(get_record_store),
+    ) -> dict:
+        """Snooze one operator-item candidate. Days outside 1..365 never reach the engine."""
+        from strata.forgetting import dismiss_operator_candidate  # noqa: PLC0415
+        from strata.forgetting_surface import reject_dismiss_days  # noqa: PLC0415
+
+        try:
+            days = reject_dismiss_days(body.days)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        try:
+            dismiss_operator_candidate(
+                candidate_id,
+                reason=body.reason,
+                days=days,
+                record_store=record_store,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return {"candidate_id": candidate_id, "dismissed": True}
+
+    @application.get("/forgetting-metrics")
+    def get_forgetting_metrics(
+        request: Request,
+        scope_id: str | None = None,
+        record_store: RecordStore = Depends(get_record_store),
+    ) -> dict:
+        """Scope forgetting counts. The body says operator items are not counted."""
+        from strata.forgetting_surface import forgetting_metrics  # noqa: PLC0415
+
+        fleet: FleetConfig = request.app.state.fleet_reloader.get()
+        if scope_id is not None and fleet.get_scope(scope_id) is None:
+            raise HTTPException(status_code=404, detail=f"Scope not found: {scope_id!r}")
+        scope_ids = [scope.id for scope in fleet.active_scopes()]
+        return forgetting_metrics(record_store, scope_ids=scope_ids, scope_id=scope_id)
+
+    # -----------------------------------------------------------------------
     # GET /staleness
     # -----------------------------------------------------------------------
 
@@ -3573,6 +4324,11 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
         if scope is None:
             raise HTTPException(status_code=404, detail=f"Scope not found: {scope_id!r}")
 
+        # v1.20: what an agent would read has already lapsed any date end condition that is over.
+        sweep_for_read(
+            scope_id, fleet=fleet, record_store=record_store, summary_store=summary_store
+        )
+
         def _operator_reader(attachment_scope_id: str) -> list:
             return read_operator_layer(
                 attachment_scope_id, summaries_dir=str(summary_store.summaries_dir)
@@ -3601,6 +4357,8 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
                 operator_reader=_operator_reader,
                 publication_reader=_publication_reader,
                 change_event_reader=_change_event_reader,
+                # ADR 0018 D6: the operator sees exactly what the agent sees, held items included.
+                review_reader=lambda target: perspective_notes(target, record_store=record_store),
             )
         except ValueError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc

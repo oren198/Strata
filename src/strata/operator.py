@@ -53,8 +53,9 @@ from __future__ import annotations
 
 import os
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Literal
 
@@ -62,6 +63,7 @@ import yaml
 
 from strata.change_events import emit as emit_change_event
 from strata.fleet_config import FleetConfig
+from strata.forgetting import validate_ends
 from strata.locks import scope_lock
 from strata.publication import propagate_directive_removals
 from strata.record_store import (
@@ -71,7 +73,13 @@ from strata.record_store import (
     RecordStore,
     Retirement,
 )
-from strata.summary_store import Directive, SummaryStore
+from strata.summary_store import (
+    Directive,
+    EndCondition,
+    SummaryStore,
+    ends_line,
+    parse_ends_line,
+)
 
 # ---------------------------------------------------------------------------
 # Models
@@ -94,6 +102,11 @@ class OperatorItem:
     content: str
     subject: str | None
     created_at: str
+    end_condition: EndCondition | None = None
+    """The end condition the operator wrote into the item when it published it (v1.20), or
+    ``None``. Rendered as one ``- ends:`` line only when set."""
+    set_by: str | None = None
+    """The id of the act that wrote :attr:`end_condition`."""
 
 
 # ---------------------------------------------------------------------------
@@ -149,6 +162,9 @@ def _render_operator_layer(scope_id: str, items: list[OperatorItem]) -> str:
             subject_value = item.subject if item.subject is not None else ""
             lines.append(f"- subject: {subject_value}")
             lines.append(f"- created_at: {item.created_at}")
+            ends = ends_line(item.end_condition, item.set_by)
+            if ends is not None:
+                lines.append(ends)
             lines.append("")
             # Blockquote every line, verbatim, so multi-line content round-trips
             # exactly instead of being flattened or truncated (mirrors
@@ -174,10 +190,13 @@ def _parse_operator_layer(text: str) -> list[OperatorItem]:
     cur_kind: str | None = None
     cur_subject: str | None = None
     cur_created_at: str | None = None
+    cur_end: EndCondition | None = None
+    cur_set_by: str | None = None
     cur_blockquote_lines: list[str] = []
 
     def _flush() -> None:
         nonlocal cur_id, cur_kind, cur_subject, cur_created_at, cur_blockquote_lines
+        nonlocal cur_end, cur_set_by
         if cur_id is None:
             return
         items.append(
@@ -187,12 +206,16 @@ def _parse_operator_layer(text: str) -> list[OperatorItem]:
                 content="\n".join(cur_blockquote_lines),
                 subject=cur_subject if cur_subject else None,
                 created_at=cur_created_at or "",
+                end_condition=cur_end,
+                set_by=cur_set_by,
             )
         )
         cur_id = None
         cur_kind = None
         cur_subject = None
         cur_created_at = None
+        cur_end = None
+        cur_set_by = None
         cur_blockquote_lines = []
 
     for raw_line in body.splitlines():
@@ -218,6 +241,11 @@ def _parse_operator_layer(text: str) -> list[OperatorItem]:
         m_created = _CREATED_AT_LINE_RE.match(line)
         if m_created:
             cur_created_at = m_created.group(1).strip()
+            continue
+
+        parsed_ends = parse_ends_line(line)
+        if parsed_ends is not None:
+            cur_end, cur_set_by = parsed_ends
             continue
 
         m_bq = _BLOCKQUOTE_RE.match(line)
@@ -388,6 +416,7 @@ def operator_publish(
     record_store: RecordStore,
     summaries_dir: str,
     fleet: FleetConfig | None = None,
+    ends: Mapping[str, object] | None = None,
 ) -> OperatorItem:
     """Publish a new piece of operator memory attached at *target_scope_id*.
 
@@ -412,15 +441,20 @@ def operator_publish(
         fleet: Read to name the scopes this write affects (ADR 0014 D3 — the
             attachment scope and its subtree). Optional: when omitted it is
             read from beside *record_store* (see :func:`_resolve_operator_fleet`).
+        ends: Optional end condition (v1.20): ``{"until": "YYYY-MM-DD"}`` or
+            ``{"when": "<text>"}``, validated by :func:`strata.forgetting.validate_ends`.
+            Only the operator, when it writes the item, can set one.
 
     Raises:
         OperatorFleetUnresolved: *fleet* is omitted and none is beside the store;
             nothing is written.
+        ValueError: *ends* is not a valid end condition; nothing is written.
 
     Returns:
         The newly published :class:`OperatorItem` (``kind="directive"``).
     """
     fleet = _resolve_operator_fleet(fleet, record_store)  # before any write
+    end_condition = validate_ends(ends)
     with scope_lock(_operator_layer_lock_key(target_scope_id)):
         act = record_store.append_operator_act(
             act="publish",
@@ -429,12 +463,16 @@ def operator_publish(
             content=content,
             subject=subject,
         )
+        if end_condition is not None:
+            record_store.set_operator_act_forgetting(act.id, ends=end_condition.model_dump_json())
         item = OperatorItem(
             id=act.id,
             kind="directive",
             content=content,
             subject=subject,
             created_at=act.created_at,
+            end_condition=end_condition,
+            set_by=act.id if end_condition is not None else None,
         )
         items = read_operator_layer(target_scope_id, summaries_dir=summaries_dir)
         items.append(item)
@@ -459,6 +497,7 @@ def operator_supersede_item(
     record_store: RecordStore,
     summaries_dir: str,
     fleet: FleetConfig | None = None,
+    ends: Mapping[str, object] | None = None,
 ) -> OperatorItem:
     """Supersede an existing operator item attached at *target_scope_id*.
 
@@ -478,6 +517,7 @@ def operator_supersede_item(
     Args:
         target_scope_id: The attachment scope the item lives at.
         item_id: The ``op_``-prefixed id of the operator item being replaced.
+        ends: Optional end condition for the replacement (see :func:`operator_publish`).
         content: Verbatim replacement content.
         subject: Optional short subject line for the replacement; defaults
             to the superseded item's subject when omitted.
@@ -496,6 +536,7 @@ def operator_supersede_item(
             instead of superseding it.
     """
     fleet = _resolve_operator_fleet(fleet, record_store)  # before any write
+    end_condition = validate_ends(ends)  # a replacement may carry its own; it never inherits one
     with scope_lock(_operator_layer_lock_key(target_scope_id)):
         items = read_operator_layer(target_scope_id, summaries_dir=summaries_dir)
         index = next((i for i, it in enumerate(items) if it.id == item_id), None)
@@ -520,12 +561,16 @@ def operator_supersede_item(
             subject=effective_subject,
             supersedes=item_id,
         )
+        if end_condition is not None:
+            record_store.set_operator_act_forgetting(act.id, ends=end_condition.model_dump_json())
         new_item = OperatorItem(
             id=act.id,
             kind="directive",
             content=content,
             subject=effective_subject,
             created_at=act.created_at,
+            end_condition=end_condition,
+            set_by=act.id if end_condition is not None else None,
         )
         items[index] = new_item
         _write_operator_layer(target_scope_id, items, summaries_dir=summaries_dir)
@@ -547,6 +592,8 @@ def operator_retire_item(
     record_store: RecordStore,
     summaries_dir: str,
     fleet: FleetConfig | None = None,
+    kind: str | None = None,
+    notice: str | None = None,
 ) -> OperatorAct:
     """Retire an operator item attached at *target_scope_id* without replacement.
 
@@ -556,12 +603,19 @@ def operator_retire_item(
     matching :func:`operator_retire`'s scope-level counterpart. Not judged
     (ADR 0008 D1).
 
+    v1.20: pass *kind* (``"currency"``, a release, or ``"correction"``, a retraction) and a
+    *notice* and the act is a forgetting act: readers are told which, and why, through the
+    ordinary change event. They go together. An operator confirms its OWN judged end
+    condition by retiring the item here; nobody else can retire an operator item. Neither
+    given keeps the plain retire, with no notice, as before.
+
     Args:
         target_scope_id: The attachment scope the item lives at.
         item_id: The ``op_``-prefixed id of the operator item being retired.
         fleet: Optional; read to name the scopes this write affects (ADR 0014 D3). When
             omitted it is read from beside *record_store* (see
             :func:`_resolve_operator_fleet`).
+        kind, notice: Release or retraction, and the notice readers get. Both or neither.
 
     Returns:
         The ``retire`` :class:`~strata.record_store.OperatorAct`.
@@ -570,34 +624,124 @@ def operator_retire_item(
         OperatorFleetUnresolved: *fleet* is omitted and none is beside the store;
             nothing is written.
         KeyError: *item_id* is not in *target_scope_id*'s current operator layer.
+        ValueError: only one of *kind* and *notice* given, an unknown kind, or a blank notice.
     """
+    if (kind is None) != (notice is None):
+        raise ValueError("kind and notice go together: give both or neither.")
+    if kind is not None:
+        if kind not in ("currency", "correction"):
+            raise ValueError(f"kind must be 'currency' or 'correction', got {kind!r}.")
+        if not notice or not notice.strip():
+            raise ValueError("A retirement needs a notice of at least one sentence.")
     fleet = _resolve_operator_fleet(fleet, record_store)  # before any write
     with scope_lock(_operator_layer_lock_key(target_scope_id)):
-        items = read_operator_layer(target_scope_id, summaries_dir=summaries_dir)
-        retired = next((it for it in items if it.id == item_id), None)
-        if retired is None:
-            raise KeyError(
-                f"Operator item {item_id!r} not found in the operator layer attached at "
-                f"{target_scope_id!r}."
-            )
-        act = record_store.append_operator_act(
-            act="retire",
-            target_scope_id=target_scope_id,
-            kind=None,
-            content=None,
-            retires=item_id,
-        )
-        remaining = [it for it in items if it.id != item_id]
-        _write_operator_layer(target_scope_id, remaining, summaries_dir=summaries_dir)
-        _emit_operator_layer_change(
-            fleet,
+        return _operator_retire_locked(
+            target_scope_id,
+            item_id,
+            kind=kind,
+            notice=notice,
+            actor_session_id="operator" if kind is not None else None,
+            cause="act" if kind is not None else None,
+            fleet=fleet,
             record_store=record_store,
-            target_scope_id=target_scope_id,
-            item_id=item_id,
-            before=retired.content,
-            after=None,
+            summaries_dir=summaries_dir,
         )
-        return act
+
+
+def _operator_retire_locked(
+    target_scope_id: str,
+    item_id: str,
+    *,
+    kind: str | None,
+    notice: str | None,
+    actor_session_id: str | None,
+    cause: str | None,
+    fleet: FleetConfig,
+    record_store: RecordStore,
+    summaries_dir: str,
+) -> OperatorAct:
+    """The retire itself. PRIVATE: the caller holds the operator-layer lock. ``cause`` other
+    than ``"act"`` is only ever set by :func:`sweep_operator_date_lapses`."""
+    items = read_operator_layer(target_scope_id, summaries_dir=summaries_dir)
+    retired = next((it for it in items if it.id == item_id), None)
+    if retired is None:
+        raise KeyError(
+            f"Operator item {item_id!r} not found in the operator layer attached at "
+            f"{target_scope_id!r}."
+        )
+    act = record_store.append_operator_act(
+        act="retire",
+        target_scope_id=target_scope_id,
+        kind=None,
+        content=None,
+        retires=item_id,
+    )
+    if kind is not None:
+        record_store.set_operator_act_forgetting(
+            act.id, kind=kind, notice=notice, cause=cause, actor_session_id=actor_session_id
+        )
+    remaining = [it for it in items if it.id != item_id]
+    _write_operator_layer(target_scope_id, remaining, summaries_dir=summaries_dir)
+    _emit_operator_layer_change(
+        fleet,
+        record_store=record_store,
+        target_scope_id=target_scope_id,
+        item_id=item_id,
+        before=retired.content,
+        after=None,
+    )
+    return act
+
+
+def sweep_operator_date_lapses(
+    target_scope_id: str,
+    *,
+    record_store: RecordStore,
+    summaries_dir: str,
+    fleet: FleetConfig | None = None,
+    now: datetime | None = None,
+) -> list[OperatorAct]:
+    """Retire every operator item attached at *target_scope_id* whose date end condition is
+    over (``until`` is inclusive through 23:59:59 UTC). No judge call, idempotent.
+
+    Reads the layer first and takes the operator-layer lock only when something is due."""
+    today = (now or datetime.now(tz=UTC)).astimezone(UTC).date()
+
+    def _due() -> list[OperatorItem]:
+        out = []
+        for it in read_operator_layer(target_scope_id, summaries_dir=summaries_dir):
+            end = it.end_condition
+            if end is not None and end.kind == "date" and end.until:
+                try:
+                    if date.fromisoformat(end.until) < today:
+                        out.append(it)
+                except ValueError:
+                    continue
+        return out
+
+    if not _due():
+        return []
+    fleet = _resolve_operator_fleet(fleet, record_store)
+    done: list[OperatorAct] = []
+    with scope_lock(_operator_layer_lock_key(target_scope_id)):
+        for it in _due():
+            done.append(
+                _operator_retire_locked(
+                    target_scope_id,
+                    it.id,
+                    kind="currency",
+                    notice=(
+                        f"end condition set by {it.set_by or 'the operator'}: "
+                        f"bound until {it.end_condition.until}."  # type: ignore[union-attr]
+                    ),
+                    actor_session_id="engine",
+                    cause="date_lapse",
+                    fleet=fleet,
+                    record_store=record_store,
+                    summaries_dir=summaries_dir,
+                )
+            )
+    return done
 
 
 # ---------------------------------------------------------------------------

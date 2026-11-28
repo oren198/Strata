@@ -191,13 +191,15 @@ see [Binding past one scope](#binding-past-one-scope).
 
 Give each scope a one-line `description:` in `fleet.yaml` — what its memory is for.
 The judge measures relevance against it: material "outside this scope's stated
-purpose" is declined, and the decline reason quotes the purpose. Without a
-description the judge may use what the scope already holds as an implied purpose,
-but only once there is enough of it to tell what the scope is about (about 50 words
-of summary and directives; `STRATA_IMPLIED_PURPOSE_MIN_WORDS`); a scope with an
-empty summary is judged exactly as before, with no relevance rule at all. `strata
-doctor` warns once per scope that has no description, and the Console shows it in
-the scope header ("no description" when unset).
+purpose" is declined, and the decline reason quotes the purpose. A scope with no
+description of its own is not judged for relevance at all: it declines nothing as
+irrelevant, whatever its memory or its ancestors say. A scope's own memory is not
+used as an implied purpose to decline (it was circular: what a scope holds would
+decide what may enter it). `strata doctor` warns once per scope with no description
+of its own, and when the scope already holds enough memory (about 50 words,
+`STRATA_IMPLIED_PURPOSE_MIN_WORDS`) it says "no description; your scope's memory
+suggests: …". That suggestion is report-only: nothing is declined or written from
+it. The Console shows the same in the scope header ("no description" when unset).
 
 ### 6. Two terminals, same project
 
@@ -548,6 +550,18 @@ skips all of this and is used as-is. (Reused pids are an edge case for any
 pid-derived id; a new connection that finds a record from an earlier server pid
 archives it and starts fresh.)
 
+**`/mcp reconnect` keeps the session and its binding.** A reconnect restarts the MCP server
+but not the harness. With the automatic session id, the server recognises the same harness
+process (its pid and start time), keeps one session record (counting the reconnect), and
+restores the scope and skill you confirmed with `strata_bind`, after checking them again
+against the current `fleet.yaml` exactly as `strata_bind` would. If that scope was removed
+or the skill is no longer permitted, the session comes up unbound and says why. A restored binding is announced once, as `binding_notice` on the first
+`strata_read_perspective` (or `strata_bind`) reply: scope, skill and when you confirmed it. The saved
+binding is `.strata/sessions/<id>.binding` (mode 0600; deleted after 30 days unused). An
+explicit `STRATA_AGENT_SESSION_ID` turns this off (nothing saved, nothing restored, a new
+connection starts a fresh session), and so does Windows, which has no readable process start
+time.
+
 **Windows: session-state counters are not cross-process locked.** The MCP server
 and the detached evaluator both read-modify-write the same `.strata/sessions/`
 state file. On POSIX each update takes an advisory `fcntl.flock` on a
@@ -801,6 +815,94 @@ has a shared local app-server daemon behind `codex agents` — sessions started
 through it were not exercised); pid reuse across long gaps (the existing
 caveat on `sess_auto_<pid>` ids).
 
+### Using Strata with Hermes Agent (the `strata` memory provider)
+
+A [Hermes Agent](https://github.com/NousResearch/hermes-agent) profile can be an agent on a Strata
+scope, next to a Claude Code session. The provider is a Hermes *directory plugin* named `strata`
+that lives in this repository (`integrations/hermes/plugin/strata`). It is not a Python package: it
+is not on PyPI and is not part of the `strata-mem` package, and nothing is installed into Hermes's
+own Python environment.
+
+**What was tested (2026-11-28).** Hermes Agent v0.23.3 (`caafe538`) installed with Hermes's official
+installer (a standard install: all extras, so Hermes's own `mcp` is 2.3.0), on Linux/WSL2, with
+*named* profiles and an existing Strata project (a new user runs `strata register` first, below). A
+Claude Code session and a Hermes profile shared one scope: each admitted contribution was visible
+to the other harness verbatim, with its provenance. The plugin took 1 command to install, or 2 with
+lazy installs off. Two things differed from what you will run: the test installed the plugin from a
+`file://` clone of this same tree rather than the GitHub address below, and, because 1.22.0 was not
+yet published, Hermes's package manager took the identical 1.22.0 wheel from a local index instead of
+PyPI. The GitHub address form was checked separately, at a pinned commit (plugin install only); the
+plain command, which installs from the repository's default branch, is checked after the merge, and
+the first use with the engine from PyPI after publishing. Other Hermes versions, the default
+profile, other operating systems, Windows, and service installs of the gateway were not tested, and
+nothing is claimed for them.
+
+**Install: one command.**
+
+1. Register a Strata project (`strata register`, in a folder that is not the Strata repository)
+   whose fleet has the scope you want the profile to act as, and set the project's judge key as in
+   [step 4](#4-set-your-judge-api-key).
+2. Install the plugin into the profile:
+
+   ```
+   hermes -p <profile> plugins install https://github.com/oren198/Strata#integrations/hermes/plugin/strata
+   ```
+
+   (This installs from the repository's default branch.)
+
+   Hermes asks for the scope
+   (`STRATA_AGENT_SCOPE`), the project folder (`STRATA_PROJECT_DIR`), an optional skill and an
+   optional judge key, saves the answers in the profile's own `.env`, and asks "Use 'strata' as the
+   memory provider now?". Answer `y`.
+
+That is all. The Strata engine (`strata-mem` 1.22.0, pinned exactly) is downloaded from PyPI the
+first time the profile starts a chat, by Hermes's own package manager into a side environment under
+the profile's Hermes home, so it never meets Hermes's own `mcp`. The first chat is slower for that
+reason: in the test it took 35 s with the engine download included (the Hermes installer itself took
+248 s).
+
+**If your Hermes has lazy installs off** (`security.allow_lazy_installs: false`), the provider says
+so in `hermes -p <profile> memory status` ("engine: not installed ... run `hermes memory setup
+strata`"), and one more command installs the engine and activates the provider:
+
+```
+hermes -p <profile> memory setup strata
+```
+
+Check either way with `hermes -p <profile> memory status`: it shows `Provider: strata` and an
+available status.
+
+**What it does on your machine.**
+
+- It starts one subprocess, the Strata engine (`strata-mcp`), when a chat starts and stops it when
+  the chat ends. The engine keeps its store in the Strata project folder you chose.
+- The engine sends each contribution to the judge provider your Strata project is configured for;
+  the first chat also downloads `strata-mem` through Hermes's package manager. The plugin makes no
+  other network calls and sends no telemetry.
+- The judge key is either in the Strata project's `.env` (only the engine reads it) or, if you
+  gave one at install, in the profile's `.env` (read through Hermes's secret scope and passed only
+  into the engine process). The plugin never reads a `.env` file itself.
+
+**Durability and isolation.** After `hermes pm repair` (which rebuilds Hermes's own environment) the
+same engine was still found and the provider was still available. For `hermes update` only Hermes's
+own guarantee is quoted: "`HERMES_HOME/plugins/` survives `hermes update` ... the updater only
+rebuilds the venv and the checkout, never the home directory" (Hermes developer guide, plugins); a
+`hermes update` was not run in the test. With `plugins.isolation: host` the provider worked in the
+test run (a chat read the other harness's item); that is reported, not a guarantee.
+
+**Limits:**
+
+- **No turn-end write-back nudge.** In Claude Code, Strata can stop a session that has read memory
+  and written nothing and ask it to contribute. None occurred in Hermes. A Hermes agent contributes
+  when it chooses to.
+- **Chats served through one gateway are one Strata session.** Two chats on one Hermes gateway
+  were recorded under the same Strata session id (measured 2026-11-27).
+- Anything the test did not measure (for example long sessions, several profiles on one scope, or
+  the write-back counters) is not claimed.
+
+More detail, including the error codes the provider returns, is in
+[`integrations/hermes/plugin/strata/README.md`](integrations/hermes/plugin/strata/README.md).
+
 ### Undoing it: `strata unregister`
 
 `strata unregister` reverses register's wiring. Like register, it is strictly
@@ -892,11 +994,53 @@ shows the same numbers.
 
 ```bash
 strata doctor                                    # diagnose config/DB/fleet/wiring/binding, offline
+strata judge-check                               # measure the configured judge against the frozen set
 strata migrate                                  # apply pending SQLite migrations only
 strata bootstrap --config path/to/fleet.yaml    # validate a fleet YAML (no DB writes)
 strata start --reload                           # uvicorn auto-reload (dev mode)
 strata start --port 8001                        # serve on a different port
 ```
+
+### `strata judge-check`
+
+`strata judge-check` tests the judge this install is set up to use. It runs the bundled judge-check set (v1) through the engine and compares each decision with the right answer stored for that item. It does not change your project.
+
+The set is public, which shapes what a pass means:
+
+> "the public set will be tuned against; a pass shows the model meets this set, not that it is good in general."
+
+**What the bar is.** The pass bars in this build come from running `qwen/qwen3-235b-a22b-2507` on Parasail 5 times on the frozen set. Your run is compared with those bars. The verdict line is printed in the engine's own words.
+
+**What it does not measure.** Version 1 does not test whether the judge's stated reasons are honest, apart from one pattern check: a reason that opens "Hearsay:" on an item whose text records no telling act. Counted with a cue list known to miss some forms of reported speech; read it as an upper bound, not a measured error rate. Nothing wider than that is measured. A context note cannot retire a directive (the engine drops its ops), so that case is not tested either.
+
+**Cost.** Before it runs, the command prints a cost estimate and asks `y/N`. `--yes` skips the question.
+
+- `--price IN,OUT` sets the price in dollars per million tokens, input and output. It wins over the provider's listed price. On OpenRouter, the listed price is the pinned provider's endpoint, or the most expensive endpoint when no provider is pinned.
+- If no price is known, the command prints the engine's message and does not run.
+- `--max-usd` is a hard spending cap during the run. If the cap stops the run, the verdict is "incomplete".
+- If the provider answers any call of a judgment with 429 (rate limited), that judgment is not scored, and the verdict is "incomplete, re-run" with exit code 2.
+
+**Exit codes:**
+
+| Code | Meaning |
+|---|---|
+| `0` | meets the bar |
+| `1` | does not meet the bar |
+| `2` | incomplete or unmeasured |
+| `3` | refused: no price, a tampered set, a config error, or you answered no at the prompt |
+
+**The report** records the model, the provider and the host part of the base URL. It never records the API key, the full base URL or a query string.
+
+**In `strata doctor`.** Doctor shows one line about the judge-check report saved for this engine version. It reads that report and never runs the judge itself. The line never changes doctor's exit status. It has one of six forms, and doctor never shows one form in place of another:
+
+| Doctor shows | When |
+|---|---|
+| meets the v1 bar (report \<date\>) | the saved report meets the bar |
+| does not meet (\<failed legs\>) | the saved report misses the bar; the line names the parts that failed |
+| incomplete (report \<date\>); re-run | the saved run stopped before it finished |
+| report not understood (report \<date\>); re-run | a report is saved, but doctor can't interpret it |
+| could not read the report (\<ExceptionClass\>) | the report file exists, but doctor can't read it |
+| unmeasured for this engine version | no report is saved for this engine version, or this build has no reference bars |
 
 ### Fleet structure changes
 
@@ -1168,6 +1312,63 @@ the contributor's position comes from the session's binding. The HTTP API takes
 position. That API is for local use and the Console (see SECURITY.md), not the
 agents' path; do not expose it.
 
+### Was this admitted? (`ContributionState.accepted`, v1.21)
+
+To ask whether a contribution was admitted, read `ContributionState.accepted`. It carries the answer on every record read (`strata_read_contribution`, `strata_read_scope_record` and the HTTP record routes), and it is False while a review scope holds the item and after it is rejected or lapses (see Human review). This is the supported way; do not restate the pair of verdicts in host code. `strata.verdict_admits(decision)` is the lower-level check: it answers whether a *verdict* admits (True only for `accept_as_directive` and `accept_as_context`; False for `decline`, for no verdict and for any other string). `ACCEPTED_DECISIONS` stays, so nothing that imports it breaks.
+
+## Human review
+
+By default a scope's judge decides what binds it. For a scope where directives are rare and weighty you can take that decision back. Set a review level on the scope in `fleet.yaml`:
+
+```yaml
+scopes:
+  - id: g_ops
+    name: Ops
+    stratum_id: L1
+    human_review: 1
+```
+
+`0` (the default) is off and changes nothing. `1` holds every directive change by a delegated party for you to approve. Any other value is refused when `fleet.yaml` loads; it never falls back to 0 or 1.
+
+At level 1 the judge still judges every contribution and its verdict is recorded as it was given, but nothing that would change the scope's directives is applied: a judged add, supersede or retire, an end-condition confirmation, and a bound session's own `strata_retire`. A held retirement leaves the directive binding for everyone, the requester included; a held addition stays out. Context and declines land as before. Your own acts (`strata operator publish`, `supersede`, `retire`, `retire-item`) and date lapses go through directly.
+
+```
+strata operator review list                 # how many are held, and how old the oldest is
+strata operator review approve <id>         # enact it (a contribution id, or an rr_ request id)
+strata operator review reject <id> --reason "..."
+```
+
+An approval applies the judge's ops unchanged, as the scope's own directive, after a mechanical re-check against the scope as it is now: the targets must still exist, the contribution must have been made in this scope (the position gate; the session that made it need not still be live), and the directive must not contradict what the scope inherits. No judge is called, so approvals work while the judge is down. A request whose directive was changed in the meantime lapses instead. If the scope's context changed after the hold, the approval applies the directive ops only and keeps the current context, so nothing admitted meanwhile is overwritten; the review act records which happened. Approving the same item twice (for example after a crash) never applies it twice. The contributing scope's perspective shows the item as "held for the operator", then "approved" or "rejected: <reason>". The Console's Held tab shows the same list read-only: the held count, the age of the oldest, and for each item its id, scope, content, status, and (for a session retirement request) who asked. It is backed by `GET /review/held`.
+
+Limits: Console review is read-only, and approve and reject are CLI only. There is no amend: change a held proposal by contributing a new one. A hold nobody gets to stalls the scope, so check `review list` regularly; this level suits scopes with few, weighty directives. If the process dies in the middle of an approval, the next approve (or the next drain, or a server start) finishes the interrupted amendment from its recorded intent and records the approval; nothing is applied twice. A held session retirement request is finished the same way (ADR 0018, Known limits).
+
+## Forgetting
+
+A directive stops binding only when someone with authority over it ends it. Being old or unused never ends it.
+
+**No grace period.** When a scope ends one of its directives, the directive leaves every reader's binding layers on that reader's next read.
+
+**Readers are told.** Each reader gets a notice. The notice stays in the reader's perspective until the reader's next refresh has processed it. It also stays in the record.
+
+**One path, two labels.** A directive ends either because it no longer applies or because it was wrong. Both go through the same path, and readers see both as an ordinary input change. Only the label differs: a release (kind `currency`) is labelled *retired*, and a retraction (kind `correction`) is labelled *retracted*.
+
+**End dates and end conditions.** A directive proposal can say when it ends, with `ends`: a date, or a condition that has to be judged. The owner decides whether a judged condition was met. The owning scope's judge confirms it, from a contribution made in that scope that carries `fulfils` with evidence. A session bound to the owning scope can also end the directive at any time with `strata_retire`. The operator can rule on a scope's directive with `strata operator retire`. Everyone else can only suggest: a `fulfils` from another scope opens a candidate for the owner, and another scope's judge cannot end the directive. An operator item belongs to the operator, so only the operator ends it; evidence for it shows up in `strata operator candidates`.
+
+**Candidates.** A directive that is old or unused can show up as a candidate. A candidate only asks the owner whether the directive should end. It never ends anything by itself.
+
+**Tools for a bound session:**
+
+- `strata_retire` ends one of the scope's own directives.
+- `strata_retirement_candidates` lists candidates, and `strata_dismiss_candidate` dismisses one.
+- `strata_contribute` carries `ends` on a directive proposal, and `fulfils` with evidence that a judged condition was met.
+
+**Commands for the operator:**
+
+- `strata operator publish` and `strata operator supersede` take `--until` or `--when`. On `supersede`, they work only with an `op_` id; a `c_` id with either flag is refused and nothing is written.
+- `strata operator retire-item` ends an operator item.
+- `strata operator candidates` lists candidates, and `strata operator dismiss-candidate` dismisses one.
+- `strata stats forgetting` counts scope retirements and candidates. It does not count operator items.
+
 ## Configuration
 
 ### Per-project: `.strata/config.toml`
@@ -1272,6 +1473,7 @@ Limits I know of, measured in the v1.18 run:
 - A restricting directive in the scope's own summary isn't weighed by the judge: 2 items, every run.
 - The ordinary judge's input wraps the scope summary in an ambiguous fence; on qwen this can make it misread the summary.
 - A retirement isn't required to state what changed. The judge is asked for it, no model I measured fills it reliably, and the engine doesn't enforce it (#209).
+- Batched judgment is not verdict-equivalent to serial judgment: measured batch-vs-serial agreement 0.808 against a serial-repeat floor of 0.975 (qwen/qwen3-235b-a22b-2507 @ Parasail, n=120). Batches form only when several contributions to one scope queue in one process (mostly `strata start` serving many clients). Setting `judgment_batch_cap = 1` makes every judgment a single call.
 
 **A model id ages.** Routers rename and retire models, and providers come and go. If an id or provider stops resolving, `strata doctor` says so and prints the override lines. A new provider is a new measurement, not the same judge.
 
@@ -1343,6 +1545,7 @@ CONTEXT.md               # Canonical glossary (23 terms — single source of voc
 docs/
   philosophy.md          # Theoretical foundations — why Strata exists
   ROADMAP.md             # Enduring principles + sequenced direction (post-V1.2)
+  judge-check.md         # What `strata judge-check` measures, and what it does not
   adr/
     0001-v1-architecture.md
     0002-fleet-config-source-of-truth.md

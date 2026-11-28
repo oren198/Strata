@@ -17,6 +17,7 @@ runnable. Subcommands:
                            the V1 → V1.2 upgrade path.
 * ``strata doctor``       — diagnose a project's config/DB/fleet/install
                            wiring/agent binding in one offline pass.
+* ``strata judge-check``  — measure the configured judge against the frozen set.
 
 All commands — including the inspection commands (``scopes``, ``summary``,
 ``record``) and ``launch`` — read ``fleet.yaml`` and the record/summary
@@ -859,6 +860,43 @@ def cmd_stats_judge(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_stats_forgetting(args: argparse.Namespace) -> int:
+    """``strata stats forgetting`` — scope retirements and candidates.
+
+    Operator-item forgetting is left out. The report says so on its own line.
+    """
+    import json
+
+    from strata.forgetting_surface import (  # noqa: PLC0415
+        forgetting_metrics,
+        format_forgetting_metrics,
+    )
+    from strata.stores import EmbeddedStoreError, open_embedded_stores  # noqa: PLC0415
+
+    try:
+        stores = open_embedded_stores()
+    except EmbeddedStoreError as exc:
+        print(exc.message, file=sys.stderr)
+        return 1
+    with stores:
+        fleet = stores.fleet_config
+        if args.scope is not None:
+            if fleet.get_scope(args.scope) is None:
+                print(f"Scope not found: {args.scope}", file=sys.stderr)
+                return 1
+            scope_ids = [args.scope]
+            scope_id = args.scope
+        else:
+            scope_ids = [scope.id for scope in fleet.active_scopes()]
+            scope_id = None
+        report = forgetting_metrics(stores.record_store, scope_ids=scope_ids, scope_id=scope_id)
+    if args.json:
+        print(json.dumps(report))
+    else:
+        print(format_forgetting_metrics(report))
+    return 0
+
+
 def cmd_stats_root(args: argparse.Namespace) -> int:
     """``strata stats`` with no subcommand — print the group's help."""
     if _stats_parser is not None:
@@ -1251,6 +1289,10 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         an input change awaiting its refresh, never a judge outage.
     11. Structure emission (ADR 0014 D8) — soft. Lists every ``remove_edge``
         or ``reparent`` act for which ``unemitted_receivers`` is not ``[]``.
+    12. Judge check — one informational line (meets, does not meet,
+        incomplete, unmeasured, report not understood, or could not read
+        the report). Soft and always passing: it never calls the judge and
+        never changes the exit status.
     """
     from strata.bootstrap import load_fleet_config
     from strata.fleet_config import FleetConfigError
@@ -1976,20 +2018,40 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     # -----------------------------------------------------------------------
     # 8c. Every active scope states its purpose (#210). Soft: a scope without a
     # description works, but the judge can only fall back to "the project's work"
-    # and cannot tell what is irrelevant to it. One warning per scope.
+    # and cannot tell what is irrelevant to it. One warning per scope (the scope's own
+    # description only: an ancestor's is not inherited).
     # -----------------------------------------------------------------------
     if fleet_config is not None:
+        from strata.scope_manager import (  # noqa: PLC0415
+            IMPLIED_PURPOSE_MIN_WORDS,
+            suggest_description,
+        )
+        from strata.summary_store import SummaryStore as _SummaryStore  # noqa: PLC0415
+
         for scope in fleet_config.active_scopes():
+            # The scope's own memory only SUGGESTS a description; it is never a purpose.
             if not scope.description:
+                suggestion = None
+                if paths is not None:
+                    try:
+                        suggestion = suggest_description(
+                            _SummaryStore(str(paths.summaries_dir)).read(scope.id),
+                            IMPLIED_PURPOSE_MIN_WORDS,
+                        )
+                    except Exception:  # noqa: BLE001 — a hint must never abort doctor
+                        suggestion = None
+                message = (
+                    "no description — the judge can't tell what's irrelevant to it; "
+                    "add one in fleet.yaml (a `description:` line under the scope)."
+                    if suggestion is None
+                    else f"no description; your scope's memory suggests: {suggestion}"
+                )
                 checks.append(
                     Check(
                         name=f"Scope description ({scope.id})",
                         kind="soft",
                         passed=False,
-                        message=(
-                            "no description — the judge can't tell what's irrelevant to it; "
-                            "add one in fleet.yaml (a `description:` line under the scope)."
-                        ),
+                        message=message,
                     )
                 )
 
@@ -2109,7 +2171,125 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     # -----------------------------------------------------------------------
     checks.append(_check_structure_emission(paths))
 
+    # 12. Judge-check measurement for this engine version and the configured
+    # judge. Informational only: one line, never a failure, so it cannot
+    # change this command's exit status and it never calls the judge.
+    checks.append(_judge_check_status())
+
+    # 13. Directives the record admitted that are missing from their summary with no retirement or
+    # supersession on record (v1.22 P2). Report only: it repairs nothing and, as a passing soft
+    # check, never changes this command's exit status.
+    checks.append(_check_directive_integrity(paths))
+
+    # 14. Amendment intents recovery marked suspect (a summary version ahead of the expected one).
+    # only, like the line above.
+    checks.append(_check_suspect_intents(paths))
+
     return _run_preflight(checks)
+
+
+def _check_suspect_intents(paths: object) -> Check:
+    """One informational line: how many amendment intents recovery marked suspect. Always a
+    passing soft check; it reports only and never changes doctor's exit status."""
+    name = "Suspect intents"
+    if paths is None or not Path(paths.db_path).exists():
+        return Check(name=name, kind="soft", passed=True, message="skipped — see the checks above.")
+    from strata.record_store import RecordStore  # noqa: PLC0415
+
+    store: RecordStore | None = None
+    try:
+        store = RecordStore(str(paths.db_path))
+        suspect = store.list_amendment_intents(state="suspect")
+    except Exception as exc:  # noqa: BLE001 — this line must not abort doctor
+        return Check(
+            name=name,
+            kind="soft",
+            passed=True,
+            message=f"could not check ({type(exc).__name__}); nothing was changed.",
+        )
+    finally:
+        if store is not None:
+            store.close()
+    if not suspect:
+        return Check(name=name, kind="soft", passed=True, message="no amendment intent is suspect.")
+    listed = ", ".join(f"{i.id} ({i.scope_id})" for i in suspect)
+    return Check(
+        name=name,
+        kind="soft",
+        passed=True,
+        message=(
+            f"{len(suspect)} amendment intents are suspect: {listed}. Each was found with the "
+            "summary ahead of its expected version and was not replayed. Report only: nothing "
+            "was changed, and this line does not change doctor's exit status."
+        ),
+    )
+
+
+def _check_directive_integrity(paths: object) -> Check:
+    """One informational line. Always a passing soft check; it never repairs anything."""
+    name = "Directive integrity"
+    if paths is None or not Path(paths.db_path).exists():
+        return Check(name=name, kind="soft", passed=True, message="skipped — see the checks above.")
+    from strata.fleet_config import FleetConfig  # noqa: PLC0415
+    from strata.integrity import missing_directives  # noqa: PLC0415
+    from strata.record_store import RecordStore  # noqa: PLC0415
+    from strata.summary_store import SummaryStore  # noqa: PLC0415
+
+    store: RecordStore | None = None
+    try:
+        store = RecordStore(str(paths.db_path))
+        fleet = FleetConfig.load(Path(paths.fleet_yaml_path))
+        missing = missing_directives(
+            fleet=fleet, record_store=store, summary_store=SummaryStore(str(paths.summaries_dir))
+        )
+    except Exception as exc:  # noqa: BLE001 — this line must not abort doctor
+        return Check(
+            name=name,
+            kind="soft",
+            passed=True,
+            message=f"could not check ({type(exc).__name__}); nothing was changed.",
+        )
+    finally:
+        if store is not None:
+            store.close()
+    if not missing:
+        return Check(
+            name=name,
+            kind="soft",
+            passed=True,
+            message="no admitted directive is missing without a retirement or supersession.",
+        )
+    listed = ", ".join(f"{m.directive_id} ({m.scope_id})" for m in missing)
+    return Check(
+        name=name,
+        kind="soft",
+        passed=True,
+        message=(
+            f"directive missing with no retirement or supersession: {listed}. Report only: "
+            "nothing was repaired, and this line does not change doctor's exit status."
+        ),
+    )
+
+
+def _judge_check_status() -> Check:
+    """One judge-check line. Always a passing soft check.
+
+    A lookup exception names the exception class. A message that contains a
+    newline is an unrecognised report, so it uses the report-not-understood
+    line. Doctor's exit status is the other checks' alone.
+    """
+    from strata.judgecheck.report import (
+        doctor_judge_check_message,
+        report_not_understood_message,
+    )
+
+    try:
+        message = doctor_judge_check_message()
+    except Exception as exc:  # noqa: BLE001 — this line must not abort doctor
+        message = f"could not read the report ({type(exc).__name__})"
+    if "\n" in message or "\r" in message:
+        message = report_not_understood_message()
+    return Check(name="Judge check", kind="soft", passed=True, message=message)
 
 
 # ---------------------------------------------------------------------------
@@ -2130,6 +2310,23 @@ def cmd_operator_root(args: argparse.Namespace) -> int:
     return 0
 
 
+def _ends_arg(args: argparse.Namespace) -> dict[str, str] | None:
+    """``--until`` or ``--when`` as the engine's ``ends`` object, or ``None``."""
+    until = getattr(args, "until", None)
+    when = getattr(args, "when", None)
+    if until is not None:
+        return {"until": until}
+    if when is not None:
+        return {"when": when}
+    return None
+
+
+def _nothing_written(message: str) -> int:
+    """A surface refusal that must not be followed by a write."""
+    print(f"{message} Nothing was written.", file=sys.stderr)
+    return 1
+
+
 def cmd_operator_publish(args: argparse.Namespace) -> int:
     """``strata operator publish`` — publish a new operator memory item (ADR 0008 D1)."""
     from strata.operator import operator_publish
@@ -2147,14 +2344,19 @@ def cmd_operator_publish(args: argparse.Namespace) -> int:
             print(f"Scope not found: {args.scope_id}", file=sys.stderr)
             return 1
 
-        item = operator_publish(
-            args.scope_id,
-            args.content,
-            args.subject,
-            fleet=stores.fleet_config,
-            record_store=stores.record_store,
-            summaries_dir=stores.summary_store.summaries_dir,
-        )
+        try:
+            item = operator_publish(
+                args.scope_id,
+                args.content,
+                args.subject,
+                fleet=stores.fleet_config,
+                record_store=stores.record_store,
+                summaries_dir=stores.summary_store.summaries_dir,
+                ends=_ends_arg(args),
+            )
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
         print(f"Published operator {item.kind} [{item.id}] attached at {args.scope_id!r}.")
     return 0
 
@@ -2164,8 +2366,15 @@ def cmd_operator_supersede(args: argparse.Namespace) -> int:
 
     ``op_`` ids supersede an operator-stratum item (capacity 1, not judged).
     ``c_`` ids correct a scope's own native directive in person (capacity 2,
-    a judgment made by the operator).
+    a judgment made by the operator). ``--until`` and ``--when`` apply only
+    to an ``op_`` id; a ``c_`` id with either flag is refused before any write.
     """
+    ends = _ends_arg(args)
+    if ends is not None and not str(args.id).startswith("op_"):
+        return _nothing_written(
+            "An end condition on supersede applies only to an operator item (an op_ id)."
+        )
+
     from strata.operator import operator_supersede, operator_supersede_item
     from strata.stores import EmbeddedStoreError, open_embedded_stores
 
@@ -2192,6 +2401,7 @@ def cmd_operator_supersede(args: argparse.Namespace) -> int:
                     fleet=stores.fleet_config,
                     record_store=stores.record_store,
                     summaries_dir=stores.summary_store.summaries_dir,
+                    ends=ends,
                 )
             except (KeyError, ValueError) as exc:
                 print(str(exc), file=sys.stderr)
@@ -2288,6 +2498,102 @@ def cmd_operator_retire(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 1
+    return 0
+
+
+def cmd_operator_retire_item(args: argparse.Namespace) -> int:
+    """``strata operator retire-item`` — retire an operator item, with an optional notice.
+
+    ``--kind`` and ``--notice`` go together. One without the other is refused
+    before any write. This is not ``strata operator retire``.
+    """
+    kind = args.kind
+    notice = args.notice
+    if (kind is None) != (notice is None):
+        return _nothing_written("kind and notice go together: give both or neither.")
+
+    from strata.operator import operator_retire_item
+    from strata.stores import EmbeddedStoreError, open_embedded_stores
+
+    try:
+        stores = open_embedded_stores()
+    except EmbeddedStoreError as exc:
+        print(exc.message, file=sys.stderr)
+        return 1
+
+    with stores:
+        if stores.fleet_config.get_scope(args.scope_id) is None:
+            print(f"Scope not found: {args.scope_id}", file=sys.stderr)
+            return 1
+        try:
+            act = operator_retire_item(
+                args.scope_id,
+                args.id,
+                fleet=stores.fleet_config,
+                record_store=stores.record_store,
+                summaries_dir=stores.summary_store.summaries_dir,
+                kind=kind,
+                notice=notice,
+            )
+        except (KeyError, ValueError) as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        print(f"Retired operator item {args.id} (act {act.id}).")
+    return 0
+
+
+def cmd_operator_candidates(args: argparse.Namespace) -> int:
+    """``strata operator candidates`` — open candidates on operator items only."""
+    from strata.forgetting import operator_candidates
+    from strata.forgetting_surface import present_candidate
+    from strata.stores import EmbeddedStoreError, open_embedded_stores
+
+    try:
+        stores = open_embedded_stores()
+    except EmbeddedStoreError as exc:
+        print(exc.message, file=sys.stderr)
+        return 1
+
+    with stores:
+        if args.scope is not None and stores.fleet_config.get_scope(args.scope) is None:
+            print(f"Scope not found: {args.scope}", file=sys.stderr)
+            return 1
+        rows = operator_candidates(stores.record_store, scope_id=args.scope)
+        for row in rows:
+            shown = present_candidate(row)
+            print(f"{shown['id']}\t{shown['ground']}\t{shown['directive_id']}\t{shown['display']}")
+    return 0
+
+
+def cmd_operator_dismiss_candidate(args: argparse.Namespace) -> int:
+    """``strata operator dismiss-candidate`` — snooze one operator-item candidate."""
+    from strata.forgetting import dismiss_operator_candidate
+    from strata.forgetting_surface import reject_dismiss_days
+    from strata.stores import EmbeddedStoreError, open_embedded_stores
+
+    try:
+        days = reject_dismiss_days(args.days)
+    except ValueError as exc:
+        return _nothing_written(str(exc))
+
+    try:
+        stores = open_embedded_stores()
+    except EmbeddedStoreError as exc:
+        print(exc.message, file=sys.stderr)
+        return 1
+
+    with stores:
+        try:
+            dismiss_operator_candidate(
+                args.id,
+                reason=args.reason,
+                days=days,
+                record_store=stores.record_store,
+            )
+        except (KeyError, ValueError) as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        print(f"Dismissed candidate {args.id} for {days} days.")
     return 0
 
 
@@ -2398,6 +2704,100 @@ def cmd_operator_show(args: argparse.Namespace) -> int:
 
 
 _operator_evidence_parser: argparse.ArgumentParser | None = None
+
+
+_operator_review_parser: argparse.ArgumentParser | None = None
+
+
+def cmd_operator_review_root(args: argparse.Namespace) -> int:
+    """``strata operator review`` with no subcommand: print the group's help."""
+    if _operator_review_parser is not None:
+        _operator_review_parser.print_help()
+    return 0
+
+
+def _format_age(seconds: float | None) -> str:
+    if seconds is None:
+        return "none"
+    minutes = int(seconds // 60)
+    if minutes < 60:
+        return f"{minutes}m"
+    hours, rest = divmod(minutes, 60)
+    if hours < 48:
+        return f"{hours}h{rest:02d}m"
+    return f"{hours // 24}d"
+
+
+def cmd_operator_review_list(args: argparse.Namespace) -> int:
+    """``strata operator review list``: the held count and the age of the oldest (ADR 0018 D4)."""
+    from strata.review import list_held
+    from strata.stores import EmbeddedStoreError, open_embedded_stores
+
+    try:
+        stores = open_embedded_stores()
+    except EmbeddedStoreError as exc:
+        print(exc.message, file=sys.stderr)
+        return 1
+    with stores:
+        listing = list_held(record_store=stores.record_store, scope_id=args.scope)
+    print(f"{listing.count} held, oldest {_format_age(listing.oldest_age_seconds)}")
+    for item in listing.items:
+        print(f"{item.id}\t{item.scope_id}\t{item.kind}\t{item.held_at}\t{item.summary}")
+    return 0
+
+
+def cmd_operator_review_approve(args: argparse.Namespace) -> int:
+    """``strata operator review approve <id>``: enact a held item, mechanically re-checked."""
+    from strata.review import ReviewRefusal, approve
+    from strata.stores import EmbeddedStoreError, open_embedded_stores
+
+    try:
+        stores = open_embedded_stores()
+    except EmbeddedStoreError as exc:
+        print(exc.message, file=sys.stderr)
+        return 1
+    with stores:
+        try:
+            act = approve(
+                args.id,
+                operator="operator",
+                fleet=stores.fleet_config,
+                record_store=stores.record_store,
+                summary_store=stores.summary_store,
+            )
+        except ReviewRefusal as exc:
+            print(f"Refused: {exc}", file=sys.stderr)
+            return 1
+    outcome = "lapsed (nothing applied)" if act.action == "lapse" else "approved"
+    print(f"{args.id} {outcome} (review act {act.id}).")
+    return 0
+
+
+def cmd_operator_review_reject(args: argparse.Namespace) -> int:
+    """``strata operator review reject <id> --reason ...``: nothing enters; the reason is kept."""
+    from strata.review import ReviewRefusal, reject
+    from strata.stores import EmbeddedStoreError, open_embedded_stores
+
+    try:
+        stores = open_embedded_stores()
+    except EmbeddedStoreError as exc:
+        print(exc.message, file=sys.stderr)
+        return 1
+    with stores:
+        try:
+            act = reject(
+                args.id,
+                args.reason,
+                operator="operator",
+                fleet=stores.fleet_config,
+                record_store=stores.record_store,
+                summary_store=stores.summary_store,
+            )
+        except (ReviewRefusal, ValueError) as exc:
+            print(f"Refused: {exc}", file=sys.stderr)
+            return 1
+    print(f"{args.id} rejected (review act {act.id}).")
+    return 0
 
 
 def cmd_operator_evidence_root(args: argparse.Namespace) -> int:
@@ -2587,7 +2987,6 @@ def cmd_publication_bootstrap(args: argparse.Namespace) -> int:
         manager = ScopeManager(
             client=settings.build_judge_client(),
             model=settings.manager_model,
-            implied_purpose_min_words=settings.implied_purpose_min_words,
             judge_provider=settings.judge_provider,
         )
 
@@ -2788,7 +3187,6 @@ def _refresh_stores(settings):  # noqa: ANN001, ANN201
     manager = ScopeManager(
         client=settings.build_judge_client(),
         model=settings.manager_model,
-        implied_purpose_min_words=settings.implied_purpose_min_words,
         judge_provider=settings.judge_provider,
     )
     return fleet_config, record_store, summary_store, manager
@@ -5603,11 +6001,75 @@ def _build_parser() -> argparse.ArgumentParser:
     p_stats_judge.add_argument("--json", action="store_true", help="Print the report as JSON.")
     p_stats_judge.set_defaults(func=cmd_stats_judge)
 
+    p_stats_forget = stats_sub.add_parser(
+        "forgetting",
+        help="Scope retirements and candidates. Operator items are left out.",
+    )
+    p_stats_forget.add_argument(
+        "--scope",
+        default=None,
+        metavar="SCOPE",
+        help="Only this scope. Omit for every active scope.",
+    )
+    p_stats_forget.add_argument("--json", action="store_true", help="Print the report as JSON.")
+    p_stats_forget.set_defaults(func=cmd_stats_forgetting)
+
     p_doctor = sub.add_parser(
         "doctor",
         help="Diagnose a project's Strata wiring: config, DB, fleet, install, binding.",
     )
     p_doctor.set_defaults(func=cmd_doctor)
+
+    p_judge_check = sub.add_parser(
+        "judge-check",
+        help=(
+            "Measure the configured judge against the frozen judge-check set. "
+            "Prints the engine's cost estimate and asks y/N unless --yes."
+        ),
+    )
+    p_judge_check.add_argument(
+        "--reps",
+        type=int,
+        default=3,
+        help="Repetitions of each item (default: 3).",
+    )
+    p_judge_check.add_argument(
+        "--max-usd",
+        type=float,
+        default=None,
+        dest="max_usd",
+        help="Stop the run when the next call would pass this many dollars.",
+    )
+    p_judge_check.add_argument(
+        "--price",
+        default=None,
+        help=(
+            "Input,output[,cache read] dollars per million tokens "
+            "(for example 0.22,0.88). Wins over the provider listing."
+        ),
+    )
+    p_judge_check.add_argument(
+        "--yes",
+        action="store_true",
+        help="Run without asking y/N.",
+    )
+    p_judge_check.add_argument(
+        "--out",
+        default=None,
+        help="Also write the JSON report to this path.",
+    )
+    p_judge_check.add_argument(
+        "--compare",
+        default=None,
+        metavar="REPORT",
+        help=(
+            "Compare this run with a saved report using the strict flags "
+            "already stored on each per_item. Does not re-grade that report."
+        ),
+    )
+    from strata.judgecheck.cli import cmd_judge_check
+
+    p_judge_check.set_defaults(func=cmd_judge_check)
 
     # -------------------------------------------------------------------
     # strata operator — ADR 0008 D1's local entry surface: publish/supersede/
@@ -5632,6 +6094,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p_op_publish.add_argument("scope_id")
     p_op_publish.add_argument("--content", required=True, help="Verbatim operator memory text.")
     p_op_publish.add_argument("--subject", default=None, help="Optional short subject line.")
+    publish_ends = p_op_publish.add_mutually_exclusive_group()
+    publish_ends.add_argument("--until", default=None, metavar="DATE", help="End date, YYYY-MM-DD.")
+    publish_ends.add_argument("--when", default=None, metavar="TEXT", help="Judged end condition.")
     p_op_publish.set_defaults(func=cmd_operator_publish)
 
     p_op_supersede = operator_sub.add_parser(
@@ -5647,6 +6112,13 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_op_supersede.add_argument("--content", required=True, help="Verbatim replacement content.")
     p_op_supersede.add_argument("--subject", default=None, help="Optional short subject line.")
+    supersede_ends = p_op_supersede.add_mutually_exclusive_group()
+    supersede_ends.add_argument(
+        "--until", default=None, metavar="DATE", help="End date, only for an op_ id."
+    )
+    supersede_ends.add_argument(
+        "--when", default=None, metavar="TEXT", help="Judged end condition, only for an op_ id."
+    )
     p_op_supersede.set_defaults(func=cmd_operator_supersede)
 
     p_op_retire = operator_sub.add_parser(
@@ -5660,6 +6132,51 @@ def _build_parser() -> argparse.ArgumentParser:
     p_op_retire.add_argument("id", help="An 'op_...' operator item id or a 'c_...' directive id.")
     p_op_retire.add_argument("--reason", default=None, help="Optional free-text rationale.")
     p_op_retire.set_defaults(func=cmd_operator_retire)
+
+    p_op_retire_item = operator_sub.add_parser(
+        "retire-item",
+        help="Retire an operator item, optionally as a release or a retraction.",
+    )
+    p_op_retire_item.add_argument("scope_id")
+    p_op_retire_item.add_argument("id", help="An 'op_...' operator item id.")
+    p_op_retire_item.add_argument(
+        "--kind",
+        choices=("currency", "correction"),
+        default=None,
+        help="currency (a release) or correction (a retraction). Requires --notice.",
+    )
+    p_op_retire_item.add_argument(
+        "--notice",
+        default=None,
+        help="Notice readers get. Requires --kind.",
+    )
+    p_op_retire_item.set_defaults(func=cmd_operator_retire_item)
+
+    p_op_candidates = operator_sub.add_parser(
+        "candidates",
+        help="List open candidates on operator items.",
+    )
+    p_op_candidates.add_argument(
+        "--scope",
+        default=None,
+        metavar="S",
+        help="Only candidates attached at this scope.",
+    )
+    p_op_candidates.set_defaults(func=cmd_operator_candidates)
+
+    p_op_dismiss = operator_sub.add_parser(
+        "dismiss-candidate",
+        help="Snooze one operator-item candidate.",
+    )
+    p_op_dismiss.add_argument("id", help="The candidate id.")
+    p_op_dismiss.add_argument("--reason", required=True, help="Why it is snoozed.")
+    p_op_dismiss.add_argument(
+        "--days",
+        type=int,
+        required=True,
+        help="Snooze length, an integer from 1 to 365.",
+    )
+    p_op_dismiss.set_defaults(func=cmd_operator_dismiss_candidate)
 
     p_op_restore = operator_sub.add_parser(
         "restore",
@@ -5684,6 +6201,34 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Attachment scope to show. Omit to show every attachment scope + totals.",
     )
     p_op_show.set_defaults(func=cmd_operator_show)
+
+    global _operator_review_parser
+    p_op_review = operator_sub.add_parser(
+        "review",
+        help="Dispose of the directive changes a human-review scope holds.",
+    )
+    _operator_review_parser = p_op_review
+    p_op_review.set_defaults(func=cmd_operator_review_root)
+    review_sub = p_op_review.add_subparsers(dest="review_command", metavar="<review-command>")
+    p_op_review_list = review_sub.add_parser(
+        "list", help="Show the held count and the age of the oldest held item."
+    )
+    p_op_review_list.add_argument("--scope", default=None, help="Only this scope's held items.")
+    p_op_review_list.set_defaults(func=cmd_operator_review_list)
+    p_op_review_approve = review_sub.add_parser(
+        "approve",
+        help="Enact a held item (the judge's ops unchanged, after a mechanical re-check).",
+    )
+    p_op_review_approve.add_argument(
+        "id", help="A held contribution id (c_...) or request (rr_...)."
+    )
+    p_op_review_approve.set_defaults(func=cmd_operator_review_approve)
+    p_op_review_reject = review_sub.add_parser(
+        "reject", help="Reject a held item. The reason is recorded and reaches the scope."
+    )
+    p_op_review_reject.add_argument("id")
+    p_op_review_reject.add_argument("--reason", required=True)
+    p_op_review_reject.set_defaults(func=cmd_operator_review_reject)
 
     global _operator_evidence_parser
     p_op_evidence = operator_sub.add_parser(

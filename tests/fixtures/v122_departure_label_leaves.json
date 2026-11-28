@@ -1,0 +1,489 @@
+{
+ "flip": [
+  {
+   "answer": "consequence_report",
+   "base": "consequence_report",
+   "content": "As agreed with the branches team in Monday's call, we're moving our story hour to 10:30 from next week.",
+   "head": "admit",
+   "item": "j1a-003",
+   "others": [],
+   "rule": "Overdue fines are waived for patrons under 12, ratified across all branches.",
+   "suite": "j1_attribution"
+  },
+  {
+   "answer": "departure_report",
+   "base": "departure_report",
+   "content": "As agreed with the branches team in Monday's call, we're moving our story hour to 10:30 from next week.",
+   "head": "admit",
+   "item": "j1a-003",
+   "others": [],
+   "rule": "Overdue fines are waived for patrons under 12, ratified across all branches.",
+   "suite": "j1_attribution"
+  },
+  {
+   "answer": "consequence_report",
+   "base": "departure_report",
+   "content": "As discussed with the clinics team at the monthly review, we're starting surgery intake at 07:30 instead of 08:00.",
+   "head": "admit",
+   "item": "j1a-011",
+   "others": [],
+   "rule": "Controlled drugs must be counted by two staff at every shift change, across all clinics.",
+   "suite": "j1_attribution"
+  },
+  {
+   "answer": "departure_report",
+   "base": "departure_report",
+   "content": "As discussed with the clinics team at the monthly review, we're starting surgery intake at 07:30 instead of 08:00.",
+   "head": "admit",
+   "item": "j1a-011",
+   "others": [],
+   "rule": "Controlled drugs must be counted by two staff at every shift change, across all clinics.",
+   "suite": "j1_attribution"
+  },
+  {
+   "answer": "consequence_report",
+   "base": "consequence_report",
+   "content": "As the bakeries team told us at the Friday huddle, we're switching to the new sourdough schedule next week.",
+   "head": "admit",
+   "item": "j1a-019",
+   "others": [],
+   "rule": "All products containing nuts must be labelled with a red allergen sticker, at every bakery.",
+   "suite": "j1_attribution"
+  },
+  {
+   "answer": "departure_report",
+   "base": "departure_report",
+   "content": "As the bakeries team told us at the Friday huddle, we're switching to the new sourdough schedule next week.",
+   "head": "admit",
+   "item": "j1a-019",
+   "others": [],
+   "rule": "All products containing nuts must be labelled with a red allergen sticker, at every bakery.",
+   "suite": "j1_attribution"
+  },
+  {
+   "answer": "consequence_report",
+   "base": "consequence_report",
+   "content": "Our harbour-bakery oven two runs hot on the left; let's rotate trays halfway through every bake.",
+   "head": "admit",
+   "item": "j1a-020",
+   "others": [],
+   "rule": "All products containing nuts must be labelled with a red allergen sticker, at every bakery.",
+   "suite": "j1_attribution"
+  },
+  {
+   "answer": "departure_report",
+   "base": "departure_report",
+   "content": "Our harbour-bakery oven two runs hot on the left; let's rotate trays halfway through every bake.",
+   "head": "admit",
+   "item": "j1a-020",
+   "others": [],
+   "rule": "All products containing nuts must be labelled with a red allergen sticker, at every bakery.",
+   "suite": "j1_attribution"
+  },
+  {
+   "answer": "consequence_report",
+   "base": "consequence_report",
+   "content": "As the bakeries directive says, purchasing only accepts flour orders placed before Tuesday noon.",
+   "head": "admit",
+   "item": "j1a-022",
+   "others": [],
+   "rule": "All products containing nuts must be labelled with a red allergen sticker, at every bakery.",
+   "suite": "j1_attribution"
+  },
+  {
+   "answer": "departure_report",
+   "base": "departure_report",
+   "content": "As the bakeries directive says, purchasing only accepts flour orders placed before Tuesday noon.",
+   "head": "admit",
+   "item": "j1a-022",
+   "others": [],
+   "rule": "All products containing nuts must be labelled with a red allergen sticker, at every bakery.",
+   "suite": "j1_attribution"
+  },
+  {
+   "answer": "consequence_report",
+   "base": "departure_report",
+   "content": "As the warehouse team told us at the shift handover, we're starting the night pick at 22:00 instead of 23:00.",
+   "head": "admit",
+   "item": "j1a-035",
+   "others": [],
+   "rule": "Robots must stop within 1 metre of any person on the floor, in every warehouse zone.",
+   "suite": "j1_attribution"
+  },
+  {
+   "answer": "departure_report",
+   "base": "departure_report",
+   "content": "As the warehouse team told us at the shift handover, we're starting the night pick at 22:00 instead of 23:00.",
+   "head": "admit",
+   "item": "j1a-035",
+   "others": [],
+   "rule": "Robots must stop within 1 metre of any person on the floor, in every warehouse zone.",
+   "suite": "j1_attribution"
+  },
+  {
+   "answer": "consequence_report",
+   "base": "consequence_report",
+   "content": "Zone-b's charging dock 3 failed twice this week; let's take it out of rotation until it's inspected.",
+   "head": "admit",
+   "item": "j1a-036",
+   "others": [],
+   "rule": "Robots must stop within 1 metre of any person on the floor, in every warehouse zone.",
+   "suite": "j1_attribution"
+  },
+  {
+   "answer": "departure_report",
+   "base": "departure_report",
+   "content": "Zone-b's charging dock 3 failed twice this week; let's take it out of rotation until it's inspected.",
+   "head": "admit",
+   "item": "j1a-036",
+   "others": [],
+   "rule": "Robots must stop within 1 metre of any person on the floor, in every warehouse zone.",
+   "suite": "j1_attribution"
+  }
+ ],
+ "keep": [
+  {
+   "answer": "consequence_report",
+   "base": "consequence_report",
+   "content": "Alerts unacknowledged for 10 minutes must auto-escalate to the secondary on-call engineer.",
+   "item": "j1-007",
+   "others": [],
+   "rule": "Any customer-facing outage lasting more than 15 minutes must be declared a SEV-1 and paged to the incident-commander rotation.",
+   "suite": "j1_golden"
+  },
+  {
+   "answer": "departure_report",
+   "base": "departure_report",
+   "content": "Alerts unacknowledged for 10 minutes must auto-escalate to the secondary on-call engineer.",
+   "item": "j1-007",
+   "others": [],
+   "rule": "Any customer-facing outage lasting more than 15 minutes must be declared a SEV-1 and paged to the incident-commander rotation.",
+   "suite": "j1_golden"
+  },
+  {
+   "answer": "consequence_report",
+   "base": "consequence_report",
+   "content": "PRs need review from two engineers prior to merging.",
+   "item": "j1-022",
+   "others": [],
+   "rule": "All PRs must be reviewed by two engineers before merge.",
+   "suite": "j1_golden"
+  },
+  {
+   "answer": "departure_report",
+   "base": "departure_report",
+   "content": "PRs need review from two engineers prior to merging.",
+   "item": "j1-022",
+   "others": [],
+   "rule": "All PRs must be reviewed by two engineers before merge.",
+   "suite": "j1_golden"
+  },
+  {
+   "answer": "consequence_report",
+   "base": "consequence_report",
+   "content": "PRs to the hotfix branch only need one engineer's review before merge, so incident fixes can move fast.",
+   "item": "j1-029",
+   "others": [],
+   "rule": "All PRs must be reviewed by two engineers before merge.",
+   "suite": "j1_golden"
+  },
+  {
+   "answer": "departure_report",
+   "base": "departure_report",
+   "content": "PRs to the hotfix branch only need one engineer's review before merge, so incident fixes can move fast.",
+   "item": "j1-029",
+   "others": [],
+   "rule": "All PRs must be reviewed by two engineers before merge.",
+   "suite": "j1_golden"
+  },
+  {
+   "answer": "consequence_report",
+   "base": "consequence_report",
+   "content": "We've migrated off VendorX to VendorY for error tracking; VendorX integration is deprecated as of this sprint.",
+   "item": "j1-044",
+   "others": [],
+   "rule": "Use VendorX for error tracking.",
+   "suite": "j1_golden"
+  },
+  {
+   "answer": "departure_report",
+   "base": "departure_report",
+   "content": "We've migrated off VendorX to VendorY for error tracking; VendorX integration is deprecated as of this sprint.",
+   "item": "j1-044",
+   "others": [],
+   "rule": "Use VendorX for error tracking.",
+   "suite": "j1_golden"
+  },
+  {
+   "answer": "consequence_report",
+   "base": "consequence_report",
+   "content": "Per platform-eng's own directive (already binding on this chain), all deploys require a documented rollback plan -- adding a local directive to actually enforce it here: 'Deploy tickets must include a filled-out rollback-plan section before merge is allowed.'",
+   "item": "j1-050",
+   "others": [],
+   "rule": "All deploys require a rollback plan documented in the deploy ticket.",
+   "suite": "j1_golden"
+  },
+  {
+   "answer": "departure_report",
+   "base": "departure_report",
+   "content": "Per platform-eng's own directive (already binding on this chain), all deploys require a documented rollback plan -- adding a local directive to actually enforce it here: 'Deploy tickets must include a filled-out rollback-plan section before merge is allowed.'",
+   "item": "j1-050",
+   "others": [],
+   "rule": "All deploys require a rollback plan documented in the deploy ticket.",
+   "suite": "j1_golden"
+  },
+  {
+   "answer": "consequence_report",
+   "base": "consequence_report",
+   "content": "As the observatory directive on closing at 40 km/h wind requires, we've added a wind alarm to the dome-two console.",
+   "item": "j1a-025",
+   "others": [],
+   "rule": "The dome must be closed whenever wind exceeds 40 km/h, ratified for all telescopes.",
+   "suite": "j1_attribution"
+  },
+  {
+   "answer": "departure_report",
+   "base": "departure_report",
+   "content": "As the observatory directive on closing at 40 km/h wind requires, we've added a wind alarm to the dome-two console.",
+   "item": "j1a-025",
+   "others": [],
+   "rule": "The dome must be closed whenever wind exceeds 40 km/h, ratified for all telescopes.",
+   "suite": "j1_attribution"
+  },
+  {
+   "answer": "consequence_report",
+   "base": "consequence_report",
+   "content": "Dome-two's filter wheel jammed twice this week; let's log every jam with the filter position.",
+   "item": "j1a-028",
+   "others": [],
+   "rule": "The dome must be closed whenever wind exceeds 40 km/h, ratified for all telescopes.",
+   "suite": "j1_attribution"
+  },
+  {
+   "answer": "departure_report",
+   "base": "departure_report",
+   "content": "Dome-two's filter wheel jammed twice this week; let's log every jam with the filter position.",
+   "item": "j1a-028",
+   "others": [],
+   "rule": "The dome must be closed whenever wind exceeds 40 km/h, ratified for all telescopes.",
+   "suite": "j1_attribution"
+  },
+  {
+   "answer": "consequence_report",
+   "base": "consequence_report",
+   "content": "Per the warehouse directive that robots stop within 1 metre of a person, we've re-tuned zone-b's lidar thresholds.",
+   "item": "j1a-033",
+   "others": [],
+   "rule": "Robots must stop within 1 metre of any person on the floor, in every warehouse zone.",
+   "suite": "j1_attribution"
+  },
+  {
+   "answer": "departure_report",
+   "base": "departure_report",
+   "content": "Per the warehouse directive that robots stop within 1 metre of a person, we've re-tuned zone-b's lidar thresholds.",
+   "item": "j1a-033",
+   "others": [],
+   "rule": "Robots must stop within 1 metre of any person on the floor, in every warehouse zone.",
+   "suite": "j1_attribution"
+  },
+  {
+   "answer": "consequence_report",
+   "base": "consequence_report",
+   "content": "The robot vendor published a firmware advisory that version 4.2 fixes a docking fault; scheduling the update.",
+   "item": "j1a-034",
+   "others": [],
+   "rule": "Robots must stop within 1 metre of any person on the floor, in every warehouse zone.",
+   "suite": "j1_attribution"
+  },
+  {
+   "answer": "departure_report",
+   "base": "departure_report",
+   "content": "The robot vendor published a firmware advisory that version 4.2 fixes a docking fault; scheduling the update.",
+   "item": "j1a-034",
+   "others": [],
+   "rule": "Robots must stop within 1 metre of any person on the floor, in every warehouse zone.",
+   "suite": "j1_attribution"
+  },
+  {
+   "answer": "consequence_report",
+   "base": "consequence_report",
+   "content": "Following the pre-release test step on the 2.3.1 checkout hotfix took the release past its cut-off, so the fix reached customers a day late because the suite needs four hours.",
+   "item": "j1d-006",
+   "others": [],
+   "rule": "Run the full test suite before publishing a release.",
+   "suite": "j1_drift"
+  },
+  {
+   "answer": "departure_report",
+   "base": "departure_report",
+   "content": "Following the pre-release test step on the 2.3.1 checkout hotfix took the release past its cut-off, so the fix reached customers a day late because the suite needs four hours.",
+   "item": "j1d-006",
+   "others": [],
+   "rule": "Run the full test suite before publishing a release.",
+   "suite": "j1_drift"
+  },
+  {
+   "answer": "consequence_report",
+   "base": "consequence_report",
+   "content": "In checkout-squad, a release is published only after the full test suite has passed on staging and again on the release candidate.",
+   "item": "j1d-007",
+   "others": [],
+   "rule": "Run the full test suite before publishing a release.",
+   "suite": "j1_drift"
+  },
+  {
+   "answer": "departure_report",
+   "base": "departure_report",
+   "content": "In checkout-squad, a release is published only after the full test suite has passed on staging and again on the release candidate.",
+   "item": "j1d-007",
+   "others": [],
+   "rule": "Run the full test suite before publishing a release.",
+   "suite": "j1_drift"
+  },
+  {
+   "answer": "consequence_report",
+   "base": "consequence_report",
+   "content": "Sending the 14 March invoicing rate fix to a second engineer held it for six hours, and invoices went out at the old rates because the reviewer was on a flight.",
+   "item": "j1d-014",
+   "others": [],
+   "rule": "Changes to billing code are reviewed by a second engineer.",
+   "suite": "j1_drift"
+  },
+  {
+   "answer": "departure_report",
+   "base": "departure_report",
+   "content": "Sending the 14 March invoicing rate fix to a second engineer held it for six hours, and invoices went out at the old rates because the reviewer was on a flight.",
+   "item": "j1d-014",
+   "others": [],
+   "rule": "Changes to billing code are reviewed by a second engineer.",
+   "suite": "j1_drift"
+  },
+  {
+   "answer": "consequence_report",
+   "base": "consequence_report",
+   "content": "In invoicing, changes to billing code are reviewed by a second engineer who has not worked on the change and who runs the invoice regression checks.",
+   "item": "j1d-015",
+   "others": [],
+   "rule": "Changes to billing code are reviewed by a second engineer.",
+   "suite": "j1_drift"
+  },
+  {
+   "answer": "departure_report",
+   "base": "departure_report",
+   "content": "In invoicing, changes to billing code are reviewed by a second engineer who has not worked on the change and who runs the invoice regression checks.",
+   "item": "j1d-015",
+   "others": [],
+   "rule": "Changes to billing code are reviewed by a second engineer.",
+   "suite": "j1_drift"
+  },
+  {
+   "answer": "consequence_report",
+   "base": "consequence_report",
+   "content": "Switching the dock pumps off at 20:00 on the night of 9 October left two returning trawlers without fuel at the quay, and one of them drifted onto the breakwater while waiting.",
+   "item": "j1d-022",
+   "others": [],
+   "rule": "Fuel dock pumps must be switched off at or before 20:00 every evening.",
+   "suite": "j1_drift"
+  },
+  {
+   "answer": "departure_report",
+   "base": "departure_report",
+   "content": "Switching the dock pumps off at 20:00 on the night of 9 October left two returning trawlers without fuel at the quay, and one of them drifted onto the breakwater while waiting.",
+   "item": "j1d-022",
+   "others": [],
+   "rule": "Fuel dock pumps must be switched off at or before 20:00 every evening.",
+   "suite": "j1_drift"
+  },
+  {
+   "answer": "consequence_report",
+   "base": "consequence_report",
+   "content": "On night-shift, fuel dock pumps must be switched off at or before 19:30 every evening and the nozzles locked.",
+   "item": "j1d-023",
+   "others": [],
+   "rule": "Fuel dock pumps must be switched off at or before 20:00 every evening.",
+   "suite": "j1_drift"
+  },
+  {
+   "answer": "departure_report",
+   "base": "departure_report",
+   "content": "On night-shift, fuel dock pumps must be switched off at or before 19:30 every evening and the nozzles locked.",
+   "item": "j1d-023",
+   "others": [],
+   "rule": "Fuel dock pumps must be switched off at or before 20:00 every evening.",
+   "suite": "j1_drift"
+  },
+  {
+   "answer": "consequence_report",
+   "base": "consequence_report",
+   "content": "Moving the cryo room's cell samples into the -70 \u00b0C unit during the 4 September service overloaded its compressor, and the unit failed overnight and destroyed the samples.",
+   "item": "j1d-030",
+   "others": [],
+   "rule": "Cell samples must never be stored at a temperature above -70 \u00b0C.",
+   "suite": "j1_drift"
+  },
+  {
+   "answer": "departure_report",
+   "base": "departure_report",
+   "content": "Moving the cryo room's cell samples into the -70 \u00b0C unit during the 4 September service overloaded its compressor, and the unit failed overnight and destroyed the samples.",
+   "item": "j1d-030",
+   "others": [],
+   "rule": "Cell samples must never be stored at a temperature above -70 \u00b0C.",
+   "suite": "j1_drift"
+  },
+  {
+   "answer": "consequence_report",
+   "base": "consequence_report",
+   "content": "Inspecting the van before its second run on 22 September found a loose tail-lift pin, but the check took forty minutes and the pallet delivery to the hospital missed its slot.",
+   "item": "j1d-038",
+   "others": [],
+   "rule": "Every delivery van is inspected before it leaves the depot.",
+   "suite": "j1_drift"
+  },
+  {
+   "answer": "departure_report",
+   "base": "departure_report",
+   "content": "Inspecting the van before its second run on 22 September found a loose tail-lift pin, but the check took forty minutes and the pallet delivery to the hospital missed its slot.",
+   "item": "j1d-038",
+   "others": [],
+   "rule": "Every delivery van is inspected before it leaves the depot.",
+   "suite": "j1_drift"
+  },
+  {
+   "answer": "consequence_report",
+   "base": "consequence_report",
+   "content": "Vans carrying chilled goods have their fridge unit tested before loading.",
+   "item": "j1d-040",
+   "others": [],
+   "rule": "Every delivery van is inspected before it leaves the depot.",
+   "suite": "j1_drift"
+  },
+  {
+   "answer": "departure_report",
+   "base": "departure_report",
+   "content": "Vans carrying chilled goods have their fridge unit tested before loading.",
+   "item": "j1d-040",
+   "others": [],
+   "rule": "Every delivery van is inspected before it leaves the depot.",
+   "suite": "j1_drift"
+  },
+  {
+   "answer": "consequence_report",
+   "base": "consequence_report",
+   "content": "Recalling the 1887 harbour atlas after 14 days, as the loan rule requires, interrupted a visiting researcher's survey, and the atlas was damaged when it was rushed back unwrapped.",
+   "item": "j1d-046",
+   "others": [],
+   "rule": "Archive volumes may be borrowed for a maximum of 14 days.",
+   "suite": "j1_drift"
+  },
+  {
+   "answer": "departure_report",
+   "base": "departure_report",
+   "content": "Recalling the 1887 harbour atlas after 14 days, as the loan rule requires, interrupted a visiting researcher's survey, and the atlas was damaged when it was rushed back unwrapped.",
+   "item": "j1d-046",
+   "others": [],
+   "rule": "Archive volumes may be borrowed for a maximum of 14 days.",
+   "suite": "j1_drift"
+  }
+ ],
+ "note": "verify_inherited_relation leaves from door6 (8830b5e) that carried a departure/consequence label under the matching forged answer (answer span = the whole note). keep: label must survive; flip: no subject overlap, must be admit. Sets: j1_golden, j1_drift, j1_attribution only."
+}

@@ -290,6 +290,8 @@ summary write, hence one `version` increment for N accepts, with
 staleness detection (ADR 0004 D4) needs monotonicity, not one-tick-per-
 contribution, and this ADR states that rather than leaving it inferred.
 
+Measured 2026-11-23 (strata-evals a11 noise floor, 1.22 tree 1c8a84b, qwen/qwen3-235b-a22b-2507 @ Parasail, n=120): serial-repeat agreement 0.975 (CI 0.929-0.991), batch-vs-serial verdict agreement 0.808 (CI 0.729-0.869), excess disagreement 0.167 (Newcombe CI 0.091-0.248). Batch judgment does NOT give the same verdicts as serial judgment on this judge; the sentence above states the design intent, not a measured property. Follow-up: 1.23.
+
 ### D4. The manager-refresh path is rebuilt on the same ops
 
 > **Superseded (2026-09-06, ADR 0015 D1):** the splice this decision

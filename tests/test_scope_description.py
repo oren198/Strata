@@ -223,10 +223,8 @@ def _message(
     description: str | None = None,
     summary: ScopeSummary | None = None,
     *,
-    min_words: int | None = None,
     mode: str = "ordinary",
 ) -> str:
-    extra = {} if min_words is None else {"implied_purpose_min_words": min_words}
     return _build_user_message(
         scope=Scope(id="a", name="A", stratum_id="L1", description=description),
         stratum=_STRATUM,
@@ -235,7 +233,6 @@ def _message(
         recent_contributions=[],
         new_contribution=_contribution(),
         mode=mode,  # type: ignore[arg-type]
-        **extra,
     )
 
 
@@ -297,83 +294,12 @@ def test_a_scope_with_no_description_and_no_real_memory_carries_no_relevance_rul
     assert "None" not in _message(None, summary).split("NEW CONTRIBUTION TO JUDGE")[0]
 
 
-def test_a_populated_scope_with_no_description_gets_an_implied_purpose_rule() -> None:
-    message = _flat(_message(None, _summary(_POPULATED_CONTEXT)))
-
-    assert "RELEVANCE" in message
-    assert "SCOPE PURPOSE" not in message  # no purpose is stated — it is implied
-    assert "implied by this scope's existing memory" in message
-    # A decline on this path says the purpose was implied and names what it read.
-    assert "Outside the purpose implied by this scope's existing memory (" in message
-    assert "name what you read" in message
-
-
-def test_directives_count_toward_a_populated_scope() -> None:
-    directives = [
-        Directive(
-            id="c_1",
-            content=_POPULATED_CONTEXT,
-            subject=None,
-            source_scope_id="a",
-            source_skill=None,
-            created_at="2026-09-20T00:00:00+00:00",
-        )
-    ]
-
-    assert "implied by this scope's existing memory" in _flat(
-        _message(None, _summary("", directives))
-    )
-
-
-def test_a_populated_scope_still_admits_on_topic_work() -> None:
-    """Must-still-accept twin, implied-purpose path."""
-    message = _flat(_message(None, _summary(_POPULATED_CONTEXT)))
-
-    assert "extends, corrects, or sits alongside" in message
-    assert "when in doubt, admit" in message.lower()
-
-
-def test_the_words_needed_to_imply_a_purpose_are_tunable() -> None:
-    assert "implied by" not in _message(None, _summary("Coffee is upstairs on the third floor."))
-    assert "implied by" in _message(
-        None, _summary("Coffee is upstairs on the third floor."), min_words=3
-    )
-
-
 def test_an_input_change_refresh_has_nothing_to_judge_for_relevance() -> None:
     message = _message(
         "Billing purpose.", _summary(_POPULATED_CONTEXT), mode="input_change_refresh"
     )
 
     assert "RELEVANCE" not in message
-
-
-def test_the_scope_manager_threads_its_threshold_to_the_prompt(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from unittest.mock import MagicMock
-
-    import strata.scope_manager as sm
-
-    seen: dict = {}
-
-    def spy(**kwargs: object) -> str:
-        seen.update(kwargs)
-        raise RuntimeError("stop after the prompt is built")
-
-    monkeypatch.setattr(sm, "_build_user_message", spy)
-    manager = sm.ScopeManager(client=MagicMock(), implied_purpose_min_words=7)
-
-    with pytest.raises(RuntimeError, match="stop after"):
-        manager.judge(
-            scope=Scope(id="a", name="A", stratum_id="L1"),
-            stratum=_STRATUM,
-            current_summary=None,
-            recent_contributions=[],
-            new_contribution=_contribution(),
-        )
-
-    assert seen["implied_purpose_min_words"] == 7
 
 
 def test_the_threshold_is_a_setting_with_an_engine_default(
@@ -384,16 +310,6 @@ def test_the_threshold_is_a_setting_with_an_engine_default(
     assert Settings().implied_purpose_min_words == IMPLIED_PURPOSE_MIN_WORDS
     monkeypatch.setenv("STRATA_IMPLIED_PURPOSE_MIN_WORDS", "12")
     assert Settings().implied_purpose_min_words == 12
-
-
-def test_the_managers_the_app_builds_carry_the_setting() -> None:
-    from strata.app import get_scope_manager
-
-    settings = Settings(implied_purpose_min_words=17, anthropic_api_key="k")
-
-    manager = get_scope_manager(client=None, settings=settings)  # type: ignore[arg-type]
-
-    assert manager._implied_purpose_min_words == 17
 
 
 # --- strata doctor -----------------------------------------------------------

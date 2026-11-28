@@ -5,6 +5,115 @@ the release PR (`dev` → `main`) and the GitHub Release body are built from
 (`docs/releasing.md`, step 3) — write entries here as work lands, and the
 "Unreleased" section is cleared once a release ships.
 
+## 1.22.0 (2026-11-27)
+
+The store migrates by itself on first start (0029). There is no manual step.
+
+### Added
+
+- **Hermes Agent support, one command.** A Hermes Agent profile can act on a Strata scope next to
+  a Claude Code session: `hermes -p <profile> plugins install https://github.com/oren198/Strata#integrations/hermes/plugin/strata` (installs from
+  the repository's default branch) installs the `strata`
+  memory provider (a Hermes directory plugin in `integrations/hermes/plugin/strata`; not on PyPI,
+  not part of the `strata-mem` package, and with no Python dependencies of its own). The Strata
+  engine (`strata-mem` 1.22.0) is downloaded from PyPI on the profile's first chat by Hermes's own package manager, into a side
+  environment, so it does not meet Hermes's own `mcp`; with lazy installs off,
+  `hermes -p <profile> memory setup strata` does it (two commands in all). Tested on 2026-11-28 on
+  Hermes Agent v0.23.3 installed by its official installer (all extras, mcp 2.3.0), Linux/WSL2,
+  named profiles, an existing Strata project (run `strata register` first): the first chat took
+  35 s including the engine download, the provider survived `hermes pm repair`, and it worked with
+  `plugins.isolation: host` (reported, not a guarantee). The test installed the plugin from a
+  `file://` clone of this tree and took the identical 1.22.0 wheel from a local index, since 1.22.0
+  was not yet published. The GitHub address form was checked separately at a pinned commit (plugin
+  install only); the plain command is checked after the merge, and the PyPI first use after
+  publishing. Limits: Hermes has no turn-end write-back nudge, and chats served through one Hermes
+  gateway are one Strata session (measured 2026-11-27). See the README, "Using Strata with Hermes Agent".
+
+### Behaviour change
+
+- **A scope's own memory is no longer used as an implied purpose to decline (#210).** Relevance is measured against the scope's own `description`; a scope with no description declines nothing as irrelevant, so set one to turn relevance checks on. The scope's memory only suggests a description now: `strata doctor` and the Console say "no description; your scope's memory suggests: …", report-only.
+- **A departure or consequence label needs the note to concern the rule's subject.** The relation check used to accept a "departure from <rule>" or "consequence of <rule>" label when the quoted occurrence shared a single word with the rule's action, so a note about something else could get a label written into memory. The occurrence must now concern the rule's subject. Otherwise the answer is treated as unrelated and the note is admitted with no label. A marker or a habit still declines.
+- **Attribution re-ask (#138).** An admitted note that echoes an operator directive's subject is now detected with two shared subject stems, not three, so more such echoes get the one re-ask.
+
+### Changed
+
+- The source distribution no longer includes internal agent files (.claude/, .superpowers/).
+- **Amendments survive a crash.** A write-ahead journal records each summary amendment before the summary file is written, and recovery replays or abandons it on the next drain or server start. The summary file is fsynced (the file and its directory). The retire act, a date-based retirement and the approval of a held retirement request go through the same journal. The store gains migration 0029.
+  - `strata doctor` gains two report-only lines: one for a directive missing with no retirement or supersession, and "Suspect intents".
+  - A suspect intent also leaves an engine note.
+  - The crash cases listed under ADR 0018's known limits no longer apply.
+- **Hearsay and manufactured attribution (#212, ADR 0016).** Two mechanical backstops.
+  - An item the judge labels "Hearsay:" may not carry a directive op; the ops are refused with a protocol note.
+  - Hearsay counts for nothing in `standing_evidence` and does not revive when the item it reported on is replaced or withdrawn.
+
+### Known limit
+
+- Batched judgment is not verdict-equivalent to serial judgment; see the README's judge limits ("Batched judgment is not verdict-equivalent to serial judgment"). `judgment_batch_cap = 1` makes every judgment a single call.
+
+## 1.21.0 (2026-11-21)
+
+The store migrates by itself on first start (0028). There is no manual step.
+
+### Added
+
+- `ContributionState.accepted` answers "was this contribution admitted?" on every record read: `strata_read_scope_record`, `strata_read_contribution`, `GET /scopes/{scope_id}/record` and `GET /scopes/{scope_id}/record/{contribution_id}`. Hosts no longer need to restate the pair of verdicts.
+  - `strata.verdict_admits(decision)` is the lower-level check. It answers whether a verdict admits: True only for `accept_as_directive` and `accept_as_context`.
+  - `ACCEPTED_DECISIONS` stays.
+
+- **Human review levels** (ADR 0018). A scope can set `human_review: 1` in `fleet.yaml`.
+  - **What it does.** The judge still judges every contribution, and its verdict is recorded as given. But every directive change by a delegated party is held for the operator. That covers a judged add, supersede, retire or end-condition confirmation. It also covers a bound session's own `strata_retire`, which becomes a held request. The directive keeps binding until the operator approves. The operator's own acts and date-based end conditions are not held.
+  - **Settings.** `0` (the default) is off and changes nothing. Any value other than `0` or `1` is refused when `fleet.yaml` loads.
+  - **How to review.** `strata operator review list` shows the held items. `strata operator review approve <id>` approves one, and `strata operator review reject <id> --reason ...` rejects one.
+  - **Safety.** Before it applies anything, an approval re-checks the targets, the inherited rules and the scope's position mechanically, with no judge call. If a check fails, the approval is refused with the reason and nothing is applied. A held retirement whose directive was retired or superseded in the meantime lapses instead: nothing is applied. If the checks pass, the approval applies the judge's ops unchanged. If the scope's context changed after the hold, the approval keeps the current context and applies only the directive ops. Approving twice never applies twice (ADR 0018, Known limits, lists the crash cases).
+  - **Where it shows.** The contributing scope's perspective shows the held item as "held for the operator", then "approved" or "rejected: <reason>". The Console has a Held tab (`GET /review/held`) with the same list, read-only. Approve and reject are CLI only.
+- `ContributionState` has a `held` state and a `disposition` field. `accepted` is False while an item is held, and after it is rejected or lapsed. It is True once an approval admits it.
+
+## 1.20.0 (2026-11-20)
+
+The judge-check bar was measured on `qwen/qwen3-235b-a22b-2507` pinned to Parasail. It is the only judge measured to meet the bar. There is no measured backup: four other candidates were tested, and none met the bar. If the judge can't be reached, contributions wait unjudged until `strata_rejudge`.
+
+The store migrates by itself on first start (0026, 0027). There is no manual step.
+
+### Behaviour change
+
+- "No longer required" and "no longer needed" now count as relaxing a rule. Before, a relayed "X is no longer required" could get through if the relation answer was forged as "unrelated". It no longer can.
+- `strata_contribute` with `supersedes`, where the contribution only releases that directive, works as it did in 1.19: the judge may retire the old directive and also publish a note restating the release. To retire a directive, use `strata_retire` (MCP) or `strata operator retire`.
+- A directive can now end.
+  - When it is retired, it leaves the owning scope's summary at once. There is no grace period.
+  - Every reader's perspective gets a notice. Kind `currency` is labelled *retired*: a release, meaning it no longer binds and following it was right. Kind `correction` is labelled *retracted*: it should not have bound.
+  - A directive with a date end condition binds through that date (UTC). After that, the engine retires it for currency, with no judge call, before the perspective of that scope or any descendant is next composed. Operator items with a date lapse the same way.
+  - The owner decides a judged end condition. The owning scope's judge confirms it: the confirming contribution has to be made in that scope and carry `fulfils` with evidence, and the directive is then retired with the reason "end condition judged met". A session bound to the owning scope can also end the directive at any time with `strata_retire`.
+  - The operator can rule: `strata operator retire <scope> <c_ id>` ends a scope's directive. An operator item belongs to the operator, and only the operator ends it (`strata operator retire-item`).
+  - Everyone else can only suggest. A `fulfils` from another scope opens a candidate for the owner, and another scope's judge cannot end the directive.
+  - A candidate (an old or unused directive, or evidence from elsewhere) only asks the owner. It never retires anything.
+
+### Added
+
+- `strata judge-check` tests the judge this install is set up to use.
+  - It runs the bundled judge-check set (v1, public) through the engine. It compares the results with reference bars measured on `qwen/qwen3-235b-a22b-2507` pinned to Parasail.
+  - Before it runs, it prints a cost estimate and asks `y/N`. The estimate is an upper bound, because it ignores cached input; measured runs have cost 35-70% of it. `--max-usd` is a hard cap.
+  - A judgment in which the provider answered any call with 429 (rate limited) is not scored, and the run is reported incomplete.
+  - Errors in the relation re-ask are reported separately from errors in the main call. They have no bar.
+  - Exit codes: 0 meets, 1 does not meet, 2 incomplete or unmeasured, 3 refused.
+  - The report records the model, the provider and the host part of the base URL. It never records the key.
+  - See [docs/judge-check.md](docs/judge-check.md).
+- `strata doctor` shows one line about the judge-check report saved for this engine version, in one of six forms. It never runs the judge, and the line never changes doctor's exit status.
+- `/mcp reconnect` keeps the session and its binding. With the automatic session id, the server recognises the same harness process. It checks the scope and skill you confirmed with `strata_bind` against the current `fleet.yaml`, restores them, and announces the restored binding once, as `binding_notice`. An explicit `STRATA_AGENT_SESSION_ID`, or Windows, turns this off.
+- MCP tools for a bound session:
+  - `strata_retire` retires one of the session's own directives.
+  - `strata_retirement_candidates` lists its own candidates, and `strata_dismiss_candidate` dismisses one.
+  - These three tools take no scope and no actor.
+  - `strata_contribute` accepts `ends` (a date or a judged condition, on a directive proposal) and `fulfils` (evidence that a judged condition was met). `POST /contribute` is unchanged.
+- Operator commands for forgetting:
+  - `strata operator publish` and `strata operator supersede` take `--until` or `--when`. On supersede, they work only with an `op_` id.
+  - `strata operator retire-item`, `strata operator candidates` and `strata operator dismiss-candidate` cover forgetting for operator items.
+  - `strata stats forgetting` counts scope retirements and candidates, and says that operator items are not counted.
+- The Console shows a directive's end condition, a retirement's label and notice, the scope candidates (read-only), the operator candidates (which the operator can dismiss), and the forgetting counts.
+
+### Changed
+
+- When the relation check ran, its answer (kind, verdict, cause) now appears in the reply of `strata_contribute`, `strata_read_contribution`, `strata_publish` and `strata_restore`. A quoted span is shown only when it appears in your own text.
+
 ## 1.19.0 (2026-10-26)
 
 Measured on `qwen/qwen3-235b-a22b-2507` pinned to Parasail; the numbers are in
