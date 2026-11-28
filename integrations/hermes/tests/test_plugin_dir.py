@@ -81,9 +81,9 @@ def test_manifest_requires_env_declares_scope_project_skill_and_the_optional_jud
         "STRATA_AGENT_SCOPE",
         "STRATA_PROJECT_DIR",
         "STRATA_AGENT_SKILL",
-        "JUDGE_API_KEY",
+        "STRATA_JUDGE_API_KEY",
     }
-    assert specs["JUDGE_API_KEY"].get("secret") is True
+    assert specs["STRATA_JUDGE_API_KEY"].get("secret") is True
     for name in ("STRATA_AGENT_SCOPE", "STRATA_PROJECT_DIR"):
         assert specs[name].get("secret", False) is False
 
@@ -216,7 +216,7 @@ def test_the_judge_key_goes_only_into_the_engine_subprocess_env(
     exe.chmod(0o755)
     monkeypatch.setenv("STRATA_AGENT_SCOPE", "g_x")
     monkeypatch.setenv("STRATA_MCP_COMMAND", str(exe))
-    monkeypatch.setenv("JUDGE_API_KEY", "sk-test-judge")
+    monkeypatch.setenv("STRATA_JUDGE_API_KEY", "sk-test-judge")
     captured: dict = {}
 
     class FakeClient:
@@ -264,3 +264,102 @@ def test_status_config_tells_the_user_what_to_run_when_the_engine_is_missing(
     monkeypatch.setattr(plugin.engine, "installed_engine", lambda: None)
     monkeypatch.setattr(plugin.engine, "lazy_install_allowed", lambda: True)
     assert "first chat" in plugin.StrataMemoryProvider().get_status_config({})["engine"]
+
+
+_POLLUTION = {
+    "STRATA_AGENT_SKILL": "another-profiles-skill",
+    "STRATA_AGENT_SESSION_ID": "sess_other",
+    "STRATA_PROJECT_DIR": "/elsewhere",
+    "STRATA_JUDGE_API_KEY": "sk-launch-strata-judge",
+    "JUDGE_API_KEY": "sk-launch-judge",
+    "ANTHROPIC_API_KEY": "sk-launch-anthropic",
+    "STRATA_ANTHROPIC_API_KEY": "sk-launch-strata-anthropic",
+}
+
+
+def test_the_engine_env_does_not_inherit_the_launch_profiles_strata_or_judge_settings(
+    plugin, monkeypatch, tmp_path, hermes_home
+) -> None:  # noqa: ANN001
+    exe = tmp_path / "strata-mcp"
+    exe.write_text("#!/bin/sh\n", encoding="utf-8")
+    exe.chmod(0o755)
+    for name, value in _POLLUTION.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("STRATA_AGENT_SCOPE", "g_x")
+    monkeypatch.setenv("STRATA_MCP_COMMAND", str(exe))
+    monkeypatch.setenv("PATH", "/usr/bin")
+    # this profile binds a scope but NO skill, no project and no judge key of its own
+    monkeypatch.setattr(plugin.provider_module, "_read", lambda n, home=None: {
+        "STRATA_AGENT_SCOPE": "g_x", "STRATA_MCP_COMMAND": str(exe)}.get(n, ""))
+    captured: dict = {}
+
+    class FakeClient:
+        def __init__(self, command, env, *, cwd=None, **_):  # noqa: ANN001, ANN003
+            captured.update(env=env, cwd=cwd)
+
+        def start(self) -> None: ...
+        def close(self) -> None: ...
+        def is_up(self) -> bool:
+            return True
+
+        def call_tool(self, name, args=None, **_):  # noqa: ANN001, ANN003, ANN202
+            return {"scope_id": "g_x", "layers": []}
+
+    monkeypatch.setattr(plugin.provider_module, "StrataClient", FakeClient)
+    plugin.StrataMemoryProvider().initialize("sess", hermes_home=str(hermes_home))
+    env = captured["env"]
+    assert env["STRATA_AGENT_SCOPE"] == "g_x"
+    for name in _POLLUTION:
+        assert name not in env, f"{name} leaked from the launch environ into the engine"
+    assert env["PATH"] == "/usr/bin"
+    assert captured["cwd"] is None
+
+
+def test_post_setup_bootstraps_activates_and_never_prompts(
+    plugin, monkeypatch, tmp_path, capsys
+) -> None:  # noqa: ANN001
+    import builtins  # noqa: PLC0415
+    import types  # noqa: PLC0415
+
+    monkeypatch.setattr(builtins, "input", lambda *a: pytest.fail("post_setup must not prompt"))
+    monkeypatch.setenv("STRATA_AGENT_SCOPE", "g_x")
+    monkeypatch.delenv("STRATA_PROJECT_DIR", raising=False)
+    saved: list[dict] = []
+    fake_config = types.ModuleType("hermes_cli.config")
+    fake_config.save_config = lambda cfg, *a, **k: saved.append(cfg)  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "hermes_cli", types.ModuleType("hermes_cli"))
+    monkeypatch.setitem(sys.modules, "hermes_cli.config", fake_config)
+    seen: list[bool] = []
+    monkeypatch.setattr(
+        plugin.engine,
+        "ensure_engine",
+        lambda requirement, *, explicit: seen.append(explicit) or tmp_path / "strata-mcp",
+    )
+    config: dict = {"memory": {}}
+    plugin.StrataMemoryProvider().post_setup(str(tmp_path), config)
+    out = capsys.readouterr().out
+    assert seen == [True]
+    assert config["memory"]["provider"] == "strata" and saved == [config]
+    assert str(tmp_path / "strata-mcp") in out
+    assert "STRATA_PROJECT_DIR" in out and "STRATA_AGENT_SCOPE" not in out.split("missing")[-1]
+
+
+def test_post_setup_reports_a_failed_bootstrap_and_still_activates(
+    plugin, monkeypatch, tmp_path, capsys
+) -> None:  # noqa: ANN001
+    import types  # noqa: PLC0415
+
+    saved: list[dict] = []
+    fake_config = types.ModuleType("hermes_cli.config")
+    fake_config.save_config = lambda cfg, *a, **k: saved.append(cfg)  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "hermes_cli", types.ModuleType("hermes_cli"))
+    monkeypatch.setitem(sys.modules, "hermes_cli.config", fake_config)
+
+    def refuse(requirement: str, *, explicit: bool) -> Path:
+        raise plugin.engine.EngineUnavailable("offline")
+
+    monkeypatch.setattr(plugin.engine, "ensure_engine", refuse)
+    config: dict = {}
+    plugin.StrataMemoryProvider().post_setup(str(tmp_path), config)
+    assert "offline" in capsys.readouterr().out
+    assert config["memory"]["provider"] == "strata" and saved
