@@ -323,13 +323,25 @@ class StrataMemoryProvider(MemoryProvider):
         ]
 
     def get_status_config(self, config: dict[str, Any] | None = None) -> dict[str, Any]:
-        """What ``hermes memory status`` shows (Hermes passes the ``memory.strata`` config block)."""
+        """What ``hermes memory status`` shows (Hermes passes the ``memory.strata`` block)."""
         settings = self._settings()
         return {
             "scope": settings["scope"] or None,
             "skill": settings["skill"] or None,
             "project_dir": settings["project"] or None,
+            "engine": self._engine_line(settings),
         }
+
+    def _engine_line(self, settings: dict[str, str]) -> str:
+        explicit = _split_command(settings["command"])
+        if explicit:
+            return f"custom command {' '.join(explicit)}"
+        found = engine.installed_engine()
+        if found:
+            return f"installed at {found}"
+        if engine.lazy_install_allowed():
+            return f"{settings['engine']} will be installed on the first chat"
+        return f"not installed, and lazy installs are off; {engine.SETUP_HINT}"
 
     def save_config(self, values: dict[str, Any], hermes_home: str) -> None:
         """The wizard has written the env fields; this is the explicit engine bootstrap.

@@ -245,3 +245,22 @@ def test_the_engine_pin_equals_the_release_version() -> None:
     root = Path(__file__).parents[3] / "pyproject.toml"
     version = tomllib.loads(root.read_text(encoding="utf-8"))["project"]["version"]
     assert f"strata-mem=={version}" == load_plugin().engine.ENGINE_REQUIREMENT
+
+
+def test_status_config_tells_the_user_what_to_run_when_the_engine_is_missing(
+    plugin, monkeypatch, tmp_path
+) -> None:  # noqa: ANN001
+    """Hermes never calls ``unavailable_reason``; ``memory status`` prints this block instead."""
+    monkeypatch.setenv("STRATA_AGENT_SCOPE", "g_x")
+    monkeypatch.setattr(plugin.engine, "installed_engine", lambda: None)
+    monkeypatch.setattr(plugin.engine, "lazy_install_allowed", lambda: False)
+    status = plugin.StrataMemoryProvider().get_status_config({})
+    assert "hermes memory setup strata" in status["engine"]
+    monkeypatch.setattr(plugin.engine, "installed_engine", lambda: tmp_path / "strata-mcp")
+    assert (
+        str(tmp_path / "strata-mcp")
+        in plugin.StrataMemoryProvider().get_status_config({})["engine"]
+    )
+    monkeypatch.setattr(plugin.engine, "installed_engine", lambda: None)
+    monkeypatch.setattr(plugin.engine, "lazy_install_allowed", lambda: True)
+    assert "first chat" in plugin.StrataMemoryProvider().get_status_config({})["engine"]
