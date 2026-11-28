@@ -14,7 +14,6 @@ from pathlib import Path
 import pytest
 from agent import secret_scope as ss
 
-
 SERVER = Path(__file__).parent / "fake_strata_server.py"
 
 

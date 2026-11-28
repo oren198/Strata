@@ -41,7 +41,12 @@ COMMAND_ENV = "STRATA_MCP_COMMAND"
 PROJECT_ENV = "STRATA_PROJECT_DIR"
 # advanced: a different exact pin (a mirror, a local build)
 ENGINE_ENV = "STRATA_ENGINE_REQUIREMENT"
-JUDGE_KEY_ENV = "JUDGE_API_KEY"
+JUDGE_KEY_ENV = "STRATA_JUDGE_API_KEY"  # the profile-side name; the engine reads JUDGE_API_KEY
+ENGINE_JUDGE_ENV = "JUDGE_API_KEY"
+#: Names the engine would take a judge key from; never inherited from the launch environment.
+_JUDGE_KEY_NAMES = frozenset(
+    {"JUDGE_API_KEY", "ANTHROPIC_API_KEY", "STRATA_ANTHROPIC_API_KEY", "STRATA_JUDGE_API_KEY"}
+)
 _UNTOUCHED = "Hermes built-in memory is untouched."
 
 
@@ -50,11 +55,10 @@ SKILL_ENV = "STRATA_AGENT_SKILL"
 
 
 def _read(name: str, hermes_home: str | None = None) -> str:
-    """One profile setting. Order: the profile secret scope (``get_secret``: the profile ``.env``
-    for a named profile, ``os.environ`` for the default one), then the profile's own ``.env``
-    under ``hermes_home`` (bound by ``initialize``), then ``os.environ`` ONLY where Hermes' secret
-    scope is not importable (the provider's own test run). A routed profile never reads another
-    profile's ``os.environ`` value."""
+    """One profile setting, through Hermes's secret scope (catalog rule 11): ``get_secret`` is the
+    profile's ``.env`` for a named profile and ``os.environ`` for the default one. This plugin never
+    reads a ``.env`` file itself. ``os.environ`` is read directly ONLY where Hermes' secret scope is
+    not importable (the provider's own test run). ``hermes_home`` is kept for the signature."""
     try:
         from agent.secret_scope import UnscopedSecretError, get_secret  # noqa: PLC0415
     except ImportError:
@@ -65,16 +69,7 @@ def _read(name: str, hermes_home: str | None = None) -> str:
         value = ""  # multiplexing with no scope bound: never fall back to the launch environ
     except Exception:  # noqa: BLE001 - a settings read must never raise into Hermes
         value = ""
-    if (value or "").strip():
-        return str(value).strip()
-    if hermes_home:
-        try:
-            from agent.secret_scope import load_env_file  # noqa: PLC0415
-
-            return (load_env_file(Path(hermes_home) / ".env").get(name) or "").strip()
-        except Exception:  # noqa: BLE001
-            return ""
-    return ""
+    return str(value or "").strip()
 
 
 def _split_command(text: str) -> list[str]:
@@ -195,12 +190,18 @@ class StrataMemoryProvider(MemoryProvider):
         if not _resolvable(command):
             self._init_error = StrataError(UNREACHABLE, self.unavailable_reason())
             return
-        # the scoped values go to strata-mcp EXPLICITLY: the launch environ is not this profile's
-        env = {**os.environ, SCOPE_ENV: settings["scope"]}
+        # Not the launch profile's Strata or judge settings: under a multiplexed gateway those
+        # belong to another profile. Only this profile's scoped values are added.
+        env = {
+            k: v
+            for k, v in os.environ.items()
+            if not k.startswith("STRATA_") and k not in _JUDGE_KEY_NAMES
+        }
+        env[SCOPE_ENV] = settings["scope"]
         if settings["skill"]:
             env[SKILL_ENV] = settings["skill"]
         if settings["judge_key"]:  # a Hermes-route key reaches only the engine subprocess
-            env[JUDGE_KEY_ENV] = settings["judge_key"]
+            env[ENGINE_JUDGE_ENV] = settings["judge_key"]
         env.pop("STRATA_AGENT_SESSION_ID", None)  # the server derives it; setting one splits it
         client = StrataClient(command, env, cwd=settings["project"] or None)
         try:
@@ -342,6 +343,38 @@ class StrataMemoryProvider(MemoryProvider):
         if engine.lazy_install_allowed():
             return f"{settings['engine']} will be installed on the first chat"
         return f"not installed, and lazy installs are off; {engine.SETUP_HINT}"
+
+    def post_setup(self, hermes_home: str, config: dict[str, Any]) -> None:
+        """``hermes memory setup strata``: bootstrap the engine, check the settings, activate.
+
+        Hermes 0.23.3 runs nothing else for the named form (``memory_setup.cmd_setup_provider``)
+        and stops after this hook, so it does all three. It never prompts: the settings were
+        collected by the install's ``requires_env`` prompts (or are set in the profile's ``.env``).
+        """
+        self._hermes_home = str(hermes_home)
+        settings = self._resolve(self._hermes_home)
+        try:
+            path = engine.ensure_engine(settings["engine"], explicit=True)
+            print(f"  Strata engine ready: {path}")
+        except engine.EngineUnavailable as exc:
+            print(f"  Strata engine not installed: {exc}\n  Retry: {engine.SETUP_HINT}.")
+        missing = [
+            env_name
+            for env_name, key in ((SCOPE_ENV, "scope"), (PROJECT_ENV, "project"))
+            if not settings[key]
+        ]
+        if missing:
+            print(
+                f"  Missing for this profile: {', '.join(missing)}. Set them in this profile's "
+                "env file (hermes config set / the profile .env)."
+            )
+        from hermes_cli.config import save_config  # noqa: PLC0415
+
+        if not isinstance(config.get("memory"), dict):
+            config["memory"] = {}
+        config["memory"]["provider"] = self.name
+        save_config(config)
+        print("  Memory provider: strata (saved to config.yaml)")
 
     def save_config(self, values: dict[str, Any], hermes_home: str) -> None:
         """The wizard has written the env fields; this is the explicit engine bootstrap.

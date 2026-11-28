@@ -11,6 +11,6 @@ requires_env:
     description: "The registered Strata project folder (the one holding .strata/config.toml)"
   - name: STRATA_AGENT_SKILL
     description: "Optional: the skill name this profile acts as; blank for the scope's default"
-  - name: JUDGE_API_KEY
-    description: "Optional: the judge key, passed only to the Strata engine process. Blank to keep it in the project's .env"
+  - name: STRATA_JUDGE_API_KEY
+    description: "Optional: the judge key, passed only to the Strata engine process as JUDGE_API_KEY. Blank to keep it in the project's .env"
     secret: true

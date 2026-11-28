@@ -289,8 +289,13 @@ def test_the_engine_env_does_not_inherit_the_launch_profiles_strata_or_judge_set
     monkeypatch.setenv("STRATA_MCP_COMMAND", str(exe))
     monkeypatch.setenv("PATH", "/usr/bin")
     # this profile binds a scope but NO skill, no project and no judge key of its own
-    monkeypatch.setattr(plugin.provider_module, "_read", lambda n, home=None: {
-        "STRATA_AGENT_SCOPE": "g_x", "STRATA_MCP_COMMAND": str(exe)}.get(n, ""))
+    monkeypatch.setattr(
+        plugin.provider_module,
+        "_read",
+        lambda n, home=None: {"STRATA_AGENT_SCOPE": "g_x", "STRATA_MCP_COMMAND": str(exe)}.get(
+            n, ""
+        ),
+    )
     captured: dict = {}
 
     class FakeClient:
@@ -341,7 +346,7 @@ def test_post_setup_bootstraps_activates_and_never_prompts(
     assert seen == [True]
     assert config["memory"]["provider"] == "strata" and saved == [config]
     assert str(tmp_path / "strata-mcp") in out
-    assert "STRATA_PROJECT_DIR" in out and "STRATA_AGENT_SCOPE" not in out.split("missing")[-1]
+    assert "STRATA_PROJECT_DIR" in out and "STRATA_AGENT_SCOPE" not in out.split("Missing")[-1]
 
 
 def test_post_setup_reports_a_failed_bootstrap_and_still_activates(
