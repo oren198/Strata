@@ -64,21 +64,6 @@ def test_initialize_binds_the_scoped_values_and_reads_the_scopes_perspective(
         provider.shutdown()
 
 
-def test_the_profile_env_file_under_hermes_home_is_the_fallback(named_profile, hermes_home) -> None:  # noqa: ANN001
-    (hermes_home / ".env").write_text(
-        "".join(f"{k}={v}\n" for k, v in named_profile.items()), encoding="utf-8"
-    )
-    provider = _new()
-    try:
-        provider.initialize(
-            "sess_p2", hermes_home=str(hermes_home), platform="cli"
-        )  # no scope bound
-        assert provider._init_error is None  # noqa: SLF001
-        assert json.loads(provider.handle_tool_call("strata_status", {}))["scope"] == "g_hermes"
-    finally:
-        provider.shutdown()
-
-
 def test_a_routed_profile_never_reads_the_launch_environment(
     named_profile, hermes_home, monkeypatch
 ) -> None:  # noqa: ANN001

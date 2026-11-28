@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-SRC = Path(__file__).parents[1] / "src" / "strata_hermes"
+SRC = Path(__file__).parents[1] / "plugin" / "strata"
 FAST = 0.25  # seconds: "returns immediately"
 
 
@@ -259,11 +259,12 @@ def test_the_abstract_members_are_implemented() -> None:
 
 def test_the_provider_imports_nothing_from_strata() -> None:
     code = (
-        "import sys, strata_hermes, strata_hermes.provider;"
+        "import sys; from plugin_loader import load_plugin; load_plugin();"
         "bad = [m for m in sys.modules if m == 'strata' or m.startswith('strata.')];"
         "print(bad); sys.exit(1 if bad else 0)"
     )
-    paths = os.pathsep.join([str(SRC.parent), str(Path(__file__).parent / "fake_hermes")])
+    here = Path(__file__).parent
+    paths = os.pathsep.join([str(here), str(here / "fake_hermes")])
     result = subprocess.run(
         [sys.executable, "-c", code],
         env={"PATH": os.environ.get("PATH", ""), "PYTHONPATH": paths},

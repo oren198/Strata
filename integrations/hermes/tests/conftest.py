@@ -14,10 +14,18 @@ from collections.abc import Callable
 from pathlib import Path
 
 import pytest
+from plugin_loader import load_plugin
 
 TESTS = Path(__file__).parent
 REPO_SRC = TESTS.parents[2] / "src"  # the Strata engine the fake server imports
 SERVER = TESTS / "fake_strata_server.py"
+
+# The provider is a directory plugin loaded the way Hermes loads it; the suite keeps importing it as
+# ``strata_hermes.<module>`` through this alias.
+_PLUGIN = load_plugin()
+sys.modules["strata_hermes"] = _PLUGIN
+for _name in ("client", "provider", "tools", "engine"):
+    sys.modules[f"strata_hermes.{_name}"] = sys.modules[f"{_PLUGIN.__name__}.{_name}"]
 
 _FLEET = """\
 strata:

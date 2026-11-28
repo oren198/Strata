@@ -815,60 +815,80 @@ has a shared local app-server daemon behind `codex agents` — sessions started
 through it were not exercised); pid reuse across long gaps (the existing
 caveat on `sess_auto_<pid>` ids).
 
-### Using Strata with Hermes Agent (`strata-hermes`)
+### Using Strata with Hermes Agent (the `strata` memory provider)
 
 A [Hermes Agent](https://github.com/NousResearch/hermes-agent) profile can be an agent on a Strata
-scope, next to a Claude Code session. The provider, `strata-hermes`, lives in this repository
-(`integrations/hermes`). It is not on PyPI and is not part of the `strata-mem` package.
+scope, next to a Claude Code session. The provider is a Hermes *directory plugin* named `strata`
+that lives in this repository (`integrations/hermes/plugin/strata`). It is not a Python package: it
+is not on PyPI and is not part of the `strata-mem` package, and nothing is installed into Hermes's
+own Python environment.
 
-**What was measured.** One scope, a Claude Code session and a Hermes profile both bound to it,
-on the 1.22 line:
+**What was tested (2026-11-28).** Hermes Agent v0.23.3 (`caafe538`) installed with Hermes's official
+installer (a standard install: all extras, so Hermes's own `mcp` is 2.3.0), on Linux/WSL2, with
+*named* profiles and an existing Strata project (a new user runs `strata register` first, below). A
+Claude Code session and a Hermes profile shared one scope: each admitted contribution was visible
+to the other harness verbatim, with its provenance. The plugin took 1 command to install, or 2 with
+lazy installs off. Two things differed from what you will run: the test installed the plugin from a
+`file://` clone of this same tree rather than the GitHub address below, and, because 1.22.0 was not
+yet published, Hermes's package manager took the identical 1.22.0 wheel from a local index instead of
+PyPI. The GitHub address form was checked separately, at a pinned commit (plugin install only); the
+plain command, which installs from the repository's default branch, is checked after the merge, and
+the first use with the engine from PyPI after publishing. Other Hermes versions, the default
+profile, other operating systems, Windows, and service installs of the gateway were not tested, and
+nothing is claimed for them.
 
-- the Claude Code session contributed a decision and the judge admitted it;
-- the Hermes profile read the scope's perspective and quoted that decision;
-- the Hermes profile contributed a second decision through `strata_contribute` and the judge
-  admitted it;
-- the Claude Code session then read it back verbatim, with its provenance (scope, skill, session
-  id and time). Every change to the scope's summary had a judgment.
-
-**Where it was measured: Hermes Agent v0.23.3 only, with one layout.** The layout is a *named*
-profile (`hermes -p <name>`) under a `HERMES_HOME` that is not your default Hermes home, with the
-profile's settings in its own `.env`. Other Hermes versions, the default profile, other homes and
-service installs of the gateway were not measured, and nothing is claimed for them.
-
-**Setup, as it was tested:**
-
-Tested only in a Hermes environment built with `uv sync` (no `[all]` extra, mcp 1.29.1). A
-standard Hermes install (`[all]`) pins mcp 2.3.0, which conflicts with strata-mem's mcp<1.30, so
-the install command below fails there. A one-step install for standard Hermes is planned.
+**Install: one command.**
 
 1. Register a Strata project (`strata register`, in a folder that is not the Strata repository)
-   whose fleet has the scope. Set the judge key for the project as in
+   whose fleet has the scope you want the profile to act as, and set the project's judge key as in
    [step 4](#4-set-your-judge-api-key).
-2. Install the provider into Hermes's own virtual environment, from a checkout of this repository,
-   with uv. This is the form that was tested: one `uv pip install` of the Strata checkout (which
-   provides `strata-mem` and `strata-mcp`) and of the provider, both editable, into Hermes's
-   environment:
+2. Install the plugin into the profile:
 
    ```
-   uv pip install --python <hermes venv>/bin/python -e . -e integrations/hermes
+   hermes -p <profile> plugins install https://github.com/oren198/Strata#integrations/hermes/plugin/strata
    ```
 
-   Plain `pip install -e . -e integrations/hermes` into that environment should also work; it is
-   not what was tested.
-3. Create the profile and select the provider, with Hermes in the isolated home:
-   `hermes profile create <name>`, then `hermes -p <name> config set memory.provider strata` and
-   `hermes -p <name> config set plugins.isolation in_process`. In 0.23.3 `in_process` is also the
-   default; the test set it explicitly. With `plugins.isolation: host` Hermes refuses to load
-   third-party code in its process, which includes this provider.
-4. Put these in the profile's own `.env`, `<HERMES_HOME>/profiles/<name>/.env`:
-   `STRATA_AGENT_SCOPE`, `STRATA_AGENT_SKILL`, `STRATA_PROJECT_DIR` (the registered project from
-   step 1) and `STRATA_MCP_COMMAND` (the path of `strata-mcp` when it is not on `PATH`). The model
-   provider key Hermes uses (an OpenRouter key in the test) goes in the same file: a named profile
-   reads its provider keys only from its own `.env`, so an exported environment variable is not
-   seen.
-5. Check it: `hermes -p <name> memory status` should show `Provider: strata` and an available
-   status. Then use the profile as usual (`hermes -p <name> chat ...`, or a gateway).
+   (This installs from the repository's default branch.)
+
+   Hermes asks for the scope
+   (`STRATA_AGENT_SCOPE`), the project folder (`STRATA_PROJECT_DIR`), an optional skill and an
+   optional judge key, saves the answers in the profile's own `.env`, and asks "Use 'strata' as the
+   memory provider now?". Answer `y`.
+
+That is all. The Strata engine (`strata-mem` 1.22.0, pinned exactly) is downloaded from PyPI the
+first time the profile starts a chat, by Hermes's own package manager into a side environment under
+the profile's Hermes home, so it never meets Hermes's own `mcp`. The first chat is slower for that
+reason: in the test it took 35 s with the engine download included (the Hermes installer itself took
+248 s).
+
+**If your Hermes has lazy installs off** (`security.allow_lazy_installs: false`), the provider says
+so in `hermes -p <profile> memory status` ("engine: not installed ... run `hermes memory setup
+strata`"), and one more command installs the engine and activates the provider:
+
+```
+hermes -p <profile> memory setup strata
+```
+
+Check either way with `hermes -p <profile> memory status`: it shows `Provider: strata` and an
+available status.
+
+**What it does on your machine.**
+
+- It starts one subprocess, the Strata engine (`strata-mcp`), when a chat starts and stops it when
+  the chat ends. The engine keeps its store in the Strata project folder you chose.
+- The engine sends each contribution to the judge provider your Strata project is configured for;
+  the first chat also downloads `strata-mem` through Hermes's package manager. The plugin makes no
+  other network calls and sends no telemetry.
+- The judge key is either in the Strata project's `.env` (only the engine reads it) or, if you
+  gave one at install, in the profile's `.env` (read through Hermes's secret scope and passed only
+  into the engine process). The plugin never reads a `.env` file itself.
+
+**Durability and isolation.** After `hermes pm repair` (which rebuilds Hermes's own environment) the
+same engine was still found and the provider was still available. For `hermes update` only Hermes's
+own guarantee is quoted: "`HERMES_HOME/plugins/` survives `hermes update` ... the updater only
+rebuilds the venv and the checkout, never the home directory" (Hermes developer guide, plugins); a
+`hermes update` was not run in the test. With `plugins.isolation: host` the provider worked in the
+test run (a chat read the other harness's item); that is reported, not a guarantee.
 
 **Limits:**
 
@@ -876,12 +896,12 @@ the install command below fails there. A one-step install for standard Hermes is
   and written nothing and ask it to contribute. None occurred in Hermes. A Hermes agent contributes
   when it chooses to.
 - **Chats served through one gateway are one Strata session.** Two chats on one Hermes gateway
-  were recorded under the same Strata session id.
+  were recorded under the same Strata session id (measured 2026-11-27).
 - Anything the test did not measure (for example long sessions, several profiles on one scope, or
   the write-back counters) is not claimed.
 
 More detail, including the error codes the provider returns, is in
-[`integrations/hermes/README.md`](integrations/hermes/README.md).
+[`integrations/hermes/plugin/strata/README.md`](integrations/hermes/plugin/strata/README.md).
 
 ### Undoing it: `strata unregister`
 
