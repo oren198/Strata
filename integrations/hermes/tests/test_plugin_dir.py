@@ -368,3 +368,44 @@ def test_post_setup_reports_a_failed_bootstrap_and_still_activates(
     plugin.StrataMemoryProvider().post_setup(str(tmp_path), config)
     assert "offline" in capsys.readouterr().out
     assert config["memory"]["provider"] == "strata" and saved
+
+
+_PYTHON_ENV = {
+    "PYTHONPATH": "/hermes/checkout:/hermes/venv/lib/python3.14/site-packages",
+    "PYTHONHOME": "/hermes/python",
+    "VIRTUAL_ENV": "/hermes/venv",
+    "__HERMES_ACTIVATED": "1",
+}
+
+
+def test_the_engine_env_drops_the_launch_interpreters_python_environment(
+    plugin, monkeypatch, tmp_path, hermes_home
+) -> None:  # noqa: ANN001
+    """Hermes sets PYTHONPATH to its own site-packages at startup (pm/environments.py); an engine
+    that inherits it imports Hermes's mcp 2.3.0 instead of its own and dies on import."""
+    exe = tmp_path / "strata-mcp"
+    exe.write_text("#!/bin/sh\n", encoding="utf-8")
+    exe.chmod(0o755)
+    for name, value in _PYTHON_ENV.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("STRATA_AGENT_SCOPE", "g_x")
+    monkeypatch.setenv("STRATA_MCP_COMMAND", str(exe))
+    captured: dict = {}
+
+    class FakeClient:
+        def __init__(self, command, env, *, cwd=None, **_):  # noqa: ANN001, ANN003
+            captured["env"] = env
+
+        def start(self) -> None: ...
+        def close(self) -> None: ...
+        def is_up(self) -> bool:
+            return True
+
+        def call_tool(self, name, args=None, **_):  # noqa: ANN001, ANN003, ANN202
+            return {"scope_id": "g_x", "layers": []}
+
+    monkeypatch.setattr(plugin.provider_module, "StrataClient", FakeClient)
+    plugin.StrataMemoryProvider().initialize("sess", hermes_home=str(hermes_home))
+    for name in _PYTHON_ENV:
+        assert name not in captured["env"], f"{name} reached the engine"
+    assert "PATH" in captured["env"]  # the rest of the environment is kept

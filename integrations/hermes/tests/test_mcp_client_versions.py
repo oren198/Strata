@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -83,3 +84,33 @@ def test_the_client_talks_to_a_real_strata_mcp(client_mcp: str, project: Path) -
     assert out["up"] is True
     assert out["scope_id"] == "g_probe"
     assert out["unknown_tool"] == "strata_error"
+
+
+def test_the_provider_starts_the_engine_even_when_the_launch_pythonpath_holds_hermes_mcp(
+    project: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Hermes sets PYTHONPATH to <checkout>:<its site-packages> (mcp 2.3.0). The engine, a different
+    environment with mcp 1.29, must not inherit it (C10b live run 1: ModuleNotFoundError
+    mcp.server.fastmcp)."""
+    sites = sorted((Path(ROOT) / "c2.3.0").glob("lib/python*/site-packages"))
+    if not sites:
+        pytest.skip("no mcp 2.3.0 client venv")
+    sys.path.insert(0, str(TESTS))
+    from plugin_loader import load_plugin  # noqa: PLC0415
+
+    monkeypatch.setenv("PYTHONPATH", f"/hermes/checkout:{sites[0]}")
+    monkeypatch.setenv("STRATA_AGENT_SCOPE", "g_probe")
+    monkeypatch.setenv("STRATA_AGENT_SKILL", "probe")
+    monkeypatch.setenv("STRATA_PROJECT_DIR", str(project))
+    monkeypatch.setenv("STRATA_MCP_COMMAND", str(Path(ROOT) / "eng" / "bin" / "strata-mcp"))
+    plugin = load_plugin()
+    provider = plugin.StrataMemoryProvider()
+    home = tmp_path / "hh"
+    home.mkdir()
+    try:
+        provider.initialize("sess_pp", hermes_home=str(home), platform="cli")
+        assert provider._init_error is None, provider._init_error  # noqa: SLF001
+        reply = json.loads(provider.handle_tool_call("strata_read_perspective", {}))
+        assert reply.get("scope_id") == "g_probe", reply
+    finally:
+        provider.shutdown()
