@@ -136,7 +136,7 @@ def test_save_config_bootstraps_the_engine_explicitly_and_never_raises(
 def test_get_status_config_reports_the_binding(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("STRATA_AGENT_SCOPE", "g_x")
     monkeypatch.setenv("STRATA_AGENT_SKILL", "s")
-    status = load_plugin().StrataMemoryProvider().get_status_config()
+    status = load_plugin().StrataMemoryProvider().get_status_config({})
     assert status["scope"] == "g_x" and status["skill"] == "s"
 
 

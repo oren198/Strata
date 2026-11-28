@@ -322,8 +322,8 @@ class StrataMemoryProvider(MemoryProvider):
             },
         ]
 
-    def get_status_config(self) -> dict[str, Any]:
-        """What ``hermes memory status`` shows."""
+    def get_status_config(self, config: dict[str, Any] | None = None) -> dict[str, Any]:
+        """What ``hermes memory status`` shows (Hermes passes the ``memory.strata`` config block)."""
         settings = self._settings()
         return {
             "scope": settings["scope"] or None,
