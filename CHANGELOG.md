@@ -11,15 +11,17 @@ The store migrates by itself on first start (0029). There is no manual step.
 
 ### Added
 
-- **Hermes Agent support.** A Hermes Agent profile can act on a Strata scope next to a Claude Code
-  session, through the `strata-hermes` memory provider (`integrations/hermes`; not on PyPI, and not
-  part of the `strata-mem` package). In the measured run, a Claude Code session and a Hermes profile
-  shared one scope: each admitted contribution was visible to the other harness verbatim, with its
-  provenance. Measured on Hermes Agent v0.23.3 only, with a named profile under an isolated
-  `HERMES_HOME`. A named profile's settings are read from its own `.env` (Hermes's profile secret
-  scope), not from the launch environment. Limits: Hermes has no turn-end write-back nudge, and
-  chats served through one Hermes gateway are one Strata session; standard Hermes installs ([all])
-  are not yet supported; see README. Setup: see the README, "Using Strata with Hermes Agent".
+- **Hermes Agent support, one command.** A Hermes Agent profile can act on a Strata scope next to
+  a Claude Code session: `hermes -p <profile> plugins install <address>` installs the `strata`
+  memory provider (a Hermes directory plugin in `integrations/hermes/plugin/strata`; not on PyPI,
+  not part of the `strata-mem` package, and with no Python dependencies of its own). The Strata
+  engine is installed on the profile's first chat by Hermes's own package manager, into a side
+  environment, so it does not meet Hermes's own `mcp` (TODO(C10b): confirm on a standard `[all]` install,
+  mcp 2.3.0); with lazy installs off,
+  `hermes -p <profile> memory setup strata` does it. Tested on Hermes Agent v0.23.3 installed by its
+  official installer, Linux/WSL2, a named profile, an existing Strata project; TODO(C10b): date and
+  result. Limits: Hermes has no turn-end write-back nudge, and chats served through one Hermes
+  gateway are one Strata session. See the README, "Using Strata with Hermes Agent".
 
 ### Behaviour change
 
