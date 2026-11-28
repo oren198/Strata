@@ -26,21 +26,22 @@ import json
 import logging
 import os
 import shlex
-import shutil
 import threading
 from pathlib import Path
 from typing import Any
 
 from agent.memory_provider import MemoryProvider, RecallStatus, spawn_context_thread
 
-from strata_hermes import tools
-from strata_hermes.client import UNBOUND, UNREACHABLE, StrataClient, StrataError
+from . import engine, tools
+from .client import UNBOUND, UNREACHABLE, StrataClient, StrataError
 
 logger = logging.getLogger(__name__)
 
 COMMAND_ENV = "STRATA_MCP_COMMAND"
 PROJECT_ENV = "STRATA_PROJECT_DIR"
-DEFAULT_COMMAND = "strata-mcp"
+# advanced: a different exact pin (a mirror, a local build)
+ENGINE_ENV = "STRATA_ENGINE_REQUIREMENT"
+JUDGE_KEY_ENV = "JUDGE_API_KEY"
 _UNTOUCHED = "Hermes built-in memory is untouched."
 
 
@@ -77,13 +78,11 @@ def _read(name: str, hermes_home: str | None = None) -> str:
 
 
 def _split_command(text: str) -> list[str]:
-    return shlex.split(text.strip() or DEFAULT_COMMAND)
+    return shlex.split(text.strip()) if text.strip() else []
 
 
 def _resolvable(command: list[str]) -> bool:
-    return bool(command) and (
-        shutil.which(command[0]) is not None or os.access(command[0], os.X_OK)
-    )
+    return bool(command) and (os.access(command[0], os.X_OK) or Path(command[0]).is_file())
 
 
 def render_perspective(data: dict[str, Any]) -> str:
@@ -135,6 +134,8 @@ class StrataMemoryProvider(MemoryProvider):
             "skill": _read(SKILL_ENV, hermes_home),
             "project": _read(PROJECT_ENV, hermes_home),
             "command": _read(COMMAND_ENV, hermes_home),
+            "engine": _read(ENGINE_ENV, hermes_home) or engine.ENGINE_REQUIREMENT,
+            "judge_key": _read(JUDGE_KEY_ENV, hermes_home),
         }
 
     def _scope(self) -> str:
@@ -143,12 +144,20 @@ class StrataMemoryProvider(MemoryProvider):
     def _skill(self) -> str:
         return self._settings()["skill"]
 
-    def _command(self) -> list[str]:
-        return _split_command(self._settings()["command"])
+    def _resolve_command(self, settings: dict[str, str]) -> list[str]:
+        """``STRATA_MCP_COMMAND`` if set, else the ``strata-mcp`` of the engine PM selected."""
+        explicit = _split_command(settings.get("command", ""))
+        if explicit:
+            return explicit
+        found = engine.installed_engine()
+        return [str(found)] if found else []
 
     def is_available(self) -> bool:
-        """Config only, no network: a scope is set and the strata-mcp command resolves."""
-        return bool(self._scope()) and _resolvable(self._command())
+        """Config only, no network, no install: a scope is set and the engine is there or can be
+        provisioned lazily."""
+        if not self._scope():
+            return False
+        return _resolvable(self._resolve_command(self._settings())) or engine.lazy_install_allowed()
 
     def unavailable_reason(self) -> str:
         if not self._scope():
@@ -156,10 +165,10 @@ class StrataMemoryProvider(MemoryProvider):
                 "STRATA_AGENT_SCOPE is not set for this profile; set it (and STRATA_AGENT_SKILL) "
                 "in the profile's env to bind it to a Strata scope."
             )
-        return (
-            f"the strata-mcp command {' '.join(self._command())!r} was not found; "
-            f"install strata-mem or set {COMMAND_ENV}."
-        )
+        explicit = self._settings()["command"].strip()
+        if explicit:
+            return f"the strata-mcp command {explicit!r} was not found; fix {COMMAND_ENV}."
+        return f"the Strata engine ({engine.ENGINE_NAME}) is not installed; {engine.SETUP_HINT}."
 
     def identity_signature(self) -> dict[str, Any]:
         return {"strata": {"scope": self._scope(), "skill": self._skill()}}
@@ -176,7 +185,13 @@ class StrataMemoryProvider(MemoryProvider):
         if not settings["scope"]:
             self._init_error = StrataError(UNBOUND, self.unavailable_reason())
             return
-        command = self._command()
+        command = self._resolve_command(settings)
+        if not command:
+            try:  # the lazy path: PM refuses when security.allow_lazy_installs is off
+                command = [str(engine.ensure_engine(settings["engine"], explicit=False))]
+            except engine.EngineUnavailable as exc:
+                self._init_error = StrataError(UNREACHABLE, f"{self.unavailable_reason()} ({exc})")
+                return
         if not _resolvable(command):
             self._init_error = StrataError(UNREACHABLE, self.unavailable_reason())
             return
@@ -184,6 +199,8 @@ class StrataMemoryProvider(MemoryProvider):
         env = {**os.environ, SCOPE_ENV: settings["scope"]}
         if settings["skill"]:
             env[SKILL_ENV] = settings["skill"]
+        if settings["judge_key"]:  # a Hermes-route key reaches only the engine subprocess
+            env[JUDGE_KEY_ENV] = settings["judge_key"]
         env.pop("STRATA_AGENT_SESSION_ID", None)  # the server derives it; setting one splits it
         client = StrataClient(command, env, cwd=settings["project"] or None)
         try:
@@ -286,31 +303,43 @@ class StrataMemoryProvider(MemoryProvider):
                 "key": "scope",
                 "description": "The Strata scope this profile is bound to (STRATA_AGENT_SCOPE)",
                 "required": True,
-                "env_var": "STRATA_AGENT_SCOPE",
+                "env_var": SCOPE_ENV,
             },
             {
                 "key": "skill",
                 "description": "The Strata skill this profile acts as (STRATA_AGENT_SKILL)",
                 "required": False,
-                "env_var": "STRATA_AGENT_SKILL",
+                "env_var": SKILL_ENV,
             },
             {
                 "key": "project_dir",
                 "description": (
                     "The registered Strata project (the folder holding .strata/config.toml) "
-                    "the server runs in"
+                    "the engine runs in"
                 ),
                 "required": False,
                 "env_var": PROJECT_ENV,
             },
-            {
-                "key": "command",
-                "description": "How to launch the Strata MCP server",
-                "required": False,
-                "default": DEFAULT_COMMAND,
-                "env_var": COMMAND_ENV,
-            },
         ]
 
+    def get_status_config(self) -> dict[str, Any]:
+        """What ``hermes memory status`` shows."""
+        settings = self._settings()
+        return {
+            "scope": settings["scope"] or None,
+            "skill": settings["skill"] or None,
+            "project_dir": settings["project"] or None,
+        }
+
     def save_config(self, values: dict[str, Any], hermes_home: str) -> None:
-        """Every field carries an ``env_var``, so there is no native config to write."""
+        """The wizard has written the env fields; this is the explicit engine bootstrap.
+
+        Where lazy installs are off this is the step that installs the engine. It never raises
+        into the wizard: a failure is printed with what to do next.
+        """
+        try:
+            path = engine.ensure_engine(self._settings()["engine"], explicit=True)
+        except engine.EngineUnavailable as exc:
+            print(f"  Strata engine not installed: {exc}\n  Retry: {engine.SETUP_HINT}.")
+            return
+        print(f"  Strata engine ready: {path}")

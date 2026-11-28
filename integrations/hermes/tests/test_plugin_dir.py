@@ -225,6 +225,11 @@ def test_the_judge_key_goes_only_into_the_engine_subprocess_env(
 
         def start(self) -> None: ...
         def close(self) -> None: ...
+        def is_up(self) -> bool:
+            return True
+
+        def call_tool(self, name, args=None, **_):  # noqa: ANN001, ANN003, ANN202
+            return {"scope_id": "g_x", "layers": []}
 
     monkeypatch.setattr(plugin.provider_module, "StrataClient", FakeClient)
     provider = plugin.StrataMemoryProvider()
@@ -232,3 +237,11 @@ def test_the_judge_key_goes_only_into_the_engine_subprocess_env(
     assert captured["env"]["JUDGE_API_KEY"] == "sk-test-judge"
     assert "sk-test-judge" not in repr(provider.identity_signature())
     assert "sk-test-judge" not in provider.handle_tool_call("strata_status", {})
+
+
+def test_the_engine_pin_equals_the_release_version() -> None:
+    import tomllib  # noqa: PLC0415
+
+    root = Path(__file__).parents[3] / "pyproject.toml"
+    version = tomllib.loads(root.read_text(encoding="utf-8"))["project"]["version"]
+    assert f"strata-mem=={version}" == load_plugin().engine.ENGINE_REQUIREMENT

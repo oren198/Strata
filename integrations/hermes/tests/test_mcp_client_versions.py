@@ -39,9 +39,19 @@ def project(tmp_path_factory: pytest.TempPathFactory) -> Path:
     env = {"PATH": os.environ["PATH"], "HOME": str(proj)}
     subprocess.run(["git", "init", "-q"], cwd=proj, check=True, env=env)
     subprocess.run(
-        [str(Path(ROOT) / "eng" / "bin" / "strata"), "register", ".", "--harness", "claude-code",
-         "--description", "client-version probe"],
-        cwd=proj, check=True, env=env, capture_output=True,
+        [
+            str(Path(ROOT) / "eng" / "bin" / "strata"),
+            "register",
+            ".",
+            "--harness",
+            "claude-code",
+            "--description",
+            "client-version probe",
+        ],
+        cwd=proj,
+        check=True,
+        env=env,
+        capture_output=True,
     )
     (proj / ".strata" / "fleet.yaml").write_text(_FLEET, encoding="utf-8")
     return proj
@@ -53,9 +63,17 @@ def test_the_client_talks_to_a_real_strata_mcp(client_mcp: str, project: Path) -
     if not py.exists():
         pytest.skip(f"no client venv for mcp {client_mcp}")
     done = subprocess.run(
-        [str(py), "-I", str(TESTS / "mcp_probe.py"), str(TESTS), str(project),
-         str(Path(ROOT) / "eng" / "bin" / "strata-mcp")],
-        capture_output=True, text=True, timeout=120,
+        [
+            str(py),
+            "-I",
+            str(TESTS / "mcp_probe.py"),
+            str(TESTS),
+            str(project),
+            str(Path(ROOT) / "eng" / "bin" / "strata-mcp"),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
         env={"PATH": os.environ["PATH"], "HOME": str(project)},
     )
     line = next((x for x in done.stdout.splitlines() if x.startswith("PROBE ")), "")

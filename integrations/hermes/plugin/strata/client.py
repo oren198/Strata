@@ -39,6 +39,27 @@ def classify(message: str) -> str:
     return UNBOUND if any(marker in lowered for marker in _UNBOUND_MARKERS) else FAILED
 
 
+def _field(result: Any, snake: str, camel: str) -> Any:
+    """A tool-result field under either naming: mcp 2.x is snake_case, mcp 1.x camelCase."""
+    value = getattr(result, snake, None)
+    return value if value is not None else getattr(result, camel, None)
+
+
+def parse_result(result: Any, name: str) -> dict[str, Any]:
+    """A tool result as a dict, or ``StrataError``; reads the mcp 1.x and 2.x field names."""
+    text = "".join(getattr(block, "text", "") for block in result.content)
+    if _field(result, "is_error", "isError"):
+        raise StrataError(classify(text), text or f"{name} failed.")
+    structured = _field(result, "structured_content", "structuredContent")
+    if isinstance(structured, dict):
+        return structured.get("result", structured) if set(structured) == {"result"} else structured
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return {"text": text}
+    return data if isinstance(data, dict) else {"result": data}
+
+
 class StrataClient:
     def __init__(
         self,
@@ -127,18 +148,4 @@ class StrataClient:
             raise StrataError(FAILED, f"{name} did not answer in time.") from exc
         except Exception as exc:  # noqa: BLE001
             raise StrataError(UNREACHABLE, f"strata-mcp failed: {exc}") from exc
-        text = "".join(getattr(block, "text", "") for block in result.content)
-        if result.isError:
-            raise StrataError(classify(text), text or f"{name} failed.")
-        structured = getattr(result, "structuredContent", None)
-        if isinstance(structured, dict):
-            return (
-                structured.get("result", structured)
-                if set(structured) == {"result"}
-                else structured
-            )
-        try:
-            data = json.loads(text)
-        except ValueError:
-            return {"text": text}
-        return data if isinstance(data, dict) else {"result": data}
+        return parse_result(result, name)
